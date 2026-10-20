@@ -1,0 +1,25 @@
+[project]
+name = "foragent"
+version = "0.1.0"
+description = "Your agent forages for the next task: an issue-queue scheduler for coding agents."
+readme = "README.md"
+authors = [
+    { name = "Jin.Yoon", email = "jin.yoon.builds@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+foragent = "foragent.cli:main"
+fa = "foragent.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
