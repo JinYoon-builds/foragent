@@ -33,6 +33,9 @@ class FakeGit:
     def blob_shas(self, ref, paths):
         return {path: "missing" for path in paths}
 
+    def remove_worktree(self, path):
+        pass
+
 
 @pytest.fixture
 def app(tmp_path, monkeypatch):
@@ -138,6 +141,7 @@ def test_status_groups_latest_reason_active_runs_and_last_ten(app, capsys, json_
         assert status["issues"] == {
             "needs-human": [{"number": 1, "title": "Issue 1", "reason": "hash-mismatch"}],
             "running": [{"number": 2, "title": "Issue 2"}],
+            "pr-open": [],
             "ready": [{"number": 3, "title": "Issue 3"}],
             "approved-waiting": [{"number": 4, "title": "Issue 4"}],
             "unapproved": [{"number": 5, "title": "Issue 5"}],
@@ -151,8 +155,30 @@ def test_status_groups_latest_reason_active_runs_and_last_ten(app, capsys, json_
     assert git.fetches == [] and calls["launches"] == []
 
 
+@pytest.mark.parametrize("json_output", [True, False])
+@pytest.mark.parametrize("labels,group", [
+    (["approved"], "pr-open"),
+    (["approved", "ready"], "pr-open"),
+    (["approved", "running"], "running"),
+    (["approved", "needs-human"], "needs-human"),
+])
+def test_status_groups_issues_awaiting_pr_review(app, capsys, json_output, labels, group):
+    root, git, tracker, store, calls = app
+    tracker.add_issue(1, "Awaiting review", BODY, labels)
+    tracker.create_pr(head="foragent/issue-1", base="main", title="PR", body="Closes #1")
+    args = ["gate", "status", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    if json_output:
+        groups = json.loads(output)["issues"]
+        assert [item["number"] for item in groups[group]] == [1]
+        assert sum(len(items) for items in groups.values()) == 1
+    else:
+        assert f"{group}:\n  #1 Awaiting review" in output
+
+
 @pytest.mark.parametrize("pid", [None, 123])
-def test_run_issue_placeholder_records_own_pid_before_finishing(app, monkeypatch, pid):
+def test_run_issue_records_own_pid_and_runs_without_approval(app, monkeypatch, pid):
     root, git, tracker, store, calls = app
     add_approved(tracker)
     tracker.add_labels(1, ["running"])
@@ -169,10 +195,10 @@ def test_run_issue_placeholder_records_own_pid_before_finishing(app, monkeypatch
     assert cli.main(["gate", "run-issue", "1", "--repo-root", str(root)]) == 0
     assert calls == [1]
     assert store.active_runs() == []
-    assert store.get_run(1).outcome == "not-implemented"
+    assert store.get_run(1).outcome == "no-approval"
     assert store.get_run(1).pid == os.getpid()
     assert store.read_history() == [store.get_run(1)]
-    assert tracker.get_issue(1).labels == {"approved", "ready"}
+    assert tracker.get_issue(1).labels == {"approved"}
     assert tracker.get_issue(1).body == BODY and tracker.get_issue(1).state == "open"
 
 
@@ -181,6 +207,23 @@ def test_missing_run_is_one_clear_error(app, capsys):
     assert cli.main(["gate", "run-issue", "99", "--repo-root", str(root)]) == 1
     captured = capsys.readouterr()
     assert captured.out == "" and captured.err == "foragent: no run record for issue #99\n"
+
+
+@pytest.mark.parametrize("outcome,code", [("merged", 0), ("error", 1)])
+def test_cli_dispatches_to_runner_and_returns_failure_code(app, monkeypatch, outcome, code):
+    root, git, tracker, store, _ = app
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    calls = []
+
+    def runner(number, ctx):
+        calls.append(number)
+        assert ctx.repo_root == root and ctx.git is git and ctx.tracker is tracker
+        assert ctx.store is store and store.get_run(number).pid == os.getpid()
+        return outcome
+
+    monkeypatch.setattr(cli, "run_issue", runner)
+    assert cli.main(["gate", "run-issue", "1", "--repo-root", str(root)]) == code
+    assert calls == [1]
 
 
 @pytest.mark.parametrize("error", [

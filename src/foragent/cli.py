@@ -16,6 +16,7 @@ from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING
 from foragent.launcher import spawn_runner
 from foragent.reasons import parse_reason
 from foragent.scheduler import TickContext, tick
+from foragent.runner import RunContext, run_issue
 from foragent.state import StateStore
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
@@ -32,7 +33,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--json", action="store_true")
         if name == "tick":
             command.add_argument("--no-start", action="store_true")
-    run_issue = actions.add_parser("run-issue", help="Runner placeholder for P3")
+    run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
     run_issue.add_argument("--repo-root", type=Path, required=True)
     return parser
@@ -40,7 +41,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def _status(tracker: Tracker, store: StateStore) -> dict[str, Any]:
     groups: dict[str, list[dict[str, Any]]] = {
-        state: [] for state in (NEEDS_HUMAN, RUNNING, READY, "approved-waiting", "unapproved")
+        state: [] for state in (NEEDS_HUMAN, RUNNING, "pr-open", READY, "approved-waiting", "unapproved")
     }
     for issue in sorted(tracker.list_open_issues(), key=lambda issue: issue.number):
         item: dict[str, Any] = {"number": issue.number, "title": issue.title}
@@ -56,6 +57,8 @@ def _status(tracker: Tracker, store: StateStore) -> dict[str, Any]:
             )
         elif RUNNING in issue.labels:
             group = RUNNING
+        elif APPROVED in issue.labels and tracker.find_pr(f"foragent/issue-{issue.number}") is not None:
+            group = "pr-open"
         elif READY in issue.labels:
             group = READY
         elif APPROVED in issue.labels:
@@ -116,9 +119,11 @@ def main(argv: list[str] | None = None) -> int:
             if store.get_run(args.number) is None:
                 raise ConfigError(f"no run record for issue #{args.number}")
             store.update_run(args.number, pid=os.getpid())
-            store.finish_run(args.number, outcome="not-implemented")
-            tracker.remove_labels(args.number, [RUNNING])
-            tracker.add_labels(args.number, [READY])
+            outcome = run_issue(args.number, RunContext(
+                repo=repo, repo_root=root, tracker=tracker, store=store,
+                config=config, git=git, now=lambda: datetime.now(UTC),
+            ))
+            return 1 if outcome == "error" else 0
         return 0
     except (ConfigError, TrackerError, GitError, OSError) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)

@@ -12,6 +12,19 @@ ACCEPTANCE = "tests/acceptance/test_feature.py"
 BASE_TIME = datetime(2026, 10, 20, 8, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def no_forbidden_git_commands(monkeypatch):
+    """Keep the run's command restrictions true even inside temporary repos."""
+    popen = subprocess.Popen
+
+    def guarded(args, *positional, **kwargs):
+        if isinstance(args, (list, tuple)) and args and args[0] == "git":
+            assert not {"commit", "push", "reset", "checkout", "stash"}.intersection(args), args
+        return popen(args, *positional, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", guarded)
+
+
 def git_command(root: Path, *args: str, input: str | None = None) -> str:
     return subprocess.run(
         ["git", *args], cwd=root, input=input, check=True, capture_output=True, text=True,

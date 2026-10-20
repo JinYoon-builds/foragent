@@ -14,6 +14,30 @@ REPO = "owner/repo"
 NOW = datetime(2026, 10, 20, 9, tzinfo=UTC)
 
 
+@pytest.mark.parametrize("numbers,expected", [([], None), ([42], 42)])
+def test_find_existing_open_pr_gh(numbers, expected):
+    run = ScriptedRun(json.dumps([{"number": number} for number in numbers]))
+    assert GhTracker(REPO, run).find_pr("foragent/issue-1") == expected
+    assert run.calls == [([
+        "api", "--paginate",
+        "repos/owner/repo/pulls?state=open&head=owner%3Aforagent%2Fissue-1&per_page=100",
+    ], None)]
+
+
+def test_find_existing_open_pr_fake():
+    tracker = FakeTracker(strict=True)
+    assert tracker.find_pr("feature") is None
+    pr = tracker.create_pr(head="feature", base="main", title="Title", body="Closes #1")
+    assert tracker.find_pr("feature") == pr
+    tracker.merge_pr(pr, expected_head_sha=tracker.pr_head_sha(pr))
+    assert tracker.find_pr("feature") is None
+
+
+def test_pr_renames_include_old_path_for_merge_policy():
+    run = ScriptedRun('[{"filename":"src/new.py","previous_filename":"tests/acceptance/old.py"}]')
+    assert GhTracker(REPO, run).pr_changed_files(42) == ["src/new.py", "tests/acceptance/old.py"]
+
+
 class ScriptedRun:
     def __init__(self, *responses):
         self.responses = list(responses)
@@ -194,7 +218,12 @@ def test_fake_pr_creation_files_checks_and_merge():
     for status in ("pending", "fail", "pass"):
         tracker.set_pr_checks(number, status)
         assert tracker.pr_checks(number) == status
-    tracker.merge_pr(number)
+    tracker.set_pr_head_sha(number, "a" * 40)
+    assert tracker.pr_head_sha(number) == "a" * 40
+    with pytest.raises(TrackerError, match="head changed"):
+        tracker.merge_pr(number, expected_head_sha="b" * 40)
+    assert tracker.merged_prs == [] and tracker.get_issue(number).state == "open"
+    tracker.merge_pr(number, expected_head_sha="a" * 40)
     assert tracker.merged_prs == [number]
     assert tracker.get_issue(number).state == "closed"
     assert tracker.create_pr(head="next", base="main", title="Next", body="") == 12
@@ -312,11 +341,11 @@ def test_gh_pr_create_files_and_merge():
     tracker = GhTracker(REPO, run)
     assert tracker.create_pr(head="feature", base="main", title="Title", body="Closes #1\nDetails") == 42
     assert tracker.pr_changed_files(42) == ["src/a.py", "tests/a.py"]
-    tracker.merge_pr(42)
+    tracker.merge_pr(42, expected_head_sha="a" * 40)
     assert run.calls == [
         (["pr", "create", "-R", REPO, "--head", "feature", "--base", "main", "--title", "Title", "--body-file", "-"], "Closes #1\nDetails"),
         (["api", "--paginate", "repos/owner/repo/pulls/42/files?per_page=100"], None),
-        (["pr", "merge", "42", "-R", REPO, "--squash", "--delete-branch"], None),
+        (["pr", "merge", "42", "-R", REPO, "--squash", "--delete-branch", "--match-head-commit", "a" * 40], None),
     ]
 
 
@@ -328,8 +357,17 @@ def test_gh_unparseable_pr_url_is_an_error():
 @pytest.mark.parametrize("method", ["merge", "rebase"])
 def test_gh_alternate_merge_method(method):
     run = ScriptedRun("")
-    GhTracker(REPO, run).merge_pr(42, method=method)
-    assert run.calls == [(["pr", "merge", "42", "-R", REPO, f"--{method}", "--delete-branch"], None)]
+    GhTracker(REPO, run).merge_pr(42, method=method, expected_head_sha="a" * 40)
+    assert run.calls == [([
+        "pr", "merge", "42", "-R", REPO, f"--{method}", "--delete-branch",
+        "--match-head-commit", "a" * 40,
+    ], None)]
+
+
+def test_gh_pr_head_sha_reads_current_head():
+    run = ScriptedRun(json.dumps({"head": {"sha": "a" * 40}}))
+    assert GhTracker(REPO, run).pr_head_sha(42) == "a" * 40
+    assert run.calls == [(["api", "repos/owner/repo/pulls/42"], None)]
 
 
 @pytest.mark.parametrize("buckets,expected", [

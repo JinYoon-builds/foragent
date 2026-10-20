@@ -31,6 +31,41 @@ class GitRepo:
         refspec = f"+refs/heads/{ref}:refs/remotes/{remote}/{ref}" if ref is not None else None
         self._call(["fetch", remote, *([refspec] if refspec is not None else [])])
 
+    def at(self, root: Path) -> "GitRepo":
+        return GitRepo(root, lambda args: self._call(["-C", str(root), *args]))
+
+    def remove_worktree(self, path: Path) -> None:
+        if path.exists():
+            self._call(["worktree", "remove", "--force", str(path)])
+        self._call(["worktree", "prune"])
+
+    def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._call(["worktree", "add", "-B", branch, str(path), base_ref])
+
+    def stage_changes(self) -> None:
+        self._call(["add", "-A", "--", ".", ":!.foragent"])
+
+    def changed_paths(self, base_ref: str) -> list[str]:
+        # NUL delimiters retain filenames containing tabs, quotes, or newlines.
+        output = self._call(["diff", "--cached", "--name-only", "--no-renames", "-z", base_ref])
+        return [path for path in output.split("\0") if path]
+
+    def staged_tree_sha(self) -> str:
+        return self._call(["write-tree"]).strip()
+
+    def head_sha(self) -> str:
+        return self._call(["rev-parse", "HEAD"]).strip()
+
+    def commit(self, title: str) -> None:
+        self._call([
+            "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+            "commit", "-m", title,
+        ])
+
+    def push(self, branch: str) -> None:
+        self._call(["push", "-f", "origin", branch])
+
     def commit_before(self, ref: str, iso_time: str) -> str | None:
         return self._call(["rev-list", "-1", f"--before={iso_time}", ref]).strip() or None
 

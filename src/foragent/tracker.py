@@ -76,9 +76,11 @@ class Tracker(Protocol):
     def ensure_labels(self, specs: list[LabelSpec]) -> None: ...
     def close_issue(self, n: int, comment: str | None = None) -> None: ...
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
+    def find_pr(self, head: str) -> int | None: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
-    def merge_pr(self, pr: int, *, method: str = "squash") -> None: ...
+    def pr_head_sha(self, pr: int) -> str: ...
+    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None: ...
 
 
 class TrackerError(RuntimeError):
@@ -114,6 +116,7 @@ class FakeTracker:
         self._dependencies: dict[int, list[Dependency]] = {}
         self._pr_files: dict[int, list[str]] = {}
         self._pr_checks: dict[int, CheckStatus] = {}
+        self._pr_heads: dict[int, str] = {}
         self._next_comment_id = 1
 
     def _timestamp(self) -> str:
@@ -196,6 +199,10 @@ class FakeTracker:
         self.add_issue(number, title, body, is_pull_request=True)
         return number
 
+    def find_pr(self, head: str) -> int | None:
+        return next((pr.number for pr in self.created_prs
+                     if pr.head == head and self.get_issue(pr.number).state == "open"), None)
+
     def set_pr_files(self, pr: int, files: list[str]) -> None:
         self._pr_files[pr] = list(files)
 
@@ -208,8 +215,16 @@ class FakeTracker:
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
 
-    def merge_pr(self, pr: int, *, method: str = "squash") -> None:
+    def set_pr_head_sha(self, pr: int, sha: str) -> None:
+        self._pr_heads[pr] = sha
+
+    def pr_head_sha(self, pr: int) -> str:
+        return self._pr_heads.get(pr, "0" * 40)
+
+    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None:
         _merge_flag(method)
+        if self.pr_head_sha(pr) != expected_head_sha:
+            raise TrackerError("PR head changed after verification")
         self.merged_prs.append(pr)
         self.issues[pr] = replace(self.get_issue(pr), state="closed")
 
@@ -354,7 +369,16 @@ class GhTracker:
 
     def pr_changed_files(self, pr: int) -> list[str]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/pulls/{pr}/files?per_page=100"]))
-        return [item["filename"] for item in data]
+        return list(dict.fromkeys(
+            path for item in data for path in (item["filename"], item.get("previous_filename")) if path
+        ))
+
+    def find_pr(self, head: str) -> int | None:
+        data = _items(self._call([
+            "api", "--paginate",
+            f"{self._path}/pulls?state=open&head={quote(self.repo.split('/')[0] + ':' + head, safe='')}&per_page=100",
+        ]))
+        return next((item["number"] for item in data), None)
 
     def pr_checks(self, pr: int) -> CheckStatus:
         try:
@@ -377,5 +401,11 @@ class GhTracker:
             return "pass"
         raise TrackerError(f"unknown check buckets: {sorted(buckets)}")
 
-    def merge_pr(self, pr: int, *, method: str = "squash") -> None:
-        self._call(["pr", "merge", str(pr), "-R", self.repo, _merge_flag(method), "--delete-branch"])
+    def pr_head_sha(self, pr: int) -> str:
+        return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
+
+    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None:
+        self._call([
+            "pr", "merge", str(pr), "-R", self.repo, _merge_flag(method), "--delete-branch",
+            "--match-head-commit", expected_head_sha,
+        ])

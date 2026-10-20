@@ -8,11 +8,13 @@ from pathlib import Path
 import re
 import subprocess
 
+from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitRepo
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING
-from foragent.reasons import Reason, format_approval_comment, format_comment
+from foragent.reasons import Reason, format_approval_comment
+from foragent.processes import kill_process_group
 from foragent.state import Approval, StateStore
 from foragent.tracker import Issue, LabelEvent, Tracker
 
@@ -46,21 +48,13 @@ class TickContext:
     launcher: Callable[[int], int | None]
     start_runs: bool = True
     runner_process_exists: Callable[[int], bool] = runner_process_exists
+    kill_runner: Callable[[int], None] = kill_process_group
 
 
 @dataclass
 class TickReport:
     skipped: str | None = None
     actions: list[str] = field(default_factory=list)
-
-
-def flag(
-    ctx: TickContext, n: int, reason: Reason, summary: str, details: str | None = None,
-) -> None:
-    ctx.store.save_flag(n, reason, flagged_at=ctx.now().astimezone(UTC).isoformat())
-    ctx.tracker.add_labels(n, [NEEDS_HUMAN])
-    ctx.tracker.remove_labels(n, [READY, RUNNING])
-    ctx.tracker.comment(n, format_comment(reason, summary, details))
 
 
 def _latest_approval(events: list[LabelEvent], approvers: list[str]) -> tuple[LabelEvent | None, set[str]]:
@@ -83,12 +77,22 @@ def _latest_approval(events: list[LabelEvent], approvers: list[str]) -> tuple[La
 def _invalidate_approval(
     ctx: TickContext, issue: Issue, summary: str, details: str | None, report: TickReport,
 ) -> None:
-    flag(ctx, issue.number, Reason.HASH_MISMATCH, summary, details)
-    ctx.tracker.remove_labels(issue.number, [APPROVED])
-    ctx.store.clear_approval(issue.number)
+    run = ctx.store.get_run(issue.number)
+    if run is not None and run.status == "running":
+        _kill_run(ctx, run.number, report)
+    invalidate_approval(ctx, issue.number, summary, details)
     report.actions.append(f"#{issue.number} flagged hash-mismatch: {summary}")
-    if RUNNING in issue.labels:
-        report.actions.append(f"#{issue.number} runner was already running; its process remains running in P2")
+
+
+def _kill_run(ctx: TickContext, number: int, report: TickReport) -> None:
+    run = ctx.store.get_run(number)
+    if run is None or run.status != "running":
+        return
+    if run.pid is not None:
+        ctx.kill_runner(run.pid)
+    ctx.git.remove_worktree(Path(run.worktree))
+    ctx.store.finish_run(number, outcome="killed")
+    report.actions.append(f"#{number} runner killed")
 
 
 def _check_integrity(
@@ -195,6 +199,9 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
     run = ctx.store.get_run(issue.number)
     if RUNNING not in issue.labels or (run is not None and run.status == "running"):
         return issue
+    if run is not None and run.outcome == "merged":
+        ctx.tracker.remove_labels(issue.number, [READY, RUNNING])
+        return ctx.tracker.get_issue(issue.number)
     detail = _crash_detail(ctx, issue.number)
     if run is None or run.outcome != "crashed" or run.detail != detail:
         ctx.store.start_run(
@@ -224,6 +231,12 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             else:
                 dead = False
         if not dead:
+            if run.pid is not None and ctx.now() - datetime.fromisoformat(run.started_at) > timedelta(
+                minutes=ctx.config.max_runtime_minutes + 10,
+            ):
+                _kill_run(ctx, run.number, report)
+                flag(ctx, run.number, Reason.TIMEOUT, "Too big for one session; split it in order")
+                report.actions.append(f"#{run.number} flagged timeout")
             continue
         finished = ctx.store.finish_run(run.number, outcome="crashed", detail=_crash_detail(ctx, run.number))
         if finished.outcome != "crashed":
@@ -236,6 +249,20 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
 def _check_prerequisites(
     ctx: TickContext, issue: Issue, approval: Approval, report: TickReport,
 ) -> bool:
+    latest_run = next(
+        (run for run in reversed(ctx.store.read_history()) if run.number == issue.number), None,
+    )
+    if (
+        latest_run is not None and latest_run.outcome == "merged"
+        and datetime.fromisoformat(approval.approved_at) <= datetime.fromisoformat(latest_run.started_at)
+    ):
+        if READY in issue.labels:
+            ctx.tracker.remove_labels(issue.number, [READY])
+        return False
+    if ctx.tracker.find_pr(f"foragent/issue-{issue.number}") is not None:
+        if READY in issue.labels:
+            ctx.tracker.remove_labels(issue.number, [READY])
+        return False
     if not has_machine_check(parse_body(approval.body)):
         flag(
             ctx, issue.number, Reason.NO_MACHINE_CHECK,

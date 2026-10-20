@@ -105,3 +105,34 @@ def test_git_errors_are_wrapped(tmp_path, failure):
 
     with pytest.raises(GitError, match="git not found|remote unavailable"):
         GitRepo(tmp_path, run).fetch()
+
+
+def test_runner_git_commands_are_exact_and_injectable(tmp_path):
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        if "diff" in args:
+            return "a.py\0odd\nname.py\0"
+        return ""
+
+    git = GitRepo(tmp_path, run)
+    path = tmp_path / "worktree"
+    git.add_worktree(path, "foragent/issue-1", "origin/main")
+    worktree = git.at(path)
+    worktree.stage_changes()
+    assert worktree.changed_paths("origin/main") == ["a.py", "odd\nname.py"]
+    worktree.commit("Issue title (#1)")
+    worktree.push("foragent/issue-1")
+    path.mkdir()
+    git.remove_worktree(path)
+    assert calls == [
+        ["worktree", "add", "-B", "foragent/issue-1", str(path), "origin/main"],
+        ["-C", str(path), "add", "-A", "--", ".", ":!.foragent"],
+        ["-C", str(path), "diff", "--cached", "--name-only", "--no-renames", "-z", "origin/main"],
+        ["-C", str(path), "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+         "commit", "-m", "Issue title (#1)"],
+        ["-C", str(path), "push", "-f", "origin", "foragent/issue-1"],
+        ["worktree", "remove", "--force", str(path)],
+        ["worktree", "prune"],
+    ]

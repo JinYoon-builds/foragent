@@ -1,6 +1,10 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import os
+import signal
 import subprocess
+import sys
+import time
 
 import pytest
 
@@ -8,6 +12,7 @@ from foragent.config import Config
 from foragent.git import GitRepo
 from foragent.issue import body_hash
 from foragent.reasons import Reason, parse_approval_comment, parse_reason
+from foragent.processes import kill_process_group
 from foragent.scheduler import TickContext, flag, runner_process_exists, tick
 from foragent.state import StateStore
 from foragent.tracker import Dependency, FakeTracker, LabelEvent, TrackerError
@@ -36,6 +41,7 @@ def ctx(git_history, tmp_path, monkeypatch):
         config=Config(approvers=["human"]), git=GitRepo(git_history.clone), now=lambda: NOW,
         launcher=lambda number: 7000 + number, start_runs=False,
         runner_process_exists=lambda number: False,
+        kill_runner=lambda pid: None,
     )
     context.tracker._now = lambda: context.now()
     context.store._now = lambda: context.now()
@@ -140,9 +146,313 @@ def test_body_integrity_for_every_approved_state(ctx, state):
     assert parse_reason(comment) == Reason.HASH_MISMATCH
     assert "body changed" in comment and "Re-approve" in comment
     if state == "running":
-        assert any("already running" in line for line in report.actions)
-        assert ctx.store.active_runs()[0].pid == 123
+        assert "#1 runner killed" in report.actions
+        assert ctx.store.active_runs() == []
+        assert ctx.store.get_run(1).outcome == "killed"
     assert tick(ctx).actions == []
+
+
+@pytest.mark.parametrize("change", ["body", "acceptance"])
+def test_running_integrity_failure_kills_and_finishes_before_flagging(ctx, git_history, monkeypatch, change):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx, pid=4321)
+    if change == "body":
+        edit_body(ctx, 1, BODY + "Changed scope\n")
+    else:
+        git_history.update({ACCEPTANCE: "weakened test\n"})
+    actions = []
+    ctx.kill_runner = lambda pid: actions.append(("kill", pid))
+    add_labels = ctx.tracker.add_labels
+
+    def add(number, labels):
+        if "needs-human" in labels:
+            assert actions == [("kill", 4321)]
+            assert ctx.store.get_run(number).outcome == "killed"
+        return add_labels(number, labels)
+
+    monkeypatch.setattr(ctx.tracker, "add_labels", add)
+    tick(ctx)
+    assert actions == [("kill", 4321)]
+    assert ctx.store.get_run(1).outcome == "killed"
+    assert ctx.store.load_flag(1).reason == Reason.HASH_MISMATCH
+    assert ctx.store.load_approval(1) is None
+    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+
+
+@pytest.mark.parametrize("seconds,killed", [(0, False), (1, True)])
+def test_running_overtime_backstop_kills_alive_runner(ctx, monkeypatch, seconds, killed):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx, pid=5432)
+    actions = []
+    ctx.kill_runner = lambda pid: actions.append(pid)
+    ctx.now = lambda: NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 10, seconds=seconds)
+    tick(ctx)
+    assert actions == ([5432] if killed else [])
+    if killed:
+        assert ctx.store.get_run(1).outcome == "killed"
+        assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+        assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    else:
+        assert ctx.store.get_run(1).status == "running"
+
+
+@pytest.mark.parametrize("trigger", ["integrity", "timeout"])
+@pytest.mark.parametrize("force", [False, True])
+def test_tick_removes_registered_worktree_after_runner_termination(ctx, monkeypatch, trigger, force):
+    approve(ctx)
+    tick(ctx)
+    run = mark_running(ctx, pid=4321)
+    path = ctx.store.worktree_path(1)
+    ctx.git.add_worktree(path, run.branch, "origin/main")
+    (path / "unfinished.txt").write_text("unfinished")
+    alive = [True]
+    signals = []
+
+    def killpg(pid, sig):
+        assert pid == 4321
+        if not alive[0]:
+            raise ProcessLookupError(pid)
+        signals.append(sig)
+        if sig == signal.SIGKILL or (sig == signal.SIGTERM and not force):
+            alive[0] = False
+
+    monkeypatch.setattr("foragent.processes.os.killpg", killpg)
+    waitpid = os.waitpid
+    monkeypatch.setattr(
+        "foragent.processes.os.waitpid",
+        lambda pid, options: (0, 0) if pid == 4321 else waitpid(pid, options),
+    )
+    monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: None)
+    ctx.kill_runner = kill_process_group
+    finish = ctx.store.finish_run
+
+    def finish_after_cleanup(*args, **kwargs):
+        assert not alive[0] and not path.exists()
+        assert str(path) not in git_command(ctx.repo_root, "worktree", "list")
+        return finish(*args, **kwargs)
+
+    monkeypatch.setattr(ctx.store, "finish_run", finish_after_cleanup)
+    if trigger == "integrity":
+        edit_body(ctx, 1, BODY + "Changed scope\n")
+    else:
+        ctx.now = lambda: NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 11)
+    tick(ctx)
+    assert (signal.SIGKILL in signals) == force
+    assert ctx.store.get_run(1).outcome == "killed"
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands(ctx, tmp_path, monkeypatch, force):
+    approve(ctx)
+    tick(ctx)
+    path = ctx.store.worktree_path(1)
+    ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    ready = tmp_path / "polling"
+    script = """
+from pathlib import Path
+import signal, sys, time
+from foragent.processes import run_logged
+root, ready = map(Path, sys.argv[1:3])
+run_logged(['/bin/sh', '-c', 'true'], cwd=root, timeout_s=5, log_path=root / 'session.log')
+assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+if sys.argv[3] == 'force':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+ready.touch()
+time.sleep(60)
+"""
+    real_sleep = time.sleep
+    with subprocess.Popen(
+        [sys.executable, "-c", script, str(path), str(ready), "force" if force else "term"],
+        start_new_session=True,
+    ) as process:
+        try:
+            for _ in range(500):
+                if ready.exists() or process.poll() is not None:
+                    break
+                real_sleep(0.01)
+            assert ready.exists(), "runner did not reach CI polling"
+            mark_running(ctx, pid=process.pid)
+            edit_body(ctx, 1, BODY + "Changed scope\n")
+            ctx.kill_runner = kill_process_group
+            monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: real_sleep(min(seconds, 0.02)))
+            tick(ctx)
+            assert process.poll() is not None
+            assert ctx.store.get_run(1).outcome == "killed"
+            assert not path.exists()
+            assert str(path) not in git_command(ctx.repo_root, "worktree", "list")
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+            ctx.git.remove_worktree(path)
+
+
+def test_failed_termination_keeps_worktree_and_active_record(ctx):
+    approve(ctx)
+    tick(ctx)
+    run = mark_running(ctx, pid=4321)
+    path = ctx.store.worktree_path(1)
+    ctx.git.add_worktree(path, run.branch, "origin/main")
+    edit_body(ctx, 1, BODY + "Changed scope\n")
+
+    def failed_kill(pid):
+        raise TimeoutError("Runner still alive")
+
+    ctx.kill_runner = failed_kill
+    try:
+        with pytest.raises(TimeoutError, match="still alive"):
+            tick(ctx)
+        assert path.exists() and ctx.store.get_run(1).status == "running"
+    finally:
+        ctx.git.remove_worktree(path)
+
+
+@pytest.mark.parametrize("mode", ["batch", "careful"])
+@pytest.mark.parametrize("ready", [False, True])
+def test_open_review_pr_is_not_rescheduled_or_allowed_to_starve_next_issue(ctx, mode, ready):
+    ctx.config = replace(ctx.config, review=mode)
+    approve(ctx)
+    approve(ctx, 2)
+    tick(ctx)
+    if not ready:
+        ctx.tracker.remove_labels(1, ["ready"])
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.finish_run(1, "pr-open")
+    ctx.tracker.create_pr(head="foragent/issue-1", base="main", title="Review", body="Closes #1")
+    launches = []
+    ctx.launcher = lambda number: launches.append(number) or 7000 + number
+    ctx.start_runs = True
+    tick(ctx)
+    tick(ctx)
+    assert launches == [2]
+    assert ctx.tracker.get_issue(1).labels == {"approved"}
+    assert ctx.store.get_run(1).outcome == "pr-open"
+
+
+def test_pr_opened_between_promotion_and_start_prevents_launch(ctx, monkeypatch):
+    approve(ctx)
+    ctx.start_runs = True
+    find = ctx.tracker.find_pr
+    probes = []
+
+    def find_pr(head):
+        probes.append(head)
+        if len(probes) == 2:
+            ctx.tracker.create_pr(head=head, base="main", title="Review", body="Closes #1")
+        return find(head)
+
+    monkeypatch.setattr(ctx.tracker, "find_pr", find_pr)
+    tick(ctx)
+    assert len(probes) == 2
+    assert ctx.store.active_runs() == []
+    assert ctx.tracker.get_issue(1).labels == {"approved"}
+
+
+def test_closed_review_pr_allows_issue_to_run_again(ctx):
+    approve(ctx)
+    pr = ctx.tracker.create_pr(head="foragent/issue-1", base="main", title="Review", body="Closes #1")
+    tick(ctx)
+    assert "ready" not in ctx.tracker.get_issue(1).labels
+    ctx.tracker.close_issue(pr)
+    ctx.start_runs = True
+    tick(ctx)
+    assert ctx.store.get_run(1).status == "running"
+
+
+@pytest.mark.parametrize("stale_label", [None, "ready", "running"])
+@pytest.mark.parametrize("start_runs", [False, True])
+def test_merged_issue_waiting_for_github_closure_is_not_rescheduled(ctx, stale_label, start_runs):
+    approve(ctx)
+    tick(ctx)
+    ctx.tracker.remove_labels(1, ["ready"])
+    if stale_label is not None:
+        ctx.tracker.add_labels(1, [stale_label])
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.finish_run(1, "merged")
+    # Keep the issue open to reproduce GitHub's delayed Closes processing, and
+    # reload state so the guard must use persisted execution history.
+    ctx.store = StateStore(ctx.store.root, now=lambda: ctx.now())
+    ctx.now = lambda: NOW + timedelta(seconds=1)
+    approve(ctx, 2)
+    launches = []
+    ctx.launcher = lambda number: launches.append(number) or 7000 + number
+    ctx.start_runs = start_runs
+    for _ in range(2):
+        report = tick(ctx)
+        assert "#1 promoted to ready" not in report.actions
+    assert ctx.tracker.get_issue(1).state == "open"
+    assert ctx.tracker.get_issue(1).labels == {"approved"}
+    assert ctx.store.get_run(1).outcome == "merged"
+    assert [run.outcome for run in ctx.store.read_history() if run.number == 1] == ["merged"]
+    assert launches == ([2] if start_runs else [])
+
+
+@pytest.mark.parametrize("approval_offset", [-1, 0, 1])
+@pytest.mark.parametrize("actor", ["human", "stranger"])
+def test_merged_issue_requires_valid_approval_strictly_after_run_start(ctx, approval_offset, actor):
+    approve(ctx)
+    tick(ctx)
+    ctx.tracker.remove_labels(1, ["ready"])
+    started_at = NOW + timedelta(minutes=1)
+    ctx.now = lambda: started_at
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.finish_run(1, "merged")
+    ctx.now = lambda: started_at + timedelta(seconds=approval_offset)
+    ctx.tracker.record_label(1, "approved", actor)
+    ctx.now = lambda: NOW + timedelta(minutes=2)
+    launches = []
+    ctx.launcher = lambda number: launches.append(number) or 7001
+    ctx.start_runs = True
+    report = tick(ctx)
+    allowed = actor == "human" and approval_offset > 0
+    assert launches == ([1] if allowed else [])
+    assert ("#1 promoted to ready" in report.actions) == allowed
+    assert ctx.tracker.get_issue(1).labels == ({"approved", "running"} if allowed else {"approved"})
+
+
+def test_merged_guard_uses_last_run_for_same_issue(ctx):
+    approve(ctx)
+    tick(ctx)
+    for seconds, number, outcome in [(0, 1, "merged"), (1, 1, "crashed"), (2, 99, "merged")]:
+        ctx.now = lambda seconds=seconds: NOW + timedelta(seconds=seconds)
+        ctx.store.start_run(number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number))
+        ctx.store.finish_run(number, outcome)
+    ctx.start_runs = True
+    tick(ctx)
+    assert ctx.store.get_run(1).status == "running"
+    assert ctx.store.get_run(1).pid == 7001
+
+
+def test_merge_history_is_rechecked_immediately_before_launch(ctx, monkeypatch):
+    approve(ctx)
+
+    def merged_while_checking_dependencies(number):
+        ctx.store.start_run(number, branch="foragent/issue-1", worktree=ctx.store.worktree_path(number))
+        ctx.store.finish_run(number, "merged")
+        return []
+
+    monkeypatch.setattr(ctx.tracker, "blocked_by", merged_while_checking_dependencies)
+    launches = []
+    ctx.launcher = lambda number: launches.append(number) or 7001
+    ctx.start_runs = True
+    tick(ctx)
+    assert launches == []
+    assert ctx.store.get_run(1).outcome == "merged"
+    assert ctx.tracker.get_issue(1).labels == {"approved"}
+
+
+def test_dead_overtime_runner_uses_crash_recovery(ctx, monkeypatch):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx)
+    ctx.now = lambda: NOW + timedelta(hours=3)
+    monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
+    ctx.kill_runner = lambda pid: pytest.fail("a dead runner needs no termination")
+    tick(ctx)
+    assert ctx.store.get_run(1).outcome == "crashed"
+    assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
 
 
 @pytest.mark.parametrize("content", ["def test_feature():\n    pass\n", None])
