@@ -1,0 +1,6 @@
+# Configuration: Foragent docs/gate.md (section 9), docs/contract.md (section 4).
+review: batch
+executor: codex
+language: ko
+approvers:
+- JinYoon-builds
