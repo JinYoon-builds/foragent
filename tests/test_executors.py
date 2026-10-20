@@ -4,6 +4,8 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -74,6 +76,7 @@ def test_executor_uses_worktree_stdin_append_log_and_output(kind, tmp_path, monk
     )
     assert result.exit_code == 7 and not result.timed_out and result.log_path == log
     assert result.last_message == ("last codex message" if kind == "codex" else "session stdout\n")
+    assert result.full_message == result.last_message
     assert log.read_text().startswith("earlier\n") and "session stdout" in log.read_text()
     args, kwargs = calls[0]
     assert kwargs["cwd"] == tmp_path and kwargs["stdin"] == subprocess.PIPE
@@ -89,6 +92,22 @@ def test_executor_uses_worktree_stdin_append_log_and_output(kind, tmp_path, monk
         assert not Path(args[args.index("-o") + 1]).exists()
 
 
+def test_claude_preserves_full_stdout_separately_from_tail_and_stderr(tmp_path, monkeypatch):
+    message = "VERDICT: FAIL\n" + "\n".join(f"file.py:{i}: " + "x" * 930 for i in range(5)) + "\n"
+    assert len(message) > 4708
+    monkeypatch.setattr("foragent.executors.claude_command", lambda model: [
+        sys.executable, "-c", f"import sys; sys.stdout.write({message!r}); sys.stderr.write('VERDICT: PASS\\n')",
+    ])
+    result = ClaudeExecutor().run(
+        worktree=tmp_path, prompt="review", model=None, timeout_s=5, log_path=tmp_path / "review.log",
+    )
+    assert result.exit_code == 0 and not result.timed_out
+    assert result.full_message == message
+    assert result.last_message == message[-4000:] and "VERDICT:" not in result.last_message
+    assert (tmp_path / "review.stdout").read_text() == message
+    assert "VERDICT: PASS" in result.log_path.read_text() and "VERDICT: PASS" not in result.full_message
+
+
 def test_logged_process_really_runs_offline_and_appends_both_streams(tmp_path):
     log = tmp_path / "session.log"
     log.write_text("old\n")
@@ -98,6 +117,35 @@ def test_logged_process_really_runs_offline_and_appends_both_streams(tmp_path):
     )
     assert code == 0 and not timed_out and tail == "hello\n"
     assert log.read_text() == "old\nerr\nhello\n"
+
+
+def test_captured_stdout_reaches_log_before_executor_finishes(tmp_path):
+    log = tmp_path / "session.log"
+    release = tmp_path / "release"
+
+    def observe_log():
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            if log.exists() and "live progress" in log.read_text():
+                release.touch()
+                return
+            time.sleep(0.01)
+
+    observer = threading.Thread(target=observe_log)
+    observer.start()
+    try:
+        code, timed_out, message = run_logged(
+            [sys.executable, "-c",
+             "from pathlib import Path\nimport time\nprint('live progress', flush=True)\n"
+             "deadline = time.monotonic() + 4\n"
+             "while not Path('release').exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+             "raise SystemExit(0 if Path('release').exists() else 1)"],
+            cwd=tmp_path, timeout_s=6, log_path=log, capture_stdout=True,
+        )
+    finally:
+        observer.join()
+    assert code == 0 and not timed_out
+    assert message == "live progress\n" and log.read_text().count("live progress") == 1
 
 
 def test_done_when_child_uses_clean_environment_and_project_path(tmp_path, monkeypatch):

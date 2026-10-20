@@ -14,6 +14,7 @@ class ExecResult:
     timed_out: bool
     last_message: str
     log_path: Path
+    full_message: str | None = None
 
 
 class Executor(Protocol):
@@ -47,8 +48,8 @@ class CodexExecutor:
                 codex_command(worktree, output_path, model), cwd=worktree, prompt=prompt,
                 timeout_s=timeout_s, log_path=log_path,
             )
-            last_message = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
-        return ExecResult(code, timed_out, last_message, log_path)
+            last_message = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
+        return ExecResult(code, timed_out, last_message, log_path, last_message)
 
 
 class ClaudeExecutor:
@@ -56,11 +57,12 @@ class ClaudeExecutor:
         self, *, worktree: Path, prompt: str, model: str | None,
         timeout_s: int, log_path: Path,
     ) -> ExecResult:
+        output_path = log_path.with_suffix(".stdout")
         code, timed_out, tail = run_logged(
             claude_command(model), cwd=worktree, prompt=prompt, timeout_s=timeout_s,
-            log_path=log_path, capture_stdout=True,
+            log_path=log_path, capture_stdout=True, stdout_path=output_path,
         )
-        return ExecResult(code, timed_out, tail, log_path)
+        return ExecResult(code, timed_out, tail, log_path, output_path.read_text(encoding="utf-8", errors="replace"))
 
 
 def executor_for(name: str) -> Executor:

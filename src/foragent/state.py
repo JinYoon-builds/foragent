@@ -137,7 +137,9 @@ class StateStore:
     ) -> Run:
         with self._state_lock():
             timestamp = self._timestamp()
-            run = Run(number, branch, str(worktree), pid, timestamp, timestamp)
+            previous = self.get_run(number)
+            restarts = previous.restarts if previous is not None and previous.outcome in {"stalled-restart", "crashed"} else 0
+            run = Run(number, branch, str(worktree), pid, timestamp, timestamp, restarts=restarts)
             self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
             return run
 

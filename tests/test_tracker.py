@@ -142,6 +142,49 @@ def test_gh_blocked_by_preserves_closure_reason():
     ]
 
 
+def test_parent_and_paginated_sub_issues_gh():
+    run = ScriptedRun('{"number": 99}', json.dumps([issue_json(1)]) + "\n" + json.dumps([issue_json(2, state="closed")]))
+    tracker = GhTracker(REPO, run)
+    assert tracker.parent_of(1) == 99
+    assert [(issue.number, issue.state) for issue in tracker.sub_issues(99)] == [(1, "open"), (2, "closed")]
+    assert run.calls == [
+        (["api", "repos/owner/repo/issues/1/parent"], None),
+        (["api", "--paginate", "repos/owner/repo/issues/99/sub_issues?per_page=100"], None),
+    ]
+
+
+@pytest.mark.parametrize("code", [404, 403, 500])
+def test_only_missing_parent_is_none(code):
+    tracker = GhTracker(REPO, ScriptedRun(gh_error(f"gh: error (HTTP {code})")))
+    if code == 404:
+        assert tracker.parent_of(1) is None
+    else:
+        with pytest.raises(TrackerError):
+            tracker.parent_of(1)
+
+
+def test_fake_sub_issues_and_dependencies_follow_child_closure():
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    tracker.add_issue(2)
+    tracker.add_issue(99)
+    tracker.set_parent(1, 99)
+    tracker.set_parent(2, 99)
+    tracker.set_blocked_by(2, [Dependency(1, "open")])
+    assert tracker.parent_of(1) == 99 and tracker.parent_of(99) is None
+    tracker.close_issue(1)
+    assert tracker.blocked_by(2) == [Dependency(1, "closed")]
+    assert [(issue.number, issue.state) for issue in tracker.sub_issues(99)] == [(1, "closed"), (2, "open")]
+
+
+def test_update_pr_sends_body_as_stdin_and_preserves_newlines():
+    run = ScriptedRun("")
+    GhTracker(REPO, run).update_pr(42, base="foragent/batch-99", title="Updated", body="## Review\nVERDICT: PASS\n")
+    assert run.calls == [([
+        "pr", "edit", "42", "-R", REPO, "--base", "foragent/batch-99", "--title", "Updated", "--body-file", "-",
+    ], "## Review\nVERDICT: PASS\n")]
+
+
 def test_fake_issues_dependencies_and_label_events():
     tracker = FakeTracker(now=lambda: NOW)
     assert tracker.add_issue(1, "First", "body", ["ready"]) == Issue(1, "First", "body", frozenset({"ready"}), "open")

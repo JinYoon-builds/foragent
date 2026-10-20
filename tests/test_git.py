@@ -66,6 +66,54 @@ def test_blobs_present_missing_and_invalid_ref(git_history):
         git.blob_sha("not-a-ref", ACCEPTANCE)
 
 
+@pytest.mark.parametrize("replacement", ["ordinary", "file-to-directory", "directory-to-file", "directory-to-symlink", "unmerged"])
+def test_review_restore_preserves_index_unstaged_files_modes_and_symlinks(git_history, replacement):
+    root = git_history.clone
+    git = GitRepo(root)
+    feature = root / "feature.txt"
+    feature.write_text("staged implementation")
+    directory = root / "directory"
+    directory.mkdir()
+    (directory / "child.txt").write_text("original child")
+    (root / "link").symlink_to("feature.txt")
+    git.stage_changes()
+    feature.write_text("original unstaged content")
+    (root / ".foragent").mkdir()
+    (root / ".foragent/keep").write_text("existing metadata")
+    before = git.review_state()
+    feature.write_text("reviewer content")
+    (root / ACCEPTANCE).chmod(0o755)
+    (root / "link").unlink()
+    (root / "link").symlink_to("directory/child.txt")
+    (root / ".foragent/keep").write_text("reviewer metadata")
+    (root / "extra.txt").write_text("reviewer addition")
+    git.stage_changes()
+    if replacement == "file-to-directory":
+        feature.unlink()
+        feature.mkdir()
+        (feature / "new.txt").write_text("reviewer nested addition")
+    elif replacement in {"directory-to-file", "directory-to-symlink"}:
+        (directory / "child.txt").unlink()
+        directory.rmdir()
+        if replacement == "directory-to-file":
+            directory.write_text("reviewer file")
+        else:
+            external = root.parent / "external"
+            external.mkdir()
+            (external / "child.txt").write_text("external content must survive")
+            directory.symlink_to(external)
+    elif replacement == "unmerged":
+        sha = git.blob_sha("HEAD", ACCEPTANCE)
+        git_command(root, "update-index", "--index-info", input=f"0 {'0' * 40}\tfeature.txt\n100644 {sha} 1\tfeature.txt\n")
+    assert git.review_state() != before
+    git.restore_review_state(before)
+    assert git.review_state() == before
+    assert git_command(root, "show", ":feature.txt") == "staged implementation"
+    assert feature.read_text() == "original unstaged content"
+    if replacement == "directory-to-symlink":
+        assert (external / "child.txt").read_text() == "external content must survive"
+
+
 @pytest.mark.parametrize("custom_refspec", [False, True])
 def test_fetch_updates_remote_tracking_blobs(git_history, custom_refspec):
     git = GitRepo(git_history.clone)
@@ -140,6 +188,7 @@ def test_default_git_runner_bounds_all_commands_and_wraps_timeouts(tmp_path, mon
         assert command == ["git", *args]
         assert kwargs == {
             "cwd": tmp_path, "check": True, "capture_output": True, "text": True, "timeout": timeout,
+            "errors": "replace",
         }
         if expired:
             raise subprocess.TimeoutExpired(command, timeout)
@@ -184,3 +233,32 @@ def test_runner_git_commands_are_exact_and_injectable(tmp_path):
         ["worktree", "remove", "--force", str(path)],
         ["worktree", "prune"],
     ]
+
+
+def test_review_baseline_restores_head_even_when_index_and_files_are_unchanged(git_history):
+    git = GitRepo(git_history.clone)
+    feature = git.root / "feature.txt"
+    feature.write_text("implementation")
+    git.stage_changes()
+    feature.write_text("unstaged implementation")
+    before = git.review_state()
+    git_history.update({"other.txt": "reviewer commit"})
+    git.fetch("origin", "main")
+    git_command(git.root, "update-ref", "HEAD", git_history.tip)
+    after = git.review_state()
+    assert after.staged_tree == before.staged_tree and after.files == before.files
+    assert after.head_sha != before.head_sha
+    git.restore_review_state(before)
+    assert git.review_state() == before
+    assert git_command(git.root, "show", ":feature.txt") == "implementation"
+    assert feature.read_text() == "unstaged implementation"
+
+
+def test_non_utf8_diff_decodes_with_replacement_and_patch_keeps_original_bytes(git_history, tmp_path):
+    git = GitRepo(git_history.clone)
+    (git.root / "latin1.txt").write_bytes(b"caf\xe9\n")
+    git.stage_changes()
+    assert "caf\ufffd" in git.staged_diff("HEAD")
+    patch = tmp_path / "child.patch"
+    git.write_staged_patch("HEAD", patch)
+    assert b"caf\xe9\n" in patch.read_bytes()

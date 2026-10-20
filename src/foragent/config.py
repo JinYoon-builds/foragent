@@ -23,6 +23,7 @@ class Config:
     executor_model: str | None = None
     reviewer: str | None = None
     reviewer_model: str | None = None
+    review_max: int = 2
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
@@ -78,9 +79,10 @@ def _validate(values: dict[str, Any]) -> None:
         value = values[key]
         if key == "reviewer" and value is None:
             continue
-        if not isinstance(value, str) or value not in _EXECUTORS:
-            raise ConfigError(f"{key} must be codex or claude")
-    for key in ("stall_minutes", "max_runtime_minutes", "max_retries"):
+        allowed = _EXECUTORS | {"none"} if key == "reviewer" else _EXECUTORS
+        if not isinstance(value, str) or value not in allowed:
+            raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
+    for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "review_max"):
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
     for key in ("always_human", "approvers"):

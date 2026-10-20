@@ -9,7 +9,7 @@ import time
 import pytest
 
 from foragent.config import Config
-from foragent.git import GitRepo
+from foragent.git import GitError, GitRepo
 from foragent.issue import body_hash
 from foragent.reasons import Reason, parse_approval_comment, parse_reason
 from foragent.processes import kill_process_group
@@ -188,6 +188,7 @@ def test_running_overtime_backstop_kills_alive_runner(ctx, monkeypatch, seconds,
     actions = []
     ctx.kill_runner = lambda pid: actions.append(pid)
     ctx.now = lambda: NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 10, seconds=seconds)
+    ctx.store.update_run(1, last_progress_at=ctx.now().isoformat())
     tick(ctx)
     assert actions == ([5432] if killed else [])
     if killed:
@@ -867,6 +868,164 @@ def mark_running(ctx, number=1, pid=123):
     )
 
 
+def test_stall_restarts_once_then_flags_second_stall(ctx):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx, pid=4321)
+    path = ctx.store.worktree_path(1)
+    ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    (path / "unfinished.txt").write_text("unfinished")
+    killed = []
+    ctx.kill_runner = lambda pid: killed.append(pid)
+    ctx.now = lambda: NOW + timedelta(minutes=31)
+    tick(ctx)
+    assert killed == [4321] and not path.exists()
+    assert ctx.store.get_run(1).outcome == "stalled-restart"
+    assert ctx.store.get_run(1).restarts == 1
+    assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
+    assert ctx.store.load_flag(1) is None
+
+    # A new store instance must carry the restart budget into the normal start.
+    ctx.store = StateStore(ctx.store.root, now=ctx.now)
+    ctx.start_runs = True
+    ctx.launcher = lambda number: 5678
+    tick(ctx)
+    assert ctx.store.get_run(1).pid == 5678
+    assert ctx.store.get_run(1).restarts == 1
+    assert ctx.tracker.get_issue(1).labels == {"approved", "running"}
+    ctx.now = lambda: NOW + timedelta(minutes=62)
+    tick(ctx)
+    assert killed == [4321, 5678]
+    assert ctx.store.get_run(1).outcome == "stalled" and ctx.store.get_run(1).restarts == 2
+    assert ctx.store.load_flag(1).reason == Reason.STALLED
+    assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert [run.outcome for run in ctx.store.read_history()] == ["stalled-restart", "stalled"]
+    assert tick(ctx).actions == []
+
+
+@pytest.mark.parametrize("progress,stalls", [("recent", False), ("boundary", False), ("missing", True)])
+def test_stall_uses_latest_progress_or_start_time(ctx, progress, stalls):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx)
+    ctx.now = lambda: NOW + timedelta(minutes=40)
+    value = {"recent": NOW + timedelta(minutes=39), "boundary": NOW + timedelta(minutes=10)}
+    ctx.store.update_run(1, last_progress_at=value[progress].isoformat() if progress in value else "")
+    killed = []
+    ctx.kill_runner = lambda pid: killed.append(pid)
+    tick(ctx)
+    assert bool(killed) == stalls
+    assert ctx.store.get_run(1).status == ("finished" if stalls else "running")
+
+
+def test_failed_stall_termination_does_not_consume_restart(ctx):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx)
+    ctx.now = lambda: NOW + timedelta(minutes=31)
+
+    def failed(pid):
+        raise TimeoutError("runner still alive")
+
+    ctx.kill_runner = failed
+    with pytest.raises(TimeoutError, match="still alive"):
+        tick(ctx)
+    run = ctx.store.get_run(1)
+    assert run.status == "running" and run.restarts == 0 and run.outcome is None
+
+
+def test_stall_intent_survives_runner_finishing_during_termination(ctx):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx)
+    ctx.now = lambda: NOW + timedelta(minutes=31)
+
+    def terminated(pid):
+        run = ctx.store.get_run(1)
+        # Runner's finally block uses the tick's persisted termination outcome.
+        ctx.store.finish_run(1, run.outcome or "killed")
+
+    ctx.kill_runner = terminated
+    tick(ctx)
+    assert ctx.store.get_run(1).outcome == "stalled-restart"
+    ctx.start_runs = True
+    tick(ctx)
+    assert ctx.store.get_run(1).restarts == 1
+
+
+@pytest.mark.parametrize("previous_restarts", [0, 1])
+def test_successful_stall_kill_keeps_count_when_locked_worktree_cleanup_fails(ctx, monkeypatch, previous_restarts):
+    approve(ctx)
+    tick(ctx)
+    run = mark_running(ctx, pid=4321)
+    ctx.store.update_run(1, restarts=previous_restarts)
+    path = ctx.store.worktree_path(1)
+    ctx.git.add_worktree(path, run.branch, "origin/main")
+    git_command(ctx.repo_root, "worktree", "lock", str(path))
+    alive = [True]
+    signals = []
+
+    def killpg(pid, sig):
+        assert pid == 4321
+        signals.append(sig)
+        if not alive[0]:
+            raise ProcessLookupError(pid)
+        if sig == signal.SIGKILL:
+            alive[0] = False
+
+    waitpid = os.waitpid
+    monkeypatch.setattr("foragent.processes.os.killpg", killpg)
+    monkeypatch.setattr("foragent.processes.os.waitpid", lambda pid, options: (0, 0) if pid == 4321 else waitpid(pid, options))
+    monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: None)
+    ctx.kill_runner = kill_process_group
+    ctx.now = lambda: NOW + timedelta(minutes=31)
+    with pytest.raises(GitError, match="locked"):
+        tick(ctx)
+    stalled = ctx.store.get_run(1)
+    outcome = "stalled-restart" if previous_restarts == 0 else "stalled"
+    assert not alive[0] and signal.SIGKILL in signals
+    assert stalled.status == "running" and stalled.restarts == previous_restarts + 1
+    assert stalled.outcome == outcome
+    git_command(ctx.repo_root, "worktree", "unlock", str(path))
+    monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
+    tick(ctx)
+    assert not path.exists() and ctx.store.get_run(1).outcome == outcome
+    assert ctx.store.get_run(1).restarts == previous_restarts + 1
+    assert [past.outcome for past in ctx.store.read_history()] == [outcome]
+    if previous_restarts == 0:
+        assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
+    else:
+        assert ctx.store.load_flag(1).reason == Reason.STALLED
+        assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+
+
+@pytest.mark.parametrize("outcome,restarts", [("stalled-restart", 1), ("stalled", 2)])
+@pytest.mark.parametrize("pid", [None, 4321])
+def test_dead_active_run_recovers_persisted_stall_intent(ctx, monkeypatch, outcome, restarts, pid):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx, pid=pid)
+    ctx.store.update_run(1, restarts=restarts, outcome=outcome)
+    ctx.now = lambda: NOW + timedelta(minutes=31)
+    monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
+    ctx.kill_runner = lambda pid: pytest.fail("the process is already dead")
+    tick(ctx)
+    assert ctx.store.get_run(1).status == "finished"
+    assert ctx.store.get_run(1).outcome == outcome and ctx.store.get_run(1).restarts == restarts
+    assert [past.outcome for past in ctx.store.read_history()] == [outcome]
+    if restarts == 1:
+        assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
+        ctx.start_runs = True
+        tick(ctx)
+        assert ctx.store.get_run(1).restarts == 1
+    else:
+        assert ctx.store.load_flag(1).reason == Reason.STALLED
+        assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+        ctx.start_runs = True
+        tick(ctx)
+        assert ctx.store.active_runs() == []
+
+
 def dead_process(pid, signal):
     raise ProcessLookupError(pid)
 
@@ -904,6 +1063,7 @@ def test_alive_or_inaccessible_pid_keeps_project_slot(ctx, monkeypatch, permissi
 
     monkeypatch.setattr("foragent.scheduler.os.kill", kill)
     ctx.now = lambda: NOW + timedelta(hours=1)
+    active = ctx.store.update_run(1, last_progress_at=ctx.now().isoformat())
     ctx.start_runs = True
     tick(ctx)
     assert calls == [(123, 0)]

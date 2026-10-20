@@ -2,7 +2,6 @@
 
 import os
 from pathlib import Path
-import shutil
 import signal
 import subprocess
 import sys
@@ -59,10 +58,13 @@ def _child_environment(cwd: Path) -> dict[str, str]:
 def run_logged(
     argv: list[str], *, cwd: Path, timeout_s: int, log_path: Path,
     prompt: str | None = None, capture_stdout: bool = False,
+    stdout_path: Path | None = None,
 ) -> tuple[int | None, bool, str]:
     """Append output without buffering an unbounded session in memory."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("ab") as log, tempfile.TemporaryFile() as output:
+    with log_path.open("ab") as log, (
+        stdout_path.open("w+b") if stdout_path is not None else tempfile.TemporaryFile()
+    ) as output:
         process = subprocess.Popen(
             argv, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
             stdout=output if capture_stdout else log, stderr=log if capture_stdout else subprocess.STDOUT,
@@ -78,6 +80,24 @@ def run_logged(
         if can_handle:
             previous = signal.signal(signal.SIGTERM, terminated)
         timed_out = False
+        forwarded = 0
+        stop_forwarding = threading.Event()
+
+        def forward_stdout():
+            nonlocal forwarded
+            output.flush()
+            while chunk := os.pread(output.fileno(), 65536, forwarded):
+                log.write(chunk)
+                log.flush()
+                forwarded += len(chunk)
+
+        def follow_stdout():
+            while not stop_forwarding.wait(1):
+                forward_stdout()
+
+        follower = threading.Thread(target=follow_stdout, daemon=True) if capture_stdout else None
+        if follower is not None:
+            follower.start()
         try:
             try:
                 process.communicate(input=prompt.encode("utf-8") if prompt is not None else None, timeout=timeout_s)
@@ -97,9 +117,10 @@ def run_logged(
                 process.wait()
             if can_handle:
                 signal.signal(signal.SIGTERM, previous)
-            if capture_stdout:
-                output.seek(0)
-                shutil.copyfileobj(output, log)
+            if follower is not None:
+                stop_forwarding.set()
+                follower.join()
+                forward_stdout()
         if capture_stdout:
             size = output.seek(0, 2)
             output.seek(max(0, size - 16000))

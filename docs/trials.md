@@ -52,3 +52,8 @@
 ## inspect 실연 준비 — 2026-10-20
 - Trial 3의 결과(#3·#4 spec-question, #1·#2 merged)를 `fa inspect`로 읽으면 "Decision 2 · Try 2". macOS 알림 한 줄 확인, 같은 내용 두 번째 호출은 조용함(중복 방지).
 - `fa`를 `uv tool install --editable`로 PATH에 설치, 스킬 `fa-init`·`fa-inspect`를 `~/.claude/skills`에 링크.
+
+## Trial 4 — 2026-10-20, P7(적대적 리뷰 단계) 적용, 수동 tick 반복
+- #1, #2만 승인(#3·#4는 order 대기). 구현 codex, 리뷰 claude(fail-closed).
+- #1 merged, #2 merged. 둘 다 "Round 1: VERDICT: PASS". 이슈당 약 2분(리뷰 포함).
+- 사람 개입 0. 리뷰어가 FAIL을 내는 경로는 아직 실제로 시험하지 못함(가짜 실행기 테스트로만 확인).

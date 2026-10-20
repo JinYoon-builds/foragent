@@ -1,13 +1,24 @@
 """Small, injectable Git adapter for approval integrity checks."""
 
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+import os
 from pathlib import Path
 import re
+import shutil
+import stat
 import subprocess
 
 
 class GitError(RuntimeError):
     """A Git command or remote URL could not be used."""
+
+
+@dataclass(frozen=True)
+class ReviewState:
+    head_sha: str
+    staged_tree: str | None
+    files: dict[str, tuple[int, bytes | str] | None]
 
 
 class GitRepo:
@@ -22,7 +33,7 @@ class GitRepo:
         timeout = 300 if command and command[0] in {"fetch", "push"} else 120
         return subprocess.run(
             ["git", *args], cwd=self.root, check=True, capture_output=True, text=True,
-            timeout=timeout,
+            timeout=timeout, errors="replace",
         ).stdout
 
     def _call(self, args: list[str]) -> str:
@@ -58,6 +69,90 @@ class GitRepo:
 
     def staged_tree_sha(self) -> str:
         return self._call(["write-tree"]).strip()
+
+    def staged_diff(self, base_ref: str, *, binary: bool = False) -> str:
+        return self._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", *(["--binary"] if binary else []), base_ref])
+
+    def write_staged_patch(self, base_ref: str, patch: Path) -> None:
+        # Keep patch bytes intact even when source files are not UTF-8.
+        self._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", "--binary", f"--output={patch}", base_ref])
+
+    def apply_staged_patch(self, patch: Path) -> None:
+        self._call(["apply", "--3way", str(patch)])
+
+    def _symlink_parent(self, name: str) -> Path | None:
+        parent = self.root
+        for part in Path(name).parts[:-1]:
+            parent /= part
+            if parent.is_symlink():
+                return parent
+        return None
+
+    def review_state(self) -> ReviewState:
+        paths = self._call(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+        files = {}
+        for name in filter(None, paths.split("\0")):
+            path = self.root / name
+            if parent := self._symlink_parent(name):
+                files[parent.relative_to(self.root).as_posix()] = (parent.lstat().st_mode, os.readlink(parent))
+                files[name] = None
+                continue
+            try:
+                mode = path.lstat().st_mode
+                if stat.S_ISLNK(mode):
+                    files[name] = (mode, os.readlink(path))
+                elif stat.S_ISREG(mode):
+                    files[name] = (mode, path.read_bytes())
+            except (FileNotFoundError, NotADirectoryError):
+                files[name] = None
+        try:
+            tree = self.staged_tree_sha()
+        except GitError as exc:
+            if "unmerged" not in str(exc):
+                raise
+            tree = None
+        return ReviewState(self.head_sha(), tree, files)
+
+    def restore_review_state(self, before: ReviewState) -> None:
+        """Restore HEAD and index, then undo the reviewer's working tree edits."""
+        after = self.review_state()
+        if before.staged_tree is None:
+            raise GitError("Cannot restore an unmerged baseline index")
+        if after.head_sha != before.head_sha:
+            self._call(["update-ref", "HEAD", before.head_sha, after.head_sha])
+        self._call(["read-tree", before.staged_tree])
+        changed = {name for name in before.files.keys() | after.files.keys()
+                   if before.files.get(name) != after.files.get(name)}
+        for name in sorted(changed, key=lambda name: name.count("/"), reverse=True):
+            path = self.root / name
+            if self._symlink_parent(name) is not None:
+                continue  # Remove the replacement link itself, never its target.
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                try:
+                    path.unlink(missing_ok=True)
+                except NotADirectoryError:
+                    pass  # A parent directory was replaced by a file.
+        for name in sorted(changed):
+            saved = before.files.get(name)
+            if saved is None:
+                continue
+            mode, content = saved
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if stat.S_ISLNK(mode):
+                path.symlink_to(content)
+            else:
+                path.write_bytes(content)
+                path.chmod(stat.S_IMODE(mode))
+
+    def ensure_batch_branch(self, branch: str, base_ref: str) -> None:
+        """Create a remote batch once; never force-push an existing batch."""
+        remote_ref = f"refs/heads/{branch}"
+        if not self._call(["ls-remote", "--heads", "origin", remote_ref]).strip():
+            self._call(["push", "origin", f"{base_ref}:{remote_ref}"])
+        self.fetch("origin", branch)
 
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()

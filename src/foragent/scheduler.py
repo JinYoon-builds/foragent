@@ -15,8 +15,9 @@ from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse
 from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING
 from foragent.reasons import Reason, format_approval_comment
 from foragent.processes import kill_process_group
+from foragent.runner import _batch_pr
 from foragent.state import Approval, StateStore
-from foragent.tracker import Issue, LabelEvent, Tracker
+from foragent.tracker import Issue, LabelEvent, Tracker, TrackerError
 
 
 def runner_process_exists(number: int) -> bool:
@@ -84,14 +85,24 @@ def _invalidate_approval(
     report.actions.append(f"#{issue.number} flagged hash-mismatch: {summary}")
 
 
-def _kill_run(ctx: TickContext, number: int, report: TickReport) -> None:
+def _kill_run(
+    ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
+    count_stall: bool = False,
+) -> None:
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
         return
-    if run.pid is not None:
-        ctx.kill_runner(run.pid)
+    if count_stall:
+        ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
+    try:
+        if run.pid is not None:
+            ctx.kill_runner(run.pid)
+    except Exception:
+        if count_stall:
+            ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
+        raise
     ctx.git.remove_worktree(Path(run.worktree))
-    ctx.store.finish_run(number, outcome="killed")
+    ctx.store.finish_run(number, outcome=outcome)
     report.actions.append(f"#{number} runner killed")
 
 
@@ -202,6 +213,9 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
     if run is not None and run.outcome == "merged":
         ctx.tracker.remove_labels(issue.number, [READY, RUNNING])
         return ctx.tracker.get_issue(issue.number)
+    if run is not None and run.outcome in {"stalled-restart", "stalled"}:
+        _restore_stalled(ctx, issue.number, run.restarts, report)
+        return ctx.tracker.get_issue(issue.number)
     detail = _crash_detail(ctx, issue.number)
     if run is None or run.outcome != "crashed" or run.detail != detail:
         ctx.store.start_run(
@@ -212,6 +226,19 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
     report.actions.append(f"#{issue.number} orphaned running label recovered as crashed")
     _restore_after_crash(ctx, issue, report)
     return ctx.tracker.get_issue(issue.number)
+
+
+def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickReport) -> None:
+    issue = ctx.tracker.get_issue(number)
+    if issue.state != "open" or NEEDS_HUMAN in issue.labels:
+        ctx.tracker.remove_labels(number, [RUNNING])
+    elif restarts <= 1:
+        ctx.tracker.add_labels(number, [READY])
+        ctx.tracker.remove_labels(number, [RUNNING])
+        report.actions.append(f"#{number} returned to ready after stall (restart {restarts})")
+    else:
+        flag(ctx, number, Reason.STALLED, "Runner stalled again after one restart.")
+        report.actions.append(f"#{number} flagged stalled")
 
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
@@ -237,8 +264,23 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 _kill_run(ctx, run.number, report)
                 flag(ctx, run.number, Reason.TIMEOUT, "Too big for one session; split it in order")
                 report.actions.append(f"#{run.number} flagged timeout")
+            elif run.pid is not None and ctx.now() - datetime.fromisoformat(
+                run.last_progress_at or run.started_at,
+            ) > timedelta(minutes=ctx.config.stall_minutes):
+                restarts = run.restarts + 1
+                outcome = "stalled-restart" if restarts <= 1 else "stalled"
+                _kill_run(ctx, run.number, report, outcome=outcome, count_stall=True)
+                _restore_stalled(ctx, run.number, restarts, report)
             continue
-        finished = ctx.store.finish_run(run.number, outcome="crashed", detail=_crash_detail(ctx, run.number))
+        # Termination intent was persisted before signalling the runner. An
+        # interrupted tick must finish that transition rather than invent a crash.
+        ctx.git.remove_worktree(Path(run.worktree))
+        outcome = run.outcome or "crashed"
+        detail = _crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
+        finished = ctx.store.finish_run(run.number, outcome=outcome, detail=detail)
+        if finished.outcome in {"stalled-restart", "stalled"}:
+            _restore_stalled(ctx, run.number, finished.restarts, report)
+            continue
         if finished.outcome != "crashed":
             continue
         report.actions.append(f"#{run.number} runner crashed")
@@ -297,11 +339,39 @@ def tick(ctx: TickContext) -> TickReport:
         return _tick_locked(ctx)
 
 
+def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
+    issues = {issue.number: issue for issue in ctx.tracker.list_open_issues()}
+    parents: set[int] = set()
+    for pr in ctx.tracker.list_prs("merged", "foragent/issue-"):
+        child_match = re.fullmatch(r"foragent/issue-(\d+)", pr.head)
+        batch_match = re.fullmatch(r"foragent/batch-(\d+)", pr.base)
+        if child_match is None or batch_match is None:
+            continue
+        number, parent = int(child_match[1]), int(batch_match[1])
+        if parent in issues:
+            parents.add(parent)
+        if number not in issues or ctx.tracker.parent_of(number) != parent:
+            continue
+        ctx.tracker.close_issue(number, f"Merged into {pr.base} (PR #{pr.number})")
+        ctx.tracker.remove_labels(number, [READY, RUNNING])
+        del issues[number]
+        report.actions.append(f"#{number} closed after batch PR #{pr.number} merged")
+    for parent in sorted(parents):
+        branch = f"foragent/batch-{parent}"
+        if ctx.tracker.find_pr(branch) is not None:
+            continue
+        try:
+            _batch_pr(parent, ctx)
+        except TrackerError as exc:
+            report.actions.append(f"#{parent} batch PR finalization deferred: {exc}")
+
+
 def _tick_locked(ctx: TickContext) -> TickReport:
     report = TickReport()
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
     _recover_runs(ctx, report)
+    _reconcile_batches(ctx, report)
     ready: list[int] = []
 
     for issue in sorted(ctx.tracker.list_open_issues(), key=lambda issue: issue.number):

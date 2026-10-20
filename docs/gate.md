@@ -122,8 +122,9 @@ always_human:
   - auth/**
 executor: codex          # codex | claude
 executor_model: null     # null이면 전역 기본값 (D12, foragent config)
-reviewer: claude         # 적대적 리뷰 실행기 (선택, 기본 = executor와 다른 것)
+reviewer: claude         # codex | claude | none (기본 = executor와 다른 것)
 reviewer_model: null
+review_max: 2            # 리뷰 FAIL 허용 수; 초과하면 PR을 열고 risk-high로 보류
 approvers: [JinYoon-builds]   # v1 승인 라벨을 붙일 수 있는 사람 (D14)
 acceptance_dir: tests/acceptance/   # order가 구현 전에 쓰고 잠그는 인수 시험 (D11)
 notify: slack:#proj-dev  # 프로젝트 오케스트레이터 창구 (형태·개수 자유)

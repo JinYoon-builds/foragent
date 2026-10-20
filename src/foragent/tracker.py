@@ -72,6 +72,8 @@ class Tracker(Protocol):
     def body_last_edited_at(self, n: int) -> str | None: ...
     def label_events(self, n: int) -> list[LabelEvent]: ...
     def blocked_by(self, n: int) -> list[Dependency]: ...
+    def parent_of(self, n: int) -> int | None: ...
+    def sub_issues(self, n: int) -> list[Issue]: ...
     def add_labels(self, n: int, labels: Iterable[str]) -> None: ...
     def remove_labels(self, n: int, labels: Iterable[str]) -> None: ...
     def comment(self, n: int, body: str) -> int: ...
@@ -80,6 +82,7 @@ class Tracker(Protocol):
     def ensure_labels(self, specs: list[LabelSpec]) -> None: ...
     def close_issue(self, n: int, comment: str | None = None) -> None: ...
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
+    def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None: ...
     def close_pr(self, pr: int, comment: str | None = None) -> None: ...
     def find_pr(self, head: str) -> int | None: ...
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
@@ -121,6 +124,7 @@ class FakeTracker:
         self._events: dict[int, list[LabelEvent]] = {}
         self._body_edits: dict[int, str] = {}
         self._dependencies: dict[int, list[Dependency]] = {}
+        self._parents: dict[int, int] = {}
         self._pr_files: dict[int, list[str]] = {}
         self._pr_checks: dict[int, CheckStatus] = {}
         self._pr_heads: dict[int, str] = {}
@@ -161,7 +165,17 @@ class FakeTracker:
         self._dependencies[n] = list(deps)
 
     def blocked_by(self, n: int) -> list[Dependency]:
-        return list(self._dependencies.get(n, []))
+        return [replace(dep, state=self.issues[dep.number].state) if dep.number in self.issues else dep
+                for dep in self._dependencies.get(n, [])]
+
+    def set_parent(self, n: int, parent: int) -> None:
+        self._parents[n] = parent
+
+    def parent_of(self, n: int) -> int | None:
+        return self._parents.get(n)
+
+    def sub_issues(self, n: int) -> list[Issue]:
+        return [self.get_issue(child) for child, parent in self._parents.items() if parent == n]
 
     def record_label(self, n: int, label: str, actor: str) -> None:
         issue = self.get_issue(n)
@@ -210,6 +224,11 @@ class FakeTracker:
         self.created_prs.append(PullRequest(number, head, base, title, body))
         self.add_issue(number, title, body, is_pull_request=True)
         return number
+
+    def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None:
+        self.created_prs = [replace(item, base=base, title=title, body=body) if item.number == pr else item
+                            for item in self.created_prs]
+        self.issues[pr] = replace(self.get_issue(pr), title=title, body=body)
 
     def find_pr(self, head: str) -> int | None:
         return next((pr.number for pr in self.created_prs
@@ -344,6 +363,18 @@ class GhTracker:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues/{n}/dependencies/blocked_by?per_page=100"]))
         return [Dependency(item["number"], item["state"], item.get("state_reason")) for item in data]
 
+    def parent_of(self, n: int) -> int | None:
+        try:
+            return json.loads(self._call(["api", f"{self._path}/issues/{n}/parent"]))["number"]
+        except TrackerError as exc:
+            if re.search(r"\bHTTP\s+404\b", str(exc)):
+                return None
+            raise
+
+    def sub_issues(self, n: int) -> list[Issue]:
+        data = _items(self._call(["api", "--paginate", f"{self._path}/issues/{n}/sub_issues?per_page=100"]))
+        return [_issue(item) for item in data]
+
     def add_labels(self, n: int, labels: Iterable[str]) -> None:
         fields = [arg for label in labels for arg in ("-f", f"labels[]={label}")]
         if fields:
@@ -422,6 +453,12 @@ class GhTracker:
         if comment is not None:
             args.extend(["--comment", comment])
         self._call(args)
+
+    def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None:
+        self._call(
+            ["pr", "edit", str(pr), "-R", self.repo, "--base", base,
+             "--title", title, "--body-file", "-"], input=body,
+        )
 
     def pr_changed_files(self, pr: int) -> list[str]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/pulls/{pr}/files?per_page=100"]))

@@ -49,4 +49,4 @@ def test_merge_decision(paths, labels, config, kind, reason):
     decision = merge_decision(changed_paths=paths, issue_labels=labels, config=config)
     assert decision.kind == kind and decision.reason == reason
     if kind == "hold_mode":
-        assert decision.summary == f"review mode {decision.mode} not implemented yet; PR left open"
+        assert decision.summary == "PR is waiting for your review"

@@ -24,7 +24,7 @@ def write_settings(path, settings):
 def test_exact_defaults(repo):
     expected = {
         "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
-        "executor_model": None, "reviewer": None, "reviewer_model": None, "approvers": [],
+        "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
         "repo": None,
@@ -107,7 +107,7 @@ def test_validation_errors_name_the_field(repo, key, value):
         load_config(repo)
 
 
-@pytest.mark.parametrize("key", ["stall_minutes", "max_runtime_minutes", "max_retries"])
+@pytest.mark.parametrize("key", ["stall_minutes", "max_runtime_minutes", "max_retries", "review_max"])
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_integer_fields_are_positive_integers(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
@@ -122,7 +122,7 @@ def test_all_valid_overrides(repo):
         "executor_model": "implementation-model", "reviewer_model": "review-model",
         "approvers": ["human"], "acceptance_dir": "checks/", "notify": ["slack:#project"],
         "run_hours": "22-08", "stall_minutes": 1, "max_runtime_minutes": 1,
-        "max_retries": 1, "base_branch": "trunk",
+        "max_retries": 1, "review_max": 3, "base_branch": "trunk",
         "repo": "owner/name",
     }
     write_settings(repo / ".foragent.yml", settings)
@@ -143,9 +143,15 @@ def test_configs_do_not_share_mutable_defaults(repo):
     ("codex", None, "claude"), ("claude", None, "codex"),
     ("codex", "codex", "codex"), ("claude", "claude", "claude"),
     ("codex", "claude", "claude"),
+    ("codex", "none", "none"),
 ])
 def test_resolved_reviewer(executor, reviewer, expected):
     assert resolved_reviewer(replace(Config(), executor=executor, reviewer=reviewer)) == expected
+
+
+def test_disabled_reviewer_loads(repo):
+    write_settings(repo / ".foragent.yml", {"reviewer": "none"})
+    assert resolved_reviewer(load_config(repo)) == "none"
 
 
 @pytest.mark.parametrize("hours,hour,minute,expected", [

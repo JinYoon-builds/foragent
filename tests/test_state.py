@@ -90,6 +90,17 @@ def test_flags_persist_latest_reason_and_timestamp_per_issue(store):
     assert reopened.load_flag(2).reason == "spec-question"
 
 
+def test_restart_budget_survives_crash_recovery_but_resets_after_completion(store):
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    store.update_run(1, restarts=1)
+    store.finish_run(1, "stalled-restart")
+    assert store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1)).restarts == 1
+    store.finish_run(1, "crashed")
+    assert store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1)).restarts == 1
+    store.finish_run(1, "merged")
+    assert store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1)).restarts == 0
+
+
 def test_approval_exact_body_and_metadata_round_trip(store):
     body = "  <!-- foragent:v1 -->\r\n## Goal\r\nKeep café text.  \r\n\r\n"
     values = {

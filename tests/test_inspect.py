@@ -176,6 +176,16 @@ def test_open_pr_review_modes_exclude_flagged_issues_and_unrelated_heads(ctx, mo
     assert (reviews[1].number, reviews[1].pr, reviews[1].reason) == (3, unflagged_pr, None)
 
 
+def test_parent_batch_pr_appears_once_under_review(ctx):
+    ctx.tracker.add_issue(99, "Epic")
+    number = ctx.tracker.create_pr(
+        head="foragent/batch-99", base="main", title="Batch: Epic", body="Closes #99\n\nChildren",
+    )
+    item, = collect(ctx).items
+    assert item.group == "review" and item.number == 99 and item.pr == number
+    assert item.url == f"https://github.com/owner/repo/pull/{number}"
+
+
 def test_fast_mode_path_review_is_collected_and_notified(ctx):
     ctx.config = replace(ctx.config, review="fast", review_paths={"src/**": "careful"})
     ctx.tracker.add_issue(1, "Path review")

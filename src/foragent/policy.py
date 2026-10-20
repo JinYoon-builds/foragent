@@ -45,7 +45,7 @@ class Decision:
 
 
 def hold_mode(mode: str) -> Decision:
-    return Decision("hold_mode", summary=f"review mode {mode} not implemented yet; PR left open", mode=mode)
+    return Decision("hold_mode", summary="PR is waiting for your review", mode=mode)
 
 
 def merge_decision(*, changed_paths: list[str], issue_labels, config: Config) -> Decision:
