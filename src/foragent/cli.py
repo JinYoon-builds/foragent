@@ -6,15 +6,16 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, launchd
+from foragent import __version__, inspect_actions, inspect_data, launchd
 from foragent.config import ConfigError, load_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
 from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING
-from foragent.launcher import spawn_runner
+from foragent.launcher import spawn_notify, spawn_runner
 from foragent.reasons import parse_reason
 from foragent.scheduler import TickContext, tick
 from foragent.runner import RunContext, run_issue
@@ -49,6 +50,21 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("install", "uninstall", "launchd-status"):
         command = actions.add_parser(name)
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
+    inspect = commands.add_parser("inspect", help="Show the human inbox and record answers")
+    inspect.add_argument("--repo-root", type=Path, default=Path.cwd())
+    inspect.add_argument("--json", action="store_true")
+    answers = inspect.add_subparsers(dest="action")
+    for name in ("answer", "retry", "feedback", "mark-seen", "notify"):
+        command = answers.add_parser(name)
+        command.add_argument("--repo-root", type=Path, default=argparse.SUPPRESS)
+        if name in {"answer", "retry"}:
+            command.add_argument("number", type=int)
+        if name == "answer":
+            command.add_argument("--text", required=True)
+        if name == "feedback":
+            command.add_argument("--title", required=True)
+            command.add_argument("--body", required=True)
+            command.add_argument("--about", type=int)
     return parser
 
 
@@ -101,6 +117,38 @@ def _print_status(status: dict[str, Any]) -> None:
         print(f"  #{run['number']} {run['outcome']} started={run['started_at']}")
 
 
+def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None:
+    if args.action == "answer":
+        comment = inspect_actions.answer(ctx, args.number, args.text)
+        print(f"Decision recorded: https://github.com/{ctx.repo}/issues/{args.number}#issuecomment-{comment}")
+    elif args.action == "retry":
+        inspect_actions.retry(ctx, args.number)
+        print(f"Retry requested for #{args.number}.")
+    elif args.action == "feedback":
+        number = inspect_actions.feedback(ctx, args.title, args.body, args.about)
+        print(f"Feedback: https://github.com/{ctx.repo}/issues/{number}")
+    elif args.action == "mark-seen":
+        print(f"Seen through {inspect_actions.mark_seen(ctx)}")
+    elif args.action == "notify":
+        if line := inspect_actions.notify(ctx):
+            print(line)
+    else:
+        inbox = inspect_data.collect(ctx)
+        if args.json:
+            print(json.dumps(asdict(inbox)))
+        else:
+            print(inspect_data.counts_line(inbox))
+            for item in inbox.items:
+                summary = f"[{item.group}] #{item.number} {item.title} — {item.summary}"
+                if item.group == "try":
+                    print(f"{summary} {item.url}")
+                    continue
+                print(summary)
+                for line in item.details.splitlines()[:12]:
+                    print(f"  {line}")
+                print(f"  {item.url}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -127,6 +175,10 @@ def main(argv: list[str] | None = None) -> int:
         repo = config.repo or git.remote_slug()
         tracker = GhTracker(repo)
         store = StateStore.for_repo(repo)
+        inspect_ctx = inspect_data.InspectContext(tracker, store, repo, config, lambda: datetime.now(UTC))
+        if args.command == "inspect":
+            _inspect(args, inspect_ctx)
+            return 0
         if args.action == "tick":
             report = tick(TickContext(
                 repo=repo, repo_root=root, tracker=tracker, store=store, config=config,
@@ -140,6 +192,10 @@ def main(argv: list[str] | None = None) -> int:
                     print(report.skipped)
                 for action in report.actions:
                     print(action)
+            try:
+                spawn_notify(root, store)
+            except Exception as exc:
+                print(f"foragent: inspect notify failed: {' '.join(str(exc).split())}", file=sys.stderr)
         elif args.action == "status":
             status = _status(tracker, store)
             status["launchd"] = asdict(launchd.status(root, repo=repo))
@@ -157,7 +213,8 @@ def main(argv: list[str] | None = None) -> int:
             ))
             return 1 if outcome == "error" else 0
         return 0
-    except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError) as exc:
+    except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError,
+            inspect_actions.InspectError, subprocess.SubprocessError) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
         return 1
 

@@ -124,6 +124,37 @@ def test_git_errors_are_wrapped(tmp_path, failure):
         GitRepo(tmp_path, run).fetch()
 
 
+@pytest.mark.parametrize("args,timeout", [
+    (["rev-parse", "HEAD"], 120),
+    (["diff", "--cached", "--name-only", "HEAD"], 120),
+    (["fetch", "origin"], 300),
+    (["push", "origin", "main"], 300),
+    (["-C", "worktree", "fetch", "origin"], 300),
+    (["-C", "worktree", "push", "origin", "main"], 300),
+    (["-C", "outer", "-C", "inner", "push", "origin", "main"], 300),
+    (["show", "HEAD:push"], 120),
+])
+@pytest.mark.parametrize("expired", [False, True])
+def test_default_git_runner_bounds_all_commands_and_wraps_timeouts(tmp_path, monkeypatch, args, timeout, expired):
+    def run(command, **kwargs):
+        assert command == ["git", *args]
+        assert kwargs == {
+            "cwd": tmp_path, "check": True, "capture_output": True, "text": True, "timeout": timeout,
+        }
+        if expired:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return subprocess.CompletedProcess(command, 0, stdout="result\n")
+
+    monkeypatch.setattr("foragent.git.subprocess.run", run)
+    git = GitRepo(tmp_path)
+    if expired:
+        with pytest.raises(GitError, match=f"timed out after {timeout} seconds") as error:
+            git._call(args)
+        assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
+    else:
+        assert git._call(args) == "result\n"
+
+
 def test_runner_git_commands_are_exact_and_injectable(tmp_path):
     calls = []
 

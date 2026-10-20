@@ -48,3 +48,7 @@
 - 전체 약 17분(5분 tick 간격이 대부분). 사람 개입 0. 재작업 PR 0/2. launchd 오류 로그 비어 있음.
 - 2회차에서 고친 머지 직후 재승격 문제 재발 없음.
 - 세 번 연속 같은 갈래로 끝남. 다음 측정은 P6(inspect) 이후 사람의 답을 받아 #3·#4를 끝내는 고리까지.
+
+## inspect 실연 준비 — 2026-10-20
+- Trial 3의 결과(#3·#4 spec-question, #1·#2 merged)를 `fa inspect`로 읽으면 "Decision 2 · Try 2". macOS 알림 한 줄 확인, 같은 내용 두 번째 호출은 조용함(중복 방지).
+- `fa`를 `uv tool install --editable`로 PATH에 설치, 스킬 `fa-init`·`fa-inspect`를 `~/.claude/skills`에 링크.

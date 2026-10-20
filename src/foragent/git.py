@@ -16,14 +16,19 @@ class GitRepo:
         self._run = run or self._run_git
 
     def _run_git(self, args: list[str]) -> str:
+        command = args
+        while command[:1] == ["-C"]:
+            command = command[2:]
+        timeout = 300 if command and command[0] in {"fetch", "push"} else 120
         return subprocess.run(
             ["git", *args], cwd=self.root, check=True, capture_output=True, text=True,
+            timeout=timeout,
         ).stdout
 
     def _call(self, args: list[str]) -> str:
         try:
             return self._run(args)
-        except (OSError, subprocess.CalledProcessError) as exc:
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             message = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else str(exc)
             raise GitError(message or str(exc)) from exc
 

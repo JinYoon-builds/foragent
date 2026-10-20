@@ -48,3 +48,6 @@ STATE="$HOME/.local/share/foragent/${REPO/\//__}"
 rm -rf "$STATE"
 git -C "$LOCAL" worktree prune
 echo "done"
+
+# Mark everything before this reset as seen so fa inspect only shows the new trial.
+"$(dirname "$0")/../.venv/bin/fa" inspect mark-seen --repo-root "$LOCAL" >/dev/null 2>&1 || true

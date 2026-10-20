@@ -30,6 +30,12 @@ class Flag:
 
 
 @dataclass(frozen=True)
+class InspectState:
+    since: str | None = None
+    notified_signature: str | None = None
+
+
+@dataclass(frozen=True)
 class Run:
     number: int
     branch: str
@@ -113,6 +119,19 @@ class StateStore:
             return None
         return Flag(**json.loads(value))
 
+    def load_inspect(self) -> InspectState:
+        try:
+            value = (self.root / "inspect.json").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return InspectState()
+        return InspectState(**json.loads(value))
+
+    def update_inspect(self, **fields: Any) -> InspectState:
+        with self._state_lock():
+            updated = replace(self.load_inspect(), **fields)
+            self._write_json(self.root / "inspect.json", asdict(updated))
+            return updated
+
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
     ) -> Run:
@@ -184,6 +203,16 @@ class StateStore:
     def _state_lock(self) -> Iterator[None]:
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / "state.lock").open("a", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def notify_lock(self) -> Iterator[None]:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / "notify.lock").open("a", encoding="utf-8") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             try:
                 yield

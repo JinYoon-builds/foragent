@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 from foragent.tracker import (
-    Comment, Dependency, FakeTracker, GhTracker, Issue, LabelEvent, LabelSpec, TrackerError,
+    Comment, Dependency, FakeTracker, GhTracker, Issue, LabelEvent, LabelSpec, PullRequest, TrackerError,
 )
 
 
@@ -207,7 +207,10 @@ def test_fake_pr_creation_files_checks_and_merge():
     tracker.add_issue(10)
     number = tracker.create_pr(head="feature", base="main", title="Change", body="Closes #10")
     assert number == 11
-    assert asdict(tracker.created_prs[0]) == {"number": 11, "head": "feature", "base": "main", "title": "Change", "body": "Closes #10"}
+    assert asdict(tracker.created_prs[0]) == {
+        "number": 11, "head": "feature", "base": "main", "title": "Change", "body": "Closes #10",
+        "merged_at": None, "url": "",
+    }
     assert [issue.number for issue in tracker.list_open_issues()] == [10]
     assert tracker.pr_checks(number) == "none"
     assert tracker.pr_changed_files(number) == []
@@ -430,5 +433,94 @@ def test_default_runner_invokes_subprocess_without_a_shell(monkeypatch):
     assert GhTracker(REPO).comment(1, "body") == 5
     assert calls == [(
         ["gh", "api", "-X", "POST", "repos/owner/repo/issues/1/comments", "--input", "-"],
-        {"input": json.dumps({"body": "body"}), "check": True, "capture_output": True, "text": True},
+        {"input": json.dumps({"body": "body"}), "check": True, "capture_output": True, "text": True,
+         "timeout": 120},
     )]
+
+
+def test_default_gh_timeout_is_wrapped(monkeypatch):
+    def run(args, **kwargs):
+        assert kwargs["timeout"] == 120
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    monkeypatch.setattr("foragent.tracker.subprocess.run", run)
+    with pytest.raises(TrackerError, match="timed out after 120 seconds") as error:
+        GhTracker(REPO).list_prs()
+    assert isinstance(error.value.__cause__, subprocess.TimeoutExpired)
+
+
+@pytest.mark.parametrize("comment", [None, "Closed by Foragent retry"])
+def test_close_pr_deletes_branch_and_records_optional_comment(comment):
+    fake = FakeTracker()
+    pr = fake.create_pr(head="foragent/issue-1", base="main", title="PR", body="")
+    fake.close_pr(pr, comment)
+    assert fake.get_issue(pr).state == "closed"
+    assert fake.deleted_branches == ["foragent/issue-1"]
+    assert [item.body for item in fake.list_comments(pr)] == ([] if comment is None else [comment])
+    assert fake.find_pr("foragent/issue-1") is None
+    assert fake.list_prs("open") == fake.list_prs("merged") == []
+
+    run = ScriptedRun("")
+    GhTracker(REPO, run).close_pr(42, comment)
+    args = ["pr", "close", "42", "-R", REPO, "--delete-branch"]
+    if comment is not None:
+        args.extend(["--comment", comment])
+    assert run.calls == [(args, None)]
+
+
+def test_create_issue_fake_and_gh_use_labels_and_json_body():
+    body = 'Feedback\n"quoted" café $(literal)'
+    tracker = FakeTracker(strict=True)
+    first = tracker.create_issue("First", body, iter(["feedback"]))
+    pr = tracker.create_pr(head="feature", base="main", title="PR", body="")
+    last = tracker.create_issue("Last", "body", [])
+    assert (first, pr, last) == (1, 2, 3)
+    assert tracker.get_issue(first) == Issue(1, "First", body, frozenset({"feedback"}), "open")
+    run = ScriptedRun('{"number": 42}')
+    assert GhTracker(REPO, run).create_issue("First", body, iter(["feedback"])) == 42
+    assert run.calls == [([
+        "api", "-X", "POST", "repos/owner/repo/issues", "--input", "-",
+    ], json.dumps({"title": "First", "body": body, "labels": ["feedback"]}))]
+
+
+@pytest.mark.parametrize("state", ["open", "merged"])
+def test_gh_list_prs_paginates_and_filters_heads_and_merges(state):
+    def pull(number, head, merged_at=None, body="body"):
+        return {
+            "number": number, "head": {"ref": head}, "base": {"ref": "main"},
+            "title": f"PR {number}", "body": body, "merged_at": merged_at,
+            "html_url": f"https://github.com/owner/repo/pull/{number}",
+        }
+    merged_at = NOW.isoformat() if state == "merged" else None
+    first = pull(10, "foragent/issue-1", merged_at)
+    second = pull(20, "foragent/issue-2", merged_at, None)
+    other = pull(30, "another/feature", merged_at)
+    closed = [pull(40, "foragent/issue-4")] if state == "merged" else []
+    run = ScriptedRun(json.dumps([first, other, *closed]) + "\n" + json.dumps([second]))
+    assert GhTracker(REPO, run).list_prs(state=state, head_prefix="foragent/issue-") == [
+        PullRequest(10, "foragent/issue-1", "main", "PR 10", "body", merged_at, first["html_url"]),
+        PullRequest(20, "foragent/issue-2", "main", "PR 20", "", merged_at, second["html_url"]),
+    ]
+    api_state = "closed" if state == "merged" else "open"
+    assert run.calls == [([
+        "api", "--paginate", f"repos/owner/repo/pulls?state={api_state}&per_page=100",
+    ], None)]
+
+
+def test_fake_list_prs_separates_open_closed_and_merged():
+    tracker = FakeTracker(now=lambda: NOW)
+    opened = tracker.create_pr(head="foragent/issue-1", base="main", title="Open", body="")
+    closed = tracker.create_pr(head="foragent/issue-2", base="main", title="Closed", body="")
+    merged = tracker.create_pr(head="foragent/issue-3", base="main", title="Merged", body="")
+    tracker.create_pr(head="feature", base="main", title="Other", body="")
+    tracker.close_issue(closed)
+    tracker.merge_pr(merged, expected_head_sha=tracker.pr_head_sha(merged))
+    assert [pr.number for pr in tracker.list_prs("open", "foragent/issue-")] == [opened]
+    merged_pr, = tracker.list_prs("merged", "foragent/issue-")
+    assert merged_pr.number == merged and merged_pr.merged_at == NOW.isoformat()
+
+
+@pytest.mark.parametrize("tracker", [FakeTracker(), GhTracker(REPO, ScriptedRun())])
+def test_list_prs_rejects_invalid_state(tracker):
+    with pytest.raises(ValueError, match="unsupported PR state"):
+        tracker.list_prs("closed", "foragent/issue-")

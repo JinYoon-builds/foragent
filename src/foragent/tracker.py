@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 IssueState = Literal["open", "closed"]
 CheckStatus = Literal["pass", "fail", "pending", "none"]
+PRState = Literal["open", "merged"]
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,8 @@ class PullRequest:
     base: str
     title: str
     body: str
+    merged_at: str | None = None
+    url: str = ""
 
 
 class Tracker(Protocol):
@@ -73,10 +76,13 @@ class Tracker(Protocol):
     def remove_labels(self, n: int, labels: Iterable[str]) -> None: ...
     def comment(self, n: int, body: str) -> int: ...
     def list_comments(self, n: int) -> list[Comment]: ...
+    def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int: ...
     def ensure_labels(self, specs: list[LabelSpec]) -> None: ...
     def close_issue(self, n: int, comment: str | None = None) -> None: ...
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
+    def close_pr(self, pr: int, comment: str | None = None) -> None: ...
     def find_pr(self, head: str) -> int | None: ...
+    def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
     def pr_head_sha(self, pr: int) -> str: ...
@@ -111,6 +117,7 @@ class FakeTracker:
         self.comments: dict[int, list[Comment]] = {}
         self.created_prs: list[PullRequest] = []
         self.merged_prs: list[int] = []
+        self.deleted_branches: list[str] = []
         self._events: dict[int, list[LabelEvent]] = {}
         self._body_edits: dict[int, str] = {}
         self._dependencies: dict[int, list[Dependency]] = {}
@@ -193,6 +200,11 @@ class FakeTracker:
             self.comment(n, comment)
         self.issues[n] = replace(self.get_issue(n), state="closed")
 
+    def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int:
+        number = max([*self.issues, *(pr.number for pr in self.created_prs)], default=0) + 1
+        self.add_issue(number, title, body, labels)
+        return number
+
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int:
         number = max([*self.issues, *(pr.number for pr in self.created_prs)], default=0) + 1
         self.created_prs.append(PullRequest(number, head, base, title, body))
@@ -202,6 +214,18 @@ class FakeTracker:
     def find_pr(self, head: str) -> int | None:
         return next((pr.number for pr in self.created_prs
                      if pr.head == head and self.get_issue(pr.number).state == "open"), None)
+
+    def close_pr(self, pr: int, comment: str | None = None) -> None:
+        self.close_issue(pr, comment)
+        self.deleted_branches.append(next(item.head for item in self.created_prs if item.number == pr))
+
+    def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]:
+        if state not in {"open", "merged"}:
+            raise ValueError(f"unsupported PR state: {state}")
+        return [pr for pr in self.created_prs if pr.head.startswith(head_prefix) and (
+            pr.merged_at is not None if state == "merged"
+            else self.get_issue(pr.number).state == "open" and pr.merged_at is None
+        )]
 
     def set_pr_files(self, pr: int, files: list[str]) -> None:
         self._pr_files[pr] = list(files)
@@ -227,10 +251,16 @@ class FakeTracker:
             raise TrackerError("PR head changed after verification")
         self.merged_prs.append(pr)
         self.issues[pr] = replace(self.get_issue(pr), state="closed")
+        self.created_prs = [
+            replace(item, merged_at=self._timestamp()) if item.number == pr else item
+            for item in self.created_prs
+        ]
 
 
 def _run_gh(args: list[str], input: str | None = None) -> str:
-    return subprocess.run(["gh", *args], input=input, check=True, capture_output=True, text=True).stdout
+    return subprocess.run(
+        ["gh", *args], input=input, check=True, capture_output=True, text=True, timeout=120,
+    ).stdout
 
 
 def _items(output: str) -> list[dict[str, Any]]:
@@ -271,7 +301,7 @@ class GhTracker:
             raise TrackerError(
                 exc.stderr or str(exc), stdout=exc.stdout or "", returncode=exc.returncode,
             ) from exc
-        except OSError as exc:
+        except (OSError, subprocess.TimeoutExpired) as exc:
             raise TrackerError(str(exc)) from exc
 
     def list_open_issues(self) -> list[Issue]:
@@ -357,6 +387,26 @@ class GhTracker:
             args.extend(["--comment", comment])
         self._call(args)
 
+    def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int:
+        output = self._call(
+            ["api", "-X", "POST", f"{self._path}/issues", "--input", "-"],
+            input=json.dumps({"title": title, "body": body, "labels": list(labels)}),
+        )
+        return json.loads(output)["number"]
+
+    def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]:
+        if state not in {"open", "merged"}:
+            raise ValueError(f"unsupported PR state: {state}")
+        api_state = "closed" if state == "merged" else "open"
+        data = _items(self._call([
+            "api", "--paginate", f"{self._path}/pulls?state={api_state}&per_page=100",
+        ]))
+        return [PullRequest(
+            item["number"], item["head"]["ref"], item["base"]["ref"],
+            item["title"], item.get("body") or "", item.get("merged_at"), item["html_url"],
+        ) for item in data if item["head"]["ref"].startswith(head_prefix)
+            and (state != "merged" or item.get("merged_at") is not None)]
+
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int:
         output = self._call(
             ["pr", "create", "-R", self.repo, "--head", head, "--base", base,
@@ -366,6 +416,12 @@ class GhTracker:
         if match is None:
             raise TrackerError(f"cannot parse PR number: {output.strip()}")
         return int(match[1])
+
+    def close_pr(self, pr: int, comment: str | None = None) -> None:
+        args = ["pr", "close", str(pr), "-R", self.repo, "--delete-branch"]
+        if comment is not None:
+            args.extend(["--comment", comment])
+        self._call(args)
 
     def pr_changed_files(self, pr: int) -> list[str]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/pulls/{pr}/files?per_page=100"]))

@@ -9,6 +9,7 @@ import pytest
 from foragent import __version__, cli, launchd
 from foragent.config import Config, ConfigError
 from foragent.git import GitError
+from foragent.launcher import spawn_notify
 from foragent.reasons import Reason, format_comment
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker, TrackerError
@@ -43,7 +44,7 @@ def app(tmp_path, monkeypatch):
     tracker = FakeTracker(now=lambda: NOW, strict=True)
     store = StateStore(tmp_path / "state", now=lambda: NOW)
     (tmp_path / ".foragent.yml").write_text("approvers: [human]\n", encoding="utf-8")
-    calls = {"roots": [], "repos": [], "stores": [], "launches": []}
+    calls = {"roots": [], "repos": [], "stores": [], "launches": [], "notifications": []}
 
     def git_repo(root):
         calls["roots"].append(root)
@@ -65,7 +66,9 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "GhTracker", gh_tracker)
     monkeypatch.setattr(cli.StateStore, "for_repo", for_repo)
     monkeypatch.setattr(cli, "spawn_runner", spawn)
+    monkeypatch.setattr(cli, "spawn_notify", lambda *args: calls["notifications"].append(args))
     monkeypatch.setattr(cli, "load_config", lambda root: Config(approvers=["human"]))
+    monkeypatch.setattr(cli.inspect_actions, "macos_notifier", lambda *args: None)
     monkeypatch.setattr(cli.launchd, "status", lambda root, **kwargs: launchd.LaunchdStatus(
         "dev.foragent.owner.repo", False, False,
     ))
@@ -388,3 +391,218 @@ def test_init_and_launchd_errors_are_clear(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli.launchd, "install", fail)
     assert cli.main(["gate", "install", "--repo-root", str(tmp_path)]) == 1
     assert capsys.readouterr().err == "foragent: launchctl unavailable more details\n"
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_inspect_cli_text_and_json_shapes(app, capsys, json_output):
+    root, git, tracker, store, calls = app
+    tracker.add_issue(3, "Add tally report", "Original", ["needs-human"])
+    details = "\n".join(f"Detail {i}" for i in range(16))
+    tracker.comment(3, format_comment(Reason.SPEC_QUESTION, "Choose a format", details))
+    args = ["inspect", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    assert cli.main(args) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    if json_output:
+        inbox = json.loads(captured.out)
+        assert set(inbox) == {"items", "counts", "since"}
+        assert inbox["counts"] == {
+            "decision": 1, "reapprove": 0, "review": 0,
+            "human-check": 0, "try": 0, "tech-failure": 0,
+        }
+        assert inbox["items"] == [{
+            "group": "decision", "number": 3, "title": "Add tally report",
+            "url": "https://github.com/owner/repo/issues/3", "reason": "spec-question",
+            "summary": "Choose a format", "details": details, "pr": None, "answered": False,
+        }]
+        assert datetime.fromisoformat(inbox["since"]).tzinfo is not None
+    else:
+        assert captured.out.splitlines() == [
+            "Decision 1", "[decision] #3 Add tally report — Choose a format",
+            *(f"  Detail {i}" for i in range(12)), "  https://github.com/owner/repo/issues/3",
+        ]
+    assert git.fetches == [] and calls["launches"] == []
+    assert not store.root.exists()
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_inspect_cli_try_is_latest_per_issue_with_empty_details_and_one_text_line(app, capsys, json_output):
+    root, git, tracker, store, calls = app
+    tracker.add_issue(7, "Tally report")
+    older = tracker.create_pr(
+        head="foragent/issue-7", base="main", title="Old tally", body="Old body\n" * 20,
+    )
+    tracker.merge_pr(older, expected_head_sha=tracker.pr_head_sha(older))
+    latest = tracker.create_pr(
+        head="foragent/issue-7", base="main", title="Latest tally", body="Latest body\n" * 20,
+    )
+    tracker._now = lambda: NOW + timedelta(minutes=1)
+    tracker.merge_pr(latest, expected_head_sha=tracker.pr_head_sha(latest))
+    store.update_inspect(since=(NOW - timedelta(days=1)).isoformat())
+    args = ["inspect", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    assert cli.main(args) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    url = f"https://github.com/owner/repo/pull/{latest}"
+    summary = f"Merged in PR #{latest}; try it"
+    if json_output:
+        inbox = json.loads(captured.out)
+        assert inbox["counts"]["try"] == 1
+        assert inbox["items"] == [{
+            "group": "try", "number": 7, "title": "Latest tally", "url": url,
+            "reason": None, "summary": summary, "details": "", "pr": latest, "answered": False,
+        }]
+    else:
+        assert captured.out.splitlines() == ["Try 1", f"[try] #7 Latest tally — {summary} {url}"]
+    assert git.fetches == [] and calls["launches"] == []
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_inspect_empty_output(app, capsys, json_output):
+    root, *_ = app
+    args = ["inspect", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    if json_output:
+        inbox = json.loads(output)
+        assert inbox["items"] == [] and not any(inbox["counts"].values())
+    else:
+        assert output == "No items.\n"
+
+
+def test_inspect_cli_records_answers_feedback_and_mark_seen(app, capsys):
+    root, git, tracker, store, calls = app
+    tracker.add_issue(1, "Question", BODY, ["needs-human"])
+    tracker.comment(1, format_comment(Reason.SPEC_QUESTION, "Question"))
+    for _ in range(2):
+        assert cli.main(["inspect", "answer", "1", "--text", "A\nA note", "--repo-root", str(root)]) == 0
+    assert tracker.list_comments(1)[-1].body == "<!-- foragent:decision -->\n**Decision:**\nA\nA note"
+    assert len(tracker.list_comments(1)) == 2
+    assert tracker.get_issue(1).labels == {"needs-human"} and tracker.get_issue(1).body == BODY
+    args = ["inspect", "--repo-root", str(root), "feedback", "--title", "Wrong spacing", "--body", "Fix it", "--about", "1"]
+    assert cli.main(args) == cli.main(args) == 0
+    issue = tracker.get_issue(2)
+    assert (issue.body, issue.labels) == ("Fix it\n\nAbout #1.", {"feedback"})
+    before = datetime.now(UTC)
+    assert cli.main(["inspect", "mark-seen", "--repo-root", str(root)]) == 0
+    assert before <= datetime.fromisoformat(store.load_inspect().since) <= datetime.now(UTC)
+    assert "Decision recorded:" in capsys.readouterr().out
+    assert git.fetches == [] and calls["launches"] == []
+
+
+def test_inspect_cli_retry_and_refusal(app, capsys):
+    root, git, tracker, store, _ = app
+    tracker.add_issue(1, labels=["needs-human"])
+    tracker.comment(1, format_comment(Reason.SPEC_QUESTION, "Question"))
+    args = ["inspect", "retry", "1", "--repo-root", str(root)]
+    assert cli.main(args) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and "not a tech-failure item; retry refused" in captured.err
+    tracker.comment(1, format_comment(Reason.TIMEOUT, "Too large"))
+    assert cli.main(args) == cli.main(args) == 0
+    assert tracker.get_issue(1).labels == frozenset()
+    assert tracker.list_comments(1)[-1].body == "<!-- foragent:retry -->\nRetry requested."
+
+
+@pytest.mark.parametrize("reason", [Reason.RETRIES_EXCEEDED, Reason.TIMEOUT])
+def test_inspect_retry_existing_failed_pr_can_be_scheduled_on_next_tick(app, monkeypatch, capsys, reason):
+    root, git, tracker, store, _ = app
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(approvers=["human"], review="fast"))
+    add_approved(tracker)
+    tracker.add_labels(1, ["needs-human"])
+    tracker.comment(1, format_comment(reason, "CI did not pass"))
+    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="Failed PR", body="Closes #1")
+    assert cli.main(["inspect", "retry", "1", "--repo-root", str(root)]) == 0
+    assert tracker.get_issue(pr).state == "closed"
+    assert tracker.list_comments(pr)[-1].body == "Closed by Foragent retry"
+    assert tracker.deleted_branches == ["foragent/issue-1"]
+    capsys.readouterr()
+    assert cli.main(["gate", "tick", "--no-start", "--repo-root", str(root), "--json"]) == 0
+    assert "#1 promoted to ready" in json.loads(capsys.readouterr().out)["actions"]
+    assert "ready" in tracker.get_issue(1).labels
+
+
+def test_inspect_cli_notify_prints_once_and_exposes_failure_for_manual_command(app, monkeypatch, capsys):
+    root, git, tracker, store, _ = app
+    tracker.add_issue(1, labels=["needs-human"])
+    args = ["inspect", "notify", "--repo-root", str(root)]
+    calls = []
+    def fail(*args):
+        raise FileNotFoundError("osascript unavailable")
+    monkeypatch.setattr(cli.inspect_actions, "macos_notifier", fail)
+    assert cli.main(args) == 1
+    assert "osascript unavailable" in capsys.readouterr().err
+    assert store.load_inspect().notified_signature is None
+    monkeypatch.setattr(cli.inspect_actions, "macos_notifier", lambda *args: calls.append(args))
+    assert cli.main(args) == cli.main(args) == 0
+    assert capsys.readouterr().out == "Decision 1\n"
+    assert calls == [("Decision 1", "Foragent owner/repo")]
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
+def test_tick_launches_notify_after_report_outside_lock_and_spawn_failure_is_isolated(
+    app, monkeypatch, capsys, json_output, failure,
+):
+    root, git, tracker, store, _ = app
+    add_approved(tracker)
+    calls = []
+    def popen(args, **kwargs):
+        # tick() has returned and printed its report before the child is spawned.
+        output = capsys.readouterr().out
+        if json_output:
+            assert json.loads(output)["actions"][-1] == "#1 promoted to ready"
+        else:
+            assert output.endswith("#1 promoted to ready\n")
+        with store.tick_lock() as acquired:
+            assert acquired
+        calls.append((args, kwargs))
+        if failure:
+            raise OSError("cannot spawn\nextra details")
+        kwargs["stdout"].write(b"foragent: notification delivery failed\n")
+        return object()
+    monkeypatch.setattr(cli, "spawn_notify", spawn_notify)
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    monkeypatch.setattr(cli.inspect_actions, "notify", lambda *args: pytest.fail("tick must not notify synchronously"))
+    args = ["gate", "tick", "--no-start", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    assert cli.main(args) == 0
+    captured = capsys.readouterr()
+    assert len(calls) == 1
+    assert calls[0][0] == [
+        sys.executable, "-m", "foragent.cli", "inspect", "notify", "--repo-root", str(root),
+    ]
+    assert calls[0][1]["start_new_session"] is True
+    assert calls[0][1]["stdout"] is calls[0][1]["stderr"]
+    assert captured.out == ""
+    if failure:
+        assert captured.err == "foragent: inspect notify failed: cannot spawn extra details\n"
+    else:
+        assert captured.err == ""
+        assert (store.root / "notify.log").read_text() == "foragent: notification delivery failed\n"
+
+
+def test_tick_returns_while_notification_child_is_still_running(app, monkeypatch, capsys):
+    root, git, tracker, store, _ = app
+    tracker.add_issue(1, labels=["needs-human"])
+    popen = subprocess.Popen
+    children = []
+
+    def slow_notification(args, **kwargs):
+        # Replace GitHub/osascript with a real offline child that stays busy.
+        child = popen([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(cli, "spawn_notify", spawn_notify)
+    monkeypatch.setattr(cli.subprocess, "Popen", slow_notification)
+    try:
+        assert cli.main(["gate", "tick", "--repo-root", str(root), "--no-start", "--json"]) == 0
+        assert len(children) == 1 and children[0].poll() is None
+        captured = capsys.readouterr()
+        assert json.loads(captured.out) == {"skipped": None, "actions": []}
+        assert captured.err == ""
+        assert store.load_inspect().notified_signature is None
+    finally:
+        for child in children:
+            child.terminate()
+            child.wait(timeout=5)
