@@ -1,0 +1,399 @@
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta, timezone
+import errno
+import fcntl
+import json
+import multiprocessing
+from pathlib import Path
+
+import pytest
+
+from foragent.issue import body_hash
+from foragent.state import StateStore
+import foragent.state as state_module
+
+
+NOW = datetime(2026, 10, 20, 9, 30, tzinfo=UTC)
+
+
+@pytest.fixture
+def store(tmp_path):
+    return StateStore(tmp_path / "state", now=lambda: NOW)
+
+
+def _mutate_run(root, method, number, fields, connection, pause_read):
+    store = StateStore(root)
+    if pause_read:
+        original_get = store.get_run
+
+        def paused_get(number):
+            run = original_get(number)
+            connection.send("read")
+            if not connection.poll(10):
+                raise TimeoutError("mutation was not resumed")
+            assert connection.recv() == "continue"
+            return run
+
+        store.get_run = paused_get
+    try:
+        connection.send("started")
+        connection.send(getattr(store, method)(number, **fields))
+    finally:
+        connection.close()
+
+
+@pytest.fixture
+def mutation_process():
+    context = multiprocessing.get_context("spawn")
+    children = []
+
+    def start(root, method, number=1, *, pause_read=False, **fields):
+        parent, child = context.Pipe()
+        process = context.Process(target=_mutate_run, args=(root, method, number, fields, child, pause_read))
+        process.start()
+        child.close()
+        children.append((process, parent))
+        assert parent.poll(10)
+        assert parent.recv() == "started"
+        return parent
+
+    yield start
+    for process, connection in children:
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        connection.close()
+        assert process.exitcode == 0
+
+
+def test_repository_root_and_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    store = StateStore.for_repo("owner/name")
+    assert store.root == tmp_path / ".local/share/foragent/owner__name"
+    assert store.worktree_path(42) == store.root / "worktrees/issue-42"
+    assert store.log_path(42) == store.root / "logs/issue-42.log"
+    assert not store.root.exists()
+
+
+def test_approval_exact_body_and_metadata_round_trip(store):
+    body = "  <!-- foragent:v1 -->\r\n## Goal\r\nKeep café text.  \r\n\r\n"
+    values = {
+        "body": body, "body_sha": body_hash(body),
+        "acceptance_blobs": {"tests/acceptance/test_a.py": "d" * 40},
+        "approved_by": "human", "approved_at": NOW.isoformat(),
+    }
+    assert store.load_approval(42) is None
+    store.save_approval(42, **values)
+    assert asdict(store.load_approval(42)) == {"number": 42, **values}
+    snapshot = json.loads((store.root / "approvals/42.json").read_text(encoding="utf-8"))
+    assert snapshot == {"number": 42, **values}
+    assert [path.name for path in (store.root / "approvals").iterdir()] == ["42.json"]
+    store.save_approval(42, **{**values, "body": "replacement"})
+    assert store.load_approval(42).body == "replacement"
+    store.clear_approval(42)
+    store.clear_approval(42)
+    assert store.load_approval(42) is None
+    assert list((store.root / "approvals").iterdir()) == []
+
+
+def test_failed_approval_replacement_preserves_complete_snapshot(store, monkeypatch):
+    store.save_approval(1, body="original", body_sha="old-sha", acceptance_blobs={"check.sh": "old"},
+                        approved_by="first", approved_at=NOW.isoformat())
+    original = store.load_approval(1)
+    original_replace = state_module.os.replace
+
+    def fail_snapshot_replace(source, destination):
+        if Path(destination) == store.root / "approvals/1.json":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(state_module.os, "replace", fail_snapshot_replace)
+    with pytest.raises(OSError, match="No space left"):
+        store.save_approval(1, body="replacement", body_sha="new-sha", acceptance_blobs={"check.sh": "new"},
+                            approved_by="second", approved_at=(NOW + timedelta(minutes=1)).isoformat())
+    assert store.load_approval(1) == original
+    assert list(store.root.rglob("*.tmp")) == []
+
+
+def test_approval_readers_observe_complete_snapshots_during_replacement(store, monkeypatch):
+    store.save_approval(1, body="original", body_sha="old-sha", acceptance_blobs={"check.sh": "old"},
+                        approved_by="first", approved_at=NOW.isoformat())
+    reader = StateStore(store.root)
+    original = reader.load_approval(1)
+    original_replace = state_module.os.replace
+    observed = []
+
+    def observe_replace(source, destination):
+        observed.append(reader.load_approval(1))
+        original_replace(source, destination)
+        observed.append(reader.load_approval(1))
+
+    monkeypatch.setattr(state_module.os, "replace", observe_replace)
+    store.save_approval(1, body="replacement", body_sha="new-sha", acceptance_blobs={"check.sh": "new"},
+                        approved_by="second", approved_at=(NOW + timedelta(minutes=1)).isoformat())
+    replacement = reader.load_approval(1)
+    assert observed == [original, replacement]
+
+
+def test_runs_round_trip_update_active_and_history(store):
+    assert store.get_run(1) is None
+    assert store.active_runs() == []
+    assert store.read_history() == []
+    first = store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1), pid=123)
+    assert first.number == 1
+    assert first.branch == "foragent/issue-1"
+    assert first.worktree == str(store.worktree_path(1))
+    assert first.pid == 123
+    assert first.started_at == first.last_progress_at == NOW.isoformat()
+    assert (first.attempts, first.restarts, first.status, first.outcome, first.detail) == (1, 0, "running", None, "")
+    assert store.get_run(1) == first
+    assert StateStore(store.root).get_run(1) == first
+    progress = (NOW + timedelta(minutes=5)).isoformat()
+    updated = store.update_run(1, attempts=2, restarts=1, pid=456, last_progress_at=progress)
+    assert updated.last_progress_at == progress
+    assert updated.started_at == first.started_at
+    assert (updated.attempts, updated.restarts, updated.pid) == (2, 1, 456)
+    store.start_run(10, branch="ten", worktree="/work/ten")
+    store.start_run(2, branch="two", worktree="/work/two")
+    assert [run.number for run in store.active_runs()] == [1, 2, 10]
+    finished = store.finish_run(1, "success", "Checks passed.")
+    assert finished.status == "finished"
+    assert finished.outcome == "success"
+    assert finished.detail == "Checks passed."
+    assert store.get_run(1) == finished
+    store.finish_run(2, "failed")
+    assert [run.number for run in store.active_runs()] == [10]
+    history = [json.loads(line) for line in (store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert history == [asdict(finished), asdict(store.get_run(2))]
+    assert store.read_history() == [finished, store.get_run(2)]
+    assert store.finish_run(1, "success") == finished
+    assert len((store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_new_execution_of_same_issue_adds_history(store):
+    store.start_run(1, branch="first", worktree="first")
+    first = store.finish_run(1, "failed")
+    store._now = lambda: NOW + timedelta(minutes=1)
+    store.start_run(1, branch="second", worktree="second")
+    second = store.finish_run(1, "success")
+    history = [json.loads(line) for line in (store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [run["outcome"] for run in history] == ["failed", "success"]
+    assert store.read_history() == [first, second]
+
+
+@pytest.mark.parametrize("fields", [{"pid": 999}, {"status": "running", "outcome": None}])
+def test_finished_runs_ignore_updates(store, fields):
+    store.start_run(1, branch="branch", worktree="worktree", pid=123)
+    finished = store.finish_run(1, "success")
+    assert store.update_run(1, **fields) == finished
+    assert store.get_run(1) == finished
+    assert store.read_history() == [finished]
+
+
+def test_failed_history_write_can_be_retried(store, monkeypatch):
+    running = store.start_run(1, branch="branch", worktree="worktree")
+    atomic_write = store._atomic_write
+
+    def fail_history_write(path, content):
+        if path == store.root / "runs.jsonl":
+            raise OSError("history write failed")
+        atomic_write(path, content)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_atomic_write", fail_history_write)
+        with pytest.raises(OSError, match="history write failed"):
+            store.finish_run(1, "success", "Checks passed.")
+    assert store.get_run(1) == running
+    assert store.read_history() == []
+    finished = store.finish_run(1, "success", "Checks passed.")
+    assert store.get_run(1) == finished
+    assert store.read_history() == [finished]
+
+
+def test_failed_finish_record_write_can_be_retried_without_duplicate_history(store, monkeypatch):
+    running = store.start_run(1, branch="branch", worktree="worktree")
+    write_json = store._write_json
+
+    def fail_record_write(path, value):
+        if path == store.root / "runs/1.json":
+            raise OSError("record write failed")
+        write_json(path, value)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_write_json", fail_record_write)
+        with pytest.raises(OSError, match="record write failed"):
+            store.finish_run(1, "success", "Checks passed.")
+    assert store.get_run(1) == running
+    assert len(store.read_history()) == 1
+    finished = store.finish_run(1, "success", "Checks passed.")
+    assert store.get_run(1) == finished
+    assert len((store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+    assert store.read_history() == [finished]
+    assert store.finish_run(1, "failed") == finished
+    assert len((store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_history_deduplicates_by_number_and_start_time_using_latest_entry(store):
+    store.start_run(1, branch="one", worktree="one")
+    first = store.finish_run(1, "success")
+    store.start_run(2, branch="two", worktree="two")
+    second = store.finish_run(2, "failed")
+    latest = {**asdict(first), "detail": "Retried completion"}
+    with (store.root / "runs.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(latest) + "\n")
+    history = store.read_history()
+    assert [asdict(run) for run in history] == [latest, asdict(second)]
+
+
+@pytest.mark.parametrize("method,args", [("update_run", {"pid": 1}), ("finish_run", {"outcome": "failed"})])
+def test_missing_run_mutation_is_an_error(store, method, args):
+    with pytest.raises(KeyError):
+        getattr(store, method)(99, **args)
+
+
+def test_unknown_update_field_does_not_change_record(store):
+    run = store.start_run(1, branch="branch", worktree="worktree")
+    with pytest.raises(TypeError):
+        store.update_run(1, unsupported=True)
+    assert store.get_run(1) == run
+
+
+def test_timestamps_are_utc_even_with_injected_offset(tmp_path):
+    offset_now = datetime(2026, 10, 20, 18, 30, tzinfo=timezone(timedelta(hours=9)))
+    store = StateStore(tmp_path, now=lambda: offset_now)
+    run = store.start_run(1, branch="branch", worktree="worktree")
+    assert run.started_at == NOW.isoformat()
+    assert datetime.fromisoformat(run.started_at).utcoffset() == timedelta(0)
+
+
+def test_naive_clock_is_rejected(tmp_path):
+    store = StateStore(tmp_path, now=lambda: NOW.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.start_run(1, branch="branch", worktree="worktree")
+
+
+def test_all_writes_replace_a_complete_same_directory_temp_file(store, monkeypatch):
+    original_replace = state_module.os.replace
+    destinations = []
+
+    def inspect_replace(source, destination):
+        source, destination = Path(source), Path(destination)
+        assert source.parent == destination.parent
+        assert source.is_file()
+        assert source.read_text(encoding="utf-8")
+        destinations.append(destination.relative_to(store.root).as_posix())
+        original_replace(source, destination)
+
+    monkeypatch.setattr(state_module.os, "replace", inspect_replace)
+    store.save_approval(1, body="body", body_sha="sha", acceptance_blobs={}, approved_by="human", approved_at=NOW.isoformat())
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.update_run(1, attempts=2)
+    store.finish_run(1, "success")
+    assert destinations == ["approvals/1.json", "runs/1.json", "runs/1.json", "runs.jsonl", "runs/1.json"]
+    assert list(store.root.rglob("*.tmp")) == []
+
+
+def test_failed_replace_preserves_previous_record_and_removes_temp(store, monkeypatch):
+    original = store.start_run(1, branch="branch", worktree="worktree")
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(state_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        store.update_run(1, attempts=2)
+    assert store.get_run(1) == original
+    assert list(store.root.rglob("*.tmp")) == []
+
+
+@pytest.mark.parametrize("method,fields", [
+    ("start_run", {"branch": "new", "worktree": "new"}),
+    ("update_run", {"pid": 999}),
+    ("finish_run", {"outcome": "success"}),
+])
+def test_run_mutations_block_on_state_lock_in_another_process(store, mutation_process, method, fields):
+    store.start_run(1, branch="branch", worktree="worktree")
+    with (store.root / "state.lock").open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        connection = mutation_process(store.root, method, **fields)
+        assert not connection.poll(0.2)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    assert connection.poll(10)
+    assert connection.recv() == store.get_run(1)
+
+
+@pytest.mark.parametrize("first_method,first_fields,second_method,second_fields", [
+    ("update_run", {"pid": 999}, "finish_run", {"outcome": "success"}),
+    ("finish_run", {"outcome": "success"}, "update_run", {"pid": 999, "status": "running"}),
+])
+def test_competing_update_and_finish_are_serialized(
+    store, mutation_process, first_method, first_fields, second_method, second_fields,
+):
+    store.start_run(1, branch="branch", worktree="worktree", pid=123)
+    first = mutation_process(store.root, first_method, pause_read=True, **first_fields)
+    assert first.poll(10)
+    assert first.recv() == "read"
+    second = mutation_process(store.root, second_method, **second_fields)
+    try:
+        assert not second.poll(0.2)
+    finally:
+        first.send("continue")
+    assert first.poll(10)
+    first_result = first.recv()
+    assert second.poll(10)
+    finished = second.recv()
+    assert finished.status == "finished"
+    assert finished.pid == (999 if first_method == "update_run" else 123)
+    assert store.get_run(1) == finished
+    assert store.read_history() == [finished]
+    if first_method == "finish_run":
+        assert first_result == finished
+
+
+def test_finishes_in_separate_processes_preserve_both_history_entries(store, mutation_process):
+    store.start_run(1, branch="one", worktree="one")
+    store.start_run(2, branch="two", worktree="two")
+    first = mutation_process(store.root, "finish_run", pause_read=True, outcome="success")
+    assert first.poll(10)
+    assert first.recv() == "read"
+    second = mutation_process(store.root, "finish_run", number=2, outcome="failed")
+    try:
+        assert not second.poll(0.2)
+    finally:
+        first.send("continue")
+    assert first.poll(10)
+    first_result = first.recv()
+    assert second.poll(10)
+    second_result = second.recv()
+    assert store.read_history() == [first_result, second_result]
+
+
+def test_run_mutations_work_while_tick_lock_is_held(store):
+    with store.tick_lock() as acquired:
+        assert acquired
+        store.start_run(1, branch="branch", worktree="worktree")
+        store.update_run(1, pid=999)
+        finished = store.finish_run(1, "success")
+    assert store.read_history() == [finished]
+
+
+def test_tick_lock_second_file_descriptor_never_blocks(store):
+    second = StateStore(store.root)
+    with store.tick_lock() as acquired:
+        assert acquired is True
+        with second.tick_lock() as other_acquired:
+            assert other_acquired is False
+        with store.tick_lock() as nested_acquired:
+            assert nested_acquired is False
+    with second.tick_lock() as acquired:
+        assert acquired is True
+
+
+def test_tick_lock_released_on_exception(store):
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with store.tick_lock() as acquired:
+            assert acquired
+            raise RuntimeError("interrupted")
+    with store.tick_lock() as acquired:
+        assert acquired
