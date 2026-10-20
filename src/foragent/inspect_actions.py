@@ -9,6 +9,7 @@ from foragent.inspect_data import (
     comment_key, counts_line, has_marker, latest_flag, pending_signature,
 )
 from foragent.labels import NEEDS_HUMAN
+from foragent.inspect_runtime import prepare, serve, stop
 from foragent.reasons import GROUP
 
 
@@ -66,6 +67,7 @@ def feedback(ctx: InspectContext, title: str, body: str, about: int | None = Non
 
 
 def mark_seen(ctx: InspectContext) -> str:
+    stop(ctx)
     since = ctx.now().astimezone(UTC).isoformat()
     ctx.store.update_inspect(since=since)
     return since

@@ -57,3 +57,13 @@
 - #1, #2만 승인(#3·#4는 order 대기). 구현 codex, 리뷰 claude(fail-closed).
 - #1 merged, #2 merged. 둘 다 "Round 1: VERDICT: PASS". 이슈당 약 2분(리뷰 포함).
 - 사람 개입 0. 리뷰어가 FAIL을 내는 경로는 아직 실제로 시험하지 못함(가짜 실행기 테스트로만 확인).
+
+## Trial 5a — 2026-10-20, P7b+P7c: codex 구현, /code-review 리뷰, language: ko
+- #1, #2 merged. 리뷰 "Round 1: VERDICT: PASS / reviewer: /code-review low".
+- TRY.md가 한국어로 생성되어 PR "Try it" 절에 들어감. 커밋에는 포함되지 않음(변경 파일 cli.py만).
+- `fa inspect prepare` → 미리 실행 결과 `4`, `0`(기대값과 일치). 다듬을 점: uv 설치 메시지가 출력에 섞임 → stdout만 보여 주고 stderr는 실패 때만.
+
+## Trial 5b — 2026-10-20, claude 구현(순정 /goal + deny + Stop 훅), codex 리뷰
+- #1, #2 merged. 로그에 "Goal set: Every command in the Done when…", Stop 훅 1회 실행, 차단 0회(처음부터 통과).
+- 수정 금지 규칙 별도 시험: 시험 파일 수정을 직접 시키자 편집 도구가 deny에 막힘, "다른 방법으로라도" 지시에도 우회하지 않고 스펙(글자 vs 바이트)을 되물음. 파일 변경 없음. 셸 우회는 규칙이 완전히 막지 못하므로 runner의 경로 잠금 판정을 계속 유지.
+- 사람 개입 0.

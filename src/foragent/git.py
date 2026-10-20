@@ -59,8 +59,20 @@ class GitRepo:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._call(["worktree", "add", "-B", branch, str(path), base_ref])
 
+    def ref_sha(self, ref: str) -> str:
+        return self._call(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
+
+    def add_detached_worktree(self, path: Path, ref: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._call(["worktree", "add", "--detach", str(path), ref])
+
     def stage_changes(self) -> None:
         self._call(["add", "-A", "--", ".", ":!.foragent"])
+        self._exclude_artifacts()
+
+    def _exclude_artifacts(self) -> None:
+        # Also remove entries staged by an executor, retaining their local files.
+        self._call(["rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"])
 
     def changed_paths(self, base_ref: str) -> list[str]:
         # NUL delimiters retain filenames containing tabs, quotes, or newlines.
@@ -158,6 +170,7 @@ class GitRepo:
         return self._call(["rev-parse", "HEAD"]).strip()
 
     def commit(self, title: str) -> None:
+        self._exclude_artifacts()
         self._call([
             "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
             "commit", "-m", title,
@@ -221,6 +234,7 @@ class GitRepo:
                 value = ""
             identity.extend(["-c", f"{key}={value or fallback}"])
         self._call(["add", "--", *paths])
+        self._exclude_artifacts()
         self._call([*identity, "commit", "--only", "-m", title, "--", *paths])
 
     def push_base(self, branch: str) -> None:

@@ -10,7 +10,7 @@ import time
 import pytest
 
 from foragent.executors import (
-    ClaudeExecutor, CodexExecutor, claude_command, codex_command, executor_for,
+    ClaudeExecutor, CodexExecutor, claude_command, claude_review_command, codex_command, executor_for,
 )
 from foragent.processes import kill_process_group, run_logged
 
@@ -26,8 +26,9 @@ def test_exact_codex_command(model):
 
 @pytest.mark.parametrize("model", [None, "other model"])
 def test_exact_claude_command(model):
-    assert claude_command(model) == [
-        "claude", "-p", "--permission-mode", "auto", "--output-format", "text",
+    assert claude_command(model, Path("/run dir/claude-settings.json")) == [
+        "claude", "-p", "--permission-mode", "auto", "--output-format", "stream-json", "--verbose",
+        "--settings", "/run dir/claude-settings.json",
         *(["--model", model] if model is not None else []),
     ]
 
@@ -37,6 +38,40 @@ def test_executor_factory():
     assert isinstance(executor_for("claude"), ClaudeExecutor)
     with pytest.raises(ValueError, match="unknown executor"):
         executor_for("unknown")
+
+
+@pytest.mark.parametrize("model", [None, "review model"])
+@pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
+def test_exact_claude_review_command(level, model):
+    assert claude_review_command(level, model) == [
+        "claude", "-p", f"/code-review {level}", "--permission-mode", "auto", "--output-format", "json",
+        *(["--model", model] if model is not None else []),
+    ]
+
+
+def test_claude_review_uses_devnull_and_preserves_json(tmp_path, monkeypatch):
+    calls = []
+    message = json.dumps({"result": "(none)", "is_error": False})
+
+    class Process:
+        returncode = 0
+
+        def __init__(self, args, **kwargs):
+            calls.append((args, kwargs))
+            kwargs["stdout"].write(message.encode())
+
+        def communicate(self, **kwargs):
+            assert kwargs == {"input": None, "timeout": 12}
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr("foragent.processes.subprocess.Popen", Process)
+    result = ClaudeExecutor().run(worktree=tmp_path, prompt="ignored", model=None, timeout_s=12,
+                                  log_path=tmp_path / "review.log", review_level="high")
+    assert calls[0][0] == claude_review_command("high")
+    assert calls[0][1]["stdin"] == subprocess.DEVNULL and calls[0][1]["cwd"] == tmp_path
+    assert result.last_message == result.full_message == message
 
 
 @pytest.mark.parametrize("kind", ["codex", "claude"])
@@ -58,7 +93,8 @@ def test_executor_uses_worktree_stdin_append_log_and_output(kind, tmp_path, monk
 
         def __init__(self, args, **kwargs):
             calls.append((args, kwargs))
-            kwargs["stdout"].write(b"session stdout\n")
+            stdout = "session stdout\n" if kind == "codex" else json.dumps({"type": "result", "result": "session stdout\n"}) + "\n"
+            kwargs["stdout"].write(stdout.encode())
             if kwargs["stderr"] != subprocess.STDOUT:
                 kwargs["stderr"].write(b"session stderr\n")
             if kind == "codex":
@@ -73,6 +109,7 @@ def test_executor_uses_worktree_stdin_append_log_and_output(kind, tmp_path, monk
     monkeypatch.setattr("foragent.processes.subprocess.Popen", Process)
     result = executor_for(kind).run(
         worktree=tmp_path, prompt="approved prompt", model="chosen", timeout_s=21, log_path=log,
+        **({"settings_path": tmp_path / "claude-settings.json"} if kind == "claude" else {}),
     )
     assert result.exit_code == 7 and not result.timed_out and result.log_path == log
     assert result.last_message == ("last codex message" if kind == "codex" else "session stdout\n")
@@ -87,24 +124,31 @@ def test_executor_uses_worktree_stdin_append_log_and_output(kind, tmp_path, monk
         assert key not in kwargs["env"]
         assert os.environ[key] == str(gate_env)
     if kind == "claude":
+        assert args == claude_command("chosen", tmp_path / "claude-settings.json")
         assert "session stderr" in log.read_text()
     else:
         assert not Path(args[args.index("-o") + 1]).exists()
 
 
-def test_claude_preserves_full_stdout_separately_from_tail_and_stderr(tmp_path, monkeypatch):
+def test_claude_extracts_last_full_result_separately_from_transcript_and_stderr(tmp_path, monkeypatch):
     message = "VERDICT: FAIL\n" + "\n".join(f"file.py:{i}: " + "x" * 930 for i in range(5)) + "\n"
     assert len(message) > 4708
-    monkeypatch.setattr("foragent.executors.claude_command", lambda model: [
-        sys.executable, "-c", f"import sys; sys.stdout.write({message!r}); sys.stderr.write('VERDICT: PASS\\n')",
+    transcript = "\n".join([
+        json.dumps({"type": "system", "message": "progress"}), "garbage", "[]",
+        json.dumps({"type": "result", "result": "old result"}),
+        json.dumps({"type": "result", "result": message}),
+        json.dumps({"type": "assistant", "message": "later progress"}),
+    ]) + "\n"
+    monkeypatch.setattr("foragent.executors.claude_command", lambda model, settings: [
+        sys.executable, "-c", f"import sys; sys.stdout.write({transcript!r}); sys.stderr.write('VERDICT: PASS\\n')",
     ])
     result = ClaudeExecutor().run(
         worktree=tmp_path, prompt="review", model=None, timeout_s=5, log_path=tmp_path / "review.log",
     )
     assert result.exit_code == 0 and not result.timed_out
     assert result.full_message == message
-    assert result.last_message == message[-4000:] and "VERDICT:" not in result.last_message
-    assert (tmp_path / "review.stdout").read_text() == message
+    assert result.last_message == message
+    assert (tmp_path / "review.stdout").read_text() == transcript
     assert "VERDICT: PASS" in result.log_path.read_text() and "VERDICT: PASS" not in result.full_message
 
 

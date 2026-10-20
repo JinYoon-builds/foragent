@@ -153,7 +153,7 @@ def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
 
 
 def test_second_init_is_idempotent_and_preserves_config_and_mtimes(setup):
-    setup.init()
+    setup.init(executor="codex", run_hours="always")
     before = {path: ((setup.root / path).read_bytes(), (setup.root / path).stat().st_mtime_ns) for path in PATHS}
     setup.git_calls.clear()
     setup.gh_calls.clear()
@@ -193,6 +193,87 @@ def test_only_nondefault_keys_and_explicit_approvers_are_written(setup):
         "review": "fast", "executor": "claude", "approvers": ["alice", "bob"], "run_hours": "22-08",
     }
     assert setup.gh_calls == [(["auth", "status"], None)]
+
+
+@pytest.mark.parametrize("language", ["ko", "en", "ja"])
+def test_init_writes_explicit_language(setup, language):
+    setup.init(language=language)
+    assert yaml.safe_load((setup.root / PATHS[0]).read_text())["language"] == language
+    assert load_config(setup.root).language == language
+
+
+@pytest.mark.parametrize("key,value", [
+    ("language", "ko"), ("review", "fast"), ("executor", "claude"),
+    ("approvers", ["new-human"]), ("run_hours", "22-08"),
+])
+def test_existing_config_adds_only_missing_explicit_keys(setup, key, value):
+    config = "# Preserve this comment\nbase_branch: main\n"
+    (setup.root / PATHS[0]).write_text(config)
+    report = setup.init(**{key: value})
+    assert (setup.root / PATHS[0]).read_text().startswith(config)
+    assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {"base_branch": "main", key: value}
+    assert report.added_keys == [key]
+    assert f"Added config key: {key}" in report.summary()
+    setup.git_calls.clear()
+    report = setup.init(**{key: value})
+    assert not report.added_keys and not report.committed
+
+
+@pytest.mark.parametrize("text", [
+    "", "{}\n", "{review: fast}\n", "---\nreview: fast\n...\n", "  review: fast\n",
+    "review: fast\n... # end\n# keep valid YAML\n", "&config\n  review: fast\n",
+    "null\n", "~\n", "NULL\n", "# Empty configuration\n", "---\nnull\n...\n",
+])
+def test_init_adds_missing_key_to_empty_flow_or_explicit_yaml_document(setup, text):
+    (setup.root / PATHS[0]).write_text(text)
+    setup.init(language="ko")
+    assert load_config(setup.root).language == "ko"
+    if "review" in text:
+        assert load_config(setup.root).review == "fast"
+
+
+def test_init_null_configuration_dry_run_and_multiple_missing_keys(setup):
+    path = setup.root / PATHS[0]
+    path.write_text("~\n")
+    report = setup.init(language="ko", executor="claude", dry_run=True)
+    assert report.added_keys == ["executor", "language"]
+    assert path.read_text() == "~\n"
+    setup.init(language="ko", executor="claude")
+    assert yaml.safe_load(path.read_text()) == {"executor": "claude", "language": "ko"}
+    assert not setup.init(language="ko", executor="claude").added_keys
+
+
+def test_existing_language_is_never_overwritten_and_missing_values_override_global(setup, monkeypatch):
+    global_path = setup.root.parent / "global/config.yml"
+    global_path.parent.mkdir()
+    global_path.write_text("language: ja\nexecutor: claude\n")
+    monkeypatch.setattr(Path, "home", lambda: global_path.parent.parent)
+    # Use the standard global configuration location with a scoped fake HOME.
+    global_config = Path.home() / ".config/foragent/config.yml"
+    global_config.parent.mkdir(parents=True)
+    global_config.write_text(global_path.read_text())
+    (setup.root / PATHS[0]).write_text("language: ko\n")
+    report = setup.init(language="en", executor="codex")
+    assert load_config(setup.root).language == "ko"
+    assert load_config(setup.root).executor == "codex"
+    assert report.added_keys == ["executor"]
+
+
+def test_init_dry_run_reports_missing_keys_without_writing(setup):
+    (setup.root / PATHS[0]).write_text("review: fast\n")
+    report = setup.init(language="ko", dry_run=True)
+    assert (setup.root / PATHS[0]).read_text() == "review: fast\n"
+    assert report.added_keys == ["language"]
+    assert "Would add config key: language" in report.summary()
+    assert not report.committed and report.commit_planned
+
+
+def test_invalid_missing_option_on_existing_config_fails_before_writes(setup):
+    (setup.root / PATHS[0]).write_text("review: fast\n")
+    with pytest.raises(ConfigError, match="language"):
+        setup.init(language="not a tag")
+    assert (setup.root / PATHS[0]).read_text() == "review: fast\n"
+    assert not setup.tracker.labels
 
 
 def test_dirty_worktree_and_unrelated_staged_changes_are_preserved(setup):

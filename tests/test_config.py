@@ -27,7 +27,7 @@ def test_exact_defaults(repo):
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
-        "repo": None,
+        "repo": None, "language": "en", "codex_goal": False, "review_level": "medium",
     }
     assert DEFAULTS == expected
     assert asdict(load_config(repo)) == expected
@@ -91,6 +91,8 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
     ("review_paths", {1: "fast"}), ("review_paths", {"app/**": []}),
     ("executor", "other"), ("executor", None), ("executor", []),
     ("reviewer", "other"), ("reviewer", []),
+    ("codex_goal", "true"), ("codex_goal", 1), ("codex_goal", None),
+    ("review_level", "extreme"), ("review_level", []), ("review_level", None),
     ("always_human", "auth/**"), ("always_human", [1]),
     ("approvers", "user"), ("approvers", [None]),
     ("executor_model", 42), ("reviewer_model", []),
@@ -105,6 +107,25 @@ def test_validation_errors_name_the_field(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
     with pytest.raises(ConfigError, match=key):
         load_config(repo)
+
+
+@pytest.mark.parametrize("source", ["local", "global"])
+@pytest.mark.parametrize("directory", [
+    "tests/acceptance[1]/", "tests/acceptance]/", "checks*/", "checks?/",
+    "checks{old,new}/", "checks}/",
+])
+def test_acceptance_directory_rejects_glob_metacharacters(repo, tmp_path, source, directory):
+    global_path = tmp_path / "global.yml"
+    path = repo / ".foragent.yml" if source == "local" else global_path
+    write_settings(path, {"acceptance_dir": directory})
+    with pytest.raises(ConfigError, match="acceptance_dir.*glob metacharacters"):
+        load_config(repo, global_path)
+
+
+@pytest.mark.parametrize("directory", ["tests/acceptance/", "checks with spaces/", "./checks/"])
+def test_acceptance_directory_allows_literal_paths(repo, directory):
+    write_settings(repo / ".foragent.yml", {"acceptance_dir": directory})
+    assert load_config(repo).acceptance_dir == directory
 
 
 @pytest.mark.parametrize("key", ["stall_minutes", "max_runtime_minutes", "max_retries", "review_max"])
@@ -123,10 +144,31 @@ def test_all_valid_overrides(repo):
         "approvers": ["human"], "acceptance_dir": "checks/", "notify": ["slack:#project"],
         "run_hours": "22-08", "stall_minutes": 1, "max_runtime_minutes": 1,
         "max_retries": 1, "review_max": 3, "base_branch": "trunk",
-        "repo": "owner/name",
+        "repo": "owner/name", "language": "ko", "codex_goal": True, "review_level": "max",
     }
     write_settings(repo / ".foragent.yml", settings)
     assert asdict(load_config(repo)) == settings
+
+
+def test_language_uses_global_default_and_repo_override(repo, tmp_path):
+    global_path = tmp_path / "global.yml"
+    write_settings(global_path, {"language": "ko"})
+    assert load_config(repo, global_path).language == "ko"
+    write_settings(repo / ".foragent.yml", {"language": "ja"})
+    assert load_config(repo, global_path).language == "ja"
+
+
+@pytest.mark.parametrize("language", ["ko", "en", "ja", "en-US", "zh-Hant-TW", "es-419"])
+def test_language_tags(repo, language):
+    write_settings(repo / ".foragent.yml", {"language": language})
+    assert load_config(repo).language == language
+
+
+@pytest.mark.parametrize("language", [None, "", "ko KR", "en_US", 1, [], "a" * 40])
+def test_invalid_language(repo, language):
+    write_settings(repo / ".foragent.yml", {"language": language})
+    with pytest.raises(ConfigError, match="language"):
+        load_config(repo)
 
 
 def test_configs_do_not_share_mutable_defaults(repo):

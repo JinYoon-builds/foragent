@@ -58,7 +58,7 @@ def _child_environment(cwd: Path) -> dict[str, str]:
 def run_logged(
     argv: list[str], *, cwd: Path, timeout_s: int, log_path: Path,
     prompt: str | None = None, capture_stdout: bool = False,
-    stdout_path: Path | None = None,
+    stdout_path: Path | None = None, terminate_children: bool = False,
 ) -> tuple[int | None, bool, str]:
     """Append output without buffering an unbounded session in memory."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,18 +109,22 @@ def run_logged(
                     pass
                 process.communicate()
         finally:
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
-            if can_handle:
-                signal.signal(signal.SIGTERM, previous)
-            if follower is not None:
-                stop_forwarding.set()
-                follower.join()
-                forward_stdout()
+            try:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                if terminate_children:
+                    kill_process_group(process.pid)
+            finally:
+                if can_handle:
+                    signal.signal(signal.SIGTERM, previous)
+                if follower is not None:
+                    stop_forwarding.set()
+                    follower.join()
+                    forward_stdout()
         if capture_stdout:
             size = output.seek(0, 2)
             output.seek(max(0, size - 16000))

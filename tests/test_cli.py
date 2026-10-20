@@ -291,12 +291,12 @@ def test_init_cli_passes_all_flags_and_prints_summary(tmp_path, monkeypatch, cap
     monkeypatch.setattr(cli, "init_repo", init)
     assert cli.main([
         "init", "--repo-root", str(tmp_path), "--approver", "alice", "bob", "--approver", "carol",
-        "--review", "careful", "--executor", "claude", "--run-hours", "22-08",
+        "--review", "careful", "--executor", "claude", "--run-hours", "22-08", "--language", "ko",
         "--no-push", "--no-launchd", "--dry-run",
     ]) == 0
     assert calls == [(tmp_path, {
         "approvers": ["alice", "bob", "carol"], "review": "careful", "executor": "claude",
-        "run_hours": "22-08", "no_push": True, "no_launchd": True, "dry_run": True,
+        "run_hours": "22-08", "language": "ko", "no_push": True, "no_launchd": True, "dry_run": True,
     })]
     assert capsys.readouterr().out == "Setup summary\n"
 
@@ -310,7 +310,7 @@ def test_init_cli_defaults_to_cwd_and_default_options(tmp_path, monkeypatch, cap
         assert root == tmp_path
         assert kwargs == {
             "approvers": None, "review": None, "executor": None, "run_hours": None,
-            "no_push": False, "no_launchd": False, "dry_run": False,
+            "no_push": False, "no_launchd": False, "dry_run": False, "language": None,
         }
         return InitReport([], [], False)
 
@@ -405,7 +405,9 @@ def test_inspect_cli_text_and_json_shapes(app, capsys, json_output):
     assert captured.err == ""
     if json_output:
         inbox = json.loads(captured.out)
-        assert set(inbox) == {"items", "counts", "since"}
+        assert set(inbox) == {"items", "counts", "since", "summary", "language"}
+        assert inbox["language"] == "en"
+        assert inbox["summary"] == {"counts": inbox["counts"], "estimated_minutes": 1}
         assert inbox["counts"] == {
             "decision": 1, "reapprove": 0, "review": 0,
             "human-check": 0, "try": 0, "tech-failure": 0,
@@ -414,11 +416,12 @@ def test_inspect_cli_text_and_json_shapes(app, capsys, json_output):
             "group": "decision", "number": 3, "title": "Add tally report",
             "url": "https://github.com/owner/repo/issues/3", "reason": "spec-question",
             "summary": "Choose a format", "details": details, "pr": None, "answered": False,
+            "try_card": None, "prepared": None,
         }]
         assert datetime.fromisoformat(inbox["since"]).tzinfo is not None
     else:
         assert captured.out.splitlines() == [
-            "Decision 1", "[decision] #3 Add tally report — Choose a format",
+            "Decision 1 (~1 min)", "[decision] #3 Add tally report — Choose a format",
             *(f"  Detail {i}" for i in range(12)), "  https://github.com/owner/repo/issues/3",
         ]
     assert git.fetches == [] and calls["launches"] == []
@@ -426,7 +429,7 @@ def test_inspect_cli_text_and_json_shapes(app, capsys, json_output):
 
 
 @pytest.mark.parametrize("json_output", [False, True])
-def test_inspect_cli_try_is_latest_per_issue_with_empty_details_and_one_text_line(app, capsys, json_output):
+def test_inspect_cli_try_is_latest_per_issue_with_missing_card(app, capsys, json_output):
     root, git, tracker, store, calls = app
     tracker.add_issue(7, "Tally report")
     older = tracker.create_pr(
@@ -451,9 +454,14 @@ def test_inspect_cli_try_is_latest_per_issue_with_empty_details_and_one_text_lin
         assert inbox["items"] == [{
             "group": "try", "number": 7, "title": "Latest tally", "url": url,
             "reason": None, "summary": summary, "details": "", "pr": latest, "answered": False,
+            "try_card": None, "prepared": None,
         }]
     else:
-        assert captured.out.splitlines() == ["Try 1", f"[try] #7 Latest tally — {summary} {url}"]
+        assert captured.out.splitlines() == [
+            "Try 1 (not prepared)", f"[try] #7 Latest tally — {summary} {url}",
+            "  What changed:", "  not provided", "  Try it:", "  not provided",
+            "  Expect:", "  not provided", "  not prepared",
+        ]
     assert git.fetches == [] and calls["launches"] == []
 
 
@@ -468,6 +476,56 @@ def test_inspect_empty_output(app, capsys, json_output):
         assert inbox["items"] == [] and not any(inbox["counts"].values())
     else:
         assert output == "No items.\n"
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_inspect_renders_card_prepared_results_and_language(app, monkeypatch, capsys, json_output):
+    root, git, tracker, store, _ = app
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(language="ko"))
+    card = "## What changed\n합계 표시\n## Try it\nkind: cli\n```sh\necho 합계:3\n```\n## Expect\n합계:3"
+    number = tracker.create_pr(head="foragent/issue-7", base="main", title="합계", body="## Try it\n\n" + card)
+    tracker.merge_pr(number, expected_head_sha=tracker.pr_head_sha(number))
+    saved = store.root / "inspect/prepared/7.json"
+    saved.parent.mkdir(parents=True)
+    saved.write_text(json.dumps({"base_sha": "abc123", "results": [
+        {"command": "echo 합계:3", "output": "합계:3\n", "exit_code": 0, "timed_out": False},
+    ]}))
+    args = ["inspect", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    if json_output:
+        payload = json.loads(output)
+        assert payload["language"] == "ko" and payload["summary"]["estimated_minutes"] == 1
+        item, = payload["items"]
+        assert item["try_card"]["commands"] == ["echo 합계:3"]
+        assert item["prepared"]["results"][0]["output"] == "합계:3\n"
+    else:
+        assert output.startswith("Try 1 (prepared)\n")
+        assert all(part in output for part in (
+            "What changed:", "합계 표시", "Try it:", "echo 합계:3", "Expect:",
+            "Prepared output (base abc123)", "합계:3", "exit_code=0",
+        ))
+
+
+@pytest.mark.parametrize("action", ["prepare", "serve", "stop"])
+@pytest.mark.parametrize("root_before_action", [False, True])
+def test_inspect_cli_local_actions_receive_repo_context(app, monkeypatch, capsys, action, root_before_action):
+    root, git, tracker, store, _ = app
+    calls = []
+    def operation(ctx, *numbers):
+        assert ctx.repo_root == root and ctx.git is git and ctx.store is store
+        calls.append(numbers)
+        return {"prepare": [7], "serve": ["http://localhost:8765/hello", "http://mini:8765/hello"], "stop": None}[action]
+    monkeypatch.setattr(cli.inspect_actions, action, operation)
+    root_args = ["--repo-root", str(root)]
+    action_args = [action] + (["7"] if action == "serve" else [])
+    args = ["inspect", *(root_args + action_args if root_before_action else action_args + root_args)]
+    assert cli.main(args) == 0
+    assert calls == ([(7,)] if action == "serve" else [()])
+    assert capsys.readouterr().out == {
+        "prepare": "Prepared: #7\n", "serve": "http://localhost:8765/hello\nhttp://mini:8765/hello\n",
+        "stop": "Served apps stopped.\n",
+    }[action]
 
 
 def test_inspect_cli_records_answers_feedback_and_mark_seen(app, capsys):

@@ -21,9 +21,11 @@ class Config:
     always_human: list[str] = field(default_factory=list)
     executor: str = "codex"
     executor_model: str | None = None
+    codex_goal: bool = False
     reviewer: str | None = None
     reviewer_model: str | None = None
     review_max: int = 2
+    review_level: str = "medium"
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
@@ -33,6 +35,7 @@ class Config:
     max_retries: int = 2
     base_branch: str = "main"
     repo: str | None = None
+    language: str = "en"
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
@@ -67,6 +70,17 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 
 
 def _validate(values: dict[str, Any]) -> None:
+    if type(values["codex_goal"]) is not bool:
+        raise ConfigError("codex_goal must be a boolean")
+    if not isinstance(values["review_level"], str) or values["review_level"] not in {
+        "low", "medium", "high", "xhigh", "max",
+    }:
+        raise ConfigError("review_level must be low, medium, high, xhigh, or max")
+    language = values["language"]
+    if not isinstance(language, str) or len(language) > 35 or not re.fullmatch(
+        r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*", language
+    ):
+        raise ConfigError("language must be a short language tag, such as en, ko, or ja")
     if not isinstance(values["review"], str) or values["review"] not in _REVIEW_LEVELS:
         raise ConfigError("review must be fast, batch, or careful")
     paths = values["review_paths"]
@@ -94,6 +108,8 @@ def _validate(values: dict[str, Any]) -> None:
     for key in ("acceptance_dir", "base_branch"):
         if not isinstance(values[key], str) or not values[key].strip():
             raise ConfigError(f"{key} must be a nonempty string")
+    if any(char in values["acceptance_dir"] for char in "[]*?{}"):
+        raise ConfigError("acceptance_dir must not contain glob metacharacters: [ ] * ? { }")
     repo = values["repo"]
     if repo is not None and (
         not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None

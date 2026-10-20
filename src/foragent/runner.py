@@ -3,9 +3,12 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import json
 import os
 from pathlib import Path
 import re
+import shlex
+import sys
 import tempfile
 import threading
 import time
@@ -100,8 +103,34 @@ def parse_review(message: str) -> ReviewResult:
     return ReviewResult("UNUSABLE", "", ("reviewer gave no verdict",))
 
 
-def build_prompt(n: int, parsed: ParsedIssue, acceptance_dir: str, failure: str = "") -> str:
+def parse_code_review(message: str) -> ReviewResult:
+    try:
+        event = json.loads(message)
+    except ValueError:
+        event = None
+    if not isinstance(event, dict) or event.get("is_error") or not isinstance(event.get("result"), str):
+        return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
+    lines = [line for line in event["result"].splitlines() if line.strip()]
+    findings = [line for line in lines if re.match(r"^- \S+:\d+ (?:—|-|--) ", line)]
+    if findings:
+        return ReviewResult("FAIL", "\n".join(findings))
+    if lines and lines[0].strip() == "(none)":
+        return ReviewResult("PASS", "")
+    return ReviewResult("UNUSABLE", "", ("/code-review gave no verdict",))
+
+
+def goal_condition(acceptance_dir: str) -> str:
+    prefix = 'Every command in the "Done when" list below exits 0 when run from the repository root, nothing under '
+    suffix = " is modified, and no files outside this repository are changed. Or stop after 40 turns."
+    return prefix + acceptance_dir[:3500 - len(prefix) - len(suffix)] + suffix
+
+
+def build_prompt(
+    n: int, parsed: ParsedIssue, acceptance_dir: str, failure: str = "", language: str = "en",
+    *, native_goal: bool = False, acceptance_locked: bool = False,
+) -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
+    acceptance_rule = "" if acceptance_locked else f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
     prompt = (
         f"You are implementing GitHub issue #{n} in this repository.\n"
         f"{parsed.goal}\n"
@@ -109,14 +138,34 @@ def build_prompt(n: int, parsed: ParsedIssue, acceptance_dir: str, failure: str 
         "The work is accepted only when these commands succeed (they will be run for you afterwards):\n"
         f"{commands}\n"
         "Rules:\n"
-        f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
+        f"{acceptance_rule}"
         "- If the issue needs a product decision you cannot make from the text and the code, do not guess:\n"
         "  write .foragent/QUESTION.md with the question, 2–3 options and your recommendation, then stop.\n"
+        f"  Write it in {language}. Include an `## Evidence` section quoting the exact conflicting lines "
+        "(issue sentence; file:line and the code line).\n"
         "- Do not commit, push or switch branches. Leave your changes in the working tree.\n"
+        "- When the Done when commands would pass, also write .foragent/TRY.md so a person can check your work in about a minute.\n"
+        f"  Write the prose in {language}. Keep these English headings exactly:\n"
+        "  ## What changed\n"
+        "  (one or two sentences, user-visible terms, no code jargon)\n"
+        "  ## Try it\n"
+        "  kind: cli            (or: web)\n"
+        "  ```sh\n"
+        "  <commands a person runs; for cli, commands that print something meaningful>\n"
+        "  ```\n"
+        "  ## Expect\n"
+        "  (what a correct result looks like, concretely)\n"
+        "  For kind: web, also add:\n"
+        "  ## Web\n"
+        "  start: <command that starts the app>\n"
+        "  port: <port>\n"
+        "  path: <path to open>\n"
+        "  steps:\n"
+        "  - <what to click or type>\n"
     )
     if failure:
         prompt += "\nA previous attempt failed. Output of the failing check:\n" + failure[-4000:]
-    return prompt
+    return f"/goal {goal_condition(acceptance_dir)}\n\n{prompt}" if native_goal else prompt
 
 
 def _append(log: Path, text: str) -> None:
@@ -138,9 +187,67 @@ def _check(command: str, worktree: Path, log: Path, timeout_s: int) -> CheckResu
     return CheckResult(command, code, timed_out, tail)
 
 
+def _claude_run_dir(snapshot: Path) -> Path:
+    return snapshot.parent.parent / "runs" / f"issue-{snapshot.stem}"
+
+
+def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
+    snapshot = (ctx.store.root / "approvals" / f"{n}.json").resolve()
+    directory = _claude_run_dir(snapshot)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "stop-block-count").write_text("0", encoding="utf-8")
+    acceptance = Path(os.path.relpath(worktree / ctx.config.acceptance_dir, worktree)).as_posix().rstrip("/") + "/"
+    command = shlex.join([
+        sys.executable, "-m", "foragent.cli", "gate", "check-done", "--snapshot", str(snapshot),
+        "--worktree", str(worktree.resolve()), "--acceptance-dir", ctx.config.acceptance_dir,
+    ])
+    settings = {
+        "permissions": {"deny": [
+            f"Edit({acceptance}**)", f"Write({acceptance}**)",
+            "Bash(git commit:*)", "Bash(git push:*)", "Bash(git checkout:*)", "Bash(git switch:*)",
+        ]},
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": command,
+                                      "timeout": max(900, ctx.config.max_runtime_minutes * 60)}]}]},
+    }
+    path = directory / "claude-settings.json"
+    path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
+    """Stop hook: re-use independent checks, allowing at most eight blocked stops."""
+    directory = _claude_run_dir(snapshot)
+    directory.mkdir(parents=True, exist_ok=True)
+    counter = directory / "stop-block-count"
+    blocked = 0
+    try:
+        blocked = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+        if blocked >= 8:
+            print("Done when: Stop hook block cap reached; runner verification will decide.")
+            return 0
+        approval = Approval(**json.loads(snapshot.read_text(encoding="utf-8")))
+        parsed = parse_body(approval.body)
+        if not has_machine_check(parsed):
+            raise ValueError("Done when has no machine check")
+        for command in parsed.done_when_commands:
+            result = _check(command, worktree, directory / "check-done.log", 900)
+            if result.exit_code != 0 or result.timed_out:
+                counter.write_text(str(blocked + 1), encoding="utf-8")
+                print(f"Done when failed: {command}\n{result.output[-2000:]}"
+                      + ("\nCheck timed out." if result.timed_out else ""), file=sys.stderr)
+                return 2
+    except (OSError, ValueError, TypeError) as exc:
+        # Malformed snapshots and check-launch failures must also block a stop.
+        counter.write_text(str(blocked + 1), encoding="utf-8")
+        print(f"Done when failed: {exc}", file=sys.stderr)
+        return 2
+    print(f"Done when: all {len(parsed.done_when_commands)} commands passed; acceptance lock: {acceptance_dir}.")
+    return 0
+
+
 def _pr_body(
     n: int, parsed: ParsedIssue, checks: list[CheckResult], attempt: int,
-    reviews: list[ReviewResult],
+    reviews: list[ReviewResult], try_text: str | None = None,
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -161,7 +268,9 @@ def _pr_body(
         lines.extend(["", "## Needs a human check", ""])
         lines.extend(f"- [ ] {item.text}" for item in parsed.done_when_checklist)
     lines.extend(["", f"Opened by Foragent gate (attempt {attempt})"])
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n\n## Try it\n\n" + (
+        try_text if try_text is not None else "_not provided by the implementer_"
+    )
 
 
 def _remaining(n: int, ctx: RunContext) -> int:
@@ -204,14 +313,16 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
 
 
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str) -> ReviewResult:
+    reviewer = resolved_reviewer(ctx.config)
+    options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
     before = git.review_state()
     edited = False
     try:
         result = _run_executor(
-            n, ctx, ctx.executor_factory(resolved_reviewer(ctx.config)), worktree=git.root,
-            prompt=build_review_prompt(parsed, git.staged_diff(base_ref)),
+            n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
+            prompt="" if reviewer == "claude" else build_review_prompt(parsed, git.staged_diff(base_ref)),
             model=ctx.config.reviewer_model, timeout_s=_remaining(n, ctx),
-            log_path=ctx.store.log_path(n),
+            log_path=ctx.store.log_path(n), **options,
         )
     finally:
         if git.review_state() != before:
@@ -223,7 +334,12 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
             f"Reviewer exit_code={result.exit_code}, timed_out={result.timed_out}",
         ))
     else:
-        review = parse_review(result.full_message if result.full_message is not None else result.last_message)
+        parser = parse_code_review if reviewer == "claude" else parse_review
+        review = parser(result.full_message if result.full_message is not None else result.last_message)
+    if reviewer == "claude":
+        review = ReviewResult(review.verdict, review.findings, (
+            f"reviewer: /code-review {ctx.config.review_level}", *review.notes,
+        ))
     if edited:
         review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
     _append(ctx.store.log_path(n), f"Review: VERDICT: {review.verdict}\n{review.findings}")
@@ -295,6 +411,8 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         flag(ctx, n, Reason.NO_MACHINE_CHECK, "Done when has no machine check.")
         return "no-machine-check"
     executor = ctx.executor_factory(ctx.config.executor)
+    native_claude = ctx.config.executor == "claude"
+    options = {"settings_path": _write_claude_settings(n, ctx, worktree)} if native_claude else {}
     log = ctx.store.log_path(n)
     failure = ""
     reviews: list[ReviewResult] = []
@@ -317,10 +435,15 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             ctx.git.ensure_batch_branch(batch_branch, base_ref)
         with tempfile.NamedTemporaryFile() as patch:
             git.write_staged_patch(start_ref, Path(patch.name))
+            try_file = worktree / ".foragent/TRY.md"
+            try_bytes = try_file.read_bytes() if try_file.is_file() else None
             ctx.git.remove_worktree(worktree)
             start_ref = f"origin/{destination}"
             target_branch = destination
             ctx.git.add_worktree(worktree, branch, start_ref)
+            if try_bytes is not None:
+                try_file.parent.mkdir(parents=True, exist_ok=True)
+                try_file.write_bytes(try_bytes)
             if not _acceptance_matches(n, ctx, git, approval):
                 return False
             try:
@@ -335,8 +458,11 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             return _timeout(n, ctx)
         result = _run_executor(
             n, ctx, executor,
-            worktree=worktree, prompt=build_prompt(n, parsed, ctx.config.acceptance_dir, failure),
-            model=ctx.config.executor_model, timeout_s=remaining, log_path=log,
+            worktree=worktree, prompt=build_prompt(
+                n, parsed, ctx.config.acceptance_dir, failure, ctx.config.language,
+                native_goal=native_claude or ctx.config.codex_goal, acceptance_locked=native_claude,
+            ),
+            model=ctx.config.executor_model, timeout_s=remaining, log_path=log, **options,
         )
         run = ctx.store.get_run(n)
         if result.timed_out or _remaining(n, ctx) <= 0:
@@ -434,7 +560,14 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     _progress(n, ctx)
     _append(log, f"Pushed verified HEAD: {verified_head_sha}")
     pr = ctx.tracker.find_pr(branch)
-    body = _pr_body(n, parsed, checks, run.attempts, reviews)
+    try_text = None
+    try_path = worktree / ".foragent/TRY.md"
+    if not review_hold and try_path.is_file():
+        try_text = try_path.read_bytes().decode("utf-8", errors="replace")
+        saved_try = ctx.store.root / "try" / f"{n}.md"
+        saved_try.parent.mkdir(parents=True, exist_ok=True)
+        saved_try.write_text(try_text, encoding="utf-8")
+    body = _pr_body(n, parsed, checks, run.attempts, reviews, try_text)
     if pr is None:
         pr = ctx.tracker.create_pr(
             head=branch, base=target_branch, title=title,

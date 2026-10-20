@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shlex
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +17,7 @@ from foragent.issue import body_hash, parse_body
 from foragent.reasons import Reason, parse_reason
 from foragent.runner import (
     REVIEW_PROMPT, CheckResult, RunContext, _batch_pr, build_prompt, build_review_prompt,
-    parse_review, run_issue,
+    goal_condition, parse_code_review, parse_review, run_issue,
 )
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker, TrackerError
@@ -635,6 +637,77 @@ def test_prompt_is_fixed_and_retry_tail_is_bounded():
     assert "discard this" not in prompt and prompt.endswith("x" * 4000)
 
 
+@pytest.mark.parametrize("language", ["ko", "en", "ja"])
+def test_prompt_try_and_evidence_in_configured_language_on_every_attempt(run_case, language):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, language=language)
+    c.executor.steps = [{"feature.txt": "not done"}, {"feature.txt": "done"}]
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 2
+    for call in c.executor.calls:
+        prompt = call["prompt"]
+        assert f"Write it in {language}. Include an `## Evidence` section" in prompt
+        assert "issue sentence; file:line and the code line" in prompt
+        assert ".foragent/TRY.md" in prompt and f"Write the prose in {language}." in prompt
+        assert all(heading in prompt for heading in ("## What changed", "## Try it", "## Expect", "## Web"))
+
+
+@pytest.mark.parametrize("provided", [False, True])
+@pytest.mark.parametrize("retarget", [False, True])
+def test_success_stores_try_card_verbatim_in_pr_but_not_git(run_case, provided, retarget):
+    c = run_case
+    if retarget:
+        batch_setup(c)
+        c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"feature.txt": "batch"})
+    card = "## What changed\n결과를 보여 줍니다.\n## Try it\nkind: cli\n```sh\ncat feature.txt\n```\n## Expect\ndone 표시\n"
+    if provided:
+        c.executor.steps[0][".foragent/TRY.md"] = card
+    enable_reviewer(c, ["VERDICT: PASS"])
+    assert run_issue(1, c.ctx) == "merged"
+    body = c.tracker.created_prs[0].body
+    saved = c.store.root / "try/1.md"
+    if provided:
+        assert saved.read_text() == card
+        assert body.endswith("## Try it\n\n" + card)
+    else:
+        assert not saved.exists()
+        assert body.endswith("## Try it\n\n_not provided by the implementer_")
+    files = git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1")
+    assert ".foragent/" not in files
+
+
+@pytest.mark.parametrize("outcome", ["merged", "held", "pr-open", "retries-exceeded", "retarget"])
+def test_prestaged_try_and_other_artifacts_never_reach_branch(run_case, outcome):
+    c = run_case
+    if outcome == "retarget":
+        batch_setup(c)
+        c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"feature.txt": "batch"})
+    elif outcome == "held":
+        c.tracker.add_labels(1, ["risk:high"])
+    elif outcome == "pr-open":
+        c.ctx.config = replace(c.ctx.config, review="careful")
+    elif outcome == "retries-exceeded":
+        c.executor.steps = [{"feature.txt": "wrong"}, {"feature.txt": "still wrong"}]
+    card = "## Try it\nkind: cli\n```sh\ncat feature.txt\n```\n"
+    implement = c.executor.run
+
+    def prestage(**kwargs):
+        result = implement(**kwargs)
+        root = kwargs["worktree"]
+        (root / ".foragent").mkdir(exist_ok=True)
+        (root / ".foragent/TRY.md").write_text(card)
+        (root / ".foragent/session.log").write_text("local execution artifact")
+        git_command(root, "add", "-A")
+        return result
+
+    c.executor.run = prestage
+    assert run_issue(1, c.ctx) == ("merged" if outcome == "retarget" else outcome)
+    files = git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1")
+    assert ".foragent/" not in files and "feature.txt" in files
+    if outcome in {"merged", "retarget"}:
+        assert (c.store.root / "try/1.md").read_text() == card
+
+
 def enable_reviewer(case, messages, edit=None):
     calls = []
     messages = iter(messages)
@@ -649,8 +722,8 @@ def enable_reviewer(case, messages, edit=None):
         return ExecResult(0, False, message, kwargs["log_path"])
 
     reviewer = SimpleNamespace(run=review)
-    case.ctx.config = replace(case.ctx.config, reviewer=None, reviewer_model="review-model")
-    case.ctx.executor_factory = lambda name: case.executor if name == "codex" else reviewer
+    case.ctx.config = replace(case.ctx.config, executor="claude", reviewer="codex", reviewer_model="review-model")
+    case.ctx.executor_factory = lambda name: case.executor if name == "claude" else reviewer
     return calls
 
 
@@ -787,10 +860,10 @@ def test_full_claude_verdict_survives_output_tail_truncation(run_case, monkeypat
 
     c = run_case
     c.executor.steps.append({})
-    finding = "feature.txt:1: " + "x" * 930
-    messages = iter(["VERDICT: FAIL\n" + "\n".join([finding] * 5), "VERDICT: PASS"])
-    monkeypatch.setattr("foragent.executors.claude_command", lambda model: [
-        sys.executable, "-c", f"print({next(messages)!r})",
+    finding = "- feature.txt:1 — " + "x" * 930
+    messages = iter(["\n".join([finding] * 5), "(none)"])
+    monkeypatch.setattr("foragent.executors.claude_review_command", lambda level, model: [
+        sys.executable, "-c", f"print({json.dumps({'result': next(messages)})!r})",
     ])
     c.ctx.config = replace(c.ctx.config, reviewer="claude")
     c.ctx.executor_factory = lambda name: c.executor if name == "codex" else ClaudeExecutor()
@@ -1174,3 +1247,176 @@ def test_log_growth_poll_updates_progress_and_quiet_poll_does_not(run_case):
     c.ctx.poll_hook = poll_hook
     assert run_issue(1, c.ctx) == "merged"
     assert len(observed) == 1
+
+
+@pytest.mark.parametrize("acceptance_dir", ["tests/acceptance/", "checks with spaces", "./checks/"])
+def test_claude_native_goal_settings_and_independent_retry(run_case, acceptance_dir):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, executor="claude", acceptance_dir=acceptance_dir)
+    c.executor.steps = [{"feature.txt": "wrong"}, {"feature.txt": "done"}]
+    assert run_issue(1, c.ctx) == "merged"
+    settings_path = c.store.root / "runs/issue-1/claude-settings.json"
+    settings = json.loads(settings_path.read_text())
+    expected_command = shlex.join([
+        sys.executable, "-m", "foragent.cli", "gate", "check-done",
+        "--snapshot", str(c.store.root / "approvals/1.json"),
+        "--worktree", str(c.store.worktree_path(1)), "--acceptance-dir", acceptance_dir,
+    ])
+    path = Path(acceptance_dir).as_posix().rstrip("/") + "/"
+    assert settings == {
+        "permissions": {"deny": [f"Edit({path}**)", f"Write({path}**)",
+                                 "Bash(git commit:*)", "Bash(git push:*)",
+                                 "Bash(git checkout:*)", "Bash(git switch:*)"]},
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": expected_command,
+                                      "timeout": c.ctx.config.max_runtime_minutes * 60}]}]},
+    }
+    assert not settings_path.is_relative_to(c.store.worktree_path(1))
+    assert (settings_path.parent / "stop-block-count").read_text() == "0"
+    expected = (f'/goal Every command in the "Done when" list below exits 0 when run from the repository root, '
+                f'nothing under {acceptance_dir} is modified, and no files outside this repository are changed. '
+                'Or stop after 40 turns.\n\nYou are implementing GitHub issue #1')
+    assert len(c.executor.calls) == 2
+    for call in c.executor.calls:
+        assert call["prompt"].startswith(expected)
+        assert "Do not modify anything under" not in call["prompt"]
+        assert COMMAND in call["prompt"] and "Other features." in call["prompt"]
+        assert ".foragent/TRY.md" in call["prompt"]
+        assert call["settings_path"] == settings_path
+    assert "feature not ready" in c.executor.calls[1]["prompt"]
+    assert c.store.log_path(1).read_text().count(f"Done when command:\n{COMMAND}") == 2
+
+
+def test_native_goal_condition_length_cap_preserves_instructions():
+    condition = goal_condition("a" * 5000)
+    assert len(condition) == 3500
+    assert condition.startswith('Every command in the "Done when" list below exits 0')
+    assert condition.endswith("no files outside this repository are changed. Or stop after 40 turns.")
+
+
+def test_claude_deny_paths_are_relative_even_for_absolute_acceptance_dir(run_case):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, executor="claude",
+                           acceptance_dir=str(c.store.worktree_path(1) / "tests/acceptance"))
+    assert run_issue(1, c.ctx) == "merged"
+    settings = json.loads((c.store.root / "runs/issue-1/claude-settings.json").read_text())
+    assert settings["permissions"]["deny"][:2] == ["Edit(tests/acceptance/**)", "Write(tests/acceptance/**)"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_codex_goal_opt_in_preserves_other_options_and_acceptance_rule(run_case, enabled):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, codex_goal=enabled)
+    assert run_issue(1, c.ctx) == "merged"
+    call = c.executor.calls[0]
+    original = build_prompt(1, parse_body(BODY), c.ctx.config.acceptance_dir)
+    assert call["prompt"] == (f"/goal {goal_condition(c.ctx.config.acceptance_dir)}\n\n" if enabled else "") + original
+    assert set(call) == {"worktree", "prompt", "model", "timeout_s", "log_path"}
+    assert not (c.store.root / "runs/issue-1").exists()
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "system", "subtype": "init"},
+    {"type": "assistant", "message": {"content": []}},
+    {"type": "result", "result": ""},
+])
+def test_any_claude_stream_line_updates_progress_through_log_poll(run_case, event):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, executor="claude")
+    observed = []
+
+    def poll_hook(execute, poll):
+        log = c.store.log_path(1)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as stream:
+            stream.write(json.dumps(event) + "\n")
+        c.now[0] += timedelta(seconds=30)
+        poll()
+        observed.append(c.store.get_run(1).last_progress_at)
+        assert observed[-1] == c.now[0].isoformat()
+        return execute()
+
+    c.ctx.poll_hook = poll_hook
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(observed) == 1
+
+
+@pytest.mark.parametrize("text,verdict", [
+    ("\n(none)\n", "PASS"),
+    ("(none)\nNo defects found.", "PASS"),
+    ("- src/file.py:12 — broken feature", "FAIL"),
+    ("- src/file.py:12 - broken feature", "FAIL"),
+    ("preamble\n- src/file.py:12 -- broken feature", "FAIL"),
+    ("(none)\n- file:1 — defect", "FAIL"),
+    ("There are no changes to review.", "UNUSABLE"),
+    ("No staged or unstaged changes.", "UNUSABLE"),
+    ("No findings", "UNUSABLE"), ("", "UNUSABLE"),
+    ("preamble\n(none)", "UNUSABLE"),
+    ("- src/file.py:no-line — broken", "UNUSABLE"),
+])
+def test_code_review_result_parsing(text, verdict):
+    result = parse_code_review(json.dumps({"result": text}))
+    assert result.verdict == verdict
+    if verdict == "FAIL":
+        assert result.findings == next(line for line in text.splitlines() if line.startswith("- "))
+
+
+@pytest.mark.parametrize("message", ["garbage", "[]", "null", "{}", '{"result":null}',
+                                          '{"result":"(none)","is_error":true}'])
+def test_code_review_invalid_json_or_error_is_unusable(message):
+    assert parse_code_review(message).verdict == "UNUSABLE"
+
+
+def enable_native_reviewer(case, messages, edit=None):
+    calls = []
+    iterator = iter(messages)
+
+    def review(**kwargs):
+        calls.append(kwargs)
+        assert "feature.txt" in git_command(kwargs["worktree"], "diff", "--cached", "--name-only")
+        if edit:
+            edit(kwargs["worktree"])
+        message = next(iterator)
+        if isinstance(message, ExecResult):
+            return message
+        return ExecResult(0, False, message, kwargs["log_path"])
+
+    case.ctx.config = replace(case.ctx.config, reviewer="claude", review_level="xhigh")
+    case.ctx.executor_factory = lambda name: case.executor if name == "codex" else SimpleNamespace(run=review)
+    return calls
+
+
+@pytest.mark.parametrize("invalid", [
+    "garbage", json.dumps({"result": "No changes to review."}),
+    json.dumps({"result": "(none)", "is_error": True}),
+    ExecResult(1, False, '{"result":"(none)"}', Path("unused")),
+])
+@pytest.mark.parametrize("recover", [False, True])
+def test_native_review_retries_once_then_passes_or_holds(run_case, invalid, recover):
+    c = run_case
+    calls = enable_native_reviewer(c, [invalid, '{"result":"(none)"}' if recover else invalid])
+    assert run_issue(1, c.ctx) == ("merged" if recover else "held")
+    assert len(calls) == 2 and len(c.executor.calls) == 1
+    assert all(call["prompt"] == "" and call["review_level"] == "xhigh" for call in calls)
+    assert "reviewer: /code-review xhigh" in c.tracker.created_prs[0].body
+    if not recover:
+        assert c.store.load_flag(1).reason == Reason.RISK_HIGH
+
+
+def test_native_review_findings_repair_and_reviewer_commits_are_restored(run_case):
+    c = run_case
+    c.executor.steps.append({})
+    finding = "- feature.txt:1 — feature is broken"
+
+    def edit(worktree):
+        (worktree / "rogue.txt").write_text("reviewer edit")
+        git_command(worktree, "add", "rogue.txt")
+        import_index(worktree, "Reviewer commit")
+        (worktree / "feature.txt").write_text("unstaged edit")
+
+    calls = enable_native_reviewer(c, [json.dumps({"result": finding}), '{"result":"(none)"}'], edit)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(calls) == len(c.executor.calls) == 2
+    assert finding in c.executor.calls[1]["prompt"]
+    assert git_command(c.history.origin, "show", "foragent/issue-1:feature.txt") == "done"
+    assert "rogue.txt" not in git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1")
+    assert "Reviewer changes discarded" in c.tracker.created_prs[0].body

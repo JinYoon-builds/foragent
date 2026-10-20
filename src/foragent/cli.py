@@ -17,8 +17,9 @@ from foragent.init import init_repo
 from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING
 from foragent.launcher import spawn_notify, spawn_runner
 from foragent.reasons import parse_reason
+from foragent.inspect_runtime import InspectRuntimeError
 from foragent.scheduler import TickContext, tick
-from foragent.runner import RunContext, run_issue
+from foragent.runner import RunContext, check_done, run_issue
 from foragent.state import StateStore
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
@@ -33,6 +34,7 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--review", choices=("fast", "batch", "careful"))
     init.add_argument("--executor", choices=("codex", "claude"))
     init.add_argument("--run-hours")
+    init.add_argument("--language")
     init.add_argument("--no-push", action="store_true")
     init.add_argument("--no-launchd", action="store_true")
     init.add_argument("--dry-run", action="store_true")
@@ -47,6 +49,10 @@ def _parser() -> argparse.ArgumentParser:
     run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
     run_issue.add_argument("--repo-root", type=Path, required=True)
+    done = actions.add_parser("check-done", help="Check Done when for a native Stop hook")
+    done.add_argument("--snapshot", type=Path, required=True)
+    done.add_argument("--worktree", type=Path, required=True)
+    done.add_argument("--acceptance-dir", required=True)
     for name in ("install", "uninstall", "launchd-status"):
         command = actions.add_parser(name)
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
@@ -54,10 +60,10 @@ def _parser() -> argparse.ArgumentParser:
     inspect.add_argument("--repo-root", type=Path, default=Path.cwd())
     inspect.add_argument("--json", action="store_true")
     answers = inspect.add_subparsers(dest="action")
-    for name in ("answer", "retry", "feedback", "mark-seen", "notify"):
+    for name in ("answer", "retry", "feedback", "mark-seen", "notify", "prepare", "serve", "stop"):
         command = answers.add_parser(name)
         command.add_argument("--repo-root", type=Path, default=argparse.SUPPRESS)
-        if name in {"answer", "retry"}:
+        if name in {"answer", "retry", "serve"}:
             command.add_argument("number", type=int)
         if name == "answer":
             command.add_argument("--text", required=True)
@@ -118,7 +124,16 @@ def _print_status(status: dict[str, Any]) -> None:
 
 
 def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None:
-    if args.action == "answer":
+    if args.action == "prepare":
+        numbers = inspect_actions.prepare(ctx)
+        print("Prepared: " + ", ".join(f"#{number}" for number in numbers) if numbers else "No new results to prepare.")
+    elif args.action == "serve":
+        for url in inspect_actions.serve(ctx, args.number):
+            print(url)
+    elif args.action == "stop":
+        inspect_actions.stop(ctx)
+        print("Served apps stopped.")
+    elif args.action == "answer":
         comment = inspect_actions.answer(ctx, args.number, args.text)
         print(f"Decision recorded: https://github.com/{ctx.repo}/issues/{args.number}#issuecomment-{comment}")
     elif args.action == "retry":
@@ -137,11 +152,13 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
         if args.json:
             print(json.dumps(asdict(inbox)))
         else:
-            print(inspect_data.counts_line(inbox))
+            print(inspect_data.counts_line(inbox, detailed=True))
             for item in inbox.items:
                 summary = f"[{item.group}] #{item.number} {item.title} — {item.summary}"
                 if item.group == "try":
                     print(f"{summary} {item.url}")
+                    for line in inspect_data.try_lines(item):
+                        print("  " + line.replace("\n", "\n  "))
                     continue
                 print(summary)
                 for line in item.details.splitlines()[:12]:
@@ -152,12 +169,14 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "gate" and args.action == "check-done":
+            return check_done(args.snapshot.resolve(), args.worktree.resolve(), args.acceptance_dir)
         root = args.repo_root.resolve()
         if args.command == "init":
             print(init_repo(
                 root, approvers=args.approvers, review=args.review, executor=args.executor,
                 run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
-                dry_run=args.dry_run,
+                dry_run=args.dry_run, language=args.language,
             ).summary())
             return 0
         if args.action in {"install", "uninstall", "launchd-status"}:
@@ -175,7 +194,9 @@ def main(argv: list[str] | None = None) -> int:
         repo = config.repo or git.remote_slug()
         tracker = GhTracker(repo)
         store = StateStore.for_repo(repo)
-        inspect_ctx = inspect_data.InspectContext(tracker, store, repo, config, lambda: datetime.now(UTC))
+        inspect_ctx = inspect_data.InspectContext(
+            tracker, store, repo, config, lambda: datetime.now(UTC), repo_root=root, git=git,
+        )
         if args.command == "inspect":
             _inspect(args, inspect_ctx)
             return 0
@@ -214,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1 if outcome == "error" else 0
         return 0
     except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError,
-            inspect_actions.InspectError, subprocess.SubprocessError) as exc:
+            inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
         return 1
 

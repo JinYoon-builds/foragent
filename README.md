@@ -31,3 +31,8 @@
 - [docs/contract.md](docs/contract.md) — order ↔ gate 경계 계약 (gate 쪽 답신, 확정본)
 - [docs/contract-proposal.md](docs/contract-proposal.md) — 경계 계약 첫 제안 (order 쪽)
 - [docs/research/](docs/research/) — 비슷한 도구 조사
+
+<!-- tagline candidates (2026-10-20):
+Say what you want. Agents build it while you're away, and show you exactly what to check.
+Multi-agent lanes, isolated worktrees and task graphs — without setting up any of it.
+-->

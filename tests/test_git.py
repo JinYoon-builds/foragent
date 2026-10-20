@@ -226,13 +226,49 @@ def test_runner_git_commands_are_exact_and_injectable(tmp_path):
     assert calls == [
         ["worktree", "add", "-B", "foragent/issue-1", str(path), "origin/main"],
         ["-C", str(path), "add", "-A", "--", ".", ":!.foragent"],
+        ["-C", str(path), "rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"],
         ["-C", str(path), "diff", "--cached", "--name-only", "--no-renames", "-z", "origin/main"],
+        ["-C", str(path), "rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"],
         ["-C", str(path), "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
          "commit", "-m", "Issue title (#1)"],
         ["-C", str(path), "push", "-f", "origin", "foragent/issue-1"],
         ["worktree", "remove", "--force", str(path)],
         ["worktree", "prune"],
     ]
+
+
+@pytest.mark.parametrize("method", ["stage_changes", "commit", "commit_paths"])
+def test_all_staging_and_commit_paths_remove_prestaged_artifacts(git_history, method):
+    root = git_history.clone
+    files = {".foragent/TRY.md": "try card", ".foragent/nested/session.log": "session",
+             "feature.txt": "implementation", ".foragent.yml": "review: fast\n"}
+    for name, contents in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+    git_command(root, "add", "-A")
+    # Force exclusion even if an artifact changed after it was staged.
+    (root / ".foragent/TRY.md").write_text("updated try card")
+    commits = []
+
+    def run(args):
+        if "commit" in args:
+            commits.append(args)
+            assert git_command(root, "ls-files", "--", ".foragent") == ""
+            return ""
+        return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout
+
+    git = GitRepo(root, run)
+    if method == "commit_paths":
+        git.commit_paths(["feature.txt"], "Implementation")
+    elif method == "commit":
+        git.commit("Implementation")
+    else:
+        git.stage_changes()
+    assert len(commits) == (method != "stage_changes")
+    assert git.changed_paths("HEAD") == [".foragent.yml", "feature.txt"]
+    assert (root / ".foragent/TRY.md").read_text() == "updated try card"
+    assert (root / ".foragent/nested/session.log").read_text() == "session"
 
 
 def test_review_baseline_restores_head_even_when_index_and_files_are_unchanged(git_history):

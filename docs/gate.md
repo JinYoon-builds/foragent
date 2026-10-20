@@ -122,8 +122,10 @@ always_human:
   - auth/**
 executor: codex          # codex | claude
 executor_model: null     # null이면 전역 기본값 (D12, foragent config)
+codex_goal: false        # 실험 기능: Codex 프롬프트에 /goal 조건을 붙임
 reviewer: claude         # codex | claude | none (기본 = executor와 다른 것)
 reviewer_model: null
+review_level: medium    # Claude /code-review: low | medium | high | xhigh | max
 review_max: 2            # 리뷰 FAIL 허용 수; 초과하면 PR을 열고 risk-high로 보류
 approvers: [JinYoon-builds]   # v1 승인 라벨을 붙일 수 있는 사람 (D14)
 acceptance_dir: tests/acceptance/   # order가 구현 전에 쓰고 잠그는 인수 시험 (D11)
@@ -134,7 +136,11 @@ max_runtime_minutes: 90
 max_retries: 2
 ```
 
-init이 기본값을 쓰고, 사람이나 init 옵션으로 고친다. 모델은 전역 기본값(`foragent config`) + 이 파일의 덮어쓰기 (D12).
+init이 기본값을 쓰고, 사람이나 init 옵션으로 고친다. 기존 파일에서는 명시한 옵션의 키가 없을 때만 추가하고, 이미 있는 값은 보존한다. 모델은 전역 기본값(`foragent config`) + 이 파일의 덮어쓰기 (D12).
+
+Claude 구현 세션은 `/goal`과 실행별 deny 규칙·Stop 훅을 쓴다. Stop 훅은 승인 스냅샷의 Done when 명령을 저장소 루트에서 실행하며, 실패하면 최대 8회 종료를 막는다. 이 한도는 runner의 재시도 사이에도 유지된다. 세션이 끝나면 runner가 독립적으로 다시 검증한다.
+
+Claude 리뷰는 스테이징한 구현에 `/code-review <review_level>`을 실행한다. 이 스킬은 결함을 검토하며 Out of scope·목표 적합성은 별도로 판정하지 않는다. Done when과 인수 시험 잠금이 목표를 보장한다. Codex 리뷰는 기존 목표·범위·diff 프롬프트를 사용한다.
 
 ## 10. 갈아끼울 축 (v1 구현은 굵게)
 

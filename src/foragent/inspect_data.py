@@ -2,17 +2,20 @@
 
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+from pathlib import Path
 import re
 
 from foragent.config import Config
+from foragent.git import GitRepo
 from foragent.labels import NEEDS_HUMAN
 from foragent.reasons import GROUP
 from foragent.state import StateStore
 from foragent.tracker import Comment, Tracker
+from foragent.trycard import TryCard, parse_try, pr_try_text
 
 
 GROUPS = ("decision", "reapprove", "review", "human-check", "try", "tech-failure")
@@ -29,6 +32,40 @@ class InspectContext:
     repo: str
     config: Config
     now: Callable[[], datetime]
+    repo_root: Path | None = None
+    git: GitRepo | None = None
+
+
+@dataclass(frozen=True)
+class PreparedCommand:
+    command: str
+    output: str
+    exit_code: int | None
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class Prepared:
+    base_sha: str
+    results: list[PreparedCommand]
+
+
+def load_prepared(store: StateStore, number: int) -> Prepared | None:
+    try:
+        data = json.loads((store.root / "inspect/prepared" / f"{number}.json").read_text(encoding="utf-8"))
+        return Prepared(data["base_sha"], [PreparedCommand(**result) for result in data["results"]])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _try_card(ctx: InspectContext, number: int, body: str) -> TryCard | None:
+    path = ctx.store.root / "try" / f"{number}.md"
+    text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else pr_try_text(body)
+    if text is None or text.strip() == "_not provided by the implementer_":
+        return None
+    if not path.is_file():
+        text = "## Try it\n" + text
+    return parse_try(text)
 
 
 @dataclass
@@ -42,6 +79,8 @@ class Item:
     details: str
     pr: int | None
     answered: bool
+    try_card: TryCard | None = None
+    prepared: Prepared | None = None
 
 
 @dataclass
@@ -49,6 +88,15 @@ class Inbox:
     items: list[Item]
     counts: dict[str, int]
     since: str | None
+    language: str = "en"
+    summary: dict = field(init=False)
+
+    def __post_init__(self):
+        self.summary = {
+            "counts": self.counts.copy(),
+            "estimated_minutes": sum(self.counts.get(group, 0) * (3 if group == "review" else 1)
+                                     for group in GROUPS),
+        }
 
 
 def comment_key(comment: Comment) -> tuple[datetime, int]:
@@ -160,6 +208,7 @@ def collect(ctx: InspectContext) -> Inbox:
             items.append(Item(
                 "try", number, pr.title, url, None, f"Merged in PR #{pr.number}; try it",
                 "", pr.number, False,
+                _try_card(ctx, number, pr.body), load_prepared(ctx.store, number),
             ))
             tried_issues.add(number)
         if checks := _human_checks(pr.body):
@@ -169,7 +218,7 @@ def collect(ctx: InspectContext) -> Inbox:
             ))
     items.sort(key=lambda item: (GROUPS.index(item.group), item.number, item.pr or 0))
     counts = Counter(item.group for item in items)
-    return Inbox(items, {group: counts[group] for group in GROUPS}, since)
+    return Inbox(items, {group: counts[group] for group in GROUPS}, since, ctx.config.language)
 
 
 def pending_signature(inbox: Inbox) -> str:
@@ -180,9 +229,35 @@ def pending_signature(inbox: Inbox) -> str:
     return hashlib.sha256(json.dumps(pending, separators=(",", ":")).encode()).hexdigest()
 
 
-def counts_line(inbox: Inbox) -> str:
+def counts_line(inbox: Inbox, *, detailed: bool = False) -> str:
     names = ("Decision", "Re-approve", "Review", "Human check", "Try", "Tech failure")
+    def suffix(group: str) -> str:
+        if not detailed:
+            return ""
+        if group == "try":
+            items = [item for item in inbox.items if item.group == "try"]
+            return " (prepared)" if items and all(item.prepared is not None for item in items) else " (not prepared)"
+        return f" (~{inbox.counts[group] * (3 if group == 'review' else 1)} min)"
+
     return " · ".join(
-        f"{name} {inbox.counts[group]}" for group, name in zip(GROUPS, names)
+        f"{name} {inbox.counts[group]}{suffix(group)}" for group, name in zip(GROUPS, names)
         if inbox.counts.get(group, 0)
     ) or "No items."
+
+
+def try_lines(item: Item) -> list[str]:
+    card = item.try_card
+    lines = ["What changed:", card.what_changed if card else "not provided", "Try it:"]
+    if card and card.kind == "web" and card.web:
+        lines += [card.web.start, f"http://localhost:{card.web.port}{card.web.path}", *card.web.steps]
+    else:
+        lines += card.commands if card and card.commands else ["not provided"]
+    lines += ["Expect:", card.expect if card else "not provided"]
+    if item.prepared is None:
+        lines.append("not prepared")
+    else:
+        lines.append(f"Prepared output (base {item.prepared.base_sha}):")
+        for result in item.prepared.results:
+            lines += [f"$ {result.command}", result.output,
+                      f"exit_code={result.exit_code}" + (" (timed out)" if result.timed_out else "")]
+    return lines
