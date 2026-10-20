@@ -17,6 +17,12 @@ specs in English unless the repository is clearly written in another language.
 Run `fa order context --json` and read it fully. Then read the repository yourself as needed
 (README, existing specs in `docs/specs/`, the code areas you will touch).
 - Pending `decisions` and `feedback` come first: they are answers the user already gave.
+- Existing design docs, decision logs, README, CLAUDE.md/AGENTS.md and specs are settled
+  context. Before asking anything, show a short "What I read from your docs" list for the
+  user to confirm, then ask only about gaps the documents do not answer.
+- Existing open issues without the Foragent format: propose per issue — rewrite (contract +
+  acceptance test), split, merge duplicates, close (with reason, original kept) or leave
+  (not finished by code). Apply only what the user approves; never delete.
 - Never ask what the code, docs, specs or earlier decisions already answer.
 
 ## 2. Interview
