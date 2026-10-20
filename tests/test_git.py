@@ -37,6 +37,23 @@ def test_remote_slug_custom_remote_and_unsupported_url(tmp_path):
     assert calls == [["remote", "get-url", "upstream"]]
 
 
+@pytest.mark.parametrize("branch", ["main", "trunk", "release/v1"])
+def test_push_base_uses_explicit_source_and_destination_despite_push_config(tmp_path, branch):
+    calls = []
+    git = GitRepo(tmp_path, lambda args: calls.append(args) or "")
+    git.push_base(branch)
+    assert calls == [["push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"]]
+
+
+def test_setup_status_preserves_leading_status_columns_and_nul_paths(tmp_path):
+    calls = []
+    git = GitRepo(tmp_path, lambda args: calls.append(args) or " M .foragent.yml\0A  odd\nname\0")
+    assert git.uncommitted_paths([".foragent.yml", "odd\nname"]) == [".foragent.yml", "odd\nname"]
+    assert calls == [[
+        "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--", ".foragent.yml", "odd\nname",
+    ]]
+
+
 def test_blobs_present_missing_and_invalid_ref(git_history):
     git = GitRepo(git_history.clone)
     sha = git.blob_sha("origin/main", ACCEPTANCE)

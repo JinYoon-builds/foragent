@@ -66,6 +66,66 @@ class GitRepo:
     def push(self, branch: str) -> None:
         self._call(["push", "-f", "origin", branch])
 
+    def check_worktree(self) -> None:
+        try:
+            inside = self._call(["rev-parse", "--is-inside-work-tree"]).strip()
+        except GitError as exc:
+            raise GitError(f"repo-root must be a git work tree: {exc}") from exc
+        if inside != "true":
+            raise GitError("repo-root must be a git work tree")
+
+    def current_branch(self) -> str:
+        try:
+            return self._call(["symbolic-ref", "--quiet", "--short", "HEAD"]).strip()
+        except GitError as exc:
+            raise GitError("init requires the base branch; HEAD is detached") from exc
+
+    def worktree_root(self) -> Path:
+        return Path(self._call(["rev-parse", "--show-toplevel"]).strip()).resolve()
+
+    def uncommitted_paths(self, paths: list[str]) -> list[str]:
+        output = self._call([
+            "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--", *paths,
+        ])
+        return [entry[3:] for entry in output.split("\0") if entry]
+
+    def has_unpushed_setup(self, branch: str) -> bool:
+        local = f"refs/heads/{branch}"
+        remote = f"refs/remotes/origin/{branch}"
+        try:
+            self._call(["rev-parse", "--verify", "--quiet", remote])
+        except GitError as exc:
+            cause = exc.__cause__
+            if not isinstance(cause, subprocess.CalledProcessError) or cause.returncode != 1:
+                raise
+            revision_range = local
+        else:
+            counts = self._call(["rev-list", "--left-right", "--count", f"{remote}...{local}"])
+            behind, ahead = map(int, counts.split())
+            if behind or not ahead:
+                return False
+            revision_range = f"{remote}..{local}"
+        subjects = self._call(["log", "--format=%s", revision_range]).splitlines()
+        return "Set up Foragent" in subjects
+
+    def commit_paths(self, paths: list[str], title: str) -> None:
+        """Commit only setup paths, preserving unrelated staged changes."""
+        identity = []
+        for key, fallback in (("user.name", "foragent"), ("user.email", "foragent@localhost")):
+            try:
+                value = self._call(["config", "--get", key]).strip()
+            except GitError as exc:
+                cause = exc.__cause__
+                if not isinstance(cause, subprocess.CalledProcessError) or cause.returncode != 1:
+                    raise
+                value = ""
+            identity.extend(["-c", f"{key}={value or fallback}"])
+        self._call(["add", "--", *paths])
+        self._call([*identity, "commit", "--only", "-m", title, "--", *paths])
+
+    def push_base(self, branch: str) -> None:
+        self._call(["push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"])
+
     def commit_before(self, ref: str, iso_time: str) -> str | None:
         return self._call(["rev-list", "-1", f"--before={iso_time}", ref]).strip() or None
 

@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from foragent import __version__, cli
+from foragent import __version__, cli, launchd
 from foragent.config import Config, ConfigError
 from foragent.git import GitError
 from foragent.reasons import Reason, format_comment
@@ -66,6 +66,9 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.StateStore, "for_repo", for_repo)
     monkeypatch.setattr(cli, "spawn_runner", spawn)
     monkeypatch.setattr(cli, "load_config", lambda root: Config(approvers=["human"]))
+    monkeypatch.setattr(cli.launchd, "status", lambda root, **kwargs: launchd.LaunchdStatus(
+        "dev.foragent.owner.repo", False, False,
+    ))
     return tmp_path, git, tracker, store, calls
 
 
@@ -138,6 +141,10 @@ def test_status_groups_latest_reason_active_runs_and_last_ten(app, capsys, json_
     output = capsys.readouterr().out
     if json_output:
         status = json.loads(output)
+        assert status["launchd"] == {
+            "label": "dev.foragent.owner.repo", "plist_present": False,
+            "loaded": False, "last_exit_status": None,
+        }
         assert status["issues"] == {
             "needs-human": [{"number": 1, "title": "Issue 1", "reason": "hash-mismatch"}],
             "running": [{"number": 2, "title": "Issue 2"}],
@@ -149,6 +156,7 @@ def test_status_groups_latest_reason_active_runs_and_last_ten(app, capsys, json_
         assert [run["number"] for run in status["active_runs"]] == [2]
         assert [run["number"] for run in status["history"]] == list(range(12, 22))
     else:
+        assert "launchd: not loaded\n" in output
         assert "#1 Issue 1 [hash-mismatch]" in output
         assert "#2 foragent/issue-2 pid=123" in output
         assert "#10 not-implemented" not in output and "#21 not-implemented" in output
@@ -264,3 +272,119 @@ def test_module_entry_point_configuration_error(tmp_path):
     )
     assert result.returncode == 1
     assert result.stdout == "" and "not a Foragent repo" in result.stderr
+
+
+def test_init_cli_passes_all_flags_and_prints_summary(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    class Report:
+        def summary(self):
+            return "Setup summary"
+
+    def init(root, **kwargs):
+        calls.append((root, kwargs))
+        return Report()
+
+    monkeypatch.setattr(cli, "init_repo", init)
+    assert cli.main([
+        "init", "--repo-root", str(tmp_path), "--approver", "alice", "bob", "--approver", "carol",
+        "--review", "careful", "--executor", "claude", "--run-hours", "22-08",
+        "--no-push", "--no-launchd", "--dry-run",
+    ]) == 0
+    assert calls == [(tmp_path, {
+        "approvers": ["alice", "bob", "carol"], "review": "careful", "executor": "claude",
+        "run_hours": "22-08", "no_push": True, "no_launchd": True, "dry_run": True,
+    })]
+    assert capsys.readouterr().out == "Setup summary\n"
+
+
+def test_init_cli_defaults_to_cwd_and_default_options(tmp_path, monkeypatch, capsys):
+    from foragent.init import InitReport
+
+    monkeypatch.chdir(tmp_path)
+
+    def init(root, **kwargs):
+        assert root == tmp_path
+        assert kwargs == {
+            "approvers": None, "review": None, "executor": None, "run_hours": None,
+            "no_push": False, "no_launchd": False, "dry_run": False,
+        }
+        return InitReport([], [], False)
+
+    monkeypatch.setattr(cli, "init_repo", init)
+    assert cli.main(["init"]) == 0
+
+
+def test_init_cli_keeps_explicit_default_options(tmp_path, monkeypatch):
+    from foragent.init import InitReport
+
+    def init(root, **kwargs):
+        assert kwargs["executor"] == "codex" and kwargs["run_hours"] == "always"
+        assert kwargs["review"] == "batch" and kwargs["approvers"] == ["human"]
+        return InitReport([], [], False)
+
+    monkeypatch.setattr(cli, "init_repo", init)
+    assert cli.main([
+        "init", "--repo-root", str(tmp_path), "--executor", "codex", "--run-hours", "always",
+        "--review", "batch", "--approver", "human",
+    ]) == 0
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_status_uses_configured_repo_without_origin(app, monkeypatch, capsys, json_output):
+    from foragent.config import load_config
+    from foragent.git import GitRepo
+
+    root, git, tracker, store, calls = app
+    (root / ".foragent.yml").write_text("repo: custom/project\n")
+    monkeypatch.setattr(cli, "load_config", lambda root: load_config(root, root / "missing-global.yml"))
+    monkeypatch.setattr(cli, "GitRepo", GitRepo)
+    # Restore the real launchd status path, with an injected launchctl result.
+    monkeypatch.setattr(launchd, "status", lambda root, **kwargs: launchd.Launchd(
+        root, home=root, run=lambda args: subprocess.CompletedProcess(args, 113, stdout="", stderr=""),
+        **kwargs,
+    ).status())
+    args = ["gate", "status", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    assert cli.main(args) == 0
+    output = capsys.readouterr().out
+    assert calls["repos"] == ["custom/project"]
+    if json_output:
+        assert json.loads(output)["launchd"]["label"] == launchd.label_for("custom/project")
+    else:
+        assert "launchd: not loaded\n" in output
+
+
+@pytest.mark.parametrize("action", ["install", "uninstall", "launchd-status"])
+def test_launchd_cli_needs_no_config_or_tracker(tmp_path, monkeypatch, capsys, action):
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    def operation(root):
+        calls.append(root)
+        if action == "launchd-status":
+            return launchd.LaunchdStatus("dev.foragent.owner.repo", True, True, 42)
+        return "dev.foragent.owner.repo"
+
+    monkeypatch.setattr(cli.launchd, "status" if action == "launchd-status" else action, operation)
+    assert cli.main(["gate", action]) == 0
+    assert calls == [tmp_path]
+    output = capsys.readouterr().out
+    assert "dev.foragent.owner.repo" in output
+    if action == "launchd-status":
+        assert "plist present, loaded, last exit status: 42" in output
+
+
+def test_status_prints_loaded_launchd(app, monkeypatch, capsys):
+    root, *_ = app
+    monkeypatch.setattr(cli.launchd, "status", lambda root, **kw: launchd.LaunchdStatus("job", True, True))
+    assert cli.main(["gate", "status", "--repo-root", str(root)]) == 0
+    assert "launchd: loaded\n" in capsys.readouterr().out
+
+
+def test_init_and_launchd_errors_are_clear(tmp_path, monkeypatch, capsys):
+    def fail(*args, **kwargs):
+        raise launchd.LaunchdError("launchctl unavailable\nmore details")
+
+    monkeypatch.setattr(cli.launchd, "install", fail)
+    assert cli.main(["gate", "install", "--repo-root", str(tmp_path)]) == 1
+    assert capsys.readouterr().err == "foragent: launchctl unavailable more details\n"

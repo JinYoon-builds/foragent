@@ -9,9 +9,10 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from foragent import __version__
+from foragent import __version__, launchd
 from foragent.config import ConfigError, load_config
 from foragent.git import GitError, GitRepo
+from foragent.init import init_repo
 from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING
 from foragent.launcher import spawn_runner
 from foragent.reasons import parse_reason
@@ -25,6 +26,15 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fa")
     parser.add_argument("--version", action="version", version=f"foragent {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
+    init = commands.add_parser("init", help="Set up this repository for Foragent")
+    init.add_argument("--repo-root", type=Path, default=Path.cwd())
+    init.add_argument("--approver", nargs="+", action="extend", dest="approvers")
+    init.add_argument("--review", choices=("fast", "batch", "careful"))
+    init.add_argument("--executor", choices=("codex", "claude"))
+    init.add_argument("--run-hours")
+    init.add_argument("--no-push", action="store_true")
+    init.add_argument("--no-launchd", action="store_true")
+    init.add_argument("--dry-run", action="store_true")
     gate = commands.add_parser("gate", help="Schedule and inspect approved issues")
     actions = gate.add_subparsers(dest="action", required=True)
     for name in ("tick", "status"):
@@ -36,6 +46,9 @@ def _parser() -> argparse.ArgumentParser:
     run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
     run_issue.add_argument("--repo-root", type=Path, required=True)
+    for name in ("install", "uninstall", "launchd-status"):
+        command = actions.add_parser(name)
+        command.add_argument("--repo-root", type=Path, default=Path.cwd())
     return parser
 
 
@@ -74,6 +87,7 @@ def _status(tracker: Tracker, store: StateStore) -> dict[str, Any]:
 
 
 def _print_status(status: dict[str, Any]) -> None:
+    print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
     for state, issues in status["issues"].items():
         print(f"{state}:")
         for issue in issues:
@@ -91,6 +105,23 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         root = args.repo_root.resolve()
+        if args.command == "init":
+            print(init_repo(
+                root, approvers=args.approvers, review=args.review, executor=args.executor,
+                run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
+                dry_run=args.dry_run,
+            ).summary())
+            return 0
+        if args.action in {"install", "uninstall", "launchd-status"}:
+            if args.action == "launchd-status":
+                report = launchd.status(root)
+                print(f"{report.label}: plist {'present' if report.plist_present else 'missing'}, "
+                      f"{'loaded' if report.loaded else 'not loaded'}, "
+                      f"last exit status: {report.last_exit_status if report.last_exit_status is not None else 'unknown'}")
+            else:
+                label = getattr(launchd, args.action)(root)
+                print(f"launchd {'installed' if args.action == 'install' else 'uninstalled'}: {label}")
+            return 0
         git = GitRepo(root)
         config = load_config(root)
         repo = config.repo or git.remote_slug()
@@ -111,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(action)
         elif args.action == "status":
             status = _status(tracker, store)
+            status["launchd"] = asdict(launchd.status(root, repo=repo))
             if args.json:
                 print(json.dumps(status))
             else:
@@ -125,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
             ))
             return 1 if outcome == "error" else 0
         return 0
-    except (ConfigError, TrackerError, GitError, OSError) as exc:
+    except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
         return 1
 
