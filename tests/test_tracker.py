@@ -35,6 +35,89 @@ def issue_json(number=1, **overrides):
     return {"number": number, "title": f"Issue {number}", "body": "body", "labels": [{"name": "approved"}], "state": "open", **overrides}
 
 
+@pytest.mark.parametrize("already_approved", [False, True])
+def test_strict_fake_rejects_approval_additions_before_any_mutation(already_approved):
+    tracker = FakeTracker(strict=True, now=lambda: NOW)
+    tracker.add_issue(1)
+    if already_approved:
+        tracker.record_label(1, "approved", "human")
+    original = tracker.get_issue(1)
+    with pytest.raises(AssertionError, match="must never add the approved label"):
+        tracker.add_labels(1, iter(["ready", "approved"]))
+    assert tracker.get_issue(1) == original
+    tracker.add_labels(1, ["running"])
+    assert "running" in tracker.get_issue(1).labels
+
+
+def test_fake_body_edit_timestamp_tracks_only_body_changes():
+    tracker = FakeTracker(now=lambda: NOW)
+    tracker.add_issue(1, body="original")
+    assert tracker.body_last_edited_at(1) is None
+    tracker.add_labels(1, ["ready"])
+    tracker.comment(1, "Comment")
+    tracker.edit_body(1, "original")
+    assert tracker.body_last_edited_at(1) is None
+    tracker.edit_body(1, "edited")
+    assert tracker.body_last_edited_at(1) == NOW.isoformat()
+    tracker._now = lambda: NOW + timedelta(minutes=1)
+    tracker.edit_body(1, "edited")
+    assert tracker.body_last_edited_at(1) == NOW.isoformat()
+    tracker.add_issue(1, body="replaced")
+    assert tracker.body_last_edited_at(1) == (NOW + timedelta(minutes=1)).isoformat()
+
+
+@pytest.mark.parametrize("edited_at", [None, "2026-10-20T09:01:00Z"])
+def test_gh_body_last_edited_at_uses_graphql(edited_at):
+    run = ScriptedRun(json.dumps({"data": {"repository": {"issue": {"lastEditedAt": edited_at}}}}))
+    assert GhTracker(REPO, run).body_last_edited_at(42) == edited_at
+    args, stdin = run.calls[0]
+    assert args[:2] == ["api", "graphql"] and stdin is None
+    assert "repository(owner: $owner, name: $name)" in args[3]
+    assert "issue(number: $number) { lastEditedAt }" in args[3]
+    assert args[4:] == ["-f", "owner=owner", "-f", "name=repo", "-F", "number=42"]
+
+
+@pytest.mark.parametrize("response", [
+    '{"errors": [{"message": "Forbidden"}]}',
+    '{"data": {"repository": null}}',
+    '{"data": {"repository": {"issue": {"lastEditedAt": 7}}}}',
+    '[]', 'not JSON',
+])
+def test_gh_body_last_edited_at_errors_propagate(response):
+    with pytest.raises(TrackerError, match="lastEditedAt"):
+        GhTracker(REPO, ScriptedRun(response)).body_last_edited_at(42)
+
+
+def test_gh_label_events_include_unapproval_and_reapproval_on_later_pages():
+    def event(action, at, label="approved"):
+        return {"event": action, "actor": {"login": "human"}, "label": {"name": label}, "created_at": at}
+
+    first = [event("labeled", NOW.isoformat())] + [
+        event("labeled", NOW.isoformat(), "feedback") for _ in range(99)
+    ]
+    second = [event("unlabeled", (NOW + timedelta(minutes=1)).isoformat())]
+    third = [event("labeled", (NOW + timedelta(minutes=2)).isoformat())]
+    run = ScriptedRun("\n".join(json.dumps(page) for page in (first, second, third)))
+    events = GhTracker(REPO, run).label_events(1)
+    assert len(events) == 102
+    assert events[-2:] == [
+        LabelEvent("approved", "unlabeled", "human", (NOW + timedelta(minutes=1)).isoformat()),
+        LabelEvent("approved", "labeled", "human", (NOW + timedelta(minutes=2)).isoformat()),
+    ]
+    assert run.calls == [(["api", "--paginate", "repos/owner/repo/issues/1/events?per_page=100"], None)]
+
+
+def test_gh_blocked_by_preserves_closure_reason():
+    run = ScriptedRun(json.dumps([
+        {"number": 1, "state": "closed", "state_reason": "not_planned"},
+        {"number": 2, "state": "closed", "state_reason": "completed"},
+        {"number": 3, "state": "open"},
+    ]))
+    assert GhTracker(REPO, run).blocked_by(4) == [
+        Dependency(1, "closed", "not_planned"), Dependency(2, "closed", "completed"), Dependency(3, "open"),
+    ]
+
+
 def test_fake_issues_dependencies_and_label_events():
     tracker = FakeTracker(now=lambda: NOW)
     assert tracker.add_issue(1, "First", "body", ["ready"]) == Issue(1, "First", "body", frozenset({"ready"}), "open")

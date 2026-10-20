@@ -76,6 +76,20 @@ def test_repository_root_and_paths(tmp_path, monkeypatch):
     assert not store.root.exists()
 
 
+def test_flags_persist_latest_reason_and_timestamp_per_issue(store):
+    assert store.load_flag(1) is None
+    store.save_flag(1, "hash-mismatch")
+    reopened = StateStore(store.root)
+    first = reopened.load_flag(1)
+    assert first.number == 1 and first.reason == "hash-mismatch" and first.flagged_at == NOW.isoformat()
+    later = (NOW + timedelta(minutes=1)).isoformat()
+    store.save_flag(2, "spec-question")
+    store.save_flag(1, "retries-exceeded", flagged_at=later)
+    assert reopened.load_flag(1).reason == "retries-exceeded"
+    assert reopened.load_flag(1).flagged_at == later
+    assert reopened.load_flag(2).reason == "spec-question"
+
+
 def test_approval_exact_body_and_metadata_round_trip(store):
     body = "  <!-- foragent:v1 -->\r\n## Goal\r\nKeep café text.  \r\n\r\n"
     values = {

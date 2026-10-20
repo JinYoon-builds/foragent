@@ -31,6 +31,7 @@ class Config:
     max_runtime_minutes: int = 90
     max_retries: int = 2
     base_branch: str = "main"
+    repo: str | None = None
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
@@ -91,6 +92,11 @@ def _validate(values: dict[str, Any]) -> None:
     for key in ("acceptance_dir", "base_branch"):
         if not isinstance(values[key], str) or not values[key].strip():
             raise ConfigError(f"{key} must be a nonempty string")
+    repo = values["repo"]
+    if repo is not None and (
+        not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None
+    ):
+        raise ConfigError("repo must be owner/name or null")
     try:
         _hours(values["run_hours"])
     except ValueError as exc:

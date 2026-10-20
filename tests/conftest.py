@@ -1,0 +1,54 @@
+"""Offline Git history fixtures; no working tree commits or pushes are needed."""
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+import subprocess
+
+import pytest
+
+
+ACCEPTANCE = "tests/acceptance/test_feature.py"
+BASE_TIME = datetime(2026, 10, 20, 8, tzinfo=UTC)
+
+
+def git_command(root: Path, *args: str, input: str | None = None) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=root, input=input, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+@dataclass
+class GitHistory:
+    origin: Path
+    clone: Path
+    tip: str | None = None
+
+    def update(self, files: dict[str, str | None], *, at: datetime = BASE_TIME) -> None:
+        """Import a new main commit directly into the local bare origin."""
+        stream = [
+            "commit refs/heads/main\n",
+            f"committer Offline Tests <tests@example.com> {int(at.timestamp())} +0000\n",
+            "data 6\nUpdate\n",
+        ]
+        if self.tip is not None:
+            stream.append(f"from {self.tip}\n")
+        for path, content in files.items():
+            if content is None:
+                stream.append(f"D {path}\n")
+            else:
+                stream.append(f"M 100644 inline {path}\ndata {len(content.encode('utf-8'))}\n{content}\n")
+        stream.append("\ndone\n")
+        git_command(self.origin, "fast-import", "--quiet", input="".join(stream))
+        self.tip = git_command(self.origin, "rev-parse", "refs/heads/main")
+
+
+@pytest.fixture
+def git_history(tmp_path):
+    origin = tmp_path / "origin.git"
+    clone = tmp_path / "clone"
+    git_command(tmp_path, "init", "--bare", "--initial-branch=main", str(origin))
+    history = GitHistory(origin, clone)
+    history.update({ACCEPTANCE: "def test_feature():\n    assert True\n"})
+    git_command(tmp_path, "clone", str(origin), str(clone))
+    return history

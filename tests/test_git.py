@@ -1,0 +1,107 @@
+import subprocess
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from foragent.git import GitError, GitRepo
+
+from conftest import ACCEPTANCE, BASE_TIME, git_command
+
+
+@pytest.mark.parametrize("url", [
+    "git@github.com:owner/repo.git",
+    "https://github.com/owner/repo",
+    "https://github.com/owner/repo.git",
+    "ssh://git@github.com/owner/repo.git",
+])
+def test_remote_slug_forms(tmp_path, url):
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        return url + "\n"
+
+    assert GitRepo(tmp_path, run).remote_slug() == "owner/repo"
+    assert calls == [["remote", "get-url", "origin"]]
+
+
+def test_remote_slug_custom_remote_and_unsupported_url(tmp_path):
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        return "/local/origin.git\n"
+
+    with pytest.raises(GitError, match="set repo"):
+        GitRepo(tmp_path, run).remote_slug("upstream")
+    assert calls == [["remote", "get-url", "upstream"]]
+
+
+def test_blobs_present_missing_and_invalid_ref(git_history):
+    git = GitRepo(git_history.clone)
+    sha = git.blob_sha("origin/main", ACCEPTANCE)
+    assert sha is not None and len(sha) == 40
+    assert git.blob_sha("origin/main", "absent.py") is None
+    assert git.blob_shas("origin/main", [ACCEPTANCE, "absent.py"]) == {
+        ACCEPTANCE: sha, "absent.py": "missing",
+    }
+    with pytest.raises(GitError):
+        git.blob_sha("not-a-ref", ACCEPTANCE)
+
+
+@pytest.mark.parametrize("custom_refspec", [False, True])
+def test_fetch_updates_remote_tracking_blobs(git_history, custom_refspec):
+    git = GitRepo(git_history.clone)
+    if custom_refspec:
+        git_command(
+            git_history.clone, "config", "remote.origin.fetch",
+            "+refs/heads/other:refs/remotes/origin/other",
+        )
+    before = git.blob_sha("origin/main", ACCEPTANCE)
+    git_history.update({ACCEPTANCE: "def test_feature():\n    assert 1 == 1\n"})
+    assert git.blob_sha("origin/main", ACCEPTANCE) == before
+    git.fetch("origin", "main")
+    assert git.blob_sha("origin/main", ACCEPTANCE) != before
+
+
+def test_commit_before_selects_approval_time_history(git_history):
+    git = GitRepo(git_history.clone)
+    initial = git_history.tip
+    approval_time = datetime(2026, 10, 20, 9, tzinfo=UTC)
+    git_history.update({ACCEPTANCE: "pass\n"}, at=approval_time + timedelta(minutes=1))
+    git.fetch("origin", "main")
+    assert git.commit_before("origin/main", approval_time.isoformat()) == initial
+    assert git.commit_before("origin/main", (approval_time + timedelta(minutes=2)).isoformat()) == git_history.tip
+    assert git.commit_before("origin/main", (BASE_TIME - timedelta(seconds=1)).isoformat()) is None
+
+
+def test_commit_before_passes_timestamp_as_one_argument(tmp_path):
+    calls = []
+    git = GitRepo(tmp_path, lambda args: calls.append(args) or "abc123\n")
+    assert git.commit_before("origin/main", "2026-10-20T09:00:00+09:00") == "abc123"
+    assert calls == [["rev-list", "-1", "--before=2026-10-20T09:00:00+09:00", "origin/main"]]
+
+
+def test_injected_fetch_and_default_remote(tmp_path):
+    calls = []
+    git = GitRepo(tmp_path, lambda args: calls.append(args) or "")
+    git.fetch()
+    git.fetch("upstream", "trunk")
+    git.fetch("origin", "release/v1")
+    assert calls == [
+        ["fetch", "origin"],
+        ["fetch", "upstream", "+refs/heads/trunk:refs/remotes/upstream/trunk"],
+        ["fetch", "origin", "+refs/heads/release/v1:refs/remotes/origin/release/v1"],
+    ]
+
+
+@pytest.mark.parametrize("failure", [
+    FileNotFoundError("git not found"),
+    subprocess.CalledProcessError(128, ["git"], stderr="remote unavailable"),
+])
+def test_git_errors_are_wrapped(tmp_path, failure):
+    def run(args):
+        raise failure
+
+    with pytest.raises(GitError, match="git not found|remote unavailable"):
+        GitRepo(tmp_path, run).fetch()

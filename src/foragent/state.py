@@ -23,6 +23,13 @@ class Approval:
 
 
 @dataclass(frozen=True)
+class Flag:
+    number: int
+    reason: str
+    flagged_at: str
+
+
+@dataclass(frozen=True)
 class Run:
     number: int
     branch: str
@@ -92,6 +99,19 @@ class StateStore:
 
     def clear_approval(self, number: int) -> None:
         (self.root / "approvals" / f"{number}.json").unlink(missing_ok=True)
+
+    def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None) -> None:
+        self._write_json(self.root / "flags" / f"{number}.json", {
+            "number": number, "reason": reason,
+            "flagged_at": flagged_at if flagged_at is not None else self._timestamp(),
+        })
+
+    def load_flag(self, number: int) -> Flag | None:
+        try:
+            value = (self.root / "flags" / f"{number}.json").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        return Flag(**json.loads(value))
 
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,

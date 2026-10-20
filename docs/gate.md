@@ -36,6 +36,10 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 - **승인 판정 (D14):**
   - **v1 (개인·비공개 저장소):** `approved` 라벨. 라벨 이벤트의 붙인 사람이 `.foragent.yml`의 `approvers`에 있어야 한다. 붙는 순간 본문과 인수 시험 파일을 스냅샷한다. 알려진 한계: 에이전트가 같은 사람 토큰을 쓰면 구분하지 못한다(D14가 받아들인 위험).
   - **공개 전 (v2):** 사용자 전용 `foragent[bot]` + 사람이 머지한 승인 매니페스트 PR (contract 추가 7). 이때 `approved` 라벨은 표시용이 된다.
+- **불변식: gate·runner는 `approved`를 절대 붙이지 않는다.** v1에서 gate도 사람 토큰을 쓰므로, gate가 만드는 승인 관련 이벤트는 `unlabeled approved`(무효화)뿐이어야 한다. 그래야 같은 계정이어도 판정이 닫히는 쪽으로만 섞인다. 테스트로 고정한다.
+- **유효 승인 (v1):** 현재 라벨에 `approved`가 있고, 최신 `labeled approved` 이벤트의 붙인 사람이 `approvers`에 있으며(대소문자 무시), 그 뒤에 `unlabeled approved`가 없음.
+- **스냅샷은 승인 순간 기준.** 첫 tick이 승인보다 늦게 오므로, 본문의 마지막 편집 시각이 승인 이벤트보다 뒤면 스냅샷을 만들지 않고 `hash-mismatch`. 인수 시험은 승인 시각의 base 커밋 blob과 현재 blob이 같을 때만 스냅샷한다. (검토 기록: [impl/p2-review.md](impl/p2-review.md) 1번)
+- **재승인은 한 동작.** `hash-mismatch`로 막힌 이슈는 그 뒤에 유효한 승인이 새로 생기면 gate가 `needs-human`을 스스로 떼고 새 스냅샷을 만든다. 다른 이유의 needs-human은 사람이 떼야 재개한다.
 - **ready 승격 조건 (모두 기계 확인):**
   1. 승인됨 (위 방식)
   2. 현재 본문 해시 = 승인 시 해시, 그리고 인수 시험 파일 해시 = 승인 시 해시 (contract 추가 6, 8)
@@ -55,7 +59,8 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 
 - 판정 근거는 GitHub 상태 + 로컬 실행 기록(pid, 마지막 출력 시각). 프로세스만 보지 않는다.
 - 멈춤(진척 없음)과 너무 큼(진척은 있으나 오래 걸림)은 다른 판정이다. order의 "세션 하나로 끝날 크기" 기준을 어긴 이슈는 너무 큼으로 잡힌다.
-- 우선순위: GitHub Projects의 우선순위 필드 → 없으면 이슈 번호 순.
+- 우선순위: v1은 이슈 번호 순. GitHub Projects 우선순위 필드는 나중.
+- **죽은 runner:** tick마다 실행 중 기록의 pid가 살아 있는지 본다. 죽었으면 그 실행을 `crashed`로 끝내고 `running`→`ready`. 같은 이슈가 연속 2번 crashed면 `retries-exceeded`.
 - 빌려 볼 코드: 멈춤 감지(orwa `hooks/clock-out-gate.sh` 358·366 부근), 작업 잠금·중복 방지(orwa `lib/ownership.sh` 335 부근). spec 작성 시 해당 줄을 직접 읽는다.
 
 ## 5. runner: 이슈 하나의 실행 절차

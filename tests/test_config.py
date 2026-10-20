@@ -27,6 +27,7 @@ def test_exact_defaults(repo):
         "executor_model": None, "reviewer": None, "reviewer_model": None, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
+        "repo": None,
     }
     assert DEFAULTS == expected
     assert asdict(load_config(repo)) == expected
@@ -97,6 +98,8 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
     ("run_hours", "24-08"), ("run_hours", "09-24"), ("run_hours", "9-18"),
     ("run_hours", "09:00-18:00"), ("run_hours", "Always"), ("run_hours", None),
     ("run_hours", 1), ("run_hours", "09-18\n"),
+    ("repo", "owner"), ("repo", "owner/repo/extra"), ("repo", " owner/repo"),
+    ("repo", ""), ("repo", 3), ("repo", []),
 ])
 def test_validation_errors_name_the_field(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
@@ -120,6 +123,7 @@ def test_all_valid_overrides(repo):
         "approvers": ["human"], "acceptance_dir": "checks/", "notify": ["slack:#project"],
         "run_hours": "22-08", "stall_minutes": 1, "max_runtime_minutes": 1,
         "max_retries": 1, "base_branch": "trunk",
+        "repo": "owner/name",
     }
     write_settings(repo / ".foragent.yml", settings)
     assert asdict(load_config(repo)) == settings

@@ -44,6 +44,7 @@ class Comment:
 class Dependency:
     number: int
     state: IssueState
+    state_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class PullRequest:
 class Tracker(Protocol):
     def list_open_issues(self) -> list[Issue]: ...
     def get_issue(self, n: int) -> Issue: ...
+    def body_last_edited_at(self, n: int) -> str | None: ...
     def label_events(self, n: int) -> list[LabelEvent]: ...
     def blocked_by(self, n: int) -> list[Dependency]: ...
     def add_labels(self, n: int, labels: Iterable[str]) -> None: ...
@@ -95,15 +97,20 @@ def _merge_flag(method: str) -> str:
 
 
 class FakeTracker:
-    def __init__(self, actor: str = "foragent-bot", now: Callable[[], datetime] | None = None):
+    def __init__(
+        self, actor: str = "foragent-bot", now: Callable[[], datetime] | None = None,
+        *, strict: bool = False,
+    ):
         self.actor = actor
         self._now = now or (lambda: datetime.now(UTC))
+        self.strict = strict
         self.issues: dict[int, Issue] = {}
         self.labels: dict[str, LabelSpec] = {}
         self.comments: dict[int, list[Comment]] = {}
         self.created_prs: list[PullRequest] = []
         self.merged_prs: list[int] = []
         self._events: dict[int, list[LabelEvent]] = {}
+        self._body_edits: dict[int, str] = {}
         self._dependencies: dict[int, list[Dependency]] = {}
         self._pr_files: dict[int, list[str]] = {}
         self._pr_checks: dict[int, CheckStatus] = {}
@@ -117,6 +124,8 @@ class FakeTracker:
         state: IssueState = "open", is_pull_request: bool = False,
     ) -> Issue:
         issue = Issue(number, title, body, frozenset(labels), state, is_pull_request)
+        if number in self.issues and self.issues[number].body != body:
+            self._body_edits[number] = self._timestamp()
         self.issues[number] = issue
         return issue
 
@@ -125,6 +134,15 @@ class FakeTracker:
 
     def get_issue(self, n: int) -> Issue:
         return self.issues[n]
+
+    def edit_body(self, n: int, body: str) -> None:
+        issue = self.get_issue(n)
+        if issue.body != body:
+            self.issues[n] = replace(issue, body=body)
+            self._body_edits[n] = self._timestamp()
+
+    def body_last_edited_at(self, n: int) -> str | None:
+        return self._body_edits.get(n)
 
     def label_events(self, n: int) -> list[LabelEvent]:
         return sorted(self._events.get(n, []), key=lambda event: datetime.fromisoformat(event.created_at))
@@ -141,6 +159,9 @@ class FakeTracker:
         self.issues[n] = replace(issue, labels=issue.labels | {label})
 
     def add_labels(self, n: int, labels: Iterable[str]) -> None:
+        labels = list(labels)
+        if self.strict and "approved" in labels:
+            raise AssertionError("gate and runner must never add the approved label")
         for label in labels:
             if label not in self.get_issue(n).labels:
                 self.record_label(n, label, self.actor)
@@ -245,6 +266,27 @@ class GhTracker:
     def get_issue(self, n: int) -> Issue:
         return _issue(json.loads(self._call(["api", f"{self._path}/issues/{n}"])))
 
+    def body_last_edited_at(self, n: int) -> str | None:
+        owner, name = self.repo.split("/", 1)
+        query = (
+            "query($owner: String!, $name: String!, $number: Int!) { "
+            "repository(owner: $owner, name: $name) { issue(number: $number) { lastEditedAt } } }"
+        )
+        output = self._call([
+            "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+            "-f", f"name={name}", "-F", f"number={n}",
+        ])
+        try:
+            data = json.loads(output)
+            if data.get("errors"):
+                raise TrackerError(f"cannot read issue #{n} lastEditedAt: {data['errors']}")
+            edited_at = data["data"]["repository"]["issue"]["lastEditedAt"]
+            if edited_at is not None and not isinstance(edited_at, str):
+                raise TypeError("lastEditedAt must be a string or null")
+            return edited_at
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
+            raise TrackerError(f"invalid lastEditedAt response for issue #{n}") from exc
+
     def label_events(self, n: int) -> list[LabelEvent]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues/{n}/events?per_page=100"]))
         events = [
@@ -255,7 +297,7 @@ class GhTracker:
 
     def blocked_by(self, n: int) -> list[Dependency]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues/{n}/dependencies/blocked_by?per_page=100"]))
-        return [Dependency(item["number"], item["state"]) for item in data]
+        return [Dependency(item["number"], item["state"], item.get("state_reason")) for item in data]
 
     def add_labels(self, n: int, labels: Iterable[str]) -> None:
         fields = [arg for label in labels for arg in ("-f", f"labels[]={label}")]
