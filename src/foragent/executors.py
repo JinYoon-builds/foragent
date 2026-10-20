@@ -100,12 +100,15 @@ class Executor(Protocol):
     ) -> ExecResult: ...
 
 
-def codex_command(worktree: Path, output_path: Path, model: str | None = None) -> list[str]:
+def codex_command(worktree: Path, output_path: Path, model: str | None = None,
+                  effort: str | None = None) -> list[str]:
     args = [
         "codex", "exec", "-", "-C", str(worktree), "-s", "workspace-write",
         "--skip-git-repo-check", "--json", "-o", str(output_path),
     ]
-    return args + (["-m", model] if model is not None else [])
+    return args + (["-m", model] if model is not None else []) + (
+        ["-c", f"model_reasoning_effort={effort}"] if effort is not None else []
+    )
 
 
 def claude_command(
@@ -142,13 +145,13 @@ def claude_stream_result(path: Path) -> str:
 class CodexExecutor:
     def run(
         self, *, worktree: Path, prompt: str, model: str | None,
-        timeout_s: int, log_path: Path,
+        timeout_s: int, log_path: Path, effort: str | None = None,
     ) -> ExecResult:
         with tempfile.TemporaryDirectory(prefix="foragent-codex-") as temporary:
             output_path = Path(temporary) / "last-message.txt"
             events_path = Path(temporary) / "events.jsonl"
             code, timed_out, _ = run_logged(
-                codex_command(worktree, output_path, model), cwd=worktree, prompt=prompt,
+                codex_command(worktree, output_path, model, effort), cwd=worktree, prompt=prompt,
                 timeout_s=timeout_s, log_path=log_path,
                 capture_stdout=True, stdout_path=events_path,
             )

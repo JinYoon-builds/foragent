@@ -12,7 +12,7 @@ from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitRepo
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
-from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_order
+from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
 from foragent.reasons import Reason, format_approval_comment
 from foragent.processes import kill_process_group
 from foragent.runner import _batch_pr
@@ -465,6 +465,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             ctx.tracker.add_labels(number, [RUNNING])
             ctx.store.start_run(
                 number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
+                tier=issue_size(issue.labels),
             )
             pid = ctx.launcher(number)
             ctx.store.update_run(number, pid=pid)

@@ -10,11 +10,14 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, inspect_actions, inspect_data, launchd
-from foragent.config import Config, ConfigError, load_config
+from foragent import __version__, inspect_actions, inspect_data, launchd, order
+from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
-from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_order
+from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_order, state_group
+from foragent.lanes import LaneError, add_lane
+from foragent.paths import PathError
+from foragent.skills import SkillError, SkillManager
 from foragent.launcher import spawn_notify, spawn_runner
 from foragent.reasons import parse_reason
 from foragent.inspect_runtime import InspectRuntimeError
@@ -38,6 +41,50 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--no-push", action="store_true")
     init.add_argument("--no-launchd", action="store_true")
     init.add_argument("--dry-run", action="store_true")
+    order_command = commands.add_parser("order", help="Deterministic tools for fa-order")
+    order_actions = order_command.add_subparsers(dest="action", required=True)
+    context = order_actions.add_parser("context")
+    context.add_argument("--repo-root", type=Path, default=Path.cwd())
+    context.add_argument("--json", action="store_true")
+    publish = order_actions.add_parser(
+        "publish", formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''PLAN.json schema (unknown fields are rejected):
+{
+  "id": "2026-10-20-login", "title": "Login MVP", "summary": "Goal of this order",
+  "spec_markdown": "# Login\\n...",
+  "new_lanes": [{"name": "api", "paths": ["api/**"], "skills": []}],
+  "issues": [{"key": "login", "title": "Login API", "goal": "...", "out_of_scope": "...",
+    "done_when": ["uv run pytest tests/acceptance/test_login.py"], "checklist": [],
+    "lane": "api", "size": "m", "blocked_by": [],
+    "acceptance_files": {"tests/acceptance/test_login.py": "..."}}],
+  "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
+    "checklist": [], "acceptance_files": {}}]
+}
+new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty collections.''',
+    )
+    publish.add_argument("plan", type=Path)
+    publish.add_argument("--repo-root", type=Path, default=Path.cwd())
+    publish.add_argument("--approve", action="store_true")
+    publish.add_argument("--approve-keys", type=_comma_keys, default=[])
+    publish.add_argument("--approve-numbers", type=_comma_numbers, default=[])
+    publish.add_argument("--dry-run", action="store_true")
+    lanes = commands.add_parser("lanes", help="Create repository lanes")
+    lane_actions = lanes.add_subparsers(dest="action", required=True)
+    lane = lane_actions.add_parser("add")
+    lane.add_argument("name")
+    lane.add_argument("--paths", nargs="+", required=True)
+    lane.add_argument("--skill", nargs="+", action="extend", default=[], dest="skills")
+    lane.add_argument("--executor", choices=("codex", "claude"))
+    lane.add_argument("--model")
+    lane.add_argument("--repo-root", type=Path, default=Path.cwd())
+    skills = commands.add_parser("skills", help="Manage skill libraries")
+    skill_actions = skills.add_subparsers(dest="action", required=True)
+    skill_actions.add_parser("sync")
+    catalog = skill_actions.add_parser("catalog")
+    catalog.add_argument("--json", action="store_true")
+    install = skill_actions.add_parser("install")
+    install.add_argument("id")
+    install.add_argument("--repo-root", type=Path, required=True)
     gate = commands.add_parser("gate", help="Schedule and inspect approved issues")
     actions = gate.add_subparsers(dest="action", required=True)
     for name in ("tick", "status"):
@@ -74,6 +121,23 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _comma_keys(value: str) -> list[str]:
+    values = value.split(",")
+    if any(not item.strip() for item in values):
+        raise argparse.ArgumentTypeError("expected comma-separated keys")
+    return [item.strip() for item in values]
+
+
+def _comma_numbers(value: str) -> list[int]:
+    try:
+        numbers = [int(item) for item in _comma_keys(value)]
+        if any(number <= 0 for number in numbers):
+            raise ValueError
+        return numbers
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected comma-separated positive issue numbers") from exc
+
+
 def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -> dict[str, Any]:
     config = config or Config()
     lanes: dict[str, dict[str, list]] = {}
@@ -82,8 +146,8 @@ def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -
     }
     for issue in sorted(tracker.list_open_issues(), key=lambda issue: issue.number):
         item: dict[str, Any] = {"number": issue.number, "title": issue.title}
-        if NEEDS_HUMAN in issue.labels:
-            group = NEEDS_HUMAN
+        group = state_group(issue, tracker)
+        if group == NEEDS_HUMAN:
             comments = sorted(
                 tracker.list_comments(issue.number),
                 key=lambda comment: (datetime.fromisoformat(comment.created_at), comment.id),
@@ -92,16 +156,6 @@ def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -
                 (reason.value for comment in reversed(comments)
                  if (reason := parse_reason(comment.body)) is not None), None,
             )
-        elif RUNNING in issue.labels:
-            group = RUNNING
-        elif APPROVED in issue.labels and tracker.find_pr(f"foragent/issue-{issue.number}") is not None:
-            group = "pr-open"
-        elif READY in issue.labels:
-            group = READY
-        elif APPROVED in issue.labels:
-            group = "approved-waiting"
-        else:
-            group = "unapproved"
         groups[group].append(item)
         if group in {RUNNING, READY}:
             run = store.get_run(issue.number) if group == RUNNING else None
@@ -185,6 +239,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "gate" and args.action == "check-done":
             return check_done(args.snapshot.resolve(), args.worktree.resolve(), args.acceptance_dir)
+        if args.command == "skills":
+            manager = SkillManager(load_global_config())
+            if args.action == "sync":
+                print("Synced: " + ", ".join(manager.sync()))
+            elif args.action == "catalog":
+                catalog = manager.catalog()
+                if args.json:
+                    print(json.dumps(catalog, ensure_ascii=False))
+                else:
+                    for skill in catalog:
+                        print(f"{skill['id']}: {skill['name']} — {skill['description']}")
+            else:
+                print("Installed: " + manager.install(args.id, args.repo_root.resolve()))
+            return 0
         root = args.repo_root.resolve()
         if args.command == "init":
             print(init_repo(
@@ -192,6 +260,10 @@ def main(argv: list[str] | None = None) -> int:
                 run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
                 dry_run=args.dry_run, language=args.language,
             ).summary())
+            return 0
+        if args.command == "lanes":
+            lane = add_lane(root, args.name, args.paths, skills=args.skills, executor=args.executor, model=args.model)
+            print(f"Created lane:{args.name} ({', '.join(lane['paths'])})")
             return 0
         if args.action in {"install", "uninstall", "launchd-status"}:
             if args.action == "launchd-status":
@@ -207,6 +279,17 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(root)
         repo = config.repo or git.remote_slug()
         tracker = GhTracker(repo)
+        if args.command == "order":
+            if args.action == "context":
+                print(json.dumps(order.context(root, config, tracker), ensure_ascii=False))
+            else:
+                plan = order.read_plan(args.plan)
+                print(order.publish(
+                    plan, root, config, tracker, repo=repo, git=git,
+                    approve=args.approve, approve_keys=args.approve_keys,
+                    approve_numbers=args.approve_numbers, dry_run=args.dry_run,
+                ).summary())
+            return 0
         store = StateStore.for_repo(repo)
         inspect_ctx = inspect_data.InspectContext(
             tracker, store, repo, config, lambda: datetime.now(UTC), repo_root=root, git=git,
@@ -249,7 +332,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1 if outcome == "error" else 0
         return 0
     except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError,
-            inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError) as exc:
+            inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError,
+            order.PlanError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
         return 1
 

@@ -96,11 +96,14 @@ def acceptance_paths(commands: list[str], acceptance_dir: str) -> list[str]:
     paths: set[str] = set()
     for command in commands:
         try:
-            tokens = shlex.split(command)
+            lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;()")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
         except ValueError:
             tokens = [token.strip("\"'") for token in command.split()]
         for token in tokens:
-            path = normalize(token.split("::", 1)[0])
+            path = normalize(token.split("::", 1)[0].rsplit("=", 1)[-1])
             if path == directory or path.startswith(directory + "/"):
                 paths.add(path)
     return sorted(paths)

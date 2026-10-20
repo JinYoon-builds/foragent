@@ -23,6 +23,15 @@ class Config:
     executor_model: str | None = None
     executor_fallback_model: str | None = None
     lanes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tiers: dict[str, dict[str, Any]] = field(default_factory=lambda: {
+        "s": {"codex_effort": "medium", "claude_model": None},
+        "m": {"codex_effort": "high", "claude_model": None},
+        "l": {"codex_effort": "xhigh", "claude_model": None},
+    })
+    skill_libraries: list[Any] = field(default_factory=lambda: [{
+        "name": "knowledge-work-plugins",
+        "repo": "https://github.com/anthropics/knowledge-work-plugins",
+    }])
     max_parallel: int = 2
     transient_max_wait_minutes: int = 30
     limit_wait_minutes: int = 60
@@ -117,7 +126,7 @@ def _validate(values: dict[str, Any]) -> None:
     for name, lane in lanes.items():
         if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9-]+", name):
             raise ConfigError(f"invalid lanes name: {name}")
-        if not isinstance(lane, dict) or lane.keys() - {"paths", "agent", "executor", "model"}:
+        if not isinstance(lane, dict) or lane.keys() - {"paths", "agent", "skills", "executor", "model"}:
             raise ConfigError(f"invalid lanes entry: {name}")
         paths = lane.get("paths", [])
         if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
@@ -127,6 +136,32 @@ def _validate(values: dict[str, Any]) -> None:
                 raise ConfigError(f"lanes.{name}.{key} must be a string or null")
         if lane.get("executor") is not None and lane["executor"] not in _EXECUTORS:
             raise ConfigError(f"lanes.{name}.executor must be codex, claude, or null")
+        if not isinstance(lane.get("skills", []), list) or any(
+            not isinstance(skill, str) for skill in lane.get("skills", [])
+        ):
+            raise ConfigError(f"lanes.{name}.skills must be a list of strings")
+    tiers = values["tiers"]
+    if not isinstance(tiers, dict) or set(tiers) != {"s", "m", "l"}:
+        raise ConfigError("tiers must define s, m, and l")
+    for name, tier in tiers.items():
+        if not isinstance(tier, dict) or set(tier) != {"codex_effort", "claude_model"}:
+            raise ConfigError(f"tiers.{name} must contain codex_effort and claude_model")
+        if tier["codex_effort"] not in ("low", "medium", "high", "xhigh", "max"):
+            raise ConfigError(f"tiers.{name}.codex_effort is invalid")
+        if tier["claude_model"] is not None and not isinstance(tier["claude_model"], str):
+            raise ConfigError(f"tiers.{name}.claude_model must be a string or null")
+    libraries = values["skill_libraries"]
+    if not isinstance(libraries, list):
+        raise ConfigError("skill_libraries must be a list of repository URLs or library mappings")
+    for library in libraries:
+        if isinstance(library, str) and library.strip():
+            continue
+        if (not isinstance(library, dict) or set(library) - {"name", "repo", "path"}
+                or not all(isinstance(library.get(key), str) and library[key].strip() for key in ("name", "repo"))
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", library["name"])
+                or library["name"] in {".", ".."}
+                or ("path" in library and not isinstance(library["path"], str))):
+            raise ConfigError("invalid skill_libraries entry; expected name, repo, and optional path")
     for key in ("acceptance_dir", "base_branch"):
         if not isinstance(values[key], str) or not values[key].strip():
             raise ConfigError(f"{key} must be a nonempty string")
@@ -151,8 +186,30 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
         global_path = Path.home() / ".config/foragent/config.yml"
     values = deepcopy(DEFAULTS)
     if global_path.exists():
-        values.update(_read_yaml(global_path))
-    values.update(_read_yaml(local_path))
+        _overlay(values, _read_yaml(global_path))
+    _overlay(values, _read_yaml(local_path))
+    _validate(values)
+    return Config(**values)
+
+
+def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
+    tiers = overrides.get("tiers")
+    if isinstance(tiers, dict):
+        previous = values["tiers"]
+        if not isinstance(previous, dict):
+            raise ConfigError("tiers must define s, m, and l")
+        overrides = {**overrides, "tiers": {
+            **previous, **{name: {**(previous[name] if isinstance(previous.get(name), dict) else {}), **tier}
+                           if isinstance(tier, dict) else tier for name, tier in tiers.items()},
+        }}
+    values.update(overrides)
+
+
+def load_global_config(global_path: Path | None = None) -> Config:
+    path = global_path or Path.home() / ".config/foragent/config.yml"
+    values = deepcopy(DEFAULTS)
+    if path.exists():
+        _overlay(values, _read_yaml(path))
     _validate(values)
     return Config(**values)
 

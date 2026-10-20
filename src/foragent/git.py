@@ -242,6 +242,20 @@ class GitRepo:
         ])
         return [entry[3:] for entry in output.split("\0") if entry]
 
+    def ensure_tracked(self, paths: list[str]) -> None:
+        """Include explicitly published files even when ignore rules hide them."""
+        if not paths:
+            return
+
+        def missing() -> list[str]:
+            tracked = set(self._call(["ls-files", "--cached", "-z", "--", *paths]).split("\0"))
+            return sorted(set(paths) - tracked)
+
+        if untracked := missing():
+            self._call(["add", "-f", "--", *untracked])
+            if untracked := missing():
+                raise GitError(f"published files are not tracked: {', '.join(untracked)}")
+
     def has_unpushed_setup(self, branch: str) -> bool:
         local = f"refs/heads/{branch}"
         remote = f"refs/remotes/origin/{branch}"
@@ -273,7 +287,7 @@ class GitRepo:
                     raise
                 value = ""
             identity.extend(["-c", f"{key}={value or fallback}"])
-        self._call(["add", "--", *paths])
+        self._call(["add", "-f", "--", *paths])
         self._exclude_artifacts()
         self._call([*identity, "commit", "--only", "-m", title, "--", *paths])
 

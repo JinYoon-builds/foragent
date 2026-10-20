@@ -1370,7 +1370,8 @@ def test_codex_goal_opt_in_preserves_other_options_and_acceptance_rule(run_case,
     call = c.executor.calls[0]
     original = build_prompt(1, parse_body(BODY), c.ctx.config.acceptance_dir)
     assert call["prompt"] == (f"/goal {goal_condition(c.ctx.config.acceptance_dir)}\n\n" if enabled else "") + original
-    assert set(call) == {"worktree", "prompt", "model", "timeout_s", "log_path"}
+    assert set(call) == {"worktree", "prompt", "model", "timeout_s", "log_path", "effort"}
+    assert call["effort"] == "high"
     assert not (c.store.root / "runs/issue-1").exists()
 
 
@@ -2216,3 +2217,45 @@ def test_review_text_about_limits_uses_normal_review_failure_budget(run_case):
     assert run_issue(1, c.ctx) == "retries-exceeded"
     assert len(calls) == 2 and c.store.get_run(1).attempts == 2
     assert c.store.get_run(1).waited_seconds == 0
+
+
+@pytest.mark.parametrize("size,efforts,tiers", [
+    ("s", ["medium", "high", "xhigh", "xhigh"], ["s", "m", "l", "l"]),
+    ("m", ["high", "xhigh", "xhigh", "xhigh"], ["m", "l", "l", "l"]),
+    ("l", ["xhigh"] * 4, ["l"] * 4),
+    (None, ["high", "xhigh", "xhigh", "xhigh"], ["m", "l", "l", "l"]),
+])
+def test_difficulty_escalates_per_failed_attempt_and_is_recorded(run_case, size, efforts, tiers):
+    c = run_case
+    if size:
+        c.tracker.add_labels(1, [f"size:{size}"])
+    c.ctx.config = replace(c.ctx.config, max_retries=3)
+    c.executor.steps = [{"feature.txt": "not done"}] * 3 + [{"feature.txt": "done"}]
+    assert run_issue(1, c.ctx) == "merged"
+    assert [call["effort"] for call in c.executor.calls] == efforts
+    run = c.store.get_run(1)
+    assert run.attempt_tiers == {str(i + 1): tier for i, tier in enumerate(tiers)}
+    assert run.tier == "l"
+    assert c.store.read_history()[-1].attempt_tiers == run.attempt_tiers
+    for index, tier in enumerate(tiers, 1):
+        assert f"Attempt {index} at tier {tier}" in c.tracker.created_prs[0].body
+
+
+@pytest.mark.parametrize("lane_model,expected", [(None, ["small-model", "medium-model"]),
+                                                    ("lane-model", ["lane-model"] * 2)])
+def test_claude_tier_model_and_lane_precedence(run_case, lane_model, expected):
+    c = run_case
+    c.tracker.add_labels(1, ["size:s", "lane:api"])
+    c.store.update_run(1, lane="api")
+    tiers = {"s": {"codex_effort": "medium", "claude_model": "small-model"},
+             "m": {"codex_effort": "high", "claude_model": "medium-model"},
+             "l": {"codex_effort": "xhigh", "claude_model": "large-model"}}
+    c.ctx.config = replace(c.ctx.config, executor="codex", executor_model="global-model", tiers=tiers,
+                           lanes={"api": {"executor": "claude", "model": lane_model}})
+    kinds = []
+    c.ctx.executor_factory = lambda name: kinds.append(name) or c.executor
+    c.executor.steps = [{"feature.txt": "wrong"}, {"feature.txt": "done"}]
+    assert run_issue(1, c.ctx) == "merged"
+    assert kinds == ["claude"]
+    assert [call["model"] for call in c.executor.calls] == expected
+    assert all("effort" not in call for call in c.executor.calls)

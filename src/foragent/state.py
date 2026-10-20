@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 import fcntl
 import json
@@ -54,6 +54,8 @@ class Run:
     transient_errors: int = 0
     fallback_model: str | None = None
     executor_waited_seconds: float = 0
+    tier: str = "m"
+    attempt_tiers: dict[str, str] = field(default_factory=dict)
 
 
 class StateStore:
@@ -140,14 +142,17 @@ class StateStore:
 
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
-        lane: str = "main",
+        lane: str = "main", tier: str = "m",
     ) -> Run:
         with self._state_lock():
             timestamp = self._timestamp()
             previous = self.get_run(number)
             restarts = previous.restarts if previous is not None and previous.outcome in {"stalled-restart", "crashed", "limit-wait"} else 0
             attempts = previous.attempts if previous is not None and previous.outcome == "limit-wait" else 1
-            run = Run(number, branch, str(worktree), pid, timestamp, timestamp, attempts=attempts, restarts=restarts, lane=lane)
+            resumed = previous is not None and previous.outcome == "limit-wait"
+            run = Run(number, branch, str(worktree), pid, timestamp, timestamp, attempts=attempts,
+                      restarts=restarts, lane=lane, tier=previous.tier if resumed else tier,
+                      attempt_tiers=previous.attempt_tiers if resumed else {})
             self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
             return run
 

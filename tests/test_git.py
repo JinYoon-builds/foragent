@@ -54,6 +54,34 @@ def test_setup_status_preserves_leading_status_columns_and_nul_paths(tmp_path):
     ]]
 
 
+def test_ensure_tracked_includes_ignored_files_without_staging_unrelated_changes(git_history):
+    root = git_history.clone
+    git = GitRepo(root)
+    (root / ".gitignore").write_text("tests/acceptance/\n")
+    name = "tests/acceptance/ignored test.py"
+    (root / name).write_text("assert True\n")
+    (root / ACCEPTANCE).write_text("unrelated local edit\n")
+    assert git.uncommitted_paths([name]) == []
+    git.ensure_tracked([name, ACCEPTANCE])
+    assert git_command(root, "ls-files", "--", name) == name
+    assert git_command(root, "show", f":{name}") == "assert True"
+    assert git.changed_paths("HEAD") == [name]
+
+
+def test_ensure_tracked_rejects_files_still_missing_after_force_add(tmp_path):
+    calls = []
+    git = GitRepo(tmp_path, lambda args: calls.append(args) or "")
+    git.ensure_tracked([])
+    assert calls == []
+    with pytest.raises(GitError, match="not tracked: ignored.py"):
+        git.ensure_tracked(["ignored.py"])
+    assert calls == [
+        ["ls-files", "--cached", "-z", "--", "ignored.py"],
+        ["add", "-f", "--", "ignored.py"],
+        ["ls-files", "--cached", "-z", "--", "ignored.py"],
+    ]
+
+
 def test_blobs_present_missing_and_invalid_ref(git_history):
     git = GitRepo(git_history.clone)
     sha = git.blob_sha("origin/main", ACCEPTANCE)

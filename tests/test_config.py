@@ -30,9 +30,32 @@ def test_exact_defaults(repo):
         "repo": None, "language": "en", "codex_goal": False, "review_level": "medium",
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
+        "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
+                  "m": {"codex_effort": "high", "claude_model": None},
+                  "l": {"codex_effort": "xhigh", "claude_model": None}},
+        "skill_libraries": [{"name": "knowledge-work-plugins",
+                             "repo": "https://github.com/anthropics/knowledge-work-plugins"}],
     }
     assert DEFAULTS == expected
     assert asdict(load_config(repo)) == expected
+
+
+def test_tiers_merge_global_and_repository_fields(repo, tmp_path):
+    global_path = tmp_path / "global.yml"
+    write_settings(global_path, {"tiers": {"s": {"claude_model": "small"}, "m": {"codex_effort": "xhigh"}}})
+    write_settings(repo / ".foragent.yml", {"tiers": {"s": {"codex_effort": "low"}}})
+    config = load_config(repo, global_path)
+    assert config.tiers["s"] == {"claude_model": "small", "codex_effort": "low"}
+    assert config.tiers["m"]["codex_effort"] == "xhigh"
+    assert config.tiers["l"] == DEFAULTS["tiers"]["l"]
+
+
+@pytest.mark.parametrize("value", [[], {"xl": {}}, {"s": None}, {"s": {"codex_effort": []}},
+                                    {"m": {"claude_model": 3}}, {"l": {"other": True}}])
+def test_invalid_tiers_are_rejected(repo, value):
+    write_settings(repo / ".foragent.yml", {"tiers": value})
+    with pytest.raises(ConfigError, match="tiers"):
+        load_config(repo)
 
 
 def test_merge_order_and_nested_mapping_replacement(repo, tmp_path):

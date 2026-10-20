@@ -142,7 +142,7 @@ def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     assert config.executor == "codex" and config.acceptance_dir == "tests/acceptance/"
     assert config.run_hours == "always"
     assert list(setup.tracker.labels.values()) == LABELS
-    assert ["add", "--", *PATHS] in setup.git_calls
+    assert ["add", "-f", "--", *PATHS] in setup.git_calls
     assert [
         "-c", "user.name=Test Human", "-c", "user.email=human@example.com",
         "commit", "--only", "-m", "Set up Foragent", "--", *PATHS,
@@ -178,7 +178,7 @@ def test_existing_partial_config_and_template_remain_byte_for_byte(setup):
     assert (setup.root / PATHS[0]).read_text() == config
     assert template.read_text() == "Existing template\n"
     assert report.created == [PATHS[2]]
-    assert ["add", "--", PATHS[2], *PATHS[:2]] in setup.git_calls
+    assert ["add", "-f", "--", PATHS[2], *PATHS[:2]] in setup.git_calls
 
 
 def test_existing_acceptance_directory_gets_no_placeholder(setup):
@@ -289,7 +289,7 @@ def test_dirty_worktree_and_unrelated_staged_changes_are_preserved(setup):
     assert (setup.root / "untracked.txt").read_text() == "Keep me\n"
     commit = next(args for args in setup.git_calls if "commit" in args)
     assert "--only" in commit and commit[commit.index("--") + 1:] == PATHS
-    assert [args for args in setup.git_calls if args[0] == "add"] == [["add", "--", *PATHS]]
+    assert [args for args in setup.git_calls if args[0] == "add"] == [["add", "-f", "--", *PATHS]]
 
 
 def test_no_push_still_commits_and_no_launchd_skips_install(setup):

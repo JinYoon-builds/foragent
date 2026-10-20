@@ -567,3 +567,46 @@ def test_fake_list_prs_separates_open_closed_and_merged():
 def test_list_prs_rejects_invalid_state(tracker):
     with pytest.raises(ValueError, match="unsupported PR state"):
         tracker.list_prs("closed", "foragent/issue-")
+@pytest.mark.parametrize("kind", ["sub", "blocked"])
+def test_native_issue_edges_use_database_ids_and_ignore_duplicates(kind):
+    calls = []
+
+    def run(args, input=None):
+        calls.append(args)
+        if "POST" not in args:
+            return '{"id":12345}'
+        raise TrackerError("HTTP 422: relationship already exists")
+
+    tracker = GhTracker("owner/repo", run=run)
+    if kind == "sub":
+        tracker.add_sub_issue(1, 2)
+        endpoint, field = "repos/owner/repo/issues/1/sub_issues", "sub_issue_id=12345"
+    else:
+        tracker.add_blocked_by(1, 2)
+        endpoint, field = "repos/owner/repo/issues/1/dependencies/blocked_by", "issue_id=12345"
+    assert calls == [["api", "repos/owner/repo/issues/2"], ["api", "-X", "POST", endpoint, "-F", field]]
+
+
+def test_remove_blocked_by_uses_database_id():
+    run = ScriptedRun('{"id":12345}', "")
+    GhTracker(REPO, run).remove_blocked_by(1, 2)
+    assert run.calls == [
+        (["api", "repos/owner/repo/issues/2"], None),
+        (["api", "-X", "DELETE", "repos/owner/repo/issues/1/dependencies/blocked_by/12345"], None),
+    ]
+
+
+def test_remove_blocked_by_fake_preserves_other_dependencies_and_is_repeatable():
+    tracker = FakeTracker()
+    tracker.set_blocked_by(1, [Dependency(2, "open"), Dependency(3, "closed")])
+    tracker.remove_blocked_by(1, 2)
+    tracker.remove_blocked_by(1, 2)
+    tracker.remove_blocked_by(4, 2)
+    assert tracker.blocked_by(1) == [Dependency(3, "closed")]
+    assert tracker.blocked_by(4) == []
+
+
+def test_remove_blocked_by_propagates_api_failure():
+    run = ScriptedRun('{"id":12345}', gh_error("HTTP 403: forbidden"))
+    with pytest.raises(TrackerError, match="HTTP 403"):
+        GhTracker(REPO, run).remove_blocked_by(1, 2)

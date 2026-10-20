@@ -147,6 +147,15 @@ def test_acceptance_paths_custom_directory_and_empty_input():
     assert acceptance_paths([], "checks/") == []
 
 
+@pytest.mark.parametrize("command", [
+    "pytest 'tests/acceptance/test_api.py::test_login[token=valid]'",
+    "pytest --file='tests/acceptance/test_api.py::test_login[token=valid]'",
+    "pytest './tests/acceptance/test_api.py::TestLogin::test_login[a=b=c]'",
+])
+def test_acceptance_paths_preserves_parametrized_node_selectors(command):
+    assert acceptance_paths([command], "tests/acceptance/") == ["tests/acceptance/test_api.py"]
+
+
 @pytest.mark.parametrize("command,expected", [
     ("pytest 'tests/acceptance/test_a.py", ["tests/acceptance/test_a.py"]),
     ('pytest "./tests/acceptance/test_a.py::test_one', ["tests/acceptance/test_a.py"]),

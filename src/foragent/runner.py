@@ -21,7 +21,7 @@ from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for
 from foragent.git import GitError, GitRepo
 from foragent.issue import ParsedIssue, has_machine_check, parse_body
-from foragent.labels import READY, RUNNING
+from foragent.labels import READY, RUNNING, attempt_tier, issue_size
 from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.processes import run_logged
 from foragent.reasons import Reason
@@ -270,6 +270,7 @@ def _pr_body(
     n: int, parsed: ParsedIssue, checks: list[CheckResult], attempt: int,
     reviews: list[ReviewResult], try_text: str | None = None,
     *, outside_lane: list[str] | None = None, fallback_model: str | None = None,
+    attempt_tiers: dict[str, str] | None = None,
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -293,6 +294,8 @@ def _pr_body(
         lines.extend(["", "## Outside lane", "", *(f"- `{path}`" for path in outside_lane)])
     if fallback_model is not None:
         lines.extend(["", f"Executor fallback model: {fallback_model}"])
+    if attempt_tiers:
+        lines.extend(["", *(f"Attempt {number} at tier {tier}" for number, tier in attempt_tiers.items())])
     lines.extend(["", f"Opened by Foragent gate (attempt {attempt})"])
     return "\n".join(lines) + "\n\n## Try it\n\n" + (
         try_text if try_text is not None else "_not provided by the implementer_"
@@ -552,11 +555,22 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     unusable_review = False
     checks: list[CheckResult] = []
     paths: list[str] = []
+    size = issue_size(ctx.tracker.get_issue(n).labels)
 
     def implement(failure: str, *, merge_conflicts: list[str] | None = None) -> None:
         remaining = _remaining(n, ctx)
         if remaining <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
+        run = ctx.store.get_run(n)
+        tier = attempt_tier(size, run.attempts)
+        ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, str(run.attempts): tier})
+        settings = ctx.config.tiers[tier]
+        lane = ctx.config.lanes.get(run.lane, {})
+        model = ctx.config.executor_model
+        if native_claude:
+            model = lane.get("model") or settings["claude_model"] or model
+        else:
+            options["effort"] = settings["codex_effort"]
         agent, notes = _lane_notes(ctx, n, worktree)
         if native_claude and agent is not None:
             options["agent"] = agent
@@ -568,7 +582,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         result = _available_executor(
             n, ctx, executor, worktree=worktree,
             prompt=prompt if native_claude else notes + prompt,
-            model=ctx.config.executor_model, timeout_s=remaining, log_path=log, **options,
+            model=model, timeout_s=remaining, log_path=log, **options,
         )
         if result.timed_out or _remaining(n, ctx) <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
@@ -747,6 +761,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             return _pr_body(
                 n, parsed, checks, ctx.store.get_run(n).attempts, reviews, try_text, outside_lane=outside,
                 fallback_model=ctx.store.get_run(n).fallback_model,
+                attempt_tiers=ctx.store.get_run(n).attempt_tiers,
             )
 
         body = pr_body()

@@ -24,6 +24,20 @@ def test_exact_codex_command(model):
     ]
 
 
+def test_codex_effort_is_an_explicit_config_argument(tmp_path, monkeypatch):
+    calls = []
+
+    def execute(args, **kwargs):
+        calls.append(args)
+        kwargs["stdout_path"].write_text("")
+        return 0, False, ""
+
+    monkeypatch.setattr("foragent.executors.run_logged", execute)
+    CodexExecutor().run(worktree=tmp_path, prompt="implement", model="lane-model", effort="xhigh",
+                        timeout_s=10, log_path=tmp_path / "run.log")
+    assert calls[0][-4:] == ["-m", "lane-model", "-c", "model_reasoning_effort=xhigh"]
+
+
 @pytest.mark.parametrize("model", [None, "other model"])
 def test_exact_claude_command(model):
     assert claude_command(model, Path("/run dir/claude-settings.json")) == [

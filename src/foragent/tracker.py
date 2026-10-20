@@ -68,6 +68,11 @@ class PullRequest:
 
 class Tracker(Protocol):
     def list_open_issues(self) -> list[Issue]: ...
+    def list_issues(self, state: str = "all") -> list[Issue]: ...
+    def update_issue(self, n: int, *, title: str, body: str) -> None: ...
+    def add_sub_issue(self, parent: int, child: int) -> None: ...
+    def add_blocked_by(self, n: int, blocker: int) -> None: ...
+    def remove_blocked_by(self, n: int, blocker: int) -> None: ...
     def get_issue(self, n: int) -> Issue: ...
     def body_last_edited_at(self, n: int) -> str | None: ...
     def label_events(self, n: int) -> list[LabelEvent]: ...
@@ -145,6 +150,24 @@ class FakeTracker:
 
     def list_open_issues(self) -> list[Issue]:
         return [issue for issue in self.issues.values() if issue.state == "open" and not issue.is_pull_request]
+
+    def list_issues(self, state: str = "all") -> list[Issue]:
+        return [issue for issue in self.issues.values()
+                if not issue.is_pull_request and (state == "all" or issue.state == state)]
+
+    def update_issue(self, n: int, *, title: str, body: str) -> None:
+        self.edit_body(n, body)
+        self.issues[n] = replace(self.get_issue(n), title=title)
+
+    def add_sub_issue(self, parent: int, child: int) -> None:
+        self.set_parent(child, parent)
+
+    def add_blocked_by(self, n: int, blocker: int) -> None:
+        if not any(dep.number == blocker for dep in self.blocked_by(n)):
+            self._dependencies.setdefault(n, []).append(Dependency(blocker, self.get_issue(blocker).state))
+
+    def remove_blocked_by(self, n: int, blocker: int) -> None:
+        self._dependencies[n] = [dep for dep in self._dependencies.get(n, []) if dep.number != blocker]
 
     def get_issue(self, n: int) -> Issue:
         return self.issues[n]
@@ -324,8 +347,35 @@ class GhTracker:
             raise TrackerError(str(exc)) from exc
 
     def list_open_issues(self) -> list[Issue]:
-        data = _items(self._call(["api", "--paginate", f"{self._path}/issues?state=open&per_page=100"]))
+        return self.list_issues("open")
+
+    def list_issues(self, state: str = "all") -> list[Issue]:
+        if state not in {"open", "closed", "all"}:
+            raise ValueError(f"unsupported issue state: {state}")
+        data = _items(self._call(["api", "--paginate", f"{self._path}/issues?state={state}&per_page=100"]))
         return [_issue(item) for item in data if "pull_request" not in item]
+
+    def update_issue(self, n: int, *, title: str, body: str) -> None:
+        self._call(["api", "-X", "PATCH", f"{self._path}/issues/{n}", "--input", "-"],
+                   input=json.dumps({"title": title, "body": body}))
+
+    def _add_issue_edge(self, path: str, field: str, number: int) -> None:
+        identity = json.loads(self._call(["api", f"{self._path}/issues/{number}"]))["id"]
+        try:
+            self._call(["api", "-X", "POST", path, "-F", f"{field}={identity}"])
+        except TrackerError as exc:
+            if not re.search(r"already exists|already (?:a sub-issue|blocked by|has)", str(exc), re.I):
+                raise
+
+    def add_sub_issue(self, parent: int, child: int) -> None:
+        self._add_issue_edge(f"{self._path}/issues/{parent}/sub_issues", "sub_issue_id", child)
+
+    def add_blocked_by(self, n: int, blocker: int) -> None:
+        self._add_issue_edge(f"{self._path}/issues/{n}/dependencies/blocked_by", "issue_id", blocker)
+
+    def remove_blocked_by(self, n: int, blocker: int) -> None:
+        identity = json.loads(self._call(["api", f"{self._path}/issues/{blocker}"]))["id"]
+        self._call(["api", "-X", "DELETE", f"{self._path}/issues/{n}/dependencies/blocked_by/{identity}"])
 
     def get_issue(self, n: int) -> Issue:
         return _issue(json.loads(self._call(["api", f"{self._path}/issues/{n}"])))
