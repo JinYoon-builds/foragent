@@ -28,6 +28,8 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
         "repo": None, "language": "en", "codex_goal": False, "review_level": "medium",
+        "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
+        "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
     }
     assert DEFAULTS == expected
     assert asdict(load_config(repo)) == expected
@@ -147,7 +149,7 @@ def test_all_valid_overrides(repo):
         "repo": "owner/name", "language": "ko", "codex_goal": True, "review_level": "max",
     }
     write_settings(repo / ".foragent.yml", settings)
-    assert asdict(load_config(repo)) == settings
+    assert asdict(load_config(repo)) == DEFAULTS | settings
 
 
 def test_language_uses_global_default_and_repo_override(repo, tmp_path):
@@ -219,3 +221,33 @@ def test_run_hours_uses_supplied_local_hour():
 def test_invalid_run_hours_raises():
     with pytest.raises(ValueError, match="run_hours"):
         in_run_hours(datetime.now(UTC), "24-08")
+
+
+@pytest.mark.parametrize("settings", [
+    {"lanes": []}, {"lanes": {"Upper": {}}}, {"lanes": {"a_b": {}}},
+    {"lanes": {"": {}}}, {"lanes": {1: {}}}, {"lanes": {"ui": None}},
+    {"lanes": {"ui": {"paths": "src/**"}}}, {"lanes": {"ui": {"paths": [1]}}},
+    {"lanes": {"ui": {"agent": 1}}}, {"lanes": {"ui": {"model": []}}},
+    {"lanes": {"ui": {"executor": "other"}}}, {"lanes": {"ui": {"unknown": True}}},
+])
+def test_lane_validation(repo, settings):
+    write_settings(repo / ".foragent.yml", settings)
+    with pytest.raises(ConfigError, match="lanes"):
+        load_config(repo)
+
+
+@pytest.mark.parametrize("key", ["max_parallel", "transient_max_wait_minutes", "limit_wait_minutes"])
+@pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
+def test_parallel_and_wait_settings_are_positive(repo, key, value):
+    write_settings(repo / ".foragent.yml", {key: value})
+    with pytest.raises(ConfigError, match=key):
+        load_config(repo)
+
+
+def test_lane_overrides_and_nulls_load(repo):
+    lanes = {"ui-2": {"paths": ["src/**"], "agent": "fa-ui", "executor": "claude", "model": "lane-model"},
+             "data": {"paths": [], "agent": None, "executor": None, "model": None}}
+    write_settings(repo / ".foragent.yml", {"lanes": lanes, "max_parallel": 1, "executor_fallback_model": "fallback"})
+    config = load_config(repo)
+    assert config.lanes == lanes and config.max_parallel == 1
+    assert config.executor_fallback_model == "fallback"

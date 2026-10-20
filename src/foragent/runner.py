@@ -1,8 +1,10 @@
 """Execute, independently check and review one approved snapshot."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from contextlib import contextmanager, ExitStack
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -16,18 +18,18 @@ import traceback
 
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
-from foragent.executors import ExecResult, Executor, executor_for
+from foragent.executors import ExecResult, Executor, classify_result, executor_for
 from foragent.git import GitError, GitRepo
 from foragent.issue import ParsedIssue, has_machine_check, parse_body
 from foragent.labels import READY, RUNNING
-from foragent.policy import merge_decision, review_mode_for
+from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.processes import run_logged
 from foragent.reasons import Reason
 from foragent.state import Approval, StateStore
 from foragent.tracker import Tracker, TrackerError
 
 
-def poll_executor(execute: Callable[[], ExecResult], poll: Callable[[], None]) -> ExecResult:
+def poll_executor[T](execute: Callable[[], T], poll: Callable[[], None]) -> T:
     """Keep execution on the main thread so subprocess termination still works."""
     stopped = threading.Event()
 
@@ -56,6 +58,7 @@ class RunContext:
     executor_factory: Callable[[str], Executor] = executor_for
     sleep: Callable[[float], None] = time.sleep
     poll_hook: Callable[[Callable[[], ExecResult], Callable[[], None]], ExecResult] = poll_executor
+    monotonic: Callable[[], float] = time.monotonic
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,15 @@ class ReviewResult:
 
 class PatchReplayError(GitError):
     """A child patch could not be replayed onto its selected destination."""
+
+
+class AttemptFailure(Exception):
+    """Fresh-base conflicts and checks share the implementation retry budget."""
+
+
+class ExecutorStopped(Exception):
+    def __init__(self, outcome: str):
+        self.outcome = outcome
 
 
 def build_review_prompt(parsed: ParsedIssue, diff: str) -> str:
@@ -128,6 +140,7 @@ def goal_condition(acceptance_dir: str) -> str:
 def build_prompt(
     n: int, parsed: ParsedIssue, acceptance_dir: str, failure: str = "", language: str = "en",
     *, native_goal: bool = False, acceptance_locked: bool = False,
+    merge_conflicts: list[str] | None = None,
 ) -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     acceptance_rule = "" if acceptance_locked else f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
@@ -165,6 +178,13 @@ def build_prompt(
     )
     if failure:
         prompt += "\nA previous attempt failed. Output of the failing check:\n" + failure[-4000:]
+    if merge_conflicts is not None:
+        prompt += (
+            "\n\nResolve the conflict markers in the following files:\n"
+            + "\n".join(f"- {path}" for path in merge_conflicts)
+            + "\nPreserve both the features newly added on the base branch and the features for this issue. "
+            "Do not commit. The runner will stage the resolution and create the merge commit."
+        )
     return f"/goal {goal_condition(acceptance_dir)}\n\n{prompt}" if native_goal else prompt
 
 
@@ -205,6 +225,7 @@ def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
         "permissions": {"deny": [
             f"Edit({acceptance}**)", f"Write({acceptance}**)",
             "Bash(git commit:*)", "Bash(git push:*)", "Bash(git checkout:*)", "Bash(git switch:*)",
+            "Bash(git merge:*)",
         ]},
         "hooks": {"Stop": [{"hooks": [{"type": "command", "command": command,
                                       "timeout": max(900, ctx.config.max_runtime_minutes * 60)}]}]},
@@ -248,6 +269,7 @@ def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
 def _pr_body(
     n: int, parsed: ParsedIssue, checks: list[CheckResult], attempt: int,
     reviews: list[ReviewResult], try_text: str | None = None,
+    *, outside_lane: list[str] | None = None, fallback_model: str | None = None,
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -267,6 +289,10 @@ def _pr_body(
     if parsed.done_when_checklist:
         lines.extend(["", "## Needs a human check", ""])
         lines.extend(f"- [ ] {item.text}" for item in parsed.done_when_checklist)
+    if outside_lane:
+        lines.extend(["", "## Outside lane", "", *(f"- `{path}`" for path in outside_lane)])
+    if fallback_model is not None:
+        lines.extend(["", f"Executor fallback model: {fallback_model}"])
     lines.extend(["", f"Opened by Foragent gate (attempt {attempt})"])
     return "\n".join(lines) + "\n\n## Try it\n\n" + (
         try_text if try_text is not None else "_not provided by the implementer_"
@@ -277,7 +303,7 @@ def _remaining(n: int, ctx: RunContext) -> int:
     run = ctx.store.get_run(n)
     if run is None:
         raise KeyError(n)
-    elapsed = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
+    elapsed = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
     return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
 
 
@@ -298,6 +324,7 @@ def _progress(n: int, ctx: RunContext) -> None:
 def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> ExecResult:
     log = kwargs["log_path"]
     size = log.stat().st_size if log.exists() else 0
+    offset = size
 
     def poll():
         nonlocal size
@@ -307,9 +334,112 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         size = current
 
     try:
-        return ctx.poll_hook(lambda: executor.run(**kwargs), poll)
+        result = ctx.poll_hook(lambda: executor.run(**kwargs), poll)
+        if log.exists():
+            with log.open("rb") as stream:
+                stream.seek(max(offset, log.stat().st_size - 16000))
+                result.log_tail = stream.read().decode("utf-8", errors="replace")[-4000:]
+        return result
     finally:
         _progress(n, ctx)
+
+
+def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
+    """Persist the wait before sleeping so tick cannot mistake it for a stall."""
+    run = ctx.store.get_run(n)
+    started = ctx.now()
+    started_mono = ctx.monotonic()
+    ctx.store.update_run(
+        n, waited_seconds=run.waited_seconds + seconds,
+        executor_waited_seconds=run.executor_waited_seconds + seconds,
+        waiting_until=(started + timedelta(seconds=seconds)).astimezone(UTC).isoformat(),
+        last_progress_at=started.astimezone(UTC).isoformat(),
+    )
+    try:
+        ctx.sleep(seconds)
+    finally:
+        elapsed = max(0, ctx.monotonic() - started_mono)
+        ctx.store.update_run(
+            n, waited_seconds=run.waited_seconds + elapsed,
+            executor_waited_seconds=run.executor_waited_seconds + elapsed,
+            waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
+        )
+
+
+@contextmanager
+def _merge_lock(n: int, ctx: RunContext):
+    run = ctx.store.get_run(n)
+    started = ctx.monotonic()
+
+    def progress():
+        now = ctx.now().astimezone(UTC)
+        ctx.store.update_run(
+            n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
+            waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat(),
+        )
+
+    # Keep tick informed during an unbounded blocking flock acquisition.
+    with ExitStack() as stack:
+        progress()
+        try:
+            poll_executor(lambda: stack.enter_context(ctx.store.merge_lock()), progress)
+        finally:
+            ctx.store.update_run(
+                n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
+                waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
+            )
+        yield
+
+
+def _available_executor(n: int, ctx: RunContext, executor: Executor, *, reviewer: bool = False, **kwargs) -> ExecResult:
+    errors = 0
+    while True:
+        run = ctx.store.get_run(n)
+        if not reviewer and run.fallback_model is not None:
+            kwargs["model"] = run.fallback_model
+        kwargs["timeout_s"] = _remaining(n, ctx)
+        result = _run_executor(n, ctx, executor, **kwargs)
+        kind = classify_result(result)
+        if kind == "normal":
+            return result
+        if kind == "transient" and _remaining(n, ctx) <= 0:
+            return replace(result, timed_out=True)
+        if kind == "limit" and not reviewer:
+            ctx.store.pause_lane(run.lane, ctx.now() + timedelta(minutes=ctx.config.limit_wait_minutes))
+            ctx.tracker.add_labels(n, [READY])
+            ctx.tracker.remove_labels(n, [RUNNING])
+            raise ExecutorStopped("limit-wait")
+        if kind == "transient" and not reviewer:
+            run = ctx.store.update_run(n, transient_errors=run.transient_errors + 1)
+            if run.transient_errors >= 2 and ctx.config.executor_fallback_model and run.fallback_model is None:
+                ctx.store.update_run(n, fallback_model=ctx.config.executor_fallback_model)
+                _append(kwargs["log_path"], f"Executor fallback model: {ctx.config.executor_fallback_model}")
+        budget = ctx.config.transient_max_wait_minutes * 60 - ctx.store.get_run(n).executor_waited_seconds
+        if budget <= 0:
+            if reviewer and kind == "limit":
+                return replace(result, exit_code=result.exit_code or 1)
+            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Executor unavailable (transient errors)")
+            raise ExecutorStopped("retries-exceeded")
+        _executor_wait(n, ctx, min(120 * 2 ** min(errors, 3), budget))
+        errors += 1
+
+
+def _lane_notes(ctx: RunContext, n: int, worktree: Path) -> tuple[str | None, str]:
+    lane = ctx.store.get_run(n).lane
+    settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
+    agent = settings.get("agent")
+    if not isinstance(agent, str) or not re.fullmatch(r"fa-[a-z0-9-]+", agent):
+        return None, ""
+    path = worktree / ".claude/agents" / f"{agent}.md"
+    if not path.is_file():
+        return None, ""
+    body = path.read_text(encoding="utf-8", errors="replace")
+    body = re.sub(r"\A---\s*\n.*?\n---[^\S\n]*(?:\n|$)", "", body, count=1, flags=re.DOTALL)
+    memory = worktree / ".claude/agent-memory" / agent / "MEMORY.md"
+    if memory.is_file():
+        with memory.open(encoding="utf-8", errors="replace") as stream:
+            body += "\n\nMemory:\n" + "".join(islice(stream, 200))
+    return agent, "Lane notes:\n" + body.strip() + "\n\n"
 
 
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str) -> ReviewResult:
@@ -318,8 +448,9 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     before = git.review_state()
     edited = False
     try:
-        result = _run_executor(
+        result = _available_executor(
             n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
+            reviewer=True,
             prompt="" if reviewer == "claude" else build_review_prompt(parsed, git.staged_diff(base_ref)),
             model=ctx.config.reviewer_model, timeout_s=_remaining(n, ctx),
             log_path=ctx.store.log_path(n), **options,
@@ -419,6 +550,34 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     review_failures = 0
     review_hold = False
     unusable_review = False
+    checks: list[CheckResult] = []
+    paths: list[str] = []
+
+    def implement(failure: str, *, merge_conflicts: list[str] | None = None) -> None:
+        remaining = _remaining(n, ctx)
+        if remaining <= 0:
+            raise ExecutorStopped(_timeout(n, ctx))
+        agent, notes = _lane_notes(ctx, n, worktree)
+        if native_claude and agent is not None:
+            options["agent"] = agent
+        prompt = build_prompt(
+            n, parsed, ctx.config.acceptance_dir, failure, ctx.config.language,
+            native_goal=native_claude or ctx.config.codex_goal, acceptance_locked=native_claude,
+            merge_conflicts=merge_conflicts,
+        )
+        result = _available_executor(
+            n, ctx, executor, worktree=worktree,
+            prompt=prompt if native_claude else notes + prompt,
+            model=ctx.config.executor_model, timeout_s=remaining, log_path=log, **options,
+        )
+        if result.timed_out or _remaining(n, ctx) <= 0:
+            raise ExecutorStopped(_timeout(n, ctx))
+        question = worktree / ".foragent/QUESTION.md"
+        if question.exists():
+            with question.open(encoding="utf-8", errors="replace") as stream:
+                details = stream.read(6000)
+            flag(ctx, n, Reason.SPEC_QUESTION, "The executor needs a product decision.", details)
+            raise ExecutorStopped("spec-question")
 
     def prepare_target() -> bool:
         nonlocal start_ref, target_branch
@@ -452,171 +611,229 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 raise PatchReplayError(str(exc)) from exc
         return True
 
-    while True:
-        remaining = _remaining(n, ctx)
-        if remaining <= 0:
-            return _timeout(n, ctx)
-        result = _run_executor(
-            n, ctx, executor,
-            worktree=worktree, prompt=build_prompt(
-                n, parsed, ctx.config.acceptance_dir, failure, ctx.config.language,
-                native_goal=native_claude or ctx.config.codex_goal, acceptance_locked=native_claude,
-            ),
-            model=ctx.config.executor_model, timeout_s=remaining, log_path=log, **options,
-        )
-        run = ctx.store.get_run(n)
-        if result.timed_out or _remaining(n, ctx) <= 0:
-            return _timeout(n, ctx)
-        question = worktree / ".foragent/QUESTION.md"
-        if question.exists():
-            with question.open(encoding="utf-8", errors="replace") as stream:
-                details = stream.read(6000)
-            flag(ctx, n, Reason.SPEC_QUESTION, "The executor needs a product decision.", details)
-            return "spec-question"
+    def recover_replay(exc: PatchReplayError) -> str:
+        nonlocal paths
+        # A three-way failure can leave unmerged index entries. Start the
+        # next implementation attempt from the destination's clean tree.
+        ctx.git.remove_worktree(worktree)
+        ctx.git.add_worktree(worktree, branch, start_ref)
+        paths = []
+        return f"Could not apply child changes to {target_branch}: {exc}"
 
-        try:
+    def verify() -> str:
+        nonlocal checks, paths
+        git.stage_changes()
+        if not prepare_target():
+            raise ExecutorStopped("hash-mismatch")
+        paths = git.changed_paths(start_ref)
+        _progress(n, ctx)
+        checks = []
+        if not paths:
+            return "The session made no changes."
+        staged_tree = git.staged_tree_sha()
+        for verification in range(2):
+            checks = []
+            for command in parsed.done_when_commands:
+                checks.append(_check(command, worktree, log, 900))
+                _progress(n, ctx)
             git.stage_changes()
             if not prepare_target():
-                return "hash-mismatch"
+                raise ExecutorStopped("hash-mismatch")
             paths = git.changed_paths(start_ref)
-            _progress(n, ctx)
-            checks = []
-            if not paths:
-                failure = "The session made no changes."
-            else:
-                staged_tree = git.staged_tree_sha()
-                for verification in range(2):
-                    checks = []
-                    for command in parsed.done_when_commands:
-                        checks.append(_check(command, worktree, log, 900))
-                        _progress(n, ctx)
-                    git.stage_changes()
-                    if not prepare_target():
-                        return "hash-mismatch"
-                    paths = git.changed_paths(start_ref)
-                    checked_tree = git.staged_tree_sha()
-                    if checked_tree != staged_tree:
-                        if verification == 1:
-                            failure = "Done when commands modify tracked files"
-                            break
-                        _append(log, "Done when changed staged contents; checking the final contents again.")
-                        staged_tree = checked_tree
-                        continue
-                    failures = [check for check in checks if check.exit_code != 0 or check.timed_out]
-                    failure = (
-                        f"Command: {failures[-1].command}\n{failures[-1].output}"
-                        + ("\nCheck timed out." if failures[-1].timed_out else "")
-                        if failures else ""
-                    )
-                    if not paths and not failure:
-                        failure = "The session made no changes."
-                    break
-        except PatchReplayError as exc:
-            failure = f"Could not apply child changes to {target_branch}: {exc}"
-            # A three-way failure can leave unmerged index entries. Start the
-            # next implementation attempt from the destination's clean tree.
-            ctx.git.remove_worktree(worktree)
-            ctx.git.add_worktree(worktree, branch, start_ref)
-            paths = []
-        if not failure and ctx.config.reviewer != "none":
-            if _remaining(n, ctx) <= 0:
-                return _timeout(n, ctx)
-            review = _review(n, ctx, git, parsed, base_ref)
-            reviews.append(review)
-            if review.verdict == "UNUSABLE":
-                review = _review(n, ctx, git, parsed, base_ref)
-                reviews.append(review)
-                if review.verdict != "PASS":
-                    failure = review.findings or "\n".join(review.notes)
-                    review_hold = unusable_review = True
-                    break
-            if review.verdict == "FAIL":
-                review_failures += 1
-                failure = review.findings or "Reviewer found defects (no findings provided)."
-                if review_failures > ctx.config.review_max:
-                    review_hold = True
-                    break
-        if not failure:
-            break
-        _append(log, f"Attempt {run.attempts} failed:\n{failure}")
-        if run.attempts < ctx.config.max_retries + 1:
-            ctx.store.update_run(n, attempts=run.attempts + 1)
-            continue
-        flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", failure)
-        # Preserve the failed implementation, rather than pushing an unchanged base.
-        if paths:
-            title = ctx.tracker.get_issue(n).title
-            git.commit(f"{title} (#{n})")
-        git.push(branch)
-        return "retries-exceeded"
+            checked_tree = git.staged_tree_sha()
+            if checked_tree != staged_tree:
+                if verification == 1:
+                    return "Done when commands modify tracked files"
+                _append(log, "Done when changed staged contents; checking the final contents again.")
+                staged_tree = checked_tree
+                continue
+            failures = [check for check in checks if check.exit_code != 0 or check.timed_out]
+            if failures:
+                check = failures[-1]
+                return f"Command: {check.command}\n{check.output}" + ("\nCheck timed out." if check.timed_out else "")
+            return "" if paths else "The session made no changes."
+        raise AssertionError("unreachable verification state")
 
-    # Only metadata is read live; instructions and checks always use the snapshot.
-    issue = ctx.tracker.get_issue(n)
-    title = f"{issue.title} (#{n})"
-    git.commit(title)
-    _progress(n, ctx)
-    verified_head_sha = git.head_sha()
-    git.push(branch)
-    _progress(n, ctx)
-    _append(log, f"Pushed verified HEAD: {verified_head_sha}")
-    pr = ctx.tracker.find_pr(branch)
-    try_text = None
-    try_path = worktree / ".foragent/TRY.md"
-    if not review_hold and try_path.is_file():
-        try_text = try_path.read_bytes().decode("utf-8", errors="replace")
-        saved_try = ctx.store.root / "try" / f"{n}.md"
-        saved_try.parent.mkdir(parents=True, exist_ok=True)
-        saved_try.write_text(try_text, encoding="utf-8")
-    body = _pr_body(n, parsed, checks, run.attempts, reviews, try_text)
-    if pr is None:
-        pr = ctx.tracker.create_pr(
-            head=branch, base=target_branch, title=title,
-            body=body,
-        )
-    else:
-        ctx.tracker.update_pr(pr, base=target_branch, title=title, body=body)
-    _progress(n, ctx)
-    pr_ready_at = ctx.now().timestamp()
-    link = f"https://github.com/{ctx.repo}/pull/{pr}"
-    if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
-        return _hold_changed_head(n, ctx, link)
-    if review_hold:
-        summary = ("Reviewer did not return a usable verdict" if unusable_review
-                   else f"Reviewer still found defects after {review_failures} rounds")
-        flag(ctx, n, Reason.RISK_HIGH, summary, f"{failure}\n\n{link}")
-        return "held"
-    decision = merge_decision(
-        changed_paths=ctx.tracker.pr_changed_files(pr),
-        issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
-    )
-    if decision.kind == "hold":
-        flag(ctx, n, decision.reason, decision.summary, link)
-        return "held"
-    if decision.kind == "hold_mode" and (decision.mode == "careful" or not batch_branch):
-        ctx.tracker.comment(n, f"PR #{pr} is waiting for your review\n\n{link}")
-        ctx.tracker.remove_labels(n, [RUNNING])
-        return "pr-open"
+    def publish() -> str:
+        with _merge_lock(n, ctx):
+            return publish_locked()
 
-    # A bounded iteration count also works with a frozen test clock.
-    has_workflows = any(
-        path.is_file()
-        for pattern in ("*.yml", "*.yaml")
-        for path in (worktree / ".github/workflows").glob(pattern)
-    )
-    deadline = ctx.now().timestamp() + 20 * 60
-    for poll in range(41):
-        status = ctx.tracker.pr_checks(pr)
+    def publish_locked() -> str:
+        # Only metadata is read live; instructions and checks always use the snapshot.
+        issue = ctx.tracker.get_issue(n)
+        title = f"{issue.title} (#{n})"
+        if git.has_staged_changes():
+            git.commit(title)
         _progress(n, ctx)
+        verified_head_sha = git.head_sha()
+        base_merges = 0
+
+        def resolve_conflicts(conflicts: list[str]) -> None:
+            pending_merge = True
+            check_failure = f"Merge conflict with {target_branch}: {', '.join(conflicts)}"
+            while True:
+                run = ctx.store.get_run(n)
+                _append(log, f"Attempt {run.attempts} failed:\n{check_failure}")
+                if run.attempts >= ctx.config.max_retries + 1:
+                    flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", check_failure)
+                    raise ExecutorStopped("retries-exceeded")
+                ctx.store.update_run(n, attempts=run.attempts + 1)
+                implement(check_failure, merge_conflicts=conflicts)
+                # Retain the merge's paths even if the executor stages them.
+                markers = git.conflict_marker_paths(conflicts)
+                if markers:
+                    check_failure = f"Conflict markers remain in: {', '.join(markers)}"
+                    continue
+                git.stage_changes()
+                if pending_merge or git.has_staged_changes():
+                    git.commit(title)
+                    pending_merge = False
+                check_failure = verify()
+                markers = git.conflict_marker_paths(conflicts)
+                if markers:
+                    check_failure = f"Conflict markers remain in: {', '.join(markers)}"
+                if not check_failure:
+                    return
+
+        def refresh_base() -> str | None:
+            nonlocal verified_head_sha, base_merges
+            ctx.git.fetch("origin", target_branch)
+            target_ref = f"origin/{target_branch}"
+            target_sha = git.ref_sha(target_ref)
+            if git.is_ancestor(target_sha, verified_head_sha):
+                return None
+            if base_merges == 3:
+                flag(ctx, n, Reason.TIMEOUT, "base kept moving")
+                raise ExecutorStopped("timeout")
+            try:
+                git.merge_base(target_ref)
+            except GitError:
+                conflicts = git.conflict_paths()
+                if not conflicts:
+                    raise
+                resolve_conflicts(conflicts)
+            else:
+                check_failure = verify()
+                if check_failure:
+                    raise AttemptFailure(check_failure)
+            base_merges += 1
+            if _remaining(n, ctx) <= 0:
+                raise ExecutorStopped(_timeout(n, ctx))
+            if git.has_staged_changes():
+                git.commit(title)
+            verified_head_sha = git.head_sha()
+            return target_sha
+
+        target_sha = refresh_base() if not review_hold else None
+        if not review_hold and _remaining(n, ctx) <= 0:
+            return _timeout(n, ctx)
+        git.push(branch)
+        _progress(n, ctx)
+        _append(log, f"Pushed verified HEAD: {verified_head_sha}")
+        pr = ctx.tracker.find_pr(branch)
+        try_text = None
+        try_path = worktree / ".foragent/TRY.md"
+        if not review_hold and try_path.is_file():
+            try_text = try_path.read_bytes().decode("utf-8", errors="replace")
+            saved_try = ctx.store.root / "try" / f"{n}.md"
+            saved_try.parent.mkdir(parents=True, exist_ok=True)
+            saved_try.write_text(try_text, encoding="utf-8")
+        lane = ctx.store.get_run(n).lane
+        globs = ctx.config.lanes.get(lane, {}).get("paths", []) if lane != "main" else None
+
+        def pr_body() -> str:
+            inside = set(touched(paths, globs)) if globs is not None else set(paths)
+            outside = [path for path in paths if path not in inside]
+            return _pr_body(
+                n, parsed, checks, ctx.store.get_run(n).attempts, reviews, try_text, outside_lane=outside,
+                fallback_model=ctx.store.get_run(n).fallback_model,
+            )
+
+        body = pr_body()
+        if pr is None:
+            pr = ctx.tracker.create_pr(
+                head=branch, base=target_branch, title=title,
+                body=body,
+            )
+        else:
+            ctx.tracker.update_pr(pr, base=target_branch, title=title, body=body)
+        if target_sha is not None:
+            ctx.tracker.comment(pr, f"base merged before merge: {target_sha}")
+        _progress(n, ctx)
+        pr_ready_at = ctx.now().timestamp()
+        link = f"https://github.com/{ctx.repo}/pull/{pr}"
         if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
             return _hold_changed_head(n, ctx, link)
-        # Actions checks may not be registered immediately after opening the PR.
-        if status == "none" and has_workflows and ctx.now().timestamp() - pr_ready_at < 180:
-            status = "pending"
-        if status in {"pass", "none"}:
+        if review_hold:
+            summary = ("Reviewer did not return a usable verdict" if unusable_review
+                       else f"Reviewer still found defects after {review_failures} rounds")
+            flag(ctx, n, Reason.RISK_HIGH, summary, f"{failure}\n\n{link}")
+            return "held"
+        decision = merge_decision(
+            changed_paths=ctx.tracker.pr_changed_files(pr),
+            issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
+        )
+        if decision.kind == "hold":
+            flag(ctx, n, decision.reason, decision.summary, link)
+            return "held"
+        if decision.kind == "hold_mode" and (decision.mode == "careful" or not batch_branch):
+            ctx.tracker.comment(n, f"PR #{pr} is waiting for your review\n\n{link}")
+            ctx.tracker.remove_labels(n, [RUNNING])
+            return "pr-open"
+
+        # A bounded iteration count also works with a frozen test clock.
+        for _ in range(4):
+            has_workflows = any(
+                path.is_file()
+                for pattern in ("*.yml", "*.yaml")
+                for path in (worktree / ".github/workflows").glob(pattern)
+            )
+            deadline = ctx.now().timestamp() + 20 * 60
+            for poll in range(41):
+                status = ctx.tracker.pr_checks(pr)
+                _progress(n, ctx)
+                if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
+                    return _hold_changed_head(n, ctx, link)
+                # Actions checks can register after each push, including base merges.
+                if status == "none" and has_workflows and ctx.now().timestamp() - pr_ready_at < 180:
+                    status = "pending"
+                if status in {"pass", "none"}:
+                    break
+                if status == "fail":
+                    flag(ctx, n, Reason.RETRIES_EXCEEDED, "CI failed", link)
+                    return "ci-failed"
+                remaining = deadline - ctx.now().timestamp()
+                if remaining <= 0 or poll == 40:
+                    flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
+                    return "timeout"
+                ctx.sleep(min(30, remaining))
+
+            target_sha = refresh_base()
+            target_ref = f"origin/{target_branch}"
+            if target_sha is not None:
+                git.push(branch)
+                _progress(n, ctx)
+                _append(log, f"Pushed verified HEAD: {verified_head_sha}")
+                ctx.tracker.update_pr(pr, base=target_branch, title=title, body=pr_body())
+                ctx.tracker.comment(pr, f"base merged before merge: {target_sha}")
+                pr_ready_at = ctx.now().timestamp()
+                if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
+                    return _hold_changed_head(n, ctx, link)
+                decision = merge_decision(
+                    changed_paths=git.changed_paths(target_ref),
+                    issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
+                )
+                if decision.kind == "hold":
+                    flag(ctx, n, decision.reason, decision.summary, link)
+                    return "held"
+                if decision.kind == "hold_mode" and (decision.mode == "careful" or not batch_branch):
+                    ctx.tracker.comment(n, f"PR #{pr} is waiting for your review\n\n{link}")
+                    ctx.tracker.remove_labels(n, [RUNNING])
+                    return "pr-open"
+                continue
             try:
                 ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha)
             except TrackerError:
-                # The atomic merge guard also covers a push after the last poll.
                 if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
                     return _hold_changed_head(n, ctx, link)
                 raise
@@ -637,15 +854,49 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                     _append(log, f"Batch PR finalization deferred to tick: {exc}")
             _progress(n, ctx)
             return "merged"
-        if status == "fail":
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, "CI failed", link)
-            return "ci-failed"
-        remaining = deadline - ctx.now().timestamp()
-        if remaining <= 0 or poll == 40:
-            break
-        ctx.sleep(min(30, remaining))
-    flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
-    return "timeout"
+        raise AssertionError("unreachable refresh state")
+
+    while True:
+        implement(failure)
+        run = ctx.store.get_run(n)
+
+        try:
+            failure = verify()
+        except PatchReplayError as exc:
+            failure = recover_replay(exc)
+        if not failure and ctx.config.reviewer != "none":
+            if _remaining(n, ctx) <= 0:
+                return _timeout(n, ctx)
+            review = _review(n, ctx, git, parsed, base_ref)
+            reviews.append(review)
+            if review.verdict == "UNUSABLE":
+                review = _review(n, ctx, git, parsed, base_ref)
+                reviews.append(review)
+                if review.verdict != "PASS":
+                    failure = review.findings or "\n".join(review.notes)
+                    review_hold = unusable_review = True
+            if review.verdict == "FAIL" and not review_hold:
+                review_failures += 1
+                failure = review.findings or "Reviewer found defects (no findings provided)."
+                if review_failures > ctx.config.review_max:
+                    review_hold = True
+        if not failure or review_hold:
+            try:
+                return publish()
+            except (AttemptFailure, PatchReplayError) as exc:
+                failure = recover_replay(exc) if isinstance(exc, PatchReplayError) else str(exc)
+                run = ctx.store.get_run(n)
+        _append(log, f"Attempt {run.attempts} failed:\n{failure}")
+        if run.attempts < ctx.config.max_retries + 1:
+            ctx.store.update_run(n, attempts=run.attempts + 1)
+            continue
+        flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", failure)
+        # Preserve the failed implementation, rather than pushing an unchanged base.
+        if paths and git.has_staged_changes():
+            title = ctx.tracker.get_issue(n).title
+            git.commit(f"{title} (#{n})")
+        git.push(branch)
+        return "retries-exceeded"
 
 
 def run_issue(n: int, ctx: RunContext) -> str:
@@ -653,11 +904,18 @@ def run_issue(n: int, ctx: RunContext) -> str:
     worktree = ctx.store.worktree_path(n)
     log = ctx.store.log_path(n)
     try:
-        ctx.store.update_run(n, pid=os.getpid())
+        run = ctx.store.update_run(n, pid=os.getpid())
+        lane = ctx.config.lanes.get(run.lane, {}) if run.lane != "main" else {}
+        ctx = replace(ctx, config=replace(
+            ctx.config, executor=lane.get("executor") or ctx.config.executor,
+            executor_model=lane.get("model") if lane.get("model") is not None else ctx.config.executor_model,
+        ))
         try:
             outcome = _execute(n, ctx, worktree)
         finally:
             ctx.git.remove_worktree(worktree)
+    except ExecutorStopped as exc:
+        outcome = exc.outcome
     except Exception as exc:
         _append(log, traceback.format_exc())
         flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")

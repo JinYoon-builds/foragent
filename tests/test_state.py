@@ -101,6 +101,76 @@ def test_restart_budget_survives_crash_recovery_but_resets_after_completion(stor
     assert store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1)).restarts == 0
 
 
+def test_limit_wait_resumptions_preserve_attempts_and_restarts(store):
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.update_run(1, attempts=2, restarts=1, waited_seconds=120, executor_waited_seconds=120)
+    for _ in range(3):
+        store.finish_run(1, "limit-wait")
+        run = store.start_run(1, branch="branch", worktree="worktree", lane="ui")
+        assert (run.attempts, run.restarts, run.lane) == (2, 1, "ui")
+        assert run.waited_seconds == 0 and run.outcome is None and run.status == "running"
+        assert run.executor_waited_seconds == 0
+    store.finish_run(1, "merged")
+    run = store.start_run(1, branch="branch", worktree="worktree")
+    assert (run.attempts, run.restarts) == (1, 0)
+
+
+def test_executor_wait_counter_persists_separately_and_old_runs_default_to_zero(store):
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.update_run(1, waited_seconds=1980, executor_waited_seconds=120)
+    reopened = StateStore(store.root)
+    assert reopened.get_run(1).waited_seconds == 1980
+    assert reopened.get_run(1).executor_waited_seconds == 120
+    store.finish_run(1, "merged")
+    assert reopened.read_history()[0].executor_waited_seconds == 120
+    path = store.root / "runs/1.json"
+    old_run = json.loads(path.read_text())
+    del old_run["executor_waited_seconds"]
+    path.write_text(json.dumps(old_run))
+    (store.root / "runs.jsonl").write_text(json.dumps(old_run) + "\n")
+    assert reopened.get_run(1).executor_waited_seconds == 0
+    assert reopened.read_history()[0].executor_waited_seconds == 0
+
+
+def _acquire_merge_lock(root, connection):
+    try:
+        connection.send("waiting")
+        with StateStore(root).merge_lock():
+            connection.send("acquired")
+            assert connection.poll(10)
+            assert connection.recv() == "release"
+    finally:
+        connection.close()
+
+
+def test_project_merge_lock_blocks_other_processes_and_releases_on_error(store):
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(target=_acquire_merge_lock, args=(store.root, child))
+    try:
+        with pytest.raises(RuntimeError, match="release lock"):
+            with store.merge_lock():
+                # State mutations and scheduler ticks use separate locks.
+                store.start_run(1, branch="branch", worktree="worktree")
+                with store.tick_lock() as acquired:
+                    assert acquired
+                process.start()
+                child.close()
+                assert parent.poll(10) and parent.recv() == "waiting"
+                assert not parent.poll(0.1)
+                raise RuntimeError("release lock")
+        assert parent.poll(10) and parent.recv() == "acquired"
+        parent.send("release")
+        process.join(5)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+        parent.close()
+        child.close()
+
+
 def test_approval_exact_body_and_metadata_round_trip(store):
     body = "  <!-- foragent:v1 -->\r\n## Goal\r\nKeep café text.  \r\n\r\n"
     values = {

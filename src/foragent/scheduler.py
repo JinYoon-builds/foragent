@@ -1,4 +1,4 @@
-"""Promote approved issues and launch at most one runner per project."""
+"""Promote approved issues and launch one runner per available lane."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -12,7 +12,7 @@ from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitRepo
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
-from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING
+from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_order
 from foragent.reasons import Reason, format_approval_comment
 from foragent.processes import kill_process_group
 from foragent.runner import _batch_pr
@@ -221,6 +221,7 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         ctx.store.start_run(
             issue.number, branch=f"foragent/issue-{issue.number}",
             worktree=ctx.store.worktree_path(issue.number),
+            lane=issue_lane(issue.labels, ctx.config.lanes),
         )
         ctx.store.finish_run(issue.number, outcome="crashed", detail=detail)
     report.actions.append(f"#{issue.number} orphaned running label recovered as crashed")
@@ -258,13 +259,13 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             else:
                 dead = False
         if not dead:
-            if run.pid is not None and ctx.now() - datetime.fromisoformat(run.started_at) > timedelta(
-                minutes=ctx.config.max_runtime_minutes + 10,
-            ):
+            waiting = run.waiting_until is not None and ctx.now() < datetime.fromisoformat(run.waiting_until)
+            runtime = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
+            if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
                 _kill_run(ctx, run.number, report)
                 flag(ctx, run.number, Reason.TIMEOUT, "Too big for one session; split it in order")
                 report.actions.append(f"#{run.number} flagged timeout")
-            elif run.pid is not None and ctx.now() - datetime.fromisoformat(
+            elif run.pid is not None and not waiting and ctx.now() - datetime.fromisoformat(
                 run.last_progress_at or run.started_at,
             ) > timedelta(minutes=ctx.config.stall_minutes):
                 restarts = run.restarts + 1
@@ -301,7 +302,10 @@ def _check_prerequisites(
         if READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [READY])
         return False
-    if ctx.tracker.find_pr(f"foragent/issue-{issue.number}") is not None:
+    if (
+        ctx.tracker.find_pr(f"foragent/issue-{issue.number}") is not None
+        and (latest_run is None or latest_run.outcome != "limit-wait")
+    ):
         if READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [READY])
         return False
@@ -372,10 +376,20 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     base_ref = f"origin/{ctx.config.base_branch}"
     _recover_runs(ctx, report)
     _reconcile_batches(ctx, report)
-    ready: list[int] = []
+    ready: dict[str, list[int]] = {}
+    unknown: set[str] = set()
+
+    def lane_for(issue: Issue) -> str:
+        for label in sorted(issue.labels):
+            if label.startswith("lane:") and label != "lane:main" and label[5:] not in ctx.config.lanes:
+                if label not in unknown:
+                    report.actions.append(f"Unknown lane {label}; treating as main")
+                    unknown.add(label)
+        return issue_lane(issue.labels, ctx.config.lanes)
 
     for issue in sorted(ctx.tracker.list_open_issues(), key=lambda issue: issue.number):
         issue = _recover_orphan(ctx, issue, report)
+        lane = lane_for(issue)
         previous_flag = ctx.store.load_flag(issue.number) if NEEDS_HUMAN in issue.labels else None
         if NEEDS_HUMAN in issue.labels and (
             previous_flag is None or previous_flag.reason != Reason.HASH_MISMATCH
@@ -412,39 +426,48 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         if not _check_prerequisites(ctx, issue, approval, report):
             continue
         if READY in issue.labels:
-            ready.append(issue.number)
+            ready.setdefault(lane, []).append(issue.number)
             continue
 
         ctx.tracker.add_labels(issue.number, [READY])
         report.actions.append(f"#{issue.number} promoted to ready")
-        ready.append(issue.number)
+        ready.setdefault(lane, []).append(issue.number)
 
-    if ctx.store.active_runs() or not ctx.start_runs or not ready:
+    if not ctx.start_runs or not ready:
         return report
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         return report
 
-    number = min(ready)
-    issue = ctx.tracker.get_issue(number)
-    if (
-        issue.state != "open" or issue.is_pull_request
-        or not {APPROVED, READY}.issubset(issue.labels)
-        or issue.labels & {NEEDS_HUMAN, RUNNING}
-    ):
-        return report
-    approval = ctx.store.load_approval(number)
-    event, _ = _latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
-    if approval is None or event is None or event.created_at != approval.approved_at:
-        return report
-    if not _check_integrity(ctx, issue, approval, base_ref, report):
-        return report
-    if not _check_prerequisites(ctx, issue, approval, report):
-        return report
+    for lane in sorted(ready, key=lane_order):
+        active = ctx.store.active_runs()
+        if len(active) >= ctx.config.max_parallel:
+            break
+        if any(run.lane == lane for run in active) or ctx.store.lane_paused(lane, ctx.now()):
+            continue
+        for number in ready[lane]:
+            issue = ctx.tracker.get_issue(number)
+            if (
+                issue.state != "open" or issue.is_pull_request
+                or not {APPROVED, READY}.issubset(issue.labels)
+                or issue.labels & {NEEDS_HUMAN, RUNNING} or lane_for(issue) != lane
+            ):
+                continue
+            approval = ctx.store.load_approval(number)
+            event, _ = _latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
+            if approval is None or event is None or event.created_at != approval.approved_at:
+                continue
+            if not _check_integrity(ctx, issue, approval, base_ref, report):
+                continue
+            if not _check_prerequisites(ctx, issue, approval, report):
+                continue
 
-    ctx.tracker.remove_labels(number, [READY])
-    ctx.tracker.add_labels(number, [RUNNING])
-    ctx.store.start_run(number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number))
-    pid = ctx.launcher(number)
-    ctx.store.update_run(number, pid=pid)
-    report.actions.append(f"#{number} started running (pid={pid})")
+            ctx.tracker.remove_labels(number, [READY])
+            ctx.tracker.add_labels(number, [RUNNING])
+            ctx.store.start_run(
+                number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
+            )
+            pid = ctx.launcher(number)
+            ctx.store.update_run(number, pid=pid)
+            report.actions.append(f"#{number} started running (pid={pid})")
+            break
     return report

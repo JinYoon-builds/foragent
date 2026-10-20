@@ -10,7 +10,7 @@ import time
 import pytest
 
 from foragent.executors import (
-    ClaudeExecutor, CodexExecutor, claude_command, claude_review_command, codex_command, executor_for,
+    ClaudeExecutor, CodexExecutor, ExecResult, classify_result, claude_command, claude_review_command, codex_command, executor_for,
 )
 from foragent.processes import kill_process_group, run_logged
 
@@ -38,6 +38,116 @@ def test_executor_factory():
     assert isinstance(executor_for("claude"), ClaudeExecutor)
     with pytest.raises(ValueError, match="unknown executor"):
         executor_for("unknown")
+
+
+@pytest.mark.parametrize("message", [
+    "Tests failed: expected quota=10, got quota=0", "Implemented quota accounting",
+    "VERDICT: FAIL\nfeature.py:503: rate limit handling is broken", "503 overloaded usage limit quota",
+])
+@pytest.mark.parametrize("code", [0, 1, 429, 503, 529, None])
+def test_free_text_and_exit_codes_never_classify_availability(tmp_path, message, code):
+    result = ExecResult(code, False, message, tmp_path / "log", message, message)
+    assert classify_result(result) == "normal"
+
+
+def execute_events(tmp_path, monkeypatch, executor, events, *, code=1, review=False):
+    log = tmp_path / "run.log"
+    log.write_text('{"type":"error","message":"HTTP 429"}\n')
+    output = json.dumps(events, indent=2) if review else "\n".join(json.dumps(event) for event in events)
+
+    def execute(args, **kwargs):
+        kwargs["stdout_path"].write_text(output + "\n")
+        with kwargs["log_path"].open("a") as stream:
+            stream.write("Tests failed: expected quota=10, got quota=0\nHTTP 429\n")
+        if executor == "codex":
+            Path(args[args.index("-o") + 1]).write_text("Implemented quota accounting")
+        return code, False, ""
+
+    monkeypatch.setattr("foragent.executors.run_logged", execute)
+    return executor_for(executor).run(
+        worktree=tmp_path, prompt="implement", model=None, timeout_s=60, log_path=log,
+        **({"review_level": "high"} if review else {}),
+    )
+
+
+@pytest.mark.parametrize("event,expected", [
+    ({"type": "error", "message": "HTTP 429: usage limit"}, "limit"),
+    ({"type": "turn.failed", "error": {"message": "rate limit exceeded"}}, "limit"),
+    ({"type": "turn.failed", "message": "HTTP 503 Service Unavailable"}, "transient"),
+    ({"type": "error", "message": "overloaded (529)"}, "transient"),
+    ({"type": "error", "message": "stream disconnected: connection reset"}, "transient"),
+    ({"type": "error", "message": "quota exceeded"}, "limit"),
+    ({"type": "error", "message": "failed test at line 5030"}, "normal"),
+    ({"type": "item.completed", "item": {"type": "agent_message", "text": "HTTP 429 quota"}}, "normal"),
+    ({"type": "item.completed", "item": {"type": "command_execution", "aggregated_output":
+      '{"type":"error","message":"HTTP 429"}'}}, "normal"),
+    ({"type": "turn.completed", "message": "quota exceeded"}, "normal"),
+    ({"type": "result", "is_error": True, "api_error_status": 429}, "normal"),
+    ({"type": "error", "result": "HTTP 429"}, "normal"),
+    ({"type": "turn.failed", "error": {"type": "rate_limit_error", "message": "unrelated failure"}}, "normal"),
+    ({"type": [], "message": "HTTP 429"}, "normal"),
+    ([], "normal"), ("HTTP 429", "normal"),
+])
+@pytest.mark.parametrize("code", [0, 1])
+def test_codex_classifies_only_structured_error_messages(tmp_path, monkeypatch, event, expected, code):
+    result = execute_events(tmp_path, monkeypatch, "codex", [event], code=code)
+    assert classify_result(result) == (expected if code else "normal")
+
+
+@pytest.mark.parametrize("event,expected", [
+    ({"type": "result", "is_error": True, "api_error_status": 429}, "limit"),
+    ({"type": "result", "is_error": True, "api_error_status": "429"}, "limit"),
+    ({"type": "result", "is_error": True, "api_error_status": 503}, "transient"),
+    ({"type": "result", "is_error": True, "api_error_status": 529}, "transient"),
+    ({"type": "result", "is_error": True, "api_error_status": "overloaded"}, "transient"),
+    ({"type": "result", "is_error": False, "api_error_status": 429}, "normal"),
+    ({"type": "result", "api_error_status": 429}, "normal"),
+    ({"type": "result", "is_error": True, "result": "Tests failed: expected quota=10; HTTP 429"}, "normal"),
+    ({"type": "result", "is_error": False, "result": "Implemented quota accounting"}, "normal"),
+    ({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}, "transient"),
+    ({"type": "error", "api_error_status": 429}, "limit"),
+    ({"type": "error", "message": "rate limit exceeded"}, "limit"),
+    ({"type": "assistant", "message": "HTTP 429 quota", "api_error_status": 429}, "normal"),
+    ({"type": "tool_result", "is_error": True, "api_error_status": 429}, "normal"),
+])
+@pytest.mark.parametrize("code", [0, 1])
+@pytest.mark.parametrize("review", [False, True])
+def test_claude_classifies_only_error_events_or_failed_result_status(tmp_path, monkeypatch, event, expected, code, review):
+    result = execute_events(tmp_path, monkeypatch, "claude", event if review else [event], code=code, review=review)
+    assert classify_result(result) == (expected if code else "normal")
+
+
+def test_claude_review_json_without_type_uses_error_status(tmp_path, monkeypatch):
+    result = execute_events(tmp_path, monkeypatch, "claude", {
+        "is_error": True, "api_error_status": 529, "result": "review unavailable",
+    }, review=True)
+    assert classify_result(result) == "transient"
+
+
+def test_structured_limits_take_precedence_over_transients(tmp_path, monkeypatch):
+    result = execute_events(tmp_path, monkeypatch, "codex", [
+        {"type": "error", "message": "HTTP 503"}, {"type": "error", "message": "HTTP 429"},
+    ])
+    assert classify_result(result) == "limit"
+
+
+def test_claude_agent_preserves_native_arguments(tmp_path, monkeypatch):
+    captured = []
+
+    def execute(args, **kwargs):
+        captured.append((args, kwargs))
+        kwargs["stdout_path"].write_text('{"type":"result","result":"done"}\n')
+        return 0, False, ""
+
+    monkeypatch.setattr("foragent.executors.run_logged", execute)
+    settings = tmp_path / "settings.json"
+    ClaudeExecutor().run(
+        worktree=tmp_path, prompt="/goal complete", model="lane-model", timeout_s=60,
+        log_path=tmp_path / "run.log", settings_path=settings, agent="fa-ui",
+    )
+    args, kwargs = captured[0]
+    assert args == [*claude_command(None, settings), "--agent", "fa-ui", "--model", "lane-model"]
+    assert kwargs["prompt"] == "/goal complete"
 
 
 @pytest.mark.parametrize("model", [None, "review model"])

@@ -29,14 +29,14 @@ def _git(ctx: InspectContext) -> GitRepo:
 
 
 def run_command(command: str, worktree: Path, log_path: Path) -> PreparedCommand:
-    code, timed_out, _ = run_logged(
-        ["/bin/sh", "-c", command], cwd=worktree, timeout_s=60, log_path=log_path,
-        terminate_children=True,
-    )
-    with log_path.open("rb") as stream:
-        stream.seek(max(0, log_path.stat().st_size - 12000))
-        output = stream.read().decode("utf-8", errors="replace")[-3000:]
-    return PreparedCommand(command, output, code, timed_out)
+    with tempfile.NamedTemporaryFile(dir=log_path.parent, suffix=".stderr") as errors:
+        code, timed_out, stdout = run_logged(
+            ["/bin/sh", "-c", command], cwd=worktree, timeout_s=60, log_path=log_path,
+            terminate_children=True, capture_stdout=True, stderr_path=Path(errors.name),
+        )
+        errors.seek(max(0, Path(errors.name).stat().st_size - 6000))
+        stderr = errors.read().decode("utf-8", errors="replace")[-1500:]
+    return PreparedCommand(command, stdout[-3000:], code, timed_out, stderr)
 
 
 def prepare(ctx: InspectContext) -> list[int]:

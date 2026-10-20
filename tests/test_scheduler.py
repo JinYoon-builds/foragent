@@ -11,6 +11,7 @@ import pytest
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.issue import body_hash
+from foragent.labels import issue_lane
 from foragent.reasons import Reason, parse_approval_comment, parse_reason
 from foragent.processes import kill_process_group
 from foragent.scheduler import TickContext, flag, runner_process_exists, tick
@@ -1426,3 +1427,118 @@ def test_new_approval_snapshots_fresh_body_after_stale_issue_list(ctx, monkeypat
     assert ctx.store.load_flag(1) is None
     assert ctx.tracker.get_issue(1).labels == {"approved", "running"}
     assert ctx.store.get_run(1).pid == 7001
+
+
+@pytest.mark.parametrize("labels,expected", [
+    ([], "main"), (["lane:main"], "main"), (["lane:ui"], "ui"),
+    (["lane:unknown"], "main"),
+])
+def test_lane_assignment(labels, expected):
+    assert issue_lane(labels, {"ui": {}}) == expected
+
+
+def test_unknown_lane_reports_once_per_tick_and_uses_main_slot(ctx):
+    approve(ctx, 1, labels=["lane:missing"])
+    approve(ctx, 2, labels=["lane:missing"])
+    ctx.start_runs = True
+    for _ in range(2):
+        report = tick(ctx)
+        assert [action for action in report.actions if "Unknown lane" in action] == [
+            "Unknown lane lane:missing; treating as main",
+        ]
+        assert [run.number for run in ctx.store.active_runs()] == [1]
+        assert ctx.store.get_run(1).lane == "main"
+
+
+@pytest.mark.parametrize("cap,expected", [(1, [2]), (2, [2, 4]), (3, [2, 4, 1])])
+def test_lane_single_run_cap_order_and_lowest_issue(ctx, cap, expected):
+    ctx.config = replace(ctx.config, lanes={"beta": {}, "alpha": {}}, max_parallel=cap)
+    for number, lane in [(1, "main"), (3, "alpha"), (2, "alpha"), (4, "beta")]:
+        approve(ctx, number, labels=[f"lane:{lane}"])
+    launches = []
+    ctx.launcher = lambda number: launches.append(number) or 7000 + number
+    ctx.start_runs = True
+    tick(ctx)
+    tick(ctx)
+    assert launches == expected
+    assert len(ctx.store.active_runs()) == cap
+    assert len({run.lane for run in ctx.store.active_runs()}) == cap
+    ctx.tracker.close_issue(2)
+    ctx.tracker.remove_labels(2, ["running"])
+    ctx.store.finish_run(2, "merged")
+    tick(ctx)
+    assert launches == [*expected, 3]
+
+
+def test_integrity_is_rechecked_before_each_lane_start(ctx):
+    ctx.config = replace(ctx.config, lanes={"alpha": {}, "beta": {}})
+    approve(ctx, 1, labels=["lane:alpha"])
+    approve(ctx, 2, labels=["lane:beta"])
+    launches = []
+
+    def launch(number):
+        launches.append(number)
+        ctx.tracker.edit_body(2, BODY + "changed after ready")
+        return 7000 + number
+
+    ctx.launcher = launch
+    ctx.start_runs = True
+    tick(ctx)
+    assert launches == [1]
+    assert ctx.store.load_flag(2).reason == Reason.HASH_MISMATCH
+
+
+def test_paused_lane_skipped_until_expiry(ctx):
+    ctx.config = replace(ctx.config, lanes={"ui": {}})
+    approve(ctx, labels=["lane:ui"])
+    ctx.store.pause_lane("ui", NOW + timedelta(minutes=60))
+    ctx.start_runs = True
+    tick(ctx)
+    assert ctx.store.active_runs() == []
+    assert ctx.tracker.get_issue(1).labels == {"approved", "ready", "lane:ui"}
+    ctx.now = lambda: NOW + timedelta(minutes=60)
+    tick(ctx)
+    assert ctx.store.get_run(1).lane == "ui"
+
+
+def test_tick_runtime_backstop_excludes_waited_seconds(ctx):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx)
+    ctx.now = lambda: NOW + timedelta(minutes=130)
+    run = ctx.store.update_run(1, waited_seconds=60 * 60, last_progress_at=ctx.now().isoformat())
+    tick(ctx)
+    assert ctx.store.active_runs() == [run]
+    ctx.store.update_run(1, waited_seconds=0)
+    tick(ctx)
+    assert ctx.store.get_run(1).outcome == "killed"
+    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+
+
+def test_tick_does_not_stall_a_waiting_executor(ctx):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx)
+    ctx.store.update_run(1, waiting_until=(NOW + timedelta(minutes=60)).isoformat(), waited_seconds=3600)
+    ctx.now = lambda: NOW + timedelta(minutes=40)
+    tick(ctx)
+    assert len(ctx.store.active_runs()) == 1
+    assert ctx.store.read_history() == []
+
+
+def test_limit_wait_can_resume_an_issue_with_an_existing_retry_pr(ctx):
+    ctx.config = replace(ctx.config, lanes={"ui": {}})
+    approve(ctx, labels=["lane:ui"])
+    tick(ctx)
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1), lane="ui")
+    ctx.store.update_run(1, attempts=2, restarts=1)
+    ctx.store.finish_run(1, "limit-wait")
+    ctx.store.pause_lane("ui", NOW + timedelta(minutes=60))
+    ctx.tracker.create_pr(head="foragent/issue-1", base="main", title="Retry in progress", body="Closes #1")
+    ctx.start_runs = True
+    tick(ctx)
+    assert ctx.store.active_runs() == [] and "ready" in ctx.tracker.get_issue(1).labels
+    ctx.now = lambda: NOW + timedelta(minutes=60)
+    tick(ctx)
+    assert ctx.store.get_run(1).status == "running" and ctx.store.get_run(1).lane == "ui"
+    assert (ctx.store.get_run(1).attempts, ctx.store.get_run(1).restarts) == (2, 1)

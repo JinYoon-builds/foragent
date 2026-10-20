@@ -169,6 +169,46 @@ class GitRepo:
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()
 
+    def is_ancestor(self, ancestor: str, head: str) -> bool:
+        try:
+            self._call(["merge-base", "--is-ancestor", ancestor, head])
+        except GitError as exc:
+            if isinstance(exc.__cause__, subprocess.CalledProcessError) and exc.__cause__.returncode == 1:
+                return False
+            raise
+        return True
+
+    def merge_base(self, target: str) -> None:
+        self._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                    "merge", "--no-edit", target])
+
+    def conflict_paths(self) -> list[str]:
+        return list(filter(None, self._call(["diff", "--name-only", "--diff-filter=U", "-z"]).split("\0")))
+
+    def conflict_marker_paths(self, paths: Iterable[str]) -> list[str]:
+        remaining = []
+        for name in sorted(set(paths)):
+            path = self.root / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            value = self._call(["check-attr", "-z", "conflict-marker-size", "--", name]).split("\0")[2]
+            try:
+                width = int(value)
+            except ValueError:
+                width = 7
+            if width <= 0:
+                width = 7
+            marker = re.compile(
+                rf"^(?:<{{{width}}}|\|{{{width}}}|={{{width}}}|>{{{width}}})(?:[ \t].*)?\r?$".encode(),
+                re.MULTILINE,
+            )
+            if marker.search(path.read_bytes()):
+                remaining.append(name)
+        return remaining
+
+    def has_staged_changes(self) -> bool:
+        return self.staged_tree_sha() != self._call(["rev-parse", "HEAD^{tree}"]).strip()
+
     def commit(self, title: str) -> None:
         self._exclude_artifacts()
         self._call([

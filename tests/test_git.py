@@ -298,3 +298,31 @@ def test_non_utf8_diff_decodes_with_replacement_and_patch_keeps_original_bytes(g
     patch = tmp_path / "child.patch"
     git.write_staged_patch("HEAD", patch)
     assert b"caf\xe9\n" in patch.read_bytes()
+
+
+@pytest.mark.parametrize("attribute,width", [
+    ("", 7),
+    ("conflict-marker-size=5", 5),
+    ("conflict-marker-size=12", 12),
+    ("conflict-marker-size=0", 7),
+    ("conflict-marker-size=invalid", 7),
+    ("-conflict-marker-size", 7),
+])
+@pytest.mark.parametrize("marker", ["<", "|", "=", ">"])
+def test_conflict_markers_use_path_attributes_and_include_ancestor(git_history, attribute, width, marker):
+    root = git_history.clone
+    if attribute:
+        (root / ".gitattributes").write_text(f"*.txt {attribute}\n")
+    name = "odd\nname.txt"
+    (root / name).write_bytes(f"content\r\n{marker * width} ancestor\r\n".encode())
+    assert GitRepo(root).conflict_marker_paths([name]) == [name]
+    (root / name).write_text("resolved content\n")
+    assert GitRepo(root).conflict_marker_paths([name]) == []
+
+
+def test_conflict_marker_width_is_selected_per_file(git_history):
+    root = git_history.clone
+    (root / ".gitattributes").write_text("small.txt conflict-marker-size=5\nwide.txt conflict-marker-size=12\n")
+    (root / "small.txt").write_text("<<<<< HEAD\n")
+    (root / "wide.txt").write_text("|||||||||||| ancestor\n")
+    assert GitRepo(root).conflict_marker_paths(["wide.txt", "small.txt", "small.txt"]) == ["small.txt", "wide.txt"]

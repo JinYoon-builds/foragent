@@ -185,7 +185,8 @@ def test_status_groups_issues_awaiting_pr_review(app, capsys, json_output, label
         assert [item["number"] for item in groups[group]] == [1]
         assert sum(len(items) for items in groups.values()) == 1
     else:
-        assert f"{group}:\n  #1 Awaiting review" in output
+        prefix = "running:\n  lane:main:\n    " if group == "running" else f"{group}:\n  "
+        assert f"{prefix}#1 Awaiting review" in output
 
 
 @pytest.mark.parametrize("pid", [None, 123])
@@ -664,3 +665,21 @@ def test_tick_returns_while_notification_child_is_still_running(app, monkeypatch
         for child in children:
             child.terminate()
             child.wait(timeout=5)
+
+
+def test_status_groups_running_and_ready_by_lane(app, capsys):
+    root, git, tracker, store, calls = app
+    tracker.add_issue(1, "Default ready", BODY, ["approved", "ready"])
+    tracker.add_issue(2, "UI running", BODY, ["approved", "running", "lane:ui"])
+    tracker.add_issue(3, "Data ready", BODY, ["approved", "ready", "lane:data"])
+    tracker.add_issue(4, "Unknown ready", BODY, ["approved", "ready", "lane:missing"])
+    store.start_run(2, branch="foragent/issue-2", worktree="wt", lane="ui")
+    status = cli._status(tracker, store, Config(lanes={"ui": {}, "data": {}}))
+    assert list(status["lanes"]) == ["data", "ui", "main"]
+    assert [item["number"] for item in status["lanes"]["main"]["ready"]] == [1, 4]
+    assert [item["number"] for item in status["lanes"]["data"]["ready"]] == [3]
+    assert [item["number"] for item in status["lanes"]["ui"]["running"]] == [2]
+    cli._print_status(status | {"launchd": {"loaded": False}})
+    output = capsys.readouterr().out
+    assert "running:\n  lane:ui:\n    #2 UI running" in output
+    assert "ready:\n  lane:data:\n    #3 Data ready\n  lane:main:\n" in output

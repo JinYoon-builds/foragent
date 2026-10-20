@@ -21,6 +21,11 @@ class Config:
     always_human: list[str] = field(default_factory=list)
     executor: str = "codex"
     executor_model: str | None = None
+    executor_fallback_model: str | None = None
+    lanes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    max_parallel: int = 2
+    transient_max_wait_minutes: int = 30
+    limit_wait_minutes: int = 60
     codex_goal: bool = False
     reviewer: str | None = None
     reviewer_model: str | None = None
@@ -96,15 +101,32 @@ def _validate(values: dict[str, Any]) -> None:
         allowed = _EXECUTORS | {"none"} if key == "reviewer" else _EXECUTORS
         if not isinstance(value, str) or value not in allowed:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
-    for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "review_max"):
+    for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "review_max",
+                "max_parallel", "transient_max_wait_minutes", "limit_wait_minutes"):
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
     for key in ("always_human", "approvers"):
         if not isinstance(values[key], list) or any(not isinstance(item, str) for item in values[key]):
             raise ConfigError(f"{key} must be a list of strings")
-    for key in ("executor_model", "reviewer_model"):
+    for key in ("executor_model", "reviewer_model", "executor_fallback_model"):
         if values[key] is not None and not isinstance(values[key], str):
             raise ConfigError(f"{key} must be a string or null")
+    lanes = values["lanes"]
+    if not isinstance(lanes, dict):
+        raise ConfigError("lanes must be a mapping")
+    for name, lane in lanes.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9-]+", name):
+            raise ConfigError(f"invalid lanes name: {name}")
+        if not isinstance(lane, dict) or lane.keys() - {"paths", "agent", "executor", "model"}:
+            raise ConfigError(f"invalid lanes entry: {name}")
+        paths = lane.get("paths", [])
+        if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+            raise ConfigError(f"lanes.{name}.paths must be a list of strings")
+        for key in ("agent", "executor", "model"):
+            if lane.get(key) is not None and not isinstance(lane[key], str):
+                raise ConfigError(f"lanes.{name}.{key} must be a string or null")
+        if lane.get("executor") is not None and lane["executor"] not in _EXECUTORS:
+            raise ConfigError(f"lanes.{name}.executor must be codex, claude, or null")
     for key in ("acceptance_dir", "base_branch"):
         if not isinstance(values[key], str) or not values[key].strip():
             raise ConfigError(f"{key} must be a nonempty string")

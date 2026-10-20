@@ -1,6 +1,7 @@
 """Bounded subprocesses and process group termination."""
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 import signal
 import subprocess
@@ -59,15 +60,17 @@ def run_logged(
     argv: list[str], *, cwd: Path, timeout_s: int, log_path: Path,
     prompt: str | None = None, capture_stdout: bool = False,
     stdout_path: Path | None = None, terminate_children: bool = False,
+    stderr_path: Path | None = None,
 ) -> tuple[int | None, bool, str]:
     """Append output without buffering an unbounded session in memory."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("ab") as log, (
         stdout_path.open("w+b") if stdout_path is not None else tempfile.TemporaryFile()
-    ) as output:
+    ) as output, (stderr_path.open("ab") if stderr_path is not None else nullcontext()) as errors:
         process = subprocess.Popen(
             argv, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
-            stdout=output if capture_stdout else log, stderr=log if capture_stdout else subprocess.STDOUT,
+            stdout=output if capture_stdout else log,
+            stderr=errors if errors is not None else log if capture_stdout else subprocess.STDOUT,
             start_new_session=True, env=_child_environment(cwd),
         )
         # Executors have their own session, so relay tick termination to them.

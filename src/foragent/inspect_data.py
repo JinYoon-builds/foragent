@@ -2,7 +2,7 @@
 
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -42,6 +42,11 @@ class PreparedCommand:
     output: str
     exit_code: int | None
     timed_out: bool = False
+    stderr: str = ""
+
+    @property
+    def stdout(self) -> str:
+        return self.output
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,18 @@ def load_prepared(store: StateStore, number: int) -> Prepared | None:
         return Prepared(data["base_sha"], [PreparedCommand(**result) for result in data["results"]])
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def inbox_payload(inbox: "Inbox") -> dict:
+    payload = asdict(inbox)
+    for item in payload["items"]:
+        if item["prepared"] is not None:
+            for result in item["prepared"]["results"]:
+                if result["exit_code"] == 0:
+                    result.pop("stderr", None)
+                else:
+                    result["stderr"] = result["stderr"][-1500:]
+    return payload
 
 
 def _try_card(ctx: InspectContext, number: int, body: str) -> TryCard | None:
@@ -258,6 +275,8 @@ def try_lines(item: Item) -> list[str]:
     else:
         lines.append(f"Prepared output (base {item.prepared.base_sha}):")
         for result in item.prepared.results:
-            lines += [f"$ {result.command}", result.output,
-                      f"exit_code={result.exit_code}" + (" (timed out)" if result.timed_out else "")]
+            lines += [f"$ {result.command}", result.output]
+            if result.exit_code != 0 and result.stderr:
+                lines.append("stderr:\n" + result.stderr[-1500:])
+            lines.append(f"exit_code={result.exit_code}" + (" (timed out)" if result.timed_out else ""))
     return lines

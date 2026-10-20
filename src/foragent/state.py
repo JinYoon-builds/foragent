@@ -48,6 +48,12 @@ class Run:
     status: str = "running"
     outcome: str | None = None
     detail: str = ""
+    lane: str = "main"
+    waited_seconds: float = 0
+    waiting_until: str | None = None
+    transient_errors: int = 0
+    fallback_model: str | None = None
+    executor_waited_seconds: float = 0
 
 
 class StateStore:
@@ -134,12 +140,14 @@ class StateStore:
 
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
+        lane: str = "main",
     ) -> Run:
         with self._state_lock():
             timestamp = self._timestamp()
             previous = self.get_run(number)
-            restarts = previous.restarts if previous is not None and previous.outcome in {"stalled-restart", "crashed"} else 0
-            run = Run(number, branch, str(worktree), pid, timestamp, timestamp, restarts=restarts)
+            restarts = previous.restarts if previous is not None and previous.outcome in {"stalled-restart", "crashed", "limit-wait"} else 0
+            attempts = previous.attempts if previous is not None and previous.outcome == "limit-wait" else 1
+            run = Run(number, branch, str(worktree), pid, timestamp, timestamp, attempts=attempts, restarts=restarts, lane=lane)
             self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
             return run
 
@@ -168,6 +176,21 @@ class StateStore:
             if run is not None and run.status == "running":
                 runs.append(run)
         return runs
+
+    def pause_lane(self, lane: str, until: datetime) -> None:
+        with self._state_lock():
+            path = self.root / "lane-pauses.json"
+            pauses = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            timestamp = until.astimezone(UTC).isoformat()
+            pauses[lane] = max(pauses.get(lane, timestamp), timestamp)
+            self._write_json(path, pauses)
+
+    def lane_paused(self, lane: str, now: datetime) -> bool:
+        try:
+            pauses = json.loads((self.root / "lane-pauses.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        return lane in pauses and now < datetime.fromisoformat(pauses[lane])
 
     def finish_run(self, number: int, outcome: str, detail: str = "") -> Run:
         with self._state_lock():
@@ -205,6 +228,16 @@ class StateStore:
     def _state_lock(self) -> Iterator[None]:
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / "state.lock").open("a", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def merge_lock(self) -> Iterator[None]:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / "merge.lock").open("a", encoding="utf-8") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             try:
                 yield

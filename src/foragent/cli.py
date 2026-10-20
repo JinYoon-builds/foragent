@@ -11,10 +11,10 @@ import sys
 from typing import Any
 
 from foragent import __version__, inspect_actions, inspect_data, launchd
-from foragent.config import ConfigError, load_config
+from foragent.config import Config, ConfigError, load_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
-from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING
+from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_order
 from foragent.launcher import spawn_notify, spawn_runner
 from foragent.reasons import parse_reason
 from foragent.inspect_runtime import InspectRuntimeError
@@ -74,7 +74,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _status(tracker: Tracker, store: StateStore) -> dict[str, Any]:
+def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -> dict[str, Any]:
+    config = config or Config()
+    lanes: dict[str, dict[str, list]] = {}
     groups: dict[str, list[dict[str, Any]]] = {
         state: [] for state in (NEEDS_HUMAN, RUNNING, "pr-open", READY, "approved-waiting", "unapproved")
     }
@@ -101,8 +103,13 @@ def _status(tracker: Tracker, store: StateStore) -> dict[str, Any]:
         else:
             group = "unapproved"
         groups[group].append(item)
+        if group in {RUNNING, READY}:
+            run = store.get_run(issue.number) if group == RUNNING else None
+            lane = run.lane if run is not None and run.status == "running" else issue_lane(issue.labels, config.lanes)
+            lanes.setdefault(lane, {RUNNING: [], READY: []})[group].append(item)
     return {
         "issues": groups,
+        "lanes": {lane: lanes[lane] for lane in sorted(lanes, key=lane_order)},
         "active_runs": [asdict(run) for run in store.active_runs()],
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
@@ -112,6 +119,13 @@ def _print_status(status: dict[str, Any]) -> None:
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
     for state, issues in status["issues"].items():
         print(f"{state}:")
+        if state in {RUNNING, READY}:
+            for lane, grouped in status["lanes"].items():
+                if grouped[state]:
+                    print(f"  lane:{lane}:")
+                    for issue in grouped[state]:
+                        print(f"    #{issue['number']} {issue['title']}")
+            continue
         for issue in issues:
             reason = f" [{issue['reason']}]" if issue.get("reason") else ""
             print(f"  #{issue['number']} {issue['title']}{reason}")
@@ -150,7 +164,7 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
     else:
         inbox = inspect_data.collect(ctx)
         if args.json:
-            print(json.dumps(asdict(inbox)))
+            print(json.dumps(inspect_data.inbox_payload(inbox)))
         else:
             print(inspect_data.counts_line(inbox, detailed=True))
             for item in inbox.items:
@@ -218,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 print(f"foragent: inspect notify failed: {' '.join(str(exc).split())}", file=sys.stderr)
         elif args.action == "status":
-            status = _status(tracker, store)
+            status = _status(tracker, store, config)
             status["launchd"] = asdict(launchd.status(root, repo=repo))
             if args.json:
                 print(json.dumps(status))

@@ -99,7 +99,9 @@ def test_prepare_worktree_results_idempotence_and_changed_base(ctx, git_history,
     assert prepared.base_sha == git_command(ctx.repo_root, "rev-parse", "origin/main")
     assert prepared.results[0].exit_code == 0
     assert str(ctx.store.root / "inspect/wt") in prepared.results[0].output
-    assert "머지된 보고서\n오류 예시" in prepared.results[0].output
+    assert "머지된 보고서" in prepared.results[0].output
+    assert "오류 예시" not in prepared.results[0].output
+    assert prepared.results[0].stderr == "오류 예시\n"
     assert (prepared.results[1].output, prepared.results[1].exit_code) == ("완료\n", 7)
     assert local.read_text() == "사용자의 로컬 변경\n"
     assert not list((ctx.store.root / "inspect/wt").iterdir())
@@ -140,7 +142,7 @@ def test_serve_fetches_explicit_base_ref_before_creating_worktree(ctx, git_histo
     runtime.stop(ctx, killer=lambda pid: None)
 
 
-def test_prepare_scrubs_runner_environment_and_bounds_combined_output(ctx, monkeypatch):
+def test_prepare_scrubs_runner_environment_and_bounds_separate_output(ctx, monkeypatch):
     gate_bin = str(Path(__file__).resolve().parents[1] / ".venv/bin")
     for key in ("VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT", "PYTHONHOME", "UV_PROJECT_ENVIRONMENT"):
         monkeypatch.setenv(key, "gate-environment")
@@ -154,7 +156,8 @@ def test_prepare_scrubs_runner_environment_and_bounds_combined_output(ctx, monke
     runtime.prepare(ctx)
     result = collect(ctx).items[0].prepared.results[0]
     assert result.exit_code == 0 and not result.timed_out
-    assert len(result.output) == 3000 and result.output.endswith("끝\n")
+    assert len(result.output) == 3000 and result.output == " " * 3000
+    assert result.stderr == "끝\n"
 
 
 def test_prepare_timeout_uses_60_seconds_and_kills_child_group(ctx, monkeypatch):
@@ -435,3 +438,28 @@ def test_tailscale_url_lookup_is_optional(monkeypatch, result):
         return SimpleNamespace(stdout=result)
     monkeypatch.setattr(runtime.subprocess, "run", run)
     assert runtime.tailscale_name() == ("mini.tailnet.ts.net" if isinstance(result, str) and "DNSName" in result else None)
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_prepared_stdout_stderr_storage_and_public_rendering(ctx, monkeypatch, exit_code):
+    from foragent.inspect_data import inbox_payload
+
+    # These commands have no background children to terminate.
+    monkeypatch.setattr("foragent.processes.kill_process_group", lambda pid: None)
+    command = f"printf 'visible stdout'; printf 'hidden-prefix%1600s' '' >&2; printf 'error-tail' >&2; exit {exit_code}"
+    merged(ctx, card=f"## Try it\nkind: cli\n```sh\n{command}\n```\n")
+    assert runtime.prepare(ctx) == [1]
+    stored = json.loads((ctx.store.root / "inspect/prepared/1.json").read_text())["results"][0]
+    assert stored["output"] == "visible stdout"
+    assert stored["stderr"].endswith("error-tail") and len(stored["stderr"]) == 1500
+    inbox = collect(ctx)
+    result = inbox_payload(inbox)["items"][0]["prepared"]["results"][0]
+    assert result["output"] == "visible stdout"
+    lines = try_lines(inbox.items[0])
+    rendered = "\n".join(lines[lines.index("visible stdout"):])
+    assert "visible stdout" in rendered
+    if exit_code == 0:
+        assert "stderr" not in result and "error-tail" not in rendered
+    else:
+        assert result["stderr"] == stored["stderr"]
+        assert "error-tail" in rendered and "hidden-prefix" not in rendered

@@ -67,3 +67,9 @@
 - #1, #2 merged. 로그에 "Goal set: Every command in the Done when…", Stop 훅 1회 실행, 차단 0회(처음부터 통과).
 - 수정 금지 규칙 별도 시험: 시험 파일 수정을 직접 시키자 편집 도구가 deny에 막힘, "다른 방법으로라도" 지시에도 우회하지 않고 스펙(글자 vs 바이트)을 되물음. 파일 변경 없음. 셸 우회는 규칙이 완전히 막지 못하므로 runner의 경로 잠금 판정을 계속 유지.
 - 사람 개입 0.
+
+## Trial 6 — 2026-10-20, P7d: 레인 2개 병렬, 같은 파일(cli.py)을 고치는 독립 이슈 #17(lane:lines)·#18(lane:stats)
+- 1차: #17 merged. #18은 fresh-base 병합 충돌이 3회 반복되어 retries-exceeded. 원인: 충돌 시 merge를 abort한 뒤 구현자에게 문구만 줘서, 구현자 worktree가 옛 base라 해결할 충돌이 없었음 → 실제 결함 발견.
+- 수정: 충돌 표시를 worktree에 남긴 채 구현자에게 "두 기능을 모두 살려 충돌을 풀라"고 맡기고, runner가 표시 잔존 확인 → 병합 커밋 → Done when 재검증 → 머지.
+- 2차(동시 재실행): #17 merged(시도 1), #18 충돌 → 해결 → merged(시도 2). main에서 E·F 인수 시험 모두 통과. 전체 약 4분, 사람 개입 0.
+- Orca: 시험 저장소를 Orca에 등록하고 외부 worktree 보이기를 켜서, 실행 중 `foragent/issue-17`·`issue-18`이 사이드바에 나타났다 사라짐.
