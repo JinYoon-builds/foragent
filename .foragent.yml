@@ -36,4 +36,13 @@ lanes:
     - skills/fa-orchestrator/**
     agent: fa-orch
     skills: []
+  view:
+    paths:
+    - src/foragent/watch*.py
+    - src/foragent/status*.py
+    - src/foragent/cli.py
+    - src/foragent/notify*.py
+    - src/foragent/i18n*.py
+    agent: fa-view
+    skills: []
 max_parallel: 3
