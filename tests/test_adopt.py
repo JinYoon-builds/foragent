@@ -37,7 +37,13 @@ def test_ci_preserves_every_other_byte(tmp_path, line):
     assert adopt._ci(tmp_path, "tests/acceptance") == [
         {"file": ".github/workflows/ci.yml", "runs_acceptance": False},
     ]
-    assert adopt.ci(tmp_path, True) == {"needs_change": [], "changed": [], "manual": []}
+    assert adopt.ci(tmp_path, True) == {
+        "needs_change": [], "changed": [], "manual": [],
+        "collect_only": [{"file": ".github/workflows/ci.yml",
+                          "add": ("uv run pytest" if b"uv run" in line else
+                                  "python -m pytest" if b"python -m" in line else "pytest")
+                          + " --collect-only -q"}],
+    }
     assert path.read_bytes() == after
 
 
@@ -85,9 +91,9 @@ def test_ci_reports_multiline_pytest_without_editing(tmp_path, style):
 
 
 def test_ci_empty_and_non_workflows_are_ignored(tmp_path):
-    assert adopt.ci(tmp_path, True) == {"needs_change": [], "changed": [], "manual": []}
+    assert adopt.ci(tmp_path, True) == {"needs_change": [], "changed": [], "manual": [], "collect_only": []}
     workflow(tmp_path, b"      - run: pytest\n", filename="ci.txt")
-    assert adopt.ci(tmp_path, True) == {"needs_change": [], "changed": [], "manual": []}
+    assert adopt.ci(tmp_path, True) == {"needs_change": [], "changed": [], "manual": [], "collect_only": []}
 
 
 def test_ci_invalid_yaml_returns_error_before_writing(tmp_path, capsys):
@@ -113,6 +119,42 @@ def test_shared_detection_preserves_quoted_hash_and_resumes_after_comments():
     assert adopt._test_invocations("pytest -k '#tag' --ignore=tests/acceptance # comment\nnpm test") == [
         ["pytest", "-k", "#tag", "--ignore=tests/acceptance"], ["npm", "test"],
     ]
+
+
+@pytest.mark.parametrize("prefix", [
+    "pytest", "uv run pytest", "uv run --no-sync pytest", "python -m pytest",
+    "poetry run python3 -m pytest", "'/path with spaces/pytest'",
+])
+def test_ci_collection_preserves_prefix_and_reports_once(tmp_path, capsys, prefix):
+    path = workflow(tmp_path, (
+        f"      - run: |\n          {prefix} -q --ignore=tests/acceptance\n"
+        "          pytest tests/unit\n          echo --collect-only\n"
+    ).encode())
+    workflow(tmp_path, b"      - run: npm test\n", filename="node.yml")
+    before = path.read_bytes()
+    expected = {"file": ".github/workflows/ci.yml", "add": prefix + " --collect-only -q"}
+    assert adopt.ci(tmp_path)["collect_only"] == [expected]
+    assert cli.main(["adopt", "ci", "--repo-root", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert expected["file"] in output and expected["add"] in output
+    assert path.read_bytes() == before
+
+
+def test_ci_collection_detection_is_per_workflow_and_exclusion_keeps_collection(tmp_path):
+    path = workflow(tmp_path, (
+        b"      - run: pytest --collect-only -q\n"
+        b"      - run: uv run pytest -q\n"
+    ))
+    workflow(tmp_path, b"      - run: python -m pytest -q\n", filename="other.yaml")
+    before = path.read_bytes()
+    report = adopt.ci(tmp_path, True)
+    assert report["collect_only"] == [
+        {"file": ".github/workflows/other.yaml", "add": "python -m pytest --collect-only -q"},
+    ]
+    assert path.read_bytes() == before.replace(
+        b"uv run pytest -q", b"uv run pytest -q --ignore=tests/acceptance",
+    )
+    assert adopt.ci(tmp_path, True)["changed"] == []
 
 
 def test_ci_yaml_merges_and_anchors_only_insert_once(tmp_path):

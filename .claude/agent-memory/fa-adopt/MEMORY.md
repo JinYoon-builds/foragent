@@ -16,3 +16,7 @@
 - baseline은 pytest 실행 부분에 설정 경로의 `--ignore`와 `-rf`를 붙인다. 자식 출력을 수집해 JSON에 섞이지 않게 하고, ANSI 색상을 제거한 `FAILED ` 요약 줄에서 node id를 추출한다. 매개변수에 공백이 있을 수 있으므로 첫 공백으로 자르면 안 된다.
 - 시간 초과는 셸만 종료하면 자식 테스트가 출력 파이프를 계속 잡을 수 있다. baseline은 별도 프로세스 그룹을 만들고 전체를 종료한 뒤 `exit_code: 124`, `passed: false`로 보고한다. 실패·시간 초과·명령 없음 모두 fa 종료 코드는 0이다.
 - issue #4 검증: `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest -q tests/acceptance/test_adopt_baseline.py tests/test_adopt.py tests/test_cli.py` — 92개 통과. 사람 확인 명령은 `.foragent/TRY.md`에 있다.
+- issue #66: `ci()`의 `collect_only`는 워크플로별 첫 pytest 접두사에 ` --collect-only -q`를 붙인 제안 목록이다. 같은 워크플로의 pytest 실행 중 하나에 `--collect-only`가 있으면 제안하지 않는다. 조회는 파일을 바꾸지 않는다.
+- `_test_commands()`는 셸 명령을 분석해 `(원래 실행 접두사 토큰, 정규화한 시험 명령 토큰)`을 반환한다. 기존 `_test_invocations()`는 정규화된 명령만 반환한다. 접두사는 uv/poetry 옵션, python -m 및 실행 경로를 보존하고 `shlex.join()`으로 인용한다.
+- `--exclude-acceptance`는 pytest 수집 전용 명령에 제외 옵션을 붙이지 않는다. fa-init은 제외 승인 여부와 무관하게 `fa adopt ci --json`의 수집 제안을 보여 주며 자동 삽입하지 않는다.
+- issue #66 검증: `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest -q tests/acceptance/test_ci_collect.py tests/test_adopt.py tests/test_cli.py tests/acceptance/test_adopt_ci.py tests/acceptance/test_adopt_survey.py tests/acceptance/test_adopt_baseline.py` — 116개 통과. 전체 수집 1,955개 성공, 기존 CI 범위 `uv run --offline pytest -q --ignore=tests/acceptance` — 1,849개 통과.
