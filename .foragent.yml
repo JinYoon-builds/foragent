@@ -11,3 +11,12 @@ lanes:
     - tests/test_adopt.py
     agent: fa-adopt
     skills: []
+  order:
+    paths:
+    - src/foragent/order.py
+    - src/foragent/config.py
+    - skills/fa-order/**
+    - tests/test_order.py
+    - tests/test_config.py
+    agent: fa-order
+    skills: []
