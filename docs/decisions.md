@@ -312,3 +312,8 @@
 ### D51. 충돌 해결은 따로 예산을 둔다 (2026-10-21, dogfooding 중 발견) — 미구현
 - 계기: #41이 리뷰 라운드로 시도 예산(max_retries)을 다 쓴 뒤, 묶음 브랜치에 넣는 순간 다른 레인과 `cli.py`가 충돌했다. 충돌을 풀 시도가 남지 않아 retries-exceeded로 막혔다.
 - 결정: 충돌 해결 시도는 구현·리뷰 시도와 별도 예산(`conflict_retries`, 기본 2)을 쓴다. 충돌 해결에 실패하면 worktree를 최신 대상 브랜치에서 다시 만들어 한 번 더 구현하는 것(fresh rebase-by-rewrite)까지 runner가 스스로 한다. 그래도 안 되면 `blocked`(D45).
+
+### D52. 테스트 이름 충돌은 구조로 막는다 (2026-10-21, 두 번째 주문 QA에서 발견) — 미구현
+- 계기: #28 구현자가 단위 테스트를 `tests/test_orch_blocked.py`로 만들어, 잠긴 인수 시험 `tests/acceptance/test_orch_blocked.py`와 모듈 이름이 겹쳤다. pytest는 둘을 한 번에 수집하지 못한다. CI는 인수 시험 폴더를 빼고 돌아 못 잡았고, 전체를 함께 돌린 QA에서만 드러났다.
+- 결정: (1) CI에 수집 전용 단계 `uv run pytest --collect-only -q`(인수 시험 폴더 포함, 실행은 안 함)를 더해 이름 충돌·수입 오류를 모든 PR에서 잡는다. (2) init/adopt가 만드는 CI 템플릿에도 같은 단계를 넣는다. 사례별 이름 검사 규칙은 runner에 넣지 않는다(땜질 금지).
+- 당장의 조치: 묶음 브랜치에서 단위 테스트 이름을 `test_orch_blocked_unit.py`로 바꿨다(기계적 이름 변경).
