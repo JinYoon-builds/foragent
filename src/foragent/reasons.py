@@ -16,6 +16,7 @@ class Reason(StrEnum):
     TIMEOUT = "timeout"
     NO_MACHINE_CHECK = "no-machine-check"
     ORCHESTRATOR_TIMEOUT = "orchestrator-timeout"
+    REVIEW_DISPUTE = "review-dispute"
 
 
 GROUP: dict[Reason, str] = {
@@ -29,6 +30,7 @@ GROUP: dict[Reason, str] = {
     Reason.TIMEOUT: "tech-failure",
     Reason.NO_MACHINE_CHECK: "decision",
     Reason.ORCHESTRATOR_TIMEOUT: "tech-failure",
+    Reason.REVIEW_DISPUTE: "tech-failure",
 }
 
 APPROVAL_MARKER = "<!-- foragent:approved"
