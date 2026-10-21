@@ -117,3 +117,29 @@ def test_empty_history_records_zero_gate_counts(setup, tmp_path):
                   "--state-dir", str(tmp_path / "state")) == 0
     row = read_row(scenario)
     assert (row["runs"], row["merged"], row["retries"]) == (0, 0, 0)
+
+
+def test_report_missing_results_needs_no_scenario_definition(tmp_path, capsys):
+    assert cli.main(["bench", "report", str(tmp_path), "--json"]) == 0
+    arms = json.loads(capsys.readouterr().out)["arms"]
+    assert list(arms) == ["A", "B", "C"]
+    for summary in arms.values():
+        assert summary["records"] == 0
+        assert all(value is None for key, value in summary.items() if key != "records")
+    assert not (tmp_path / "results.jsonl").exists()
+
+
+def test_report_medians_exclude_nulls_independently(tmp_path, capsys):
+    metrics = ("elapsed_seconds", "checks_passed", "checks_total", "retries", "tokens", "interventions")
+    rows = [
+        dict(arm="C", **dict(zip(metrics, values)))
+        for values in [(9, None, 3, 0, 100, None),
+                       (1, 2, 7, None, None, None),
+                       (5, 5, None, 3, 0, None)]
+    ]
+    (tmp_path / "results.jsonl").write_text(
+        "\n" + "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8",
+    )
+    assert cli.main(["bench", "report", str(tmp_path), "--json"]) == 0
+    summary = json.loads(capsys.readouterr().out)["arms"]["C"]
+    assert summary == dict(records=3, **dict(zip(metrics, (5, 3.5, 5, 1.5, 50, None))))
