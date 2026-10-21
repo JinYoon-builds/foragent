@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, inspect_actions, inspect_data, launchd, order
+from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, order
 from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -31,6 +31,31 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fa")
     parser.add_argument("--version", action="version", version=f"foragent {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
+    adopt_command = commands.add_parser("adopt", help="Prepare an existing repository for Foragent")
+    adopt_actions = adopt_command.add_subparsers(dest="action", required=True)
+    for name in ("survey", "baseline", "ci"):
+        command = adopt_actions.add_parser(name)
+        command.add_argument("--repo-root", type=Path, default=Path.cwd())
+        command.add_argument("--json", action="store_true")
+        if name == "baseline":
+            command.add_argument("--command", dest="test_command")
+            command.add_argument("--timeout", type=int, default=900)
+        elif name == "ci":
+            command.add_argument("--exclude-acceptance", action="store_true")
+    bench_command = commands.add_parser("bench", help="Record and report benchmark scenarios")
+    bench_actions = bench_command.add_subparsers(dest="action", required=True)
+    record = bench_actions.add_parser("record")
+    record.add_argument("scenario_dir", type=Path)
+    record.add_argument("--arm", choices=("A", "B", "C"), required=True)
+    record.add_argument("--repo", type=Path, required=True)
+    record.add_argument("--started", required=True)
+    record.add_argument("--finished")
+    record.add_argument("--state-dir", type=Path)
+    record.add_argument("--tokens", type=int)
+    record.add_argument("--interventions", type=int)
+    report = bench_actions.add_parser("report")
+    report.add_argument("scenario_dir", type=Path)
+    report.add_argument("--json", action="store_true")
     init = commands.add_parser("init", help="Set up this repository for Foragent")
     init.add_argument("--repo-root", type=Path, default=Path.cwd())
     init.add_argument("--approver", nargs="+", action="extend", dest="approvers")
@@ -237,6 +262,10 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "adopt":
+            return adopt.run(args)
+        if args.command == "bench":
+            return bench.run(args)
         if args.command == "gate" and args.action == "check-done":
             return check_done(args.snapshot.resolve(), args.worktree.resolve(), args.acceptance_dir)
         if args.command == "skills":
