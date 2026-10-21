@@ -170,3 +170,7 @@
 - 결정: `/fa-order`의 인터뷰 단계(묻기 → 되짚기 → 스펙 굳히기)를 엔진으로 분리한다. 설정 `interview: ouroboros | native`(기본 ouroboros). ouroboros면 설치된 `/ouroboros:interview`와 `seed`를 부르고(MCP 서버 없이 스킬 방식으로 충분 — 서버는 비교로 이득이 확인될 때만), 나온 seed를 order가 이슈로 쪼갠다. Ouroboros가 없거나 실패하면 native로 대체. Ouroboros의 run/evolve(실행 루프)는 쓰지 않는다(D18: 작업 안의 반복은 순정 /goal).
 - 이유: 공개 벤치마크에서 Ouroboros의 문제 정의(인터뷰·seed)가 강점으로 확인됨. Foragent의 강점(쪼개기·레인·독립 검증·검수)과 맞물린다. Ouroboros는 거의 매일 릴리스되므로 검증한 버전을 고정하고, 올릴 때 비교를 한 번 돌린다.
 - 검증: D27의 A/B/C 비교(가상 사용자)로 native vs ouroboros를 잰다 — 미구현.
+
+### D30. 일이 생기면 바로 깨운다 (2026-10-21, Jin)
+- 문제: gate는 launchd 5분 주기로만 깨어나서, 승인 직후 최대 5분, 그리고 이슈 하나가 끝날 때마다 다음 이슈까지 최대 5분을 기다렸다. "끝나면 바로 다음 일을 가져온다"는 핵심 가치와 어긋나고 처리량을 잃는다.
+- 결정: 일이 생기는 순간 곧바로 tick을 분리 실행한다 — `fa order publish --approve` 직후, runner가 run을 끝낸 직후(어떤 결과든), `fa inspect retry`/`answer` 직후, `fa gate install` 직후. tick 잠금이 겹침을 막는다. launchd 5분 주기는 놓친 것을 잡는 안전망으로 남긴다.
