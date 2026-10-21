@@ -27,6 +27,7 @@ def test_exact_defaults(repo):
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
+        "orchestrator_timeout_minutes": 30,
         "repo": None, "board": None, "language": "en", "codex_goal": False, "review_level": "low",
         "interview": "ouroboros", "ouroboros_version": None,
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
@@ -113,6 +114,8 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
 
 
 @pytest.mark.parametrize("key,value", [
+    ("orchestrator_timeout_minutes", 0), ("orchestrator_timeout_minutes", -1),
+    ("orchestrator_timeout_minutes", True), ("orchestrator_timeout_minutes", "5"),
     ("interview", "magic"), ("interview", None), ("interview", []), ("interview", True),
     ("ouroboros_version", 52), ("ouroboros_version", []), ("ouroboros_version", False),
     ("review", "FAST"), ("review", None), ("review", []),

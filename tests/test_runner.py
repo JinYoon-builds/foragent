@@ -204,7 +204,7 @@ def test_board_tracks_runner_transitions_without_affecting_outcome(run_case, mon
     c.ctx.config = replace(c.ctx.config, board=identity)
     if question:
         c.executor.steps = [{".foragent/QUESTION.md": "선택이 필요합니다."}]
-    expected = ["Running", "Needs human"] if question else ["Running", "PR open", "Done"]
+    expected = ["Running", "Blocked"] if question else ["Running", "PR open", "Done"]
     calls = []
     setter = board.set_status
 
@@ -281,7 +281,7 @@ def test_merge_does_not_ignore_close_failure_for_open_issue(run_case, monkeypatc
     assert run_issue(1, c.ctx) == "error"
     assert c.tracker.merged_prs == [2]
     assert c.tracker.get_issue(1).state == "open"
-    assert "needs-human" in c.tracker.get_issue(1).labels
+    assert "blocked" in c.tracker.get_issue(1).labels
     assert "HTTP 403 Forbidden" in c.tracker.list_comments(1)[-1].body
 
 
@@ -324,7 +324,7 @@ def test_changed_pr_head_is_held_as_risk_high(run_case, monkeypatch, when):
 
     assert run_issue(1, c.ctx) == "held"
     assert c.tracker.merged_prs == []
-    assert c.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert c.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert c.store.load_flag(1).reason == Reason.RISK_HIGH
     comment = c.tracker.list_comments(1)[-1].body
     assert parse_reason(comment) == Reason.RISK_HIGH
@@ -553,7 +553,7 @@ def test_fetched_worktree_blob_mismatch_invalidates_approval(run_case, content):
     c.history.update({ACCEPTANCE: content})
     assert run_issue(1, c.ctx) == "hash-mismatch"
     assert c.store.load_approval(1) is None and c.store.load_flag(1).reason == Reason.HASH_MISMATCH
-    assert c.tracker.get_issue(1).labels == {"needs-human"}
+    assert c.tracker.get_issue(1).labels == {"blocked"}
     assert c.executor.calls == [] and c.tracker.created_prs == []
 
 
@@ -1824,7 +1824,7 @@ def test_unusable_review_saves_full_result_and_comments_only_latest_raw_prefix(r
                 for raw in (first, second)]
     (enable_native_reviewer if native else enable_reviewer)(c, messages)
     assert run_issue(1, c.ctx) == "held"
-    assert "needs-human" in c.tracker.get_issue(1).labels
+    assert "blocked" in c.tracker.get_issue(1).labels
     assert c.tracker.merged_prs == []
     directory = c.store.root / "runs/issue-1"
     assert (directory / "review-1.txt").read_text() == first

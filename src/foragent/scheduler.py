@@ -13,8 +13,8 @@ from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitRepo
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
-from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
-from foragent.reasons import Reason, format_approval_comment
+from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
+from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import kill_process_group
 from foragent.runner import _batch_pr
 from foragent.state import Approval, StateStore
@@ -185,7 +185,7 @@ def _crash_detail(ctx: TickContext, number: int) -> str:
 
 def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> None:
     number = issue.number
-    if issue.state != "open" or NEEDS_HUMAN in issue.labels:
+    if issue.state != "open" or issue.labels & {BLOCKED, NEEDS_HUMAN}:
         ctx.tracker.remove_labels(number, [RUNNING])
         return
     failures = 0
@@ -233,7 +233,7 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
 
 def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickReport) -> None:
     issue = ctx.tracker.get_issue(number)
-    if issue.state != "open" or NEEDS_HUMAN in issue.labels:
+    if issue.state != "open" or issue.labels & {BLOCKED, NEEDS_HUMAN}:
         ctx.tracker.remove_labels(number, [RUNNING])
     elif restarts <= 1:
         ctx.tracker.add_labels(number, [READY])
@@ -349,6 +349,32 @@ def tick(ctx: TickContext) -> TickReport:
         return _tick_locked(ctx)
 
 
+def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
+    if BLOCKED not in issue.labels or NEEDS_HUMAN in issue.labels:
+        return issue
+    comments = [
+        comment for comment in ctx.tracker.list_comments(issue.number)
+        if re.fullmatch(
+            r"<!-- foragent:blocked reason=[a-z-]+ -->",
+            comment.body.partition("\n")[0].removesuffix("\r"),
+        )
+    ]
+    latest = max(comments, key=lambda c: (datetime.fromisoformat(c.created_at), c.id), default=None)
+    if latest is None or ctx.now() - datetime.fromisoformat(latest.created_at) <= timedelta(
+        minutes=ctx.config.orchestrator_timeout_minutes,
+    ):
+        return issue
+    ctx.tracker.add_labels(issue.number, [NEEDS_HUMAN])
+    ctx.tracker.comment(issue.number, format_comment(
+        Reason.ORCHESTRATOR_TIMEOUT,
+        "The orchestrator has not responded to this blocker.",
+        f"Blocked since {latest.created_at}; timeout: {ctx.config.orchestrator_timeout_minutes} minutes.\n\n"
+        f"Latest blocker:\n{latest.body}",
+    ))
+    report.actions.append(f"#{issue.number} flagged orchestrator-timeout")
+    return replace(issue, labels=issue.labels | {NEEDS_HUMAN})
+
+
 def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
     issues = {issue.number: issue for issue in ctx.tracker.list_open_issues()}
     parents: set[int] = set()
@@ -396,12 +422,14 @@ def _tick_locked(ctx: TickContext) -> TickReport:
 
     for issue in sorted(ctx.tracker.list_open_issues(), key=lambda issue: issue.number):
         issue = _recover_orphan(ctx, issue, report)
+        issue = _escalate_overdue_blocker(ctx, issue, report)
         lane = lane_for(issue)
-        previous_flag = ctx.store.load_flag(issue.number) if NEEDS_HUMAN in issue.labels else None
-        if NEEDS_HUMAN in issue.labels and (
+        waiting_labels = issue.labels & {BLOCKED, NEEDS_HUMAN}
+        previous_flag = ctx.store.load_flag(issue.number) if waiting_labels else None
+        if waiting_labels and (
             previous_flag is None or previous_flag.reason != Reason.HASH_MISMATCH
         ):
-            board.sync_status(ctx, issue, "Needs human")
+            board.sync_status(ctx, issue, "Needs human" if NEEDS_HUMAN in waiting_labels else "Blocked")
             continue
         if APPROVED not in issue.labels:
             continue
@@ -412,11 +440,11 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             )
         if event is None:
             continue
-        if NEEDS_HUMAN in issue.labels:
+        if waiting_labels:
             if datetime.fromisoformat(event.created_at) <= datetime.fromisoformat(previous_flag.flagged_at):
                 continue
-            ctx.tracker.remove_labels(issue.number, [NEEDS_HUMAN])
-            issue = replace(issue, labels=issue.labels - {NEEDS_HUMAN})
+            ctx.tracker.remove_labels(issue.number, waiting_labels)
+            issue = replace(issue, labels=issue.labels - waiting_labels)
             report.actions.append(f"#{issue.number} resumed after re-approval")
 
         approval = ctx.store.load_approval(issue.number)
@@ -458,7 +486,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             if (
                 issue.state != "open" or issue.is_pull_request
                 or not {APPROVED, READY}.issubset(issue.labels)
-                or issue.labels & {NEEDS_HUMAN, RUNNING} or lane_for(issue) != lane
+                or issue.labels & {BLOCKED, NEEDS_HUMAN, RUNNING} or lane_for(issue) != lane
             ):
                 continue
             approval = ctx.store.load_approval(number)
