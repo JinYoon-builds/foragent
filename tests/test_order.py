@@ -563,7 +563,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
     assert result["feedback"] == [{"number": 1, "title": "Feedback", "body": "Fix it\n\nAbout #8.", "about": 8}]
@@ -581,6 +581,47 @@ def test_context_all_sections_and_gate_groups(tmp_path):
     assert not any(path.startswith((".git/", ".venv/", "node_modules/")) for path in result["repo"]["tree"])
     (tmp_path / "package.json").write_text('{"scripts":{"test":"test"}}')
     assert "npm test" in order.context(tmp_path, config, tracker)["repo"]["test_commands"]
+
+
+@pytest.mark.parametrize("requested,pin,engine", [
+    ("ouroboros", None, "ouroboros"), ("ouroboros", "0.52.0", "ouroboros"),
+    ("ouroboros", "0.51.1", "native"), ("ouroboros", "", "native"),
+    ("native", None, "native"), ("native", "0.51.1", "native"),
+])
+def test_interview_resolution_uses_first_installed_entry(tmp_path, monkeypatch, requested, pin, engine):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    path = tmp_path / "home/.claude/plugins/installed_plugins.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"plugins": {
+        "other@ouroboros": [{"version": "9.0.0"}],
+        "ouroboros@marketplace": [{"version": "0.52.0"}, {"version": "0.51.1"}],
+    }}))
+    result = order.context(tmp_path, Config(interview=requested, ouroboros_version=pin), FakeTracker())["interview"]
+    reason = None
+    if requested == "ouroboros" and pin is not None and pin != "0.52.0":
+        reason = f"ouroboros version mismatch: installed 0.52.0, pinned {pin}"
+    assert result == {"requested": requested, "engine": engine, "installed_version": "0.52.0",
+                      "pinned_version": pin, "reason": reason}
+
+
+@pytest.mark.parametrize("contents", [
+    None, b"{", b"\xff", b"null", b"[]", b"{}", b'{"plugins": []}',
+    b'{"plugins": {"ouroboros-other@marketplace": [{"version": "0.52.0"}]}}',
+    b'{"plugins": {"ouroboros@marketplace": []}}',
+    b'{"plugins": {"ouroboros@marketplace": {"version": "0.52.0"}}}',
+    b'{"plugins": {"ouroboros@marketplace": [null]}}',
+    b'{"plugins": {"ouroboros@marketplace": [{}]}}',
+    b'{"plugins": {"ouroboros@marketplace": [{"version": 52}]}}',
+])
+def test_missing_or_broken_plugins_fall_back_to_native(tmp_path, monkeypatch, contents):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    if contents is not None:
+        path = tmp_path / "home/.claude/plugins/installed_plugins.json"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(contents)
+    result = order.context(tmp_path, Config(ouroboros_version="0.51.1"), FakeTracker())["interview"]
+    assert result == {"requested": "ouroboros", "engine": "native", "installed_version": None,
+                      "pinned_version": "0.51.1", "reason": "ouroboros not installed"}
 
 
 def test_order_cli_context_and_publish_dry_run(publishing, plan, monkeypatch, capsys):

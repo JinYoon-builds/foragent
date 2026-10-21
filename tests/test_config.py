@@ -30,6 +30,7 @@ def test_exact_defaults(repo):
         "repo": None, "language": "en", "codex_goal": False, "review_level": "medium",
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
+        "interview": "ouroboros", "ouroboros_version": None,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
                   "m": {"codex_effort": "high", "claude_model": None},
                   "l": {"codex_effort": "xhigh", "claude_model": None}},
@@ -48,6 +49,30 @@ def test_tiers_merge_global_and_repository_fields(repo, tmp_path):
     assert config.tiers["s"] == {"claude_model": "small", "codex_effort": "low"}
     assert config.tiers["m"]["codex_effort"] == "xhigh"
     assert config.tiers["l"] == DEFAULTS["tiers"]["l"]
+
+
+@pytest.mark.parametrize("value", ["magic", "Ouroboros", "", None, True, 1, [], {}])
+def test_invalid_interview_names_both_allowed_engines(repo, value):
+    write_settings(repo / ".foragent.yml", {"interview": value})
+    with pytest.raises(ConfigError, match="interview.*ouroboros.*native"):
+        load_config(repo)
+
+
+@pytest.mark.parametrize("value", [True, 1, 0.52, [], {}])
+def test_ouroboros_version_requires_string_or_null(repo, value):
+    write_settings(repo / ".foragent.yml", {"ouroboros_version": value})
+    with pytest.raises(ConfigError, match="ouroboros_version.*string or null"):
+        load_config(repo)
+
+
+def test_interview_global_settings_and_local_overrides(repo, tmp_path):
+    global_path = tmp_path / "global.yml"
+    write_settings(global_path, {"interview": "native", "ouroboros_version": "0.51.1"})
+    config = load_config(repo, global_path)
+    assert (config.interview, config.ouroboros_version) == ("native", "0.51.1")
+    write_settings(repo / ".foragent.yml", {"interview": "ouroboros", "ouroboros_version": None})
+    config = load_config(repo, global_path)
+    assert (config.interview, config.ouroboros_version) == ("ouroboros", None)
 
 
 @pytest.mark.parametrize("value", [[], {"xl": {}}, {"s": None}, {"s": {"codex_effort": []}},
