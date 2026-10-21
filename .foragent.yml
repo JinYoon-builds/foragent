@@ -27,3 +27,4 @@ lanes:
     - tests/test_bench.py
     agent: fa-bench
     skills: []
+max_parallel: 3
