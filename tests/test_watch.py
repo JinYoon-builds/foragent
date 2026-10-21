@@ -80,6 +80,52 @@ def test_open_order_after_last_child_and_no_order_are_renderable(tmp_path):
     assert "1/1" in output and "all done" in output
 
 
+@pytest.mark.parametrize("language,idle_label,all_idle", [
+    ("en", "idle lanes:", "all lanes are idle"),
+    ("ko", "쉬는 레인:", "모든 레인이 쉬는 중"),
+])
+def test_idle_done_count_and_automatic_unfold_keep_original_lane_numbers(
+    tmp_path, language, idle_label, all_idle,
+):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(language=language, lanes={
+        "api": {"title": "Server", "emoji": "🔧"},
+        "docs": {"title": "Docs", "emoji": "🧩"},
+    })
+    tracker.add_issue(90, "Order")
+    finish(tracker, store, 1, 90, lane="docs")
+    idle = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80)
+    folded = [line for line in idle.splitlines() if idle_label in line]
+    assert len(folded) == 1
+    assert "1 🔧 Server · 2 🧩 Docs ✓1 · 3 🧰" in folded[0]
+    assert all_idle in idle and "1–3" in idle
+    assert "▐" not in idle
+
+    tracker.add_issue(2, "Next docs task", labels=["approved", "ready", "lane:docs"])
+    active = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80)
+    assert all_idle not in active
+    assert any("2 🧩 Docs" in line and "▐" in line for line in active.splitlines())
+    folded = next(line for line in active.splitlines() if idle_label in line)
+    assert "1 🔧 Server · 3 🧰" in folded and "Docs" not in folded
+    assert "1–3" in active
+
+
+@pytest.mark.parametrize("width", [40, 80, 120])
+def test_work_table_has_one_row_per_busy_lane_with_unicode_ellipsis(tmp_path, width):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(language="ko", lanes={"api": {"title": "서버", "emoji": "🔧"}})
+    tracker.add_issue(1, "긴 작업 이름 " * 30, labels=["approved", "ready", "lane:api"])
+    frame = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=width)
+    lines = frame.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("┌") and "지금 하는 일" in line)
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("└"))
+    assert end - start == 3  # heading, column names, one work row, bottom border
+    assert "…" in lines[start + 2]
+    assert all(watch._cells(line) <= width for line in lines)
+
+
 def test_live_liveness_crosses_ten_minutes_between_refreshes(tmp_path):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
