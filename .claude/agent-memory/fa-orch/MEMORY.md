@@ -14,3 +14,9 @@
 - `review-dispute`는 반박이 있는 상태로 진행한 리뷰 두 회에서 연속으로 같은 지적이 나왔을 때의 기술 차단이다. 공백·대소문자·목록 기호를 정규화한다. 비정형 원문은 하나의 지적으로 비교하여 공통 서문만으로 분쟁을 만들지 않는다.
 - #29 인수 시험: `uv run pytest -q tests/acceptance/test_orch_review_handoff.py`. `tests/test_orch_blocked.py`와 `tests/acceptance/test_orch_blocked.py`는 모듈명이 같아 기본 pytest 모드로 함께 수집하면 충돌하므로 별도로 실행한다.
 - 로컬 스킬 기능과 병합할 때 `recreate_worktree()` 안에서 작업공간 생성 직후 `_inject_lane_skills(ctx, n, git)`를 호출한다. 대상 브랜치 전환과 패치 충돌 복구 모두 이 함수를 쓰므로 `TRY.md`·`REBUTTAL.md` 보존과 스킬 복원·커밋 제외 경로를 함께 유지할 수 있다.
+- #30의 오케스트레이터 동작은 `src/foragent/orch.py`, CLI 연결은 `cli.py`의 `_orch()`에 있다. 이슈 대상 동작은 같은 요약을 `orch-events.jsonl`과 `<!-- foragent:orch -->` 댓글에 남긴다. 대상 이슈가 없는 list·log도 `issue: null` 이벤트를 남기며, log는 자신을 기록하기 전 최근 20건을 보여 준다.
+- `runner.review_only(n, ctx)`는 PR의 정확한 SHA를 분리 작업공간에서 검토한다. 구현자를 부르거나 PR 제목·본문을 덮어쓰지 않는다. `_pr_policy()`·`_wait_pr_ci()`·`_merge_verified_pr()`는 일반 실행과 공유하여 fast/batch/careful 정책과 CI·커밋 일치 검사를 유지한다.
+- `resolve pass`는 리뷰만 대신한다. 승인 스냅샷·현재 승인 라벨·본문 일치·실제 Done when·CI가 필요하다. batch 자식은 해당 batch 브랜치가 PR 대상일 때만 자동 병합할 수 있다.
+- 구현 힌트는 `<state>/hints/<n>.txt`에서 다음 구현 호출 직전에 한 번 소비한다. `build_prompt(orchestrator_hint=...)`에 넣어 `/goal` 호출문은 첫 줄에 유지한다. PR 재검토의 원본 리뷰 번호는 기존 파일의 최댓값 다음을 사용한다.
+- #30 인수 시험은 `uv run pytest -q tests/acceptance/test_orch_verbs.py`, 추가 경계 시험은 `tests/test_orch.py`다. 캐시 쓰기 제한이 있는 이 환경에서는 위의 준비된 임시 uv 캐시를 사용한다.
+- #30 검증: 지정 인수 시험 7개, 신규 경계 시험 19개, 기존 runner·CLI·scheduler·blocked·reasons·inspect 회귀 시험 679개 및 #28·#29 인수 시험 6개 통과. 신규 경계 시험은 승인 누락·본문 변경, PR 커밋 변경, 검사 자체의 파일 수정, CI 대기 초과, batch/careful 대기를 확인한다.

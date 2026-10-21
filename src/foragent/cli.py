@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, order
+from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, orch, order
 from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -114,6 +114,26 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
     install.add_argument("id")
     install.add_argument("--repo-root", type=Path, required=True)
     install.add_argument("--commit", action="store_true", help="Install for committing; requires an open-source license")
+    orch_command = commands.add_parser("orch", help="Diagnose and recover blocked issues")
+    orch_command.add_argument("--repo-root", type=Path, default=Path.cwd())
+    orch_actions = orch_command.add_subparsers(dest="action", required=True)
+    for name in ("list", "rerun-review", "retry", "resolve", "escalate", "log"):
+        command = orch_actions.add_parser(name)
+        command.add_argument("--repo-root", type=Path, default=argparse.SUPPRESS)
+        if name == "list":
+            command.add_argument("--json", action="store_true")
+        elif name != "log":
+            command.add_argument("number", type=int)
+        if name == "retry":
+            command.add_argument("--hint")
+        elif name == "resolve":
+            command.add_argument("--verdict", choices=("pass", "fail"), required=True)
+            command.add_argument("--note", required=True)
+        elif name == "escalate":
+            command.add_argument("--summary", required=True)
+            command.add_argument("--tried", required=True)
+            command.add_argument("--option", action="append", default=[])
+            command.add_argument("--recommend", type=int)
     gate = commands.add_parser("gate", help="Schedule and inspect approved issues")
     actions = gate.add_subparsers(dest="action", required=True)
     for name in ("tick", "status"):
@@ -266,6 +286,39 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
                 print(f"  {item.url}")
 
 
+def _orch(args: argparse.Namespace, ctx: RunContext) -> None:
+    if args.action == "list":
+        items = orch.list_blocked(ctx)
+        if args.json:
+            print(json.dumps(items, ensure_ascii=False))
+            return
+        if not items:
+            print("No blocked issues.")
+        for item in items:
+            print(f"#{item['number']} {item['title']} [{item['lane']}] "
+                  f"reason={item['reason']} blocked_at={item['blocked_at']}")
+            print(item["details"])
+            for review in item["reviews"]:
+                print(f"Review: {review['path']}\n{review['text']}")
+            print(f"Log (last 60 lines): {item['log_path']}\n{item['log_tail']}")
+    elif args.action == "log":
+        for event in orch.log(ctx):
+            issue = f" #{event['issue']}" if event["issue"] is not None else ""
+            print(f"{event['at']} {event['kind']}{issue}: {event['summary']}")
+    else:
+        outcome = None
+        if args.action == "rerun-review":
+            outcome = orch.rerun_review(ctx, args.number)
+        elif args.action == "retry":
+            orch.retry(ctx, args.number, args.hint)
+        elif args.action == "resolve":
+            outcome = orch.resolve(ctx, args.number, args.verdict, args.note)
+        elif args.action == "escalate":
+            orch.escalate(ctx, args.number, args.summary, args.tried, args.option, args.recommend)
+        print(f"#{args.number}: {args.action}" + (f" ({outcome})" if outcome else ""))
+        kick_tick(ctx.repo_root)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -332,6 +385,12 @@ def main(argv: list[str] | None = None) -> int:
                 ).summary())
             return 0
         store = StateStore.for_repo(repo)
+        if args.command == "orch":
+            _orch(args, RunContext(
+                repo=repo, repo_root=root, tracker=tracker, store=store,
+                config=config, git=git, now=lambda: datetime.now(UTC),
+            ))
+            return 0
         inspect_ctx = inspect_data.InspectContext(
             tracker, store, repo, config, lambda: datetime.now(UTC), repo_root=root, git=git,
         )
@@ -374,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError,
             inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError,
-            order.PlanError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:
+            order.PlanError, LaneError, SkillError, PathError, orch.OrchError, json.JSONDecodeError) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
         return 1
 
