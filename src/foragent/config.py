@@ -50,6 +50,8 @@ class Config:
     base_branch: str = "main"
     repo: str | None = None
     language: str = "en"
+    interview: str = "ouroboros"
+    ouroboros_version: str | None = None
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
@@ -84,6 +86,8 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 
 
 def _validate(values: dict[str, Any]) -> None:
+    if not isinstance(values["interview"], str) or values["interview"] not in {"ouroboros", "native"}:
+        raise ConfigError("interview must be ouroboros or native")
     if type(values["codex_goal"]) is not bool:
         raise ConfigError("codex_goal must be a boolean")
     if not isinstance(values["review_level"], str) or values["review_level"] not in {
@@ -120,6 +124,8 @@ def _validate(values: dict[str, Any]) -> None:
     for key in ("executor_model", "reviewer_model", "executor_fallback_model"):
         if values[key] is not None and not isinstance(values[key], str):
             raise ConfigError(f"{key} must be a string or null")
+    if values["ouroboros_version"] is not None and not isinstance(values["ouroboros_version"], str):
+        raise ConfigError('ouroboros_version must be a string or null; quote YAML versions, e.g. "1.0"')
     lanes = values["lanes"]
     if not isinstance(lanes, dict):
         raise ConfigError("lanes must be a mapping")

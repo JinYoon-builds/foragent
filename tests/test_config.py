@@ -28,6 +28,7 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
         "repo": None, "language": "en", "codex_goal": False, "review_level": "medium",
+        "interview": "ouroboros", "ouroboros_version": None,
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
@@ -48,6 +49,39 @@ def test_tiers_merge_global_and_repository_fields(repo, tmp_path):
     assert config.tiers["s"] == {"claude_model": "small", "codex_effort": "low"}
     assert config.tiers["m"]["codex_effort"] == "xhigh"
     assert config.tiers["l"] == DEFAULTS["tiers"]["l"]
+
+
+def test_interview_settings_merge_and_clear_pin(repo, tmp_path):
+    global_path = tmp_path / "global.yml"
+    write_settings(global_path, {"interview": "native", "ouroboros_version": "0.52.0"})
+    config = load_config(repo, global_path)
+    assert config.interview == "native" and config.ouroboros_version == "0.52.0"
+    write_settings(repo / ".foragent.yml", {"interview": "ouroboros", "ouroboros_version": None})
+    config = load_config(repo, global_path)
+    assert config.interview == "ouroboros" and config.ouroboros_version is None
+
+
+@pytest.mark.parametrize("value", ["other", "Ouroboros", "", None, [], {}, True, 1])
+def test_invalid_interview_names_both_allowed_engines(repo, value):
+    write_settings(repo / ".foragent.yml", {"interview": value})
+    with pytest.raises(ConfigError, match="interview.*ouroboros.*native"):
+        load_config(repo)
+
+
+@pytest.mark.parametrize("value", [1, True, [], {}])
+def test_ouroboros_pin_requires_string_or_null(repo, value):
+    write_settings(repo / ".foragent.yml", {"ouroboros_version": value})
+    with pytest.raises(ConfigError, match="ouroboros_version.*string or null"):
+        load_config(repo)
+
+
+@pytest.mark.parametrize("version", ["0.52", "1.0"])
+def test_numeric_yaml_version_explains_quoting(repo, version):
+    (repo / ".foragent.yml").write_text(f"ouroboros_version: {version}\n")
+    with pytest.raises(ConfigError, match="ouroboros_version.*quote"):
+        load_config(repo)
+    (repo / ".foragent.yml").write_text(f'ouroboros_version: "{version}"\n')
+    assert load_config(repo).ouroboros_version == version
 
 
 @pytest.mark.parametrize("value", [[], {"xl": {}}, {"s": None}, {"s": {"codex_effort": []}},

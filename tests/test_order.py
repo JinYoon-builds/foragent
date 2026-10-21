@@ -540,6 +540,119 @@ def test_lane_skills_and_notices_reach_remote_runner_worktree(offline_publicatio
     assert len([args for args in calls if args[0] == "push"]) == 1
 
 
+@pytest.fixture(autouse=True)
+def isolated_claude_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+
+@pytest.fixture
+def interview_files(tmp_path):
+    root, home = tmp_path / "repo", tmp_path / "home"
+    root.mkdir()
+    registry = home / ".claude/plugins/installed_plugins.json"
+    registry.parent.mkdir(parents=True)
+    return root, home, registry
+
+
+@pytest.mark.parametrize("requested,pin,engine,reason", [
+    ("ouroboros", None, "ouroboros", None),
+    ("ouroboros", "0.52.0", "ouroboros", None),
+    ("ouroboros", "0.51.1", "native", "Ouroboros version mismatch: installed 0.52.0, pinned 0.51.1"),
+    ("native", None, "native", None),
+    ("native", "0.51.1", "native", None),
+])
+def test_context_interview_resolution(interview_files, requested, pin, engine, reason):
+    root, _, path = interview_files
+    path.write_text(json.dumps({"plugins": {
+        "other@marketplace": [{"version": "9.0.0"}],
+        "ouroboros@marketplace": [{"version": "0.52.0"}, {"version": "0.51.1"}],
+    }}))
+    config = Config(interview=requested, ouroboros_version=pin)
+    assert order.context(root, config, FakeTracker())["interview"] == {
+        "requested": requested, "engine": engine, "installed_version": "0.52.0",
+        "pinned_version": pin, "reason": reason,
+    }
+
+
+@pytest.mark.parametrize("pin", ["", "   ", "v0.52.0", "V0.52.0", " 0.52.0 ", "0.52.0-rc.1"])
+def test_interview_pin_must_equal_installed_string(interview_files, pin):
+    root, _, path = interview_files
+    path.write_text(json.dumps({"plugins": {"ouroboros@marketplace": [{"version": "0.52.0"}]}}))
+    result = order.context(root, Config(ouroboros_version=pin), FakeTracker())["interview"]
+    assert result["engine"] == "native"
+    assert result["installed_version"] == "0.52.0" and result["pinned_version"] == pin
+    assert result["reason"] == f"Ouroboros version mismatch: installed 0.52.0, pinned {pin}"
+
+
+@pytest.mark.parametrize("content", [
+    None, b"{broken", b"\xff", b"null", b"[]", b"{}", b'{"plugins": null}',
+    b'{"plugins": []}', b'{"plugins": {"ouroboros-other@marketplace": [{"version": "1"}]}}',
+    b'{"plugins": {"ouroboros@marketplace": []}}',
+    b'{"plugins": {"ouroboros@marketplace": null}}',
+    b'{"plugins": {"ouroboros@marketplace": {"version": "1"}}}',
+    b'{"plugins": {"ouroboros@marketplace": [null]}}',
+    b'{"plugins": {"ouroboros@marketplace": [{}]}}',
+    b'{"plugins": {"ouroboros@marketplace": [{"version": 1}]}}',
+    b'{"plugins": {"ouroboros@marketplace": [{"version": " "}]}}',
+    b'{"plugins": {"ouroboros@marketplace": [null, {"version": "0.52.0"}]}}',
+])
+def test_context_interview_missing_or_broken_plugins(interview_files, content):
+    root, _, path = interview_files
+    if content is not None:
+        path.write_bytes(content)
+    assert order.context(root, Config(ouroboros_version="0.52.0"), FakeTracker())["interview"] == {
+        "requested": "ouroboros", "engine": "native", "installed_version": None,
+        "pinned_version": "0.52.0", "reason": "Ouroboros not installed",
+    }
+
+
+def test_context_interview_unreadable_plugins(interview_files, monkeypatch):
+    root, _, path = interview_files
+    read_text = type(path).read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path.name == "installed_plugins.json":
+            raise PermissionError("unreadable plugin registry")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(path), "read_text", unreadable)
+    result = order.context(root, Config(), FakeTracker())["interview"]
+    assert result["engine"] == "native" and "not installed" in result["reason"]
+    assert result["installed_version"] is None
+
+
+@pytest.mark.parametrize("scope", [None, "user", "project", "local", "managed", "enterprise"])
+def test_interview_uses_first_install_regardless_of_scope(interview_files, scope):
+    root, _, path = interview_files
+    entry = {"version": "0.52.0"}
+    if scope:
+        entry.update(scope=scope, projectPath=str(root.parent / "other-project"))
+    path.write_text(json.dumps({"plugins": {"ouroboros@marketplace": [
+        entry, {"scope": "local", "projectPath": str(root), "version": "0.51.1"},
+    ]}}))
+    result = order.context(root, Config(), FakeTracker())["interview"]
+    assert result["engine"] == "ouroboros" and result["installed_version"] == "0.52.0"
+
+
+def test_interview_uses_home_registry_only(interview_files, monkeypatch):
+    root, home, path = interview_files
+    path.write_text(json.dumps({"plugins": {"ouroboros@marketplace": [{"version": "0.52.0"}]}}))
+    directory = root.parent / "custom-claude"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(directory))
+    custom_registry = directory / "plugins/installed_plugins.json"
+    custom_registry.parent.mkdir(parents=True)
+    custom_registry.write_text(json.dumps({"plugins": {"ouroboros@custom": [{"version": "9.0.0"}]}}))
+    (home / ".claude/settings.json").write_text(json.dumps({"enabledPlugins": {
+        "ouroboros@marketplace": False,
+    }}))
+    (root / ".claude").mkdir()
+    (root / ".claude/settings.json").write_text("{broken")
+    (root / ".claude/settings.local.json").write_text('{"unrelated": true}')
+    result = order.context(root, Config(), FakeTracker())["interview"]
+    assert result["engine"] == "ouroboros" and result["installed_version"] == "0.52.0"
+
+
 def test_context_all_sections_and_gate_groups(tmp_path):
     tracker = FakeTracker()
     tracker.add_issue(1, "Feedback", "Fix it\n\nAbout #8.", ["feedback"])
@@ -563,7 +676,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
+    assert set(result) == {"interview", "language", "lanes", "tiers", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
     assert result["feedback"] == [{"number": 1, "title": "Feedback", "body": "Fix it\n\nAbout #8.", "about": 8}]

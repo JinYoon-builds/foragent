@@ -34,6 +34,42 @@ def read_plan(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique)
 
 
+def _installed_ouroboros_version() -> str | None:
+    """Read the first install entry under an ouroboros@ registry key."""
+    path = Path.home() / ".claude/plugins/installed_plugins.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("plugins"), dict):
+        return None
+    for key, entries in data["plugins"].items():
+        if not key.startswith("ouroboros@") or not isinstance(entries, list) or not entries:
+            continue
+        entry = entries[0]
+        version = entry.get("version") if isinstance(entry, dict) else None
+        if isinstance(version, str) and version.strip():
+            return version
+    return None
+
+
+def _interview_context(config: Config) -> dict:
+    installed_version = _installed_ouroboros_version()
+    pin = config.ouroboros_version
+    engine, reason = "native", None
+    if config.interview == "ouroboros":
+        if installed_version is None:
+            reason = "Ouroboros not installed"
+        elif pin is not None and pin != installed_version:
+            reason = (f"Ouroboros version mismatch: installed {installed_version}, "
+                      f"pinned {pin}")
+        else:
+            engine = "ouroboros"
+    return {"requested": config.interview, "engine": engine,
+            "installed_version": installed_version, "pinned_version": config.ouroboros_version,
+            "reason": reason}
+
+
 def context(root: Path, config: Config, tracker: Tracker) -> dict:
     issues = sorted(tracker.list_open_issues(), key=lambda issue: issue.number)
     feedback, decisions = [], []
@@ -103,6 +139,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
                     meta = yaml.safe_load(match[1])
                     lane["skills"] = meta.get("skills", []) if isinstance(meta, dict) else []
     return {
+        "interview": _interview_context(config),
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
         "feedback": feedback, "decisions": decisions,
