@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, adopt, bench, design, inspect_actions, inspect_data, launchd, notify, orch, order
+from foragent import __version__, adopt, bench, design, inspect_actions, inspect_data, launchd, notify, orch, order, watch
 from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -29,10 +29,15 @@ from foragent.state import StateStore
 from foragent.status import collect_lanes
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
+try:
+    from foragent._build import GIT_SHA
+except ImportError:
+    GIT_SHA = "unknown"
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fa")
-    parser.add_argument("--version", action="version", version=f"foragent {__version__}")
+    parser.add_argument("--version", action="version", version=f"foragent {__version__} ({GIT_SHA})")
     commands = parser.add_subparsers(dest="command", required=True)
     design_command = commands.add_parser("design", help="Check the project's design foundation")
     design_actions = design_command.add_subparsers(dest="action", required=True)
@@ -132,6 +137,9 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
         command.add_argument("--json", action="store_true")
         if name == "tick":
             command.add_argument("--no-start", action="store_true")
+    watch_command = actions.add_parser("watch", help="Watch the lane conveyor")
+    watch_command.add_argument("--repo-root", type=Path, default=Path.cwd())
+    watch_command.add_argument("--once", action="store_true")
     run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
     run_issue.add_argument("--repo-root", type=Path, required=True)
@@ -144,12 +152,15 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
     orchestrator = commands.add_parser("orch", help="Diagnose and recover blocked issues")
     orch_actions = orchestrator.add_subparsers(dest="action", required=True)
-    for name in ("list", "rerun-review", "retry", "resolve", "escalate", "log"):
+    for name in ("list", "rerun-review", "retry", "resolve", "escalate", "log", "watch"):
         command = orch_actions.add_parser(name)
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
         if name == "list":
             command.add_argument("--json", action="store_true")
-        elif name not in {"log"}:
+        elif name == "watch":
+            command.add_argument("--interval", type=float, default=5, help="Poll interval in seconds (default: 5)")
+            command.add_argument("--follow", action="store_true", help="Keep printing changes until interrupted")
+        elif name != "log":
             command.add_argument("number", type=int)
         if name == "retry":
             command.add_argument("--hint")
@@ -403,6 +414,12 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == "log":
                 for event in orch.log(ctx):
                     print(f"{event['at']} [{event['kind']}] {event['summary']}")
+            elif args.action == "watch":
+                try:
+                    for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow):
+                        print(json.dumps(snapshot, ensure_ascii=False), flush=True)
+                except KeyboardInterrupt:
+                    pass
             elif args.action == "retry":
                 print(orch.retry(ctx, args.number, args.hint))
             elif args.action == "rerun-review":
@@ -442,6 +459,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(status))
             else:
                 _print_status(status, config.language)
+        elif args.action == "watch":
+            watch.run(
+                lambda: _status(tracker, store, config), tracker, store, config, root,
+                once=args.once, now=lambda: datetime.now(UTC),
+            )
         else:
             if store.get_run(args.number) is None:
                 raise ConfigError(f"no run record for issue #{args.number}")

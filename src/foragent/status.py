@@ -28,7 +28,7 @@ def collect_lanes(
             "slug": slug, "lane_display": lane_display(config, slug, config.language),
             "state": "idle", "issue": None, "title": None, "phase": None,
             "elapsed_seconds": None, "last_activity_seconds": None, "waiting_for": [],
-            RUNNING: [], READY: [],
+            RUNNING: [], READY: [], "queued": [],
         })
 
     for slug in {*config.lanes, "main"}:
@@ -54,6 +54,8 @@ def collect_lanes(
         else:
             continue
         summary[state.replace("-", "_")] += 1
+        if state == "queued":
+            row["queued"].append(item)
         if priority[state] >= priority[row["state"]]:
             continue
         waiting_for = (
