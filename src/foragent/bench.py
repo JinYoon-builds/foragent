@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+from statistics import median
 import subprocess
 import sys
 
@@ -71,12 +72,42 @@ def _record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report(args: argparse.Namespace) -> int:
+    path = args.scenario_dir / "results.jsonl"
+    try:
+        with path.open(encoding="utf-8") as stream:
+            rows = [json.loads(line) for line in stream if line.strip()]
+    except FileNotFoundError:
+        rows = []
+
+    metrics = ("elapsed_seconds", "checks_passed", "checks_total", "retries", "tokens", "interventions")
+    arms = {}
+    for arm in ("A", "B", "C"):
+        records = [row for row in rows if row["arm"] == arm]
+        summary = {"records": len(records)}
+        for metric in metrics:
+            values = [row[metric] for row in records if row.get(metric) is not None]
+            summary[metric] = median(values) if values else None
+        arms[arm] = summary
+
+    if args.json:
+        print(json.dumps({"arms": arms}, ensure_ascii=False))
+    else:
+        columns = ("records", *metrics)
+        print("| Arm | " + " | ".join(columns) + " |")
+        print("| --- | " + " | ".join("---" for _ in columns) + " |")
+        for arm, summary in arms.items():
+            values = ["—" if summary[column] is None else str(summary[column]) for column in columns]
+            print(f"| {arm} | " + " | ".join(values) + " |")
+    return 0
+
+
 def run(args: argparse.Namespace) -> int:
-    if args.action == "record":
+    if args.action in ("record", "report"):
         try:
-            return _record(args)
+            return _record(args) if args.action == "record" else _report(args)
         except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as exc:
-            print(f"bench record: {exc}", file=sys.stderr)
+            print(f"bench {args.action}: {exc}", file=sys.stderr)
             return 1
     print(f"not implemented yet: {args.action}", file=sys.stderr)
     return 2
