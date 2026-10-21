@@ -30,11 +30,6 @@ description: Set up a project folder for Foragent.
    - `existing_setup`: settings already present that will NOT be touched,
      including existing CLAUDE.md, AGENTS.md, .claude/ files and skills.
    - `ci`: workflow files, detected test commands, and `runs_acceptance` findings.
-
-   Run `fa adopt ci --json` and show each `collect_only` finding with its
-   workflow `file` and suggested `add` command. This collects every test without
-   running it, catching import errors and module name clashes. Report these
-   suggestions for human follow-up; do not insert collection steps automatically.
    Preserve existing agent setup; the only CI edit is the approved step 8 change.
 
 6. Propose lanes from `hot_paths`, showing each name and path globs. Reuse
@@ -56,8 +51,10 @@ description: Set up a project folder for Foragent.
    acceptance directory (recommended), or No, keep CI as is. Only on an explicit
    yes, run `fa adopt ci --exclude-acceptance --json`, report the result, and
    commit only the workflow files listed in `changed`. Report `manual` entries
-   and `collect_only` suggestions for human follow-up. Collection steps must keep
-   the acceptance directory included. If the answer is no or CI already excludes
+   for human follow-up. Also show each `collect_only` finding (workflow `file` and
+   suggested `add` command): a collection step lists every test without running
+   it, so it catches import errors and module name clashes. Collection steps must
+   keep the acceptance directory included; report them, do not insert them. If the answer is no or CI already excludes
    the acceptance directory, leave CI unchanged and create no CI commit.
 
 9. Run `fa order context --json`. When `ui.frameworks` is nonempty, propose a

@@ -1440,8 +1440,10 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return "merged"
 
 
-def review_only(n: int, ctx: RunContext, *, verdict_head: str | None = None) -> str:
-    """Review an existing PR; hand CI failures back to implementation when budget allows."""
+def review_only(
+    n: int, ctx: RunContext, *, verdict_head: str | None = None, repair_ci: bool = True,
+) -> str:
+    """Review a PR, optionally repairing CI inline instead of returning its failure."""
     worktree = ctx.store.worktree_path(n)
     outcome = "error"
     issue = ctx.tracker.get_issue(n)
@@ -1459,6 +1461,9 @@ def review_only(n: int, ctx: RunContext, *, verdict_head: str | None = None) -> 
         try:
             outcome = _review_only(n, ctx, worktree, verdict_head)
         except CIFailure as exc:
+            if not repair_ci:
+                # Let the caller schedule repair without changing the verdict's head.
+                raise ExecutorStopped("ci-failed") from exc
             git = ctx.git.at(worktree)
             git.attach_branch(f"foragent/issue-{n}")
             _inject_lane_skills(ctx, n, git)

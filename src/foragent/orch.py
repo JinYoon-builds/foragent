@@ -170,7 +170,7 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str) -> str:
             _retry(ctx, n, note)
             outcome = "queued implementation retry"
         else:
-            outcome = review_only(n, ctx, verdict_head=head)
+            outcome = review_only(n, ctx, verdict_head=head, repair_ci=False)
             # A review verdict cannot fix failing code or CI. Give the implementer
             # the evidence and queue a fresh attempt rather than strand the issue.
             if outcome in {"checks-failed", "ci-failed"}:

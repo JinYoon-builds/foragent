@@ -51,6 +51,29 @@ def assert_blocked(c, reason):
     assert len(c.tracker.created_prs) == 1
 
 
+def test_resolve_queues_ci_repair_without_changing_the_verdict_head(review_case):
+    c = review_case
+    logs = "FAILED existing tests: preserve the original failure output"
+    c.tracker.set_pr_checks(c.pr, "fail")
+    c.tracker.set_pr_failed_logs(c.pr, logs)
+
+    summary = orch.resolve(c.ctx, 1, "pass", "Reviewed the current head")
+
+    assert "ci-failed; queued implementation retry" in summary
+    assert c.executor.calls == c.review_calls == []
+    assert c.tracker.get_issue(1).labels == {"approved", "ready"}
+    assert c.tracker.get_issue(c.pr).state == "closed"
+    assert c.tracker.merged_prs == []
+    assert c.tracker.pr_head_sha(c.pr) == c.head
+    assert not any("push" in args or "commit" in args for _, args in c.operations)
+    hint = (c.store.root / "hints/1.txt").read_text()
+    assert "Reviewed the current head" in hint
+    assert str(c.store.log_path(1)) in hint
+    assert logs in c.store.log_path(1).read_text()
+    assert any(f"head={c.head} verdict=pass" in comment.body
+               for comment in c.tracker.list_comments(1))
+
+
 @pytest.mark.parametrize("resolved", [False, True])
 @pytest.mark.parametrize("repair_result", ["pass", "ci-fail", "review-fail"])
 def test_review_ci_failure_repairs_same_pr_and_rechecks_new_head(run_case, monkeypatch, resolved, repair_result):
