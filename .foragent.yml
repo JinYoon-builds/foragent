@@ -60,4 +60,11 @@ lanes:
     - src/foragent/git.py
     agent: fa-skills
     skills: []
+  design:
+    paths:
+    - src/foragent/design*.py
+    - skills/fa-order/**
+    - skills/fa-init/**
+    agent: fa-design
+    skills: []
 max_parallel: 3
