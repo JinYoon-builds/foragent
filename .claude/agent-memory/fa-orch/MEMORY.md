@@ -8,3 +8,8 @@
 - #28 인수 시험: `uv run pytest -q tests/acceptance/test_orch_blocked.py`. acceptance 파일은 수정하지 않는다. 임시 Git 이력과 가짜 실행기로 네트워크 없이 검증한다.
 - #28 검증 결과: scheduler·runner·config·reasons·inspect 및 지정 인수 시험 781개, `tests/test_orch_blocked.py`의 경계 시험 10개 통과. 경계 시험은 Git 없이 가짜 tracker와 주입 시계로 실행한다.
 - 이 환경에서 기본 uv 캐시에 쓰기 제한이 있으면, 패키지가 준비된 임시 캐시로 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest ...`를 실행할 수 있다.
+- 판정 불가 리뷰는 리뷰어만 다시 호출하지 않고 구현 시도를 하나 소비한다. `build_prompt(..., reviewer_text=...)`가 `A reviewer said (verbatim):` 뒤에 원문 전체를 넣는다. 일반 검사 실패의 4,000자 꼬리 제한을 이 경로에 적용하면 안 된다.
+- 반박은 `.foragent/REBUTTAL.md`에서 읽어 PR의 `## Rebuttals`와 다음 리뷰에 전달한다. Claude는 임시 `CLAUDE.local.md`, Codex는 리뷰 프롬프트를 쓴다. `GitRepo.stage_changes()`는 실행기가 직접 스테이징한 `.foragent` 파일도 인덱스에서 제거하므로 기존 경로를 공유한다.
+- batch/fast 대상 전환은 worktree를 다시 만들기 때문에 `TRY.md`와 `REBUTTAL.md`를 함께 보존해야 한다. PR에는 각 세션의 서로 다른 반박 내용을 보존한다.
+- `review-dispute`는 반박이 있는 상태로 진행한 리뷰 두 회에서 연속으로 같은 지적이 나왔을 때의 기술 차단이다. 공백·대소문자·목록 기호를 정규화한다. 비정형 원문은 하나의 지적으로 비교하여 공통 서문만으로 분쟁을 만들지 않는다.
+- #29 인수 시험: `uv run pytest -q tests/acceptance/test_orch_review_handoff.py`. `tests/test_orch_blocked.py`와 `tests/acceptance/test_orch_blocked.py`는 모듈명이 같아 기본 pytest 모드로 함께 수집하면 충돌하므로 별도로 실행한다.

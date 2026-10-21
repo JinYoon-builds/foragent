@@ -110,12 +110,15 @@ def review_scope_rules(acceptance_dir: str) -> str:
     )
 
 
-def build_review_prompt(parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/") -> str:
+def build_review_prompt(
+    parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
+) -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
         f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
         f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         f"\n\nDone when commands:\n{commands}\n\nDiff:\n{diff[:60000]}"
+        + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
     )
 
 
@@ -176,6 +179,7 @@ def build_prompt(
     n: int, parsed: ParsedIssue, acceptance_dir: str, failure: str = "", language: str = "en",
     *, native_goal: bool = False, acceptance_locked: bool = False,
     merge_conflicts: list[str] | None = None,
+    reviewer_text: str | None = None,
 ) -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     acceptance_rule = "" if acceptance_locked else f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
@@ -192,6 +196,8 @@ def build_prompt(
         f"  Write it in {language}. Include an `## Evidence` section quoting the exact conflicting lines "
         "(issue sentence; file:line and the code line).\n"
         "- Do not commit, push or switch branches. Leave your changes in the working tree.\n"
+        "- For each reviewer point either fix it or write `.foragent/REBUTTAL.md` "
+        "with `- <point>: <why it is out of scope or not a defect>`.\n"
         "- When the Done when commands would pass, also write .foragent/TRY.md so a person can check your work in about a minute.\n"
         f"  Write the prose in {language}. Keep these English headings exactly:\n"
         "  ## What changed\n"
@@ -211,7 +217,9 @@ def build_prompt(
         "  steps:\n"
         "  - <what to click or type>\n"
     )
-    if failure:
+    if reviewer_text is not None:
+        prompt += "\nA reviewer said (verbatim):\n" + reviewer_text
+    elif failure:
         prompt += "\nA previous attempt failed. Output of the failing check:\n" + failure[-4000:]
     if merge_conflicts is not None:
         prompt += (
@@ -307,6 +315,7 @@ def _pr_body(
     *, outside_lane: list[str] | None = None, fallback_model: str | None = None,
     attempt_tiers: dict[str, str] | None = None,
     missing_skills: list[str] | None = None,
+    rebuttals: str = "",
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -323,6 +332,8 @@ def _pr_body(
             lines.append(review.findings)
         lines.extend(review.notes)
         lines.append("")
+    if rebuttals:
+        lines.extend(["", "## Rebuttals", "", rebuttals])
     if parsed.done_when_checklist:
         lines.extend(["", "## Needs a human check", ""])
         lines.extend(f"- [ ] {item.text}" for item in parsed.done_when_checklist)
@@ -520,7 +531,7 @@ def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> 
 
 
 @contextmanager
-def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str):
+def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = ""):
     git.ignore_review_scope()
     path = git.root / REVIEW_SCOPE_FILE
     link = os.readlink(path) if path.is_symlink() else None
@@ -529,6 +540,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str):
     section = (
         "# Review scope (written by Foragent for this review only)\n\n"
         f"{body}\n\n{review_scope_rules(acceptance_dir)}\n\n"
+        + (f"Implementer rebuttals (judge them):\n{rebuttals}\n\n" if rebuttals else "")
     ).encode("utf-8")
     try:
         if link is not None:
@@ -552,20 +564,21 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
             *, round_number: int = 1) -> ReviewResult:
     reviewer = resolved_reviewer(ctx.config)
     options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
+    rebuttals = _read_rebuttals(git.root)
     edited = False
     with ExitStack() as scope:
         if reviewer == "claude":
             approval = ctx.store.load_approval(n)
             if approval is None:
                 raise ValueError("Claude review requires an approved snapshot")
-            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir))
+            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir, rebuttals))
         before = git.review_state()
         try:
             result = _available_executor(
                 n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
                 reviewer=True,
                 prompt="" if reviewer == "claude" else build_review_prompt(
-                    parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir,
+                    parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
                 ),
                 model=ctx.config.reviewer_model, timeout_s=_remaining(n, ctx),
                 log_path=ctx.store.log_path(n), **options,
@@ -603,6 +616,18 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     _append(ctx.store.log_path(n), f"Review: VERDICT: {review.verdict}\n{review.findings}")
     _progress(n, ctx)
     return replace(review, raw=raw)
+
+
+def _read_rebuttals(worktree: Path) -> str:
+    path = worktree / ".foragent/REBUTTAL.md"
+    return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+
+
+def _normalized_findings(review: ReviewResult) -> set[str]:
+    # Unstructured prose is one finding: repeated preambles alone are not a dispute.
+    points = [review.raw] if review.verdict == "UNUSABLE" else review.findings.splitlines()
+    return {" ".join(re.sub(r"^\s*[-*]\s+", "", point).split()).casefold()
+            for point in points if point.strip()}
 
 
 def _batch_pr(parent: int, ctx: RunContext) -> None:
@@ -676,13 +701,18 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     reviews: list[ReviewResult] = []
     review_failures = 0
     review_hold = False
-    unusable_review = False
+    review_hold_reason = Reason.RISK_HIGH
+    reviewer_text: str | None = None
+    rebuttals: list[str] = []
+    previous_rebutted_findings: set[str] = set()
     checks: list[CheckResult] = []
     paths: list[str] = []
     missing_skills: list[str] = []
     size = issue_size(ctx.tracker.get_issue(n).labels)
 
-    def implement(failure: str, *, merge_conflicts: list[str] | None = None) -> None:
+    def implement(
+        failure: str, *, merge_conflicts: list[str] | None = None, reviewer_text: str | None = None,
+    ) -> None:
         remaining = _remaining(n, ctx)
         if remaining <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
@@ -707,12 +737,16 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             n, parsed, ctx.config.acceptance_dir, failure, ctx.config.language,
             native_goal=native_claude or ctx.config.codex_goal, acceptance_locked=native_claude,
             merge_conflicts=merge_conflicts,
+            reviewer_text=reviewer_text,
         )
         result = _available_executor(
             n, ctx, executor, worktree=worktree,
             prompt=prompt if native_claude else notes + prompt,
             model=model, timeout_s=remaining, log_path=log, **options,
         )
+        rebuttal = _read_rebuttals(worktree)
+        if rebuttal.strip() and rebuttal not in rebuttals:
+            rebuttals.append(rebuttal)
         if result.timed_out or _remaining(n, ctx) <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
         question = worktree / ".foragent/QUESTION.md"
@@ -721,6 +755,16 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 details = stream.read(6000)
             flag(ctx, n, Reason.SPEC_QUESTION, "The executor needs a product decision.", details)
             raise ExecutorStopped("spec-question")
+
+    def recreate_worktree() -> None:
+        artifacts = {name: path.read_bytes() for name in ("TRY.md", "REBUTTAL.md")
+                     if (path := worktree / ".foragent" / name).is_file()}
+        ctx.git.remove_worktree(worktree)
+        ctx.git.add_worktree(worktree, branch, start_ref)
+        for name, content in artifacts.items():
+            path = worktree / ".foragent" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
 
     def prepare_target() -> bool:
         nonlocal start_ref, target_branch
@@ -737,15 +781,9 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             ctx.git.ensure_batch_branch(batch_branch, base_ref)
         with tempfile.NamedTemporaryFile() as patch:
             git.write_staged_patch(start_ref, Path(patch.name))
-            try_file = worktree / ".foragent/TRY.md"
-            try_bytes = try_file.read_bytes() if try_file.is_file() else None
-            ctx.git.remove_worktree(worktree)
             start_ref = f"origin/{destination}"
             target_branch = destination
-            ctx.git.add_worktree(worktree, branch, start_ref)
-            if try_bytes is not None:
-                try_file.parent.mkdir(parents=True, exist_ok=True)
-                try_file.write_bytes(try_bytes)
+            recreate_worktree()
             if not _acceptance_matches(n, ctx, git, approval):
                 return False
             try:
@@ -758,8 +796,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         nonlocal paths
         # A three-way failure can leave unmerged index entries. Start the
         # next implementation attempt from the destination's clean tree.
-        ctx.git.remove_worktree(worktree)
-        ctx.git.add_worktree(worktree, branch, start_ref)
+        recreate_worktree()
         paths = []
         return f"Could not apply child changes to {target_branch}: {exc}"
 
@@ -892,6 +929,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 fallback_model=ctx.store.get_run(n).fallback_model,
                 attempt_tiers=ctx.store.get_run(n).attempt_tiers,
                 missing_skills=missing_skills,
+                rebuttals="\n\n".join(rebuttals),
             )
 
         body = pr_body()
@@ -910,13 +948,13 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
             return _hold_changed_head(n, ctx, link)
         if review_hold:
-            summary = ("Reviewer did not return a usable verdict" if unusable_review
-                       else f"Reviewer still found defects after {review_failures} rounds")
+            summary = (
+                "Reviewer repeated a disputed finding after implementer rebuttals"
+                if review_hold_reason == Reason.REVIEW_DISPUTE
+                else f"Reviewer still found defects after {review_failures} rounds"
+            )
             details = f"{failure}\n\n{link}"
-            if unusable_review:
-                raw = next(review.raw for review in reversed(reviews) if review.verdict == "UNUSABLE")
-                details += f"\n\nRaw reviewer result:\n{raw[:3000]}"
-            flag(ctx, n, Reason.RISK_HIGH, summary, details)
+            flag(ctx, n, review_hold_reason, summary, details)
             return "held"
         decision = merge_decision(
             changed_paths=ctx.tracker.pr_changed_files(pr),
@@ -1006,7 +1044,8 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         raise AssertionError("unreachable refresh state")
 
     while True:
-        implement(failure)
+        implement(failure, reviewer_text=reviewer_text)
+        reviewer_text = None
         run = ctx.store.get_run(n)
 
         try:
@@ -1017,16 +1056,21 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             if _remaining(n, ctx) <= 0:
                 return _timeout(n, ctx)
             review = _review(n, ctx, git, parsed, base_ref, round_number=len(reviews) + 1)
-            reviews.append(review)
             if review.verdict == "UNUSABLE":
-                review = _review(n, ctx, git, parsed, base_ref, round_number=len(reviews) + 1)
-                reviews.append(review)
-                if review.verdict != "PASS":
-                    failure = review.findings or "\n".join(review.notes)
-                    review_hold = unusable_review = True
-            if review.verdict == "FAIL" and not review_hold:
+                review = replace(review, findings=review.raw)
+            reviews.append(review)
+            if review.verdict != "PASS":
                 review_failures += 1
-                failure = review.findings or "Reviewer found defects (no findings provided)."
+                if review.verdict == "UNUSABLE":
+                    reviewer_text = review.raw
+                    failure = "A reviewer said (verbatim):\n" + review.raw
+                else:
+                    failure = review.findings or "Reviewer found defects (no findings provided)."
+                findings = _normalized_findings(review) if _read_rebuttals(worktree).strip() else set()
+                if findings & previous_rebutted_findings:
+                    review_hold = True
+                    review_hold_reason = Reason.REVIEW_DISPUTE
+                previous_rebutted_findings = findings
                 if review_failures > ctx.config.review_max:
                     review_hold = True
         if not failure or review_hold:
