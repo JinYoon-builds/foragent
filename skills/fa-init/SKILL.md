@@ -24,6 +24,14 @@ description: Set up a project folder for Foragent.
 
 4. Run `fa adopt survey --json` after setup. When `kind` is `existing`,
    complete steps 5–8 in order. When it is `empty`, go to step 9.
+   Also run `fa order context --json`. If `ui.frameworks` is nonempty (React,
+   Vue, Svelte, Next, Nuxt, Solid or HTML), include a design lane in the lane
+   proposal with `frontend-design`, `design-system`, `design-critique`,
+   `accessibility-review`, `ux-copy`, and `webapp-testing` skills. Use
+   `fa skills catalog` to resolve their library IDs and show the proposed paths
+   and skills for approval before creating it, including for an empty project.
+   Keep overlapping UI paths in the same lane. Design taste and the foundation
+   interview belong to `/fa-order`'s Design first step.
 
 5. Show a short "What I read" list from the survey:
    - `hot_paths`: frequently changed paths and their commit counts.
