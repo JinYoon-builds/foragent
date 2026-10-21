@@ -185,7 +185,7 @@ def test_status_groups_issues_awaiting_pr_review(app, capsys, json_output, label
         assert [item["number"] for item in groups[group]] == [1]
         assert sum(len(items) for items in groups.values()) == 1
     else:
-        prefix = "running:\n  lane:main:\n    " if group == "running" else f"{group}:\n  "
+        prefix = "running:\n  🧰 Common:\n    " if group == "running" else f"{group}:\n  "
         assert f"{prefix}#1 Awaiting review" in output
 
 
@@ -419,12 +419,12 @@ def test_inspect_cli_text_and_json_shapes(app, capsys, json_output):
             "group": "decision", "number": 3, "title": "Add tally report",
             "url": "https://github.com/owner/repo/issues/3", "reason": "spec-question",
             "summary": "Choose a format", "details": details, "pr": None, "answered": False,
-            "try_card": None, "prepared": None,
+            "try_card": None, "prepared": None, "lane": "main", "lane_display": "🧰 Common",
         }]
         assert datetime.fromisoformat(inbox["since"]).tzinfo is not None
     else:
         assert captured.out.splitlines() == [
-            "Decision 1 (~1 min)", "[decision] #3 Add tally report — Choose a format",
+            "Decision 1 (~1 min)", "[decision] 🧰 Common · #3 Add tally report — Choose a format",
             *(f"  Detail {i}" for i in range(12)), "  https://github.com/owner/repo/issues/3",
         ]
     assert git.fetches == [] and calls["launches"] == []
@@ -457,11 +457,11 @@ def test_inspect_cli_try_is_latest_per_issue_with_missing_card(app, capsys, json
         assert inbox["items"] == [{
             "group": "try", "number": 7, "title": "Latest tally", "url": url,
             "reason": None, "summary": summary, "details": "", "pr": latest, "answered": False,
-            "try_card": None, "prepared": None,
+            "try_card": None, "prepared": None, "lane": "main", "lane_display": "🧰 Common",
         }]
     else:
         assert captured.out.splitlines() == [
-            "Try 1 (not prepared)", f"[try] #7 Latest tally — {summary} {url}",
+            "Try 1 (not prepared)", f"[try] 🧰 Common · #7 Latest tally — {summary} {url}",
             "  What changed:", "  not provided", "  Try it:", "  not provided",
             "  Expect:", "  not provided", "  not prepared",
         ]
@@ -686,5 +686,5 @@ def test_status_groups_running_and_ready_by_lane(app, capsys):
     assert [item["number"] for item in status["lanes"]["ui"]["running"]] == [2]
     cli._print_status(status | {"launchd": {"loaded": False}})
     output = capsys.readouterr().out
-    assert "running:\n  lane:ui:\n    #2 UI running" in output
-    assert "ready:\n  lane:data:\n    #3 Data ready\n  lane:main:\n" in output
+    assert "running:\n  ui:\n    #2 UI running" in output
+    assert "ready:\n  data:\n    #3 Data ready\n  🧰 Common:\n" in output

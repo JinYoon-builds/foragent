@@ -1,5 +1,6 @@
 """Shared issue labels installed by repository setup."""
 
+from foragent.config import Config
 from foragent.tracker import LabelSpec
 
 
@@ -17,6 +18,15 @@ def issue_lane(labels, lanes) -> str:
     names = sorted(label.removeprefix("lane:") for label in labels if label.startswith("lane:"))
     name = names[0] if names else "main"
     return name if name in lanes else "main"
+
+
+def lane_display(config: Config, slug: str, language: str) -> str:
+    """Return the human lane name while keeping slugs stable for machines."""
+    lane = config.lanes.get(slug, {})
+    fallback = ("공통" if language.lower().split("-")[0] == "ko" else "Common") if slug == "main" else slug
+    title = lane.get("title") or fallback
+    emoji = lane.get("emoji") or ("🧰" if slug == "main" else "")
+    return f"{emoji} {title}".strip()
 
 
 def lane_order(name: str) -> tuple[bool, str]:
