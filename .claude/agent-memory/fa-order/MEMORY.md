@@ -5,3 +5,5 @@
 - 인터뷰 설치 정보는 현재 `Path.home() / ".claude/plugins/installed_plugins.json"`에서 읽는다. `plugins`의 `ouroboros@`로 시작하는 키에서 첫 항목 버전을 사용한다. 파일·구조가 손상됐으면 미설치로 처리한다. 버전 고정은 문자열 완전 일치이며 `None`만 고정 없음이다.
 - 외부 계정 없이 주문 컨텍스트를 검증하려면 `order.context(root, config, FakeTracker())`를 사용한다. 설치 파일 테스트는 임시 HOME으로 격리한다.
 - 검증: `uv run pytest -q tests/acceptance/test_interview_engine.py tests/test_order.py tests/test_config.py`. 인수 테스트는 수정하지 않는다.
+- 주문 스킬의 인터뷰 분기는 설정 요청값이 아니라 `fa order context --json`의 `interview.engine`을 따른다. `interview.reason`은 native 전환 설명에 활용하며, seed도 실패하면 기존 답변을 유지한 채 AskUserQuestion으로 이어간다. seed는 3단계 되짚기와 4단계 분할의 확정 맥락이다.
+- 스킬 문서 변경 검증: `uv run pytest -q tests/acceptance/test_fa_order_skill.py`. 이 테스트는 문서를 직접 읽으며 외부 계정이 필요 없다.
