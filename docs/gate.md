@@ -135,6 +135,7 @@ run_hours: always         # 선택: "22-08"처럼 시간대 제한
 stall_minutes: 30
 max_runtime_minutes: 90
 max_retries: 2
+conflict_retries: 2       # 별도 충돌 해결 예산; 소진하면 최신 대상 브랜치에서 한 번 재구축
 ```
 
 init이 기본값을 쓰고, 사람이나 init 옵션으로 고친다. 기존 파일에서는 명시한 옵션의 키가 없을 때만 추가하고, 이미 있는 값은 보존한다. 모델은 전역 기본값(`foragent config`) + 이 파일의 덮어쓰기 (D12).

@@ -45,6 +45,22 @@ def test_push_base_uses_explicit_source_and_destination_despite_push_config(tmp_
     assert calls == [["push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"]]
 
 
+@pytest.mark.parametrize("lease", ["", "a" * 40])
+def test_rewritten_branch_push_uses_explicit_lease(tmp_path, lease):
+    calls = []
+    git = GitRepo(tmp_path, lambda args: calls.append(args) or "")
+    git.push("foragent/issue-1", lease=lease)
+    assert calls == [["push", f"--force-with-lease=refs/heads/foragent/issue-1:{lease}",
+                      "origin", "foragent/issue-1"]]
+
+
+@pytest.mark.parametrize("present", [False, True])
+def test_read_remote_branch_head_for_rebuild_lease(git_history, present):
+    if present:
+        git_command(git_history.origin, "update-ref", "refs/heads/foragent/issue-1", git_history.tip)
+    assert GitRepo(git_history.clone).remote_branch_sha("foragent/issue-1") == (git_history.tip if present else None)
+
+
 def test_setup_status_preserves_leading_status_columns_and_nul_paths(tmp_path):
     calls = []
     git = GitRepo(tmp_path, lambda args: calls.append(args) or " M .foragent.yml\0A  odd\nname\0")

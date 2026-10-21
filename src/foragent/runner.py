@@ -98,7 +98,11 @@ class PatchReplayError(GitError):
 
 
 class AttemptFailure(Exception):
-    """Fresh-base conflicts and checks share the implementation retry budget."""
+    """Checks on a refreshed base failed and need another implementation attempt."""
+
+
+class ConflictBudgetExhausted(Exception):
+    """Conflict resolution needs one fresh implementation on the latest target."""
 
 
 class CIFailure(AttemptFailure):
@@ -795,6 +799,9 @@ def _implement_and_publish(
     checks: list[CheckResult] = []
     paths: list[str] = []
     missing_skills: list[str] = []
+    conflict_attempts = 0
+    rebuilt = False
+    rebuild_lease: str | None = None
     size = issue_size(ctx.tracker.get_issue(n).labels)
 
     def implement(
@@ -902,6 +909,41 @@ def _implement_and_publish(
         paths = []
         return f"Could not apply child changes to {target_branch}: {exc}"
 
+    def rebuild(exc: ConflictBudgetExhausted) -> str:
+        nonlocal start_ref, rebuilt, rebuild_lease, paths
+        rebuilt = True
+        _append(log, f"Rebuilding issue branch once from latest {target_branch}.\n{exc}")
+        ctx.git.fetch("origin", target_branch)
+        start_ref = f"origin/{target_branch}"
+        if not _acceptance_matches(n, ctx, ctx.git, approval, start_ref):
+            raise ExecutorStopped("hash-mismatch")
+        # Bind every rewritten push to the remote head observed before rebuilding.
+        # An empty lease means the branch must still be absent.
+        rebuild_lease = git.remote_branch_sha(branch) or ""
+        _append(log, f"Rebuild target: {start_ref} ({git.ref_sha(start_ref)})")
+        recreate_worktree()
+        paths = []
+        run = ctx.store.get_run(n)
+        ctx.store.update_run(n, attempts=run.attempts + 1)
+        return (
+            f"The earlier attempt could not be merged onto the moved base ({target_branch}). "
+            "The issue branch and worktree have been rebuilt from the latest target branch. "
+            "Implement the original instructions again, preserving the features now on the base."
+        )
+
+    def push_branch() -> None:
+        nonlocal rebuild_lease
+        if rebuilt:
+            git.push(branch, lease=rebuild_lease)
+            rebuild_lease = git.head_sha()
+        else:
+            git.push(branch)
+
+    def block_rebuild(details: str) -> str:
+        _append(log, f"Rebuilt attempt failed:\n{details}")
+        flag(ctx, n, Reason.RETRIES_EXCEEDED, "Rebuilt implementation failed; no attempts remain.", details)
+        return "retries-exceeded"
+
     def verify() -> str:
         nonlocal checks, paths
         _phase(n, ctx, "checking")
@@ -975,15 +1017,16 @@ def _implement_and_publish(
         base_merges = 0
 
         def resolve_conflicts(conflicts: list[str]) -> None:
+            nonlocal conflict_attempts
             pending_merge = True
             check_failure = f"Merge conflict with {target_branch}: {', '.join(conflicts)}"
             while True:
-                run = ctx.store.get_run(n)
-                _append(log, f"Attempt {run.attempts} failed:\n{check_failure}")
-                if run.attempts >= ctx.config.max_retries + 1:
-                    flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", check_failure)
-                    raise ExecutorStopped("retries-exceeded")
-                ctx.store.update_run(n, attempts=run.attempts + 1)
+                if rebuilt:
+                    raise ExecutorStopped(block_rebuild(check_failure))
+                if conflict_attempts >= ctx.config.conflict_retries:
+                    raise ConflictBudgetExhausted(check_failure)
+                conflict_attempts += 1
+                _append(log, f"Conflict attempt {conflict_attempts}/{ctx.config.conflict_retries}:\n{check_failure}")
                 implement(check_failure, merge_conflicts=conflicts)
                 # Retain the merge's paths even if the executor stages them.
                 markers = git.conflict_marker_paths(conflicts)
@@ -991,9 +1034,11 @@ def _implement_and_publish(
                     check_failure = f"Conflict markers remain in: {', '.join(markers)}"
                     continue
                 git.stage_changes()
-                if pending_merge or git.has_staged_changes():
-                    git.commit(title)
+                if pending_merge:
+                    git.continue_merge()
                     pending_merge = False
+                elif git.has_staged_changes():
+                    git.commit(title)
                 check_failure = verify()
                 markers = git.conflict_marker_paths(conflicts)
                 if markers:
@@ -1033,7 +1078,7 @@ def _implement_and_publish(
         target_sha = refresh_base() if not review_hold else None
         if not review_hold and _remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
-        git.push(branch)
+        push_branch()
         _progress(n, ctx)
         _append(log, f"Pushed verified HEAD: {verified_head_sha}")
         try_text = None
@@ -1096,6 +1141,8 @@ def _implement_and_publish(
                 if status in {"pass", "none"}:
                     break
                 if status == "fail":
+                    if rebuilt:
+                        raise ExecutorStopped(block_rebuild(f"CI failed:\n{ctx.tracker.pr_failed_logs(pr)}"))
                     _ci_failure(n, ctx, pr, verified_head_sha, target_branch)
                 remaining = deadline - ctx.now().timestamp()
                 if remaining <= 0 or poll == 40:
@@ -1106,7 +1153,7 @@ def _implement_and_publish(
             target_sha = refresh_base()
             target_ref = f"origin/{target_branch}"
             if target_sha is not None:
-                git.push(branch)
+                push_branch()
                 _progress(n, ctx)
                 _append(log, f"Pushed verified HEAD: {verified_head_sha}")
                 ctx.tracker.update_pr(pr, base=target_branch, title=title, body=pr_body())
@@ -1170,7 +1217,7 @@ def _implement_and_publish(
                 title = f"{ctx.tracker.get_issue(n).title} (#{n})"
                 if git.has_staged_changes():
                     git.commit(title)
-                git.push(branch)
+                push_branch()
                 pr = open_or_update_pr(title, render_pr_body())
                 _progress(n, ctx)
             review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx), pr=pr)
@@ -1195,15 +1242,24 @@ def _implement_and_publish(
                 previous_rebutted_findings = findings
                 if review_failures > ctx.config.review_max:
                     review_hold = True
+        if rebuilt and failure:
+            return block_rebuild(str(failure))
         if not failure or review_hold:
             try:
                 return publish()
+            except ConflictBudgetExhausted as exc:
+                failure = rebuild(exc)
+                continue
             except CIFailure as exc:
+                if rebuilt:
+                    return block_rebuild(str(exc))
                 failure = exc
                 continue
             except (AttemptFailure, PatchReplayError) as exc:
                 failure = recover_replay(exc) if isinstance(exc, PatchReplayError) else str(exc)
                 run = ctx.store.get_run(n)
+        if rebuilt:
+            return block_rebuild(str(failure))
         _append(log, f"Attempt {run.attempts} failed:\n{failure}")
         if run.attempts < ctx.config.max_retries + 1:
             ctx.store.update_run(n, attempts=run.attempts + 1)
