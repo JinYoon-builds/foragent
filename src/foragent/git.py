@@ -70,6 +70,10 @@ class GitRepo:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._call(["worktree", "add", "--detach", str(path), ref])
 
+    def attach_branch(self, branch: str) -> None:
+        """Continue work on a detached PR head without replacing its worktree."""
+        self._call(["switch", "-C", branch, "HEAD"])
+
     def stage_changes(self) -> None:
         output = self._call([
             "ls-files", "--modified", "--deleted", "--others", "--exclude-standard", "-z",

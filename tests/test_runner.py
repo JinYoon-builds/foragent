@@ -410,6 +410,7 @@ def test_workflows_wait_three_minutes_before_trusting_no_checks(run_case, monkey
 ])
 def test_workflow_checks_keep_pass_failure_and_pending_behavior(run_case, monkeypatch, statuses, outcome, elapsed):
     c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
     c.executor.steps[0][".github/workflows/ci.yml"] = "name: CI\n"
     started_at = c.now[0]
     results = iter(statuses)
@@ -525,6 +526,7 @@ def test_non_fast_leaves_pr_open_without_needs_human(run_case, config):
 ])
 def test_ci_failure_and_timeout(run_case, status, outcome, reason):
     c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
     c.tracker.set_pr_checks(2, status)
     assert run_issue(1, c.ctx) == outcome
     assert c.store.load_flag(1).reason == reason
@@ -532,6 +534,103 @@ def test_ci_failure_and_timeout(run_case, status, outcome, reason):
     assert c.tracker.merged_prs == []
     if status == "pending":
         assert c.now[0] == BASE_TIME + timedelta(hours=1, minutes=20)
+
+
+@pytest.mark.parametrize("files,configured,expected", [
+    ({}, None, None),
+    ({"pyproject.toml": "[project]\n", "go.mod": "module example"}, None, "uv run pytest"),
+    ({"package.json": '{"scripts":{"test":"vitest"}}'}, None, "npm test"),
+    ({"pyproject.toml": "[project]\n"}, "make check", "make check"),
+])
+def test_implementation_prompt_full_suite_from_worktree(run_case, files, configured, expected):
+    c = run_case
+    c.history.update(files)
+    c.ctx.config = replace(c.ctx.config, test_command=configured)
+    assert run_issue(1, c.ctx) == "merged"
+    prompt = c.executor.calls[0]["prompt"]
+    if expected is None:
+        assert "Before you finish" not in prompt
+    else:
+        assert prompt.splitlines().count(
+            f"- Before you finish, also run the full test suite: `{expected}`. "
+            "CI runs it, so existing tests must keep passing."
+        ) == 1
+
+
+@pytest.mark.parametrize("ci_passes,repair_passes_done_when", [(True, True), (False, True), (True, False)])
+def test_ci_retry_preserves_worktree_logs_and_all_checks(run_case, monkeypatch, ci_passes, repair_passes_done_when):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command="make check")
+    reviews = enable_reviewer(c, ["VERDICT: PASS", "VERDICT: PASS"])
+    logs = "first run\n" + "A" * 3990 + "\nsecond run\n" + "B" * 3990
+    c.tracker.set_pr_checks(2, "fail")
+    c.tracker.set_pr_failed_logs(2, logs)
+    c.executor.steps.append({"feature.txt": "done" if repair_passes_done_when else "broken"})
+    execute = c.executor.run
+    worktree_identity = []
+
+    def implement(**kwargs):
+        path = kwargs["worktree"]
+        worktree_identity.append(path.stat().st_ino)
+        if c.executor.calls:
+            assert (path / "feature.txt").read_text() == "done"
+            assert (path / ".foragent/TRY.md").read_text() == "keep try"
+            assert (path / ".foragent/REBUTTAL.md").read_text() == "keep rebuttal"
+            c.tracker.set_pr_checks(2, "pass" if ci_passes else "fail")
+        else:
+            (path / ".foragent").mkdir()
+            (path / ".foragent/TRY.md").write_text("keep try")
+            (path / ".foragent/REBUTTAL.md").write_text("keep rebuttal")
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    expected = "merged" if ci_passes and repair_passes_done_when else "ci-failed" if not ci_passes else "retries-exceeded"
+    assert run_issue(1, c.ctx) == expected
+    assert len(c.executor.calls) == 2
+    assert worktree_identity[0] == worktree_identity[1]
+    assert "CI failed:\n" + logs in c.executor.calls[1]["prompt"]
+    assert "`make check`" in c.executor.calls[1]["prompt"]
+    assert len(reviews) == (2 if repair_passes_done_when else 1)
+    assert c.store.get_run(1).attempts == 2
+    assert len(c.tracker.created_prs) == 1
+    if expected == "merged":
+        assert not c.tracker.get_issue(1).labels & {"blocked", "needs-human"}
+    else:
+        assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+        assert c.tracker.get_issue(1).labels & {"blocked", "needs-human"} == {"blocked"}
+        if expected == "ci-failed":
+            assert logs in c.tracker.list_comments(1)[-1].body
+
+
+def test_ci_retry_after_base_refresh_keeps_merged_base_and_rereviews(run_case, monkeypatch):
+    c = run_case
+    reviews = enable_reviewer(c, ["VERDICT: PASS", "VERDICT: PASS"])
+    c.executor.steps.append({"repair.txt": "fix CI on merged base"})
+    c.tracker.set_pr_failed_logs(2, "failure after refreshing base")
+    polls = []
+
+    def checks(pr):
+        polls.append(c.tracker.pr_head_sha(pr))
+        if len(polls) == 1:
+            c.history.update({"sibling.txt": "new base"})
+        return "fail" if len(polls) == 2 else "pass"
+
+    execute = c.executor.run
+
+    def implement(**kwargs):
+        if c.executor.calls:
+            assert (kwargs["worktree"] / "sibling.txt").read_text() == "new base"
+            assert c.ctx.git.at(kwargs["worktree"]).is_ancestor(c.history.tip, "HEAD")
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    monkeypatch.setattr(c.tracker, "pr_checks", checks)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == len(reviews) == 2
+    assert len(polls) == 3 and polls[0] != polls[1] != polls[2]
+    assert "CI failed:\nfailure after refreshing base" in c.executor.calls[1]["prompt"]
+    assert c.store.get_run(1).attempts == 2
+    assert c.store.log_path(1).read_text().count("Done when command:") == 6
 
 
 def test_ci_pending_polls_every_thirty_seconds_then_merges(run_case, monkeypatch):
@@ -1435,6 +1534,7 @@ def test_retry_removing_batch_override_returns_only_child_patch_to_base(run_case
 def test_batch_ci_failure_keeps_child_open_and_does_not_open_parent_pr(run_case):
     c = run_case
     batch_setup(c)
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
     c.tracker.set_pr_checks(100, "fail")
     assert run_issue(1, c.ctx) == "ci-failed"
     assert c.tracker.get_issue(1).state == "open"

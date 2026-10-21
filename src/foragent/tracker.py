@@ -94,6 +94,7 @@ class Tracker(Protocol):
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
+    def pr_failed_logs(self, pr: int) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None: ...
 
@@ -133,6 +134,7 @@ class FakeTracker:
         self._parents: dict[int, int] = {}
         self._pr_files: dict[int, list[str]] = {}
         self._pr_checks: dict[int, CheckStatus] = {}
+        self._pr_failed_logs: dict[int, str] = {}
         self._pr_heads: dict[int, str] = {}
         self._next_comment_id = 1
         from foragent.board_fake import FakeProjects
@@ -286,6 +288,12 @@ class FakeTracker:
 
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
+
+    def set_pr_failed_logs(self, pr: int, text: str) -> None:
+        self._pr_failed_logs[pr] = text
+
+    def pr_failed_logs(self, pr: int) -> str:
+        return self._pr_failed_logs.get(pr, "")
 
     def set_pr_head_sha(self, pr: int, sha: str) -> None:
         self._pr_heads[pr] = sha
@@ -567,6 +575,19 @@ class GhTracker:
 
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
+
+    def pr_failed_logs(self, pr: int) -> str:
+        head = self.pr_head_sha(pr)
+        runs = _items(self._call([
+            "api", "--paginate", "--jq", ".workflow_runs",
+            f"{self._path}/actions/runs?head_sha={head}&per_page=100",
+        ]))
+        logs = []
+        for run in runs:
+            if run["conclusion"] in {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}:
+                output = self._call(["run", "view", str(run["id"]), "-R", self.repo, "--log-failed"])
+                logs.append(output[-4000:])
+        return "\n\n".join(logs)
 
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None:
         self._call([

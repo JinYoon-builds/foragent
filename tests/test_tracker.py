@@ -51,6 +51,53 @@ class ScriptedRun:
         return response
 
 
+def test_fake_failed_logs_default_and_pr_isolation():
+    tracker = FakeTracker()
+    assert tracker.pr_failed_logs(42) == ""
+    tracker.set_pr_failed_logs(42, "raw failure\n")
+    assert tracker.pr_failed_logs(42) == "raw failure\n"
+    assert tracker.pr_failed_logs(43) == ""
+
+
+def test_gh_failed_logs_use_head_sha_all_pages_and_per_run_tails():
+    head = "a" * 40
+    runs = [
+        {"id": 1, "conclusion": "failure"},
+        {"id": 2, "conclusion": "success"},
+        {"id": 3, "conclusion": None},
+    ]
+    second_page = [{"id": 4, "conclusion": "timed_out"}]
+    run = ScriptedRun(
+        json.dumps({"head": {"sha": head}}),
+        json.dumps(runs) + "\n" + json.dumps(second_page),
+        "discard me" + "A" * 4000,
+        "discard me too" + "B" * 4000,
+    )
+    assert GhTracker(REPO, run).pr_failed_logs(42) == "A" * 4000 + "\n\n" + "B" * 4000
+    assert run.calls == [
+        (["api", "repos/owner/repo/pulls/42"], None),
+        (["api", "--paginate", "--jq", ".workflow_runs",
+          f"repos/owner/repo/actions/runs?head_sha={head}&per_page=100"], None),
+        (["run", "view", "1", "-R", REPO, "--log-failed"], None),
+        (["run", "view", "4", "-R", REPO, "--log-failed"], None),
+    ]
+
+
+def test_gh_failed_logs_empty_when_head_has_no_failed_actions():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"success"}]')
+    assert GhTracker(REPO, run).pr_failed_logs(42) == ""
+    assert len(run.calls) == 2
+
+
+def test_gh_failed_log_errors_propagate():
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]',
+        subprocess.CalledProcessError(1, ["gh"], stderr="logs unavailable"),
+    )
+    with pytest.raises(TrackerError, match="logs unavailable"):
+        GhTracker(REPO, run).pr_failed_logs(42)
+
+
 def gh_error(stderr, stdout="", code=1):
     return subprocess.CalledProcessError(code, ["gh"], output=stdout, stderr=stderr)
 
