@@ -53,4 +53,11 @@ lanes:
     - src/foragent/tracker.py
     agent: fa-board
     skills: []
+  skills:
+    paths:
+    - src/foragent/skills.py
+    - src/foragent/lanes.py
+    - src/foragent/git.py
+    agent: fa-skills
+    skills: []
 max_parallel: 3
