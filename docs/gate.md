@@ -165,3 +165,7 @@ Claude 리뷰는 스테이징한 구현에 `/code-review <review_level>`을 실�
 - 빌려 볼 코드 줄 확인 (orwa 344·358·366, ownership.sh 335, marcus budget.go 199)
 - 멈춤 판정에 쓸 "세션 출력 변화"의 구체 신호 (실행기별)
 - 시험: 이슈 3~5개짜리 시험 저장소로 쉼·멈춤·막힘 판정 확인
+
+## 운영 메모: gate 고정본 올리기 (2026-10-21)
+- `uv tool install --force .`만으로는 같은 버전(0.1.0)의 캐시된 빌드가 재사용되어 **예전 코드가 그대로 남는다**(실제로 리뷰 해석기 수정이 반영되지 않아 #2·#7이 다시 멈춤).
+- 반드시 `uv tool install --force --reinstall .` 후 `diff -rq src/foragent <설치 경로>/foragent --exclude=__pycache__`로 같음을 확인한다. 나중 후보: `fa --version`에 커밋 SHA를 넣어 한 줄로 확인.
