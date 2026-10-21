@@ -11,7 +11,7 @@ import re
 
 from foragent.config import Config
 from foragent.git import GitRepo
-from foragent.labels import NEEDS_HUMAN
+from foragent.labels import BLOCKED, NEEDS_HUMAN
 from foragent.reasons import GROUP
 from foragent.state import StateStore
 from foragent.tracker import Comment, Tracker
@@ -205,7 +205,7 @@ def collect(ctx: InspectContext) -> Inbox:
         if not match:
             continue
         number = int(match[1])
-        if number in issues and NEEDS_HUMAN in issues[number].labels:
+        if number in issues and issues[number].labels & {BLOCKED, NEEDS_HUMAN}:
             continue
         items.append(Item(
             "review", number, pr.title, pr.url or f"https://github.com/{ctx.repo}/pull/{pr.number}",
