@@ -224,6 +224,48 @@ def test_merge_explicitly_closes_issue_and_removes_ready_and_running(run_case, m
     assert c.store.load_flag(1) is None
 
 
+@pytest.mark.parametrize("mode,question,outcome,statuses", [
+    ("fast", False, "merged", ["Running", "PR open", "Done"]),
+    ("careful", False, "pr-open", ["Running", "PR open"]),
+    ("fast", True, "spec-question", ["Running", "Blocked"]),
+])
+def test_runner_updates_project_on_execution_pr_merge_and_block(run_case, monkeypatch, mode, question, outcome, statuses):
+    from foragent import board
+    from test_board import item_values
+
+    c = run_case
+    project_id = board.ensure(c.tracker, c.ctx.repo)
+    c.ctx.config = replace(c.ctx.config, board=project_id, review=mode)
+    if question:
+        c.executor.steps = [{".foragent/QUESTION.md": "Which behavior is intended?"}]
+    calls = []
+    set_status = board.set_status
+
+    def recorded(issue, status):
+        calls.append(status)
+        set_status(issue, status)
+
+    monkeypatch.setattr(board, "set_status", recorded)
+    assert run_issue(1, c.ctx) == outcome
+    assert calls == statuses
+    assert item_values(c.tracker, project_id, 1)["Status"] == statuses[-1]
+
+
+def test_board_transport_failure_does_not_fail_runner(run_case, caplog):
+    from foragent import board
+
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, board=board.ensure(c.tracker, c.ctx.repo))
+
+    def unavailable(*args):
+        raise OSError("offline project")
+
+    c.tracker.graphql = unavailable
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.tracker.get_issue(1).state == "closed"
+    assert "Could not set board Status" in caplog.text
+
+
 def test_merge_does_not_ignore_close_failure_for_open_issue(run_case, monkeypatch):
     c = run_case
 

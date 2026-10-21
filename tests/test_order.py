@@ -154,6 +154,30 @@ def test_publish_order_contract_labels_native_links_and_summary(publishing, plan
     assert "| 3 | Login client | s | 2 | yes |" in report.summary()
 
 
+@pytest.mark.parametrize("offline", [False, True])
+def test_publish_projects_are_idempotent_and_failure_does_not_stop_publication(publishing, plan, caplog, offline):
+    from foragent import board
+    from test_board import item_values, snapshot
+
+    root, config, tracker, git, events = publishing
+    project_id = board.ensure(tracker, "owner/repo", config.lanes)
+    config = replace(config, board=project_id)
+    if offline:
+        def unavailable(*args):
+            raise OSError("offline project")
+        tracker.graphql = unavailable
+    for _ in range(2):
+        report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git, approve=True)
+        assert report.parent == 1
+    assert len(tracker.issues) == 3 and tracker.get_issue(2).labels == {"lane:api", "size:m", "approved"}
+    if offline:
+        assert "Could not add issue" in caplog.text and "Could not set board Status" in caplog.text
+    else:
+        assert len(snapshot(tracker, project_id)["items"]["nodes"]) == 3
+        assert item_values(tracker, project_id, 2) == {"Lane": "api", "Size": "m", "Status": "Approved"}
+        assert item_values(tracker, project_id, 3) == {"Lane": "main", "Size": "s", "Status": "Approved"}
+
+
 @pytest.mark.parametrize("options,approved", [
     ({}, set()), ({"approve": True}, {2, 3}),
     ({"approve_keys": ["api"]}, {2}), ({"approve_numbers": [3]}, {3}),

@@ -113,6 +113,9 @@ class Setup:
         return "dev.foragent.owner.repo"
 
     def init(self, **kwargs):
+        # These legacy setup checks focus on files/labels. Board defaults and
+        # lifecycle are exercised separately below and in locked acceptance tests.
+        kwargs.setdefault("no_board", True)
         return init_repo(
             self.root, git=GitRepo(self.root, self.run_git), gh_run=self.run_gh,
             tracker=self.tracker, install_launchd=self.install, **kwargs,
@@ -152,6 +155,49 @@ def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     assert ["push", "origin", "refs/heads/main:refs/heads/main"] in setup.git_calls
     assert report.committed and report.pushed and setup.installs == [setup.root]
     assert "Created: .foragent.yml" in report.summary()
+
+
+def test_board_default_is_persisted_and_idempotent(setup):
+    report = setup.init(no_board=False)
+    project_id = load_config(setup.root).board
+    assert project_id and project_id in report.summary()
+    original = (setup.root / ".foragent.yml").read_bytes()
+    setup.git_calls.clear()
+    report = setup.init(no_board=False)
+    assert report.board_id == project_id and not report.committed and not report.pushed
+    assert (setup.root / ".foragent.yml").read_bytes() == original
+
+
+@pytest.mark.parametrize("existing", ["# Keep me\nreview: fast\n", "review: fast\nboard: null\n"])
+def test_init_adds_board_to_existing_config_and_commits_it(setup, existing):
+    setup.init()
+    path = setup.root / ".foragent.yml"
+    path.write_text(existing)
+    report = setup.init(no_board=False)
+    assert load_config(setup.root).review == "fast" and load_config(setup.root).board
+    assert path.read_text().count("board:") == 1
+    if existing.startswith("#"):
+        assert path.read_text().startswith(existing)
+    assert report.added_keys == ["board"] and report.committed and report.pushed
+
+
+def test_board_opt_out_and_dry_run_do_not_call_graphql(setup):
+    setup.tracker.graphql = lambda *a: pytest.fail("must not call Projects API")
+    setup.init(no_board=True)
+    assert load_config(setup.root).board is None
+    report = setup.init(no_board=False, dry_run=True)
+    assert report.board_planned and report.commit_planned and report.push_planned
+    assert load_config(setup.root).board is None
+
+
+def test_board_failure_does_not_stop_init(setup, caplog):
+    def unavailable(*args):
+        raise OSError("missing project scope")
+
+    setup.tracker.graphql = unavailable
+    assert setup.init(no_board=False).committed
+    assert load_config(setup.root).board is None
+    assert "Could not configure board" in caplog.text
 
 
 def test_second_init_is_idempotent_and_preserves_config_and_mtimes(setup):
@@ -401,6 +447,7 @@ def test_default_gh_tracker_uses_injected_runner_for_labels(setup):
     init_repo(
         setup.root, git=GitRepo(setup.root, setup.run_git), gh_run=setup.run_gh,
         no_launchd=True, no_push=True,
+        no_board=True,
     )
     mutations = [(args, body) for args, body in setup.gh_calls if args[:3] == ["api", "-X", "POST"]]
     assert len(mutations) == len(LABELS)

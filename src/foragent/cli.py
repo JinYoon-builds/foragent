@@ -68,6 +68,7 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--language")
     init.add_argument("--no-push", action="store_true")
     init.add_argument("--no-launchd", action="store_true")
+    init.add_argument("--no-board", action="store_true")
     init.add_argument("--dry-run", action="store_true")
     order_command = commands.add_parser("order", help="Deterministic tools for fa-order")
     order_actions = order_command.add_subparsers(dest="action", required=True)
@@ -308,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
             print(init_repo(
                 root, approvers=args.approvers, review=args.review, executor=args.executor,
                 run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
-                dry_run=args.dry_run, language=args.language,
+                dry_run=args.dry_run, language=args.language, no_board=args.no_board,
             ).summary())
             return 0
         if args.command == "lanes":
