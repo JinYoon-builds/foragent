@@ -17,3 +17,7 @@
 - watch 주문 진행률은 실행 중인 작업의 열린 부모 이슈와 native `sub_issues`를 우선한다. 주문별 완료 실적은 `StateStore.read_history()` 전체를 쓰고 저장된 실행 lane을 따른다. status JSON의 `history`는 최근 10건뿐이라 완료 집계 원본으로 쓰면 안 된다.
 - watch는 표준 `curses`로 0.3초마다 그리며 상태 조회는 별도 스레드에서 5초마다 한다. `--once`와 실시간 화면은 같은 배치를 공유하고, 한글·이모지는 터미널 셀 너비로 계산한다. 레인이 10개 이상이면 번호+Enter로 상세를 토글한다. 사건 파일의 작성 중인 마지막 JSON 줄은 건너뛴다.
 - #35 검증: `UV_CACHE_DIR=/tmp/foragent-issue-38-uv-cache uv run --offline pytest -q tests/acceptance/test_view_watch.py tests/test_watch.py tests/test_status.py tests/test_cli.py`. 실제 TTY는 임시 FakeTracker 시나리오로 배지·타격 프레임·상세 토글·종료까지 확인한다.
+
+- #37 `fa --version`은 `foragent._build.GIT_SHA`를 읽으며 모듈이 없으면 `unknown`이다. 실행 시 Git을 호출하지 않는다. `setuptools.build_meta`가 `setup.py`를 실행해 일반·editable 설치와 sdist 빌드 때 `_build.py`를 생성한다. 생성 파일은 gitignore 대상이다.
+- sdist에는 `_build.py`가 포함된다. `.git`이 없는 배포본을 다시 빌드할 때는 저장된 SHA를 보존하고 상위 폴더의 다른 Git 저장소를 조회하지 않는다. uv 캐시 키에는 `setup.py`와 Git 커밋을 포함한다.
+- #37 검증: `UV_CACHE_DIR=/tmp/foragent-issue-38-uv-cache uv run --offline pytest -q tests/acceptance/test_view_version.py tests/test_build_metadata.py tests/test_cli.py` (69개). `uv build --offline`로 sdist→wheel을 만든 뒤 `/tmp`의 별도 환경에 설치하고 `PATH=/nonexistent <환경>/bin/fa --version`으로 Git 없이 저장된 SHA가 나오는 것도 확인했다. 오프라인 캐시의 setuptools를 재사용할 때는 simple 인덱스·wheel 메타데이터뿐 아니라 archive도 새 캐시에 복사하고 symlink를 새 archive로 연결해야 한다.

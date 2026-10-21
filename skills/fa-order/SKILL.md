@@ -48,6 +48,22 @@ Do not ask about reversible implementation details — decide them and note them
 Keep a visible list of **open questions** in your messages; the interview ends when it is
 empty. Stop asking once remaining choices are reversible.
 
+## Design first (D33)
+Use `ui.frameworks` and `ui.has_design_foundation` from the context alongside the request.
+For UI work without a foundation, create a small design foundation issue first: tokens,
+a few basic components, a sample page, and `docs/design/CONTRACT.md` for product-wide
+tone, density and principles. Derive taste from 2–3 reference apps or sites the user
+likes (spacing, density, color count, typography); get one screenshot approval.
+Only visual work (colors, spacing, component shapes and layout) is `blocked_by` this
+foundation. Backend, API, data, logic and unstyled UI structure with E2E can run in
+parallel from the start. Put each screen's audience, task and information hierarchy in
+that screen issue's plan; read an existing foundation as settled context.
+For visual feedback, ask "this screen or the standard?" If the standard is the problem,
+create an issue to fix the tokens or contract so all screens improve together.
+Exploratory throwaway prototypes are exempt: label the prototype as disposable, then
+establish the foundation and rebuild once the direction is known. Include
+`fa design lint` in visual issues' Done when checks, alongside accessibility and flow E2E.
+
 ## 3. Restate and confirm
 Before splitting, restate in a few lines: what will exist when this order is done, what is
 out of scope, and every decision you made on the user's behalf. Get an explicit yes.
