@@ -92,6 +92,8 @@ def offline_publication(git_history):
             stream = ["commit refs/heads/main\n", "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
                       "data 7\nPublish\n", f"from {parent}\n"]
             for name in args[args.index("--") + 1:]:
+                if name == ":!CLAUDE.local.md":
+                    continue
                 entry = git_command(root, "ls-files", "--stage", "-z", "--", name)
                 metadata, filename = entry.rstrip("\0").split("\t", 1)
                 mode, sha, stage = metadata.split()
@@ -557,6 +559,7 @@ def test_lane_skills_and_notices_reach_remote_runner_worktree(offline_publicatio
     assert set(lane_commit[lane_commit.index("--") + 1:]) == {
         ".foragent.yml", ".claude/agents/fa-web.md", ".claude/skills/testing-strategy/SKILL.md",
         ".claude/skills/testing-strategy/references/example.md", "THIRD_PARTY_NOTICES.md",
+        ":!CLAUDE.local.md",
     }
     assert len([args for args in calls if args[0] == "push"]) == 1
     order.publish(plan, root, load_config(root), tracker, repo="owner/repo", git=git, manager=manager)

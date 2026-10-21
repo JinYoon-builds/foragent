@@ -125,7 +125,7 @@ executor_model: null     # null이면 전역 기본값 (D12, foragent config)
 codex_goal: false        # 실험 기능: Codex 프롬프트에 /goal 조건을 붙임
 reviewer: claude         # codex | claude | none (기본 = executor와 다른 것)
 reviewer_model: null
-review_level: medium    # Claude /code-review: low | medium | high | xhigh | max
+review_level: low       # Claude /code-review: low | medium | high | xhigh | max
 review_max: 2            # 리뷰 FAIL 허용 수; 초과하면 PR을 열고 risk-high로 보류
 approvers: [JinYoon-builds]   # v1 승인 라벨을 붙일 수 있는 사람 (D14)
 acceptance_dir: tests/acceptance/   # order가 구현 전에 쓰고 잠그는 인수 시험 (D11)

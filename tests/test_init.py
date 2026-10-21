@@ -74,6 +74,8 @@ class Setup:
                 f"data {len(title.encode())}\n{title}\n", f"from {parent}\n",
             ]
             for setup_path in args[args.index("--") + 1:]:
+                if setup_path == ":!CLAUDE.local.md":
+                    continue
                 entry = git_command(root, "ls-files", "--stage", "--", setup_path)
                 if entry:
                     metadata, filename = entry.split("\t", 1)
@@ -145,7 +147,7 @@ def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     assert ["add", "-f", "--", *PATHS] in setup.git_calls
     assert [
         "-c", "user.name=Test Human", "-c", "user.email=human@example.com",
-        "commit", "--only", "-m", "Set up Foragent", "--", *PATHS,
+        "commit", "--only", "-m", "Set up Foragent", "--", *PATHS, ":!CLAUDE.local.md",
     ] in setup.git_calls
     assert ["push", "origin", "refs/heads/main:refs/heads/main"] in setup.git_calls
     assert report.committed and report.pushed and setup.installs == [setup.root]
@@ -288,7 +290,7 @@ def test_dirty_worktree_and_unrelated_staged_changes_are_preserved(setup):
     assert readme.read_text() == "Unstaged user change\n"
     assert (setup.root / "untracked.txt").read_text() == "Keep me\n"
     commit = next(args for args in setup.git_calls if "commit" in args)
-    assert "--only" in commit and commit[commit.index("--") + 1:] == PATHS
+    assert "--only" in commit and commit[commit.index("--") + 1:] == [*PATHS, ":!CLAUDE.local.md"]
     assert [args for args in setup.git_calls if args[0] == "add"] == [["add", "-f", "--", *PATHS]]
 
 
@@ -459,7 +461,7 @@ def test_rerun_commits_existing_setup_changes_and_preserves_other_staged_paths(s
     report = setup.init()
     assert not report.created and report.committed and report.pushed
     commit = next(args for args in setup.git_calls if "commit" in args)
-    assert commit[commit.index("--") + 1:] == [PATHS[1]]
+    assert commit[commit.index("--") + 1:] == [PATHS[1], ":!CLAUDE.local.md"]
     assert git_command(setup.root, "diff", "--cached", "--name-only") == "README.md"
     assert git_command(setup.root, "show", "HEAD:README.md") == "Original"
 

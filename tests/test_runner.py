@@ -20,7 +20,7 @@ from foragent.git import GitRepo
 from foragent.issue import body_hash, parse_body
 from foragent.reasons import Reason, parse_reason
 from foragent.runner import (
-    REVIEW_PROMPT, CheckResult, RunContext, _batch_pr, _executor_wait, _lane_skills, _merge_lock, build_prompt, build_review_prompt,
+    REVIEW_PROMPT, CheckResult, RunContext, _batch_pr, _executor_wait, _lane_skills, _merge_lock, _review, build_prompt, build_review_prompt,
     goal_condition, parse_code_review, parse_review, run_issue,
 )
 from foragent.state import StateStore
@@ -1579,6 +1579,141 @@ def enable_native_reviewer(case, messages, edit=None):
     return calls
 
 
+@pytest.fixture
+def review_context(git_history, tmp_path):
+    now = BASE_TIME + timedelta(hours=1)
+    git = GitRepo(git_history.clone)
+    (git.root / "feature.txt").write_text("implementation")
+    git.stage_changes()
+    store = StateStore(tmp_path / "review-state", now=lambda: now)
+    store.save_approval(
+        1, body=BODY, body_sha=body_hash(BODY), acceptance_blobs={},
+        approved_by="human", approved_at=now.isoformat(),
+    )
+    store.start_run(1, branch="foragent/issue-1", worktree=git.root)
+    return RunContext(
+        repo="owner/repo", repo_root=git.root, tracker=FakeTracker(), store=store,
+        config=Config(), git=git, now=lambda: now,
+        poll_hook=lambda execute, poll: execute(),
+    )
+
+
+def expected_review_rules(acceptance_dir):
+    return (
+        "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
+        f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
+        "Improvements beyond this issue's Goal are not defects."
+    )
+
+
+@pytest.mark.parametrize("original", [None, b"", b"# Personal instructions\r\nKeep exact bytes: \xff\n"],
+                         ids=["absent", "empty", "existing-bytes"])
+@pytest.mark.parametrize("outcome", ["pass", "fail", "unusable", "timeout", "nonzero", "exception", "force-stage"])
+def test_claude_review_scope_restores_original_or_removes_temporary_file(review_context, original, outcome):
+    ctx = review_context
+    ctx.config = replace(ctx.config, acceptance_dir="locked checks/other/")
+    path = ctx.git.root / "CLAUDE.local.md"
+    if original is not None:
+        path.write_bytes(original)
+        path.chmod(0o640)
+    tree = ctx.git.staged_tree_sha()
+    head = ctx.git.head_sha()
+    expected = (
+        "# Review scope (written by Foragent for this review only)\n\n"
+        + BODY + "\n\n" + expected_review_rules(ctx.config.acceptance_dir) + "\n\n"
+    ).encode() + (original if original is not None else b"")
+    calls = []
+
+    def review(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["prompt"] == "" and kwargs["review_level"] == "low"
+        assert path.read_bytes() == expected
+        assert git_command(ctx.git.root, "check-ignore", "CLAUDE.local.md") == "CLAUDE.local.md"
+        assert "CLAUDE.local.md" not in ctx.git.changed_paths("HEAD")
+        if outcome == "force-stage":
+            git_command(ctx.git.root, "add", "-f", "--", "CLAUDE.local.md")
+        path.write_bytes(b"reviewer changed the local instructions")
+        if outcome == "exception":
+            raise RuntimeError("reviewer crashed")
+        raw = {"pass": "[]", "fail": '[{"summary":"Goal is not met"}]', "unusable": "unrecognized"}.get(outcome, "[]")
+        return ExecResult(1 if outcome == "nonzero" else 0, outcome == "timeout",
+                          json.dumps({"result": raw}), kwargs["log_path"])
+
+    ctx.executor_factory = lambda name: SimpleNamespace(run=review)
+    if outcome == "exception":
+        with pytest.raises(RuntimeError, match="reviewer crashed"):
+            _review(1, ctx, ctx.git, parse_body("Different parsed body"), "HEAD")
+    else:
+        result = _review(1, ctx, ctx.git, parse_body("Different parsed body"), "HEAD")
+        assert result.verdict == {"pass": "PASS", "fail": "FAIL", "force-stage": "PASS"}.get(outcome, "UNUSABLE")
+        assert any("changes discarded" in note for note in result.notes) == (outcome == "force-stage")
+    assert len(calls) == 1
+    if original is None:
+        assert not path.exists()
+    else:
+        assert path.read_bytes() == original and path.stat().st_mode & 0o777 == 0o640
+    assert ctx.git.staged_tree_sha() == tree and ctx.git.head_sha() == head
+    assert git_command(ctx.git.root, "ls-files", "--", "CLAUDE.local.md") == ""
+
+
+def test_claude_review_scope_does_not_accumulate_between_reviews(review_context):
+    ctx = review_context
+    path = ctx.git.root / "CLAUDE.local.md"
+    original = b"Existing instructions\r\n"
+    path.write_bytes(original)
+    observed = []
+
+    def review(**kwargs):
+        observed.append(path.read_bytes())
+        return ExecResult(0, False, '{"result":"[]"}', kwargs["log_path"])
+
+    ctx.executor_factory = lambda name: SimpleNamespace(run=review)
+    for round_number in (1, 2):
+        assert _review(1, ctx, ctx.git, parse_body(BODY), "HEAD", round_number=round_number).verdict == "PASS"
+        assert path.read_bytes() == original
+    assert observed[0] == observed[1]
+    assert observed[0].count(b"# Review scope (written by Foragent for this review only)") == 1
+    exclude = ctx.git.root / ".git/info/exclude"
+    assert exclude.read_bytes().splitlines().count(b"/CLAUDE.local.md") == 1
+
+
+def test_claude_review_scope_preserves_a_local_instructions_symlink(review_context):
+    ctx = review_context
+    target = ctx.git.root.parent / "personal-instructions.md"
+    target.write_bytes(b"Original target\r\n")
+    path = ctx.git.root / "CLAUDE.local.md"
+    path.symlink_to(target)
+
+    def review(**kwargs):
+        assert not path.is_symlink() and path.read_bytes().endswith(target.read_bytes())
+        path.write_bytes(b"reviewer change")
+        raise RuntimeError("reviewer crashed")
+
+    ctx.executor_factory = lambda name: SimpleNamespace(run=review)
+    with pytest.raises(RuntimeError, match="reviewer crashed"):
+        _review(1, ctx, ctx.git, parse_body(BODY), "HEAD")
+    assert path.is_symlink() and os.readlink(path) == str(target)
+    assert target.read_bytes() == b"Original target\r\n"
+
+
+def test_codex_review_gets_the_same_rules_without_a_temporary_scope_file(review_context):
+    ctx = review_context
+    ctx.config = replace(ctx.config, reviewer="codex", acceptance_dir="custom/locked-checks/")
+    path = ctx.git.root / "CLAUDE.local.md"
+    original = b"Personal instructions\r\n"
+    path.write_bytes(original)
+
+    def review(**kwargs):
+        assert path.read_bytes() == original
+        assert expected_review_rules(ctx.config.acceptance_dir) in kwargs["prompt"]
+        assert "review_level" not in kwargs
+        return ExecResult(0, False, "VERDICT: PASS", kwargs["log_path"])
+
+    ctx.executor_factory = lambda name: SimpleNamespace(run=review)
+    assert _review(1, ctx, ctx.git, parse_body(BODY), "HEAD").verdict == "PASS"
+    assert path.read_bytes() == original
+
+
 @pytest.mark.parametrize("fenced", [False, True])
 def test_native_json_findings_trigger_repair_then_empty_array_passes_and_saves_raw_results(run_case, fenced):
     c = run_case
@@ -1596,6 +1731,7 @@ def test_native_json_findings_trigger_repair_then_empty_array_passes_and_saves_r
     directory = c.store.root / "runs/issue-1"
     assert (directory / "review-1.txt").read_text() == raw
     assert (directory / "review-2.txt").read_text() == "[]"
+    assert "CLAUDE.local.md" not in git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1")
     assert not c.store.worktree_path(1).exists()
 
 

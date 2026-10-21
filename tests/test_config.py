@@ -27,7 +27,7 @@ def test_exact_defaults(repo):
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
-        "repo": None, "language": "en", "codex_goal": False, "review_level": "medium",
+        "repo": None, "language": "en", "codex_goal": False, "review_level": "low",
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},

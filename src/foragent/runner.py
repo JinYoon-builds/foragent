@@ -21,7 +21,7 @@ import yaml
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for
-from foragent.git import GitError, GitRepo
+from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, has_machine_check, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import READY, RUNNING, attempt_tier, issue_size
@@ -102,10 +102,19 @@ class ExecutorStopped(Exception):
         self.outcome = outcome
 
 
-def build_review_prompt(parsed: ParsedIssue, diff: str) -> str:
+def review_scope_rules(acceptance_dir: str) -> str:
+    return (
+        "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
+        f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
+        "Improvements beyond this issue's Goal are not defects."
+    )
+
+
+def build_review_prompt(parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/") -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
-        f"{REVIEW_PROMPT}\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
+        f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
+        f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         f"\n\nDone when commands:\n{commands}\n\nDiff:\n{diff[:60000]}"
     )
 
@@ -510,37 +519,74 @@ def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> 
             if sections else ""), missing
 
 
+@contextmanager
+def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str):
+    git.ignore_review_scope()
+    path = git.root / REVIEW_SCOPE_FILE
+    link = os.readlink(path) if path.is_symlink() else None
+    original = path.read_bytes() if path.exists() else None
+    mode = path.stat().st_mode if path.exists() else None
+    section = (
+        "# Review scope (written by Foragent for this review only)\n\n"
+        f"{body}\n\n{review_scope_rules(acceptance_dir)}\n\n"
+    ).encode("utf-8")
+    try:
+        if link is not None:
+            path.unlink()
+        path.write_bytes(section + (original if original is not None else b""))
+        yield
+    finally:
+        if path.is_symlink():
+            path.unlink()
+        if link is not None:
+            path.unlink(missing_ok=True)
+            path.symlink_to(link)
+        elif original is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(original)
+            path.chmod(mode)
+
+
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1) -> ReviewResult:
     reviewer = resolved_reviewer(ctx.config)
     options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
-    before = git.review_state()
     edited = False
-    try:
-        result = _available_executor(
-            n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
-            reviewer=True,
-            prompt="" if reviewer == "claude" else build_review_prompt(parsed, git.staged_diff(base_ref)),
-            model=ctx.config.reviewer_model, timeout_s=_remaining(n, ctx),
-            log_path=ctx.store.log_path(n), **options,
-        )
-        message = result.full_message if result.full_message is not None else result.last_message
-        raw = message
+    with ExitStack() as scope:
         if reviewer == "claude":
-            try:
-                event = json.loads(message)
-            except ValueError:
-                event = None
-            if isinstance(event, dict) and isinstance(event.get("result"), str):
-                raw = event["result"]
-        path = ctx.store.root / "runs" / f"issue-{n}" / f"review-{round_number}.txt"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(raw, encoding="utf-8")
-    finally:
-        if git.review_state() != before:
-            git.restore_review_state(before)
-            edited = True
-            _append(ctx.store.log_path(n), "Reviewer changed repository state; restored HEAD, index and working tree.")
+            approval = ctx.store.load_approval(n)
+            if approval is None:
+                raise ValueError("Claude review requires an approved snapshot")
+            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir))
+        before = git.review_state()
+        try:
+            result = _available_executor(
+                n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
+                reviewer=True,
+                prompt="" if reviewer == "claude" else build_review_prompt(
+                    parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir,
+                ),
+                model=ctx.config.reviewer_model, timeout_s=_remaining(n, ctx),
+                log_path=ctx.store.log_path(n), **options,
+            )
+            message = result.full_message if result.full_message is not None else result.last_message
+            raw = message
+            if reviewer == "claude":
+                try:
+                    event = json.loads(message)
+                except ValueError:
+                    event = None
+                if isinstance(event, dict) and isinstance(event.get("result"), str):
+                    raw = event["result"]
+            path = ctx.store.root / "runs" / f"issue-{n}" / f"review-{round_number}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw, encoding="utf-8")
+        finally:
+            if git.review_state() != before:
+                git.restore_review_state(before)
+                edited = True
+                _append(ctx.store.log_path(n), "Reviewer changed repository state; restored HEAD, index and working tree.")
     if result.timed_out or result.exit_code != 0:
         review = ReviewResult("UNUSABLE", "", (
             f"Reviewer exit_code={result.exit_code}, timed_out={result.timed_out}",

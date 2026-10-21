@@ -42,7 +42,7 @@ class Config:
     reviewer: str | None = None
     reviewer_model: str | None = None
     review_max: int = 2
-    review_level: str = "medium"
+    review_level: str = "low"
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
