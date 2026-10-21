@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, order
+from foragent import __version__, adopt, bench, design, inspect_actions, inspect_data, launchd, order
 from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -32,6 +32,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fa")
     parser.add_argument("--version", action="version", version=f"foragent {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
+    design_command = commands.add_parser("design", help="Check UI design conventions")
+    design_actions = design_command.add_subparsers(dest="action", required=True)
+    lint = design_actions.add_parser("lint", help="Report raw colors outside design token files")
+    lint.add_argument("--repo-root", type=Path, default=Path.cwd())
+    lint.add_argument("--tokens", nargs="+", action="extend", help="Token paths or globs (default: **/tokens.css, **/tokens.ts)")
+    lint.add_argument("--glob", nargs="+", action="extend", dest="globs", help="UI file globs (default: CSS, TSX, JSX, Vue, Svelte, HTML)")
+    lint.add_argument("--json", action="store_true")
     adopt_command = commands.add_parser("adopt", help="Prepare an existing repository for Foragent")
     adopt_actions = adopt_command.add_subparsers(dest="action", required=True)
     for name in ("survey", "baseline", "ci"):
@@ -266,6 +273,8 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "design":
+            return design.run(args)
         if args.command == "adopt":
             return adopt.run(args)
         if args.command == "bench":

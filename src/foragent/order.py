@@ -8,6 +8,7 @@ import re
 from urllib.parse import quote
 
 from foragent.config import Config
+from foragent.design import ui_context
 from foragent.git import GitError, GitRepo
 from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, latest_flag
 from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
@@ -137,6 +138,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
     return {
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "interview": _interview_context(config),
+        "ui": ui_context(root),
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
         "feedback": feedback, "decisions": decisions,
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),
