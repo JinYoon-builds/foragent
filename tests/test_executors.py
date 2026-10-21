@@ -173,7 +173,8 @@ def test_exact_claude_review_command(level, model):
     ]
 
 
-def test_claude_review_uses_devnull_and_preserves_json(tmp_path, monkeypatch):
+@pytest.mark.parametrize("pr", [None, 42])
+def test_claude_review_uses_devnull_and_preserves_json(tmp_path, monkeypatch, pr):
     calls = []
     message = json.dumps({"result": "(none)", "is_error": False})
 
@@ -192,8 +193,11 @@ def test_claude_review_uses_devnull_and_preserves_json(tmp_path, monkeypatch):
 
     monkeypatch.setattr("foragent.processes.subprocess.Popen", Process)
     result = ClaudeExecutor().run(worktree=tmp_path, prompt="ignored", model=None, timeout_s=12,
-                                  log_path=tmp_path / "review.log", review_level="high")
-    assert calls[0][0] == claude_review_command("high")
+                                  log_path=tmp_path / "review.log", review_level="high", review_pr=pr)
+    expected_prompt = f"/code-review {pr} high" if pr is not None else "/code-review high"
+    assert calls[0][0] == [
+        "claude", "-p", expected_prompt, "--permission-mode", "auto", "--output-format", "json",
+    ]
     assert calls[0][1]["stdin"] == subprocess.DEVNULL and calls[0][1]["cwd"] == tmp_path
     assert result.last_message == result.full_message == message
 

@@ -122,8 +122,9 @@ def claude_command(
     return args + (["--model", model] if model is not None else [])
 
 
-def claude_review_command(level: str, model: str | None = None) -> list[str]:
-    args = ["claude", "-p", f"/code-review {level}", "--permission-mode", "auto", "--output-format", "json"]
+def claude_review_command(level: str, model: str | None = None, *, pr: int | None = None) -> list[str]:
+    target = f"{pr} " if pr is not None else ""
+    args = ["claude", "-p", f"/code-review {target}{level}", "--permission-mode", "auto", "--output-format", "json"]
     return args + (["--model", model] if model is not None else [])
 
 
@@ -165,10 +166,10 @@ class ClaudeExecutor:
         self, *, worktree: Path, prompt: str, model: str | None,
         timeout_s: int, log_path: Path,
         settings_path: Path | None = None, review_level: str | None = None,
-        agent: str | None = None,
+        agent: str | None = None, review_pr: int | None = None,
     ) -> ExecResult:
         output_path = log_path.with_suffix(".stdout")
-        command = (claude_review_command(review_level, model) if review_level is not None
+        command = (claude_review_command(review_level, model, pr=review_pr) if review_level is not None
                    else claude_command(model, settings_path, agent) if agent is not None
                    else claude_command(model, settings_path))
         code, timed_out, _ = run_logged(

@@ -43,6 +43,7 @@ class Config:
     reviewer_model: str | None = None
     review_max: int = 2
     review_level: str = "low"
+    review_scope: str = "claude-local"
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
@@ -90,6 +91,8 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 
 
 def _validate(values: dict[str, Any]) -> None:
+    if not isinstance(values["review_scope"], str) or values["review_scope"] not in {"claude-local", "pr-body"}:
+        raise ConfigError("review_scope must be claude-local or pr-body")
     if not isinstance(values["interview"], str) or values["interview"] not in {"ouroboros", "native"}:
         raise ConfigError("interview must be ouroboros or native")
     if type(values["codex_goal"]) is not bool:

@@ -317,6 +317,7 @@ def _pr_body(
     attempt_tiers: dict[str, str] | None = None,
     missing_skills: list[str] | None = None,
     rebuttals: str = "",
+    review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -325,9 +326,13 @@ def _pr_body(
         passed = check.exit_code == 0 and not check.timed_out
         lines.append(f"| <code>{command}</code> | {'pass' if passed else 'fail'} |")
     lines.extend(["", "## Review", ""])
-    if not reviews:
+    if review_scope == "pr-body":
+        lines.append(f"VERDICT: {reviews[-1].verdict}" if reviews else "Pending review.")
+        lines.extend(["", "## Review scope", "", review_scope_rules(acceptance_dir),
+                      "The acceptance tests are locked."])
+    elif not reviews:
         lines.append("Disabled (reviewer: none).")
-    for round_number, review in enumerate(reviews, 1):
+    for round_number, review in enumerate(reviews if review_scope == "claude-local" else [], 1):
         lines.append(f"Round {round_number}: VERDICT: {review.verdict}")
         if review.findings:
             lines.append(review.findings)
@@ -572,13 +577,15 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
 
 
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
-            *, round_number: int = 1) -> ReviewResult:
+            *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
     reviewer = resolved_reviewer(ctx.config)
     options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
+    if reviewer == "claude" and pr is not None:
+        options["review_pr"] = pr
     rebuttals = _read_rebuttals(git.root)
     edited = False
     with ExitStack() as scope:
-        if reviewer == "claude":
+        if reviewer == "claude" and ctx.config.review_scope == "claude-local":
             approval = ctx.store.load_approval(n)
             if approval is None:
                 raise ValueError("Claude review requires an approved snapshot")
@@ -847,6 +854,27 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             return "" if paths else "The session made no changes."
         raise AssertionError("unreachable verification state")
 
+    def render_pr_body(try_text: str | None = None) -> str:
+        lane = ctx.store.get_run(n).lane
+        globs = ctx.config.lanes.get(lane, {}).get("paths", []) if lane != "main" else None
+        inside = set(touched(paths, globs)) if globs is not None else set(paths)
+        outside = [path for path in paths if path not in inside]
+        return _pr_body(
+            n, parsed, checks, ctx.store.get_run(n).attempts, reviews, try_text, outside_lane=outside,
+            fallback_model=ctx.store.get_run(n).fallback_model,
+            attempt_tiers=ctx.store.get_run(n).attempt_tiers,
+            missing_skills=missing_skills,
+            rebuttals="\n\n".join(rebuttals),
+            review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
+        )
+
+    def open_or_update_pr(title: str, body: str) -> int:
+        pr = ctx.tracker.find_pr(branch)
+        if pr is None:
+            return ctx.tracker.create_pr(head=branch, base=target_branch, title=title, body=body)
+        ctx.tracker.update_pr(pr, base=target_branch, title=title, body=body)
+        return pr
+
     def publish() -> str:
         with _merge_lock(n, ctx):
             return publish_locked()
@@ -923,7 +951,6 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         git.push(branch)
         _progress(n, ctx)
         _append(log, f"Pushed verified HEAD: {verified_head_sha}")
-        pr = ctx.tracker.find_pr(branch)
         try_text = None
         try_path = worktree / ".foragent/TRY.md"
         if not review_hold and try_path.is_file():
@@ -931,28 +958,11 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             saved_try = ctx.store.root / "try" / f"{n}.md"
             saved_try.parent.mkdir(parents=True, exist_ok=True)
             saved_try.write_text(try_text, encoding="utf-8")
-        lane = ctx.store.get_run(n).lane
-        globs = ctx.config.lanes.get(lane, {}).get("paths", []) if lane != "main" else None
 
         def pr_body() -> str:
-            inside = set(touched(paths, globs)) if globs is not None else set(paths)
-            outside = [path for path in paths if path not in inside]
-            return _pr_body(
-                n, parsed, checks, ctx.store.get_run(n).attempts, reviews, try_text, outside_lane=outside,
-                fallback_model=ctx.store.get_run(n).fallback_model,
-                attempt_tiers=ctx.store.get_run(n).attempt_tiers,
-                missing_skills=missing_skills,
-                rebuttals="\n\n".join(rebuttals),
-            )
+            return render_pr_body(try_text)
 
-        body = pr_body()
-        if pr is None:
-            pr = ctx.tracker.create_pr(
-                head=branch, base=target_branch, title=title,
-                body=body,
-            )
-        else:
-            ctx.tracker.update_pr(pr, base=target_branch, title=title, body=body)
+        pr = open_or_update_pr(title, pr_body())
         if target_sha is not None:
             ctx.tracker.comment(pr, f"base merged before merge: {target_sha}")
         _progress(n, ctx)
@@ -1068,10 +1078,22 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         if not failure and ctx.config.reviewer != "none":
             if _remaining(n, ctx) <= 0:
                 return _timeout(n, ctx)
-            review = _review(n, ctx, git, parsed, base_ref, round_number=len(reviews) + 1)
+            pr = None
+            if ctx.config.review_scope == "pr-body":
+                title = f"{ctx.tracker.get_issue(n).title} (#{n})"
+                if git.has_staged_changes():
+                    git.commit(title)
+                git.push(branch)
+                pr = open_or_update_pr(title, render_pr_body())
+                _progress(n, ctx)
+            review = _review(n, ctx, git, parsed, base_ref, round_number=len(reviews) + 1, pr=pr)
             if review.verdict == "UNUSABLE":
                 review = replace(review, findings=review.raw)
             reviews.append(review)
+            if pr is not None:
+                ctx.tracker.comment(pr, "\n".join([
+                    f"Round {len(reviews)}: VERDICT: {review.verdict}", review.findings, *review.notes,
+                ]))
             if review.verdict != "PASS":
                 review_failures += 1
                 if review.verdict == "UNUSABLE":
