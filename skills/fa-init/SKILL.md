@@ -51,8 +51,11 @@ description: Set up a project folder for Foragent.
    acceptance directory (recommended), or No, keep CI as is. Only on an explicit
    yes, run `fa adopt ci --exclude-acceptance --json`, report the result, and
    commit only the workflow files listed in `changed`. Report `manual` entries
-   for human follow-up. If the answer is no or CI already excludes the acceptance
-   directory, leave CI unchanged and create no CI commit.
+   for human follow-up. Also show each `collect_only` finding (workflow `file` and
+   suggested `add` command): a collection step lists every test without running
+   it, so it catches import errors and module name clashes. Collection steps must
+   keep the acceptance directory included; report them, do not insert them. If the answer is no or CI already excludes
+   the acceptance directory, leave CI unchanged and create no CI commit.
 
 9. Run `fa order context --json`. When `ui.frameworks` is nonempty, propose a
    design lane covering the project's actual UI and design foundation paths, reusing

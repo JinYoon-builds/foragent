@@ -410,6 +410,7 @@ def test_workflows_wait_three_minutes_before_trusting_no_checks(run_case, monkey
 ])
 def test_workflow_checks_keep_pass_failure_and_pending_behavior(run_case, monkeypatch, statuses, outcome, elapsed):
     c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
     c.executor.steps[0][".github/workflows/ci.yml"] = "name: CI\n"
     started_at = c.now[0]
     results = iter(statuses)
@@ -525,6 +526,7 @@ def test_non_fast_leaves_pr_open_without_needs_human(run_case, config):
 ])
 def test_ci_failure_and_timeout(run_case, status, outcome, reason):
     c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
     c.tracker.set_pr_checks(2, status)
     assert run_issue(1, c.ctx) == outcome
     assert c.store.load_flag(1).reason == reason
@@ -532,6 +534,103 @@ def test_ci_failure_and_timeout(run_case, status, outcome, reason):
     assert c.tracker.merged_prs == []
     if status == "pending":
         assert c.now[0] == BASE_TIME + timedelta(hours=1, minutes=20)
+
+
+@pytest.mark.parametrize("files,configured,expected", [
+    ({}, None, None),
+    ({"pyproject.toml": "[project]\n", "go.mod": "module example"}, None, "uv run pytest"),
+    ({"package.json": '{"scripts":{"test":"vitest"}}'}, None, "npm test"),
+    ({"pyproject.toml": "[project]\n"}, "make check", "make check"),
+])
+def test_implementation_prompt_full_suite_from_worktree(run_case, files, configured, expected):
+    c = run_case
+    c.history.update(files)
+    c.ctx.config = replace(c.ctx.config, test_command=configured)
+    assert run_issue(1, c.ctx) == "merged"
+    prompt = c.executor.calls[0]["prompt"]
+    if expected is None:
+        assert "Before you finish" not in prompt
+    else:
+        assert prompt.splitlines().count(
+            f"- Before you finish, also run the full test suite: `{expected}`. "
+            "CI runs it, so existing tests must keep passing."
+        ) == 1
+
+
+@pytest.mark.parametrize("ci_passes,repair_passes_done_when", [(True, True), (False, True), (True, False)])
+def test_ci_retry_preserves_worktree_logs_and_all_checks(run_case, monkeypatch, ci_passes, repair_passes_done_when):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command="make check")
+    reviews = enable_reviewer(c, ["VERDICT: PASS", "VERDICT: PASS"])
+    logs = "first run\n" + "A" * 3990 + "\nsecond run\n" + "B" * 3990
+    c.tracker.set_pr_checks(2, "fail")
+    c.tracker.set_pr_failed_logs(2, logs)
+    c.executor.steps.append({"feature.txt": "done" if repair_passes_done_when else "broken"})
+    execute = c.executor.run
+    worktree_identity = []
+
+    def implement(**kwargs):
+        path = kwargs["worktree"]
+        worktree_identity.append(path.stat().st_ino)
+        if c.executor.calls:
+            assert (path / "feature.txt").read_text() == "done"
+            assert (path / ".foragent/TRY.md").read_text() == "keep try"
+            assert (path / ".foragent/REBUTTAL.md").read_text() == "keep rebuttal"
+            c.tracker.set_pr_checks(2, "pass" if ci_passes else "fail")
+        else:
+            (path / ".foragent").mkdir()
+            (path / ".foragent/TRY.md").write_text("keep try")
+            (path / ".foragent/REBUTTAL.md").write_text("keep rebuttal")
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    expected = "merged" if ci_passes and repair_passes_done_when else "ci-failed" if not ci_passes else "retries-exceeded"
+    assert run_issue(1, c.ctx) == expected
+    assert len(c.executor.calls) == 2
+    assert worktree_identity[0] == worktree_identity[1]
+    assert "CI failed:\n" + logs in c.executor.calls[1]["prompt"]
+    assert "`make check`" in c.executor.calls[1]["prompt"]
+    assert len(reviews) == (2 if repair_passes_done_when else 1)
+    assert c.store.get_run(1).attempts == 2
+    assert len(c.tracker.created_prs) == 1
+    if expected == "merged":
+        assert not c.tracker.get_issue(1).labels & {"blocked", "needs-human"}
+    else:
+        assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+        assert c.tracker.get_issue(1).labels & {"blocked", "needs-human"} == {"blocked"}
+        if expected == "ci-failed":
+            assert logs in c.tracker.list_comments(1)[-1].body
+
+
+def test_ci_retry_after_base_refresh_keeps_merged_base_and_rereviews(run_case, monkeypatch):
+    c = run_case
+    reviews = enable_reviewer(c, ["VERDICT: PASS", "VERDICT: PASS"])
+    c.executor.steps.append({"repair.txt": "fix CI on merged base"})
+    c.tracker.set_pr_failed_logs(2, "failure after refreshing base")
+    polls = []
+
+    def checks(pr):
+        polls.append(c.tracker.pr_head_sha(pr))
+        if len(polls) == 1:
+            c.history.update({"sibling.txt": "new base"})
+        return "fail" if len(polls) == 2 else "pass"
+
+    execute = c.executor.run
+
+    def implement(**kwargs):
+        if c.executor.calls:
+            assert (kwargs["worktree"] / "sibling.txt").read_text() == "new base"
+            assert c.ctx.git.at(kwargs["worktree"]).is_ancestor(c.history.tip, "HEAD")
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    monkeypatch.setattr(c.tracker, "pr_checks", checks)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == len(reviews) == 2
+    assert len(polls) == 3 and polls[0] != polls[1] != polls[2]
+    assert "CI failed:\nfailure after refreshing base" in c.executor.calls[1]["prompt"]
+    assert c.store.get_run(1).attempts == 2
+    assert c.store.log_path(1).read_text().count("Done when command:") == 6
 
 
 def test_ci_pending_polls_every_thirty_seconds_then_merges(run_case, monkeypatch):
@@ -1435,6 +1534,7 @@ def test_retry_removing_batch_override_returns_only_child_patch_to_base(run_case
 def test_batch_ci_failure_keeps_child_open_and_does_not_open_parent_pr(run_case):
     c = run_case
     batch_setup(c)
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
     c.tracker.set_pr_checks(100, "fail")
     assert run_issue(1, c.ctx) == "ci-failed"
     assert c.tracker.get_issue(1).state == "open"
@@ -2349,7 +2449,7 @@ def test_fresh_base_same_line_conflict_is_resolved_in_place_and_merge_commit_is_
             assert "['help', 'issue']" in text and "['help', 'base']" in text
             assert git_command(root, "rev-parse", "MERGE_HEAD") == c.target_heads[0]
             assert GitRepo(root).conflict_paths() == ["cli.py"]
-            assert c.store.get_run(1).attempts == 2
+            assert c.store.get_run(1).attempts == 1
             implementation_heads.append(git_command(root, "rev-parse", "HEAD"))
             # The project merge lock remains held while the implementer resolves conflicts.
             with (c.store.root / "merge.lock").open("a") as lock:
@@ -2372,7 +2472,7 @@ def test_fresh_base_same_line_conflict_is_resolved_in_place_and_merge_commit_is_
     monkeypatch.setattr(c.executor, "run", resolve)
     monkeypatch.setattr(c.tracker, "merge_pr", merge_verified)
     assert run_issue(1, c.ctx) == "merged"
-    assert len(c.executor.calls) == 2 and c.store.get_run(1).attempts == 2
+    assert len(c.executor.calls) == 2 and c.store.get_run(1).attempts == 1
     prompt = c.executor.calls[1]["prompt"]
     assert "Resolve the conflict markers in the following files:\n- cli.py" in prompt
     assert "Preserve both the features newly added on the base branch and the features for this issue." in prompt
@@ -2381,7 +2481,7 @@ def test_fresh_base_same_line_conflict_is_resolved_in_place_and_merge_commit_is_
         assert c.ci_heads == [c.tracker.pr_head_sha(2)]
     else:
         assert len(c.ci_heads) == 3 and c.ci_heads[0] != c.ci_heads[1] == c.ci_heads[2]
-    assert "attempt 2" in c.tracker.created_prs[0].body
+    assert "attempt 1" in c.tracker.created_prs[0].body
     assert c.store.log_path(1).read_text().count("Done when command:") == 2
     assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == "commands = ['help', 'base', 'issue']"
     assert not any(args == ["merge", "--abort"] for _, args in c.operations)
@@ -2416,7 +2516,7 @@ def test_conflict_marker_left_after_staging_consumes_attempt_before_merge_commit
 
     monkeypatch.setattr(c.executor, "run", prestage)
     assert run_issue(1, c.ctx) == "merged"
-    assert len(c.executor.calls) == 3 and c.store.get_run(1).attempts == 3
+    assert len(c.executor.calls) == 3 and c.store.get_run(1).attempts == 1
     assert "Conflict markers remain in: cli.py" in c.executor.calls[2]["prompt"]
     assert "Resolve the conflict markers" in c.executor.calls[2]["prompt"]
     assert c.store.log_path(1).read_text().count("Done when command:") == 2
@@ -2430,7 +2530,7 @@ def test_noop_conflict_resolver_is_retried_even_when_done_when_checks_other_file
     set_done_when(c, [f"test -f {ACCEPTANCE}"])
     c.executor.steps += [{}, {"cli.py": "commands = ['help', 'base', 'issue']\n"}]
     assert run_issue(1, c.ctx) == "merged"
-    assert len(c.executor.calls) == 3 and c.store.get_run(1).attempts == 3
+    assert len(c.executor.calls) == 3 and c.store.get_run(1).attempts == 1
     assert "Conflict markers remain in: cli.py" in c.executor.calls[2]["prompt"]
     assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == "commands = ['help', 'base', 'issue']"
 
@@ -2444,7 +2544,7 @@ def test_done_when_reintroduced_ancestor_marker_in_conflict_file_consumes_attemp
     resolved = "commands = ['help', 'base', 'issue']\n"
     c.executor.steps += [{"cli.py": resolved}, {"cli.py": resolved, "fixed.txt": "done"}]
     assert run_issue(1, c.ctx) == "merged"
-    assert len(c.executor.calls) == 3 and c.store.get_run(1).attempts == 3
+    assert len(c.executor.calls) == 3 and c.store.get_run(1).attempts == 1
     assert "Conflict markers remain in: cli.py" in c.executor.calls[2]["prompt"]
     assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == resolved.strip()
 
@@ -2467,9 +2567,9 @@ def test_conflict_resolution_done_when_failure_uses_remaining_attempt_on_merged_
 
     monkeypatch.setattr(c.executor, "run", fix_checks)
     assert run_issue(1, c.ctx) == "merged"
-    assert len(c.executor.calls) == 3 and c.store.get_run(1).attempts == 3
+    assert len(c.executor.calls) == 3 and c.store.get_run(1).attempts == 1
     assert "Command:" in c.executor.calls[2]["prompt"] and "Resolve the conflict markers" in c.executor.calls[2]["prompt"]
-    assert "attempt 3" in c.tracker.created_prs[0].body
+    assert "attempt 1" in c.tracker.created_prs[0].body
     assert c.store.log_path(1).read_text().count("Done when command:") == 3
     assert c.ci_heads[0] != c.ci_heads[1] == c.ci_heads[2]
 
@@ -2488,7 +2588,7 @@ def test_conflict_resolution_ignores_section_underlines_in_other_changed_files(c
         set_done_when(c, [*commands, "printf 'Heading\\n=======\\n' > README.rst"])
     c.executor.steps.append(resolution)
     assert run_issue(1, c.ctx) == "merged"
-    assert len(c.executor.calls) == 2 and c.store.get_run(1).attempts == 2
+    assert len(c.executor.calls) == 2 and c.store.get_run(1).attempts == 1
     assert git_command(c.history.origin, "show", "foragent/issue-1:README.rst") == readme.strip()
 
 
@@ -2496,23 +2596,156 @@ def test_conflict_resolution_ignores_section_underlines_in_other_changed_files(c
 def test_conflict_resolution_exhaustion_never_publishes_failed_resolution(conflicting_lanes, failure):
     c = conflicting_lanes
     content = "commands = ['help', 'issue']\n" + ("<<<<<<< HEAD\n" if failure == "markers" else "")
-    c.executor.steps += [{"cli.py": content}] * 2
+    c.executor.steps += [{"cli.py": content}] * 3
     assert run_issue(1, c.ctx) == "retries-exceeded"
-    assert len(c.executor.calls) == 3 and c.store.get_run(1).attempts == 3
+    assert len(c.executor.calls) == 4 and c.store.get_run(1).attempts == 2
     assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
     assert len(c.ci_heads) == 1 and c.tracker.merged_prs == []
     assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == c.ci_heads[0]
     assert not any(args == ["merge", "--abort"] for _, args in c.operations)
 
 
-def test_conflict_resolution_does_not_receive_a_fresh_attempt_budget(conflicting_lanes):
+def test_conflict_resolution_has_full_budget_after_implementation_retries(conflicting_lanes):
     c = conflicting_lanes
     c.ctx.config = replace(c.ctx.config, max_retries=1)
     c.executor.steps.insert(0, {"cli.py": "commands = ['help']\n"})
+    c.executor.steps += [{}, {"cli.py": "commands = ['help', 'base', 'issue']\n"}]
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 4 and c.store.get_run(1).attempts == 2
+    assert "Conflict markers remain in: cli.py" in c.executor.calls[-1]["prompt"]
+    assert c.store.load_flag(1) is None
+
+
+@pytest.mark.parametrize("before_push", [False, True])
+@pytest.mark.parametrize("scope", ["claude-local", "pr-body"])
+def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflicting_lanes, monkeypatch, before_push, scope):
+    c = conflicting_lanes
+    c.ctx.config = replace(c.ctx.config, max_retries=1, review_scope=scope)
+    approval = c.store.load_approval(1)
+    body = "## Goal\nPreserve the CLI feature.\n## Out of scope\nOther features.\n" + approval.body
+    c.store.save_approval(**replace(approval, body=body, body_sha=body_hash(body)).__dict__)
+    reviews = enable_reviewer(c, ["VERDICT: FAIL\ncli.py:1 wording", "VERDICT: PASS", "VERDICT: PASS"])
+    c.executor.steps += [{}, {}, {}, {"cli.py": "commands = ['help', 'base', 'newbase', 'issue']\n"}]
+    execute = c.executor.run
+    latest = []
+    leases = []
+
+    def implement(**kwargs):
+        index = len(c.executor.calls)
+        root = kwargs["worktree"]
+        if index == 4:
+            leases.append(c.ctx.git.remote_branch_sha("foragent/issue-1") or "")
+            assert (root / "cli.py").read_text() == "commands = ['help', 'base', 'newbase']\n"
+            assert (root / "latest.txt").read_text() == "latest\n"
+            assert (root / ".foragent/TRY.md").read_text() == "Try the feature\n"
+            assert (root / ".foragent/REBUTTAL.md").read_text() == "- A finding: explanation\n"
+            assert git_command(root, "rev-parse", "HEAD") == latest[0]
+            assert not (root / git_command(root, "rev-parse", "--git-path", "MERGE_HEAD")).exists()
+            assert "earlier attempt could not be merged onto the moved base" in kwargs["prompt"]
+            parsed = parse_body(c.store.load_approval(1).body)
+            assert parsed.goal in kwargs["prompt"]
+            assert parsed.out_of_scope in kwargs["prompt"]
+            assert all(command in kwargs["prompt"] for command in parsed.done_when_commands)
+            assert "Resolve the conflict markers" not in kwargs["prompt"]
+        result = execute(**kwargs)
+        if index == 0:
+            (root / ".foragent").mkdir(exist_ok=True)
+            (root / ".foragent/TRY.md").write_text("Try the feature\n")
+            (root / ".foragent/REBUTTAL.md").write_text("- A finding: explanation\n")
+            if before_push:
+                c.move_target()
+        if index == 3:
+            c.history.update({"cli.py": "commands = ['help', 'base', 'newbase']\n", "latest.txt": "latest\n"})
+            latest.append(c.history.tip)
+        return result
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 5 and len(reviews) == 3
+    assert c.store.get_run(1).attempts == 3
+    assert c.store.load_flag(1) is None
+    log = c.store.log_path(1).read_text()
+    assert log.count("Rebuilding issue branch once") == 1
+    assert "Conflict attempt 2/2" in log
+    assert log.count("Done when command:") == 3
+    assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == "commands = ['help', 'base', 'newbase', 'issue']"
+    pushes = [args for _, args in c.operations if args[0] == "push"]
+    first_rewrite = next(i for i, args in enumerate(pushes) if args[1].startswith("--force-with-lease="))
+    assert all(args[1].startswith("--force-with-lease=") for args in pushes[first_rewrite:])
+    assert pushes[first_rewrite][1] == f"--force-with-lease=refs/heads/foragent/issue-1:{leases[0]}"
+    assert len(c.tracker.created_prs) == 1
+
+
+@pytest.mark.parametrize("failure", ["checks", "review", "ci", "conflict"])
+def test_failed_rebuild_blocks_without_more_implementation_or_resolution(conflicting_lanes, monkeypatch, failure):
+    c = conflicting_lanes
+    c.ctx.config = replace(c.ctx.config, conflict_retries=1, max_retries=8)
+    c.executor.steps += [{}, {"cli.py": "commands = ['help', 'base', 'issue']\n"}]
+    if failure == "checks":
+        c.executor.steps[-1] = {"cli.py": "commands = ['help', 'base']\n"}
+    if failure == "review":
+        enable_reviewer(c, ["VERDICT: PASS", "VERDICT: FAIL\ncli.py:1 still broken"])
+    if failure in {"ci", "conflict"}:
+        statuses = ["pass", "fail" if failure == "ci" else "pass"]
+
+        def ci(pr):
+            c.ci_heads.append(c.tracker.pr_head_sha(pr))
+            if len(c.ci_heads) == 1:
+                c.move_target()
+            elif failure == "conflict":
+                c.history.update({"cli.py": "commands = ['help', 'base', 'parallel']\n"})
+            return statuses.pop(0)
+
+        monkeypatch.setattr(c.tracker, "pr_checks", ci)
+        c.tracker.set_pr_failed_logs(2, "The rebuilt CI failed")
     assert run_issue(1, c.ctx) == "retries-exceeded"
-    assert len(c.executor.calls) == 2 and c.store.get_run(1).attempts == 2
-    assert "Merge conflict with main: cli.py" in c.tracker.list_comments(1)[-1].body
+    assert len(c.executor.calls) == 3
+    assert c.store.get_run(1).attempts == 2
+    assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+    assert "blocked" in c.tracker.get_issue(1).labels
     assert c.tracker.merged_prs == []
+    log = c.store.log_path(1).read_text()
+    assert log.count("Rebuilding issue branch once") == 1
+    assert "Rebuilt attempt failed:" in log
+    if failure in {"checks", "review"}:
+        assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == c.ci_heads[0]
+    if failure == "ci":
+        assert "The rebuilt CI failed" in c.tracker.list_comments(1)[-1].body
+
+
+def test_conflict_budget_survives_ci_repair_and_republishing(conflicting_lanes, monkeypatch):
+    c = conflicting_lanes
+    c.ctx.config = replace(c.ctx.config, conflict_retries=1)
+    c.executor.steps += [
+        {"cli.py": "commands = ['help', 'base', 'issue']\n"},
+        {"repair.txt": "CI repair\n"},
+        {"cli.py": "commands = ['help', 'base', 'parallel', 'issue']\n"},
+    ]
+    execute = c.executor.run
+
+    def implement(**kwargs):
+        index = len(c.executor.calls)
+        result = execute(**kwargs)
+        if index == 2:
+            c.history.update({"cli.py": "commands = ['help', 'base', 'parallel']\n"})
+        return result
+
+    def ci(pr):
+        c.ci_heads.append(c.tracker.pr_head_sha(pr))
+        if len(c.ci_heads) == 1:
+            c.move_target()
+        return "fail" if len(c.ci_heads) == 2 else "pass"
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    monkeypatch.setattr(c.tracker, "pr_checks", ci)
+    c.tracker.set_pr_failed_logs(2, "Repair the CI failure")
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 4
+    assert "CI failed:\nRepair the CI failure" in c.executor.calls[2]["prompt"]
+    assert "earlier attempt could not be merged onto the moved base" in c.executor.calls[3]["prompt"]
+    log = c.store.log_path(1).read_text()
+    assert log.count("Conflict attempt 1/1:") == 1
+    assert log.count("Rebuilding issue branch once") == 1
 
 
 def test_fresh_base_done_when_failure_returns_to_implementer(run_case, monkeypatch):
@@ -2836,7 +3069,7 @@ def test_merge_lock_wait_does_not_consume_conflict_executor_backoff_budget(confl
     assert run_issue(1, c.ctx) == "merged"
     assert waits == [120] * (2 if prior_backoff else 1) + [30]
     run = c.store.get_run(1)
-    assert run.attempts == 2 and run.executor_waited_seconds == 120 * (2 if prior_backoff else 1)
+    assert run.attempts == 1 and run.executor_waited_seconds == 120 * (2 if prior_backoff else 1)
     assert run.waited_seconds == 31 * 60 + run.executor_waited_seconds
     assert [call["timeout_s"] for call in c.executor.calls] == [60] * (4 if prior_backoff else 3)
     assert c.store.load_flag(1) is None

@@ -26,6 +26,7 @@ from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
+from foragent.order import detect_test_commands
 from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.processes import run_logged
 from foragent.reasons import Reason
@@ -97,7 +98,17 @@ class PatchReplayError(GitError):
 
 
 class AttemptFailure(Exception):
-    """Fresh-base conflicts and checks share the implementation retry budget."""
+    """Checks on a refreshed base failed and need another implementation attempt."""
+
+
+class ConflictBudgetExhausted(Exception):
+    """Conflict resolution needs one fresh implementation on the latest target."""
+
+
+class CIFailure(AttemptFailure):
+    def __init__(self, logs: str, target_branch: str):
+        super().__init__(f"CI failed:\n{logs}")
+        self.target_branch = target_branch
 
 
 class ExecutorStopped(Exception):
@@ -184,9 +195,15 @@ def build_prompt(
     merge_conflicts: list[str] | None = None,
     reviewer_text: str | None = None,
     orchestrator_hint: str | None = None,
+    test_command: str | None = None,
+    failure_limit: int | None = 4000,
 ) -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     acceptance_rule = "" if acceptance_locked else f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
+    test_rule = (
+        f"- Before you finish, also run the full test suite: `{test_command}`. CI runs it, so existing tests must keep passing.\n"
+        if test_command is not None else ""
+    )
     prompt = (
         f"You are implementing GitHub issue #{n} in this repository.\n"
         f"{parsed.goal}\n"
@@ -195,6 +212,7 @@ def build_prompt(
         f"{commands}\n"
         "Rules:\n"
         f"{acceptance_rule}"
+        f"{test_rule}"
         "- If the issue needs a product decision you cannot make from the text and the code, do not guess:\n"
         "  write .foragent/QUESTION.md with the question, 2–3 options and your recommendation, then stop.\n"
         f"  Write it in {language}. Include an `## Evidence` section quoting the exact conflicting lines "
@@ -224,7 +242,9 @@ def build_prompt(
     if reviewer_text is not None:
         prompt += "\nA reviewer said (verbatim):\n" + reviewer_text
     elif failure:
-        prompt += "\nA previous attempt failed. Output of the failing check:\n" + failure[-4000:]
+        prompt += "\nA previous attempt failed. Output of the failing check:\n" + (
+            failure if failure_limit is None else failure[-failure_limit:]
+        )
     if merge_conflicts is not None:
         prompt += (
             "\n\nResolve the conflict markers in the following files:\n"
@@ -378,6 +398,21 @@ def _timeout(n: int, ctx: RunContext) -> str:
 def _hold_changed_head(n: int, ctx: RunContext, link: str) -> str:
     flag(ctx, n, Reason.RISK_HIGH, "PR head changed after verification", link)
     return "held"
+
+
+def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str) -> None:
+    """Spend one implementation retry, preserving the raw logs from every run."""
+    failure = CIFailure(ctx.tracker.pr_failed_logs(pr), target_branch)
+    link = f"https://github.com/{ctx.repo}/pull/{pr}"
+    if ctx.tracker.pr_head_sha(pr) != head:
+        raise ExecutorStopped(_hold_changed_head(n, ctx, link))
+    run = ctx.store.get_run(n)
+    _append(ctx.store.log_path(n), f"Attempt {run.attempts} failed:\n{failure}")
+    if run.attempts >= ctx.config.max_retries + 1:
+        flag(ctx, n, Reason.RETRIES_EXCEEDED, "CI failed after all attempts.", f"{failure}\n\n{link}")
+        raise ExecutorStopped("ci-failed")
+    ctx.store.update_run(n, attempts=run.attempts + 1)
+    raise failure
 
 
 def _progress(n: int, ctx: RunContext) -> None:
@@ -655,6 +690,13 @@ def _read_rebuttals(worktree: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
 
 
+def _next_review_round(n: int, ctx: RunContext) -> int:
+    rounds = [int(path.stem.removeprefix("review-"))
+              for path in (ctx.store.root / "runs" / f"issue-{n}").glob("review-*.txt")
+              if path.stem.removeprefix("review-").isdigit()]
+    return max(rounds, default=0) + 1
+
+
 def _normalized_findings(review: ReviewResult) -> set[str]:
     # Unstructured prose is one finding: repeated preambles alone are not a dispute.
     points = [review.raw] if review.verdict == "UNUSABLE" else review.findings.splitlines()
@@ -728,11 +770,25 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     if not has_machine_check(parsed):
         flag(ctx, n, Reason.NO_MACHINE_CHECK, "Done when has no machine check.")
         return "no-machine-check"
+    return _implement_and_publish(n, ctx, git, target_branch=target_branch)
+
+
+def _implement_and_publish(
+    n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
+) -> str:
+    """Run the common implementation/check/review/publish loop in an existing worktree."""
+    approval = ctx.store.load_approval(n)
+    parsed = parse_body(approval.body)
+    worktree = git.root
+    branch = f"foragent/issue-{n}"
+    base_ref = f"origin/{ctx.config.base_branch}"
+    parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
+    batch_branch = f"foragent/batch-{parent}" if parent is not None else None
+    start_ref = f"origin/{target_branch}"
     executor = ctx.executor_factory(ctx.config.executor)
     native_claude = ctx.config.executor == "claude"
     options = {"settings_path": _write_claude_settings(n, ctx, worktree)} if native_claude else {}
     log = ctx.store.log_path(n)
-    failure = ""
     reviews: list[ReviewResult] = []
     review_failures = 0
     review_hold = False
@@ -743,10 +799,13 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     checks: list[CheckResult] = []
     paths: list[str] = []
     missing_skills: list[str] = []
+    conflict_attempts = 0
+    rebuilt = False
+    rebuild_lease: str | None = None
     size = issue_size(ctx.tracker.get_issue(n).labels)
 
     def implement(
-        failure: str, *, merge_conflicts: list[str] | None = None, reviewer_text: str | None = None,
+        failure: str | CIFailure, *, merge_conflicts: list[str] | None = None, reviewer_text: str | None = None,
     ) -> None:
         _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")
         remaining = _remaining(n, ctx)
@@ -771,12 +830,17 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             missing_skills.extend(name for name in missing if name not in missing_skills)
         hint_path = ctx.store.root / "hints" / f"{n}.txt"
         hint = hint_path.read_text(encoding="utf-8") if hint_path.is_file() else None
+        test_command = ctx.config.test_command
+        if test_command is None:
+            test_command = next(iter(detect_test_commands(worktree)), None)
         prompt = build_prompt(
-            n, parsed, ctx.config.acceptance_dir, failure, ctx.config.language,
+            n, parsed, ctx.config.acceptance_dir, str(failure), ctx.config.language,
             native_goal=native_claude or ctx.config.codex_goal, acceptance_locked=native_claude,
             merge_conflicts=merge_conflicts,
             reviewer_text=reviewer_text,
             orchestrator_hint=hint,
+            test_command=test_command,
+            failure_limit=None if isinstance(failure, CIFailure) else 4000,
         )
         result = _available_executor(
             n, ctx, executor, worktree=worktree,
@@ -844,6 +908,41 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         recreate_worktree()
         paths = []
         return f"Could not apply child changes to {target_branch}: {exc}"
+
+    def rebuild(exc: ConflictBudgetExhausted) -> str:
+        nonlocal start_ref, rebuilt, rebuild_lease, paths
+        rebuilt = True
+        _append(log, f"Rebuilding issue branch once from latest {target_branch}.\n{exc}")
+        ctx.git.fetch("origin", target_branch)
+        start_ref = f"origin/{target_branch}"
+        if not _acceptance_matches(n, ctx, ctx.git, approval, start_ref):
+            raise ExecutorStopped("hash-mismatch")
+        # Bind every rewritten push to the remote head observed before rebuilding.
+        # An empty lease means the branch must still be absent.
+        rebuild_lease = git.remote_branch_sha(branch) or ""
+        _append(log, f"Rebuild target: {start_ref} ({git.ref_sha(start_ref)})")
+        recreate_worktree()
+        paths = []
+        run = ctx.store.get_run(n)
+        ctx.store.update_run(n, attempts=run.attempts + 1)
+        return (
+            f"The earlier attempt could not be merged onto the moved base ({target_branch}). "
+            "The issue branch and worktree have been rebuilt from the latest target branch. "
+            "Implement the original instructions again, preserving the features now on the base."
+        )
+
+    def push_branch() -> None:
+        nonlocal rebuild_lease
+        if rebuilt:
+            git.push(branch, lease=rebuild_lease)
+            rebuild_lease = git.head_sha()
+        else:
+            git.push(branch)
+
+    def block_rebuild(details: str) -> str:
+        _append(log, f"Rebuilt attempt failed:\n{details}")
+        flag(ctx, n, Reason.RETRIES_EXCEEDED, "Rebuilt implementation failed; no attempts remain.", details)
+        return "retries-exceeded"
 
     def verify() -> str:
         nonlocal checks, paths
@@ -918,15 +1017,16 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         base_merges = 0
 
         def resolve_conflicts(conflicts: list[str]) -> None:
+            nonlocal conflict_attempts
             pending_merge = True
             check_failure = f"Merge conflict with {target_branch}: {', '.join(conflicts)}"
             while True:
-                run = ctx.store.get_run(n)
-                _append(log, f"Attempt {run.attempts} failed:\n{check_failure}")
-                if run.attempts >= ctx.config.max_retries + 1:
-                    flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", check_failure)
-                    raise ExecutorStopped("retries-exceeded")
-                ctx.store.update_run(n, attempts=run.attempts + 1)
+                if rebuilt:
+                    raise ExecutorStopped(block_rebuild(check_failure))
+                if conflict_attempts >= ctx.config.conflict_retries:
+                    raise ConflictBudgetExhausted(check_failure)
+                conflict_attempts += 1
+                _append(log, f"Conflict attempt {conflict_attempts}/{ctx.config.conflict_retries}:\n{check_failure}")
                 implement(check_failure, merge_conflicts=conflicts)
                 # Retain the merge's paths even if the executor stages them.
                 markers = git.conflict_marker_paths(conflicts)
@@ -934,9 +1034,11 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                     check_failure = f"Conflict markers remain in: {', '.join(markers)}"
                     continue
                 git.stage_changes()
-                if pending_merge or git.has_staged_changes():
-                    git.commit(title)
+                if pending_merge:
+                    git.continue_merge()
                     pending_merge = False
+                elif git.has_staged_changes():
+                    git.commit(title)
                 check_failure = verify()
                 markers = git.conflict_marker_paths(conflicts)
                 if markers:
@@ -976,7 +1078,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         target_sha = refresh_base() if not review_hold else None
         if not review_hold and _remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
-        git.push(branch)
+        push_branch()
         _progress(n, ctx)
         _append(log, f"Pushed verified HEAD: {verified_head_sha}")
         try_text = None
@@ -1039,8 +1141,9 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 if status in {"pass", "none"}:
                     break
                 if status == "fail":
-                    flag(ctx, n, Reason.RETRIES_EXCEEDED, "CI failed", link)
-                    return "ci-failed"
+                    if rebuilt:
+                        raise ExecutorStopped(block_rebuild(f"CI failed:\n{ctx.tracker.pr_failed_logs(pr)}"))
+                    _ci_failure(n, ctx, pr, verified_head_sha, target_branch)
                 remaining = deadline - ctx.now().timestamp()
                 if remaining <= 0 or poll == 40:
                     flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
@@ -1050,7 +1153,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             target_sha = refresh_base()
             target_ref = f"origin/{target_branch}"
             if target_sha is not None:
-                git.push(branch)
+                push_branch()
                 _progress(n, ctx)
                 _append(log, f"Pushed verified HEAD: {verified_head_sha}")
                 ctx.tracker.update_pr(pr, base=target_branch, title=title, body=pr_body())
@@ -1114,10 +1217,10 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 title = f"{ctx.tracker.get_issue(n).title} (#{n})"
                 if git.has_staged_changes():
                     git.commit(title)
-                git.push(branch)
+                push_branch()
                 pr = open_or_update_pr(title, render_pr_body())
                 _progress(n, ctx)
-            review = _review(n, ctx, git, parsed, base_ref, round_number=len(reviews) + 1, pr=pr)
+            review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx), pr=pr)
             if review.verdict == "UNUSABLE":
                 review = replace(review, findings=review.raw)
             reviews.append(review)
@@ -1139,12 +1242,24 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 previous_rebutted_findings = findings
                 if review_failures > ctx.config.review_max:
                     review_hold = True
+        if rebuilt and failure:
+            return block_rebuild(str(failure))
         if not failure or review_hold:
             try:
                 return publish()
+            except ConflictBudgetExhausted as exc:
+                failure = rebuild(exc)
+                continue
+            except CIFailure as exc:
+                if rebuilt:
+                    return block_rebuild(str(exc))
+                failure = exc
+                continue
             except (AttemptFailure, PatchReplayError) as exc:
                 failure = recover_replay(exc) if isinstance(exc, PatchReplayError) else str(exc)
                 run = ctx.store.get_run(n)
+        if rebuilt:
+            return block_rebuild(str(failure))
         _append(log, f"Attempt {run.attempts} failed:\n{failure}")
         if run.attempts < ctx.config.max_retries + 1:
             ctx.store.update_run(n, attempts=run.attempts + 1)
@@ -1233,10 +1348,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         if ctx.config.review_scope == "pr-body" and "## Review scope" not in pr.body:
             ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title,
                                   body=pr.body + "\n\n## Review scope\n\n" + review_scope_rules(ctx.config.acceptance_dir))
-        rounds = [int(path.stem.removeprefix("review-"))
-                  for path in (ctx.store.root / "runs" / f"issue-{n}").glob("review-*.txt")
-                  if path.stem.removeprefix("review-").isdigit()]
-        review = _review(n, ctx, git, parsed, base_ref, round_number=max(rounds, default=0) + 1,
+        review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx),
                          pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
         if review.timed_out or _remaining(n, ctx) <= 0:
@@ -1294,8 +1406,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             if status in {"pass", "none"}:
                 break
             if status == "fail":
-                flag(ctx, n, Reason.RETRIES_EXCEEDED, "CI failed", link)
-                return "ci-failed"
+                _ci_failure(n, ctx, pr.number, head, pr.base)
             if ctx.now().timestamp() - started >= 1200 or poll == 40:
                 flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
                 return "timeout"
@@ -1329,8 +1440,10 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return "merged"
 
 
-def review_only(n: int, ctx: RunContext, *, verdict_head: str | None = None) -> str:
-    """Resume an existing PR without invoking the implementer or changing its head."""
+def review_only(
+    n: int, ctx: RunContext, *, verdict_head: str | None = None, repair_ci: bool = True,
+) -> str:
+    """Review a PR, optionally repairing CI inline instead of returning its failure."""
     worktree = ctx.store.worktree_path(n)
     outcome = "error"
     issue = ctx.tracker.get_issue(n)
@@ -1345,7 +1458,16 @@ def review_only(n: int, ctx: RunContext, *, verdict_head: str | None = None) -> 
         ctx.tracker.add_labels(n, [RUNNING])
         ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
         ctx.git.remove_worktree(worktree)
-        outcome = _review_only(n, ctx, worktree, verdict_head)
+        try:
+            outcome = _review_only(n, ctx, worktree, verdict_head)
+        except CIFailure as exc:
+            if not repair_ci:
+                # Let the caller schedule repair without changing the verdict's head.
+                raise ExecutorStopped("ci-failed") from exc
+            git = ctx.git.at(worktree)
+            git.attach_branch(f"foragent/issue-{n}")
+            _inject_lane_skills(ctx, n, git)
+            outcome = _implement_and_publish(n, ctx, git, target_branch=exc.target_branch, failure=exc)
     except ExecutorStopped as exc:
         outcome = exc.outcome
     except Exception as exc:

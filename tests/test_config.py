@@ -26,7 +26,7 @@ def test_exact_defaults(repo):
         "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
-        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
+        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "repo": None, "board": None, "language": "en", "codex_goal": False, "review_level": "low",
         "review_scope": "claude-local", "test_command": None,
@@ -173,7 +173,7 @@ def test_acceptance_directory_allows_literal_paths(repo, directory):
     assert load_config(repo).acceptance_dir == directory
 
 
-@pytest.mark.parametrize("key", ["stall_minutes", "max_runtime_minutes", "max_retries", "review_max"])
+@pytest.mark.parametrize("key", ["stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max"])
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_integer_fields_are_positive_integers(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
@@ -188,7 +188,7 @@ def test_all_valid_overrides(repo):
         "executor_model": "implementation-model", "reviewer_model": "review-model",
         "approvers": ["human"], "acceptance_dir": "checks/", "notify": ["slack:#project"],
         "run_hours": "22-08", "stall_minutes": 1, "max_runtime_minutes": 1,
-        "max_retries": 1, "review_max": 3, "base_branch": "trunk",
+        "max_retries": 1, "conflict_retries": 3, "review_max": 3, "base_branch": "trunk",
         "repo": "owner/name", "language": "ko", "codex_goal": True, "review_level": "max",
         "review_scope": "pr-body",
     }

@@ -53,6 +53,7 @@ class Config:
     orchestrator_timeout_minutes: int = 30
     max_runtime_minutes: int = 90
     max_retries: int = 2
+    conflict_retries: int = 2
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None
@@ -127,7 +128,7 @@ def _validate(values: dict[str, Any]) -> None:
         allowed = _EXECUTORS | {"none"} if key == "reviewer" else _EXECUTORS
         if not isinstance(value, str) or value not in allowed:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
-    for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "review_max",
+    for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
                 "max_parallel", "transient_max_wait_minutes", "limit_wait_minutes",
                 "orchestrator_timeout_minutes"):
         if type(values[key]) is not int or values[key] <= 0:

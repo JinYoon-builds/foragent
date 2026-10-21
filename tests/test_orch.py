@@ -51,6 +51,86 @@ def assert_blocked(c, reason):
     assert len(c.tracker.created_prs) == 1
 
 
+def test_resolve_queues_ci_repair_without_changing_the_verdict_head(review_case):
+    c = review_case
+    logs = "FAILED existing tests: preserve the original failure output"
+    c.tracker.set_pr_checks(c.pr, "fail")
+    c.tracker.set_pr_failed_logs(c.pr, logs)
+
+    summary = orch.resolve(c.ctx, 1, "pass", "Reviewed the current head")
+
+    assert "ci-failed; queued implementation retry" in summary
+    assert c.executor.calls == c.review_calls == []
+    assert c.tracker.get_issue(1).labels == {"approved", "ready"}
+    assert c.tracker.get_issue(c.pr).state == "closed"
+    assert c.tracker.merged_prs == []
+    assert c.tracker.pr_head_sha(c.pr) == c.head
+    assert not any("push" in args or "commit" in args for _, args in c.operations)
+    hint = (c.store.root / "hints/1.txt").read_text()
+    assert "Reviewed the current head" in hint
+    assert str(c.store.log_path(1)) in hint
+    assert logs in c.store.log_path(1).read_text()
+    assert any(f"head={c.head} verdict=pass" in comment.body
+               for comment in c.tracker.list_comments(1))
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+@pytest.mark.parametrize("repair_result", ["pass", "ci-fail", "review-fail"])
+def test_review_ci_failure_repairs_same_pr_and_rechecks_new_head(run_case, monkeypatch, resolved, repair_result):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, repo="owner/repo", test_command="make check")
+    c.store.finish_run(1, outcome="blocked")
+    c.now[0] += timedelta(seconds=1)
+    c.tracker.remove_labels(1, ["running"])
+    c.tracker.add_labels(1, ["blocked"])
+    base = c.history.tip
+    c.history.update({"feature.txt": "done", "existing.txt": "preserve existing PR work"})
+    head = c.history.tip
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing PR", body="Original")
+    c.tracker.set_pr_head_sha(pr, head)
+    c.tracker.set_pr_checks(pr, "fail")
+    c.tracker.set_pr_failed_logs(pr, "original failed CI output")
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    prior_review = c.store.root / "runs/issue-1/review-1.txt"
+    prior_review.parent.mkdir(parents=True)
+    prior_review.write_text("prior raw review")
+    messages = ([] if resolved else ["VERDICT: PASS"]) + [
+        "VERDICT: FAIL\nrepair.txt:1 defect" if repair_result == "review-fail" else "VERDICT: PASS",
+    ]
+    reviews = enable_reviewer(c, messages)
+    c.executor.steps = [{"repair.txt": "CI repair"}]
+    execute = c.executor.run
+
+    def implement(**kwargs):
+        assert (kwargs["worktree"] / "existing.txt").read_text() == "preserve existing PR work"
+        assert c.ctx.git.at(kwargs["worktree"]).head_sha() == head
+        c.tracker.set_pr_checks(pr, "fail" if repair_result == "ci-fail" else "pass")
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    outcome = runner.review_only(1, c.ctx, verdict_head=head if resolved else None)
+    assert outcome == {"pass": "merged", "ci-fail": "ci-failed", "review-fail": "retries-exceeded"}[repair_result]
+    assert len(c.executor.calls) == 1
+    assert "CI failed:\noriginal failed CI output" in c.executor.calls[0]["prompt"]
+    assert "`make check`" in c.executor.calls[0]["prompt"]
+    assert len(reviews) == (1 if resolved else 2)
+    assert c.store.get_run(1).attempts == 2
+    assert prior_review.read_text() == "prior raw review"
+    assert len(list(prior_review.parent.glob("review-*.txt"))) == len(reviews) + 1
+    assert len(c.tracker.created_prs) == 1
+    adds = [args for _, args in c.operations if args[:2] == ["worktree", "add"]]
+    assert len(adds) == 1 and "--detach" in adds[0]
+    assert c.store.log_path(1).read_text().count("Done when command:") == 4
+    if repair_result == "pass":
+        assert c.tracker.merged_prs == [pr]
+        assert c.tracker.pr_head_sha(pr) != head
+        assert not c.tracker.get_issue(1).labels & {"blocked", "needs-human"}
+    else:
+        assert c.tracker.merged_prs == []
+        assert c.tracker.get_issue(1).labels & {"blocked", "needs-human"} == {"blocked"}
+
+
 @pytest.mark.parametrize("entry", ["review-only", "rerun-review", "resolve"])
 def test_review_entries_merge_verified_head_without_implementation(review_case, entry):
     c = review_case
@@ -104,6 +184,7 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
     elif failure == "check-timeout":
         monkeypatch.setattr(runner, "_check", lambda command, *args: runner.CheckResult(command, None, True, "Timed out"))
     elif failure == "ci":
+        c.ctx.config = replace(c.ctx.config, max_retries=0)
         c.tracker.set_pr_checks(c.pr, "fail")
     elif failure == "ci-timeout":
         c.tracker.set_pr_checks(c.pr, "pending")
