@@ -132,6 +132,23 @@ def test_executor_wait_counter_persists_separately_and_old_runs_default_to_zero(
     assert reopened.read_history()[0].executor_waited_seconds == 0
 
 
+def test_run_visibility_fields_survive_completion_and_old_records_still_load(store):
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.update_run(1, phase="checking", phase_started_at=NOW.isoformat())
+    store.finish_run(1, "merged")
+    reopened = StateStore(store.root)
+    assert reopened.get_run(1).phase == reopened.read_history()[0].phase == "checking"
+    assert reopened.read_history()[0].last_activity_at == NOW.isoformat()
+    path = store.root / "runs/1.json"
+    legacy = json.loads(path.read_text())
+    for name in ("phase", "phase_started_at", "last_activity_at"):
+        del legacy[name]
+    path.write_text(json.dumps(legacy))
+    (store.root / "runs.jsonl").write_text(json.dumps(legacy) + "\n")
+    for run in (reopened.get_run(1), *reopened.read_history()):
+        assert run.phase is None and run.phase_started_at is None and run.last_activity_at is None
+
+
 def _acquire_merge_lock(root, connection):
     try:
         connection.send("waiting")
