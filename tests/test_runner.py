@@ -1489,6 +1489,13 @@ def test_code_review_plain_finding_reports_failure():
     assert result.findings == text
 
 
+def test_code_review_numbered_backtick_finding_reports_failure():
+    text = '1. `src/foragent/design.py:50` — `path.read_text(encoding="utf-8")` has no error handling.'
+    result = parse_code_review(json.dumps({"result": text}))
+    assert result.verdict == "FAIL"
+    assert result.findings == text
+
+
 @pytest.mark.parametrize("message", ["garbage", "[]", "null", "{}", '{"result":null}',
                                           '{"result":"(none)","is_error":true}'])
 def test_code_review_invalid_json_or_error_is_unusable(message):
