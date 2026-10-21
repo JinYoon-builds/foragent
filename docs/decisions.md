@@ -174,3 +174,9 @@
 ### D30. 일이 생기면 바로 깨운다 (2026-10-21, Jin)
 - 문제: gate는 launchd 5분 주기로만 깨어나서, 승인 직후 최대 5분, 그리고 이슈 하나가 끝날 때마다 다음 이슈까지 최대 5분을 기다렸다. "끝나면 바로 다음 일을 가져온다"는 핵심 가치와 어긋나고 처리량을 잃는다.
 - 결정: 일이 생기는 순간 곧바로 tick을 분리 실행한다 — `fa order publish --approve` 직후, runner가 run을 끝낸 직후(어떤 결과든), `fa inspect retry`/`answer` 직후, `fa gate install` 직후. tick 잠금이 겹침을 막는다. launchd 5분 주기는 놓친 것을 잡는 안전망으로 남긴다.
+
+### D31. GitHub Projects 보드를 화면으로 (2026-10-21, Jin) — 미구현
+- 발견: 이슈 발행과 Projects 보드는 별개다. 지금 Foragent는 보드를 만들지 않아 D25의 "레인별 줄 칸반"이 없다.
+- 결정: init이 프로젝트 보드(Projects v2) "Foragent: <repo>"를 만들고 필드 Lane(단일 선택), Size(s/m/l), Status(Approved/Ready/Running/Needs human/PR open/Done)를 둔다. order는 이슈를 만들 때 보드에 넣고 Lane·Size를 채운다. gate는 상태 전이마다 Status를 갱신한다(한 방향). 보드를 Lane으로 묶으면 레인별 줄이 된다 — "레인에 쌓인 이슈를 하나씩 쳐내는 화면"을 GitHub가 그려 준다.
+- 원칙: 진실은 이슈 라벨. 보드는 보기용이라 어긋나거나 지워져도 시스템은 돈다. 보드 갱신 실패는 tick을 막지 않는다.
+- 만드는 방법: Foragent 저장소에서 /fa-order로 주문(dogfooding 두 번째 주문).
