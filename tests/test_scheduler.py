@@ -34,6 +34,32 @@ pytest {ACCEPTANCE}
 """
 
 
+@pytest.mark.parametrize("start_runs,expected", [(False, "Ready"), (True, "Running")])
+def test_tick_updates_board_after_approval_and_launch(ctx, start_runs, expected):
+    from foragent import board
+    from test_board import item_values
+
+    ctx.config = replace(ctx.config, board=board.ensure_board(ctx.tracker, ctx.repo, ctx.config))
+    ctx.start_runs = start_runs
+    approve(ctx)
+    assert tick(ctx).skipped is None
+    assert item_values(ctx.tracker, ctx.config.board)["Status"] == expected
+    assert expected.lower() in ctx.tracker.get_issue(1).labels
+
+
+def test_overdue_blocker_updates_board_to_needs_human(ctx):
+    from foragent import board
+    from test_board import item_values
+
+    ctx.config = replace(ctx.config, board=board.ensure_board(ctx.tracker, ctx.repo, ctx.config))
+    approve(ctx)
+    flag(ctx, 1, Reason.SPEC_QUESTION, "Choose an option.")
+    assert item_values(ctx.tracker, ctx.config.board)["Status"] == "Blocked"
+    ctx.now = lambda: NOW + timedelta(minutes=31)
+    tick(ctx)
+    assert item_values(ctx.tracker, ctx.config.board)["Status"] == "Needs human"
+
+
 @pytest.fixture
 def ctx(git_history, tmp_path, monkeypatch):
     context = TickContext(

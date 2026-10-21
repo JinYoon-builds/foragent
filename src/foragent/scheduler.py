@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 
+from foragent import board
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitRepo
@@ -169,6 +170,8 @@ def _snapshot(
     ctx.tracker.comment(
         issue.number, format_approval_comment(approval.body_sha, blobs, event.actor, event.created_at),
     )
+    if not issue.labels & {READY, RUNNING}:
+        board.sync_status(ctx, issue, "Approved")
     report.actions.append(f"#{issue.number} approval snapshot saved")
     return approval
 
@@ -203,6 +206,7 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
     else:
         ctx.tracker.add_labels(number, [READY])
         ctx.tracker.remove_labels(number, [RUNNING])
+        board.sync_status(ctx, number, "Ready")
         report.actions.append(f"#{number} returned to ready after runner crash")
 
 
@@ -236,6 +240,7 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
     elif restarts <= 1:
         ctx.tracker.add_labels(number, [READY])
         ctx.tracker.remove_labels(number, [RUNNING])
+        board.sync_status(ctx, number, "Ready")
         report.actions.append(f"#{number} returned to ready after stall (restart {restarts})")
     else:
         flag(ctx, number, Reason.STALLED, "Runner stalled again after one restart.")
@@ -301,6 +306,7 @@ def _check_prerequisites(
     ):
         if READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [READY])
+        board.sync_status(ctx, issue, "Done")
         return False
     if (
         ctx.tracker.find_pr(f"foragent/issue-{issue.number}") is not None
@@ -308,6 +314,7 @@ def _check_prerequisites(
     ):
         if READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [READY])
+        board.sync_status(ctx, issue, "PR open")
         return False
     if not has_machine_check(parse_body(approval.body)):
         flag(
@@ -331,6 +338,7 @@ def _check_prerequisites(
     if any(dependency.state == "open" for dependency in dependencies):
         if READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [READY])
+            board.sync_status(ctx, issue, "Approved")
             report.actions.append(f"#{issue.number} returned to approved waiting for open blockers")
         return False
     return True
@@ -366,6 +374,7 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
         f"Latest blocker:\n{latest.body}",
     ))
     report.actions.append(f"#{issue.number} flagged orchestrator-timeout")
+    board.sync_status(ctx, issue, "Needs human")
     return replace(issue, labels=issue.labels | {NEEDS_HUMAN})
 
 
@@ -384,6 +393,7 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
             continue
         ctx.tracker.close_issue(number, f"Merged into {pr.base} (PR #{pr.number})")
         ctx.tracker.remove_labels(number, [READY, RUNNING])
+        board.sync_status(ctx, number, "Done")
         del issues[number]
         report.actions.append(f"#{number} closed after batch PR #{pr.number} merged")
     for parent in sorted(parents):
@@ -458,6 +468,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             continue
 
         ctx.tracker.add_labels(issue.number, [READY])
+        board.sync_status(ctx, issue, "Ready")
         report.actions.append(f"#{issue.number} promoted to ready")
         ready.setdefault(lane, []).append(issue.number)
 
@@ -491,6 +502,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
 
             ctx.tracker.remove_labels(number, [READY])
             ctx.tracker.add_labels(number, [RUNNING])
+            board.sync_status(ctx, number, "Running")
             ctx.store.start_run(
                 number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
                 tier=issue_size(issue.labels),

@@ -113,6 +113,8 @@ class Setup:
         return "dev.foragent.owner.repo"
 
     def init(self, **kwargs):
+        # These setup/recovery tests also cover the explicit board opt-out path.
+        kwargs.setdefault("no_board", True)
         return init_repo(
             self.root, git=GitRepo(self.root, self.run_git), gh_run=self.run_gh,
             tracker=self.tracker, install_launchd=self.install, **kwargs,
@@ -400,7 +402,7 @@ def test_existing_config_selects_base_branch(setup):
 def test_default_gh_tracker_uses_injected_runner_for_labels(setup):
     init_repo(
         setup.root, git=GitRepo(setup.root, setup.run_git), gh_run=setup.run_gh,
-        no_launchd=True, no_push=True,
+        no_launchd=True, no_push=True, no_board=True,
     )
     mutations = [(args, body) for args, body in setup.gh_calls if args[:3] == ["api", "-X", "POST"]]
     assert len(mutations) == len(LABELS)
@@ -532,6 +534,7 @@ def test_nested_repo_root_is_normalized_and_reported(setup, dry_run):
     report = init_repo(
         nested, git=GitRepo(nested, setup.run_git), gh_run=setup.run_gh,
         tracker=setup.tracker, install_launchd=setup.install, dry_run=dry_run,
+        no_board=True,
     )
     assert report.normalized_root == setup.root
     assert f"Using repository root: {setup.root}" in report.summary()
@@ -549,3 +552,52 @@ def test_recovery_still_requires_base_branch_for_pending_paths(setup):
     with pytest.raises(GitError, match="base branch 'main'"):
         setup.init()
     assert not any("commit" in args or args[0] == "push" for args in setup.git_calls)
+
+
+def test_default_board_setup_is_saved_once_without_rewriting_existing_comments(setup):
+    (setup.root / PATHS[0]).write_text("# Team settings\nreview: careful\napprovers: [human]\n")
+    report = setup.init(no_board=False)
+    config_path = setup.root / PATHS[0]
+    config = load_config(setup.root)
+    assert config.board and report.board_id == config.board
+    assert "GitHub Projects board:" in report.summary()
+    assert config_path.read_text().startswith("# Team settings\nreview: careful\napprovers: [human]\n")
+    assert report.added_keys == ["board"]
+    before = config_path.stat().st_mtime_ns
+    calls = len(setup.tracker.graphql_calls)
+    report = setup.init(no_board=False)
+    assert not report.committed and config_path.stat().st_mtime_ns == before
+    assert not any("mutation" in query for query, _ in setup.tracker.graphql_calls[calls:])
+
+
+def test_new_init_config_includes_board_by_default(setup):
+    report = setup.init(no_board=False)
+    assert load_config(setup.root).board == report.board_id
+    assert report.board_id
+
+
+def test_init_replaces_null_board_instead_of_appending_a_duplicate_key(setup):
+    (setup.root / PATHS[0]).write_text("review: careful\nboard: null\n")
+    report = setup.init(no_board=False)
+    text = (setup.root / PATHS[0]).read_text()
+    assert text.count("board:") == 1
+    assert load_config(setup.root).board == report.board_id
+    assert load_config(setup.root).review == "careful"
+
+
+def test_dry_run_does_not_call_board_or_write_config(setup):
+    report = setup.init(no_board=False, dry_run=True)
+    assert "Would ensure GitHub Projects board." in report.summary()
+    assert setup.tracker.graphql_calls == []
+    assert not (setup.root / PATHS[0]).exists()
+
+
+def test_board_setup_failure_is_logged_and_does_not_break_init(setup, monkeypatch, caplog):
+    def offline(*args):
+        raise TrackerError("Projects permission missing")
+
+    monkeypatch.setattr(setup.tracker, "graphql", offline)
+    report = setup.init(no_board=False)
+    assert report.committed and report.board_id is None
+    assert load_config(setup.root).board is None
+    assert "Projects permission missing" in caplog.text

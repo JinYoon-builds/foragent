@@ -1,6 +1,7 @@
 """Issue tracking interfaces, an in-memory fake, and an offline-testable gh adapter."""
 
 from collections.abc import Callable, Iterable
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
@@ -67,6 +68,7 @@ class PullRequest:
 
 
 class Tracker(Protocol):
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]: ...
     def list_open_issues(self) -> list[Issue]: ...
     def list_issues(self, state: str = "all") -> list[Issue]: ...
     def update_issue(self, n: int, *, title: str, body: str) -> None: ...
@@ -134,6 +136,94 @@ class FakeTracker:
         self._pr_checks: dict[int, CheckStatus] = {}
         self._pr_heads: dict[int, str] = {}
         self._next_comment_id = 1
+        self.graphql_calls: list[tuple[str, dict]] = []
+        self._projects: dict[str, dict] = {}
+        self._next_project_node = 1
+
+    def _project_id(self, prefix: str) -> str:
+        value = f"{prefix}_{self._next_project_node}"
+        self._next_project_node += 1
+        return value
+
+    def _project_field(self, project: dict, name: str, options: list[dict]) -> dict:
+        field = {"id": self._project_id("PVTSSF"), "name": name, "options": []}
+        self._project_options(field, options)
+        project["fields"].append(field)
+        return field
+
+    def _project_options(self, field: dict, options: list[dict]) -> None:
+        field["options"] = [
+            {"id": option.get("id") or self._project_id("OPTION"), "name": option["name"],
+             "color": option.get("color", "GRAY"), "description": option.get("description", "")}
+            for option in options
+        ]
+
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        """Offline Projects v2 transport with GitHub-shaped fields, items and values."""
+        self.graphql_calls.append((query, deepcopy(variables)))
+        values = variables.get("input", {})
+
+        def connection(nodes):
+            offset = int(variables.get("after") or 0)
+            page = nodes[offset:offset + 100]
+            return {"nodes": page, "pageInfo": {
+                "hasNextPage": offset + len(page) < len(nodes), "endCursor": str(offset + len(page)),
+            }}
+
+        if "createProjectV2(" in query:
+            project_id = self._project_id("PVT")
+            project = {"id": project_id, "title": values["title"], "closed": False,
+                       "owner": values["ownerId"], "fields": [], "items": []}
+            self._projects[project_id] = project
+            # GitHub creates a Status field even on an otherwise empty project.
+            self._project_field(project, "Status", [{"name": name} for name in ("Todo", "In Progress", "Done")])
+            data = {"createProjectV2": {"projectV2": {"id": project_id}}}
+        elif "createProjectV2Field(" in query:
+            field = self._project_field(self._projects[values["projectId"]], values["name"], values["singleSelectOptions"])
+            data = {"createProjectV2Field": {"projectV2Field": field}}
+        elif "updateProjectV2Field(" in query:
+            field = next(field for project in self._projects.values() for field in project["fields"]
+                         if field["id"] == values["fieldId"])
+            self._project_options(field, values["singleSelectOptions"])
+            data = {"updateProjectV2Field": {"projectV2Field": field}}
+        elif "addProjectV2ItemById(" in query:
+            number = int(values["contentId"].removeprefix("ISSUE_"))
+            self.get_issue(number)
+            project = self._projects[values["projectId"]]
+            item = next((item for item in project["items"] if item["content"]["number"] == number), None)
+            if item is None:
+                item = {"id": self._project_id("PVTI"), "content": {"number": number},
+                        "fieldValues": {"nodes": []}}
+                project["items"].append(item)
+            data = {"addProjectV2ItemById": {"item": {"id": item["id"]}}}
+        elif "updateProjectV2ItemFieldValue(" in query:
+            project = self._projects[values["projectId"]]
+            field = next(field for field in project["fields"] if field["id"] == values["fieldId"])
+            item = next(item for item in project["items"] if item["id"] == values["itemId"])
+            option = next(option for option in field["options"]
+                          if option["id"] == values["value"]["singleSelectOptionId"])
+            nodes = item["fieldValues"]["nodes"]
+            nodes[:] = [node for node in nodes if node["field"]["id"] != field["id"]]
+            nodes.append({"name": option["name"], "optionId": option["id"],
+                          "field": {"id": field["id"], "name": field["name"]}})
+            data = {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": item["id"]}}}
+        elif "repositoryOwner(" in query:
+            owner_id = f"OWNER_{variables['owner']}"
+            projects = [{key: project[key] for key in ("id", "title", "closed")}
+                        for project in self._projects.values() if project["owner"] == owner_id]
+            data = {"repositoryOwner": {"id": owner_id, "projectsV2": connection(projects)}}
+        elif "repository(" in query:
+            number = variables["number"]
+            data = {"repository": {"issue": {"id": f"ISSUE_{number}"} if number in self.issues else None}}
+        elif "node(" in query:
+            project = self._projects.get(variables["id"])
+            data = {"node": None if project is None else {
+                "id": project["id"], "title": project["title"],
+                "fields": connection(project["fields"]), "items": connection(project["items"]),
+            }}
+        else:
+            raise TrackerError("unsupported FakeTracker GraphQL operation")
+        return deepcopy({"data": data})
 
     def _timestamp(self) -> str:
         return self._now().astimezone(UTC).isoformat()
@@ -345,6 +435,21 @@ class GhTracker:
             ) from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise TrackerError(str(exc)) from exc
+
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        output = self._call(["api", "graphql", "--input", "-"],
+                            input=json.dumps({"query": query, "variables": variables}))
+        try:
+            result = json.loads(output)
+            if not isinstance(result, dict):
+                raise ValueError("expected an object")
+            if result.get("errors"):
+                raise TrackerError(f"GraphQL failed: {result['errors']}")
+            if not isinstance(result.get("data"), dict):
+                raise ValueError("expected GraphQL data")
+            return result
+        except (ValueError, TypeError) as exc:
+            raise TrackerError(f"invalid GraphQL response: {exc}") from exc
 
     def list_open_issues(self) -> list[Issue]:
         return self.list_issues("open")

@@ -2849,6 +2849,50 @@ def test_review_text_about_limits_uses_normal_review_failure_budget(run_case):
     assert c.store.get_run(1).waited_seconds == 0
 
 
+@pytest.mark.parametrize("outcome,status", [
+    ("merged", "Done"), ("pr-open", "PR open"), ("spec-question", "Blocked"), ("limit-wait", "Ready"),
+])
+def test_runner_updates_board_on_each_outcome(run_case, monkeypatch, outcome, status):
+    from foragent import board
+    from test_board import item_values
+
+    c = run_case
+    board_id = board.ensure_board(c.tracker, c.ctx.repo, c.ctx.config)
+    c.ctx.config = replace(c.ctx.config, board=board_id)
+    transitions = []
+    set_status = board.set_status
+
+    def record(issue, value):
+        transitions.append(value)
+        set_status(issue, value)
+
+    monkeypatch.setattr(board, "set_status", record)
+    if outcome == "pr-open":
+        c.ctx.config = replace(c.ctx.config, review="careful")
+    elif outcome == "spec-question":
+        c.executor.steps = [{".foragent/QUESTION.md": "어느 동작을 원하나요?"}]
+    elif outcome == "limit-wait":
+        scripted_results(c, monkeypatch, [("HTTP 429", "limit")])
+    assert run_issue(1, c.ctx) == outcome
+    assert transitions[0] == "Running" and transitions[-1] == status
+    if outcome == "merged":
+        assert transitions == ["Running", "PR open", "Done"]
+    assert item_values(c.tracker, board_id)["Status"] == status
+
+
+def test_board_outage_does_not_interrupt_runner_or_merge(run_case, monkeypatch, caplog):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, board="unavailable")
+
+    def offline(*args):
+        raise OSError("board offline")
+
+    monkeypatch.setattr(c.tracker, "graphql", offline)
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.tracker.get_issue(1).state == "closed"
+    assert "board offline" in caplog.text
+
+
 @pytest.mark.parametrize("size,efforts,tiers", [
     ("s", ["medium", "high", "xhigh", "xhigh"], ["s", "m", "l", "l"]),
     ("m", ["high", "xhigh", "xhigh", "xhigh"], ["m", "l", "l", "l"]),

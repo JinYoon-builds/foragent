@@ -128,6 +128,38 @@ def publish(case, plan, **kwargs):
     return order.publish(plan, root, config, tracker, repo="owner/repo", git=git, **kwargs)
 
 
+def test_publish_populates_board_and_republication_keeps_running_status(publishing, plan):
+    from types import SimpleNamespace
+    from foragent import board
+    from test_board import item_values
+
+    root, config, tracker, git, events = publishing
+    config = replace(config, board=board.ensure_board(tracker, "owner/repo", config))
+    case = root, config, tracker, git, events
+    publish(case, plan, approve=True)
+    assert item_values(tracker, config.board, 2) == {"Lane": "api", "Size": "m", "Status": "Approved"}
+    assert item_values(tracker, config.board, 3) == {"Lane": "main", "Size": "s", "Status": "Approved"}
+    tracker.add_labels(2, ["running"])
+    board.sync_status(SimpleNamespace(config=config, tracker=tracker, repo="owner/repo"), 2, "Running")
+    publish(case, plan, approve=True)
+    assert item_values(tracker, config.board, 2)["Status"] == "Running"
+    assert len(tracker._projects[config.board]["items"]) == 2
+
+
+def test_board_failure_does_not_stop_order_publication(publishing, plan, monkeypatch, caplog):
+    root, config, tracker, git, events = publishing
+    config = replace(config, board="unavailable")
+
+    def offline(*args):
+        raise OSError("board unavailable")
+
+    monkeypatch.setattr(tracker, "graphql", offline)
+    report = publish((root, config, tracker, git, events), plan, approve=True)
+    assert report.parent == 1
+    assert all("approved" in tracker.get_issue(number).labels for number in (2, 3))
+    assert "board unavailable" in caplog.text
+
+
 def test_publish_order_contract_labels_native_links_and_summary(publishing, plan):
     root, _, tracker, git, events = publishing
     report = publish(publishing, plan, approve=True)

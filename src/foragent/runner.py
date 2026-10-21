@@ -18,6 +18,7 @@ import traceback
 
 import yaml
 
+from foragent import board
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for
@@ -461,6 +462,7 @@ def _available_executor(n: int, ctx: RunContext, executor: Executor, *, reviewer
             ctx.store.pause_lane(run.lane, ctx.now() + timedelta(minutes=ctx.config.limit_wait_minutes))
             ctx.tracker.add_labels(n, [READY])
             ctx.tracker.remove_labels(n, [RUNNING])
+            board.sync_status(ctx, n, "Ready")
             raise ExecutorStopped("limit-wait")
         if kind == "transient" and not reviewer:
             run = ctx.store.update_run(n, transient_errors=run.transient_errors + 1)
@@ -659,6 +661,7 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
         return
     pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
+    board.sync_status(ctx, parent, "PR open")
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
 
 
@@ -953,6 +956,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             )
         else:
             ctx.tracker.update_pr(pr, base=target_branch, title=title, body=body)
+        board.sync_status(ctx, n, "PR open")
         if target_sha is not None:
             ctx.tracker.comment(pr, f"base merged before merge: {target_sha}")
         _progress(n, ctx)
@@ -1047,6 +1051,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 if ctx.tracker.get_issue(n).state != "closed":
                     raise
             ctx.tracker.remove_labels(n, [READY, RUNNING])
+            board.sync_status(ctx, n, "Done")
             if target_branch == batch_branch and parent is not None:
                 try:
                     _batch_pr(parent, ctx)
@@ -1111,6 +1116,7 @@ def run_issue(n: int, ctx: RunContext) -> str:
     log = ctx.store.log_path(n)
     try:
         run = ctx.store.update_run(n, pid=os.getpid())
+        board.sync_status(ctx, n, "Running")
         lane = ctx.config.lanes.get(run.lane, {}) if run.lane != "main" else {}
         ctx = replace(ctx, config=replace(
             ctx.config, executor=lane.get("executor") or ctx.config.executor,
