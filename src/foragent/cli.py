@@ -1,7 +1,7 @@
 """Command-line entry points for the issue gate."""
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 import json
 import os
@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, order
+from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, notify, order
 from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -134,6 +134,11 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
     for name in ("install", "uninstall", "launchd-status"):
         command = actions.add_parser(name)
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
+    notification = commands.add_parser("notify", help="Send an alert through the configured channel")
+    notification.add_argument("--title", required=True)
+    notification.add_argument("--line", required=True)
+    notification.add_argument("--link")
+    notification.add_argument("--repo-root", type=Path, default=Path.cwd())
     inspect = commands.add_parser("inspect", help="Show the human inbox and record answers")
     inspect.add_argument("--repo-root", type=Path, default=Path.cwd())
     inspect.add_argument("--json", action="store_true")
@@ -315,6 +320,11 @@ def main(argv: list[str] | None = None) -> int:
             lane = add_lane(root, args.name, args.paths, skills=args.skills, executor=args.executor, model=args.model,
                             title=args.title, emoji=args.emoji)
             print(f"Created lane:{args.name} ({', '.join(lane['paths'])})")
+            return 0
+        if args.command == "notify":
+            config = load_config(root)
+            repo = config.repo or GitRepo(root).remote_slug()
+            notify.send(replace(config, repo=repo), args.title, args.line, args.link)
             return 0
         if args.action in {"install", "uninstall", "launchd-status"}:
             if args.action == "launchd-status":
