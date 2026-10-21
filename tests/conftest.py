@@ -15,10 +15,10 @@ BASE_TIME = datetime(2026, 10, 20, 8, tzinfo=UTC)
 @pytest.fixture(autouse=True)
 def kicks(monkeypatch):
     """Record event hooks without starting background ticks in any test."""
-    from foragent import cli, order, runner
+    from foragent import cli, orch, order, runner
 
     calls = []
-    for module in (cli, order, runner):
+    for module in (cli, orch, order, runner):
         monkeypatch.setattr(module, "kick_tick", calls.append)
     return calls
 
