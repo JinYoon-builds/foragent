@@ -10,6 +10,9 @@ import stat
 import subprocess
 
 
+REVIEW_SCOPE_FILE = "CLAUDE.local.md"
+
+
 class GitError(RuntimeError):
     """A Git command or remote URL could not be used."""
 
@@ -67,12 +70,31 @@ class GitRepo:
         self._call(["worktree", "add", "--detach", str(path), ref])
 
     def stage_changes(self) -> None:
-        self._call(["add", "-A", "--", ".", ":!.foragent"])
+        output = self._call([
+            "ls-files", "--modified", "--deleted", "--others", "--exclude-standard", "-z",
+            "--", ".", ":!.foragent", f":!{REVIEW_SCOPE_FILE}",
+        ])
+        paths = sorted(set(filter(None, output.split("\0"))))
+        if paths:
+            self._call(["--literal-pathspecs", "add", "-A", "--", *paths])
         self._exclude_artifacts()
 
     def _exclude_artifacts(self) -> None:
         # Also remove entries staged by an executor, retaining their local files.
         self._call(["rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"])
+        if self._call(["ls-files", "--cached", "-z", "--", REVIEW_SCOPE_FILE]):
+            self._call(["restore", "--staged", "--", REVIEW_SCOPE_FILE])
+
+    def ignore_review_scope(self) -> None:
+        # Linked worktrees use the common repository's info/exclude.
+        path = Path(self._call(["rev-parse", "--git-path", "info/exclude"]).strip())
+        if not path.is_absolute():
+            path = self.root / path
+        original = path.read_bytes() if path.exists() else b""
+        rule = f"/{REVIEW_SCOPE_FILE}".encode()
+        if rule not in original.splitlines():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(original + (b"\n" if original and not original.endswith(b"\n") else b"") + rule + b"\n")
 
     def changed_paths(self, base_ref: str) -> list[str]:
         # NUL delimiters retain filenames containing tabs, quotes, or newlines.
@@ -244,6 +266,7 @@ class GitRepo:
 
     def ensure_tracked(self, paths: list[str]) -> None:
         """Include explicitly published files even when ignore rules hide them."""
+        paths = [path for path in paths if Path(path).as_posix() != REVIEW_SCOPE_FILE]
         if not paths:
             return
 
@@ -277,6 +300,10 @@ class GitRepo:
 
     def commit_paths(self, paths: list[str], title: str) -> None:
         """Commit only setup paths, preserving unrelated staged changes."""
+        paths = [path for path in paths if Path(path).as_posix() != REVIEW_SCOPE_FILE]
+        if not paths:
+            self._exclude_artifacts()
+            return
         identity = []
         for key, fallback in (("user.name", "foragent"), ("user.email", "foragent@localhost")):
             try:
@@ -289,7 +316,7 @@ class GitRepo:
             identity.extend(["-c", f"{key}={value or fallback}"])
         self._call(["add", "-f", "--", *paths])
         self._exclude_artifacts()
-        self._call([*identity, "commit", "--only", "-m", title, "--", *paths])
+        self._call([*identity, "commit", "--only", "-m", title, "--", *paths, f":!{REVIEW_SCOPE_FILE}"])
 
     def push_base(self, branch: str) -> None:
         self._call(["push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"])

@@ -16,11 +16,14 @@ import threading
 import time
 import traceback
 
+import yaml
+
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for
-from foragent.git import GitError, GitRepo
+from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, has_machine_check, parse_body
+from foragent.kick import kick_tick
 from foragent.labels import READY, RUNNING, attempt_tier, issue_size
 from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.processes import run_logged
@@ -83,6 +86,7 @@ class ReviewResult:
     verdict: str
     findings: str
     notes: tuple[str, ...] = ()
+    raw: str = ""
 
 
 class PatchReplayError(GitError):
@@ -98,10 +102,19 @@ class ExecutorStopped(Exception):
         self.outcome = outcome
 
 
-def build_review_prompt(parsed: ParsedIssue, diff: str) -> str:
+def review_scope_rules(acceptance_dir: str) -> str:
+    return (
+        "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
+        f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
+        "Improvements beyond this issue's Goal are not defects."
+    )
+
+
+def build_review_prompt(parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/") -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
-        f"{REVIEW_PROMPT}\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
+        f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
+        f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         f"\n\nDone when commands:\n{commands}\n\nDiff:\n{diff[:60000]}"
     )
 
@@ -122,11 +135,33 @@ def parse_code_review(message: str) -> ReviewResult:
         event = None
     if not isinstance(event, dict) or event.get("is_error") or not isinstance(event.get("result"), str):
         return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
-    lines = [line for line in event["result"].splitlines() if line.strip()]
-    findings = [line for line in lines if re.match(r"^- \S+:\d+ (?:—|-|--) ", line)]
+    text = event["result"]
+    lines = [line for line in text.splitlines() if line.strip()]
+    findings = [line for line in lines if re.match(r"^(?:[-*]\s+)?\S+:\d+\s+(?:—|-|--)\s+", line)]
     if findings:
         return ReviewResult("FAIL", "\n".join(findings))
-    if lines and lines[0].strip() == "(none)":
+    payload = text.strip()
+    blocks = list(re.finditer(r"^[ \t]*```([^\r\n]*)\r?\n(.*?)^[ \t]*```[ \t]*\r?$", payload, re.M | re.S))
+    json_blocks = [block for block in blocks if block[1].strip() == "json"]
+    if len(json_blocks) > 1:
+        return ReviewResult("UNUSABLE", "", ("/code-review gave multiple findings payloads",))
+    if len(blocks) == 1 and blocks[0].span() == (0, len(payload)):
+        payload = blocks[0][2]
+    elif json_blocks:
+        payload = json_blocks[0][2]
+    try:
+        items = json.loads(payload)
+    except ValueError:
+        items = None
+    if isinstance(items, list):
+        if not items:
+            return ReviewResult("PASS", "")
+        if any(not isinstance(item, dict) or not {"file", "line", "summary"}.intersection(item) for item in items):
+            return ReviewResult("UNUSABLE", "", ("/code-review gave invalid findings",))
+        return ReviewResult("FAIL", "\n".join(
+            f"{item.get('file', '?')}:{item.get('line', '?')} — {item.get('summary', '')}" for item in items
+        ))
+    if not blocks and lines and lines[0].strip() == "(none)":
         return ReviewResult("PASS", "")
     return ReviewResult("UNUSABLE", "", ("/code-review gave no verdict",))
 
@@ -271,6 +306,7 @@ def _pr_body(
     reviews: list[ReviewResult], try_text: str | None = None,
     *, outside_lane: list[str] | None = None, fallback_model: str | None = None,
     attempt_tiers: dict[str, str] | None = None,
+    missing_skills: list[str] | None = None,
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -292,6 +328,8 @@ def _pr_body(
         lines.extend(f"- [ ] {item.text}" for item in parsed.done_when_checklist)
     if outside_lane:
         lines.extend(["", "## Outside lane", "", *(f"- `{path}`" for path in outside_lane)])
+    if missing_skills:
+        lines.extend(["", "## Lane skills", "", *(f"- missing skill: {name}" for name in missing_skills)])
     if fallback_model is not None:
         lines.extend(["", f"Executor fallback model: {fallback_model}"])
     if attempt_tiers:
@@ -445,31 +483,117 @@ def _lane_notes(ctx: RunContext, n: int, worktree: Path) -> tuple[str | None, st
     return agent, "Lane notes:\n" + body.strip() + "\n\n"
 
 
-def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str) -> ReviewResult:
+def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
+    """List installed skills so Codex can read them when relevant."""
+    lane = ctx.store.get_run(n).lane
+    settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
+    skills = settings.get("skills", [])
+    frontmatter = re.compile(r"\A---[^\S\n]*\n(.*?)^---[^\S\n]*(?:\n|$)", re.DOTALL | re.MULTILINE)
+    if not skills and agent is not None:
+        definition = (worktree / ".claude/agents" / f"{agent}.md").read_text(encoding="utf-8", errors="replace")
+        match = frontmatter.match(definition)
+        try:
+            metadata = yaml.safe_load(match[1]) if match else None
+        except yaml.YAMLError:
+            metadata = None
+        skills = metadata.get("skills", []) if isinstance(metadata, dict) else []
+    if not isinstance(skills, list):
+        return "", []
+    sections, missing = [], []
+    for name in skills:
+        if not isinstance(name, str):
+            continue
+        path = worktree / ".claude/skills" / name / "SKILL.md"
+        if not path.resolve().is_relative_to(worktree.resolve()) or not path.is_file():
+            missing.append(name)
+            continue
+        match = frontmatter.match(path.read_text(encoding="utf-8", errors="replace"))
+        try:
+            metadata = yaml.safe_load(match[1]) if match else None
+        except yaml.YAMLError:
+            metadata = None
+        description = metadata.get("description", "") if isinstance(metadata, dict) else ""
+        description = " ".join(description.split()) if isinstance(description, str) else ""
+        sections.append(f"- {name}: {description} (.claude/skills/{name}/SKILL.md)")
+    return ("Lane skills (read the file when relevant and follow it):\n" + "\n".join(sections) + "\n\n"
+            if sections else ""), missing
+
+
+@contextmanager
+def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str):
+    git.ignore_review_scope()
+    path = git.root / REVIEW_SCOPE_FILE
+    link = os.readlink(path) if path.is_symlink() else None
+    original = path.read_bytes() if path.exists() else None
+    mode = path.stat().st_mode if path.exists() else None
+    section = (
+        "# Review scope (written by Foragent for this review only)\n\n"
+        f"{body}\n\n{review_scope_rules(acceptance_dir)}\n\n"
+    ).encode("utf-8")
+    try:
+        if link is not None:
+            path.unlink()
+        path.write_bytes(section + (original if original is not None else b""))
+        yield
+    finally:
+        if path.is_symlink():
+            path.unlink()
+        if link is not None:
+            path.unlink(missing_ok=True)
+            path.symlink_to(link)
+        elif original is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(original)
+            path.chmod(mode)
+
+
+def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
+            *, round_number: int = 1) -> ReviewResult:
     reviewer = resolved_reviewer(ctx.config)
     options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
-    before = git.review_state()
     edited = False
-    try:
-        result = _available_executor(
-            n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
-            reviewer=True,
-            prompt="" if reviewer == "claude" else build_review_prompt(parsed, git.staged_diff(base_ref)),
-            model=ctx.config.reviewer_model, timeout_s=_remaining(n, ctx),
-            log_path=ctx.store.log_path(n), **options,
-        )
-    finally:
-        if git.review_state() != before:
-            git.restore_review_state(before)
-            edited = True
-            _append(ctx.store.log_path(n), "Reviewer changed repository state; restored HEAD, index and working tree.")
+    with ExitStack() as scope:
+        if reviewer == "claude":
+            approval = ctx.store.load_approval(n)
+            if approval is None:
+                raise ValueError("Claude review requires an approved snapshot")
+            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir))
+        before = git.review_state()
+        try:
+            result = _available_executor(
+                n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
+                reviewer=True,
+                prompt="" if reviewer == "claude" else build_review_prompt(
+                    parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir,
+                ),
+                model=ctx.config.reviewer_model, timeout_s=_remaining(n, ctx),
+                log_path=ctx.store.log_path(n), **options,
+            )
+            message = result.full_message if result.full_message is not None else result.last_message
+            raw = message
+            if reviewer == "claude":
+                try:
+                    event = json.loads(message)
+                except ValueError:
+                    event = None
+                if isinstance(event, dict) and isinstance(event.get("result"), str):
+                    raw = event["result"]
+            path = ctx.store.root / "runs" / f"issue-{n}" / f"review-{round_number}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw, encoding="utf-8")
+        finally:
+            if git.review_state() != before:
+                git.restore_review_state(before)
+                edited = True
+                _append(ctx.store.log_path(n), "Reviewer changed repository state; restored HEAD, index and working tree.")
     if result.timed_out or result.exit_code != 0:
         review = ReviewResult("UNUSABLE", "", (
             f"Reviewer exit_code={result.exit_code}, timed_out={result.timed_out}",
         ))
     else:
         parser = parse_code_review if reviewer == "claude" else parse_review
-        review = parser(result.full_message if result.full_message is not None else result.last_message)
+        review = parser(message)
     if reviewer == "claude":
         review = ReviewResult(review.verdict, review.findings, (
             f"reviewer: /code-review {ctx.config.review_level}", *review.notes,
@@ -478,7 +602,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
         review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
     _append(ctx.store.log_path(n), f"Review: VERDICT: {review.verdict}\n{review.findings}")
     _progress(n, ctx)
-    return review
+    return replace(review, raw=raw)
 
 
 def _batch_pr(parent: int, ctx: RunContext) -> None:
@@ -555,6 +679,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     unusable_review = False
     checks: list[CheckResult] = []
     paths: list[str] = []
+    missing_skills: list[str] = []
     size = issue_size(ctx.tracker.get_issue(n).labels)
 
     def implement(failure: str, *, merge_conflicts: list[str] | None = None) -> None:
@@ -574,6 +699,10 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         agent, notes = _lane_notes(ctx, n, worktree)
         if native_claude and agent is not None:
             options["agent"] = agent
+        if not native_claude:
+            skill_notes, missing = _lane_skills(ctx, n, worktree, agent)
+            notes += skill_notes
+            missing_skills.extend(name for name in missing if name not in missing_skills)
         prompt = build_prompt(
             n, parsed, ctx.config.acceptance_dir, failure, ctx.config.language,
             native_goal=native_claude or ctx.config.codex_goal, acceptance_locked=native_claude,
@@ -762,6 +891,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 n, parsed, checks, ctx.store.get_run(n).attempts, reviews, try_text, outside_lane=outside,
                 fallback_model=ctx.store.get_run(n).fallback_model,
                 attempt_tiers=ctx.store.get_run(n).attempt_tiers,
+                missing_skills=missing_skills,
             )
 
         body = pr_body()
@@ -782,7 +912,11 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         if review_hold:
             summary = ("Reviewer did not return a usable verdict" if unusable_review
                        else f"Reviewer still found defects after {review_failures} rounds")
-            flag(ctx, n, Reason.RISK_HIGH, summary, f"{failure}\n\n{link}")
+            details = f"{failure}\n\n{link}"
+            if unusable_review:
+                raw = next(review.raw for review in reversed(reviews) if review.verdict == "UNUSABLE")
+                details += f"\n\nRaw reviewer result:\n{raw[:3000]}"
+            flag(ctx, n, Reason.RISK_HIGH, summary, details)
             return "held"
         decision = merge_decision(
             changed_paths=ctx.tracker.pr_changed_files(pr),
@@ -882,10 +1016,10 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         if not failure and ctx.config.reviewer != "none":
             if _remaining(n, ctx) <= 0:
                 return _timeout(n, ctx)
-            review = _review(n, ctx, git, parsed, base_ref)
+            review = _review(n, ctx, git, parsed, base_ref, round_number=len(reviews) + 1)
             reviews.append(review)
             if review.verdict == "UNUSABLE":
-                review = _review(n, ctx, git, parsed, base_ref)
+                review = _review(n, ctx, git, parsed, base_ref, round_number=len(reviews) + 1)
                 reviews.append(review)
                 if review.verdict != "PASS":
                     failure = review.findings or "\n".join(review.notes)
@@ -940,7 +1074,10 @@ def run_issue(n: int, ctx: RunContext) -> str:
         raise
     finally:
         # A tick may already have finished the record while terminating this runner.
-        run = ctx.store.get_run(n)
-        if run is not None and run.status != "finished":
-            ctx.store.finish_run(n, outcome=run.outcome or outcome)
+        try:
+            run = ctx.store.get_run(n)
+            if run is not None and run.status != "finished":
+                ctx.store.finish_run(n, outcome=run.outcome or outcome)
+        finally:
+            kick_tick(ctx.repo_root)
     return outcome

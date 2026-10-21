@@ -239,6 +239,8 @@ def test_runner_git_commands_are_exact_and_injectable(tmp_path):
         calls.append(args)
         if "diff" in args:
             return "a.py\0odd\nname.py\0"
+        if "--modified" in args:
+            return "feature.txt\0"
         return ""
 
     git = GitRepo(tmp_path, run)
@@ -253,10 +255,14 @@ def test_runner_git_commands_are_exact_and_injectable(tmp_path):
     git.remove_worktree(path)
     assert calls == [
         ["worktree", "add", "-B", "foragent/issue-1", str(path), "origin/main"],
-        ["-C", str(path), "add", "-A", "--", ".", ":!.foragent"],
+        ["-C", str(path), "ls-files", "--modified", "--deleted", "--others", "--exclude-standard", "-z",
+         "--", ".", ":!.foragent", ":!CLAUDE.local.md"],
+        ["-C", str(path), "--literal-pathspecs", "add", "-A", "--", "feature.txt"],
         ["-C", str(path), "rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"],
+        ["-C", str(path), "ls-files", "--cached", "-z", "--", "CLAUDE.local.md"],
         ["-C", str(path), "diff", "--cached", "--name-only", "--no-renames", "-z", "origin/main"],
         ["-C", str(path), "rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"],
+        ["-C", str(path), "ls-files", "--cached", "-z", "--", "CLAUDE.local.md"],
         ["-C", str(path), "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
          "commit", "-m", "Issue title (#1)"],
         ["-C", str(path), "push", "-f", "origin", "foragent/issue-1"],
@@ -269,7 +275,8 @@ def test_runner_git_commands_are_exact_and_injectable(tmp_path):
 def test_all_staging_and_commit_paths_remove_prestaged_artifacts(git_history, method):
     root = git_history.clone
     files = {".foragent/TRY.md": "try card", ".foragent/nested/session.log": "session",
-             "feature.txt": "implementation", ".foragent.yml": "review: fast\n"}
+             "feature.txt": "implementation", ".foragent.yml": "review: fast\n",
+             "CLAUDE.local.md": "local review scope"}
     for name, contents in files.items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -283,6 +290,7 @@ def test_all_staging_and_commit_paths_remove_prestaged_artifacts(git_history, me
         if "commit" in args:
             commits.append(args)
             assert git_command(root, "ls-files", "--", ".foragent") == ""
+            assert git_command(root, "ls-files", "--", "CLAUDE.local.md") == ""
             return ""
         return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout
 
@@ -297,6 +305,62 @@ def test_all_staging_and_commit_paths_remove_prestaged_artifacts(git_history, me
     assert git.changed_paths("HEAD") == [".foragent.yml", "feature.txt"]
     assert (root / ".foragent/TRY.md").read_text() == "updated try card"
     assert (root / ".foragent/nested/session.log").read_text() == "session"
+    assert (root / "CLAUDE.local.md").read_text() == "local review scope"
+
+
+def test_ignore_review_scope_uses_common_excludes_and_preserves_existing_bytes(git_history, tmp_path):
+    git = GitRepo(git_history.clone)
+    root = tmp_path / "linked-worktree"
+    git.add_detached_worktree(root, "HEAD")
+    exclude = git_history.clone / ".git/info/exclude"
+    original = b"# Personal excludes\r\nprivate.cache"
+    exclude.write_bytes(original)
+    worktree = git.at(root)
+    worktree.ignore_review_scope()
+    worktree.ignore_review_scope()
+    assert exclude.read_bytes() == original + b"\n/CLAUDE.local.md\n"
+    (root / "CLAUDE.local.md").write_text("scope")
+    assert git_command(root, "check-ignore", "CLAUDE.local.md") == "CLAUDE.local.md"
+    worktree.stage_changes()
+    assert git_command(root, "ls-files", "--", "CLAUDE.local.md") == ""
+
+
+def test_staging_keeps_previously_tracked_local_instructions_at_their_original_version(git_history, tmp_path):
+    git_history.update({"CLAUDE.local.md": "Original instructions\n"})
+    git = GitRepo(git_history.clone)
+    git.fetch("origin", "main")
+    root = tmp_path / "tracked-instructions"
+    git.add_detached_worktree(root, "origin/main")
+    scope = root / "CLAUDE.local.md"
+    scope.write_text("Temporary review scope\nOriginal instructions\n")
+    git_command(root, "add", "-f", "--", "CLAUDE.local.md")
+    git.at(root).stage_changes()
+    assert git_command(root, "diff", "--cached", "--name-only") == ""
+    assert git_command(root, "show", ":CLAUDE.local.md") == "Original instructions"
+    assert scope.read_text().startswith("Temporary review scope")
+
+
+@pytest.mark.parametrize("method", ["ensure_tracked", "commit_paths"])
+def test_explicit_publication_excludes_local_review_scope(git_history, method):
+    root = git_history.clone
+    (root / "CLAUDE.local.md").write_text("temporary scope")
+    (root / "feature.txt").write_text("implementation")
+    commits = []
+
+    def run(args):
+        if "commit" in args:
+            commits.append(args)
+            assert "CLAUDE.local.md" not in args[args.index("--") + 1:]
+            return ""
+        return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout
+
+    git = GitRepo(root, run)
+    if method == "ensure_tracked":
+        git.ensure_tracked(["CLAUDE.local.md", "feature.txt"])
+    else:
+        git.commit_paths(["CLAUDE.local.md", "feature.txt"], "Implementation")
+    assert git.changed_paths("HEAD") == ["feature.txt"]
+    assert len(commits) == (method == "commit_paths")
 
 
 def test_review_baseline_restores_head_even_when_index_and_files_are_unchanged(git_history):

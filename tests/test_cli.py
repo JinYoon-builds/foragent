@@ -359,7 +359,7 @@ def test_status_uses_configured_repo_without_origin(app, monkeypatch, capsys, js
 
 
 @pytest.mark.parametrize("action", ["install", "uninstall", "launchd-status"])
-def test_launchd_cli_needs_no_config_or_tracker(tmp_path, monkeypatch, capsys, action):
+def test_launchd_cli_needs_no_config_or_tracker(tmp_path, monkeypatch, capsys, action, kicks):
     monkeypatch.chdir(tmp_path)
     calls = []
 
@@ -372,6 +372,7 @@ def test_launchd_cli_needs_no_config_or_tracker(tmp_path, monkeypatch, capsys, a
     monkeypatch.setattr(cli.launchd, "status" if action == "launchd-status" else action, operation)
     assert cli.main(["gate", action]) == 0
     assert calls == [tmp_path]
+    assert kicks == ([tmp_path] if action == "install" else [])
     output = capsys.readouterr().out
     assert "dev.foragent.owner.repo" in output
     if action == "launchd-status":
@@ -385,13 +386,14 @@ def test_status_prints_loaded_launchd(app, monkeypatch, capsys):
     assert "launchd: loaded\n" in capsys.readouterr().out
 
 
-def test_init_and_launchd_errors_are_clear(tmp_path, monkeypatch, capsys):
+def test_init_and_launchd_errors_are_clear(tmp_path, monkeypatch, capsys, kicks):
     def fail(*args, **kwargs):
         raise launchd.LaunchdError("launchctl unavailable\nmore details")
 
     monkeypatch.setattr(cli.launchd, "install", fail)
     assert cli.main(["gate", "install", "--repo-root", str(tmp_path)]) == 1
     assert capsys.readouterr().err == "foragent: launchctl unavailable more details\n"
+    assert kicks == []
 
 
 @pytest.mark.parametrize("json_output", [False, True])
@@ -529,7 +531,7 @@ def test_inspect_cli_local_actions_receive_repo_context(app, monkeypatch, capsys
     }[action]
 
 
-def test_inspect_cli_records_answers_feedback_and_mark_seen(app, capsys):
+def test_inspect_cli_records_answers_feedback_and_mark_seen(app, capsys, kicks):
     root, git, tracker, store, calls = app
     tracker.add_issue(1, "Question", BODY, ["needs-human"])
     tracker.comment(1, format_comment(Reason.SPEC_QUESTION, "Question"))
@@ -547,9 +549,10 @@ def test_inspect_cli_records_answers_feedback_and_mark_seen(app, capsys):
     assert before <= datetime.fromisoformat(store.load_inspect().since) <= datetime.now(UTC)
     assert "Decision recorded:" in capsys.readouterr().out
     assert git.fetches == [] and calls["launches"] == []
+    assert kicks == [root, root]
 
 
-def test_inspect_cli_retry_and_refusal(app, capsys):
+def test_inspect_cli_retry_and_refusal(app, capsys, kicks):
     root, git, tracker, store, _ = app
     tracker.add_issue(1, labels=["needs-human"])
     tracker.comment(1, format_comment(Reason.SPEC_QUESTION, "Question"))
@@ -557,10 +560,12 @@ def test_inspect_cli_retry_and_refusal(app, capsys):
     assert cli.main(args) == 1
     captured = capsys.readouterr()
     assert captured.out == "" and "not a tech-failure item; retry refused" in captured.err
+    assert kicks == []
     tracker.comment(1, format_comment(Reason.TIMEOUT, "Too large"))
     assert cli.main(args) == cli.main(args) == 0
     assert tracker.get_issue(1).labels == frozenset()
     assert tracker.list_comments(1)[-1].body == "<!-- foragent:retry -->\nRetry requested."
+    assert kicks == [root, root]
 
 
 @pytest.mark.parametrize("reason", [Reason.RETRIES_EXCEEDED, Reason.TIMEOUT])

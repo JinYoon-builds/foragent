@@ -92,6 +92,8 @@ def offline_publication(git_history):
             stream = ["commit refs/heads/main\n", "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
                       "data 7\nPublish\n", f"from {parent}\n"]
             for name in args[args.index("--") + 1:]:
+                if name == ":!CLAUDE.local.md":
+                    continue
                 entry = git_command(root, "ls-files", "--stage", "-z", "--", name)
                 metadata, filename = entry.rstrip("\0").split("\t", 1)
                 mode, sha, stage = metadata.split()
@@ -152,7 +154,27 @@ def test_publish_order_contract_labels_native_links_and_summary(publishing, plan
     assert "| 3 | Login client | s | 2 | yes |" in report.summary()
 
 
-def test_dry_run_has_no_writes(publishing, plan):
+@pytest.mark.parametrize("options,approved", [
+    ({}, set()), ({"approve": True}, {2, 3}),
+    ({"approve_keys": ["api"]}, {2}), ({"approve_numbers": [3]}, {3}),
+])
+def test_publish_kicks_once_after_requested_approvals(publishing, plan, monkeypatch, options, approved):
+    root, _, tracker, _, _ = publishing
+    calls = []
+
+    def kick(repo_root):
+        assert repo_root == root
+        assert {n for n in (2, 3) if "approved" in tracker.get_issue(n).labels} == approved
+        calls.append(repo_root)
+
+    monkeypatch.setattr(order, "kick_tick", kick)
+    publish(publishing, plan, **options)
+    assert calls == ([root] if approved else [])
+    publish(publishing, plan, **options)
+    assert calls == ([root, root] if approved else [])
+
+
+def test_dry_run_has_no_writes(publishing, plan, kicks):
     root, _, tracker, _, events = publishing
     before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
     plan["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": []}]
@@ -160,6 +182,7 @@ def test_dry_run_has_no_writes(publishing, plan):
     report = publish(publishing, plan, dry_run=True, approve_keys=["client"])
     assert report.dry_run and "dry run" in report.summary()
     assert events == [] and tracker.issues == {} and tracker.labels == {}
+    assert kicks == []
     assert before == {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
@@ -502,15 +525,15 @@ def test_edit_reverting_to_a_prior_revision_still_refreshes_approval(publishing,
 def test_lane_skills_and_notices_reach_remote_runner_worktree(offline_publication, plan, monkeypatch, interrupted):
     root, config, tracker, git, calls, _ = offline_publication
     library = root.parent / "library"
-    skill = library / "engineering/skills/testing-strategy"
+    skill = library / "skills/testing-strategy"
     (skill / "references").mkdir(parents=True)
     (skill / "SKILL.md").write_text("---\nname: testing-strategy\ndescription: Tests\n---\nUse tests.\n")
     (skill / "references/example.md").write_text("Useful example\n")
-    (library / "LICENSE").write_text("MIT License\n")
+    (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\nMIT License\n")
     manager = SkillManager(Config(skill_libraries=[{"name": "local", "repo": "local", "path": str(library)}]),
                            run=lambda args: "a" * 40 + "\n")
     (root / ".gitignore").write_text(".claude/skills/\nTHIRD_PARTY_NOTICES.md\n")
-    plan["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": ["engineering/testing-strategy"]}]
+    plan["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": ["local:testing-strategy"]}]
     plan["issues"][1]["lane"] = "web"
     if interrupted:
         commit = git.commit_paths
@@ -536,8 +559,11 @@ def test_lane_skills_and_notices_reach_remote_runner_worktree(offline_publicatio
     assert set(lane_commit[lane_commit.index("--") + 1:]) == {
         ".foragent.yml", ".claude/agents/fa-web.md", ".claude/skills/testing-strategy/SKILL.md",
         ".claude/skills/testing-strategy/references/example.md", "THIRD_PARTY_NOTICES.md",
+        ":!CLAUDE.local.md",
     }
     assert len([args for args in calls if args[0] == "push"]) == 1
+    order.publish(plan, root, load_config(root), tracker, repo="owner/repo", git=git, manager=manager)
+    assert len(tracker.issues) == 3
 
 
 @pytest.mark.parametrize("requested,pin,engine,reason", [

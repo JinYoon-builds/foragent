@@ -43,7 +43,7 @@ Steps (each idempotent; a re-run of the same `id` updates instead of duplicating
 Ensure labels `size:s|m|l` exist (add to `labels.LABELS`).
 
 ## 3. Lanes and skills
-- `fa lanes add NAME --paths GLOB... [--skill LIB/PLUGIN/SKILL ...] [--executor] [--model]`: add to `.foragent.yml` `lanes` (never overwrite an existing lane; error), create `.claude/agents/fa-<name>.md`:
+- `fa lanes add NAME --paths GLOB... [--skill LIB:SKILL ...] [--executor] [--model]`: add to `.foragent.yml` `lanes` (never overwrite an existing lane; error), create `.claude/agents/fa-<name>.md`:
   ```
   ---
   name: fa-<name>
@@ -55,7 +55,9 @@ Ensure labels `size:s|m|l` exist (add to `labels.LABELS`).
   Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.
   ```
   and commit the configuration, agent, every installed skill file, and `THIRD_PARTY_NOTICES.md` (only these paths) with message "Foragent lane <name>", then push the base branch. Order publication includes these files when recovering an interrupted lane commit and pushes once after acceptance files are committed.
-- Skill libraries: `fa skills sync` clones or fast-forwards `https://github.com/anthropics/knowledge-work-plugins` into `~/.local/share/foragent/libraries/knowledge-work-plugins` (configurable list `skill_libraries` in global config; this one is the default). `fa skills catalog [--json]` lists `{id: "<plugin>/<skill>", name, description}` from each `*/skills/*/SKILL.md` frontmatter (all libraries, id prefixed by library name when more than one). `fa skills install ID --repo-root` copies the skill directory into `.claude/skills/<skill>/` (refuse to overwrite a different existing skill), and appends to `THIRD_PARTY_NOTICES.md` the source repo, path, commit SHA and license (read the library's LICENSE file name/SPDX if present; knowledge-work-plugins is Apache-2.0). `fa lanes add --skill` uses install.
+- Skill libraries: `fa skills sync` clones or fast-forwards the defaults `https://github.com/anthropics/knowledge-work-plugins` and `https://github.com/anthropics/skills` into `~/.local/share/foragent/libraries/<name>` (configurable through `skill_libraries`). Discover both `*/skills/*/SKILL.md` and `skills/*/SKILL.md`. `fa skills catalog [--json]` lists `{id, name, description, license}` with stable IDs such as `kwp:design/design-system` and `skills:frontend-design`. Unprefixed and previous library-qualified IDs are accepted only when unique.
+- `fa skills install ID --repo-root` checks the skill folder's `LICENSE`/`LICENSE.txt`, falling back to the library root. Recognized Apache-2.0, MIT, BSD and ISC licenses permit installation; source-available and unknown licenses are refused with a reason. Copy the skill directory into `.claude/skills/<skill>/` without overwriting different local contents, and record the source, commit, and selected license text in `THIRD_PARTY_NOTICES.md`. `fa lanes add --skill` uses the same check before writing lane files.
+- Lane skill counts have no cap. Codex receives `Lane skills (read the file when relevant and follow it):` followed by `- <name>: <one-line description> (.claude/skills/<name>/SKILL.md)` for each installed skill; skill bodies stay in their files. Missing files are skipped and recorded as `missing skill: <name>` in the PR body. Claude receives its lane through `--agent`.
 
 ## 4. Difficulty tiers (D26) in gate
 - Config `tiers` (default):

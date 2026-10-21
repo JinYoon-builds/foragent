@@ -10,6 +10,7 @@ import subprocess
 import yaml
 
 from foragent.config import Config, load_global_config
+from foragent.license_texts import STANDARD_LICENSES
 from foragent.paths import repo_path
 
 
@@ -23,6 +24,10 @@ class Library:
     repo: str
     path: Path
 
+    @property
+    def prefix(self) -> str:
+        return "kwp" if self.name == "knowledge-work-plugins" else self.name
+
 
 @dataclass(frozen=True)
 class Skill:
@@ -31,6 +36,46 @@ class Skill:
     description: str
     library: Library
     path: Path
+    license: str
+    license_file: Path | None
+
+
+OPEN_SOURCE_LICENSES = {
+    "Apache-2.0", "MIT", "BSD-1-Clause", "BSD-2-Clause", "BSD-3-Clause", "BSD-4-Clause", "0BSD", "ISC",
+}
+
+
+def _normalized_license(text: str) -> str:
+    text = re.sub(
+        r"^[ \t]*Copyright[ \t]+(?:\(c\)[ \t]*|©[ \t]*)?(?:\d{4}|<year>|\[yyyy\])[^\r\n]*$",
+        "", text, flags=re.I | re.M,
+    )
+    return " ".join(text.split())
+
+
+def _license(skill: Path, library: Path) -> tuple[str, Path | None]:
+    license_file = next((directory / name for directory in (skill, library) for name in ("LICENSE", "LICENSE.txt")
+                         if (directory / name).is_file()), None)
+    if license_file is None:
+        return "unknown", None
+    try:
+        text = license_file.read_text(encoding="utf-8")
+    except UnicodeError:
+        return "unknown", license_file
+    spdx = re.findall(
+        r"^[ \t]*(?:(?:#|//|/\*|\*)[ \t]*)?SPDX-License-Identifier:[ \t]*([^\r\n]*)", text, re.M,
+    )
+    if spdx:
+        identities = {identity.strip().removesuffix("*/").strip().casefold() for identity in spdx}
+        if len(identities) != 1 or not next(iter(identities)):
+            return "unknown", license_file
+        identity = spdx[0].strip().removesuffix("*/").strip()
+        return next((known for known in OPEN_SOURCE_LICENSES if known.casefold() == identity.casefold()), identity), license_file
+    normalized = _normalized_license(text)
+    for identity, standard in STANDARD_LICENSES.items():
+        if normalized == _normalized_license(standard):
+            return identity, license_file
+    return "unknown", license_file
 
 
 def _run(args: list[str]) -> str:
@@ -52,7 +97,10 @@ class SkillManager:
             if any(lib.name == name for lib in self.libraries):
                 raise SkillError(f"duplicate library name: {name}")
             path = Path(entry["path"]).expanduser() if isinstance(entry, dict) and "path" in entry else directory / name
-            self.libraries.append(Library(name, repo, path))
+            library = Library(name, repo, path)
+            if any(lib.prefix == library.prefix for lib in self.libraries):
+                raise SkillError(f"duplicate library prefix: {library.prefix}")
+            self.libraries.append(library)
 
     def sync(self) -> list[str]:
         synced = []
@@ -70,7 +118,8 @@ class SkillManager:
         for library in self.libraries:
             if not library.path.is_dir():
                 raise SkillError(f"library {library.name} is missing; run fa skills sync")
-            for path in sorted(library.path.glob("*/skills/*/SKILL.md")):
+            paths = {path for pattern in ("*/skills/*/SKILL.md", "skills/*/SKILL.md") for path in library.path.glob(pattern)}
+            for path in sorted(paths):
                 match = re.match(r"\A---\s*\n(.*?)\n---(?:\s*\n|$)", path.read_text(encoding="utf-8"), re.S)
                 try:
                     meta = yaml.safe_load(match[1]) if match else None
@@ -78,26 +127,37 @@ class SkillManager:
                     raise SkillError(f"invalid skill frontmatter: {path}: {exc}") from exc
                 if not isinstance(meta, dict) or any(not isinstance(meta.get(key), str) for key in ("name", "description")):
                     raise SkillError(f"skill requires name and description frontmatter: {path}")
-                plugin = path.relative_to(library.path).parts[0]
-                identity = f"{plugin}/{path.parent.name}"
-                if len(self.libraries) > 1:
-                    identity = f"{library.name}/{identity}"
-                result.append(Skill(identity, meta["name"], meta["description"], library, path.parent))
+                relative = path.relative_to(library.path).parts
+                identity = path.parent.name if len(relative) == 3 else f"{relative[0]}/{path.parent.name}"
+                license_id, license_file = _license(path.parent, library.path)
+                result.append(Skill(f"{library.prefix}:{identity}", meta["name"], meta["description"],
+                                    library, path.parent, license_id, license_file))
         return result
 
     def catalog(self) -> list[dict[str, str]]:
-        return [{"id": skill.id, "name": skill.name, "description": skill.description} for skill in self.skills()]
+        return [{"id": skill.id, "name": skill.name, "description": skill.description, "license": skill.license}
+                for skill in self.skills()]
 
     def _select(self, identity: str) -> Skill:
+        matches = []
         for skill in self.skills():
-            if identity in {skill.id, f"{skill.library.name}/{skill.id}"}:
-                return skill
+            relative = skill.id.split(":", 1)[1]
+            if identity in {skill.id, relative, f"{skill.library.name}/{relative}", f"{skill.library.name}:{relative}"}:
+                matches.append(skill)
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise SkillError(f"ambiguous skill: {identity}; use one of: {', '.join(skill.id for skill in matches)}")
         raise SkillError(f"unknown skill: {identity}")
 
     def check_install(self, identity: str, root: Path) -> Skill:
         skill = self._select(identity)
         if skill.path.is_symlink() or any(path.is_symlink() for path in skill.path.rglob("*")):
             raise SkillError(f"skill contains a symlink: {identity}")
+        if skill.license not in OPEN_SOURCE_LICENSES:
+            location = str(skill.license_file) if skill.license_file else "no LICENSE or LICENSE.txt"
+            raise SkillError(f"refusing to install {skill.id}: cannot confirm an open-source license "
+                             f"({skill.license}; {location})")
         destination = repo_path(root, f".claude/skills/{skill.path.name}")
         if destination.exists() and (destination.is_symlink() or not destination.is_dir()
                                      or self._contents(destination) != self._contents(skill.path)):
@@ -112,20 +172,13 @@ class SkillManager:
     def install(self, identity: str, root: Path) -> str:
         skill = self.check_install(identity, root)
         sha = self.run(["git", "-C", str(skill.library.path), "rev-parse", "HEAD"]).strip()
-        licenses = sorted(path for path in skill.library.path.iterdir()
-                          if path.is_file() and path.name.upper().startswith(("LICENSE", "LICENCE", "COPYING")))
-        license_file = licenses[0] if licenses else None
+        license_file = skill.license_file
         license_text = license_file.read_text(encoding="utf-8") if license_file else ""
-        spdx = re.search(r"SPDX-License-Identifier:\s*([^\s]+)", license_text)
-        license_id = spdx[1] if spdx else (
-            "Apache-2.0" if skill.library.name == "knowledge-work-plugins" or "Apache License" in license_text
-            else "MIT" if "MIT License" in license_text else "not specified"
-        )
         source = skill.path.relative_to(skill.library.path).as_posix()
         notice = (
             f"## {skill.library.name}/{source} @ {sha}\n\n"
             f"Source: {skill.library.repo}\nPath: {source}\nCommit: {sha}\n"
-            f"License: {license_id}" + (f" ({license_file.name})" if license_file else "") + "\n"
+            f"License: {skill.license}" + (f" ({license_file.name})" if license_file else "") + "\n"
         )
         if license_text:
             notice += "\n" + license_text.strip() + "\n"

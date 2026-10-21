@@ -60,7 +60,7 @@ rest still completes. For each issue you must be able to write one sentence:
 "Close when <specific evidence>". If you cannot, split or ask.
 - **Lane** = the area of the code it changes. Issues in one lane run one after another;
   lanes run in parallel. Use existing lanes; propose a new lane only for a genuinely new
-  area (name, paths, 0–3 skills from `fa skills catalog` that clearly fit). Never put two
+  area (name, paths, skills from `fa skills catalog` that clearly fit). Never put two
   issues that edit the same files into different lanes unless one is blocked by the other.
 - **Size** s/m/l = how much reasoning it needs (s: mechanical, m: normal feature,
   l: tricky logic, concurrency, data migration). Size picks the starting model tier.

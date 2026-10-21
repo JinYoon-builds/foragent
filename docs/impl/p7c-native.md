@@ -18,10 +18,10 @@ When `executor == "claude"`:
 When `executor == "codex"`: unchanged behaviour (runner-level enforcement and retry loop). If `config.codex_goal` (new bool key, default false) is true, prefix the prompt with `/goal <same condition>` — documented as experimental; nothing else changes.
 
 ## 2. Review uses the bundled `/code-review` skill when the reviewer is claude
-- Reviewer claude: `claude -p "/code-review <level>" --permission-mode auto --output-format json`, stdin `/dev/null`, cwd = worktree with the implementation **staged** (it reviews staged + unstaged changes). `<level>` from new config key `review_level` (low|medium|high|xhigh|max, default `medium`).
+- Reviewer claude: `claude -p "/code-review <level>" --permission-mode auto --output-format json`, stdin `/dev/null`, cwd = worktree with the implementation **staged** (it reviews staged + unstaged changes). `<level>` from config key `review_level` (low|medium|high|xhigh|max, default `low`).
 - Parse `result` from the JSON: lines matching `^- \S+:\d+ — ` (em dash, also accept ` - ` and ` -- `) are findings → FAIL with those lines; a result whose first non-empty line is `(none)` → PASS; anything else, non-zero exit, `is_error: true`, or unparsable JSON → no usable verdict (existing fail-closed path: rerun once, then hold `risk-high`).
-- Out-of-scope / goal conformance is not checked by `/code-review`; that is acceptable (Done when + acceptance lock cover the goal). Note it in the PR "Review" section as `reviewer: /code-review <level>`.
-- Reviewer codex keeps the current custom prompt path.
+- Before each Claude review, prepend a review scope section to `CLAUDE.local.md` containing the full approved snapshot body and rules limiting defects to unmet Goals, changes listed in Out of scope, or weakened checks. Ignore intentionally failing locked acceptance tests belonging to other issues and improvements beyond this issue's Goal. Restore the original file bytes after review, including failed or interrupted reviews, or remove the temporary file if none existed. Add `/CLAUDE.local.md` to the repository's `info/exclude` and explicitly exclude it from staging and commits. Note the reviewer in the PR "Review" section as `reviewer: /code-review <level>`.
+- Reviewer codex uses the same three scope rules in its custom prompt.
 - Keep the existing guard that reverts any reviewer edits/commits.
 
 ## 3. Small fixes from P7b QA
