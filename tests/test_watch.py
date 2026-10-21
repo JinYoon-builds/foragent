@@ -1,0 +1,158 @@
+from datetime import UTC, datetime, timedelta
+import json
+
+import pytest
+
+from foragent import cli, watch
+from foragent.config import Config, ConfigError
+from foragent.state import StateStore
+from foragent.tracker import FakeTracker
+
+
+NOW = datetime(2026, 10, 21, 9, tzinfo=UTC)
+
+
+def snapshot(tracker, store, config):
+    return watch.collect(cli._status(tracker, store, config), tracker, store, config, NOW)
+
+
+def finish(tracker, store, number, parent, lane="api"):
+    tracker.add_issue(number, f"Finished task {number}", labels=[f"lane:{lane}"], state="closed")
+    tracker.set_parent(number, parent)
+    store.start_run(number, branch=f"issue-{number}", worktree="unused", lane=lane)
+    store.update_run(number, last_progress_at=(NOW + timedelta(minutes=4)).isoformat())
+    store.finish_run(number, "merged")
+
+
+def test_order_progress_and_lane_totals_use_full_history_without_other_orders(tmp_path):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(lanes={"api": {"title": "Server"}}, max_parallel=2)
+    tracker.add_issue(90, "Current order")
+    tracker.add_issue(91, "Other order")
+    for number in range(1, 14):
+        finish(tracker, store, number, 90)
+    finish(tracker, store, 14, 91)
+    tracker.add_issue(15, "Active task", labels=["approved", "running", "lane:api"])
+    tracker.set_parent(15, 90)
+    store.start_run(15, branch="active", worktree="unused", lane="api")
+    result = snapshot(tracker, store, config)
+    assert len(result.status["history"]) == 10
+    assert result.order.number == 90
+    assert (result.completed, result.total) == (13, 14)
+    assert [issue.number for issue in result.done["api"]] == list(range(1, 14))
+    assert result.eta == NOW + timedelta(minutes=4)
+    output = watch.render_frame(result, config, tmp_path)
+    assert "13/14" in output and "✓ 13 done" in output and "Finished task 13" in output
+    assert "Finished task 14" not in output
+
+
+def test_road_keeps_dependency_queue_and_hit_only_flashes_active_block(tmp_path):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(lanes={"api": {"title": "Server"}})
+    tracker.add_issue(1, "Working", labels=["approved", "running", "lane:api"])
+    tracker.add_issue(2, "Ready", labels=["approved", "ready", "lane:api"])
+    tracker.add_issue(3, "Waiting", labels=["approved", "lane:api"])
+    store.start_run(1, branch="active", worktree="unused", lane="api")
+    result = snapshot(tracker, store, config)
+    output = watch.render_frame(result, config, tmp_path)
+    assert "#2" in output and "#3" in output
+    frames = [watch._frame(result, config, tmp_path, tick=tick, width=120, selected=None, now=NOW)
+              for tick in range(4)]
+    for tick, frame in enumerate(frames):
+        spans = [span for line in frame for span in line]
+        assert [(value, style) for value, style in spans if style == "hit"] == (
+            [(" #1 ", "hit")] if tick == 2 else [])
+        assert [(value, style) for value, style in spans if style == "queue"] == [
+            (" #3 ", "queue"), (" #2 ", "queue")]
+
+
+def test_open_order_after_last_child_and_no_order_are_renderable(tmp_path):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config()
+    empty = watch.render_frame(snapshot(tracker, store, config), config, tmp_path)
+    assert "no open order" in empty and "none yet" in empty
+    tracker.add_issue(90, "Awaiting order closure")
+    finish(tracker, store, 1, 90, lane="main")
+    output = watch.render_frame(snapshot(tracker, store, config), config, tmp_path)
+    assert "1/1" in output and "all done" in output
+
+
+def test_live_liveness_crosses_ten_minutes_between_refreshes(tmp_path):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(language="ko")
+    tracker.add_issue(1, "진행 중", labels=["approved", "running"])
+    store.start_run(1, branch="active", worktree="unused")
+    store.update_run(1, last_activity_at=(NOW - timedelta(seconds=599)).isoformat())
+    # Use a frozen status clock, just as the CLI's live refresh does.
+    status = cli._status(tracker, store, config)
+    status["lanes"]["main"]["last_activity_seconds"] = 599
+    result = watch.collect(status, tracker, store, config, NOW)
+    before = watch.render_frame(result, config, tmp_path, now=NOW)
+    after = watch.render_frame(result, config, tmp_path, now=NOW + timedelta(seconds=2))
+    assert "멈춘 듯" not in before
+    assert "○ 멈춘 듯 10분" in after
+
+
+def test_partial_event_append_and_missing_memory_have_usable_output(tmp_path):
+    store = StateStore(tmp_path)
+    events = [{"summary": f"Event {number}"} for number in range(7)]
+    (tmp_path / "orch-events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events)
+                                               + '{"summary": "incomplete')
+    assert [event["summary"] for event in watch.recent_events(store)] == [f"Event {n}" for n in range(6, 1, -1)]
+    config = Config(language="ko-KR", executor="claude", executor_model="inherited-model", lanes={"api": {}})
+    detail = watch.render_detail(config, "api", tmp_path)
+    assert "claude" in detail and "inherited-model" in detail and "아직 기억 없음" in detail
+
+
+@pytest.mark.parametrize("width", [40, 80, 120, 180])
+def test_unicode_layout_fits_resized_terminal_and_preserves_event_summary(tmp_path, width):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(language="ko", lanes={"api": {"title": "서버", "emoji": "🔧"}})
+    result = snapshot(tracker, store, config)
+    result.events = [{"summary": "긴 사건 기록도 잘리지 않고 마지막 내용까지 보여야 합니다 끝", "at": NOW.isoformat()}]
+    output = watch.render_frame(result, config, tmp_path, width=width)
+    assert all(watch._cells(line) <= width for line in output.splitlines())
+    assert "합니다 끝 ✓" in output
+
+
+@pytest.mark.parametrize("lane_count,keys", [(1, "11q"), (12, "12\n12\nq")])
+def test_keyboard_toggles_detail_and_scrolls_it_into_view(tmp_path, monkeypatch, lane_count, keys):
+    import curses
+
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(lanes={f"lane-{n:02}": {"title": f"Lane {n}"} for n in range(lane_count)})
+    result = snapshot(tracker, store, config)
+    monkeypatch.setattr(curses, "has_colors", lambda: False)
+    monkeypatch.setattr(curses, "curs_set", lambda value: None)
+
+    class Screen:
+        def __init__(self):
+            self.keys = iter(keys)
+            self.frames = []
+            self.current = []
+
+        def keypad(self, value): pass
+        def timeout(self, value): pass
+        def getmaxyx(self): return 24, 120
+        def erase(self): self.current = []
+        def addstr(self, y, x, value, style): self.current.append(value)
+        def refresh(self): self.frames.append("".join(self.current))
+        def getch(self): return ord(next(self.keys))
+
+    screen = Screen()
+    watch._terminal(screen, lambda: result, result, config, tmp_path, lambda: NOW)
+    assert "executor:" not in screen.frames[0]
+    assert any("agent detail" in frame and "executor:" in frame for frame in screen.frames[1:-1])
+    assert "executor:" not in screen.frames[-1]
+
+
+def test_live_watch_without_a_terminal_explains_once_option(tmp_path, monkeypatch):
+    monkeypatch.setattr(watch.sys.stdin, "isatty", lambda: False)
+    with pytest.raises(ConfigError, match="--once"):
+        watch.run(lambda: {}, FakeTracker(), StateStore(tmp_path), Config(), tmp_path)

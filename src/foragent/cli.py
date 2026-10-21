@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, notify, orch, order
+from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, notify, orch, order, watch
 from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -125,6 +125,9 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
         command.add_argument("--json", action="store_true")
         if name == "tick":
             command.add_argument("--no-start", action="store_true")
+    watch_command = actions.add_parser("watch", help="Watch the lane conveyor")
+    watch_command.add_argument("--repo-root", type=Path, default=Path.cwd())
+    watch_command.add_argument("--once", action="store_true")
     run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
     run_issue.add_argument("--repo-root", type=Path, required=True)
@@ -433,6 +436,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(status))
             else:
                 _print_status(status, config.language)
+        elif args.action == "watch":
+            watch.run(
+                lambda: _status(tracker, store, config), tracker, store, config, root,
+                once=args.once, now=lambda: datetime.now(UTC),
+            )
         else:
             if store.get_run(args.number) is None:
                 raise ConfigError(f"no run record for issue #{args.number}")
