@@ -219,3 +219,9 @@
 ### D38. 리뷰어 답을 못 읽은 경우는 기술 실패로 (2026-10-21, dogfooding 중 발견) — 미구현
 - 문제: 리뷰어가 쓸 수 있는 판정을 주지 않으면 `risk-high`(검토 묶음)로 표시했는데, inspect의 재시도는 기술 실패 묶음만 허용해서 사람이 PR을 닫고 라벨을 손으로 떼야 했다(#2, #7).
 - 결정: 새 이유 코드 `review-unusable`(기술 실패 묶음). 원본 답은 댓글에 이미 들어간다. inspect는 "재시도(리뷰만 다시)" / "그대로 머지 검토" / "닫기"를 제시한다. 재시도는 PR을 유지한 채 리뷰 단계만 다시 돌린다.
+
+### D39. 리뷰 범위는 PR 본문의 "Review scope"로 (2026-10-21, Jin 제안 + 비교 실험) — 미구현, 비교 후 결정
+- 문제: 순정 /code-review가 이슈 범위를 몰라 사소한 개선·다른 이슈의 잠긴 시험 실패까지 결함으로 내서 큐가 멈춤(#2·#7).
+- 비교(같은 #7 변경): (A) worktree의 임시 CLAUDE.local.md에 이슈 본문 + "이것만 막아라" 규칙 + low → 지적 1개(진짜 결함), 13초. (B) `/code-review <PR> low`(규칙 없음) → 리뷰어가 연결된 이슈를 스스로 읽었지만 지적 4개 이상, 테스트 286개를 직접 돌려 1분 40초, PR 본문의 지난 리뷰 지적에 영향 받음.
+- 결론 후보: PR 방식에 규칙을 더한다 — PR 본문에 `## Review scope`(Block only on: Goal not met / Out of scope changed / check weakened; other issues' locked acceptance tests fail on purpose)를 넣고 `/code-review <PR> low`. 임시 파일이 없고 사람도 기준을 본다. 지난 리뷰 지적은 PR 본문이 아니라 댓글로 남겨 다음 라운드에 영향을 주지 않는다.
+- 현재: 큐를 풀기 위해 (A)를 blocker 수정으로 먼저 적용. (A)와 PR+규칙 방식을 실제 이슈들로 비교한 뒤 정한다(지적 수, 진짜 결함 비율, 시간).
