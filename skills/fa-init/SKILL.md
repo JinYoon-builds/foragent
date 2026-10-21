@@ -24,6 +24,15 @@ description: Set up a project folder for Foragent.
 
 4. Run `fa adopt survey --json` after setup. When `kind` is `existing`,
    complete steps 5–8 in order. When it is `empty`, go to step 9.
+   Also run `fa order context --json` and read `ui.frameworks`. When UI frameworks
+   (including plain HTML) are detected, propose a design lane covering the project's
+   design tokens, basic components, sample pages and `docs/design/**`, with skills
+   `frontend-design`, `design-system`, `design-critique`, `accessibility-review`,
+   `ux-copy`, and `webapp-testing` (resolve their library IDs with `fa skills catalog`).
+   Include this proposal in step 6's lane approval for existing projects; for an empty
+   project with UI files, use the same approval before creating it. Reuse an existing
+   design lane and keep overlapping paths together. Design interviews and foundation
+   issues belong to the ordering workflow.
 
 5. Show a short "What I read" list from the survey:
    - `hot_paths`: frequently changed paths and their commit counts.

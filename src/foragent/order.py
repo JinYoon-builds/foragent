@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import quote
 
+from foragent import design
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, latest_flag
@@ -93,7 +94,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
                         if (match := re.match(r"^#{1,6}\s+(.+)", line))), None)
         specs.append({"path": path.relative_to(root).as_posix(), "heading": heading})
     ignored = {".git", ".venv", "node_modules", ".pytest_cache", "__pycache__"}
-    tree, languages = [], set()
+    tree, languages, frameworks = [], set(), set()
     extensions = {".py": "Python", ".js": "JavaScript", ".jsx": "JavaScript", ".ts": "TypeScript",
                   ".tsx": "TypeScript", ".go": "Go", ".rs": "Rust", ".swift": "Swift",
                   ".java": "Java", ".rb": "Ruby", ".sh": "Shell"}
@@ -105,6 +106,10 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
             tree.extend((relative / name).as_posix() + "/" for name in dirs)
             tree.extend((relative / name).as_posix() for name in sorted(files) if name not in ignored)
         languages.update(extensions[Path(name).suffix] for name in files if Path(name).suffix in extensions)
+        if any(Path(name).suffix.lower() == ".html" for name in files):
+            frameworks.add("html")
+        if "package.json" in files:
+            frameworks.update(design.package_frameworks(Path(parent) / "package.json"))
     commands = []
     if (root / "pyproject.toml").is_file():
         languages.add("Python")
@@ -117,7 +122,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
             if isinstance(data.get("scripts"), dict) and data["scripts"].get("test"):
                 pnpm = (root / "pnpm-lock.yaml").is_file() or str(data.get("packageManager", "")).startswith("pnpm@")
                 commands.append("pnpm test" if pnpm else "npm test")
-        except (ValueError, AttributeError):
+        except (OSError, ValueError, AttributeError):
             pass
     if (root / "go.mod").is_file():
         languages.add("Go")
@@ -137,6 +142,8 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
     return {
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "interview": _interview_context(config),
+        "ui": {"frameworks": sorted(frameworks),
+               "has_design_foundation": (root / "docs/design/CONTRACT.md").is_file()},
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
         "feedback": feedback, "decisions": decisions,
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),

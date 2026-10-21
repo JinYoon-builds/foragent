@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, order
+from foragent import __version__, adopt, bench, design, inspect_actions, inspect_data, launchd, order
 from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -57,6 +57,13 @@ def _parser() -> argparse.ArgumentParser:
     report = bench_actions.add_parser("report")
     report.add_argument("scenario_dir", type=Path)
     report.add_argument("--json", action="store_true")
+    design_command = commands.add_parser("design", help="Check the design foundation")
+    design_actions = design_command.add_subparsers(dest="action", required=True)
+    lint = design_actions.add_parser("lint", help="Find raw colors outside token files")
+    lint.add_argument("--repo-root", type=Path, default=Path.cwd())
+    lint.add_argument("--tokens", nargs="+", action="extend", help="Token file paths or globs (replaces defaults)")
+    lint.add_argument("--glob", nargs="+", action="extend", dest="globs", help="UI file globs (replaces defaults)")
+    lint.add_argument("--json", action="store_true")
     init = commands.add_parser("init", help="Set up this repository for Foragent")
     init.add_argument("--repo-root", type=Path, default=Path.cwd())
     init.add_argument("--approver", nargs="+", action="extend", dest="approvers")
@@ -273,6 +280,8 @@ def main(argv: list[str] | None = None) -> int:
             return adopt.run(args)
         if args.command == "bench":
             return bench.run(args)
+        if args.command == "design":
+            return design.run(args)
         if args.command == "gate" and args.action == "check-done":
             return check_done(args.snapshot.resolve(), args.worktree.resolve(), args.acceptance_dir)
         if args.command == "skills":
