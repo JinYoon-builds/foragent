@@ -1442,23 +1442,44 @@ def test_log_growth_poll_updates_progress_and_quiet_poll_does_not(run_case):
     def poll_hook(execute, poll):
         result = execute()
         before = c.store.get_run(1).last_progress_at
+        activity_before = c.store.get_run(1).last_activity_at
         c.now[0] += timedelta(seconds=30)
         poll()
         assert c.store.get_run(1).last_progress_at == before
+        assert c.store.get_run(1).last_activity_at == activity_before
         c.store.log_path(1).parent.mkdir(parents=True, exist_ok=True)
         c.store.log_path(1).write_text("new executor output\n")
         c.now[0] += timedelta(seconds=30)
         poll()
         observed.append(c.store.get_run(1).last_progress_at)
         assert observed[-1] == c.now[0].isoformat()
+        assert c.store.get_run(1).last_activity_at == observed[-1]
         c.now[0] += timedelta(seconds=30)
         poll()
         assert c.store.get_run(1).last_progress_at == observed[-1]
+        assert c.store.get_run(1).last_activity_at == observed[-1]
         return result
 
     c.ctx.poll_hook = poll_hook
     assert run_issue(1, c.ctx) == "merged"
     assert len(observed) == 1
+
+
+def test_short_executor_records_activity_without_a_periodic_poll(run_case, monkeypatch):
+    c = run_case
+    execute = c.executor.run
+
+    def short_run(**kwargs):
+        result = execute(**kwargs)
+        c.now[0] += timedelta(seconds=7)
+        kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["log_path"].write_text("completed before the first poll\n")
+        return result
+
+    monkeypatch.setattr(c.executor, "run", short_run)
+    c.ctx.poll_hook = lambda execute, poll: execute()
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.store.get_run(1).last_activity_at == c.now[0].isoformat()
 
 
 @pytest.mark.parametrize("acceptance_dir", ["tests/acceptance/", "checks with spaces", "./checks/"])
@@ -2271,6 +2292,7 @@ def test_fresh_base_same_line_conflict_is_resolved_in_place_and_merge_commit_is_
 
     def resolve(**kwargs):
         initial = not c.executor.calls
+        assert c.store.get_run(1).phase == ("implementing" if initial else "resolving-conflict")
         if not initial:
             root = kwargs["worktree"]
             text = (root / "cli.py").read_text()
@@ -2291,6 +2313,7 @@ def test_fresh_base_same_line_conflict_is_resolved_in_place_and_merge_commit_is_
 
     def merge_verified(pr, *, method, expected_head_sha):
         root = c.store.worktree_path(1)
+        assert c.store.get_run(1).phase == "merging"
         assert expected_head_sha == git_command(root, "rev-parse", "HEAD")
         assert not (root / git_command(root, "rev-parse", "--git-path", "MERGE_HEAD")).exists()
         parents = git_command(root, "show", "-s", "--format=%P", "HEAD").split()

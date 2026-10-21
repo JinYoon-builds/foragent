@@ -21,4 +21,6 @@
 - 힌트 소비는 프롬프트 작성이 아니라 `_available_executor()`가 일반 실행 결과를 반환한 뒤에 한다. limit 대기·transient 소진·transient 중 런타임 소진·실행 파일 누락·예외·SystemExit에서는 파일을 보존해야 다음 실행이 같은 힌트를 받는다. `classify_result(result)`로 이미 있는 실행기 가용성 구분을 재사용한다.
 - `orch-verbs` 명세는 조회를 포함한 모든 동사의 이력을 요구한다. `list`는 journal과 조회된 이슈 댓글, `log`는 이슈 번호 없는 journal을 남긴다. 조회의 `foragent:orch` 댓글은 blocked 근거·시각을 갱신하지 않는다.
 - `run_case`로 한 시험에서 실행을 여러 번 시작할 때 주입 시계를 한 번 이상 전진시킨다. 실행 이력은 `(이슈 번호, started_at)`으로 중복을 제거하므로 같은 시각에 시작하면 서로 다른 실행이 합쳐진다.
-- #30 검증: `uv run pytest -q tests/acceptance/test_orch_verbs.py` 7개, `tests/test_orch.py` 회귀 시험 71개, 전체 CI 명령 `uv run pytest -q --ignore=tests/acceptance` 1,732개 통과. 인수 시험 파일과 이름이 겹치는 새 시험 파일은 만들지 않는다.
+- #30 통합 검증: `uv run pytest -q tests/acceptance/test_orch_verbs.py` 7개 통과. 전체 CI 명령 `uv run pytest -q --ignore=tests/acceptance`은 1,754개 통과, 아래 샌드박스 권한 제한으로 1개 실패이며 `tests/test_orch.py`의 71개 회귀 시험도 이 실행에 포함된다. 인수 시험 파일과 이름이 겹치는 새 시험 파일은 만들지 않는다.
+- `foragent/batch-27`과 `cli.py` 충돌 시 `orch`와 `notify`의 import 및 명령 등록을 모두 보존한다. `fa orch --help`와 `fa notify --help`로 양쪽 명령을 확인하고, 알림·상태 표시가 통합된 전체 CI 시험을 실행한다. 충돌 해결은 작업 트리에 남기고 스테이징·병합 커밋은 runner에 맡긴다.
+- 이 세션의 샌드박스에서는 `tests/test_inspect_runtime.py::test_prepare_timeout_uses_60_seconds_and_kills_child_group`가 종료 후 `src/foragent/processes.py:16`의 `os.killpg(pid, signal.SIGTERM)`에서 `PermissionError: [Errno 1] Operation not permitted`로 실패한다. 단독 실행에서도 재현됐으며 두 파일은 이 병합에서 바뀌지 않았다. uv 임시 캐시 설정과 별개의 실행 권한 제한이다.

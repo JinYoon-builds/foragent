@@ -1,7 +1,7 @@
 """Command-line entry points for the issue gate."""
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 import json
 import os
@@ -10,12 +10,13 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, orch, order
+from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, notify, orch, order
 from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
+from foragent.i18n import text
 from foragent.kick import kick_tick
-from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_display, lane_order, state_group
+from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, state_group
 from foragent.lanes import LaneError, add_lane
 from foragent.paths import PathError
 from foragent.skills import SkillError, SkillManager
@@ -25,6 +26,7 @@ from foragent.inspect_runtime import InspectRuntimeError
 from foragent.scheduler import TickContext, tick
 from foragent.runner import RunContext, check_done, run_issue
 from foragent.state import StateStore
+from foragent.status import collect_lanes
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
 
@@ -151,6 +153,11 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
             command.add_argument("--tried", required=True)
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
+    notification = commands.add_parser("notify", help="Send an alert through the configured channel")
+    notification.add_argument("--title", required=True)
+    notification.add_argument("--line", required=True)
+    notification.add_argument("--link")
+    notification.add_argument("--repo-root", type=Path, default=Path.cwd())
     inspect = commands.add_parser("inspect", help="Show the human inbox and record answers")
     inspect.add_argument("--repo-root", type=Path, default=Path.cwd())
     inspect.add_argument("--json", action="store_true")
@@ -188,11 +195,11 @@ def _comma_numbers(value: str) -> list[int]:
 
 def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -> dict[str, Any]:
     config = config or Config()
-    lanes: dict[str, dict[str, Any]] = {}
     groups: dict[str, list[dict[str, Any]]] = {
         state: [] for state in (NEEDS_HUMAN, RUNNING, "pr-open", READY, "approved-waiting", "unapproved")
     }
-    for issue in sorted(tracker.list_open_issues(), key=lambda issue: issue.number):
+    issues = sorted(tracker.list_open_issues(), key=lambda issue: issue.number)
+    for issue in issues:
         item: dict[str, Any] = {"number": issue.number, "title": issue.title}
         group = state_group(issue, tracker)
         if group == NEEDS_HUMAN:
@@ -205,21 +212,31 @@ def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -
                  if (reason := parse_reason(comment.body)) is not None), None,
             )
         groups[group].append(item)
-        if group in {RUNNING, READY}:
-            run = store.get_run(issue.number) if group == RUNNING else None
-            lane = run.lane if run is not None and run.status == "running" else issue_lane(issue.labels, config.lanes)
-            lanes.setdefault(lane, {RUNNING: [], READY: [],
-                                    "lane_display": lane_display(config, lane, config.language)})[group].append(item)
+    lanes, summary = collect_lanes(issues, groups, tracker, store, config, datetime.now(UTC))
     return {
         "issues": groups,
-        "lanes": {lane: lanes[lane] for lane in sorted(lanes, key=lane_order)},
+        "lanes": lanes,
+        "summary": summary,
         "active_runs": [asdict(run) for run in store.active_runs()],
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
 
 
-def _print_status(status: dict[str, Any]) -> None:
+def _print_status(status: dict[str, Any], language: str = "en") -> None:
+    print(text("summary", language, **status["summary"]))
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
+    for lane in status["lanes"].values():
+        details = [text(lane["state"], language)]
+        if lane["issue"] is not None:
+            details.append(f"#{lane['issue']} {lane['title']}")
+        if lane["phase"]:
+            details.append(text(lane["phase"], language))
+        for field, key in (("elapsed_seconds", "elapsed"), ("last_activity_seconds", "activity")):
+            if lane[field] is not None:
+                details.append(text(key, language, seconds=int(lane[field])))
+        if lane["waiting_for"]:
+            details.append(text("waiting_for", language, issues=", ".join(f"#{n}" for n in lane["waiting_for"])))
+        print(f"{lane['lane_display']}: {' · '.join(details)}")
     for state, issues in status["issues"].items():
         print(f"{state}:")
         if state in {RUNNING, READY}:
@@ -323,6 +340,11 @@ def main(argv: list[str] | None = None) -> int:
                             title=args.title, emoji=args.emoji)
             print(f"Created lane:{args.name} ({', '.join(lane['paths'])})")
             return 0
+        if args.command == "notify":
+            config = load_config(root)
+            repo = config.repo or GitRepo(root).remote_slug()
+            notify.send(replace(config, repo=repo), args.title, args.line, args.link)
+            return 0
         if args.action in {"install", "uninstall", "launchd-status"}:
             if args.action == "launchd-status":
                 report = launchd.status(root)
@@ -409,7 +431,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.json:
                 print(json.dumps(status))
             else:
-                _print_status(status)
+                _print_status(status, config.language)
         else:
             if store.get_run(args.number) is None:
                 raise ConfigError(f"no run record for issue #{args.number}")

@@ -1,13 +1,14 @@
 """GitHub answers and a deduplicated, injectable inbox notification."""
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC
-import subprocess
 
 from foragent.inspect_data import (
     ACTIONABLE, DECISION_MARKER, RETRY_MARKER, InspectContext, collect,
     comment_key, counts_line, has_marker, latest_flag, pending_signature,
 )
+from foragent import notify as notifications
 from foragent.labels import NEEDS_HUMAN
 from foragent.inspect_runtime import prepare, serve, stop
 from foragent.reasons import GROUP
@@ -73,16 +74,6 @@ def mark_seen(ctx: InspectContext) -> str:
     return since
 
 
-def macos_notifier(line: str, title: str) -> None:
-    def quoted(value: str) -> str:
-        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-    subprocess.run(
-        ["osascript", "-e", f"display notification {quoted(line)} with title {quoted(title)}"],
-        check=True, capture_output=True, text=True, timeout=10,
-    )
-
-
 def notify(ctx: InspectContext, notifier: Callable[[str, str], None] | None = None) -> str | None:
     with ctx.store.notify_lock():
         inbox = collect(ctx)
@@ -94,7 +85,12 @@ def notify(ctx: InspectContext, notifier: Callable[[str, str], None] | None = No
             ctx.store.update_inspect(notified_signature=signature)
             return None
         line = counts_line(inbox)
-        if ctx.config.notify is None or ctx.config.notify == "macos":
-            (notifier or macos_notifier)(line, f"Foragent {ctx.repo}")
+        if notifier is not None:
+            notifier(line, f"Foragent {ctx.repo}")
+        elif not notifications.send(
+            replace(ctx.config, repo=ctx.repo), f"Foragent {ctx.repo}", line,
+            f"https://github.com/{ctx.repo}/issues",
+        ):
+            return line
         ctx.store.update_inspect(notified_signature=signature)
         return line

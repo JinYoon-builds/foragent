@@ -383,6 +383,11 @@ def _progress(n: int, ctx: RunContext) -> None:
     ctx.store.update_run(n, last_progress_at=ctx.now().astimezone(UTC).isoformat())
 
 
+def _phase(n: int, ctx: RunContext, phase: str) -> None:
+    if ctx.store.get_run(n).phase != phase:
+        ctx.store.update_run(n, phase=phase, phase_started_at=ctx.now().astimezone(UTC).isoformat())
+
+
 def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> ExecResult:
     log = kwargs["log_path"]
     size = log.stat().st_size if log.exists() else 0
@@ -392,7 +397,8 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         nonlocal size
         current = log.stat().st_size if log.exists() else 0
         if current > size:
-            _progress(n, ctx)
+            timestamp = ctx.now().astimezone(UTC).isoformat()
+            ctx.store.update_run(n, last_progress_at=timestamp, last_activity_at=timestamp)
         size = current
 
     try:
@@ -403,6 +409,7 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
                 result.log_tail = stream.read().decode("utf-8", errors="replace")[-4000:]
         return result
     finally:
+        poll()
         _progress(n, ctx)
 
 
@@ -582,6 +589,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
 
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
+    _phase(n, ctx, "reviewing")
     reviewer = resolved_reviewer(ctx.config)
     options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
     if reviewer == "claude" and pr is not None:
@@ -736,6 +744,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     def implement(
         failure: str, *, merge_conflicts: list[str] | None = None, reviewer_text: str | None = None,
     ) -> None:
+        _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")
         remaining = _remaining(n, ctx)
         if remaining <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
@@ -834,6 +843,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
 
     def verify() -> str:
         nonlocal checks, paths
+        _phase(n, ctx, "checking")
         git.stage_changes()
         if not prepare_target():
             raise ExecutorStopped("hash-mismatch")
@@ -1005,6 +1015,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
 
         # A bounded iteration count also works with a frozen test clock.
         for _ in range(4):
+            _phase(n, ctx, "ci")
             has_workflows = any(
                 path.is_file()
                 for pattern in ("*.yml", "*.yaml")
@@ -1053,6 +1064,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                     ctx.tracker.remove_labels(n, [RUNNING])
                     return "pr-open"
                 continue
+            _phase(n, ctx, "merging")
             try:
                 ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha)
             except TrackerError:
