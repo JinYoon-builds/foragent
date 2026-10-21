@@ -180,3 +180,8 @@
 - 결정: init이 프로젝트 보드(Projects v2) "Foragent: <repo>"를 만들고 필드 Lane(단일 선택), Size(s/m/l), Status(Approved/Ready/Running/Needs human/PR open/Done)를 둔다. order는 이슈를 만들 때 보드에 넣고 Lane·Size를 채운다. gate는 상태 전이마다 Status를 갱신한다(한 방향). 보드를 Lane으로 묶으면 레인별 줄이 된다 — "레인에 쌓인 이슈를 하나씩 쳐내는 화면"을 GitHub가 그려 준다.
 - 원칙: 진실은 이슈 라벨. 보드는 보기용이라 어긋나거나 지워져도 시스템은 돈다. 보드 갱신 실패는 tick을 막지 않는다.
 - 만드는 방법: Foragent 저장소에서 /fa-order로 주문(dogfooding 두 번째 주문).
+
+### D32. Codex 레인도 장착 스킬을 받는다 (2026-10-21, Jin 질문에서 발견)
+- 빈틈: 스킬은 `.claude/skills/`와 에이전트 `skills:` 칸으로 장착되는데 둘 다 Claude Code만 읽는다. runner는 Codex 레인에 메모·기억만 붙이고 스킬은 넘기지 않아, Codex 레인에서는 스킬 장착이 효과가 없었다. Foragent 저장소 첫 주문에서 레인 3개 모두 `skills: []`였던 것도 이와 무관하지 않다.
+- 결정: Codex 실행 시 레인에 장착된 스킬의 SKILL.md 본문(프런트매터 제외)을 지시문의 `Lane skills:` 절로 넣는다. 레인당 최대 3개, 스킬당 길이 상한. 실행기가 무엇이든 같은 레인은 같은 스킬을 쓴다.
+- 효과 측정: 스킬을 붙인 레인과 안 붙인 레인을 A/B/C 비교 장치로 잰다(D27 — 두꺼운 스킬이 오히려 나빴다는 보고가 있음).
