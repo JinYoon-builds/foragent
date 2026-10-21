@@ -68,7 +68,6 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "spawn_runner", spawn)
     monkeypatch.setattr(cli, "spawn_notify", lambda *args: calls["notifications"].append(args))
     monkeypatch.setattr(cli, "load_config", lambda root: Config(approvers=["human"]))
-    monkeypatch.setattr(cli.inspect_actions, "macos_notifier", lambda *args: None)
     monkeypatch.setattr(cli.launchd, "status", lambda root, **kwargs: launchd.LaunchdStatus(
         "dev.foragent.owner.repo", False, False,
     ))
@@ -586,21 +585,35 @@ def test_inspect_retry_existing_failed_pr_can_be_scheduled_on_next_tick(app, mon
     assert "ready" in tracker.get_issue(1).labels
 
 
-def test_inspect_cli_notify_prints_once_and_exposes_failure_for_manual_command(app, monkeypatch, capsys):
+def test_inspect_cli_notify_logs_failure_and_retries_then_dedupes(app, monkeypatch, capsys, caplog):
     root, git, tracker, store, _ = app
     tracker.add_issue(1, labels=["needs-human"])
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(notify="command:/offline/notifier"))
     args = ["inspect", "notify", "--repo-root", str(root)]
     calls = []
-    def fail(*args):
-        raise FileNotFoundError("osascript unavailable")
-    monkeypatch.setattr(cli.inspect_actions, "macos_notifier", fail)
-    assert cli.main(args) == 1
-    assert "osascript unavailable" in capsys.readouterr().err
+
+    def fail(*args, **kwargs):
+        raise FileNotFoundError("notifier unavailable")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    assert cli.main(args) == 0
+    assert "notifier unavailable" in caplog.text
+    assert capsys.readouterr().out == "Decision 1\n"
     assert store.load_inspect().notified_signature is None
-    monkeypatch.setattr(cli.inspect_actions, "macos_notifier", lambda *args: calls.append(args))
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
     assert cli.main(args) == cli.main(args) == 0
     assert capsys.readouterr().out == "Decision 1\n"
-    assert calls == [("Decision 1", "Foragent owner/repo")]
+    assert len(calls) == 1
+    assert calls[0][1]["env"]["FA_TITLE"] == "Foragent owner/repo"
+
+
+def test_notify_cli_resolves_repo_without_github_access(app, monkeypatch):
+    root, git, tracker, store, _ = app
+    monkeypatch.setattr(cli, "GhTracker", lambda *args: pytest.fail("notification must not contact GitHub"))
+    assert cli.main(["notify", "--repo-root", str(root), "--title", "확인", "--line", "준비 완료"]) == 0
+    record = json.loads((store.root / "push-outbox.jsonl").read_text())
+    assert record == {"title": "확인", "line": "준비 완료", "link": None}
+    assert git.remotes == ["origin"]
 
 
 @pytest.mark.parametrize("json_output", [False, True])

@@ -6,8 +6,9 @@ import subprocess
 
 import pytest
 
+from foragent.notify import macos_notifier
 from foragent.config import Config
-from foragent.inspect_actions import InspectError, answer, feedback, macos_notifier, mark_seen, notify, retry
+from foragent.inspect_actions import InspectError, answer, feedback, mark_seen, notify, retry
 from foragent.inspect_data import GROUPS, Inbox, InspectContext, collect, pending_signature
 from foragent.reasons import GROUP, Reason, format_comment
 from foragent.state import StateStore
@@ -439,8 +440,8 @@ def test_signature_is_stable_and_only_uses_actionable_identity(ctx):
     )
 
 
-@pytest.mark.parametrize("channel", [None, "macos", "slack", {"future": "channel"}])
-def test_notify_dedupes_signature_print_only_channels_and_counts(ctx, channel):
+@pytest.mark.parametrize("channel", [None, "claude-push", "macos", "slack:https://example.test/hook"])
+def test_notify_dedupes_signature_with_injected_delivery_and_counts(ctx, channel):
     ctx.config = replace(ctx.config, notify=channel)
     flag(ctx, 1)
     flag(ctx, 2)
@@ -450,9 +451,9 @@ def test_notify_dedupes_signature_print_only_channels_and_counts(ctx, channel):
     calls = []
     notifier = lambda *args: calls.append(args)
     assert notify(ctx, notifier) == "Decision 2 · Re-approve 1 · Review 1 · Try 1"
-    assert calls == ([] if channel not in (None, "macos") else [
+    assert calls == [
         ("Decision 2 · Re-approve 1 · Review 1 · Try 1", "Foragent owner/repo"),
-    ])
+    ]
     assert notify(ctx, notifier) is None
     # Changes to try items or an answer do not change the pending identity.
     pr(ctx, 6, merged=True)
