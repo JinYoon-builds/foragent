@@ -8,6 +8,8 @@
 - 결정: Foragent는 한 작업 안이 아니라 작업과 작업 사이(끝 → 검증 → 리뷰 → 다음 이슈 당기기)를 자동화한다.
 - 이유: 한 작업을 끝까지 하는 것은 이제 순정 모델도 잘한다. 병목은 사람이 "다음 거"를 눌러 주는 것이다. oh-my-openagent, orwa-mahmoud/nightshift는 "한 작업 끝까지" 쪽이고, marcus/nightshift는 내장 잡일 처리 쪽이다.
 
+- D1 보강 (2026-10-21, Jin): 모델이 아무리 좋아져도 서로 다른 성격의 일을 한 컨텍스트에 섞으면 성능을 다 내지 못한다 — (1) 이미 들어간 맥락의 잡음은 사라지지 않는다(공식 문서의 "kitchen sink session" 실패 패턴), (2) 일마다 완료 기준이 다르다, (3) 한 세션은 한 줄로 일한다(시간은 모델로 못 줄인다), (4) 하는 쪽과 판정하는 쪽은 나눠야 한다. 반대로 너무 잘게 쪼개면 넘김 손실과 레인 사이 틈(시험 6의 충돌)이 생기므로, 성격이 같은 일은 한 레인에 묶고 다른 일만 나눈다. "모델이 좋아지면 필요 없어지나?"에 대한 답이며 README 첫 줄 후보: "A smarter model still can't do unrelated work well in one muddled context. Foragent splits it by nature, runs it in parallel lanes, and checks each piece against its own bar."
+
 ### D2. 이름: Foragent
 - 결정: Foragent. 명령은 `init` / `order` / `gate` / `morning`.
 - 이유: forage + agent(스스로 다음 일을 찾아옴)와 for agent(에이전트를 위해 이슈를 찾아 넣어 줌) 두 뜻이 모두 제품 설명이 된다. 발음("포리전트")은 forage를, 글자는 agent를 강조한다.
