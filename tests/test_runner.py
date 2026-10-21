@@ -1005,7 +1005,7 @@ def test_full_claude_verdict_survives_output_tail_truncation(run_case, monkeypat
     c.executor.steps.append({})
     finding = "- feature.txt:1 — " + "x" * 930
     messages = iter(["\n".join([finding] * 5), "(none)"])
-    monkeypatch.setattr("foragent.executors.claude_review_command", lambda level, model: [
+    monkeypatch.setattr("foragent.executors.claude_review_command", lambda level, model, *, pr=None: [
         sys.executable, "-c", f"print({json.dumps({'result': next(messages)})!r})",
     ])
     c.ctx.config = replace(c.ctx.config, reviewer="claude")
@@ -1678,6 +1678,37 @@ def enable_native_reviewer(case, messages, edit=None):
     case.ctx.config = replace(case.ctx.config, reviewer="claude", review_level="xhigh")
     case.ctx.executor_factory = lambda name: case.executor if name == "codex" else SimpleNamespace(run=review)
     return calls
+
+
+@pytest.mark.parametrize("last_result,outcome", [("(none)", "merged"), ("No verdict", "retries-exceeded")])
+def test_pr_body_reviews_published_head_and_keeps_findings_in_comments(run_case, last_result, outcome):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, reviewer="claude", review_scope="pr-body")
+    c.executor.steps.append({"fix.txt": "fixed"})
+    finding = "feature.txt:1 — Fix the feature"
+    messages = iter([finding, last_result])
+    heads = []
+
+    def review(**kwargs):
+        pr = c.tracker.created_prs[0]
+        assert kwargs["review_pr"] == pr.number
+        assert not (kwargs["worktree"] / "CLAUDE.local.md").exists()
+        assert "## Review scope" in pr.body and finding not in pr.body
+        assert git_command(kwargs["worktree"], "diff", "--cached", "--name-only") == ""
+        head = git_command(kwargs["worktree"], "rev-parse", "HEAD")
+        assert head == git_command(c.history.origin, "rev-parse", "foragent/issue-1")
+        assert head == c.tracker.pr_head_sha(pr.number)
+        heads.append(head)
+        return ExecResult(0, False, json.dumps({"result": next(messages)}), kwargs["log_path"])
+
+    c.ctx.executor_factory = lambda name: c.executor if name == "codex" else SimpleNamespace(run=review)
+    assert run_issue(1, c.ctx) == outcome
+    assert len(heads) == 2 and heads[0] != heads[1]
+    assert finding in c.executor.calls[1]["prompt"]
+    comments = c.tracker.list_comments(c.tracker.created_prs[0].number)
+    assert any(finding in comment.body for comment in comments)
+    if outcome != "merged":
+        assert any(last_result in comment.body for comment in comments)
 
 
 @pytest.fixture

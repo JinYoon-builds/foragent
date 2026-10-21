@@ -7,3 +7,6 @@
 - 복사한 경로만 `GitRepo.local_skill_paths`에 등록한다. 자동 스테이징에서 제외하고 실행기가 강제로 스테이징한 복사본도 커밋 전에 인덱스에서 제거한다. 사용자 스킬은 계속 커밋할 수 있다.
 - 검증 명령: `uv run pytest -q tests/acceptance/test_skills_local.py`. 관련 회귀: `tests/test_skills_lanes.py`, `tests/test_git.py`, `tests/test_runner.py`, `tests/test_cli.py`, `tests/test_order.py`. acceptance 파일은 수정하지 않는다.
 - 제한 환경에서 기본 uv 캐시에 쓰기가 막히면 `/private/tmp`의 작업 전용 캐시에 필요한 캐시를 복사한 뒤 `UV_CACHE_DIR=/private/tmp/fa-issue-39-uv-cache uv run --offline ...`로 검증할 수 있다.
+- `review_scope` 기본값은 `claude-local`이다. `pr-body`는 각 리뷰 전에 검증한 변경을 커밋·푸시하고 같은 PR을 갱신한 뒤 Claude에 `review_pr`를 전달한다. CLI 명령은 `/code-review <PR 번호> <review_level>`이며 임시 `CLAUDE.local.md`를 만들지 않는다.
+- PR 본문은 초기 생성·재리뷰·최종 공개 모두 같은 렌더러를 쓴다. `pr-body`에서는 범위 규칙과 판정만 본문에, 각 라운드 지적·메모는 PR 댓글에 기록한다. 기본 모드는 이전처럼 본문에 리뷰 이력을 남긴다.
+- 리뷰 모드 검증: `uv run pytest -q tests/acceptance/test_skills_review_scope.py`. 회귀: `tests/test_config.py tests/test_executors.py tests/test_runner.py tests/test_git.py`. `tests/test_runner.py -k pr_body_reviews`는 매 라운드의 로컬 HEAD·원격 브랜치·PR HEAD 일치와 재시도 댓글 보존을 확인한다.
