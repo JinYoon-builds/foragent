@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import quote
 
-from foragent import board
+from foragent import board, design
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, latest_flag
@@ -138,6 +138,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
     return {
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "interview": _interview_context(config),
+        "ui": design.ui_context(root),
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
         "feedback": feedback, "decisions": decisions,
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),

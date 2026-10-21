@@ -668,7 +668,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
     assert result["feedback"] == [{"number": 1, "title": "Feedback", "body": "Fix it\n\nAbout #8.", "about": 8}]
