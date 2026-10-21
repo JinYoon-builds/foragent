@@ -140,14 +140,19 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
     orchestrator = commands.add_parser("orch", help="Diagnose and recover blocked issues")
     orch_actions = orchestrator.add_subparsers(dest="action", required=True)
-    for name in ("list", "rerun-review", "retry", "resolve", "escalate", "log"):
+    for name in ("list", "rerun-review", "retry", "resolve", "escalate", "log", "premerge", "merge"):
         command = orch_actions.add_parser(name)
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
         if name == "list":
             command.add_argument("--json", action="store_true")
         elif name not in {"log"}:
             command.add_argument("number", type=int)
-        if name == "retry":
+        if name == "premerge":
+            command.add_argument("--json", action="store_true")
+        elif name == "merge":
+            command.add_argument("--approved-by", required=True)
+            command.add_argument("--at")
+        elif name == "retry":
             command.add_argument("--hint")
         elif name == "resolve":
             command.add_argument("--verdict", choices=("pass", "fail"), required=True)
@@ -405,6 +410,17 @@ def main(argv: list[str] | None = None) -> int:
                 print(orch.resolve(ctx, args.number, args.verdict, args.note))
             elif args.action == "escalate":
                 print(orch.escalate(ctx, args.number, args.summary, args.tried, args.option, args.recommend))
+            elif args.action == "premerge":
+                report = orch.premerge(ctx, args.number)
+                if args.json:
+                    print(json.dumps(report, ensure_ascii=False))
+                else:
+                    print(f"PR #{report['pr']}: tests {report['tests']}; "
+                          f"conflicts: {', '.join(report['conflicts']) or 'none'}; "
+                          f"CI {report['ci']}; ready: {str(report['ready']).lower()}")
+                return 0 if report["ready"] else 1
+            elif args.action == "merge":
+                print(orch.merge(ctx, args.number, approved_by=args.approved_by, at=args.at))
             return 0
         inspect_ctx = inspect_data.InspectContext(
             tracker, store, repo, config, lambda: datetime.now(UTC), repo_root=root, git=git,

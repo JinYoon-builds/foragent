@@ -44,6 +44,7 @@ class Config:
     review_max: int = 2
     review_level: str = "low"
     review_scope: str = "claude-local"
+    test_command: str | None = None
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
@@ -92,6 +93,10 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 
 
 def _validate(values: dict[str, Any]) -> None:
+    if values["test_command"] is not None and (
+        not isinstance(values["test_command"], str) or not values["test_command"].strip()
+    ):
+        raise ConfigError("test_command must be a nonempty string or null")
     if not isinstance(values["review_scope"], str) or values["review_scope"] not in {"claude-local", "pr-body"}:
         raise ConfigError("review_scope must be claude-local or pr-body")
     if not isinstance(values["interview"], str) or values["interview"] not in {"ouroboros", "native"}:
