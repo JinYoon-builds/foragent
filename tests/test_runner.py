@@ -1482,6 +1482,13 @@ def test_code_review_result_parsing(text, verdict):
         assert result.findings == next(line for line in text.splitlines() if line.startswith("- "))
 
 
+def test_code_review_plain_finding_reports_failure():
+    text = "src/foragent/adopt.py:180 — I couldn't confirm this one, because ..."
+    result = parse_code_review(json.dumps({"result": text}))
+    assert result.verdict == "FAIL"
+    assert result.findings == text
+
+
 @pytest.mark.parametrize("message", ["garbage", "[]", "null", "{}", '{"result":null}',
                                           '{"result":"(none)","is_error":true}'])
 def test_code_review_invalid_json_or_error_is_unusable(message):

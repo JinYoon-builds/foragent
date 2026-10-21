@@ -137,7 +137,7 @@ def parse_code_review(message: str) -> ReviewResult:
         return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
     text = event["result"]
     lines = [line for line in text.splitlines() if line.strip()]
-    findings = [line for line in lines if re.match(r"^- \S+:\d+ (?:—|-|--) ", line)]
+    findings = [line for line in lines if re.match(r"^(?:[-*]\s+)?\S+:\d+\s+(?:—|-|--)\s+", line)]
     if findings:
         return ReviewResult("FAIL", "\n".join(findings))
     payload = text.strip()
