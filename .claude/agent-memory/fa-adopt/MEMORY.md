@@ -7,3 +7,7 @@
 - CI 파일 하나에 여러 테스트 실행이 있으면, 하나라도 인수 시험을 포함할 때 `runs_acceptance`는 true다. pytest의 정확한 `--ignore=<acceptance_dir 끝 슬래시 제거>` 인자가 제외 근거다.
 - 사람이 확인하는 명령: `uv run fa adopt survey --json`, `uv run fa adopt survey`. 인수 시험 명령: `uv run pytest -q tests/acceptance/test_adopt_survey.py`. issue #3에서는 사용자 지시에 따라 테스트를 실행하지 않았다.
 - 로컬 기본 `python3`에는 PyYAML이 없었다. 환경을 만들지 않고 CLI를 확인할 때 `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /Users/apple/.local/share/uv/tools/foragent/bin/python -B -m foragent.cli adopt survey`를 사용했다.
+- baseline의 자동 감지 순서는 Python(`pyproject.toml` 또는 `requirements*.txt`) → package.json의 test 스크립트 → Go다. 명령은 각각 `uv run pytest`, `npm test`/`pnpm test`, `go test ./...`이며, pnpm은 잠금 파일 또는 `packageManager: pnpm@...`로 고른다. order 레인 파일을 수정하지 않고 adopt 안에서 감지한다.
+- baseline은 `.foragent.yml`이 없어도 실행한다. pytest에는 끝 슬래시를 뺀 `--ignore=<acceptance_dir>`와 `-rf`를 추가하고, 공백이 있는 경로는 셸 인용한다. JSON stdout에 테스트 실행 로그를 섞지 않는다. 비-pytest의 실패 목록은 항상 빈 배열이다.
+- `foragent.processes.run_logged()`가 실행 제한 시 자식 프로세스 그룹까지 종료한다. 임시 로그 파일을 사용하면 기존 실행기를 재사용하면서 pytest의 전체 `FAILED` 요약을 읽을 수 있다. `capture_stdout=True`의 반환 문자열은 꼬리만 담으므로 실패 목록 파싱에 쓰지 않는다.
+- 검증: `uv run pytest -q tests/test_adopt.py tests/acceptance/test_adopt_baseline.py tests/acceptance/test_adopt_survey.py` → 20 passed. 이 작업 환경에서는 기본 uv 캐시 쓰기가 막혀 `/private/tmp/fa-issue-4-uv-cache`로 필요한 기존 wheel 캐시와 연결된 archive를 복사한 뒤 `UV_CACHE_DIR`로 지정했다. 네트워크 없이 로컬 의존성으로 실행 가능했다.

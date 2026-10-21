@@ -4,14 +4,17 @@ import argparse
 from collections import Counter
 import json
 from pathlib import Path, PurePosixPath
+import re
 import shlex
 import subprocess
 import sys
+import tempfile
 
 import yaml
 
 from foragent.config import Config, ConfigError, load_config
 from foragent.git import GitError, GitRepo
+from foragent.processes import run_logged
 
 
 def _scaffold(path: str, acceptance_dir: str) -> bool:
@@ -150,7 +153,65 @@ def survey(root: Path) -> dict:
     }
 
 
+def _detect_test_command(root: Path) -> str | None:
+    """Use order.context's runner preference, including requirements-only projects."""
+    if (root / "pyproject.toml").is_file() or any(path.is_file() for path in root.glob("requirements*.txt")):
+        return "uv run pytest"
+    package = root / "package.json"
+    if package.is_file():
+        try:
+            data = json.loads(package.read_text(encoding="utf-8"))
+            if isinstance(data.get("scripts"), dict) and data["scripts"].get("test"):
+                pnpm = (root / "pnpm-lock.yaml").is_file() or str(data.get("packageManager", "")).startswith("pnpm@")
+                return "pnpm test" if pnpm else "npm test"
+        except (ValueError, AttributeError):
+            pass
+    if (root / "go.mod").is_file():
+        return "go test ./..."
+    return None
+
+
+def baseline(root: Path, command: str | None = None, timeout: int = 900) -> dict:
+    """Run existing tests once and report their state without treating red as an error."""
+    root = root.resolve()
+    command = command or _detect_test_command(root)
+    if command is None:
+        return {"command": None, "passed": None, "skipped": "no test command found"}
+    is_pytest = any(invocation[0] == "pytest" for invocation in _test_invocations(command))
+    if is_pytest:
+        config = load_config(root) if (root / ".foragent.yml").is_file() else Config()
+        command += " " + shlex.quote(f"--ignore={config.acceptance_dir.rstrip('/')}") + " -rf"
+    with tempfile.TemporaryDirectory(prefix="fa-baseline-") as directory:
+        log = Path(directory) / "output.log"
+        exit_code, timed_out, _ = run_logged(
+            ["/bin/sh", "-c", command], cwd=root, timeout_s=timeout, log_path=log,
+        )
+        output = log.read_text(encoding="utf-8", errors="replace") if is_pytest else ""
+    # Explicit --color=yes can leave terminal escapes around pytest's summary.
+    output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    failing = []
+    for line in output.splitlines():
+        if line.startswith("FAILED "):
+            node_id = line.removeprefix("FAILED ").split(" - ", 1)[0]
+            if node_id not in failing:
+                failing.append(node_id)
+    return {"command": command, "exit_code": exit_code,
+            "passed": exit_code == 0 and not timed_out, "failing": failing}
+
+
 def run(args: argparse.Namespace) -> int:
+    if args.action == "baseline":
+        report = baseline(args.repo_root, args.test_command, args.timeout)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False))
+        elif report["command"] is None:
+            print(f"Baseline skipped: {report['skipped']}")
+        else:
+            print(f"Command: {report['command']}")
+            print(f"Baseline: {'passed' if report['passed'] else 'failed'} (exit {report['exit_code']})")
+            for node_id in report["failing"]:
+                print(f"FAILED {node_id}")
+        return 0
     if args.action == "survey":
         report = survey(args.repo_root)
         if args.json:
