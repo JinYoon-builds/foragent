@@ -29,10 +29,15 @@ from foragent.state import StateStore
 from foragent.status import collect_lanes
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
+try:
+    from foragent._build import GIT_SHA
+except ImportError:
+    GIT_SHA = "unknown"
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fa")
-    parser.add_argument("--version", action="version", version=f"foragent {__version__}")
+    parser.add_argument("--version", action="version", version=f"foragent {__version__} ({GIT_SHA})")
     commands = parser.add_subparsers(dest="command", required=True)
     adopt_command = commands.add_parser("adopt", help="Prepare an existing repository for Foragent")
     adopt_actions = adopt_command.add_subparsers(dest="action", required=True)

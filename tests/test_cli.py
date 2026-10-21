@@ -265,7 +265,9 @@ def test_module_entry_point_version():
         [sys.executable, "-m", "foragent.cli", "--version"], check=True,
         capture_output=True, text=True,
     )
-    assert result.stdout == f"foragent {__version__}\n" and result.stderr == ""
+    from foragent._build import GIT_SHA
+
+    assert result.stdout == f"foragent {__version__} ({GIT_SHA})\n" and result.stderr == ""
 
 
 def test_module_entry_point_configuration_error(tmp_path):
