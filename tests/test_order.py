@@ -527,7 +527,7 @@ def test_lane_skills_and_notices_reach_remote_runner_worktree(offline_publicatio
     (skill / "references").mkdir(parents=True)
     (skill / "SKILL.md").write_text("---\nname: testing-strategy\ndescription: Tests\n---\nUse tests.\n")
     (skill / "references/example.md").write_text("Useful example\n")
-    (library / "LICENSE").write_text("MIT License\n")
+    (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\nMIT License\n")
     manager = SkillManager(Config(skill_libraries=[{"name": "local", "repo": "local", "path": str(library)}]),
                            run=lambda args: "a" * 40 + "\n")
     (root / ".gitignore").write_text(".claude/skills/\nTHIRD_PARTY_NOTICES.md\n")

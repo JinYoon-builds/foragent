@@ -1497,8 +1497,11 @@ REPORTED_JSON_FINDINGS = [
 
 
 @pytest.mark.parametrize("wrapper", [
-    "{}", "```json\n{}\n```", "```\n{}\n```",
-    "Review findings: {}\nEnd of review.", "[Review notes]\n```json\n{}\n```",
+    "{}", " \n{}\n\t", "```json\n{}\n```", "```\n{}\n```",
+    "```text\n{}\n```", "```python\n{}\n```",
+    "[Review notes]\n```json\n{}\n```",
+    "FAIL: foo([]) crashes.\n```json\n{}\n```\nEnd of review.",
+    "FAIL: foo([]) crashes.\r\n```json\r\n{}\r\n```\r\nEnd of review.",
 ])
 @pytest.mark.parametrize("items", [[], REPORTED_JSON_FINDINGS])
 def test_code_review_accepts_reported_json_array_shape(wrapper, items):
@@ -1509,18 +1512,41 @@ def test_code_review_accepts_reported_json_array_shape(wrapper, items):
 
 
 @pytest.mark.parametrize("first,second", [([], REPORTED_JSON_FINDINGS), (REPORTED_JSON_FINDINGS, [])])
-def test_code_review_uses_only_the_first_json_array(first, second):
-    text = json.dumps(first) + "\n" + json.dumps(second)
+@pytest.mark.parametrize("wrapper", ["{}", "```json\n{}\n```"])
+def test_code_review_multiple_json_arrays_are_unusable(first, second, wrapper):
+    text = wrapper.format(json.dumps(first)) + "\n" + wrapper.format(json.dumps(second))
     result = parse_code_review(json.dumps({"result": text}))
-    assert result.verdict == ("FAIL" if first else "PASS")
-    assert result.findings == "\n".join(f"{item['file']}:{item['line']} — {item['summary']}" for item in first)
+    assert result.verdict == "UNUSABLE"
+
+
+@pytest.mark.parametrize("items", [[], REPORTED_JSON_FINDINGS])
+@pytest.mark.parametrize("wrapper", [
+    "Review findings: {}\nEnd of review.", "FAIL: foo([]) crashes.\n{}",
+    "FAIL: foo([]) crashes.\n```\n{}\n```", "Review:\n```python\n{}\n```",
+    "Example `[]`, then {}", "[Review notes]\n{}",
+])
+def test_code_review_arrays_outside_findings_payload_are_unusable(wrapper, items):
+    result = parse_code_review(json.dumps({"result": wrapper.format(json.dumps(items))}))
+    assert result.verdict == "UNUSABLE"
+
+
+@pytest.mark.parametrize("item", [
+    {"file": "src/foo.py"}, {"line": 12}, {"summary": "Empty input crashes"},
+    {"file": "src/foo.py", "line": 12}, {"summary": "mishandles []", "details": []},
+])
+def test_code_review_partial_findings_fail(item):
+    result = parse_code_review(json.dumps({"result": json.dumps([item])}))
+    assert result.verdict == "FAIL" and result.findings
 
 
 @pytest.mark.parametrize("text", [
     "[", "[{", '[{"file":"x.py","line":1,"summary":"broken","details":[],}]',
     '[{"file":"x.py","line":1,"summary":"broken","details":[]}',
-    '[{"file":"x.py","line":1}]', '[{}, {"file":"x.py","line":1,"summary":"broken"}]',
-    '["unexpected finding"]', '[null]', '[123]',
+    '[{}, {"file":"x.py","line":1,"summary":"broken"}]',
+    '["unexpected finding"]', '[null]', '[123]', '[[]]', '[{"details": []}]',
+    '[{"summary":"broken"}, "unexpected"]', '[{"summary":"broken"}, null]',
+    '(none)\n```json\n["unexpected"]\n```',
+    '(none)\n```json\n[]\n```\n```json\n[]\n```',
 ])
 def test_code_review_bad_arrays_are_unusable_without_passing_on_nested_empty_arrays(text):
     assert parse_code_review(json.dumps({"result": text})).verdict == "UNUSABLE"
@@ -1571,6 +1597,30 @@ def test_native_json_findings_trigger_repair_then_empty_array_passes_and_saves_r
     assert (directory / "review-1.txt").read_text() == raw
     assert (directory / "review-2.txt").read_text() == "[]"
     assert not c.store.worktree_path(1).exists()
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+def test_native_prose_empty_array_cannot_skip_defects_and_merge(run_case, fenced):
+    c = run_case
+    finding = {"file": "src/foo.py", "line": 12, "summary": "Empty input crashes"}
+    payload = json.dumps([finding])
+    raw = "FAIL: foo([]) crashes.\n" + (f"```json\n{payload}\n```" if fenced else payload)
+    if fenced:
+        c.executor.steps.append({})
+        messages = [json.dumps({"result": raw}), '{"result":"[]"}']
+    else:
+        messages = [json.dumps({"result": raw})] * 2
+    calls = enable_native_reviewer(c, messages)
+    assert run_issue(1, c.ctx) == ("merged" if fenced else "held")
+    assert len(calls) == 2
+    assert len(c.executor.calls) == (2 if fenced else 1)
+    if fenced:
+        assert "src/foo.py:12 — Empty input crashes" in c.executor.calls[1]["prompt"]
+        assert "Round 1: VERDICT: FAIL" in c.tracker.created_prs[0].body
+    else:
+        assert c.tracker.merged_prs == []
+        assert "Round 1: VERDICT: UNUSABLE" in c.tracker.created_prs[0].body
+    assert (c.store.root / "runs/issue-1/review-1.txt").read_text() == raw
 
 
 @pytest.mark.parametrize("native", [False, True])

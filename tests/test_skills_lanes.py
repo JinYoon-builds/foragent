@@ -9,6 +9,7 @@ from foragent import cli
 from foragent.config import Config, load_config
 from foragent.git import GitError
 from foragent.lanes import LaneError, add_lane, validate_lane
+from foragent.license_texts import STANDARD_LICENSES
 from foragent.skills import SkillError, SkillManager
 
 
@@ -20,7 +21,7 @@ def library(tmp_path):
     (skill / "SKILL.md").write_text('---\nname: testing-strategy\ndescription: |\n  Pick useful checks.\n---\nTesting instructions.\n')
     (skill / "references").mkdir()
     (skill / "references/example.md").write_text("Example\n")
-    (root / "LICENSE").write_text("Apache License\nVersion 2.0\n")
+    (root / "LICENSE").write_text("SPDX-License-Identifier: Apache-2.0\nApache License\nVersion 2.0\n")
     (root / "NOTICE").write_text("Library attribution\n")
     config = Config(skill_libraries=[{"name": "knowledge-work-plugins", "repo": "https://example.test/library",
                                       "path": str(root)}])
@@ -45,7 +46,7 @@ def two_libraries(library, tmp_path):
     docx.mkdir()
     (docx / "SKILL.md").write_text("---\nname: docx\ndescription: Create documents.\n---\nDocument body.\n")
     (docx / "LICENSE.txt").write_text("Source-available. Governed by commercial terms.\n")
-    (skills / "LICENSE").write_text("Apache License\nVersion 2.0\nLibrary root copyright\n")
+    (skills / "LICENSE").write_text("SPDX-License-Identifier: Apache-2.0\nApache License\nVersion 2.0\nLibrary root copyright\n")
     config = replace(config, skill_libraries=[*config.skill_libraries, {
         "name": "skills", "repo": "https://github.com/anthropics/skills", "path": str(skills),
     }])
@@ -68,7 +69,7 @@ def test_two_library_layouts_have_stable_ids_and_per_skill_licenses(two_librarie
     kwp, skills, _, manager, _ = two_libraries
     assert {row["id"]: row["license"] for row in manager.catalog()} == {
         "kwp:engineering/testing-strategy": "Apache-2.0",
-        "skills:docx": "source-available", "skills:frontend-design": "MIT",
+        "skills:docx": "unknown", "skills:frontend-design": "MIT",
     }
     repo = tmp_path / "repo"
     assert manager.install("kwp:engineering/testing-strategy", repo) == "testing-strategy"
@@ -152,12 +153,11 @@ def test_spdx_license_is_used(library, tmp_path):
     ("LICENSE", "SPDX-License-Identifier: Apache-2.0\n", "Apache-2.0"),
     ("LICENSE.txt", "SPDX-License-Identifier: MIT\n", "MIT"),
     ("LICENSE.txt", "SPDX-License-Identifier: apache-2.0\n", "Apache-2.0"),
-    ("LICENSE.txt", "BSD 2-Clause License\n", "BSD-2-Clause"),
-    ("LICENSE", "BSD 3-Clause License\n", "BSD-3-Clause"),
+    ("LICENSE.txt", STANDARD_LICENSES["BSD-2-Clause"], "BSD-2-Clause"),
+    ("LICENSE", STANDARD_LICENSES["BSD-3-Clause"], "BSD-3-Clause"),
     ("LICENSE", "SPDX-License-Identifier: BSD-4-Clause\n", "BSD-4-Clause"),
     ("LICENSE.txt", "SPDX-License-Identifier: 0BSD\n", "0BSD"),
-    ("LICENSE", "ISC License\n", "ISC"),
-    ("LICENSE.txt", "Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted.\n", "ISC"),
+    ("LICENSE", STANDARD_LICENSES["ISC"], "ISC"),
 ])
 def test_skill_license_is_used_before_library_root(library, tmp_path, filename, text, license_id):
     source, _, manager, _ = library
@@ -181,6 +181,12 @@ def test_skill_license_is_used_before_library_root(library, tmp_path, filename, 
     "Example only: Apache License Version 2.0. Actual conditions are unspecified.\n",
     "BSD 3-Clause No Nuclear License\nRedistribution and use in source and binary forms\nNeither the name\n",
     b"\xff\xfeUnknown license encoding",
+    "Apache License\nVersion 2.0\n", "MIT License\n", "BSD 2-Clause License\n",
+    "BSD 3-Clause License\n", "ISC License\n",
+    "Permission is hereby granted, free of charge, to any person obtaining a copy\n",
+    "Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted.\n",
+    "SPDX-License-Identifier:\nMIT License\n", "Example: SPDX-License-Identifier: MIT\n",
+    "SPDX-License-Identifier: MIT\nSPDX-License-Identifier: LicenseRef-Custom\n",
 ])
 def test_nonfree_or_unknown_skill_overrides_open_source_root_and_writes_nothing(library, tmp_path, text):
     source, _, manager, commands = library
@@ -194,6 +200,76 @@ def test_nonfree_or_unknown_skill_overrides_open_source_root_and_writes_nothing(
             action("kwp:engineering/testing-strategy", repo)
         assert "LICENSE.txt" in str(error.value)
     assert list(repo.iterdir()) == [repo / "keep.txt"] and commands == []
+
+
+@pytest.mark.parametrize("license_id", STANDARD_LICENSES)
+@pytest.mark.parametrize("variant", ["standard", "whitespace", "copyright", "no-copyright"])
+def test_complete_standard_licenses_are_accepted(library, tmp_path, license_id, variant):
+    source, _, manager, _ = library
+    text = STANDARD_LICENSES[license_id]
+    if variant == "copyright":
+        text = (text.replace("<year>", "1999-2026").replace("<copyright holders>", "Jin and contributors")
+                .replace("<owner>", "Jin and contributors").replace("[yyyy]", "2026")
+                .replace("[name of copyright owner]", "Jin"))
+    elif variant == "no-copyright":
+        text = "\n".join(line for line in text.splitlines() if not line.startswith("Copyright "))
+    elif variant == "whitespace":
+        text = "\r\n".join("\t " + line.replace(" ", " \t ") + "  " for line in text.splitlines())
+    (source / "engineering/skills/testing-strategy/LICENSE.txt").write_text(text)
+    assert manager.catalog()[0]["license"] == license_id
+    manager.install("kwp:engineering/testing-strategy", tmp_path / "repo")
+    assert f"License: {license_id}" in (tmp_path / "repo/THIRD_PARTY_NOTICES.md").read_text()
+
+
+@pytest.mark.parametrize("license_id", STANDARD_LICENSES)
+@pytest.mark.parametrize("variant", ["appended", "inserted", "truncated"])
+def test_modified_standard_licenses_are_unknown_and_install_writes_nothing(library, tmp_path, license_id, variant):
+    source, _, manager, commands = library
+    text = STANDARD_LICENSES[license_id]
+    restriction = "The Software shall be used for Good, not Evil.\n"
+    if variant == "appended":
+        text += restriction
+    elif variant == "inserted":
+        position = text.index("\n\n")
+        text = text[:position] + "\n" + restriction + text[position:]
+    else:
+        text = text[:len(text) // 2]
+    (source / "engineering/skills/testing-strategy/LICENSE.txt").write_text(text)
+    assert manager.catalog()[0]["license"] == "unknown"
+    for action in (manager.check_install, manager.install):
+        with pytest.raises(SkillError, match="unknown"):
+            action("kwp:engineering/testing-strategy", tmp_path / "repo")
+    assert not (tmp_path / "repo").exists() and commands == []
+
+
+def test_json_org_license_is_unknown_and_install_leaves_existing_files_untouched(library, tmp_path):
+    source, _, manager, commands = library
+    text = STANDARD_LICENSES["MIT"].replace("MIT License", "The JSON License").replace(
+        'THE SOFTWARE IS PROVIDED', 'The Software shall be used for Good, not Evil.\n\nTHE SOFTWARE IS PROVIDED',
+    )
+    (source / "engineering/skills/testing-strategy/LICENSE.txt").write_text(text)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    notices = repo / "THIRD_PARTY_NOTICES.md"
+    notices.write_text("Existing notices\n")
+    assert manager.catalog()[0]["license"] == "unknown"
+    with pytest.raises(SkillError, match="unknown"):
+        manager.install("kwp:engineering/testing-strategy", repo)
+    assert notices.read_text() == "Existing notices\n"
+    assert not (repo / ".claude").exists() and commands == []
+
+
+@pytest.mark.parametrize("marker", [
+    "SPDX-License-Identifier: MIT", "# SPDX-License-Identifier: MIT",
+    "// SPDX-License-Identifier: MIT", "/* SPDX-License-Identifier: MIT */",
+    " * SPDX-License-Identifier: MIT", "SPDX-License-Identifier: MIT\nSPDX-License-Identifier: mit",
+])
+def test_spdx_line_takes_precedence_over_prose(library, marker):
+    source, _, manager, _ = library
+    (source / "engineering/skills/testing-strategy/LICENSE.txt").write_text(
+        marker + "\nSource-available. Additional restrictions.\n",
+    )
+    assert manager.catalog()[0]["license"] == "MIT"
 
 
 def test_a_known_library_name_does_not_imply_an_open_source_license(tmp_path):
@@ -213,7 +289,7 @@ def test_a_known_library_name_does_not_imply_an_open_source_license(tmp_path):
 def test_skill_open_source_license_can_override_a_nonfree_root(library, tmp_path):
     source, _, manager, _ = library
     (source / "LICENSE").write_text("Source-available root terms.\n")
-    (source / "engineering/skills/testing-strategy/LICENSE.txt").write_text("MIT License\n")
+    (source / "engineering/skills/testing-strategy/LICENSE.txt").write_text(STANDARD_LICENSES["MIT"])
     manager.install("engineering/testing-strategy", tmp_path / "repo")
     assert manager.catalog()[0]["license"] == "MIT"
 
@@ -223,7 +299,7 @@ def test_license_file_priority_does_not_skip_restrictive_skill_terms(library, tm
     skill = source / "engineering/skills/testing-strategy"
     (skill / "LICENSE").write_text("Source-available terms.\n")
     (skill / "LICENSE.txt").write_text("MIT License\n")
-    with pytest.raises(SkillError, match="source-available"):
+    with pytest.raises(SkillError, match="unknown"):
         manager.install("engineering/testing-strategy", tmp_path / "repo")
 
 
@@ -336,7 +412,7 @@ def test_nonfree_lane_skill_is_rejected_before_any_lane_files_are_written(two_li
     root = tmp_path / "repo"
     root.mkdir()
     (root / ".foragent.yml").write_text("{}\n")
-    with pytest.raises(SkillError, match="source-available"):
+    with pytest.raises(SkillError, match="unknown"):
         add_lane(root, "design", ["ui/**"], skills=["skills:frontend-design", "skills:docx"], manager=manager)
     assert list(root.iterdir()) == [root / ".foragent.yml"]
 
@@ -345,11 +421,11 @@ def test_nonfree_install_cli_explains_refusal_and_catalog_still_lists_it(two_lib
     manager = two_libraries[3]
     monkeypatch.setattr(cli, "SkillManager", lambda config: manager)
     assert cli.main(["skills", "catalog", "--json"]) == 0
-    assert any(row["id"] == "skills:docx" and row["license"] == "source-available"
+    assert any(row["id"] == "skills:docx" and row["license"] == "unknown"
                for row in json.loads(capsys.readouterr().out))
     assert cli.main(["skills", "install", "skills:docx", "--repo-root", str(tmp_path / "repo")]) == 1
     output = capsys.readouterr()
-    assert output.out == "" and "source-available" in output.err and "skills:docx" in output.err
+    assert output.out == "" and "unknown" in output.err and "skills:docx" in output.err
     assert not (tmp_path / "repo").exists()
 
 

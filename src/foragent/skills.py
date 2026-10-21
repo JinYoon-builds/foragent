@@ -10,6 +10,7 @@ import subprocess
 import yaml
 
 from foragent.config import Config, load_global_config
+from foragent.license_texts import STANDARD_LICENSES
 from foragent.paths import repo_path
 
 
@@ -44,6 +45,14 @@ OPEN_SOURCE_LICENSES = {
 }
 
 
+def _normalized_license(text: str) -> str:
+    text = re.sub(
+        r"^[ \t]*Copyright[ \t]+(?:\(c\)[ \t]*|©[ \t]*)?(?:\d{4}|<year>|\[yyyy\])[^\r\n]*$",
+        "", text, flags=re.I | re.M,
+    )
+    return " ".join(text.split())
+
+
 def _license(skill: Path, library: Path) -> tuple[str, Path | None]:
     license_file = next((directory / name for directory in (skill, library) for name in ("LICENSE", "LICENSE.txt")
                          if (directory / name).is_file()), None)
@@ -53,33 +62,19 @@ def _license(skill: Path, library: Path) -> tuple[str, Path | None]:
         text = license_file.read_text(encoding="utf-8")
     except UnicodeError:
         return "unknown", license_file
-    normalized = " ".join(text.split())
-    if re.search(r"source[- ]available|proprietary|non[- ]commercial|commercial terms|not open.source|additional restrictions", normalized, re.I):
-        return "source-available", license_file
-    spdx = re.search(r"SPDX-License-Identifier:\s*([^\r\n]+)", text)
+    spdx = re.findall(
+        r"^[ \t]*(?:(?:#|//|/\*|\*)[ \t]*)?SPDX-License-Identifier:[ \t]*([^\r\n]*)", text, re.M,
+    )
     if spdx:
-        identity = spdx[1].strip().removesuffix("*/").strip()
+        identities = {identity.strip().removesuffix("*/").strip().casefold() for identity in spdx}
+        if len(identities) != 1 or not next(iter(identities)):
+            return "unknown", license_file
+        identity = spdx[0].strip().removesuffix("*/").strip()
         return next((known for known in OPEN_SOURCE_LICENSES if known.casefold() == identity.casefold()), identity), license_file
-    if re.search(r"^\s*Apache License\s*,?\s*(?:Version\s*)?2\.0\b", text, re.I | re.M):
-        return "Apache-2.0", license_file
-    if (re.search(r"^\s*(?:The )?MIT License(?: \(MIT\))?\s*$", text, re.I | re.M)
-            or re.search(r"Permission is hereby granted, free of charge, to any person obtaining a copy", normalized, re.I)):
-        return "MIT", license_file
-    bsd = re.search(r"^\s*BSD[- ]([1-4])[- ]Clause(?: License)?\s*$", text, re.I | re.M)
-    if bsd:
-        return f"BSD-{bsd[1]}-Clause", license_file
-    if re.search(r"\bBSD[- ][1-4][- ]Clause\b", normalized, re.I):
-        return "unknown", license_file
-    if "Redistribution and use in source and binary forms" in normalized:
-        if "All advertising materials" in normalized:
-            return "BSD-4-Clause", license_file
-        if "Neither the name" in normalized:
-            return "BSD-3-Clause", license_file
-        if "Redistributions of source code" in normalized and "Redistributions in binary form" in normalized:
-            return "BSD-2-Clause", license_file
-    if (re.search(r"^\s*ISC License(?: \(ISC\))?\s*$", text, re.I | re.M)
-            or re.search(r"Permission to use, copy, modify, and/or distribute this software for any purpose", normalized, re.I)):
-        return "ISC", license_file
+    normalized = _normalized_license(text)
+    for identity, standard in STANDARD_LICENSES.items():
+        if normalized == _normalized_license(standard):
+            return identity, license_file
     return "unknown", license_file
 
 

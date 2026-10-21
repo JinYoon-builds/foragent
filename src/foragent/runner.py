@@ -119,37 +119,6 @@ def parse_review(message: str) -> ReviewResult:
     return ReviewResult("UNUSABLE", "", ("reviewer gave no verdict",))
 
 
-def _first_json_array(text: str) -> list | None:
-    """Find the first JSON array, skipping whole non-JSON bracketed spans."""
-    start = text.find("[")
-    while start != -1:
-        depth, quoted, escaped = 0, False, False
-        for end in range(start, len(text)):
-            char = text[end]
-            if quoted:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    quoted = False
-            elif char == '"':
-                quoted = True
-            elif char == "[":
-                depth += 1
-            elif char == "]":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start:end + 1])
-                    except ValueError:
-                        break
-        else:
-            return None
-        start = text.find("[", end + 1)
-    return None
-
-
 def parse_code_review(message: str) -> ReviewResult:
     try:
         event = json.loads(message)
@@ -162,14 +131,28 @@ def parse_code_review(message: str) -> ReviewResult:
     findings = [line for line in lines if re.match(r"^- \S+:\d+ (?:—|-|--) ", line)]
     if findings:
         return ReviewResult("FAIL", "\n".join(findings))
-    items = _first_json_array(text)
-    if items is not None:
+    payload = text.strip()
+    blocks = list(re.finditer(r"^[ \t]*```([^\r\n]*)\r?\n(.*?)^[ \t]*```[ \t]*\r?$", payload, re.M | re.S))
+    json_blocks = [block for block in blocks if block[1].strip() == "json"]
+    if len(json_blocks) > 1:
+        return ReviewResult("UNUSABLE", "", ("/code-review gave multiple findings payloads",))
+    if len(blocks) == 1 and blocks[0].span() == (0, len(payload)):
+        payload = blocks[0][2]
+    elif json_blocks:
+        payload = json_blocks[0][2]
+    try:
+        items = json.loads(payload)
+    except ValueError:
+        items = None
+    if isinstance(items, list):
         if not items:
             return ReviewResult("PASS", "")
-        if any(not isinstance(item, dict) or not {"file", "line", "summary"} <= item.keys() for item in items):
+        if any(not isinstance(item, dict) or not {"file", "line", "summary"}.intersection(item) for item in items):
             return ReviewResult("UNUSABLE", "", ("/code-review gave invalid findings",))
-        return ReviewResult("FAIL", "\n".join(f"{item['file']}:{item['line']} — {item['summary']}" for item in items))
-    if lines and lines[0].strip() == "(none)":
+        return ReviewResult("FAIL", "\n".join(
+            f"{item.get('file', '?')}:{item.get('line', '?')} — {item.get('summary', '')}" for item in items
+        ))
+    if not blocks and lines and lines[0].strip() == "(none)":
         return ReviewResult("PASS", "")
     return ReviewResult("UNUSABLE", "", ("/code-review gave no verdict",))
 
