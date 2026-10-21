@@ -703,3 +703,40 @@ def test_status_groups_running_and_ready_by_lane(app, capsys):
     output = capsys.readouterr().out
     assert "running:\n  ui:\n    #2 UI running" in output
     assert "ready:\n  data:\n    #3 Data ready\n  🧰 Common:\n" in output
+
+
+def test_orch_watch_follow_prints_only_changes_and_stops_cleanly(app, monkeypatch, capsys):
+    from foragent import orch
+
+    root, git, tracker, store, calls = app
+    add_approved(tracker)
+    output, polls = [], []
+
+    def sleep(seconds):
+        polls.append(seconds)
+        lines = capsys.readouterr().out.splitlines()
+        # An initial snapshot, a silent identical poll, then one changed snapshot.
+        assert len(lines) == (0 if len(polls) == 2 else 1)
+        output.extend(json.loads(line) for line in lines)
+        if len(polls) == 2:
+            tracker.add_labels(1, ["blocked"])
+        if len(polls) == 3:
+            raise KeyboardInterrupt
+        assert len(polls) <= 3
+
+    monkeypatch.setattr(orch.time, "sleep", sleep)
+    assert cli.main(["orch", "watch", "--repo-root", str(root), "--interval", "0.01", "--follow"]) == 0
+    assert polls == [0.01] * 3
+    assert [snapshot["blocked"] for snapshot in output] == [[], [1]]
+    assert json.loads((store.root / "orch-watch.json").read_text()) == output[-1]
+    assert calls["launches"] == calls["notifications"] == git.fetches == []
+
+
+@pytest.mark.parametrize("interval", ["0", "-1", "nan", "inf", "-inf"])
+def test_orch_watch_refuses_invalid_intervals(app, capsys, interval):
+    root, _, _, store, _ = app
+    assert cli.main(["orch", "watch", "--repo-root", str(root), f"--interval={interval}"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "finite positive" in captured.err
+    assert not (store.root / "orch-watch.json").exists()

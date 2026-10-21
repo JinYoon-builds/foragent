@@ -1,19 +1,63 @@
 """Orchestrator actions, with GitHub evidence and a local event journal."""
 
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 import json
+import math
 import re
+import time
 
 from foragent.kick import kick_tick
-from foragent.labels import BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
+from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.runner import RunContext, review_only
 from foragent.tracker import Issue
 
 
 class OrchError(ValueError):
     """An orchestrator action does not apply to the current issue."""
+
+
+def _watch_snapshot(ctx: RunContext) -> dict:
+    issues = [issue for issue in ctx.tracker.list_open_issues() if not issue.is_pull_request]
+    merged = {
+        int(match[1]) for pr in ctx.tracker.list_prs("merged", "foragent/")
+        if pr.merged_at is not None
+        and (match := re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", pr.head))
+    }
+    return {
+        "blocked": sorted(issue.number for issue in issues if BLOCKED in issue.labels),
+        "needs_human": sorted(issue.number for issue in issues if NEEDS_HUMAN in issue.labels),
+        "merged": sorted(merged),
+        "queue_empty": not any(issue.labels & {APPROVED, READY, RUNNING} for issue in issues)
+                       and not ctx.store.active_runs(),
+    }
+
+
+def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iterator[dict]:
+    """Yield an initial snapshot, then only changes to the watched sets/state.
+
+    The persisted snapshot lets a Monitor until-loop invoke this repeatedly
+    without receiving the same event. Titles, timestamps and logs are excluded.
+    """
+    if not math.isfinite(interval) or interval <= 0:
+        raise OrchError("interval must be a finite positive number")
+    path = ctx.store.root / "orch-watch.json"
+    while True:
+        snapshot = _watch_snapshot(ctx)
+        with ctx.store._state_lock():
+            try:
+                previous = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                previous = None
+            changed = snapshot != previous
+            if changed:
+                ctx.store._write_json(path, snapshot)
+        if changed:
+            yield snapshot
+            if not follow:
+                return
+        time.sleep(interval)
 
 
 def _issue(ctx: RunContext, n: int) -> Issue:
