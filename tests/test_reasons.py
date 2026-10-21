@@ -19,6 +19,7 @@ def test_groups_cover_exact_contract_codes():
         Reason.STALLED: "tech-failure", Reason.TIMEOUT: "tech-failure",
         Reason.NO_MACHINE_CHECK: "decision",
         Reason.ORCHESTRATOR_TIMEOUT: "tech-failure",
+        Reason.REVIEW_DISPUTE: "tech-failure",
     }
     assert set(GROUP) == set(Reason)
     assert str(Reason.TIMEOUT) == "timeout"
