@@ -58,7 +58,7 @@ description: Set up a project folder for Foragent.
    design lane covering the project's actual UI and design foundation paths, reusing
    existing lanes where paths overlap. Suggest the relevant skills from
    `frontend-design`, `design-system`, `design-critique`, `accessibility-review`,
-   `ux-copy`, and `webapp-testing`; select at most three to attach (the lane limit).
+   `ux-copy`, and `webapp-testing`; attach the ones that fit the project, with no count limit (D35).
    Show the paths and skill choices for approval before `fa lanes add`. Design
    interviews and foundation issues belong to `/fa-order` (D33).
 
