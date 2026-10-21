@@ -113,6 +113,46 @@ def test_latest_valid_approval_ignores_other_actors(ctx):
     assert len([line for line in report.actions if "non-approver" in line]) == 1
 
 
+def test_scheduler_projects_follow_ready_running_and_blocked_labels(ctx):
+    from foragent import board
+    from test_board import item_values
+
+    project_id = board.ensure(ctx.tracker, ctx.repo)
+    ctx.config = replace(ctx.config, board=project_id)
+    approve(ctx)
+    tick(ctx)
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Ready"
+    ctx.start_runs = True
+    tick(ctx)
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Running"
+    flag(ctx, 1, Reason.SPEC_QUESTION, "Choose a behavior")
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Blocked"
+    ctx.store.finish_run(1, outcome="blocked")
+    ctx.now = lambda: NOW + timedelta(minutes=31)
+    tick(ctx)
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Needs human"
+
+
+def test_scheduler_repairs_board_after_transport_recovers(ctx, caplog):
+    from foragent import board
+    from test_board import item_values
+
+    project_id = board.ensure(ctx.tracker, ctx.repo)
+    ctx.config = replace(ctx.config, board=project_id)
+    approve(ctx)
+    graphql = ctx.tracker.graphql
+
+    def unavailable(*args):
+        raise OSError("offline project")
+
+    ctx.tracker.graphql = unavailable
+    assert tick(ctx).skipped is None and "ready" in ctx.tracker.get_issue(1).labels
+    assert "Could not set board Status" in caplog.text
+    ctx.tracker.graphql = graphql
+    assert tick(ctx).skipped is None
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Ready"
+
+
 def test_latest_approver_event_is_the_snapshot_identity(ctx):
     approve(ctx)
     later = NOW + timedelta(minutes=1)

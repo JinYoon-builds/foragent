@@ -1,0 +1,12 @@
+# Board lane 기억
+
+- 보드의 진실은 이슈 라벨이다. `board.sync_status(ctx, issue, status)`가 저장소 문맥을 잠시 연결하고 공개 함수 `board.set_status(issue, status)`를 호출한다. 실패는 로그에 남기고 초기화·발행·tick·runner를 계속 진행한다. 저장소 문맥은 호출 뒤 복원한다.
+- Projects v2 전송은 `Tracker.graphql(query, variables)` 한 곳으로 모은다. `GhTracker`는 `gh api graphql --input -`에 JSON을 넘겨 숫자·null·목록 타입을 보존한다. HTTP 성공이어도 응답의 `errors`를 확인한다.
+- 보드 소유자는 인증 사용자 대신 `repository.owner.id`로 찾는다. 개인·조직의 `projectsV2`와 보드 필드 조회 모두 페이지를 순회한다. 저장된 보드 ID가 없더라도 같은 소유자와 제목의 보드를 재사용한다.
+- GitHub는 보드 생성 시 Status 필드를 기본으로 만든다. 이번 호출에서 직접 만든 새 보드만 지정된 일곱 상태로 초기화한다(`ensure_fields(..., new_project=True)`). 제목으로 찾거나 저장된 ID로 재사용하는 보드와 상태 갱신에서는 Todo·In Progress·사용자 옵션을 모두 보존한다. Foragent 상태는 Approved → Ready → Running → Blocked → Needs human → PR open → Done 순서로 앞에 두고 나머지 기존 옵션을 뒤에 유지한다. 옵션 갱신 시 기존 옵션 ID·색·설명을 전달해야 이미 선택된 값이 유지된다. Lane 옵션은 새 레인을 추가하면서 기존 옵션을 보존한다.
+- 보존 회귀 테스트는 Foragent 초기화 전의 보드·옵션·카드를 GraphQL로 준비하고, 제목 검색·저장된 ID·상태 갱신 각각을 반복한 뒤 옵션 메타데이터와 기존 카드 값을 확인한다. FakeProjects는 삭제된 옵션의 카드 값을 지우는 동작을 유지해야 실제 데이터 손실을 드러낼 수 있다. `uv run pytest -q tests/test_board.py -k existing_status`로 집중 확인한다.
+- API 근거: [GitHub Projects GraphQL 참조](https://docs.github.com/en/graphql/reference/projects#projectv2singleselectfieldoptioninput)의 옵션 입력 `id`는 기존 선택값을 보존하는 용도다. `UpdateProjectV2FieldInput.singleSelectOptions`는 기존 목록을 덮어쓰므로 일부만 추가할 때도 보존할 옵션을 함께 보내야 한다.
+- 보드 생성 후 필드 설정만 실패한 경우에도 생성된 ID를 저장해서 다음 init에서 보완한다. `--no-board`와 `--dry-run`에서는 Projects API를 호출하지 않는다.
+- init은 기존 YAML의 주석과 값을 보존하며 board 키를 추가한다. `board: null`처럼 기존 키를 교체할 때는 중복 키를 만들지 않는다.
+- 설정 추가 시 `tests/test_config.py::test_exact_defaults`, init CLI 옵션 추가 시 `tests/test_cli.py`의 두 kwargs 완전 일치 검사를 함께 갱신한다. 기존 파일 설정 테스트는 `no_board=True`로 격리하고 보드 동작을 별도 검증한다.
+- 검증: `uv run pytest -q tests/acceptance/test_board_projects.py`, `uv run pytest -q --ignore=tests/acceptance`. 인수 테스트는 수정하지 않는다. 샌드박스에서 기본 uv 캐시에 쓸 수 없으면 쓰기 가능한 임시 `UV_CACHE_DIR`를 사용한다.

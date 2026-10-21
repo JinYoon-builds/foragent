@@ -28,7 +28,7 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
-        "repo": None, "language": "en", "codex_goal": False, "review_level": "low",
+        "repo": None, "board": None, "language": "en", "codex_goal": False, "review_level": "low",
         "review_scope": "claude-local",
         "interview": "ouroboros", "ouroboros_version": None,
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
