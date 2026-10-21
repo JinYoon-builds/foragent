@@ -43,24 +43,9 @@ def _hot_paths(git: GitRepo) -> list[dict]:
 
 def _test_invocations(script: str) -> list[list[str]]:
     """Find test invocations in shell commands without executing any of them."""
-    lexer = shlex.shlex(script.replace("\\\n", ""), posix=True, punctuation_chars=";&|()\n")
-    lexer.whitespace = " \t\r"
-    lexer.commenters = ""
-    commands: list[list[str]] = [[]]
-    comment = False
+    script = script.replace("\\\n", "")
     try:
-        for token in lexer:
-            if "\n" in token and all(char in ";&|()\n" for char in token):
-                comment = False
-            elif comment:
-                continue
-            elif token.startswith("#"):
-                comment = True
-                continue
-            if all(char in ";&|()\n" for char in token):
-                commands.append([])
-            else:
-                commands[-1].append(token)
+        commands = [shlex.split(script[start:end]) for start, end in _command_ranges(script)]
     except ValueError:
         # A shell expression may use syntax that shlex does not understand.
         return []
@@ -90,26 +75,58 @@ def _test_invocations(script: str) -> list[list[str]]:
     return invocations
 
 
-def _ci(root: Path, acceptance_dir: str) -> list[dict]:
-    reports = []
+def _field(node: yaml.Node | None, key: str) -> yaml.Node | None:
+    if isinstance(node, yaml.MappingNode):
+        # Match the loader's last-value-wins behavior for duplicate keys.
+        return next((value for name, value in reversed(node.value) if name.value == key), None)
+    return None
+
+
+def _workflow_runs(root: Path):
+    """Read GitHub Actions run scalars with their original source positions."""
     for path in sorted((root / ".github/workflows").glob("*")):
         if not path.is_file() or path.suffix not in {".yml", ".yaml"}:
             continue
+        source = path.read_bytes().decode("utf-8")
+        loader = yaml.SafeLoader(source)
         try:
-            workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+            workflow = loader.get_single_node()
+            # Flatten YAML merge keys as safe_load does, retaining scalar marks.
+            def flatten(node, seen):
+                if node is None or id(node) in seen:
+                    return
+                seen.add(id(node))
+                if isinstance(node, yaml.MappingNode):
+                    loader.flatten_mapping(node)
+                    for _, value in node.value:
+                        flatten(value, seen)
+                elif isinstance(node, yaml.SequenceNode):
+                    for value in node.value:
+                        flatten(value, seen)
+            flatten(workflow, set())
         except yaml.YAMLError as exc:
             raise ConfigError(f"cannot read workflow {path}: {exc}") from exc
-        jobs = workflow.get("jobs", {}) if isinstance(workflow, dict) else {}
-        if not isinstance(jobs, dict):
+        finally:
+            loader.dispose()
+        jobs = _field(workflow, "jobs")
+        if not isinstance(jobs, yaml.MappingNode):
             continue
-        invocations = []
-        for job in jobs.values():
-            steps = job.get("steps", []) if isinstance(job, dict) else []
-            if not isinstance(steps, list):
+        runs = []
+        for _, job in jobs.value:
+            steps = _field(job, "steps")
+            if not isinstance(steps, yaml.SequenceNode):
                 continue
-            for step in steps:
-                if isinstance(step, dict) and isinstance(step.get("run"), str):
-                    invocations.extend(_test_invocations(step["run"]))
+            for step in steps.value:
+                script = _field(step, "run")
+                if isinstance(script, yaml.ScalarNode) and script.tag == "tag:yaml.org,2002:str":
+                    runs.append(script)
+        yield path, source, runs
+
+
+def _ci(root: Path, acceptance_dir: str) -> list[dict]:
+    reports = []
+    for path, _, runs in _workflow_runs(root):
+        invocations = [command for script in runs for command in _test_invocations(script.value)]
         if invocations:
             reports.append({
                 "file": path.relative_to(root).as_posix(),
@@ -119,6 +136,105 @@ def _ci(root: Path, acceptance_dir: str) -> list[dict]:
                 ),
             })
     return reports
+
+
+def _command_ranges(script: str):
+    """Locate shell command boundaries without splitting quoted arguments."""
+    start = 0
+    quote = None
+    escaped = False
+    comment = False
+    for index, char in enumerate(script):
+        if comment:
+            if char == "\n":
+                comment = False
+                start = index + 1
+        elif escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "#" and (index == 0 or script[index - 1].isspace() or script[index - 1] in ";&|()"):
+            yield start, index
+            comment = True
+        elif char == "&" and ((index > 0 and script[index - 1] in "><")
+                              or script[index + 1:index + 2] == ">"):
+            # Shell redirects such as 2>&1 and &>file are not command separators.
+            continue
+        elif char in ";&|()\n":
+            yield start, index
+            start = index + 1
+    if not comment:
+        yield start, len(script)
+
+
+def _scalar_offsets(script: yaml.ScalarNode, source: str) -> list[int]:
+    """Map decoded shell character boundaries back to the YAML source."""
+    start, end = script.start_mark.index, script.end_mark.index
+    # Scalar tokens start after optional YAML anchors and tags.
+    token = next(token for token in yaml.scan(source[start:end]) if isinstance(token, yaml.ScalarToken))
+    start += token.start_mark.index
+    if script.style in {"'", '"'}:
+        start += 1
+        end -= 1
+    offsets = [start]
+    while start < end:
+        length = 1
+        if script.style == "'" and source[start:start + 2] == "''":
+            length = 2
+        elif script.style == '"' and source[start] == "\\":
+            length = 2 + yaml.scanner.Scanner.ESCAPE_CODES.get(source[start + 1], 0)
+        start += length
+        offsets.append(start)
+    return offsets
+
+
+def ci(root: Path, exclude_acceptance: bool = False) -> dict:
+    """Report CI changes, optionally inserting exclusions into the original text."""
+    root = root.resolve()
+    config = load_config(root) if (root / ".foragent.yml").is_file() else Config()
+    ignore = f"--ignore={config.acceptance_dir.rstrip('/')}"
+    report = {"needs_change": [], "changed": [], "manual": []}
+    for path, source, runs in _workflow_runs(root):
+        name = path.relative_to(root).as_posix()
+        insertions = {}
+        needs_change = False
+        for script in runs:
+            commands = _test_invocations(script.value)
+            missing = any(command[0] == "pytest" and ignore not in command[1:] for command in commands)
+            needs_change |= missing
+            multiline = (script.style in {"|", ">"} or "\n" in script.value
+                         or script.start_mark.line != script.end_mark.line)
+            if multiline:
+                if missing or any(command[0] != "pytest" for command in commands):
+                    report["manual"].append({"file": name, "line": script.value})
+                continue
+            offsets = _scalar_offsets(script, source) if missing else []
+            for start, end in _command_ranges(script.value):
+                line = script.value[start:end].rstrip()
+                for command in _test_invocations(line):
+                    if command[0] != "pytest":
+                        report["manual"].append({"file": name, "line": line.strip()})
+                    elif ignore not in command[1:]:
+                        addition = " " + shlex.quote(ignore)
+                        if script.style == "'":
+                            addition = addition.replace("'", "''")
+                        elif script.style == '"':
+                            addition = addition.replace("\\", "\\\\").replace('"', '\\"')
+                        insertions[offsets[start + len(line)]] = addition
+        if needs_change:
+            report["needs_change"].append(name)
+        if exclude_acceptance and insertions:
+            # Inserting into the source preserves comments, quotes, CRLF, and EOF.
+            for end, addition in sorted(insertions.items(), reverse=True):
+                source = source[:end] + addition + source[end:]
+            path.write_bytes(source.encode("utf-8"))
+            report["changed"].append(name)
+    return report
 
 
 def survey(root: Path) -> dict:
@@ -151,6 +267,16 @@ def survey(root: Path) -> dict:
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.action == "ci":
+        report = ci(args.repo_root, args.exclude_acceptance)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False))
+        else:
+            print(f"Needs change: {', '.join(report['needs_change']) or 'none'}")
+            print(f"Changed: {', '.join(report['changed']) or 'none'}")
+            for item in report["manual"]:
+                print(f"Manual: {item['file']}: {item['line']}")
+        return 0
     if args.action == "survey":
         report = survey(args.repo_root)
         if args.json:
