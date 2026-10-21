@@ -11,6 +11,7 @@ from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, latest_flag
 from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
+from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
 from foragent.lanes import add_lane, lane_files, validate_lane
 from foragent.paths import repo_path
@@ -339,7 +340,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         if lane["name"] in config.lanes:
             existing = config.lanes[lane["name"]]
             if (existing.get("paths", []) != lane["paths"] or existing.get("agent") != f"fa-{lane['name']}"
-                    or existing.get("skills", []) != [skill.rsplit("/", 1)[-1] for skill in lane["skills"]]):
+                    or existing.get("skills", []) != [skill.split(":", 1)[-1].rsplit("/", 1)[-1] for skill in lane["skills"]]):
                 raise PlanError(f"existing lane differs from plan: {lane['name']}")
         else:
             validate_lane(root, config, lane["name"], lane["paths"], lane["skills"], manager=manager)
@@ -454,6 +455,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
     for number in sorted(approved_numbers):
         tracker.add_labels(number, ["approved"])
+    if approved_numbers:
+        kick_tick(root)
     for item, row in zip(plan["issues"], rows):
         row["number"] = mapping[item["key"]]
         row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]

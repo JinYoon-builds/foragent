@@ -34,7 +34,8 @@ def test_exact_defaults(repo):
                   "m": {"codex_effort": "high", "claude_model": None},
                   "l": {"codex_effort": "xhigh", "claude_model": None}},
         "skill_libraries": [{"name": "knowledge-work-plugins",
-                             "repo": "https://github.com/anthropics/knowledge-work-plugins"}],
+                             "repo": "https://github.com/anthropics/knowledge-work-plugins"},
+                            {"name": "skills", "repo": "https://github.com/anthropics/skills"}],
     }
     assert DEFAULTS == expected
     assert asdict(load_config(repo)) == expected

@@ -20,7 +20,7 @@ from foragent.git import GitRepo
 from foragent.issue import body_hash, parse_body
 from foragent.reasons import Reason, parse_reason
 from foragent.runner import (
-    REVIEW_PROMPT, CheckResult, RunContext, _batch_pr, _executor_wait, _merge_lock, build_prompt, build_review_prompt,
+    REVIEW_PROMPT, CheckResult, RunContext, _batch_pr, _executor_wait, _lane_skills, _merge_lock, build_prompt, build_review_prompt,
     goal_condition, parse_code_review, parse_review, run_issue,
 )
 from foragent.state import StateStore
@@ -546,6 +546,54 @@ def test_snapshot_supplies_prompt_checks_and_checklist_despite_live_body_and_com
     assert "Looks right to a human" in c.tracker.created_prs[0].body
 
 
+@pytest.mark.parametrize("result", [
+    "merged", "pr-open", "no-approval", "retries-exceeded", "limit-wait",
+    RuntimeError("unexpected execution failure"), SystemExit(1),
+])
+def test_runner_kicks_after_cleanup_and_finish_for_every_outcome(run_case, monkeypatch, result, kicks):
+    c = run_case
+
+    def execute(number, ctx, worktree):
+        ctx.tracker.remove_labels(number, ["running"])
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def kick(root):
+        assert root == c.ctx.repo_root
+        assert c.store.get_run(1).status == "finished"
+        assert not c.store.worktree_path(1).exists()
+        assert len(c.finished) == 1
+        kicks.append(root)
+
+    monkeypatch.setattr("foragent.runner._execute", execute)
+    monkeypatch.setattr("foragent.runner.kick_tick", kick)
+    if isinstance(result, SystemExit):
+        with pytest.raises(SystemExit):
+            run_issue(1, c.ctx)
+    else:
+        assert run_issue(1, c.ctx) == ("error" if isinstance(result, Exception) else result)
+    assert kicks == [c.ctx.repo_root]
+    assert c.store.get_run(1).outcome == (
+        "killed" if isinstance(result, SystemExit) else "error" if isinstance(result, Exception) else result
+    )
+
+
+def test_runner_still_kicks_when_a_tick_already_finished_its_record(run_case, monkeypatch, kicks):
+    c = run_case
+
+    def execute(number, ctx, worktree):
+        ctx.tracker.remove_labels(number, ["running"])
+        ctx.store.finish_run(number, "killed")
+        return "no-approval"
+
+    monkeypatch.setattr("foragent.runner._execute", execute)
+    assert run_issue(1, c.ctx) == "no-approval"
+    assert c.store.get_run(1).outcome == "killed"
+    assert len(c.finished) == 1
+    assert kicks == [c.ctx.repo_root]
+
+
 def test_missing_approval_finishes_without_execution(run_case):
     c = run_case
     c.store.clear_approval(1)
@@ -780,6 +828,9 @@ def test_review_failure_retries_implementation_and_done_when(run_case):
     assert "Round 1: VERDICT: FAIL" in body and finding in body
     assert "Round 2: VERDICT: PASS" in body
     assert finding not in calls[1]["prompt"]
+    directory = c.store.root / "runs/issue-1"
+    assert (directory / "review-1.txt").read_text() == f"VERDICT: FAIL\n{finding}"
+    assert (directory / "review-2.txt").read_text() == "VERDICT: PASS"
 
 
 @pytest.mark.parametrize("review_max,retries,rounds", [(1, 3, 2), (2, 2, 3)])
@@ -797,6 +848,10 @@ def test_exceeding_review_max_opens_pr_with_risk_high_hold(run_case, review_max,
     assert f"Reviewer still found defects after {rounds} rounds" in comment
     assert finding in comment and "https://github.com/owner/repo/pull/2" in comment
     assert c.tracker.created_prs[0].body.count("VERDICT: FAIL") == rounds
+    directory = c.store.root / "runs/issue-1"
+    assert len(list(directory.glob("review-*.txt"))) == rounds
+    assert all((directory / f"review-{number}.txt").read_text() == f"VERDICT: FAIL\n{finding}"
+               for number in range(1, rounds + 1))
 
 
 def test_review_failure_uses_shared_retry_budget(run_case):
@@ -884,6 +939,9 @@ def test_full_claude_verdict_survives_output_tail_truncation(run_case, monkeypat
     assert finding in c.executor.calls[1]["prompt"] or "x" * 900 in c.executor.calls[1]["prompt"]
     assert "Round 1: VERDICT: FAIL" in c.tracker.created_prs[0].body
     assert "Round 2: VERDICT: PASS" in c.tracker.created_prs[0].body
+    directory = c.store.root / "runs/issue-1"
+    assert (directory / "review-1.txt").read_text() == "\n".join([finding] * 5)
+    assert (directory / "review-2.txt").read_text() == "(none)"
 
 
 def test_reviewer_timeout_at_runtime_limit_still_opens_held_pr(run_case):
@@ -1407,6 +1465,9 @@ def test_any_claude_stream_line_updates_progress_through_log_poll(run_case, even
     ("- src/file.py:12 — broken feature", "FAIL"),
     ("- src/file.py:12 - broken feature", "FAIL"),
     ("preamble\n- src/file.py:12 -- broken feature", "FAIL"),
+    ("- src/array[].py:12 — broken feature", "FAIL"),
+    ("- src/file.py:12 — mishandles []", "FAIL"),
+    ("- src/app/[123]/page.tsx:12 — broken feature", "FAIL"),
     ("(none)\n- file:1 — defect", "FAIL"),
     ("There are no changes to review.", "UNUSABLE"),
     ("No staged or unstaged changes.", "UNUSABLE"),
@@ -1427,6 +1488,52 @@ def test_code_review_invalid_json_or_error_is_unusable(message):
     assert parse_code_review(message).verdict == "UNUSABLE"
 
 
+REPORTED_JSON_FINDINGS = [
+    {"file": "src/foragent/runner.py", "line": 121, "summary": "JSON 배열 지적이 판정 불가로 처리됨",
+     "failure_scenario": '리뷰가 [{"file": "src/file.py"}] 형식이면 수정 대신 보류됨'},
+    {"file": "src/foragent/cli.py", "line": 300, "summary": "결과가 누락됨",
+     "failure_scenario": 'A quoted "value", a closing bracket ], and a path [name] are retained.'},
+]
+
+
+@pytest.mark.parametrize("wrapper", [
+    "{}", "```json\n{}\n```", "```\n{}\n```",
+    "Review findings: {}\nEnd of review.", "[Review notes]\n```json\n{}\n```",
+])
+@pytest.mark.parametrize("items", [[], REPORTED_JSON_FINDINGS])
+def test_code_review_accepts_reported_json_array_shape(wrapper, items):
+    text = wrapper.format(json.dumps(items, ensure_ascii=False, indent=2))
+    result = parse_code_review(json.dumps({"result": text}))
+    assert result.verdict == ("FAIL" if items else "PASS")
+    assert result.findings == "\n".join(f"{item['file']}:{item['line']} — {item['summary']}" for item in items)
+
+
+@pytest.mark.parametrize("first,second", [([], REPORTED_JSON_FINDINGS), (REPORTED_JSON_FINDINGS, [])])
+def test_code_review_uses_only_the_first_json_array(first, second):
+    text = json.dumps(first) + "\n" + json.dumps(second)
+    result = parse_code_review(json.dumps({"result": text}))
+    assert result.verdict == ("FAIL" if first else "PASS")
+    assert result.findings == "\n".join(f"{item['file']}:{item['line']} — {item['summary']}" for item in first)
+
+
+@pytest.mark.parametrize("text", [
+    "[", "[{", '[{"file":"x.py","line":1,"summary":"broken","details":[],}]',
+    '[{"file":"x.py","line":1,"summary":"broken","details":[]}',
+    '[{"file":"x.py","line":1}]', '[{}, {"file":"x.py","line":1,"summary":"broken"}]',
+    '["unexpected finding"]', '[null]', '[123]',
+])
+def test_code_review_bad_arrays_are_unusable_without_passing_on_nested_empty_arrays(text):
+    assert parse_code_review(json.dumps({"result": text})).verdict == "UNUSABLE"
+
+
+def test_code_review_json_array_reports_every_item():
+    items = [dict(REPORTED_JSON_FINDINGS[0], line=number) for number in range(1, 8)]
+    result = parse_code_review(json.dumps({"result": json.dumps(items)}))
+    assert result.verdict == "FAIL"
+    assert result.findings.splitlines() == [f"src/foragent/runner.py:{number} — JSON 배열 지적이 판정 불가로 처리됨"
+                                          for number in range(1, 8)]
+
+
 def enable_native_reviewer(case, messages, edit=None):
     calls = []
     iterator = iter(messages)
@@ -1444,6 +1551,64 @@ def enable_native_reviewer(case, messages, edit=None):
     case.ctx.config = replace(case.ctx.config, reviewer="claude", review_level="xhigh")
     case.ctx.executor_factory = lambda name: case.executor if name == "codex" else SimpleNamespace(run=review)
     return calls
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+def test_native_json_findings_trigger_repair_then_empty_array_passes_and_saves_raw_results(run_case, fenced):
+    c = run_case
+    c.executor.steps.append({})
+    raw = json.dumps(REPORTED_JSON_FINDINGS, ensure_ascii=False, indent=2)
+    if fenced:
+        raw = f"```json\n{raw}\n```"
+    calls = enable_native_reviewer(c, [json.dumps({"result": raw}), '{"result":"[]"}'])
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(calls) == len(c.executor.calls) == 2
+    for item in REPORTED_JSON_FINDINGS:
+        assert f"{item['file']}:{item['line']} — {item['summary']}" in c.executor.calls[1]["prompt"]
+    assert "Round 1: VERDICT: FAIL" in c.tracker.created_prs[0].body
+    assert "Round 2: VERDICT: PASS" in c.tracker.created_prs[0].body
+    directory = c.store.root / "runs/issue-1"
+    assert (directory / "review-1.txt").read_text() == raw
+    assert (directory / "review-2.txt").read_text() == "[]"
+    assert not c.store.worktree_path(1).exists()
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("exit_code,timed_out", [(0, False), (1, False), (0, True)])
+def test_unusable_review_saves_full_result_and_comments_only_latest_raw_prefix(run_case, native, exit_code, timed_out):
+    c = run_case
+    first = "First raw result\n" + "가" * 4000 + "\nFIRST END"
+    second = "Latest raw result\n" + "나" * 4000 + "\nSECOND END"
+    messages = [ExecResult(exit_code, timed_out, "only a tail", Path("unused"),
+                           full_message=json.dumps({"result": raw}, ensure_ascii=False) if native else raw)
+                for raw in (first, second)]
+    (enable_native_reviewer if native else enable_reviewer)(c, messages)
+    assert run_issue(1, c.ctx) == "held"
+    assert "needs-human" in c.tracker.get_issue(1).labels
+    assert c.tracker.merged_prs == []
+    directory = c.store.root / "runs/issue-1"
+    assert (directory / "review-1.txt").read_text() == first
+    assert (directory / "review-2.txt").read_text() == second
+    comment = c.tracker.list_comments(1)[-1].body
+    assert comment.partition("\n\nRaw reviewer result:\n")[2] == second[:3000]
+    assert first[:3000] not in comment and "SECOND END" not in comment
+
+
+def test_unusable_review_followed_by_fail_keeps_the_unusable_original_in_hold_comment(run_case):
+    c = run_case
+    raw = "Unrecognized output\n" + "x" * 3500
+    enable_native_reviewer(c, [json.dumps({"result": raw}), json.dumps({"result": json.dumps(REPORTED_JSON_FINDINGS)})])
+    assert run_issue(1, c.ctx) == "held"
+    assert c.tracker.list_comments(1)[-1].body.partition("\n\nRaw reviewer result:\n")[2] == raw[:3000]
+
+
+def test_invalid_native_envelope_is_saved_unchanged_for_the_human(run_case):
+    c = run_case
+    raw = "Not a JSON response\n" + "x" * 3500
+    enable_native_reviewer(c, [raw, raw])
+    assert run_issue(1, c.ctx) == "held"
+    assert (c.store.root / "runs/issue-1/review-2.txt").read_text() == raw
+    assert c.tracker.list_comments(1)[-1].body.partition("\n\nRaw reviewer result:\n")[2] == raw[:3000]
 
 
 @pytest.mark.parametrize("invalid", [
@@ -1527,6 +1692,138 @@ def test_lane_null_overrides_and_main_use_project_defaults(run_case, lane):
     assert not call["prompt"].startswith("Lane notes:")
     if lane == "main":
         assert "## Outside lane" not in c.tracker.created_prs[0].body
+
+
+@pytest.mark.parametrize("kind", ["codex", "claude"])
+@pytest.mark.parametrize("source", ["config", "frontmatter", "empty-config"])
+def test_lane_skills_come_from_worktree_and_only_extend_codex_prompts(run_case, source, kind):
+    c = run_case
+    definition = "---\nname: fa-ui\nskills:\n- agent-skill\n- missing\n---\nLane instructions.\n"
+    c.history.update({
+        ".claude/agents/fa-ui.md": definition,
+        ".claude/skills/configured/SKILL.md": "---\nname: configured\ndescription: Skill metadata\n---\nConfigured strategy.\n",
+        ".claude/skills/agent-skill/SKILL.md": "---\nname: agent-skill\ndescription: Skill metadata\n---\nAgent strategy.\n",
+    })
+    # The coordinator's local file must not replace the remote worktree's skill.
+    local = c.ctx.repo_root / ".claude/skills/configured/SKILL.md"
+    local.parent.mkdir(parents=True)
+    local.write_text("Wrong local strategy.\n")
+    lane = {"agent": "fa-ui", "executor": kind}
+    if source != "frontmatter":
+        lane["skills"] = ["configured", "missing"] if source == "config" else []
+    c.ctx.config = replace(c.ctx.config, lanes={"ui": lane})
+    c.store.update_run(1, lane="ui")
+    assert run_issue(1, c.ctx) == "merged"
+    call = c.executor.calls[0]
+    pr = c.tracker.created_prs[0]
+    if kind == "codex":
+        name = "configured" if source == "config" else "agent-skill"
+        assert f"- {name}: Skill metadata (.claude/skills/{name}/SKILL.md)\n\n" in call["prompt"]
+        assert call["prompt"].startswith("Lane notes:\nLane instructions.\n\nLane skills (read the file when relevant and follow it):\n")
+        assert "Configured strategy." not in call["prompt"] and "Agent strategy." not in call["prompt"]
+        assert "description: Skill metadata" not in call["prompt"]
+        assert "Wrong local strategy." not in call["prompt"]
+        assert "missing skill: missing" in pr.body
+        assert "agent" not in call
+    else:
+        assert call["agent"] == "fa-ui"
+        assert call["prompt"].startswith("/goal ")
+        assert "Lane skills (read the file" not in call["prompt"]
+        assert "Configured strategy." not in call["prompt"] and "Agent strategy." not in call["prompt"]
+        assert "missing skill:" not in pr.body
+    assert local.read_text() == "Wrong local strategy.\n"
+
+
+@pytest.mark.parametrize("agent", [None, "fa-missing"])
+def test_codex_configured_skills_do_not_require_an_agent_file(run_case, agent):
+    c = run_case
+    c.history.update({".claude/skills/testing/SKILL.md": "---\ndescription: Focused checks\n---\nUse focused checks.\n"})
+    c.ctx.config = replace(c.ctx.config, lanes={"ui": {"agent": agent, "skills": ["testing"]}})
+    c.store.update_run(1, lane="ui")
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.executor.calls[0]["prompt"].startswith("Lane skills (read the file when relevant and follow it):\n"
+                                                "- testing: Focused checks (.claude/skills/testing/SKILL.md)\n\n")
+    assert "Use focused checks." not in c.executor.calls[0]["prompt"]
+    assert "missing skill:" not in c.tracker.created_prs[0].body
+
+
+@pytest.fixture
+def skill_case(tmp_path):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    ctx = SimpleNamespace(
+        store=SimpleNamespace(get_run=lambda number: SimpleNamespace(lane="ui")),
+        config=Config(lanes={"ui": {"skills": ["testing"]}}),
+    )
+    return ctx, worktree
+
+
+@pytest.mark.parametrize("length", [5999, 6000, 6001, 12000])
+def test_lane_skill_list_includes_one_line_description_without_any_body(skill_case, length):
+    ctx, worktree = skill_case
+    path = worktree / ".claude/skills/testing/SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("---\nname: testing\ndescription: |\n  Useful metadata\n  on two lines.\n---\n" + "가" * length)
+    notes, missing = _lane_skills(ctx, 1, worktree, None)
+    assert missing == []
+    assert notes == ("Lane skills (read the file when relevant and follow it):\n"
+                     "- testing: Useful metadata on two lines. (.claude/skills/testing/SKILL.md)\n\n")
+    assert "가" not in notes and "[truncated]" not in notes
+
+
+@pytest.mark.parametrize("missing_name", [None, "first", "sixth"])
+def test_lane_skills_list_every_entry_in_order_with_no_count_limit(skill_case, missing_name):
+    ctx, worktree = skill_case
+    names = ["third", "first", "second", "fourth", "fifth", "sixth"]
+    ctx.config.lanes["ui"]["skills"] = names
+    for name in names:
+        if name == missing_name:
+            continue
+        path = worktree / ".claude/skills" / name / "SKILL.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(f"---\ndescription: About {name}\n---\nInstructions for {name}.")
+    notes, missing = _lane_skills(ctx, 1, worktree, None)
+    selected = [name for name in names if name != missing_name]
+    assert [line.split(":", 1)[0].removeprefix("- ") for line in notes.splitlines() if line.startswith("- ")] == selected
+    assert missing == ([missing_name] if missing_name else [])
+    assert ("- sixth: About sixth (.claude/skills/sixth/SKILL.md)" in notes) == (missing_name != "sixth")
+
+
+@pytest.mark.parametrize("header", ["", "---\n---\n", "--- \nname: metadata\n--- \n"])
+def test_lane_skills_without_a_description_keep_the_name_and_path(skill_case, header):
+    ctx, worktree = skill_case
+    path = worktree / ".claude/skills/testing/SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text(header + "Testing instructions.\n")
+    assert _lane_skills(ctx, 1, worktree, None) == (
+        "Lane skills (read the file when relevant and follow it):\n- testing:  (.claude/skills/testing/SKILL.md)\n\n", [],
+    )
+
+
+@pytest.mark.parametrize("existing_pr", [False, True])
+def test_missing_lane_skill_is_recorded_once_in_created_or_updated_pr_after_retry(run_case, existing_pr):
+    c = run_case
+    if existing_pr:
+        c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing", body="old")
+    c.ctx.config = replace(c.ctx.config, lanes={"ui": {"skills": ["missing"]}})
+    c.store.update_run(1, lane="ui")
+    c.executor.steps = [{"feature.txt": "not ready"}, {"feature.txt": "done"}]
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 2
+    assert all("Lane skills (read the file" not in call["prompt"] for call in c.executor.calls)
+    assert len(c.tracker.created_prs) == 1
+    assert c.tracker.created_prs[0].body.count("missing skill: missing") == 1
+
+
+def test_lane_skills_do_not_read_a_symlink_outside_the_worktree(skill_case, tmp_path):
+    ctx, worktree = skill_case
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text("Outside instructions.")
+    directory = worktree / ".claude/skills"
+    directory.mkdir(parents=True)
+    (directory / "testing").symlink_to(outside, target_is_directory=True)
+    assert _lane_skills(ctx, 1, worktree, None) == ("", ["testing"])
 
 
 def test_unchanged_base_does_not_merge_or_repeat_checks(run_case):

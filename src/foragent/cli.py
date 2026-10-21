@@ -14,6 +14,7 @@ from foragent import __version__, inspect_actions, inspect_data, launchd, order
 from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
+from foragent.kick import kick_tick
 from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_order, state_group
 from foragent.lanes import LaneError, add_lane
 from foragent.paths import PathError
@@ -203,9 +204,11 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
         print("Served apps stopped.")
     elif args.action == "answer":
         comment = inspect_actions.answer(ctx, args.number, args.text)
+        kick_tick(ctx.repo_root)
         print(f"Decision recorded: https://github.com/{ctx.repo}/issues/{args.number}#issuecomment-{comment}")
     elif args.action == "retry":
         inspect_actions.retry(ctx, args.number)
+        kick_tick(ctx.repo_root)
         print(f"Retry requested for #{args.number}.")
     elif args.action == "feedback":
         number = inspect_actions.feedback(ctx, args.title, args.body, args.about)
@@ -248,8 +251,10 @@ def main(argv: list[str] | None = None) -> int:
                 if args.json:
                     print(json.dumps(catalog, ensure_ascii=False))
                 else:
+                    print("ID\tName\tLicense\tDescription")
                     for skill in catalog:
-                        print(f"{skill['id']}: {skill['name']} — {skill['description']}")
+                        description = " ".join(skill["description"].split())
+                        print(f"{skill['id']}\t{skill['name']}\t{skill['license']}\t{description}")
             else:
                 print("Installed: " + manager.install(args.id, args.repo_root.resolve()))
             return 0
@@ -273,6 +278,8 @@ def main(argv: list[str] | None = None) -> int:
                       f"last exit status: {report.last_exit_status if report.last_exit_status is not None else 'unknown'}")
             else:
                 label = getattr(launchd, args.action)(root)
+                if args.action == "install":
+                    kick_tick(root)
                 print(f"launchd {'installed' if args.action == 'install' else 'uninstalled'}: {label}")
             return 0
         git = GitRepo(root)

@@ -31,6 +31,9 @@ class Config:
     skill_libraries: list[Any] = field(default_factory=lambda: [{
         "name": "knowledge-work-plugins",
         "repo": "https://github.com/anthropics/knowledge-work-plugins",
+    }, {
+        "name": "skills",
+        "repo": "https://github.com/anthropics/skills",
     }])
     max_parallel: int = 2
     transient_max_wait_minutes: int = 30
