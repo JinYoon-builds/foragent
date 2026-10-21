@@ -1,0 +1,84 @@
+"""The orchestrator watcher reports state transitions across invocations."""
+
+from datetime import UTC, datetime
+import json
+
+import pytest
+
+from foragent import orch
+from foragent.config import Config
+from foragent.git import GitRepo
+from foragent.runner import RunContext
+from foragent.state import StateStore
+from foragent.tracker import FakeTracker
+
+
+@pytest.fixture
+def ctx(tmp_path):
+    now = lambda: datetime(2026, 10, 21, tzinfo=UTC)
+    return RunContext("owner/repo", tmp_path, FakeTracker(now=now),
+                      StateStore(tmp_path / "state", now=now), Config(), GitRepo(tmp_path), now)
+
+
+def test_label_removals_and_closed_items_change_the_watched_sets(ctx):
+    ctx.tracker.add_issue(9, labels=["blocked", "needs-human"])
+    ctx.tracker.add_issue(2, labels=["blocked"])
+    ctx.tracker.add_issue(20, labels=["blocked"], is_pull_request=True)
+    snapshots = [list(orch.watch(ctx))[0]]
+    assert snapshots[0] == {"blocked": [2, 9], "needs_human": [9], "merged": [], "queue_empty": True}
+
+    ctx.tracker.remove_labels(9, ["blocked", "needs-human"])
+    snapshots += list(orch.watch(ctx))
+    assert snapshots[-1]["blocked"] == [2]
+    assert snapshots[-1]["needs_human"] == []
+    ctx.tracker.close_issue(2)
+    snapshots += list(orch.watch(ctx))
+    assert snapshots[-1]["blocked"] == []
+    assert json.loads((ctx.store.root / "orch-watch.json").read_text()) == snapshots[-1]
+    assert all(not ctx.tracker.list_comments(n) for n in (2, 9, 20))
+    assert not (ctx.store.root / "orch-events.jsonl").exists()
+
+
+def test_queue_empty_tracks_refills_and_waits_for_active_run_completion(ctx, monkeypatch):
+    assert list(orch.watch(ctx))[0]["queue_empty"] is True
+    ctx.tracker.add_issue(1, labels=["approved"])
+    assert list(orch.watch(ctx))[0]["queue_empty"] is False
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree="unused")
+    ctx.tracker.close_issue(1)
+    # The runner still has cleanup to perform after GitHub closes the issue.
+    polls = []
+
+    def sleep(seconds):
+        polls.append(seconds)
+        assert len(polls) == 1, "Run completion must wake the next poll"
+        ctx.store.finish_run(1, "merged")
+
+    monkeypatch.setattr(orch.time, "sleep", sleep)
+    assert list(orch.watch(ctx, interval=0.01))[0]["queue_empty"] is True
+    assert polls == [0.01]
+    ctx.tracker.add_issue(3, labels=["ready"])
+    assert list(orch.watch(ctx))[0]["queue_empty"] is False
+
+
+def test_unchanged_poll_order_and_closed_prs_do_not_wake_but_batch_merges_do(ctx, monkeypatch):
+    ctx.tracker.add_issue(2, labels=["blocked"])
+    ctx.tracker.add_issue(1, labels=["blocked"])
+    assert list(orch.watch(ctx))[0]["blocked"] == [1, 2]
+    list_issues = ctx.tracker.list_open_issues
+    monkeypatch.setattr(ctx.tracker, "list_open_issues", lambda: list(reversed(list_issues())))
+
+    closed = ctx.tracker.create_pr(head="foragent/issue-3", base="main", title="Closed", body="")
+    ctx.tracker.close_pr(closed)
+    unrelated = ctx.tracker.create_pr(head="feature", base="main", title="Unrelated", body="")
+    ctx.tracker.merge_pr(unrelated, expected_head_sha=ctx.tracker.pr_head_sha(unrelated))
+    polls = []
+
+    def sleep(seconds):
+        polls.append(seconds)
+        assert len(polls) == 1, "A merged batch must wake the next poll"
+        pr = ctx.tracker.create_pr(head="foragent/batch-42", base="main", title="Batch", body="")
+        ctx.tracker.merge_pr(pr, expected_head_sha=ctx.tracker.pr_head_sha(pr))
+
+    monkeypatch.setattr(orch.time, "sleep", sleep)
+    assert list(orch.watch(ctx, interval=0.01))[0]["merged"] == [42]
+    assert polls == [0.01]

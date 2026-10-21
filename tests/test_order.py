@@ -154,6 +154,30 @@ def test_publish_order_contract_labels_native_links_and_summary(publishing, plan
     assert "| 3 | Login client | s | 2 | yes |" in report.summary()
 
 
+@pytest.mark.parametrize("offline", [False, True])
+def test_publish_projects_are_idempotent_and_failure_does_not_stop_publication(publishing, plan, caplog, offline):
+    from foragent import board
+    from test_board import item_values, snapshot
+
+    root, config, tracker, git, events = publishing
+    project_id = board.ensure(tracker, "owner/repo", config.lanes)
+    config = replace(config, board=project_id)
+    if offline:
+        def unavailable(*args):
+            raise OSError("offline project")
+        tracker.graphql = unavailable
+    for _ in range(2):
+        report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git, approve=True)
+        assert report.parent == 1
+    assert len(tracker.issues) == 3 and tracker.get_issue(2).labels == {"lane:api", "size:m", "approved"}
+    if offline:
+        assert "Could not add issue" in caplog.text and "Could not set board Status" in caplog.text
+    else:
+        assert len(snapshot(tracker, project_id)["items"]["nodes"]) == 3
+        assert item_values(tracker, project_id, 2) == {"Lane": "api", "Size": "m", "Status": "Approved"}
+        assert item_values(tracker, project_id, 3) == {"Lane": "main", "Size": "s", "Status": "Approved"}
+
+
 @pytest.mark.parametrize("options,approved", [
     ({}, set()), ({"approve": True}, {2, 3}),
     ({"approve_keys": ["api"]}, {2}), ({"approve_numbers": [3]}, {3}),
@@ -522,7 +546,9 @@ def test_edit_reverting_to_a_prior_revision_still_refreshes_approval(publishing,
 
 
 @pytest.mark.parametrize("interrupted", [False, True])
-def test_lane_skills_and_notices_reach_remote_runner_worktree(offline_publication, plan, monkeypatch, interrupted):
+def test_lane_skills_stay_local_and_copy_into_runner_worktree(offline_publication, plan, monkeypatch, interrupted):
+    from foragent.skills import copy_lane_skills
+
     root, config, tracker, git, calls, _ = offline_publication
     library = root.parent / "library"
     skill = library / "skills/testing-strategy"
@@ -551,15 +577,16 @@ def test_lane_skills_and_notices_reach_remote_runner_worktree(offline_publicatio
     git.fetch("origin", "main")
     runner = root.parent / "runner"
     git.add_detached_worktree(runner, "origin/main")
+    assert not (runner / ".claude/skills/testing-strategy").exists()
+    assert not (runner / "THIRD_PARTY_NOTICES.md").exists()
+    assert "/.claude/skills/testing-strategy/" in (runner / ".gitignore").read_text().splitlines()
+    assert copy_lane_skills(root, runner, ["testing-strategy"], manager) == [".claude/skills/testing-strategy"]
     assert (runner / ".claude/skills/testing-strategy/SKILL.md").read_bytes() == (skill / "SKILL.md").read_bytes()
     assert (runner / ".claude/skills/testing-strategy/references/example.md").read_text() == "Useful example\n"
-    assert "License: MIT (LICENSE)" in (runner / "THIRD_PARTY_NOTICES.md").read_text()
     assert "skills: [testing-strategy]" in (runner / ".claude/agents/fa-web.md").read_text()
     lane_commit = next(args for args in calls if "commit" in args and args[args.index("-m") + 1] == "Foragent lane web")
     assert set(lane_commit[lane_commit.index("--") + 1:]) == {
-        ".foragent.yml", ".claude/agents/fa-web.md", ".claude/skills/testing-strategy/SKILL.md",
-        ".claude/skills/testing-strategy/references/example.md", "THIRD_PARTY_NOTICES.md",
-        ":!CLAUDE.local.md",
+        ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ":!CLAUDE.local.md",
     }
     assert len([args for args in calls if args[0] == "push"]) == 1
     order.publish(plan, root, load_config(root), tracker, repo="owner/repo", git=git, manager=manager)
@@ -641,7 +668,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
     assert result["feedback"] == [{"number": 1, "title": "Feedback", "body": "Fix it\n\nAbout #8.", "about": 8}]

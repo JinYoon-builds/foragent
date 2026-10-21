@@ -43,15 +43,19 @@ class Config:
     reviewer_model: str | None = None
     review_max: int = 2
     review_level: str = "low"
+    review_scope: str = "claude-local"
+    test_command: str | None = None
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
     run_hours: str = "always"
     stall_minutes: int = 30
+    orchestrator_timeout_minutes: int = 30
     max_runtime_minutes: int = 90
     max_retries: int = 2
     base_branch: str = "main"
     repo: str | None = None
+    board: str | None = None
     language: str = "en"
     interview: str = "ouroboros"
     ouroboros_version: str | None = None
@@ -89,6 +93,12 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 
 
 def _validate(values: dict[str, Any]) -> None:
+    if values["test_command"] is not None and (
+        not isinstance(values["test_command"], str) or not values["test_command"].strip()
+    ):
+        raise ConfigError("test_command must be a nonempty string or null")
+    if not isinstance(values["review_scope"], str) or values["review_scope"] not in {"claude-local", "pr-body"}:
+        raise ConfigError("review_scope must be claude-local or pr-body")
     if not isinstance(values["interview"], str) or values["interview"] not in {"ouroboros", "native"}:
         raise ConfigError("interview must be ouroboros or native")
     if type(values["codex_goal"]) is not bool:
@@ -118,13 +128,14 @@ def _validate(values: dict[str, Any]) -> None:
         if not isinstance(value, str) or value not in allowed:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "review_max",
-                "max_parallel", "transient_max_wait_minutes", "limit_wait_minutes"):
+                "max_parallel", "transient_max_wait_minutes", "limit_wait_minutes",
+                "orchestrator_timeout_minutes"):
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
     for key in ("always_human", "approvers"):
         if not isinstance(values[key], list) or any(not isinstance(item, str) for item in values[key]):
             raise ConfigError(f"{key} must be a list of strings")
-    for key in ("executor_model", "reviewer_model", "executor_fallback_model", "ouroboros_version"):
+    for key in ("executor_model", "reviewer_model", "executor_fallback_model", "ouroboros_version", "board"):
         if values[key] is not None and not isinstance(values[key], str):
             raise ConfigError(f"{key} must be a string or null")
     lanes = values["lanes"]
@@ -133,12 +144,12 @@ def _validate(values: dict[str, Any]) -> None:
     for name, lane in lanes.items():
         if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9-]+", name):
             raise ConfigError(f"invalid lanes name: {name}")
-        if not isinstance(lane, dict) or lane.keys() - {"paths", "agent", "skills", "executor", "model"}:
+        if not isinstance(lane, dict) or lane.keys() - {"paths", "agent", "skills", "executor", "model", "title", "emoji"}:
             raise ConfigError(f"invalid lanes entry: {name}")
         paths = lane.get("paths", [])
         if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
             raise ConfigError(f"lanes.{name}.paths must be a list of strings")
-        for key in ("agent", "executor", "model"):
+        for key in ("agent", "executor", "model", "title", "emoji"):
             if lane.get(key) is not None and not isinstance(lane[key], str):
                 raise ConfigError(f"lanes.{name}.{key} must be a string or null")
         if lane.get("executor") is not None and lane["executor"] not in _EXECUTORS:

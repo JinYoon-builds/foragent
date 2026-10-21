@@ -67,6 +67,7 @@ class PullRequest:
 
 
 class Tracker(Protocol):
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]: ...
     def list_open_issues(self) -> list[Issue]: ...
     def list_issues(self, state: str = "all") -> list[Issue]: ...
     def update_issue(self, n: int, *, title: str, body: str) -> None: ...
@@ -134,6 +135,11 @@ class FakeTracker:
         self._pr_checks: dict[int, CheckStatus] = {}
         self._pr_heads: dict[int, str] = {}
         self._next_comment_id = 1
+        from foragent.board_fake import FakeProjects
+        self._projects = FakeProjects()
+
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        return self._projects.graphql(query, variables, self)
 
     def _timestamp(self) -> str:
         return self._now().astimezone(UTC).isoformat()
@@ -345,6 +351,21 @@ class GhTracker:
             ) from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise TrackerError(str(exc)) from exc
+
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        output = self._call(["api", "graphql", "--input", "-"],
+                            input=json.dumps({"query": query, "variables": variables}))
+        try:
+            result = json.loads(output)
+            if not isinstance(result, dict):
+                raise TrackerError("invalid GraphQL response: expected an object")
+            if result.get("errors"):
+                raise TrackerError(f"GraphQL errors: {result['errors']}")
+            if not isinstance(result.get("data"), dict):
+                raise TrackerError("invalid GraphQL response: missing data")
+            return result
+        except json.JSONDecodeError as exc:
+            raise TrackerError(f"invalid GraphQL JSON: {exc}") from exc
 
     def list_open_issues(self) -> list[Issue]:
         return self.list_issues("open")

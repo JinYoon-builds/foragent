@@ -7,10 +7,10 @@ import yaml
 
 from foragent import cli
 from foragent.config import Config, load_config
-from foragent.git import GitError
+from foragent.git import GitError, GitRepo
 from foragent.lanes import LaneError, add_lane, validate_lane
 from foragent.license_texts import STANDARD_LICENSES
-from foragent.skills import SkillError, SkillManager
+from foragent.skills import SkillError, SkillManager, copy_lane_skills
 
 
 @pytest.fixture
@@ -72,8 +72,8 @@ def test_two_library_layouts_have_stable_ids_and_per_skill_licenses(two_librarie
         "skills:docx": "unknown", "skills:frontend-design": "MIT",
     }
     repo = tmp_path / "repo"
-    assert manager.install("kwp:engineering/testing-strategy", repo) == "testing-strategy"
-    assert manager.install("skills:frontend-design", repo) == "frontend-design"
+    assert manager.install("kwp:engineering/testing-strategy", repo, commit=True) == "testing-strategy"
+    assert manager.install("skills:frontend-design", repo, commit=True) == "frontend-design"
     assert (repo / ".claude/skills/frontend-design/SKILL.md").read_bytes() == (skills / "skills/frontend-design/SKILL.md").read_bytes()
     assert (repo / ".claude/skills/testing-strategy/SKILL.md").read_bytes() == (kwp / "engineering/skills/testing-strategy/SKILL.md").read_bytes()
     notices = (repo / "THIRD_PARTY_NOTICES.md").read_text()
@@ -88,7 +88,7 @@ def test_two_library_layouts_have_stable_ids_and_per_skill_licenses(two_librarie
 ])
 def test_unique_legacy_ids_and_new_prefixed_ids_are_accepted(two_libraries, tmp_path, identity):
     manager = two_libraries[3]
-    installed = manager.install(identity, tmp_path / "repo")
+    installed = manager.install(identity, tmp_path / "repo", commit=True)
     assert installed == ("frontend-design" if "frontend-design" in identity else "testing-strategy")
 
 
@@ -98,11 +98,11 @@ def test_ambiguous_unprefixed_id_is_rejected_with_choices(two_libraries, tmp_pat
     duplicate.mkdir(parents=True)
     (duplicate / "SKILL.md").write_text("---\nname: testing-strategy\ndescription: Another strategy.\n---\nOther body.\n")
     with pytest.raises(SkillError, match="ambiguous skill") as error:
-        manager.install("engineering/testing-strategy", tmp_path / "repo")
+        manager.install("engineering/testing-strategy", tmp_path / "repo", commit=True)
     assert "kwp:engineering/testing-strategy" in str(error.value)
     assert "skills:engineering/testing-strategy" in str(error.value)
     assert commands == [] and not (tmp_path / "repo").exists()
-    assert manager.install("skills:engineering/testing-strategy", tmp_path / "repo") == "testing-strategy"
+    assert manager.install("skills:engineering/testing-strategy", tmp_path / "repo", commit=True) == "testing-strategy"
 
 
 def test_sync_clones_then_fast_forwards_with_no_live_network(tmp_path):
@@ -124,20 +124,21 @@ def test_sync_clones_then_fast_forwards_with_no_live_network(tmp_path):
 
 
 def test_install_copies_full_skill_and_records_notice_once(library, tmp_path):
+    # Redistribution retains the original license and attribution checks via --commit.
     source, _, manager, commands = library
     repo = tmp_path / "repo"
     repo.mkdir()
-    assert manager.install("engineering/testing-strategy", repo) == "testing-strategy"
+    assert manager.install("engineering/testing-strategy", repo, commit=True) == "testing-strategy"
     destination = repo / ".claude/skills/testing-strategy"
     assert (destination / "SKILL.md").read_bytes() == (source / "engineering/skills/testing-strategy/SKILL.md").read_bytes()
     assert (destination / "references/example.md").read_text() == "Example\n"
     notice = (repo / "THIRD_PARTY_NOTICES.md").read_text()
     assert all(value in notice for value in ("https://example.test/library", "engineering/skills/testing-strategy", "a" * 40, "Apache-2.0 (LICENSE)", "Library attribution"))
-    manager.install("knowledge-work-plugins/engineering/testing-strategy", repo)
+    manager.install("knowledge-work-plugins/engineering/testing-strategy", repo, commit=True)
     assert (repo / "THIRD_PARTY_NOTICES.md").read_text() == notice
     (destination / "SKILL.md").write_text("Custom local skill\n")
     with pytest.raises(SkillError, match="different existing skill"):
-        manager.install("engineering/testing-strategy", repo)
+        manager.install("engineering/testing-strategy", repo, commit=True)
     assert (destination / "SKILL.md").read_text() == "Custom local skill\n"
     assert (repo / "THIRD_PARTY_NOTICES.md").read_text() == notice
 
@@ -145,7 +146,7 @@ def test_install_copies_full_skill_and_records_notice_once(library, tmp_path):
 def test_spdx_license_is_used(library, tmp_path):
     source, _, manager, _ = library
     (source / "LICENSE").write_text("SPDX-License-Identifier: MIT\nMIT License\n")
-    manager.install("engineering/testing-strategy", tmp_path)
+    manager.install("engineering/testing-strategy", tmp_path, commit=True)
     assert "License: MIT (LICENSE)" in (tmp_path / "THIRD_PARTY_NOTICES.md").read_text()
 
 
@@ -164,7 +165,7 @@ def test_skill_license_is_used_before_library_root(library, tmp_path, filename, 
     (source / "engineering/skills/testing-strategy" / filename).write_text(text)
     assert manager.catalog()[0]["license"] == license_id
     repo = tmp_path / "repo"
-    manager.install("kwp:engineering/testing-strategy", repo)
+    manager.install("kwp:engineering/testing-strategy", repo, commit=True)
     notices = (repo / "THIRD_PARTY_NOTICES.md").read_text()
     assert f"License: {license_id} ({filename})" in notices
     assert text.strip() in notices
@@ -197,7 +198,7 @@ def test_nonfree_or_unknown_skill_overrides_open_source_root_and_writes_nothing(
     (repo / "keep.txt").write_text("Keep me.\n")
     for action in (manager.check_install, manager.install):
         with pytest.raises(SkillError, match="cannot confirm an open-source license") as error:
-            action("kwp:engineering/testing-strategy", repo)
+            action("kwp:engineering/testing-strategy", repo, commit=True)
         assert "LICENSE.txt" in str(error.value)
     assert list(repo.iterdir()) == [repo / "keep.txt"] and commands == []
 
@@ -217,7 +218,7 @@ def test_complete_standard_licenses_are_accepted(library, tmp_path, license_id, 
         text = "\r\n".join("\t " + line.replace(" ", " \t ") + "  " for line in text.splitlines())
     (source / "engineering/skills/testing-strategy/LICENSE.txt").write_text(text)
     assert manager.catalog()[0]["license"] == license_id
-    manager.install("kwp:engineering/testing-strategy", tmp_path / "repo")
+    manager.install("kwp:engineering/testing-strategy", tmp_path / "repo", commit=True)
     assert f"License: {license_id}" in (tmp_path / "repo/THIRD_PARTY_NOTICES.md").read_text()
 
 
@@ -238,7 +239,7 @@ def test_modified_standard_licenses_are_unknown_and_install_writes_nothing(libra
     assert manager.catalog()[0]["license"] == "unknown"
     for action in (manager.check_install, manager.install):
         with pytest.raises(SkillError, match="unknown"):
-            action("kwp:engineering/testing-strategy", tmp_path / "repo")
+            action("kwp:engineering/testing-strategy", tmp_path / "repo", commit=True)
     assert not (tmp_path / "repo").exists() and commands == []
 
 
@@ -254,7 +255,7 @@ def test_json_org_license_is_unknown_and_install_leaves_existing_files_untouched
     notices.write_text("Existing notices\n")
     assert manager.catalog()[0]["license"] == "unknown"
     with pytest.raises(SkillError, match="unknown"):
-        manager.install("kwp:engineering/testing-strategy", repo)
+        manager.install("kwp:engineering/testing-strategy", repo, commit=True)
     assert notices.read_text() == "Existing notices\n"
     assert not (repo / ".claude").exists() and commands == []
 
@@ -282,7 +283,7 @@ def test_a_known_library_name_does_not_imply_an_open_source_license(tmp_path):
     }]), run=lambda args: pytest.fail("license refusal must precede Git operations"))
     assert manager.catalog()[0]["license"] == "unknown"
     with pytest.raises(SkillError, match="no LICENSE or LICENSE.txt"):
-        manager.install("kwp:example", tmp_path / "repo")
+        manager.install("kwp:example", tmp_path / "repo", commit=True)
     assert not (tmp_path / "repo").exists()
 
 
@@ -290,7 +291,7 @@ def test_skill_open_source_license_can_override_a_nonfree_root(library, tmp_path
     source, _, manager, _ = library
     (source / "LICENSE").write_text("Source-available root terms.\n")
     (source / "engineering/skills/testing-strategy/LICENSE.txt").write_text(STANDARD_LICENSES["MIT"])
-    manager.install("engineering/testing-strategy", tmp_path / "repo")
+    manager.install("engineering/testing-strategy", tmp_path / "repo", commit=True)
     assert manager.catalog()[0]["license"] == "MIT"
 
 
@@ -300,18 +301,18 @@ def test_license_file_priority_does_not_skip_restrictive_skill_terms(library, tm
     (skill / "LICENSE").write_text("Source-available terms.\n")
     (skill / "LICENSE.txt").write_text("MIT License\n")
     with pytest.raises(SkillError, match="unknown"):
-        manager.install("engineering/testing-strategy", tmp_path / "repo")
+        manager.install("engineering/testing-strategy", tmp_path / "repo", commit=True)
 
 
 def test_conflicting_skill_or_missing_id_does_not_write(library, tmp_path):
     _, _, manager, _ = library
     with pytest.raises(SkillError, match="unknown skill"):
-        manager.install("no/such-skill", tmp_path)
+        manager.install("no/such-skill", tmp_path, commit=True)
     destination = tmp_path / ".claude/skills/testing-strategy"
     destination.mkdir(parents=True)
     (destination / "SKILL.md").write_text("different")
     with pytest.raises(SkillError, match="overwrite"):
-        manager.install("engineering/testing-strategy", tmp_path)
+        manager.install("engineering/testing-strategy", tmp_path, commit=True)
     assert not (tmp_path / "THIRD_PARTY_NOTICES.md").exists()
 
 
@@ -348,8 +349,7 @@ def test_add_lane_agent_settings_and_scoped_commit(library, tmp_path):
                       "memory": "project", "skills": ["testing-strategy"]}
     assert "repository's api lane (api/**, shared/**)." in text
     assert "Record durable, project-specific lessons" in text
-    expected = [".foragent.yml", ".claude/agents/fa-api.md", ".claude/skills/testing-strategy/SKILL.md",
-                ".claude/skills/testing-strategy/references/example.md", "THIRD_PARTY_NOTICES.md"]
+    expected = [".foragent.yml", ".claude/agents/fa-api.md", ".gitignore"]
     assert commits == [(expected, "Foragent lane api")]
     assert tracked == [expected] and pushes == ["main"]
     before = (root / ".foragent.yml").read_text()
@@ -404,17 +404,25 @@ def test_validate_and_add_lane_accept_more_than_three_skills(library, tmp_path):
 
     assert add_lane(root, "design", ["ui/**"], skills=identities, manager=manager, git=Git())["skills"] == names
     assert load_config(root).lanes["design"]["skills"] == names
-    assert all(f".claude/skills/{name}/SKILL.md" in commits[0] for name in names)
+    assert ".gitignore" in commits[0]
+    assert not any(path.startswith(".claude/skills/") for path in commits[0])
 
 
-def test_nonfree_lane_skill_is_rejected_before_any_lane_files_are_written(two_libraries, tmp_path):
+def test_nonfree_lane_skill_installs_locally_with_warning(two_libraries, tmp_path, monkeypatch, capsys):
     manager = two_libraries[3]
     root = tmp_path / "repo"
     root.mkdir()
     (root / ".foragent.yml").write_text("{}\n")
-    with pytest.raises(SkillError, match="unknown"):
-        add_lane(root, "design", ["ui/**"], skills=["skills:frontend-design", "skills:docx"], manager=manager)
-    assert list(root.iterdir()) == [root / ".foragent.yml"]
+    monkeypatch.setattr(GitRepo, "current_branch", lambda self: "main")
+    published = []
+    monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: published.extend(paths))
+    monkeypatch.setattr(GitRepo, "commit_paths", lambda *args: None)
+    lane = add_lane(root, "design", ["ui/**"], skills=["skills:frontend-design", "skills:docx"],
+                    manager=manager, push=False)
+    assert lane["skills"] == ["frontend-design", "docx"]
+    assert "unknown" in capsys.readouterr().err
+    assert (root / ".claude/skills/docx/SKILL.md").is_file()
+    assert published == [".foragent.yml", ".claude/agents/fa-design.md", ".gitignore"]
 
 
 def test_nonfree_install_cli_explains_refusal_and_catalog_still_lists_it(two_libraries, tmp_path, monkeypatch, capsys):
@@ -423,7 +431,7 @@ def test_nonfree_install_cli_explains_refusal_and_catalog_still_lists_it(two_lib
     assert cli.main(["skills", "catalog", "--json"]) == 0
     assert any(row["id"] == "skills:docx" and row["license"] == "unknown"
                for row in json.loads(capsys.readouterr().out))
-    assert cli.main(["skills", "install", "skills:docx", "--repo-root", str(tmp_path / "repo")]) == 1
+    assert cli.main(["skills", "install", "skills:docx", "--repo-root", str(tmp_path / "repo"), "--commit"]) == 1
     output = capsys.readouterr()
     assert output.out == "" and "unknown" in output.err and "skills:docx" in output.err
     assert not (tmp_path / "repo").exists()
@@ -442,3 +450,40 @@ def test_skills_cli_routes_offline(library, tmp_path, monkeypatch, capsys):
     assert "Synced:" in capsys.readouterr().out
     assert cli.main(["skills", "install", "engineering/testing-strategy", "--repo-root", str(tmp_path)]) == 0
     assert "Installed: testing-strategy" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("license_bytes", [b"SPDX-License-Identifier: Proprietary\n", b"\xff\xfe"])
+def test_local_install_ignores_only_its_directory_and_does_not_publish_notices(library, tmp_path, license_bytes, capsys):
+    source, _, manager, commands = library
+    (source / "LICENSE").write_bytes(license_bytes)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / ".gitignore").write_bytes(b"# Existing rules\r\nbuild/")
+    (root / "THIRD_PARTY_NOTICES.md").write_text("User notices\n")
+    for _ in range(2):
+        assert manager.install("kwp:engineering/testing-strategy", root) == "testing-strategy"
+    assert (root / ".gitignore").read_bytes() == b"# Existing rules\r\nbuild/\n/.claude/skills/testing-strategy/\n"
+    assert (root / "THIRD_PARTY_NOTICES.md").read_text() == "User notices\n"
+    assert "Warning:" in capsys.readouterr().err
+    assert commands == []
+
+
+def test_copy_lane_skills_prefers_local_then_cache_and_preserves_checkout(library, tmp_path):
+    source, config, manager, _ = library
+    root, worktree = tmp_path / "repo", tmp_path / "worktree"
+    skill = "engineering/testing-strategy"
+    manager.install(skill, root)
+    local = root / ".claude/skills/testing-strategy/SKILL.md"
+    local.write_text("Local customization\n")
+    copied = copy_lane_skills(root, worktree, ["testing-strategy"], manager)
+    assert copied == [".claude/skills/testing-strategy"]
+    assert (worktree / copied[0] / "SKILL.md").read_text() == "Local customization\n"
+    (worktree / copied[0] / "SKILL.md").write_text("Checkout skill\n")
+    assert copy_lane_skills(root, worktree, ["testing-strategy"], manager) == []
+    assert (worktree / copied[0] / "SKILL.md").read_text() == "Checkout skill\n"
+    # A missing unrelated library must not prevent using a synced cache.
+    config.skill_libraries.append({"name": "missing", "repo": "local", "path": str(tmp_path / "missing")})
+    cached = tmp_path / "cached-worktree"
+    assert copy_lane_skills(tmp_path / "fresh-repo", cached, ["testing-strategy"], SkillManager(config)) == copied
+    assert (cached / copied[0] / "references/example.md").read_text() == "Example\n"
+    assert (cached / copied[0] / "SKILL.md").read_bytes() == (source / "engineering/skills/testing-strategy/SKILL.md").read_bytes()

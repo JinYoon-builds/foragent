@@ -54,6 +54,14 @@ description: Set up a project folder for Foragent.
    for human follow-up. If the answer is no or CI already excludes the acceptance
    directory, leave CI unchanged and create no CI commit.
 
-9. Tell the user the next step is `/fa-order`: for an existing project, normalize
+9. Run `fa order context --json`. When `ui.frameworks` is nonempty, propose a
+   design lane covering the project's actual UI and design foundation paths, reusing
+   existing lanes where paths overlap. Suggest the relevant skills from
+   `frontend-design`, `design-system`, `design-critique`, `accessibility-review`,
+   `ux-copy`, and `webapp-testing`; select at most three to attach (the lane limit).
+   Show the paths and skill choices for approval before `fa lanes add`. Design
+   interviews and foundation issues belong to `/fa-order` (D33).
+
+10. Tell the user the next step is `/fa-order`: for an existing project, normalize
    existing open issues into the Foragent format with the user's approval; for
    a new project, order the first work.

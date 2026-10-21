@@ -1,7 +1,7 @@
 """Command-line entry points for the issue gate."""
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 import json
 import os
@@ -10,12 +10,13 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, adopt, bench, inspect_actions, inspect_data, launchd, order
+from foragent import __version__, adopt, bench, design, inspect_actions, inspect_data, launchd, notify, orch, order, watch
 from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
+from foragent.i18n import text
 from foragent.kick import kick_tick
-from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_order, state_group
+from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, state_group
 from foragent.lanes import LaneError, add_lane
 from foragent.paths import PathError
 from foragent.skills import SkillError, SkillManager
@@ -25,13 +26,26 @@ from foragent.inspect_runtime import InspectRuntimeError
 from foragent.scheduler import TickContext, tick
 from foragent.runner import RunContext, check_done, run_issue
 from foragent.state import StateStore
+from foragent.status import collect_lanes
 from foragent.tracker import GhTracker, Tracker, TrackerError
+
+try:
+    from foragent._build import GIT_SHA
+except ImportError:
+    GIT_SHA = "unknown"
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fa")
-    parser.add_argument("--version", action="version", version=f"foragent {__version__}")
+    parser.add_argument("--version", action="version", version=f"foragent {__version__} ({GIT_SHA})")
     commands = parser.add_subparsers(dest="command", required=True)
+    design_command = commands.add_parser("design", help="Check the project's design foundation")
+    design_actions = design_command.add_subparsers(dest="action", required=True)
+    lint = design_actions.add_parser("lint", help="Report raw colors outside token files")
+    lint.add_argument("--repo-root", type=Path, default=Path.cwd())
+    lint.add_argument("--tokens", nargs="+", action="extend", help="Token paths/globs (replaces defaults)")
+    lint.add_argument("--glob", nargs="+", action="extend", dest="globs", help="UI globs (replaces defaults)")
+    lint.add_argument("--json", action="store_true")
     adopt_command = commands.add_parser("adopt", help="Prepare an existing repository for Foragent")
     adopt_actions = adopt_command.add_subparsers(dest="action", required=True)
     for name in ("survey", "baseline", "ci"):
@@ -66,6 +80,7 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--language")
     init.add_argument("--no-push", action="store_true")
     init.add_argument("--no-launchd", action="store_true")
+    init.add_argument("--no-board", action="store_true")
     init.add_argument("--dry-run", action="store_true")
     order_command = commands.add_parser("order", help="Deterministic tools for fa-order")
     order_actions = order_command.add_subparsers(dest="action", required=True)
@@ -102,6 +117,8 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
     lane.add_argument("--skill", nargs="+", action="extend", default=[], dest="skills")
     lane.add_argument("--executor", choices=("codex", "claude"))
     lane.add_argument("--model")
+    lane.add_argument("--title")
+    lane.add_argument("--emoji")
     lane.add_argument("--repo-root", type=Path, default=Path.cwd())
     skills = commands.add_parser("skills", help="Manage skill libraries")
     skill_actions = skills.add_subparsers(dest="action", required=True)
@@ -111,6 +128,7 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
     install = skill_actions.add_parser("install")
     install.add_argument("id")
     install.add_argument("--repo-root", type=Path, required=True)
+    install.add_argument("--commit", action="store_true", help="Install for committing; requires an open-source license")
     gate = commands.add_parser("gate", help="Schedule and inspect approved issues")
     actions = gate.add_subparsers(dest="action", required=True)
     for name in ("tick", "status"):
@@ -119,6 +137,9 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
         command.add_argument("--json", action="store_true")
         if name == "tick":
             command.add_argument("--no-start", action="store_true")
+    watch_command = actions.add_parser("watch", help="Watch the lane conveyor")
+    watch_command.add_argument("--repo-root", type=Path, default=Path.cwd())
+    watch_command.add_argument("--once", action="store_true")
     run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
     run_issue.add_argument("--repo-root", type=Path, required=True)
@@ -129,6 +150,38 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
     for name in ("install", "uninstall", "launchd-status"):
         command = actions.add_parser(name)
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
+    orchestrator = commands.add_parser("orch", help="Diagnose and recover blocked issues")
+    orch_actions = orchestrator.add_subparsers(dest="action", required=True)
+    for name in ("list", "rerun-review", "retry", "resolve", "escalate", "log", "watch", "premerge", "merge"):
+        command = orch_actions.add_parser(name)
+        command.add_argument("--repo-root", type=Path, default=Path.cwd())
+        if name == "list":
+            command.add_argument("--json", action="store_true")
+        elif name == "watch":
+            command.add_argument("--interval", type=float, default=5, help="Poll interval in seconds (default: 5)")
+            command.add_argument("--follow", action="store_true", help="Keep printing changes until interrupted")
+        elif name != "log":
+            command.add_argument("number", type=int)
+        if name == "premerge":
+            command.add_argument("--json", action="store_true")
+        elif name == "merge":
+            command.add_argument("--approved-by", required=True)
+            command.add_argument("--at")
+        elif name == "retry":
+            command.add_argument("--hint")
+        elif name == "resolve":
+            command.add_argument("--verdict", choices=("pass", "fail"), required=True)
+            command.add_argument("--note", required=True)
+        elif name == "escalate":
+            command.add_argument("--summary", required=True)
+            command.add_argument("--tried", required=True)
+            command.add_argument("--option", action="append", default=[])
+            command.add_argument("--recommend", type=int)
+    notification = commands.add_parser("notify", help="Send an alert through the configured channel")
+    notification.add_argument("--title", required=True)
+    notification.add_argument("--line", required=True)
+    notification.add_argument("--link")
+    notification.add_argument("--repo-root", type=Path, default=Path.cwd())
     inspect = commands.add_parser("inspect", help="Show the human inbox and record answers")
     inspect.add_argument("--repo-root", type=Path, default=Path.cwd())
     inspect.add_argument("--json", action="store_true")
@@ -166,11 +219,11 @@ def _comma_numbers(value: str) -> list[int]:
 
 def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -> dict[str, Any]:
     config = config or Config()
-    lanes: dict[str, dict[str, list]] = {}
     groups: dict[str, list[dict[str, Any]]] = {
         state: [] for state in (NEEDS_HUMAN, RUNNING, "pr-open", READY, "approved-waiting", "unapproved")
     }
-    for issue in sorted(tracker.list_open_issues(), key=lambda issue: issue.number):
+    issues = sorted(tracker.list_open_issues(), key=lambda issue: issue.number)
+    for issue in issues:
         item: dict[str, Any] = {"number": issue.number, "title": issue.title}
         group = state_group(issue, tracker)
         if group == NEEDS_HUMAN:
@@ -183,26 +236,37 @@ def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -
                  if (reason := parse_reason(comment.body)) is not None), None,
             )
         groups[group].append(item)
-        if group in {RUNNING, READY}:
-            run = store.get_run(issue.number) if group == RUNNING else None
-            lane = run.lane if run is not None and run.status == "running" else issue_lane(issue.labels, config.lanes)
-            lanes.setdefault(lane, {RUNNING: [], READY: []})[group].append(item)
+    lanes, summary = collect_lanes(issues, groups, tracker, store, config, datetime.now(UTC))
     return {
         "issues": groups,
-        "lanes": {lane: lanes[lane] for lane in sorted(lanes, key=lane_order)},
+        "lanes": lanes,
+        "summary": summary,
         "active_runs": [asdict(run) for run in store.active_runs()],
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
 
 
-def _print_status(status: dict[str, Any]) -> None:
+def _print_status(status: dict[str, Any], language: str = "en") -> None:
+    print(text("summary", language, **status["summary"]))
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
+    for lane in status["lanes"].values():
+        details = [text(lane["state"], language)]
+        if lane["issue"] is not None:
+            details.append(f"#{lane['issue']} {lane['title']}")
+        if lane["phase"]:
+            details.append(text(lane["phase"], language))
+        for field, key in (("elapsed_seconds", "elapsed"), ("last_activity_seconds", "activity")):
+            if lane[field] is not None:
+                details.append(text(key, language, seconds=int(lane[field])))
+        if lane["waiting_for"]:
+            details.append(text("waiting_for", language, issues=", ".join(f"#{n}" for n in lane["waiting_for"])))
+        print(f"{lane['lane_display']}: {' · '.join(details)}")
     for state, issues in status["issues"].items():
         print(f"{state}:")
         if state in {RUNNING, READY}:
             for lane, grouped in status["lanes"].items():
                 if grouped[state]:
-                    print(f"  lane:{lane}:")
+                    print(f"  {grouped['lane_display']}:")
                     for issue in grouped[state]:
                         print(f"    #{issue['number']} {issue['title']}")
             continue
@@ -250,7 +314,7 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
         else:
             print(inspect_data.counts_line(inbox, detailed=True))
             for item in inbox.items:
-                summary = f"[{item.group}] #{item.number} {item.title} — {item.summary}"
+                summary = f"[{item.group}] {item.lane_display} · #{item.number} {item.title} — {item.summary}"
                 if item.group == "try":
                     print(f"{summary} {item.url}")
                     for line in inspect_data.try_lines(item):
@@ -265,6 +329,8 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "design":
+            return design.run(args)
         if args.command == "adopt":
             return adopt.run(args)
         if args.command == "bench":
@@ -285,19 +351,25 @@ def main(argv: list[str] | None = None) -> int:
                         description = " ".join(skill["description"].split())
                         print(f"{skill['id']}\t{skill['name']}\t{skill['license']}\t{description}")
             else:
-                print("Installed: " + manager.install(args.id, args.repo_root.resolve()))
+                print("Installed: " + manager.install(args.id, args.repo_root.resolve(), commit=args.commit))
             return 0
         root = args.repo_root.resolve()
         if args.command == "init":
             print(init_repo(
                 root, approvers=args.approvers, review=args.review, executor=args.executor,
                 run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
-                dry_run=args.dry_run, language=args.language,
+                dry_run=args.dry_run, language=args.language, no_board=args.no_board,
             ).summary())
             return 0
         if args.command == "lanes":
-            lane = add_lane(root, args.name, args.paths, skills=args.skills, executor=args.executor, model=args.model)
+            lane = add_lane(root, args.name, args.paths, skills=args.skills, executor=args.executor, model=args.model,
+                            title=args.title, emoji=args.emoji)
             print(f"Created lane:{args.name} ({', '.join(lane['paths'])})")
+            return 0
+        if args.command == "notify":
+            config = load_config(root)
+            repo = config.repo or GitRepo(root).remote_slug()
+            notify.send(replace(config, repo=repo), args.title, args.line, args.link)
             return 0
         if args.action in {"install", "uninstall", "launchd-status"}:
             if args.action == "launchd-status":
@@ -327,6 +399,52 @@ def main(argv: list[str] | None = None) -> int:
                 ).summary())
             return 0
         store = StateStore.for_repo(repo)
+        if args.command == "orch":
+            ctx = RunContext(repo=repo, repo_root=root, tracker=tracker, store=store,
+                             config=config, git=git, now=lambda: datetime.now(UTC))
+            if args.action == "list":
+                items = orch.list_blocked(ctx)
+                if args.json:
+                    print(json.dumps(items, ensure_ascii=False))
+                elif not items:
+                    print("No blocked issues.")
+                else:
+                    for item in items:
+                        print(f"#{item['number']} {item['title']} [{item['lane']}] "
+                              f"{item['reason'] or 'unknown'} · {item['blocked_at'] or 'unknown time'}")
+                        print(item["details"])
+                        for review in item["reviews"]:
+                            print(f"Review: {review['path']}\n{review['text']}")
+                        print(f"Log (last 60 lines): {item['log_path']}\n{item['log_tail']}")
+            elif args.action == "log":
+                for event in orch.log(ctx):
+                    print(f"{event['at']} [{event['kind']}] {event['summary']}")
+            elif args.action == "watch":
+                try:
+                    for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow):
+                        print(json.dumps(snapshot, ensure_ascii=False), flush=True)
+                except KeyboardInterrupt:
+                    pass
+            elif args.action == "retry":
+                print(orch.retry(ctx, args.number, args.hint))
+            elif args.action == "rerun-review":
+                print(orch.rerun_review(ctx, args.number))
+            elif args.action == "resolve":
+                print(orch.resolve(ctx, args.number, args.verdict, args.note))
+            elif args.action == "escalate":
+                print(orch.escalate(ctx, args.number, args.summary, args.tried, args.option, args.recommend))
+            elif args.action == "premerge":
+                report = orch.premerge(ctx, args.number)
+                if args.json:
+                    print(json.dumps(report, ensure_ascii=False))
+                else:
+                    print(f"PR #{report['pr']}: tests {report['tests']}; "
+                          f"conflicts: {', '.join(report['conflicts']) or 'none'}; "
+                          f"CI {report['ci']}; ready: {str(report['ready']).lower()}")
+                return 0 if report["ready"] else 1
+            elif args.action == "merge":
+                print(orch.merge(ctx, args.number, approved_by=args.approved_by, at=args.at))
+            return 0
         inspect_ctx = inspect_data.InspectContext(
             tracker, store, repo, config, lambda: datetime.now(UTC), repo_root=root, git=git,
         )
@@ -356,7 +474,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.json:
                 print(json.dumps(status))
             else:
-                _print_status(status)
+                _print_status(status, config.language)
+        elif args.action == "watch":
+            watch.run(
+                lambda: _status(tracker, store, config), tracker, store, config, root,
+                once=args.once, now=lambda: datetime.now(UTC),
+            )
         else:
             if store.get_run(args.number) is None:
                 raise ConfigError(f"no run record for issue #{args.number}")
@@ -369,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError,
             inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError,
-            order.PlanError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:
+            order.PlanError, orch.OrchError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
         return 1
 

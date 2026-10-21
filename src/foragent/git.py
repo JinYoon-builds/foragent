@@ -28,6 +28,7 @@ class GitRepo:
     def __init__(self, root: Path, run: Callable[..., str] | None = None):
         self.root = Path(root)
         self._run = run or self._run_git
+        self.local_skill_paths: set[str] = set()
 
     def _run_git(self, args: list[str]) -> str:
         command = args
@@ -73,6 +74,7 @@ class GitRepo:
         output = self._call([
             "ls-files", "--modified", "--deleted", "--others", "--exclude-standard", "-z",
             "--", ".", ":!.foragent", f":!{REVIEW_SCOPE_FILE}",
+            *(f":(exclude,literal){path}" for path in sorted(self.local_skill_paths)),
         ])
         paths = sorted(set(filter(None, output.split("\0"))))
         if paths:
@@ -82,6 +84,9 @@ class GitRepo:
     def _exclude_artifacts(self) -> None:
         # Also remove entries staged by an executor, retaining their local files.
         self._call(["rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"])
+        if self.local_skill_paths:
+            self._call(["--literal-pathspecs", "rm", "--cached", "-r", "-f", "--ignore-unmatch",
+                        "--", *sorted(self.local_skill_paths)])
         if self._call(["ls-files", "--cached", "-z", "--", REVIEW_SCOPE_FILE]):
             self._call(["restore", "--staged", "--", REVIEW_SCOPE_FILE])
 

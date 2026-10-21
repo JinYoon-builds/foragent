@@ -2,6 +2,7 @@
 
 from enum import StrEnum
 import re
+from typing import Literal
 
 
 class Reason(StrEnum):
@@ -14,6 +15,8 @@ class Reason(StrEnum):
     STALLED = "stalled"
     TIMEOUT = "timeout"
     NO_MACHINE_CHECK = "no-machine-check"
+    ORCHESTRATOR_TIMEOUT = "orchestrator-timeout"
+    REVIEW_DISPUTE = "review-dispute"
 
 
 GROUP: dict[Reason, str] = {
@@ -26,20 +29,25 @@ GROUP: dict[Reason, str] = {
     Reason.STALLED: "tech-failure",
     Reason.TIMEOUT: "tech-failure",
     Reason.NO_MACHINE_CHECK: "decision",
+    Reason.ORCHESTRATOR_TIMEOUT: "tech-failure",
+    Reason.REVIEW_DISPUTE: "tech-failure",
 }
 
 APPROVAL_MARKER = "<!-- foragent:approved"
 
 
-def format_comment(reason: Reason, summary: str, details: str | None = None) -> str:
+def format_comment(
+    reason: Reason, summary: str, details: str | None = None, *,
+    label: Literal["blocked", "needs-human"] = "needs-human",
+) -> str:
     summary = " ".join(summary.split())
-    body = f"<!-- foragent:needs-human reason={reason.value} -->\n**{summary}**"
+    body = f"<!-- foragent:{label} reason={reason.value} -->\n**{summary}**"
     return f"{body}\n\n{details}" if details else body
 
 
 def parse_reason(comment_body: str) -> Reason | None:
     first_line = comment_body.split("\n", 1)[0].removesuffix("\r")
-    match = re.fullmatch(r"<!-- foragent:needs-human reason=([a-z-]+) -->", first_line)
+    match = re.fullmatch(r"<!-- foragent:(?:blocked|needs-human) reason=([a-z-]+) -->", first_line)
     if match is None:
         return None
     try:

@@ -1,0 +1,41 @@
+# orch 레인 현재 메모
+
+- gate·runner의 차단 처리는 `src/foragent/actions.py`의 `flag()`를 공유한다. 이 함수는 `blocked` 라벨과 `<!-- foragent:blocked reason=... -->` 댓글을 남기며, 기존 이유 코드·상세 출력·승인 무효화 기록을 유지한다.
+- `format_comment()`의 기본은 기존 사람 확인 댓글과 호환되도록 `needs-human`이다. gate·runner에서는 `label="blocked"`를 명시한다. `parse_reason()`은 두 표식을 모두 읽는다.
+- `scheduler.tick()`의 타임아웃은 로컬 flag 기록이 아니라 GitHub에서 가장 최근의 blocked 댓글 시각을 기준으로 한다. 알 수 없는 새 이유 코드도 유효한 blocked 표식이면 시계 기준이 된다. `orchestrator_timeout_minutes` 기본값은 30이며 양의 정수만 허용한다.
+- 재시작·중단 복구와 실행 직전 검사에도 `blocked`를 포함해야 대기 이슈가 다시 실행되지 않는다. 기존 hash-mismatch의 유효한 재승인 경로는 두 대기 라벨을 해제한 뒤 스냅샷을 갱신한다.
+- inspect는 이슈 목록 외에 열린 PR도 따로 수집한다. blocked 이슈의 PR이 이 우회 경로로 사람 검토 목록에 나오지 않도록 함께 확인한다.
+- #28 인수 시험: `uv run pytest -q tests/acceptance/test_orch_blocked.py`. acceptance 파일은 수정하지 않는다. 임시 Git 이력과 가짜 실행기로 네트워크 없이 검증한다.
+- #28 검증 결과: scheduler·runner·config·reasons·inspect 및 지정 인수 시험 781개, `tests/test_orch_blocked.py`의 경계 시험 10개 통과. 경계 시험은 Git 없이 가짜 tracker와 주입 시계로 실행한다.
+- 이 환경에서 기본 uv 캐시에 쓰기 제한이 있으면, 패키지가 준비된 임시 캐시로 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest ...`를 실행할 수 있다.
+- 판정 불가 리뷰는 리뷰어만 다시 호출하지 않고 구현 시도를 하나 소비한다. `build_prompt(..., reviewer_text=...)`가 `A reviewer said (verbatim):` 뒤에 원문 전체를 넣는다. 일반 검사 실패의 4,000자 꼬리 제한을 이 경로에 적용하면 안 된다.
+- 반박은 `.foragent/REBUTTAL.md`에서 읽어 PR의 `## Rebuttals`와 다음 리뷰에 전달한다. Claude는 임시 `CLAUDE.local.md`, Codex는 리뷰 프롬프트를 쓴다. `GitRepo.stage_changes()`는 실행기가 직접 스테이징한 `.foragent` 파일도 인덱스에서 제거하므로 기존 경로를 공유한다.
+- batch/fast 대상 전환은 worktree를 다시 만들기 때문에 `TRY.md`와 `REBUTTAL.md`를 함께 보존해야 한다. PR에는 각 세션의 서로 다른 반박 내용을 보존한다.
+- `review-dispute`는 반박이 있는 상태로 진행한 리뷰 두 회에서 연속으로 같은 지적이 나왔을 때의 기술 차단이다. 공백·대소문자·목록 기호를 정규화한다. 비정형 원문은 하나의 지적으로 비교하여 공통 서문만으로 분쟁을 만들지 않는다.
+- #29 인수 시험: `uv run pytest -q tests/acceptance/test_orch_review_handoff.py`. `tests/test_orch_blocked.py`와 `tests/acceptance/test_orch_blocked.py`는 모듈명이 같아 기본 pytest 모드로 함께 수집하면 충돌하므로 별도로 실행한다.
+- 로컬 스킬 기능과 병합할 때 `recreate_worktree()` 안에서 작업공간 생성 직후 `_inject_lane_skills(ctx, n, git)`를 호출한다. 대상 브랜치 전환과 패치 충돌 복구 모두 이 함수를 쓰므로 `TRY.md`·`REBUTTAL.md` 보존과 스킬 복원·커밋 제외 경로를 함께 유지할 수 있다.
+- #30의 `runner.review_only(n, ctx, verdict_head=...)`는 기존 PR의 정확한 head를 detached worktree에서 검증한다. `verdict_head`가 없으면 리뷰어를 부르고, 있으면 그 head의 오케스트레이터 판정만 대신 쓴다. Done when·승인 스냅샷·CI·기존 경로별 병합 정책은 계속 적용하며 head·base·이슈 변경을 병합 직전에 재확인한다.
+- 재리뷰의 열린 이슈는 어떤 종료 경로에서도 `blocked` 또는 `ready`를 남겨야 한다. `resolve pass` 뒤 Done when·CI 실패는 PR을 닫고 근거를 힌트로 남겨 `ready`로 돌린다. 나머지 실패는 이유가 있는 `blocked`로 남긴다. SystemExit와 작업공간 정리 실패도 공통 종료 경로를 거친다.
+- 열린 PR이 있는 runner가 죽거나 멈추면 scheduler에서 `ready`로만 복구해서는 안 된다. 기존 PR 검사가 바로 `ready`를 지워 상태가 사라진다. crash·stall 복구에서 PR 존재를 확인하고 각각 `retries-exceeded`·`stalled`로 차단한다.
+- 힌트는 `<state>/hints/<n>.txt`를 다음 구현 프롬프트에 한 번 넣고 소비한다. `build_prompt(orchestrator_hint=...)`에서 native `/goal` 감싸기 전에 넣어 Claude·Codex의 `/goal` 명령이 맨 앞에 남도록 한다.
+- 힌트 소비는 프롬프트 작성이 아니라 `_available_executor()`가 일반 실행 결과를 반환한 뒤에 한다. limit 대기·transient 소진·transient 중 런타임 소진·실행 파일 누락·예외·SystemExit에서는 파일을 보존해야 다음 실행이 같은 힌트를 받는다. `classify_result(result)`로 이미 있는 실행기 가용성 구분을 재사용한다.
+- `orch-verbs` 명세는 조회를 포함한 모든 동사의 이력을 요구한다. `list`는 journal과 조회된 이슈 댓글, `log`는 이슈 번호 없는 journal을 남긴다. 조회의 `foragent:orch` 댓글은 blocked 근거·시각을 갱신하지 않는다.
+- `run_case`로 한 시험에서 실행을 여러 번 시작할 때 주입 시계를 한 번 이상 전진시킨다. 실행 이력은 `(이슈 번호, started_at)`으로 중복을 제거하므로 같은 시각에 시작하면 서로 다른 실행이 합쳐진다.
+- #30 통합 검증: `uv run pytest -q tests/acceptance/test_orch_verbs.py` 7개 통과. 전체 CI 명령 `uv run pytest -q --ignore=tests/acceptance`은 1,754개 통과, 아래 샌드박스 권한 제한으로 1개 실패이며 `tests/test_orch.py`의 71개 회귀 시험도 이 실행에 포함된다. 인수 시험 파일과 이름이 겹치는 새 시험 파일은 만들지 않는다.
+- `foragent/batch-27`과 `cli.py` 충돌 시 `orch`와 `notify`의 import 및 명령 등록을 모두 보존한다. `fa orch --help`와 `fa notify --help`로 양쪽 명령을 확인하고, 알림·상태 표시가 통합된 전체 CI 시험을 실행한다. 충돌 해결은 작업 트리에 남기고 스테이징·병합 커밋은 runner에 맡긴다.
+- #30 검증 당시 샌드박스에서는 `tests/test_inspect_runtime.py::test_prepare_timeout_uses_60_seconds_and_kills_child_group`가 종료 후 `src/foragent/processes.py:16`의 `os.killpg(pid, signal.SIGTERM)`에서 `PermissionError: [Errno 1] Operation not permitted`로 실패했다. 단독 실행에서도 재현됐으며 두 파일은 해당 병합에서 바뀌지 않았다. uv 임시 캐시 설정과 별개의 실행 권한 제한이었다.
+- #31의 `orch.premerge(ctx, pr)`는 정확한 PR head를 detached 임시 작업공간에서 검사한다. `test_command`가 없으면 `order.detect_test_commands()`를 공유하여 Python·Node·Go의 전체 시험을 모두 실행한다. 명령을 찾지 못하면 `.foragent.yml` 설정을 안내하고 중단한다.
+- 사전 검사에서 시험이 만든 파일이 충돌 판정에 섞이지 않도록 같은 head의 작업공간을 다시 만든 뒤 `git merge --no-commit --no-ff`로 시험 병합한다. 충돌 없는 Git 오류는 성공으로 취급하지 않는다. 시험 출력은 `<state>/runs/premerge-pr-<n>.log`에 남기며, 예외·중단 때도 작업공간을 정리한다.
+- `orch.merge()`는 사전 검사를 새로 실행하고 PR head·base와 CI를 다시 확인한 뒤 승인 댓글을 단다. 기존 `tracker.merge_pr(expected_head_sha=...)`가 `--match-head-commit`을 제공한다. 병합 이벤트는 이슈 번호 없는 journal에 PR 번호·SHA·승인자를 담으며, 사전 검사에는 GitHub 댓글이나 이벤트를 남기지 않는다.
+- #31 인수 시험: `uv run pytest -q tests/acceptance/test_orch_merge.py` 9개 통과. 추가 경계 시험은 기존 인수 파일명과 겹치지 않는 `tests/test_orch_premerge.py`에 둔다. orch·config·order 관련 회귀 시험 362개 통과.
+- #31 초기 구현 검증의 전체 CI 명령 `uv run pytest -q --ignore=tests/acceptance`은 1,815개 전부 통과했다. merge·verbs·review-handoff 인수 시험도 함께 19개 통과했다. #30에서 기록한 프로세스 권한 실패는 이 실행에서는 발생하지 않았다.
+- #31 생성 실패 보완: `add_detached_worktree()` 성공 뒤에만 해당 작업공간의 `try/finally` 정리 범위에 들어간다. 시험용·시험 병합용 작업공간의 수명을 나누면 최초 생성이나 재생성 실패 뒤 `remove_worktree()`가 원래 Git 오류를 가리지 않는다. 실패 후 디렉터리만 남아도 Git 작업공간 등록은 없을 수 있으므로 디렉터리 존재만으로 정리 여부를 판단하지 않는다.
+- 보완 검증: 최초 생성·재생성 실패를 `premerge`·`merge`로 교차한 회귀 4개를 추가했다. 실제 Git의 `not a working tree` 오류로 기존 실패를 재현한 뒤 원래 예외 보존·임시 공간 정리·GitHub 변경 없음이 통과함을 확인했다. `tests/test_orch_premerge.py tests/test_orch.py tests/test_config.py tests/test_order.py tests/acceptance/test_orch_merge.py` 총 375개(지정 인수 시험 9개 포함) 통과. 기본 uv 캐시 쓰기 제한으로 앞서 기록한 임시 캐시와 `--offline`을 사용했다.
+- #32의 `orch.watch(ctx, interval=5, follow=False)`는 최초 상태와 변화만 내보내는 generator다. CLI는 JSON 한 줄을 즉시 flush하고 기본은 한 번 출력 후 종료, `--follow`는 Ctrl-C까지 계속한다. 대기는 `time.sleep`을 사용하므로 주입 시험은 이 함수를 교체한다.
+- 감시 서명은 정렬한 `blocked`·`needs_human`·`merged` 이슈 번호와 `queue_empty`만 포함한다. 제목·시각·로그는 제외한다. 병합은 GitHub의 `foragent/issue-N`·`foragent/batch-N` PR로 확인하며, 승인/ready/running 열린 이슈 또는 활성 run이 있으면 큐가 비지 않았다. 상태 비교와 원자 저장은 기존 state lock과 `<state>/orch-watch.json`을 쓴다. 감시 자체는 댓글·알림·orch-events를 쓰지 않는다.
+- `skills/fa-orchestrator/SKILL.md`는 150줄 이하 영어 스킬이다. 기술 문제의 두 차례 처리 뒤 escalate, 사람 결정·알림, 5종 대화 분류, order publish를 통한 승인과 AskUserQuestion 이후 orch merge 경계를 함께 유지한다. `fa-inspect`의 수동 라벨/머지 안내는 이 세션의 승인 경로로 가져오지 않는다.
+- #32 인수 시험: `uv run pytest -q tests/acceptance/test_orch_skill.py`. 추가 경계 시험은 모듈명이 겹치지 않는 `tests/test_orch_watcher.py`, CLI 연속 출력·간격 검증은 `tests/test_cli.py -k orch_watch`에 있다.
+- #32 검증: orch-skill·orch-verbs·orch-review-handoff·orch-blocked 인수 시험 16개, orch watcher·orch·cli·notify·status 회귀 시험 161개 통과. 스킬 quick_validate와 `git diff --check`도 통과했다.
+- #31·#32 통합 시 CLI의 `watch`·`premerge`·`merge` 등록을 모두 보존한다. `orch.py`도 감시용 `Iterator`·`math`·`time`·`APPROVED`와 사전 검사용 `dataclass`·`Path`·`TemporaryDirectory`·`GitError`·시험 실행 함수를 함께 가져와야 한다. 기능 본문은 자동 병합되어도 목록·import 충돌에서 한쪽을 택하면 다른 기능이 사라진다.
+- 베이스의 setuptools 빌드 전환 뒤 임시 uv 캐시에 `setuptools>=81`이 없어 오프라인 빌드가 실패할 수 있다. 기본 캐시의 `wheels-v6/pypi/setuptools`·`simple-v21/pypi/setuptools.rkyv`와 wheel이 참조하는 `archive-v0/<id>`를 쓰기 가능한 캐시로 복사하면 기존 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline ...`을 그대로 쓸 수 있다. wheel 디렉터리만 복사하면 archive 참조가 풀리지 않는다.
+- #31 충돌 해결 후 검증: 지정 orch-merge 인수 시험 9개, orch-skill·orch-verbs·orch-review-handoff·orch-blocked 인수 시험 16개, 전체 CI 시험(`uv run --offline pytest -q --ignore=tests/acceptance`) 1,841개가 모두 통과했다. `orch`·`watch`·`premerge`·`merge`·`notify` 도움말과 충돌 표시 제거도 확인했다. 인수 시험 파일과 Git 인덱스는 수정하지 않고 해결본을 작업 트리에 남겼다.

@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import quote
 
+from foragent import board, design
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, latest_flag
@@ -66,6 +67,25 @@ def _interview_context(config: Config) -> dict:
             "pinned_version": config.ouroboros_version, "reason": reason}
 
 
+def detect_test_commands(root: Path) -> list[str]:
+    """Detect full-suite commands for both order context and pre-merge checks."""
+    commands = []
+    if (root / "pyproject.toml").is_file():
+        commands.append("uv run pytest")
+    package = root / "package.json"
+    if package.is_file():
+        try:
+            data = json.loads(package.read_text(encoding="utf-8"))
+            if isinstance(data.get("scripts"), dict) and data["scripts"].get("test"):
+                pnpm = (root / "pnpm-lock.yaml").is_file() or str(data.get("packageManager", "")).startswith("pnpm@")
+                commands.append("pnpm test" if pnpm else "npm test")
+        except (ValueError, AttributeError):
+            pass
+    if (root / "go.mod").is_file():
+        commands.append("go test ./...")
+    return commands
+
+
 def context(root: Path, config: Config, tracker: Tracker) -> dict:
     issues = sorted(tracker.list_open_issues(), key=lambda issue: issue.number)
     feedback, decisions = [], []
@@ -105,23 +125,13 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
             tree.extend((relative / name).as_posix() + "/" for name in dirs)
             tree.extend((relative / name).as_posix() for name in sorted(files) if name not in ignored)
         languages.update(extensions[Path(name).suffix] for name in files if Path(name).suffix in extensions)
-    commands = []
+    commands = detect_test_commands(root)
     if (root / "pyproject.toml").is_file():
         languages.add("Python")
-        commands.append("uv run pytest")
-    package = root / "package.json"
-    if package.is_file():
+    if (root / "package.json").is_file():
         languages.add("JavaScript")
-        try:
-            data = json.loads(package.read_text(encoding="utf-8"))
-            if isinstance(data.get("scripts"), dict) and data["scripts"].get("test"):
-                pnpm = (root / "pnpm-lock.yaml").is_file() or str(data.get("packageManager", "")).startswith("pnpm@")
-                commands.append("pnpm test" if pnpm else "npm test")
-        except (ValueError, AttributeError):
-            pass
     if (root / "go.mod").is_file():
         languages.add("Go")
-        commands.append("go test ./...")
     lanes = {name: {"paths": lane.get("paths", []), "agent": lane.get("agent"),
                     "skills": lane.get("skills", [])} for name, lane in config.lanes.items()}
     # Existing lane definitions can keep their installed skills in agent frontmatter.
@@ -137,6 +147,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
     return {
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "interview": _interview_context(config),
+        "ui": design.ui_context(root),
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
         "feedback": feedback, "decisions": decisions,
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),
@@ -437,6 +448,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         parent = tracker.create_issue(plan["title"], parent_body(), [])
     else:
         tracker.update_issue(parent, title=plan["title"], body=parent_body())
+    board.add_issue(tracker, repo, config.board, parent)
     for item in plan["issues"]:
         body = issue_body(item, repo, config.base_branch, config.acceptance_dir) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
@@ -457,6 +469,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             tracker.add_labels(number, labels)
             recorded_blobs[str(number)] = blobs
         tracker.add_sub_issue(parent, number)
+        board.add_issue(tracker, repo, config.board, number, item["lane"], item["size"])
     for item in plan["issues"]:
         number = mapping[item["key"]]
         desired = {mapping[key] for key in item.get("blocked_by", [])}
@@ -487,6 +500,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
     for number in sorted(approved_numbers):
         tracker.add_labels(number, ["approved"])
+        board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
     if approved_numbers:
         kick_tick(root)
     for item, row in zip(plan["issues"], rows):

@@ -18,15 +18,18 @@ def test_groups_cover_exact_contract_codes():
         Reason.RISK_HIGH: "review", Reason.RETRIES_EXCEEDED: "tech-failure",
         Reason.STALLED: "tech-failure", Reason.TIMEOUT: "tech-failure",
         Reason.NO_MACHINE_CHECK: "decision",
+        Reason.ORCHESTRATOR_TIMEOUT: "tech-failure",
+        Reason.REVIEW_DISPUTE: "tech-failure",
     }
     assert set(GROUP) == set(Reason)
     assert str(Reason.TIMEOUT) == "timeout"
 
 
 @pytest.mark.parametrize("reason", list(Reason))
-def test_reason_round_trip(reason):
-    body = format_comment(reason, "Human input is needed.", "Please choose an option.\nKeep this detail.")
-    assert body.splitlines()[0] == f"<!-- foragent:needs-human reason={reason.value} -->"
+@pytest.mark.parametrize("label", ["blocked", "needs-human"])
+def test_reason_round_trip(reason, label):
+    body = format_comment(reason, "Human input is needed.", "Please choose an option.\nKeep this detail.", label=label)
+    assert body.splitlines()[0] == f"<!-- foragent:{label} reason={reason.value} -->"
     assert body.splitlines()[1] == "**Human input is needed.**"
     assert body.endswith("Please choose an option.\nKeep this detail.")
     assert parse_reason(body) == reason

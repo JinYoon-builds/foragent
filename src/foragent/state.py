@@ -56,6 +56,9 @@ class Run:
     executor_waited_seconds: float = 0
     tier: str = "m"
     attempt_tiers: dict[str, str] = field(default_factory=dict)
+    phase: str | None = None
+    phase_started_at: str | None = None
+    last_activity_at: str | None = None
 
 
 class StateStore:
@@ -152,7 +155,8 @@ class StateStore:
             resumed = previous is not None and previous.outcome == "limit-wait"
             run = Run(number, branch, str(worktree), pid, timestamp, timestamp, attempts=attempts,
                       restarts=restarts, lane=lane, tier=previous.tier if resumed else tier,
-                      attempt_tiers=previous.attempt_tiers if resumed else {})
+                      attempt_tiers=previous.attempt_tiers if resumed else {},
+                      last_activity_at=timestamp)
             self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
             return run
 

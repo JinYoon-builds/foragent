@@ -18,16 +18,18 @@ import traceback
 
 import yaml
 
+from foragent import board
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for
 from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE
-from foragent.issue import ParsedIssue, has_machine_check, parse_body
+from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
-from foragent.labels import READY, RUNNING, attempt_tier, issue_size
+from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
 from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.processes import run_logged
 from foragent.reasons import Reason
+from foragent.skills import SkillManager, copy_lane_skills
 from foragent.state import Approval, StateStore
 from foragent.tracker import Tracker, TrackerError
 
@@ -87,6 +89,7 @@ class ReviewResult:
     findings: str
     notes: tuple[str, ...] = ()
     raw: str = ""
+    timed_out: bool = False
 
 
 class PatchReplayError(GitError):
@@ -110,12 +113,15 @@ def review_scope_rules(acceptance_dir: str) -> str:
     )
 
 
-def build_review_prompt(parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/") -> str:
+def build_review_prompt(
+    parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
+) -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
         f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
         f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         f"\n\nDone when commands:\n{commands}\n\nDiff:\n{diff[:60000]}"
+        + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
     )
 
 
@@ -176,6 +182,8 @@ def build_prompt(
     n: int, parsed: ParsedIssue, acceptance_dir: str, failure: str = "", language: str = "en",
     *, native_goal: bool = False, acceptance_locked: bool = False,
     merge_conflicts: list[str] | None = None,
+    reviewer_text: str | None = None,
+    orchestrator_hint: str | None = None,
 ) -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     acceptance_rule = "" if acceptance_locked else f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
@@ -192,6 +200,8 @@ def build_prompt(
         f"  Write it in {language}. Include an `## Evidence` section quoting the exact conflicting lines "
         "(issue sentence; file:line and the code line).\n"
         "- Do not commit, push or switch branches. Leave your changes in the working tree.\n"
+        "- For each reviewer point either fix it or write `.foragent/REBUTTAL.md` "
+        "with `- <point>: <why it is out of scope or not a defect>`.\n"
         "- When the Done when commands would pass, also write .foragent/TRY.md so a person can check your work in about a minute.\n"
         f"  Write the prose in {language}. Keep these English headings exactly:\n"
         "  ## What changed\n"
@@ -211,7 +221,9 @@ def build_prompt(
         "  steps:\n"
         "  - <what to click or type>\n"
     )
-    if failure:
+    if reviewer_text is not None:
+        prompt += "\nA reviewer said (verbatim):\n" + reviewer_text
+    elif failure:
         prompt += "\nA previous attempt failed. Output of the failing check:\n" + failure[-4000:]
     if merge_conflicts is not None:
         prompt += (
@@ -220,6 +232,8 @@ def build_prompt(
             + "\nPreserve both the features newly added on the base branch and the features for this issue. "
             "Do not commit. The runner will stage the resolution and create the merge commit."
         )
+    if orchestrator_hint is not None:
+        prompt = "Orchestrator hint:\n" + orchestrator_hint + "\n\n" + prompt
     return f"/goal {goal_condition(acceptance_dir)}\n\n{prompt}" if native_goal else prompt
 
 
@@ -307,6 +321,8 @@ def _pr_body(
     *, outside_lane: list[str] | None = None, fallback_model: str | None = None,
     attempt_tiers: dict[str, str] | None = None,
     missing_skills: list[str] | None = None,
+    rebuttals: str = "",
+    review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -315,14 +331,20 @@ def _pr_body(
         passed = check.exit_code == 0 and not check.timed_out
         lines.append(f"| <code>{command}</code> | {'pass' if passed else 'fail'} |")
     lines.extend(["", "## Review", ""])
-    if not reviews:
+    if review_scope == "pr-body":
+        lines.append(f"VERDICT: {reviews[-1].verdict}" if reviews else "Pending review.")
+        lines.extend(["", "## Review scope", "", review_scope_rules(acceptance_dir),
+                      "The acceptance tests are locked."])
+    elif not reviews:
         lines.append("Disabled (reviewer: none).")
-    for round_number, review in enumerate(reviews, 1):
+    for round_number, review in enumerate(reviews if review_scope == "claude-local" else [], 1):
         lines.append(f"Round {round_number}: VERDICT: {review.verdict}")
         if review.findings:
             lines.append(review.findings)
         lines.extend(review.notes)
         lines.append("")
+    if rebuttals:
+        lines.extend(["", "## Rebuttals", "", rebuttals])
     if parsed.done_when_checklist:
         lines.extend(["", "## Needs a human check", ""])
         lines.extend(f"- [ ] {item.text}" for item in parsed.done_when_checklist)
@@ -362,6 +384,11 @@ def _progress(n: int, ctx: RunContext) -> None:
     ctx.store.update_run(n, last_progress_at=ctx.now().astimezone(UTC).isoformat())
 
 
+def _phase(n: int, ctx: RunContext, phase: str) -> None:
+    if ctx.store.get_run(n).phase != phase:
+        ctx.store.update_run(n, phase=phase, phase_started_at=ctx.now().astimezone(UTC).isoformat())
+
+
 def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> ExecResult:
     log = kwargs["log_path"]
     size = log.stat().st_size if log.exists() else 0
@@ -371,7 +398,8 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         nonlocal size
         current = log.stat().st_size if log.exists() else 0
         if current > size:
-            _progress(n, ctx)
+            timestamp = ctx.now().astimezone(UTC).isoformat()
+            ctx.store.update_run(n, last_progress_at=timestamp, last_activity_at=timestamp)
         size = current
 
     try:
@@ -382,6 +410,7 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
                 result.log_tail = stream.read().decode("utf-8", errors="replace")[-4000:]
         return result
     finally:
+        poll()
         _progress(n, ctx)
 
 
@@ -449,6 +478,7 @@ def _available_executor(n: int, ctx: RunContext, executor: Executor, *, reviewer
             ctx.store.pause_lane(run.lane, ctx.now() + timedelta(minutes=ctx.config.limit_wait_minutes))
             ctx.tracker.add_labels(n, [READY])
             ctx.tracker.remove_labels(n, [RUNNING])
+            board.sync_status(ctx, n, "Ready")
             raise ExecutorStopped("limit-wait")
         if kind == "transient" and not reviewer:
             run = ctx.store.update_run(n, transient_errors=run.transient_errors + 1)
@@ -483,8 +513,7 @@ def _lane_notes(ctx: RunContext, n: int, worktree: Path) -> tuple[str | None, st
     return agent, "Lane notes:\n" + body.strip() + "\n\n"
 
 
-def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
-    """List installed skills so Codex can read them when relevant."""
+def _lane_skill_names(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> list[str]:
     lane = ctx.store.get_run(n).lane
     settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
     skills = settings.get("skills", [])
@@ -497,12 +526,23 @@ def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> 
         except yaml.YAMLError:
             metadata = None
         skills = metadata.get("skills", []) if isinstance(metadata, dict) else []
-    if not isinstance(skills, list):
-        return "", []
+    return [name for name in skills if isinstance(name, str)] if isinstance(skills, list) else []
+
+
+def _inject_lane_skills(ctx: RunContext, n: int, git: GitRepo) -> None:
+    agent, _ = _lane_notes(ctx, n, git.root)
+    names = _lane_skill_names(ctx, n, git.root, agent)
+    git.local_skill_paths = (
+        set(copy_lane_skills(ctx.repo_root, git.root, names, SkillManager(ctx.config))) if names else set()
+    )
+
+
+def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
+    """List installed skills so Codex can read them when relevant."""
+    skills = _lane_skill_names(ctx, n, worktree, agent)
+    frontmatter = re.compile(r"\A---[^\S\n]*\n(.*?)^---[^\S\n]*(?:\n|$)", re.DOTALL | re.MULTILINE)
     sections, missing = [], []
     for name in skills:
-        if not isinstance(name, str):
-            continue
         path = worktree / ".claude/skills" / name / "SKILL.md"
         if not path.resolve().is_relative_to(worktree.resolve()) or not path.is_file():
             missing.append(name)
@@ -520,7 +560,7 @@ def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> 
 
 
 @contextmanager
-def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str):
+def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = ""):
     git.ignore_review_scope()
     path = git.root / REVIEW_SCOPE_FILE
     link = os.readlink(path) if path.is_symlink() else None
@@ -529,6 +569,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str):
     section = (
         "# Review scope (written by Foragent for this review only)\n\n"
         f"{body}\n\n{review_scope_rules(acceptance_dir)}\n\n"
+        + (f"Implementer rebuttals (judge them):\n{rebuttals}\n\n" if rebuttals else "")
     ).encode("utf-8")
     try:
         if link is not None:
@@ -549,23 +590,27 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str):
 
 
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
-            *, round_number: int = 1) -> ReviewResult:
+            *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
+    _phase(n, ctx, "reviewing")
     reviewer = resolved_reviewer(ctx.config)
     options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
+    if reviewer == "claude" and pr is not None:
+        options["review_pr"] = pr
+    rebuttals = _read_rebuttals(git.root)
     edited = False
     with ExitStack() as scope:
-        if reviewer == "claude":
+        if reviewer == "claude" and ctx.config.review_scope == "claude-local":
             approval = ctx.store.load_approval(n)
             if approval is None:
                 raise ValueError("Claude review requires an approved snapshot")
-            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir))
+            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir, rebuttals))
         before = git.review_state()
         try:
             result = _available_executor(
                 n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
                 reviewer=True,
                 prompt="" if reviewer == "claude" else build_review_prompt(
-                    parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir,
+                    parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
                 ),
                 model=ctx.config.reviewer_model, timeout_s=_remaining(n, ctx),
                 log_path=ctx.store.log_path(n), **options,
@@ -602,7 +647,19 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
         review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
     _append(ctx.store.log_path(n), f"Review: VERDICT: {review.verdict}\n{review.findings}")
     _progress(n, ctx)
-    return replace(review, raw=raw)
+    return replace(review, raw=raw, timed_out=result.timed_out)
+
+
+def _read_rebuttals(worktree: Path) -> str:
+    path = worktree / ".foragent/REBUTTAL.md"
+    return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+
+
+def _normalized_findings(review: ReviewResult) -> set[str]:
+    # Unstructured prose is one finding: repeated preambles alone are not a dispute.
+    points = [review.raw] if review.verdict == "UNUSABLE" else review.findings.splitlines()
+    return {" ".join(re.sub(r"^\s*[-*]\s+", "", point).split()).casefold()
+            for point in points if point.strip()}
 
 
 def _batch_pr(parent: int, ctx: RunContext) -> None:
@@ -621,8 +678,10 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
     body = "\n".join(lines)
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
+        board.sync_status(ctx, parent, "PR open")
         return
     pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
+    board.sync_status(ctx, parent, "PR open")
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
 
 
@@ -660,6 +719,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     start_ref = f"origin/{target_branch}"
     ctx.git.add_worktree(worktree, branch, start_ref)
     git = ctx.git.at(worktree)
+    _inject_lane_skills(ctx, n, git)
     if not _acceptance_matches(n, ctx, git, approval):
         return "hash-mismatch"
     _progress(n, ctx)
@@ -676,13 +736,19 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     reviews: list[ReviewResult] = []
     review_failures = 0
     review_hold = False
-    unusable_review = False
+    review_hold_reason = Reason.RISK_HIGH
+    reviewer_text: str | None = None
+    rebuttals: list[str] = []
+    previous_rebutted_findings: set[str] = set()
     checks: list[CheckResult] = []
     paths: list[str] = []
     missing_skills: list[str] = []
     size = issue_size(ctx.tracker.get_issue(n).labels)
 
-    def implement(failure: str, *, merge_conflicts: list[str] | None = None) -> None:
+    def implement(
+        failure: str, *, merge_conflicts: list[str] | None = None, reviewer_text: str | None = None,
+    ) -> None:
+        _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")
         remaining = _remaining(n, ctx)
         if remaining <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
@@ -703,16 +769,28 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             skill_notes, missing = _lane_skills(ctx, n, worktree, agent)
             notes += skill_notes
             missing_skills.extend(name for name in missing if name not in missing_skills)
+        hint_path = ctx.store.root / "hints" / f"{n}.txt"
+        hint = hint_path.read_text(encoding="utf-8") if hint_path.is_file() else None
         prompt = build_prompt(
             n, parsed, ctx.config.acceptance_dir, failure, ctx.config.language,
             native_goal=native_claude or ctx.config.codex_goal, acceptance_locked=native_claude,
             merge_conflicts=merge_conflicts,
+            reviewer_text=reviewer_text,
+            orchestrator_hint=hint,
         )
         result = _available_executor(
             n, ctx, executor, worktree=worktree,
             prompt=prompt if native_claude else notes + prompt,
             model=model, timeout_s=remaining, log_path=log, **options,
         )
+        # A prepared prompt has not been delivered yet. Keep its hint through
+        # availability waits, launch failures and interruptions; acknowledge it
+        # only once the implementer returns an ordinary execution result.
+        if hint is not None and classify_result(result) == "normal":
+            hint_path.unlink()
+        rebuttal = _read_rebuttals(worktree)
+        if rebuttal.strip() and rebuttal not in rebuttals:
+            rebuttals.append(rebuttal)
         if result.timed_out or _remaining(n, ctx) <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
         question = worktree / ".foragent/QUESTION.md"
@@ -721,6 +799,17 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 details = stream.read(6000)
             flag(ctx, n, Reason.SPEC_QUESTION, "The executor needs a product decision.", details)
             raise ExecutorStopped("spec-question")
+
+    def recreate_worktree() -> None:
+        artifacts = {name: path.read_bytes() for name in ("TRY.md", "REBUTTAL.md")
+                     if (path := worktree / ".foragent" / name).is_file()}
+        ctx.git.remove_worktree(worktree)
+        ctx.git.add_worktree(worktree, branch, start_ref)
+        _inject_lane_skills(ctx, n, git)
+        for name, content in artifacts.items():
+            path = worktree / ".foragent" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
 
     def prepare_target() -> bool:
         nonlocal start_ref, target_branch
@@ -737,15 +826,9 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             ctx.git.ensure_batch_branch(batch_branch, base_ref)
         with tempfile.NamedTemporaryFile() as patch:
             git.write_staged_patch(start_ref, Path(patch.name))
-            try_file = worktree / ".foragent/TRY.md"
-            try_bytes = try_file.read_bytes() if try_file.is_file() else None
-            ctx.git.remove_worktree(worktree)
             start_ref = f"origin/{destination}"
             target_branch = destination
-            ctx.git.add_worktree(worktree, branch, start_ref)
-            if try_bytes is not None:
-                try_file.parent.mkdir(parents=True, exist_ok=True)
-                try_file.write_bytes(try_bytes)
+            recreate_worktree()
             if not _acceptance_matches(n, ctx, git, approval):
                 return False
             try:
@@ -758,13 +841,13 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         nonlocal paths
         # A three-way failure can leave unmerged index entries. Start the
         # next implementation attempt from the destination's clean tree.
-        ctx.git.remove_worktree(worktree)
-        ctx.git.add_worktree(worktree, branch, start_ref)
+        recreate_worktree()
         paths = []
         return f"Could not apply child changes to {target_branch}: {exc}"
 
     def verify() -> str:
         nonlocal checks, paths
+        _phase(n, ctx, "checking")
         git.stage_changes()
         if not prepare_target():
             raise ExecutorStopped("hash-mismatch")
@@ -796,6 +879,29 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 return f"Command: {check.command}\n{check.output}" + ("\nCheck timed out." if check.timed_out else "")
             return "" if paths else "The session made no changes."
         raise AssertionError("unreachable verification state")
+
+    def render_pr_body(try_text: str | None = None) -> str:
+        lane = ctx.store.get_run(n).lane
+        globs = ctx.config.lanes.get(lane, {}).get("paths", []) if lane != "main" else None
+        inside = set(touched(paths, globs)) if globs is not None else set(paths)
+        outside = [path for path in paths if path not in inside]
+        return _pr_body(
+            n, parsed, checks, ctx.store.get_run(n).attempts, reviews, try_text, outside_lane=outside,
+            fallback_model=ctx.store.get_run(n).fallback_model,
+            attempt_tiers=ctx.store.get_run(n).attempt_tiers,
+            missing_skills=missing_skills,
+            rebuttals="\n\n".join(rebuttals),
+            review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
+        )
+
+    def open_or_update_pr(title: str, body: str) -> int:
+        pr = ctx.tracker.find_pr(branch)
+        if pr is None:
+            pr = ctx.tracker.create_pr(head=branch, base=target_branch, title=title, body=body)
+        else:
+            ctx.tracker.update_pr(pr, base=target_branch, title=title, body=body)
+        board.sync_status(ctx, n, "PR open")
+        return pr
 
     def publish() -> str:
         with _merge_lock(n, ctx):
@@ -873,7 +979,6 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         git.push(branch)
         _progress(n, ctx)
         _append(log, f"Pushed verified HEAD: {verified_head_sha}")
-        pr = ctx.tracker.find_pr(branch)
         try_text = None
         try_path = worktree / ".foragent/TRY.md"
         if not review_hold and try_path.is_file():
@@ -881,27 +986,11 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             saved_try = ctx.store.root / "try" / f"{n}.md"
             saved_try.parent.mkdir(parents=True, exist_ok=True)
             saved_try.write_text(try_text, encoding="utf-8")
-        lane = ctx.store.get_run(n).lane
-        globs = ctx.config.lanes.get(lane, {}).get("paths", []) if lane != "main" else None
 
         def pr_body() -> str:
-            inside = set(touched(paths, globs)) if globs is not None else set(paths)
-            outside = [path for path in paths if path not in inside]
-            return _pr_body(
-                n, parsed, checks, ctx.store.get_run(n).attempts, reviews, try_text, outside_lane=outside,
-                fallback_model=ctx.store.get_run(n).fallback_model,
-                attempt_tiers=ctx.store.get_run(n).attempt_tiers,
-                missing_skills=missing_skills,
-            )
+            return render_pr_body(try_text)
 
-        body = pr_body()
-        if pr is None:
-            pr = ctx.tracker.create_pr(
-                head=branch, base=target_branch, title=title,
-                body=body,
-            )
-        else:
-            ctx.tracker.update_pr(pr, base=target_branch, title=title, body=body)
+        pr = open_or_update_pr(title, pr_body())
         if target_sha is not None:
             ctx.tracker.comment(pr, f"base merged before merge: {target_sha}")
         _progress(n, ctx)
@@ -910,13 +999,13 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
             return _hold_changed_head(n, ctx, link)
         if review_hold:
-            summary = ("Reviewer did not return a usable verdict" if unusable_review
-                       else f"Reviewer still found defects after {review_failures} rounds")
+            summary = (
+                "Reviewer repeated a disputed finding after implementer rebuttals"
+                if review_hold_reason == Reason.REVIEW_DISPUTE
+                else f"Reviewer still found defects after {review_failures} rounds"
+            )
             details = f"{failure}\n\n{link}"
-            if unusable_review:
-                raw = next(review.raw for review in reversed(reviews) if review.verdict == "UNUSABLE")
-                details += f"\n\nRaw reviewer result:\n{raw[:3000]}"
-            flag(ctx, n, Reason.RISK_HIGH, summary, details)
+            flag(ctx, n, review_hold_reason, summary, details)
             return "held"
         decision = merge_decision(
             changed_paths=ctx.tracker.pr_changed_files(pr),
@@ -932,6 +1021,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
 
         # A bounded iteration count also works with a frozen test clock.
         for _ in range(4):
+            _phase(n, ctx, "ci")
             has_workflows = any(
                 path.is_file()
                 for pattern in ("*.yml", "*.yaml")
@@ -980,6 +1070,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                     ctx.tracker.remove_labels(n, [RUNNING])
                     return "pr-open"
                 continue
+            _phase(n, ctx, "merging")
             try:
                 ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha)
             except TrackerError:
@@ -996,6 +1087,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
                 if ctx.tracker.get_issue(n).state != "closed":
                     raise
             ctx.tracker.remove_labels(n, [READY, RUNNING])
+            board.sync_status(ctx, n, "Done")
             if target_branch == batch_branch and parent is not None:
                 try:
                     _batch_pr(parent, ctx)
@@ -1006,7 +1098,8 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         raise AssertionError("unreachable refresh state")
 
     while True:
-        implement(failure)
+        implement(failure, reviewer_text=reviewer_text)
+        reviewer_text = None
         run = ctx.store.get_run(n)
 
         try:
@@ -1016,17 +1109,34 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         if not failure and ctx.config.reviewer != "none":
             if _remaining(n, ctx) <= 0:
                 return _timeout(n, ctx)
-            review = _review(n, ctx, git, parsed, base_ref, round_number=len(reviews) + 1)
-            reviews.append(review)
+            pr = None
+            if ctx.config.review_scope == "pr-body":
+                title = f"{ctx.tracker.get_issue(n).title} (#{n})"
+                if git.has_staged_changes():
+                    git.commit(title)
+                git.push(branch)
+                pr = open_or_update_pr(title, render_pr_body())
+                _progress(n, ctx)
+            review = _review(n, ctx, git, parsed, base_ref, round_number=len(reviews) + 1, pr=pr)
             if review.verdict == "UNUSABLE":
-                review = _review(n, ctx, git, parsed, base_ref, round_number=len(reviews) + 1)
-                reviews.append(review)
-                if review.verdict != "PASS":
-                    failure = review.findings or "\n".join(review.notes)
-                    review_hold = unusable_review = True
-            if review.verdict == "FAIL" and not review_hold:
+                review = replace(review, findings=review.raw)
+            reviews.append(review)
+            if pr is not None:
+                ctx.tracker.comment(pr, "\n".join([
+                    f"Round {len(reviews)}: VERDICT: {review.verdict}", review.findings, *review.notes,
+                ]))
+            if review.verdict != "PASS":
                 review_failures += 1
-                failure = review.findings or "Reviewer found defects (no findings provided)."
+                if review.verdict == "UNUSABLE":
+                    reviewer_text = review.raw
+                    failure = "A reviewer said (verbatim):\n" + review.raw
+                else:
+                    failure = review.findings or "Reviewer found defects (no findings provided)."
+                findings = _normalized_findings(review) if _read_rebuttals(worktree).strip() else set()
+                if findings & previous_rebutted_findings:
+                    review_hold = True
+                    review_hold_reason = Reason.REVIEW_DISPUTE
+                previous_rebutted_findings = findings
                 if review_failures > ctx.config.review_max:
                     review_hold = True
         if not failure or review_hold:
@@ -1048,12 +1158,221 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         return "retries-exceeded"
 
 
+def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | None) -> str:
+    """Verify one immutable PR head, then apply the ordinary merge policy."""
+    approval = ctx.store.load_approval(n)
+    if approval is None:
+        invalidate_approval(ctx, n, "Review requires a current approved snapshot. Re-approve to run it.")
+        return "no-approval"
+    pr = next((pr for pr in ctx.tracker.list_prs("open", f"foragent/issue-{n}")
+               if pr.head == f"foragent/issue-{n}"), None)
+    if pr is None:
+        flag(ctx, n, Reason.RISK_HIGH, "No open Foragent PR to review; retry implementation.")
+        return "no-pr"
+    head = ctx.tracker.pr_head_sha(pr.number)
+    link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
+    parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
+    batch_branch = f"foragent/batch-{parent}" if parent is not None else None
+    if pr.base not in {ctx.config.base_branch, batch_branch}:
+        flag(ctx, n, Reason.RISK_HIGH, "PR targets an unexpected base; retry implementation.", link)
+        return "base-changed"
+    if verdict_head is not None and head != verdict_head:
+        return _hold_changed_head(n, ctx, link)
+
+    def approved() -> bool:
+        issue = ctx.tracker.get_issue(n)
+        if APPROVED not in issue.labels or body_hash(issue.body) != approval.body_sha:
+            invalidate_approval(ctx, n, "Approval invalidated: issue or approval changed. Re-approve to run it.")
+            return False
+        return True
+
+    if not approved():
+        return "hash-mismatch"
+    parsed = parse_body(approval.body)
+    if not has_machine_check(parsed):
+        flag(ctx, n, Reason.NO_MACHINE_CHECK, "Done when has no machine check.")
+        return "no-machine-check"
+    ctx.git.fetch("origin", ctx.config.base_branch)
+    base_ref = f"origin/{pr.base}"
+    if pr.base != ctx.config.base_branch:
+        ctx.git.fetch("origin", pr.base)
+    base_sha = ctx.git.ref_sha(base_ref)
+    if not _acceptance_matches(n, ctx, ctx.git, approval, f"origin/{ctx.config.base_branch}"):
+        return "hash-mismatch"
+    ctx.git.fetch("origin", pr.head)
+    if ctx.git.ref_sha(f"origin/{pr.head}") != head:
+        return _hold_changed_head(n, ctx, link)
+    ctx.git.add_detached_worktree(worktree, head)
+    git = ctx.git.at(worktree)
+    if not _acceptance_matches(n, ctx, git, approval):
+        return "hash-mismatch"
+    if not git.is_ancestor(base_sha, head):
+        flag(ctx, n, Reason.RISK_HIGH, "PR base changed; retry implementation on the current base.", link)
+        return "base-changed"
+
+    log = ctx.store.log_path(n)
+    for command in parsed.done_when_commands:
+        if _remaining(n, ctx) <= 0:
+            return _timeout(n, ctx)
+        check = _check(command, worktree, log, min(900, _remaining(n, ctx)))
+        _progress(n, ctx)
+        if check.timed_out or _remaining(n, ctx) <= 0:
+            return _timeout(n, ctx)
+        if check.exit_code != 0:
+            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.",
+                 f"Command: {command}\n{check.output}\n{link}")
+            return "checks-failed"
+    git.stage_changes()
+    if git.head_sha() != head or git.has_staged_changes():
+        flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when changed the verified PR contents.", link)
+        return "checks-failed"
+
+    if verdict_head is None and ctx.config.reviewer != "none":
+        if _remaining(n, ctx) <= 0:
+            return _timeout(n, ctx)
+        if ctx.config.review_scope == "pr-body" and "## Review scope" not in pr.body:
+            ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title,
+                                  body=pr.body + "\n\n## Review scope\n\n" + review_scope_rules(ctx.config.acceptance_dir))
+        rounds = [int(path.stem.removeprefix("review-"))
+                  for path in (ctx.store.root / "runs" / f"issue-{n}").glob("review-*.txt")
+                  if path.stem.removeprefix("review-").isdigit()]
+        review = _review(n, ctx, git, parsed, base_ref, round_number=max(rounds, default=0) + 1,
+                         pr=pr.number if ctx.config.review_scope == "pr-body" else None)
+        ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
+        if review.timed_out or _remaining(n, ctx) <= 0:
+            return _timeout(n, ctx)
+        if review.verdict != "PASS":
+            flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
+            return "review-failed"
+
+    with _merge_lock(n, ctx):
+        # A pass applies only to this head and these instructions. Neither the
+        # reviewer nor an orchestrator verdict can waive the remaining checks.
+        def unchanged() -> str | None:
+            if not approved():
+                return "hash-mismatch"
+            if ctx.tracker.pr_head_sha(pr.number) != head:
+                return _hold_changed_head(n, ctx, link)
+            current = next((item for item in ctx.tracker.list_prs("open", pr.head)
+                            if item.number == pr.number), None)
+            ctx.git.fetch("origin", pr.base)
+            if current is None or current.base != pr.base or ctx.git.ref_sha(base_ref) != base_sha:
+                flag(ctx, n, Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
+                return "base-changed"
+            if not _acceptance_matches(n, ctx, git, approval):
+                return "hash-mismatch"
+            return None
+
+        if stopped := unchanged():
+            return stopped
+        paths = sorted(set(git.changed_paths(base_ref)) | set(ctx.tracker.pr_changed_files(pr.number)))
+
+        def policy_hold() -> str | None:
+            decision = merge_decision(changed_paths=paths, issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config)
+            if decision.kind == "hold":
+                flag(ctx, n, decision.reason, decision.summary, link)
+                return "held"
+            if decision.kind == "hold_mode" and (decision.mode == "careful" or pr.base != batch_branch):
+                flag(ctx, n, Reason.RISK_HIGH, "PR is waiting for your review.", link)
+                return "pr-open"
+            return None
+
+        if stopped := policy_hold():
+            return stopped
+        has_workflows = any(path.is_file() for pattern in ("*.yml", "*.yaml")
+                            for path in (worktree / ".github/workflows").glob(pattern))
+        started = ctx.now().timestamp()
+        for poll in range(41):
+            if _remaining(n, ctx) <= 0:
+                return _timeout(n, ctx)
+            status = ctx.tracker.pr_checks(pr.number)
+            _progress(n, ctx)
+            if ctx.tracker.pr_head_sha(pr.number) != head:
+                return _hold_changed_head(n, ctx, link)
+            if status == "none" and has_workflows and ctx.now().timestamp() - started < 180:
+                status = "pending"
+            if status in {"pass", "none"}:
+                break
+            if status == "fail":
+                flag(ctx, n, Reason.RETRIES_EXCEEDED, "CI failed", link)
+                return "ci-failed"
+            if ctx.now().timestamp() - started >= 1200 or poll == 40:
+                flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
+                return "timeout"
+            ctx.sleep(min(30, _remaining(n, ctx)))
+        if stopped := unchanged():
+            return stopped
+        if stopped := policy_hold():
+            return stopped
+        if _remaining(n, ctx) <= 0:
+            return _timeout(n, ctx)
+        try:
+            ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head)
+        except TrackerError:
+            if ctx.tracker.pr_head_sha(pr.number) != head:
+                return _hold_changed_head(n, ctx, link)
+            raise
+        try:
+            if pr.base == batch_branch:
+                ctx.tracker.close_issue(n, f"Merged into {batch_branch} (PR #{pr.number})")
+            else:
+                ctx.tracker.close_issue(n)
+        except TrackerError:
+            if ctx.tracker.get_issue(n).state != "closed":
+                raise
+        ctx.tracker.remove_labels(n, [READY, RUNNING, BLOCKED])
+        if pr.base == batch_branch and parent is not None:
+            try:
+                _batch_pr(parent, ctx)
+            except TrackerError as exc:
+                _append(log, f"Batch PR finalization deferred to tick: {exc}")
+        return "merged"
+
+
+def review_only(n: int, ctx: RunContext, *, verdict_head: str | None = None) -> str:
+    """Resume an existing PR without invoking the implementer or changing its head."""
+    worktree = ctx.store.worktree_path(n)
+    outcome = "error"
+    issue = ctx.tracker.get_issue(n)
+    previous = ctx.store.get_run(n)
+    if issue.state != "open" or issue.is_pull_request:
+        raise ValueError(f"#{n} must be an open issue")
+    if RUNNING in issue.labels or (previous is not None and previous.status == "running"):
+        raise TrackerError(f"issue #{n} already has a running execution")
+    ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree, pid=os.getpid(),
+                        lane=issue_lane(issue.labels, ctx.config.lanes))
+    try:
+        ctx.tracker.add_labels(n, [RUNNING])
+        ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
+        ctx.git.remove_worktree(worktree)
+        outcome = _review_only(n, ctx, worktree, verdict_head)
+    except ExecutorStopped as exc:
+        outcome = exc.outcome
+    except Exception as exc:
+        _append(ctx.store.log_path(n), traceback.format_exc())
+        flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
+    finally:
+        try:
+            ctx.git.remove_worktree(worktree)
+        finally:
+            # Includes executor interruption and every early return. Open work
+            # must remain discoverable by the scheduler or the orchestrator.
+            current = ctx.tracker.get_issue(n)
+            if current.state == "open" and not current.labels & {BLOCKED, READY}:
+                flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
+            ctx.tracker.remove_labels(n, [RUNNING])
+            ctx.store.finish_run(n, outcome=outcome)
+            kick_tick(ctx.repo_root)
+    return outcome
+
+
 def run_issue(n: int, ctx: RunContext) -> str:
     outcome = "error"
     worktree = ctx.store.worktree_path(n)
     log = ctx.store.log_path(n)
     try:
         run = ctx.store.update_run(n, pid=os.getpid())
+        board.sync_status(ctx, n, "Running")
         lane = ctx.config.lanes.get(run.lane, {}) if run.lane != "main" else {}
         ctx = replace(ctx, config=replace(
             ctx.config, executor=lane.get("executor") or ctx.config.executor,

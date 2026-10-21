@@ -27,7 +27,9 @@ def test_exact_defaults(repo):
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
-        "repo": None, "language": "en", "codex_goal": False, "review_level": "low",
+        "orchestrator_timeout_minutes": 30,
+        "repo": None, "board": None, "language": "en", "codex_goal": False, "review_level": "low",
+        "review_scope": "claude-local", "test_command": None,
         "interview": "ouroboros", "ouroboros_version": None,
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
@@ -113,6 +115,8 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
 
 
 @pytest.mark.parametrize("key,value", [
+    ("orchestrator_timeout_minutes", 0), ("orchestrator_timeout_minutes", -1),
+    ("orchestrator_timeout_minutes", True), ("orchestrator_timeout_minutes", "5"),
     ("interview", "magic"), ("interview", None), ("interview", []), ("interview", True),
     ("ouroboros_version", 52), ("ouroboros_version", []), ("ouroboros_version", False),
     ("review", "FAST"), ("review", None), ("review", []),
@@ -122,6 +126,8 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
     ("reviewer", "other"), ("reviewer", []),
     ("codex_goal", "true"), ("codex_goal", 1), ("codex_goal", None),
     ("review_level", "extreme"), ("review_level", []), ("review_level", None),
+    ("review_scope", "unknown"), ("review_scope", []), ("review_scope", None),
+    ("test_command", ""), ("test_command", "  "), ("test_command", []), ("test_command", True),
     ("always_human", "auth/**"), ("always_human", [1]),
     ("approvers", "user"), ("approvers", [None]),
     ("executor_model", 42), ("reviewer_model", []),
@@ -184,6 +190,7 @@ def test_all_valid_overrides(repo):
         "run_hours": "22-08", "stall_minutes": 1, "max_runtime_minutes": 1,
         "max_retries": 1, "review_max": 3, "base_branch": "trunk",
         "repo": "owner/name", "language": "ko", "codex_goal": True, "review_level": "max",
+        "review_scope": "pr-body",
     }
     write_settings(repo / ".foragent.yml", settings)
     assert asdict(load_config(repo)) == DEFAULTS | settings

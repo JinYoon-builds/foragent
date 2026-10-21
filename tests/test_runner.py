@@ -224,6 +224,48 @@ def test_merge_explicitly_closes_issue_and_removes_ready_and_running(run_case, m
     assert c.store.load_flag(1) is None
 
 
+@pytest.mark.parametrize("mode,question,outcome,statuses", [
+    ("fast", False, "merged", ["Running", "PR open", "Done"]),
+    ("careful", False, "pr-open", ["Running", "PR open"]),
+    ("fast", True, "spec-question", ["Running", "Blocked"]),
+])
+def test_runner_updates_project_on_execution_pr_merge_and_block(run_case, monkeypatch, mode, question, outcome, statuses):
+    from foragent import board
+    from test_board import item_values
+
+    c = run_case
+    project_id = board.ensure(c.tracker, c.ctx.repo)
+    c.ctx.config = replace(c.ctx.config, board=project_id, review=mode)
+    if question:
+        c.executor.steps = [{".foragent/QUESTION.md": "Which behavior is intended?"}]
+    calls = []
+    set_status = board.set_status
+
+    def recorded(issue, status):
+        calls.append(status)
+        set_status(issue, status)
+
+    monkeypatch.setattr(board, "set_status", recorded)
+    assert run_issue(1, c.ctx) == outcome
+    assert calls == statuses
+    assert item_values(c.tracker, project_id, 1)["Status"] == statuses[-1]
+
+
+def test_board_transport_failure_does_not_fail_runner(run_case, caplog):
+    from foragent import board
+
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, board=board.ensure(c.tracker, c.ctx.repo))
+
+    def unavailable(*args):
+        raise OSError("offline project")
+
+    c.tracker.graphql = unavailable
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.tracker.get_issue(1).state == "closed"
+    assert "Could not set board Status" in caplog.text
+
+
 def test_merge_does_not_ignore_close_failure_for_open_issue(run_case, monkeypatch):
     c = run_case
 
@@ -234,7 +276,7 @@ def test_merge_does_not_ignore_close_failure_for_open_issue(run_case, monkeypatc
     assert run_issue(1, c.ctx) == "error"
     assert c.tracker.merged_prs == [2]
     assert c.tracker.get_issue(1).state == "open"
-    assert "needs-human" in c.tracker.get_issue(1).labels
+    assert "blocked" in c.tracker.get_issue(1).labels
     assert "HTTP 403 Forbidden" in c.tracker.list_comments(1)[-1].body
 
 
@@ -277,7 +319,7 @@ def test_changed_pr_head_is_held_as_risk_high(run_case, monkeypatch, when):
 
     assert run_issue(1, c.ctx) == "held"
     assert c.tracker.merged_prs == []
-    assert c.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert c.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert c.store.load_flag(1).reason == Reason.RISK_HIGH
     comment = c.tracker.list_comments(1)[-1].body
     assert parse_reason(comment) == Reason.RISK_HIGH
@@ -506,7 +548,7 @@ def test_fetched_worktree_blob_mismatch_invalidates_approval(run_case, content):
     c.history.update({ACCEPTANCE: content})
     assert run_issue(1, c.ctx) == "hash-mismatch"
     assert c.store.load_approval(1) is None and c.store.load_flag(1).reason == Reason.HASH_MISMATCH
-    assert c.tracker.get_issue(1).labels == {"needs-human"}
+    assert c.tracker.get_issue(1).labels == {"blocked"}
     assert c.executor.calls == [] and c.tracker.created_prs == []
 
 
@@ -864,6 +906,80 @@ def test_review_failure_uses_shared_retry_budget(run_case):
     assert "goal still broken" in c.tracker.list_comments(1)[-1].body
 
 
+@pytest.mark.parametrize("findings,rebuttal,expected,attempts", [
+    (["feature.txt:1 Payment support", "- feature.txt:1   PAYMENT support", "feature.txt:1 payment support"],
+     True, "held", 3),
+    (["feature.txt:1 payment support", "feature.txt:1 payment support", None], True, "merged", 3),
+    (["feature.txt:1 payment support", "feature.txt:1 locale", "feature.txt:1 payment support", None],
+     True, "merged", 4),
+    (["feature.txt:1 payment support"] * 3 + [None], False, "merged", 4),
+])
+def test_review_dispute_requires_consecutive_findings_after_rebuttal(run_case, findings, rebuttal, expected, attempts):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=3, review_max=4)
+    c.executor.steps += ([{".foragent/REBUTTAL.md": "- payment support: outside the approved goal\n"}]
+                         if rebuttal else [{}]) + [{}] * 2
+    calls = enable_reviewer(c, [f"VERDICT: FAIL\n{point}" if point else "VERDICT: PASS" for point in findings])
+    assert run_issue(1, c.ctx) == expected
+    assert c.store.get_run(1).attempts == attempts
+    assert len(calls) == len(c.executor.calls) == attempts
+    if expected == "held":
+        assert c.store.load_flag(1).reason == Reason.REVIEW_DISPUTE
+        assert c.tracker.get_issue(1).labels & {"blocked", "needs-human"} == {"blocked"}
+        assert "## Rebuttals" in c.tracker.created_prs[0].body
+        assert not c.tracker.merged_prs
+    else:
+        assert c.store.load_flag(1) is None
+
+
+def test_unstructured_reviews_with_shared_preamble_do_not_create_a_dispute(run_case):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=3, review_max=4)
+    c.executor.steps += [{".foragent/REBUTTAL.md": "- points: outside the approved goal\n"}, {}, {}]
+    calls = enable_reviewer(c, [
+        "Please inspect:\npayment support", "Please inspect:\nlocale support",
+        "Please inspect:\nemail support", "VERDICT: PASS",
+    ])
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(calls) == 4
+    assert c.store.load_flag(1) is None
+
+
+def test_repeated_unstructured_finding_normalizes_wrapping_after_rebuttal(run_case):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=3, review_max=4)
+    c.executor.steps += [{".foragent/REBUTTAL.md": "- payment support: outside the approved goal\n"}, {}]
+    calls = enable_reviewer(c, ["Needs payment support.", "Needs\npayment support.", "  NEEDS payment   support.\n"])
+    assert run_issue(1, c.ctx) == "held"
+    assert len(calls) == 3
+    assert c.store.load_flag(1).reason == Reason.REVIEW_DISPUTE
+
+
+def test_rebuttal_history_reaches_pr_and_codex_review_even_when_executor_stages_it(run_case, monkeypatch):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=2, review_max=3)
+    first = "- payment support: outside the approved goal\n"
+    second = "- locale support: outside the approved goal\n"
+    c.executor.steps += [{".foragent/REBUTTAL.md": first}, {".foragent/REBUTTAL.md": second}]
+    implement = c.executor.run
+
+    def stage_rebuttal(**kwargs):
+        result = implement(**kwargs)
+        if (kwargs["worktree"] / ".foragent/REBUTTAL.md").is_file():
+            git_command(kwargs["worktree"], "add", "-f", ".foragent/REBUTTAL.md")
+        return result
+
+    monkeypatch.setattr(c.executor, "run", stage_rebuttal)
+    calls = enable_reviewer(c, ["VERDICT: FAIL\nfeature.txt:1 payment support",
+                                "VERDICT: FAIL\nfeature.txt:1 locale support", "VERDICT: PASS"])
+    assert run_issue(1, c.ctx) == "merged"
+    assert "Implementer rebuttals (judge them):\n" + first in calls[1]["prompt"]
+    assert "Implementer rebuttals (judge them):\n" + second in calls[2]["prompt"]
+    body = c.tracker.created_prs[0].body
+    assert "## Rebuttals" in body and first in body and second in body
+    assert ".foragent/REBUTTAL.md" not in git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1")
+
+
 def test_reviewer_edits_are_discarded_before_commit(run_case):
     c = run_case
 
@@ -903,22 +1019,24 @@ def test_disabled_review_does_not_create_a_reviewer(run_case):
     ExecResult(0, False, "VERDICT: PASS with caveats", Path("unused")),
 ])
 @pytest.mark.parametrize("retry", ["pass", "fail", "invalid"])
-def test_unusable_review_retries_once_and_only_explicit_success_allows_merge(run_case, invalid, retry):
+def test_unusable_review_retries_implementation_using_the_shared_budget(run_case, invalid, retry):
     c = run_case
+    c.executor.steps.append({})
     second = {"pass": "VERDICT: PASS", "fail": "VERDICT: FAIL\nfeature.txt:1: broken", "invalid": invalid}[retry]
     calls = enable_reviewer(c, [invalid, second])
-    assert run_issue(1, c.ctx) == ("merged" if retry == "pass" else "held")
-    assert len(calls) == 2 and len(c.executor.calls) == 1
-    assert c.store.get_run(1).attempts == 1
-    assert len(c.tracker.created_prs) == 1
-    body = c.tracker.created_prs[0].body
-    assert "Round 1: VERDICT: UNUSABLE" in body and "Round 2: VERDICT:" in body
+    assert run_issue(1, c.ctx) == ("merged" if retry == "pass" else "retries-exceeded")
+    assert len(calls) == len(c.executor.calls) == 2
+    assert c.store.get_run(1).attempts == 2
+    raw = invalid.full_message if invalid.full_message is not None else invalid.last_message
+    assert "A reviewer said (verbatim):\n" + raw in c.executor.calls[1]["prompt"]
+    assert c.store.log_path(1).read_text().count("Done when command:") == 4
     if retry == "pass":
         assert c.tracker.merged_prs == [2] and c.store.load_flag(1) is None
+        body = c.tracker.created_prs[0].body
+        assert "Round 1: VERDICT: UNUSABLE" in body and "Round 2: VERDICT: PASS" in body
     else:
         assert not c.tracker.merged_prs and c.tracker.get_issue(1).state == "open"
-        assert c.store.load_flag(1).reason == Reason.RISK_HIGH
-        assert "Reviewer did not return a usable verdict" in c.tracker.list_comments(1)[-1].body
+        assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
 
 
 def test_full_claude_verdict_survives_output_tail_truncation(run_case, monkeypatch):
@@ -929,7 +1047,7 @@ def test_full_claude_verdict_survives_output_tail_truncation(run_case, monkeypat
     c.executor.steps.append({})
     finding = "- feature.txt:1 — " + "x" * 930
     messages = iter(["\n".join([finding] * 5), "(none)"])
-    monkeypatch.setattr("foragent.executors.claude_review_command", lambda level, model: [
+    monkeypatch.setattr("foragent.executors.claude_review_command", lambda level, model, *, pr=None: [
         sys.executable, "-c", f"print({json.dumps({'result': next(messages)})!r})",
     ])
     c.ctx.config = replace(c.ctx.config, reviewer="claude")
@@ -944,19 +1062,18 @@ def test_full_claude_verdict_survives_output_tail_truncation(run_case, monkeypat
     assert (directory / "review-2.txt").read_text() == "(none)"
 
 
-def test_reviewer_timeout_at_runtime_limit_still_opens_held_pr(run_case):
+def test_reviewer_timeout_at_runtime_limit_does_not_launch_more_sessions(run_case):
     c = run_case
 
     def consume_runtime(worktree):
         c.now[0] += timedelta(minutes=c.ctx.config.max_runtime_minutes)
 
     timeout = ExecResult(0, True, "VERDICT: PASS", Path("unused"))
-    calls = enable_reviewer(c, [timeout, timeout], consume_runtime)
-    assert run_issue(1, c.ctx) == "held"
-    assert len(calls) == 2 and calls[1]["timeout_s"] == 0
-    assert len(c.tracker.created_prs) == 1 and not c.tracker.merged_prs
-    assert c.store.load_flag(1).reason == Reason.RISK_HIGH
-    assert "Reviewer did not return a usable verdict" in c.tracker.list_comments(1)[-1].body
+    calls = enable_reviewer(c, [timeout], consume_runtime)
+    assert run_issue(1, c.ctx) == "timeout"
+    assert len(calls) == len(c.executor.calls) == 1
+    assert not c.tracker.created_prs and not c.tracker.merged_prs
+    assert c.store.load_flag(1).reason == Reason.TIMEOUT
 
 
 def test_reviewer_commit_is_detected_and_head_index_and_files_are_restored(run_case):
@@ -1113,6 +1230,25 @@ def test_path_override_replays_child_changes_on_batch_before_checks(run_case):
     set_done_when(c, [COMMAND, "test -f sibling.txt"])
     assert run_issue(1, c.ctx) == "merged"
     assert c.tracker.created_prs[0].base == "foragent/batch-99"
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_rebuttal_survives_batch_retarget_and_patch_recovery(run_case, conflicting):
+    c = run_case
+    c.history.update({"shared.txt": "base\n"})
+    batch_setup(c)
+    c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"shared.txt": "batch"})
+    seed_batch(c, {"shared.txt": "sibling\n"} if conflicting else {"sibling.txt": "sibling\n"})
+    rebuttal = "- payment support: outside the approved goal\n"
+    c.executor.steps[0].update({"shared.txt": "child\n", ".foragent/REBUTTAL.md": rebuttal})
+    if conflicting:
+        c.executor.steps.append({"feature.txt": "done", "shared.txt": "resolved\n"})
+    calls = enable_reviewer(c, ["VERDICT: PASS"])
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == (2 if conflicting else 1)
+    assert "Implementer rebuttals (judge them):\n" + rebuttal in calls[0]["prompt"]
+    assert rebuttal in c.tracker.created_prs[0].body
+    assert ".foragent/REBUTTAL.md" not in git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1")
 
 
 @pytest.mark.parametrize("conflicting", [False, True])
@@ -1348,23 +1484,44 @@ def test_log_growth_poll_updates_progress_and_quiet_poll_does_not(run_case):
     def poll_hook(execute, poll):
         result = execute()
         before = c.store.get_run(1).last_progress_at
+        activity_before = c.store.get_run(1).last_activity_at
         c.now[0] += timedelta(seconds=30)
         poll()
         assert c.store.get_run(1).last_progress_at == before
+        assert c.store.get_run(1).last_activity_at == activity_before
         c.store.log_path(1).parent.mkdir(parents=True, exist_ok=True)
         c.store.log_path(1).write_text("new executor output\n")
         c.now[0] += timedelta(seconds=30)
         poll()
         observed.append(c.store.get_run(1).last_progress_at)
         assert observed[-1] == c.now[0].isoformat()
+        assert c.store.get_run(1).last_activity_at == observed[-1]
         c.now[0] += timedelta(seconds=30)
         poll()
         assert c.store.get_run(1).last_progress_at == observed[-1]
+        assert c.store.get_run(1).last_activity_at == observed[-1]
         return result
 
     c.ctx.poll_hook = poll_hook
     assert run_issue(1, c.ctx) == "merged"
     assert len(observed) == 1
+
+
+def test_short_executor_records_activity_without_a_periodic_poll(run_case, monkeypatch):
+    c = run_case
+    execute = c.executor.run
+
+    def short_run(**kwargs):
+        result = execute(**kwargs)
+        c.now[0] += timedelta(seconds=7)
+        kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["log_path"].write_text("completed before the first poll\n")
+        return result
+
+    monkeypatch.setattr(c.executor, "run", short_run)
+    c.ctx.poll_hook = lambda execute, poll: execute()
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.store.get_run(1).last_activity_at == c.now[0].isoformat()
 
 
 @pytest.mark.parametrize("acceptance_dir", ["tests/acceptance/", "checks with spaces", "./checks/"])
@@ -1593,6 +1750,37 @@ def enable_native_reviewer(case, messages, edit=None):
     return calls
 
 
+@pytest.mark.parametrize("last_result,outcome", [("(none)", "merged"), ("No verdict", "retries-exceeded")])
+def test_pr_body_reviews_published_head_and_keeps_findings_in_comments(run_case, last_result, outcome):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, reviewer="claude", review_scope="pr-body")
+    c.executor.steps.append({"fix.txt": "fixed"})
+    finding = "feature.txt:1 — Fix the feature"
+    messages = iter([finding, last_result])
+    heads = []
+
+    def review(**kwargs):
+        pr = c.tracker.created_prs[0]
+        assert kwargs["review_pr"] == pr.number
+        assert not (kwargs["worktree"] / "CLAUDE.local.md").exists()
+        assert "## Review scope" in pr.body and finding not in pr.body
+        assert git_command(kwargs["worktree"], "diff", "--cached", "--name-only") == ""
+        head = git_command(kwargs["worktree"], "rev-parse", "HEAD")
+        assert head == git_command(c.history.origin, "rev-parse", "foragent/issue-1")
+        assert head == c.tracker.pr_head_sha(pr.number)
+        heads.append(head)
+        return ExecResult(0, False, json.dumps({"result": next(messages)}), kwargs["log_path"])
+
+    c.ctx.executor_factory = lambda name: c.executor if name == "codex" else SimpleNamespace(run=review)
+    assert run_issue(1, c.ctx) == outcome
+    assert len(heads) == 2 and heads[0] != heads[1]
+    assert finding in c.executor.calls[1]["prompt"]
+    comments = c.tracker.list_comments(c.tracker.created_prs[0].number)
+    assert any(finding in comment.body for comment in comments)
+    if outcome != "merged":
+        assert any(last_result in comment.body for comment in comments)
+
+
 @pytest.fixture
 def review_context(git_history, tmp_path):
     now = BASE_TIME + timedelta(hours=1)
@@ -1759,56 +1947,62 @@ def test_native_prose_empty_array_cannot_skip_defects_and_merge(run_case, fenced
         c.executor.steps.append({})
         messages = [json.dumps({"result": raw}), '{"result":"[]"}']
     else:
+        c.executor.steps.append({})
         messages = [json.dumps({"result": raw})] * 2
     calls = enable_native_reviewer(c, messages)
-    assert run_issue(1, c.ctx) == ("merged" if fenced else "held")
+    assert run_issue(1, c.ctx) == ("merged" if fenced else "retries-exceeded")
     assert len(calls) == 2
-    assert len(c.executor.calls) == (2 if fenced else 1)
+    assert len(c.executor.calls) == 2
     if fenced:
         assert "src/foo.py:12 — Empty input crashes" in c.executor.calls[1]["prompt"]
         assert "Round 1: VERDICT: FAIL" in c.tracker.created_prs[0].body
     else:
         assert c.tracker.merged_prs == []
-        assert "Round 1: VERDICT: UNUSABLE" in c.tracker.created_prs[0].body
+        assert "A reviewer said (verbatim):\n" + raw in c.executor.calls[1]["prompt"]
     assert (c.store.root / "runs/issue-1/review-1.txt").read_text() == raw
 
 
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("exit_code,timed_out", [(0, False), (1, False), (0, True)])
-def test_unusable_review_saves_full_result_and_comments_only_latest_raw_prefix(run_case, native, exit_code, timed_out):
+def test_unusable_review_saves_full_result_and_hands_off_full_raw_text(run_case, native, exit_code, timed_out):
     c = run_case
+    c.executor.steps.append({})
     first = "First raw result\n" + "가" * 4000 + "\nFIRST END"
     second = "Latest raw result\n" + "나" * 4000 + "\nSECOND END"
     messages = [ExecResult(exit_code, timed_out, "only a tail", Path("unused"),
                            full_message=json.dumps({"result": raw}, ensure_ascii=False) if native else raw)
                 for raw in (first, second)]
     (enable_native_reviewer if native else enable_reviewer)(c, messages)
-    assert run_issue(1, c.ctx) == "held"
-    assert "needs-human" in c.tracker.get_issue(1).labels
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    assert "blocked" in c.tracker.get_issue(1).labels
     assert c.tracker.merged_prs == []
     directory = c.store.root / "runs/issue-1"
     assert (directory / "review-1.txt").read_text() == first
     assert (directory / "review-2.txt").read_text() == second
-    comment = c.tracker.list_comments(1)[-1].body
-    assert comment.partition("\n\nRaw reviewer result:\n")[2] == second[:3000]
-    assert first[:3000] not in comment and "SECOND END" not in comment
+    assert "A reviewer said (verbatim):\n" + first in c.executor.calls[1]["prompt"]
+    assert second in c.tracker.list_comments(1)[-1].body
+    assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
 
 
-def test_unusable_review_followed_by_fail_keeps_the_unusable_original_in_hold_comment(run_case):
+def test_unusable_review_followed_by_fail_keeps_both_raw_results(run_case):
     c = run_case
+    c.executor.steps.append({})
     raw = "Unrecognized output\n" + "x" * 3500
     enable_native_reviewer(c, [json.dumps({"result": raw}), json.dumps({"result": json.dumps(REPORTED_JSON_FINDINGS)})])
-    assert run_issue(1, c.ctx) == "held"
-    assert c.tracker.list_comments(1)[-1].body.partition("\n\nRaw reviewer result:\n")[2] == raw[:3000]
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    assert "A reviewer said (verbatim):\n" + raw in c.executor.calls[1]["prompt"]
+    assert (c.store.root / "runs/issue-1/review-1.txt").read_text() == raw
+    assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
 
 
-def test_invalid_native_envelope_is_saved_unchanged_for_the_human(run_case):
+def test_invalid_native_envelope_is_saved_and_handed_off_unchanged(run_case):
     c = run_case
+    c.executor.steps.append({})
     raw = "Not a JSON response\n" + "x" * 3500
     enable_native_reviewer(c, [raw, raw])
-    assert run_issue(1, c.ctx) == "held"
+    assert run_issue(1, c.ctx) == "retries-exceeded"
     assert (c.store.root / "runs/issue-1/review-2.txt").read_text() == raw
-    assert c.tracker.list_comments(1)[-1].body.partition("\n\nRaw reviewer result:\n")[2] == raw[:3000]
+    assert "A reviewer said (verbatim):\n" + raw in c.executor.calls[1]["prompt"]
 
 
 @pytest.mark.parametrize("invalid", [
@@ -1817,15 +2011,17 @@ def test_invalid_native_envelope_is_saved_unchanged_for_the_human(run_case):
     ExecResult(1, False, '{"result":"(none)"}', Path("unused")),
 ])
 @pytest.mark.parametrize("recover", [False, True])
-def test_native_review_retries_once_then_passes_or_holds(run_case, invalid, recover):
+def test_native_unusable_review_retries_implementation_then_passes_or_exhausts_budget(run_case, invalid, recover):
     c = run_case
+    c.executor.steps.append({})
     calls = enable_native_reviewer(c, [invalid, '{"result":"(none)"}' if recover else invalid])
-    assert run_issue(1, c.ctx) == ("merged" if recover else "held")
-    assert len(calls) == 2 and len(c.executor.calls) == 1
+    assert run_issue(1, c.ctx) == ("merged" if recover else "retries-exceeded")
+    assert len(calls) == len(c.executor.calls) == 2
     assert all(call["prompt"] == "" and call["review_level"] == "xhigh" for call in calls)
-    assert "reviewer: /code-review xhigh" in c.tracker.created_prs[0].body
     if not recover:
-        assert c.store.load_flag(1).reason == Reason.RISK_HIGH
+        assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+    else:
+        assert "reviewer: /code-review xhigh" in c.tracker.created_prs[0].body
 
 
 def test_native_review_findings_repair_and_reviewer_commits_are_restored(run_case):
@@ -1956,6 +2152,43 @@ def skill_case(tmp_path):
         config=Config(lanes={"ui": {"skills": ["testing"]}}),
     )
     return ctx, worktree
+
+
+@pytest.mark.parametrize("kind", ["codex", "claude"])
+@pytest.mark.parametrize("source", ["local", "cache"])
+def test_local_lane_skill_is_available_on_retries_and_never_published(run_case, tmp_path, monkeypatch, kind, source):
+    c = run_case
+    relative = ".claude/skills/testing"
+    library = tmp_path / "library"
+    skill = (c.ctx.repo_root / relative) if source == "local" else (library / "skills/testing")
+    skill.mkdir(parents=True)
+    content = "---\nname: testing\ndescription: Focused tests\n---\nRun useful checks.\n"
+    (skill / "SKILL.md").write_text(content)
+    (skill / "references").mkdir()
+    (skill / "references/example.md").write_text("Reference\n")
+    c.ctx.config = replace(c.ctx.config, executor=kind, lanes={"api": {"skills": ["testing"]}},
+                           skill_libraries=[{"name": "fixture", "repo": "local", "path": str(library)}])
+    c.store.update_run(1, lane="api")
+    c.executor.steps = [{"feature.txt": "broken"}, {"feature.txt": "done"}]
+    execute = c.executor.run
+
+    def implement(**kwargs):
+        worktree = kwargs["worktree"]
+        assert (worktree / relative / "SKILL.md").read_text() == content
+        assert (worktree / relative / "references/example.md").read_text() == "Reference\n"
+        # Even explicitly staged copies must stay out of the published tree.
+        git_command(worktree, "add", "-f", "--", relative)
+        handmade = worktree / ".claude/skills/handmade/SKILL.md"
+        handmade.parent.mkdir(parents=True, exist_ok=True)
+        handmade.write_text("User-authored skill\n")
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 2
+    published = git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1").splitlines()
+    assert not any(name.startswith(relative + "/") for name in published)
+    assert ".claude/skills/handmade/SKILL.md" in published
 
 
 @pytest.mark.parametrize("length", [5999, 6000, 6001, 12000])
@@ -2108,6 +2341,7 @@ def test_fresh_base_same_line_conflict_is_resolved_in_place_and_merge_commit_is_
 
     def resolve(**kwargs):
         initial = not c.executor.calls
+        assert c.store.get_run(1).phase == ("implementing" if initial else "resolving-conflict")
         if not initial:
             root = kwargs["worktree"]
             text = (root / "cli.py").read_text()
@@ -2128,6 +2362,7 @@ def test_fresh_base_same_line_conflict_is_resolved_in_place_and_merge_commit_is_
 
     def merge_verified(pr, *, method, expected_head_sha):
         root = c.store.worktree_path(1)
+        assert c.store.get_run(1).phase == "merging"
         assert expected_head_sha == git_command(root, "rev-parse", "HEAD")
         assert not (root / git_command(root, "rev-parse", "--git-path", "MERGE_HEAD")).exists()
         parents = git_command(root, "show", "-s", "--format=%P", "HEAD").split()
@@ -2416,13 +2651,14 @@ def test_reviewer_availability_waits_then_uses_recovered_verdict(run_case, messa
 
 def test_reviewer_limit_only_becomes_unusable_after_wait_budget(run_case):
     c = run_case
+    c.executor.steps.append({})
     c.ctx.config = replace(c.ctx.config, transient_max_wait_minutes=2)
     limit = ExecResult(1, False, "usage limit", Path("unused"), error_kind="limit")
     calls = enable_reviewer(c, [limit, limit, limit])
-    assert run_issue(1, c.ctx) == "held"
+    assert run_issue(1, c.ctx) == "retries-exceeded"
     assert len(calls) == 3 and c.store.get_run(1).waited_seconds == 120
-    assert c.store.get_run(1).attempts == 1
-    assert c.store.load_flag(1).reason == Reason.RISK_HIGH
+    assert c.store.get_run(1).attempts == 2
+    assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
     assert not c.store.lane_paused("main", c.now[0])
 
 

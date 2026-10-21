@@ -68,7 +68,6 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "spawn_runner", spawn)
     monkeypatch.setattr(cli, "spawn_notify", lambda *args: calls["notifications"].append(args))
     monkeypatch.setattr(cli, "load_config", lambda root: Config(approvers=["human"]))
-    monkeypatch.setattr(cli.inspect_actions, "macos_notifier", lambda *args: None)
     monkeypatch.setattr(cli.launchd, "status", lambda root, **kwargs: launchd.LaunchdStatus(
         "dev.foragent.owner.repo", False, False,
     ))
@@ -185,7 +184,7 @@ def test_status_groups_issues_awaiting_pr_review(app, capsys, json_output, label
         assert [item["number"] for item in groups[group]] == [1]
         assert sum(len(items) for items in groups.values()) == 1
     else:
-        prefix = "running:\n  lane:main:\n    " if group == "running" else f"{group}:\n  "
+        prefix = "running:\n  🧰 Common:\n    " if group == "running" else f"{group}:\n  "
         assert f"{prefix}#1 Awaiting review" in output
 
 
@@ -266,7 +265,9 @@ def test_module_entry_point_version():
         [sys.executable, "-m", "foragent.cli", "--version"], check=True,
         capture_output=True, text=True,
     )
-    assert result.stdout == f"foragent {__version__}\n" and result.stderr == ""
+    from foragent._build import GIT_SHA
+
+    assert result.stdout == f"foragent {__version__} ({GIT_SHA})\n" and result.stderr == ""
 
 
 def test_module_entry_point_configuration_error(tmp_path):
@@ -293,11 +294,11 @@ def test_init_cli_passes_all_flags_and_prints_summary(tmp_path, monkeypatch, cap
     assert cli.main([
         "init", "--repo-root", str(tmp_path), "--approver", "alice", "bob", "--approver", "carol",
         "--review", "careful", "--executor", "claude", "--run-hours", "22-08", "--language", "ko",
-        "--no-push", "--no-launchd", "--dry-run",
+        "--no-push", "--no-launchd", "--no-board", "--dry-run",
     ]) == 0
     assert calls == [(tmp_path, {
         "approvers": ["alice", "bob", "carol"], "review": "careful", "executor": "claude",
-        "run_hours": "22-08", "language": "ko", "no_push": True, "no_launchd": True, "dry_run": True,
+        "run_hours": "22-08", "language": "ko", "no_push": True, "no_launchd": True, "no_board": True, "dry_run": True,
     })]
     assert capsys.readouterr().out == "Setup summary\n"
 
@@ -311,7 +312,7 @@ def test_init_cli_defaults_to_cwd_and_default_options(tmp_path, monkeypatch, cap
         assert root == tmp_path
         assert kwargs == {
             "approvers": None, "review": None, "executor": None, "run_hours": None,
-            "no_push": False, "no_launchd": False, "dry_run": False, "language": None,
+            "no_push": False, "no_launchd": False, "no_board": False, "dry_run": False, "language": None,
         }
         return InitReport([], [], False)
 
@@ -419,12 +420,12 @@ def test_inspect_cli_text_and_json_shapes(app, capsys, json_output):
             "group": "decision", "number": 3, "title": "Add tally report",
             "url": "https://github.com/owner/repo/issues/3", "reason": "spec-question",
             "summary": "Choose a format", "details": details, "pr": None, "answered": False,
-            "try_card": None, "prepared": None,
+            "try_card": None, "prepared": None, "lane": "main", "lane_display": "🧰 Common",
         }]
         assert datetime.fromisoformat(inbox["since"]).tzinfo is not None
     else:
         assert captured.out.splitlines() == [
-            "Decision 1 (~1 min)", "[decision] #3 Add tally report — Choose a format",
+            "Decision 1 (~1 min)", "[decision] 🧰 Common · #3 Add tally report — Choose a format",
             *(f"  Detail {i}" for i in range(12)), "  https://github.com/owner/repo/issues/3",
         ]
     assert git.fetches == [] and calls["launches"] == []
@@ -457,11 +458,11 @@ def test_inspect_cli_try_is_latest_per_issue_with_missing_card(app, capsys, json
         assert inbox["items"] == [{
             "group": "try", "number": 7, "title": "Latest tally", "url": url,
             "reason": None, "summary": summary, "details": "", "pr": latest, "answered": False,
-            "try_card": None, "prepared": None,
+            "try_card": None, "prepared": None, "lane": "main", "lane_display": "🧰 Common",
         }]
     else:
         assert captured.out.splitlines() == [
-            "Try 1 (not prepared)", f"[try] #7 Latest tally — {summary} {url}",
+            "Try 1 (not prepared)", f"[try] 🧰 Common · #7 Latest tally — {summary} {url}",
             "  What changed:", "  not provided", "  Try it:", "  not provided",
             "  Expect:", "  not provided", "  not prepared",
         ]
@@ -586,21 +587,35 @@ def test_inspect_retry_existing_failed_pr_can_be_scheduled_on_next_tick(app, mon
     assert "ready" in tracker.get_issue(1).labels
 
 
-def test_inspect_cli_notify_prints_once_and_exposes_failure_for_manual_command(app, monkeypatch, capsys):
+def test_inspect_cli_notify_logs_failure_and_retries_then_dedupes(app, monkeypatch, capsys, caplog):
     root, git, tracker, store, _ = app
     tracker.add_issue(1, labels=["needs-human"])
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(notify="command:/offline/notifier"))
     args = ["inspect", "notify", "--repo-root", str(root)]
     calls = []
-    def fail(*args):
-        raise FileNotFoundError("osascript unavailable")
-    monkeypatch.setattr(cli.inspect_actions, "macos_notifier", fail)
-    assert cli.main(args) == 1
-    assert "osascript unavailable" in capsys.readouterr().err
+
+    def fail(*args, **kwargs):
+        raise FileNotFoundError("notifier unavailable")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    assert cli.main(args) == 0
+    assert "notifier unavailable" in caplog.text
+    assert capsys.readouterr().out == "Decision 1\n"
     assert store.load_inspect().notified_signature is None
-    monkeypatch.setattr(cli.inspect_actions, "macos_notifier", lambda *args: calls.append(args))
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
     assert cli.main(args) == cli.main(args) == 0
     assert capsys.readouterr().out == "Decision 1\n"
-    assert calls == [("Decision 1", "Foragent owner/repo")]
+    assert len(calls) == 1
+    assert calls[0][1]["env"]["FA_TITLE"] == "Foragent owner/repo"
+
+
+def test_notify_cli_resolves_repo_without_github_access(app, monkeypatch):
+    root, git, tracker, store, _ = app
+    monkeypatch.setattr(cli, "GhTracker", lambda *args: pytest.fail("notification must not contact GitHub"))
+    assert cli.main(["notify", "--repo-root", str(root), "--title", "확인", "--line", "준비 완료"]) == 0
+    record = json.loads((store.root / "push-outbox.jsonl").read_text())
+    assert record == {"title": "확인", "line": "준비 완료", "link": None}
+    assert git.remotes == ["origin"]
 
 
 @pytest.mark.parametrize("json_output", [False, True])
@@ -686,5 +701,42 @@ def test_status_groups_running_and_ready_by_lane(app, capsys):
     assert [item["number"] for item in status["lanes"]["ui"]["running"]] == [2]
     cli._print_status(status | {"launchd": {"loaded": False}})
     output = capsys.readouterr().out
-    assert "running:\n  lane:ui:\n    #2 UI running" in output
-    assert "ready:\n  lane:data:\n    #3 Data ready\n  lane:main:\n" in output
+    assert "running:\n  ui:\n    #2 UI running" in output
+    assert "ready:\n  data:\n    #3 Data ready\n  🧰 Common:\n" in output
+
+
+def test_orch_watch_follow_prints_only_changes_and_stops_cleanly(app, monkeypatch, capsys):
+    from foragent import orch
+
+    root, git, tracker, store, calls = app
+    add_approved(tracker)
+    output, polls = [], []
+
+    def sleep(seconds):
+        polls.append(seconds)
+        lines = capsys.readouterr().out.splitlines()
+        # An initial snapshot, a silent identical poll, then one changed snapshot.
+        assert len(lines) == (0 if len(polls) == 2 else 1)
+        output.extend(json.loads(line) for line in lines)
+        if len(polls) == 2:
+            tracker.add_labels(1, ["blocked"])
+        if len(polls) == 3:
+            raise KeyboardInterrupt
+        assert len(polls) <= 3
+
+    monkeypatch.setattr(orch.time, "sleep", sleep)
+    assert cli.main(["orch", "watch", "--repo-root", str(root), "--interval", "0.01", "--follow"]) == 0
+    assert polls == [0.01] * 3
+    assert [snapshot["blocked"] for snapshot in output] == [[], [1]]
+    assert json.loads((store.root / "orch-watch.json").read_text()) == output[-1]
+    assert calls["launches"] == calls["notifications"] == git.fetches == []
+
+
+@pytest.mark.parametrize("interval", ["0", "-1", "nan", "inf", "-inf"])
+def test_orch_watch_refuses_invalid_intervals(app, capsys, interval):
+    root, _, _, store, _ = app
+    assert cli.main(["orch", "watch", "--repo-root", str(root), f"--interval={interval}"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "finite positive" in captured.err
+    assert not (store.root / "orch-watch.json").exists()
