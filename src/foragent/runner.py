@@ -28,6 +28,7 @@ from foragent.labels import READY, RUNNING, attempt_tier, issue_size
 from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.processes import run_logged
 from foragent.reasons import Reason
+from foragent.skills import SkillManager, copy_lane_skills
 from foragent.state import Approval, StateStore
 from foragent.tracker import Tracker, TrackerError
 
@@ -483,8 +484,7 @@ def _lane_notes(ctx: RunContext, n: int, worktree: Path) -> tuple[str | None, st
     return agent, "Lane notes:\n" + body.strip() + "\n\n"
 
 
-def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
-    """List installed skills so Codex can read them when relevant."""
+def _lane_skill_names(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> list[str]:
     lane = ctx.store.get_run(n).lane
     settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
     skills = settings.get("skills", [])
@@ -497,12 +497,23 @@ def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> 
         except yaml.YAMLError:
             metadata = None
         skills = metadata.get("skills", []) if isinstance(metadata, dict) else []
-    if not isinstance(skills, list):
-        return "", []
+    return [name for name in skills if isinstance(name, str)] if isinstance(skills, list) else []
+
+
+def _inject_lane_skills(ctx: RunContext, n: int, git: GitRepo) -> None:
+    agent, _ = _lane_notes(ctx, n, git.root)
+    names = _lane_skill_names(ctx, n, git.root, agent)
+    git.local_skill_paths = (
+        set(copy_lane_skills(ctx.repo_root, git.root, names, SkillManager(ctx.config))) if names else set()
+    )
+
+
+def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
+    """List installed skills so Codex can read them when relevant."""
+    skills = _lane_skill_names(ctx, n, worktree, agent)
+    frontmatter = re.compile(r"\A---[^\S\n]*\n(.*?)^---[^\S\n]*(?:\n|$)", re.DOTALL | re.MULTILINE)
     sections, missing = [], []
     for name in skills:
-        if not isinstance(name, str):
-            continue
         path = worktree / ".claude/skills" / name / "SKILL.md"
         if not path.resolve().is_relative_to(worktree.resolve()) or not path.is_file():
             missing.append(name)
@@ -660,6 +671,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     start_ref = f"origin/{target_branch}"
     ctx.git.add_worktree(worktree, branch, start_ref)
     git = ctx.git.at(worktree)
+    _inject_lane_skills(ctx, n, git)
     if not _acceptance_matches(n, ctx, git, approval):
         return "hash-mismatch"
     _progress(n, ctx)
@@ -743,6 +755,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
             start_ref = f"origin/{destination}"
             target_branch = destination
             ctx.git.add_worktree(worktree, branch, start_ref)
+            _inject_lane_skills(ctx, n, git)
             if try_bytes is not None:
                 try_file.parent.mkdir(parents=True, exist_ok=True)
                 try_file.write_bytes(try_bytes)
@@ -760,6 +773,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         # next implementation attempt from the destination's clean tree.
         ctx.git.remove_worktree(worktree)
         ctx.git.add_worktree(worktree, branch, start_ref)
+        _inject_lane_skills(ctx, n, git)
         paths = []
         return f"Could not apply child changes to {target_branch}: {exc}"
 

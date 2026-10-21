@@ -45,11 +45,8 @@ def lane_files(root: Path, name: str, skills: list[str]) -> list[str]:
         directory = repo_path(root, f".claude/skills/{skill}")
         if not (directory / "SKILL.md").is_file():
             raise LaneError(f"installed lane skill is missing: {skill}")
-        paths.extend(path.relative_to(root).as_posix() for path in sorted(directory.rglob("*")) if path.is_file())
     if skills:
-        if not repo_path(root, "THIRD_PARTY_NOTICES.md").is_file():
-            raise LaneError("installed lane skill notices are missing")
-        paths.append("THIRD_PARTY_NOTICES.md")
+        paths.append(".gitignore")
     return paths
 
 
