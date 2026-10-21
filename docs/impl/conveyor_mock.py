@@ -42,7 +42,14 @@ class Lane:
         self.deployed = False
 
     def step(self):
-        if not self.deployed or self.waiting_human:
+        if not self.deployed:
+            return
+        if self.waiting_human:
+            if time.time() - self.stuck_since > 6:
+                self.waiting_human = False
+                self.handled = True
+                self.attempt += 1
+                EVENTS.append((time.strftime("%H:%M"), f"#{self.current} 리뷰 답 형식 오류 → 리뷰 다시 돌림 ✓"))
             return
         if self.current is None and self.queue:
             self.current = self.queue.pop(0)
@@ -52,10 +59,13 @@ class Lane:
         if self.current is not None:
             self.progress += random.randint(4, 11)
             self.last_move = time.time() - random.randint(0, 8)
-            if self.current == 7 and self.progress > 60:
+            if self.current == 7 and self.progress > 60 and not getattr(self, "handled", False):
                 self.waiting_human = True
+                self.stuck_since = time.time()
                 return
             if self.progress >= 100:
+                if self.current == 2:
+                    EVENTS.append((time.strftime("%H:%M"), "#2 범위 밖 지적 → 구현자에게 힌트, 재시도 ✓"))
                 self.done.append(self.current)
                 self.current = None
 
@@ -90,10 +100,17 @@ def road(lanes, tick):
     for i, lane in enumerate(lanes):
         line = Text(f" {lane.name:<6}", style="bold white " + ASPHALT)
         line.append("▸ ", style="dim " + ASPHALT)
-        queue = "".join(f"[#{n}] " for n in reversed(lane.queue))
-        line.append(f"{queue:>16}", style="white " + ASPHALT)
+        blocks = list(reversed(lane.queue))
+        width = sum(len(f" #{n} ") + 1 for n in blocks)
+        line.append(" " * max(0, 18 - width), style=ASPHALT)
+        for n in blocks:
+            line.append(f" #{n} ", style="bold black on white")
+            line.append(" ", style=ASPHALT)
         if lane.current is not None:
-            line.append(f"[#{lane.current}]", style=f"bold {lane.color} " + ASPHALT)
+            # The block flashes once per pickaxe swing, on the hit frame (PICK[2] "⛏✦").
+            hit = tick % 4 == 2 and not lane.waiting_human
+            style = "bold black on bright_white" if hit else f"bold black on {lane.color}"
+            line.append(f" #{lane.current} ", style=style)
         else:
             line.append("    ", style=ASPHALT)
         if not lane.deployed:
@@ -120,19 +137,32 @@ def road(lanes, tick):
     return Group(*rows)
 
 
+EVENTS = []  # (time, text) the orchestrator handled without calling the human
+
+
 def orchestrator(lanes, tick):
     triage = sum(1 for l in lanes if l.waiting_human)
     pending = [l for l in lanes if not l.deployed]
+    total = TOTAL_ISSUES
+    done = sum(len(l.done) for l in lanes)
+    filled = round(10 * done / total) if total else 0
     body = Text()
-    body.append("🧭 오케스트레이터\n\n", style="bold white")
+    body.append("🧭 오케스트레이터\n", style="bold white")
     if pending:
         body.append(f"에이전트 배치 중\n→ {pending[0].agent}\n", style="cyan")
     elif triage:
-        body.append("문제 확인 중\n", style="bold yellow")
+        body.append("문제 처리 중\n", style="bold yellow")
     else:
         body.append("지켜보는 중\n", style="green")
+    body.append("\n이번 주문\n", style="grey62")
+    body.append("▓" * filled, style="green")
+    body.append("░" * (10 - filled), style="grey35")
+    body.append(f" {done}/{total}\n", style="bold")
     body.append("\n나를 기다림 ", style="bold")
-    body.append("0", style="bold")
+    body.append("0\n", style="bold")
+    remaining = total - done
+    eta = time.strftime("%H:%M", time.localtime(time.time() + remaining * 240))
+    body.append(f"예상 완료 {eta}" if remaining else "모두 끝남", style="grey62")
     links = Text("\n")
     for lane in lanes:
         links.append("━━━━▶\n\n\n", style="bold blue" if lane.deployed else "dim")
@@ -143,16 +173,26 @@ def orchestrator(lanes, tick):
     return grid
 
 
+def events_panel():
+    text = Text()
+    if not EVENTS:
+        text.append("아직 없음", style="grey50")
+    for when, what in EVENTS[-5:][::-1]:
+        text.append(f"{when}  ", style="grey62")
+        text.append(f"{what}\n")
+    return Panel(text, title="오케스트레이터가 처리한 일", border_style="blue")
+
+
 def pulse(lane, tick):
     """One liveness signal instead of raw numbers."""
     if lane.current is None or not lane.deployed:
         return Text("")
     if lane.waiting_human:
-        return Text("● 오케스트레이터가 보는 중", style="yellow")
+        return Text("● 처리 중", style="yellow")
     idle = int(time.time() - lane.last_move)
     if idle > 600:
         return Text(f"○ 멈춘 듯 {idle // 60}분", style="bold red")
-    return Text("● 움직이는 중", style="green" if tick % 2 else "dark_green")
+    return Text("●", style="green" if tick % 2 else "dark_green")
 
 
 def work_table(lanes, tick):
@@ -181,8 +221,12 @@ def render(lanes, tick):
     layout = Layout()
     layout.split_column(
         Layout(Panel(top, title="foragent · 레인 (견본 · 가짜 데이터)", border_style="dim"), size=17),
-        Layout(Panel(work_table(lanes, tick), title="지금 하는 일", border_style="dim"), size=8),
+        Layout(name="bottom", size=9),
         Layout(Text(" ")),
+    )
+    layout["bottom"].split_row(
+        Layout(Panel(work_table(lanes, tick), title="지금 하는 일", border_style="dim"), ratio=3),
+        Layout(events_panel(), ratio=2),
     )
     return layout
 
@@ -194,6 +238,8 @@ def main():
         Lane("order", "📋", "fa-order", "Codex", "gpt-6.1 · medium", [], [7, 8]),
         Lane("docs", "📝", "fa-docs", "Claude", "sonnet-5.5 · low", ["documentation"], []),
     ]
+    global TOTAL_ISSUES
+    TOTAL_ISSUES = sum(len(l.queue) for l in lanes)
     tick = 0
     with Live(render(lanes, tick), refresh_per_second=4, screen=True) as live:
         while True:
