@@ -193,6 +193,53 @@ def test_happy_path_merges_and_records_results(run_case, monkeypatch, ci):
     assert c.now[0] == BASE_TIME + timedelta(hours=1)
 
 
+@pytest.mark.parametrize("offline", [False, True])
+@pytest.mark.parametrize("question", [False, True])
+def test_board_tracks_runner_transitions_without_affecting_outcome(run_case, monkeypatch, caplog, offline, question):
+    from foragent import board
+    from test_board import snapshot
+
+    c = run_case
+    identity = board.Board(c.tracker, c.ctx.repo, c.ctx.config).ensure()
+    c.ctx.config = replace(c.ctx.config, board=identity)
+    if question:
+        c.executor.steps = [{".foragent/QUESTION.md": "선택이 필요합니다."}]
+    expected = ["Running", "Needs human"] if question else ["Running", "PR open", "Done"]
+    calls = []
+    setter = board.set_status
+
+    def set_status(issue, status):
+        calls.append((getattr(issue, "number", issue), status))
+        if offline:
+            raise OSError("board offline")
+        setter(issue, status)
+
+    monkeypatch.setattr(board, "set_status", set_status)
+    assert run_issue(1, c.ctx) == ("spec-question" if question else "merged")
+    assert calls == [(1, status) for status in expected]
+    if offline:
+        assert "Board status update failed" in caplog.text
+    else:
+        project = snapshot(c.tracker, identity)
+        values = project["items"]["nodes"][0]["fieldValues"]["nodes"]
+        assert {value["field"]["name"]: value["name"] for value in values}["Status"] == expected[-1]
+
+
+def test_runner_without_approval_preserves_board_human_wait(run_case):
+    from foragent import board
+    from test_board import snapshot
+
+    c = run_case
+    identity = board.Board(c.tracker, c.ctx.repo, c.ctx.config).ensure()
+    c.ctx.config = replace(c.ctx.config, board=identity)
+    c.tracker.add_labels(1, ["needs-human"])
+    c.store.clear_approval(1)
+    board.update_status(c.ctx.config, c.tracker, c.ctx.repo, 1, "Needs human")
+    assert run_issue(1, c.ctx) == "no-approval"
+    values = snapshot(c.tracker, identity)["items"]["nodes"][0]["fieldValues"]["nodes"]
+    assert {value["field"]["name"]: value["name"] for value in values}["Status"] == "Needs human"
+
+
 @pytest.mark.parametrize("already_closed", [False, True])
 def test_merge_explicitly_closes_issue_and_removes_ready_and_running(run_case, monkeypatch, already_closed):
     c = run_case

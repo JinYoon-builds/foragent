@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 
+from foragent import board
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitRepo
@@ -203,6 +204,7 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
     else:
         ctx.tracker.add_labels(number, [READY])
         ctx.tracker.remove_labels(number, [RUNNING])
+        board.sync_status(ctx, number, "Ready")
         report.actions.append(f"#{number} returned to ready after runner crash")
 
 
@@ -236,6 +238,7 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
     elif restarts <= 1:
         ctx.tracker.add_labels(number, [READY])
         ctx.tracker.remove_labels(number, [RUNNING])
+        board.sync_status(ctx, number, "Ready")
         report.actions.append(f"#{number} returned to ready after stall (restart {restarts})")
     else:
         flag(ctx, number, Reason.STALLED, "Runner stalled again after one restart.")
@@ -301,6 +304,7 @@ def _check_prerequisites(
     ):
         if READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [READY])
+        board.sync_status(ctx, issue, "Done")
         return False
     if (
         ctx.tracker.find_pr(f"foragent/issue-{issue.number}") is not None
@@ -308,6 +312,7 @@ def _check_prerequisites(
     ):
         if READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [READY])
+        board.sync_status(ctx, issue, "PR open")
         return False
     if not has_machine_check(parse_body(approval.body)):
         flag(
@@ -332,6 +337,7 @@ def _check_prerequisites(
         if READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [READY])
             report.actions.append(f"#{issue.number} returned to approved waiting for open blockers")
+        board.sync_status(ctx, issue, "Approved")
         return False
     return True
 
@@ -357,6 +363,7 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
         if number not in issues or ctx.tracker.parent_of(number) != parent:
             continue
         ctx.tracker.close_issue(number, f"Merged into {pr.base} (PR #{pr.number})")
+        board.sync_status(ctx, number, "Done")
         ctx.tracker.remove_labels(number, [READY, RUNNING])
         del issues[number]
         report.actions.append(f"#{number} closed after batch PR #{pr.number} merged")
@@ -394,6 +401,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         if NEEDS_HUMAN in issue.labels and (
             previous_flag is None or previous_flag.reason != Reason.HASH_MISMATCH
         ):
+            board.sync_status(ctx, issue, "Needs human")
             continue
         if APPROVED not in issue.labels:
             continue
@@ -430,6 +438,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             continue
 
         ctx.tracker.add_labels(issue.number, [READY])
+        board.sync_status(ctx, issue, "Ready")
         report.actions.append(f"#{issue.number} promoted to ready")
         ready.setdefault(lane, []).append(issue.number)
 
@@ -463,6 +472,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
 
             ctx.tracker.remove_labels(number, [READY])
             ctx.tracker.add_labels(number, [RUNNING])
+            board.sync_status(ctx, number, "Running")
             ctx.store.start_run(
                 number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
                 tier=issue_size(issue.labels),

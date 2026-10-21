@@ -7,8 +7,8 @@ import subprocess
 
 import yaml
 
-from foragent import launchd
-from foragent.config import DEFAULTS, ConfigError, _read_yaml, _validate, load_config
+from foragent import board, launchd
+from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.labels import LABELS
 from foragent.tracker import GhTracker, Tracker, TrackerError
@@ -77,11 +77,21 @@ def _gh_call(run: Callable[..., str], args: list[str]) -> str:
         raise TrackerError(f"gh {' '.join(args)} failed: {message or exc}") from exc
 
 
+def _add_config_keys(original: str, local: dict, added: dict) -> str:
+    node = yaml.compose(original)
+    closed = any(isinstance(event, yaml.events.DocumentEndEvent) and event.explicit
+                 for event in yaml.parse(original))
+    if (added.keys() & local.keys() or not isinstance(node, yaml.MappingNode) or node.flow_style or closed
+            or (node.value and node.value[0][0].start_mark.column)):
+        return yaml.safe_dump({**local, **added}, sort_keys=False)
+    return original.rstrip("\n") + "\n" + yaml.safe_dump(added, sort_keys=False)
+
+
 def init_repo(
     repo_root: Path, *, approvers: list[str] | None = None, review: str | None = None,
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
     no_push: bool = False,
-    no_launchd: bool = False, dry_run: bool = False, git: GitRepo | None = None,
+    no_launchd: bool = False, no_board: bool = False, dry_run: bool = False, git: GitRepo | None = None,
     gh_run: Callable[..., str] | None = None, tracker: Tracker | None = None,
     install_launchd: Callable[[Path], str] | None = None,
 ) -> InitReport:
@@ -114,15 +124,7 @@ def init_repo(
         added = {key: value for key, value in explicit.items() if value is not None and key not in local}
         if added:
             _validate({**asdict(config), **added})
-            original = config_path.read_text(encoding="utf-8")
-            node = yaml.compose(original)
-            closed = any(isinstance(event, yaml.events.DocumentEndEvent) and event.explicit
-                         for event in yaml.parse(original))
-            if (not isinstance(node, yaml.MappingNode) or node.flow_style or closed
-                    or (node.value and node.value[0][0].start_mark.column)):
-                updated_config = yaml.safe_dump({**local, **added}, sort_keys=False)
-            else:
-                updated_config = original.rstrip("\n") + "\n" + yaml.safe_dump(added, sort_keys=False)
+            updated_config = _add_config_keys(config_path.read_text(encoding="utf-8"), local, added)
     else:
         if approvers is None:
             login = _gh_call(run, ["api", "user", "--jq", ".login"])
@@ -135,6 +137,7 @@ def init_repo(
         values = {key: DEFAULTS[key] if value is None else value for key, value in options.items()}
         values["approvers"] = approvers
         _validate({**DEFAULTS, **values})
+        config = Config(**{**DEFAULTS, **values})
         minimal = {key: value for key, value in values.items()
                    if key in {"review", "approvers"} or options[key] is not None or value != DEFAULTS[key]}
         contents = {".foragent.yml": CONFIG_COMMENT + yaml.safe_dump(minimal, sort_keys=False), **contents}
@@ -150,16 +153,33 @@ def init_repo(
     pending = list(dict.fromkeys([
         *created, *([".foragent.yml"] if added else []), *git.uncommitted_paths(SETUP_PATHS),
     ]))
-    if pending and git.current_branch() != base_branch:
+    board_key_needed = not no_board and not config.board
+    if (pending or board_key_needed) and git.current_branch() != base_branch:
         raise GitError(f"init must run on the base branch {base_branch!r}; switch to it and re-run")
-    push_planned = not no_push and (bool(pending) or git.has_unpushed_setup(base_branch))
+    push_planned = not no_push and (bool(pending) or board_key_needed or git.has_unpushed_setup(base_branch))
 
     if dry_run:
         return InitReport(created, existed, True, push_planned=push_planned,
-                          commit_planned=bool(pending), launchd_planned=not no_launchd,
-                          normalized_root=normalized_root, added_keys=list(added))
+                          commit_planned=bool(pending) or board_key_needed, launchd_planned=not no_launchd,
+                          normalized_root=normalized_root,
+                          added_keys=[*added, *(["board"] if board_key_needed else [])])
 
-    (tracker or GhTracker(repo, run=run)).ensure_labels(LABELS)
+    tracker = tracker or GhTracker(repo, run=run)
+    tracker.ensure_labels(LABELS)
+    if not no_board:
+        try:
+            board_id = board.Board(tracker, repo, config).ensure()
+        except Exception:
+            board.log.warning("Board setup failed; continuing repository setup", exc_info=True)
+        else:
+            if config_path.exists() and local.get("board") != board_id:
+                added["board"] = board_id
+                updated_config = _add_config_keys(config_path.read_text(encoding="utf-8"), local, added)
+                if ".foragent.yml" not in pending:
+                    pending.append(".foragent.yml")
+            elif not config_path.exists():
+                contents[".foragent.yml"] = _add_config_keys(contents[".foragent.yml"], minimal, {"board": board_id})
+    push_planned = not no_push and (bool(pending) or git.has_unpushed_setup(base_branch))
     for path in created:
         destination = root / path
         destination.parent.mkdir(parents=True, exist_ok=True)

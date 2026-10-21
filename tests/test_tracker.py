@@ -51,6 +51,27 @@ class ScriptedRun:
         return response
 
 
+def test_graphql_uses_json_stdin_for_typed_nested_variables():
+    query = "mutation($input: CreateProjectV2Input!) { createProjectV2(input: $input) { projectV2 { id } } }"
+    variables = {"input": {"ownerId": "ORG_1", "title": 'Foragent: 한글 "repo"\n'}}
+    response = {"data": {"createProjectV2": {"projectV2": {"id": "PVT_1"}}}}
+    run = ScriptedRun(json.dumps(response))
+    assert GhTracker(REPO, run).graphql(query, variables) == response
+    args, stdin = run.calls[0]
+    assert args == ["api", "graphql", "--input", "-"]
+    assert json.loads(stdin) == {"query": query, "variables": variables}
+
+
+@pytest.mark.parametrize("response", [
+    '{"errors": [{"message": "Forbidden"}]}',
+    '{"data": {}, "errors": [{"message": "Forbidden"}]}',
+    '[]', '{"data": null}', 'not JSON',
+])
+def test_graphql_rejects_errors_and_malformed_responses(response):
+    with pytest.raises(TrackerError):
+        GhTracker(REPO, ScriptedRun(response)).graphql("query { viewer { id } }", {})
+
+
 def gh_error(stderr, stdout="", code=1):
     return subprocess.CalledProcessError(code, ["gh"], output=stdout, stderr=stderr)
 

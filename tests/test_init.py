@@ -113,6 +113,8 @@ class Setup:
         return "dev.foragent.owner.repo"
 
     def init(self, **kwargs):
+        # These setup cases exercise file/commit recovery independently of Projects.
+        kwargs.setdefault("no_board", True)
         return init_repo(
             self.root, git=GitRepo(self.root, self.run_git), gh_run=self.run_gh,
             tracker=self.tracker, install_launchd=self.install, **kwargs,
@@ -400,11 +402,43 @@ def test_existing_config_selects_base_branch(setup):
 def test_default_gh_tracker_uses_injected_runner_for_labels(setup):
     init_repo(
         setup.root, git=GitRepo(setup.root, setup.run_git), gh_run=setup.run_gh,
-        no_launchd=True, no_push=True,
+        no_launchd=True, no_push=True, no_board=True,
     )
     mutations = [(args, body) for args, body in setup.gh_calls if args[:3] == ["api", "-X", "POST"]]
     assert len(mutations) == len(LABELS)
     assert all(args[3] == "repos/owner/repo/labels" for args, body in mutations)
+
+
+def test_board_setup_dry_run_does_not_call_graphql(setup):
+    report = setup.init(no_board=False, dry_run=True)
+    assert report.commit_planned and report.push_planned
+    assert not setup.tracker.graphql_calls
+    assert not (setup.root / ".foragent.yml").exists()
+
+
+@pytest.mark.parametrize("config_text", [None, "board: null\n"])
+def test_init_finds_existing_owner_board_without_configured_id(setup, config_text):
+    from foragent.board import Board
+    from foragent.config import Config
+
+    if config_text is not None:
+        (setup.root / ".foragent.yml").write_text(config_text)
+    identity = Board(setup.tracker, "owner/repo", Config()).ensure()
+    setup.init(no_board=False)
+    assert load_config(setup.root).board == identity
+    assert (setup.root / ".foragent.yml").read_text().count("board:") == 1
+    assert len(setup.tracker.projects) == 1
+
+
+def test_init_board_failure_is_logged_and_setup_continues(setup, monkeypatch, caplog):
+    def offline(*args):
+        raise OSError("board is offline")
+
+    monkeypatch.setattr(setup.tracker, "graphql", offline)
+    report = setup.init(no_board=False)
+    assert report.committed
+    assert load_config(setup.root).board is None
+    assert "Board setup failed" in caplog.text
 
 
 def test_rerun_recovers_after_commit_hook_failure(setup):

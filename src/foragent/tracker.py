@@ -1,6 +1,7 @@
 """Issue tracking interfaces, an in-memory fake, and an offline-testable gh adapter."""
 
 from collections.abc import Callable, Iterable
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
@@ -67,6 +68,7 @@ class PullRequest:
 
 
 class Tracker(Protocol):
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]: ...
     def list_open_issues(self) -> list[Issue]: ...
     def list_issues(self, state: str = "all") -> list[Issue]: ...
     def update_issue(self, n: int, *, title: str, body: str) -> None: ...
@@ -134,6 +136,103 @@ class FakeTracker:
         self._pr_checks: dict[int, CheckStatus] = {}
         self._pr_heads: dict[int, str] = {}
         self._next_comment_id = 1
+        self.projects: dict[str, dict[str, Any]] = {}
+        self.graphql_calls: list[tuple[str, dict[str, Any]]] = []
+        self._next_graphql_id = 1
+
+    def _graphql_id(self, prefix: str) -> str:
+        identity = f"{prefix}_{self._next_graphql_id}"
+        self._next_graphql_id += 1
+        return identity
+
+    def _project_field(self, name: str, options: list[dict]) -> dict:
+        return {"id": self._graphql_id("FIELD"), "name": name, "options": [
+            {"id": option.get("id") or self._graphql_id("OPTION"), "color": "GRAY",
+             "description": "", **option} for option in options
+        ]}
+
+    @staticmethod
+    def _graphql_page(nodes: list, after: str | None = None) -> dict:
+        start = int(after) if after else 0
+        end = start + 100
+        return {"nodes": nodes[start:end], "pageInfo": {
+            "hasNextPage": end < len(nodes), "endCursor": str(min(end, len(nodes))),
+        }}
+
+    def _project_snapshot(self, project: dict, after: str | None = None) -> dict:
+        fields = project["fields"]
+        items = []
+        for item in project["items"].values():
+            values = []
+            for field_id, option_id in item["values"].items():
+                field = fields[field_id]
+                option = next((option for option in field["options"] if option["id"] == option_id), None)
+                if option is not None:
+                    values.append({"name": option["name"], "field": {"id": field_id, "name": field["name"]}})
+            items.append({"id": item["id"], "content": item["content"],
+                          "fieldValues": self._graphql_page(values)})
+        return {"id": project["id"], "title": project["title"],
+                "fields": self._graphql_page(list(fields.values()), after),
+                "items": self._graphql_page(items)}
+
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        """Offline Projects v2 operations, with the same response shape as GitHub."""
+        self.graphql_calls.append((query, deepcopy(variables)))
+        inputs = variables.get("input", {})
+        if re.search(r"\bcreateProjectV2\s*\(", query):
+            identity = self._graphql_id("PROJECT")
+            status = self._project_field("Status", [{"name": name} for name in ("Todo", "In Progress", "Done")])
+            self.projects[identity] = {"id": identity, "title": inputs["title"],
+                "ownerId": inputs["ownerId"], "fields": {status["id"]: status}, "items": {}}
+            result = {"createProjectV2": {"projectV2": {"id": identity, "title": inputs["title"]}}}
+        elif re.search(r"\bcreateProjectV2Field\s*\(", query):
+            field = self._project_field(inputs["name"], inputs["singleSelectOptions"])
+            self.projects[inputs["projectId"]]["fields"][field["id"]] = field
+            result = {"createProjectV2Field": {"projectV2Field": field}}
+        elif re.search(r"\bupdateProjectV2Field\s*\(", query):
+            field = next((p["fields"][inputs["fieldId"]] for p in self.projects.values()
+                          if inputs["fieldId"] in p["fields"]), None)
+            if field is None:
+                raise TrackerError("project field not found")
+            field["options"] = self._project_field(field["name"], inputs["singleSelectOptions"])["options"]
+            result = {"updateProjectV2Field": {"projectV2Field": field}}
+        elif re.search(r"\baddProjectV2ItemById\s*\(", query):
+            project = self.projects[inputs["projectId"]]
+            number = int(inputs["contentId"].removeprefix("ISSUE_"))
+            self.get_issue(number)
+            item = next((item for item in project["items"].values() if item["content"]["number"] == number), None)
+            if item is None:
+                identity = self._graphql_id("ITEM")
+                item = {"id": identity, "content": {"id": inputs["contentId"], "number": number}, "values": {}}
+                project["items"][identity] = item
+            result = {"addProjectV2ItemById": {"item": {"id": item["id"]}}}
+        elif re.search(r"\bupdateProjectV2ItemFieldValue\s*\(", query):
+            project = self.projects[inputs["projectId"]]
+            field = project["fields"][inputs["fieldId"]]
+            option_id = inputs["value"]["singleSelectOptionId"]
+            if not any(option["id"] == option_id for option in field["options"]):
+                raise TrackerError("project option not found")
+            item = project["items"][inputs["itemId"]]
+            item["values"][field["id"]] = option_id
+            result = {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": item["id"]}}}
+        elif re.search(r"\bnode\s*\(", query):
+            project = self.projects.get(variables["id"])
+            result = {"node": self._project_snapshot(project, variables.get("after")) if project else None}
+        elif re.search(r"\brepository\s*\(", query):
+            owner, name = variables["owner"], variables["name"]
+            if "number" in variables:
+                number = variables["number"]
+                self.get_issue(number)
+                result = {"repository": {"issue": {"id": f"ISSUE_{number}", "number": number}}}
+            else:
+                owner_id = f"OWNER_{owner}"
+                projects = [{"id": p["id"], "title": p["title"]} for p in self.projects.values()
+                            if p["ownerId"] == owner_id]
+                result = {"repository": {"id": f"REPO_{owner}/{name}", "owner": {"id": owner_id,
+                          "projectsV2": self._graphql_page(projects, variables.get("after"))}}}
+        else:
+            raise TrackerError("unsupported fake GraphQL operation")
+        return {"data": deepcopy(result)}
 
     def _timestamp(self) -> str:
         return self._now().astimezone(UTC).isoformat()
@@ -345,6 +444,21 @@ class GhTracker:
             ) from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise TrackerError(str(exc)) from exc
+
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        output = self._call(["api", "graphql", "--input", "-"],
+                            input=json.dumps({"query": query, "variables": variables}))
+        try:
+            result = json.loads(output)
+            if not isinstance(result, dict):
+                raise TrackerError("invalid GraphQL response")
+            if result.get("errors"):
+                raise TrackerError(f"GraphQL failed: {result['errors']}")
+            if not isinstance(result.get("data"), dict):
+                raise TrackerError("invalid GraphQL response")
+            return result
+        except json.JSONDecodeError as exc:
+            raise TrackerError(f"invalid GraphQL JSON: {exc}") from exc
 
     def list_open_issues(self) -> list[Issue]:
         return self.list_issues("open")

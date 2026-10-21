@@ -52,6 +52,7 @@ class Config:
     max_retries: int = 2
     base_branch: str = "main"
     repo: str | None = None
+    board: str | None = None
     language: str = "en"
     interview: str = "ouroboros"
     ouroboros_version: str | None = None
@@ -124,7 +125,7 @@ def _validate(values: dict[str, Any]) -> None:
     for key in ("always_human", "approvers"):
         if not isinstance(values[key], list) or any(not isinstance(item, str) for item in values[key]):
             raise ConfigError(f"{key} must be a list of strings")
-    for key in ("executor_model", "reviewer_model", "executor_fallback_model", "ouroboros_version"):
+    for key in ("executor_model", "reviewer_model", "executor_fallback_model", "ouroboros_version", "board"):
         if values[key] is not None and not isinstance(values[key], str):
             raise ConfigError(f"{key} must be a string or null")
     lanes = values["lanes"]

@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import quote
 
+from foragent import board
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, latest_flag
@@ -457,6 +458,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             tracker.add_labels(number, labels)
             recorded_blobs[str(number)] = blobs
         tracker.add_sub_issue(parent, number)
+        board.add_issue(config, tracker, repo, tracker.get_issue(number))
     for item in plan["issues"]:
         number = mapping[item["key"]]
         desired = {mapping[key] for key in item.get("blocked_by", [])}
@@ -481,12 +483,16 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             if not prior:
                 tracker.comment(number, comment)
         recorded_blobs[str(number)] = blobs
+        board.add_issue(config, tracker, repo, tracker.get_issue(number))
     tracker.update_issue(parent, title=plan["title"], body=parent_body())
     if selected_numbers - edit_numbers - {mapping[key] for key in keys}:
         raise PlanError("approve numbers must refer to this plan's children or edits")
     approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
     for number in sorted(approved_numbers):
+        already_approved = "approved" in tracker.get_issue(number).labels
         tracker.add_labels(number, ["approved"])
+        if not already_approved:
+            board.update_status(config, tracker, repo, number, "Approved")
     if approved_numbers:
         kick_tick(root)
     for item, row in zip(plan["issues"], rows):

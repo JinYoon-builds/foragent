@@ -4,6 +4,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol
 
+from foragent import board
+from foragent.config import Config
 from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING
 from foragent.reasons import Reason, format_comment
 from foragent.state import StateStore
@@ -11,6 +13,8 @@ from foragent.tracker import Tracker
 
 
 class FlagContext(Protocol):
+    config: Config
+    repo: str
     store: StateStore
     tracker: Tracker
     now: Callable[[], datetime]
@@ -23,6 +27,7 @@ def flag(
     ctx.tracker.add_labels(n, [NEEDS_HUMAN])
     ctx.tracker.remove_labels(n, [READY, RUNNING])
     ctx.tracker.comment(n, format_comment(reason, summary, details))
+    board.sync_status(ctx, n, "Needs human")
 
 
 def invalidate_approval(

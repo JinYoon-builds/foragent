@@ -27,7 +27,7 @@ def test_exact_defaults(repo):
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
-        "repo": None, "language": "en", "codex_goal": False, "review_level": "low",
+        "repo": None, "board": None, "language": "en", "codex_goal": False, "review_level": "low",
         "interview": "ouroboros", "ouroboros_version": None,
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
@@ -183,7 +183,7 @@ def test_all_valid_overrides(repo):
         "approvers": ["human"], "acceptance_dir": "checks/", "notify": ["slack:#project"],
         "run_hours": "22-08", "stall_minutes": 1, "max_runtime_minutes": 1,
         "max_retries": 1, "review_max": 3, "base_branch": "trunk",
-        "repo": "owner/name", "language": "ko", "codex_goal": True, "review_level": "max",
+        "repo": "owner/name", "board": "PVT_example", "language": "ko", "codex_goal": True, "review_level": "max",
     }
     write_settings(repo / ".foragent.yml", settings)
     assert asdict(load_config(repo)) == DEFAULTS | settings

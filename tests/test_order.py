@@ -174,6 +174,43 @@ def test_publish_kicks_once_after_requested_approvals(publishing, plan, monkeypa
     assert calls == ([root, root] if approved else [])
 
 
+def test_publish_new_lane_and_republish_preserve_board_items_and_running_status(publishing, plan):
+    from foragent import board
+    from test_board import snapshot
+
+    root, config, tracker, git, events = publishing
+    identity = board.Board(tracker, "owner/repo", config).ensure()
+    config = replace(config, board=identity)
+    case = (root, config, tracker, git, events)
+    plan["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": []}]
+    plan["issues"][1]["lane"] = "web"
+    publish(case, plan, approve=True)
+    board.update_status(config, tracker, "owner/repo", 2, "Running")
+    updated = (root, replace(load_config(root), board=identity), tracker, git, events)
+    publish(updated, plan, approve=True)
+    project = snapshot(tracker, identity)
+    values = {item["content"]["number"]: {v["field"]["name"]: v["name"]
+              for v in item["fieldValues"]["nodes"]} for item in project["items"]["nodes"]}
+    assert values == {2: {"Lane": "api", "Size": "m", "Status": "Running"},
+                      3: {"Lane": "web", "Size": "s", "Status": "Approved"}}
+
+
+def test_board_failure_does_not_interrupt_publication(publishing, plan, monkeypatch, caplog):
+    from foragent import board
+
+    root, config, tracker, git, events = publishing
+    identity = board.Board(tracker, "owner/repo", config).ensure()
+
+    def offline(*args):
+        raise OSError("board offline")
+
+    monkeypatch.setattr(tracker, "graphql", offline)
+    report = publish((root, replace(config, board=identity), tracker, git, events), plan, approve=True)
+    assert report.parent == 1
+    assert all("approved" in tracker.get_issue(n).labels for n in (2, 3))
+    assert "Board item update failed" in caplog.text
+
+
 def test_dry_run_has_no_writes(publishing, plan, kicks):
     root, _, tracker, _, events = publishing
     before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
