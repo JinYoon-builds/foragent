@@ -189,6 +189,11 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
     if issue.state != "open" or issue.labels & {BLOCKED, NEEDS_HUMAN}:
         ctx.tracker.remove_labels(number, [RUNNING])
         return
+    if ctx.tracker.find_pr(f"foragent/issue-{number}") is not None:
+        flag(ctx, number, Reason.RETRIES_EXCEEDED,
+             "Runner stopped with an open PR; rerun review or retry implementation.")
+        report.actions.append(f"#{number} flagged retries-exceeded after runner crash with open PR")
+        return
     failures = 0
     for past in reversed(ctx.store.read_history()):
         if past.number != number:
@@ -236,6 +241,10 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
     issue = ctx.tracker.get_issue(number)
     if issue.state != "open" or issue.labels & {BLOCKED, NEEDS_HUMAN}:
         ctx.tracker.remove_labels(number, [RUNNING])
+    elif ctx.tracker.find_pr(f"foragent/issue-{number}") is not None:
+        flag(ctx, number, Reason.STALLED,
+             "Runner stalled with an open PR; rerun review or retry implementation.")
+        report.actions.append(f"#{number} flagged stalled with open PR")
     elif restarts <= 1:
         ctx.tracker.add_labels(number, [READY])
         ctx.tracker.remove_labels(number, [RUNNING])
