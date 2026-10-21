@@ -140,12 +140,15 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
     orchestrator = commands.add_parser("orch", help="Diagnose and recover blocked issues")
     orch_actions = orchestrator.add_subparsers(dest="action", required=True)
-    for name in ("list", "rerun-review", "retry", "resolve", "escalate", "log"):
+    for name in ("list", "rerun-review", "retry", "resolve", "escalate", "log", "watch"):
         command = orch_actions.add_parser(name)
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
         if name == "list":
             command.add_argument("--json", action="store_true")
-        elif name not in {"log"}:
+        elif name == "watch":
+            command.add_argument("--interval", type=float, default=5, help="Poll interval in seconds (default: 5)")
+            command.add_argument("--follow", action="store_true", help="Keep printing changes until interrupted")
+        elif name != "log":
             command.add_argument("number", type=int)
         if name == "retry":
             command.add_argument("--hint")
@@ -397,6 +400,12 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == "log":
                 for event in orch.log(ctx):
                     print(f"{event['at']} [{event['kind']}] {event['summary']}")
+            elif args.action == "watch":
+                try:
+                    for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow):
+                        print(json.dumps(snapshot, ensure_ascii=False), flush=True)
+                except KeyboardInterrupt:
+                    pass
             elif args.action == "retry":
                 print(orch.retry(ctx, args.number, args.hint))
             elif args.action == "rerun-review":
