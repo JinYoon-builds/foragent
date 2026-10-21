@@ -204,3 +204,4 @@
 - 결정: 기본 `skill_libraries`에 `anthropics/skills`(Anthropic 공식, Apache-2.0, 스킬마다 LICENSE.txt)를 추가한다. 디자인 레인 기본 구성: 기준 만들기 = `frontend-design`(템플릿 같은 기본값·생성 티를 피하고 의도적으로 색·글꼴·배치를 고름), 기준 지키기 = `design-system`·`design-critique`·`accessibility-review`·`ux-copy`(knowledge-work-plugins), 확인하기 = `webapp-testing`(Playwright로 띄워 누르고 스크린샷 — inspect 웹 써 보기에도 사용). 탐색 단계 시제품은 `theme-factory`.
 - 주의: `frontend-design`은 과감한 개성 쪽으로 기운다. 사람의 취향 인터뷰(좋아하는 앱 2~3개)와 디자인 계약서가 스킬보다 우선한다고 계약서에 적는다. 스킬은 "의도를 갖고 고르는 법", 취향은 "무엇을 고르나".
 - 레인당 스킬 3개 상한(D32)은 디자인 레인에서 단계별로 나눠 쓴다(디자인 기초 이슈는 frontend-design·design-system, 화면 이슈는 design-critique·accessibility-review·ux-copy). — 미구현
+- D34 보강: anthropics/skills는 "스킬 형식의 공식 견본집(예시·교육용)"이고 knowledge-work-plugins는 "직무별 업무 패키지"다. anthropics/skills의 docx·pdf·pptx·xlsx는 source-available(오픈소스 아님)이다. `fa skills install`은 스킬마다 LICENSE를 읽어 오픈소스 라이선스(Apache-2.0, MIT 등)가 아니면 장착하지 않고 이유를 출력한다. 카탈로그에도 라이선스를 표시한다. — 미구현
