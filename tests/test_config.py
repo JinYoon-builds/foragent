@@ -28,6 +28,7 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "base_branch": "main",
         "repo": None, "language": "en", "codex_goal": False, "review_level": "low",
+        "interview": "ouroboros", "ouroboros_version": None,
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
@@ -112,6 +113,8 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
 
 
 @pytest.mark.parametrize("key,value", [
+    ("interview", "magic"), ("interview", None), ("interview", []), ("interview", True),
+    ("ouroboros_version", 52), ("ouroboros_version", []), ("ouroboros_version", False),
     ("review", "FAST"), ("review", None), ("review", []),
     ("review_paths", []), ("review_paths", {"app/**": "unknown"}),
     ("review_paths", {1: "fast"}), ("review_paths", {"app/**": []}),
@@ -133,6 +136,16 @@ def test_validation_errors_name_the_field(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
     with pytest.raises(ConfigError, match=key):
         load_config(repo)
+
+
+def test_interview_settings_merge_global_and_repository(repo, tmp_path):
+    global_path = tmp_path / "global.yml"
+    write_settings(global_path, {"interview": "native", "ouroboros_version": "0.51.1"})
+    config = load_config(repo, global_path)
+    assert config.interview == "native" and config.ouroboros_version == "0.51.1"
+    write_settings(repo / ".foragent.yml", {"interview": "ouroboros", "ouroboros_version": None})
+    config = load_config(repo, global_path)
+    assert config.interview == "ouroboros" and config.ouroboros_version is None
 
 
 @pytest.mark.parametrize("source", ["local", "global"])

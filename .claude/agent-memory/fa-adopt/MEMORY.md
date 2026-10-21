@@ -1,0 +1,18 @@
+# adopt 레인 현재 메모
+
+- `fa adopt` 하위 명령의 인자와 오류 처리는 `src/foragent/cli.py`에 이미 있다. 구현은 `src/foragent/adopt.py`의 `run()`에서 분기한다.
+- `load_config()`는 `.foragent.yml`이 없으면 오류를 낸다. 초기 도입 전 survey는 파일이 없을 때 `Config()` 기본값을 사용한다. 기본 인수 시험 경로는 `tests/acceptance/`다.
+- survey의 빈 저장소 판정은 추적 파일 기준이고, 기존 에이전트 설정과 CI는 현재 작업 폴더 기준이다. 같은 경로의 여러 파일이 한 커밋에 바뀌어도 변경 횟수는 한 번이다.
+- Git 파일명은 NUL 구분자로 읽는다. `git log --name-only -z`는 커밋 헤더 뒤 첫 파일명 앞에 줄바꿈을 추가한다. 파일명 자체의 공백이나 줄바꿈을 일괄 제거하면 안 된다.
+- CI 파일 하나에 여러 테스트 실행이 있으면, 하나라도 인수 시험을 포함할 때 `runs_acceptance`는 true다. pytest의 정확한 `--ignore=<acceptance_dir 끝 슬래시 제거>` 인자가 제외 근거다.
+- 사람이 확인하는 명령: `uv run fa adopt survey --json`, `uv run fa adopt survey`. 인수 시험 명령: `uv run pytest -q tests/acceptance/test_adopt_survey.py`. issue #3에서는 사용자 지시에 따라 테스트를 실행하지 않았다.
+- 로컬 기본 `python3`에는 PyYAML이 없었다. 환경을 만들지 않고 CLI를 확인할 때 `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /Users/apple/.local/share/uv/tools/foragent/bin/python -B -m foragent.cli adopt survey`를 사용했다.
+- issue #5의 CI 조회·수정은 `ci(root, exclude_acceptance=False)`가 맡는다. survey와 `_workflow_runs()`·`_test_invocations()`를 공유한다. CI 조회에는 Git 초기화나 `.foragent.yml`이 필요 없다.
+- YAML을 다시 저장하거나 `read_text()`로 개행을 정규화하면 바이트 보존 조건을 깨뜨린다. `read_bytes().decode("utf-8")`와 YAML scalar 위치를 사용해 뒤쪽부터 옵션만 삽입한다. 따옴표·주석·CRLF·마지막 개행 유무를 보존한다. alias·merge는 같은 원문 위치에 한 번만 삽입한다.
+- 셸 주석과 따옴표 안의 `#`를 구별해야 한다. 따옴표를 제거한 토큰에서 `#`를 주석으로 판단하면 이미 붙인 `--ignore`를 못 보고 반복 실행 때 중복 추가한다.
+- CI의 npm/pnpm/go 실행 및 여러 줄 YAML 실행 블록은 `manual`에 표시한다. `needs_change`는 수정 전 상태이고 `changed`는 이번 호출이 실제 바꾼 파일이다.
+- 검증: `uv run pytest -q tests/acceptance/test_adopt_ci.py tests/acceptance/test_adopt_survey.py tests/test_adopt.py tests/test_cli.py` (issue #5: 84개 통과). 기본 uv 캐시에 쓰기가 막히면 `/private/tmp`에 캐시 메타데이터와 해당 패키지 archive를 복사하고 `UV_CACHE_DIR`로 지정해 `uv run --offline`을 쓸 수 있다. 외부 archive를 가리키는 symlink만 복사하면 캐시가 인식되지 않았다.
+- issue #4의 baseline은 `baseline(root, command=None, timeout=900)`이 맡는다. `_detect_test_command()`는 Python(`pyproject.toml` 또는 `requirements.txt`) → npm/pnpm(`package.json` test 스크립트) → Go 순서다. Python은 order와 같은 `uv run pytest`를 쓰며, requirements 감지만 adopt에 추가했다. `order.py`는 다른 레인 소유다.
+- baseline은 pytest 실행 부분에 설정 경로의 `--ignore`와 `-rf`를 붙인다. 자식 출력을 수집해 JSON에 섞이지 않게 하고, ANSI 색상을 제거한 `FAILED ` 요약 줄에서 node id를 추출한다. 매개변수에 공백이 있을 수 있으므로 첫 공백으로 자르면 안 된다.
+- 시간 초과는 셸만 종료하면 자식 테스트가 출력 파이프를 계속 잡을 수 있다. baseline은 별도 프로세스 그룹을 만들고 전체를 종료한 뒤 `exit_code: 124`, `passed: false`로 보고한다. 실패·시간 초과·명령 없음 모두 fa 종료 코드는 0이다.
+- issue #4 검증: `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest -q tests/acceptance/test_adopt_baseline.py tests/test_adopt.py tests/test_cli.py` — 92개 통과. 사람 확인 명령은 `.foragent/TRY.md`에 있다.

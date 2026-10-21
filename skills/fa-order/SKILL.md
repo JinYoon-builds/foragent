@@ -26,7 +26,20 @@ Run `fa order context --json` and read it fully. Then read the repository yourse
 - Never ask what the code, docs, specs or earlier decisions already answer.
 
 ## 2. Interview
-Use AskUserQuestion. Multiple choice, your recommendation first and marked, 2–4 options.
+Read `interview.engine` from `fa order context --json` to choose the interview:
+- If `ouroboros`, run the Ouroboros interview (`ooo interview` / `/ouroboros:interview`)
+  with the request and settled context from step 1, then run its seed step
+  (`ooo seed` / `/ouroboros:seed`). Read the produced seed as settled context and skip
+  questions it already answers. Carry the seed into step 3's restatement and confirmation
+  and step 4's issue split; continue through steps 3–7.
+- If `native`, or if the Ouroboros interview or seed step fails, use the native
+  AskUserQuestion interview below. Mention the reason once (use `interview.reason` from
+  the context when available, otherwise the selected native engine or observed failure).
+  Keep any settled answers already gathered and ask only about remaining gaps.
+Use Ouroboros only for interview and seed; never use Ouroboros run/evolve (D18).
+
+For the native interview, use AskUserQuestion. Multiple choice, your recommendation first
+and marked, 2–4 options.
 Ask only what changes product behaviour, scope, priority, UX or an approval boundary.
 Do not ask about reversible implementation details — decide them and note them in the spec.
 - New project (no specs yet): find the goal first — who uses it, the first thing they do,
