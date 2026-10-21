@@ -98,7 +98,7 @@ def pad(line):
 def road(lanes, tick):
     rows = [edge()]
     for i, lane in enumerate(lanes):
-        line = Text(f" {lane.name:<6}", style="bold white " + ASPHALT)
+        line = Text(f" {lane.emoji} {lane.name:<4}", style="bold white " + ASPHALT)
         line.append("▸ ", style="dim " + ASPHALT)
         blocks = list(reversed(lane.queue))
         width = sum(len(f" #{n} ") + 1 for n in blocks)
@@ -124,7 +124,7 @@ def road(lanes, tick):
         line.append(tool, style="yellow " + ASPHALT)
         line.append(" ", style=ASPHALT)
         if lane.deployed:
-            line.append(f"▐ {lane.badge} {lane.emoji} {lane.agent:<9}▌", style=label_style)
+            line.append(f"▐ {lane.badge} {lane.agent} ▌", style=label_style)
         else:
             line.append("  · · ·  배치 중  ", style=label_style)
         rows.append(pad(line))
@@ -233,10 +233,10 @@ def render(lanes, tick):
 
 def main():
     lanes = [
-        Lane("api", "🔧", "fa-api", "Claude", "opus-5.5 · high", ["testing-strategy", "system-design"], [1, 2, 3, 6]),
-        Lane("web", "🎨", "fa-web", "Codex", "gpt-6.1 · xhigh", ["frontend-design", "accessibility-review", "ux-copy"], [4, 5, 9]),
-        Lane("order", "📋", "fa-order", "Codex", "gpt-6.1 · medium", [], [7, 8]),
-        Lane("docs", "📝", "fa-docs", "Claude", "sonnet-5.5 · low", ["documentation"], []),
+        Lane("서버", "🔧", "서버 담당", "Claude", "opus-5.5 · high", ["testing-strategy", "system-design"], [1, 2, 3, 6]),
+        Lane("화면", "🎨", "화면 담당", "Codex", "gpt-6.1 · xhigh", ["frontend-design", "accessibility-review", "ux-copy"], [4, 5, 9]),
+        Lane("주문", "📋", "주문 담당", "Codex", "gpt-6.1 · medium", [], [7, 8]),
+        Lane("문서", "📝", "문서 담당", "Claude", "sonnet-5.5 · low", ["documentation"], []),
     ]
     global TOTAL_ISSUES
     TOTAL_ISSUES = sum(len(l.queue) for l in lanes)
