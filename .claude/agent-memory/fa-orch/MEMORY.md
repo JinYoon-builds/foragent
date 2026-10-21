@@ -1,5 +1,11 @@
 # orch 레인 현재 메모
 
+- #64: 구현 프롬프트의 전체 시험 명령은 `config.test_command`를 우선하고, 없으면 실제 작업공간에서 `order.detect_test_commands()`의 첫 명령을 사용한다. CI 로그는 `GhTracker.pr_failed_logs()`가 PR head SHA의 Actions 실행을 페이지 끝까지 읽고 실행별 마지막 4,000자를 가져온다. `.workflow_runs`를 `--jq`로 배열로 꺼내야 기존 `_items()`로 읽을 수 있다.
+- #64: 일반 구현과 재리뷰의 CI 실패는 `_ci_failure()`에서 예산을 한 번만 소비하고 `_implement_and_publish()`의 공통 검증·리뷰·게시 경로로 돌아간다. CI 로그 여러 개를 다시 전체 4,000자로 자르지 않는다. 재리뷰의 detached 작업공간은 같은 위치에서 이슈 브랜치에 연결하고, 새 head는 새 리뷰를 받아야 한다. `_next_review_round()`로 이전 원문 파일을 보존한다.
+- 공통 실행 루프를 추출할 때 기존 `GitRepo` 인스턴스도 넘긴다. 로컬 스킬 제외 경로인 `local_skill_paths`는 인스턴스에 있으므로 `ctx.git.at(worktree)`를 다시 만들면 제외 정보가 사라진다. 스킬 복사를 두 번 호출해도 두 번째 호출은 이미 존재하는 파일을 로컬 주입 대상으로 기록하지 않으므로 처음 인스턴스의 기록을 보존해야 한다.
+- #64 이전 orch-verbs 인수 시험의 `resolve pass` + CI 실패 항목은 `max_retries=3`에 구현자 응답을 하나만 준비하여 새 재시도 흐름과 맞지 않는다. 고정 시험은 수정하지 않으며 `.foragent/REBUTTAL.md`에 근거를 남겼다. 지정 시험은 `tests/acceptance/test_ci_feedback.py`이고 새 경계 시험은 기존 `tests/test_runner.py`, `tests/test_tracker.py`, `tests/test_orch.py`에 추가한다.
+- #64 검증: 지정 ci-feedback 인수 시험 4개와 전체 CI 명령(`UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest -q --ignore=tests/acceptance`) 1,859개 통과. 전체 시험 수집 뒤 추가한 최신 base 병합 후 CI 재시도 시험도 별도로 1개 통과했다. ci-feedback·orch-verbs·review-handoff·merge 인수 시험을 함께 실행하면 위의 이전 orch-verbs 항목 1개만 실패하고 나머지 22개는 통과한다. 인수 시험 파일과 Git 인덱스는 수정하지 않았다.
+
 - gate·runner의 차단 처리는 `src/foragent/actions.py`의 `flag()`를 공유한다. 이 함수는 `blocked` 라벨과 `<!-- foragent:blocked reason=... -->` 댓글을 남기며, 기존 이유 코드·상세 출력·승인 무효화 기록을 유지한다.
 - `format_comment()`의 기본은 기존 사람 확인 댓글과 호환되도록 `needs-human`이다. gate·runner에서는 `label="blocked"`를 명시한다. `parse_reason()`은 두 표식을 모두 읽는다.
 - `scheduler.tick()`의 타임아웃은 로컬 flag 기록이 아니라 GitHub에서 가장 최근의 blocked 댓글 시각을 기준으로 한다. 알 수 없는 새 이유 코드도 유효한 blocked 표식이면 시계 기준이 된다. `orchestrator_timeout_minutes` 기본값은 30이며 양의 정수만 허용한다.
