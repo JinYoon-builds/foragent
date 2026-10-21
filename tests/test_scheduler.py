@@ -141,7 +141,7 @@ def test_body_integrity_for_every_approved_state(ctx, state):
         ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1), pid=123)
     edit_body(ctx, 1, BODY.replace("Other features.", "Changed scope."))
     report = tick(ctx)
-    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
     assert ctx.store.load_approval(1) is None
     comment = ctx.tracker.list_comments(1)[-1].body
     assert parse_reason(comment) == Reason.HASH_MISMATCH
@@ -167,7 +167,7 @@ def test_running_integrity_failure_kills_and_finishes_before_flagging(ctx, git_h
     add_labels = ctx.tracker.add_labels
 
     def add(number, labels):
-        if "needs-human" in labels:
+        if "blocked" in labels:
             assert actions == [("kill", 4321)]
             assert ctx.store.get_run(number).outcome == "killed"
         return add_labels(number, labels)
@@ -178,7 +178,7 @@ def test_running_integrity_failure_kills_and_finishes_before_flagging(ctx, git_h
     assert ctx.store.get_run(1).outcome == "killed"
     assert ctx.store.load_flag(1).reason == Reason.HASH_MISMATCH
     assert ctx.store.load_approval(1) is None
-    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
 
 
 @pytest.mark.parametrize("seconds,killed", [(0, False), (1, True)])
@@ -195,7 +195,7 @@ def test_running_overtime_backstop_kills_alive_runner(ctx, monkeypatch, seconds,
     if killed:
         assert ctx.store.get_run(1).outcome == "killed"
         assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
-        assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+        assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     else:
         assert ctx.store.get_run(1).status == "running"
 
@@ -463,7 +463,7 @@ def test_acceptance_integrity_tracks_origin_changes_and_deletions(ctx, git_histo
     tick(ctx)
     git_history.update({ACCEPTANCE: content})
     tick(ctx)
-    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
     assert ctx.store.load_approval(1) is None
     comment = ctx.tracker.list_comments(1)[-1].body
     assert parse_reason(comment) == Reason.HASH_MISMATCH
@@ -490,18 +490,18 @@ def test_missing_acceptance_file_is_snapshotted_and_detected_when_added(ctx, git
     assert ctx.store.load_approval(1).acceptance_blobs == {path: "missing"}
     git_history.update({path: "assert True\n"})
     tick(ctx)
-    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
 
 
 def test_no_machine_check_flags_once_and_human_removal_resumes(ctx):
     approve(ctx, body="## Done when\n- [ ] Looks good\n")
     tick(ctx)
-    assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert parse_reason(ctx.tracker.list_comments(1)[-1].body) == Reason.NO_MACHINE_CHECK
     count = len(ctx.tracker.list_comments(1))
     assert tick(ctx).actions == []
     assert len(ctx.tracker.list_comments(1)) == count
-    ctx.tracker.remove_labels(1, ["needs-human", "approved"])
+    ctx.tracker.remove_labels(1, ["blocked", "approved"])
     edit_body(ctx, 1, BODY)
     ctx.tracker._now = lambda: NOW + timedelta(minutes=1)
     ctx.tracker.record_label(1, "approved", "human")
@@ -509,11 +509,12 @@ def test_no_machine_check_flags_once_and_human_removal_resumes(ctx):
     assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
 
 
-def test_needs_human_is_skipped_entirely(ctx, monkeypatch):
-    approve(ctx, labels=["needs-human", "ready"])
+@pytest.mark.parametrize("label", ["blocked", "needs-human"])
+def test_flagged_issue_is_skipped_entirely(ctx, monkeypatch, label):
+    approve(ctx, labels=[label, "ready"])
 
     def unexpected(*args):
-        pytest.fail("needs-human issues must not be inspected")
+        pytest.fail("flagged issues must not be inspected")
 
     monkeypatch.setattr(ctx.tracker, "label_events", unexpected)
     monkeypatch.setattr(ctx.tracker, "blocked_by", unexpected)
@@ -649,7 +650,7 @@ def test_integrity_rechecked_against_fresh_issue_right_before_start(ctx, monkeyp
     tick(ctx)
     assert calls
     assert ctx.store.active_runs() == []
-    assert original(1).labels == {"needs-human"}
+    assert original(1).labels == {"blocked"}
     assert ctx.store.load_approval(1) is None
 
 
@@ -669,10 +670,10 @@ def test_acceptance_blobs_rechecked_before_start(ctx, monkeypatch):
     tick(ctx)
     assert len(calls) == 2
     assert ctx.store.active_runs() == []
-    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
 
 
-@pytest.mark.parametrize("change", ["closed", "needs-human", "unapproved", "reapproved"])
+@pytest.mark.parametrize("change", ["closed", "blocked", "needs-human", "unapproved", "reapproved"])
 def test_issue_must_still_be_eligible_before_start(ctx, monkeypatch, change):
     approve(ctx)
     tick(ctx)
@@ -683,8 +684,8 @@ def test_issue_must_still_be_eligible_before_start(ctx, monkeypatch, change):
         issue = original(number)
         if change == "closed":
             return replace(issue, state="closed")
-        if change == "needs-human":
-            return replace(issue, labels=issue.labels | {"needs-human"})
+        if change in {"blocked", "needs-human"}:
+            return replace(issue, labels=issue.labels | {change})
         if change == "unapproved":
             return replace(issue, labels=issue.labels - {"approved"})
         event = next(event for event in ctx.tracker.label_events(number) if event.label == "approved")
@@ -703,7 +704,7 @@ def test_flag_only_changes_labels_and_posts_a_reason(ctx):
     original = ctx.tracker.get_issue(1)
     flag(ctx, 1, Reason.SPEC_QUESTION, "Choose a behavior.", "Option A or B.")
     issue = ctx.tracker.get_issue(1)
-    assert issue.labels == {"approved", "needs-human"}
+    assert issue.labels == {"approved", "blocked"}
     assert issue.body == original.body and issue.state == "open"
     assert parse_reason(ctx.tracker.list_comments(1)[-1].body) == Reason.SPEC_QUESTION
     assert ctx.tracker.created_prs == ctx.tracker.merged_prs == []
@@ -725,7 +726,7 @@ def test_first_snapshot_rejects_edits_at_or_after_approval(ctx, edit_seconds):
     tick(ctx)
     if edit_seconds >= 0:
         assert ctx.store.load_approval(1) is None
-        assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+        assert ctx.tracker.get_issue(1).labels == {"blocked"}
         assert len(ctx.tracker.list_comments(1)) == 1
         comment = ctx.tracker.list_comments(1)[0].body
         assert parse_reason(comment) == Reason.HASH_MISMATCH
@@ -744,7 +745,7 @@ def test_body_changed_and_reverted_before_first_tick_still_requires_reapproval(c
     edit_body(ctx, 1, BODY)
     tick(ctx)
     assert ctx.store.load_approval(1) is None
-    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
 
 
 @pytest.mark.parametrize("content", ["pass\n", None])
@@ -754,7 +755,7 @@ def test_acceptance_changed_after_approval_before_first_tick(ctx, git_history, c
     ctx.now = lambda: NOW + timedelta(minutes=2)
     tick(ctx)
     assert ctx.store.load_approval(1) is None
-    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
     comments = ctx.tracker.list_comments(1)
     assert len(comments) == 1 and parse_reason(comments[0].body) == Reason.HASH_MISMATCH
     assert ACCEPTANCE in comments[0].body
@@ -777,7 +778,7 @@ def test_missing_approval_time_base_commit_requires_reapproval(ctx, monkeypatch)
     monkeypatch.setattr(ctx.git, "commit_before", lambda ref, time: None)
     tick(ctx)
     assert ctx.store.load_approval(1) is None
-    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
     assert "no base commit" in ctx.tracker.list_comments(1)[0].body
 
 
@@ -788,7 +789,7 @@ def test_hash_mismatch_reapproval_is_one_human_action_and_survives_restart(ctx):
     edit_body(ctx, 1, BODY + "Changed\n")
     ctx.now = lambda: NOW + timedelta(minutes=2)
     tick(ctx)
-    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
     assert ctx.store.load_flag(1).reason == Reason.HASH_MISMATCH
     ctx.store = StateStore(ctx.store.root, now=lambda: ctx.now())
     ctx.now = lambda: NOW + timedelta(minutes=3)
@@ -810,7 +811,7 @@ def test_reapproval_must_be_strictly_after_flag(ctx, event_offset):
     ctx.tracker.record_label(1, "approved", "human")
     ctx.now = lambda: NOW + timedelta(minutes=3)
     assert tick(ctx).actions == []
-    assert "needs-human" in ctx.tracker.get_issue(1).labels
+    assert "blocked" in ctx.tracker.get_issue(1).labels
 
 
 @pytest.mark.parametrize("reason", [Reason.NO_MACHINE_CHECK, Reason.SPEC_QUESTION, Reason.RETRIES_EXCEEDED])
@@ -820,9 +821,9 @@ def test_other_flags_require_human_removal_even_with_new_approval(ctx, reason):
     ctx.now = lambda: NOW + timedelta(minutes=1)
     ctx.tracker.record_label(1, "approved", "human")
     assert tick(ctx).actions == []
-    assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert ctx.store.load_approval(1) is None
-    ctx.tracker.remove_labels(1, ["needs-human"])
+    ctx.tracker.remove_labels(1, ["blocked"])
     tick(ctx)
     assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
 
@@ -834,7 +835,7 @@ def test_nonapprover_cannot_resume_hash_mismatch(ctx):
     ctx.now = lambda: NOW + timedelta(minutes=1)
     ctx.tracker.record_label(1, "approved", "stranger")
     tick(ctx)
-    assert "needs-human" in ctx.tracker.get_issue(1).labels
+    assert "blocked" in ctx.tracker.get_issue(1).labels
     assert ctx.store.load_approval(1) is None
 
 
@@ -899,7 +900,7 @@ def test_stall_restarts_once_then_flags_second_stall(ctx):
     assert killed == [4321, 5678]
     assert ctx.store.get_run(1).outcome == "stalled" and ctx.store.get_run(1).restarts == 2
     assert ctx.store.load_flag(1).reason == Reason.STALLED
-    assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert [run.outcome for run in ctx.store.read_history()] == ["stalled-restart", "stalled"]
     assert tick(ctx).actions == []
 
@@ -997,7 +998,7 @@ def test_successful_stall_kill_keeps_count_when_locked_worktree_cleanup_fails(ct
         assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
     else:
         assert ctx.store.load_flag(1).reason == Reason.STALLED
-        assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+        assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
 
 
 @pytest.mark.parametrize("outcome,restarts", [("stalled-restart", 1), ("stalled", 2)])
@@ -1021,7 +1022,7 @@ def test_dead_active_run_recovers_persisted_stall_intent(ctx, monkeypatch, outco
         assert ctx.store.get_run(1).restarts == 1
     else:
         assert ctx.store.load_flag(1).reason == Reason.STALLED
-        assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+        assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
         ctx.start_runs = True
         tick(ctx)
         assert ctx.store.active_runs() == []
@@ -1110,7 +1111,7 @@ def test_two_consecutive_crashes_flag_and_stop_relaunching(ctx, monkeypatch):
     report = tick(ctx)
     assert launches == [1] and ctx.store.active_runs() == []
     assert [run.outcome for run in ctx.store.read_history()] == ["crashed", "crashed"]
-    assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert parse_reason(ctx.tracker.list_comments(1)[-1].body) == Reason.RETRIES_EXCEEDED
     assert ctx.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
     assert "#1 flagged retries-exceeded" in report.actions
@@ -1131,11 +1132,11 @@ def test_crash_streak_is_per_issue_and_resets_on_another_outcome(ctx, monkeypatc
     ctx.now = lambda: NOW + timedelta(seconds=3)
     monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
     tick(ctx)
-    assert ("needs-human" in ctx.tracker.get_issue(1).labels) == expected_flag
+    assert ("blocked" in ctx.tracker.get_issue(1).labels) == expected_flag
     assert ("ready" in ctx.tracker.get_issue(1).labels) != expected_flag
 
 
-@pytest.mark.parametrize("state", ["closed", "needs-human"])
+@pytest.mark.parametrize("state", ["closed", "blocked", "needs-human"])
 def test_dead_run_finishes_without_requeueing_closed_or_flagged_issue(ctx, monkeypatch, state):
     approve(ctx)
     tick(ctx)
@@ -1143,7 +1144,7 @@ def test_dead_run_finishes_without_requeueing_closed_or_flagged_issue(ctx, monke
     if state == "closed":
         ctx.tracker.close_issue(1)
     else:
-        flag(ctx, 1, Reason.SPEC_QUESTION, "Human decision required.")
+        ctx.tracker.add_labels(1, [state])
     monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
     tick(ctx)
     assert ctx.store.active_runs() == []
@@ -1155,7 +1156,7 @@ def test_cancelled_blocker_flags_once_instead_of_promoting(ctx):
     approve(ctx)
     ctx.tracker.set_blocked_by(1, [Dependency(2, "open"), Dependency(3, "closed", "not_planned")])
     tick(ctx)
-    assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     comment = ctx.tracker.list_comments(1)[-1].body
     assert parse_reason(comment) == Reason.SPEC_QUESTION
     assert "blocker #3 was closed as not planned" in comment
@@ -1270,7 +1271,7 @@ def test_two_distinct_orphan_running_labels_count_as_consecutive_crashes(ctx):
     report = tick(ctx)
     assert ctx.store.active_runs() == []
     assert [run.outcome for run in ctx.store.read_history()] == ["crashed", "crashed"]
-    assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert ctx.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
     assert "#1 flagged retries-exceeded" in report.actions
     assert tick(ctx).actions == []
@@ -1312,7 +1313,7 @@ def test_ready_issue_reapproved_without_machine_check_is_flagged(ctx):
     ctx.start_runs = True
     report = tick(ctx)
     assert ctx.store.load_approval(1).body == "## Done when\n- [ ] Looks good\n"
-    assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert ctx.store.active_runs() == []
     assert ctx.store.load_flag(1).reason == Reason.NO_MACHINE_CHECK
     assert "#1 flagged no-machine-check" in report.actions
@@ -1343,7 +1344,7 @@ def test_ready_issue_with_cancelled_blocker_is_flagged(ctx):
     ctx.tracker.set_blocked_by(1, [Dependency(2, "closed", "not_planned")])
     ctx.start_runs = True
     tick(ctx)
-    assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert ctx.store.active_runs() == []
     assert ctx.store.load_flag(1).reason == Reason.SPEC_QUESTION
 
@@ -1364,7 +1365,7 @@ def test_dependencies_are_rechecked_immediately_before_launch(ctx, monkeypatch, 
     ctx.start_runs = True
     tick(ctx)
     assert calls == [1, 1] and ctx.store.active_runs() == []
-    assert ctx.tracker.get_issue(1).labels == ({"approved", "needs-human"} if cancelled else {"approved"})
+    assert ctx.tracker.get_issue(1).labels == ({"approved", "blocked"} if cancelled else {"approved"})
 
 
 def test_machine_check_is_rechecked_from_snapshot_immediately_before_launch(ctx, monkeypatch):
@@ -1382,7 +1383,7 @@ def test_machine_check_is_rechecked_from_snapshot_immediately_before_launch(ctx,
     assert len(calls) == 2 and calls[0] == calls[1]
     assert calls[1].done_when_commands == [f"pytest {ACCEPTANCE}"]
     assert ctx.store.active_runs() == []
-    assert ctx.tracker.get_issue(1).labels == {"approved", "needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert ctx.store.load_flag(1).reason == Reason.NO_MACHINE_CHECK
 
 
@@ -1397,7 +1398,7 @@ def test_custom_fetch_refspec_cannot_hide_changed_acceptance_files(ctx, git_hist
     ctx.now = lambda: NOW + timedelta(minutes=2)
     ctx.start_runs = True
     tick(ctx)
-    assert ctx.tracker.get_issue(1).labels == {"needs-human"}
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
     assert ctx.store.active_runs() == [] and ctx.store.load_approval(1) is None
     assert ctx.store.load_flag(1).reason == Reason.HASH_MISMATCH
 
