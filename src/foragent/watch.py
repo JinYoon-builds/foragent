@@ -188,16 +188,21 @@ def _wrap(value: str, width: int, style: str = "") -> list[Line]:
 
 
 def _columns(values: list[str], widths: list[int], style: str = "") -> list[Line]:
-    columns = [_wrap(value, width, style) for value, width in zip(values, widths)]
-    result = []
-    for cells in zip_longest(*columns, fillvalue=[]):
-        row: Line = []
-        for index, (cell, width) in enumerate(zip(cells, widths)):
-            if index:
-                row.append((" ", ""))
-            row.extend(_fit(cell, width))
-        result.append(row)
-    return result
+    """Keep each table record on one row, marking clipped cells explicitly."""
+    row: Line = []
+    for index, (value, width) in enumerate(zip(values, widths)):
+        if index:
+            row.append((" ", ""))
+        value = _clean(value)
+        if _cells(value) > width:
+            value = "".join(part for part, _ in _fit(_line(value, style), width - 1)).rstrip() + "…"
+        row.extend(_fit(_line(value, style), width))
+    return [row]
+
+
+def _has_work(row: dict[str, Any]) -> bool:
+    return (row["issue"] is not None or bool(row["queued"])
+            or row["state"] in {"working", "blocked", "waiting-human"})
 
 
 def _panel(lines: list[Line], width: int, title: str) -> list[Line]:
@@ -231,6 +236,8 @@ def _frame(
     language = config.language
     status = snapshot.status
     rows = list(status["lanes"].values())
+    busy = [(index, row) for index, row in enumerate(rows, 1) if _has_work(row)]
+    idle = [(index, row) for index, row in enumerate(rows, 1) if not _has_work(row)]
     t = lambda key, **values: text(key, language, **values)
     side_by_side = width >= 100
     orchestrator_width = 28 if side_by_side else width
@@ -251,7 +258,7 @@ def _frame(
     overview.append(_line(eta))
     left = _panel(overview, orchestrator_width, "🧭 " + t("watch_orchestrator"))
     roads: list[Line] = [[("━" * road_width, "edge")]]
-    for index, row in enumerate(rows, 1):
+    for index, row in busy:
         slug, state = row["slug"], row["state"]
         lane = config.lanes.get(slug, {})
         executor = lane.get("executor") or config.executor
@@ -283,8 +290,16 @@ def _frame(
         roads.append(_fit([*prefix, (" " * max(0, space - road_cells), "road"), *road, *tail], road_width))
         done = snapshot.done.get(slug, [])
         roads.append(_fit(_line("  " + t("watch_done", count=len(done), title=done[-1].title if done else "—"), "green"), road_width))
-        edge = "━" * road_width if index == len(rows) else ("▬▬▬   " * (road_width // 6 + 1))[:road_width]
-        roads.append([(edge, "edge" if index == len(rows) else "divider")])
+        last = index == busy[-1][0] and not idle
+        edge = "━" * road_width if last else ("▬▬▬   " * (road_width // 6 + 1))[:road_width]
+        roads.append([(edge, "edge" if last else "divider")])
+    if idle:
+        items = []
+        for index, row in idle:
+            count = len(snapshot.done.get(row["slug"], []))
+            items.append(f"{index} {row['lane_display']}" + (f" ✓{count}" if count else ""))
+        roads.append(_fit(_line(t("watch_idle_lanes") + ": " + " · ".join(items)), road_width))
+        roads.append([("━" * road_width, "edge")])
     age = max(0, (now - snapshot.captured_at).total_seconds())
     runs = {run["number"]: run for run in status["active_runs"]}
     table_width = (width - 2) * 3 // 5 if side_by_side else width
@@ -295,7 +310,7 @@ def _frame(
     activity_width = min(24, inner // 3)
     widths = [lane_width, inner - lane_width - phase_width - activity_width - 3, phase_width, activity_width]
     table = _columns([t("watch_lane"), t("watch_now"), t("watch_phase"), ""], widths, "bold")
-    for row in rows:
+    for _, row in busy:
         phase = "" if row["state"] == "blocked" else text(row["phase"] or row["state"], language)
         task = f"#{row['issue']} {row['title']}" if row["issue"] is not None else "—"
         run = runs.get(row["issue"])
@@ -304,6 +319,8 @@ def _frame(
         activity = _activity(row, language, age)
         table += _columns([row["lane_display"], task, phase, activity], widths,
                           "yellow" if activity.startswith("○") or row["state"] == "blocked" else "")
+    if not busy:
+        table.append(_line(t("watch_all_idle")))
     events: list[Line] = []
     for event in snapshot.events:
         when = datetime.fromisoformat(event["at"]).astimezone().strftime("%H:%M") if event.get("at") else "—"
