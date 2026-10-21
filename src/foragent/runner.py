@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import traceback
+import xml.etree.ElementTree as ET
 
 import yaml
 
@@ -73,6 +74,12 @@ class CheckResult:
     exit_code: int | None
     timed_out: bool
     output: str
+
+
+@dataclass(frozen=True)
+class AcceptanceBaseline:
+    command: str
+    node_ids: tuple[str, ...]
 
 
 REVIEW_PROMPT = (
@@ -196,6 +203,7 @@ def build_prompt(
     reviewer_text: str | None = None,
     orchestrator_hint: str | None = None,
     test_command: str | None = None,
+    acceptance_baseline: tuple[str, ...] = (),
     failure_limit: int | None = 4000,
 ) -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
@@ -245,6 +253,11 @@ def build_prompt(
         prompt += "\nA previous attempt failed. Output of the failing check:\n" + (
             failure if failure_limit is None else failure[-failure_limit:]
         )
+    if acceptance_baseline:
+        prompt += (
+            f"\nThese acceptance tests already pass on the base and must keep passing ({len(acceptance_baseline)}):\n"
+            + "\n".join(f"- {node_id}" for node_id in acceptance_baseline)
+        )
     if merge_conflicts is not None:
         prompt += (
             "\n\nResolve the conflict markers in the following files:\n"
@@ -274,6 +287,107 @@ def _check(command: str, worktree: Path, log: Path, timeout_s: int) -> CheckResu
         tail = stream.read().decode("utf-8", errors="replace")[-4000:]
     _append(log, f"\nCheck exit_code={code}, timed_out={timed_out}\nOutput tail:\n{tail}")
     return CheckResult(command, code, timed_out, tail)
+
+
+def _pytest_command(command: str) -> str | None:
+    """Keep the pytest invocation/options, replacing its test selection later."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        words = list(lexer)
+    except ValueError:
+        return None
+    index = next((i for i, word in enumerate(words)
+                  if Path(word).name == "pytest"), None)
+    if index is None or any(word and all(char in "();<>|&" for char in word) for word in words):
+        return None
+    # A full-suite command can exclude acceptance tests or select other paths.
+    # Neither that selection nor early stopping should narrow the baseline.
+    selection_values = {"--ignore", "--ignore-glob", "--deselect", "-k", "-m", "--maxfail", "--junitxml", "--junit-xml"}
+    selection_flags = {"-x", "--exitfirst", "--lf", "--last-failed", "--ff", "--failed-first",
+                       "--sw", "--stepwise", "--sw-skip", "--stepwise-skip", "--collect-only", "--co"}
+    option_values = {"-c", "--config-file", "-o", "--override-ini", "-p", "--rootdir", "--confcutdir",
+                     "--basetemp", "--import-mode", "--tb", "--capture", "--color", "--code-highlight",
+                     "--junit-prefix", "--verbosity", "--durations", "--durations-min"}
+    result = words[:index + 1]
+    args = iter(words[index + 1:])
+    for arg in args:
+        option = arg.split("=", 1)[0]
+        if option in selection_values:
+            if "=" not in arg:
+                next(args, None)
+        elif arg in selection_flags or arg == "--":
+            continue
+        elif option in option_values and "=" not in arg:
+            result.append(arg)
+            if (value := next(args, None)) is not None:
+                result.append(value)
+        elif arg.startswith("-"):
+            result.append(arg)
+        # Remaining positional arguments are test paths/node ids.
+    # Preserve shell environment assignments before the executable.
+    prefix = []
+    while result and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", result[0], re.S):
+        name, value = result.pop(0).split("=", 1)
+        prefix.append(f"{name}={shlex.quote(value)}")
+    # Stable, repository-relative JUnit paths are also valid pytest selectors.
+    return " ".join([*prefix, shlex.join(result), "-o addopts= --rootdir=."])
+
+
+def _passing_acceptance_ids(report: Path) -> tuple[str, ...]:
+    """Legacy JUnit provides exact file paths; classname adds nested classes."""
+    passed, failed = set(), set()
+    for case in ET.parse(report).iter("testcase"):
+        file, name = case.get("file"), case.get("name")
+        if not file or not name:
+            continue
+        module = file.removesuffix(".py").replace("/", ".")
+        classname = case.get("classname", "")
+        classes = classname.removeprefix(module).lstrip(".").replace(".", "::")
+        node_id = "::".join(part for part in (file, classes, name) if part)
+        (failed if any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) else passed).add(node_id)
+    return tuple(sorted(passed - failed))
+
+
+def _capture_acceptance_baseline(
+    n: int, ctx: RunContext, test_command: str | None, target_ref: str,
+) -> AcceptanceBaseline | None:
+    log = ctx.store.log_path(n)
+    command = _pytest_command(test_command) if test_command else None
+    if command is None:
+        reason = "no test command is known" if test_command is None else f"not a supported pytest command: {test_command}"
+        _append(log, f"Acceptance baseline skipped (count=0): {reason}")
+        return None
+    report = ctx.store.root / "runs" / f"issue-{n}-acceptance-baseline.xml"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.unlink(missing_ok=True)
+    # Use a fresh target checkout, including when repairing an existing PR's CI.
+    # Tests can write files; discard them without touching the implementation.
+    with tempfile.TemporaryDirectory(prefix="foragent-baseline-") as directory:
+        worktree = Path(directory) / "worktree"
+        ctx.git.add_detached_worktree(worktree, target_ref)
+        try:
+            if not (worktree / ctx.config.acceptance_dir).is_dir():
+                _append(log, "Acceptance baseline skipped (count=0): acceptance directory does not exist")
+                return None
+            if _remaining(n, ctx) <= 0:
+                raise ExecutorStopped(_timeout(n, ctx))
+            _phase(n, ctx, "checking")
+            baseline_command = (
+                f"{command} {shlex.quote(ctx.config.acceptance_dir)} "
+                f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(report.resolve()))}"
+            )
+            result = _check(baseline_command, worktree, log, min(900, _remaining(n, ctx)))
+            _progress(n, ctx)
+            try:
+                node_ids = _passing_acceptance_ids(report)
+            except (OSError, ET.ParseError) as exc:
+                _append(log, f"Acceptance baseline count=0: no usable JUnit report ({exc})")
+                node_ids = ()
+            _append(log, f"Acceptance baseline count={len(node_ids)}, exit_code={result.exit_code}, timed_out={result.timed_out}")
+            return AcceptanceBaseline(command, node_ids)
+        finally:
+            ctx.git.remove_worktree(worktree)
 
 
 def _claude_run_dir(snapshot: Path) -> Path:
@@ -803,6 +917,10 @@ def _implement_and_publish(
     rebuilt = False
     rebuild_lease: str | None = None
     size = issue_size(ctx.tracker.get_issue(n).labels)
+    baseline_test_command = ctx.config.test_command
+    if baseline_test_command is None:
+        baseline_test_command = next(iter(detect_test_commands(worktree)), None)
+    baseline = _capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
 
     def implement(
         failure: str | CIFailure, *, merge_conflicts: list[str] | None = None, reviewer_text: str | None = None,
@@ -840,6 +958,7 @@ def _implement_and_publish(
             reviewer_text=reviewer_text,
             orchestrator_hint=hint,
             test_command=test_command,
+            acceptance_baseline=baseline.node_ids if baseline else (),
             failure_limit=None if isinstance(failure, CIFailure) else 4000,
         )
         result = _available_executor(
@@ -960,6 +1079,13 @@ def _implement_and_publish(
             checks = []
             for command in parsed.done_when_commands:
                 checks.append(_check(command, worktree, log, 900))
+                _progress(n, ctx)
+            if baseline and baseline.node_ids:
+                command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
+                result = _check(command, worktree, log, 900)
+                checks.append(result)
+                _append(log, f"Acceptance baseline verification count={len(baseline.node_ids)}, "
+                        f"exit_code={result.exit_code}, timed_out={result.timed_out}")
                 _progress(n, ctx)
             git.stage_changes()
             if not prepare_target():
