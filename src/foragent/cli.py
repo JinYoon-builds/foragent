@@ -111,6 +111,7 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
     install = skill_actions.add_parser("install")
     install.add_argument("id")
     install.add_argument("--repo-root", type=Path, required=True)
+    install.add_argument("--commit", action="store_true", help="Install for committing; requires an open-source license")
     gate = commands.add_parser("gate", help="Schedule and inspect approved issues")
     actions = gate.add_subparsers(dest="action", required=True)
     for name in ("tick", "status"):
@@ -285,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
                         description = " ".join(skill["description"].split())
                         print(f"{skill['id']}\t{skill['name']}\t{skill['license']}\t{description}")
             else:
-                print("Installed: " + manager.install(args.id, args.repo_root.resolve()))
+                print("Installed: " + manager.install(args.id, args.repo_root.resolve(), commit=args.commit))
             return 0
         root = args.repo_root.resolve()
         if args.command == "init":

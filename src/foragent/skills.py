@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 
 import yaml
 
@@ -113,10 +114,12 @@ class SkillManager:
             synced.append(library.name)
         return synced
 
-    def skills(self) -> list[Skill]:
+    def skills(self, *, available_only: bool = False) -> list[Skill]:
         result = []
         for library in self.libraries:
             if not library.path.is_dir():
+                if available_only:
+                    continue
                 raise SkillError(f"library {library.name} is missing; run fa skills sync")
             paths = {path for pattern in ("*/skills/*/SKILL.md", "skills/*/SKILL.md") for path in library.path.glob(pattern)}
             for path in sorted(paths):
@@ -150,11 +153,11 @@ class SkillManager:
             raise SkillError(f"ambiguous skill: {identity}; use one of: {', '.join(skill.id for skill in matches)}")
         raise SkillError(f"unknown skill: {identity}")
 
-    def check_install(self, identity: str, root: Path) -> Skill:
+    def check_install(self, identity: str, root: Path, *, commit: bool = False) -> Skill:
         skill = self._select(identity)
         if skill.path.is_symlink() or any(path.is_symlink() for path in skill.path.rglob("*")):
             raise SkillError(f"skill contains a symlink: {identity}")
-        if skill.license not in OPEN_SOURCE_LICENSES:
+        if commit and skill.license not in OPEN_SOURCE_LICENSES:
             location = str(skill.license_file) if skill.license_file else "no LICENSE or LICENSE.txt"
             raise SkillError(f"refusing to install {skill.id}: cannot confirm an open-source license "
                              f"({skill.license}; {location})")
@@ -162,15 +165,35 @@ class SkillManager:
         if destination.exists() and (destination.is_symlink() or not destination.is_dir()
                                      or self._contents(destination) != self._contents(skill.path)):
             raise SkillError(f"refusing to overwrite different existing skill: {destination}")
-        repo_path(root, "THIRD_PARTY_NOTICES.md")
+        repo_path(root, "THIRD_PARTY_NOTICES.md" if commit else ".gitignore")
         return skill
 
     @staticmethod
     def _contents(path: Path) -> dict[str, bytes]:
         return {file.relative_to(path).as_posix(): file.read_bytes() for file in path.rglob("*") if file.is_file()}
 
-    def install(self, identity: str, root: Path) -> str:
-        skill = self.check_install(identity, root)
+    def install(self, identity: str, root: Path, *, commit: bool = False) -> str:
+        skill = self.check_install(identity, root, commit=commit)
+        if skill.license not in OPEN_SOURCE_LICENSES:
+            location = str(skill.license_file) if skill.license_file else "no LICENSE or LICENSE.txt"
+            print(f"Warning: {skill.id}: cannot confirm an open-source license "
+                  f"({skill.license}; {location}); installing locally only", file=sys.stderr)
+        destination = repo_path(root, f".claude/skills/{skill.path.name}")
+        if not destination.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(skill.path, destination)
+        if not commit:
+            ignore = repo_path(root, ".gitignore")
+            original = ignore.read_bytes() if ignore.exists() else b""
+            rule = f"/.claude/skills/{skill.path.name}/".encode()
+            if rule not in original.splitlines():
+                ignore.write_bytes(original + (b"\n" if original and not original.endswith(b"\n") else b"")
+                                   + rule + b"\n")
+            return skill.path.name
+        self._write_notice(skill, root)
+        return skill.path.name
+
+    def _write_notice(self, skill: Skill, root: Path) -> None:
         sha = self.run(["git", "-C", str(skill.library.path), "rev-parse", "HEAD"]).strip()
         license_file = skill.license_file
         license_text = license_file.read_text(encoding="utf-8") if license_file else ""
@@ -186,12 +209,37 @@ class SkillManager:
             if (skill.library.path / filename).is_file():
                 notice += "\n" + (skill.library.path / filename).read_text(encoding="utf-8").strip() + "\n"
                 break
-        destination = repo_path(root, f".claude/skills/{skill.path.name}")
-        if not destination.exists():
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(skill.path, destination)
         notices = repo_path(root, "THIRD_PARTY_NOTICES.md")
         original = notices.read_text(encoding="utf-8") if notices.exists() else "# Third-party notices\n"
         if notice.splitlines()[0] not in original.splitlines():
             notices.write_text(original.rstrip() + "\n\n" + notice, encoding="utf-8")
-        return skill.path.name
+
+    def cached_skill(self, name: str) -> Path | None:
+        """Resolve an installed directory name using available library caches."""
+        matches = [skill for skill in self.skills(available_only=True) if skill.path.name == name]
+        if len(matches) > 1:
+            raise SkillError(f"ambiguous skill: {name}; install one explicitly with fa skills install")
+        return matches[0].path if matches else None
+
+
+def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: SkillManager) -> list[str]:
+    """Copy local dependencies, leaving skills already in the checkout intact."""
+    copied = []
+    for name in dict.fromkeys(names):
+        if not isinstance(name, str) or not name or Path(name).name != name or name in {".", ".."}:
+            continue
+        relative = f".claude/skills/{name}"
+        destination = repo_path(worktree, relative)
+        if destination.exists():
+            continue  # In particular, preserve user-authored, committed skills.
+        source = repo_path(root, relative)
+        if not (source / "SKILL.md").is_file():
+            source = manager.cached_skill(name)
+        if source is None:
+            continue
+        if source.is_symlink() or any(path.is_symlink() for path in source.rglob("*")):
+            raise SkillError(f"skill contains a symlink: {name}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination)
+        copied.append(relative)
+    return copied

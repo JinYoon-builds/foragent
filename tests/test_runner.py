@@ -1951,6 +1951,43 @@ def skill_case(tmp_path):
     return ctx, worktree
 
 
+@pytest.mark.parametrize("kind", ["codex", "claude"])
+@pytest.mark.parametrize("source", ["local", "cache"])
+def test_local_lane_skill_is_available_on_retries_and_never_published(run_case, tmp_path, monkeypatch, kind, source):
+    c = run_case
+    relative = ".claude/skills/testing"
+    library = tmp_path / "library"
+    skill = (c.ctx.repo_root / relative) if source == "local" else (library / "skills/testing")
+    skill.mkdir(parents=True)
+    content = "---\nname: testing\ndescription: Focused tests\n---\nRun useful checks.\n"
+    (skill / "SKILL.md").write_text(content)
+    (skill / "references").mkdir()
+    (skill / "references/example.md").write_text("Reference\n")
+    c.ctx.config = replace(c.ctx.config, executor=kind, lanes={"api": {"skills": ["testing"]}},
+                           skill_libraries=[{"name": "fixture", "repo": "local", "path": str(library)}])
+    c.store.update_run(1, lane="api")
+    c.executor.steps = [{"feature.txt": "broken"}, {"feature.txt": "done"}]
+    execute = c.executor.run
+
+    def implement(**kwargs):
+        worktree = kwargs["worktree"]
+        assert (worktree / relative / "SKILL.md").read_text() == content
+        assert (worktree / relative / "references/example.md").read_text() == "Reference\n"
+        # Even explicitly staged copies must stay out of the published tree.
+        git_command(worktree, "add", "-f", "--", relative)
+        handmade = worktree / ".claude/skills/handmade/SKILL.md"
+        handmade.parent.mkdir(parents=True, exist_ok=True)
+        handmade.write_text("User-authored skill\n")
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 2
+    published = git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1").splitlines()
+    assert not any(name.startswith(relative + "/") for name in published)
+    assert ".claude/skills/handmade/SKILL.md" in published
+
+
 @pytest.mark.parametrize("length", [5999, 6000, 6001, 12000])
 def test_lane_skill_list_includes_one_line_description_without_any_body(skill_case, length):
     ctx, worktree = skill_case

@@ -522,7 +522,9 @@ def test_edit_reverting_to_a_prior_revision_still_refreshes_approval(publishing,
 
 
 @pytest.mark.parametrize("interrupted", [False, True])
-def test_lane_skills_and_notices_reach_remote_runner_worktree(offline_publication, plan, monkeypatch, interrupted):
+def test_lane_skills_stay_local_and_copy_into_runner_worktree(offline_publication, plan, monkeypatch, interrupted):
+    from foragent.skills import copy_lane_skills
+
     root, config, tracker, git, calls, _ = offline_publication
     library = root.parent / "library"
     skill = library / "skills/testing-strategy"
@@ -551,15 +553,16 @@ def test_lane_skills_and_notices_reach_remote_runner_worktree(offline_publicatio
     git.fetch("origin", "main")
     runner = root.parent / "runner"
     git.add_detached_worktree(runner, "origin/main")
+    assert not (runner / ".claude/skills/testing-strategy").exists()
+    assert not (runner / "THIRD_PARTY_NOTICES.md").exists()
+    assert "/.claude/skills/testing-strategy/" in (runner / ".gitignore").read_text().splitlines()
+    assert copy_lane_skills(root, runner, ["testing-strategy"], manager) == [".claude/skills/testing-strategy"]
     assert (runner / ".claude/skills/testing-strategy/SKILL.md").read_bytes() == (skill / "SKILL.md").read_bytes()
     assert (runner / ".claude/skills/testing-strategy/references/example.md").read_text() == "Useful example\n"
-    assert "License: MIT (LICENSE)" in (runner / "THIRD_PARTY_NOTICES.md").read_text()
     assert "skills: [testing-strategy]" in (runner / ".claude/agents/fa-web.md").read_text()
     lane_commit = next(args for args in calls if "commit" in args and args[args.index("-m") + 1] == "Foragent lane web")
     assert set(lane_commit[lane_commit.index("--") + 1:]) == {
-        ".foragent.yml", ".claude/agents/fa-web.md", ".claude/skills/testing-strategy/SKILL.md",
-        ".claude/skills/testing-strategy/references/example.md", "THIRD_PARTY_NOTICES.md",
-        ":!CLAUDE.local.md",
+        ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ":!CLAUDE.local.md",
     }
     assert len([args for args in calls if args[0] == "push"]) == 1
     order.publish(plan, root, load_config(root), tracker, repo="owner/repo", git=git, manager=manager)
