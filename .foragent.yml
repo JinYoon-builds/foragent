@@ -27,4 +27,13 @@ lanes:
     - tests/test_bench.py
     agent: fa-bench
     skills: []
+  orch:
+    paths:
+    - src/foragent/orch*.py
+    - src/foragent/scheduler.py
+    - src/foragent/runner.py
+    - src/foragent/reasons.py
+    - skills/fa-orchestrator/**
+    agent: fa-orch
+    skills: []
 max_parallel: 3
