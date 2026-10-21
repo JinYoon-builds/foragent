@@ -13,3 +13,4 @@
 - batch/fast 대상 전환은 worktree를 다시 만들기 때문에 `TRY.md`와 `REBUTTAL.md`를 함께 보존해야 한다. PR에는 각 세션의 서로 다른 반박 내용을 보존한다.
 - `review-dispute`는 반박이 있는 상태로 진행한 리뷰 두 회에서 연속으로 같은 지적이 나왔을 때의 기술 차단이다. 공백·대소문자·목록 기호를 정규화한다. 비정형 원문은 하나의 지적으로 비교하여 공통 서문만으로 분쟁을 만들지 않는다.
 - #29 인수 시험: `uv run pytest -q tests/acceptance/test_orch_review_handoff.py`. `tests/test_orch_blocked.py`와 `tests/acceptance/test_orch_blocked.py`는 모듈명이 같아 기본 pytest 모드로 함께 수집하면 충돌하므로 별도로 실행한다.
+- 로컬 스킬 기능과 병합할 때 `recreate_worktree()` 안에서 작업공간 생성 직후 `_inject_lane_skills(ctx, n, git)`를 호출한다. 대상 브랜치 전환과 패치 충돌 복구 모두 이 함수를 쓰므로 `TRY.md`·`REBUTTAL.md` 보존과 스킬 복원·커밋 제외 경로를 함께 유지할 수 있다.
