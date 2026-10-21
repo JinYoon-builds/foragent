@@ -30,6 +30,7 @@ def test_exact_defaults(repo):
         "repo": None, "language": "en", "codex_goal": False, "review_level": "medium",
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
+        "interview": "ouroboros", "ouroboros_version": None,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
                   "m": {"codex_effort": "high", "claude_model": None},
                   "l": {"codex_effort": "xhigh", "claude_model": None}},
@@ -48,6 +49,23 @@ def test_tiers_merge_global_and_repository_fields(repo, tmp_path):
     assert config.tiers["s"] == {"claude_model": "small", "codex_effort": "low"}
     assert config.tiers["m"]["codex_effort"] == "xhigh"
     assert config.tiers["l"] == DEFAULTS["tiers"]["l"]
+
+
+def test_interview_settings_merge_global_and_repository(repo, tmp_path):
+    global_path = tmp_path / "global.yml"
+    write_settings(global_path, {"interview": "native", "ouroboros_version": "0.52.0"})
+    config = load_config(repo, global_path)
+    assert (config.interview, config.ouroboros_version) == ("native", "0.52.0")
+    write_settings(repo / ".foragent.yml", {"interview": "ouroboros", "ouroboros_version": None})
+    config = load_config(repo, global_path)
+    assert (config.interview, config.ouroboros_version) == ("ouroboros", None)
+
+
+@pytest.mark.parametrize("value", ["magic", "Ouroboros", "", None, True, 3, [], {}])
+def test_interview_rejects_invalid_values_with_allowed_engines(repo, value):
+    write_settings(repo / ".foragent.yml", {"interview": value})
+    with pytest.raises(ConfigError, match="interview.*ouroboros.*native"):
+        load_config(repo)
 
 
 @pytest.mark.parametrize("value", [[], {"xl": {}}, {"s": None}, {"s": {"codex_effort": []}},
@@ -121,6 +139,8 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
     ("always_human", "auth/**"), ("always_human", [1]),
     ("approvers", "user"), ("approvers", [None]),
     ("executor_model", 42), ("reviewer_model", []),
+    ("ouroboros_version", 52), ("ouroboros_version", True),
+    ("ouroboros_version", []), ("ouroboros_version", {}),
     ("acceptance_dir", ""), ("acceptance_dir", None), ("base_branch", "  "),
     ("run_hours", "24-08"), ("run_hours", "09-24"), ("run_hours", "9-18"),
     ("run_hours", "09:00-18:00"), ("run_hours", "Always"), ("run_hours", None),

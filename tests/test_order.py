@@ -563,7 +563,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
     assert result["feedback"] == [{"number": 1, "title": "Feedback", "body": "Fix it\n\nAbout #8.", "about": 8}]
@@ -581,6 +581,63 @@ def test_context_all_sections_and_gate_groups(tmp_path):
     assert not any(path.startswith((".git/", ".venv/", "node_modules/")) for path in result["repo"]["tree"])
     (tmp_path / "package.json").write_text('{"scripts":{"test":"test"}}')
     assert "npm test" in order.context(tmp_path, config, tracker)["repo"]["test_commands"]
+
+
+@pytest.mark.parametrize("requested,pin,installed,engine,reason", [
+    ("ouroboros", None, "0.52.0", "ouroboros", None),
+    ("ouroboros", "0.52.0", "0.52.0", "ouroboros", None),
+    ("ouroboros", "0.51.1", "0.52.0", "native",
+     "ouroboros version mismatch: installed 0.52.0, pinned 0.51.1"),
+    ("ouroboros", None, None, "native", "ouroboros not installed"),
+    ("ouroboros", "0.52.0", None, "native", "ouroboros not installed"),
+    ("native", None, "0.52.0", "native", None),
+    ("native", "0.51.1", "0.52.0", "native", None),
+    ("native", None, None, "native", None),
+])
+def test_context_resolves_interview_engine(tmp_path, monkeypatch, requested, pin, installed, engine, reason):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    if installed is not None:
+        path = home / ".claude/plugins/installed_plugins.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"plugins": {
+            "other@marketplace": [{"version": "9"}],
+            "ouroboros@custom-marketplace": [{"version": installed}, {"version": "ignored"}],
+        }}))
+    result = order.context(tmp_path, Config(interview=requested, ouroboros_version=pin), FakeTracker())
+    assert result["interview"] == {"requested": requested, "engine": engine,
+                                   "installed_version": installed, "pinned_version": pin, "reason": reason}
+
+
+@pytest.mark.parametrize("contents", [
+    b"{", b"\xff", b"null", b"[]", b"{}", b'{"plugins": []}',
+    b'{"plugins": {"other@ouroboros": [{"version": "0.52.0"}]}}',
+    b'{"plugins": {"ouroboros@marketplace": []}}',
+    b'{"plugins": {"ouroboros@marketplace": null}}',
+    b'{"plugins": {"ouroboros@marketplace": {"version": "0.52.0"}}}',
+    b'{"plugins": {"ouroboros@marketplace": [null]}}',
+    b'{"plugins": {"ouroboros@marketplace": [{}]}}',
+    b'{"plugins": {"ouroboros@marketplace": [{"version": 52}]}}',
+    b'{"plugins": {"ouroboros@marketplace": [{}, {"version": "0.52.0"}]}}',
+])
+def test_context_treats_broken_or_unrelated_plugins_as_not_installed(tmp_path, monkeypatch, contents):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = tmp_path / ".claude/plugins/installed_plugins.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(contents)
+    result = order.context(tmp_path, Config(), FakeTracker())["interview"]
+    assert result["engine"] == "native"
+    assert result["installed_version"] is None
+    assert "not installed" in result["reason"]
+
+
+def test_context_treats_unreadable_plugins_as_not_installed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude/plugins/installed_plugins.json").mkdir(parents=True)
+    result = order.context(tmp_path, Config(), FakeTracker())["interview"]
+    assert result["engine"] == "native"
+    assert result["installed_version"] is None
+    assert "not installed" in result["reason"]
 
 
 def test_order_cli_context_and_publish_dry_run(publishing, plan, monkeypatch, capsys):

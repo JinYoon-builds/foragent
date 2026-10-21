@@ -34,6 +34,38 @@ def read_plan(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique)
 
 
+def _ouroboros_version() -> str | None:
+    path = Path.home() / ".claude/plugins/installed_plugins.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    if not isinstance(plugins, dict):
+        return None
+    for name, entries in plugins.items():
+        if not name.startswith("ouroboros@"):
+            continue
+        if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+            version = entries[0].get("version")
+            if isinstance(version, str):
+                return version
+    return None
+
+
+def _interview_context(config: Config) -> dict:
+    installed = _ouroboros_version()
+    engine, reason = config.interview, None
+    if engine == "ouroboros":
+        if installed is None:
+            engine, reason = "native", "ouroboros not installed"
+        elif config.ouroboros_version is not None and config.ouroboros_version != installed:
+            engine = "native"
+            reason = f"ouroboros version mismatch: installed {installed}, pinned {config.ouroboros_version}"
+    return {"requested": config.interview, "engine": engine, "installed_version": installed,
+            "pinned_version": config.ouroboros_version, "reason": reason}
+
+
 def context(root: Path, config: Config, tracker: Tracker) -> dict:
     issues = sorted(tracker.list_open_issues(), key=lambda issue: issue.number)
     feedback, decisions = [], []
@@ -104,6 +136,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
                     lane["skills"] = meta.get("skills", []) if isinstance(meta, dict) else []
     return {
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
+        "interview": _interview_context(config),
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
         "feedback": feedback, "decisions": decisions,
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),
