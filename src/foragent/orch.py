@@ -2,20 +2,26 @@
 
 from collections import deque
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import math
+from pathlib import Path
 import re
+from tempfile import TemporaryDirectory
 import time
 
+from foragent.git import GitError
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
+from foragent.order import detect_test_commands
+from foragent.processes import run_logged
 from foragent.runner import RunContext, review_only
-from foragent.tracker import Issue
+from foragent.tracker import Issue, PullRequest
 
 
 class OrchError(ValueError):
-    """An orchestrator action does not apply to the current issue."""
+    """An orchestrator action does not apply to the current issue or PR."""
 
 
 def _watch_snapshot(ctx: RunContext) -> dict:
@@ -207,3 +213,103 @@ def log(ctx: RunContext) -> list[dict]:
             events = []
     _event(ctx, None, "log", f"Read {len(events)} recent orchestrator events")
     return events
+
+
+def _open_pr(ctx: RunContext, n: int) -> PullRequest:
+    pr = next((pr for pr in ctx.tracker.list_prs() if pr.number == n), None)
+    if pr is None:
+        raise OrchError(f"PR #{n} must be open")
+    return pr
+
+
+@dataclass(frozen=True)
+class _Premerge:
+    pr: PullRequest
+    head: str
+    base: str
+    report: dict
+
+
+def _premerge(ctx: RunContext, n: int) -> _Premerge:
+    pr = _open_pr(ctx, n)
+    head = ctx.tracker.pr_head_sha(n)
+    ctx.git.fetch("origin", pr.base)
+    # Fetch the exact PR object as well, including heads outside origin's branches.
+    ctx.git._call(["fetch", "origin", head])
+    base = ctx.git.ref_sha(f"refs/remotes/origin/{pr.base}")
+    log_path = ctx.store.root / "runs" / f"premerge-pr-{n}.log"
+    with TemporaryDirectory(prefix=f"foragent-premerge-{n}-") as directory:
+        worktree = Path(directory) / "worktree"
+        ctx.git.add_detached_worktree(worktree, head)
+        try:
+            commands = ([ctx.config.test_command] if ctx.config.test_command is not None
+                        else detect_test_commands(worktree))
+            if not commands:
+                raise OrchError("no full test command detected; set test_command in .foragent.yml")
+            tests = "pass"
+            for command in commands:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as stream:
+                    stream.write(f"\nPre-merge PR #{n} head={head} base={base}\n$ {command}\n")
+                code, timed_out, _ = run_logged(
+                    ["/bin/sh", "-c", command], cwd=worktree,
+                    timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path,
+                )
+                if code != 0 or timed_out:
+                    tests = "fail"
+        finally:
+            ctx.git.remove_worktree(worktree)
+        # Tests may generate files. Use a fresh checkout of the same SHA for
+        # the merge probe so those files cannot hide or create conflicts.
+        ctx.git.add_detached_worktree(worktree, head)
+        try:
+            probe = ctx.git.at(worktree)
+            conflicts = []
+            try:
+                probe._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                             "merge", "--no-commit", "--no-ff", base])
+            except GitError:
+                conflicts = sorted(probe.conflict_paths())
+                if not conflicts:
+                    raise
+        finally:
+            ctx.git.remove_worktree(worktree)
+    ci = ctx.tracker.pr_checks(n)
+    report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
+              "ready": tests == "pass" and not conflicts and ci in {"pass", "none"}}
+    return _Premerge(pr, head, base, report)
+
+
+def premerge(ctx: RunContext, n: int) -> dict:
+    """Check the PR head in isolation without posting or changing GitHub state."""
+    return _premerge(ctx, n).report
+
+
+def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -> str:
+    """Record the human's decision and merge only the freshly checked PR head."""
+    approved_by = _text(approved_by, "approved-by")
+    at = ctx.now().astimezone(UTC).isoformat() if at is None else _text(at, "at")
+    try:
+        datetime.fromisoformat(at)
+    except ValueError as exc:
+        raise OrchError("at must be an ISO8601 timestamp") from exc
+    checked = _premerge(ctx, n)
+    report = checked.report
+    if not report["ready"]:
+        raise OrchError(f"PR #{n} is not ready: tests {report['tests']}; "
+                        f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
+    current = _open_pr(ctx, n)
+    ctx.git.fetch("origin", current.base)
+    if (current.base != checked.pr.base or current.head != checked.pr.head
+            or ctx.git.ref_sha(f"refs/remotes/origin/{current.base}") != checked.base
+            or ctx.tracker.pr_head_sha(n) != checked.head):
+        raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
+    ci = ctx.tracker.pr_checks(n)
+    if ci not in {"pass", "none"}:
+        raise OrchError(f"PR #{n} is not ready: CI {ci}")
+    ctx.tracker.comment(n, f"Approved by {approved_by} in the orchestrator ({at}). "
+                          f"Pre-merge: tests pass, no conflicts, CI {ci}.")
+    ctx.tracker.merge_pr(n, expected_head_sha=checked.head)
+    summary = f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; tests pass, no conflicts, CI {ci}"
+    _event(ctx, None, "merge", summary)
+    return summary
