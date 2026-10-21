@@ -20,3 +20,10 @@ lanes:
     - tests/test_config.py
     agent: fa-order
     skills: []
+  bench:
+    paths:
+    - src/foragent/bench.py
+    - bench/**
+    - tests/test_bench.py
+    agent: fa-bench
+    skills: []
