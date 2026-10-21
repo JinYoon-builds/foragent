@@ -14,3 +14,13 @@
 - `review-dispute`는 반박이 있는 상태로 진행한 리뷰 두 회에서 연속으로 같은 지적이 나왔을 때의 기술 차단이다. 공백·대소문자·목록 기호를 정규화한다. 비정형 원문은 하나의 지적으로 비교하여 공통 서문만으로 분쟁을 만들지 않는다.
 - #29 인수 시험: `uv run pytest -q tests/acceptance/test_orch_review_handoff.py`. `tests/test_orch_blocked.py`와 `tests/acceptance/test_orch_blocked.py`는 모듈명이 같아 기본 pytest 모드로 함께 수집하면 충돌하므로 별도로 실행한다.
 - 로컬 스킬 기능과 병합할 때 `recreate_worktree()` 안에서 작업공간 생성 직후 `_inject_lane_skills(ctx, n, git)`를 호출한다. 대상 브랜치 전환과 패치 충돌 복구 모두 이 함수를 쓰므로 `TRY.md`·`REBUTTAL.md` 보존과 스킬 복원·커밋 제외 경로를 함께 유지할 수 있다.
+- #30의 `runner.review_only(n, ctx, verdict_head=...)`는 기존 PR의 정확한 head를 detached worktree에서 검증한다. `verdict_head`가 없으면 리뷰어를 부르고, 있으면 그 head의 오케스트레이터 판정만 대신 쓴다. Done when·승인 스냅샷·CI·기존 경로별 병합 정책은 계속 적용하며 head·base·이슈 변경을 병합 직전에 재확인한다.
+- 재리뷰의 열린 이슈는 어떤 종료 경로에서도 `blocked` 또는 `ready`를 남겨야 한다. `resolve pass` 뒤 Done when·CI 실패는 PR을 닫고 근거를 힌트로 남겨 `ready`로 돌린다. 나머지 실패는 이유가 있는 `blocked`로 남긴다. SystemExit와 작업공간 정리 실패도 공통 종료 경로를 거친다.
+- 열린 PR이 있는 runner가 죽거나 멈추면 scheduler에서 `ready`로만 복구해서는 안 된다. 기존 PR 검사가 바로 `ready`를 지워 상태가 사라진다. crash·stall 복구에서 PR 존재를 확인하고 각각 `retries-exceeded`·`stalled`로 차단한다.
+- 힌트는 `<state>/hints/<n>.txt`를 다음 구현 프롬프트에 한 번 넣고 소비한다. `build_prompt(orchestrator_hint=...)`에서 native `/goal` 감싸기 전에 넣어 Claude·Codex의 `/goal` 명령이 맨 앞에 남도록 한다.
+- 힌트 소비는 프롬프트 작성이 아니라 `_available_executor()`가 일반 실행 결과를 반환한 뒤에 한다. limit 대기·transient 소진·transient 중 런타임 소진·실행 파일 누락·예외·SystemExit에서는 파일을 보존해야 다음 실행이 같은 힌트를 받는다. `classify_result(result)`로 이미 있는 실행기 가용성 구분을 재사용한다.
+- `orch-verbs` 명세는 조회를 포함한 모든 동사의 이력을 요구한다. `list`는 journal과 조회된 이슈 댓글, `log`는 이슈 번호 없는 journal을 남긴다. 조회의 `foragent:orch` 댓글은 blocked 근거·시각을 갱신하지 않는다.
+- `run_case`로 한 시험에서 실행을 여러 번 시작할 때 주입 시계를 한 번 이상 전진시킨다. 실행 이력은 `(이슈 번호, started_at)`으로 중복을 제거하므로 같은 시각에 시작하면 서로 다른 실행이 합쳐진다.
+- #30 통합 검증: `uv run pytest -q tests/acceptance/test_orch_verbs.py` 7개 통과. 전체 CI 명령 `uv run pytest -q --ignore=tests/acceptance`은 1,754개 통과, 아래 샌드박스 권한 제한으로 1개 실패이며 `tests/test_orch.py`의 71개 회귀 시험도 이 실행에 포함된다. 인수 시험 파일과 이름이 겹치는 새 시험 파일은 만들지 않는다.
+- `foragent/batch-27`과 `cli.py` 충돌 시 `orch`와 `notify`의 import 및 명령 등록을 모두 보존한다. `fa orch --help`와 `fa notify --help`로 양쪽 명령을 확인하고, 알림·상태 표시가 통합된 전체 CI 시험을 실행한다. 충돌 해결은 작업 트리에 남기고 스테이징·병합 커밋은 runner에 맡긴다.
+- 이 세션의 샌드박스에서는 `tests/test_inspect_runtime.py::test_prepare_timeout_uses_60_seconds_and_kills_child_group`가 종료 후 `src/foragent/processes.py:16`의 `os.killpg(pid, signal.SIGTERM)`에서 `PermissionError: [Errno 1] Operation not permitted`로 실패한다. 단독 실행에서도 재현됐으며 두 파일은 이 병합에서 바뀌지 않았다. uv 임시 캐시 설정과 별개의 실행 권한 제한이다.

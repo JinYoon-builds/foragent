@@ -55,6 +55,27 @@ def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
     ctx.tracker.record_label(number, "approved", actor)
 
 
+@pytest.mark.parametrize("failure,reason", [("crashed", Reason.RETRIES_EXCEEDED), ("stalled", Reason.STALLED)])
+def test_interrupted_runner_with_open_pr_stays_visible(ctx, monkeypatch, failure, reason):
+    approve(ctx)
+    tick(ctx)
+    ctx.tracker.remove_labels(1, ["ready"])
+    ctx.tracker.add_labels(1, ["running"])
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1), pid=7001)
+    ctx.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing PR", body="Closes #1")
+    if failure == "crashed":
+        def dead(pid, signal):
+            raise ProcessLookupError()
+        monkeypatch.setattr("foragent.scheduler.os.kill", dead)
+    else:
+        ctx.now = lambda: NOW + timedelta(minutes=ctx.config.stall_minutes + 1)
+    tick(ctx)
+    tick(ctx)
+    assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
+    assert ctx.store.load_flag(1).reason == reason
+    assert ctx.store.get_run(1).status == "finished"
+
+
 def edit_body(ctx, number, body):
     ctx.tracker.edit_body(number, body)
 
