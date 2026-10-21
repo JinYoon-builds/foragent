@@ -1,6 +1,13 @@
-# Configuration: Foragent docs/gate.md (section 9), docs/contract.md (section 4).
 review: batch
 executor: codex
 language: ko
 approvers:
 - JinYoon-builds
+lanes:
+  adopt:
+    paths:
+    - src/foragent/adopt.py
+    - skills/fa-init/**
+    - tests/test_adopt.py
+    agent: fa-adopt
+    skills: []
