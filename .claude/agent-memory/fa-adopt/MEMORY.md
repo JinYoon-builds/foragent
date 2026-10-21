@@ -12,3 +12,7 @@
 - 셸 주석과 따옴표 안의 `#`를 구별해야 한다. 따옴표를 제거한 토큰에서 `#`를 주석으로 판단하면 이미 붙인 `--ignore`를 못 보고 반복 실행 때 중복 추가한다.
 - CI의 npm/pnpm/go 실행 및 여러 줄 YAML 실행 블록은 `manual`에 표시한다. `needs_change`는 수정 전 상태이고 `changed`는 이번 호출이 실제 바꾼 파일이다.
 - 검증: `uv run pytest -q tests/acceptance/test_adopt_ci.py tests/acceptance/test_adopt_survey.py tests/test_adopt.py tests/test_cli.py` (issue #5: 84개 통과). 기본 uv 캐시에 쓰기가 막히면 `/private/tmp`에 캐시 메타데이터와 해당 패키지 archive를 복사하고 `UV_CACHE_DIR`로 지정해 `uv run --offline`을 쓸 수 있다. 외부 archive를 가리키는 symlink만 복사하면 캐시가 인식되지 않았다.
+- issue #4의 baseline은 `baseline(root, command=None, timeout=900)`이 맡는다. `_detect_test_command()`는 Python(`pyproject.toml` 또는 `requirements.txt`) → npm/pnpm(`package.json` test 스크립트) → Go 순서다. Python은 order와 같은 `uv run pytest`를 쓰며, requirements 감지만 adopt에 추가했다. `order.py`는 다른 레인 소유다.
+- baseline은 pytest 실행 부분에 설정 경로의 `--ignore`와 `-rf`를 붙인다. 자식 출력을 수집해 JSON에 섞이지 않게 하고, ANSI 색상을 제거한 `FAILED ` 요약 줄에서 node id를 추출한다. 매개변수에 공백이 있을 수 있으므로 첫 공백으로 자르면 안 된다.
+- 시간 초과는 셸만 종료하면 자식 테스트가 출력 파이프를 계속 잡을 수 있다. baseline은 별도 프로세스 그룹을 만들고 전체를 종료한 뒤 `exit_code: 124`, `passed: false`로 보고한다. 실패·시간 초과·명령 없음 모두 fa 종료 코드는 0이다.
+- issue #4 검증: `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest -q tests/acceptance/test_adopt_baseline.py tests/test_adopt.py tests/test_cli.py` — 92개 통과. 사람 확인 명령은 `.foragent/TRY.md`에 있다.

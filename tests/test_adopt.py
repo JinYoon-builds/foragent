@@ -1,4 +1,9 @@
-"""Regression coverage for CI source preservation and shared survey detection."""
+"""Regression coverage for adoption reports and CI source preservation."""
+
+import json
+import shlex
+import sys
+import time
 
 import pytest
 
@@ -122,3 +127,65 @@ def test_ci_yaml_merges_and_anchors_only_insert_once(tmp_path):
     assert report["changed"] == [".github/workflows/ci.yml"]
     assert path.read_bytes() == before.replace(b"pytest -q", b"pytest -q --ignore=tests/acceptance")
     assert adopt.ci(tmp_path, True)["changed"] == []
+
+
+@pytest.mark.parametrize(("files", "expected"), [
+    ({"pyproject.toml": "", "go.mod": ""}, "uv run pytest"),
+    ({"requirements.txt": "pytest\n"}, "uv run pytest"),
+    ({"package.json": '{"scripts":{"test":"vitest"}}'}, "npm test"),
+    ({"package.json": '{"scripts":{"test":"vitest"}}', "pnpm-lock.yaml": ""}, "pnpm test"),
+    ({"package.json": '{"scripts":{"test":"vitest"},"packageManager":"pnpm@10"}'}, "pnpm test"),
+    ({"go.mod": "module example\n"}, "go test ./..."),
+    ({"package.json": "broken", "go.mod": ""}, "go test ./..."),
+    ({"package.json": "[]"}, None),
+    ({"package.json": '{"scripts":{"build":"vite build"}}'}, None),
+])
+def test_baseline_command_detection(tmp_path, files, expected):
+    for name, content in files.items():
+        (tmp_path / name).write_text(content)
+    assert adopt._detect_test_command(tmp_path) == expected
+
+
+def test_baseline_override_runs_once_in_root_without_parsing_non_pytest(tmp_path, capsys):
+    (tmp_path / "pyproject.toml").touch()
+    (tmp_path / "runner.py").write_text(
+        "from pathlib import Path\n"
+        "with Path('runs').open('a') as f: f.write('once\\n')\n"
+        "print('FAILED tests/test_example.py::test_example - error')\n"
+        "raise SystemExit(3)\n"
+    )
+    command = shlex.join([sys.executable, "runner.py"])
+    assert cli.main(["adopt", "baseline", "--repo-root", str(tmp_path),
+                     "--command", command, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "command": command, "exit_code": 3, "passed": False, "failing": [],
+    }
+    assert (tmp_path / "runs").read_text() == "once\n"
+
+
+def test_baseline_pytest_reports_colored_parameterized_ids_and_quotes_ignore(tmp_path):
+    (tmp_path / ".foragent.yml").write_text("acceptance_dir: 'checks/locked tests/'\n")
+    runner = tmp_path / "pytest"
+    runner.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\" > args\n"
+        "printf '\\033[31mFAILED tests/test_example.py::test_case[a b] - AssertionError\\033[0m\\n'\n"
+        "exit 1\n"
+    )
+    runner.chmod(0o755)
+    report = adopt.baseline(tmp_path, shlex.quote(str(runner)))
+    assert report["passed"] is False
+    assert report["failing"] == ["tests/test_example.py::test_case[a b]"]
+    assert (tmp_path / "args").read_text().splitlines() == ["--ignore=checks/locked tests", "-rf"]
+
+
+def test_baseline_timeout_stops_shell_and_runner(tmp_path, capsys):
+    command = shlex.join([sys.executable, "-c", "import time; time.sleep(30)"])
+    started = time.monotonic()
+    assert cli.main(["adopt", "baseline", "--repo-root", str(tmp_path),
+                     "--command", command, "--timeout", "1", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["exit_code"] == 124
+    assert report["passed"] is False
+    assert report["failing"] == []
+    assert time.monotonic() - started < 5

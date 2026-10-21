@@ -3,8 +3,11 @@
 import argparse
 from collections import Counter
 import json
+import os
 from pathlib import Path, PurePosixPath
+import re
 import shlex
+import signal
 import subprocess
 import sys
 
@@ -266,7 +269,79 @@ def survey(root: Path) -> dict:
     }
 
 
+def _detect_test_command(root: Path) -> str | None:
+    """Follow order.context's command priority without needing its tracker."""
+    if (root / "pyproject.toml").is_file() or (root / "requirements.txt").is_file():
+        return "uv run pytest"
+    package = root / "package.json"
+    if package.is_file():
+        try:
+            data = json.loads(package.read_text(encoding="utf-8"))
+            if isinstance(data.get("scripts"), dict) and data["scripts"].get("test"):
+                pnpm = (root / "pnpm-lock.yaml").is_file() or str(data.get("packageManager", "")).startswith("pnpm@")
+                return "pnpm test" if pnpm else "npm test"
+        except (ValueError, AttributeError):
+            pass
+    if (root / "go.mod").is_file():
+        return "go test ./..."
+    return None
+
+
+def baseline(root: Path, command: str | None = None, timeout: int = 900) -> dict:
+    """Run existing tests once and report their state, including a red baseline."""
+    root = root.resolve()
+    command = command if command is not None else _detect_test_command(root)
+    if not command:
+        return {"command": None, "passed": None, "skipped": "no test command found"}
+    config = load_config(root) if (root / ".foragent.yml").is_file() else Config()
+    pytest = False
+    # Insert before shell separators/comments so each pytest receives the flags.
+    for start, end in reversed(list(_command_ranges(command))):
+        line = command[start:end].rstrip()
+        if any(args[0] == "pytest" for args in _test_invocations(line)):
+            pytest = True
+            offset = start + len(line)
+            flags = " " + shlex.quote(f"--ignore={config.acceptance_dir.rstrip('/')}") + " -rf"
+            command = command[:offset] + flags + command[offset:]
+    with subprocess.Popen(
+        ["/bin/sh", "-c", command], cwd=root, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+    ) as process:
+        try:
+            output, _ = process.communicate(timeout=timeout)
+            exit_code = process.returncode
+        except subprocess.TimeoutExpired:
+            # Kill the shell and its test runner, including inherited output pipes.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            output, _ = process.communicate()
+            exit_code = 124
+    failing = []
+    if pytest:
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output.decode("utf-8", errors="replace"))
+        for line in text.splitlines():
+            if line.startswith("FAILED "):
+                node_id = line.removeprefix("FAILED ").split(" - ", 1)[0].strip()
+                if node_id and node_id not in failing:
+                    failing.append(node_id)
+    return {"command": command, "exit_code": exit_code, "passed": exit_code == 0, "failing": failing}
+
+
 def run(args: argparse.Namespace) -> int:
+    if args.action == "baseline":
+        report = baseline(args.repo_root, args.test_command, args.timeout)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False))
+        elif report["command"] is None:
+            print(f"Skipped: {report['skipped']}")
+        else:
+            print(f"Command: {report['command']}")
+            print(f"Baseline: {'passed' if report['passed'] else 'failed'} (exit {report['exit_code']})")
+            for node_id in report["failing"]:
+                print(f"FAILED {node_id}")
+        return 0
     if args.action == "ci":
         report = ci(args.repo_root, args.exclude_acceptance)
         if args.json:
