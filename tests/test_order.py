@@ -540,6 +540,58 @@ def test_lane_skills_and_notices_reach_remote_runner_worktree(offline_publicatio
     assert len([args for args in calls if args[0] == "push"]) == 1
 
 
+@pytest.mark.parametrize("requested,pin,engine,reason", [
+    ("ouroboros", None, "ouroboros", None),
+    ("ouroboros", "0.52.0", "ouroboros", None),
+    ("ouroboros", "0.51.1", "native", "mismatch"),
+    ("ouroboros", "", "native", "mismatch"),
+    ("native", "0.51.1", "native", None),
+])
+def test_context_resolves_interview_from_first_plugin_entry(tmp_path, monkeypatch, requested, pin, engine, reason):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = tmp_path / ".claude/plugins/installed_plugins.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"plugins": {
+        "other@market": [{"version": "1.0"}],
+        "ouroboros@custom-market": [{"version": "0.52.0"}, {"version": "0.51.1"}],
+    }}))
+    result = order.context(tmp_path, Config(interview=requested, ouroboros_version=pin), FakeTracker())["interview"]
+    assert result == {"requested": requested, "engine": engine, "installed_version": "0.52.0",
+                      "pinned_version": pin, "reason": result["reason"]}
+    if reason is None:
+        assert result["reason"] is None
+    else:
+        assert reason in result["reason"]
+        assert "0.52.0" in result["reason"] and pin in result["reason"]
+
+
+@pytest.mark.parametrize("contents", [
+    None, b"{", b"\xff", b"null", b"[]", b"{}", b'{"plugins": []}',
+    b'{"plugins": {"other-ouroboros@market": [{"version": "0.52.0"}]}}',
+    b'{"plugins": {"ouroboros@market": []}}',
+    b'{"plugins": {"ouroboros@market": {}}}',
+    b'{"plugins": {"ouroboros@market": [null]}}',
+    b'{"plugins": {"ouroboros@market": [{}]}}',
+    b'{"plugins": {"ouroboros@market": [{"version": 52}]}}',
+])
+def test_context_missing_or_broken_plugins_falls_back(tmp_path, monkeypatch, contents):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if contents is not None:
+        path = tmp_path / ".claude/plugins/installed_plugins.json"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(contents)
+    result = order.context(tmp_path, Config(), FakeTracker())["interview"]
+    assert result == {"requested": "ouroboros", "engine": "native", "installed_version": None,
+                      "pinned_version": None, "reason": "Ouroboros not installed"}
+
+
+def test_context_unreadable_plugins_falls_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude/plugins/installed_plugins.json").mkdir(parents=True)
+    result = order.context(tmp_path, Config(), FakeTracker())["interview"]
+    assert result["engine"] == "native" and "not installed" in result["reason"]
+
+
 def test_context_all_sections_and_gate_groups(tmp_path):
     tracker = FakeTracker()
     tracker.add_issue(1, "Feedback", "Fix it\n\nAbout #8.", ["feedback"])
@@ -563,7 +615,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
     assert result["feedback"] == [{"number": 1, "title": "Feedback", "body": "Fix it\n\nAbout #8.", "about": 8}]
