@@ -247,8 +247,21 @@ class GitRepo:
             "commit", "-m", title,
         ])
 
-    def push(self, branch: str) -> None:
-        self._call(["push", "-f", "origin", branch])
+    def continue_merge(self) -> None:
+        """Conclude a resolved merge, retaining its parents and clearing merge state."""
+        self._exclude_artifacts()
+        self._call([
+            "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+            "-c", "core.editor=true", "merge", "--continue",
+        ])
+
+    def remote_branch_sha(self, branch: str) -> str | None:
+        output = self._call(["ls-remote", "--heads", "origin", f"refs/heads/{branch}"])
+        return output.split()[0] if output.strip() else None
+
+    def push(self, branch: str, *, lease: str | None = None) -> None:
+        force = "-f" if lease is None else f"--force-with-lease=refs/heads/{branch}:{lease}"
+        self._call(["push", force, "origin", branch])
 
     def check_worktree(self) -> None:
         try:
