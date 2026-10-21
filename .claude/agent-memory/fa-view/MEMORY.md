@@ -1,5 +1,9 @@
 # View lane 기억
 
+- #74 유휴 접기는 `watch._frame`에서만 한다. 전체 레인 순서로 번호를 매긴 뒤 `_has_work`로 도로·표만 걸러야 접힌 레인의 숫자 키와 footer 범위가 유지된다. 완료 실적은 작업 유무와 별개로 접힌 줄에 `✓N`으로 표시한다.
+- watch의 `_columns`는 작업 표 전용이며 터미널 셀 너비로 잘라 `…`를 붙인 한 줄을 반환한다. 사건 기록의 `_wrap`과 상세 화면은 그대로 유지한다. 검증: `UV_CACHE_DIR=/tmp/foragent-issue-38-uv-cache uv run --offline pytest -q tests/acceptance/test_view_compact.py tests/acceptance/test_view_watch.py tests/test_watch.py`.
+- `_columns`의 줄바꿈을 없애도 `zip_longest`는 `_beside`의 좌우 화면 합치기에, `_wrap`은 사건 기록에 쓰인다. 미사용 코드 지적은 diff뿐 아니라 파일 전체의 호출 위치를 검색해 확인한다.
+
 - 레인 이름의 원본은 `.foragent.yml`의 `lanes.<slug>.title`·`emoji`. 사람용 문자열은 `foragent.labels.lane_display(config, slug, language)`로 만들고, JSON의 slug와 라벨·에이전트 파일 이름은 유지한다.
 - `fa gate status`는 `cli._status` → `_print_status`, `fa inspect`는 `inspect_data.collect` → `cli._inspect` 흐름이다. inspect의 완료 항목은 열린 이슈 목록에서 사라지므로 저장된 실행 기록의 lane을 우선 사용한다.
 - 이름 관련 검증: `uv run pytest -q tests/acceptance/test_view_names.py tests/test_lane_display.py tests/test_cli.py tests/test_config.py tests/test_skills_lanes.py tests/test_inspect.py`. 인수 테스트는 수정하지 않는다.
