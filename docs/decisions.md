@@ -198,3 +198,9 @@
   - 땜질 방지: inspect의 "별로야"에 order는 "이 화면만의 문제인가, 기준의 문제인가?"를 묻고, 기준의 문제면 토큰·계약서를 고치는 이슈로 만든다(모든 화면이 한 번에 바뀜).
 - Figma MCP는 처음엔 쓰지 않는다. 디자이너와 협업하거나 사람이 직접 화면을 고치며 정하고 싶을 때 붙인다.
 - 만드는 방법: Foragent 저장소에 /fa-order로 주문. 시험은 UI가 아쉬운 Jin의 실제 웹 프로젝트를 브라운필드로 들여서.
+
+### D34. 두 번째 스킬 라이브러리: anthropics/skills (2026-10-21, Jin)
+- 계기: knowledge-work-plugins의 design 스킬 7개는 모두 "기준 지키기"(점검·비평·정리·명세)이고 "기준 만들기"가 없었다. 라이브러리를 꽂는 구조(D23) 덕분에 다른 라이브러리에서 찾아 넣으면 된다.
+- 결정: 기본 `skill_libraries`에 `anthropics/skills`(Anthropic 공식, Apache-2.0, 스킬마다 LICENSE.txt)를 추가한다. 디자인 레인 기본 구성: 기준 만들기 = `frontend-design`(템플릿 같은 기본값·생성 티를 피하고 의도적으로 색·글꼴·배치를 고름), 기준 지키기 = `design-system`·`design-critique`·`accessibility-review`·`ux-copy`(knowledge-work-plugins), 확인하기 = `webapp-testing`(Playwright로 띄워 누르고 스크린샷 — inspect 웹 써 보기에도 사용). 탐색 단계 시제품은 `theme-factory`.
+- 주의: `frontend-design`은 과감한 개성 쪽으로 기운다. 사람의 취향 인터뷰(좋아하는 앱 2~3개)와 디자인 계약서가 스킬보다 우선한다고 계약서에 적는다. 스킬은 "의도를 갖고 고르는 법", 취향은 "무엇을 고르나".
+- 레인당 스킬 3개 상한(D32)은 디자인 레인에서 단계별로 나눠 쓴다(디자인 기초 이슈는 frontend-design·design-system, 화면 이슈는 design-critique·accessibility-review·ux-copy). — 미구현
