@@ -46,6 +46,11 @@ def _hot_paths(git: GitRepo) -> list[dict]:
 
 def _test_invocations(script: str) -> list[list[str]]:
     """Find test invocations in shell commands without executing any of them."""
+    return [command for _, command in _test_commands(script)]
+
+
+def _test_commands(script: str) -> list[tuple[list[str], list[str]]]:
+    """Keep invocation prefixes alongside normalized test commands."""
     script = script.replace("\\\n", "")
     try:
         commands = [shlex.split(script[start:end]) for start, end in _command_ranges(script)]
@@ -59,6 +64,7 @@ def _test_invocations(script: str) -> list[list[str]]:
             tokens = tokens[1:]
         if not tokens:
             continue
+        invocation = tokens
         program = PurePosixPath(tokens[0]).name
         if program in {"uv", "poetry", "pipenv", "pdm", "hatch"} and "run" in tokens:
             tokens = tokens[tokens.index("run") + 1:]
@@ -74,7 +80,8 @@ def _test_invocations(script: str) -> list[list[str]]:
             tokens = tokens[2:]
             program = "pytest"
         if program == "pytest" or (program in {"npm", "pnpm", "go"} and tokens[1:2] == ["test"]):
-            invocations.append([program, *tokens[1:]])
+            prefix = invocation[:len(invocation) - len(tokens) + 1]
+            invocations.append((prefix, [program, *tokens[1:]]))
     return invocations
 
 
@@ -201,13 +208,22 @@ def ci(root: Path, exclude_acceptance: bool = False) -> dict:
     root = root.resolve()
     config = load_config(root) if (root / ".foragent.yml").is_file() else Config()
     ignore = f"--ignore={config.acceptance_dir.rstrip('/')}"
-    report = {"needs_change": [], "changed": [], "manual": []}
+    report = {"needs_change": [], "changed": [], "manual": [], "collect_only": []}
     for path, source, runs in _workflow_runs(root):
         name = path.relative_to(root).as_posix()
+        pytest_commands = [
+            (prefix, command) for script in runs for prefix, command in _test_commands(script.value)
+            if command[0] == "pytest"
+        ]
+        if pytest_commands and not any("--collect-only" in command[1:] for _, command in pytest_commands):
+            report["collect_only"].append({
+                "file": name, "add": shlex.join(pytest_commands[0][0]) + " --collect-only -q",
+            })
         insertions = {}
         needs_change = False
         for script in runs:
-            commands = _test_invocations(script.value)
+            commands = [command for command in _test_invocations(script.value)
+                        if command[0] != "pytest" or "--collect-only" not in command[1:]]
             missing = any(command[0] == "pytest" and ignore not in command[1:] for command in commands)
             needs_change |= missing
             multiline = (script.style in {"|", ">"} or "\n" in script.value
@@ -222,7 +238,7 @@ def ci(root: Path, exclude_acceptance: bool = False) -> dict:
                 for command in _test_invocations(line):
                     if command[0] != "pytest":
                         report["manual"].append({"file": name, "line": line.strip()})
-                    elif ignore not in command[1:]:
+                    elif "--collect-only" not in command[1:] and ignore not in command[1:]:
                         addition = " " + shlex.quote(ignore)
                         if script.style == "'":
                             addition = addition.replace("'", "''")
@@ -351,6 +367,8 @@ def run(args: argparse.Namespace) -> int:
             print(f"Changed: {', '.join(report['changed']) or 'none'}")
             for item in report["manual"]:
                 print(f"Manual: {item['file']}: {item['line']}")
+            for item in report["collect_only"]:
+                print(f"Collect only: {item['file']}: add {item['add']}")
         return 0
     if args.action == "survey":
         report = survey(args.repo_root)
