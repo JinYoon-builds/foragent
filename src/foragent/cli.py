@@ -15,7 +15,7 @@ from foragent.config import Config, ConfigError, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
 from foragent.kick import kick_tick
-from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_order, state_group
+from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_display, lane_order, state_group
 from foragent.lanes import LaneError, add_lane
 from foragent.paths import PathError
 from foragent.skills import SkillError, SkillManager
@@ -102,6 +102,8 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
     lane.add_argument("--skill", nargs="+", action="extend", default=[], dest="skills")
     lane.add_argument("--executor", choices=("codex", "claude"))
     lane.add_argument("--model")
+    lane.add_argument("--title")
+    lane.add_argument("--emoji")
     lane.add_argument("--repo-root", type=Path, default=Path.cwd())
     skills = commands.add_parser("skills", help="Manage skill libraries")
     skill_actions = skills.add_subparsers(dest="action", required=True)
@@ -167,7 +169,7 @@ def _comma_numbers(value: str) -> list[int]:
 
 def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -> dict[str, Any]:
     config = config or Config()
-    lanes: dict[str, dict[str, list]] = {}
+    lanes: dict[str, dict[str, Any]] = {}
     groups: dict[str, list[dict[str, Any]]] = {
         state: [] for state in (NEEDS_HUMAN, RUNNING, "pr-open", READY, "approved-waiting", "unapproved")
     }
@@ -187,7 +189,8 @@ def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -
         if group in {RUNNING, READY}:
             run = store.get_run(issue.number) if group == RUNNING else None
             lane = run.lane if run is not None and run.status == "running" else issue_lane(issue.labels, config.lanes)
-            lanes.setdefault(lane, {RUNNING: [], READY: []})[group].append(item)
+            lanes.setdefault(lane, {RUNNING: [], READY: [],
+                                    "lane_display": lane_display(config, lane, config.language)})[group].append(item)
     return {
         "issues": groups,
         "lanes": {lane: lanes[lane] for lane in sorted(lanes, key=lane_order)},
@@ -203,7 +206,7 @@ def _print_status(status: dict[str, Any]) -> None:
         if state in {RUNNING, READY}:
             for lane, grouped in status["lanes"].items():
                 if grouped[state]:
-                    print(f"  lane:{lane}:")
+                    print(f"  {grouped['lane_display']}:")
                     for issue in grouped[state]:
                         print(f"    #{issue['number']} {issue['title']}")
             continue
@@ -251,7 +254,7 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
         else:
             print(inspect_data.counts_line(inbox, detailed=True))
             for item in inbox.items:
-                summary = f"[{item.group}] #{item.number} {item.title} — {item.summary}"
+                summary = f"[{item.group}] {item.lane_display} · #{item.number} {item.title} — {item.summary}"
                 if item.group == "try":
                     print(f"{summary} {item.url}")
                     for line in inspect_data.try_lines(item):
@@ -297,7 +300,8 @@ def main(argv: list[str] | None = None) -> int:
             ).summary())
             return 0
         if args.command == "lanes":
-            lane = add_lane(root, args.name, args.paths, skills=args.skills, executor=args.executor, model=args.model)
+            lane = add_lane(root, args.name, args.paths, skills=args.skills, executor=args.executor, model=args.model,
+                            title=args.title, emoji=args.emoji)
             print(f"Created lane:{args.name} ({', '.join(lane['paths'])})")
             return 0
         if args.action in {"install", "uninstall", "launchd-status"}:

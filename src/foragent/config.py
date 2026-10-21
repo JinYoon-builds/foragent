@@ -135,12 +135,12 @@ def _validate(values: dict[str, Any]) -> None:
     for name, lane in lanes.items():
         if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9-]+", name):
             raise ConfigError(f"invalid lanes name: {name}")
-        if not isinstance(lane, dict) or lane.keys() - {"paths", "agent", "skills", "executor", "model"}:
+        if not isinstance(lane, dict) or lane.keys() - {"paths", "agent", "skills", "executor", "model", "title", "emoji"}:
             raise ConfigError(f"invalid lanes entry: {name}")
         paths = lane.get("paths", [])
         if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
             raise ConfigError(f"lanes.{name}.paths must be a list of strings")
-        for key in ("agent", "executor", "model"):
+        for key in ("agent", "executor", "model", "title", "emoji"):
             if lane.get(key) is not None and not isinstance(lane[key], str):
                 raise ConfigError(f"lanes.{name}.{key} must be a string or null")
         if lane.get("executor") is not None and lane["executor"] not in _EXECUTORS:

@@ -53,7 +53,7 @@ def lane_files(root: Path, name: str, skills: list[str]) -> list[str]:
 def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | None = None,
              executor: str | None = None, model: str | None = None,
              git: GitRepo | None = None, manager: SkillManager | None = None,
-             push: bool = True) -> dict:
+             push: bool = True, title: str | None = None, emoji: str | None = None) -> dict:
     config = load_config(root)
     skills = skills or []
     manager = manager or (SkillManager(config) if skills else None)
@@ -68,6 +68,9 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
         lane["executor"] = executor
     if model is not None:
         lane["model"] = model
+    for key, value in (("title", title), ("emoji", emoji)):
+        if value is not None:
+            lane[key] = value
     local = _read_yaml(root / ".foragent.yml")
     local["lanes"] = {**config.lanes, name: lane}
     _validate({**asdict(config), "lanes": local["lanes"]})
