@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, adopt, bench, design, inspect_actions, inspect_data, launchd, notify, orch, order, watch, watch_open
+from foragent import __version__, adopt, bench, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, order, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -39,13 +39,33 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fa")
     parser.add_argument("--version", action="version", version=f"foragent {__version__} ({GIT_SHA})")
     commands = parser.add_subparsers(dest="command", required=True)
-    design_command = commands.add_parser("design", help="Check the project's design foundation")
-    design_actions = design_command.add_subparsers(dest="action", required=True)
+    design_command = commands.add_parser("design", help="Preview designs and check the project's foundation")
+    design_actions = design_command.add_subparsers(dest="action", required=True,
+                                                  metavar="{lint,preview,picks,done}")
     lint = design_actions.add_parser("lint", help="Report raw colors outside token files")
     lint.add_argument("--repo-root", type=Path, default=Path.cwd())
     lint.add_argument("--tokens", nargs="+", action="extend", help="Token paths/globs (replaces defaults)")
     lint.add_argument("--glob", nargs="+", action="extend", dest="globs", help="UI globs (replaces defaults)")
     lint.add_argument("--json", action="store_true")
+    preview = design_actions.add_parser("preview", help="Show references or running drafts in planning mode")
+    preview.add_argument("--stage", choices=("board", "drafts"), default="drafts")
+    preview.add_argument("--topic", default="default")
+    preview.add_argument("--references", type=Path, help="JSON reference manifest for the local board")
+    medium = preview.add_mutually_exclusive_group()
+    medium.add_argument("--command", dest="preview_commands", action="append", help="Runnable terminal draft; repeat to compare")
+    medium.add_argument("--url", action="append", help="Running web draft; repeat to compare")
+    preview.add_argument("--repo-root", type=Path, default=Path.cwd())
+    picks = design_actions.add_parser("picks", help="Read saved reference likes and dislikes")
+    picks.add_argument("--topic", required=True)
+    picks.add_argument("--json", action="store_true")
+    picks.add_argument("--repo-root", type=Path, default=Path.cwd())
+    done = design_actions.add_parser("done", help="Close preview panes and return to the lane view")
+    done.add_argument("--repo-root", type=Path, default=Path.cwd())
+    serve = design_actions.add_parser("_serve")
+    serve.add_argument("--directory", type=Path, required=True)
+    serve.add_argument("--topic", required=True)
+    serve.add_argument("--token", required=True)
+    serve.add_argument("--repo-root", type=Path, default=Path.cwd())
     adopt_command = commands.add_parser("adopt", help="Prepare an existing repository for Foragent")
     adopt_actions = adopt_command.add_subparsers(dest="action", required=True)
     for name in ("survey", "baseline", "ci"):
@@ -384,7 +404,12 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "design":
-            return design.run(args)
+            if args.action == "lint":
+                return design.run(args)
+            root = args.repo_root.resolve()
+            config = load_config(root)
+            repo = config.repo or GitRepo(root).remote_slug()
+            return design_session.run(args, StateStore.for_repo(repo))
         if args.command == "adopt":
             return adopt.run(args)
         if args.command == "bench":
@@ -577,7 +602,7 @@ def main(argv: list[str] | None = None) -> int:
             ))
             return 1 if outcome == "error" else 0
         return 0
-    except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError,
+    except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError, design_session.DesignError,
             inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError,
             order.PlanError, orch.OrchError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
