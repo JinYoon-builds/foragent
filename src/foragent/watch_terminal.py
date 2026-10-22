@@ -47,6 +47,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     animation_started = watch.time.monotonic()
     next_refresh = animation_started + 5
     pending = None
+    started_build = watch._installed_build()
     with watch.ThreadPoolExecutor(max_workers=1) as worker:
         while True:
             if pending is not None and pending.done():
@@ -57,6 +58,8 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     error = watch.text("watch_refresh_failed", config.language, error=watch._clean(exc))
                 pending = None
                 next_refresh = watch.time.monotonic() + 5
+                if watch.should_reload(started_build, watch._installed_build()):
+                    return True
             if pending is None and watch.time.monotonic() >= next_refresh:
                 pending = worker.submit(refresh)
             tick = int((watch.time.monotonic() - animation_started) / 0.3)

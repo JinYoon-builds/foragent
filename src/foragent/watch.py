@@ -12,8 +12,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice, zip_longest
 import json
+import importlib
 import os
 from pathlib import Path
+import runpy
 import sys
 import time
 import unicodedata
@@ -31,6 +33,24 @@ from foragent.watch_open import registered
 from foragent.watch_terminal import _terminal
 
 
+def _installed_build() -> str:
+    """Read installation metadata afresh, bypassing module and bytecode caches."""
+    try:
+        build = importlib.import_module("foragent._build")
+        source = getattr(build, "__file__", None)
+        sha = runpy.run_path(source)["GIT_SHA"] if source else build.GIT_SHA
+        return sha.strip() if isinstance(sha, str) else "unknown"
+    except (ImportError, OSError, SyntaxError, ValueError, KeyError, AttributeError):
+        # A package replacement can briefly leave metadata missing or incomplete.
+        return "unknown"
+
+
+def should_reload(started: str, current: str) -> bool:
+    """Only a change between two known builds warrants replacing the view."""
+    return bool(started and current and started != "unknown" and current != "unknown"
+                and started != current)
+
+
 def run(
     status: Callable[[], dict[str, Any]], tracker: Tracker, store: StateStore,
     config: Config, repo_root: Path, *, once: bool = False,
@@ -38,6 +58,8 @@ def run(
 ) -> None:
     if not once and not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise ConfigError(text("watch_terminal", config.language))
+    argv = sys.argv.copy()
+    reload_requested = False
     refresh = lambda: collect(status(), tracker, store, config, now())
     with nullcontext() if once else registered(store):
         snapshot = refresh()
@@ -47,8 +69,14 @@ def run(
         import curses
 
         try:
-            curses.wrapper(_terminal, refresh, snapshot, config, repo_root, now)
+            reload_requested = curses.wrapper(_terminal, refresh, snapshot, config, repo_root, now)
         except KeyboardInterrupt:
             pass
         except curses.error as exc:
             raise ConfigError(str(exc)) from exc
+    if reload_requested:
+        # Both curses and PID registration must unwind before exec replaces us.
+        if Path(argv[0]).resolve() == Path(__file__).with_name("cli.py").resolve():
+            os.execv(sys.executable, [sys.executable, "-m", "foragent.cli", *argv[1:]])
+        else:
+            os.execv(argv[0], argv)
