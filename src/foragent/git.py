@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 
 
 REVIEW_SCOPE_FILE = "CLAUDE.local.md"
@@ -49,7 +50,15 @@ class GitRepo:
 
     def fetch(self, remote: str = "origin", ref: str | None = None) -> None:
         refspec = f"+refs/heads/{ref}:refs/remotes/{remote}/{ref}" if ref is not None else None
-        self._call(["fetch", remote, *([refspec] if refspec is not None else [])])
+        for attempt in range(3):
+            try:
+                self._call(["fetch", remote, *([refspec] if refspec is not None else [])])
+                return
+            except GitError as exc:
+                # Another fetch can update the shared remote ref after Git reads it.
+                if "incorrect old value provided" not in str(exc) or attempt == 2:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
 
     def at(self, root: Path) -> "GitRepo":
         return GitRepo(root, lambda args: self._call(["-C", str(root), *args]))

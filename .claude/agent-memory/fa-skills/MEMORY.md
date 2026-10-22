@@ -1,5 +1,7 @@
 # skills 레인 현재 메모
 
+- `GitRepo.fetch()`는 공유 clone의 참조 갱신 경합(`incorrect old value provided`)만 짧게 기다려 최대 3회 시도한다. `_call()` 전체에 재시도를 넣으면 다른 Git 작업까지 바뀌므로 fetch 안에서 처리한다. 재시도 중 다른 오류가 나오면 즉시 원문으로 전달한다. #134 검증: `uv run pytest tests/acceptance/test_fetch_race.py`, 회귀: `uv run pytest tests/test_git.py -k fetch`.
+
 - 라이브러리 스킬 설치 기본값은 로컬 복사다. `.gitignore`에는 `/.claude/skills/<이름>/` 규칙만 한 번 추가하며, 기존 내용은 바이트 그대로 보존한다. 전체 `.claude/skills/`를 제외하면 사용자 스킬도 빠지므로 개별 경로를 쓴다.
 - `SkillManager.install(..., commit=True)` / `fa skills install --commit`에서만 기존 오픈소스 라이선스 차단과 `THIRD_PARTY_NOTICES.md` 생성을 적용한다. 로컬 설치는 불명확하거나 비공개인 라이선스도 경고 후 허용하며 Git 조회가 필요 없다.
 - `lane_files()`는 레인 설정·에이전트 정의·`.gitignore`만 반환한다. `order.publish()`의 중단 복구도 이 함수를 쓰므로 라이브러리 스킬 파일을 반환하면 강제 추적·커밋된다.
