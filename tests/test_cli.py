@@ -589,7 +589,7 @@ def test_inspect_retry_existing_failed_pr_can_be_scheduled_on_next_tick(app, mon
 
 def test_inspect_cli_notify_logs_failure_and_retries_then_dedupes(app, monkeypatch, capsys, caplog):
     root, git, tracker, store, _ = app
-    tracker.add_issue(1, labels=["needs-human"])
+    tracker.add_issue(1, "Issue 1", labels=["needs-human"])
     monkeypatch.setattr(cli, "load_config", lambda root: Config(notify="command:/offline/notifier"))
     args = ["inspect", "notify", "--repo-root", str(root)]
     calls = []
@@ -600,11 +600,11 @@ def test_inspect_cli_notify_logs_failure_and_retries_then_dedupes(app, monkeypat
     monkeypatch.setattr(subprocess, "run", fail)
     assert cli.main(args) == 0
     assert "notifier unavailable" in caplog.text
-    assert capsys.readouterr().out == "Decision 1\n"
+    assert capsys.readouterr().out == "Decision 1 · #1 Issue 1\n"
     assert store.load_inspect().notified_signature is None
     monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
     assert cli.main(args) == cli.main(args) == 0
-    assert capsys.readouterr().out == "Decision 1\n"
+    assert capsys.readouterr().out == "Decision 1 · #1 Issue 1\n"
     assert len(calls) == 1
     assert calls[0][1]["env"]["FA_TITLE"] == "Foragent owner/repo"
 
