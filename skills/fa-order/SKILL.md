@@ -151,7 +151,11 @@ no-match or deferred choice with the person; do not invent candidates or hand th
 ## Design first (D33)
 Use `ui.frameworks` and `ui.has_design_foundation` from the context alongside the request.
 For UI work without a foundation, first suggest a design session (`/fa-design-session`)
-to settle the visual direction (D72). Use its agreed output as settled context, then
+to settle the visual direction (D72). It is design mode in this planning session,
+continuing in the same window. Read its
+`docs/design/<topic>/HANDOFF.md` before splitting implementation into lane issues;
+carry the chosen runnable draft and "same screen as the draft" into Done when.
+Use its agreed output as settled context, then
 create a small design foundation implementation issue: tokens,
 a few basic components, a sample page, and `docs/design/CONTRACT.md` for product-wide
 tone, density and principles. Derive taste from 2–3 reference apps or sites the user
@@ -190,7 +194,8 @@ rest still completes. For each issue you must be able to write one sentence:
   `interactive` label. Use `false` or omit it for work an agent can finish unattended;
   complexity alone is not a reason to mark an issue interactive. For visual design,
   suggest a design session (`/fa-design-session`) to settle the direction together.
-  This order records the choice and suggestion; session startup is a separate workflow.
+  Continue that design mode in the planning session's current window, then hand
+  the selected draft and HANDOFF.md to the orchestrator through `fa orch request`.
 - **blocked_by** only for real order dependencies (B cannot be built or verified without A).
 - Fill each issue's **`files`** with the repository-relative paths or globs it is expected
   to change (for example, `["src/foragent/order.py", "skills/fa-order/**"]`). Use `[]`

@@ -90,6 +90,15 @@ Do not turn every sentence into a new issue. Keep one durable order draft in
 `docs/specs/` and use the project's decision log for settled context.
 Use the repository's `fa-order` skill to clarify only unresolved product choices,
 split work into independently verifiable issues and prepare a plan JSON.
+When visual direction or taste is unresolved, suggest design mode in the planning
+session with `fa-design-session`. The conversation continues in the same window;
+the gate does not supervise design previews. Read a design handoff delivered by
+`fa orch request` from `docs/design/<topic>/HANDOFF.md`, including the selected
+runnable draft, decisions, reference notes and screenshots. Turn that agreement
+into lane issues, with visual Done when: "same screen as the draft"
+(시안과 같은 화면), checked at the documented size with screenshots and interaction
+checks. Preserve the normal order approval flow below; a handoff request is not
+approval to publish issues.
 When clear, propose one card with new issues grouped by lane, dependencies,
 Done when checks, and any new lanes (human name, paths, skills).
 AskUserQuestion: [add] (recommended) / [edit] / [later].

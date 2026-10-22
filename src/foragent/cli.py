@@ -39,13 +39,30 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fa")
     parser.add_argument("--version", action="version", version=f"foragent {__version__} ({GIT_SHA})")
     commands = parser.add_subparsers(dest="command", required=True)
-    design_command = commands.add_parser("design", help="Check the project's design foundation")
+    design_command = commands.add_parser("design", help="Preview designs and check the design foundation")
     design_actions = design_command.add_subparsers(dest="action", required=True)
     lint = design_actions.add_parser("lint", help="Report raw colors outside token files")
     lint.add_argument("--repo-root", type=Path, default=Path.cwd())
     lint.add_argument("--tokens", nargs="+", action="extend", help="Token paths/globs (replaces defaults)")
     lint.add_argument("--glob", nargs="+", action="extend", dest="globs", help="UI globs (replaces defaults)")
     lint.add_argument("--json", action="store_true")
+    preview = design_actions.add_parser("preview", help="Show references or running drafts beside planning")
+    preview.add_argument("--repo-root", type=Path, default=Path.cwd())
+    preview.add_argument("--topic", default="default", help="Design topic used for saved picks")
+    preview.add_argument("--stage", choices=("board", "drafts"))
+    preview.add_argument("--references", type=Path, help="JSON reference manifest for the board")
+    medium = preview.add_mutually_exclusive_group()
+    medium.add_argument("--command", dest="preview_commands", action="append", default=[], help="Runnable terminal draft (repeatable)")
+    medium.add_argument("--url", action="append", default=[], help="Running web draft URL (repeatable)")
+    picks = design_actions.add_parser("picks", help="Read saved reference likes and dislikes")
+    picks.add_argument("--repo-root", type=Path, default=Path.cwd())
+    picks.add_argument("--topic", required=True)
+    picks.add_argument("--json", action="store_true")
+    done = design_actions.add_parser("done", help="Close preview panes and return to the lane view")
+    done.add_argument("--repo-root", type=Path, default=Path.cwd())
+    serve = design_actions.add_parser("serve", help="Serve a prepared local preview (used by preview)")
+    serve.add_argument("--repo-root", type=Path, default=Path.cwd())
+    serve.add_argument("--directory", type=Path, required=True)
     adopt_command = commands.add_parser("adopt", help="Prepare an existing repository for Foragent")
     adopt_actions = adopt_command.add_subparsers(dest="action", required=True)
     for name in ("survey", "baseline", "ci"):
@@ -384,7 +401,14 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "design":
-            return design.run(args)
+            if args.action == "lint":
+                return design.run(args)
+            from foragent import design_session
+
+            root = args.repo_root.resolve()
+            config = load_config(root)
+            repo = config.repo or GitRepo(root).remote_slug()
+            return design_session.run(args, StateStore.for_repo(repo))
         if args.command == "adopt":
             return adopt.run(args)
         if args.command == "bench":
@@ -579,7 +603,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError,
             inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError,
-            order.PlanError, orch.OrchError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:
+            order.PlanError, orch.OrchError, design.DesignError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
         return 1
 

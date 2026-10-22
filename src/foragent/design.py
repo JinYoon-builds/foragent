@@ -14,6 +14,10 @@ FRAMEWORKS = {"react", "vue", "svelte", "next", "nuxt", "solid-js"}
 COLOR = re.compile(r"(?<![\w#])#(?:[0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{4}|[0-9a-f]{3})(?![\w-])|\b(?:rgb|hsl)\(", re.I)
 
 
+class DesignError(ValueError):
+    """A local design preview cannot be prepared or opened."""
+
+
 def project_files(root: Path):
     """Prune dependencies, generated output, hidden folders and directory symlinks."""
     for parent, dirs, files in os.walk(root, followlinks=False):
