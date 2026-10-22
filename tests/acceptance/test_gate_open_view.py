@@ -91,6 +91,8 @@ def test_idle_tick_opens_nothing_then_approved_work_opens_the_view(
     assert commands.calls() == []
     # Pair the idle contract with a real start so a missing opener cannot pass.
     case.tracker.record_label(1, "approved", "human")
+    # A person's direct GitHub change is picked up by the next 5-minute refresh (local-truth rule).
+    case.clock[0] += timedelta(minutes=5)
     report = tick(ctx)
     assert launched == [1], report.actions
     assert_opened(commands, case.root)

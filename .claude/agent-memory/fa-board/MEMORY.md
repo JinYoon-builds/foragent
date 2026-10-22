@@ -11,3 +11,6 @@
 - 설정 추가 시 `tests/test_config.py::test_exact_defaults`, init CLI 옵션 추가 시 `tests/test_cli.py`의 두 kwargs 완전 일치 검사를 함께 갱신한다. 기존 파일 설정 테스트는 `no_board=True`로 격리하고 보드 동작을 별도 검증한다.
 - 검증: `uv run pytest -q tests/acceptance/test_board_projects.py`, `uv run pytest -q --ignore=tests/acceptance`. 인수 테스트는 수정하지 않는다. 샌드박스에서 기본 uv 캐시에 쓸 수 없으면 쓰기 가능한 임시 `UV_CACHE_DIR`를 사용한다.
 - 발행 중 보드 추가의 `TrackerError`는 호출자에게 전달해 CLI가 실패와 원인을 표시하게 한다. 단, `addProjectV2ItemById`의 `Content already exists in this project` 응답은 이미 가입된 상태이므로 traceback·경고 없이 성공 처리한다. 이 응답에는 item ID가 없어 필드 갱신을 건너뛴다. 같은 문구라도 조회·필드 갱신에서 난 오류에는 적용하지 않는다. gh 비정상 종료와 GraphQL errors 응답 양쪽을 `tests/test_board.py`로 검증한다.
+- 새 저장소의 `init` 기본 도구는 설치 여부가 아니라 `codex login status`의 종료 코드와 `claude auth status`의 JSON `loggedIn`으로 확인한다. 누락·시간 초과·잘못된 응답은 로그인 사실로 인정하지 않는다. 기존 설정은 재탐지하지 않고 보존한다.
+- Claude 작업자에 기본 교차 리뷰를 그대로 두면 `resolved_reviewer`가 Codex를 고르므로, Claude를 고를 때 `reviewer: claude`도 저장한다. 리뷰의 새 세션은 기존 `ClaudeExecutor`의 별도 `claude -p /code-review ...` 프로세스로 보장된다.
+- `tests/test_init.py::setup`은 도구 상태 확인을 subprocess 경계에서 오프라인으로 대체한다. 이 fixture를 가져오는 잠긴 인수 테스트는 같은 경계에서 로그인 사실을 다시 주입하므로, 초기화 함수 자체를 가짜로 바꾸지 않는다. 집중 검증은 `uv run pytest tests/acceptance/test_claude_only.py`다.
