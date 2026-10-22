@@ -74,4 +74,4 @@ lanes:
     skills:
     - skill-creator
 max_parallel: 5
-board: PVT_kwHODvdhm84BoMtn
+# board: PVT_kwHODvdhm84BoMtn  # paused 2026-10-23: each tick rewrote every Status (58% of GitHub calls); restore after the tick only writes changes
