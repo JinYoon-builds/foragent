@@ -10,3 +10,4 @@
 - #109: 인터뷰 기본값은 `native`. Ouroboros 폴백 테스트는 `Config(interview="ouroboros")`를 명시해야 한다. `profile`은 매핑 또는 `None`이며 주문 컨텍스트 최상위에 그대로 나온다.
 - `fa profile set --kind ... --stage ... --priority ...`은 Git/GitHub 초기화 전에 처리한다. 저장은 `config.set_profile`에서 로컬 YAML만 갱신해 전역 설정을 복사하지 않고 `date.today().isoformat()`을 기록한다.
 - 제한 환경에서 기본 uv 캐시를 쓸 수 없으면 `UV_CACHE_DIR`를 `/tmp`로 지정한다. 네트워크도 막혔으면 기존 `wheels-v6`, `simple-v21` 및 필요한 패키지의 `archive-v0` 디렉터리를 임시 캐시에 복사하고 `UV_OFFLINE=true uv run pytest`로 실행할 수 있다.
+- #110: `validate_plan`은 신규 `issues`와 기존 이슈 `edits`의 `out_of_scope`에 `_text`의 기본 비어 있지 않은 문자열 검증을 적용한다. `publish`는 dry-run 분기 및 외부 작업 전에 이를 호출한다. 정상 발행 테스트 데이터에도 제외 범위를 명시해야 한다. 검증: `uv run pytest tests/acceptance/test_publish_out_of_scope.py`; 신규·수정 및 일반·dry-run 거절 회귀 테스트는 `tests/test_order.py -k empty_out_of_scope`.

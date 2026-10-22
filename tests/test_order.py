@@ -118,7 +118,7 @@ def plan():
                 {"key": "api", "title": "Login API", "goal": "Implement login.", "out_of_scope": "Payments.",
                  "done_when": [f"uv run pytest -q {FILE}", "true"], "checklist": ["Looks right"],
                  "lane": "api", "size": "m", "blocked_by": [], "acceptance_files": {FILE: "assert True\n"}},
-                {"key": "client", "title": "Login client", "goal": "Call login.", "out_of_scope": "", "done_when": ["true"],
+                {"key": "client", "title": "Login client", "goal": "Call login.", "out_of_scope": "Payments.", "done_when": ["true"],
                  "checklist": [], "lane": "main", "size": "s", "blocked_by": ["api"], "acceptance_files": {}},
             ], "edits": []}
 
@@ -228,13 +228,29 @@ def test_dry_run_has_no_writes(publishing, plan, kicks):
     (lambda p: p["issues"][0].update(done_when=["pytest --file=tests/acceptance/missing.py; true"]), "missing acceptance"),
     (lambda p: p["issues"][0].update(checklist=["a\nb"]), "single line"),
     (lambda p: p["issues"][0].update(done_when=["true\n```\nfalse"]), "code fences"),
-    (lambda p: p.update(edits=[{"number": True, "goal": "g", "out_of_scope": "", "done_when": ["true"]}]), "number"),
+    (lambda p: p.update(edits=[{"number": True, "goal": "g", "out_of_scope": "Payments.", "done_when": ["true"]}]), "number"),
 ])
 def test_validation_errors_precede_writes(publishing, plan, mutate, error):
     mutate(plan)
     with pytest.raises(order.PlanError, match=error):
         publish(publishing, plan)
     assert publishing[-1] == [] and publishing[2].issues == {}
+
+
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+@pytest.mark.parametrize("value", ["", "   ", "\n\t "])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_empty_out_of_scope_is_rejected_before_writes(publishing, plan, kind, value, dry_run):
+    if kind == "edits":
+        plan["edits"] = [{"number": 9, "goal": "Fixed goal", "out_of_scope": value, "done_when": ["true"]}]
+    else:
+        plan["issues"][1]["out_of_scope"] = value
+    with pytest.raises(order.PlanError, match=rf"{kind}\[\d+\]\.out_of_scope must be a nonempty string"):
+        publish(publishing, plan, dry_run=dry_run)
+    root, _, tracker, _, events = publishing
+    assert events == [] and tracker.issues == {}
+    assert not (root / "docs").exists()
+    assert not (root / "tests").exists()
 
 
 def test_acceptance_symlink_escape_is_rejected(publishing, plan, tmp_path):
@@ -445,7 +461,7 @@ def test_push_failure_prevents_any_issue_creation(publishing, plan, monkeypatch)
 def test_approval_variants_and_edits_invalidate_approval(publishing, plan, options, approved):
     tracker = publishing[2]
     tracker.add_issue(3, "Keep this title", "old", ["approved", "needs-human", "ready", "size:l"])
-    plan["edits"] = [{"number": 3, "goal": "New goal", "out_of_scope": "", "done_when": ["true"],
+    plan["edits"] = [{"number": 3, "goal": "New goal", "out_of_scope": "Payments.", "done_when": ["true"],
                       "checklist": [], "acceptance_files": {"tests/acceptance/edited.py": "edited\n"}}]
     publish(publishing, plan, **options)
     # Parent is #4, children are #5 and #6 because #3 existed before publication.
@@ -512,7 +528,7 @@ def test_interrupted_lane_commit_is_completed_before_issues(publishing, plan, mo
 def test_edit_with_changed_acceptance_invalidates_approval_on_retry(publishing, plan):
     tracker = publishing[2]
     tracker.add_issue(9, "Existing", "old", ["approved", "needs-human"])
-    edit = {"number": 9, "goal": "Fixed goal", "out_of_scope": "", "done_when": ["true"],
+    edit = {"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.", "done_when": ["true"],
             "acceptance_files": {"tests/acceptance/edit.py": "first\n"}}
     plan["edits"] = [edit]
     publish(publishing, plan, approve=True)
@@ -528,7 +544,7 @@ def test_edit_reverting_to_a_prior_revision_still_refreshes_approval(publishing,
     root, _, tracker, git, _ = publishing
     tracker.add_issue(9, "Existing", "old", ["approved", "needs-human"])
     name = "tests/acceptance/edit.py"
-    edit = {"number": 9, "goal": "Fixed goal", "out_of_scope": "", "done_when": ["true"],
+    edit = {"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.", "done_when": ["true"],
             "acceptance_files": {name: "first\n"}}
     plan["edits"] = [edit]
     publish(publishing, plan, approve=True)
