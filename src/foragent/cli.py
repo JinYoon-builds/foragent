@@ -17,7 +17,7 @@ from foragent.init import init_repo
 from foragent.i18n import text
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, state_group
-from foragent.lanes import LaneError, add_lane
+from foragent.lanes import LaneError, add_lane, set_lane_skills
 from foragent.paths import PathError
 from foragent.skills import SkillError, SkillManager
 from foragent.launcher import spawn_notify, spawn_runner
@@ -115,7 +115,7 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
     publish.add_argument("--approve-keys", type=_comma_keys, default=[])
     publish.add_argument("--approve-numbers", type=_comma_numbers, default=[])
     publish.add_argument("--dry-run", action="store_true")
-    lanes = commands.add_parser("lanes", help="Create repository lanes")
+    lanes = commands.add_parser("lanes", help="Manage repository lanes")
     lane_actions = lanes.add_subparsers(dest="action", required=True)
     lane = lane_actions.add_parser("add")
     lane.add_argument("name")
@@ -126,6 +126,10 @@ new_lanes, edits, checklist, blocked_by, and acceptance_files default to empty c
     lane.add_argument("--title")
     lane.add_argument("--emoji")
     lane.add_argument("--repo-root", type=Path, default=Path.cwd())
+    fixed_skills = lane_actions.add_parser("skills", help="Replace the fixed skills a person chose for a lane")
+    fixed_skills.add_argument("name")
+    fixed_skills.add_argument("ids", nargs="*", help="Skill IDs; omit to clear the lane's fixed skills")
+    fixed_skills.add_argument("--repo-root", type=Path, default=Path.cwd())
     skills = commands.add_parser("skills", help="Manage skill libraries")
     skill_actions = skills.add_subparsers(dest="action", required=True)
     skill_actions.add_parser("sync")
@@ -403,6 +407,10 @@ def main(argv: list[str] | None = None) -> int:
                 _open_lane_view(report.normalized_root or root)
             return 0
         if args.command == "lanes":
+            if args.action == "skills":
+                lane = set_lane_skills(root, args.name, args.ids)
+                print(f"Updated lane:{args.name} skills: {', '.join(lane['skills']) or '(none)'}")
+                return 0
             lane = add_lane(root, args.name, args.paths, skills=args.skills, executor=args.executor, model=args.model,
                             title=args.title, emoji=args.emoji)
             print(f"Created lane:{args.name} ({', '.join(lane['paths'])})")
