@@ -1,4 +1,4 @@
-"""Create a lane's thin agent definition and repository configuration."""
+"""Manage lanes' thin agent definitions and repository configuration."""
 
 from dataclasses import asdict
 from pathlib import Path
@@ -13,7 +13,17 @@ from foragent.skills import SkillManager
 
 
 class LaneError(ValueError):
-    """A lane cannot be added without overwriting existing settings."""
+    """A lane cannot be created or updated with the requested settings."""
+
+
+def _check_skills(root: Path, skills: list[str], manager: SkillManager | None) -> list[str]:
+    selected = [manager.check_install(identity, root) for identity in skills]
+    installed = [skill.path.name for skill in selected]
+    if len(set(installed)) != len(installed):
+        raise LaneError("duplicate lane skills or conflicting installation names")
+    if sum(skill.role == "style" for skill in selected) > 1:
+        raise LaneError("a lane can have at most one style skill")
+    return installed
 
 
 def validate_lane(root: Path, config: Config, name: str, paths: list[str], skills: list[str],
@@ -33,10 +43,8 @@ def validate_lane(root: Path, config: Config, name: str, paths: list[str], skill
     if agent.exists():
         raise LaneError(f"agent already exists: {agent.relative_to(root)}")
     repo_path(root, ".foragent.yml")
-    if len(set(skills)) != len(skills):
-        raise LaneError("duplicate lane skills")
     manager = manager or (SkillManager(config) if skills else None)
-    return [manager.check_install(identity, root).path.name for identity in skills]
+    return _check_skills(root, skills, manager)
 
 
 def lane_files(root: Path, name: str, skills: list[str]) -> list[str]:
@@ -95,4 +103,40 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     git.commit_paths(published, f"Foragent lane {name}")
     if push:
         git.push_base(config.base_branch)
+    return lane
+
+
+def set_lane_skills(root: Path, name: str, skills: list[str], *,
+                    manager: SkillManager | None = None) -> dict:
+    """Replace an existing lane's fixed skills, preserving its other settings."""
+    config = load_config(root)
+    if name not in config.lanes:
+        raise LaneError(f"unknown lane: {name}")
+    lane = {**config.lanes[name]}
+    agent_name = lane.get("agent") or f"fa-{name}"
+    agent = repo_path(root, f".claude/agents/{agent_name}.md")
+    try:
+        content = agent.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise LaneError(f"cannot read lane agent {agent}: {exc}") from exc
+    match = re.match(r"\A---[ \t]*\n(.*?)^---[ \t]*(?:\n|$)", content, re.S | re.M)
+    try:
+        header = yaml.safe_load(match[1]) if match else None
+    except yaml.YAMLError as exc:
+        raise LaneError(f"invalid agent frontmatter: {agent}: {exc}") from exc
+    if not isinstance(header, dict):
+        raise LaneError(f"agent requires mapping frontmatter: {agent}")
+    manager = manager or (SkillManager(config) if skills else None)
+    installed = _check_skills(root, skills, manager)
+    lane["skills"] = installed
+    local = _read_yaml(repo_path(root, ".foragent.yml"))
+    local["lanes"] = {**config.lanes, name: lane}
+    _validate({**asdict(config), "lanes": local["lanes"]})
+    header["skills"] = installed
+    agent_content = ("---\n" + yaml.safe_dump(header, sort_keys=False, allow_unicode=True)
+                     + "---\n" + content[match.end():])
+    for identity in skills:
+        manager.install(identity, root)
+    (root / ".foragent.yml").write_text(yaml.safe_dump(local, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    agent.write_text(agent_content, encoding="utf-8")
     return lane
