@@ -11,3 +11,5 @@
 - `fa profile set --kind ... --stage ... --priority ...`은 Git/GitHub 초기화 전에 처리한다. 저장은 `config.set_profile`에서 로컬 YAML만 갱신해 전역 설정을 복사하지 않고 `date.today().isoformat()`을 기록한다.
 - 제한 환경에서 기본 uv 캐시를 쓸 수 없으면 `UV_CACHE_DIR`를 `/tmp`로 지정한다. 네트워크도 막혔으면 기존 `wheels-v6`, `simple-v21` 및 필요한 패키지의 `archive-v0` 디렉터리를 임시 캐시에 복사하고 `UV_OFFLINE=true uv run pytest`로 실행할 수 있다.
 - #110: `validate_plan`은 신규 `issues`와 기존 이슈 `edits`의 `out_of_scope`에 `_text`의 기본 비어 있지 않은 문자열 검증을 적용한다. `publish`는 dry-run 분기 및 외부 작업 전에 이를 호출한다. 정상 발행 테스트 데이터에도 제외 범위를 명시해야 한다. 검증: `uv run pytest tests/acceptance/test_publish_out_of_scope.py`; 신규·수정 및 일반·dry-run 거절 회귀 테스트는 `tests/test_order.py -k empty_out_of_scope`.
+- #111: 주문 인터뷰의 기준은 `docs/decisions.md` D58과 보강 2다. 스타일은 사람이 확인해 장부에 고정하고, 도구·검토·분야 스킬은 승인 목록에서 레인 에이전트가 이슈마다 고른다. `fa skills add SOURCE --approve`는 발견한 모든 스킬에 `--role SKILL=ROLE`이 필요하다. `fa order publish`는 스펙·인수 시험만 커밋하므로 결정 기록 변경까지 자동 발행한다고 안내하면 안 된다.
+- #111 검증: `uv run pytest tests/acceptance/test_fa_order_interview.py tests/acceptance/test_fa_order_skill.py`. 선택적 Ouroboros 분기는 유지한다. 이 인수 시험은 명령 주변의 분기 문맥도 읽으므로, native 폴백 설명에서 외부 인터뷰 명령을 무조건 실행하는 것처럼 쓰지 않는다.
