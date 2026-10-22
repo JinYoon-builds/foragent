@@ -340,6 +340,7 @@
 - 결정: Claude 실행기 레인은 이슈 작업을 `claude --bg -n "#<번호> <제목>"`으로 띄우고, 이슈가 끝나면(머지·사람에게 넘김) 세션을 지운다. 사람은 맥미니(또는 SSH)에서 `claude agents`로 목록을 보고 `attach`로 들어간다.
 - 구현 때 정할 것: 세션 끝 판정(`claude agents` 상태 vs Stop 훅), 진행 감지(D20의 stream-json을 대신할 것), 권한 대기로 멈추지 않게 권한 모드를 명시(D54: 헤드리스는 거부, 세션은 기다림), runner가 죽어도 세션은 남으므로 D54 (1)의 정리를 세션 id 기준으로.
 - 범위 밖: Codex 레인은 그대로 `codex exec`(앱 목록에 띄우려면 실험 기능 `codex remote-control` 데몬이 필요 — 따로 시험). 폰·claude.ai에서 보기(Remote Control)는 모바일이 필요해질 때 검토(Jin).
+- D55 보강 (2026-10-23, Jin: "애초에 이게 가능하면, 멀티에이전트가 안 보인다는 문제가 어느 정도는 없었던 걸지도?" → "기본적으로 백그라운드에서 돌리다가 궁금하면 클릭하는 걸로"): **D55를 줄인다.** "안 보인다"의 답은 모든 작업자를 보이는 세션으로 띄워 두는 것이 아니라 "위에서 보다가(D64) 필요할 때 들어가고, 필요하면 불러 주는(D66) 것"이다. 실행 방식은 지금처럼 백그라운드(`codex exec`, `claude -p`)로 두고, **작업마다 세션 번호를 기록**한다(Codex는 이미 로그에 `thread_id`가 남는다). 다람쥐를 누르면: 일하는 중이면 그 작업의 실시간 기록(`logs/issue-N.log`)을 펼쳐 보여 주고 메시지를 넣을 수 있다(Codex `codex queue` — 구현 때 `codex exec` 세션에도 들어가는지 시험). 끝났거나 멈췄으면 그 세션을 대화창으로 이어서 연다(Codex `codex resume <thread_id>`, Claude `claude --resume <session_id>`). 확인(2026-10-23): 이미 머지된 #118의 Codex 세션을 로그의 `thread_id`로 다른 폴더에서 다시 열어 물으니, 작업자가 하던 일을 그대로 기억했다(질문 하나에 약 7만 토큰 — 세션 전체를 다시 읽으므로 궁금할 때만 연다). Claude 레인의 `--resume`은 구현 때 확인한다.
 
 ### D56. 스킬은 사람이 가져오고, 팀 인터뷰가 골라 장착한다 (2026-10-22, Jin) — 미구현
 - 계기: 인스타에서 본 커뮤니티 디자인 스킬(Emil Kowalski skills, Impeccable, Taste Skill)과 MCP(Figma, Playwright)를 Foragent에 넣어 봤다. Emil·Taste는 지금 라이브러리 구조로 그대로 읽힌다. Impeccable은 도구별 사본 때문에 같은 스킬이 21개로 잡히고 라이선스가 unknown으로 나온다. MCP는 레인별로 붙일 자리가 없다(실행기는 사용자 전역 MCP 설정을 그대로 쓴다).
