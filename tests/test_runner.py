@@ -616,13 +616,21 @@ def test_keep():
 
 
 @pytest.mark.parametrize("command,reason", [(None, "no test command is known"), ("npm test", "pytest")])
-def test_baseline_skip_is_logged_without_creating_a_probe(run_case, command, reason):
+def test_baseline_skip_is_logged_without_creating_a_probe(run_case, monkeypatch, command, reason):
     c = run_case
     c.ctx.config = replace(c.ctx.config, test_command=command)
+    execute = c.executor.run
+
+    def implement(**kwargs):
+        # The baseline probe precedes implementation; a post-merge reinstall
+        # may independently create a detached worktree afterwards.
+        assert not any("--detach" in args for _, args in c.operations)
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", implement)
     assert run_issue(1, c.ctx) == "merged"
     log = c.store.log_path(1).read_text()
     assert "Acceptance baseline skipped (count=0)" in log and reason in log
-    assert not any("--detach" in args for _, args in c.operations)
 
 
 def test_baseline_uses_detection_and_ignores_full_suite_selection_and_generated_files(run_case, monkeypatch):

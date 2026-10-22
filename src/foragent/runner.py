@@ -28,6 +28,7 @@ from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
 from foragent.order import detect_test_commands
+from foragent.orch_reinstall import after_merge
 from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.processes import run_logged, track_process_group
 from foragent.reasons import Reason
@@ -1310,6 +1311,8 @@ def _implement_and_publish(
                 if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
                     return _hold_changed_head(n, ctx, link)
                 raise
+            if decision.kind == "merge":
+                after_merge(ctx, pr, target_branch)
             _progress(n, ctx)
             try:
                 if target_branch == batch_branch:
@@ -1553,6 +1556,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             if ctx.tracker.pr_head_sha(pr.number) != head:
                 return _hold_changed_head(n, ctx, link)
             raise
+        if review_mode_for(paths, ctx.config) == "fast":
+            after_merge(ctx, pr.number, pr.base)
         try:
             if pr.base == batch_branch:
                 ctx.tracker.close_issue(n, f"Merged into {batch_branch} (PR #{pr.number})")
