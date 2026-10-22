@@ -30,7 +30,7 @@ def test_exact_defaults(repo):
         "orchestrator_timeout_minutes": 30,
         "repo": None, "board": None, "language": "en", "codex_goal": False, "review_level": "low",
         "review_scope": "claude-local", "test_command": None,
-        "interview": "ouroboros", "ouroboros_version": None,
+        "interview": "native", "ouroboros_version": None, "profile": None,
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
@@ -152,6 +152,26 @@ def test_interview_settings_merge_global_and_repository(repo, tmp_path):
     write_settings(repo / ".foragent.yml", {"interview": "ouroboros", "ouroboros_version": None})
     config = load_config(repo, global_path)
     assert config.interview == "ouroboros" and config.ouroboros_version is None
+
+
+@pytest.mark.parametrize("source", ["local", "global"])
+@pytest.mark.parametrize("profile", ["daily-app", [], False, 3])
+def test_profile_requires_mapping_or_null(repo, tmp_path, source, profile):
+    global_path = tmp_path / "global.yml"
+    path = repo / ".foragent.yml" if source == "local" else global_path
+    write_settings(path, {"profile": profile})
+    with pytest.raises(ConfigError, match="profile"):
+        load_config(repo, global_path)
+
+
+def test_profile_uses_local_mapping_and_can_be_cleared(repo, tmp_path):
+    global_path = tmp_path / "global.yml"
+    write_settings(global_path, {"profile": {"kind": "daily-app", "stage": "build"}})
+    assert load_config(repo, global_path).profile == {"kind": "daily-app", "stage": "build"}
+    write_settings(repo / ".foragent.yml", {"profile": {"kind": "tool"}})
+    assert load_config(repo, global_path).profile == {"kind": "tool"}
+    write_settings(repo / ".foragent.yml", {"profile": None})
+    assert load_config(repo, global_path).profile is None
 
 
 @pytest.mark.parametrize("source", ["local", "global"])

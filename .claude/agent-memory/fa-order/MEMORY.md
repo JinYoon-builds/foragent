@@ -7,3 +7,6 @@
 - 검증: `uv run pytest -q tests/acceptance/test_interview_engine.py tests/test_order.py tests/test_config.py`. 인수 테스트는 수정하지 않는다.
 - 주문 스킬의 인터뷰 분기는 설정 요청값이 아니라 `fa order context --json`의 `interview.engine`을 따른다. `interview.reason`은 native 전환 설명에 활용하며, seed도 실패하면 기존 답변을 유지한 채 AskUserQuestion으로 이어간다. seed는 3단계 되짚기와 4단계 분할의 확정 맥락이다.
 - 스킬 문서 변경 검증: `uv run pytest -q tests/acceptance/test_fa_order_skill.py`. 이 테스트는 문서를 직접 읽으며 외부 계정이 필요 없다.
+- #109: 인터뷰 기본값은 `native`. Ouroboros 폴백 테스트는 `Config(interview="ouroboros")`를 명시해야 한다. `profile`은 매핑 또는 `None`이며 주문 컨텍스트 최상위에 그대로 나온다.
+- `fa profile set --kind ... --stage ... --priority ...`은 Git/GitHub 초기화 전에 처리한다. 저장은 `config.set_profile`에서 로컬 YAML만 갱신해 전역 설정을 복사하지 않고 `date.today().isoformat()`을 기록한다.
+- 제한 환경에서 기본 uv 캐시를 쓸 수 없으면 `UV_CACHE_DIR`를 `/tmp`로 지정한다. 네트워크도 막혔으면 기존 `wheels-v6`, `simple-v21` 및 필요한 패키지의 `archive-v0` 디렉터리를 임시 캐시에 복사하고 `UV_OFFLINE=true uv run pytest`로 실행할 수 있다.
