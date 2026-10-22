@@ -10,3 +10,5 @@
 - `fa design open`은 CLI에서 설정과 로컬 StateStore만 읽고 GitHub tracker 초기화 전에 분기한다. 세션은 `design-sessions/*.json`에 기록하며 `runs/`에 넣지 않아야 gate의 레인 용량·멈춤 감지와 분리된다.
 - 디자인 세션 스킬의 원본은 `skills/fa-design-session/SKILL.md`다. wheel은 같은 파일을 `share/foragent/skills/fa-design-session/`에 포함하며 런처는 설치 환경의 `sys.prefix`에서 읽어 Claude에 전달한다. 스킬 변경도 uv 빌드 캐시 키에 포함한다.
 - pytest 기본 import 방식에서 `tests/`와 `tests/acceptance/`의 파일명이 같으면 수집 충돌이 난다. 디자인 세션 회귀 검사는 `tests/test_design_session_open.py`, 잠긴 인수 검사는 `tests/acceptance/test_design_session.py`로 구별한다.
+- main 병합으로 잠긴 인수 테스트가 교체되면 이전 baseline의 node ID가 없어질 수 있다. #164 재검증에서 `test_claude_sessions_codex_lane_keeps_exec_argv`는 `3f0b728`의 테스트 교체로 사라졌다. 별칭을 만들거나 잠긴 테스트를 되돌리지 말고 현재 파일로 검증하고, 낡은 baseline 선택 문제는 근거와 함께 `.foragent/REBUTTAL.md`에 남긴다. 기존 통과 목록은 StateStore의 `runs/issue-<번호>-acceptance-baseline.xml`에서 `runner._passing_acceptance_ids()`로 읽을 수 있다. 수동 회귀 확인에서는 현재 `pytest --collect-only -q` 결과와 비교해 사라진 선택자를 명시하고 남은 검사를 실행한다.
+- 샌드박스에서 기본 uv 캐시에 접근할 수 없으면 `UV_CACHE_DIR=/private/tmp/foragent-issue-164-uv uv run --offline pytest ...`로 기존 가상환경을 사용해 검증한다. 이슈의 인수 검사뿐 아니라 `uv run pytest` 전체 실행 결과도 확인한다.
