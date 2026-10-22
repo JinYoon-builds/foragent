@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice, zip_longest
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -218,13 +219,22 @@ def _beside(left: list[Line], right: list[Line], left_width: int, *, links: bool
             for index, (a, b) in enumerate(zip_longest(left, right, fillvalue=[]))]
 
 
-def _activity(row: dict[str, Any], language: str, age: float) -> str:
+def _activity(
+    row: dict[str, Any], language: str, age: float, stall_minutes: float, pid: int | None,
+) -> str:
     if row["state"] == "blocked":
         return "● " + text("blocked", language)
     if row["state"] != "working":
         return ""
+    if pid is not None:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return text("watch_runner_gone", language)
+        except PermissionError:
+            pass  # A process owned by another user still exists.
     seconds = row["last_activity_seconds"]
-    if seconds is not None and seconds + age > 600:
+    if seconds is not None and seconds + age > min(10, stall_minutes) * 60:
         return text("watch_stalled", language, minutes=int((seconds + age) // 60))
     return "●"
 
@@ -316,7 +326,7 @@ def _frame(
         run = runs.get(row["issue"])
         if run and run["attempts"] > 1:
             task += " · " + t("watch_retry", count=run["attempts"])
-        activity = _activity(row, language, age)
+        activity = _activity(row, language, age, config.stall_minutes, run.get("pid") if run else None)
         table += _columns([row["lane_display"], task, phase, activity], widths,
                           "yellow" if activity.startswith("○") or row["state"] == "blocked" else "")
     if not busy:

@@ -143,6 +143,46 @@ def test_live_liveness_crosses_ten_minutes_between_refreshes(tmp_path):
     assert "○ 멈춘 듯 10분" in after
 
 
+@pytest.mark.parametrize("language,gone", [("en", "○ runner gone"), ("ko", "○ 실행기 종료")])
+def test_live_runner_death_is_visible_without_refresh_and_permission_is_alive(tmp_path, monkeypatch, language, gone):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(language=language)
+    tracker.add_issue(1, "Working", labels=["running"])
+    store.start_run(1, branch="active", worktree="unused")
+    store.update_run(1, pid=12345)
+    result = snapshot(tracker, store, config)
+    result.status["lanes"]["main"]["last_activity_seconds"] = 0
+
+    def inaccessible(pid, signal):
+        assert (pid, signal) == (12345, 0)
+        raise PermissionError
+
+    monkeypatch.setattr(watch.os, "kill", inaccessible)
+    assert "○" not in watch.render_frame(result, config, tmp_path)
+
+    def dead(pid, signal):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(watch.os, "kill", dead)
+    assert gone in watch.render_frame(result, config, tmp_path)
+    result.status["lanes"]["main"]["state"] = "blocked"
+    assert gone not in watch.render_frame(result, config, tmp_path)
+
+
+@pytest.mark.parametrize("stall_minutes,threshold", [(3, 180), (20, 600)])
+def test_live_liveness_uses_configured_threshold_between_refreshes(tmp_path, stall_minutes, threshold):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(stall_minutes=stall_minutes)
+    tracker.add_issue(1, "Working", labels=["running"])
+    store.start_run(1, branch="active", worktree="unused")
+    result = snapshot(tracker, store, config)
+    result.status["lanes"]["main"]["last_activity_seconds"] = threshold - 1
+    assert "○" not in watch.render_frame(result, config, tmp_path, now=NOW)
+    assert "○ looks stalled" in watch.render_frame(result, config, tmp_path, now=NOW + timedelta(seconds=2))
+
+
 def test_partial_event_append_and_missing_memory_have_usable_output(tmp_path):
     store = StateStore(tmp_path)
     events = [{"summary": f"Event {number}"} for number in range(7)]
