@@ -92,9 +92,15 @@ class Project:
         content = _data(self.tracker, """query ForagentBoardIssue($owner: String!, $name: String!, $number: Int!) {
           repository(owner: $owner, name: $name) { issue(number: $number) { id } }
         }""", {"owner": owner, "name": name, "number": number})["repository"]["issue"]
-        item = _data(self.tracker, """mutation ForagentAddBoardItem($input: AddProjectV2ItemByIdInput!) {
-          addProjectV2ItemById(input: $input) { item { id } }
-        }""", {"input": {"projectId": self.id, "contentId": content["id"]}})["addProjectV2ItemById"]["item"]
+        try:
+            item = _data(self.tracker, """mutation ForagentAddBoardItem($input: AddProjectV2ItemByIdInput!) {
+              addProjectV2ItemById(input: $input) { item { id } }
+            }""", {"input": {"projectId": self.id, "contentId": content["id"]}})["addProjectV2ItemById"]["item"]
+        except TrackerError as exc:
+            if "Content already exists in this project" not in str(exc):
+                raise
+            # GitHub confirmed membership but did not return an item ID to update.
+            return
         fields = self.ensure_fields({key: [value] for key, value in values.items()})
         for name, value in values.items():
             field = fields[name]
@@ -191,5 +197,7 @@ def add_issue(tracker: Tracker, repo: str, project_id: str | None, issue: int,
     try:
         values = {name: value for name, value in (("Lane", lane), ("Size", size)) if value is not None}
         Project(tracker, repo, project_id).set_values(issue, values)
+    except TrackerError:
+        raise
     except Exception:
         log.warning("Could not add issue #%s to board", issue, exc_info=True)
