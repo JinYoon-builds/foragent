@@ -19,7 +19,9 @@ lanes:
     - tests/test_order.py
     - tests/test_config.py
     agent: fa-order
-    skills: []
+    skills:
+    - skill-creator
+    - testing-strategy
   bench:
     paths:
     - src/foragent/bench.py
@@ -35,7 +37,8 @@ lanes:
     - src/foragent/reasons.py
     - skills/fa-orchestrator/**
     agent: fa-orch
-    skills: []
+    skills:
+    - testing-strategy
   view:
     paths:
     - src/foragent/watch*.py
@@ -44,7 +47,9 @@ lanes:
     - src/foragent/notify*.py
     - src/foragent/i18n*.py
     agent: fa-view
-    skills: []
+    skills:
+    - toss-ux-writing
+    - ux-copy
   board:
     paths:
     - src/foragent/board*.py
@@ -59,13 +64,15 @@ lanes:
     - src/foragent/lanes.py
     - src/foragent/git.py
     agent: fa-skills
-    skills: []
+    skills:
+    - skill-creator
   design:
     paths:
     - src/foragent/design*.py
     - skills/fa-order/**
     - skills/fa-init/**
     agent: fa-design
-    skills: []
+    skills:
+    - skill-creator
 max_parallel: 5
 board: PVT_kwHODvdhm84BoMtn
