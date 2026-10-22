@@ -98,10 +98,14 @@ def test_local_truth_runner_records_pr_merge_close_and_label_removal_immediately
         reader = getattr(StateStore(case.store.root), "local_issues", None)
         observed[stage] = deepcopy(list(reader())) if callable(reader) else None
 
-    def review(kwargs):
+    merge = case.tracker.merge_pr
+
+    def merge_pr(number, **kwargs):
+        # Default local review precedes PR creation. At merge entry, the
+        # runner has returned from creating and recording the unmerged PR.
         capture("pr-created")
         case.clock[0] += timedelta(seconds=1)
-        return "VERDICT: PASS"
+        return merge(number, **kwargs)
 
     close = case.tracker.close_issue
 
@@ -109,7 +113,7 @@ def test_local_truth_runner_records_pr_merge_close_and_label_removal_immediately
         capture("merged-before-close")
         close(number, comment)
 
-    case.reviewer.steps = [review]
+    monkeypatch.setattr(case.tracker, "merge_pr", merge_pr)
     monkeypatch.setattr(case.tracker, "close_issue", close_issue)
     assert run_issue(1, case.ctx) == "merged"
     row = local_rows(StateStore(case.store.root))[1]

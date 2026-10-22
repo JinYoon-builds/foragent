@@ -8,17 +8,24 @@ import shlex
 from test_heartbeats import heartbeats_offline, heartbeats_write
 
 
-def orch_spawn_case(git_history, tmp_path, monkeypatch, *, screen="background"):
+def orch_spawn_case(git_history, tmp_path, monkeypatch, *, screen="background", seed_snapshot=True):
     import shutil
     import subprocess
     import sys
 
     from foragent import notify
-    from test_orch_review_handoff import make_case
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import make_case, tick_context
 
     tmp_path.mkdir(parents=True, exist_ok=True)
     case = make_case(git_history, tmp_path, monkeypatch, language="ko")
     case.tracker.record_label(1, "approved", "human")
+    # Import without spawning, even if an earlier case enabled it. The gate-
+    # tick test defers the import until its queued/running setup is complete.
+    if seed_snapshot:
+        with monkeypatch.context() as seed:
+            seed.setenv("FORAGENT_ORCH_SPAWN", "off")
+            tick(tick_context(case, start_runs=False))
     commands, pushes = [], []
     real_run = subprocess.run
     real_popen = subprocess.Popen
@@ -190,7 +197,8 @@ def test_orch_spawn_gate_tick_opens_for_running_and_queued_approved_work(git_his
     from test_orch_review_handoff import tick_context
 
     for state in ("running", "queued"):
-        case, commands, pushes = orch_spawn_case(git_history, tmp_path / state, monkeypatch)
+        case, commands, pushes = orch_spawn_case(git_history, tmp_path / state, monkeypatch,
+                                               seed_snapshot=False)
         if state == "queued":
             case.store.finish_run(1, outcome="not-started")
             case.tracker.remove_labels(1, ["running"])

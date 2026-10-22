@@ -10,14 +10,17 @@ from test_skills_autosync import isolated_home
 
 
 def speaking_case(git_history, tmp_path, monkeypatch):
+    from foragent.actions import flag
+    from foragent.reasons import Reason
+    from foragent.scheduler import tick
     from test_orch_merge import premerge_case
+    from test_orch_review_handoff import tick_context
 
     case, main, pr, _ = premerge_case(git_history, tmp_path, monkeypatch)
     case.ctx.config = replace(case.ctx.config, language="ko", review="fast", skill_libraries=[])
+    tick(tick_context(case, start_runs=False))
     case.store.finish_run(1, outcome="blocked")
-    case.tracker.remove_labels(1, ["running"])
-    case.tracker.add_labels(1, ["blocked"])
-    case.tracker.comment(1, "<!-- foragent:blocked reason=review-dispute -->\nLocale mismatch")
+    flag(case.ctx, 1, Reason.REVIEW_DISPUTE, "Locale mismatch")
     monkeypatch.setattr("foragent.cli.RunContext", lambda **kw: case.ctx)
     return case, main
 
