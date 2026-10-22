@@ -125,13 +125,11 @@ def test_orch_spawn_orca_uses_recorded_executable_or_path_and_opens_adjacent_vie
         assert f"orch: {case.root.name}" in argv[argv.index("--title") + 1]
         command = shlex.split(argv[argv.index("--command") + 1])
         assert "claude" in [Path(part).name for part in command] and "/fa-orchestrator" in command
-        splits = [argv for argv in commands if argv[1:3] == ["terminal", "split"]]
-        assert len(splits) == 1, commands
-        assert commands.index(created[0]) < commands.index(splits[0])
-        assert splits[0][splits[0].index("--terminal") + 1] == "term_orch"
-        assert splits[0][splits[0].index("--direction") + 1] == "vertical"
-        view = splits[0][splits[0].index("--command") + 1]
-        assert "gate watch" in view and str(case.root) in view
+        # D76: keep the historical test name for baseline runners. The view
+        # belongs beside the planning session; spawning must leave focus there.
+        assert not any(argv[1:3] == ["terminal", "split"] for argv in commands), commands
+        assert not any("switch" in argv for argv in commands), commands
+        assert not any("gate watch" in part for argv in commands for part in argv), commands
         assert not any(Path(argv[0]).name in {"tmux", "osascript"} for argv in commands)
         orch_spawn_assert_push(pushes)
 
@@ -144,6 +142,7 @@ def test_orch_spawn_tmux_opens_a_named_claude_window(git_history, tmp_path, monk
     windows = [argv for argv in commands if Path(argv[0]).name == "tmux" and "new-window" in argv]
     assert len(windows) == 1, commands
     argv = windows[0]
+    assert "-d" in argv, "the orchestrator window must open in the background"
     assert argv[argv.index("-n") + 1] == f"orch: {case.root.name}"
     command = " ".join(argv)
     assert "claude" in command and "/fa-orchestrator" in command
