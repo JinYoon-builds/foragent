@@ -90,6 +90,18 @@ Do not turn every sentence into a new issue. Keep one durable order draft in
 `docs/specs/` and use the project's decision log for settled context.
 Use the repository's `fa-order` skill to clarify only unresolved product choices,
 split work into independently verifiable issues and prepare a plan JSON.
+For work that needs visual or interaction choices, suggest a design session first:
+`fa design open --repo-root <project> --topic <topic>` (omit `--topic` when unclear).
+It opens a separate `design: <project>` Claude tab with a preview pane. The session
+is a peer conversation with the user, outside gate monitoring and lane capacity;
+keep handling other work while they compare drafts. Do not treat its silence as a stall.
+When it hands back `docs/design/<topic>/HANDOFF.md`, read the selected draft,
+screenshots and decisions. Use `fa-order` to turn that handoff into lane issues,
+carrying the chosen revision, preview instructions and reference screenshots into
+each relevant issue. Include "same screen as the draft" in visual issues' Done when
+with the exact viewport, data and UI states, and require result screenshots for
+comparison. Route unresolved product choices back with options; retain settled
+design decisions. Prepare the usual approval card below before publishing issues.
 When clear, propose one card with new issues grouped by lane, dependencies,
 Done when checks, and any new lanes (human name, paths, skills).
 AskUserQuestion: [add] (recommended) / [edit] / [later].

@@ -7,3 +7,6 @@
 - CLI import 병합에서 디자인 레인의 `design`과 상태 화면의 `watch`를 모두 보존한다. `GIT_SHA` 버전 표시와 `gate watch`·`orch watch` 분기도 유지하고 전체 테스트로 함께 검증한다.
 - 검증: `uv run pytest -q tests/acceptance/test_design_first.py tests/test_design.py`, CI 전체: `uv run pytest -q --ignore=tests/acceptance`. 인수 테스트는 수정하지 않는다.
 - `/fa-init`의 D35 안내 검증: `uv run pytest -q tests/acceptance/test_init_skill_cap.py`.
+- `fa design open`은 CLI에서 설정과 로컬 StateStore만 읽고 GitHub tracker 초기화 전에 분기한다. 세션은 `design-sessions/*.json`에 기록하며 `runs/`에 넣지 않아야 gate의 레인 용량·멈춤 감지와 분리된다.
+- 디자인 세션 스킬의 원본은 `skills/fa-design-session/SKILL.md`다. wheel은 같은 파일을 `share/foragent/skills/fa-design-session/`에 포함하며 런처는 설치 환경의 `sys.prefix`에서 읽어 Claude에 전달한다. 스킬 변경도 uv 빌드 캐시 키에 포함한다.
+- pytest 기본 import 방식에서 `tests/`와 `tests/acceptance/`의 파일명이 같으면 수집 충돌이 난다. 디자인 세션 회귀 검사는 `tests/test_design_session_open.py`, 잠긴 인수 검사는 `tests/acceptance/test_design_session.py`로 구별한다.

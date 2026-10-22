@@ -20,7 +20,10 @@ requires = ["setuptools>=81"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
-cache-keys = [{ file = "pyproject.toml" }, { file = "setup.py" }, { git = { commit = true } }]
+cache-keys = [{ file = "pyproject.toml" }, { file = "setup.py" }, { file = "skills/fa-design-session/SKILL.md" }, { git = { commit = true } }]
+
+[tool.setuptools.data-files]
+"share/foragent/skills/fa-design-session" = ["skills/fa-design-session/SKILL.md"]
 
 [dependency-groups]
 dev = [

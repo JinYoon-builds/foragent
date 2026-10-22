@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import __version__, adopt, bench, design, inspect_actions, inspect_data, launchd, notify, orch, order, watch, watch_open
+from foragent import __version__, adopt, bench, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, order, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -39,8 +39,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fa")
     parser.add_argument("--version", action="version", version=f"foragent {__version__} ({GIT_SHA})")
     commands = parser.add_subparsers(dest="command", required=True)
-    design_command = commands.add_parser("design", help="Check the project's design foundation")
+    design_command = commands.add_parser("design", help="Explore designs and check the project's design foundation")
     design_actions = design_command.add_subparsers(dest="action", required=True)
+    design_open = design_actions.add_parser("open", help="Open a Claude design session with a preview pane")
+    design_open.add_argument("--repo-root", type=Path, default=Path.cwd())
+    design_open.add_argument("--topic", help="Initial design topic (optional)")
     lint = design_actions.add_parser("lint", help="Report raw colors outside token files")
     lint.add_argument("--repo-root", type=Path, default=Path.cwd())
     lint.add_argument("--tokens", nargs="+", action="extend", help="Token paths/globs (replaces defaults)")
@@ -363,7 +366,14 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "design":
-            return design.run(args)
+            if args.action == "lint":
+                return design.run(args)
+            root = args.repo_root.resolve()
+            config = load_config(root)
+            repo = config.repo or GitRepo(root).remote_slug()
+            design_session.open_session(root, StateStore.for_repo(repo), topic=args.topic,
+                                        language=config.language)
+            return 0
         if args.command == "adopt":
             return adopt.run(args)
         if args.command == "bench":
