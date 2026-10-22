@@ -13,6 +13,12 @@ BASE_TIME = datetime(2026, 10, 20, 8, tzinfo=UTC)
 
 
 @pytest.fixture(autouse=True)
+def no_view_windows(monkeypatch):
+    """Never open real terminal windows during the test suite."""
+    monkeypatch.setenv("FORAGENT_VIEW", "off")
+
+
+@pytest.fixture(autouse=True)
 def kicks(monkeypatch):
     """Record event hooks without starting background ticks in any test."""
     from foragent import cli, orch, order, runner

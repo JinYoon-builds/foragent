@@ -3,6 +3,7 @@
 from collections import Counter, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice, zip_longest
@@ -19,6 +20,7 @@ from foragent.i18n import text
 from foragent.labels import issue_lane, lane_display
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
+from foragent.watch_open import registered
 
 
 # Only the pickaxe moves. One hit every four 0.3-second frames.
@@ -463,15 +465,16 @@ def run(
     if not once and not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise ConfigError(text("watch_terminal", config.language))
     refresh = lambda: collect(status(), tracker, store, config, now())
-    snapshot = refresh()
-    if once:
-        print(render_frame(snapshot, config, repo_root))
-        return
-    import curses
+    with nullcontext() if once else registered(store):
+        snapshot = refresh()
+        if once:
+            print(render_frame(snapshot, config, repo_root))
+            return
+        import curses
 
-    try:
-        curses.wrapper(_terminal, refresh, snapshot, config, repo_root, now)
-    except KeyboardInterrupt:
-        pass
-    except curses.error as exc:
-        raise ConfigError(str(exc)) from exc
+        try:
+            curses.wrapper(_terminal, refresh, snapshot, config, repo_root, now)
+        except KeyboardInterrupt:
+            pass
+        except curses.error as exc:
+            raise ConfigError(str(exc)) from exc

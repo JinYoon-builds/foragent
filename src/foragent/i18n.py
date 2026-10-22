@@ -31,6 +31,7 @@ MESSAGES = {
         "watch_help": "1–{count}: agent details · ↑/↓: scroll · q: quit",
         "watch_help_many": "type 1–{count}, Enter: details · ↑/↓: scroll · q: quit",
         "watch_terminal": "watch requires a terminal; use --once for plain text",
+        "watch_open_failed": "could not open lane view: {error}",
         "watch_refresh_failed": "Refresh failed: {error}",
     },
     "ko": {
@@ -62,6 +63,7 @@ MESSAGES = {
         "watch_help": "1–{count}: 담당 상세 · ↑/↓: 스크롤 · q: 종료",
         "watch_help_many": "1–{count} 입력 후 Enter: 상세 · ↑/↓: 스크롤 · q: 종료",
         "watch_terminal": "실시간 화면은 터미널에서 실행하세요. 일반 텍스트는 --once를 사용하세요",
+        "watch_open_failed": "레인 화면을 열지 못했습니다: {error}",
         "watch_refresh_failed": "새로고침 실패: {error}",
     },
 }
