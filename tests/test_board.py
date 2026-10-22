@@ -1,5 +1,6 @@
 from dataclasses import replace
 import json
+import subprocess
 
 import pytest
 
@@ -181,3 +182,49 @@ def test_gh_graphql_sends_typed_variables_over_stdin():
 def test_gh_graphql_rejects_errors_and_invalid_payloads(response, message):
     with pytest.raises(TrackerError, match=message):
         GhTracker("owner/repo", lambda *a, **kw: response).graphql("query { node { id } }", {})
+
+
+@pytest.mark.parametrize("transport", ["gh", "graphql"])
+def test_duplicate_board_addition_is_silent_success(transport, caplog):
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    project_id = board.ensure(tracker, "owner/repo")
+    graphql = tracker.graphql
+    message = "Content already exists in this project"
+
+    def run(args, input=None):
+        payload = json.loads(input)
+        query, variables = payload["query"], payload["variables"]
+        result = graphql(query, variables)
+        if "addProjectV2ItemById" in query:
+            if transport == "gh":
+                raise subprocess.CalledProcessError(1, args, stderr=f"gh: {message}")
+            return json.dumps({"errors": [{"message": message}]})
+        return json.dumps(result)
+
+    tracker.graphql = GhTracker("owner/repo", run).graphql
+    board.add_issue(tracker, "owner/repo", project_id, 1, "main", "s")
+    assert len(snapshot(tracker, project_id)["items"]["nodes"]) == 1
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("operation, message", [
+    ("addProjectV2ItemById", "Resource not accessible (HTTP 403)"),
+    ("ForagentBoardIssue", "Content already exists in this project"),
+    ("ForagentSetBoardValue", "Content already exists in this project"),
+])
+def test_board_addition_propagates_other_github_errors(operation, message):
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    project_id = board.ensure(tracker, "owner/repo")
+    graphql = tracker.graphql
+
+    def fail(query, variables):
+        if operation in query:
+            raise TrackerError(message)
+        return graphql(query, variables)
+
+    tracker.graphql = fail
+    with pytest.raises(TrackerError) as error:
+        board.add_issue(tracker, "owner/repo", project_id, 1, "main", "s")
+    assert str(error.value) == message
