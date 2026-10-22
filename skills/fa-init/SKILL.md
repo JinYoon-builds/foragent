@@ -57,13 +57,23 @@ description: Set up a project folder for Foragent.
    keep the acceptance directory included; report them, do not insert them. If the answer is no or CI already excludes
    the acceptance directory, leave CI unchanged and create no CI commit.
 
-9. Run `fa order context --json`. When `ui.frameworks` is nonempty, propose a
-   design lane covering the project's actual UI and design foundation paths, reusing
-   existing lanes where paths overlap. Suggest the relevant skills from
-   `frontend-design`, `design-system`, `design-critique`, `accessibility-review`,
-   `ux-copy`, and `webapp-testing`; attach the ones that fit the project, with no count limit (D35).
-   Show the paths and skill choices for approval before `fa lanes add`. Design
-   interviews and foundation issues belong to `/fa-order` (D33).
+9. Run `fa order context --json` and read the project's code and docs to determine
+   whether it has a screen: web UI and terminal UI (TUI) both count. A nonempty
+   `ui.frameworks` is evidence of a screen, but an empty list does not rule out a
+   TUI or a planned screen. For a project with no screen, skip the design direction
+   question. Otherwise, propose a design lane covering the project's actual UI and
+   design foundation paths, reusing existing lanes where paths overlap.
+   Run `fa skills catalog --json` and ask only which style skill should set the
+   design direction (for example, `frontend-design`), using AskUserQuestion (or the
+   available question tool) with the recommended choice first. Offer skills with
+   role `style` from the existing catalog; if none fits, report that and leave the
+   style unset. Show the paths and style choice for approval, create approved new
+   lanes with `fa lanes add <name> --paths '<path>/**'`, then fix only the chosen
+   style with `fa lanes skills <name> <style-id>` on the relevant new or reused lane.
+   Each lane agent chooses tool, review, and domain skills per issue as needed;
+   examples include `design-system`, `design-critique`, `accessibility-review`,
+   `ux-copy`, and `webapp-testing`. These are examples, not a fixed design lane
+   skill list. Design interviews and foundation issues belong to `/fa-order` (D33).
 
 10. Tell the user the next step is `/fa-order`: for an existing project, normalize
    existing open issues into the Foragent format with the user's approval; for
