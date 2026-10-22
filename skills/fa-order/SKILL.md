@@ -76,7 +76,9 @@ empty. Stop asking once remaining choices are reversible.
 
 ## Design first (D33)
 Use `ui.frameworks` and `ui.has_design_foundation` from the context alongside the request.
-For UI work without a foundation, create a small design foundation issue first: tokens,
+For UI work without a foundation, first suggest a design session (`/fa-design-session`)
+to settle the visual direction (D72). Use its agreed output as settled context, then
+create a small design foundation implementation issue: tokens,
 a few basic components, a sample page, and `docs/design/CONTRACT.md` for product-wide
 tone, density and principles. Derive taste from 2–3 reference apps or sites the user
 likes (spacing, density, color count, typography); get one screenshot approval.
@@ -106,6 +108,13 @@ rest still completes. For each issue you must be able to write one sentence:
   issues that edit the same files into different lanes unless one is blocked by the other.
 - **Size** s/m/l = how much reasoning it needs (s: mechanical, m: normal feature,
   l: tricky logic, concurrency, data migration). Size picks the starting model tier.
+- **Interactive (D72)**: set per-issue `interactive: true` when completing the work
+  clearly needs a lot of back-and-forth with the user, such as repeated visual feedback
+  or decisions that depend on seeing intermediate results. Publication adds the
+  `interactive` label. Use `false` or omit it for work an agent can finish unattended;
+  complexity alone is not a reason to mark an issue interactive. For visual design,
+  suggest a design session (`/fa-design-session`) to settle the direction together.
+  This order records the choice and suggestion; session startup is a separate workflow.
 - **blocked_by** only for real order dependencies (B cannot be built or verified without A).
 - Fill each issue's **`files`** with the repository-relative paths or globs it is expected
   to change (for example, `["src/foragent/order.py", "skills/fa-order/**"]`). Use `[]`
@@ -134,6 +143,7 @@ This order: 7 issues
 ```
 Then AskUserQuestion: Approve all (recommended) / Approve some / Change something.
 Show the acceptance test of any issue the user asks about.
+Show which issues are interactive and why before asking for approval.
 Record `fa order progress approval` once the user approves. If the plan changes, repeat
 the dry-run and present the revised scope for approval.
 
