@@ -335,6 +335,86 @@ def test_init_cli_keeps_explicit_default_options(tmp_path, monkeypatch):
     ]) == 0
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_init_view_uses_normalized_root_and_skips_dry_run(app, monkeypatch, dry_run):
+    from foragent.init import InitReport
+
+    root, git, tracker, store, calls = app
+    nested = root / "nested"
+    nested.mkdir()
+    opened = []
+    monkeypatch.delenv("FORAGENT_VIEW")
+    monkeypatch.setattr(cli, "init_repo", lambda *a, **kw: InitReport(
+        [], [], dry_run, normalized_root=root,
+    ))
+    monkeypatch.setattr(cli, "load_config", lambda selected: (
+        opened.append(selected) or Config(repo="custom/repo", language="ko")
+    ))
+    monkeypatch.setattr(cli.watch_open, "open_view", lambda *args: opened.append(args))
+    argv = ["init", "--repo-root", str(nested)] + (["--dry-run"] if dry_run else [])
+    assert cli.main(argv) == 0
+    assert opened == ([] if dry_run else [root, (root, store, "ko")])
+    assert calls["stores"] == ([] if dry_run else ["custom/repo"])
+    assert git.remotes == []
+
+
+def test_init_view_metadata_failure_keeps_success(app, monkeypatch, capsys):
+    from foragent.init import InitReport
+
+    root, git, *_ = app
+    monkeypatch.delenv("FORAGENT_VIEW")
+    monkeypatch.setattr(cli, "init_repo", lambda *a, **kw: InitReport([], [], False))
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(language="ko"))
+
+    def unavailable():
+        raise GitError("origin unavailable\ntry again")
+
+    monkeypatch.setattr(git, "remote_slug", unavailable)
+    assert cli.main(["init", "--repo-root", str(root)]) == 0
+    output = capsys.readouterr()
+    assert "Foragent setup:" in output.out
+    assert output.err == "foragent: 레인 화면을 열지 못했습니다: origin unavailable try again\n"
+
+
+@pytest.mark.parametrize("command", ["publish", "orch"])
+@pytest.mark.parametrize("opt_out", [False, True])
+def test_automatic_view_failure_keeps_command_success(app, monkeypatch, capsys, command, opt_out):
+    root, _, tracker, store, _ = app
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(repo="owner/repo", language="ko"))
+    if opt_out:
+        monkeypatch.setenv("FORAGENT_VIEW", "off")
+    else:
+        monkeypatch.delenv("FORAGENT_VIEW")
+    opened = []
+
+    def unavailable(*args):
+        opened.append(args)
+        raise OSError("terminal unavailable\ntry again")
+
+    monkeypatch.setattr(cli.watch_open, "open_view", unavailable)
+    if command == "publish":
+        plan = root / "plan.json"
+        plan.write_text("{}")
+        monkeypatch.setattr(cli.order, "publish", lambda *a, **kw: cli.order.PublishReport(
+            "View task", 1, [], [], False,
+        ))
+        argv = ["order", "publish", str(plan)]
+    else:
+        tracker.add_issue(1, "Waiting for repair", labels=["blocked"])
+        argv = ["orch", "watch"]
+
+    assert cli.main([*argv, "--repo-root", str(root)]) == 0
+    output = capsys.readouterr()
+    assert opened == ([] if opt_out else [(root, store, "ko")])
+    assert output.err == ("" if opt_out else
+                          "foragent: 레인 화면을 열지 못했습니다: terminal unavailable try again\n")
+    if command == "publish":
+        assert output.out.startswith("Published: View task\nParent: #1\n")
+    else:
+        assert json.loads(output.out)["blocked"] == [1]
+        assert json.loads((store.root / "orch-watch.json").read_text())["blocked"] == [1]
+
+
 @pytest.mark.parametrize("json_output", [False, True])
 def test_status_uses_configured_repo_without_origin(app, monkeypatch, capsys, json_output):
     from foragent.config import load_config

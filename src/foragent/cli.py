@@ -327,6 +327,21 @@ def _inspect(args: argparse.Namespace, ctx: inspect_data.InspectContext) -> None
                 print(f"  {item.url}")
 
 
+def _open_lane_view(root: Path) -> None:
+    """Load the completed setup without making an optional view fail the command."""
+    if os.environ.get("FORAGENT_VIEW") == "off":
+        return
+    language = "en"
+    try:
+        config = load_config(root)
+        language = config.language
+        repo = config.repo or GitRepo(root).remote_slug()
+        watch_open.open_view(root, StateStore.for_repo(repo), language)
+    except (ConfigError, GitError, OSError) as exc:
+        error = " ".join(str(exc).split())[:200]
+        print("foragent: " + text("watch_open_failed", language, error=error), file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -356,16 +371,20 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         root = args.repo_root.resolve()
         if args.command == "init":
-            print(init_repo(
+            report = init_repo(
                 root, approvers=args.approvers, review=args.review, executor=args.executor,
                 run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
                 dry_run=args.dry_run, language=args.language, no_board=args.no_board,
-            ).summary())
+            )
+            print(report.summary())
+            if not args.dry_run:
+                _open_lane_view(report.normalized_root or root)
             return 0
         if args.command == "lanes":
             lane = add_lane(root, args.name, args.paths, skills=args.skills, executor=args.executor, model=args.model,
                             title=args.title, emoji=args.emoji)
             print(f"Created lane:{args.name} ({', '.join(lane['paths'])})")
+            _open_lane_view(root)
             return 0
         if args.command == "notify":
             config = load_config(root)
@@ -398,6 +417,8 @@ def main(argv: list[str] | None = None) -> int:
                     approve=args.approve, approve_keys=args.approve_keys,
                     approve_numbers=args.approve_numbers, dry_run=args.dry_run,
                 ).summary())
+                if not args.dry_run:
+                    _open_lane_view(root)
             return 0
         store = StateStore.for_repo(repo)
         if args.command == "orch":
@@ -421,6 +442,7 @@ def main(argv: list[str] | None = None) -> int:
                 for event in orch.log(ctx):
                     print(f"{event['at']} [{event['kind']}] {event['summary']}")
             elif args.action == "watch":
+                _open_lane_view(root)
                 try:
                     for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow):
                         print(json.dumps(snapshot, ensure_ascii=False), flush=True)
