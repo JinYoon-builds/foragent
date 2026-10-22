@@ -49,7 +49,6 @@ lanes:
     agent: fa-view
     skills:
     - toss-ux-writing
-    - ux-copy
   board:
     paths:
     - src/foragent/board*.py
