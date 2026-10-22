@@ -81,10 +81,21 @@ def notify(ctx: InspectContext, notifier: Callable[[str, str], None] | None = No
         previous = ctx.store.load_inspect().notified_signature
         if signature == previous:
             return None
-        if not any(item.group in ACTIONABLE for item in inbox.items):
+        pending = [item for item in inbox.items if item.group in ACTIONABLE]
+        if not pending:
             ctx.store.update_inspect(notified_signature=signature)
             return None
-        line = counts_line(inbox)
+        items = []
+        for item in pending[:3]:
+            label = f"#{item.number} {item.title}"
+            if item.reason:
+                summary = " ".join((item.summary or "").split())
+                reason = ": ".join(part for part in (item.reason, summary) if part)
+                label += f" ({reason})"
+            items.append(label)
+        if len(pending) > 3:
+            items.append(f"+{len(pending) - 3}")
+        line = " ".join(" · ".join([counts_line(inbox), *items]).split())
         if notifier is not None:
             notifier(line, f"Foragent {ctx.repo}")
         elif not notifications.send(

@@ -1,7 +1,9 @@
 """Bounded subprocesses and process group termination."""
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import os
-from contextlib import nullcontext
 from pathlib import Path
 import signal
 import subprocess
@@ -9,6 +11,21 @@ import sys
 import tempfile
 import threading
 import time
+
+
+_process_group_callback: ContextVar[Callable[[int | None], None] | None] = ContextVar(
+    "process_group_callback", default=None,
+)
+
+
+@contextmanager
+def track_process_group(callback: Callable[[int | None], None]) -> Iterator[None]:
+    """Observe subprocess ownership within one executor call without changing its API."""
+    token = _process_group_callback.set(callback)
+    try:
+        yield
+    finally:
+        _process_group_callback.reset(token)
 
 
 def kill_process_group(pid: int) -> None:
@@ -63,6 +80,7 @@ def run_logged(
     stderr_path: Path | None = None,
 ) -> tuple[int | None, bool, str]:
     """Append output without buffering an unbounded session in memory."""
+    on_process_group = _process_group_callback.get()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("ab") as log, (
         stdout_path.open("w+b") if stdout_path is not None else tempfile.TemporaryFile()
@@ -102,6 +120,8 @@ def run_logged(
         if follower is not None:
             follower.start()
         try:
+            if on_process_group is not None:
+                on_process_group(process.pid)  # start_new_session makes PID == PGID.
             try:
                 process.communicate(input=prompt.encode("utf-8") if prompt is not None else None, timeout=timeout_s)
             except subprocess.TimeoutExpired:
@@ -121,6 +141,8 @@ def run_logged(
                     process.wait()
                 if terminate_children:
                     kill_process_group(process.pid)
+                if on_process_group is not None:
+                    on_process_group(None)
             finally:
                 if can_handle:
                     signal.signal(signal.SIGTERM, previous)

@@ -15,6 +15,7 @@ from foragent.git import GitError
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
+from foragent.orch_events import append_event
 from foragent.processes import run_logged
 from foragent.runner import RunContext, review_only
 from foragent.tracker import Issue, PullRequest
@@ -83,14 +84,9 @@ def _text(value: str, name: str) -> str:
 
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = ()) -> dict:
-    summary = " ".join(summary.split())
-    event = {"at": ctx.now().astimezone(UTC).isoformat(), "issue": n,
-             "kind": kind, "summary": summary}
-    with ctx.store._state_lock():
-        with (ctx.store.root / "orch-events.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+    event = append_event(ctx.store, ctx.now(), n, kind, summary)
     for number in ([n] if n is not None else issues):
-        ctx.tracker.comment(number, "<!-- foragent:orch -->\n" + summary)
+        ctx.tracker.comment(number, "<!-- foragent:orch -->\n" + event["summary"])
     return event
 
 

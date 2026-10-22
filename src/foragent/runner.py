@@ -29,7 +29,7 @@ from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
 from foragent.order import detect_test_commands
 from foragent.policy import merge_decision, review_mode_for, touched
-from foragent.processes import run_logged
+from foragent.processes import run_logged, track_process_group
 from foragent.reasons import Reason
 from foragent.skills import SkillManager, copy_lane_skills
 from foragent.state import Approval, StateStore
@@ -551,8 +551,12 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
             ctx.store.update_run(n, last_progress_at=timestamp, last_activity_at=timestamp)
         size = current
 
+    def execute():
+        with track_process_group(lambda pgid: ctx.store.update_run(n, executor_pgid=pgid)):
+            return executor.run(**kwargs)
+
     try:
-        result = ctx.poll_hook(lambda: executor.run(**kwargs), poll)
+        result = ctx.poll_hook(execute, poll)
         if log.exists():
             with log.open("rb") as stream:
                 stream.seek(max(offset, log.stat().st_size - 16000))

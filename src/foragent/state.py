@@ -59,6 +59,7 @@ class Run:
     phase: str | None = None
     phase_started_at: str | None = None
     last_activity_at: str | None = None
+    executor_pgid: int | None = None
 
 
 class StateStore:

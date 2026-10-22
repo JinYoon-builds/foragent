@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import json
 import os
 import signal
 import subprocess
@@ -74,6 +75,10 @@ def test_interrupted_runner_with_open_pr_stays_visible(ctx, monkeypatch, failure
     assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert ctx.store.load_flag(1).reason == reason
     assert ctx.store.get_run(1).status == "finished"
+    events = recovery_events(ctx)
+    assert len(events) == 1
+    assert events[0]["kind"] == reason.value
+    assert "blocked" in events[0]["summary"]
 
 
 def edit_body(ctx, number, body):
@@ -512,8 +517,10 @@ def test_dead_overtime_runner_uses_crash_recovery(ctx, monkeypatch):
     mark_running(ctx)
     ctx.now = lambda: NOW + timedelta(hours=3)
     monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
-    ctx.kill_runner = lambda pid: pytest.fail("a dead runner needs no termination")
+    killed = []
+    ctx.kill_runner = killed.append
     tick(ctx)
+    assert killed == [123]
     assert ctx.store.get_run(1).outcome == "crashed"
     assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
 
@@ -963,7 +970,11 @@ def test_stall_restarts_once_then_flags_second_stall(ctx):
     assert ctx.store.load_flag(1).reason == Reason.STALLED
     assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     assert [run.outcome for run in ctx.store.read_history()] == ["stalled-restart", "stalled"]
+    events = recovery_events(ctx)
+    assert [event["kind"] for event in events] == ["stall-restart", "stalled"]
+    assert all(event["issue"] == 1 and event["at"] and event["summary"] for event in events)
     assert tick(ctx).actions == []
+    assert recovery_events(ctx) == events
 
 
 @pytest.mark.parametrize("progress,stalls", [("recent", False), ("boundary", False), ("missing", True)])
@@ -1071,8 +1082,10 @@ def test_dead_active_run_recovers_persisted_stall_intent(ctx, monkeypatch, outco
     ctx.store.update_run(1, restarts=restarts, outcome=outcome)
     ctx.now = lambda: NOW + timedelta(minutes=31)
     monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
-    ctx.kill_runner = lambda pid: pytest.fail("the process is already dead")
+    killed = []
+    ctx.kill_runner = killed.append
     tick(ctx)
+    assert killed == ([] if pid is None else [pid])
     assert ctx.store.get_run(1).status == "finished"
     assert ctx.store.get_run(1).outcome == outcome and ctx.store.get_run(1).restarts == restarts
     assert [past.outcome for past in ctx.store.read_history()] == [outcome]
@@ -1176,7 +1189,11 @@ def test_two_consecutive_crashes_flag_and_stop_relaunching(ctx, monkeypatch):
     assert parse_reason(ctx.tracker.list_comments(1)[-1].body) == Reason.RETRIES_EXCEEDED
     assert ctx.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
     assert "#1 flagged retries-exceeded" in report.actions
+    events = recovery_events(ctx)
+    assert [event["kind"] for event in events] == ["crash-restart", "retries-exceeded"]
+    assert "blocked" in events[-1]["summary"]
     assert tick(ctx).actions == []
+    assert recovery_events(ctx) == events
 
 
 @pytest.mark.parametrize("intervening_number,expected_flag", [(1, False), (2, True)])
@@ -1604,3 +1621,113 @@ def test_limit_wait_can_resume_an_issue_with_an_existing_retry_pr(ctx):
     tick(ctx)
     assert ctx.store.get_run(1).status == "running" and ctx.store.get_run(1).lane == "ui"
     assert (ctx.store.get_run(1).attempts, ctx.store.get_run(1).restarts) == (2, 1)
+
+
+def recovery_events(ctx):
+    path = ctx.store.root / "orch-events.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_crash_cleanup_kills_group_before_removing_worktree(ctx, monkeypatch):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx, pid=4321)
+    monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
+    actions = []
+    ctx.kill_runner = lambda pid: actions.append(("kill", pid))
+    monkeypatch.setattr(ctx.git, "remove_worktree", lambda path: actions.append(("remove", path)))
+    tick(ctx)
+    assert actions == [("kill", 4321), ("remove", ctx.store.worktree_path(1))]
+    events = recovery_events(ctx)
+    assert len(events) == 1
+    assert events[0] == {"at": NOW.isoformat(), "issue": 1, "kind": "crash-restart",
+                         "summary": "Runner crashed; returned to ready for restart."}
+    tick(ctx)
+    assert recovery_events(ctx) == events
+
+
+def test_crash_group_termination_failure_preserves_worktree_and_active_run(ctx, monkeypatch):
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx)
+    monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
+    monkeypatch.setattr(ctx.git, "remove_worktree", lambda path: pytest.fail("group is not stopped"))
+
+    def fail(pid):
+        raise PermissionError("cannot terminate group")
+
+    ctx.kill_runner = fail
+    with pytest.raises(PermissionError, match="cannot terminate group"):
+        tick(ctx)
+    assert ctx.store.get_run(1).status == "running"
+    assert recovery_events(ctx) == []
+
+
+@pytest.mark.parametrize("outcome", ["merged", "blocked", "killed", "limit-wait"])
+def test_dead_run_with_recorded_completion_does_not_signal_group(ctx, monkeypatch, outcome):
+    from foragent.scheduler import TickReport, _recover_runs
+
+    approve(ctx)
+    tick(ctx)
+    run = mark_running(ctx, pid=4321)
+    path = ctx.store.worktree_path(1)
+    ctx.git.add_worktree(path, run.branch, "origin/main")
+    ctx.store.update_run(1, outcome=outcome)
+    monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
+    ctx.kill_runner = lambda pid: pytest.fail("completion does not need another signal")
+
+    _recover_runs(ctx, TickReport())
+
+    assert not path.exists()
+    assert ctx.store.get_run(1).status == "finished"
+    assert ctx.store.get_run(1).outcome == outcome
+    assert recovery_events(ctx) == []
+
+
+def test_crash_recovery_with_default_killer_tolerates_missing_group(ctx, monkeypatch):
+    approve(ctx)
+    tick(ctx)
+    run = mark_running(ctx, pid=4321)
+    ctx.git.add_worktree(ctx.store.worktree_path(1), run.branch, "origin/main")
+    monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
+    calls = []
+
+    def missing_group(pid, sig):
+        calls.append((pid, sig))
+        raise ProcessLookupError()
+
+    monkeypatch.setattr("foragent.processes.os.killpg", missing_group)
+    # time.sleep is the global module function; subprocess polling (git fetch on Linux) uses it too.
+    # The killpg call list below already proves no SIGKILL wait happened.
+    monkeypatch.setattr("foragent.processes.time.sleep", lambda _: None)
+    remove_worktree = ctx.git.remove_worktree
+
+    def remove_after_kill(path):
+        assert calls == [(4321, signal.SIGTERM)]
+        remove_worktree(path)
+
+    monkeypatch.setattr(ctx.git, "remove_worktree", remove_after_kill)
+    ctx.kill_runner = TickContext.__dataclass_fields__["kill_runner"].default
+    tick(ctx)
+    assert ctx.store.get_run(1).status == "finished"
+    assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
+    assert not ctx.store.worktree_path(1).exists()
+    assert [event["kind"] for event in recovery_events(ctx)] == ["crash-restart"]
+    tick(ctx)
+    assert calls == [(4321, signal.SIGTERM)]
+
+
+def test_overdue_blocker_escalation_is_journaled_once(ctx):
+    approve(ctx)
+    tick(ctx)
+    flag(ctx, 1, Reason.STALLED, "Runner stalled again.")
+    ctx.now = lambda: NOW + timedelta(minutes=ctx.config.orchestrator_timeout_minutes + 1)
+    tick(ctx)
+    events = recovery_events(ctx)
+    assert len(events) == 1
+    assert events[0]["kind"] == "orchestrator-timeout"
+    assert events[0]["at"] == ctx.now().isoformat()
+    assert events[0]["issue"] == 1 and "needs-human" in events[0]["summary"]
+    assert "needs-human" in ctx.tracker.get_issue(1).labels
+    tick(ctx)
+    assert recovery_events(ctx) == events
