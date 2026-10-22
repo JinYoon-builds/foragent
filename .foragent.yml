@@ -1,4 +1,4 @@
-review: batch
+review: fast
 executor: codex
 language: ko
 approvers:
@@ -68,3 +68,4 @@ lanes:
     agent: fa-design
     skills: []
 max_parallel: 3
+board: PVT_kwHODvdhm84BoMtn
