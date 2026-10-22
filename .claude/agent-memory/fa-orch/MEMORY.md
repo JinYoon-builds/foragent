@@ -1,5 +1,13 @@
 # orch 레인 현재 메모
 
+- #84(D54 1·2): 죽은 runner PID도 `_recover_runs()`에서 `ctx.kill_runner(pid)`로 그룹을 정리한 뒤 작업공간을 제거한다. PID가 없으면 종료 호출을 생략한다. 종료 실패는 활성 실행과 작업공간을 보존하고 전파한다.
+- #84: `orch_events.append_event()`가 state lock 안에서 기존 `at/issue/kind/summary` JSONL 형식을 공유한다. orch 동사는 기존 감사 댓글을 계속 쓰고, gate의 복구 기록은 로컬 journal에 남긴다. 기록은 `_restore_after_crash()`·`_restore_stalled()`의 실제 전환 결과에서 추가한다.
+- #84 리뷰: `crash-restart`는 ready 복귀에만 사용한다. 열린 PR이나 연속 crash로 차단하면 기존 이유 코드와 같은 `retries-exceeded`, stall 차단은 `stalled`다. 요약뿐 아니라 kind도 실제 결과와 일치시킨다.
+- #84 리뷰: `kill_process_group()`은 사라진 그룹의 `ProcessLookupError`를 이미 정상 반환으로 처리한다(`processes.py:15–18`, 이후 확인에도 동일). `test_crash_recovery_with_default_killer_tolerates_missing_group`는 기본 종료 함수를 써서 실제 임시 Git 작업공간 제거와 ready 복귀까지 확인한다. 권한 오류는 그룹이 사라졌다는 증거가 아니므로 삼키지 않는다.
+- #84 재리뷰: 죽은 실행의 그룹 종료는 crash 또는 미완료 stall 종료에 한정한다. 완료 결과(`merged`·`blocked`·`killed`·`limit-wait`)가 있으면 추가 신호 없이 작업공간과 실행 기록을 정리한다. POSIX §4.17상 그룹이 남아 있으면 그 ID를 PID로 재사용할 수 없지만, 그룹 소멸 뒤 검사와 신호 사이의 재사용 경쟁까지 기존 숫자 PID 인터페이스가 보장하지는 않는다. 범위 밖인 원자적 소유권 확인 체계는 `.foragent/REBUTTAL.md`에 근거를 남겼다.
+
+- #84 최종 검증: 지정 인수 시험 12개와 스케줄러 회귀 167개(완료 결과가 있는 실행의 신호 생략 4개 포함) 통과. 전체 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest`는 2,021개 통과, 별도 D54 3·4의 `stall-visibility` 3개만 실패(381.49초). HEAD의 src를 `/private/tmp/fa-84-final-base.deywzV/src`에 추출해 같은 3개 실패를 재현했다. 전체 로그는 `/private/tmp/fa-issue-84-final-full.log`다. 인수 시험과 Git 인덱스는 수정하지 않았다.
+
 - #80(D53): `_implement_and_publish()` 시작 시 설정 명령 또는 실제 작업공간에서 감지한 첫 명령으로 기준선을 한 번 캡처한다. pytest만 지원하며, 대상 ref의 별도 detached 작업공간을 버려 시험이 만든 파일이 구현 작업공간에 섞이지 않게 한다. CI 재리뷰에서 구현으로 돌아오는 경로도 PR head가 아니라 target ref에서 기준선을 잡는다.
 - #80: JUnit은 `<state>/runs/issue-N-acceptance-baseline.xml`에 저장한다. `junit_family=legacy`의 file·classname·name으로 클래스·매개변수를 포함한 정확한 ID를 만들고, 실패·오류·건너뜀(같은 ID의 teardown 오류 포함)을 뺀다. 저장소 루트와 빈 JUnit 접두어를 지정해야 사용자 지정 pytest root·접두어가 실행 가능한 ID를 바꾸지 않는다.
 - #80: 기준선 검사는 기존 `verify()` 안에서 Done when과 함께 실행한다. 매 시도·대상 갱신·충돌 해결 뒤에도 같은 통과 ID만 검사하고 실패는 기존 시도 예산을 쓴다. 0개면 pytest를 빈 선택으로 호출하지 않는다(전체 시험이 다시 실행됨). 구현 프롬프트의 전체 시험 명령은 기준선과 별도로 매 시도 재감지하는 기존 동작을 유지한다.

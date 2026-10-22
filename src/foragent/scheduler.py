@@ -14,6 +14,7 @@ from foragent.config import Config, in_run_hours
 from foragent.git import GitRepo
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
+from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import kill_process_group
 from foragent.runner import _batch_pr
@@ -193,6 +194,8 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
         flag(ctx, number, Reason.RETRIES_EXCEEDED,
              "Runner stopped with an open PR; rerun review or retry implementation.")
         report.actions.append(f"#{number} flagged retries-exceeded after runner crash with open PR")
+        append_event(ctx.store, ctx.now(), number, "retries-exceeded",
+                     "Runner crashed with an open PR; blocked for review or retry.")
         return
     failures = 0
     for past in reversed(ctx.store.read_history()):
@@ -207,11 +210,15 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
             "Runner crashed twice consecutively for this issue. Investigate before resuming.",
         )
         report.actions.append(f"#{number} flagged retries-exceeded")
+        append_event(ctx.store, ctx.now(), number, "retries-exceeded",
+                     "Runner crashed twice consecutively; blocked for investigation.")
     else:
         ctx.tracker.add_labels(number, [READY])
         ctx.tracker.remove_labels(number, [RUNNING])
         report.actions.append(f"#{number} returned to ready after runner crash")
         board.sync_status(ctx, number, "Ready")
+        append_event(ctx.store, ctx.now(), number, "crash-restart",
+                     "Runner crashed; returned to ready for restart.")
 
 
 def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
@@ -245,14 +252,20 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
         flag(ctx, number, Reason.STALLED,
              "Runner stalled with an open PR; rerun review or retry implementation.")
         report.actions.append(f"#{number} flagged stalled with open PR")
+        append_event(ctx.store, ctx.now(), number, "stalled",
+                     "Runner stalled with an open PR; blocked for review or retry.")
     elif restarts <= 1:
         ctx.tracker.add_labels(number, [READY])
         ctx.tracker.remove_labels(number, [RUNNING])
         report.actions.append(f"#{number} returned to ready after stall (restart {restarts})")
         board.sync_status(ctx, number, "Ready")
+        append_event(ctx.store, ctx.now(), number, "stall-restart",
+                     "Runner stalled; stopped and returned to ready for restart.")
     else:
         flag(ctx, number, Reason.STALLED, "Runner stalled again after one restart.")
         report.actions.append(f"#{number} flagged stalled")
+        append_event(ctx.store, ctx.now(), number, "stalled",
+                     "Runner stalled again after one restart; stopped and blocked.")
 
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
@@ -286,8 +299,10 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 _kill_run(ctx, run.number, report, outcome=outcome, count_stall=True)
                 _restore_stalled(ctx, run.number, restarts, report)
             continue
-        # Termination intent was persisted before signalling the runner. An
-        # interrupted tick must finish that transition rather than invent a crash.
+        # Clean up a crashed group or finish an interrupted stall termination.
+        # A recorded completion does not need another signal.
+        if run.pid is not None and run.outcome in {None, "crashed", "stalled-restart", "stalled"}:
+            ctx.kill_runner(run.pid)
         ctx.git.remove_worktree(Path(run.worktree))
         outcome = run.outcome or "crashed"
         detail = _crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
@@ -383,6 +398,8 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
         f"Latest blocker:\n{latest.body}",
     ))
     report.actions.append(f"#{issue.number} flagged orchestrator-timeout")
+    append_event(ctx.store, ctx.now(), issue.number, "orchestrator-timeout",
+                 "Orchestrator did not respond to the blocker in time; escalated to needs-human.")
     return replace(issue, labels=issue.labels | {NEEDS_HUMAN})
 
 
