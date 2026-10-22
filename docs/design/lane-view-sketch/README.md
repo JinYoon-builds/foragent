@@ -14,7 +14,9 @@ switch between side-by-side (56+ columns) and stacked (44–55 columns).
 - `cast.py`: pixel grids — big orchestrator squirrel, GitHub tree, small lane squirrels.
 - `anim.py`: half-block renderer, numbered acorns, acorns flying to the tree.
 - `tui.py`: wide first draft (about 100 columns) — too wide for the side pane.
-- `tui_narrow.py`: the side-pane version to follow.
+- `tui_narrow.py`: the side-pane version to follow (prep, publish, running, done).
+- `interview_scene.py`: the interview phase — ledger, big picture, filling the five cells, lane map.
+  Run `python3 docs/design/lane-view-sketch/interview_scene.py`.
 
 The squirrel is original pixel art in the style of a reference image Jin shared;
 that reference image is not part of this repository.
