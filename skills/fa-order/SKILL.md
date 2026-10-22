@@ -81,6 +81,9 @@ rest still completes. For each issue you must be able to write one sentence:
 - **Size** s/m/l = how much reasoning it needs (s: mechanical, m: normal feature,
   l: tricky logic, concurrency, data migration). Size picks the starting model tier.
 - **blocked_by** only for real order dependencies (B cannot be built or verified without A).
+- Fill each issue's **`files`** with the repository-relative paths or globs it is expected
+  to change (for example, `["src/foragent/order.py", "skills/fa-order/**"]`). Use `[]`
+  when the affected files are not yet known. The published issue lists these under `## Files`.
 - Put the shared outcome and cross-issue constraints in the parent summary, not in children.
 
 ## 5. Write the final checks before any code exists

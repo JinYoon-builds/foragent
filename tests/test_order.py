@@ -210,6 +210,57 @@ def test_dry_run_has_no_writes(publishing, plan, kicks):
     assert before == {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+def test_publish_preserves_issue_files_as_metadata(publishing, plan, kind):
+    paths = ["src/new module.py", "skills/**", "src/[ab].py", "docs/설계.md"]
+    if kind == "edits":
+        publish(publishing, plan)
+        item = {"number": 2, "goal": "Updated login.", "out_of_scope": "Payments.",
+                "done_when": ["true"], "checklist": ["Looks right"], "files": paths}
+        plan["id"] = "2026-10-21-login-update"
+        plan["issues"], plan["edits"] = [], [item]
+    else:
+        item = plan["issues"][0]
+        item["files"] = paths
+    report = publish(publishing, plan)
+    body = publishing[2].get_issue(2).body
+    assert "## Files\n" + "\n".join(f"- {path}" for path in paths) in body
+    parsed = parse_body(body)
+    assert parsed.files == paths
+    assert parsed.goal == item["goal"] and parsed.out_of_scope == item["out_of_scope"]
+    assert parsed.done_when_commands == item["done_when"]
+    assert [check.text for check in parsed.done_when_checklist] == item["checklist"]
+    assert not set(paths) & set(report.paths)
+    assert all(not (publishing[0] / path).exists() for path in paths)
+
+
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("files", [None, ["../outside.py"], ["src/../outside.py"],
+                                   ["/outside.py"], ["src\\file.py"], ["src/\0file.py"],
+                                   ["src/file.py\n## Goal\nWrong goal"]])
+def test_invalid_issue_files_are_rejected_before_writes(publishing, plan, kind, dry_run, files):
+    if kind == "edits":
+        plan["edits"] = [{"number": 9, "goal": "Updated goal", "out_of_scope": "Payments.",
+                          "done_when": ["true"], "files": files}]
+    else:
+        plan["issues"][0]["files"] = files
+    with pytest.raises(order.PlanError, match=rf"{kind}\[\d+\]\.files"):
+        publish(publishing, plan, dry_run=dry_run)
+    assert publishing[-1] == [] and publishing[2].issues == {}
+    assert not (publishing[0] / "docs").exists()
+
+
+def test_files_section_keeps_first_list_and_respects_other_sections():
+    parsed = parse_body(
+        "## Goal\nChange the code.\n## Files\n- src/file.py\n* skills/**\n"
+        "## Notes\n- excluded.py\n## Files\n- also-excluded.py\n"
+        "## Done when\n```sh\n## Files\n- command-not-path\n```\n"
+    )
+    assert parsed.files == ["src/file.py", "skills/**"]
+    assert parsed.done_when_commands == ["## Files\n- command-not-path"]
+
+
 @pytest.mark.parametrize("mutate,error", [
     (lambda p: p.update(extra=True), "unknown fields"),
     (lambda p: p.update(id="../escape"), "plan.id"),

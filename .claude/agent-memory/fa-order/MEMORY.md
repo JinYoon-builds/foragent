@@ -11,3 +11,5 @@
 - `fa profile set --kind ... --stage ... --priority ...`은 Git/GitHub 초기화 전에 처리한다. 저장은 `config.set_profile`에서 로컬 YAML만 갱신해 전역 설정을 복사하지 않고 `date.today().isoformat()`을 기록한다.
 - 제한 환경에서 기본 uv 캐시를 쓸 수 없으면 `UV_CACHE_DIR`를 `/tmp`로 지정한다. 네트워크도 막혔으면 기존 `wheels-v6`, `simple-v21` 및 필요한 패키지의 `archive-v0` 디렉터리를 임시 캐시에 복사하고 `UV_OFFLINE=true uv run pytest`로 실행할 수 있다.
 - #110: `validate_plan`은 신규 `issues`와 기존 이슈 `edits`의 `out_of_scope`에 `_text`의 기본 비어 있지 않은 문자열 검증을 적용한다. `publish`는 dry-run 분기 및 외부 작업 전에 이를 호출한다. 정상 발행 테스트 데이터에도 제외 범위를 명시해야 한다. 검증: `uv run pytest tests/acceptance/test_publish_out_of_scope.py`; 신규·수정 및 일반·dry-run 거절 회귀 테스트는 `tests/test_order.py -k empty_out_of_scope`.
+- #144: `issues`와 `edits`의 선택 `files`는 예상 변경 경로/glob 목록이다. `_strings`와 `repo_path`로 검증하며 오류에 해당 `files` 필드명을 포함한다. 실제 파일 생성·glob 확장 없이 `## Files`의 일반 Markdown 목록으로 보존한다. 본문 파서는 `src/foragent/issue.py`, 주문 JSON 스키마 도움말은 `src/foragent/cli.py`에 있으므로 본문 필드를 추가할 때 함께 갱신한다.
+- 기존 주문의 자식을 `edits`로 수정하는 테스트는 새 주문 `id`를 써야 한다. 같은 주문의 자식과 `edits`가 겹치면 발행이 거절된다. #144 검증: `uv run pytest tests/acceptance/test_issue_files.py`; 일반 회귀 검사는 `uv run pytest tests/test_order.py tests/test_issue.py`.
