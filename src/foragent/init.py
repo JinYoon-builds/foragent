@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+import json
 from pathlib import Path
 import subprocess
 
@@ -94,6 +95,23 @@ def _add_config(path: Path, local: dict, added: dict) -> str:
     return original.rstrip("\n") + "\n" + yaml.safe_dump(added, sort_keys=False)
 
 
+def _logged_in(tool: str) -> bool:
+    command = ["codex", "login", "status"] if tool == "codex" else ["claude", "auth", "status"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    if tool == "codex":
+        return True
+    try:
+        status = json.loads(result.stdout)
+    except ValueError:
+        return False
+    return isinstance(status, dict) and status.get("loggedIn") is True
+
+
 def init_repo(
     repo_root: Path, *, approvers: list[str] | None = None, review: str | None = None,
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
@@ -133,12 +151,21 @@ def init_repo(
             _validate({**asdict(config), **added})
             updated_config = _add_config(config_path, local, added)
     else:
+        codex_available = _logged_in("codex")
+        claude_available = _logged_in("claude")
+        if not codex_available and not claude_available:
+            raise ConfigError("No logged-in coding tool found; log in to Claude Code or Codex and retry.")
+        if executor is None and not codex_available:
+            executor = "claude"
         if approvers is None:
             login = _gh_call(run, ["api", "user", "--jq", ".login"])
             if not login:
                 raise TrackerError("gh api user returned an empty authenticated login")
             approvers = [login]
         options = {"review": review, "executor": executor, "run_hours": run_hours}
+        if claude_available and executor == "claude":
+            # Same-tool review still starts a separate Claude process/session.
+            options["reviewer"] = "claude"
         if language is not None:
             options["language"] = language
         values = {key: DEFAULTS[key] if value is None else value for key, value in options.items()}
