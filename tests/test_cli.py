@@ -373,7 +373,7 @@ def test_init_view_metadata_failure_keeps_success(app, monkeypatch, capsys):
     assert cli.main(["init", "--repo-root", str(root)]) == 0
     output = capsys.readouterr()
     assert "Foragent setup:" in output.out
-    assert output.err == "foragent: 레인 화면을 열지 못했습니다: origin unavailable try again\n"
+    assert output.err == "foragent: 레인 화면을 열지 못했어요(origin unavailable try again). 다시 시도해요\n"
 
 
 @pytest.mark.parametrize("command", ["publish", "orch"])
@@ -407,7 +407,7 @@ def test_automatic_view_failure_keeps_command_success(app, monkeypatch, capsys, 
     output = capsys.readouterr()
     assert opened == ([] if opt_out else [(root, store, "ko")])
     assert output.err == ("" if opt_out else
-                          "foragent: 레인 화면을 열지 못했습니다: terminal unavailable try again\n")
+                          "foragent: 레인 화면을 열지 못했어요(terminal unavailable try again). 다시 시도해요\n")
     if command == "publish":
         assert output.out.startswith("Published: View task\nParent: #1\n")
     else:
