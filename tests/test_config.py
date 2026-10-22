@@ -31,6 +31,7 @@ def test_exact_defaults(repo):
         "repo": None, "board": None, "language": "en", "codex_goal": False, "review_level": "low",
         "review_scope": "claude-local", "test_command": None,
         "interview": "native", "ouroboros_version": None, "profile": None,
+        "skill_roles": {},
         "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
@@ -91,6 +92,14 @@ def test_default_global_location(repo, monkeypatch, tmp_path):
 def test_missing_global_and_empty_yaml_are_allowed(repo, tmp_path):
     (repo / ".foragent.yml").write_text("", encoding="utf-8")
     assert asdict(load_config(repo, tmp_path / "missing.yml")) == DEFAULTS
+
+
+@pytest.mark.parametrize("roles", [[], None, {"pack:demo": "pretty"}, {"pack:demo": []},
+                                   {"pack:demo": None}, {1: "style"}, {"": "style"}])
+def test_invalid_skill_roles_are_rejected(repo, roles):
+    write_settings(repo / ".foragent.yml", {"skill_roles": roles})
+    with pytest.raises(ConfigError, match="skill_roles"):
+        load_config(repo)
 
 
 def test_missing_repository_config(tmp_path):
