@@ -5,6 +5,7 @@ from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from itertools import islice
+import ast
 import json
 import os
 from pathlib import Path
@@ -210,7 +211,9 @@ def build_prompt(
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     acceptance_rule = "" if acceptance_locked else f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
     test_rule = (
-        f"- Before you finish, also run the full test suite: `{test_command}`. CI runs it, so existing tests must keep passing.\n"
+        f"- Optional additional check: Before you finish, also run the full test suite: `{test_command}`. "
+        "Each attempt checks Done when, the acceptance baseline and related unit tests; "
+        "CI runs the full suite after publication and sends failures back for repair.\n"
         if test_command is not None else ""
     )
     prompt = (
@@ -348,6 +351,50 @@ def _passing_acceptance_ids(report: Path) -> tuple[str, ...]:
         node_id = "::".join(part for part in (file, classes, name) if part)
         (failed if any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) else passed).add(node_id)
     return tuple(sorted(passed - failed))
+
+
+def _related_unit_tests(worktree: Path, paths: list[str], acceptance_dir: str) -> tuple[str, ...]:
+    """Select changed pytest files and direct static importers of changed modules."""
+    acceptance = Path(acceptance_dir)
+    tests = {
+        path.relative_to(worktree).as_posix(): path
+        for path in (worktree / "tests").rglob("*.py")
+        if (path.name.startswith("test_") or path.name.endswith("_test.py"))
+        and not path.relative_to(worktree).is_relative_to(acceptance)
+    }
+    selected = set(paths) & tests.keys()
+    modules = set()
+    for name in paths:
+        path = Path(name)
+        if path.suffix != ".py" or path.is_relative_to("tests") or path.is_relative_to(acceptance):
+            continue
+        parts = list(path.with_suffix("").parts)
+        if parts[0] == "src":
+            parts.pop(0)
+        if parts and parts[-1] == "__init__":
+            parts.pop()
+        if parts:
+            modules.add(".".join(parts))
+    if not modules:
+        return tuple(sorted(selected))
+    for name, path in tests.items():
+        if name in selected:
+            continue
+        try:
+            tree = ast.parse(path.read_bytes(), filename=name)
+        except (SyntaxError, UnicodeError):
+            continue
+        imports = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                imports.add(node.module)
+                imports.update(f"{node.module}.{alias.name}" for alias in node.names)
+        if any(imported == module or imported.startswith(module + ".")
+               for imported in imports for module in modules):
+            selected.add(name)
+    return tuple(sorted(selected))
 
 
 def _capture_acceptance_baseline(
@@ -1092,6 +1139,16 @@ def _implement_and_publish(
                 _append(log, f"Acceptance baseline verification count={len(baseline.node_ids)}, "
                         f"exit_code={result.exit_code}, timed_out={result.timed_out}")
                 _progress(n, ctx)
+            test_command = ctx.config.test_command
+            if test_command is None:
+                test_command = next(iter(detect_test_commands(worktree)), None)
+            unit_command = _pytest_command(test_command) if test_command else None
+            unit_tests = _related_unit_tests(worktree, paths, ctx.config.acceptance_dir)
+            if unit_tests and unit_command:
+                checks.append(_check(f"{unit_command} {shlex.join(unit_tests)}", worktree, log, 900))
+                _progress(n, ctx)
+            elif unit_tests:
+                _append(log, "Related unit tests skipped: no supported pytest command is known")
             git.stage_changes()
             if not prepare_target():
                 raise ExecutorStopped("hash-mismatch")

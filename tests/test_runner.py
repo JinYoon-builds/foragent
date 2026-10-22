@@ -552,9 +552,58 @@ def test_implementation_prompt_full_suite_from_worktree(run_case, files, configu
         assert "Before you finish" not in prompt
     else:
         assert prompt.splitlines().count(
-            f"- Before you finish, also run the full test suite: `{expected}`. "
-            "CI runs it, so existing tests must keep passing."
+            f"- Optional additional check: Before you finish, also run the full test suite: `{expected}`. "
+            "Each attempt checks Done when, the acceptance baseline and related unit tests; "
+            "CI runs the full suite after publication and sends failures back for repair."
         ) == 1
+
+
+@pytest.mark.parametrize("source", ["src/demo/service.py", "demo/service.py"])
+def test_related_units_include_importers_of_deleted_modules_and_existing_changed_tests(tmp_path, source):
+    from foragent.runner import _related_unit_tests
+
+    files = {
+        "tests/test_direct.py": "import demo.service as service\n",
+        "tests/unit/service_test.py": "from demo import service as target\n",
+        "tests/test_symbols.py": "def test_local_import():\n    from demo.service import run\n",
+        "tests/test_unrelated.py": '# import demo.service\nEXAMPLE = "from demo import service"\nimport demo.other\n',
+        "tests/test_changed with spaces.py": "broken syntax is still selected!",
+        "tests/test_old_broken.py": "broken syntax!",
+        "tests/locked/test_acceptance.py": "import demo.service\n",
+        "tests/helpers.py": "import demo.service\n",
+    }
+    for name, contents in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+    assert _related_unit_tests(tmp_path, [source, "tests/test_changed with spaces.py", "tests/test_deleted.py"],
+                               "./tests/locked/") == (
+        "tests/test_changed with spaces.py", "tests/test_direct.py", "tests/test_symbols.py",
+        "tests/unit/service_test.py",
+    )
+    assert _related_unit_tests(tmp_path, ["src/demo/__init__.py"], "tests/locked") == (
+        "tests/test_direct.py", "tests/test_symbols.py", "tests/test_unrelated.py", "tests/unit/service_test.py",
+    )
+
+
+@pytest.mark.parametrize("repaired", [True, False])
+def test_related_unit_failure_uses_implementation_budget_and_reaches_next_prompt(run_case, repaired):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command=f"{shlex.quote(sys.executable)} -m pytest -q -k ignored")
+    c.executor.steps = [
+        {"feature.txt": "done", "unit.txt": "bad", "tests/test_new.py": (
+            "from pathlib import Path\n"
+            "def test_related():\n"
+            '    assert Path("unit.txt").read_text() == "good", "related unit failed"\n'
+        )},
+        {"unit.txt": "good"} if repaired else {},
+    ]
+    assert run_issue(1, c.ctx) == ("merged" if repaired else "retries-exceeded")
+    assert len(c.executor.calls) == 2
+    assert "related unit failed" in c.executor.calls[1]["prompt"]
+    assert "tests/test_new.py" in c.executor.calls[1]["prompt"]
+    assert c.store.get_run(1).attempts == 2
+    assert bool(c.tracker.merged_prs) == repaired
 
 
 @pytest.mark.parametrize("options", ["", "--rootdir=tests --junit-prefix=project"])
