@@ -10,3 +10,5 @@
 - `review_scope` 기본값은 `claude-local`이다. `pr-body`는 각 리뷰 전에 검증한 변경을 커밋·푸시하고 같은 PR을 갱신한 뒤 Claude에 `review_pr`를 전달한다. CLI 명령은 `/code-review <PR 번호> <review_level>`이며 임시 `CLAUDE.local.md`를 만들지 않는다.
 - PR 본문은 초기 생성·재리뷰·최종 공개 모두 같은 렌더러를 쓴다. `pr-body`에서는 범위 규칙과 판정만 본문에, 각 라운드 지적·메모는 PR 댓글에 기록한다. 기본 모드는 이전처럼 본문에 리뷰 이력을 남긴다.
 - 리뷰 모드 검증: `uv run pytest -q tests/acceptance/test_skills_review_scope.py`. 회귀: `tests/test_config.py tests/test_executors.py tests/test_runner.py tests/test_git.py`. `tests/test_runner.py -k pr_body_reviews`는 매 라운드의 로컬 HEAD·원격 브랜치·PR HEAD 일치와 재시도 댓글 보존을 확인한다.
+- `SkillManager.skills()`는 등록된 라이브러리가 디스크에 없으면 복제하고 조회를 계속한다. catalog·install·레인 검증이 이 경로를 공유한다. 기존 디렉터리는 갱신하지 않으며, runner의 `available_only=True` 캐시 조회는 누락 라이브러리를 건너뛰어 오프라인 동작을 보존한다. 복제 실패는 라이브러리 이름을 포함한 `SkillError`로 전달한다.
+- 자동 복제 검증: `uv run pytest tests/acceptance/test_skills_autosync.py`. `tests/test_skills_lanes.py`의 자동 복제 회귀는 로컬 bare 저장소로 복제 1회·기존 캐시 미갱신·레인 설치를 함께 확인한다.

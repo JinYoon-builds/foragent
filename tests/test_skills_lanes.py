@@ -1,6 +1,7 @@
 from dataclasses import replace
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 import yaml
@@ -121,6 +122,47 @@ def test_sync_clones_then_fast_forwards_with_no_live_network(tmp_path):
         ["git", "-C", str(directory / "knowledge-work-plugins"), "pull", "--ff-only"],
         ["git", "-C", str(directory / "skills"), "pull", "--ff-only"],
     ]
+
+
+def test_catalog_and_lane_install_clone_once_without_updating_existing_library(library, git_history, tmp_path):
+    _, config, _, _ = library
+    git_history.update({"skills/demo/SKILL.md": "---\nname: demo\ndescription: Original\n---\n"})
+    destination = tmp_path / "new-cache/demo-pack"
+    config.skill_libraries.append({"name": "demo-pack", "repo": str(git_history.origin), "path": str(destination)})
+    commands = []
+
+    def run(args):
+        commands.append(args)
+        return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+
+    manager = SkillManager(config, run=run)
+    # The runner's cache-only lookup must remain offline.
+    assert manager.cached_skill("demo") is None
+    assert commands == []
+    assert manager.catalog()[-1]["description"] == "Original"
+    git_history.update({"skills/demo/SKILL.md": "---\nname: demo\ndescription: Updated\n---\n"})
+    repo = tmp_path / "repo"
+    assert validate_lane(repo, config, "demo", ["src/**"], ["demo"], None, None, manager) == ["demo"]
+    assert manager.install("demo", repo) == "demo"
+    assert manager.catalog()[-1]["description"] == "Original"
+    assert commands == [["git", "clone", "--", str(git_history.origin), str(destination)]]
+
+
+@pytest.mark.parametrize("failure", [
+    subprocess.CalledProcessError(128, ["git", "clone"], stderr="remote unavailable"),
+    subprocess.TimeoutExpired(["git", "clone"], 300),
+    OSError("git unavailable"),
+])
+def test_autoclone_error_identifies_library(tmp_path, failure):
+    def run(args):
+        raise failure
+
+    manager = SkillManager(Config(skill_libraries=[{"name": "demo-pack", "repo": "unavailable",
+                                                   "path": str(tmp_path / "cache")}]), run=run)
+    with pytest.raises(SkillError, match="could not clone library demo-pack") as error:
+        manager.catalog()
+    assert "fa skills sync" not in str(error.value)
+    assert error.value.__cause__ is failure
 
 
 def test_install_copies_full_skill_and_records_notice_once(library, tmp_path):

@@ -109,10 +109,17 @@ class SkillManager:
             if library.path.exists():
                 self.run(["git", "-C", str(library.path), "pull", "--ff-only"])
             else:
-                library.path.parent.mkdir(parents=True, exist_ok=True)
-                self.run(["git", "clone", "--", library.repo, str(library.path)])
+                self._clone(library)
             synced.append(library.name)
         return synced
+
+    def _clone(self, library: Library) -> None:
+        try:
+            library.path.parent.mkdir(parents=True, exist_ok=True)
+            self.run(["git", "clone", "--", library.repo, str(library.path)])
+        except (OSError, subprocess.SubprocessError) as exc:
+            message = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+            raise SkillError(f"could not clone library {library.name}: {message or exc}") from exc
 
     def skills(self, *, available_only: bool = False) -> list[Skill]:
         result = []
@@ -120,7 +127,9 @@ class SkillManager:
             if not library.path.is_dir():
                 if available_only:
                     continue
-                raise SkillError(f"library {library.name} is missing; run fa skills sync")
+                if library.path.exists():
+                    raise SkillError(f"library {library.name} path is not a directory: {library.path}")
+                self._clone(library)
             paths = {path for pattern in ("*/skills/*/SKILL.md", "skills/*/SKILL.md") for path in library.path.glob(pattern)}
             for path in sorted(paths):
                 match = re.match(r"\A---\s*\n(.*?)\n---(?:\s*\n|$)", path.read_text(encoding="utf-8"), re.S)
