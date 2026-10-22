@@ -183,6 +183,13 @@
 - 결정: init이 프로젝트 보드(Projects v2) "Foragent: <repo>"를 만들고 필드 Lane(단일 선택), Size(s/m/l), Status(Approved/Ready/Running/Needs human/PR open/Done)를 둔다. order는 이슈를 만들 때 보드에 넣고 Lane·Size를 채운다. gate는 상태 전이마다 Status를 갱신한다(한 방향). 보드를 Lane으로 묶으면 레인별 줄이 된다 — "레인에 쌓인 이슈를 하나씩 쳐내는 화면"을 GitHub가 그려 준다.
 - 원칙: 진실은 이슈 라벨. 보드는 보기용이라 어긋나거나 지워져도 시스템은 돈다. 보드 갱신 실패는 tick을 막지 않는다.
 - 만드는 방법: Foragent 저장소에서 /fa-order로 주문(dogfooding 두 번째 주문).
+- D31 보강 (2026-10-23, Jin): **Foragent 칸반 규칙.** 보드의 Status를 gate 안의 상태 일곱 개(Approved/Ready/Running/Blocked/Needs human/PR open/Done) 그대로 두지 않는다 — 에이전트에겐 필요하지만 사람에겐 Approved와 Ready, Running과 PR open의 차이가 의미 없다. GitHub 국룰(Todo/In Progress/Done 3칸)처럼 단순하게, 단 뜻이 정확히 맞을 때만 국룰 단어를 쓴다. 기본 칸:
+  - **🗂 Backlog** — 승인 전 이슈(`unapproved`). 국룰의 Backlog("아직 하기로 정하지 않은 것")와 뜻이 같다. 첫 칸(승인된 대기)을 Backlog라 부르지 않는다.
+  - **🌰 Up next** — Approved, Ready.
+  - **🐿 In progress** — Running, PR open, Blocked(막힘은 오케스트레이터가 처리하므로 ⚠ 표시만).
+  - **✋ Your turn** — Needs human. 국룰에 맞는 말이 없어 Foragent 말을 쓴다. 보드를 열면 이 칸만 보면 된다(다람쥐가 손 흔드는 것과 같은 뜻).
+  - **📦 Done** — Done.
+  단어는 익숙하게, 다람쥐 느낌은 이모지가 맡는다(레인 화면 D64의 회색 도토리·갉는 다람쥐·손 흔들기·창고와 짝). 보드 칸 이름은 영어로 둔다(오픈소스, 칸 이름은 언어별로 바꾸기 어렵다). 레인 화면은 화면 언어로 보여 준다. gate 안에서는 일곱 상태를 그대로 쓰고 보드에 옮길 때만 묶는다. 칸반에 정해진 국룰은 없고 팀마다 다르므로, 이미 자기 보드가 있는 저장소(D28)는 갈아엎지 않고 Foragent 상태를 그 팀의 칸에 짝지어 넣는다 — init이 기존 보드를 보고 한 번 묻고, 바꾸는 곳은 설정창 👥 팀 장(D70). 보드는 보기용이라(위 원칙) 짝짓기가 어떻든 시스템은 돈다. 카드 옮기기도 GitHub 요청이므로 상태가 실제로 바뀔 때만 옮긴다.
 
 ### D32. Codex 레인도 장착 스킬을 받는다 (2026-10-21, Jin 질문에서 발견) — 구현됨 (2026-10-22, 상한은 D35로 없앰)
 - 빈틈: 스킬은 `.claude/skills/`와 에이전트 `skills:` 칸으로 장착되는데 둘 다 Claude Code만 읽는다. runner는 Codex 레인에 에이전트 정의 본문('Lane notes')과 MEMORY.md만 붙이고 스킬은 넘기지 않아, Codex 레인에서는 스킬 장착이 효과가 없었다. Foragent 저장소 첫 주문에서 레인 3개 모두 `skills: []`였던 것도 이와 무관하지 않다.
