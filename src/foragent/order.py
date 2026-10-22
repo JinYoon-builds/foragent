@@ -219,7 +219,7 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
             _object(item, required, {"checklist", "acceptance_files", "blocked_by"} if kind == "issues"
                     else {"checklist", "acceptance_files"}, label)
             _text(item["goal"], f"{label}.goal")
-            _text(item["out_of_scope"], f"{label}.out_of_scope", empty=True)
+            _text(item["out_of_scope"], f"{label}.out_of_scope")
             _strings(item["done_when"], f"{label}.done_when", nonempty=True)
             _strings(item.get("checklist", []), f"{label}.checklist")
             if any("\n" in line or "\r" in line for line in item.get("checklist", [])):
