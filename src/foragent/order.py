@@ -17,11 +17,76 @@ from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_gr
 from foragent.lanes import add_lane, lane_files, validate_lane
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
+from foragent.state import StateStore
 from foragent.tracker import LabelSpec, Tracker
 
 
 class PlanError(ValueError):
     """An order plan is malformed or cannot be applied."""
+
+
+PROGRESS_SLOTS = ("goal", "out_of_scope", "done_when", "lane", "skills")
+PROGRESS_STEPS = ("start", "ledger", "chunk", "cell", "tests", "check", "approval", "publish", "end")
+
+
+def progress(
+    store: StateStore, step: str, *, title: str | None = None, add: str | None = None,
+    chunk: str | None = None, slot: str | None = None, ask: str | None = None,
+    filled: bool = False, done: int | None = None, total: int | None = None,
+    issue: int | None = None,
+) -> dict | None:
+    """Record preparation facts, without GitHub, executors or terminal actions.
+
+    Cells are keyed by chunk and slot. A question reopens its cell; marking it
+    filled resolves the question. Replayed additions and fills are idempotent.
+    """
+    if step not in PROGRESS_STEPS:
+        raise PlanError(f"unknown order progress step: {step}")
+
+    def update(state):
+        if step == "end":
+            return None
+        if step == "start":
+            _text(title, "title")
+            return {"title": title, "step": step, "ledger": [], "chunks": [],
+                    "cells": {}, "tests": {"done": 0, "total": 0},
+                    "published": [], "cells_left": 0}
+        if state is None:
+            raise PlanError("no order in preparation; run fa order progress start --title TITLE")
+        if step in {"ledger", "chunk"}:
+            _text(add, "add")
+            collection = state["ledger" if step == "ledger" else "chunks"]
+            if add not in collection:
+                collection.append(add)
+                if step == "chunk":
+                    state["cells"][add] = {name: {"filled": False, "ask": None}
+                                           for name in PROGRESS_SLOTS}
+        elif step == "cell":
+            _text(chunk, "chunk")
+            if chunk not in state["chunks"]:
+                raise PlanError(f"unknown chunk: {chunk}; add it with fa order progress chunk --add")
+            if slot not in PROGRESS_SLOTS:
+                raise PlanError(f"unknown cell slot: {slot}; choose from {', '.join(PROGRESS_SLOTS)}")
+            if filled == (ask is not None):
+                raise PlanError("cell requires either --ask or --filled")
+            if ask is not None:
+                _text(ask, "ask")
+            state["cells"][chunk][slot] = {"filled": filled, "ask": ask}
+        elif step == "tests":
+            if type(done) is not int or type(total) is not int or not 0 <= done <= total:
+                raise PlanError("tests requires integer counts with 0 <= done <= total")
+            state["tests"] = {"done": done, "total": total}
+        elif step == "publish":
+            if type(issue) is not int or issue <= 0:
+                raise PlanError("issue must be a positive integer")
+            if issue not in state["published"]:
+                state["published"].append(issue)
+        state["step"] = step
+        state["cells_left"] = sum(not cell["filled"] for cells in state["cells"].values()
+                                  for cell in cells.values())
+        return state
+
+    return store.update_order_progress(update)
 
 
 def read_plan(path: Path) -> dict:

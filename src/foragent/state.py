@@ -97,6 +97,26 @@ class StateStore:
     def _write_json(self, path: Path, value: dict[str, Any]) -> None:
         self._atomic_write(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
+    def order_progress(self) -> dict[str, Any] | None:
+        """Read order preparation facts shared by the CLI and lane view."""
+        try:
+            return json.loads((self.root / "order-progress.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+
+    def update_order_progress(
+        self, update: Callable[[dict[str, Any] | None], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        """Apply one local fact under a lock; None ends preparation."""
+        with self._state_lock():
+            updated = update(self.order_progress())
+            path = self.root / "order-progress.json"
+            if updated is None:
+                path.unlink(missing_ok=True)
+            else:
+                self._write_json(path, updated)
+            return updated
+
     def save_approval(
         self, number: int, *, body: str, body_sha: str,
         acceptance_blobs: dict[str, str], approved_by: str, approved_at: str,

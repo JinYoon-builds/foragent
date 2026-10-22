@@ -806,3 +806,94 @@ def test_profile_cli_rejects_invalid_config_without_overwriting(tmp_path, monkey
                      "--priority", "speed", "--repo-root", str(tmp_path)]) == 1
     assert "review" in capsys.readouterr().err
     assert path.read_text() == "review: invalid\n"
+
+
+@pytest.mark.parametrize("step,fields", [
+    ("unknown", {}), ("start", {"title": "  "}),
+    ("ledger", {"add": ""}), ("chunk", {"add": "\n"}),
+    ("cell", {"chunk": "missing", "slot": "goal", "filled": True}),
+    ("cell", {"chunk": "API", "slot": "unknown", "filled": True}),
+    ("cell", {"chunk": "API", "slot": "goal"}),
+    ("cell", {"chunk": "API", "slot": "goal", "ask": "?", "filled": True}),
+    ("cell", {"chunk": "API", "slot": "goal", "ask": "  "}),
+    ("tests", {"done": -1, "total": 2}), ("tests", {"done": 3, "total": 2}),
+    ("tests", {"done": 0, "total": -1}), ("tests", {"done": True, "total": 2}),
+    ("tests", {"done": 0}), ("publish", {"issue": 0}), ("publish", {"issue": True}),
+])
+def test_order_progress_rejected_fact_preserves_saved_bytes(tmp_path, step, fields):
+    store = StateStore(tmp_path / "state")
+    order.progress(store, "start", title="API order")
+    order.progress(store, "chunk", add="API")
+    path = store.root / "order-progress.json"
+    before = path.read_bytes()
+    with pytest.raises(order.PlanError):
+        order.progress(store, step, **fields)
+    assert path.read_bytes() == before
+
+
+def test_order_progress_duplicate_chunk_preserves_answers_and_questions_reopen_cells(tmp_path):
+    store = StateStore(tmp_path)
+    order.progress(store, "start", title="API order")
+    order.progress(store, "chunk", add="API")
+    order.progress(store, "cell", chunk="API", slot="goal", filled=True)
+    order.progress(store, "chunk", add="API")
+    assert store.order_progress()["cells_left"] == 4
+    order.progress(store, "cell", chunk="API", slot="goal", ask="Which endpoint?")
+    assert store.order_progress()["cells_left"] == 5
+    assert store.order_progress()["cells"]["API"]["goal"]["ask"] == "Which endpoint?"
+    order.progress(store, "cell", chunk="API", slot="goal", filled=True)
+    assert store.order_progress()["cells"]["API"]["goal"] == {"filled": True, "ask": None}
+    for _ in range(2):
+        order.progress(store, "ledger", add="D1: REST")
+        order.progress(store, "publish", issue=42)
+    assert store.order_progress()["ledger"] == ["D1: REST"]
+    assert store.order_progress()["published"] == [42]
+
+
+def test_order_progress_requires_start_and_new_start_resets_only_preparation(tmp_path):
+    store = StateStore(tmp_path)
+    with pytest.raises(order.PlanError, match="progress start"):
+        order.progress(store, "check")
+    assert store.order_progress() is None
+    store.start_run(42, branch="issue-42", worktree=tmp_path / "worktree")
+    order.progress(store, "start", title="Old")
+    order.progress(store, "ledger", add="Old decision")
+    order.progress(store, "start", title="New")
+    state = StateStore(tmp_path).order_progress()
+    assert state["title"] == "New" and state["ledger"] == [] and state["cells_left"] == 0
+    order.progress(store, "end")
+    order.progress(store, "end")
+    assert StateStore(tmp_path).order_progress() is None
+    assert store.get_run(42).status == "running"
+
+
+def test_order_progress_concurrent_writers_do_not_lose_facts(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    order.progress(StateStore(tmp_path), "start", title="Concurrent order")
+
+    def add_decision(number):
+        order.progress(StateStore(tmp_path), "ledger", add=f"Decision {number}")
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        list(workers.map(add_decision, range(20)))
+    assert set(StateStore(tmp_path).order_progress()["ledger"]) == {
+        f"Decision {number}" for number in range(20)}
+
+
+def test_order_progress_cli_uses_configured_repo_without_external_services(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(repo="owner/repo"))
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo: cls(tmp_path / repo)))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("progress must not initialize Git/GitHub, call an LLM or open a view")
+
+    monkeypatch.setattr(cli, "GitRepo", unexpected)
+    monkeypatch.setattr(cli, "GhTracker", unexpected)
+    monkeypatch.setattr(cli.watch_open, "open_view", unexpected)
+    monkeypatch.setattr(subprocess, "Popen", unexpected)
+    assert cli.main(["order", "progress", "start", "--title", "주문 준비"]) == 0
+    assert json.loads(capsys.readouterr().out)["title"] == "주문 준비"
+    assert cli.main(["order", "progress", "tests", "--done", "3", "--total", "2"]) == 1
+    assert "0 <= done <= total" in capsys.readouterr().err
+    assert StateStore(tmp_path / "owner/repo").order_progress()["step"] == "start"
