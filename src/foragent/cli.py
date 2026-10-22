@@ -96,6 +96,26 @@ def _parser() -> argparse.ArgumentParser:
     context = order_actions.add_parser("context")
     context.add_argument("--repo-root", type=Path, default=Path.cwd())
     context.add_argument("--json", action="store_true")
+    progress = order_actions.add_parser("progress", help="Record local order preparation facts")
+    progress_steps = progress.add_subparsers(dest="step", required=True)
+    for step in order.PROGRESS_STEPS:
+        command = progress_steps.add_parser(step)
+        command.add_argument("--repo-root", type=Path, default=Path.cwd())
+        if step == "start":
+            command.add_argument("--title", required=True)
+        elif step in {"ledger", "chunk"}:
+            command.add_argument("--add", required=True)
+        elif step == "cell":
+            command.add_argument("--chunk", required=True)
+            command.add_argument("--slot", choices=order.PROGRESS_SLOTS, required=True)
+            cell = command.add_mutually_exclusive_group(required=True)
+            cell.add_argument("--ask")
+            cell.add_argument("--filled", action="store_true")
+        elif step == "tests":
+            command.add_argument("--done", type=int, required=True)
+            command.add_argument("--total", type=int, required=True)
+        elif step == "publish":
+            command.add_argument("--issue", type=int, required=True)
     publish = order_actions.add_parser(
         "publish", formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''PLAN.json schema (unknown fields are rejected):
@@ -405,6 +425,15 @@ def main(argv: list[str] | None = None) -> int:
         root = args.repo_root.resolve()
         if args.command == "profile":
             print(json.dumps(set_profile(root, kind=args.kind, stage=args.stage, priority=args.priority),
+                             ensure_ascii=False))
+            return 0
+        if args.command == "order" and args.action == "progress":
+            config = load_config(root)
+            repo = config.repo or GitRepo(root).remote_slug()
+            fields = {name: getattr(args, name) for name in
+                      ("title", "add", "chunk", "slot", "ask", "filled", "done", "total", "issue")
+                      if hasattr(args, name)}
+            print(json.dumps(order.progress(StateStore.for_repo(repo), args.step, **fields),
                              ensure_ascii=False))
             return 0
         if args.command == "init":
