@@ -36,7 +36,6 @@ def test_run_failure_reasons_error_outcome_keeps_the_exception_in_the_run_record
 def test_run_failure_reasons_github_failure_while_starting_is_not_a_crash(
     git_history, tmp_path, monkeypatch,
 ):
-    from foragent import board
     from foragent.scheduler import tick
     from foragent.tracker import TrackerError
 
@@ -46,15 +45,18 @@ def test_run_failure_reasons_github_failure_while_starting_is_not_a_crash(
     case.tracker.remove_labels(1, ["running", "approved"])
     case.tracker.record_label(1, "approved", "human")
     monkeypatch.setattr("foragent.watch_open.open_view", lambda *args, **kwargs: None)
-    original = board.sync_status
-    failures = ["gh: Post https://api.github.com/graphql: REFUSED_STREAM"]
+    original = case.tracker.add_labels
+    failures = ["gh: http2: cannot retry err [stream error: REFUSED_STREAM] after Request.Body was written"]
 
-    def sync_status(ctx, issue, status, *args, **kwargs):
-        if status == "Running" and failures:
+    def add_labels(number, labels, *args, **kwargs):
+        # GitHub applied the label, then the connection failed before the reply
+        # (seen as "REFUSED_STREAM ... after Request.Body was written").
+        result = original(number, labels, *args, **kwargs)
+        if "running" in labels and failures:
             raise TrackerError(failures.pop())
-        return original(ctx, issue, status, *args, **kwargs)
+        return result
 
-    monkeypatch.setattr(board, "sync_status", sync_status)
+    monkeypatch.setattr(case.tracker, "add_labels", add_labels)
     launched = []
     ctx = replace(tick_context(case), launcher=lambda n: launched.append(n) or os.getpid())  # a live pid
     try:
