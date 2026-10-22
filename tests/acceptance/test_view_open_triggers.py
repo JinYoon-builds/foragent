@@ -35,8 +35,13 @@ def foreground_argv(case, command, sequence=1):
         # test_board_projects.initialized_case already drives this real init path.
         return ["init", "--no-push", "--no-launchd", "--no-board", "--approver", "human"]
     if command == "orch":
-        # A new snapshot makes each non-follow watch return on its first poll.
-        case.tracker.add_issue(100 + sequence, "Waiting for repair", labels=["blocked"])
+        from foragent.actions import flag
+        from foragent.reasons import Reason
+
+        # Publish through Foragent's write path so the next watch sees a new
+        # local blocker immediately, without depending on a gate refresh.
+        case.tracker.add_issue(100 + sequence, "Waiting for repair")
+        flag(case.ctx, 100 + sequence, Reason.RETRIES_EXCEEDED, "Waiting for repair")
         return ["orch", "watch", "--interval", "0.01"]
     path = case.root / f"plan-{sequence}.json"
     acceptance = f"tests/acceptance/test_order_view_{sequence}.py"

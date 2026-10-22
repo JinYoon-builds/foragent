@@ -33,12 +33,17 @@ def test_cli_add_stores_human_name_and_emoji(git_history, tmp_path, monkeypatch)
 def test_status_and_inspect_show_display_name_and_json_keeps_slug(git_history, tmp_path, monkeypatch, capsys):
     import json
 
-    from test_orch_review_handoff import bind_cli, make_case
+    from foragent.actions import flag
+    from foragent.orch import escalate
+    from foragent.reasons import Reason
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import bind_cli, make_case, tick_context
 
     case = make_case(git_history, tmp_path, monkeypatch,
                      lanes={"api": {"paths": ["api/**"], "title": "Server", "emoji": "🔧"}})
     case.tracker.add_labels(1, ["lane:api"])
     case.store.update_run(1, lane="api")
+    tick(tick_context(case, start_runs=False))
     main = bind_cli(case, monkeypatch)
     assert main(["gate", "status"]) == 0
     assert "🔧 Server" in capsys.readouterr().out
@@ -46,8 +51,8 @@ def test_status_and_inspect_show_display_name_and_json_keeps_slug(git_history, t
     payload = json.loads(capsys.readouterr().out)
     serialized = json.dumps(payload, ensure_ascii=False)
     assert '"api"' in serialized and '"lane_display": "🔧 Server"' in serialized
-    case.tracker.remove_labels(1, ["running"])
-    case.tracker.add_labels(1, ["needs-human"])
-    case.tracker.comment(1, "<!-- foragent:needs-human reason=escalated -->\nChoose a locale")
+    flag(case.ctx, 1, Reason.SPEC_QUESTION, "Choose a locale")
+    case.store.finish_run(1, outcome="spec-question")
+    escalate(case.ctx, 1, "Choose a locale", "Reviewed the available locales")
     assert main(["inspect"]) == 0
     assert "🔧 Server" in capsys.readouterr().out
