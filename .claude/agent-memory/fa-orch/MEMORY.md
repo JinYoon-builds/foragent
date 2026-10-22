@@ -1,5 +1,11 @@
 # orch 레인 현재 메모
 
+- #80(D53): `_implement_and_publish()` 시작 시 설정 명령 또는 실제 작업공간에서 감지한 첫 명령으로 기준선을 한 번 캡처한다. pytest만 지원하며, 대상 ref의 별도 detached 작업공간을 버려 시험이 만든 파일이 구현 작업공간에 섞이지 않게 한다. CI 재리뷰에서 구현으로 돌아오는 경로도 PR head가 아니라 target ref에서 기준선을 잡는다.
+- #80: JUnit은 `<state>/runs/issue-N-acceptance-baseline.xml`에 저장한다. `junit_family=legacy`의 file·classname·name으로 클래스·매개변수를 포함한 정확한 ID를 만들고, 실패·오류·건너뜀(같은 ID의 teardown 오류 포함)을 뺀다. 저장소 루트와 빈 JUnit 접두어를 지정해야 사용자 지정 pytest root·접두어가 실행 가능한 ID를 바꾸지 않는다.
+- #80: 기준선 검사는 기존 `verify()` 안에서 Done when과 함께 실행한다. 매 시도·대상 갱신·충돌 해결 뒤에도 같은 통과 ID만 검사하고 실패는 기존 시도 예산을 쓴다. 0개면 pytest를 빈 선택으로 호출하지 않는다(전체 시험이 다시 실행됨). 구현 프롬프트의 전체 시험 명령은 기준선과 별도로 매 시도 재감지하는 기존 동작을 유지한다.
+- #80: 기준선 건너뜀 기록도 구현자 실행 전에 로그를 만든다. 로그 활동 시험의 가짜 실행기는 실제 `run_logged()`처럼 append해야 한다. `write_text()`로 덮어쓰면 새 출력이 짧아졌을 때 기존 크기 증가 기반 활동 감지가 동작하지 않아 시험 의도와 달라진다.
+- #80 검증: 지정 acceptance-baseline·ci-feedback·conflict-budget·orch-verbs 인수 시험 16개, 새 기준선 경계 시험 8개와 로그 활동 시험 2개가 통과했다. 최종 전체 명령 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest`는 인수 시험을 포함한 2,011개 전부 통과했다. 고정 인수 시험과 Git 인덱스는 수정하지 않았다.
+
 - #64: 구현 프롬프트의 전체 시험 명령은 `config.test_command`를 우선하고, 없으면 실제 작업공간에서 `order.detect_test_commands()`의 첫 명령을 사용한다. CI 로그는 `GhTracker.pr_failed_logs()`가 PR head SHA의 Actions 실행을 페이지 끝까지 읽고 실행별 마지막 4,000자를 가져온다. `.workflow_runs`를 `--jq`로 배열로 꺼내야 기존 `_items()`로 읽을 수 있다.
 - #64: 일반 구현과 재리뷰의 CI 실패는 `_ci_failure()`에서 예산을 한 번만 소비하고 `_implement_and_publish()`의 공통 검증·리뷰·게시 경로로 돌아간다. CI 로그 여러 개를 다시 전체 4,000자로 자르지 않는다. 재리뷰의 detached 작업공간은 같은 위치에서 이슈 브랜치에 연결하고, 새 head는 새 리뷰를 받아야 한다. `_next_review_round()`로 이전 원문 파일을 보존한다.
 - 공통 실행 루프를 추출할 때 기존 `GitRepo` 인스턴스도 넘긴다. 로컬 스킬 제외 경로인 `local_skill_paths`는 인스턴스에 있으므로 `ctx.git.at(worktree)`를 다시 만들면 제외 정보가 사라진다. 스킬 복사를 두 번 호출해도 두 번째 호출은 이미 존재하는 파일을 로컬 주입 대상으로 기록하지 않으므로 처음 인스턴스의 기록을 보존해야 한다.

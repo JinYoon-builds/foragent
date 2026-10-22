@@ -557,6 +557,133 @@ def test_implementation_prompt_full_suite_from_worktree(run_case, files, configu
         ) == 1
 
 
+@pytest.mark.parametrize("options", ["", "--rootdir=tests --junit-prefix=project"])
+def test_baseline_preserves_exact_parameterized_ids_and_excludes_nonpasses(run_case, options):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command=f"{shlex.quote(sys.executable)} -m pytest -q {options}")
+    c.history.update({"tests/acceptance/test_baseline_cases.py": '''import pytest
+
+class TestGroup:
+    @pytest.mark.parametrize("value", ["a b", "x&y"], ids=["a b", "x&y"])
+    def test_pass(self, value):
+        assert value
+
+@pytest.mark.skip(reason="later")
+def test_skipped():
+    pass
+
+@pytest.mark.xfail(reason="later")
+def test_expected_failure():
+    assert False
+
+@pytest.fixture
+def broken_teardown():
+    yield
+    assert False, "teardown failed"
+
+def test_failed_teardown(broken_teardown):
+    pass
+
+def test_future():
+    assert False, "another issue"
+'''})
+    assert run_issue(1, c.ctx) == "merged"
+    prompt = c.executor.calls[0]["prompt"]
+    for parameter in ("a b", "x&y"):
+        assert f"tests/acceptance/test_baseline_cases.py::TestGroup::test_pass[{parameter}]" in prompt
+    for excluded in ("test_skipped", "test_expected_failure", "test_failed_teardown", "test_future"):
+        assert excluded not in prompt
+    log = c.store.log_path(1).read_text()
+    assert "Acceptance baseline count=3, exit_code=1" in log
+    assert "Acceptance baseline verification count=3, exit_code=0" in log
+    assert (c.store.root / "runs/issue-1-acceptance-baseline.xml").is_file()
+
+
+def test_baseline_failure_exhausts_the_done_when_budget(run_case):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0, test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    c.history.update({"tests/acceptance/test_keep.py": '''from pathlib import Path
+def test_keep():
+    assert not Path("feature.txt").exists(), "existing behavior regressed"
+'''})
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    assert c.store.get_run(1).attempts == 1
+    assert len(c.executor.calls) == 1
+    assert c.tracker.merged_prs == []
+    assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+    assert "existing behavior regressed" in c.tracker.list_comments(1)[-1].body
+    assert "Acceptance baseline verification count=2, exit_code=1" in c.store.log_path(1).read_text()
+
+
+@pytest.mark.parametrize("command,reason", [(None, "no test command is known"), ("npm test", "pytest")])
+def test_baseline_skip_is_logged_without_creating_a_probe(run_case, command, reason):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command=command)
+    assert run_issue(1, c.ctx) == "merged"
+    log = c.store.log_path(1).read_text()
+    assert "Acceptance baseline skipped (count=0)" in log and reason in log
+    assert not any("--detach" in args for _, args in c.operations)
+
+
+def test_baseline_uses_detection_and_ignores_full_suite_selection_and_generated_files(run_case, monkeypatch):
+    c = run_case
+    c.history.update({
+        "pytest.ini": "[pytest]\naddopts = --ignore=tests/acceptance\n",
+        "tests/acceptance/test_isolated.py": '''from pathlib import Path
+def test_isolated():
+    if not Path("feature.txt").exists():
+        Path("probe-side-effect.txt").write_text("baseline only")
+''',
+    })
+    command = f"{shlex.quote(sys.executable)} -m pytest -q -c pytest.ini --tb short --ignore=tests/acceptance -k nothing tests"
+    roots = []
+
+    def detect(root):
+        roots.append(root)
+        return [command, "npm test"]
+
+    monkeypatch.setattr("foragent.runner.detect_test_commands", detect)
+    original = c.executor.run
+
+    def implement(**kwargs):
+        assert not (kwargs["worktree"] / "probe-side-effect.txt").exists()
+        return original(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    assert run_issue(1, c.ctx) == "merged"
+    assert roots and all(root == c.store.worktree_path(1) for root in roots)
+    assert "test_isolated" in c.executor.calls[0]["prompt"]
+    assert "Acceptance baseline count=2, exit_code=0" in c.store.log_path(1).read_text()
+    assert "Acceptance baseline verification count=2, exit_code=0" in c.store.log_path(1).read_text()
+    assert not git_command(c.history.origin, "ls-tree", "--name-only", "foragent/issue-1", "probe-side-effect.txt")
+
+
+def test_baseline_is_captured_once_and_survives_review_retry(run_case):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    c.executor.steps.append({})
+    enable_reviewer(c, ["VERDICT: FAIL\nfeature.txt:1 — fix it", "VERDICT: PASS"])
+    assert run_issue(1, c.ctx) == "merged"
+    log = c.store.log_path(1).read_text()
+    assert log.count("Acceptance baseline count=") == 1
+    assert log.count("Acceptance baseline verification count=1, exit_code=0") >= 2
+    for call in c.executor.calls:
+        assert f"- {ACCEPTANCE}::test_feature" in call["prompt"]
+
+
+def test_empty_baseline_does_not_rerun_failing_tests_or_default_to_the_full_suite(run_case):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, acceptance_dir="checks with spaces",
+                           test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    c.history.update({"checks with spaces/test_future.py": "def test_future():\n    assert False\n"})
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 1
+    assert "test_future" not in c.executor.calls[0]["prompt"]
+    log = c.store.log_path(1).read_text()
+    assert "Acceptance baseline count=0, exit_code=1" in log
+    assert "Acceptance baseline verification" not in log
+
+
 @pytest.mark.parametrize("ci_passes,repair_passes_done_when", [(True, True), (False, True), (True, False)])
 def test_ci_retry_preserves_worktree_logs_and_all_checks(run_case, monkeypatch, ci_passes, repair_passes_done_when):
     c = run_case
@@ -1590,7 +1717,8 @@ def test_log_growth_poll_updates_progress_and_quiet_poll_does_not(run_case):
         assert c.store.get_run(1).last_progress_at == before
         assert c.store.get_run(1).last_activity_at == activity_before
         c.store.log_path(1).parent.mkdir(parents=True, exist_ok=True)
-        c.store.log_path(1).write_text("new executor output\n")
+        with c.store.log_path(1).open("a") as stream:
+            stream.write("new executor output\n")
         c.now[0] += timedelta(seconds=30)
         poll()
         observed.append(c.store.get_run(1).last_progress_at)
@@ -1615,7 +1743,8 @@ def test_short_executor_records_activity_without_a_periodic_poll(run_case, monke
         result = execute(**kwargs)
         c.now[0] += timedelta(seconds=7)
         kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
-        kwargs["log_path"].write_text("completed before the first poll\n")
+        with kwargs["log_path"].open("a") as stream:
+            stream.write("completed before the first poll\n")
         return result
 
     monkeypatch.setattr(c.executor, "run", short_run)
