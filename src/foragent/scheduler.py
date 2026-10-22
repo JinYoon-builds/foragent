@@ -87,6 +87,14 @@ def _invalidate_approval(
     report.actions.append(f"#{issue.number} flagged hash-mismatch: {summary}")
 
 
+def _kill_executor(ctx: TickContext, number: int) -> None:
+    # Re-read after stopping the runner: it may have spawned or reaped an executor.
+    run = ctx.store.get_run(number)
+    if run.executor_pgid is not None:
+        ctx.kill_runner(run.executor_pgid)
+        ctx.store.update_run(number, executor_pgid=None)
+
+
 def _kill_run(
     ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
     count_stall: bool = False,
@@ -99,6 +107,7 @@ def _kill_run(
     try:
         if run.pid is not None:
             ctx.kill_runner(run.pid)
+        _kill_executor(ctx, number)
     except Exception:
         if count_stall:
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
@@ -303,6 +312,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         # A recorded completion does not need another signal.
         if run.pid is not None and run.outcome in {None, "crashed", "stalled-restart", "stalled"}:
             ctx.kill_runner(run.pid)
+        _kill_executor(ctx, run.number)
         ctx.git.remove_worktree(Path(run.worktree))
         outcome = run.outcome or "crashed"
         detail = _crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
