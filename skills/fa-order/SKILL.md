@@ -151,7 +151,9 @@ no-match or deferred choice with the person; do not invent candidates or hand th
 ## Design first (D33)
 Use `ui.frameworks` and `ui.has_design_foundation` from the context alongside the request.
 For UI work without a foundation, first suggest a design session (`/fa-design-session`)
-to settle the visual direction (D72). Use its agreed output as settled context, then
+as design mode in this same planning session to settle the visual direction (D72).
+Compare references on the local board, then running drafts in their actual medium.
+Read its `docs/design/<topic>/HANDOFF.md` as settled context, then
 create a small design foundation implementation issue: tokens,
 a few basic components, a sample page, and `docs/design/CONTRACT.md` for product-wide
 tone, density and principles. Derive taste from 2–3 reference apps or sites the user
@@ -165,6 +167,8 @@ create an issue to fix the tokens or contract so all screens improve together.
 Exploratory throwaway prototypes are exempt: label the prototype as disposable, then
 establish the foundation and rebuild once the direction is known. Include
 `fa design lint` in visual issues' Done when checks, alongside accessibility and flow E2E.
+Carry the selected draft's run instructions and the same screen as the draft into
+visual Done when evidence so implementing workers can reproduce the agreed result.
 
 ## 3. Restate and confirm
 Before splitting, restate in a few lines: what will exist when this order is done, what is
