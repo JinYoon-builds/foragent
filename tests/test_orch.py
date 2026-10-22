@@ -51,6 +51,38 @@ def assert_blocked(c, reason):
     assert len(c.tracker.created_prs) == 1
 
 
+@pytest.mark.parametrize("entry", ["review-only", "resolve"])
+def test_fast_review_merge_reuses_post_merge_reinstall(review_case, monkeypatch, entry):
+    c = review_case
+    calls = []
+
+    def reinstall(ctx, pr, base):
+        assert c.tracker.merged_prs == [c.pr]
+        calls.append((ctx, pr, base))
+
+    monkeypatch.setattr(runner, "after_merge", reinstall)
+    if entry == "resolve":
+        orch.resolve(c.ctx, 1, "pass", "Reviewed the current head")
+    else:
+        assert runner.review_only(1, c.ctx) == "merged"
+    assert calls == [(c.ctx, c.pr, "main")]
+
+
+def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch):
+    c = review_case
+    calls = []
+
+    def failed_merge(*args, **kwargs):
+        raise runner.TrackerError("merge failed")
+
+    monkeypatch.setattr(c.tracker, "merge_pr", failed_merge)
+    monkeypatch.setattr(runner, "after_merge", lambda *args: calls.append(args))
+    assert runner.review_only(1, c.ctx) == "error"
+    assert_blocked(c, Reason.RETRIES_EXCEEDED)
+    assert "merge failed" in c.store.log_path(1).read_text()
+    assert calls == []
+
+
 def test_resolve_queues_ci_repair_without_changing_the_verdict_head(review_case):
     c = review_case
     logs = "FAILED existing tests: preserve the original failure output"
@@ -119,7 +151,8 @@ def test_review_ci_failure_repairs_same_pr_and_rechecks_new_head(run_case, monke
     assert prior_review.read_text() == "prior raw review"
     assert len(list(prior_review.parent.glob("review-*.txt"))) == len(reviews) + 1
     assert len(c.tracker.created_prs) == 1
-    adds = [args for _, args in c.operations if args[:2] == ["worktree", "add"]]
+    adds = [args for _, args in c.operations
+            if args[:2] == ["worktree", "add"] and str(c.store.worktree_path(1)) in args]
     assert len(adds) == 1 and "--detach" in adds[0]
     assert c.store.log_path(1).read_text().count("Done when command:") == 4
     if repair_result == "pass":
