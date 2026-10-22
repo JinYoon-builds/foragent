@@ -1,5 +1,9 @@
 # orch 레인 현재 메모
 
+- #92: gate의 `_tick_locked()`는 모든 레인의 시작·PID 저장을 마친 뒤 실제 시작이 있으면 `watch_open.open_view(repo_root, store, config.language)`를 tick당 한 번 호출한다. 기존 opener가 Orca 재사용·Terminal 대체·살아 있는 `watch.pid`와 `FORAGENT_VIEW=off` 억제를 맡는다. gate 호출 경계에서도 `Exception`을 처리해 예상 밖 opener 오류가 시작 결과를 잃게 하지 않으며, 오류는 기존 번역 문구로 정규화한 한 줄을 `report.actions`에 추가한다.
+- #92 시험: `tests/conftest.py`의 자동 fixture가 `FORAGENT_VIEW=off`로 실제 창을 막는다. `_call` 실패 주입은 opt-out을 해제해 opener 내부의 예상 오류 처리를 확인하고, `open_view` 자체의 예외 주입은 gate의 반환 결과·다중 레인 PID·시작 메시지·다음 tick 보존을 확인한다. 지정 인수 시험은 `tests/acceptance/test_gate_open_view.py` 4개, 경계 시험은 `tests/test_scheduler.py -k 'view_opens_once or view_opener'` 6개다. 레인 시작 순서는 `lane_order()`로 main이 마지막이므로 보존 시험에서는 메시지 집합을 비교한다.
+- #92 최종 검증: 지정 인수 시험 4개와 scheduler·watch_open 회귀 188개 통과. `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run pytest`는 2,093개 통과, 범위 밖 foreground 자동 열기 8개 실패(401.26초). 변경 전 HEAD의 src를 `/private/tmp/fa-92-review-base.er7BTu/src`로 추출해 같은 8개 실패를 재현했고, `foragent.scheduler.__file__`로 기준선 소스 로딩과 실패 ID 집합의 일치도 확인했다. 전체 로그는 `/private/tmp/fa-issue-92-review-full.log`, 기준선 로그는 `/private/tmp/fa-issue-92-review-base-foreground.log`이며 `.foragent/REBUTTAL.md`에 범위 근거를 남겼다. 인수 시험·Git 인덱스는 수정하지 않았다.
+
 - #93(D57 재설치): `orch.merge()`의 성공 이벤트 뒤에서만 `orch_reinstall.after_merge()`를 호출한다. 병합 후 base를 다시 fetch해 SHA를 고정하고 detached 임시 작업공간의 `[project].name == "foragent"`일 때만 `uv tool install --force --reinstall <path>`를 실행한다. 사용자 checkout이나 PR head를 설치 소스로 쓰지 않는다.
 - #93: `uv tool dir`의 `foragent/lib/python*/site-packages/foragent`를 재귀적으로 비교한다. 설치 누락·남은 파일·중첩 데이터·`_build.py`도 검사하고 Python 캐시만 제외한다. `setup.py`가 빌드 중 소스의 `_build.py`를 생성하므로 설치 후 소스와 비교한다. 실제 uv의 격리 설치에서도 소스·설치본 41개 파일이 일치했다.
 - #93: 설치·검증·fetch·작업공간 오류는 병합을 되돌리지 않고 `reinstall failed: <reason>` 한 줄과 로컬 `reinstall-failed` 이벤트로 남긴다. 생성에 성공한 작업공간만 `finally`에서 Git 등록을 제거한다. 별도 경계 시험은 고정 인수 파일과 모듈명이 겹치지 않는 `tests/test_orch_reinstall_unit.py`에 있다.

@@ -647,6 +647,84 @@ def test_launcher_can_return_no_pid(ctx):
     assert ctx.store.get_run(1).pid is None
 
 
+def test_view_opens_once_after_all_available_lanes_launch(ctx, monkeypatch):
+    ctx.config = replace(ctx.config, lanes={"ui": {}}, max_parallel=2, language="ko")
+    ctx.start_runs = True
+    approve(ctx, 1)
+    approve(ctx, 2, labels=["lane:ui"])
+    opened = []
+
+    def open_view(root, store, language):
+        assert {run.number: run.pid for run in store.active_runs()} == {1: 7001, 2: 7002}
+        opened.append((root, store, language))
+
+    monkeypatch.setattr("foragent.scheduler.watch_open.open_view", open_view)
+    tick(ctx)
+    assert opened == [(ctx.repo_root, ctx.store, "ko")]
+    tick(ctx)
+    assert len(opened) == 1
+
+
+@pytest.mark.parametrize("failure", [
+    FileNotFoundError("opener gone"), PermissionError("desktop unavailable"),
+    subprocess.TimeoutExpired("opener", 5),
+])
+def test_view_opener_failure_keeps_all_runs_and_reports_success(ctx, monkeypatch, capsys, failure):
+    ctx.config = replace(ctx.config, lanes={"ui": {}}, max_parallel=2, language="ko")
+    ctx.start_runs = True
+    approve(ctx, 1)
+    approve(ctx, 2, labels=["lane:ui"])
+    monkeypatch.delenv("FORAGENT_VIEW")
+    monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.setattr("foragent.watch_open.shutil.which", lambda name: "/fake/osascript")
+
+    def fail(argv, root):
+        raise failure
+
+    monkeypatch.setattr("foragent.watch_open._call", fail)
+    report = tick(ctx)
+    assert report.skipped is None
+    assert {run.number: run.pid for run in ctx.store.active_runs()} == {1: 7001, 2: 7002}
+    assert all("running" in ctx.tracker.get_issue(number).labels for number in (1, 2))
+    assert {action for action in report.actions if "started running" in action} == {
+        "#1 started running (pid=7001)", "#2 started running (pid=7002)",
+    }
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert len(captured.err.splitlines()) == 1
+    assert "레인 화면을 열지 못했습니다" in captured.err
+    tick(ctx)
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("failure", [
+    OSError("cannot read watch.pid"), RuntimeError("opener failed\nunexpectedly"),
+])
+def test_view_opener_exception_preserves_tick_report_and_next_tick(ctx, monkeypatch, failure):
+    ctx.config = replace(ctx.config, lanes={"ui": {}}, max_parallel=2)
+    ctx.start_runs = True
+    approve(ctx, 1)
+    approve(ctx, 2, labels=["lane:ui"])
+    opened = []
+
+    def fail(root, store, language):
+        opened.append((root, store, language))
+        raise failure
+
+    monkeypatch.setattr("foragent.scheduler.watch_open.open_view", fail)
+    report = tick(ctx)
+    assert report.skipped is None
+    assert {run.number: run.pid for run in ctx.store.active_runs()} == {1: 7001, 2: 7002}
+    assert all("running" in ctx.tracker.get_issue(number).labels for number in (1, 2))
+    assert {action for action in report.actions if "started running" in action} == {
+        "#1 started running (pid=7001)", "#2 started running (pid=7002)",
+    }
+    assert report.actions[-1] == "could not open lane view: " + " ".join(str(failure).split())
+    assert opened == [(ctx.repo_root, ctx.store, ctx.config.language)]
+    assert tick(ctx).actions == []
+    assert len(opened) == 1
+
+
 def test_outside_local_run_hours_promotes_without_starting(ctx):
     approve(ctx)
     local_hour = ctx.now().astimezone().hour

@@ -8,10 +8,11 @@ from pathlib import Path
 import re
 import subprocess
 
-from foragent import board
+from foragent import board, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitRepo
+from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
 from foragent.orch_events import append_event
@@ -515,6 +516,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         return report
 
+    started = False
     for lane in sorted(ready, key=lane_order):
         active = ctx.store.active_runs()
         if len(active) >= ctx.config.max_parallel:
@@ -548,5 +550,13 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             pid = ctx.launcher(number)
             ctx.store.update_run(number, pid=pid)
             report.actions.append(f"#{number} started running (pid={pid})")
+            started = True
             break
+    if started:
+        try:
+            watch_open.open_view(ctx.repo_root, ctx.store, ctx.config.language)
+        except Exception as exc:
+            # Optional progress display must never hide successfully started runs.
+            error = " ".join(str(exc).split())[:200]
+            report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
     return report
