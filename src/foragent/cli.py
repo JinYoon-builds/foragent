@@ -122,12 +122,13 @@ def _parser() -> argparse.ArgumentParser:
   "new_lanes": [{"name": "api", "paths": ["api/**"], "skills": []}],
   "issues": [{"key": "login", "title": "Login API", "goal": "...", "out_of_scope": "...",
     "done_when": ["uv run pytest tests/acceptance/test_login.py"], "checklist": [],
-    "lane": "api", "size": "m", "blocked_by": [], "files": ["src/api/**"],
+    "lane": "api", "size": "m", "interactive": false, "blocked_by": [], "files": ["src/api/**"],
     "acceptance_files": {"tests/acceptance/test_login.py": "..."}}],
   "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
     "checklist": [], "files": [], "acceptance_files": {}}]
 }
 new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
+issues[].interactive is an optional boolean (default false); true adds the interactive label.
 files lists repository-relative paths or globs expected to change; absolute paths and .. are rejected.''',
     )
     publish.add_argument("plan", type=Path)
