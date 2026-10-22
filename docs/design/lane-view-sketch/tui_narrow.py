@@ -116,6 +116,26 @@ def lane(name, pose, nums, done, line1, line2, f):
     return out
 
 
+def progress_block(done=7, total=20, last_hour=3):
+    """Plain words: how far, when it ends (clock time), and why; plus quota in words."""
+    import datetime
+    w = max(10, min(24, width() - 22))
+    filled = round(w * done / total)
+    bar = GRN + "█" * filled + RESET + DIM + "░" * (w - filled) + RESET
+    left = total - done
+    out = [f" {BOLD}진행{RESET}  {bar} {done}/{total}"]
+    if last_hour:
+        end = datetime.datetime.now() + datetime.timedelta(hours=left / last_hour)
+        ampm = "새벽" if end.hour < 6 else ("오전" if end.hour < 12 else ("오후" if end.hour < 18 else "밤"))
+        h = end.hour % 12 or 12
+        out += [f"       이 속도면 {BOLD}{ampm} {h}시 {end.minute // 10 * 10}분쯤{RESET} 끝나요",
+                f"       {DIM}(최근 1시간에 {last_hour}개 끝냈어요){RESET}"]
+    else:
+        out += [f"       {DIM}끝나는 시각은 아직 몰라요 (최근 1시간에 끝낸 게 없어요){RESET}"]
+    out.append(f" {BOLD}쿼터{RESET}  Codex 67% · 일요일 리셋 전에 다 써요")
+    return out
+
+
 def draw(lines):
     sys.stdout.write("\x1b[H\x1b[J" + "\n".join(lines) + "\n")
     sys.stdout.flush()
@@ -216,7 +236,7 @@ def running(seconds=None):
                       f"        {DIM}항상 열기로 Jin이 정했어요.{RESET}",
                       f"  {DIM}19:10{RESET} #93 머지했어요",
                       f"  {DIM}18:55{RESET} #92 리뷰 지적 1개를 고쳐서 다시 맡겼어요"]
-        lines += [rule()]
+        lines += [rule()] + progress_block() + [rule()]
         for ln in LANES:
             lines += lane(*ln, f) + [""]
         lines += foot() + [hint()]
