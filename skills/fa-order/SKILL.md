@@ -13,6 +13,32 @@ The quality of everything that follows is decided here.
 Talk to the user in the `language` from `fa order context`. Write issue text, tests and
 specs in English unless the repository is clearly written in another language.
 
+## Local preparation progress
+At order start, immediately run `fa order progress start --title "<request summary>"`,
+then `fa gate watch --open` so the lane view is available while the order is prepared.
+Report facts after every preparation step with `fa order progress`; its JSON output is
+the persisted state shared with the view. Bubble text is built deterministically from
+these facts, with no LLM calls or separate model generation for bubbles.
+
+Use these commands as the corresponding facts become known (replace angle brackets):
+- Settled decision: `fa order progress ledger --add "<decision>"`.
+- Proposed issue: `fa order progress chunk --add "<chunk>"`. Keep its name stable;
+  each chunk has five cells: `goal`, `out_of_scope`, `done_when`, `lane`, `skills`.
+- Open question: `fa order progress cell --chunk "<chunk>" --slot <slot> --ask "<question>"`.
+- Settled cell: `fa order progress cell --chunk "<chunk>" --slot <slot> --filled`.
+  Mark each cell only when its content is settled, including an explicitly empty skills
+  list. An unanswered question leaves the cell empty; a filled cell clears its question.
+- Acceptance checks written: `fa order progress tests --done <n> --total <N>`;
+  count chunks with finished checks out of all chunks that need them.
+- Successful plan dry-run: `fa order progress check`.
+- User approval received: `fa order progress approval`.
+- Each issue actually published or updated: `fa order progress publish --issue <number>`.
+- After the final summary, or when the user cancels: `fa order progress end` clears
+  preparation state. Keep facts on a recoverable failure so preparation can continue.
+
+These commands record facts locally; `progress publish` records the result of publication.
+Use `fa order publish` below to perform the approved publication itself.
+
 ## 1. Gather before asking
 Run `fa order context --json` and read it fully. Then read the repository yourself as needed
 (README, existing specs in `docs/specs/`, the code areas you will touch).
@@ -96,6 +122,8 @@ checklist item and keep at least one executable command anyway (e.g. the build o
 check). Done when commands must run with the repo's normal tooling from the repo root.
 
 ## 6. One approval
+Write the plan JSON (schema in `fa order publish --help`) to a temp file. Run
+`fa order publish PLAN.json --dry-run`, fix validation errors, then record `progress check`.
 Show the order grouped by lane, work first:
 ```
 This order: 7 issues
@@ -106,13 +134,16 @@ This order: 7 issues
 ```
 Then AskUserQuestion: Approve all (recommended) / Approve some / Change something.
 Show the acceptance test of any issue the user asks about.
+Record `fa order progress approval` once the user approves. If the plan changes, repeat
+the dry-run and present the revised scope for approval.
 
 ## 7. Publish
-Write the plan JSON (schema in `fa order publish --help`) to a temp file, run
-`fa order publish PLAN.json --dry-run`, fix any validation error, then run it for real with
+Run the validated `fa order publish PLAN.json` for real with
 `--approve` (or `--approve-keys` for a partial approval). Decisions and feedback that change
-existing issues go into `edits`. Show the printed summary and one line on what happens next
-("the gate starts within 5 minutes; /fa-inspect shows results").
+existing issues go into `edits`. Record `progress publish --issue <number>` for each
+published or updated issue in the result. Show the printed summary and one line on what
+happens next ("the gate starts within 5 minutes; /fa-inspect shows results"), then run
+`fa order progress end`.
 
 Never add `approved` yourself outside `fa order publish`, never edit acceptance tests of
 issues that are already running, never merge.
