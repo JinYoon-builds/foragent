@@ -67,5 +67,5 @@ lanes:
     - skills/fa-init/**
     agent: fa-design
     skills: []
-max_parallel: 3
+max_parallel: 5
 board: PVT_kwHODvdhm84BoMtn
