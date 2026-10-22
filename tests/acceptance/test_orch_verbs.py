@@ -4,13 +4,13 @@ import pytest
 
 
 def blocked_case(git_history, tmp_path, monkeypatch):
+    from foragent.actions import flag
+    from foragent.reasons import Reason
     from test_orch_review_handoff import bind_cli, make_case
 
     case = make_case(git_history, tmp_path, monkeypatch)
     case.store.finish_run(1, outcome="blocked")
-    case.tracker.remove_labels(1, ["running"])
-    case.tracker.add_labels(1, ["blocked"])
-    case.tracker.comment(1, "<!-- foragent:blocked reason=review-dispute -->\nLocale mismatch\nRaw details")
+    flag(case.ctx, 1, Reason.REVIEW_DISPUTE, "Locale mismatch", "Raw details")
     main = bind_cli(case, monkeypatch)
     monkeypatch.setattr("foragent.cli.RunContext", lambda **kwargs: case.ctx)
     return case, main
@@ -34,6 +34,8 @@ def assert_event(case):
 def test_list_exposes_blocked_details_reviews_and_log_reference(git_history, tmp_path, monkeypatch, capsys):
     import json
 
+    from foragent.orch import escalate
+
     case, main = blocked_case(git_history, tmp_path, monkeypatch)
     review = case.store.root / "runs/issue-1/review-1.txt"
     review.parent.mkdir(parents=True, exist_ok=True)
@@ -41,7 +43,8 @@ def test_list_exposes_blocked_details_reviews_and_log_reference(git_history, tmp
     log = case.store.log_path(1)
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("".join(f"line {i}\n" for i in range(100)))
-    case.tracker.add_issue(2, "Human decision", labels=["needs-human"])
+    case.tracker.add_issue(2, "Human decision")
+    escalate(case.ctx, 2, "Choose a locale", "Reviewed the available locales")
     assert main(["orch", "list", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     items = payload if isinstance(payload, list) else payload["items"]

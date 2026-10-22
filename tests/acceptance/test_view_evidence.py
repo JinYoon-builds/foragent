@@ -8,11 +8,16 @@ from test_heartbeats import heartbeats_offline, heartbeats_write
 
 
 def view_evidence_case(git_history, tmp_path, monkeypatch):
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
     from test_view_status import status_case
 
     case, main = status_case(git_history, tmp_path, monkeypatch, language="ko")
     for number in (2, 3, 4):
         case.tracker.close_issue(number)
+    # The first gate tick imports these existing remote closures before
+    # the PID, log and heartbeat evidence under test is installed.
+    tick(tick_context(case, start_runs=False))
     case.store.update_run(1, pid=88001, phase="implementing",
                           last_activity_at=case.clock[0].isoformat(),
                           last_progress_at=case.clock[0].isoformat())
@@ -113,11 +118,17 @@ def test_view_evidence_stale_gate_warns_on_first_line(git_history, tmp_path, mon
 def test_view_evidence_idle_without_heartbeats_has_no_orchestrator_warning(
     git_history, tmp_path, monkeypatch, capsys,
 ):
+    from foragent.scheduler import tick
     from foragent.watch import render_frame
+    from test_orch_review_handoff import tick_context
 
     case, main = view_evidence_case(git_history, tmp_path, monkeypatch)
     case.store.finish_run(1, outcome="merged")
+    # A person closes the issue after the initial snapshot; the gate must
+    # refresh it before the local-only view can observe the idle project.
     case.tracker.close_issue(1)
+    case.clock[0] += timedelta(minutes=5)
+    tick(tick_context(case, start_runs=False))
     for name in ("orch", "gate"):
         (case.store.root / f"{name}-heartbeat.json").unlink()
     frame = render_frame(view_evidence_snapshot(case, main, capsys), case.config, case.root,

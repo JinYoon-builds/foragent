@@ -45,9 +45,11 @@ def test_heartbeats_watch_overwrites_on_first_and_unchanged_state_reads(
 ):
     from foragent import orch
     from foragent.cli import main
-    from test_orch_review_handoff import bind_cli, make_case
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import bind_cli, make_case, tick_context
 
     case = make_case(git_history, tmp_path, monkeypatch)
+    tick(tick_context(case, start_runs=False))
     bind_cli(case, monkeypatch)
     path = case.store.root / "orch-heartbeat.json"
     assert not path.exists()

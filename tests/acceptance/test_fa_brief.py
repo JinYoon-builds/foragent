@@ -11,21 +11,26 @@ from test_skills_autosync import isolated_home
 
 
 def briefing_case(git_history, tmp_path, monkeypatch, *, language="ko"):
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
     from test_view_status import status_case
 
     case, main = status_case(git_history, tmp_path, monkeypatch, language=language)
     lanes = {name: dict(settings) for name, settings in case.ctx.config.lanes.items()}
     lanes["api"]["skills"] = ["house-style"]
     case.ctx.config = replace(case.ctx.config, lanes=lanes, skill_libraries=[])
-    # Persist the public run record, including the new field, rather than mocking briefing output.
-    path = case.store.root / "runs/1.json"
-    record = json.loads(path.read_text())
-    record["skills_used"] = ["tone", "polish-x"]
-    path.write_text(json.dumps(record))
     case.tracker.add_issue(5, "Review this PR", labels=["approved", "lane:docs"])
     case.tracker.create_pr(head="foragent/issue-5", base="main", title="Review", body="Closes #5")
     case.tracker.add_issue(6, "Pick a policy", labels=["needs-human", "lane:decision"])
     case.tracker.comment(6, "<!-- foragent:needs-human reason=spec-question -->\nPick policy\nA or B?")
+    # Import the complete pre-existing GitHub state before briefing reads it.
+    tick(tick_context(case, start_runs=False))
+    # Install the future run field after the import, so today's gate does not
+    # deserialize an unsupported schema before the briefing under test runs.
+    path = case.store.root / "runs/1.json"
+    record = json.loads(path.read_text())
+    record["skills_used"] = ["tone", "polish-x"]
+    path.write_text(json.dumps(record))
     return case, main
 
 

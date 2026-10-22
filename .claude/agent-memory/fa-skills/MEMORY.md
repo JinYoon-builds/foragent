@@ -1,5 +1,7 @@
 # skills 레인 현재 메모
 
+- `GitRepo.fetch()`는 공유 clone의 참조 갱신 경합(`incorrect old value provided`)만 짧게 기다려 최대 3회 시도한다. `_call()` 전체에 재시도를 넣으면 다른 Git 작업까지 바뀌므로 fetch 안에서 처리한다. 재시도 중 다른 오류가 나오면 즉시 원문으로 전달한다. #134 검증: `uv run pytest tests/acceptance/test_fetch_race.py`, 회귀: `uv run pytest tests/test_git.py -k fetch`.
+
 - 라이브러리 스킬 설치 기본값은 로컬 복사다. `.gitignore`에는 `/.claude/skills/<이름>/` 규칙만 한 번 추가하며, 기존 내용은 바이트 그대로 보존한다. 전체 `.claude/skills/`를 제외하면 사용자 스킬도 빠지므로 개별 경로를 쓴다.
 - `SkillManager.install(..., commit=True)` / `fa skills install --commit`에서만 기존 오픈소스 라이선스 차단과 `THIRD_PARTY_NOTICES.md` 생성을 적용한다. 로컬 설치는 불명확하거나 비공개인 라이선스도 경고 후 허용하며 Git 조회가 필요 없다.
 - `lane_files()`는 레인 설정·에이전트 정의·`.gitignore`만 반환한다. `order.publish()`의 중단 복구도 이 함수를 쓰므로 라이브러리 스킬 파일을 반환하면 강제 추적·커밋된다.
@@ -16,3 +18,8 @@
 - `skills/<이름>`과 `.<도구>/skills/<이름>`은 같은 `<라이브러리 접두사>:<이름>`으로 묶는다. 공용 사본을 먼저 선택하고 `copies`에는 모든 상대 경로를 남긴다. `engineering/skills/<이름>` 같은 직무별 기존 ID는 유지한다. 완전한 ID 선택은 이름 별칭보다 우선한다.
 - 카탈로그의 `role`은 미확정이면 `null`이다. `runs_scripts`는 파일 경로만 확인하며 모든 도구 사본을 합산한다. 스크립트를 읽어 평가하거나 실행하지 않는다.
 - 등록 회귀는 `tests/test_skill_registration.py`에 둔다. pytest 기본 수집 방식에서는 acceptance 파일과 같은 `test_skills_add.py` 이름을 쓰면 import 충돌이 난다. #101 검증은 `UV_CACHE_DIR=/private/tmp/fa-issue-101-uv-cache uv run pytest tests/acceptance/test_skills_add.py`다.
+- `fa lanes skills <lane> [ids]`는 기존 레인의 고정 목록을 교체하며 ID 생략은 비우기다. 설정의 `agent`가 가리키는 파일의 본문·다른 필드는 보존하고, 설치본은 제거하지 않는다. 변경은 작업 트리에 남긴다.
+- 레인 생성·고정 스킬 변경은 `_check_skills()`로 설치 전에 모든 ID와 설치 디렉터리 중복·`style` 최대 하나를 확인한다. 역할은 별칭 문자열 대신 해석된 `Skill.role`로 판정한다. 검증 실패 시 레인 파일과 설치 디렉터리를 바꾸지 않아야 한다.
+- #102 검증: `uv run pytest tests/acceptance/test_lane_fixed_skills.py`; 회귀는 `tests/test_skills_lanes.py`의 `fixed_lane` 사례(사용자 지정 에이전트·설정 보존, 목록 비우기, 잘못된 요청의 무변경, 생성 시 style 제한)다.
+- 레인 에이전트는 삭제되거나 처음부터 없을 수 있다. `set_lane_skills()`는 설치 전에 `read_text()`의 `OSError`를 경로가 포함된 `LaneError`로 변환한다. 누락·미생성·디렉터리 경로의 CLI 오류와 프로젝트 파일 무변경을 함께 검증한다.
+- 설정 `_overlay()`는 `tiers`만 깊게 병합하며 `lanes`는 전역 → 로컬 순으로 목록 전체를 교체한다. 로컬 `lanes`가 있으면 `config.lanes`에 전역 전용 레인이 섞이지 않는다. 목록을 처음 로컬에 저장할 때는 상속한 다른 레인을 보존해야 한다. 전역·로컬 혼합 회귀는 `test_set_lane_skills_does_not_copy_overridden_global_lanes`다.

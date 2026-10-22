@@ -173,6 +173,22 @@ def test_fetch_updates_remote_tracking_blobs(git_history, custom_refspec):
     assert git.blob_sha("origin/main", ACCEPTANCE) != before
 
 
+def test_fetch_stops_on_a_different_error_after_a_ref_race(tmp_path, monkeypatch):
+    calls = []
+    messages = ["incorrect old value provided\n", "fatal: remote unavailable\n"]
+    monkeypatch.setattr("foragent.git.time.sleep", lambda _: None)
+
+    def run(args):
+        calls.append(args)
+        raise subprocess.CalledProcessError(1, ["git", *args], stderr=messages[len(calls) - 1])
+
+    with pytest.raises(GitError) as error:
+        GitRepo(tmp_path, run).fetch("upstream", "release/v1")
+
+    assert str(error.value) == messages[1]
+    assert calls == [["fetch", "upstream", "+refs/heads/release/v1:refs/remotes/upstream/release/v1"]] * 2
+
+
 def test_commit_before_selects_approval_time_history(git_history):
     git = GitRepo(git_history.clone)
     initial = git_history.tip

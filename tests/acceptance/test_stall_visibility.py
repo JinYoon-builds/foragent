@@ -13,9 +13,12 @@ def _api_row(output):
 
 
 def test_dead_runner_shows_as_stalled_at_once(git_history, tmp_path, monkeypatch, capsys):
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
     from test_view_status import status_case
 
     case, main = status_case(git_history, tmp_path, monkeypatch)
+    tick(tick_context(case, start_runs=False))
     process = subprocess.Popen(["true"])
     process.wait()
     now = case.clock[0].isoformat()
@@ -26,9 +29,12 @@ def test_dead_runner_shows_as_stalled_at_once(git_history, tmp_path, monkeypatch
 
 def test_stalled_mark_follows_stall_minutes(git_history, tmp_path, monkeypatch, capsys):
     from foragent import cli
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
     from test_view_status import status_case
 
     case, main = status_case(git_history, tmp_path, monkeypatch)
+    tick(tick_context(case, start_runs=False))
     config = replace(case.ctx.config, stall_minutes=3)
     monkeypatch.setattr(cli, "load_config", lambda root: config)
     recent = (case.clock[0] - timedelta(minutes=4)).isoformat()
@@ -43,19 +49,20 @@ def test_stalled_mark_follows_stall_minutes(git_history, tmp_path, monkeypatch, 
 
 
 def test_notification_line_names_the_issue_and_the_reason(git_history, tmp_path, monkeypatch):
+    from foragent.actions import flag
     from foragent.config import Config
     from foragent.inspect_actions import notify
     from foragent.inspect_data import InspectContext
-    from foragent.reasons import Reason, format_comment
-    from test_orch_review_handoff import make_case
+    from foragent.reasons import Reason
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import make_case, tick_context
 
     case = make_case(git_history, tmp_path, monkeypatch)
-    case.tracker.remove_labels(1, ["running"])
-    case.tracker.add_labels(1, ["blocked", "needs-human"])
-    case.tracker.comment(1, format_comment(Reason.ORCHESTRATOR_TIMEOUT,
-                                           "The orchestrator has not responded to this blocker.",
-                                           "Latest blocker: Runner stalled again after one restart.",
-                                           label="needs-human"))
+    flag(case.ctx, 1, Reason.STALLED, "Runner stalled again after one restart.")
+    case.store.finish_run(1, outcome="stalled")
+    case.clock[0] += timedelta(minutes=case.config.orchestrator_timeout_minutes + 1)
+    tick(tick_context(case, start_runs=False))
+    assert "needs-human" in case.tracker.get_issue(1).labels
     sent = []
     ctx = InspectContext(case.tracker, case.store, "owner/repo", Config(repo="owner/repo"), lambda: case.clock[0])
     line = notify(ctx, notifier=lambda line, title: sent.append(line))

@@ -23,6 +23,11 @@
 
 설치는 두 조각: 대화 단계용 스킬(`fa-init`, `fa-order`, `fa-inspect`)과 명령줄 프로그램 `foragent`(별칭 `fa`: `fa gate`, `fa config`).
 
+기존 레인에 사람이 고른 고정 스킬을 지정하려면 `fa lanes skills <lane> <id>...`를 쓴다.
+지정한 목록으로 `.foragent.yml`과 해당 에이전트의 스킬 목록을 교체하고, 스킬은 로컬에 설치한다.
+ID 없이 `fa lanes skills <lane>`을 실행하면 목록을 비운다. `style` 스킬은 레인당 하나까지 지정할 수 있다.
+변경은 작업 트리에 남으므로 확인한 뒤 커밋한다.
+
 ## 문서
 
 - [docs/decisions.md](docs/decisions.md) — 확정된 결정과 이유

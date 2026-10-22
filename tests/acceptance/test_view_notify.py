@@ -107,8 +107,11 @@ def test_delivery_failure_is_logged_without_escaping_and_inspect_uses_default_ou
     from types import SimpleNamespace
     import urllib.request
 
+    from foragent.actions import flag
     from foragent.config import Config
     from foragent import notify
+    from foragent.orch import escalate
+    from foragent.reasons import Reason
     from test_orch_review_handoff import bind_cli, make_case
 
     def broken(*args, **kwargs):
@@ -126,8 +129,9 @@ def test_delivery_failure_is_logged_without_escaping_and_inspect_uses_default_ou
             notify.send(Config(repo="owner/repo", notify=target), "Title", "Line", None)
     assert caplog.records or capsys.readouterr().err
     case = make_case(git_history, tmp_path, monkeypatch)
-    case.tracker.add_labels(1, ["needs-human"])
-    case.tracker.comment(1, "<!-- foragent:needs-human reason=escalated -->\nChoose locale")
+    flag(case.ctx, 1, Reason.SPEC_QUESTION, "Choose locale")
+    case.store.finish_run(1, outcome="spec-question")
+    escalate(case.ctx, 1, "Choose locale", "Reviewed the available locales")
     main = bind_cli(case, monkeypatch)
     processes = []
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw:
