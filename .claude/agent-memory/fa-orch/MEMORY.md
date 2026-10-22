@@ -1,5 +1,11 @@
 # orch 레인 현재 메모
 
+- #93(D57 재설치): `orch.merge()`의 성공 이벤트 뒤에서만 `orch_reinstall.after_merge()`를 호출한다. 병합 후 base를 다시 fetch해 SHA를 고정하고 detached 임시 작업공간의 `[project].name == "foragent"`일 때만 `uv tool install --force --reinstall <path>`를 실행한다. 사용자 checkout이나 PR head를 설치 소스로 쓰지 않는다.
+- #93: `uv tool dir`의 `foragent/lib/python*/site-packages/foragent`를 재귀적으로 비교한다. 설치 누락·남은 파일·중첩 데이터·`_build.py`도 검사하고 Python 캐시만 제외한다. `setup.py`가 빌드 중 소스의 `_build.py`를 생성하므로 설치 후 소스와 비교한다. 실제 uv의 격리 설치에서도 소스·설치본 41개 파일이 일치했다.
+- #93: 설치·검증·fetch·작업공간 오류는 병합을 되돌리지 않고 `reinstall failed: <reason>` 한 줄과 로컬 `reinstall-failed` 이벤트로 남긴다. 생성에 성공한 작업공간만 `finally`에서 Git 등록을 제거한다. 별도 경계 시험은 고정 인수 파일과 모듈명이 겹치지 않는 `tests/test_orch_reinstall_unit.py`에 있다.
+- #93 환경: 오프라인 `uv tool install --reinstall`은 잠금 파일 기반 `uv run`과 달리 의존성의 simple 메타데이터도 필요하다. 임시 캐시에 wheel이 있어도 PyYAML 탐색이 실패하면 기본 캐시의 `simple-v21/pypi/pyyaml.rkyv`를 쓰기 가능한 캐시에 복사한다. 시험용 `UV_TOOL_DIR`·`UV_TOOL_BIN_DIR`를 임시 경로로 지정하면 실제 사용자 설치를 건드리지 않고 실제 uv 빌드와 설치를 확인할 수 있다.
+- #93 최종 검증: `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run pytest tests/acceptance/test_orch_reinstall.py` 5개와 추가 경계 시험 12개 통과. 같은 캐시로 실행한 전체 `uv run pytest`는 2,061개 통과, 화면 자동 열기 19개 실패(447.92초). 변경 전 HEAD의 src를 `/private/tmp/fa-93-base.rLj9PV/src`에 추출해 동일한 19개 실패를 확인했다. 전체 로그는 `/private/tmp/fa-issue-93-full.log`, 기준선 재현 로그는 `/private/tmp/fa-issue-93-base-view.log`다. 고정 인수 파일·Git 인덱스는 수정하지 않았다.
+
 - #84(D54 1·2): 죽은 runner PID도 `_recover_runs()`에서 `ctx.kill_runner(pid)`로 그룹을 정리한 뒤 작업공간을 제거한다. PID가 없으면 종료 호출을 생략한다. 종료 실패는 활성 실행과 작업공간을 보존하고 전파한다.
 - #84: `orch_events.append_event()`가 state lock 안에서 기존 `at/issue/kind/summary` JSONL 형식을 공유한다. orch 동사는 기존 감사 댓글을 계속 쓰고, gate의 복구 기록은 로컬 journal에 남긴다. 기록은 `_restore_after_crash()`·`_restore_stalled()`의 실제 전환 결과에서 추가한다.
 - #84 리뷰: `crash-restart`는 ready 복귀에만 사용한다. 열린 PR이나 연속 crash로 차단하면 기존 이유 코드와 같은 `retries-exceeded`, stall 차단은 `stalled`다. 요약뿐 아니라 kind도 실제 결과와 일치시킨다.

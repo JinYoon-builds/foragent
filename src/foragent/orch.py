@@ -16,6 +16,7 @@ from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
+from foragent.orch_reinstall import after_merge
 from foragent.processes import run_logged
 from foragent.runner import RunContext, review_only
 from foragent.tracker import Issue, PullRequest
@@ -308,4 +309,5 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     ctx.tracker.merge_pr(n, expected_head_sha=checked.head)
     summary = f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; tests pass, no conflicts, CI {ci}"
     _event(ctx, None, "merge", summary)
+    after_merge(ctx, n, current.base)
     return summary
