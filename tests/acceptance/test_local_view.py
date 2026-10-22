@@ -141,3 +141,293 @@ def test_local_view_missing_snapshot_status_is_successful_unknown_and_offline(
     assert "as_of" in payload and payload["as_of"] is None
     assert all(not issues for issues in payload["issues"].values())
     assert calls == [] and local_rows(case.store) == {}
+
+
+def test_local_view_failed_gate_refresh_preserves_data_as_of_and_failure_time(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    from test_orch_review_handoff import tick_context
+    from foragent.scheduler import tick
+    from foragent.state import StateStore
+    from foragent.tracker import GhTracker, TrackerError
+
+    case = snapshot_case(git_history, tmp_path, monkeypatch)
+    loaded_at = case.clock[0]
+    case.clock[0] += timedelta(minutes=5, seconds=1)
+    failed_at = case.clock[0]
+    case.tracker.update_issue(2, title="Unrefreshed remote title", body="")
+    case.tracker.record_label(2, "needs-human", "human")
+    main = local_cli(case, monkeypatch)
+    error = "HTTP 503: GitHub unavailable"
+
+    def unavailable(argv):
+        raise subprocess.CalledProcessError(1, ["gh", *argv], stderr=error)
+
+    refresh_calls = record_gh(monkeypatch, reply=unavailable)
+    ctx = tick_context(case, start_runs=False)
+    ctx.tracker = GhTracker("owner/repo")
+    try:
+        tick(ctx)
+    except TrackerError:
+        pass  # Gate exit policy is separate from preserving observation facts.
+    assert refresh_calls, "The due gate refresh must actually attempt a read"
+
+    # A new reader must see durable failure facts. Even if GitHub recovers,
+    # an ordinary status cannot replace them with an unrequested live read.
+    case.store = StateStore(case.store.root, now=lambda: case.clock[0])
+    calls = record_gh(monkeypatch, reply=lambda argv: github_reply(case, argv))
+    assert main(["gate", "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.get("stale") is True, "A failed refresh must mark the last known data stale"
+    assert error in payload["error"]
+    assert payload["summary"] == {"working": 1, "blocked": 1, "waiting_human": 1, "queued": 0}
+    assert datetime.fromisoformat(payload["as_of"]) == loaded_at
+    assert payload["lanes"]["review"]["title"] == "Review dispute"
+    assert payload["lanes"]["review"]["state"] == "blocked"
+    rows = local_rows(case.store)
+    assert set(rows) == {1, 2, 3, 4, 99}
+    assert rows[2]["title"] == "Review dispute" and "needs-human" not in rows[2]["labels"]
+    assert rows[4]["merged"] is True and rows[4]["pr_number"] is not None
+    # The persistence layout is private; require the failure and its time to
+    # be recorded together without prescribing a filename or field name.
+    records = [path.read_text(encoding="utf-8") for path in case.store.root.rglob("*.json")]
+    assert any(error in record and failed_at.isoformat() in record for record in records), (
+        "The refresh failure time must be persisted separately from the last successful as_of"
+    )
+    assert calls == []
+
+
+def test_local_view_failed_initial_refresh_json_summary_is_null(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    from test_orch_review_handoff import tick_context
+    from foragent.scheduler import tick
+    from foragent.tracker import GhTracker, TrackerError
+
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
+    case.store.finish_run(1, outcome="cancelled")
+    main = local_cli(case, monkeypatch)
+
+    def timeout(argv):
+        raise subprocess.TimeoutExpired(["gh", *argv], 120)
+
+    refresh_calls = record_gh(monkeypatch, reply=timeout)
+    ctx = tick_context(case, start_runs=False)
+    ctx.tracker = GhTracker("owner/repo")
+    try:
+        tick(ctx)
+    except TrackerError:
+        pass
+    assert refresh_calls
+    # An empty remote response must not become a substitute for a missing
+    # local snapshot, even if an observer incorrectly tries another read.
+    calls = record_gh(monkeypatch, reply=lambda argv: "[]")
+    assert main(["gate", "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"] == {
+        "working": None, "blocked": None, "waiting_human": None, "queued": None,
+    }, "Without usable data, zero would claim a known empty queue"
+    assert payload["as_of"] is None
+    assert payload["stale"] is True and payload["error"]
+    assert payload["active_runs"] == []
+    assert calls == [] and local_rows(case.store) == {}
+
+
+def test_local_view_failed_initial_refresh_korean_text_warns_instead_of_zero(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    from test_orch_review_handoff import tick_context
+    from foragent.scheduler import tick
+    from foragent.tracker import GhTracker, TrackerError
+
+    case = make_case(git_history, tmp_path, monkeypatch, language="ko",
+                     skill_libraries=[], test_command="true")
+    case.store.finish_run(1, outcome="cancelled")
+    main = local_cli(case, monkeypatch)
+
+    def timeout(argv):
+        raise subprocess.TimeoutExpired(["gh", *argv], 120)
+
+    refresh_calls = record_gh(monkeypatch, reply=timeout)
+    ctx = tick_context(case, start_runs=False)
+    ctx.tracker = GhTracker("owner/repo")
+    try:
+        tick(ctx)
+    except TrackerError:
+        pass
+    assert refresh_calls
+    calls = record_gh(monkeypatch, reply=lambda argv: "[]")
+    assert main(["gate", "status"]) == 0
+    output = capsys.readouterr().out
+    assert "⚠ 상태를 못 읽었어요" in output
+    assert "일하는 중 0" not in output
+    assert calls == []
+
+
+def test_local_view_live_timeout_json_returns_success_with_stale_local_numbers(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    case = snapshot_case(git_history, tmp_path, monkeypatch)
+    loaded_at = case.clock[0]
+    case.clock[0] += timedelta(minutes=2)
+    main = local_cli(case, monkeypatch)
+
+    def timeout(argv):
+        raise subprocess.TimeoutExpired(["gh", *argv], 120)
+
+    calls = record_gh(monkeypatch, reply=timeout)
+    assert cli_exit(main, ["gate", "status", "--live", "--json"]) == 0, (
+        "A failed live observation must return a usable stale status, not a CLI error"
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert calls, "--live must attempt the GitHub read that timed out"
+    assert payload["stale"] is True and payload["error"]
+    assert payload["summary"] == {"working": 1, "blocked": 1, "waiting_human": 1, "queued": 0}
+    assert datetime.fromisoformat(payload["as_of"]) == loaded_at
+    assert payload["lanes"]["api"]["issue"] == 1
+    assert payload["lanes"]["review"]["title"] == "Review dispute"
+
+
+def test_local_view_live_timeout_korean_text_warns_and_keeps_last_known_numbers(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    from dataclasses import replace
+
+    case = snapshot_case(git_history, tmp_path, monkeypatch)
+    case.config = case.ctx.config = replace(case.config, language="ko")
+    loaded_at = case.clock[0]
+    case.clock[0] += timedelta(minutes=2)
+    main = local_cli(case, monkeypatch)
+
+    def timeout(argv):
+        raise subprocess.TimeoutExpired(["gh", *argv], 120)
+
+    calls = record_gh(monkeypatch, reply=timeout)
+    assert cli_exit(main, ["gate", "status", "--live"]) == 0, (
+        "A timeout must print the warning and cached numbers while exiting successfully"
+    )
+    output = capsys.readouterr().out
+    assert calls, "--live must attempt the GitHub read that timed out"
+    assert "⚠ 상태를 못 읽었어요" in output
+    assert "일하는 중 1" in output and "일하는 중 0" not in output
+    # The failed live read must also remain visible to the next local reader.
+    live_calls = list(calls)
+    assert main(["gate", "status", "--json"]) == 0
+    cached = json.loads(capsys.readouterr().out)
+    assert cached["stale"] is True and cached["error"]
+    assert cached["summary"] == {"working": 1, "blocked": 1, "waiting_human": 1, "queued": 0}
+    assert datetime.fromisoformat(cached["as_of"]) == loaded_at
+    assert calls == live_calls
+
+
+def test_local_view_stale_snapshot_frame_warns_on_first_line_with_active_run(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    from dataclasses import replace
+    from foragent import watch
+
+    case = snapshot_case(git_history, tmp_path, monkeypatch)
+    case.config = case.ctx.config = replace(case.config, language="ko")
+    main = local_cli(case, monkeypatch)
+    record_gh(monkeypatch, reply=lambda argv: github_reply(case, argv))
+    assert main(["gate", "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [run.number for run in case.store.active_runs()] == [1]
+    # Exercise rendering independently of refresh/error persistence: this is
+    # the public status shape required after a failed refresh of known data.
+    payload.update(stale=True, error="GitHub read timed out after 120 seconds",
+                   as_of=case.clock[0].isoformat())
+    snapshot = watch.collect(payload, case.tracker, case.store, case.config, case.clock[0])
+    calls = record_gh(monkeypatch)
+    frame = watch.render_frame(snapshot, case.config, case.root, width=160)
+    assert "⚠ 상태를 못 읽었어요" in frame.splitlines()[0]
+    assert "일하는 중 1" in frame and "일하는 중 0" not in frame
+    assert "Implement feature" in frame
+    assert calls == []
+
+
+def test_local_view_failed_refresh_counts_five_local_runs_without_issue_snapshot(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    from test_orch_review_handoff import tick_context
+    from foragent.scheduler import tick
+    from foragent.tracker import GhTracker, TrackerError
+
+    lanes = {f"worker-{number}": {"paths": [f"worker-{number}/**"]} for number in range(1, 6)}
+    case = make_case(git_history, tmp_path, monkeypatch, lanes=lanes, max_parallel=5,
+                     skill_libraries=[], test_command="true")
+    for number in range(1, 6):
+        case.store.start_run(number, branch=f"foragent/issue-{number}",
+                             worktree=case.store.worktree_path(number), lane=f"worker-{number}")
+        case.store.update_run(number, phase="implementing")
+    main = local_cli(case, monkeypatch)
+
+    def timeout(argv):
+        raise subprocess.TimeoutExpired(["gh", *argv], 120)
+
+    refresh_calls = record_gh(monkeypatch, reply=timeout)
+    ctx = tick_context(case, start_runs=False)
+    ctx.tracker = GhTracker("owner/repo")
+    try:
+        tick(ctx)
+    except TrackerError:
+        pass
+    assert refresh_calls
+    assert [run.number for run in case.store.active_runs()] == [1, 2, 3, 4, 5]
+    calls = record_gh(monkeypatch, reply=lambda argv: "[]")
+    assert main(["gate", "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert {run["number"] for run in payload["active_runs"]} == {1, 2, 3, 4, 5}
+    assert payload["summary"]["working"] == 5, (
+        "Local run records establish working=5 even when no tracker snapshot is available"
+    )
+    assert all(payload["summary"][key] is None for key in ("blocked", "waiting_human", "queued"))
+    assert payload["stale"] is True and payload["error"]
+    for number in range(1, 6):
+        lane = payload["lanes"][f"worker-{number}"]
+        assert lane["state"] == "working" and lane["issue"] == number
+    assert calls == []
+
+
+def test_local_view_failed_refresh_counts_runs_started_after_last_snapshot(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    from dataclasses import replace
+    from test_orch_review_handoff import tick_context
+    from foragent.scheduler import tick
+    from foragent.tracker import GhTracker, TrackerError
+
+    case = snapshot_case(git_history, tmp_path, monkeypatch)
+    loaded_at = case.clock[0]
+    case.clock[0] += timedelta(minutes=5, seconds=1)
+    new_lanes = {f"worker-{number}": {"paths": [f"worker-{number}/**"]} for number in range(10, 14)}
+    case.config = case.ctx.config = replace(case.config, lanes=case.config.lanes | new_lanes,
+                                           max_parallel=5)
+    # These runs started after the last successful gate read and have no
+    # tracker issue records. Retaining the old summary alone would miss them.
+    for number in range(10, 14):
+        case.store.start_run(number, branch=f"foragent/issue-{number}",
+                             worktree=case.store.worktree_path(number), lane=f"worker-{number}")
+    main = local_cli(case, monkeypatch)
+
+    def timeout(argv):
+        raise subprocess.TimeoutExpired(["gh", *argv], 120)
+
+    refresh_calls = record_gh(monkeypatch, reply=timeout)
+    ctx = tick_context(case, start_runs=False)
+    ctx.tracker = GhTracker("owner/repo")
+    try:
+        tick(ctx)
+    except TrackerError:
+        pass
+    assert refresh_calls
+    assert len(case.store.active_runs()) == 5
+    calls = record_gh(monkeypatch, reply=lambda argv: github_reply(case, argv))
+    assert main(["gate", "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"] == {"working": 5, "blocked": 1, "waiting_human": 1, "queued": 0}, (
+        "Stale tracker data must be combined with current local runs, counting each run once"
+    )
+    assert payload["stale"] is True and payload["error"]
+    assert datetime.fromisoformat(payload["as_of"]) == loaded_at
+    assert calls == []
