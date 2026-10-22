@@ -1,6 +1,6 @@
 """Parse the versioned issue body without executing its contents."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import re
 import shlex
@@ -22,6 +22,7 @@ class ParsedIssue:
     out_of_scope: str
     done_when_commands: list[str]
     done_when_checklist: list[ChecklistItem]
+    files: list[str] = field(default_factory=list)
 
 
 def parse_body(body: str) -> ParsedIssue:
@@ -39,7 +40,7 @@ def parse_body(body: str) -> ParsedIssue:
             if opening:
                 fence = opening[1]
             elif line.startswith("## "):
-                heading = re.fullmatch(r"## (Goal|Out of scope|Done when)[ \t]*", line)
+                heading = re.fullmatch(r"## (Goal|Out of scope|Files|Done when)[ \t]*", line)
                 current = None
                 if heading and heading[1] not in sections:
                     current = sections[heading[1]] = []
@@ -74,6 +75,8 @@ def parse_body(body: str) -> ParsedIssue:
         out_of_scope="".join(sections.get("Out of scope", [])).strip(),
         done_when_commands=commands,
         done_when_checklist=checklist,
+        files=[match[1] for raw_line in sections.get("Files", [])
+               if (match := re.fullmatch(r"[ \t]*[-*] (.+)", raw_line.removesuffix("\n")))],
     )
 
 
