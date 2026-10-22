@@ -329,3 +329,10 @@
 - 잘 된 것: A는 멈춤 기준 뒤 gate가 runner와 Codex를 정리하고 한 번 재시작, 두 번째 멈춤에 `blocked` + 이유 댓글, 오케스트레이터 응답이 없으면 `orchestrator_timeout_minutes` 뒤 `needs-human` + 알림. B는 runner가 실패 1회로 세고 바로 재시도. C는 다음 tick에 runner 죽음을 감지하고 다시 시작. D53 기준선도 실제 저장소에서 동작(통과하던 인수 시험 4개).
 - 구멍: (1) runner가 죽으면 그 아래 Codex가 고아로 살아남아(부모 PID 1), 재시작된 새 실행기와 같은 worktree에서 동시에 일한다. (2) gate의 자동 복구(멈춤 재시작·죽음 재시작·멈춤 막힘·타임아웃 승격)가 "처리한 일" 기록에 안 남아 화면에 안 보인다 — "멈췄었나?"의 답이 사라진다. (3) 대시보드의 "멈춘 듯"은 10분 고정이라 gate의 `stall_minutes`와 따로 놀고, runner가 이미 죽어도 다음 tick까지 "●"로 보인다. (4) 알림 문장이 "Try 2 · Tech failure 1"뿐이라 어느 이슈가 왜 사람을 부르는지 모른다.
 - 결정: (1) runner가 죽은 것을 발견하면 그 프로세스 그룹 전체를 끝낸 뒤 worktree를 지운다(안전선). (2) gate의 자동 복구를 오케스트레이터 사건 기록에 남긴다(kind: `stall-restart`, `crash-restart`, `stalled`, `orchestrator-timeout`). (3) 대시보드 "멈춘 듯" 기준은 min(10분, `stall_minutes`), runner 프로세스가 없으면 즉시 표시. (4) 알림 문장에 사람이 볼 이슈 번호·제목·이유를 넣는다.
+
+### D55. 작업을 진짜 세션으로: Claude 레인은 이름 붙은 백그라운드 세션 (2026-10-22, Jin) — 미구현
+- 계기: Jin이 원하는 그림 — 사람은 세션 하나(오케스트레이터)에 말만 던지고, 이슈마다 작업 세션이 목록에 생겼다가 끝나면 사라진다(제목·PR·상태가 보이고, 열어서 보거나 도중에 말을 걸 수 있다). 지금 작업은 `claude -p`·`codex exec` 헤드리스 프로세스라 어디에도 세션으로 보이지 않는다.
+- 시험(2026-10-22): `claude --bg -n "<이름>" "<지시>"`는 이름 붙은 백그라운드 세션을 만든다. `claude agents --json --all`에 이름·상태(`done` 등)가 나오고, `claude attach <id>`로 들어가 이어서 말할 수 있고, `claude rm <id>`로 목록에서 지운다. 세션은 보통 대화 세션이라 일을 마친 뒤에도 다음 말을 기다린다.
+- 결정: Claude 실행기 레인은 이슈 작업을 `claude --bg -n "#<번호> <제목>"`으로 띄우고, 이슈가 끝나면(머지·사람에게 넘김) 세션을 지운다. 사람은 맥미니(또는 SSH)에서 `claude agents`로 목록을 보고 `attach`로 들어간다.
+- 구현 때 정할 것: 세션 끝 판정(`claude agents` 상태 vs Stop 훅), 진행 감지(D20의 stream-json을 대신할 것), 권한 대기로 멈추지 않게 권한 모드를 명시(D54: 헤드리스는 거부, 세션은 기다림), runner가 죽어도 세션은 남으므로 D54 (1)의 정리를 세션 id 기준으로.
+- 범위 밖: Codex 레인은 그대로 `codex exec`(앱 목록에 띄우려면 실험 기능 `codex remote-control` 데몬이 필요 — 따로 시험). 폰·claude.ai에서 보기(Remote Control)는 모바일이 필요해질 때 검토(Jin).

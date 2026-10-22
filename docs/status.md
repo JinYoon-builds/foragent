@@ -40,3 +40,4 @@
 ## 백로그 (공개 준비 때)
 - `fa gate watch`: 레인을 줄로, 이슈를 블록으로(대기 · 실행 중 · 머지 · 질문) 보여 주는 터미널 화면. README 첫 화면 데모 GIF용. (2026-10-20 Jin 아이디어, 필수 아님)
 - README 첫 줄 문구: A/B/C 비교 숫자가 나온 뒤.
+- 모바일에서 작업 세션 보기: Remote Control(Claude)·`codex remote-control`(Codex). 필요해지면 검토 (2026-10-22 Jin, D55).
