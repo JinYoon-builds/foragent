@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 import re
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 import yaml
@@ -12,6 +13,9 @@ import yaml
 
 class ConfigError(ValueError):
     """Configuration could not be loaded or validated."""
+
+
+SKILL_ROLES = {"style", "review", "tool", "domain"}
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,7 @@ class Config:
         "name": "skills",
         "repo": "https://github.com/anthropics/skills",
     }])
+    skill_roles: dict[str, str] = field(default_factory=dict)
     max_parallel: int = 2
     transient_max_wait_minutes: int = 30
     limit_wait_minutes: int = 60
@@ -184,6 +189,13 @@ def _validate(values: dict[str, Any]) -> None:
                 or library["name"] in {".", ".."}
                 or ("path" in library and not isinstance(library["path"], str))):
             raise ConfigError("invalid skill_libraries entry; expected name, repo, and optional path")
+    roles = values["skill_roles"]
+    if not isinstance(roles, dict) or any(
+        not isinstance(identity, str) or not identity.strip()
+        or not isinstance(role, str) or role not in SKILL_ROLES
+        for identity, role in roles.items()
+    ):
+        raise ConfigError("skill_roles must map skill IDs to style, review, tool, or domain")
     for key in ("acceptance_dir", "base_branch"):
         if not isinstance(values[key], str) or not values[key].strip():
             raise ConfigError(f"{key} must be a nonempty string")
@@ -234,6 +246,31 @@ def load_global_config(global_path: Path | None = None) -> Config:
         _overlay(values, _read_yaml(path))
     _validate(values)
     return Config(**values)
+
+
+def register_skill_library(name: str, repo: str, roles: dict[str, str]) -> Config:
+    """Persist an approved library and roles, preserving unrelated global settings."""
+    path = Path.home() / ".config/foragent/config.yml"
+    config = load_global_config(path)
+    values = _read_yaml(path) if path.exists() else {}
+    libraries = deepcopy(config.skill_libraries)
+    if not any((entry if isinstance(entry, str) else entry["repo"]) == repo for entry in libraries):
+        libraries.append({"name": name, "repo": repo})
+    values.update(skill_libraries=libraries, skill_roles={**config.skill_roles, **roles})
+    registered = {**asdict(config), "skill_libraries": libraries, "skill_roles": values["skill_roles"]}
+    _validate(registered)
+    content = yaml.safe_dump(values, sort_keys=False, allow_unicode=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return Config(**registered)
 
 
 def set_profile(repo_root: Path, *, kind: str, stage: str, priority: str) -> dict[str, str]:

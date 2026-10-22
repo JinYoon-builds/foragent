@@ -692,7 +692,7 @@ def test_view_opener_failure_keeps_all_runs_and_reports_success(ctx, monkeypatch
     captured = capsys.readouterr()
     assert captured.out == ""
     assert len(captured.err.splitlines()) == 1
-    assert "레인 화면을 열지 못했습니다" in captured.err
+    assert "레인 화면을 열지 못했어요" in captured.err
     tick(ctx)
     assert capsys.readouterr() == ("", "")
 
@@ -719,7 +719,7 @@ def test_view_opener_exception_preserves_tick_report_and_next_tick(ctx, monkeypa
     assert {action for action in report.actions if "started running" in action} == {
         "#1 started running (pid=7001)", "#2 started running (pid=7002)",
     }
-    assert report.actions[-1] == "could not open lane view: " + " ".join(str(failure).split())
+    assert report.actions[-1] == "Couldn't open the lane view (" + " ".join(str(failure).split()) + "). Try again."
     assert opened == [(ctx.repo_root, ctx.store, ctx.config.language)]
     assert tick(ctx).actions == []
     assert len(opened) == 1

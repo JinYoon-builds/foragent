@@ -1,16 +1,18 @@
 """Sync skill libraries, inspect their metadata, and install selected skills."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
+from typing import Any
 
 import yaml
 
-from foragent.config import Config, load_global_config
+from foragent.config import Config, SKILL_ROLES, load_global_config, register_skill_library
 from foragent.license_texts import STANDARD_LICENSES
 from foragent.paths import repo_path
 
@@ -39,6 +41,9 @@ class Skill:
     path: Path
     license: str
     license_file: Path | None
+    copies: tuple[Path, ...] = ()
+    runs_scripts: bool = False
+    role: str | None = None
 
 
 OPEN_SOURCE_LICENSES = {
@@ -83,11 +88,21 @@ def _run(args: list[str]) -> str:
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=300).stdout
 
 
+def _runs_scripts(directory: Path) -> bool:
+    """Report script files from their paths; never inspect or run their contents."""
+    extensions = {".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".ps1", ".bat", ".cmd"}
+    return any(path.is_file() and ("scripts" in path.relative_to(directory).parts[:-1]
+                                  or path.suffix.lower() in extensions)
+               for path in directory.rglob("*"))
+
+
 class SkillManager:
     def __init__(self, config: Config | None = None, *, libraries_dir: Path | None = None,
                  run: Callable[[list[str]], str] | None = None):
         config = config or load_global_config()
         directory = libraries_dir or Path.home() / ".local/share/foragent/libraries"
+        self.config = config
+        self.libraries_dir = directory
         self.libraries = []
         self.run = run or _run
         for entry in config.skill_libraries:
@@ -109,10 +124,17 @@ class SkillManager:
             if library.path.exists():
                 self.run(["git", "-C", str(library.path), "pull", "--ff-only"])
             else:
-                library.path.parent.mkdir(parents=True, exist_ok=True)
-                self.run(["git", "clone", "--", library.repo, str(library.path)])
+                self._clone(library)
             synced.append(library.name)
         return synced
+
+    def _clone(self, library: Library) -> None:
+        try:
+            library.path.parent.mkdir(parents=True, exist_ok=True)
+            self.run(["git", "clone", "--", library.repo, str(library.path)])
+        except (OSError, subprocess.SubprocessError) as exc:
+            message = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+            raise SkillError(f"could not clone library {library.name}: {message or exc}") from exc
 
     def skills(self, *, available_only: bool = False) -> list[Skill]:
         result = []
@@ -120,32 +142,99 @@ class SkillManager:
             if not library.path.is_dir():
                 if available_only:
                     continue
-                raise SkillError(f"library {library.name} is missing; run fa skills sync")
-            paths = {path for pattern in ("*/skills/*/SKILL.md", "skills/*/SKILL.md") for path in library.path.glob(pattern)}
-            for path in sorted(paths):
-                match = re.match(r"\A---\s*\n(.*?)\n---(?:\s*\n|$)", path.read_text(encoding="utf-8"), re.S)
-                try:
-                    meta = yaml.safe_load(match[1]) if match else None
-                except yaml.YAMLError as exc:
-                    raise SkillError(f"invalid skill frontmatter: {path}: {exc}") from exc
-                if not isinstance(meta, dict) or any(not isinstance(meta.get(key), str) for key in ("name", "description")):
-                    raise SkillError(f"skill requires name and description frontmatter: {path}")
-                relative = path.relative_to(library.path).parts
-                identity = path.parent.name if len(relative) == 3 else f"{relative[0]}/{path.parent.name}"
-                license_id, license_file = _license(path.parent, library.path)
-                result.append(Skill(f"{library.prefix}:{identity}", meta["name"], meta["description"],
-                                    library, path.parent, license_id, license_file))
+                if library.path.exists():
+                    raise SkillError(f"library {library.name} path is not a directory: {library.path}")
+                self._clone(library)
+            result.extend(self._library_skills(library))
         return result
 
-    def catalog(self) -> list[dict[str, str]]:
-        return [{"id": skill.id, "name": skill.name, "description": skill.description, "license": skill.license}
-                for skill in self.skills()]
+    def _library_skills(self, library: Library) -> list[Skill]:
+        paths = {path for pattern in ("*/skills/*/SKILL.md", "skills/*/SKILL.md") for path in library.path.glob(pattern)}
+        groups: dict[str, list[Path]] = {}
+        # Prefer the shared copy when present; otherwise select a tool copy deterministically.
+        for path in sorted(paths, key=lambda path: (len(path.relative_to(library.path).parts), path)):
+            relative = path.relative_to(library.path).parts
+            identity = path.parent.name if len(relative) == 3 or relative[0].startswith(".") else f"{relative[0]}/{path.parent.name}"
+            groups.setdefault(identity, []).append(path.parent)
+        result = []
+        for identity, copies in sorted(groups.items()):
+            path = copies[0] / "SKILL.md"
+            match = re.match(r"\A---\s*\n(.*?)\n---(?:\s*\n|$)", path.read_text(encoding="utf-8"), re.S)
+            try:
+                meta = yaml.safe_load(match[1]) if match else None
+            except yaml.YAMLError as exc:
+                raise SkillError(f"invalid skill frontmatter: {path}: {exc}") from exc
+            if not isinstance(meta, dict) or any(not isinstance(meta.get(key), str) for key in ("name", "description")):
+                raise SkillError(f"skill requires name and description frontmatter: {path}")
+            license_id, license_file = _license(path.parent, library.path)
+            skill_id = f"{library.prefix}:{identity}"
+            result.append(Skill(skill_id, meta["name"], meta["description"], library, path.parent,
+                                license_id, license_file, tuple(copies), any(_runs_scripts(copy) for copy in copies),
+                                self.config.skill_roles.get(skill_id)))
+        return result
 
-    def _select(self, identity: str) -> Skill:
+    @staticmethod
+    def _summary(skill: Skill) -> dict[str, Any]:
+        return {"id": skill.id, "name": skill.name, "description": skill.description, "license": skill.license,
+                "runs_scripts": skill.runs_scripts, "copies": sorted(copy.relative_to(skill.library.path).as_posix()
+                                                                      for copy in skill.copies), "role": skill.role}
+
+    def catalog(self) -> list[dict[str, Any]]:
+        return [self._summary(skill) for skill in self.skills()]
+
+    def add(self, source: str, *, approve: bool = False, roles: list[str] | None = None) -> dict[str, Any]:
+        """Preview a temporary checkout; register only explicitly approved, classified skills."""
+        assignments = []
+        for assignment in roles or []:
+            identity, separator, role = assignment.partition("=")
+            if not separator or not identity or role not in SKILL_ROLES:
+                raise SkillError(f"invalid skill role: {assignment}; expected SKILL=style|review|tool|domain")
+            assignments.append((identity, role))
+        if assignments and not approve:
+            raise SkillError("--role requires --approve")
+        repo = str(Path(source).expanduser().resolve()) if Path(source).expanduser().exists() else source
+        library = next((library for library in self.libraries if library.repo == repo), None)
+        if library is None:
+            name = re.split(r"[/:]", repo.rstrip("/"))[-1].removesuffix(".git")
+            candidate = replace(self.config, skill_libraries=[*self.config.skill_libraries, {"name": name, "repo": repo}])
+            library = SkillManager(candidate, libraries_dir=self.libraries_dir, run=self.run).libraries[-1]
+        with TemporaryDirectory(prefix="foragent-skills-") as directory:
+            preview = replace(library, path=Path(directory) / library.name)
+            self._clone(preview)
+            skills = self._library_skills(preview)
+            if not skills:
+                raise SkillError(f"no skills found in library {library.name}")
+            confirmed = {}
+            for identity, role in assignments:
+                skill = self._select(identity, skills=skills)
+                if skill.id in confirmed and confirmed[skill.id] != role:
+                    raise SkillError(f"conflicting roles for {skill.id}")
+                confirmed[skill.id] = role
+            if approve:
+                missing = [skill.id for skill in skills if skill.id not in confirmed]
+                if missing:
+                    raise SkillError("confirm a role for each skill with --role SKILL=style|review|tool|domain: "
+                                     + ", ".join(missing))
+                self.config = register_skill_library(library.name, repo, confirmed)
+                if library not in self.libraries:
+                    self.libraries.append(library)
+            return {"source": source, "skills": [self._summary(replace(skill, role=confirmed.get(skill.id, skill.role)))
+                                                 for skill in skills], "approved": approve}
+
+    def _select(self, identity: str, *, skills: list[Skill] | None = None) -> Skill:
+        skills = self.skills() if skills is None else skills
+        exact = next((skill for skill in skills if skill.id == identity), None)
+        if exact is not None:
+            return exact
         matches = []
-        for skill in self.skills():
+        for skill in skills:
             relative = skill.id.split(":", 1)[1]
-            if identity in {skill.id, relative, f"{skill.library.name}/{relative}", f"{skill.library.name}:{relative}"}:
+            aliases = {relative, skill.name}
+            for copy in skill.copies:
+                parts = copy.relative_to(skill.library.path).parts
+                aliases.add(copy.name if len(parts) == 2 else f"{parts[0]}/{copy.name}")
+            if any(identity in {alias, f"{skill.library.prefix}:{alias}", f"{skill.library.name}/{alias}",
+                                f"{skill.library.name}:{alias}"} for alias in aliases):
                 matches.append(skill)
         if len(matches) == 1:
             return matches[0]

@@ -143,7 +143,7 @@ def test_live_liveness_crosses_ten_minutes_between_refreshes(tmp_path):
     assert "○ 멈춘 듯 10분" in after
 
 
-@pytest.mark.parametrize("language,gone", [("en", "○ runner gone"), ("ko", "○ 실행기 종료")])
+@pytest.mark.parametrize("language,gone", [("en", "○ runner gone"), ("ko", "○ 실행기가 끝났어요")])
 def test_live_runner_death_is_visible_without_refresh_and_permission_is_alive(tmp_path, monkeypatch, language, gone):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
@@ -191,7 +191,7 @@ def test_partial_event_append_and_missing_memory_have_usable_output(tmp_path):
     assert [event["summary"] for event in watch.recent_events(store)] == [f"Event {n}" for n in range(6, 1, -1)]
     config = Config(language="ko-KR", executor="claude", executor_model="inherited-model", lanes={"api": {}})
     detail = watch.render_detail(config, "api", tmp_path)
-    assert "claude" in detail and "inherited-model" in detail and "아직 기억 없음" in detail
+    assert "claude" in detail and "inherited-model" in detail and "아직 기억이 없어요" in detail
 
 
 @pytest.mark.parametrize("width", [40, 80, 120, 180])
