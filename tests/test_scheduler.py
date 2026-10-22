@@ -1697,7 +1697,9 @@ def test_crash_recovery_with_default_killer_tolerates_missing_group(ctx, monkeyp
         raise ProcessLookupError()
 
     monkeypatch.setattr("foragent.processes.os.killpg", missing_group)
-    monkeypatch.setattr("foragent.processes.time.sleep", lambda _: pytest.fail("group is gone"))
+    # time.sleep is the global module function; subprocess polling (git fetch on Linux) uses it too.
+    # The killpg call list below already proves no SIGKILL wait happened.
+    monkeypatch.setattr("foragent.processes.time.sleep", lambda _: None)
     remove_worktree = ctx.git.remove_worktree
 
     def remove_after_kill(path):
