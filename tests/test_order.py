@@ -1,6 +1,6 @@
 from copy import deepcopy
 from dataclasses import replace
-from datetime import timedelta
+from datetime import date, timedelta
 import hashlib
 import json
 import re
@@ -633,7 +633,7 @@ def test_context_missing_or_broken_plugins_falls_back(tmp_path, monkeypatch, con
         path = tmp_path / ".claude/plugins/installed_plugins.json"
         path.parent.mkdir(parents=True)
         path.write_bytes(contents)
-    result = order.context(tmp_path, Config(), FakeTracker())["interview"]
+    result = order.context(tmp_path, Config(interview="ouroboros"), FakeTracker())["interview"]
     assert result == {"requested": "ouroboros", "engine": "native", "installed_version": None,
                       "pinned_version": None, "reason": "Ouroboros not installed"}
 
@@ -641,7 +641,7 @@ def test_context_missing_or_broken_plugins_falls_back(tmp_path, monkeypatch, con
 def test_context_unreadable_plugins_falls_back(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".claude/plugins/installed_plugins.json").mkdir(parents=True)
-    result = order.context(tmp_path, Config(), FakeTracker())["interview"]
+    result = order.context(tmp_path, Config(interview="ouroboros"), FakeTracker())["interview"]
     assert result["engine"] == "native" and "not installed" in result["reason"]
 
 
@@ -668,7 +668,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
     assert result["feedback"] == [{"number": 1, "title": "Feedback", "body": "Fix it\n\nAbout #8.", "about": 8}]
@@ -703,3 +703,39 @@ def test_order_cli_context_and_publish_dry_run(publishing, plan, monkeypatch, ca
     path.write_text("{")
     assert cli.main(["order", "publish", str(path), "--repo-root", str(root)]) == 1
     assert "foragent:" in capsys.readouterr().err
+
+
+def test_profile_cli_updates_local_config_without_github(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    global_path = tmp_path / "home/.config/foragent/config.yml"
+    global_path.parent.mkdir(parents=True)
+    global_path.write_text("executor: claude\n")
+    path = tmp_path / ".foragent.yml"
+    path.write_text("language: ko\nlanes:\n  api:\n    paths: [src/**]\nprofile:\n  kind: old\n")
+
+    def unexpected(*args):
+        pytest.fail("profile set must work without Git or GitHub")
+
+    monkeypatch.setattr(cli, "GitRepo", unexpected)
+    monkeypatch.setattr(cli, "GhTracker", unexpected)
+    assert cli.main(["profile", "set", "--kind", "daily-app", "--stage", "build",
+                     "--priority", "speed", "--repo-root", str(tmp_path)]) == 0
+    expected = {"kind": "daily-app", "stage": "build", "priority": "speed",
+                "confirmed_at": date.today().isoformat()}
+    assert json.loads(capsys.readouterr().out) == expected
+    assert yaml.safe_load(path.read_text()) == {
+        "language": "ko", "lanes": {"api": {"paths": ["src/**"]}}, "profile": expected,
+    }
+    config = load_config(tmp_path)
+    assert config.executor == "claude"
+    assert order.context(tmp_path, config, FakeTracker())["profile"] == expected
+
+
+def test_profile_cli_rejects_invalid_config_without_overwriting(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    path = tmp_path / ".foragent.yml"
+    path.write_text("review: invalid\n")
+    assert cli.main(["profile", "set", "--kind", "daily-app", "--stage", "build",
+                     "--priority", "speed", "--repo-root", str(tmp_path)]) == 1
+    assert "review" in capsys.readouterr().err
+    assert path.read_text() == "review: invalid\n"

@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import re
 from typing import Any
@@ -58,8 +58,9 @@ class Config:
     repo: str | None = None
     board: str | None = None
     language: str = "en"
-    interview: str = "ouroboros"
+    interview: str = "native"
     ouroboros_version: str | None = None
+    profile: dict[str, Any] | None = None
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
@@ -94,6 +95,8 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 
 
 def _validate(values: dict[str, Any]) -> None:
+    if values["profile"] is not None and not isinstance(values["profile"], dict):
+        raise ConfigError("profile must be a mapping or null")
     if values["test_command"] is not None and (
         not isinstance(values["test_command"], str) or not values["test_command"].strip()
     ):
@@ -231,6 +234,18 @@ def load_global_config(global_path: Path | None = None) -> Config:
         _overlay(values, _read_yaml(path))
     _validate(values)
     return Config(**values)
+
+
+def set_profile(repo_root: Path, *, kind: str, stage: str, priority: str) -> dict[str, str]:
+    """Save the confirmed project profile without copying global settings locally."""
+    load_config(repo_root)
+    path = repo_root / ".foragent.yml"
+    local = _read_yaml(path)
+    profile = {"kind": kind, "stage": stage, "priority": priority,
+               "confirmed_at": date.today().isoformat()}
+    local["profile"] = profile
+    path.write_text(yaml.safe_dump(local, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return profile
 
 
 def resolved_reviewer(config: Config) -> str:

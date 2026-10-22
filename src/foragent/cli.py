@@ -11,7 +11,7 @@ import sys
 from typing import Any
 
 from foragent import __version__, adopt, bench, design, inspect_actions, inspect_data, launchd, notify, orch, order, watch, watch_open
-from foragent.config import Config, ConfigError, load_config, load_global_config
+from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
 from foragent.i18n import text
@@ -82,6 +82,12 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--no-launchd", action="store_true")
     init.add_argument("--no-board", action="store_true")
     init.add_argument("--dry-run", action="store_true")
+    profile_command = commands.add_parser("profile", help="Save the project's confirmed profile")
+    profile_actions = profile_command.add_subparsers(dest="action", required=True)
+    profile_set = profile_actions.add_parser("set")
+    for field in ("kind", "stage", "priority"):
+        profile_set.add_argument(f"--{field}", required=True)
+    profile_set.add_argument("--repo-root", type=Path, default=Path.cwd())
     order_command = commands.add_parser("order", help="Deterministic tools for fa-order")
     order_actions = order_command.add_subparsers(dest="action", required=True)
     context = order_actions.add_parser("context")
@@ -370,6 +376,10 @@ def main(argv: list[str] | None = None) -> int:
                 print("Installed: " + manager.install(args.id, args.repo_root.resolve(), commit=args.commit))
             return 0
         root = args.repo_root.resolve()
+        if args.command == "profile":
+            print(json.dumps(set_profile(root, kind=args.kind, stage=args.stage, priority=args.priority),
+                             ensure_ascii=False))
+            return 0
         if args.command == "init":
             report = init_repo(
                 root, approvers=args.approvers, review=args.review, executor=args.executor,
