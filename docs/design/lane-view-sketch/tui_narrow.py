@@ -1,0 +1,276 @@
+"""Side-pane lane view sketch: fits ~48 columns. Loops prep -> publish -> running -> done."""
+import math
+import re
+import sys
+import time
+
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+from cast import COL, ORCH_GATHER, TREE  # noqa: E402
+from anim import RESET, DIM, acorn_chip, cells, stamp, blank, text_at  # noqa: E402
+from tui import BOLD, GNAW, SIT, SLEEP, WAVE8, rgb, pad  # noqa: E402
+
+import shutil
+W = 48
+
+
+def width():
+    return max(40, shutil.get_terminal_size((48, 40)).columns - 1)
+YEL = rgb(255, 210, 60)
+GRN = rgb(120, 200, 120)
+
+
+STATE = {"log": False}
+
+
+def read_key(timeout):
+    import select
+    r, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not r:
+        return None
+    ch = sys.stdin.read(1)
+    if ch == "\x1b":
+        seq = sys.stdin.read(2)
+        if seq == "[M":  # X10 mouse report: button, x, y
+            sys.stdin.read(3)
+            return "click"
+        return None
+    return ch
+
+
+def enter_pressed(timeout):
+    """Wait up to timeout seconds. True on Enter; l or a mouse click toggles the log."""
+    end = time.time() + timeout
+    while True:
+        left = end - time.time()
+        if left <= 0:
+            return False
+        k = read_key(left)
+        if k in ("\n", "\r"):
+            return True
+        if k in ("l", "L", "click"):
+            STATE["log"] = not STATE["log"]
+            return False
+
+
+def hint(text="Enter ▶ 다음 장면 · l 또는 말풍선 클릭 ▶ 기록"):
+    return f" {DIM}{text}{RESET}"
+
+
+def vis(t):
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", t)
+    return len(plain) + sum(1 for ch in plain if "\uac00" <= ch <= "\ud7a3")
+
+
+def fit(t, n):
+    out = ""
+    for ch in t:
+        if vis(out + ch) > n - 1 and vis(t) > n:
+            return out + "…"
+        out += ch
+    return out
+
+
+def rule():
+    return " " + DIM + "─" * (width() - 2) + RESET
+
+
+def head(text):
+    return [f" {BOLD}foragent{RESET} {DIM}·{RESET} {text}", rule()]
+
+
+def foot(mode="내 몫 남기기"):
+    return [rule(),
+            f" Claude {GRN}41%{RESET}{DIM}·3시{RESET}  Codex {rgb(230,170,70)}67%{RESET}{DIM}·일{RESET}  동시 4/5",
+            f" 메모리 여유  {DIM}모드:{RESET} {mode} {DIM}[m]{RESET}"]
+
+
+def dots(done, total):
+    return rgb(150, 95, 50) + "●" * done + RESET + rgb(90, 90, 90) + "●" * (total - done) + RESET
+
+
+def lane(name, pose, nums, done, line1, line2, f):
+    """Small squirrel on the left; status lines and numbered acorns (wrapped to the pane width) on the right."""
+    frames = {"gnaw": GNAW, "sit": SIT, "sleep": SLEEP, "wave": WAVE8}[pose]
+    icon = cells(frames[f % len(frames)])
+    chips = [acorn_chip(n, i < done) for i, n in enumerate(nums)]
+    room = width() - 18
+    per_row, used, rows_of_chips, cur = 0, 0, [], []
+    for c in chips:
+        w = len(re.sub(r"\x1b\[[0-9;]*m", "", c[1])) + 1
+        if cur and used + w > room:
+            rows_of_chips.append(cur)
+            cur, used = [], 0
+        cur.append(c)
+        used += w
+    if cur:
+        rows_of_chips.append(cur)
+    right = [line1, line2]
+    for group in rows_of_chips:
+        for k in range(3):
+            right.append(" ".join(c[k] for c in group))
+    out = []
+    for i in range(max(len(icon), len(right))):
+        left = f" {BOLD}{name:<6}{RESET}" if i == 1 else " " * 7
+        sq = "".join(icon[i]) if i < len(icon) else ""
+        out.append(left + pad(sq, 11) + (right[i] if i < len(right) else ""))
+    return out
+
+
+def draw(lines):
+    sys.stdout.write("\x1b[H\x1b[J" + "\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def prep():
+    total = 8
+    for n in range(total + 1):
+        sq = cells(ORCH_GATHER)
+        lines = head("주문 준비 중")
+        lines += ["  " + "".join(r) for r in sq]
+        lines += ["", f" {BOLD}🧭 완료 시험을 쓰고 있어요{RESET}  {n}/{total}",
+                  f" {DIM}다 쓰면 지금 실패하는지 돌려 볼게요{RESET}", ""]
+        steps = [("✓", "문서 읽고 작업 정리"), ("✓" if n == total else "⛏", f"완료 시험 {n}/{total}"),
+                 ("·", "실패하는지 확인"), ("·", f"Jin 승인 {YEL}← Jin 필요{RESET}"), ("·", "발행")]
+        lines += [f"   {a} {b}" for a, b in steps] + [""]
+        row = [acorn_chip(90 + i, True) for i in range(min(n, 5))]
+        for k in range(3):
+            lines.append("  " + " ".join(r[k] for r in row))
+        if n > 5:
+            lines.append(f"  {DIM}+{n - 5}개 더{RESET}")
+        lines += foot() + [hint()]
+        draw(lines)
+        if enter_pressed(1.0):
+            return
+    while not enter_pressed(10):
+        pass
+
+
+def publish(issues):
+    cw, ch = 46, 20
+    ox, oy, tx, ty = 0, 4, 32, 6
+    hollow = (tx + 5, ty + 6)
+    start = (ox + 16, oy + 9)
+    for idx, num in enumerate(issues):
+        for s in range(15):
+            t = s / 14
+            x = start[0] + (hollow[0] - start[0]) * t
+            y = start[1] + (hollow[1] - start[1]) * t - 6 * math.sin(math.pi * t)
+            canvas = blank(cw, ch)
+            stamp(canvas, ORCH_GATHER, ox, oy)
+            stamp(canvas, TREE, tx, ty)
+            rows = cells(canvas)
+            cx, cy = int(round(x)) - 1, int(round(y)) // 2
+            label = f"#{num}"
+            text_at(rows, cx, cy - 1, "▄" * len(label), "\x1b[38;2;%d;%d;%dm" % COL["C"])
+            text_at(rows, cx, cy, label, "\x1b[48;2;%d;%d;%dm\x1b[38;2;255;240;200m\x1b[1m" % COL["A"])
+            text_at(rows, tx + 3, ch // 2 - 1, "GitHub", BOLD)
+            lines = head(f"발행 중 {idx}/{len(issues)}") + ["  " + "".join(r) for r in rows]
+            lines += ["", f" {BOLD}🧭 도토리를 GitHub 나무로 보내요{RESET}"] + foot() + [hint()]
+            draw(lines)
+            if enter_pressed(0.07):
+                return
+
+
+LANES = [
+    ("orch", "gnaw", [93, 94, 95, 96, 97, 98], 3, f"{BOLD}#96{RESET} 사용량 읽기", f"{DIM}구현 중 · 12분{RESET}"),
+    ("view", "wave", [99, 100, 101, 102, 103, 104], 1, f"{YEL}{BOLD}#100 머지할까요? ← Jin{RESET}", f"{DIM}말투 기준{RESET}"),
+    ("order", "sit", [105, 106, 107, 108], 1, f"{BOLD}#106{RESET} 인터뷰 다시 쓰기", f"{DIM}⏳ #96이 끝나길 기다려요{RESET}"),
+    ("skills", "gnaw", [109, 110, 111], 1, f"{BOLD}#110{RESET} 링크로 스킬 가져오기", f"{DIM}리뷰 중{RESET}"),
+    ("board", "sleep", [112], 1, "모두 끝냈어요", ""),
+]
+
+
+def running(seconds=None):
+    f = -1
+    while True:
+        f += 1
+        lines = head(f"D56~D62 · 7/20 끝 · {YEL}Jin 1{RESET}")
+        side_by_side = width() >= 56
+        inner = min(34, width() - (25 if side_by_side else 6))
+        t1, t2 = fit("#109를 다시 맡겼어요.", inner - 2), fit("기본 인터뷰를 native로 고치래요", inner - 2)
+        box = [f"{DIM}╭{'─' * inner}╮{RESET}",
+               f"{DIM}│{RESET} {pad(t1, inner - 2)} {DIM}│{RESET}",
+               f"{DIM}│{RESET} {DIM}{pad(t2, inner - 2)}{RESET} {DIM}│{RESET}"]
+        tag = " [l] 기록 "
+        bottom = f"{DIM}╰{'─' * (inner - vis(tag))}{tag}╯{RESET}"
+        who = [f"🧭 {BOLD}오케스트레이터{RESET} {DIM}21:23{RESET}", f"{YEL}Jin이 볼 것 · view #100 머지{RESET}"]
+        sq = cells(ORCH_GATHER)
+        if side_by_side:
+            # tail on the left of the middle row, pointing at the squirrel
+            bubble = ["", "  " + box[0], "  " + box[1], f"{DIM}<─┤{RESET}" + box[2][len(DIM) + 1 + len(RESET):],
+                      "  " + bottom, ""] + ["  " + w for w in who]
+            for i in range(max(len(sq), len(bubble))):
+                left = "".join(sq[i]) if i < len(sq) else ""
+                lines.append("  " + pad(left, 19) + (bubble[i] if i < len(bubble) else ""))
+        else:
+            # stacked: tail drops down from the bubble toward the squirrel below
+            tail_bottom = f"{DIM}╰──┬{'─' * (inner - 3 - vis(tag))}{tag}╯{RESET}"
+            lines += ["  " + w for w in who] + ["", "  " + box[0], "  " + box[1], "  " + box[2],
+                      "  " + tail_bottom, f"  {DIM}   │{RESET}", f"  {DIM}   ▼{RESET}"]
+            lines += ["  " + "".join(r) for r in sq]
+        if STATE["log"]:
+            lines += [rule(), f" {BOLD}오케스트레이터 기록{RESET}  {DIM}[l] 닫기{RESET}",
+                      f"  {DIM}21:23{RESET} #109 다시 맡겼어요 — 기본 인터뷰를 native로",
+                      f"        {DIM}바꾸래요(D58). 시험 두 개가 그걸로 통과해요.{RESET}",
+                      f"  {DIM}19:42{RESET} #91 다시 맡겼어요 — init 뒤에는 레인 화면을",
+                      f"        {DIM}항상 열기로 Jin이 정했어요.{RESET}",
+                      f"  {DIM}19:10{RESET} #93 머지했어요",
+                      f"  {DIM}18:55{RESET} #92 리뷰 지적 1개를 고쳐서 다시 맡겼어요"]
+        lines += [rule()]
+        for ln in LANES:
+            lines += lane(*ln, f) + [""]
+        lines += foot() + [hint()]
+        draw(lines)
+        if enter_pressed(0.45):
+            return
+
+
+def done():
+    import random
+    random.seed(5)
+    cols = [(255, 90, 90), (255, 200, 60), (90, 200, 255), (160, 255, 120), (230, 130, 255)]
+    bursts = [(8, 3, 0), (26, 2, 3), (40, 4, 6), (16, 5, 9)]
+    sq = cells(ORCH_GATHER)
+    for frame in range(20):
+        canvas = [[" "] * W for _ in range(8)]
+        for bx, by, st in bursts:
+            r = frame - st
+            if 0 <= r <= 4:
+                c = cols[(bx + by) % len(cols)]
+                for dx, dy in [(0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1)]:
+                    x, y = bx + dx * r * 2, by + dy * r
+                    if 0 <= x < W and 0 <= y < 8:
+                        canvas[y][x] = rgb(*c) + ("✦" if r < 3 else "·") + RESET
+        lines = head("D56~D62 · 20/20 끝")
+        lines += ["".join(r) for r in canvas] + ["  " + "".join(r) for r in sq]
+        lines += ["", f" {BOLD}이번 주문을 모두 끝냈어요 ✓{RESET}  20개 머지"] + foot()
+        draw(lines)
+        time.sleep(0.2)
+    lines = head("D56~D62 · 20/20 끝") + ["  " + "".join(r) for r in sq]
+    lines += ["", f" {BOLD}이번 주문을 모두 끝냈어요 ✓{RESET}", ""]
+    for num, what in [(93, "머지 뒤 다시 설치"), (99, "말투 기준 한 장"), (105, "문서 먼저 읽는 인터뷰"), (109, "스킬 저절로 내려받기")]:
+        lines.append(f"  {GRN}✓{RESET} #{num} {what}")
+    lines += [f"  {DIM}… 16개 더{RESET}", "", f" {GRN}쿼터가 남아 있어요.{RESET}", f" {GRN}/fa로 다음 일을 주면 바로 써요.{RESET}"]
+    lines += foot() + [hint("Enter ▶ 처음부터 다시")]
+    draw(lines)
+    while not enter_pressed(10):
+        pass
+
+
+if __name__ == "__main__":
+    import termios
+    import tty
+    saved = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
+    sys.stdout.write("\x1b[?25l\x1b[?1000h")
+    try:
+        while True:
+            prep()
+            publish([90, 91, 92, 93, 94])
+            running()
+            done()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\x1b[?25h\x1b[?1000l")
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)
