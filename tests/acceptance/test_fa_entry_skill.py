@@ -44,3 +44,11 @@ def test_fa_entry_skill_next_step_instructions_use_single_entry_command(skill):
         r"(?im)^\s*(?:[-*]|\d+\.)?\s*(?:run|type|use|실행|입력|tell the user the next step)\b[^\n]*", text)
     bad = [line for line in instructions if re.search(r"`/fa-(?:init|order|inspect)`", line, re.I)]
     assert bad == [], f"next-step instructions must name /fa: {bad}"
+
+
+def test_fa_entry_skill_offers_named_interviews_at_the_end_of_the_briefing():
+    # D59 addendum 2: people see "기획 인터뷰" (/fa-order) and "디자인 인터뷰" (D73); command names stay.
+    text = entry_skill_text()
+    for choice in ("기획 인터뷰", "디자인 인터뷰", "볼 것 처리"):
+        assert choice in text, choice
+    assert re.search(r"무엇을 할까요", text)
