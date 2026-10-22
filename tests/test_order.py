@@ -128,6 +128,43 @@ def publish(case, plan, **kwargs):
     return order.publish(plan, root, config, tracker, repo="owner/repo", git=git, **kwargs)
 
 
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_interactive_requires_boolean_before_writes(publishing, plan, value, dry_run):
+    plan["issues"][0]["interactive"] = value
+    with pytest.raises(order.PlanError, match=r"issues\[0\]\.interactive must be a boolean"):
+        publish(publishing, plan, dry_run=dry_run)
+    assert publishing[4] == []
+    assert publishing[2].issues == {} and publishing[2].labels == {}
+
+
+@pytest.mark.parametrize("disable", [False, None])
+def test_interactive_republication_syncs_label_without_duplicate_children(publishing, plan, disable):
+    tracker = publishing[2]
+    plan["issues"][0]["interactive"] = True
+    publish(publishing, plan, approve=True)
+    assert "interactive" in tracker.labels
+    assert "interactive" in tracker.get_issue(2).labels
+    assert "interactive" not in tracker.get_issue(3).labels
+    tracker.add_labels(2, ["ready", "custom"])
+    prior_events = tracker.label_events(2)
+    publish(publishing, plan)
+    assert tracker.label_events(2) == prior_events
+    if disable is None:
+        del plan["issues"][0]["interactive"]
+    else:
+        plan["issues"][0]["interactive"] = disable
+    preview = publish(publishing, plan, dry_run=True)
+    assert preview.rows[0]["interactive"] is False
+    assert "interactive" in tracker.get_issue(2).labels
+    publish(publishing, plan)
+    assert len(tracker.issues) == 3
+    assert tracker.get_issue(2).labels == {"lane:api", "size:m", "custom"}
+    plan["issues"][0]["interactive"] = True
+    publish(publishing, plan)
+    assert "interactive" in tracker.get_issue(2).labels
+
+
 def test_publish_order_contract_labels_native_links_and_summary(publishing, plan):
     root, _, tracker, git, events = publishing
     report = publish(publishing, plan, approve=True)
