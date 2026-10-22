@@ -1,12 +1,15 @@
-"""Refresh the installed Foragent tool after an orchestrator self-merge."""
+"""Refresh the installed Foragent tool after a successful self-merge."""
 
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
 import tomllib
+from typing import TYPE_CHECKING
 
 from foragent.orch_events import append_event
-from foragent.runner import RunContext
+
+if TYPE_CHECKING:
+    from foragent.runner import RunContext
 
 
 def _uv(args: list[str], *, cwd: Path) -> str:
@@ -32,7 +35,7 @@ def _package_files(root: Path) -> dict[Path, bytes]:
     }
 
 
-def _reinstall(ctx: RunContext, base: str) -> str | None:
+def _reinstall(ctx: "RunContext", base: str) -> str | None:
     ctx.git.fetch("origin", base)
     sha = ctx.git.ref_sha(f"refs/remotes/origin/{base}")
     with TemporaryDirectory(prefix="foragent-reinstall-") as directory:
@@ -68,7 +71,7 @@ def _reinstall(ctx: RunContext, base: str) -> str | None:
     return f"reinstalled Foragent {sha}; installed package matches merged source"
 
 
-def after_merge(ctx: RunContext, pr: int, base: str) -> None:
+def after_merge(ctx: "RunContext", pr: int, base: str) -> None:
     """Keep the successful merge even if installing or verifying fails."""
     try:
         message = _reinstall(ctx, base)

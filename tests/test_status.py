@@ -64,7 +64,7 @@ def test_open_pr_waits_for_human_and_language_variants_translate(tmp_path, capsy
     status = cli._status(tracker, store, Config(language="ko-KR"))
     assert status["lanes"]["main"]["state"] == "waiting-human"
     cli._print_status(status | {"launchd": {"loaded": False}}, "ko-KR")
-    assert capsys.readouterr().out.startswith("일하는 중 0 · 나를 기다림 1 · 순서 대기 0\n")
+    assert capsys.readouterr().out.startswith("일하는 중 0 · 확인할 일 1 · 기다리는 일 0\n")
 
 
 @pytest.mark.parametrize(("labels", "expected_state"), [
