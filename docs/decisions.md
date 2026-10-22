@@ -468,3 +468,18 @@
   - 의미: 가재코드·Ouroboros는 명료함을 LLM이 매긴 숫자 하나("흐릿함 42%")로 보여 준다. Foragent는 셀 수 있는 빈칸으로 보여 주므로 어느 덩어리의 어느 칸이 비었는지 보이고, 표가 다 차면 그대로 레인 지도가 된다 — 명료해지는 과정이 곧 나누는 과정이다.
   - 스케치: `docs/design/lane-view-sketch/interview_scene.py`.
 - D64 보강 3 (2026-10-22, Jin: "LLM이 다람쥐 말풍선 문구도 계속 써 줘야 하나"): **말풍선만을 위한 LLM 호출은 하지 않는다.** 기계적인 사건(머지, 레인 시작, 한도 대기, 다 끝남)은 D61 말투로 쓴 문장 틀(i18n)에 번호만 끼운다. 판단이 들어간 일은 판단한 LLM이 그 자리에서 한 줄을 덧붙인다 — 오케스트레이터는 다시 맡기는 명령에 구현자용 힌트와 함께 사람용 한 줄을 적고(orch-say), 인터뷰 세션은 이미 쓰는 질문과 진행 상태(장부 항목·덩어리·칸)를 짧은 명령으로 알리면 말풍선은 그 상태에서 틀로 만들어진다.
+
+### D65. 첫 화면 문구와 제품 철학 (2026-10-22, Jin) — 미구현
+- 계기: Jin: "Easiest way to use Multiagent System, Graph Engineering, etc. And it's cute! 이런 느낌인 거지." 그리고 "이 제품 철학이 꽤 마음에 든다."
+- 결정: README 첫 화면은
+  > **The easiest way to run a team of coding agents. And it's cute.**
+  >
+  > Stop babysitting seven agent sessions. One conversation, parallel lanes, and a squirrel that waves when it needs you.
+  - 둘째 줄의 "일곱 세션"은 Jin의 실제 경험(세션 6~7개를 하루 종일 직접 관리)이다. "Graph Engineering"처럼 듣는 사람마다 다르게 읽는 말은 쓰지 않고 결과를 말한다.
+  - "And it's cute"는 말이 아니라 증거로 보여 준다 — 다람쥐 대시보드(D64)가 움직이는 GIF를 함께 둔다. 그래서 README는 D64가 구현된 뒤에 바꾼다.
+- 제품 철학(이날 결정들을 관통하는 다섯 가지, `docs/principles.md`로 한 장에 정리한다):
+  1. 사람은 말하고 고르기만 한다 — 명령어·설정 파일 안내는 실패 신호다(D57, D56 보강, D63).
+  2. 판단은 에이전트가, 코드는 사실·계산·안전선만(땜질 금지, D58 보강 2, D60).
+  3. 이미 말한 것은 다시 묻지 않고, 지금 하는 말이 옛 문서를 이긴다(D58).
+  4. 남는 쿼터와 컴퓨터 성능은 낭비다 — 한도까지 밀어붙이고, 쉬면 다음 일을 청한다(D60, D62).
+  5. 눈으로 보이게, 단 실제 상태만 — 다람쥐와 도토리는 진행 상황이고, 말풍선 하나를 위해 LLM을 부르지 않는다(D64).
