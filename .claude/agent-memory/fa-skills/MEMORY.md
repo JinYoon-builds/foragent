@@ -12,3 +12,7 @@
 - 리뷰 모드 검증: `uv run pytest -q tests/acceptance/test_skills_review_scope.py`. 회귀: `tests/test_config.py tests/test_executors.py tests/test_runner.py tests/test_git.py`. `tests/test_runner.py -k pr_body_reviews`는 매 라운드의 로컬 HEAD·원격 브랜치·PR HEAD 일치와 재시도 댓글 보존을 확인한다.
 - `SkillManager.skills()`는 등록된 라이브러리가 디스크에 없으면 복제하고 조회를 계속한다. catalog·install·레인 검증이 이 경로를 공유한다. 기존 디렉터리는 갱신하지 않으며, runner의 `available_only=True` 캐시 조회는 누락 라이브러리를 건너뛰어 오프라인 동작을 보존한다. 복제 실패는 라이브러리 이름을 포함한 `SkillError`로 전달한다.
 - 자동 복제 검증: `uv run pytest tests/acceptance/test_skills_autosync.py`. `tests/test_skills_lanes.py`의 자동 복제 회귀는 로컬 bare 저장소로 복제 1회·기존 캐시 미갱신·레인 설치를 함께 확인한다.
+- `fa skills add SOURCE [--json]`는 임시 복제본만 읽고 정리한다. `--approve --role SKILL=style|review|tool|domain`으로 모든 스킬의 역할을 명시해야 전역 `skill_libraries`·`skill_roles`를 함께 저장한다. 실제 캐시는 이후 catalog/install의 기존 자동 복제가 만든다.
+- `skills/<이름>`과 `.<도구>/skills/<이름>`은 같은 `<라이브러리 접두사>:<이름>`으로 묶는다. 공용 사본을 먼저 선택하고 `copies`에는 모든 상대 경로를 남긴다. `engineering/skills/<이름>` 같은 직무별 기존 ID는 유지한다. 완전한 ID 선택은 이름 별칭보다 우선한다.
+- 카탈로그의 `role`은 미확정이면 `null`이다. `runs_scripts`는 파일 경로만 확인하며 모든 도구 사본을 합산한다. 스크립트를 읽어 평가하거나 실행하지 않는다.
+- 등록 회귀는 `tests/test_skill_registration.py`에 둔다. pytest 기본 수집 방식에서는 acceptance 파일과 같은 `test_skills_add.py` 이름을 쓰면 import 충돌이 난다. #101 검증은 `UV_CACHE_DIR=/private/tmp/fa-issue-101-uv-cache uv run pytest tests/acceptance/test_skills_add.py`다.

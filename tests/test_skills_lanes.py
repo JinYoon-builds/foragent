@@ -58,7 +58,8 @@ def two_libraries(library, tmp_path):
 def test_catalog_metadata_and_multiple_library_prefixes(library, tmp_path):
     root, config, manager, _ = library
     assert manager.catalog() == [{"id": "kwp:engineering/testing-strategy", "name": "testing-strategy",
-                                  "description": "Pick useful checks.", "license": "Apache-2.0"}]
+                                  "description": "Pick useful checks.", "license": "Apache-2.0", "role": None,
+                                  "runs_scripts": False, "copies": ["engineering/skills/testing-strategy"]}]
     second = tmp_path / "second"
     (second / "other/skills/testing-strategy").mkdir(parents=True)
     (second / "other/skills/testing-strategy/SKILL.md").write_text("---\nname: different\ndescription: Other skill\n---\n")
