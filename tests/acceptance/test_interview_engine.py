@@ -31,15 +31,16 @@ def dirs(tmp_path, monkeypatch):
 OUROBOROS = {"ouroboros@ouroboros": [{"scope": "user", "version": "0.52.0"}]}
 
 
-def test_default_engine_is_ouroboros_when_installed(dirs):
-    result = context(*dirs, "review: batch\n", OUROBOROS)
+def test_requested_ouroboros_runs_when_installed(dirs):
+    # D58: native is the default; Ouroboros stays available when requested.
+    result = context(*dirs, "review: batch\ninterview: ouroboros\n", OUROBOROS)
     assert result["requested"] == "ouroboros"
     assert result["engine"] == "ouroboros"
     assert result["installed_version"] == "0.52.0"
 
 
-def test_falls_back_to_native_when_not_installed(dirs):
-    result = context(*dirs, "review: batch\n", None)
+def test_requested_ouroboros_falls_back_to_native_when_not_installed(dirs):
+    result = context(*dirs, "review: batch\ninterview: ouroboros\n", None)
     assert result["requested"] == "ouroboros"
     assert result["engine"] == "native"
     assert result["installed_version"] is None
