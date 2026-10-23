@@ -16,6 +16,8 @@ from foragent.tracker import FakeTracker
 def opening(tmp_path, monkeypatch):
     monkeypatch.delenv("FORAGENT_VIEW")
     monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TERM_PROGRAM", raising=False)
     monkeypatch.setattr(watch_open.shutil, "which", lambda name: None)
     calls = []
     monkeypatch.setattr(watch_open, "_call", lambda argv, root: calls.append((argv, root)))
@@ -39,17 +41,26 @@ def test_recorded_absolute_orca_path_survives_a_minimal_path(opening, tmp_path, 
     assert calls[1][0][:5] == [executable, "terminal", "split", "--terminal", "term_original"]
 
 
-def test_terminal_command_preserves_shell_and_applescript_special_characters(opening, tmp_path, monkeypatch):
+@pytest.mark.parametrize("terminal", ["Terminal", "iTerm.app", "tmux"])
+def test_terminal_command_preserves_shell_and_applescript_special_characters(opening, tmp_path, monkeypatch, terminal):
     store, calls = opening
     root = tmp_path / '한글 "double" \'single\' $HOME `echo nope` \\ newline\nrepo'
     root.mkdir()
-    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/osascript" if name == "osascript" else None)
+    monkeypatch.setenv("TERM_PROGRAM", terminal)
+    if terminal == "tmux":
+        monkeypatch.setenv("TMUX", "/tmp/tmux/default,123,0")
+    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/" + name if name in {"osascript", "tmux"} else None)
     watch_open.open_view(root, store)
     argv, cwd = calls[0]
-    assert argv[:2] == ["/fake/osascript", "-e"]
-    prefix = 'tell application "Terminal" to do script '
-    assert argv[2].startswith(prefix)
-    command = json.loads(argv[2][len(prefix):])
+    if terminal == "tmux":
+        assert argv[:5] == ["/fake/tmux", "split-window", "-h", "-c", str(root)]
+        command = argv[5]
+    else:
+        assert argv[:2] == ["/fake/osascript", "-e"]
+        prefix = ('tell application "iTerm2" to create window with default profile command '
+                  if terminal == "iTerm.app" else 'tell application "Terminal" to do script ')
+        assert argv[2].startswith(prefix)
+        command = json.loads(argv[2][len(prefix):])
     assert shlex.split(command)[-4:] == ["gate", "watch", "--repo-root", str(root)]
     assert "--open" not in shlex.split(command)
     assert Path(shlex.split(command)[0]).is_absolute()
@@ -96,11 +107,16 @@ def test_open_failure_is_one_localized_nonfatal_line(opening, tmp_path, monkeypa
     assert "레인 화면을 열지 못했어요" in captured.err
 
 
-def test_no_opener_reports_once_without_starting_a_process(opening, tmp_path, capsys):
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_no_opener_reports_once_without_starting_a_process(opening, tmp_path, capsys, language):
     store, calls = opening
-    watch_open.open_view(tmp_path, store)
+    root = tmp_path / "a repo's directory"
+    root.mkdir()
+    watch_open.open_view(root, store, language)
     assert calls == []
-    assert len(capsys.readouterr().err.splitlines()) == 1
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1
+    assert shlex.join(["fa", "gate", "watch", "--repo-root", str(root.resolve())]) in lines[0]
 
 
 @pytest.mark.parametrize("error", [None, KeyboardInterrupt, "curses", RuntimeError])
