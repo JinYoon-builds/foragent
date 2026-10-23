@@ -12,7 +12,7 @@ from foragent import board, orch_github, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.capacity import (
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, machine_load, machine_lock, machine_runs, next_parallel, read_state,
-    write_state,
+    update_test_slots, write_state,
 )
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -591,12 +591,15 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if until := ctx.store.github_wait_until(ctx.now()):
         report.skipped = f"GitHub rate limit until {until.isoformat()}"
         return report
+    # One sensor sample per tick sizes both the test slots and the run budget.
+    sample = machine_load()
+    update_test_slots(ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1])
     if not ctx.start_runs or not ready:
         return report
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         return report
 
-    started = _start_ready(ctx, ready, lane_for, base_ref, report)
+    started = _start_ready(ctx, ready, lane_for, base_ref, report, sample)
     if started is None:
         return report
     if started:
@@ -609,12 +612,14 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     return report
 
 
-def _machine_budget(ctx: TickContext, ready: dict[str, list[int]]) -> int:
+def _machine_budget(
+    ctx: TickContext, ready: dict[str, list[int]], sample: tuple[str, float] | None = None,
+) -> int:
     """Update the machine-wide AIMD value once per tick and return this tick's machine budget."""
     now = ctx.now()
     busy_lanes = {run.lane for run in ctx.store.active_runs()}
     waiting = sum(1 for lane in ready if lane not in busy_lanes and not ctx.store.lane_paused(lane, now))
-    pressure, load = machine_load()
+    pressure, load = sample if sample is not None else machine_load()
     with machine_lock(ctx.store):
         state = read_state(ctx.store)
         current = int(state["parallel"]) if state else INITIAL_PARALLEL
@@ -649,10 +654,10 @@ def _reserve_slot(ctx: TickContext, number: int, budget: int) -> bool:
 
 def _start_ready(
     ctx: TickContext, ready: dict[str, list[int]], lane_for: Callable[[Issue], str], base_ref: str,
-    report: TickReport,
+    report: TickReport, sample: tuple[str, float] | None = None,
 ) -> bool | None:
     """Start ready lanes within the machine budget; None means a GitHub wait began."""
-    budget = _machine_budget(ctx, ready)
+    budget = _machine_budget(ctx, ready, sample)
     started = False
     for lane in sorted(ready, key=lane_order):
         if not _has_slot(ctx, budget):

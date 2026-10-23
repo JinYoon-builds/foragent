@@ -11,7 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import __version__, adopt, bench, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, order, watch, watch_open
+from foragent import __version__, adopt, bench, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, order, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -24,7 +24,7 @@ from foragent.skills import SkillError, SkillManager
 from foragent.launcher import spawn_notify, spawn_runner
 from foragent.inspect_runtime import InspectRuntimeError
 from foragent.scheduler import TickContext, tick
-from foragent.runner import RunContext, check_done, run_issue
+from foragent.runner import RunContext, check_done, run_issue, run_tests
 from foragent.state import StateStore
 from foragent.status import collect as collect_status, summary_values, unknown as status_unknown
 from foragent.tracker import GhTracker, RecordingTracker, Tracker, TrackerError
@@ -239,6 +239,12 @@ files lists repository-relative paths or globs expected to change; absolute path
             command.add_argument("--tried", required=True)
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
+    # Listed for `fa --help` only; main() hands `fa test ...` to pytest before parsing.
+    test = commands.add_parser(
+        "test", help="Wait for a machine-wide test slot, then run pytest with the given arguments",
+        usage=TEST_USAGE, add_help=False,
+    )
+    test.add_argument("pytest_args", nargs=argparse.REMAINDER)
     notification = commands.add_parser("notify", help="Send an alert through the configured channel")
     notification.add_argument("--title", required=True)
     notification.add_argument("--line", required=True)
@@ -392,7 +398,33 @@ def _open_lane_view(root: Path) -> None:
         print("foragent: " + text("watch_open_failed", language, error=error), file=sys.stderr)
 
 
+TEST_USAGE = "fa test [--repo-root DIR] <pytest args>"
+
+
+def _test_command(argv: list[str]) -> int:
+    """`fa test`: everything after `test` goes to pytest, except a leading --repo-root."""
+    root = None
+    if argv[:1] == ["--repo-root"] and len(argv) > 1:
+        root, argv = Path(argv[1]), argv[2:]
+    elif argv and argv[0].startswith("--repo-root="):
+        root, argv = Path(argv[0].split("=", 1)[1]), argv[1:]
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
+    if root is None:
+        cwd = Path.cwd()
+        root = next((path for path in (cwd, *cwd.parents) if (path / ".foragent.yml").is_file()), cwd)
+    root = root.resolve()
+    try:
+        return run_tests(root, load_config(root), argv)
+    except (ConfigError, OSError, subprocess.SubprocessError) as exc:
+        print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["test"]:
+        return _test_command(argv[1:])
     args = _parser().parse_args(argv)
     try:
         if args.command == "design":
@@ -577,6 +609,7 @@ def main(argv: list[str] | None = None) -> int:
                 _refresh_status(tracker, store, config)
             status = _status(tracker, store, config)
             status["launchd"] = asdict(launchd.status(root, repo=repo))
+            status["test_slots"] = capacity.effective_test_slots(config.test_slots)
             if args.json:
                 print(json.dumps(status))
             else:

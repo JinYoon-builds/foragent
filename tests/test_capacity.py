@@ -174,3 +174,102 @@ def test_lanes_cap_limits_the_tick_but_not_the_shared_value(tmp_path, monkeypatc
     ctx = budget_ctx(tmp_path, NOW)
     assert scheduler._machine_budget(ctx, {"a": [1], "b": [2]}) == 2
     assert capacity.read_state(ctx.store) == {"parallel": 5, "changed_at": changed.isoformat()}
+
+
+@pytest.mark.parametrize("pressure,load,increase_ok,expected", [
+    ("warn", 0.1, True, 1), ("normal", 1.5, True, 1), ("normal", 0.5, True, 3),
+    ("normal", 0.5, False, 2), ("normal", 1.2, True, 2),
+])
+def test_next_test_slots_steps_by_one_within_ceiling(pressure, load, increase_ok, expected):
+    assert capacity.next_test_slots(2, pressure=pressure, load_per_cpu=load, ceiling=3,
+                                    increase_ok=increase_ok) == expected
+
+
+def test_next_test_slots_stays_between_one_and_ceiling():
+    assert capacity.next_test_slots(1, pressure="critical", load_per_cpu=3.0, ceiling=4, increase_ok=True) == 1
+    assert capacity.next_test_slots(4, pressure="normal", load_per_cpu=0.0, ceiling=4, increase_ok=True) == 4
+    assert capacity.next_test_slots(6, pressure="normal", load_per_cpu=1.2, ceiling=2, increase_ok=False) == 2
+
+
+def test_effective_test_slots_reads_shared_value_capped_by_ceiling():
+    assert capacity.effective_test_slots(3) == 3
+    capacity.update_test_slots(3, NOW, pressure="warn", load_per_cpu=0.0)
+    assert capacity.effective_test_slots(3) == 2
+    assert capacity.effective_test_slots(1) == 1
+    (capacity.machine_root() / capacity.TEST_SLOTS_FILE).write_text("{not json")
+    assert capacity.effective_test_slots(3) == 3
+
+
+def test_update_test_slots_waits_between_increases():
+    assert capacity.update_test_slots(3, NOW, pressure="warn", load_per_cpu=0.0) == 2
+    assert capacity.update_test_slots(3, NOW + timedelta(minutes=1), pressure="normal", load_per_cpu=0.0) == 2
+    assert capacity.update_test_slots(3, NOW + timedelta(minutes=2), pressure="normal", load_per_cpu=0.0) == 3
+
+
+def test_test_slot_is_exclusive_up_to_the_effective_limit(monkeypatch):
+    monkeypatch.setattr(capacity, "SLOT_POLL_SECONDS", 0.01)
+    with capacity.hold_test_slot(2), capacity.hold_test_slot(2):
+        assert capacity._take_test_slot(2) is None
+    with capacity.hold_test_slot(1):
+        assert capacity._take_test_slot(1) is None
+    stream = capacity._take_test_slot(1)
+    assert stream is not None
+    stream.close()
+
+
+def test_test_slot_held_above_a_lowered_limit_still_counts():
+    with capacity.hold_test_slot(3), capacity.hold_test_slot(3), capacity.hold_test_slot(3):
+        # The AIMD value dropped to 2 while three commands ran; none may join.
+        assert capacity._take_test_slot(2) is None
+        assert capacity._take_test_slot(3) is None
+        assert capacity._take_test_slot(4) is not None
+
+
+def test_test_slot_waiter_reports_waiting_then_proceeds(monkeypatch):
+    import threading
+
+    monkeypatch.setattr(capacity, "SLOT_POLL_SECONDS", 0.01)
+    reported, entered = threading.Event(), threading.Event()
+
+    def waiter():
+        with capacity.hold_test_slot(1, waiting=reported.set):
+            entered.set()
+
+    with capacity.hold_test_slot(1):
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        assert reported.wait(5)
+        assert not entered.is_set()
+    thread.join(5)
+    assert entered.is_set()
+
+
+def test_test_slot_of_a_killed_holder_is_released():
+    directory = capacity.machine_root() / capacity.TEST_SLOTS_DIR
+    directory.mkdir(parents=True)
+    holder = subprocess.Popen([
+        sys.executable, "-c",
+        "import fcntl, sys, time\n"
+        f"stream = open({str(directory / 'slot-0.lock')!r}, 'a')\n"
+        "fcntl.flock(stream.fileno(), fcntl.LOCK_EX)\n"
+        "print('held', flush=True)\n"
+        "time.sleep(60)\n",
+    ], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline() == "held\n"
+        assert capacity._take_test_slot(1) is None
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+        holder.stdout.close()
+    stream = capacity._take_test_slot(1)
+    assert stream is not None
+    stream.close()
+
+
+def test_test_slot_held_by_the_parent_command_is_not_taken_twice(monkeypatch):
+    monkeypatch.setenv(capacity.TEST_SLOT_ENV, "held")
+    with capacity.hold_test_slot(1):
+        # A Done-when command that runs `fa test` inherits the slot instead of waiting forever.
+        with capacity.hold_test_slot(1):
+            pass

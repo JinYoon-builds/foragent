@@ -68,6 +68,8 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "spawn_runner", spawn)
     monkeypatch.setattr(cli, "spawn_notify", lambda *args: calls["notifications"].append(args))
     monkeypatch.setattr(cli, "load_config", lambda root: Config(approvers=["human"]))
+    # Every tick samples the machine for test slots; keep the real sensor out of tests.
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: ("normal", 0.0))
     monkeypatch.setattr(cli.launchd, "status", lambda root, **kwargs: launchd.LaunchdStatus(
         "dev.foragent.owner.repo", False, False,
     ))
@@ -827,3 +829,33 @@ def test_orch_watch_refuses_invalid_intervals(app, capsys, interval):
     assert captured.out == ""
     assert "finite positive" in captured.err
     assert not (store.root / "orch-watch.json").exists()
+
+
+@pytest.mark.parametrize("argv,expected", [
+    (["test", "-q", "tests/test_x.py"], ["-q", "tests/test_x.py"]),
+    (["test", "-k", "foo"], ["-k", "foo"]),
+    (["test", "-x", "tests"], ["-x", "tests"]),
+    (["test", "-h"], ["-h"]),
+    (["test", "--", "-q", "x"], ["-q", "x"]),
+    (["test"], []),
+])
+def test_fa_test_forwards_every_argument_to_pytest(tmp_path, monkeypatch, argv, expected):
+    calls = []
+    (tmp_path / ".foragent.yml").write_text("repo: owner/repo\n")
+    nested = tmp_path / "src/pkg"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(test_slots=1))
+    monkeypatch.setattr(cli, "run_tests", lambda root, config, args: calls.append((root, args)) or 5)
+    assert cli.main(argv) == 5
+    # Without --repo-root, the root is the nearest folder with .foragent.yml.
+    assert calls == [(tmp_path.resolve(), expected)]
+
+
+def test_fa_test_accepts_its_own_repo_root_first(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli, "load_config", lambda root: Config())
+    monkeypatch.setattr(cli, "run_tests", lambda root, config, args: calls.append((root, args)) or 0)
+    assert cli.main(["test", "--repo-root", str(tmp_path), "-q", "--repo-root=x"]) == 0
+    assert cli.main(["test", f"--repo-root={tmp_path}", "-x"]) == 0
+    assert calls == [(tmp_path.resolve(), ["-q", "--repo-root=x"]), (tmp_path.resolve(), ["-x"])]

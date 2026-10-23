@@ -41,6 +41,7 @@ class Config:
     }])
     skill_roles: dict[str, str] = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
+    test_slots: int = 2  # Machine-wide test command ceiling; AIMD lowers it under load (#243).
     transient_max_wait_minutes: int = 30
     limit_wait_minutes: int = 60
     codex_goal: bool = False
@@ -143,7 +144,7 @@ def _validate(values: dict[str, Any]) -> None:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
                 "max_parallel", "transient_max_wait_minutes", "limit_wait_minutes",
-                "orchestrator_timeout_minutes"):
+                "orchestrator_timeout_minutes", "test_slots"):
         if key == "max_parallel" and values[key] is None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
