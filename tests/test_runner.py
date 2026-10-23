@@ -1292,6 +1292,28 @@ def test_future():
     assert (c.store.root / "runs/issue-1-acceptance-baseline.xml").is_file()
 
 
+def test_baseline_cache_rebuilds_collection_errors_even_when_pytest_continues(git_history, tmp_path):
+    from foragent.runner import _capture_acceptance_baseline
+
+    git_history.update({"tests/acceptance/test_broken.py": "def test_broken(:\n"})
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    command = f"{shlex.quote(sys.executable)} -m pytest -q --continue-on-collection-errors"
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    ctx = RunContext(
+        repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
+        config=Config(test_command=command), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
+    )
+
+    first = _capture_acceptance_baseline(1, ctx, command, git_history.tip)
+    second = _capture_acceptance_baseline(1, ctx, command, git_history.tip)
+
+    assert first == second
+    assert first.node_ids == (f"{ACCEPTANCE}::test_feature",)
+    assert store.log_path(1).read_text().count("Acceptance baseline count=1, exit_code=1") == 2
+    assert not list((store.root.parent / "baselines").glob("*.json"))
+
+
 def test_baseline_failure_exhausts_the_done_when_budget(run_case):
     c = run_case
     c.ctx.config = replace(c.ctx.config, max_retries=0, test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
