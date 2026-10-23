@@ -464,6 +464,14 @@ class StateStore:
     def run_start_pending(self, number: int) -> bool:
         return (self.root / "run-starts" / f"{number}.json").exists()
 
+    def run_starts(self) -> dict[int, str]:
+        """Map each journaled, not yet cleared start to its prepared_at time."""
+        starts = {}
+        for path in (self.root / "run-starts").glob("*.json"):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            starts[int(value["number"])] = value["prepared_at"]
+        return starts
+
     def clear_run_start(self, number: int) -> None:
         (self.root / "run-starts" / f"{number}.json").unlink(missing_ok=True)
 

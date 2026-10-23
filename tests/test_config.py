@@ -32,7 +32,7 @@ def test_exact_defaults(repo):
         "review_scope": "claude-local", "test_command": None,
         "interview": "native", "ouroboros_version": None, "profile": None,
         "skill_roles": {},
-        "lanes": {}, "max_parallel": 2, "executor_fallback_model": None,
+        "lanes": {}, "max_parallel": None, "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
                   "m": {"codex_effort": "high", "claude_model": None},

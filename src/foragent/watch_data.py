@@ -101,9 +101,9 @@ def collect(
             durations.append(duration)
     eta = None
     if order is not None and durations and completed < len(children):
-        # A lane is serial; max_parallel also caps total throughput. Historical
+        # A lane is serial; max_parallel (or else the lane count) caps throughput. Historical
         # run duration is an estimate, so the UI explicitly prefixes the time ~.
         workloads = watch.Counter(watch.issue_lane(issue.labels, config.lanes) for issue in children if issue.state == "open")
-        batches = max(max(workloads.values()), sum(workloads.values()) / config.max_parallel)
+        batches = max(max(workloads.values()), sum(workloads.values()) / (config.max_parallel or len(workloads)))
         eta = now + watch.timedelta(seconds=batches * sum(durations) / len(durations))
     return watch.Snapshot(status, done, order, completed, len(children), eta, watch.recent_events(store), now)
