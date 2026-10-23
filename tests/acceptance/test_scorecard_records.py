@@ -3,6 +3,7 @@
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 import json
+import os
 import re
 
 import pytest
@@ -16,6 +17,12 @@ def review_events(store):
     path = store.root / "orch-events.jsonl"
     return [event for line in (path.read_text().splitlines() if path.exists() else [])
             if (event := json.loads(line))["kind"] == "review"]
+
+
+def phase_events(store):
+    path = store.root / "orch-events.jsonl"
+    return [event for line in (path.read_text().splitlines() if path.exists() else [])
+            if (event := json.loads(line))["kind"] == "phase"]
 
 
 def test_scorecard_records_cli_github_calls_are_persisted_in_utc_hour_buckets(
@@ -111,3 +118,77 @@ def test_scorecard_records_spec_question_adds_no_review_event_to_an_existing_jou
     events = review_events(case.store)
     assert len(events) == 1, "Keep the completed review of #1 and add none for the spec question"
     assert events[0]["issue"] == 1 and "PASS" in events[0]["summary"]
+
+
+def test_scorecard_records_phase_changes_journal_elapsed_seconds_and_load_through_finish(
+    git_history, tmp_path, monkeypatch,
+):
+    from foragent import runner
+    from foragent.state import StateStore
+
+    calls = record_gh(monkeypatch)
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
+    started = case.clock[0]
+    monkeypatch.setattr(os, "getloadavg", lambda: (9.25, 6.5, 4.0))
+    case.ctx.poll_hook = lambda execute, poll: execute()
+    during_review, during_ci, during_merge, checks = [], [], [], []
+
+    def implement(kwargs):
+        case.implement(kwargs)
+        case.clock[0] += timedelta(seconds=7)
+
+    run_logged = runner.run_logged
+
+    def check(argv, **kwargs):
+        # Run the real Done-when commands; only their elapsed clock time is fake.
+        result = run_logged(argv, **kwargs)
+        checks.append(list(argv))
+        case.clock[0] += timedelta(seconds=11)
+        return result
+
+    def review(kwargs):
+        during_review.extend(phase_events(StateStore(case.store.root)))
+        case.clock[0] += timedelta(seconds=13)
+        return "VERDICT: PASS"
+
+    pr_checks, merge_pr = case.tracker.pr_checks, case.tracker.merge_pr
+
+    def ci(pr):
+        during_ci.extend(phase_events(StateStore(case.store.root)))
+        case.clock[0] += timedelta(seconds=17)
+        return pr_checks(pr)
+
+    def merge(pr, **kwargs):
+        during_merge.extend(phase_events(StateStore(case.store.root)))
+        case.clock[0] += timedelta(seconds=19)
+        return merge_pr(pr, **kwargs)
+
+    case.implementer.steps = [implement]
+    case.reviewer.steps = [review]
+    monkeypatch.setattr(runner, "run_logged", check)
+    monkeypatch.setattr(case.tracker, "pr_checks", ci)
+    monkeypatch.setattr(case.tracker, "merge_pr", merge)
+    assert runner.run_issue(1, case.ctx) == "merged", case.store.log_path(1).read_text()
+    assert len(checks) == 2  # Two Done-when commands: checking takes 2 * 11 = 22 seconds.
+    assert case.clock[0] == started + timedelta(seconds=78)  # 7 + 22 + 13 + 17 + 19.
+    store = StateStore(case.store.root)
+    assert store.get_run(1).status == "finished"
+    events = phase_events(store)
+    assert len(events) == 5, "Each ended phase, including the final phase, must append a local kind=phase event"
+    assert [(event["issue"], event["phase"], event["seconds"], event["load"]) for event in events] == [
+        (1, "implementing", 7, 9.25),
+        (1, "checking", 22, 9.25),
+        (1, "reviewing", 13, 9.25),
+        (1, "ci", 17, 9.25),
+        (1, "merging", 19, 9.25),
+    ]
+    # End timestamps are cumulative: 7, 7+22=29, 29+13=42, 42+17=59, 59+19=78.
+    assert [datetime.fromisoformat(event["at"]) for event in events] == [
+        started + timedelta(seconds=seconds) for seconds in (7, 29, 42, 59, 78)
+    ]
+    assert all(type(event["load"]) is float for event in events)
+    # Transitions must append durably as they happen, rather than batch at finish.
+    assert during_review == events[:2]
+    assert during_ci == events[:3]
+    assert during_merge == events[:4]
+    assert calls == []
