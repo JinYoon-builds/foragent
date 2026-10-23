@@ -17,7 +17,7 @@ from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
 from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
-from foragent.processes import kill_process_group
+from foragent.processes import kill_process_group, reap_worktree_processes
 from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
 from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
@@ -53,6 +53,7 @@ class TickContext:
     start_runs: bool = True
     runner_process_exists: Callable[[int], bool] = runner_process_exists
     kill_runner: Callable[[int], None] = kill_process_group
+    reap_orphans: Callable[..., dict[int, set[int]]] = reap_worktree_processes
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self)
@@ -496,6 +497,28 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
             report.actions.append(f"#{parent} batch PR finalization deferred: {exc}")
 
 
+def _reap_orphans(ctx: TickContext, report: TickReport) -> None:
+    """Stop processes left inside worktrees of issues that have no running run."""
+    worktrees: dict[int, Path] = {}
+    protected: set[int] = set()
+    for run in ctx.store.active_runs():
+        protected |= {pid for pid in (run.pid, run.executor_pgid) if pid is not None}
+    root = ctx.store.worktree_path(0).parent
+    for path in root.glob("issue-*") if root.is_dir() else ():
+        match = re.fullmatch(r"issue-(\d+)", path.name)
+        if match is None or not path.is_dir():
+            continue
+        run = ctx.store.get_run(int(match[1]))
+        if run is None or run.status != "running":
+            worktrees[int(match[1])] = path
+    for number, pids in sorted(ctx.reap_orphans(worktrees, protected=protected).items()):
+        if not pids:
+            continue
+        summary = f"Stopped {len(pids)} orphan process(es) left in the worktree of an issue that is not running."
+        append_event(ctx.store, ctx.now(), number, "orphans-reaped", summary)
+        report.actions.append(f"#{number} orphans reaped: {len(pids)}")
+
+
 def _tick_locked(ctx: TickContext) -> TickReport:
     report = TickReport()
     ctx.git.fetch("origin", ctx.config.base_branch)
@@ -504,6 +527,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         ctx.tracker.refresh_issues()
     _recover_runs(ctx, report)
     _reconcile_batches(ctx, report)
+    _reap_orphans(ctx, report)
     ready: dict[str, list[int]] = {}
     unknown: set[str] = set()
 
