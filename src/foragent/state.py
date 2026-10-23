@@ -67,6 +67,8 @@ class Run:
     session_ids: list[str] = field(default_factory=list)
     session_body: str | None = None
     resume_reason: str = ""
+    merge_conflicts: list[str] = field(default_factory=list)
+    local_skill_paths: list[str] = field(default_factory=list)
 
 
 class StateStore:
@@ -298,6 +300,8 @@ class StateStore:
                 session = {
                     "session_id": previous.session_id, "session_executor": previous.session_executor,
                     "session_ids": previous.session_ids, "session_body": previous.session_body,
+                    "merge_conflicts": previous.merge_conflicts,
+                    "local_skill_paths": previous.local_skill_paths,
                     "resume_reason": reason + (
                         "\nThe runner recreated the worktree from its target branch; "
                         "earlier uncommitted changes are no longer present."

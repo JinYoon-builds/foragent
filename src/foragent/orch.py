@@ -11,7 +11,7 @@ import re
 from tempfile import TemporaryDirectory
 import time
 
-from foragent.git import GitError
+from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
@@ -239,6 +239,11 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
         worktree = Path(directory) / "worktree"
         ctx.git.add_detached_worktree(worktree, head)
         try:
+            publication_conflicts = []
+            try:
+                ctx.git.at(worktree).check_publication(base)
+            except PublicationError as exc:
+                publication_conflicts = [f"{path}:{line}" for path, line in exc.markers]
             commands = ([ctx.config.test_command] if ctx.config.test_command is not None
                         else detect_test_commands(worktree))
             if not commands:
@@ -261,14 +266,15 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
         ctx.git.add_detached_worktree(worktree, head)
         try:
             probe = ctx.git.at(worktree)
-            conflicts = []
+            conflicts = list(publication_conflicts)
             try:
                 probe._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
                              "merge", "--no-commit", "--no-ff", base])
             except GitError:
-                conflicts = sorted(probe.conflict_paths())
-                if not conflicts:
+                merge_conflicts = sorted(probe.conflict_paths())
+                if not merge_conflicts:
                     raise
+                conflicts.extend(merge_conflicts)
         finally:
             ctx.git.remove_worktree(worktree)
     ci = ctx.tracker.pr_checks(n)

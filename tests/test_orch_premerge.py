@@ -69,6 +69,38 @@ def test_test_artifacts_do_not_affect_trial_merge(merge_case):
     assert c.tracker.pr_head_sha(c.pr) == c.head
 
 
+@pytest.mark.parametrize("action", ["premerge", "merge"])
+@pytest.mark.parametrize("content,blocked", [
+    ("<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> target\n", True),
+    (">>>>>>> A valid nested blockquote\n||||||| text\nHeading\n=======\n", False),
+])
+def test_publication_checks_actual_pr_contents_before_direct_merge(merge_case, action, content, blocked):
+    c = merge_case
+    base = c.history.tip
+    c.history.update({"notes.md": content})
+    c.head = c.history.tip
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/batch-1", c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    c.history.tip = base
+    c.tracker.set_pr_head_sha(c.pr, c.head)
+    # Neither the caller's index nor test-generated files represent the PR.
+    c.ctx.config = replace(c.ctx.config, test_command="test -f suite-ok; printf clean > notes.md")
+    if action == "premerge":
+        report = orch.premerge(c.ctx, c.pr)
+        assert report["tests"] == "pass" and report["ci"] == "pass"
+        assert report["ready"] is not blocked
+        if blocked:
+            assert any("notes.md:1" in item for item in report["conflicts"])
+        assert not c.tracker.comments and not c.tracker.merged_prs
+    elif blocked:
+        with pytest.raises(orch.OrchError, match="notes.md:1"):
+            orch.merge(c.ctx, c.pr, approved_by="jin")
+        assert not c.tracker.comments and not c.tracker.merged_prs
+    else:
+        orch.merge(c.ctx, c.pr, approved_by="jin")
+        assert c.tracker.merged_prs == [c.pr]
+
+
 @pytest.mark.parametrize("change", ["head", "base", "retarget", "closed", "ci-fail", "ci-pending"])
 def test_changes_during_premerge_refuse_merge_before_attribution(merge_case, monkeypatch, change):
     c = merge_case

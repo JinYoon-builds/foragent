@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from foragent.state import StateStore
 from foragent.tracker import Dependency, FakeTracker, LabelEvent, TrackerError
 
 from conftest import ACCEPTANCE, git_command
+from test_runner import import_index
 
 
 NOW = datetime(2026, 10, 20, 9, tzinfo=UTC)
@@ -37,10 +39,23 @@ pytest {ACCEPTANCE}
 
 @pytest.fixture
 def ctx(git_history, tmp_path, monkeypatch):
+    def git_run(args):
+        root, command = git_history.clone, args
+        while command[:1] == ["-C"]:
+            root, command = Path(command[1]), command[2:]
+        if command[:1] == ["-c"] and "commit" in command:
+            import_index(root, command[-1])
+            return ""
+        if command[:1] == ["push"]:
+            branch = command[-1]
+            git_command(git_history.origin, "fetch", str(root), f"+refs/heads/{branch}:refs/heads/{branch}")
+            return ""
+        return GitRepo(git_history.clone)._run_git(args)
+
     context = TickContext(
         repo="owner/repo", repo_root=git_history.clone,
         tracker=FakeTracker(strict=True), store=StateStore(tmp_path / "state"),
-        config=Config(approvers=["human"]), git=GitRepo(git_history.clone), now=lambda: NOW,
+        config=Config(approvers=["human"]), git=GitRepo(git_history.clone, git_run), now=lambda: NOW,
         launcher=lambda number: 7000 + number, start_runs=False,
         runner_process_exists=lambda number: False,
         kill_runner=lambda pid: None,
@@ -1206,6 +1221,7 @@ def test_stall_restarts_once_then_flags_second_stall(ctx):
     assert killed == [4321] and not path.exists()
     assert ctx.store.get_run(1).outcome == "stalled-restart"
     assert ctx.store.get_run(1).restarts == 1
+    assert git_command(ctx.repo_root, "show", "foragent/issue-1:unfinished.txt") == "unfinished"
     assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
     assert ctx.store.load_flag(1) is None
 
