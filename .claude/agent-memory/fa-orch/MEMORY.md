@@ -87,3 +87,4 @@
 - #195 검증: 지정 `tests/acceptance/test_fast_checks.py` 5개와 `tests/test_runner.py -k 'related_unit or implementation_prompt_full_suite or baseline_'` 16개 통과. 전체 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run pytest`는 2,351개 통과·257개 실패(3,345.93초), runner 402개는 전부 통과했다. HEAD 소스를 `/private/tmp/fa-195-base-e0eavpzb/src`에서 로딩해 257개 실패 ID를 모두 재현했으며 집합이 정확히 일치한다. 256개는 다른 이슈의 인수 시험, 1개는 `tests/test_scheduler.py::test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands[True]`의 간헐적인 `os.killpg(..., SIGKILL)` 권한 오류다. 전체 로그 `/private/tmp/fa-issue-195-full.log`, 비교 `/private/tmp/fa-issue-195-failure-comparison.json`; `.foragent/REBUTTAL.md`에 근거를 남겼다. 인수 시험·CI·Git 인덱스는 수정하지 않았다.
 
 - [#261 프로세스 트리 종료](process-tree-stop.md) — 종료 경로 subprocess 금지·SIGSTOP 순서·macOS EPERM·lsof 없음
+- [#106 machine AIMD budget](project_106_capacity.md) — capacity.py, data-root state, per-repo ceiling, grace window, lock scope

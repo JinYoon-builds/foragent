@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 from foragent import __version__, adopt, bench, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, order, watch, watch_open
@@ -16,18 +17,17 @@ from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
 from foragent.i18n import text
 from foragent.kick import kick_tick
-from foragent.labels import APPROVED, NEEDS_HUMAN, READY, RUNNING, state_group
+from foragent.labels import READY, RUNNING
 from foragent.lanes import LaneError, add_lane, set_lane_skills
 from foragent.paths import PathError
 from foragent.skills import SkillError, SkillManager
 from foragent.launcher import spawn_notify, spawn_runner
-from foragent.reasons import parse_reason
 from foragent.inspect_runtime import InspectRuntimeError
 from foragent.scheduler import TickContext, tick
 from foragent.runner import RunContext, check_done, run_issue
 from foragent.state import StateStore
-from foragent.status import collect_lanes
-from foragent.tracker import GhTracker, Tracker, TrackerError
+from foragent.status import collect as collect_status, summary_values, unknown as status_unknown
+from foragent.tracker import GhTracker, RecordingTracker, Tracker, TrackerError
 
 try:
     from foragent._build import GIT_SHA
@@ -195,6 +195,9 @@ files lists repository-relative paths or globs expected to change; absolute path
         command.add_argument("--json", action="store_true")
         if name == "tick":
             command.add_argument("--no-start", action="store_true")
+        else:
+            command.add_argument("--live", action="store_true",
+                                 help="Read GitHub once and refresh the local snapshot first")
     watch_command = actions.add_parser("watch", help="Watch the lane conveyor")
     watch_command.add_argument("--repo-root", type=Path, default=Path.cwd())
     watch_command.add_argument("--once", action="store_true")
@@ -277,36 +280,25 @@ def _comma_numbers(value: str) -> list[int]:
 
 
 def _status(tracker: Tracker, store: StateStore, config: Config | None = None) -> dict[str, Any]:
-    config = config or Config()
-    groups: dict[str, list[dict[str, Any]]] = {
-        state: [] for state in (NEEDS_HUMAN, RUNNING, "pr-open", READY, "approved-waiting", "unapproved")
-    }
-    issues = sorted(tracker.list_open_issues(), key=lambda issue: issue.number)
-    for issue in issues:
-        item: dict[str, Any] = {"number": issue.number, "title": issue.title}
-        group = state_group(issue, tracker)
-        if group == NEEDS_HUMAN:
-            comments = sorted(
-                tracker.list_comments(issue.number),
-                key=lambda comment: (datetime.fromisoformat(comment.created_at), comment.id),
-            )
-            item["reason"] = next(
-                (reason.value for comment in reversed(comments)
-                 if (reason := parse_reason(comment.body)) is not None), None,
-            )
-        groups[group].append(item)
-    lanes, summary = collect_lanes(issues, groups, tracker, store, config, datetime.now(UTC))
-    return {
-        "issues": groups,
-        "lanes": lanes,
-        "summary": summary,
-        "active_runs": [asdict(run) for run in store.active_runs()],
-        "history": [asdict(run) for run in store.read_history()[-10:]],
-    }
+    """Local status; the tracker is accepted for compatibility and never read."""
+    return collect_status(store, config or Config(), datetime.now(UTC))
+
+
+def _refresh_status(tracker: Tracker, store: StateStore, config: Config) -> None:
+    """Read GitHub once for --live; a failure is recorded and the stale snapshot is shown."""
+    context = SimpleNamespace(store=store, config=config, now=lambda: datetime.now(UTC))
+    try:
+        RecordingTracker(tracker, context).refresh_issues()
+    except TrackerError:
+        pass
 
 
 def _print_status(status: dict[str, Any], language: str = "en") -> None:
-    print(text("summary", language, **status["summary"]))
+    if status_unknown(status):
+        print(text("status_unknown", language) + (f": {status['error']}" if status.get("error") else ""))
+    print(text("summary", language, **summary_values(status["summary"])))
+    if status.get("as_of"):
+        print(text("status_as_of", language, time=status["as_of"]))
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
     for lane in status["lanes"].values():
         details = [text(lane["state"], language)]
@@ -581,6 +573,8 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 print(f"foragent: inspect notify failed: {' '.join(str(exc).split())}", file=sys.stderr)
         elif args.action == "status":
+            if args.live:
+                _refresh_status(tracker, store, config)
             status = _status(tracker, store, config)
             status["launchd"] = asdict(launchd.status(root, repo=repo))
             if args.json:
@@ -591,6 +585,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.open:
                 watch_open.open_view(root, store, config.language)
             else:
+                observation = store.issues_observation()
+                if observation["as_of"] is None and observation["error"] is None:
+                    # Never observed: seed the snapshot once; refreshes stay local.
+                    _refresh_status(tracker, store, config)
                 watch.run(
                     lambda: _status(tracker, store, config), tracker, store, config, root,
                     once=args.once, now=lambda: datetime.now(UTC),

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from foragent.config import Config
+from foragent.status import summary_values, unknown as status_unknown
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
@@ -96,7 +97,7 @@ def _frame(
                      watch._line("▓" * filled + "░" * (10 - filled) + f" {snapshot.completed}/{snapshot.total}", "green")]
     else:
         overview.append(watch._line(t("watch_no_order")))
-    overview.append(watch._line(t("watch_waiting", count=status["summary"]["waiting_human"]), "bold"))
+    overview.append(watch._line(t("watch_waiting", **summary_values({"count": status["summary"]["waiting_human"]})), "bold"))
     eta = (t("watch_complete") if snapshot.order and snapshot.completed == snapshot.total
            else t("watch_eta", time="~" + snapshot.eta.astimezone().strftime("%H:%M") if snapshot.eta
                   else t("watch_estimating") if snapshot.order else "—"))
@@ -175,7 +176,12 @@ def _frame(
         events.append(watch._line(t("watch_no_events")))
     work = watch._panel(table, table_width, t("watch_now"))
     handled = watch._panel(events, events_width, t("watch_events"))
-    frame = [watch._line(t("summary", **status["summary"]), "bold"), []]
+    summary = t("summary", **summary_values(status["summary"]))
+    if status.get("as_of"):
+        observed = watch.datetime.fromisoformat(status["as_of"]).astimezone().strftime("%H:%M")
+        summary += " · " + t("status_as_of", time=observed)
+    first = [watch._line(t("status_unknown") + "  " + summary, "yellow")] if status_unknown(status) else []
+    frame = (first or [watch._line(summary, "bold")]) + [[]]
     frame += watch._beside(left, roads, orchestrator_width, links=True) if side_by_side else left + roads
     frame += [[]] + (watch._beside(work, handled, table_width) if side_by_side else work + handled)
     if selected is not None:

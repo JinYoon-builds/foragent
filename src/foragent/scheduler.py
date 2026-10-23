@@ -10,6 +10,10 @@ import subprocess
 
 from foragent import board, orch_github, watch_open
 from foragent.actions import flag, invalidate_approval
+from foragent.capacity import (
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, machine_load, machine_lock, machine_runs, next_parallel, read_state,
+    write_state,
+)
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
@@ -323,7 +327,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
     for run in ctx.store.active_runs():
         if run.pid is None:
             dead = (
-                ctx.now() - datetime.fromisoformat(run.started_at) >= timedelta(minutes=2)
+                ctx.now() - datetime.fromisoformat(run.started_at) >= LAUNCH_GRACE
                 and not ctx.runner_process_exists(run.number)
             )
         else:
@@ -530,7 +534,9 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
     if ctx.store.issues_refresh_due(ctx.now()) or ctx.store.github_outbox():
-        ctx.tracker.refresh_issues()
+        # Keep an existing recorder; wrapping again would bypass its own state.
+        recorder = ctx.tracker if isinstance(ctx.tracker, RecordingTracker) else RecordingTracker(ctx.tracker, ctx)
+        recorder.refresh_issues()
     ctx.tracker.flush_outbox()
     if until := ctx.store.github_wait_until(ctx.now()):
         return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
@@ -617,11 +623,68 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         return report
 
+    started = _start_ready(ctx, ready, lane_for, base_ref, report)
+    if started is None:
+        return report
+    if started:
+        try:
+            watch_open.open_view(ctx.repo_root, ctx.store, ctx.config.language)
+        except Exception as exc:
+            # Optional progress display must never hide successfully started runs.
+            error = " ".join(str(exc).split())[:200]
+            report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
+    return report
+
+
+def _machine_budget(ctx: TickContext, ready: dict[str, list[int]]) -> int:
+    """Update the machine-wide AIMD value once per tick and return this tick's machine budget."""
+    now = ctx.now()
+    busy_lanes = {run.lane for run in ctx.store.active_runs()}
+    waiting = sum(1 for lane in ready if lane not in busy_lanes and not ctx.store.lane_paused(lane, now))
+    pressure, load = machine_load()
+    with machine_lock(ctx.store):
+        state = read_state(ctx.store)
+        current = int(state["parallel"]) if state else INITIAL_PARALLEL
+        changed_at = datetime.fromisoformat(state["changed_at"]) if state else now
+        demand = machine_runs(ctx.store, now) + waiting
+        # Work only caps growth: the shared value never drops below itself for lack
+        # of work here, so it stays the pressure- and load-driven value.
+        value = next_parallel(
+            current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
+            ceiling=None, increase_ok=now - changed_at >= INCREASE_INTERVAL,
+        )
+        if state is None or value != current:
+            write_state(ctx.store, value, now)
+    return max(1, min(value, demand))
+
+
+def _has_slot(ctx: TickContext, budget: int) -> bool:
+    """Machine-wide runs stay under the shared budget; this project's under its ceiling."""
+    if machine_runs(ctx.store, ctx.now()) >= budget:
+        return False
+    return ctx.config.max_parallel is None or len(ctx.store.active_runs()) < ctx.config.max_parallel
+
+
+def _reserve_slot(ctx: TickContext, number: int, budget: int) -> bool:
+    """Recount and journal the start under the machine lock; GitHub work happens outside."""
+    with machine_lock(ctx.store):
+        if not _has_slot(ctx, budget):
+            return False
+        ctx.store.prepare_run_start(number)
+        return True
+
+
+def _start_ready(
+    ctx: TickContext, ready: dict[str, list[int]], lane_for: Callable[[Issue], str], base_ref: str,
+    report: TickReport,
+) -> bool | None:
+    """Start ready lanes within the machine budget; None means a GitHub wait began."""
+    budget = _machine_budget(ctx, ready)
     started = False
     for lane in sorted(ready, key=lane_order):
-        active = ctx.store.active_runs()
-        if len(active) >= ctx.config.max_parallel:
+        if not _has_slot(ctx, budget):
             break
+        active = ctx.store.active_runs()
         if any(run.lane == lane for run in active) or ctx.store.lane_paused(lane, ctx.now()):
             continue
         for number in ready[lane]:
@@ -641,14 +704,15 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             if not _check_prerequisites(ctx, issue, approval, report):
                 continue
 
-            ctx.store.prepare_run_start(number)
+            if not _reserve_slot(ctx, number, budget):
+                return started
             try:
                 ctx.tracker.remove_labels(number, [READY])
                 ctx.tracker.add_labels(number, [RUNNING])
                 board.sync_status(ctx, number, "Running")
                 if until := ctx.store.github_wait_until(ctx.now()):
                     report.skipped = f"GitHub rate limit until {until.isoformat()}"
-                    return report
+                    return None
             except TrackerError as exc:
                 if not exc.is_rate_limit:
                     raise
@@ -663,7 +727,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                 orch_github.wait_run(ctx, number, until)
                 ctx.store.finish_run(number, "limit-wait", detail=str(exc))
                 report.skipped = f"GitHub rate limit until {until.isoformat()}"
-                return report
+                return None
             ctx.store.start_run(
                 number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
                 tier=issue_size(issue.labels),
@@ -674,11 +738,4 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             report.actions.append(f"#{number} started running (pid={pid})")
             started = True
             break
-    if started:
-        try:
-            watch_open.open_view(ctx.repo_root, ctx.store, ctx.config.language)
-        except Exception as exc:
-            # Optional progress display must never hide successfully started runs.
-            error = " ".join(str(exc).split())[:200]
-            report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
-    return report
+    return started

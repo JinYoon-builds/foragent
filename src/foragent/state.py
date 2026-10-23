@@ -199,6 +199,20 @@ class StateStore:
                 baseline["revision"] = snapshot.get("revision", 0) + 1
             self._save_local_issue(snapshot, row)
 
+    def issues_observation(self) -> dict[str, Any]:
+        """When the snapshot was last read and whether a later read failed."""
+        snapshot = self._issue_snapshot()
+        failure = snapshot.get("refresh_failure") or {}
+        return {"as_of": snapshot["refreshed_at"], "error": failure.get("error"),
+                "failed_at": failure.get("failed_at")}
+
+    def record_issues_refresh_failure(self, error: str, failed_at: datetime) -> None:
+        """Keep the last known facts and note that a later read failed."""
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            snapshot["refresh_failure"] = {"error": error, "failed_at": failed_at.isoformat()}
+            self._write_json(self.root / "issues.json", snapshot)
+
     def issues_revision(self) -> int:
         return self._issue_snapshot().get("revision", 0)
 
@@ -270,6 +284,8 @@ class StateStore:
     def refresh_local_issues(
         self, issues: list, prs: list, lanes: dict, now: datetime,
         *, comments: dict[int, list[dict]] | None = None, since_revision: int | None = None,
+        parents: dict[int, int] | None = None, blocked_by: dict[int, list[dict]] | None = None,
+        complete_prs: bool = False,
     ) -> list[int]:
         """Replace remote facts, preserving local changes made since the refresh began."""
         from foragent.labels import issue_lane
@@ -296,8 +312,9 @@ class StateStore:
                 remote = {
                     **old, "number": issue.number, "title": issue.title, "body": issue.body,
                     "labels": sorted(issue.labels), "lane": issue_lane(issue.labels, lanes),
-                    "state": issue.state, "pr_number": old.get("pr_number"),
-                    "merged": old.get("merged", False),
+                    "state": issue.state,
+                    "pr_number": None if complete_prs else old.get("pr_number"),
+                    "merged": False if complete_prs else old.get("merged", False),
                     "comments": comments.get(issue.number, old_comments),
                     "updated_at": self._timestamp(),
                 }
@@ -317,6 +334,12 @@ class StateStore:
                         continue
                     dropped.add(issue.number)
                 rows[str(issue.number)] = remote
+            for number, row in rows.items():
+                # Order edges and dependencies are observations, never local intent.
+                if parents is not None:
+                    row["parent"] = parents.get(int(number))
+                if blocked_by is not None:
+                    row["blocked_by"] = blocked_by.get(int(number), [])
             for pr in prs:
                 if (row := rows.get(str(pr_issue_number(pr.head)))) is not None:
                     row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
@@ -324,6 +347,7 @@ class StateStore:
             if since_revision is not None:
                 rows.update({number: row for number, row in previous.items()
                              if row.get("revision", 0) > since_revision and int(number) not in dropped})
+            snapshot.pop("refresh_failure", None)
             self._write_json(self.root / "issues.json", {
                 **snapshot, "refreshed_at": now.isoformat(), "issues": rows,
                 "outbox": [entry for entry in snapshot.get("outbox", []) if entry["issue"] not in dropped],
@@ -439,6 +463,14 @@ class StateStore:
 
     def run_start_pending(self, number: int) -> bool:
         return (self.root / "run-starts" / f"{number}.json").exists()
+
+    def run_starts(self) -> dict[int, str]:
+        """Map each journaled, not yet cleared start to its prepared_at time."""
+        starts = {}
+        for path in (self.root / "run-starts").glob("*.json"):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            starts[int(value["number"])] = value["prepared_at"]
+        return starts
 
     def clear_run_start(self, number: int) -> None:
         (self.root / "run-starts" / f"{number}.json").unlink(missing_ok=True)
