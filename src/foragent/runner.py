@@ -1601,7 +1601,7 @@ def _implement_and_publish(
             except TrackerError as exc:
                 if exc.is_rate_limit:
                     raise
-                if ctx.tracker.get_issue(n).state != "closed":
+                if ctx.tracker.current_issue(n).state != "closed":
                     raise
             ctx.tracker.remove_labels(n, [READY, RUNNING])
             board.sync_status(ctx, n, "Done")
@@ -1905,7 +1905,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         except TrackerError as exc:
             if exc.is_rate_limit:
                 raise
-            if ctx.tracker.get_issue(n).state != "closed":
+            if ctx.tracker.current_issue(n).state != "closed":
                 raise
         ctx.tracker.remove_labels(n, [READY, RUNNING, BLOCKED])
         if pr.base == batch_branch and parent is not None:
@@ -1985,7 +1985,7 @@ def review_only(
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
                     if outcome != "limit-wait":
-                        current = ctx.tracker.get_issue(n)
+                        current = ctx.tracker.current_issue(n)
                         if current.state == "open" and not current.labels & {BLOCKED, READY}:
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
                         ctx.tracker.remove_labels(n, [RUNNING])
