@@ -75,9 +75,11 @@ def _activity(
 
 def _frame(
     snapshot: Snapshot, config: Config, repo_root: Path, *, tick: int, width: int,
-    selected: str | None, now: datetime,
+    selected: str | None, now: datetime, layout: dict[str, Any] | None = None,
 ) -> list[Line]:
     from foragent import watch
+
+    hits: list[tuple[int, int, int, int, Any]] = []
 
     language = config.language
     status = snapshot.status
@@ -102,6 +104,9 @@ def _frame(
            else t("watch_eta", time="~" + snapshot.eta.astimezone().strftime("%H:%M") if snapshot.eta
                   else t("watch_estimating") if snapshot.order else "—"))
     overview.append(watch._line(eta))
+    if snapshot.requests:
+        count = lambda name: sum(row.get("status") == name for row in snapshot.requests)
+        overview.append(watch._line(t("watch_requests", processing=count("processing"), done=count("done"))))
     left = watch._panel(overview, orchestrator_width, "🧭 " + t("watch_orchestrator"))
     roads: list[Line] = [[("━" * road_width, "edge")]]
     # Several runs in one lane are clones of its agent: name the lane once with ×N.
@@ -206,23 +211,55 @@ def _frame(
         summary += " · " + t("status_as_of", time=observed)
     first = [watch._line(t("status_unknown") + "  " + summary, "yellow")] if status_unknown(status) else []
     frame = (first or [watch._line(summary, "bold")]) + [[]]
+    stage = watch._stage(snapshot, language, width)
+    if stage:
+        hits.append((0, len(frame), width if width < 44 else 18, len(frame) + len(stage), ("orchestrator", None)))
+        frame += stage + [[]]
+    hits.append((0, len(frame), orchestrator_width, len(frame) + len(left), ("orchestrator", None)))
     frame += watch._beside(left, roads, orchestrator_width, links=True) if side_by_side else left + roads
     frame += [[]] + (watch._beside(work, handled, table_width) if side_by_side else work + handled)
     if selected is not None:
         detail = watch.render_detail(config, selected, repo_root, done_count=len(snapshot.done.get(selected, [])))
         frame += [[]] + watch._panel([watch._line(line) for line in detail.splitlines()], width, t("watch_detail"))
     frame += [watch._line(t("watch_help_many" if len(rows) > 9 else "watch_help", count=len(rows)))]
+    if layout is not None:
+        layout["hits"] = hits
     return [watch._fit(list(line), width) for line in frame]
+
+
+def _stage(snapshot: Snapshot, language: str, width: int) -> list[Line]:
+    """The big orchestrator squirrel saying which planning request it is handling (D76).
+
+    Shown only while a request in the durable box is being processed. The speech
+    shares the squirrel's pixel rows from 56 columns, sits below it from 44, and
+    is plain text below that.
+    """
+    from foragent import watch
+
+    processing = [row for row in snapshot.requests if row.get("status") == "processing"]
+    if not processing:
+        return []
+    request = (processing[-1].get("text") or "").strip().splitlines() or [""]
+    speech = watch.text("watch_request_bubble", language, text=request[0])
+    if width < 44:
+        return [watch._fit(watch._line(speech, "bold"), width)]
+    art: list[Line] = [[(glyph, "art") for glyph, foreground, background in row]
+                       for row in watch.half_blocks(watch.ORCHESTRATOR, watch.PALETTE)]
+    if width < 56:
+        return art + [watch._fit(watch._line(speech, "bold"), width)]
+    art[1] = [*art[1], ("  ", ""), *watch._fit(watch._line(speech, "bold"), width - 20)]
+    return art
 
 
 def render_frame(
     snapshot: Snapshot, config: Config, repo_root: Path, *, tick: int = 0, width: int = 120,
     selected: str | None = None, now: datetime | None = None,
+    state: dict[str, Any] | None = None, layout: dict[str, Any] | None = None,
 ) -> str:
     """A single plain-text frame, sharing the live view's layout and data."""
     from foragent import watch
 
     return "\n".join("".join(value for value, style in line).rstrip() for line in watch._frame(
         snapshot, config, repo_root, tick=tick, width=max(40, width), selected=selected,
-        now=now or snapshot.captured_at,
+        now=now or snapshot.captured_at, **({} if layout is None else {"layout": layout}),
     ))
