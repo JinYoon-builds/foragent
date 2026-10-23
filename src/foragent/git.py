@@ -8,13 +8,41 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 
 
 REVIEW_SCOPE_FILE = "CLAUDE.local.md"
 
 
+def _conflict_marker_numbers(content: str, widths: set[int]) -> list[int]:
+    """Report marker lines only when an opening is followed by a closing."""
+    openings = tuple("<" * width for width in widths)
+    closings = tuple(">" * width for width in widths)
+    ancestors = tuple("|" * width for width in widths)
+    separators = {"=" * width for width in widths}
+    remaining, pending = [], []
+    for number, line in enumerate(content.splitlines(), 1):
+        if line.startswith(openings):
+            pending.append(number)
+        elif line.startswith(closings):
+            if pending:
+                remaining.extend([*pending, number])
+                pending = []
+        elif pending and (line.startswith(ancestors) or line in separators):
+            pending.append(number)
+    return remaining
+
+
 class GitError(RuntimeError):
     """A Git command or remote URL could not be used."""
+
+
+class PublicationError(GitError):
+    """The proposed Git contents contain unresolved conflict markers."""
+
+    def __init__(self, markers: list[tuple[str, int]]):
+        self.markers = markers
+        super().__init__("\n".join(f"충돌 마커가 남음: {path}:{line}" for path, line in markers))
 
 
 @dataclass(frozen=True)
@@ -49,7 +77,15 @@ class GitRepo:
 
     def fetch(self, remote: str = "origin", ref: str | None = None) -> None:
         refspec = f"+refs/heads/{ref}:refs/remotes/{remote}/{ref}" if ref is not None else None
-        self._call(["fetch", remote, *([refspec] if refspec is not None else [])])
+        for attempt in range(3):
+            try:
+                self._call(["fetch", remote, *([refspec] if refspec is not None else [])])
+                return
+            except GitError as exc:
+                # Another fetch can update the shared remote ref after Git reads it.
+                if "incorrect old value provided" not in str(exc) or attempt == 2:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
 
     def at(self, root: Path) -> "GitRepo":
         return GitRepo(root, lambda args: self._call(["-C", str(root), *args]))
@@ -65,6 +101,15 @@ class GitRepo:
 
     def ref_sha(self, ref: str) -> str:
         return self._call(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
+
+    def local_branch_sha(self, branch: str) -> str | None:
+        try:
+            return self._call(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"]).strip()
+        except GitError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, subprocess.CalledProcessError) and cause.returncode == 1:
+                return None
+            raise
 
     def add_detached_worktree(self, path: Path, ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +129,22 @@ class GitRepo:
         if paths:
             self._call(["--literal-pathspecs", "add", "-A", "--", *paths])
         self._exclude_artifacts()
+
+    def reconcile_local_skills(self, target_ref: str) -> None:
+        """Release injected dependencies only after clearing copies owned by target."""
+        owned = {name for name in self.local_skill_paths if self.blob_sha(target_ref, name) is not None}
+        for name in sorted(owned):
+            # A tracked HEAD copy already belongs to the repository. Otherwise
+            # remove the injected directory (including executor-staged files) so
+            # the target merge can install its tree without an untracked collision.
+            if self.blob_sha("HEAD", name) is None:
+                path = self.root / name
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+                self._call(["--literal-pathspecs", "rm", "--cached", "-r", "-f", "--ignore-unmatch", "--", name])
+        self.local_skill_paths.difference_update(owned)
 
     def _exclude_artifacts(self) -> None:
         # Also remove entries staged by an executor, retaining their local files.
@@ -112,6 +173,20 @@ class GitRepo:
 
     def staged_tree_sha(self) -> str:
         return self._call(["write-tree"]).strip()
+
+    def restore_staged_paths(self, ref: str, paths: Iterable[str]) -> None:
+        paths = list(paths)
+        if not paths:
+            return
+        # restore rejects paths absent from both trees, even when other paths
+        # need restoring. Index-only entries must remain in the list to remove
+        # additions whose approved state is absence.
+        source = self._call(["--literal-pathspecs", "ls-tree", "-r", "--name-only", "-z", ref, "--", *paths])
+        indexed = self._call(["--literal-pathspecs", "ls-files", "--cached", "-z", "--", *paths])
+        known = set(source.split("\0")) | set(indexed.split("\0"))
+        paths = [path for path in paths if path in known]
+        if paths:
+            self._call(["--literal-pathspecs", "restore", "--source", ref, "--staged", "--", *paths])
 
     def staged_diff(self, base_ref: str, *, binary: bool = False) -> str:
         return self._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", *(["--binary"] if binary else []), base_ref])
@@ -209,12 +284,28 @@ class GitRepo:
             raise
         return True
 
-    def merge_base(self, target: str) -> None:
+    def merge_base(self, target: str, *, commit: bool = True) -> None:
         self._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
-                    "merge", "--no-edit", target])
+                    "merge", "--no-edit", *([] if commit else ["--no-commit"]), target])
+
+    def merge_in_progress(self) -> bool:
+        path = Path(self._call(["rev-parse", "--git-path", "MERGE_HEAD"]).strip())
+        return (path if path.is_absolute() else self.root / path).is_file()
+
+    def quit_merge(self) -> None:
+        """Forget merge parents while retaining the index and partial resolution."""
+        self._call(["merge", "--quit"])
 
     def conflict_paths(self) -> list[str]:
         return list(filter(None, self._call(["diff", "--name-only", "--diff-filter=U", "-z"]).split("\0")))
+
+    def _conflict_marker_width(self, name: str) -> int:
+        value = self._call(["check-attr", "-z", "conflict-marker-size", "--", name]).split("\0")[2]
+        try:
+            width = int(value)
+        except ValueError:
+            width = 7
+        return width if width > 0 else 7
 
     def conflict_marker_paths(self, paths: Iterable[str]) -> list[str]:
         remaining = []
@@ -222,20 +313,44 @@ class GitRepo:
             path = self.root / name
             if path.is_symlink() or not path.is_file():
                 continue
-            value = self._call(["check-attr", "-z", "conflict-marker-size", "--", name]).split("\0")[2]
-            try:
-                width = int(value)
-            except ValueError:
-                width = 7
-            if width <= 0:
-                width = 7
-            marker = re.compile(
-                rf"^(?:<{{{width}}}|\|{{{width}}}|={{{width}}}|>{{{width}}})(?:[ \t].*)?\r?$".encode(),
-                re.MULTILINE,
-            )
-            if marker.search(path.read_bytes()):
+            widths = {7, self._conflict_marker_width(name)}
+            if _conflict_marker_numbers(path.read_text(errors="replace"), widths):
                 remaining.append(name)
         return remaining
+
+    def conflict_marker_lines(self, paths: Iterable[str]) -> list[tuple[str, int]]:
+        """Locate Git markers in the index contents that would be published."""
+        paths = sorted(set(paths))
+        if not paths:
+            return []
+        # Git does not generate conflict marker lines in binary blobs. Ask Git
+        # which index entries are text before reading them through the text adapter.
+        try:
+            text_paths = self._call(["--literal-pathspecs", "grep", "--cached", "-I", "-l", "-z",
+                                     "-e", "", "--", *paths])
+        except GitError as exc:
+            if isinstance(exc.__cause__, subprocess.CalledProcessError) and exc.__cause__.returncode == 1:
+                return []
+            raise
+        paths = list(filter(None, text_paths.split("\0")))
+        if not paths:
+            return []
+        entries = self._call(["--literal-pathspecs", "ls-files", "--stage", "-z", "--", *paths])
+        remaining = []
+        for entry in filter(None, entries.split("\0")):
+            metadata, name = entry.split("\t", 1)
+            mode, sha, stage = metadata.split()
+            if mode not in {"100644", "100755"} or stage != "0":
+                continue
+            widths = {7, self._conflict_marker_width(name)}
+            remaining.extend((name, number) for number in _conflict_marker_numbers(self._call(["cat-file", "blob", sha]), widths))
+        return remaining
+
+    def check_publication(self, base_ref: str) -> None:
+        """Validate staged PR contents in files changed against the actual base."""
+        markers = self.conflict_marker_lines(self.changed_paths(base_ref))
+        if markers:
+            raise PublicationError(markers)
 
     def has_staged_changes(self) -> bool:
         return self.staged_tree_sha() != self._call(["rev-parse", "HEAD^{tree}"]).strip()

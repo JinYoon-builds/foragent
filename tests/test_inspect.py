@@ -31,9 +31,17 @@ def flag(ctx, number=1, reason=Reason.SPEC_QUESTION, details="Question?\n1. A (r
     ctx.tracker.comment(number, format_comment(reason, f"Summary {number}", details))
 
 
+def human_question(ctx, number=1):
+    flag(ctx, number)
+    comment = ctx.tracker.comments[number][-1]
+    ctx.tracker.comments[number][-1] = replace(
+        comment, body=comment.body.replace("reason=spec-question", "reason=escalated"),
+    )
+
+
 def _notify_in_process(root, connection, pause_delivery, fail_delivery):
     ctx = InspectContext(FakeTracker(now=lambda: NOW), StateStore(root), "owner/repo", Config(), lambda: NOW)
-    flag(ctx)
+    human_question(ctx)
 
     def notifier(line, title):
         connection.send(("delivering", line))
@@ -82,6 +90,8 @@ def notification_process():
 
 
 def pr(ctx, number=1, *, body="Closes #1", merged=False, head=None, at=NOW):
+    if head is None and number not in ctx.tracker.issues:
+        ctx.tracker.add_issue(number)
     result = ctx.tracker.create_pr(
         head=head or f"foragent/issue-{number}", base="main", title=f"PR for {number}", body=body,
     )
@@ -195,8 +205,8 @@ def test_fast_mode_path_review_is_collected_and_notified(ctx):
     item, = collect(ctx).items
     assert (item.group, item.number, item.pr) == ("review", 1, number)
     calls = []
-    assert notify(ctx, lambda *args: calls.append(args)) == "Review 1 · #1 PR for 1"
-    assert calls == [("Review 1 · #1 PR for 1", "Foragent owner/repo")]
+    assert notify(ctx, lambda *args: calls.append(args)) == f"#1 PR for 1 · PR #{number}: Decide whether to merge"
+    assert calls == [(f"#1 PR for 1 · PR #{number}: Decide whether to merge", "Foragent owner/repo")]
 
 
 def test_merged_pr_since_checklists_and_one_try_per_issue(ctx):
@@ -419,7 +429,8 @@ def test_mark_seen_and_signature_persist_independently(ctx):
     ctx.store.update_inspect(notified_signature="signature")
     assert mark_seen(ctx) == NOW.isoformat()
     reopened = StateStore(ctx.store.root)
-    assert asdict(reopened.load_inspect()) == {"since": NOW.isoformat(), "notified_signature": "signature"}
+    assert asdict(reopened.load_inspect()) == {"since": NOW.isoformat(), "notified_signature": "signature",
+                                               "notified_items": [], "summary_date": None}
     reopened.update_inspect(notified_signature="new")
     assert ctx.store.load_inspect().since == NOW.isoformat()
     assert json.loads((ctx.store.root / "inspect.json").read_text())["notified_signature"] == "new"
@@ -441,82 +452,80 @@ def test_signature_is_stable_and_only_uses_actionable_identity(ctx):
 
 
 @pytest.mark.parametrize("channel", [None, "claude-push", "macos", "slack:https://example.test/hook"])
-def test_notify_dedupes_signature_with_injected_delivery_and_counts(ctx, channel):
+def test_notify_dedupes_individual_questions_and_ignores_counts(ctx, channel):
     ctx.config = replace(ctx.config, notify=channel)
-    flag(ctx, 1)
-    flag(ctx, 2)
+    human_question(ctx, 1)
+    human_question(ctx, 2)
     flag(ctx, 3, Reason.HASH_MISMATCH)
-    flag(ctx, 4, Reason.RISK_HIGH)
+    flag(ctx, 4, Reason.RETRIES_EXCEEDED)
     pr(ctx, 5, merged=True)
     calls = []
     notifier = lambda *args: calls.append(args)
-    expected = ("Decision 2 · Re-approve 1 · Review 1 · Try 1 · "
-                "#1 Issue 1 (spec-question: Summary 1) · #2 Issue 2 (spec-question: Summary 2) · "
-                "#3 Issue 3 (hash-mismatch: Summary 3) · +1")
-    assert notify(ctx, notifier) == expected
-    assert calls == [
-        (expected, "Foragent owner/repo"),
-    ]
+    expected = [f"#{n} Issue {n} (escalated: Summary {n})" for n in (1, 2)]
+    assert notify(ctx, notifier) == "\n".join(expected)
+    assert calls == [(line, "Foragent owner/repo") for line in expected]
     assert notify(ctx, notifier) is None
-    # Changes to try items or an answer do not change the pending identity.
     pr(ctx, 6, merged=True)
     answer(ctx, 1, "A")
-    assert notify(ctx, notifier) is None
+    ctx.tracker.close_issue(1)
     flag(ctx, 9, Reason.STALLED)
-    line = notify(ctx, notifier)
-    assert line.startswith("Decision 2 · Re-approve 1 · Review 1 · Try 2 · Tech failure 1 · ")
-    assert line.endswith("+2")
+    assert notify(ctx, notifier) is None
+    human_question(ctx, 10)
+    assert notify(ctx, notifier) == "#10 Issue 10 (escalated: Summary 10)"
+    assert len(calls) == 3
 
 
-def test_notify_silent_for_empty_and_try_only_and_resets_resolved_signature(ctx):
+def test_notify_silent_for_empty_try_only_and_same_question_relabelled(ctx):
     calls = []
     notifier = lambda *args: calls.append(args)
     assert notify(ctx, notifier) is None
     pr(ctx, 1, merged=True)
     assert notify(ctx, notifier) is None
     assert calls == []
-    flag(ctx, 2)
+    human_question(ctx, 2)
     assert notify(ctx, notifier)
     ctx.tracker.remove_labels(2, ["needs-human"])
     assert notify(ctx, notifier) is None
     ctx.tracker.add_labels(2, ["needs-human"])
-    assert notify(ctx, notifier)
+    assert notify(ctx, notifier) is None
+    # Another escalation on the same issue is a new decision, even with the same reason.
+    ctx.tracker.comment(2, "<!-- foragent:needs-human reason=escalated -->\nAnother question?")
+    assert notify(ctx, notifier) == "#2 Issue 2 (escalated: Another question?)"
     assert len(calls) == 2
 
 
 def test_notification_flattens_titles_and_reasons_and_omits_try_items(ctx):
     ctx.tracker.add_issue(1, "Choose\nformat\tplease", labels=["needs-human"])
-    ctx.tracker.comment(1, "<!-- foragent:needs-human reason=spec-question -->\n**Which\tformat?**")
+    ctx.tracker.comment(1, "<!-- foragent:needs-human reason=escalated -->\n**Which\tformat?**")
     ctx.tracker.add_issue(2, "Unknown reason", labels=["needs-human"])
     pr(ctx, 3, merged=True)
     sent = []
     line = notify(ctx, lambda line, title: sent.append(line))
-    assert line == ("Decision 2 · Try 1 · #1 Choose format please (spec-question: Which format?) · "
-                    "#2 Unknown reason")
+    assert line == "#1 Choose format please (escalated: Which format?)"
     assert sent == [line]
     assert len(line.splitlines()) == 1
 
 
 @pytest.mark.parametrize("summary", [None, "", " \n\t "])
 def test_notification_keeps_reason_without_missing_summary(ctx, monkeypatch, summary):
-    flag(ctx)
+    human_question(ctx)
     inbox = collect(ctx)
     inbox.items[0] = replace(inbox.items[0], summary=summary)
     monkeypatch.setattr("foragent.inspect_actions.collect", lambda ctx: inbox)
     sent = []
-    assert notify(ctx, lambda line, title: sent.append(line)) == "Decision 1 · #1 Issue 1 (spec-question)"
-    assert sent == ["Decision 1 · #1 Issue 1 (spec-question)"]
+    assert notify(ctx, lambda line, title: sent.append(line)) == "#1 Issue 1 (escalated)"
+    assert sent == ["#1 Issue 1 (escalated)"]
 
 
 def test_notify_failure_does_not_mark_as_notified_and_can_retry(ctx):
-    flag(ctx)
+    human_question(ctx)
     def fail(*args):
         raise RuntimeError("notification unavailable")
     with pytest.raises(RuntimeError, match="unavailable"):
         notify(ctx, fail)
     assert ctx.store.load_inspect().notified_signature is None
     calls = []
-    assert notify(ctx, lambda *args: calls.append(args)) == "Decision 1 · #1 Issue 1 (spec-question: Summary 1)"
+    assert notify(ctx, lambda *args: calls.append(args)) == "#1 Issue 1 (escalated: Summary 1)"
     assert len(calls) == 1
 
 
@@ -526,7 +535,7 @@ def test_concurrent_notifications_serialize_delivery_and_signature_and_release_a
 ):
     first = notification_process(ctx.store.root, pause_delivery=True, fail_delivery=fail_first)
     assert first.poll(10)
-    assert first.recv() == ("delivering", "Decision 1 · #1 Issue 1 (spec-question: Summary 1)")
+    assert first.recv() == ("delivering", "#1 Issue 1 (escalated: Summary 1)")
     assert (ctx.store.root / "notify.lock").exists()
     second = notification_process(ctx.store.root)
     try:
@@ -538,13 +547,13 @@ def test_concurrent_notifications_serialize_delivery_and_signature_and_release_a
     finally:
         first.send("continue")
     assert first.poll(10)
-    assert first.recv() == (("error", "delivery failed") if fail_first else ("result", "Decision 1 · #1 Issue 1 (spec-question: Summary 1)"))
+    assert first.recv() == (("error", "delivery failed") if fail_first else ("result", "#1 Issue 1 (escalated: Summary 1)"))
     assert second.poll(10)
     if fail_first:
-        assert second.recv() == ("delivering", "Decision 1 · #1 Issue 1 (spec-question: Summary 1)")
+        assert second.recv() == ("delivering", "#1 Issue 1 (escalated: Summary 1)")
         assert second.poll(10)
-    assert second.recv() == ("result", "Decision 1 · #1 Issue 1 (spec-question: Summary 1)" if fail_first else None)
-    flag(ctx)
+    assert second.recv() == ("result", "#1 Issue 1 (escalated: Summary 1)" if fail_first else None)
+    human_question(ctx)
     assert ctx.store.load_inspect().notified_signature == pending_signature(collect(ctx))
     assert ctx.store.load_inspect().since == NOW.isoformat()
 

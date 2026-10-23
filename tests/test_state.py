@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta, timezone
 import errno
 import fcntl
@@ -101,6 +101,23 @@ def test_restart_budget_survives_crash_recovery_but_resets_after_completion(stor
     assert store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1)).restarts == 0
 
 
+def test_recovery_metadata_survives_restart_and_old_records_default_to_empty(store):
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.update_run(1, merge_conflicts=["notes.txt"], local_skill_paths=[".claude/skills/testing"])
+    store.finish_run(1, "timeout")
+    reopened = StateStore(store.root)
+    run = reopened.start_run(1, branch="branch", worktree="worktree")
+    assert run.merge_conflicts == ["notes.txt"]
+    assert run.local_skill_paths == [".claude/skills/testing"]
+    path = store.root / "runs/1.json"
+    old_run = json.loads(path.read_text())
+    del old_run["merge_conflicts"], old_run["local_skill_paths"]
+    path.write_text(json.dumps(old_run))
+    (store.root / "runs.jsonl").write_text(json.dumps(old_run) + "\n")
+    for run in (reopened.get_run(1), *reopened.read_history()):
+        assert run.merge_conflicts == [] and run.local_skill_paths == []
+
+
 def test_limit_wait_resumptions_preserve_attempts_and_restarts(store):
     store.start_run(1, branch="branch", worktree="worktree")
     store.update_run(1, attempts=2, restarts=1, waited_seconds=120, executor_waited_seconds=120)
@@ -113,6 +130,16 @@ def test_limit_wait_resumptions_preserve_attempts_and_restarts(store):
     store.finish_run(1, "merged")
     run = store.start_run(1, branch="branch", worktree="worktree")
     assert (run.attempts, run.restarts) == (1, 0)
+
+
+def test_github_pause_is_persisted_project_wide_and_cannot_be_shortened(store):
+    until = NOW + timedelta(minutes=10)
+    assert store.pause_github(until) == until
+    reopened = StateStore(store.root)
+    assert reopened.pause_github(NOW + timedelta(minutes=1)) == until
+    assert store.github_wait_until(until - timedelta(seconds=1)) == until
+    assert reopened.github_wait_until(until) is None
+    assert not store.lane_paused("main", NOW)
 
 
 def test_executor_wait_counter_persists_separately_and_old_runs_default_to_zero(store):
@@ -419,6 +446,20 @@ def test_failed_replace_preserves_previous_record_and_removes_temp(store, monkey
     assert list(store.root.rglob("*.tmp")) == []
 
 
+def test_outbox_refresh_preserves_issue_created_after_bulk_read_started(store):
+    from foragent.tracker import Issue
+
+    revision = store.issues_revision()
+    issue = Issue(1, "New issue", "body", frozenset(), "open")
+    store.record_issue(issue, {})
+    store.queue_github_write(1, "comment", body="New evidence")
+    pending = store.github_outbox()
+
+    assert store.refresh_local_issues([], [], {}, NOW, since_revision=revision) == []
+    assert store.github_outbox() == pending
+    assert store.local_issues()[0]["number"] == 1
+
+
 @pytest.mark.parametrize("method,fields", [
     ("start_run", {"branch": "new", "worktree": "new"}),
     ("update_run", {"pid": 999}),
@@ -509,3 +550,75 @@ def test_tick_lock_released_on_exception(store):
             raise RuntimeError("interrupted")
     with store.tick_lock() as acquired:
         assert acquired
+
+
+def test_issue_snapshot_is_shared_and_remote_refresh_replaces_local_labels(store):
+    from foragent.tracker import Issue
+
+    issue = Issue(1, "Feature", "body", frozenset({"approved"}), "open")
+    assert store.local_issues() == []
+    assert store.issues_refresh_due(NOW)
+    store.refresh_local_issues([issue], [], {}, NOW)
+    other = StateStore(store.root, now=lambda: NOW)
+    other.record_labels(1, ["ready"], remove=False, lanes={})
+    assert store.local_issues()[0]["labels"] == ["approved", "ready"]
+    assert not other.issues_refresh_due(NOW + timedelta(minutes=5, microseconds=-1))
+    assert other.issues_refresh_due(NOW + timedelta(minutes=5))
+    human = replace(issue, title="Human title", labels=frozenset({"needs-human"}), state="closed")
+    other.refresh_local_issues([human], [], {}, NOW + timedelta(minutes=5))
+    row, = store.local_issues()
+    assert (row["title"], row["labels"], row["state"]) == ("Human title", ["needs-human"], "closed")
+
+
+def test_outbox_refresh_uses_first_queued_write_and_drops_only_changed_issue(store):
+    from foragent.tracker import Issue
+
+    issues = [Issue(number, "Feature", "body", frozenset({"blocked"}), "open", updated_at=NOW.isoformat())
+              for number in (1, 2)]
+    store.refresh_local_issues(issues, [], {}, NOW)
+    for issue in issues:
+        store.queue_github_write(issue.number, "add_labels", labels=["ready"])
+    first = store.github_outbox()
+    assert store.refresh_local_issues(issues, [], {}, NOW) == []
+    assert all(row["labels"] == ["blocked", "ready"] for row in store.local_issues())
+    assert store.github_outbox() == first
+
+    revision = store.issues_revision()
+    later = StateStore(store.root, now=lambda: NOW + timedelta(minutes=2))
+    later.queue_github_write(1, "comment", body="Pending evidence")
+    # The person's edit predates the later comment, but follows the first queued write.
+    changed = replace(issues[0], labels=frozenset({"needs-human"}),
+                      updated_at=(NOW + timedelta(minutes=1)).isoformat())
+    assert later.refresh_local_issues([changed, issues[1]], [], {}, NOW + timedelta(minutes=3),
+                                      since_revision=revision) == [1]
+    assert later.github_outbox() == [first[1]]
+    row, untouched = later.local_issues()
+    assert row["labels"] == ["needs-human"] and row["comments"] == []
+    assert untouched["labels"] == ["blocked", "ready"]
+
+
+@pytest.mark.parametrize("method,fields", [
+    ("update_local_issue", {"state": "closed", "pr_number": 42, "merged": True}),
+    ("record_labels", {"labels": ["blocked", "needs-human"], "remove": True, "lanes": {}}),
+    ("record_comments", {"comments": [{"id": 1, "body": "New local evidence"}]}),
+    ("record_board_value", {"project": "project", "field": "Status", "value": "Todo"}),
+])
+def test_refresh_preserves_each_kind_of_concurrent_local_write(store, method, fields):
+    from foragent.tracker import Issue, PullRequest
+
+    issue = Issue(1, "Question", "body", frozenset({"blocked", "needs-human"}), "open")
+    store.refresh_local_issues([issue], [], {}, NOW)
+    revision = store.issues_revision()
+    writer = StateStore(store.root, now=lambda: NOW)
+    getattr(writer, method)(1, **fields)
+    written, = writer.local_issues()
+    stale_pr = PullRequest(99, "foragent/issue-1", "main", "Old PR", "Old body")
+    store.refresh_local_issues([issue], [stale_pr], {}, NOW,
+                               comments={1: []}, since_revision=revision)
+    assert store.local_issues() == [written]
+
+    revision = store.issues_revision()
+    human = replace(issue, title="Human revision", labels=frozenset({"needs-human"}), state="closed")
+    store.refresh_local_issues([human], [], {}, NOW + timedelta(minutes=5), since_revision=revision)
+    row, = writer.local_issues()
+    assert (row["title"], row["labels"], row["state"]) == ("Human revision", ["needs-human"], "closed")

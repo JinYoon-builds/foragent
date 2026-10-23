@@ -8,19 +8,23 @@ from pathlib import Path
 import re
 import subprocess
 
-from foragent import board, watch_open
+from foragent import board, orch_github, watch_open
 from foragent.actions import flag, invalidate_approval
+from foragent.capacity import (
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, machine_load, machine_lock, machine_runs, next_parallel, read_state,
+    write_state,
+)
 from foragent.config import Config, in_run_hours
-from foragent.git import GitRepo
+from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
 from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import kill_process_group
-from foragent.runner import _batch_pr
+from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
 from foragent.state import Approval, StateStore
-from foragent.tracker import Issue, LabelEvent, Tracker, TrackerError
+from foragent.tracker import Comment, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
 
 
 def runner_process_exists(number: int) -> bool:
@@ -54,6 +58,9 @@ class TickContext:
     runner_process_exists: Callable[[int], bool] = runner_process_exists
     kill_runner: Callable[[int], None] = kill_process_group
 
+    def __post_init__(self) -> None:
+        self.tracker = RecordingTracker(self.tracker, self, queue_writes=True)
+
 
 @dataclass
 class TickReport:
@@ -83,7 +90,7 @@ def _invalidate_approval(
 ) -> None:
     run = ctx.store.get_run(issue.number)
     if run is not None and run.status == "running":
-        _kill_run(ctx, run.number, report)
+        _kill_run(ctx, run.number, report, detail=summary)
     invalidate_approval(ctx, issue.number, summary, details)
     report.actions.append(f"#{issue.number} flagged hash-mismatch: {summary}")
 
@@ -96,9 +103,28 @@ def _kill_executor(ctx: TickContext, number: int) -> None:
         ctx.store.update_run(number, executor_pgid=None)
 
 
+def _remove_run_worktree(
+    ctx: TickContext, number: int, worktree: Path, report: TickReport, *, outcome: str,
+) -> None:
+    try:
+        if worktree.exists() and outcome != "merged":
+            try:
+                _preserve_failed_implementation(
+                    number, ctx, ctx.git.at(worktree), outcome, approval=ctx.store.load_approval(number),
+                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None,
+                )
+            except Exception as exc:
+                detail = f"WIP preservation failed before worktree cleanup: {exc}"
+                _append(ctx.store.log_path(number), detail)
+                append_event(ctx.store, ctx.now(), number, "wip-preservation-failed", detail)
+                report.actions.append(f"#{number} {detail}")
+    finally:
+        ctx.git.remove_worktree(worktree)
+
+
 def _kill_run(
     ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
-    count_stall: bool = False,
+    count_stall: bool = False, detail: str = "",
 ) -> None:
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
@@ -113,8 +139,8 @@ def _kill_run(
         if count_stall:
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         raise
-    ctx.git.remove_worktree(Path(run.worktree))
-    ctx.store.finish_run(number, outcome=outcome)
+    _remove_run_worktree(ctx, number, Path(run.worktree), report, outcome=outcome)
+    ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
     report.actions.append(f"#{number} runner killed")
 
 
@@ -233,10 +259,28 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
 
 def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
     run = ctx.store.get_run(issue.number)
+    if ctx.store.run_start_pending(issue.number):
+        if run is None or run.status != "running":
+            # The label request may have succeeded even when its reply was lost.
+            # No run record means this scheduler never reached the launcher.
+            ctx.tracker.remove_labels(issue.number, [RUNNING])
+            ctx.store.clear_run_start(issue.number)
+            report.actions.append(f"#{issue.number} incomplete start recovered before launch")
+            return ctx.tracker.get_issue(issue.number)
+        ctx.store.clear_run_start(issue.number)
     if RUNNING not in issue.labels or (run is not None and run.status == "running"):
         return issue
+    _remove_run_worktree(
+        ctx, issue.number, Path(run.worktree) if run is not None else ctx.store.worktree_path(issue.number),
+        report, outcome=(run.outcome or "crashed") if run is not None else "crashed",
+    )
     if run is not None and run.outcome == "merged":
         ctx.tracker.remove_labels(issue.number, [READY, RUNNING])
+        return ctx.tracker.get_issue(issue.number)
+    if run is not None and run.outcome == "limit-wait":
+        if not issue.labels & {BLOCKED, NEEDS_HUMAN}:
+            ctx.tracker.add_labels(issue.number, [READY])
+        ctx.tracker.remove_labels(issue.number, [RUNNING])
         return ctx.tracker.get_issue(issue.number)
     if run is not None and run.outcome in {"stalled-restart", "stalled"}:
         _restore_stalled(ctx, issue.number, run.restarts, report)
@@ -282,7 +326,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
     for run in ctx.store.active_runs():
         if run.pid is None:
             dead = (
-                ctx.now() - datetime.fromisoformat(run.started_at) >= timedelta(minutes=2)
+                ctx.now() - datetime.fromisoformat(run.started_at) >= LAUNCH_GRACE
                 and not ctx.runner_process_exists(run.number)
             )
         else:
@@ -298,7 +342,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             waiting = run.waiting_until is not None and ctx.now() < datetime.fromisoformat(run.waiting_until)
             runtime = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
-                _kill_run(ctx, run.number, report)
+                _kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit.")
                 flag(ctx, run.number, Reason.TIMEOUT, "Too big for one session; split it in order")
                 report.actions.append(f"#{run.number} flagged timeout")
             elif run.pid is not None and not waiting and ctx.now() - datetime.fromisoformat(
@@ -306,7 +350,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             ) > timedelta(minutes=ctx.config.stall_minutes):
                 restarts = run.restarts + 1
                 outcome = "stalled-restart" if restarts <= 1 else "stalled"
-                _kill_run(ctx, run.number, report, outcome=outcome, count_stall=True)
+                _kill_run(ctx, run.number, report, outcome=outcome, count_stall=True,
+                          detail="Runner stopped making progress past the stall limit.")
                 _restore_stalled(ctx, run.number, restarts, report)
             continue
         # Clean up a crashed group or finish an interrupted stall termination.
@@ -314,8 +359,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         if run.pid is not None and run.outcome in {None, "crashed", "stalled-restart", "stalled"}:
             ctx.kill_runner(run.pid)
         _kill_executor(ctx, run.number)
-        ctx.git.remove_worktree(Path(run.worktree))
         outcome = run.outcome or "crashed"
+        _remove_run_worktree(ctx, run.number, Path(run.worktree), report, outcome=outcome)
         detail = _crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
         finished = ctx.store.finish_run(run.number, outcome=outcome, detail=detail)
         if finished.outcome in {"stalled-restart", "stalled"}:
@@ -382,14 +427,25 @@ def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired:
         if not acquired:
             return TickReport(skipped="another tick is running")
-        return _tick_locked(ctx)
+        if until := ctx.store.github_wait_until(ctx.now()):
+            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
+        if not isinstance(ctx.tracker, RecordingTracker):
+            ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
+        try:
+            return _tick_locked(ctx)
+        except TrackerError as exc:
+            if not exc.is_rate_limit:
+                raise
+            until = orch_github.pause(ctx, exc)
+            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
 
 
 def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
     if BLOCKED not in issue.labels or NEEDS_HUMAN in issue.labels:
         return issue
+    row = next(row for row in ctx.store.local_issues() if row["number"] == issue.number)
     comments = [
-        comment for comment in ctx.tracker.list_comments(issue.number)
+        comment for comment in (Comment(**item) for item in row["comments"])
         if re.fullmatch(
             r"<!-- foragent:blocked reason=[a-z-]+ -->",
             comment.body.partition("\n")[0].removesuffix("\r"),
@@ -415,9 +471,11 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
 
 
 def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
-    issues = {issue.number: issue for issue in ctx.tracker.list_open_issues()}
+    issues = {issue.number: issue for issue in local_issue_models(ctx.store) if issue.state == "open"}
     parents: set[int] = set()
-    for pr in ctx.tracker.list_prs("merged", "foragent/issue-"):
+    prs = [PullRequest(row["pr_number"], row["pr_head"], row["pr_base"], row["title"], row["body"])
+           for row in ctx.store.local_issues() if row["merged"] and row.get("pr_head") and row.get("pr_base")]
+    for pr in prs:
         child_match = re.fullmatch(r"foragent/issue-(\d+)", pr.head)
         batch_match = re.fullmatch(r"foragent/batch-(\d+)", pr.base)
         if child_match is None or batch_match is None:
@@ -438,7 +496,9 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
             continue
         try:
             _batch_pr(parent, ctx)
-        except TrackerError as exc:
+        except (GitError, TrackerError) as exc:
+            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+                raise
             report.actions.append(f"#{parent} batch PR finalization deferred: {exc}")
 
 
@@ -446,6 +506,13 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     report = TickReport()
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
+    if ctx.store.issues_refresh_due(ctx.now()) or ctx.store.github_outbox():
+        # Keep an existing recorder; wrapping again would bypass its own state.
+        recorder = ctx.tracker if isinstance(ctx.tracker, RecordingTracker) else RecordingTracker(ctx.tracker, ctx)
+        recorder.refresh_issues()
+    ctx.tracker.flush_outbox()
+    if until := ctx.store.github_wait_until(ctx.now()):
+        return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
     _recover_runs(ctx, report)
     _reconcile_batches(ctx, report)
     ready: dict[str, list[int]] = {}
@@ -459,7 +526,9 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                     unknown.add(label)
         return issue_lane(issue.labels, ctx.config.lanes)
 
-    for issue in sorted(ctx.tracker.list_open_issues(), key=lambda issue: issue.number):
+    for issue in local_issue_models(ctx.store):
+        if issue.state != "open":
+            continue
         issue = _recover_orphan(ctx, issue, report)
         issue = _escalate_overdue_blocker(ctx, issue, report)
         lane = lane_for(issue)
@@ -470,7 +539,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         ):
             board.sync_status(ctx, issue, "Needs human" if NEEDS_HUMAN in waiting_labels else "Blocked")
             continue
-        if APPROVED not in issue.labels:
+        if APPROVED not in issue.labels and not waiting_labels:
             continue
         event, ignored = _latest_approval(ctx.tracker.label_events(issue.number), ctx.config.approvers)
         if ignored:
@@ -482,13 +551,18 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         if waiting_labels:
             if datetime.fromisoformat(event.created_at) <= datetime.fromisoformat(previous_flag.flagged_at):
                 continue
+            # A new approval is a new generation even between full refreshes.
+            issue = ctx.tracker.get_issue(issue.number)
+            if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
+                continue
             ctx.tracker.remove_labels(issue.number, waiting_labels)
             issue = replace(issue, labels=issue.labels - waiting_labels)
             report.actions.append(f"#{issue.number} resumed after re-approval")
 
         approval = ctx.store.load_approval(issue.number)
         if approval is None or approval.approved_at != event.created_at:
-            issue = ctx.tracker.get_issue(issue.number)
+            if not waiting_labels:
+                issue = ctx.tracker.get_issue(issue.number)
             if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
                 continue
             approval = _snapshot(ctx, issue, event, base_ref, report)
@@ -506,21 +580,84 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             ready.setdefault(lane, []).append(issue.number)
             continue
 
+        row = next(row for row in ctx.store.local_issues() if row["number"] == issue.number)
+        if row.get("ready_approval") == approval.approved_at:
+            continue  # This approval already promoted it; the remote removal wins.
         ctx.tracker.add_labels(issue.number, [READY])
         board.sync_status(ctx, issue, "Ready")
         report.actions.append(f"#{issue.number} promoted to ready")
         ready.setdefault(lane, []).append(issue.number)
 
+    if until := ctx.store.github_wait_until(ctx.now()):
+        report.skipped = f"GitHub rate limit until {until.isoformat()}"
+        return report
     if not ctx.start_runs or not ready:
         return report
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         return report
 
+    started = _start_ready(ctx, ready, lane_for, base_ref, report)
+    if started is None:
+        return report
+    if started:
+        try:
+            watch_open.open_view(ctx.repo_root, ctx.store, ctx.config.language)
+        except Exception as exc:
+            # Optional progress display must never hide successfully started runs.
+            error = " ".join(str(exc).split())[:200]
+            report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
+    return report
+
+
+def _machine_budget(ctx: TickContext, ready: dict[str, list[int]]) -> int:
+    """Update the machine-wide AIMD value once per tick and return this tick's machine budget."""
+    now = ctx.now()
+    busy_lanes = {run.lane for run in ctx.store.active_runs()}
+    waiting = sum(1 for lane in ready if lane not in busy_lanes and not ctx.store.lane_paused(lane, now))
+    pressure, load = machine_load()
+    with machine_lock(ctx.store):
+        state = read_state(ctx.store)
+        current = int(state["parallel"]) if state else INITIAL_PARALLEL
+        changed_at = datetime.fromisoformat(state["changed_at"]) if state else now
+        demand = machine_runs(ctx.store, now) + waiting
+        # Work only caps growth: the shared value never drops below itself for lack
+        # of work here, so it stays the pressure- and load-driven value.
+        value = next_parallel(
+            current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
+            ceiling=None, increase_ok=now - changed_at >= INCREASE_INTERVAL,
+        )
+        if state is None or value != current:
+            write_state(ctx.store, value, now)
+    return max(1, min(value, demand))
+
+
+def _has_slot(ctx: TickContext, budget: int) -> bool:
+    """Machine-wide runs stay under the shared budget; this project's under its ceiling."""
+    if machine_runs(ctx.store, ctx.now()) >= budget:
+        return False
+    return ctx.config.max_parallel is None or len(ctx.store.active_runs()) < ctx.config.max_parallel
+
+
+def _reserve_slot(ctx: TickContext, number: int, budget: int) -> bool:
+    """Recount and journal the start under the machine lock; GitHub work happens outside."""
+    with machine_lock(ctx.store):
+        if not _has_slot(ctx, budget):
+            return False
+        ctx.store.prepare_run_start(number)
+        return True
+
+
+def _start_ready(
+    ctx: TickContext, ready: dict[str, list[int]], lane_for: Callable[[Issue], str], base_ref: str,
+    report: TickReport,
+) -> bool | None:
+    """Start ready lanes within the machine budget; None means a GitHub wait began."""
+    budget = _machine_budget(ctx, ready)
     started = False
     for lane in sorted(ready, key=lane_order):
-        active = ctx.store.active_runs()
-        if len(active) >= ctx.config.max_parallel:
+        if not _has_slot(ctx, budget):
             break
+        active = ctx.store.active_runs()
         if any(run.lane == lane for run in active) or ctx.store.lane_paused(lane, ctx.now()):
             continue
         for number in ready[lane]:
@@ -540,23 +677,38 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             if not _check_prerequisites(ctx, issue, approval, report):
                 continue
 
-            ctx.tracker.remove_labels(number, [READY])
-            ctx.tracker.add_labels(number, [RUNNING])
-            board.sync_status(ctx, number, "Running")
+            if not _reserve_slot(ctx, number, budget):
+                return started
+            try:
+                ctx.tracker.remove_labels(number, [READY])
+                ctx.tracker.add_labels(number, [RUNNING])
+                board.sync_status(ctx, number, "Running")
+                if until := ctx.store.github_wait_until(ctx.now()):
+                    report.skipped = f"GitHub rate limit until {until.isoformat()}"
+                    return None
+            except TrackerError as exc:
+                if not exc.is_rate_limit:
+                    raise
+                until = orch_github.pause(ctx, exc)
+                # A label may already say running even though no process started.
+                # Record availability, so recovery does not charge a crash.
+                ctx.store.start_run(
+                    number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number),
+                    lane=lane, tier=issue_size(issue.labels),
+                )
+                ctx.store.clear_run_start(number)
+                orch_github.wait_run(ctx, number, until)
+                ctx.store.finish_run(number, "limit-wait", detail=str(exc))
+                report.skipped = f"GitHub rate limit until {until.isoformat()}"
+                return None
             ctx.store.start_run(
                 number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
                 tier=issue_size(issue.labels),
             )
+            ctx.store.clear_run_start(number)
             pid = ctx.launcher(number)
             ctx.store.update_run(number, pid=pid)
             report.actions.append(f"#{number} started running (pid={pid})")
             started = True
             break
-    if started:
-        try:
-            watch_open.open_view(ctx.repo_root, ctx.store, ctx.config.language)
-        except Exception as exc:
-            # Optional progress display must never hide successfully started runs.
-            error = " ".join(str(exc).split())[:200]
-            report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
-    return report
+    return started

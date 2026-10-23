@@ -21,9 +21,9 @@ def review_case(run_case):
     c.ctx.config = replace(c.ctx.config, repo="owner/repo")
     c.store.finish_run(1, outcome="blocked")
     c.now[0] += timedelta(seconds=1)
-    c.tracker.remove_labels(1, ["running"])
-    c.tracker.add_labels(1, ["blocked"])
-    c.tracker.comment(1, "<!-- foragent:blocked reason=review-dispute -->\nOriginal details")
+    c.ctx.tracker.remove_labels(1, ["running"])
+    c.ctx.tracker.add_labels(1, ["blocked"])
+    c.ctx.tracker.comment(1, "<!-- foragent:blocked reason=review-dispute -->\nOriginal details")
     base = c.history.tip
     c.history.update({"feature.txt": "done"})
     c.head = c.history.tip
@@ -49,6 +49,99 @@ def assert_blocked(c, reason):
     assert c.store.load_flag(1).reason == reason
     assert c.tracker.get_issue(c.pr).state == "open"
     assert len(c.tracker.created_prs) == 1
+
+
+def test_review_pending_close_finishes_without_failure_flag(review_case):
+    c = review_case
+    c.ctx.tracker.remove_labels(1, ["blocked"])
+    c.ctx.tracker.refresh_issues()
+    c.store.queue_github_write(1, "comment", body="Pending evidence")
+
+    assert runner.review_only(1, c.ctx) == "merged"
+
+    assert c.tracker.merged_prs == [c.pr]
+    assert c.tracker.get_issue(1).state == "open"
+    row, = c.store.local_issues()
+    assert row["state"] == "closed"
+    assert not set(row["labels"]) & {"blocked", "ready", "running", "needs-human"}
+    assert c.store.load_flag(1) is None
+    c.ctx.tracker.flush_outbox()
+    assert c.tracker.get_issue(1).state == "closed"
+    assert not c.tracker.get_issue(1).labels & {"blocked", "ready", "running", "needs-human"}
+    assert not any("retries-exceeded" in comment.body for comment in c.tracker.list_comments(1))
+    assert c.store.github_outbox() == []
+
+
+@pytest.mark.parametrize("entry", ["review-only", "resolve"])
+def test_fast_review_merge_reuses_post_merge_reinstall(review_case, monkeypatch, entry):
+    c = review_case
+    calls = []
+
+    def reinstall(ctx, pr, base):
+        assert c.tracker.merged_prs == [c.pr]
+        calls.append((ctx, pr, base))
+
+    monkeypatch.setattr(runner, "after_merge", reinstall)
+    if entry == "resolve":
+        orch.resolve(c.ctx, 1, "pass", "Reviewed the current head")
+    else:
+        assert runner.review_only(1, c.ctx) == "merged"
+    assert calls == [(c.ctx, c.pr, "main")]
+
+
+def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch):
+    c = review_case
+    calls = []
+
+    def failed_merge(*args, **kwargs):
+        raise runner.TrackerError("merge failed")
+
+    monkeypatch.setattr(c.tracker, "merge_pr", failed_merge)
+    monkeypatch.setattr(runner, "after_merge", lambda *args: calls.append(args))
+    assert runner.review_only(1, c.ctx) == "error"
+    assert_blocked(c, Reason.RETRIES_EXCEEDED)
+    assert "merge failed" in c.store.log_path(1).read_text()
+    assert calls == []
+
+
+@pytest.mark.parametrize("entry,operation", [
+    ("review-only", "get_issue"), ("review-only", "pr_checks"),
+    ("rerun-review", "pr_checks"), ("resolve", "merge_pr"),
+])
+def test_review_rate_limit_remains_a_local_wait_including_audit_cleanup(review_case, monkeypatch, entry, operation):
+    c = review_case
+    until = c.now[0] + timedelta(minutes=10)
+    failed = False
+    followups = []
+
+    def limited(*args, **kwargs):
+        nonlocal failed
+        failed = True
+        raise runner.TrackerError("API rate limit exceeded (HTTP 403)",
+                                  stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    with monkeypatch.context() as patch:
+        for method in ("get_issue", "pr_head_sha", "add_labels", "remove_labels", "comment"):
+            original = getattr(c.tracker, method)
+
+            def tracked(*args, _method=method, _original=original, **kwargs):
+                if failed:
+                    followups.append(_method)
+                return _original(*args, **kwargs)
+
+            patch.setattr(c.tracker, method, tracked)
+        patch.setattr(c.tracker, operation, limited)
+        if entry == "review-only":
+            assert runner.review_only(1, c.ctx) == "limit-wait"
+        elif entry == "rerun-review":
+            assert "limit-wait" in orch.rerun_review(c.ctx, 1)
+        else:
+            assert "limit-wait" in orch.resolve(c.ctx, 1, "pass", "Reviewed this head")
+        assert followups == []
+    assert failed
+    assert c.store.get_run(1).waiting_until == until.isoformat()
+    assert c.store.get_run(1).outcome == "limit-wait"
+    assert c.store.load_flag(1) is None
 
 
 def test_resolve_queues_ci_repair_without_changing_the_verdict_head(review_case):
@@ -119,7 +212,8 @@ def test_review_ci_failure_repairs_same_pr_and_rechecks_new_head(run_case, monke
     assert prior_review.read_text() == "prior raw review"
     assert len(list(prior_review.parent.glob("review-*.txt"))) == len(reviews) + 1
     assert len(c.tracker.created_prs) == 1
-    adds = [args for _, args in c.operations if args[:2] == ["worktree", "add"]]
+    adds = [args for _, args in c.operations
+            if args[:2] == ["worktree", "add"] and str(c.store.worktree_path(1)) in args]
     assert len(adds) == 1 and "--detach" in adds[0]
     assert c.store.log_path(1).read_text().count("Done when command:") == 4
     if repair_result == "pass":
@@ -180,9 +274,9 @@ def test_failed_rerun_preserves_pr_and_raw_review_with_visible_reason(review_cas
 def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch, entry, failure, reason):
     c = review_case
     if failure == "checks":
-        monkeypatch.setattr(runner, "_check", lambda command, *args: runner.CheckResult(command, 1, False, "Broken feature"))
+        monkeypatch.setattr(runner, "_check", lambda command, *args, **kwargs: runner.CheckResult(command, 1, False, "Broken feature"))
     elif failure == "check-timeout":
-        monkeypatch.setattr(runner, "_check", lambda command, *args: runner.CheckResult(command, None, True, "Timed out"))
+        monkeypatch.setattr(runner, "_check", lambda command, *args, **kwargs: runner.CheckResult(command, None, True, "Timed out"))
     elif failure == "ci":
         c.ctx.config = replace(c.ctx.config, max_retries=0)
         c.tracker.set_pr_checks(c.pr, "fail")
@@ -204,7 +298,7 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
         c.tracker.edit_body(1, body)
         c.store.save_approval(**{**approval.__dict__, "body": body, "body_sha": body_hash(body)})
     elif failure == "error":
-        monkeypatch.setattr(runner, "_check", lambda *args: (_ for _ in ()).throw(RuntimeError("check crashed")))
+        monkeypatch.setattr(runner, "_check", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("check crashed")))
 
     if entry == "rerun-review":
         orch.rerun_review(c.ctx, 1)
@@ -257,7 +351,7 @@ def test_resolve_preserves_normal_merge_policy(review_case, mode, always_human, 
 @pytest.mark.parametrize("entry", ["review-only", "rerun-review", "resolve"])
 def test_interruption_leaves_visible_state_and_cleans_worktree(review_case, monkeypatch, entry):
     c = review_case
-    def interrupted(*args):
+    def interrupted(*args, **kwargs):
         raise SystemExit(1)
     monkeypatch.setattr(runner, "_check", interrupted)
     with pytest.raises(SystemExit):
@@ -354,7 +448,7 @@ def test_escalation_options_and_immutable_approval(review_case):
 def test_list_uses_latest_unknown_reason_and_only_last_sixty_lines(review_case):
     c = review_case
     c.now[0] += timedelta(seconds=5)
-    c.tracker.comment(1, "<!-- foragent:blocked reason=future-code -->\r\nNewest details")
+    c.ctx.tracker.comment(1, "<!-- foragent:blocked reason=future-code -->\r\nNewest details")
     log = c.store.log_path(1)
     log.parent.mkdir(parents=True)
     log.write_text("".join(f"line {i}\n" for i in range(100)))
@@ -382,7 +476,7 @@ def test_inspection_audits_follow_spec_without_resetting_blocked_evidence(review
     assert all(event["issue"] is None for event in events)
     comments = [comment.body for comment in c.tracker.list_comments(1)
                 if comment.body.startswith("<!-- foragent:orch -->")]
-    assert comments == ["<!-- foragent:orch -->\n" + event["summary"] for event in prior_events]
+    assert comments == []  # Observation is audited locally and stays offline.
     assert c.tracker.get_issue(1) == original
 
 
@@ -397,7 +491,9 @@ def test_hint_keeps_native_goal_and_is_consumed_once(run_case, native):
     assert runner.run_issue(1, c.ctx) == "merged"
     first, second = [call["prompt"] for call in c.executor.calls]
     assert "Orchestrator hint:\nUse existing locale" in first
-    assert first.startswith("/goal " if native else "Orchestrator hint:")
+    assert first.startswith("Orchestrator hint:")
+    if native:
+        assert c.executor.calls[0]["goal"] == runner.goal_condition(c.ctx.config.acceptance_dir)
     assert "Use existing locale" not in second
     assert not hint.exists()
 

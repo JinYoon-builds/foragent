@@ -11,7 +11,7 @@ import re
 from tempfile import TemporaryDirectory
 import time
 
-from foragent.git import GitError
+from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
@@ -19,7 +19,7 @@ from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.processes import run_logged
 from foragent.runner import RunContext, review_only
-from foragent.tracker import Issue, PullRequest
+from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
 
 class OrchError(ValueError):
@@ -27,17 +27,13 @@ class OrchError(ValueError):
 
 
 def _watch_snapshot(ctx: RunContext) -> dict:
-    issues = [issue for issue in ctx.tracker.list_open_issues() if not issue.is_pull_request]
-    merged = {
-        int(match[1]) for pr in ctx.tracker.list_prs("merged", "foragent/")
-        if pr.merged_at is not None
-        and (match := re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", pr.head))
-    }
+    rows = ctx.store.local_issues()
+    issues = [row for row in rows if row["state"] == "open"]
     return {
-        "blocked": sorted(issue.number for issue in issues if BLOCKED in issue.labels),
-        "needs_human": sorted(issue.number for issue in issues if NEEDS_HUMAN in issue.labels),
-        "merged": sorted(merged),
-        "queue_empty": not any(issue.labels & {APPROVED, READY, RUNNING} for issue in issues)
+        "blocked": sorted(row["number"] for row in issues if BLOCKED in row["labels"]),
+        "needs_human": sorted(row["number"] for row in issues if NEEDS_HUMAN in row["labels"]),
+        "merged": sorted(row["number"] for row in rows if row["merged"]),
+        "queue_empty": not any(set(row["labels"]) & {APPROVED, READY, RUNNING} for row in issues)
                        and not ctx.store.active_runs(),
     }
 
@@ -69,7 +65,7 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
 
 
 def _issue(ctx: RunContext, n: int) -> Issue:
-    issue = ctx.tracker.get_issue(n)
+    issue = RecordingTracker(ctx.tracker, ctx).get_issue(n)
     if issue.is_pull_request or issue.state != "open":
         raise OrchError(f"#{n} must be an open issue")
     run = ctx.store.get_run(n)
@@ -86,18 +82,23 @@ def _text(value: str, name: str) -> str:
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = ()) -> dict:
     event = append_event(ctx.store, ctx.now(), n, kind, summary)
+    if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
+        return event
+    tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     for number in ([n] if n is not None else issues):
-        ctx.tracker.comment(number, "<!-- foragent:orch -->\n" + event["summary"])
+        tracker.comment(number, "<!-- foragent:orch -->\n" + event["summary"])
     return event
 
 
 def list_blocked(ctx: RunContext) -> list[dict]:
     """Inspect blocked evidence and audit the lookup, as orch-verbs requires."""
     items = []
-    for issue in sorted(ctx.tracker.list_open_issues(), key=lambda issue: issue.number):
-        if issue.is_pull_request or BLOCKED not in issue.labels:
+    for row in ctx.store.local_issues():
+        if row["state"] != "open" or BLOCKED not in row["labels"]:
             continue
-        flags = [(comment, match[1]) for comment in ctx.tracker.list_comments(issue.number)
+        issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
+        comments = [Comment(**item) for item in row["comments"]]
+        flags = [(comment, match[1]) for comment in comments
                  if (match := re.fullmatch(r"<!-- foragent:blocked reason=([a-z-]+) -->",
                                            comment.body.splitlines()[0] if comment.body else ""))]
         latest = max(flags, key=lambda item: (datetime.fromisoformat(item[0].created_at), item[0].id), default=None)
@@ -109,16 +110,17 @@ def list_blocked(ctx: RunContext) -> list[dict]:
         if log.is_file():
             with log.open(encoding="utf-8", errors="replace") as stream:
                 tail = "".join(deque(stream, maxlen=60))
-        items.append({"number": issue.number, "title": issue.title, "lane": issue_lane(issue.labels, ctx.config.lanes),
+        items.append({"number": issue.number, "title": issue.title, "lane": row["lane"],
                       "reason": latest[1] if latest else None,
                       "blocked_at": latest[0].created_at if latest else None,
                       "details": latest[0].body if latest else "",
                       "reviews": reviews, "log_path": str(log), "log_tail": tail})
-    _event(ctx, None, "list", f"Listed {len(items)} blocked issues", issues=[item["number"] for item in items])
+    append_event(ctx.store, ctx.now(), None, "list", f"Listed {len(items)} blocked issues")
     return items
 
 
 def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
+    tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     path = ctx.store.root / "hints" / f"{n}.txt"
     if hint is not None:
         ctx.store._atomic_write(path, hint)
@@ -127,8 +129,8 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         ctx.tracker.close_pr(pr, "Closed by Foragent orchestrator retry")
     # Establish the destination before clearing the old state, including on errors.
-    ctx.tracker.add_labels(n, [READY])
-    ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
+    tracker.add_labels(n, [READY])
+    tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
 
 
 def retry(ctx: RunContext, n: int, hint: str | None = None) -> str:
@@ -160,7 +162,8 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str) -> str:
     if pr is None:
         raise OrchError(f"issue #{n} has no open Foragent PR")
     head = ctx.tracker.pr_head_sha(pr)
-    ctx.tracker.comment(n, f"<!-- foragent:orch-verdict pr={pr} head={head} verdict={verdict} -->\n{note}")
+    RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
+        n, f"<!-- foragent:orch-verdict pr={pr} head={head} verdict={verdict} -->\n{note}")
     outcome = "interrupted"
     try:
         if verdict == "fail":
@@ -191,9 +194,10 @@ def escalate(ctx: RunContext, n: int, summary: str, tried: str,
     if options:
         lines.extend(["", "Options:", *(f"{i}. {option}" + (" (recommended)" if i == recommend else "")
                                            for i, option in enumerate(options, 1))])
-    ctx.tracker.comment(n, "\n".join(lines))
-    ctx.tracker.add_labels(n, [NEEDS_HUMAN])
-    ctx.tracker.remove_labels(n, [READY])
+    tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
+    tracker.comment(n, "\n".join(lines))
+    tracker.add_labels(n, [NEEDS_HUMAN])
+    tracker.remove_labels(n, [READY])
     event_summary = f"#{n}: escalated to human; {summary}; tried: {tried}"
     _event(ctx, n, "escalate", event_summary)
     return event_summary
@@ -239,6 +243,11 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
         worktree = Path(directory) / "worktree"
         ctx.git.add_detached_worktree(worktree, head)
         try:
+            publication_conflicts = []
+            try:
+                ctx.git.at(worktree).check_publication(base)
+            except PublicationError as exc:
+                publication_conflicts = [f"{path}:{line}" for path, line in exc.markers]
             commands = ([ctx.config.test_command] if ctx.config.test_command is not None
                         else detect_test_commands(worktree))
             if not commands:
@@ -261,14 +270,15 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
         ctx.git.add_detached_worktree(worktree, head)
         try:
             probe = ctx.git.at(worktree)
-            conflicts = []
+            conflicts = list(publication_conflicts)
             try:
                 probe._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
                              "merge", "--no-commit", "--no-ff", base])
             except GitError:
-                conflicts = sorted(probe.conflict_paths())
-                if not conflicts:
+                merge_conflicts = sorted(probe.conflict_paths())
+                if not merge_conflicts:
                     raise
+                conflicts.extend(merge_conflicts)
         finally:
             ctx.git.remove_worktree(worktree)
     ci = ctx.tracker.pr_checks(n)
@@ -304,10 +314,17 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     ci = ctx.tracker.pr_checks(n)
     if ci not in {"pass", "none"}:
         raise OrchError(f"PR #{n} is not ready: CI {ci}")
-    ctx.tracker.comment(n, f"Approved by {approved_by} in the orchestrator ({at}). "
-                          f"Pre-merge: tests pass, no conflicts, CI {ci}.")
+    RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
+        n, f"Approved by {approved_by} in the orchestrator ({at}). "
+           f"Pre-merge: tests pass, no conflicts, CI {ci}.")
     ctx.tracker.merge_pr(n, expected_head_sha=checked.head)
     summary = f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; tests pass, no conflicts, CI {ci}"
     _event(ctx, None, "merge", summary)
     after_merge(ctx, n, current.base)
+    if (number := pr_issue_number(current.head)) is not None:
+        # GitHub applies closing references only on eligible merges; observe its result.
+        try:
+            ctx.tracker.get_issue(number)
+        except TrackerError as exc:
+            print(f"issue #{number} refresh failed after merge: {exc}")
     return summary

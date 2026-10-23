@@ -12,6 +12,8 @@ def test_once_frame_contains_lane_queue_done_stall_and_recent_events(
 ):
     import json
 
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
     from test_view_status import status_case
 
     case, main = status_case(git_history, tmp_path, monkeypatch, language=language)
@@ -27,6 +29,7 @@ def test_once_frame_contains_lane_queue_done_stall_and_recent_events(
     case.tracker.add_issue(99, "Current order")
     for number in (1, 5, 10, 20):
         case.tracker.set_parent(number, 99)
+    tick(tick_context(case, start_runs=False))
     events = [{"at": case.clock[0].isoformat(), "issue": 2, "kind": "retry", "summary": f"handled-event-{i}"}
               for i in range(7)]
     (case.store.root / "orch-events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))

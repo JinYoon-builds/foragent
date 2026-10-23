@@ -54,7 +54,8 @@ def test_init_creates_single_select_board_once_and_persists_id(git_history, tmp_
               for field in project["fields"]["nodes"] if field}
     assert "Lane" in fields
     assert set(fields["Size"]) == {"s", "m", "l"}
-    assert set(fields["Status"]) == {"Approved", "Ready", "Running", "Blocked", "Needs human", "PR open", "Done"}
+    # D31 addendum: the board shows five grouped columns; test_board_status_groups owns the details.
+    assert fields["Status"] == ["🗂 Backlog", "🌰 Up next", "🐿 In progress", "✋ Your turn", "📦 Done"]
     assert main(argv) == 0
     assert yaml.safe_load((case.root / ".foragent.yml").read_text())["board"] == config["board"]
     assert board_snapshot(case.tracker, config["board"])["fields"] == project["fields"]

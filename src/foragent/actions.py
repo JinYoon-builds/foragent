@@ -20,6 +20,9 @@ class FlagContext(board.BoardContext, Protocol):
 def flag(
     ctx: FlagContext, n: int, reason: Reason, summary: str, details: str | None = None,
 ) -> None:
+    run = ctx.store.get_run(n)
+    if run is not None and run.status == "running":
+        ctx.store.update_run(n, detail=f"{summary}\n{details}" if details else summary)
     ctx.store.save_flag(n, reason, flagged_at=ctx.now().astimezone(UTC).isoformat())
     ctx.tracker.add_labels(n, [BLOCKED])
     ctx.tracker.remove_labels(n, [READY, RUNNING])

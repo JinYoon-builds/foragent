@@ -8,9 +8,12 @@ import os
 from pathlib import Path
 import subprocess
 import shlex
+import signal
 import sys
 import threading
+import time
 from types import SimpleNamespace
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -24,6 +27,7 @@ from foragent.runner import (
     goal_condition, parse_code_review, parse_review, run_issue,
 )
 from foragent.state import StateStore
+from foragent.scheduler import TickContext, TickReport, _kill_run, _recover_orphan, _recover_runs
 from foragent.tracker import FakeTracker, TrackerError
 
 from conftest import ACCEPTANCE, BASE_TIME, git_command
@@ -158,7 +162,62 @@ def run_case(git_history, tmp_path, monkeypatch):
         assert not Path(run.worktree).exists()
         assert run.worktree not in git_command(git_history.clone, "worktree", "list")
         assert store.get_run(run.number).status == "finished"
-        assert "running" not in tracker.get_issue(run.number).labels
+        current = store.get_run(run.number)
+        # GitHub waits defer remote label cleanup until the reset.
+        assert "running" not in tracker.get_issue(run.number).labels or (
+            current.outcome == "limit-wait" and current.waiting_until is not None
+            and store.github_wait_until(now[0]) is not None
+        )
+
+
+@pytest.mark.parametrize("operation", ["get_issue", "pr_checks", "merge_pr", "board"])
+def test_github_limit_from_runner_stages_waits_without_followup_calls(run_case, monkeypatch, operation):
+    c = run_case
+    c.store.update_run(1, attempts=3, restarts=1)
+    until = c.now[0] + timedelta(minutes=45)
+    failed = False
+    followups = []
+
+    def limited(*args, **kwargs):
+        nonlocal failed
+        failed = True
+        raise TrackerError("API rate limit exceeded (HTTP 403)",
+                           stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    with monkeypatch.context() as patch:
+        for method in ("get_issue", "pr_head_sha", "add_labels", "remove_labels", "comment"):
+            original = getattr(c.tracker, method)
+
+            def tracked(*args, _method=method, _original=original, **kwargs):
+                if failed:
+                    followups.append(_method)
+                return _original(*args, **kwargs)
+
+            patch.setattr(c.tracker, method, tracked)
+        if operation == "board":
+            c.ctx.config = replace(c.ctx.config, board="project")
+            patch.setattr("foragent.board.set_status", limited)
+        else:
+            patch.setattr(c.tracker, operation, limited)
+        assert run_issue(1, c.ctx) == "limit-wait"
+        assert followups == []
+    assert failed
+    run = StateStore(c.store.root).get_run(1)
+    assert run.waiting_until == until.isoformat() and run.outcome == "limit-wait"
+    assert (run.attempts, run.restarts) == (3, 1)
+    assert c.store.load_flag(1) is None
+    assert not c.tracker.get_issue(1).labels & {"blocked", "needs-human"}
+
+
+def test_runner_launched_during_persisted_github_wait_stays_offline(run_case, monkeypatch):
+    c = run_case
+    until = c.now[0] + timedelta(minutes=10)
+    c.store.pause_github(until)
+    with monkeypatch.context() as patch:
+        patch.setattr(c.tracker, "get_issue", lambda *args: pytest.fail("waiting runner must stay offline"))
+        assert run_issue(1, c.ctx) == "limit-wait"
+    assert c.executor.calls == []
+    assert c.store.get_run(1).waiting_until == until.isoformat()
 
 
 @pytest.mark.parametrize("ci", ["pass", "none"])
@@ -324,6 +383,7 @@ def test_changed_pr_head_is_held_as_risk_high(run_case, monkeypatch, when):
     comment = c.tracker.list_comments(1)[-1].body
     assert parse_reason(comment) == Reason.RISK_HIGH
     assert "PR head changed after verification" in comment
+    assert len([args for _, args in c.operations if args[:1] == ["push"]]) == 1
 
 
 def set_done_when(case, commands):
@@ -480,6 +540,464 @@ def test_no_changes_are_a_failed_attempt_with_retry_output(run_case):
     assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == c.history.tip
 
 
+@pytest.mark.parametrize("reason", ["killed", "stalled", "stalled-restart", "error"])
+def test_interrupted_worker_preserves_unstaged_work_with_recorded_reason(run_case, monkeypatch, reason):
+    c = run_case
+    c.executor.steps = [{"unfinished.txt": "partial implementation\n"}]
+    execute = c.executor.run
+
+    def interrupt(**kwargs):
+        execute(**kwargs)
+        if reason == "error":
+            raise RuntimeError("Worker interrupted unexpectedly")
+        # The scheduler records a stall before signalling the runner.
+        if reason.startswith("stalled"):
+            c.store.update_run(1, outcome=reason)
+        raise SystemExit(143)
+
+    monkeypatch.setattr(c.executor, "run", interrupt)
+    if reason == "error":
+        assert run_issue(1, c.ctx) == "error"
+    else:
+        with pytest.raises(SystemExit):
+            run_issue(1, c.ctx)
+    branch = "foragent/issue-1"
+    for root in (c.history.clone, c.history.origin):
+        assert git_command(root, "show", f"{branch}:unfinished.txt") == "partial implementation"
+        assert f"[{reason}]" in git_command(root, "log", "-1", "--format=%B", branch)
+        assert git_command(root, "rev-list", "--count", f"{c.history.tip}..{branch}") == "1"
+    assert c.store.get_run(1).outcome == reason
+    assert c.tracker.get_issue(1).labels == {"approved", "blocked"}
+    local, = StateStore(c.store.root).local_issues()
+    assert set(local["labels"]) == {"approved", "blocked"}
+    assert not c.tracker.created_prs and not c.tracker.merged_prs
+
+
+@pytest.mark.parametrize("saved_at", ["local", "origin"])
+def test_retry_reads_saved_branch_before_worker_even_without_both_copies(run_case, monkeypatch, saved_at):
+    c = run_case
+    branch = "foragent/issue-1"
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    c.executor.steps = [{"feature.txt": "unfinished"}]
+    original_git_run = c.ctx.git._run
+
+    def unavailable_push(args):
+        command = args
+        while command[:1] == ["-C"]:
+            command = command[2:]
+        if command[:1] == ["push"]:
+            raise subprocess.CalledProcessError(1, ["git", *args], stderr="Origin unavailable")
+        return original_git_run(args)
+
+    with monkeypatch.context() as patch:
+        if saved_at == "local":
+            patch.setattr(c.ctx.git, "_run", unavailable_push)
+        assert run_issue(1, c.ctx) == ("error" if saved_at == "local" else "retries-exceeded")
+    if saved_at == "origin":
+        # Model a new clone that has the remote WIP but no local issue branch.
+        git_command(c.history.clone, "update-ref", "-d", f"refs/heads/{branch}")
+    c.now[0] += timedelta(minutes=1)
+    c.store.start_run(1, branch=branch, worktree=c.store.worktree_path(1))
+    c.executor.steps = [{"feature.txt": "done"}]
+    execute = c.executor.run
+
+    def finish(**kwargs):
+        assert (kwargs["worktree"] / "feature.txt").read_text() == "unfinished"
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", finish)
+    assert run_issue(1, c.ctx) == "merged"
+    assert git_command(c.history.origin, "show", f"{branch}:feature.txt") == "done"
+
+
+def test_staged_runner_files_and_locked_edits_alone_do_not_create_wip(run_case, monkeypatch):
+    c = run_case
+    c.executor.steps = [{
+        ACCEPTANCE: "def test_feature():\n    pass\n",
+        ".foragent/QUESTION.md": "Choose A or B (recommended).\n",
+        "CLAUDE.local.md": "Runner scope\n",
+    }]
+    execute = c.executor.run
+
+    def stage(**kwargs):
+        result = execute(**kwargs)
+        git_command(kwargs["worktree"], "add", "-A")
+        return result
+
+    monkeypatch.setattr(c.executor, "run", stage)
+    assert run_issue(1, c.ctx) == "spec-question"
+    assert not any("commit" in args for _, args in c.operations)
+    assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == c.history.tip
+
+
+@pytest.mark.parametrize("reason", ["spec-question", "timeout", "retries-exceeded"])
+@pytest.mark.parametrize("pr_timing", ["before-worker", "during-worker"])
+def test_wip_stop_keeps_open_pr_head_unchanged(run_case, monkeypatch, reason, pr_timing):
+    c = run_case
+    branch = "foragent/issue-1"
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    git_command(c.history.origin, "update-ref", f"refs/heads/{branch}", c.history.tip)
+
+    def open_pr():
+        pr = c.tracker.create_pr(head=branch, base="main", title="Existing PR", body="Closes #1")
+        c.tracker.set_pr_head_sha(pr, c.history.tip)
+
+    if pr_timing == "before-worker":
+        open_pr()
+    c.executor.steps = [{"feature.txt": "unfinished"}]
+    if reason == "spec-question":
+        c.executor.steps[0][".foragent/QUESTION.md"] = "Choose A or B (recommended).\n"
+    c.executor.timed_out = reason == "timeout"
+    execute = c.executor.run
+
+    def implement(**kwargs):
+        result = execute(**kwargs)
+        if pr_timing == "during-worker":
+            open_pr()
+        return result
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    assert run_issue(1, c.ctx) == reason
+    assert git_command(c.history.clone, "show", f"{branch}:feature.txt") == "unfinished"
+    assert f"[{reason}]" in git_command(c.history.clone, "log", "-1", "--format=%B", branch)
+    assert git_command(c.history.origin, "rev-parse", branch) == c.history.tip
+    assert c.tracker.pr_head_sha(c.tracker.find_pr(branch)) == c.history.tip
+    assert not any(args[:1] == ["push"] for _, args in c.operations)
+    assert len(c.tracker.created_prs) == 1 and not c.tracker.merged_prs
+
+
+def test_wip_stop_pushes_when_previous_pr_is_closed(run_case):
+    c = run_case
+    branch = "foragent/issue-1"
+    pr = c.tracker.create_pr(head=branch, base="main", title="Closed PR", body="Closes #1")
+    c.tracker.close_issue(pr)
+    c.executor.steps = [{"feature.txt": "unfinished", ".foragent/QUESTION.md": "Choose A or B.\n"}]
+
+    assert run_issue(1, c.ctx) == "spec-question"
+    assert git_command(c.history.origin, "show", f"{branch}:feature.txt") == "unfinished"
+    assert git_command(c.history.origin, "rev-parse", branch) == git_command(c.history.clone, "rev-parse", branch)
+
+
+def test_wip_stays_local_when_open_pr_lookup_fails(run_case, monkeypatch):
+    c = run_case
+    branch = "foragent/issue-1"
+    c.executor.steps = [{"feature.txt": "unfinished", ".foragent/QUESTION.md": "Choose A or B.\n"}]
+
+    def unavailable(head):
+        raise TrackerError("GitHub unavailable during PR lookup")
+
+    monkeypatch.setattr(c.tracker, "find_pr", unavailable)
+    assert run_issue(1, c.ctx) == "spec-question"
+    assert git_command(c.history.clone, "show", f"{branch}:feature.txt") == "unfinished"
+    assert not any(args[:1] == ["push"] for _, args in c.operations)
+    assert "open PR lookup failed" in c.store.log_path(1).read_text()
+
+
+def test_tracker_failure_keeps_wip_local_without_further_pr_lookup(run_case, monkeypatch):
+    c = run_case
+    c.executor.steps = [{"feature.txt": "unfinished"}]
+    execute = c.executor.run
+
+    def interrupt(**kwargs):
+        execute(**kwargs)
+        raise TrackerError("GitHub returned HTTP 502")
+
+    monkeypatch.setattr(c.executor, "run", interrupt)
+    monkeypatch.setattr(c.tracker, "find_pr", lambda head: pytest.fail("Tracker already failed"))
+    assert run_issue(1, c.ctx) == "error"
+    assert git_command(c.history.clone, "show", "foragent/issue-1:feature.txt") == "unfinished"
+    assert not any(args[:1] == ["push"] for _, args in c.operations)
+
+
+@pytest.mark.parametrize("cleanup", ["kill", "crash", "orphan"])
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGKILL])
+def test_scheduler_preserves_wip_after_real_process_death(run_case, cleanup, signum):
+    c = run_case
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    ready = c.store.root / "ready"
+    unwound = c.store.root / "unwound"
+    script = """
+from pathlib import Path
+import sys, time
+root, ready, unwound = map(Path, sys.argv[1:])
+try:
+    (root / 'unfinished.txt').write_text('partial implementation\\n')
+    (root / 'tests/acceptance/test_feature.py').write_text('tampered\\n')
+    (root / '.foragent').mkdir()
+    (root / '.foragent/session.log').write_text('runner artifact')
+    ready.touch()
+    time.sleep(60)
+finally:
+    unwound.touch()
+"""
+    with subprocess.Popen([sys.executable, "-c", script, str(path), str(ready), str(unwound)]) as process:
+        def terminate(pid):
+            if process.poll() is None:
+                process.send_signal(signum)
+                process.wait(timeout=5)
+
+        ctx = TickContext(
+            repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+            config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+            kill_runner=terminate,
+        )
+        try:
+            for _ in range(500):
+                if ready.exists() or process.poll() is not None:
+                    break
+                time.sleep(0.01)
+            assert ready.exists(), "runner did not write WIP"
+            c.store.update_run(1, pid=process.pid)
+            report = TickReport()
+            if cleanup == "kill":
+                _kill_run(ctx, 1, report)
+            else:
+                terminate(process.pid)
+                if cleanup == "crash":
+                    _recover_runs(ctx, report)
+                else:
+                    c.store.finish_run(1, "error")
+                    c.now[0] += timedelta(seconds=1)
+                    _recover_orphan(ctx, c.tracker.get_issue(1), report)
+            assert process.returncode == -signum and not unwound.exists()
+            assert not path.exists()
+            for root in (c.history.clone, c.history.origin):
+                assert git_command(root, "show", "foragent/issue-1:unfinished.txt") == "partial implementation"
+                assert git_command(root, "rev-parse", f"foragent/issue-1:{ACCEPTANCE}") == (
+                    c.store.load_approval(1).acceptance_blobs[ACCEPTANCE]
+                )
+                assert ".foragent" not in git_command(root, "ls-tree", "-r", "--name-only", "foragent/issue-1")
+        finally:
+            terminate(process.pid)
+            c.ctx.git.remove_worktree(path)
+            c.tracker.remove_labels(1, ["running"])
+
+
+@pytest.mark.parametrize("saved_at", ["local", "origin"])
+def test_retry_integrates_latest_target_before_worker_and_baseline_verification(run_case, monkeypatch, saved_at):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0, test_command=f"{shlex.quote(sys.executable)} -m pytest")
+    c.executor.steps = [{"feature.txt": "unfinished"}]
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    if saved_at == "origin":
+        git_command(c.history.clone, "update-ref", "-d", "refs/heads/foragent/issue-1")
+    sibling = "tests/acceptance/test_sibling.py"
+    c.history.update({sibling: "def test_sibling():\n    assert True\n"})
+    c.now[0] += timedelta(minutes=1)
+    c.store.start_run(1, branch="foragent/issue-1", worktree=c.store.worktree_path(1))
+    c.executor.steps = [{"feature.txt": "done"}]
+    execute = c.executor.run
+
+    def finish(**kwargs):
+        root = kwargs["worktree"]
+        assert (root / "feature.txt").read_text() == "unfinished"
+        assert (root / sibling).is_file(), "latest target must be present before the worker runs"
+        assert GitRepo(root).is_ancestor(c.history.tip, git_command(root, "rev-parse", "HEAD"))
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", finish)
+    assert run_issue(1, c.ctx) == "merged"
+    assert "test_sibling" in c.store.log_path(1).read_text()
+
+
+@pytest.mark.parametrize("created", [False, True])
+def test_missing_approved_path_does_not_discard_failed_implementation(run_case, created):
+    c = run_case
+    missing = "tests/acceptance/not_yet.py"
+    approval = c.store.load_approval(1)
+    c.store.save_approval(
+        1, body=approval.body, body_sha=approval.body_sha,
+        acceptance_blobs={**approval.acceptance_blobs, missing: "missing"},
+        approved_by=approval.approved_by, approved_at=approval.approved_at,
+    )
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    c.executor.steps = [{"feature.txt": "unfinished", **({missing: "tampered\n"} if created else {})}]
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    for root in (c.history.clone, c.history.origin):
+        assert git_command(root, "show", "foragent/issue-1:feature.txt") == "unfinished"
+        assert GitRepo(root).blob_sha("foragent/issue-1", missing) is None
+
+
+def test_retry_target_conflict_uses_existing_resolver_before_ordinary_implementation(run_case, monkeypatch):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    c.history.update({"cli.py": "commands = ['help']\n"})
+    c.executor.steps = [{"feature.txt": "unfinished", "cli.py": "commands = ['help', 'issue']\n"}]
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    c.history.update({"cli.py": "commands = ['help', 'base']\n", "sibling.txt": "new target file\n"})
+    c.now[0] += timedelta(minutes=1)
+    c.store.start_run(1, branch="foragent/issue-1", worktree=c.store.worktree_path(1))
+    c.executor.steps = [{"feature.txt": "done", "cli.py": "commands = ['help', 'base', 'issue']\n"}]
+    execute = c.executor.run
+    calls = []
+
+    def resolve(**kwargs):
+        root = kwargs["worktree"]
+        assert c.store.get_run(1).phase == "resolving-conflict"
+        assert (root / "feature.txt").read_text() == "unfinished"
+        assert (root / "sibling.txt").is_file()
+        assert GitRepo(root).conflict_paths() == ["cli.py"]
+        assert "Resolve the conflict markers" in kwargs["prompt"]
+        calls.append(kwargs)
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", resolve)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("saved_at", ["local", "origin"])
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_retry_binds_reapproved_acceptance_after_integrating_target(run_case, monkeypatch, saved_at, conflicting):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    c.history.update({"notes.txt": "original\n"})
+    c.executor.steps = [{"feature.txt": "unfinished", "notes.txt": "issue work\n"}]
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    if saved_at == "origin":
+        git_command(c.history.clone, "update-ref", "-d", "refs/heads/foragent/issue-1")
+    acceptance = "def test_feature():\n    assert 1 + 1 == 2\n"
+    c.history.update({ACCEPTANCE: acceptance, **({"notes.txt": "base work\n"} if conflicting else {})})
+    approval = c.store.load_approval(1)
+    c.store.save_approval(
+        1, body=approval.body, body_sha=approval.body_sha,
+        acceptance_blobs=GitRepo(c.history.origin).blob_shas("main", [ACCEPTANCE]),
+        approved_by=approval.approved_by, approved_at=c.now[0].isoformat(),
+    )
+    c.now[0] += timedelta(minutes=1)
+    c.store.start_run(1, branch="foragent/issue-1", worktree=c.store.worktree_path(1))
+    c.executor.steps = [{"feature.txt": "done", "notes.txt": "base work\nissue work\n"}]
+    execute = c.executor.run
+
+    def finish(**kwargs):
+        assert (kwargs["worktree"] / ACCEPTANCE).read_text() == acceptance
+        assert (kwargs["worktree"] / "feature.txt").read_text() == "unfinished"
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", finish)
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.store.load_approval(1) is not None
+    assert git_command(c.history.origin, "rev-parse", f"foragent/issue-1:{ACCEPTANCE}") == (
+        c.store.load_approval(1).acceptance_blobs[ACCEPTANCE]
+    )
+
+
+@pytest.mark.parametrize("cleanup", ["kill", "crash", "orphan"])
+def test_scheduler_excludes_injected_lane_skills_from_saved_and_resumed_work(run_case, cleanup):
+    from foragent.runner import _inject_lane_skills
+
+    c = run_case
+    relative = ".claude/skills/testing"
+    skill = c.ctx.repo_root / relative / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\ndescription: Focused tests\n---\nRun useful checks.\n")
+    c.ctx.config = replace(c.ctx.config, lanes={"api": {"skills": ["testing"]}}, skill_libraries=[])
+    c.store.update_run(1, lane="api", pid=None)
+    worktree = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(worktree, "foragent/issue-1", "origin/main")
+    git = c.ctx.git.at(worktree)
+    _inject_lane_skills(c.ctx, 1, git)
+    (worktree / "feature.txt").write_text("unfinished")
+    handmade = ".claude/skills/handmade/SKILL.md"
+    (worktree / handmade).parent.mkdir(parents=True)
+    (worktree / handmade).write_text("User-authored skill\n")
+    git_command(worktree, "add", "-f", "--", relative)
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+        kill_runner=lambda pid: None, runner_process_exists=lambda n: False,
+    )
+    report = TickReport()
+    if cleanup == "kill":
+        _kill_run(ctx, 1, report)
+    elif cleanup == "crash":
+        c.now[0] += timedelta(minutes=3)
+        _recover_runs(ctx, report)
+    else:
+        c.store.finish_run(1, "error")
+        c.now[0] += timedelta(seconds=1)
+        _recover_orphan(ctx, c.tracker.get_issue(1), report)
+    c.tracker.remove_labels(1, ["running"])
+    for root in (c.history.clone, c.history.origin):
+        published = git_command(root, "ls-tree", "-r", "--name-only", "foragent/issue-1").splitlines()
+        assert relative + "/SKILL.md" not in published
+        assert handmade in published
+    assert c.store.get_run(1).local_skill_paths == [relative]
+    c.now[0] += timedelta(minutes=1)
+    c.store.start_run(1, branch="foragent/issue-1", worktree=worktree, lane="api")
+    assert c.store.get_run(1).local_skill_paths == [relative]
+    assert run_issue(1, c.ctx) == "merged"
+    published = git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1").splitlines()
+    assert relative + "/SKILL.md" not in published
+    assert handmade in published
+
+
+@pytest.mark.parametrize("cleanup", ["kill", "crash", "orphan"])
+@pytest.mark.parametrize("failure", ["stage", "push"])
+def test_scheduler_records_preservation_failure_and_still_removes_worktree(run_case, monkeypatch, cleanup, failure):
+    c = run_case
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    (path / "unfinished.txt").write_text("partial implementation\n")
+    git_run = c.ctx.git._run
+
+    def unavailable(args):
+        command = args
+        while command[:1] == ["-C"]:
+            command = command[2:]
+        if (failure == "stage" and command[:2] == ["ls-files", "--modified"]) or (
+            failure == "push" and command[:1] == ["push"]
+        ):
+            raise subprocess.CalledProcessError(1, ["git", *args], stderr=f"{failure} unavailable")
+        return git_run(args)
+
+    monkeypatch.setattr(c.ctx.git, "_run", unavailable)
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+        runner_process_exists=lambda n: False,
+    )
+    report = TickReport()
+    if cleanup == "kill":
+        _kill_run(ctx, 1, report)
+    elif cleanup == "crash":
+        c.now[0] += timedelta(minutes=3)
+        _recover_runs(ctx, report)
+    else:
+        c.store.finish_run(1, "error")
+        c.now[0] += timedelta(seconds=1)
+        _recover_orphan(ctx, c.tracker.get_issue(1), report)
+    assert not path.exists() and c.store.get_run(1).status == "finished"
+    events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
+    failures = [event for event in events if event["kind"] == "wip-preservation-failed"]
+    assert len(failures) == 1 and f"{failure} unavailable" in failures[0]["summary"]
+    assert "WIP preservation failed" in c.store.log_path(1).read_text()
+    assert any("WIP preservation failed" in action for action in report.actions)
+    if failure == "push":
+        assert git_command(c.history.clone, "show", "foragent/issue-1:unfinished.txt") == "partial implementation"
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_scheduler_keeps_unverified_wip_local_with_open_pr(run_case):
+    c = run_case
+    branch = "foragent/issue-1"
+    git_command(c.history.origin, "update-ref", f"refs/heads/{branch}", c.history.tip)
+    c.tracker.create_pr(head=branch, base="main", title="Existing PR", body="Closes #1")
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, branch, "origin/main")
+    (path / "unfinished.txt").write_text("partial implementation\n")
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+    )
+    _kill_run(ctx, 1, TickReport())
+    assert git_command(c.history.clone, "show", f"{branch}:unfinished.txt") == "partial implementation"
+    assert git_command(c.history.origin, "rev-parse", branch) == c.history.tip
+    assert not any(args[:1] == ["push"] for _, args in c.operations)
+    c.tracker.remove_labels(1, ["running"])
+
+
 def test_question_stops_before_checks_and_is_truncated(run_case):
     c = run_case
     c.executor.steps = [{".foragent/QUESTION.md": "Choose A or B; recommend A.\n" + "q" * 7000}]
@@ -548,13 +1066,188 @@ def test_implementation_prompt_full_suite_from_worktree(run_case, files, configu
     c.ctx.config = replace(c.ctx.config, test_command=configured)
     assert run_issue(1, c.ctx) == "merged"
     prompt = c.executor.calls[0]["prompt"]
+    assert "Optional additional check" not in prompt
+    assert "run the full test suite" not in prompt
+    assert "You run only the Done when tests and the tests for files you change" in prompt
+    assert "no parallel test helper is needed" in prompt
     if expected is None:
-        assert "Before you finish" not in prompt
+        assert "The runner runs Done when." in prompt
+        assert "previously passing acceptance tests" not in prompt
+        assert "related unit tests" not in prompt
+        assert "CI runs the full suite after publication" not in prompt
     else:
-        assert prompt.splitlines().count(
-            f"- Before you finish, also run the full test suite: `{expected}`. "
-            "CI runs it, so existing tests must keep passing."
-        ) == 1
+        assert "The runner runs Done when, the previously passing acceptance tests and related unit tests." in prompt
+        assert f"CI runs the full suite after publication (`{expected}`)" in prompt
+
+
+@pytest.mark.parametrize("source", ["src/demo/service.py", "demo/service.py"])
+def test_related_units_include_importers_of_deleted_modules_and_existing_changed_tests(tmp_path, source):
+    from foragent.runner import _related_unit_tests
+
+    files = {
+        "tests/test_direct.py": "import demo.service as service\n",
+        "tests/unit/service_test.py": "from demo import service as target\n",
+        "tests/test_symbols.py": "def test_local_import():\n    from demo.service import run\n",
+        "tests/test_unrelated.py": '# import demo.service\nEXAMPLE = "from demo import service"\nimport demo.other\n',
+        "tests/test_changed with spaces.py": "broken syntax is still selected!",
+        "tests/test_old_broken.py": "broken syntax!",
+        "tests/locked/test_acceptance.py": "import demo.service\n",
+        "tests/helpers.py": "import demo.service\n",
+    }
+    for name, contents in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+    assert _related_unit_tests(tmp_path, [source, "tests/test_changed with spaces.py", "tests/test_deleted.py"],
+                               "./tests/locked/") == (
+        "tests/test_changed with spaces.py", "tests/test_direct.py", "tests/test_symbols.py",
+        "tests/unit/service_test.py",
+    )
+    assert _related_unit_tests(tmp_path, ["src/demo/__init__.py"], "tests/locked") == (
+        "tests/test_direct.py", "tests/test_symbols.py", "tests/test_unrelated.py", "tests/unit/service_test.py",
+    )
+
+
+@pytest.mark.parametrize("repaired", [True, False])
+def test_related_unit_failure_uses_implementation_budget_and_reaches_next_prompt(run_case, repaired):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command=f"{shlex.quote(sys.executable)} -m pytest -q -k ignored")
+    c.executor.steps = [
+        {"feature.txt": "done", "unit.txt": "bad", "tests/test_new.py": (
+            "from pathlib import Path\n"
+            "def test_related():\n"
+            '    assert Path("unit.txt").read_text() == "good", "related unit failed"\n'
+        )},
+        {"unit.txt": "good"} if repaired else {},
+    ]
+    assert run_issue(1, c.ctx) == ("merged" if repaired else "retries-exceeded")
+    assert len(c.executor.calls) == 2
+    assert "related unit failed" in c.executor.calls[1]["prompt"]
+    assert "tests/test_new.py" in c.executor.calls[1]["prompt"]
+    assert c.store.get_run(1).attempts == 2
+    assert bool(c.tracker.merged_prs) == repaired
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkeypatch, timed_out):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command="pytest -q")
+    c.executor.steps = [{"feature.txt": "done", "tests/test_new.py": "def test_new():\n    assert True\n"}]
+    c.now[0] += timedelta(minutes=60)
+    c.store.update_run(1, waited_seconds=600)
+    calls = []
+
+    def check(command, worktree, log, timeout_s, **kwargs):
+        selected = "tests/test_new.py" in shlex.split(command)
+        if worktree == c.store.worktree_path(1):
+            calls.append((command, timeout_s))
+            c.now[0] += timedelta(seconds=120)
+        killed = selected and timed_out
+        return CheckResult(command, -9 if killed else 0, killed, "")
+
+    monkeypatch.setattr("foragent.runner._check", check)
+    assert run_issue(1, c.ctx) == ("timeout" if timed_out else "merged")
+    assert [limit for _, limit in calls] == [900, 900, 2160]
+    assert "tests/test_new.py" in shlex.split(calls[-1][0])
+    assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
+    if timed_out:
+        assert c.store.load_flag(1).reason == Reason.TIMEOUT
+        assert c.store.get_run(1).detail == "Related unit tests timed out after 2160 s (1 selected tests)."
+        assert c.tracker.created_prs == []
+
+
+@pytest.mark.parametrize("max_retries", [0, 1])
+def test_related_check_timeout_preserves_implementation_before_cleanup(run_case, monkeypatch, max_retries):
+    c = run_case
+    c.history.update({
+        "src/sample.py": "VALUE = 1\n",
+        "tests/test_sample.py": "from sample import VALUE\n",
+    })
+    c.ctx.config = replace(c.ctx.config, test_command="pytest -q", max_retries=max_retries)
+    c.executor.steps = [{"feature.txt": "done", "src/sample.py": "VALUE = 2\n"}]
+    c.now[0] += timedelta(minutes=70)
+
+    def check(command, worktree, log, timeout_s, **kwargs):
+        timed_out = "tests/test_sample.py" in shlex.split(command)
+        if timed_out:
+            assert timeout_s == 1200
+            c.now[0] += timedelta(seconds=timeout_s)
+        return CheckResult(command, -9 if timed_out else 0, timed_out, "")
+
+    monkeypatch.setattr("foragent.runner._check", check)
+    assert run_issue(1, c.ctx) == "timeout"
+    assert not c.store.worktree_path(1).exists()
+    assert git_command(c.history.clone, "show", "foragent/issue-1:src/sample.py") == "VALUE = 2"
+    assert git_command(c.history.origin, "show", "foragent/issue-1:src/sample.py") == "VALUE = 2"
+    assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
+    assert c.store.load_flag(1).reason == Reason.TIMEOUT
+    assert c.store.get_run(1).detail == "Related unit tests timed out after 1200 s (1 selected tests)."
+    assert c.tracker.created_prs == c.tracker.merged_prs == []
+
+
+@pytest.mark.parametrize("slow_check", ["baseline", "done-when", "related"])
+def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_case, monkeypatch, slow_check):
+    from foragent.scheduler import TickContext, TickReport, _recover_runs
+
+    c = run_case
+    stall_minutes = 30 if slow_check == "related" else 1
+    c.ctx.config = replace(c.ctx.config, test_command="pytest -q", stall_minutes=stall_minutes)
+    if slow_check == "related":
+        c.now[0] += timedelta(minutes=30)
+    c.executor.steps = [{"feature.txt": "done", "tests/test_new.py": "def test_new():\n    assert True\n"}]
+    killed = []
+    scheduler = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, kill_runner=killed.append,
+        launcher=lambda number: pytest.fail("check must keep the current runner"), start_runs=False,
+    )
+    polls = []
+    observed = []
+
+    def watch(execute, poll):
+        polls.append(poll)
+        try:
+            return execute()
+        finally:
+            polls.pop()
+
+    def check_process(argv, *, cwd, timeout_s, log_path, **kwargs):
+        command = argv[2]
+        words = shlex.split(command)
+        report = next((word.split("=", 1)[1] for word in words if word.startswith("--junitxml=")), None)
+        if report:
+            kind = "baseline"
+        elif command == COMMAND:
+            kind = "done-when"
+        elif "tests/test_new.py" in words:
+            kind = "related"
+        else:
+            kind = "other"
+        if kind == slow_check and not observed:
+            assert timeout_s >= (stall_minutes + 1) * 60
+            if kind == "related":
+                assert timeout_s == 3600
+            for _ in range(stall_minutes + 1):
+                c.now[0] += timedelta(minutes=1)
+                if polls:
+                    polls[-1]()
+                observed.append(c.store.get_run(1).last_progress_at)
+            _recover_runs(scheduler, TickReport())
+            assert killed == []
+            assert c.store.get_run(1).status == "running"
+            assert observed[-1] == c.now[0].isoformat()
+        if report:
+            suite = ET.Element("testsuite")
+            ET.SubElement(suite, "testcase", file=ACCEPTANCE, name="test_feature",
+                          classname=ACCEPTANCE.removesuffix(".py").replace("/", "."))
+            ET.ElementTree(suite).write(report, encoding="unicode")
+        return 0, False, ""
+
+    monkeypatch.setattr("foragent.runner.poll_executor", watch)
+    monkeypatch.setattr("foragent.runner.run_logged", check_process)
+    assert run_issue(1, c.ctx) == "merged", c.store.log_path(1).read_text()
+    assert len(set(observed)) == stall_minutes + 1
+    assert killed == []
 
 
 @pytest.mark.parametrize("options", ["", "--rootdir=tests --junit-prefix=project"])
@@ -599,6 +1292,28 @@ def test_future():
     assert (c.store.root / "runs/issue-1-acceptance-baseline.xml").is_file()
 
 
+def test_baseline_cache_rebuilds_collection_errors_even_when_pytest_continues(git_history, tmp_path):
+    from foragent.runner import _capture_acceptance_baseline
+
+    git_history.update({"tests/acceptance/test_broken.py": "def test_broken(:\n"})
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    command = f"{shlex.quote(sys.executable)} -m pytest -q --continue-on-collection-errors"
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    ctx = RunContext(
+        repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
+        config=Config(test_command=command), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
+    )
+
+    first = _capture_acceptance_baseline(1, ctx, command, git_history.tip)
+    second = _capture_acceptance_baseline(1, ctx, command, git_history.tip)
+
+    assert first == second
+    assert first.node_ids == (f"{ACCEPTANCE}::test_feature",)
+    assert store.log_path(1).read_text().count("Acceptance baseline count=1, exit_code=1") == 2
+    assert not list((store.root.parent / "baselines").glob("*.json"))
+
+
 def test_baseline_failure_exhausts_the_done_when_budget(run_case):
     c = run_case
     c.ctx.config = replace(c.ctx.config, max_retries=0, test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
@@ -616,13 +1331,21 @@ def test_keep():
 
 
 @pytest.mark.parametrize("command,reason", [(None, "no test command is known"), ("npm test", "pytest")])
-def test_baseline_skip_is_logged_without_creating_a_probe(run_case, command, reason):
+def test_baseline_skip_is_logged_without_creating_a_probe(run_case, monkeypatch, command, reason):
     c = run_case
     c.ctx.config = replace(c.ctx.config, test_command=command)
+    execute = c.executor.run
+
+    def implement(**kwargs):
+        # The baseline probe precedes implementation; a post-merge reinstall
+        # may independently create a detached worktree afterwards.
+        assert not any("--detach" in args for _, args in c.operations)
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", implement)
     assert run_issue(1, c.ctx) == "merged"
     log = c.store.log_path(1).read_text()
     assert "Acceptance baseline skipped (count=0)" in log and reason in log
-    assert not any("--detach" in args for _, args in c.operations)
 
 
 def test_baseline_uses_detection_and_ignores_full_suite_selection_and_generated_files(run_case, monkeypatch):
@@ -717,6 +1440,8 @@ def test_ci_retry_preserves_worktree_logs_and_all_checks(run_case, monkeypatch, 
     assert worktree_identity[0] == worktree_identity[1]
     assert "CI failed:\n" + logs in c.executor.calls[1]["prompt"]
     assert "`make check`" in c.executor.calls[1]["prompt"]
+    assert "CI runs the full suite after publication" in c.executor.calls[1]["prompt"]
+    assert "You run only the Done when tests and the tests for files you change" in c.executor.calls[1]["prompt"]
     assert len(reviews) == (2 if repair_passes_done_when else 1)
     assert c.store.get_run(1).attempts == 2
     assert len(c.tracker.created_prs) == 1
@@ -918,7 +1643,7 @@ def test_check_timeout_uses_retry_limit_and_reports_command(run_case, monkeypatc
     c.executor.steps = [{"feature.txt": "done"}, {}]
     calls = []
 
-    def check(command, worktree, log, timeout_s):
+    def check(command, worktree, log, timeout_s, **kwargs):
         calls.append((command, timeout_s))
         return CheckResult(command, -9, True, "slow check output")
 
@@ -935,9 +1660,9 @@ def test_retry_gets_remaining_budget_after_checks_spend_time(run_case, monkeypat
     c.executor.steps = [{"feature.txt": "wrong"}, {"feature.txt": "done"}]
     from foragent.runner import _check
 
-    def check(*args):
+    def check(*args, **kwargs):
         c.now[0] += timedelta(minutes=1)
-        return _check(*args)
+        return _check(*args, **kwargs)
 
     monkeypatch.setattr("foragent.runner._check", check)
     assert run_issue(1, c.ctx) == "merged"
@@ -1776,12 +2501,13 @@ def test_claude_native_goal_settings_and_independent_retry(run_case, acceptance_
     }
     assert not settings_path.is_relative_to(c.store.worktree_path(1))
     assert (settings_path.parent / "stop-block-count").read_text() == "0"
-    expected = (f'/goal Every command in the "Done when" list below exits 0 when run from the repository root, '
+    expected = ('Every command in the "Done when" list below exits 0 when run from the repository root, '
                 f'nothing under {acceptance_dir} is modified, and no files outside this repository are changed. '
-                'Or stop after 40 turns.\n\nYou are implementing GitHub issue #1')
+                'Or stop after 40 turns.')
     assert len(c.executor.calls) == 2
     for call in c.executor.calls:
-        assert call["prompt"].startswith(expected)
+        assert call["goal"] == expected
+        assert call["prompt"].startswith("You are implementing GitHub issue #1")
         assert "Do not modify anything under" not in call["prompt"]
         assert COMMAND in call["prompt"] and "Other features." in call["prompt"]
         assert ".foragent/TRY.md" in call["prompt"]
@@ -2292,7 +3018,8 @@ def test_lane_executor_model_agent_notes_and_outside_paths(run_case, kind):
     assert call["model"] == "lane-model"
     if kind == "claude":
         assert call["agent"] == "fa-ui" and "settings_path" in call
-        assert call["prompt"].startswith("/goal ")
+        assert call["goal"] == goal_condition(c.ctx.config.acceptance_dir)
+        assert call["prompt"].startswith("You are implementing GitHub issue #1")
     else:
         assert "agent" not in call
         assert call["prompt"].startswith("Lane notes:\nUse the UI skills.")
@@ -2352,7 +3079,8 @@ def test_lane_skills_come_from_worktree_and_only_extend_codex_prompts(run_case, 
         assert "agent" not in call
     else:
         assert call["agent"] == "fa-ui"
-        assert call["prompt"].startswith("/goal ")
+        assert call["goal"] == goal_condition(c.ctx.config.acceptance_dir)
+        assert call["prompt"].startswith("You are implementing GitHub issue #1")
         assert "Lane skills (read the file" not in call["prompt"]
         assert "Configured strategy." not in call["prompt"] and "Agent strategy." not in call["prompt"]
         assert "missing skill:" not in pr.body
@@ -2627,7 +3355,7 @@ def test_conflict_marker_left_after_staging_consumes_attempt_before_merge_commit
         c.history.update({".gitattributes": f"cli.py conflict-marker-size={width}\n"})
     git_command(c.history.clone, "config", "merge.conflictStyle", "diff3")
     c.executor.steps += [
-        {"cli.py": f"commands = ['help', 'base', 'issue']\n{marker * width}\n"},
+        {"cli.py": f"commands = ['help', 'base', 'issue']\n{'<' * width} HEAD\n{marker * width}\n{'>' * width} target\n"},
         {"cli.py": "commands = ['help', 'base', 'issue']\n"},
     ]
     implement = c.executor.run
@@ -2668,7 +3396,7 @@ def test_done_when_reintroduced_ancestor_marker_in_conflict_file_consumes_attemp
     c = conflicting_lanes
     set_done_when(c, [
         f"test -f {ACCEPTANCE}",
-        "if test -f base-feature.txt && ! test -f fixed.txt; then printf '||||||| ancestor\\n' > cli.py; fi",
+        "if test -f base-feature.txt && ! test -f fixed.txt; then printf '<<<<<<< HEAD\\n||||||| ancestor\\n=======\\n>>>>>>> target\\n' > cli.py; fi",
     ])
     resolved = "commands = ['help', 'base', 'issue']\n"
     c.executor.steps += [{"cli.py": resolved}, {"cli.py": resolved, "fixed.txt": "done"}]
@@ -2724,7 +3452,7 @@ def test_conflict_resolution_ignores_section_underlines_in_other_changed_files(c
 @pytest.mark.parametrize("failure", ["markers", "checks"])
 def test_conflict_resolution_exhaustion_never_publishes_failed_resolution(conflicting_lanes, failure):
     c = conflicting_lanes
-    content = "commands = ['help', 'issue']\n" + ("<<<<<<< HEAD\n" if failure == "markers" else "")
+    content = "commands = ['help', 'issue']\n" + ("<<<<<<< HEAD\n=======\n>>>>>>> target\n" if failure == "markers" else "")
     c.executor.steps += [{"cli.py": content}] * 3
     assert run_issue(1, c.ctx) == "retries-exceeded"
     assert len(c.executor.calls) == 4 and c.store.get_run(1).attempts == 2
@@ -2732,6 +3460,367 @@ def test_conflict_resolution_exhaustion_never_publishes_failed_resolution(confli
     assert len(c.ci_heads) == 1 and c.tracker.merged_prs == []
     assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == c.ci_heads[0]
     assert not any(args == ["merge", "--abort"] for _, args in c.operations)
+
+
+@pytest.mark.parametrize("failure", ["markers", "checks"])
+def test_failed_conflict_resolution_resumes_local_wip_while_preserving_open_pr(conflicting_lanes, monkeypatch, failure):
+    c = conflicting_lanes
+    branch = "foragent/issue-1"
+    content = "commands = ['help', 'issue']\n" + ("<<<<<<< HEAD\n=======\n>>>>>>> target\n" if failure == "markers" else "")
+    c.executor.steps += [{"cli.py": content}] * 3
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    assert git_command(c.history.clone, "show", f"{branch}:cli.py") == content.strip()
+    assert "[retries-exceeded]" in git_command(c.history.clone, "log", "-1", "--format=%B", branch)
+    assert git_command(c.history.clone, "rev-parse", f"{branch}^") == c.target_heads[0]
+    assert git_command(c.history.origin, "rev-parse", branch) == c.ci_heads[0]
+    assert git_command(c.history.origin, "rev-parse", "main") == c.history.tip
+
+    c.now[0] += timedelta(minutes=1)
+    c.store.start_run(1, branch=branch, worktree=c.store.worktree_path(1))
+    c.executor.steps = [{"cli.py": "commands = ['help', 'base', 'issue']\n"}]
+    execute = c.executor.run
+
+    def finish(**kwargs):
+        assert (kwargs["worktree"] / "cli.py").read_text() == content
+        assert git_command(c.history.origin, "rev-parse", branch) == c.ci_heads[0]
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", finish)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.tracker.created_prs) == 1 and c.tracker.merged_prs == [2]
+    assert git_command(c.history.origin, "show", f"{branch}:cli.py") == "commands = ['help', 'base', 'issue']"
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("restart", ["resolve", "noop"])
+def test_interrupted_conflict_keeps_single_parent_wip_and_rechecks_on_restart(conflicting_lanes, monkeypatch, staged, restart):
+    c = conflicting_lanes
+    set_done_when(c, ["test -f feature.txt"])
+    c.executor.steps = [{"feature.txt": "done", "cli.py": "commands = ['help', 'issue']\n"}, {}]
+    execute = c.executor.run
+
+    def interrupt(**kwargs):
+        result = execute(**kwargs)
+        if len(c.executor.calls) == 1:
+            c.move_target()
+        else:
+            (kwargs["worktree"] / "partial.txt").write_text("keep partial resolution\n")
+            if staged:
+                git_command(kwargs["worktree"], "add", "-A")
+            return replace(result, timed_out=True)
+        return result
+
+    monkeypatch.setattr(c.executor, "run", interrupt)
+    assert run_issue(1, c.ctx) == "timeout"
+    branch = "foragent/issue-1"
+    saved = git_command(c.history.clone, "rev-parse", branch)
+    assert len(git_command(c.history.clone, "show", "-s", "--format=%P", saved).split()) == 1
+    assert c.store.get_run(1).merge_conflicts == ["cli.py"]
+    assert "<<<<<<<" in git_command(c.history.clone, "show", f"{saved}:cli.py")
+    c.now[0] += timedelta(minutes=1)
+    c.store.start_run(1, branch=branch, worktree=c.store.worktree_path(1))
+    assert c.store.get_run(1).merge_conflicts == ["cli.py"]
+    resolution = {"cli.py": "commands = ['help', 'base', 'issue']\n", "feature.txt": "done"}
+    c.executor.steps = [resolution] if restart == "resolve" else [{}, {}, resolution]
+    seen = []
+
+    def resume(**kwargs):
+        if not seen:
+            assert "Resolve the conflict markers" in kwargs["prompt"]
+            assert (kwargs["worktree"] / "partial.txt").read_text() == "keep partial resolution\n"
+        seen.append(kwargs)
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", resume)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(seen) == (1 if restart == "resolve" else 3)
+    assert c.store.get_run(1).merge_conflicts == []
+    assert "<<<<<<<" not in git_command(c.history.origin, "show", f"{branch}:cli.py")
+
+
+def test_interrupted_conflict_is_rechecked_when_target_is_already_an_ancestor(conflicting_lanes, monkeypatch):
+    c = conflicting_lanes
+    set_done_when(c, [
+        f"test -f {ACCEPTANCE}",
+        "if test -f base-feature.txt && ! test -f fixed.txt; then printf '<<<<<<< HEAD\\n||||||| ancestor\\n=======\\n>>>>>>> target\\n' > cli.py; fi",
+    ])
+    resolved = "commands = ['help', 'base', 'issue']\n"
+    c.executor.steps += [{"cli.py": resolved}, {}]
+    execute = c.executor.run
+
+    def interrupt(**kwargs):
+        result = execute(**kwargs)
+        return replace(result, timed_out=True) if len(c.executor.calls) == 3 else result
+
+    monkeypatch.setattr(c.executor, "run", interrupt)
+    assert run_issue(1, c.ctx) == "timeout"
+    branch = "foragent/issue-1"
+    assert c.ctx.git.is_ancestor(c.history.tip, git_command(c.history.clone, "rev-parse", branch))
+    assert c.store.get_run(1).merge_conflicts == ["cli.py"]
+    c.now[0] += timedelta(minutes=1)
+    c.store.start_run(1, branch=branch, worktree=c.store.worktree_path(1))
+    c.executor.steps = [{}, {}, {"cli.py": resolved, "fixed.txt": "done"}]
+    monkeypatch.setattr(c.executor, "run", execute)
+    assert run_issue(1, c.ctx) == "merged"
+    assert all("Resolve the conflict markers" in call["prompt"] for call in c.executor.calls[3:5])
+    assert "|||||||" not in git_command(c.history.origin, "show", f"{branch}:cli.py")
+
+
+def test_remote_conflicted_wip_is_rechecked_without_local_state(conflicting_lanes, monkeypatch, tmp_path):
+    c = conflicting_lanes
+    set_done_when(c, [
+        f"test -f {ACCEPTANCE}",
+        "if test -f base-feature.txt && ! test -f fixed.txt; then printf '<<<<<<< HEAD\\n||||||| ancestor\\n=======\\n>>>>>>> target\\n' > cli.py; fi",
+    ])
+    resolved = "commands = ['help', 'base', 'issue']\n"
+    c.executor.steps += [{"cli.py": resolved}, {}]
+    execute = c.executor.run
+
+    def interrupt(**kwargs):
+        result = execute(**kwargs)
+        if len(c.executor.calls) == 1:
+            c.move_target()
+        return replace(result, timed_out=True) if len(c.executor.calls) == 3 else result
+
+    monkeypatch.setattr(c.executor, "run", interrupt)
+    assert run_issue(1, c.ctx) == "timeout"
+    branch = "foragent/issue-1"
+    assert git_command(c.history.origin, "show", f"{branch}:cli.py") == "<<<<<<< HEAD\n||||||| ancestor\n=======\n>>>>>>> target"
+    assert c.ctx.git.is_ancestor(c.history.tip, git_command(c.history.clone, "rev-parse", branch))
+    assert c.tracker.created_prs == []
+
+    approval = c.store.load_approval(1)
+    clone = tmp_path / "fresh-clone"
+    git_command(tmp_path, "clone", str(c.history.origin), str(clone))
+    c.history.clone = c.ctx.repo_root = clone
+    c.ctx.git = GitRepo(clone, c.ctx.git._run)
+    c.store = c.ctx.store = StateStore(tmp_path / "fresh-state", now=c.ctx.now)
+    c.store.save_approval(**approval.__dict__)
+    c.store.start_run(1, branch=branch, worktree=c.store.worktree_path(1))
+    assert c.store.get_run(1).merge_conflicts == []
+    c.executor.steps = [{}, {"cli.py": resolved, "fixed.txt": "done"}]
+    monkeypatch.setattr(c.executor, "run", execute)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 5
+    assert "충돌 마커가 남음: cli.py:1" in c.executor.calls[-1]["prompt"]
+    assert git_command(c.history.origin, "show", f"{branch}:cli.py") == resolved.strip()
+
+
+@pytest.mark.parametrize("scope", ["claude-local", "pr-body"])
+@pytest.mark.parametrize("repair", [False, True])
+def test_publication_returns_conflict_marker_locations_before_opening_pr(run_case, scope, repair):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, review_scope=scope)
+    reviews = enable_reviewer(c, ["VERDICT: PASS"])
+    c.executor.steps = [{"feature.txt": "done", "notes.txt": "text\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> target\n"}]
+    if repair:
+        c.executor.steps.append({"notes.txt": "resolved\n"})
+    else:
+        c.executor.steps.append({})
+    assert run_issue(1, c.ctx) == ("merged" if repair else "retries-exceeded")
+    assert len(c.executor.calls) == 2
+    for line in (2, 4, 6):
+        assert f"충돌 마커가 남음: notes.txt:{line}" in c.executor.calls[-1]["prompt"]
+    assert len(reviews) == int(repair)
+    assert len(c.tracker.created_prs) == int(repair)
+    assert len(c.tracker.merged_prs) == int(repair)
+
+
+def test_publication_ignores_markers_in_unchanged_target_files(run_case):
+    c = run_case
+    c.history.update({"examples.txt": "<<<<<<< documented example\n=======\n>>>>>>> target\n"})
+    c.executor.steps[0]["notes.rst"] = "Heading\n=======\n"
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 1
+
+
+@pytest.mark.parametrize("content", [
+    ">>>>>>> A valid nested blockquote\n", "||||||| ancestor\n", "Heading\n=======\n", "<<<<<<< example\n",
+])
+def test_publication_allows_standalone_marker_text(run_case, content):
+    c = run_case
+    c.executor.steps[0]["notes.md"] = content
+    c.executor.steps.append({})
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 1 and len(c.tracker.created_prs) == 1
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_batch_publication_checks_inherited_changes_against_actual_base(run_case, existing):
+    from foragent.git import GitError
+
+    c = run_case
+    batch_setup(c)
+    # Wait for a sibling so the ordinary child-relative publication can finish.
+    c.tracker.add_issue(3, "Sibling")
+    c.tracker.set_parent(3, 99)
+    seed_batch(c, {"notes.txt": "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> target\n"})
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.tracker.created_prs) == 1
+    c.tracker.close_issue(3)
+    if existing:
+        pr = c.tracker.create_pr(head="foragent/batch-99", base="main", title="Old title", body="Old body")
+    before = list(c.tracker.created_prs)
+    with pytest.raises(GitError, match="notes.txt:1"):
+        _batch_pr(99, c.ctx)
+    assert c.tracker.created_prs == before
+    if existing:
+        assert c.tracker.get_issue(pr).body == "Old body"
+
+
+def test_batch_publication_failure_is_deferred_until_aggregate_contents_are_repaired(run_case):
+    from foragent.scheduler import TickContext, tick
+
+    c = run_case
+    batch_setup(c)
+    branch = "foragent/batch-99"
+    seed_batch(c, {"notes.txt": "<<<<<<< HEAD\n=======\n>>>>>>> target\n"})
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.tracker.get_issue(1).state == "closed" and c.store.load_flag(1) is None
+    assert len(c.tracker.created_prs) == 1
+    assert "Batch PR finalization deferred to tick: 충돌 마커가 남음: notes.txt:1" in c.store.log_path(1).read_text()
+    context = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda number: None, start_runs=False,
+    )
+    assert any("notes.txt:1" in action for action in tick(context).actions)
+    assert len(c.tracker.created_prs) == 1
+    base = c.history.tip
+    c.history.tip = c.ctx.git.remote_branch_sha(branch)
+    c.history.update({"notes.txt": "resolved\n"})
+    git_command(c.history.origin, "update-ref", f"refs/heads/{branch}", c.history.tip)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    c.history.tip = base
+    tick(context)
+    assert len(c.tracker.created_prs) == 2 and c.tracker.created_prs[-1].head == branch
+
+
+@pytest.mark.parametrize("staged", [False, True])
+@pytest.mark.parametrize("merge_fails", [False, True])
+def test_active_injected_skill_becomes_target_owned_without_leaking_to_wip(run_case, monkeypatch, staged, merge_fails):
+    from foragent.git import GitError
+
+    c = run_case
+    relative = ".claude/skills/testing"
+    path = relative + "/SKILL.md"
+    local = c.ctx.repo_root / path
+    local.parent.mkdir(parents=True)
+    local.write_text("Local injected skill\n")
+    (local.parent / "injected-helper.py").write_text("# local dependency\n")
+    c.ctx.config = replace(c.ctx.config, lanes={"api": {"skills": ["testing"]}}, skill_libraries=[])
+    c.store.update_run(1, lane="api")
+    execute = c.executor.run
+    official = "Official repository skill\n"
+
+    def implement(**kwargs):
+        assert (kwargs["worktree"] / path).read_text() == "Local injected skill\n"
+        if staged:
+            git_command(kwargs["worktree"], "add", "--", relative)
+        result = execute(**kwargs)
+        c.history.update({path: official})
+        return result
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    merge_base = GitRepo.merge_base
+
+    def refresh(git, target, **kwargs):
+        if merge_fails:
+            raise GitError("unrelated refresh failure")
+        return merge_base(git, target, **kwargs)
+
+    monkeypatch.setattr(GitRepo, "merge_base", refresh)
+    assert run_issue(1, c.ctx) == ("error" if merge_fails else "merged")
+    branch = "foragent/issue-1"
+    if merge_fails:
+        assert c.ctx.git.blob_sha(branch, path) is None
+        assert git_command(c.history.origin, "ls-tree", "-r", "--name-only", branch, "--", relative) == ""
+        assert not c.tracker.created_prs
+    else:
+        assert git_command(c.history.origin, "show", f"{branch}:{path}") == official.strip()
+        assert c.ctx.git.blob_sha(branch, relative + "/injected-helper.py") is None
+    assert c.store.get_run(1).local_skill_paths == []
+
+
+def test_publication_rechecks_marker_locations_after_ci_before_merge(run_case, monkeypatch):
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done", "notes.txt": "ready\n"}, {"notes.txt": "resolved\n"}]
+    checks = c.tracker.pr_checks
+    introduced = False
+
+    def ci(pr):
+        nonlocal introduced
+        if not introduced:
+            introduced = True
+            root = c.store.worktree_path(1)
+            (root / "notes.txt").write_text("<<<<<<< HEAD\n||||||| ancestor\n=======\n>>>>>>> target\n")
+            git_command(root, "add", "--", "notes.txt")
+        return checks(pr)
+
+    monkeypatch.setattr(c.tracker, "pr_checks", ci)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 2
+    assert "충돌 마커가 남음: notes.txt:1" in c.executor.calls[-1]["prompt"]
+    assert len(c.tracker.merged_prs) == 1
+    assert git_command(c.history.origin, "show", "foragent/issue-1:notes.txt") == "resolved"
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+def test_review_returns_conflicted_pr_to_implementer_even_with_pass_verdict(run_case, resolved):
+    from foragent.runner import review_only
+
+    c = run_case
+    c.store.finish_run(1, outcome="held")
+    c.now[0] += timedelta(seconds=1)
+    c.tracker.remove_labels(1, ["running"])
+    base = c.history.tip
+    c.history.update({"feature.txt": "done", "notes.txt": "<<<<<<< HEAD\n||||||| ancestor\n=======\n>>>>>>> target\n"})
+    head = c.history.tip
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing PR", body="Review")
+    c.tracker.set_pr_head_sha(pr, head)
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    enable_reviewer(c, ["VERDICT: PASS"])
+    c.executor.steps = [{"notes.txt": "resolved\n"}]
+    assert review_only(1, c.ctx, verdict_head=head if resolved else None) == "merged"
+    assert len(c.executor.calls) == 1
+    assert "충돌 마커가 남음: notes.txt:1" in c.executor.calls[0]["prompt"]
+    assert c.tracker.merged_prs == [pr]
+    assert git_command(c.history.origin, "show", "foragent/issue-1:notes.txt") == "resolved"
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_resumed_injected_skill_becomes_target_owned(run_case, monkeypatch, selected):
+    c = run_case
+    relative = ".claude/skills/testing"
+    path = relative + "/SKILL.md"
+    local = c.ctx.repo_root / path
+    local.parent.mkdir(parents=True)
+    local.write_text("Local injected skill\n")
+    c.ctx.config = replace(c.ctx.config, lanes={"api": {"skills": ["testing"]}}, skill_libraries=[])
+    c.store.update_run(1, lane="api")
+    execute = c.executor.run
+
+    def interrupt(**kwargs):
+        return replace(execute(**kwargs), timed_out=True)
+
+    monkeypatch.setattr(c.executor, "run", interrupt)
+    assert run_issue(1, c.ctx) == "timeout"
+    assert c.store.get_run(1).local_skill_paths == [relative]
+    official = "Official repository skill\n"
+    c.history.update({path: official})
+    c.ctx.config = replace(c.ctx.config, lanes={"api": {"skills": ["testing"] if selected else []}})
+    c.now[0] += timedelta(minutes=1)
+    c.store.start_run(1, branch="foragent/issue-1", worktree=c.store.worktree_path(1), lane="api")
+    c.executor.steps = [{"feature.txt": "done"}]
+
+    def finish(**kwargs):
+        assert (kwargs["worktree"] / path).read_text() == official
+        return execute(**kwargs)
+
+    monkeypatch.setattr(c.executor, "run", finish)
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.store.get_run(1).local_skill_paths == []
+    assert git_command(c.history.origin, "show", f"foragent/issue-1:{path}") == official.strip()
 
 
 def test_conflict_resolution_has_full_budget_after_implementation_retries(conflicting_lanes):

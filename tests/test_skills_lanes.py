@@ -1,6 +1,7 @@
 from dataclasses import replace
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 import yaml
@@ -8,7 +9,7 @@ import yaml
 from foragent import cli
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
-from foragent.lanes import LaneError, add_lane, validate_lane
+from foragent.lanes import LaneError, add_lane, set_lane_skills, validate_lane
 from foragent.license_texts import STANDARD_LICENSES
 from foragent.skills import SkillError, SkillManager, copy_lane_skills
 
@@ -57,7 +58,8 @@ def two_libraries(library, tmp_path):
 def test_catalog_metadata_and_multiple_library_prefixes(library, tmp_path):
     root, config, manager, _ = library
     assert manager.catalog() == [{"id": "kwp:engineering/testing-strategy", "name": "testing-strategy",
-                                  "description": "Pick useful checks.", "license": "Apache-2.0"}]
+                                  "description": "Pick useful checks.", "license": "Apache-2.0", "role": None,
+                                  "runs_scripts": False, "copies": ["engineering/skills/testing-strategy"]}]
     second = tmp_path / "second"
     (second / "other/skills/testing-strategy").mkdir(parents=True)
     (second / "other/skills/testing-strategy/SKILL.md").write_text("---\nname: different\ndescription: Other skill\n---\n")
@@ -121,6 +123,47 @@ def test_sync_clones_then_fast_forwards_with_no_live_network(tmp_path):
         ["git", "-C", str(directory / "knowledge-work-plugins"), "pull", "--ff-only"],
         ["git", "-C", str(directory / "skills"), "pull", "--ff-only"],
     ]
+
+
+def test_catalog_and_lane_install_clone_once_without_updating_existing_library(library, git_history, tmp_path):
+    _, config, _, _ = library
+    git_history.update({"skills/demo/SKILL.md": "---\nname: demo\ndescription: Original\n---\n"})
+    destination = tmp_path / "new-cache/demo-pack"
+    config.skill_libraries.append({"name": "demo-pack", "repo": str(git_history.origin), "path": str(destination)})
+    commands = []
+
+    def run(args):
+        commands.append(args)
+        return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+
+    manager = SkillManager(config, run=run)
+    # The runner's cache-only lookup must remain offline.
+    assert manager.cached_skill("demo") is None
+    assert commands == []
+    assert manager.catalog()[-1]["description"] == "Original"
+    git_history.update({"skills/demo/SKILL.md": "---\nname: demo\ndescription: Updated\n---\n"})
+    repo = tmp_path / "repo"
+    assert validate_lane(repo, config, "demo", ["src/**"], ["demo"], None, None, manager) == ["demo"]
+    assert manager.install("demo", repo) == "demo"
+    assert manager.catalog()[-1]["description"] == "Original"
+    assert commands == [["git", "clone", "--", str(git_history.origin), str(destination)]]
+
+
+@pytest.mark.parametrize("failure", [
+    subprocess.CalledProcessError(128, ["git", "clone"], stderr="remote unavailable"),
+    subprocess.TimeoutExpired(["git", "clone"], 300),
+    OSError("git unavailable"),
+])
+def test_autoclone_error_identifies_library(tmp_path, failure):
+    def run(args):
+        raise failure
+
+    manager = SkillManager(Config(skill_libraries=[{"name": "demo-pack", "repo": "unavailable",
+                                                   "path": str(tmp_path / "cache")}]), run=run)
+    with pytest.raises(SkillError, match="could not clone library demo-pack") as error:
+        manager.catalog()
+    assert "fa skills sync" not in str(error.value)
+    assert error.value.__cause__ is failure
 
 
 def test_install_copies_full_skill_and_records_notice_once(library, tmp_path):
@@ -423,6 +466,153 @@ def test_nonfree_lane_skill_installs_locally_with_warning(two_libraries, tmp_pat
     assert "unknown" in capsys.readouterr().err
     assert (root / ".claude/skills/docx/SKILL.md").is_file()
     assert published == [".foragent.yml", ".claude/agents/fa-design.md", ".gitignore"]
+
+
+@pytest.fixture
+def fixed_lane(two_libraries, tmp_path):
+    config = replace(two_libraries[2], skill_roles={
+        "skills:frontend-design": "style", "skills:docx": "style",
+        "kwp:engineering/testing-strategy": "domain",
+    })
+    lane = {"paths": ["api/**"], "agent": "custom-api", "skills": ["old-skill"],
+            "executor": "claude", "model": "lane-model", "title": "API", "emoji": "🛠️"}
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / ".foragent.yml").write_text(yaml.safe_dump({
+        "language": "ko", "skill_libraries": config.skill_libraries, "skill_roles": config.skill_roles,
+        "lanes": {"api": lane, "web": {"paths": ["web/**"], "skills": ["user-skill"]}},
+    }))
+    agent = root / ".claude/agents/custom-api.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("---\nname: custom-api\ndescription: My API agent\nskills: [old-skill]\n"
+                     "memory: project\ntools: [Read, Edit]\n---\nKeep these instructions.\n---\nAnd this section.\n")
+    return root, agent, lane, SkillManager(config)
+
+
+def test_set_lane_skills_replaces_selection_preserving_agent_and_other_settings(fixed_lane):
+    root, agent, original, manager = fixed_lane
+    before = load_config(root)
+    header, body = agent.read_text().split("---", 2)[1:]
+    expected = {**original, "skills": ["frontend-design", "testing-strategy"]}
+    assert set_lane_skills(root, "api", ["skills:frontend-design", "engineering/testing-strategy"],
+                           manager=manager) == expected
+    after = load_config(root)
+    assert after.lanes == {**before.lanes, "api": expected}
+    assert after.language == before.language
+    changed_header, changed_body = agent.read_text().split("---", 2)[1:]
+    assert yaml.safe_load(changed_header) == {**yaml.safe_load(header), "skills": expected["skills"]}
+    assert changed_body == body
+    for name in expected["skills"]:
+        assert (root / f".claude/skills/{name}/SKILL.md").is_file()
+        assert f"/.claude/skills/{name}/" in (root / ".gitignore").read_text().splitlines()
+
+    # Clearing the declarations keeps installed skills available to other lanes.
+    assert set_lane_skills(root, "api", [], manager=manager) == {**original, "skills": []}
+    assert load_config(root).lanes["api"]["skills"] == []
+    assert yaml.safe_load(agent.read_text().split("---", 2)[1])["skills"] == []
+    assert (root / ".claude/skills/frontend-design/SKILL.md").is_file()
+
+
+@pytest.mark.parametrize("identities, message", [
+    (["skills:frontend-design", "skills:docx"], "style"),
+    (["skills:frontend-design", "missing"], "missing"),
+    (["skills:frontend-design", "frontend-design"], "duplicate"),
+])
+def test_set_lane_skills_invalid_selection_leaves_all_project_files_intact(fixed_lane, identities, message):
+    root, _, _, manager = fixed_lane
+    before = SkillManager._contents(root)
+    with pytest.raises((LaneError, SkillError), match=message):
+        set_lane_skills(root, "api", identities, manager=manager)
+    assert SkillManager._contents(root) == before
+
+
+def test_set_lane_skills_unknown_lane_and_invalid_agent_do_not_install(fixed_lane):
+    root, agent, _, manager = fixed_lane
+    before = SkillManager._contents(root)
+    with pytest.raises(LaneError, match="unknown lane"):
+        set_lane_skills(root, "missing", ["frontend-design"], manager=manager)
+    assert SkillManager._contents(root) == before
+    for content in ("No frontmatter.\n", "---\n[]\n---\nBody\n", "---\nskills: [\n---\nBody\n"):
+        agent.write_text(content)
+        before = SkillManager._contents(root)
+        with pytest.raises(LaneError, match="frontmatter"):
+            set_lane_skills(root, "api", ["frontend-design"], manager=manager)
+        assert SkillManager._contents(root) == before
+
+
+@pytest.mark.parametrize("agent_state", ["deleted", "never-created", "directory"])
+def test_set_lane_skills_unreadable_agent_is_a_clean_error_without_changes(fixed_lane, agent_state, capsys):
+    root, agent, _, manager = fixed_lane
+    if agent_state == "never-created":
+        settings = root / ".foragent.yml"
+        local = yaml.safe_load(settings.read_text())
+        local["lanes"]["api"]["agent"] = "never-created"
+        settings.write_text(yaml.safe_dump(local))
+        agent = root / ".claude/agents/never-created.md"
+    else:
+        agent.unlink()
+        if agent_state == "directory":
+            agent.mkdir()
+    before = SkillManager._contents(root)
+    with pytest.raises(LaneError, match="cannot read lane agent"):
+        set_lane_skills(root, "api", ["frontend-design"], manager=manager)
+    assert cli.main(["lanes", "skills", "api", "skills:frontend-design", "--repo-root", str(root)]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "cannot read lane agent" in output.err and str(agent) in output.err
+    assert "Traceback" not in output.err
+    assert SkillManager._contents(root) == before
+    assert not (root / ".claude/skills").exists()
+
+
+def test_set_lane_skills_does_not_copy_overridden_global_lanes(fixed_lane, tmp_path, monkeypatch):
+    root, _, original, manager = fixed_lane
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    global_path = home / ".config/foragent/config.yml"
+    global_path.parent.mkdir(parents=True)
+    global_path.write_text(yaml.safe_dump({"lanes": {
+        "global-only": {"paths": ["global/**"], "skills": []},
+        "api": {"paths": ["global-api/**"], "agent": "global-api"},
+    }}))
+    global_before = global_path.read_bytes()
+    settings = root / ".foragent.yml"
+    local_before = yaml.safe_load(settings.read_text())
+    assert load_config(root).lanes == local_before["lanes"]
+    expected = {**original, "skills": ["frontend-design"]}
+    assert set_lane_skills(root, "api", ["frontend-design"], manager=manager) == expected
+    local_after = yaml.safe_load(settings.read_text())
+    assert local_after == {**local_before, "lanes": {**local_before["lanes"], "api": expected}}
+    assert load_config(root).lanes == local_after["lanes"]
+    assert global_path.read_bytes() == global_before
+
+
+def test_set_lane_skills_conflicting_install_names_do_not_partly_install(fixed_lane):
+    root, _, _, manager = fixed_lane
+    other = manager.libraries[0].path / "other/skills/testing-strategy"
+    other.mkdir(parents=True)
+    (other / "SKILL.md").write_text("---\nname: other-testing\ndescription: Different skill\n---\nOther body.\n")
+    before = SkillManager._contents(root)
+    with pytest.raises(LaneError, match="conflicting installation names"):
+        set_lane_skills(root, "api", ["kwp:engineering/testing-strategy", "kwp:other/testing-strategy"],
+                        manager=manager)
+    assert SkillManager._contents(root) == before
+
+
+def test_lane_add_also_rejects_two_style_skills_before_writes(fixed_lane):
+    root, _, _, manager = fixed_lane
+    before = SkillManager._contents(root)
+    with pytest.raises(LaneError, match="style"):
+        add_lane(root, "design", ["ui/**"], skills=["frontend-design", "docx"], manager=manager)
+    assert SkillManager._contents(root) == before
+
+
+def test_lane_skills_cli_reports_replacement_and_clear(fixed_lane, capsys):
+    root, _, _, _ = fixed_lane
+    assert cli.main(["lanes", "skills", "api", "skills:frontend-design", "--repo-root", str(root)]) == 0
+    assert "Updated lane:api skills: frontend-design" in capsys.readouterr().out
+    assert cli.main(["lanes", "skills", "api", "--repo-root", str(root)]) == 0
+    assert "Updated lane:api skills: (none)" in capsys.readouterr().out
 
 
 def test_nonfree_install_cli_explains_refusal_and_catalog_still_lists_it(two_libraries, tmp_path, monkeypatch, capsys):

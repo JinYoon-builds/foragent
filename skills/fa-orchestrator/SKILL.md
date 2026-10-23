@@ -102,3 +102,15 @@ Never add `approved` except through `fa order publish` after the user chose it.
 Summarize what was recorded or published and resume watching without asking
 the user to prompt you again. Retain compact pending decisions, attempts and draft
 references across turns; re-read current facts when handling the next event.
+
+## Design handoff from planning
+
+When visual direction is unresolved, suggest `/fa-design-session` as design mode
+in the planning session. Keep the conversation in that session while references
+and running drafts are compared. Read design requests recorded by
+`fa orch request` and the referenced `docs/design/<topic>/HANDOFF.md` before
+preparing the order. Turn its selected draft, principles and run instructions
+into lane issues. Include visual Done when evidence of the same screen as the
+draft, at the recorded viewport/terminal size and interaction states, alongside
+functional checks. Use the normal single order approval card before publication;
+a design handoff or request alone does not approve implementation.

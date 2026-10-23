@@ -17,11 +17,76 @@ from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_gr
 from foragent.lanes import add_lane, lane_files, validate_lane
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
+from foragent.state import StateStore
 from foragent.tracker import LabelSpec, Tracker
 
 
 class PlanError(ValueError):
     """An order plan is malformed or cannot be applied."""
+
+
+PROGRESS_SLOTS = ("goal", "out_of_scope", "done_when", "lane", "skills")
+PROGRESS_STEPS = ("start", "ledger", "chunk", "cell", "tests", "check", "approval", "publish", "end")
+
+
+def progress(
+    store: StateStore, step: str, *, title: str | None = None, add: str | None = None,
+    chunk: str | None = None, slot: str | None = None, ask: str | None = None,
+    filled: bool = False, done: int | None = None, total: int | None = None,
+    issue: int | None = None,
+) -> dict | None:
+    """Record preparation facts, without GitHub, executors or terminal actions.
+
+    Cells are keyed by chunk and slot. A question reopens its cell; marking it
+    filled resolves the question. Replayed additions and fills are idempotent.
+    """
+    if step not in PROGRESS_STEPS:
+        raise PlanError(f"unknown order progress step: {step}")
+
+    def update(state):
+        if step == "end":
+            return None
+        if step == "start":
+            _text(title, "title")
+            return {"title": title, "step": step, "ledger": [], "chunks": [],
+                    "cells": {}, "tests": {"done": 0, "total": 0},
+                    "published": [], "cells_left": 0}
+        if state is None:
+            raise PlanError("no order in preparation; run fa order progress start --title TITLE")
+        if step in {"ledger", "chunk"}:
+            _text(add, "add")
+            collection = state["ledger" if step == "ledger" else "chunks"]
+            if add not in collection:
+                collection.append(add)
+                if step == "chunk":
+                    state["cells"][add] = {name: {"filled": False, "ask": None}
+                                           for name in PROGRESS_SLOTS}
+        elif step == "cell":
+            _text(chunk, "chunk")
+            if chunk not in state["chunks"]:
+                raise PlanError(f"unknown chunk: {chunk}; add it with fa order progress chunk --add")
+            if slot not in PROGRESS_SLOTS:
+                raise PlanError(f"unknown cell slot: {slot}; choose from {', '.join(PROGRESS_SLOTS)}")
+            if filled == (ask is not None):
+                raise PlanError("cell requires either --ask or --filled")
+            if ask is not None:
+                _text(ask, "ask")
+            state["cells"][chunk][slot] = {"filled": filled, "ask": ask}
+        elif step == "tests":
+            if type(done) is not int or type(total) is not int or not 0 <= done <= total:
+                raise PlanError("tests requires integer counts with 0 <= done <= total")
+            state["tests"] = {"done": done, "total": total}
+        elif step == "publish":
+            if type(issue) is not int or issue <= 0:
+                raise PlanError("issue must be a positive integer")
+            if issue not in state["published"]:
+                state["published"].append(issue)
+        state["step"] = step
+        state["cells_left"] = sum(not cell["filled"] for cells in state["cells"].values()
+                                  for cell in cells.values())
+        return state
+
+    return store.update_order_progress(update)
 
 
 def read_plan(path: Path) -> dict:
@@ -216,15 +281,24 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
             label = f"{kind}[{index}]"
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
-            _object(item, required, {"checklist", "acceptance_files", "blocked_by"} if kind == "issues"
-                    else {"checklist", "acceptance_files"}, label)
+            _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "interactive"} if kind == "issues"
+                    else {"checklist", "acceptance_files", "files"}, label)
             _text(item["goal"], f"{label}.goal")
-            _text(item["out_of_scope"], f"{label}.out_of_scope", empty=True)
+            _text(item["out_of_scope"], f"{label}.out_of_scope")
             _strings(item["done_when"], f"{label}.done_when", nonempty=True)
+            for name in _strings(item.get("files", []), f"{label}.files"):
+                if name.splitlines() != [name]:
+                    raise PlanError(f"{label}.files items must each be a single line")
+                try:
+                    repo_path(root, name)
+                except ValueError as exc:
+                    raise PlanError(f"{label}.files: {exc}") from exc
             _strings(item.get("checklist", []), f"{label}.checklist")
             if any("\n" in line or "\r" in line for line in item.get("checklist", [])):
                 raise PlanError(f"{label}.checklist items must each be a single line")
             if kind == "issues":
+                if type(item.get("interactive", False)) is not bool:
+                    raise PlanError(f"{label}.interactive must be a boolean")
                 _text(item["key"], f"{label}.key")
                 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", item["key"]):
                     raise PlanError(f"{label}.key must be a simple identifier")
@@ -286,7 +360,10 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
 
 
 def issue_body(item: dict, repo: str, base: str, acceptance_dir: str = "tests/acceptance/") -> str:
-    lines = [MARKER, "## Goal", item["goal"], "", "## Out of scope", item["out_of_scope"], "", "## Done when"]
+    lines = [MARKER, "## Goal", item["goal"], "", "## Out of scope", item["out_of_scope"]]
+    if item.get("files"):
+        lines.extend(["", "## Files", *(f"- {path}" for path in item["files"])])
+    lines.extend(["", "## Done when"])
     for command in item["done_when"]:
         lines.extend(["```sh", command, "```"])
     lines.extend(f"- [ ] {text}" for text in item.get("checklist", []))
@@ -318,12 +395,12 @@ class PublishReport:
             lines.append(f"Parent: #{self.parent}")
         lines.append("Files: " + ", ".join(self.paths))
         for lane in sorted({row["lane"] for row in self.rows}, key=lane_order):
-            lines += [f"\nlane:{lane}", "| Number | Title | Size | Blocked by | Approved? |", "| --- | --- | --- | --- | --- |"]
+            lines += [f"\nlane:{lane}", "| Number | Title | Size | Blocked by | Approved? | Interactive? |", "| --- | --- | --- | --- | --- | --- |"]
             for row in self.rows:
                 if row["lane"] == lane:
                     title = row["title"].replace("|", "\\|").replace("\n", " ")
                     blockers = ", ".join(map(str, row["blocked_by"])) or "—"
-                    lines.append(f"| {row['number']} | {title} | {row['size']} | {blockers} | {'yes' if row['approved'] else 'no'} |")
+                    lines.append(f"| {row['number']} | {title} | {row['size']} | {blockers} | {'yes' if row['approved'] else 'no'} | {'yes' if row['interactive'] else 'no'} |")
         return "\n".join(lines)
 
 
@@ -392,11 +469,13 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for item in plan["issues"]:
         number = mapping.get(item["key"])
         rows.append({"number": number or item["key"], "title": item["title"], "size": item["size"],
+                     "interactive": item.get("interactive", False),
                      "lane": item["lane"], "blocked_by": [mapping.get(key, key) for key in item.get("blocked_by", [])],
                      "approved": approve or item["key"] in selected_keys or number in selected_numbers})
     for item in plan.get("edits", []):
         issue = by_number[item["number"]]
         rows.append({"number": issue.number, "title": issue.title, "size": issue_size(issue.labels),
+                     "interactive": "interactive" in issue.labels,
                      "lane": issue_lane(issue.labels, config.lanes), "blocked_by": [dep.number for dep in tracker.blocked_by(issue.number)],
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
@@ -433,6 +512,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     git.push_base(config.base_branch)
     lane_names = {item["lane"] for item in plan["issues"]} - {"main"}
     tracker.ensure_labels([*LABELS, *(LabelSpec(f"lane:{name}", "ededed", f"Foragent lane {name}.") for name in sorted(lane_names))])
+    if any(item.get("interactive", False) for item in plan["issues"]):
+        tracker.ensure_labels([LabelSpec("interactive", "d4c5f9", "Work that needs substantial back-and-forth with the user.")])
 
     recorded_blobs = saved_blobs.copy()
 
@@ -453,6 +534,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for item in plan["issues"]:
         body = issue_body(item, repo, config.base_branch, config.acceptance_dir) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
+        if item.get("interactive", False):
+            labels.append("interactive")
         number = mapping.get(item["key"])
         blobs = acceptance_blobs(item)
         if number is None:
@@ -463,10 +546,13 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             tracker.update_issue(parent, title=plan["title"], body=parent_body())
         else:
             existing = tracker.get_issue(number)
-            if existing.body != body or saved_blobs.get(str(number), {}) != blobs:
+            if (existing.body != body or saved_blobs.get(str(number), {}) != blobs
+                    or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
             tracker.update_issue(number, title=item["title"], body=body)
-            tracker.remove_labels(number, [label for label in existing.labels if label.startswith(("lane:", "size:")) and label not in labels])
+            tracker.remove_labels(number, [label for label in existing.labels
+                                           if (label.startswith(("lane:", "size:")) or label == "interactive")
+                                           and label not in labels])
             tracker.add_labels(number, labels)
             recorded_blobs[str(number)] = blobs
         tracker.add_sub_issue(parent, number)

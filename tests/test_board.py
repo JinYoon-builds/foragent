@@ -1,11 +1,77 @@
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 import json
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 from foragent import board
 from foragent.config import Config
-from foragent.tracker import FakeTracker, GhTracker, TrackerError
+from foragent.state import StateStore
+from foragent.tracker import FakeTracker, GhTracker, RecordingTracker, TrackerError
+
+
+@pytest.fixture(params=["fake", "gh"])
+def recording_board(tmp_path, request):
+    clock = [datetime(2026, 10, 23, tzinfo=UTC)]
+    remote = FakeTracker(now=lambda: clock[0])
+    issue = remote.add_issue(1, "Feature", labels=["blocked"])
+    project_id = board.ensure(remote, "owner/repo")
+    transport = remote
+    if request.param == "gh":
+        def run(args, input=None):
+            payload = json.loads(input)
+            return json.dumps(remote.graphql(payload["query"], payload["variables"]))
+
+        transport = GhTracker("owner/repo", run)
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.record_issue(issue, {})
+    ctx = SimpleNamespace(store=store, config=Config(board=project_id), repo="owner/repo")
+    ctx.tracker = RecordingTracker(transport, ctx)
+    return ctx, remote, clock
+
+
+def test_board_field_writes_record_confirmed_values_and_timestamp(recording_board):
+    ctx, remote, clock = recording_board
+    clock[0] += timedelta(seconds=1)
+    board.sync_status(ctx, 1, "PR open")
+    row, = StateStore(ctx.store.root).local_issues()
+    assert row.get("board_values") == {ctx.config.board: {"Status": "PR open"}}
+    assert row["updated_at"] == clock[0].isoformat()
+    clock[0] += timedelta(seconds=1)
+    board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 1, "main", "m")
+    row, = StateStore(ctx.store.root).local_issues()
+    assert row["board_values"][ctx.config.board] == item_values(remote, ctx.config.board, 1)
+    assert row["board_values"][ctx.config.board] == {"Status": "PR open", "Lane": "main", "Size": "m"}
+    assert row["updated_at"] == clock[0].isoformat() and row["labels"] == ["blocked"]
+
+
+@pytest.mark.parametrize("fail_at", [1, 2])
+def test_board_field_failure_retains_only_confirmed_values(recording_board, monkeypatch, fail_at):
+    ctx, remote, clock = recording_board
+    before = ctx.store.local_issues()
+    clock[0] += timedelta(seconds=1)
+    graphql = remote.graphql
+    writes = 0
+
+    def fail(query, variables):
+        nonlocal writes
+        if "ForagentSetBoardValue" in query:
+            writes += 1
+            if writes == fail_at:
+                return {"errors": [{"message": "Field update failed"}]}
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", fail)
+    with pytest.raises(TrackerError, match="Field update failed"):
+        board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 1, "main", "m")
+    rows = StateStore(ctx.store.root).local_issues()
+    if fail_at == 1:
+        assert rows == before
+    else:
+        assert rows[0].get("board_values") == {ctx.config.board: {"Lane": "main"}}
+        assert rows[0]["updated_at"] == clock[0].isoformat()
 
 
 def snapshot(tracker, project_id):
@@ -181,3 +247,49 @@ def test_gh_graphql_sends_typed_variables_over_stdin():
 def test_gh_graphql_rejects_errors_and_invalid_payloads(response, message):
     with pytest.raises(TrackerError, match=message):
         GhTracker("owner/repo", lambda *a, **kw: response).graphql("query { node { id } }", {})
+
+
+@pytest.mark.parametrize("transport", ["gh", "graphql"])
+def test_duplicate_board_addition_is_silent_success(transport, caplog):
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    project_id = board.ensure(tracker, "owner/repo")
+    graphql = tracker.graphql
+    message = "Content already exists in this project"
+
+    def run(args, input=None):
+        payload = json.loads(input)
+        query, variables = payload["query"], payload["variables"]
+        result = graphql(query, variables)
+        if "addProjectV2ItemById" in query:
+            if transport == "gh":
+                raise subprocess.CalledProcessError(1, args, stderr=f"gh: {message}")
+            return json.dumps({"errors": [{"message": message}]})
+        return json.dumps(result)
+
+    tracker.graphql = GhTracker("owner/repo", run).graphql
+    board.add_issue(tracker, "owner/repo", project_id, 1, "main", "s")
+    assert len(snapshot(tracker, project_id)["items"]["nodes"]) == 1
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("operation, message", [
+    ("addProjectV2ItemById", "Resource not accessible (HTTP 403)"),
+    ("ForagentBoardIssue", "Content already exists in this project"),
+    ("ForagentSetBoardValue", "Content already exists in this project"),
+])
+def test_board_addition_propagates_other_github_errors(operation, message):
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    project_id = board.ensure(tracker, "owner/repo")
+    graphql = tracker.graphql
+
+    def fail(query, variables):
+        if operation in query:
+            raise TrackerError(message)
+        return graphql(query, variables)
+
+    tracker.graphql = fail
+    with pytest.raises(TrackerError) as error:
+        board.add_issue(tracker, "owner/repo", project_id, 1, "main", "s")
+    assert str(error.value) == message

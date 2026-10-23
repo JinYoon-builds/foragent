@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import time
 
 import pytest
 
+from foragent.capacity import write_state
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.issue import body_hash
@@ -20,6 +22,7 @@ from foragent.state import StateStore
 from foragent.tracker import Dependency, FakeTracker, LabelEvent, TrackerError
 
 from conftest import ACCEPTANCE, git_command
+from test_runner import import_index
 
 
 NOW = datetime(2026, 10, 20, 9, tzinfo=UTC)
@@ -37,10 +40,23 @@ pytest {ACCEPTANCE}
 
 @pytest.fixture
 def ctx(git_history, tmp_path, monkeypatch):
+    def git_run(args):
+        root, command = git_history.clone, args
+        while command[:1] == ["-C"]:
+            root, command = Path(command[1]), command[2:]
+        if command[:1] == ["-c"] and "commit" in command:
+            import_index(root, command[-1])
+            return ""
+        if command[:1] == ["push"]:
+            branch = command[-1]
+            git_command(git_history.origin, "fetch", str(root), f"+refs/heads/{branch}:refs/heads/{branch}")
+            return ""
+        return GitRepo(git_history.clone)._run_git(args)
+
     context = TickContext(
         repo="owner/repo", repo_root=git_history.clone,
         tracker=FakeTracker(strict=True), store=StateStore(tmp_path / "state"),
-        config=Config(approvers=["human"]), git=GitRepo(git_history.clone), now=lambda: NOW,
+        config=Config(approvers=["human"]), git=GitRepo(git_history.clone, git_run), now=lambda: NOW,
         launcher=lambda number: 7000 + number, start_runs=False,
         runner_process_exists=lambda number: False,
         kill_runner=lambda pid: None,
@@ -48,12 +64,244 @@ def ctx(git_history, tmp_path, monkeypatch):
     context.tracker._now = lambda: context.now()
     context.store._now = lambda: context.now()
     monkeypatch.setattr("foragent.scheduler.os.kill", lambda pid, signal: None)
+    # Scheduler behavior must not depend on this machine's live memory and load.
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: ("normal", 0.0))
     return context
 
 
 def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
     ctx.tracker.add_issue(number, f"Issue {number}", body, labels=labels)
     ctx.tracker.record_label(number, "approved", actor)
+
+
+@pytest.mark.parametrize("needs_human", [False, True])
+def test_refresh_populates_blocker_evidence_and_listing_stays_offline(ctx, monkeypatch, needs_human):
+    from foragent import orch
+
+    remote = ctx.tracker._tracker
+    remote.add_issue(1, "Question", labels=["blocked", *(["needs-human"] if needs_human else [])])
+    question = "<!-- foragent:blocked reason=spec-question -->\nWhich locale should we use?"
+    remote.comment(1, question)
+    assert ctx.store.local_issues() == []
+    reads = []
+    list_comments = remote.list_comments
+
+    def read(number):
+        reads.append(number)
+        return list_comments(number)
+
+    monkeypatch.setattr(remote, "list_comments", read)
+    tick(ctx)
+    assert reads == [1]
+    with monkeypatch.context() as patch:
+        patch.setattr(remote, "list_comments", lambda n: pytest.fail("orch list must stay offline"))
+        item, = orch.list_blocked(ctx)
+    assert item["reason"] == "spec-question" and item["details"] == question
+    ctx.now = lambda: NOW + timedelta(minutes=4, seconds=59)
+    tick(ctx)
+    assert reads == [1]
+    revised = "<!-- foragent:blocked reason=spec-question -->\nShould we support both locales?"
+    remote.comment(1, revised)
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    tick(ctx)
+    assert reads == [1, 1]
+    assert orch.list_blocked(ctx)[0]["details"] == revised
+
+
+@pytest.mark.parametrize("during", ["list_prs", "list_comments"])
+def test_refresh_preserves_local_writes_during_remote_reads(ctx, monkeypatch, during):
+    from types import SimpleNamespace
+    from foragent import orch
+    from foragent.tracker import RecordingTracker
+
+    remote = ctx.tracker._tracker
+    for number in (1, 2):
+        remote.add_issue(number, f"Question {number}", labels=["blocked", "needs-human"])
+    tick(ctx)
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    remote.update_issue(2, title="Human revision before refresh", body="Human body")
+    writer = RecordingTracker(remote, SimpleNamespace(
+        store=StateStore(ctx.store.root, now=ctx.now), config=ctx.config, now=ctx.now,
+    ))
+    read = getattr(remote, during)
+    written = {}
+
+    def interleaved(*args, **kwargs):
+        result = read(*args, **kwargs)
+        if not written:
+            writer.remove_labels(1, ["blocked", "needs-human"])
+            writer.update_issue(1, title="Local revision during refresh", body="Local body")
+            writer.comment(1, "Local evidence during refresh")
+            writer.record_board_value(1, "project", "Status", "Todo")
+            number = writer.create_issue("Created during refresh", "New body", [])
+            assert number == 3
+            written.update({row["number"]: row for row in writer._context.store.local_issues()})
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(remote, during, interleaved)
+        tick(ctx)
+    rows = {row["number"]: row for row in StateStore(ctx.store.root).local_issues()}
+    assert rows[1] == written[1]
+    assert rows[3] == written[3]
+    assert rows[2]["title"] == "Human revision before refresh"
+    assert remote.get_issue(1).labels == frozenset()
+    watched, = orch.watch(ctx)
+    assert watched["blocked"] == watched["needs_human"] == [2]
+
+    remote.update_issue(1, title="Human revision after refresh", body="Latest human body")
+    remote.add_labels(1, ["needs-human"])
+    ctx.now = lambda: NOW + timedelta(minutes=10)
+    tick(ctx)
+    row = ctx.store.local_issues()[0]
+    assert (row["title"], row["body"], row["labels"]) == (
+        "Human revision after refresh", "Latest human body", ["needs-human"],
+    )
+
+
+@pytest.mark.parametrize("message,limited", [
+    ("API rate limit exceeded (HTTP 403)", True),
+    ("HTTP 422 Validation Failed", False),
+])
+def test_tick_rate_limit_persists_wait_but_other_tracker_errors_raise(ctx, monkeypatch, message, limited):
+    calls = []
+    until = NOW + timedelta(minutes=10)
+
+    def unavailable():
+        calls.append("issues")
+        raise TrackerError(message, stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    monkeypatch.setattr(ctx.tracker, "list_issues", unavailable)
+    if not limited:
+        with pytest.raises(TrackerError, match=message):
+            tick(ctx)
+        assert ctx.store.github_wait_until(NOW) is None
+        return
+    assert "GitHub rate limit" in tick(ctx).skipped
+    ctx.store = StateStore(ctx.store.root, now=ctx.now)
+    ctx.now = lambda: until - timedelta(seconds=1)
+    monkeypatch.setattr(ctx.git, "fetch", lambda *args: pytest.fail("waiting tick must stay offline"))
+    assert "GitHub rate limit" in tick(ctx).skipped
+    assert calls == ["issues"]
+    assert ctx.store.active_runs() == []
+
+
+def test_github_wait_repairs_running_label_without_crash_or_stall_cost(ctx):
+    approve(ctx, labels=["running"])
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.update_run(1, attempts=3, restarts=1, waiting_until=NOW.isoformat())
+    ctx.store.finish_run(1, "limit-wait")
+    ctx.tracker.create_pr(head="foragent/issue-1", base="main", title="Already published", body="Closes #1")
+    ctx.start_runs = True
+    report = tick(ctx)
+    assert any("started running" in action for action in report.actions)
+    run = ctx.store.get_run(1)
+    assert (run.attempts, run.restarts, run.status) == (3, 1, "running")
+    assert ctx.store.load_flag(1) is None
+
+
+@pytest.mark.parametrize("human_change", [False, True])
+def test_outbox_reset_refreshes_before_delivery_inside_the_snapshot_window(ctx, monkeypatch, human_change):
+    remote = ctx.tracker._tracker
+    remote.add_issue(1, "Feature", labels=["blocked"])
+    tick(ctx)
+    until = NOW + timedelta(minutes=1)
+    close = remote.close_issue
+    attempts = []
+
+    def limited(number, comment=None):
+        attempts.append((number, comment))
+        if ctx.now() < until:
+            raise TrackerError("API rate limit exceeded (HTTP 403)",
+                               stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+        return close(number, comment)
+
+    monkeypatch.setattr(remote, "close_issue", limited)
+    ctx.tracker.close_issue(1, "Merged")
+    assert ctx.store.local_issues()[0]["state"] == "closed"
+    ctx.now = lambda: until - timedelta(seconds=1)
+    if human_change:
+        remote.issues[1] = replace(remote.get_issue(1), title="Human revision", labels=frozenset(),
+                                   updated_at=ctx.now().isoformat())
+    assert "GitHub rate limit" in tick(ctx).skipped
+    assert attempts == [(1, "Merged")]
+    ctx.now = lambda: until
+    tick(ctx)
+    assert ctx.store.github_outbox() == []
+    row, = ctx.store.local_issues()
+    if human_change:
+        assert attempts == [(1, "Merged")]
+        assert row["state"] == "open" and row["title"] == "Human revision"
+        assert row["comments"] == []
+        events = [json.loads(line) for line in (ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+        assert [(event["kind"], event["issue"]) for event in events] == [("outbox-dropped", 1)]
+    else:
+        assert attempts == [(1, "Merged"), (1, "Merged")]
+        assert row["state"] == remote.get_issue(1).state == "closed"
+
+
+def test_deleted_issue_outbox_does_not_block_tick_progress(ctx, monkeypatch):
+    from foragent import orch
+
+    remote = ctx.tracker._tracker
+    for number in (1, 2):
+        remote.add_issue(number, f"Question {number}", labels=["blocked"])
+    tick(ctx)
+    until = NOW + timedelta(minutes=1)
+    ctx.store.pause_github(until)
+    ctx.tracker.comment(1, "Deleted issue evidence")
+    ctx.tracker.comment(2, "Surviving evidence")
+    approve(ctx, 3)
+    del remote.issues[1]
+    comment = remote.comment
+
+    def write(number, body):
+        if number not in remote.issues:
+            raise TrackerError("gh: Not Found (HTTP 404)")
+        return comment(number, body)
+
+    monkeypatch.setattr(remote, "comment", write)
+    ctx.now = lambda: until
+    report = tick(ctx)
+
+    assert report.skipped is None
+    assert ctx.store.github_outbox() == []
+    assert [item.body for item in remote.list_comments(2)] == ["Surviving evidence"]
+    assert "ready" in remote.get_issue(3).labels
+    assert all(row["number"] != 1 for row in ctx.store.local_issues())
+    assert any(event["kind"] == "outbox-dropped" and event["issue"] == 1
+               and "issue not found" in event["summary"] for event in orch.log(ctx))
+
+
+def test_github_limit_during_launch_labels_defers_without_creating_a_crash(ctx, monkeypatch):
+    approve(ctx)
+    tick(ctx)
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.update_run(1, attempts=3, restarts=1)
+    ctx.store.finish_run(1, "limit-wait")
+    ctx.start_runs = True
+    ctx.config = replace(ctx.config, board="project")
+    launches = []
+    ctx.launcher = lambda n: launches.append(n) or 7001
+    until = NOW + timedelta(minutes=10)
+
+    def status(issue, value):
+        if value == "Running":
+            raise TrackerError("API rate limit exceeded (HTTP 403)",
+                               stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    monkeypatch.setattr("foragent.board.set_status", status)
+    assert "GitHub rate limit" in tick(ctx).skipped
+    assert launches == []
+    assert ctx.tracker.get_issue(1).labels == {"approved", "running"}
+    run = ctx.store.get_run(1)
+    assert (run.outcome, run.attempts, run.restarts) == ("limit-wait", 3, 1)
+    ctx.now = lambda: until
+    monkeypatch.setattr("foragent.board.set_status", lambda *args: None)
+    tick(ctx)
+    assert launches == [1]
+    assert (ctx.store.get_run(1).attempts, ctx.store.get_run(1).restarts) == (3, 1)
+    assert ctx.store.load_flag(1) is None
 
 
 @pytest.mark.parametrize("failure,reason", [("crashed", Reason.RETRIES_EXCEEDED), ("stalled", Reason.STALLED)])
@@ -83,6 +331,24 @@ def test_interrupted_runner_with_open_pr_stays_visible(ctx, monkeypatch, failure
 
 def edit_body(ctx, number, body):
     ctx.tracker.edit_body(number, body)
+
+
+def test_human_ready_removal_is_not_promoted_again_for_the_same_approval(ctx, monkeypatch):
+    approve(ctx)
+    tick(ctx)
+    remote = ctx.tracker._tracker
+    remote.remove_labels(1, ["ready"])
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    with monkeypatch.context() as patch:
+        patch.setattr(remote, "add_labels", lambda *args: pytest.fail("replayed the earlier promotion"))
+        tick(ctx)
+        ctx.now = lambda: NOW + timedelta(minutes=10)
+        tick(ctx)
+    assert ctx.store.local_issues()[0]["labels"] == ["approved"]
+    ctx.now = lambda: NOW + timedelta(minutes=11)
+    ctx.tracker.record_label(1, "approved", "human")
+    tick(ctx)
+    assert remote.get_issue(1).labels == {"approved", "ready"}
 
 
 @pytest.mark.parametrize("actor,allowed", [("human", True), ("HuMaN", True), ("stranger", False)])
@@ -264,6 +530,56 @@ def test_running_overtime_backstop_kills_alive_runner(ctx, monkeypatch, seconds,
         assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     else:
         assert ctx.store.get_run(1).status == "running"
+
+
+def test_runtime_backstop_outbox_survives_uncollected_old_comment_after_reset(ctx, monkeypatch):
+    approve(ctx)
+    remote = ctx.tracker._tracker
+    old_comment = remote.comment(1, "Earlier discussion")
+    tick(ctx)
+    mark_running(ctx, pid=5432)
+    assert all(comment["id"] != old_comment for comment in ctx.store.local_issues()[0]["comments"])
+
+    ctx.now = lambda: NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 11)
+    ctx.store.update_run(1, last_progress_at=ctx.now().isoformat())
+    until = ctx.now() + timedelta(minutes=1)
+    add_labels = remote.add_labels
+    attempts, killed, launches = [], [], []
+    ctx.kill_runner = killed.append
+    ctx.launcher = lambda number: launches.append(number) or 7000 + number
+    ctx.start_runs = True
+
+    def limited(number, labels):
+        labels = list(labels)
+        attempts.append((number, labels))
+        if ctx.now() < until:
+            raise TrackerError("API rate limit exceeded (HTTP 403)",
+                               stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+        return add_labels(number, labels)
+
+    monkeypatch.setattr(remote, "add_labels", limited)
+    tick(ctx)
+    assert killed == [5432]
+    assert ctx.store.get_run(1).outcome == "killed"
+    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert [entry["action"] for entry in ctx.store.github_outbox()] == [
+        "add_labels", "remove_labels", "comment",
+    ]
+    assert remote.get_issue(1).labels == {"approved", "running"}
+
+    ctx.now = lambda: until
+    report = tick(ctx)
+
+    assert attempts == [(1, ["blocked"]), (1, ["blocked"])]
+    assert ctx.store.github_outbox() == []
+    assert remote.get_issue(1).labels == {"approved", "blocked"}
+    assert ctx.store.local_issues()[0]["labels"] == ["approved", "blocked"]
+    assert parse_reason(remote.list_comments(1)[-1].body) == Reason.TIMEOUT
+    assert ctx.store.get_run(1).outcome == "killed"
+    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert [run.outcome for run in ctx.store.read_history()] == ["killed"]
+    assert launches == []
+    assert report.actions == []
 
 
 @pytest.mark.parametrize("trigger", ["integrity", "timeout"])
@@ -692,7 +1008,7 @@ def test_view_opener_failure_keeps_all_runs_and_reports_success(ctx, monkeypatch
     captured = capsys.readouterr()
     assert captured.out == ""
     assert len(captured.err.splitlines()) == 1
-    assert "레인 화면을 열지 못했습니다" in captured.err
+    assert "레인 화면을 열지 못했어요" in captured.err
     tick(ctx)
     assert capsys.readouterr() == ("", "")
 
@@ -719,7 +1035,7 @@ def test_view_opener_exception_preserves_tick_report_and_next_tick(ctx, monkeypa
     assert {action for action in report.actions if "started running" in action} == {
         "#1 started running (pid=7001)", "#2 started running (pid=7002)",
     }
-    assert report.actions[-1] == "could not open lane view: " + " ".join(str(failure).split())
+    assert report.actions[-1] == "Couldn't open the lane view (" + " ".join(str(failure).split()) + "). Try again."
     assert opened == [(ctx.repo_root, ctx.store, ctx.config.language)]
     assert tick(ctx).actions == []
     assert len(opened) == 1
@@ -939,7 +1255,8 @@ def test_hash_mismatch_reapproval_is_one_human_action_and_survives_restart(ctx):
     assert ctx.store.load_flag(1).reason == Reason.HASH_MISMATCH
     ctx.store = StateStore(ctx.store.root, now=lambda: ctx.now())
     ctx.now = lambda: NOW + timedelta(minutes=3)
-    ctx.tracker.record_label(1, "approved", "HUMAN")
+    # A person re-approves remotely before the next full snapshot refresh.
+    ctx.tracker._tracker.record_label(1, "approved", "HUMAN")
     report = tick(ctx)
     assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
     assert ctx.store.load_approval(1).approved_at == ctx.now().isoformat()
@@ -1030,6 +1347,7 @@ def test_stall_restarts_once_then_flags_second_stall(ctx):
     assert killed == [4321] and not path.exists()
     assert ctx.store.get_run(1).outcome == "stalled-restart"
     assert ctx.store.get_run(1).restarts == 1
+    assert git_command(ctx.repo_root, "show", "foragent/issue-1:unfinished.txt") == "unfinished"
     assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
     assert ctx.store.load_flag(1) is None
 
@@ -1455,7 +1773,11 @@ def test_crash_recovery_replays_after_tracker_failures_without_double_counting(c
     assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
     assert [run.outcome for run in ctx.store.read_history()] == ["crashed"]
     assert ctx.store.load_flag(1) is None
-    assert "#1 orphaned running label recovered as crashed" in report.actions
+    if operation == "get_issue":
+        # The successful label writes were already recorded before the read failed.
+        assert report.actions == []
+    else:
+        assert "#1 orphaned running label recovered as crashed" in report.actions
 
 
 def test_ready_issue_reapproved_without_machine_check_is_flagged(ctx):
@@ -1564,23 +1886,25 @@ def test_new_approval_snapshots_fresh_body_after_stale_issue_list(ctx, monkeypat
     approve(ctx)
     if existing_snapshot:
         tick(ctx)
-    list_open_issues = ctx.tracker.list_open_issues
+    list_issues = ctx.tracker.list_issues
+    refresh_at = NOW + (timedelta(minutes=5) if existing_snapshot else timedelta())
+    ctx.now = lambda: refresh_at
     new_body = BODY.replace("Implement the feature.", "Implement the approved revision.")
 
     def stale_issues():
-        issues = list_open_issues()
-        ctx.now = lambda: NOW + timedelta(seconds=1)
+        issues = list_issues()
+        ctx.now = lambda: refresh_at + timedelta(seconds=1)
         ctx.tracker.remove_labels(1, ["approved"])
         edit_body(ctx, 1, new_body)
-        ctx.now = lambda: NOW + timedelta(seconds=2)
+        ctx.now = lambda: refresh_at + timedelta(seconds=2)
         ctx.tracker.record_label(1, "approved", "human")
         return issues
 
-    monkeypatch.setattr(ctx.tracker, "list_open_issues", stale_issues)
+    monkeypatch.setattr(ctx.tracker, "list_issues", stale_issues)
     ctx.start_runs = True
     tick(ctx)
     assert ctx.store.load_approval(1).body == new_body
-    assert ctx.store.load_approval(1).approved_at == (NOW + timedelta(seconds=2)).isoformat()
+    assert ctx.store.load_approval(1).approved_at == (refresh_at + timedelta(seconds=2)).isoformat()
     assert ctx.store.load_flag(1) is None
     assert ctx.tracker.get_issue(1).labels == {"approved", "running"}
     assert ctx.store.get_run(1).pid == 7001
@@ -1610,6 +1934,8 @@ def test_unknown_lane_reports_once_per_tick_and_uses_main_slot(ctx):
 @pytest.mark.parametrize("cap,expected", [(1, [2]), (2, [2, 4]), (3, [2, 4, 1])])
 def test_lane_single_run_cap_order_and_lowest_issue(ctx, cap, expected):
     ctx.config = replace(ctx.config, lanes={"beta": {}, "alpha": {}}, max_parallel=cap)
+    # A roomy machine-wide AIMD value leaves the project ceiling as the binding cap.
+    write_state(ctx.store, 8, NOW - timedelta(hours=1))
     for number, lane in [(1, "main"), (3, "alpha"), (2, "alpha"), (4, "beta")]:
         approve(ctx, number, labels=[f"lane:{lane}"])
     launches = []
@@ -1809,3 +2135,58 @@ def test_overdue_blocker_escalation_is_journaled_once(ctx):
     assert "needs-human" in ctx.tracker.get_issue(1).labels
     tick(ctx)
     assert recovery_events(ctx) == events
+
+
+def test_project_ceiling_counts_only_this_repositorys_runs(ctx, tmp_path):
+    other = StateStore(tmp_path / "other")
+    for number in (1, 2):
+        other.start_run(number, branch=f"b{number}", worktree=other.worktree_path(number), pid=8000 + number)
+    write_state(ctx.store, 4, NOW - timedelta(hours=1))
+    ctx.config = replace(ctx.config, lanes={"alpha": {}, "beta": {}}, max_parallel=2)
+    for number, lane in [(1, "main"), (2, "alpha"), (3, "beta")]:
+        approve(ctx, number, labels=[f"lane:{lane}"])
+    ctx.start_runs = True
+    tick(ctx)
+    # Machine: 2 elsewhere + 2 here fills the shared 4; the ceiling of 2 is per repository.
+    assert sorted(run.number for run in ctx.store.active_runs()) == [2, 3]
+    tick(ctx)
+    assert len(ctx.store.active_runs()) == 2
+
+
+def test_start_checks_and_github_writes_run_outside_the_machine_lock(ctx, monkeypatch):
+    import fcntl
+
+    from foragent import capacity, scheduler
+
+    held = []
+
+    def probe(name):
+        with (ctx.store.root.parent / capacity.LOCK_FILE).open("a") as stream:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held.append(name)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    def wrap(owner, name):
+        original = getattr(owner, name)
+
+        def call(*args, **kwargs):
+            probe(name)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, call)
+
+    ctx.config = replace(ctx.config, lanes={"alpha": {}})
+    approve(ctx, 1)
+    approve(ctx, 2, labels=["lane:alpha"])
+    ctx.start_runs = True
+    for name in ("get_issue", "label_events", "add_labels", "remove_labels"):
+        wrap(ctx.tracker, name)
+    for name in ("_check_integrity", "_check_prerequisites"):
+        wrap(scheduler, name)
+    wrap(scheduler.board, "sync_status")
+    tick(ctx)
+    assert sorted(run.number for run in ctx.store.active_runs()) == [1, 2]
+    assert held == []

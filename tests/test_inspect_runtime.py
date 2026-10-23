@@ -247,7 +247,8 @@ def test_inbox_summary_json_and_rendering(ctx):
     inbox = collect(ctx)
     payload = json.loads(json.dumps(asdict(inbox)))
     assert payload["language"] == "ko"
-    assert payload["summary"] == {"counts": inbox.counts, "estimated_minutes": 8}
+    assert inbox.counts["human-check"] == 0
+    assert payload["summary"] == {"counts": inbox.counts, "estimated_minutes": 7}
     item = next(item for item in inbox.items if item.group == "try")
     assert next(item for item in payload["items"] if item["group"] == "try")["try_card"]["what_changed"] == "보고서를 볼 수 있습니다."
     assert "Decision 1 (~1 min)" in counts_line(inbox, detailed=True)

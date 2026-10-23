@@ -66,7 +66,11 @@ def test_runner_records_phases_in_order_and_executor_activity(git_history, tmp_p
 def test_status_json_covers_all_lane_states_and_blocker_numbers(git_history, tmp_path, monkeypatch, capsys):
     import json
 
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
+
     case, main = status_case(git_history, tmp_path, monkeypatch)
+    tick(tick_context(case, start_runs=False))
     assert main(["gate", "status", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     rows = payload["lanes"]
@@ -85,7 +89,11 @@ def test_status_json_covers_all_lane_states_and_blocker_numbers(git_history, tmp
 @pytest.mark.parametrize("language,words", [("en", ("working 1", "waiting for you 1", "queued 1")),
                                              ("ko", ("1",))])
 def test_status_first_line_is_localized(git_history, tmp_path, monkeypatch, capsys, language, words):
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
+
     case, main = status_case(git_history, tmp_path, monkeypatch, language=language)
+    tick(tick_context(case, start_runs=False))
     assert main(["gate", "status"]) == 0
     first = capsys.readouterr().out.splitlines()[0]
     assert all(word in first.lower() for word in words)

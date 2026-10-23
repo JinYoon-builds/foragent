@@ -2,11 +2,18 @@
 
 
 def test_watch_emits_for_blocked_human_merge_and_queue_empty_changes(git_history, tmp_path, monkeypatch, capsys):
+    from datetime import timedelta
     import json
 
-    from test_orch_review_handoff import bind_cli, make_case
+    from foragent.actions import flag
+    from foragent.orch import escalate
+    from foragent.reasons import Reason
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import bind_cli, make_case, tick_context
 
     case = make_case(git_history, tmp_path, monkeypatch)
+    ctx = tick_context(case, start_runs=False)
+    tick(ctx)
     main = bind_cli(case, monkeypatch)
 
     def changed():
@@ -18,26 +25,42 @@ def test_watch_emits_for_blocked_human_merge_and_queue_empty_changes(git_history
         return lines[0]
 
     baseline = changed()
-    case.tracker.add_labels(1, ["blocked"])
+    flag(case.ctx, 1, Reason.SPEC_QUESTION, "Choose a locale")
+    case.store.finish_run(1, outcome="spec-question")
     blocked = changed()
-    case.tracker.add_labels(1, ["needs-human"])
+    assert json.loads(blocked)["blocked"] == [1]
+    escalate(case.ctx, 1, "Choose a locale", "Reviewed the available locales")
     human = changed()
+    assert json.loads(human)["needs_human"] == [1]
+    # A person merges and then closes on GitHub; each becomes visible after
+    # the gate's next eligible refresh, unlike Foragent's writes above.
     pr = case.tracker.create_pr(head="foragent/issue-1", base="main", title="Feature", body="Closes #1")
     case.tracker.merge_pr(pr, expected_head_sha=case.tracker.pr_head_sha(pr))
+    case.clock[0] += timedelta(minutes=5)
+    tick(ctx)
     merged = changed()
-    case.store.finish_run(1, outcome="merged")
+    assert json.loads(merged)["merged"] == [1]
     case.tracker.close_issue(1)
+    case.clock[0] += timedelta(minutes=5)
+    tick(ctx)
     empty = changed()
+    assert json.loads(empty)["queue_empty"] is True
     assert len({baseline, blocked, human, merged, empty}) == 5
 
 
 def test_watch_waits_through_identical_polls_and_ignores_title_edits(git_history, tmp_path, monkeypatch, capsys):
+    from datetime import timedelta
     import json
     import time
 
-    from test_orch_review_handoff import bind_cli, make_case
+    from foragent.actions import flag
+    from foragent.reasons import Reason
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import bind_cli, make_case, tick_context
 
     case = make_case(git_history, tmp_path, monkeypatch)
+    ctx = tick_context(case, start_runs=False)
+    tick(ctx)
     main = bind_cli(case, monkeypatch)
     assert main(["orch", "watch", "--interval", "0.01"]) == 0
     capsys.readouterr()
@@ -50,8 +73,12 @@ def test_watch_waits_through_identical_polls_and_ignores_title_edits(git_history
         if len(polls) == 1:
             issue = case.tracker.get_issue(1)
             case.tracker.update_issue(1, title="Title only", body=issue.body)
+            # Import the person's title edit so the next unchanged poll
+            # really proves that titles are excluded from watch events.
+            case.clock[0] += timedelta(minutes=5)
+            tick(ctx)
         if len(polls) == 2:
-            case.tracker.add_labels(1, ["blocked"])
+            flag(case.ctx, 1, Reason.SPEC_QUESTION, "Choose a locale")
 
     monkeypatch.setattr(time, "sleep", sleep)
     assert main(["orch", "watch", "--interval", "0.01"]) == 0

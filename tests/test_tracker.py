@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 import json
 import subprocess
@@ -31,6 +31,515 @@ def test_find_existing_open_pr_fake():
     assert tracker.find_pr("feature") == pr
     tracker.merge_pr(pr, expected_head_sha=tracker.pr_head_sha(pr))
     assert tracker.find_pr("feature") is None
+
+
+def test_recording_gh_writes_need_no_extra_reads_and_failed_writes_leave_snapshot(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path, now=lambda: NOW)
+    store.record_issue(Issue(1, "Feature", "body", frozenset({"approved"}), "open"), {})
+    run = ScriptedRun("[]", gh_error("HTTP 422 validation failed", code=422), "")
+    tracker = RecordingTracker(GhTracker(REPO, run),
+                               SimpleNamespace(store=store, config=Config(), now=lambda: NOW))
+    tracker.add_labels(1, ["blocked"])
+    with pytest.raises(TrackerError, match="422"):
+        tracker.remove_labels(1, ["approved"])
+    tracker.close_issue(1)
+    row, = StateStore(tmp_path).local_issues()
+    assert row["labels"] == ["approved", "blocked"] and row["state"] == "closed"
+    assert [args[:3] for args, _ in run.calls] == [
+        ["api", "-X", "POST"], ["api", "-X", "DELETE"], ["issue", "close", "1"],
+    ]
+
+
+def test_outbox_repeated_limit_keeps_fifo_and_acknowledges_partial_label_removal(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    clock = [NOW]
+    first_reset, second_reset = NOW + timedelta(minutes=1), NOW + timedelta(minutes=2)
+    limited = lambda reset: gh_error("API rate limit exceeded (HTTP 403)",
+                                    f"X-RateLimit-Reset: {int(reset.timestamp())}\r\n")
+    run = ScriptedRun(limited(first_reset), "[]", "[]", limited(second_reset),
+                      "[]", '{"id": 88}', "")
+    store = StateStore(tmp_path, now=lambda: clock[0])
+    issue = Issue(1, "Feature", "body", frozenset({"blocked", "running"}), "open")
+    store.record_issue(issue, {})
+    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: clock[0])
+    tracker = RecordingTracker(GhTracker(REPO, run), ctx, queue_writes=True)
+    ctx.tracker = tracker
+    tracker.add_labels(1, ["ready"])
+    tracker.remove_labels(1, ["blocked", "running"])
+    tracker.comment(1, "Pending evidence")
+    tracker.close_issue(1)
+    assert len(run.calls) == 1
+    assert store.local_issues()[0]["state"] == "closed"
+
+    clock[0] = first_reset
+    tracker.flush_outbox()
+    pending = StateStore(tmp_path).github_outbox()
+    assert [entry["action"] for entry in pending] == ["remove_labels", "comment", "close_issue"]
+    assert pending[0]["labels"] == ["running"]
+    assert store.github_wait_until(clock[0]) == second_reset
+    partial = replace(issue, labels=frozenset({"ready", "running"}), updated_at=first_reset.isoformat())
+    assert store.refresh_local_issues([partial], [], {}, clock[0]) == []
+    assert store.local_issues()[0]["state"] == "closed"
+
+    clock[0] = second_reset
+    ctx.store = StateStore(tmp_path, now=lambda: clock[0])
+    tracker.flush_outbox()
+    assert ctx.store.github_outbox() == []
+    assert ctx.store.local_issues()[0]["comments"][0]["id"] == 88
+    assert len(run.calls) == 7
+    assert sum(args[-1].endswith("/labels/blocked") for args, _ in run.calls) == 1
+
+
+def test_outbox_flush_propagates_validation_error_without_discarding_pending_write(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path, now=lambda: NOW)
+    entry = store.queue_github_write(1, "comment", body="Evidence")
+    run = ScriptedRun(gh_error("HTTP 422 Validation Failed"))
+    tracker = RecordingTracker(GhTracker(REPO, run), SimpleNamespace(store=store, config=Config()))
+    with pytest.raises(TrackerError, match="422"):
+        tracker.flush_outbox()
+    assert store.github_outbox() == [entry]
+    assert store.github_wait_until(NOW) is None
+
+
+@pytest.fixture
+def outbox_context(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    clock = [NOW + timedelta(milliseconds=100)]
+    remote = FakeTracker(now=lambda: clock[0])
+    remote.add_issue(1, "Feature", "body")
+    ctx = SimpleNamespace(remote=remote, clock=clock, config=Config(), now=lambda: clock[0],
+                          store=StateStore(tmp_path, now=lambda: clock[0]),
+                          reset=NOW + timedelta(minutes=1))
+    ctx.tracker = RecordingTracker(remote, ctx, queue_writes=True)
+    ctx.tracker.refresh_issues()
+    ctx.store.pause_github(ctx.reset)
+    return ctx
+
+
+@pytest.mark.parametrize("deleted_at", ["refresh", "comments", "flush"])
+def test_outbox_missing_issue_drops_all_its_writes_and_delivers_fifo_tail(
+    outbox_context, monkeypatch, deleted_at,
+):
+    from foragent import orch
+
+    ctx = outbox_context
+    ctx.remote.add_issue(2, "Surviving issue")
+    ctx.tracker.refresh_issues()
+    ctx.tracker.comment(1, "Deleted issue evidence")
+    ctx.tracker.comment(2, "Surviving evidence")
+    ctx.tracker.close_issue(1)
+    ctx.clock[0] = ctx.reset
+    attempts = []
+    get_issue, comment = ctx.remote.get_issue, ctx.remote.comment
+    list_comments = ctx.remote.list_comments
+
+    def get(number):
+        if number not in ctx.remote.issues:
+            raise TrackerError("gh: Not Found (HTTP 404)")
+        return get_issue(number)
+
+    def write(number, body):
+        attempts.append(number)
+        get(number)
+        return comment(number, body)
+
+    def read_comments(number):
+        if deleted_at == "comments" and number == 1:
+            del ctx.remote.issues[1]
+        get(number)
+        return list_comments(number)
+
+    monkeypatch.setattr(ctx.remote, "get_issue", get)
+    monkeypatch.setattr(ctx.remote, "comment", write)
+    monkeypatch.setattr(ctx.remote, "list_comments", read_comments)
+    if deleted_at == "flush":
+        ctx.tracker.refresh_issues()
+    if deleted_at != "comments":
+        del ctx.remote.issues[1]
+    if deleted_at != "flush":
+        ctx.tracker.refresh_issues()
+    ctx.tracker.flush_outbox()
+    ctx.tracker.refresh_issues()
+    ctx.tracker.flush_outbox()
+
+    assert attempts == ([1, 2] if deleted_at == "flush" else [2])
+    assert ctx.store.github_outbox() == []
+    assert ctx.store._issue_snapshot()["outbox_base"] == {}
+    assert [row["number"] for row in ctx.store.local_issues()] == [2]
+    assert [item.body for item in ctx.remote.list_comments(2)] == ["Surviving evidence"]
+    event, = orch.log(ctx)
+    assert (event["kind"], event["issue"]) == ("outbox-dropped", 1)
+    assert "issue not found" in event["summary"]
+
+
+def test_outbox_write_404_does_not_drop_an_existing_issue(outbox_context, monkeypatch):
+    ctx = outbox_context
+    ctx.tracker.comment(1, "Pending evidence")
+    pending = ctx.store.github_outbox()
+
+    def missing_resource(*args):
+        raise TrackerError("gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(ctx.remote, "comment", missing_resource)
+    with pytest.raises(TrackerError, match="404"):
+        ctx.tracker.flush_outbox()
+    assert ctx.store.github_outbox() == pending
+    assert ctx.store.local_issues()[0]["number"] == 1
+
+
+@pytest.mark.parametrize("limited", [False, True])
+def test_outbox_failed_missing_issue_lookup_preserves_pending_writes(outbox_context, monkeypatch, limited):
+    ctx = outbox_context
+    ctx.tracker.comment(1, "Pending evidence")
+    pending = ctx.store.github_outbox()
+    ctx.clock[0] = ctx.reset
+    until = ctx.reset + timedelta(minutes=1)
+
+    def missing_resource(*args):
+        raise TrackerError("gh: Not Found (HTTP 404)")
+
+    def unavailable(*args):
+        raise TrackerError("API rate limit exceeded (HTTP 403)" if limited else "HTTP 503",
+                           stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    monkeypatch.setattr(ctx.remote, "comment", missing_resource)
+    monkeypatch.setattr(ctx.remote, "get_issue", unavailable)
+    if limited:
+        ctx.tracker.flush_outbox()
+        assert ctx.store.github_wait_until(ctx.clock[0]) == until
+    else:
+        with pytest.raises(TrackerError, match="503"):
+            ctx.tracker.flush_outbox()
+    assert ctx.store.github_outbox() == pending
+    assert ctx.store.local_issues()[0]["number"] == 1
+
+
+def test_batch_completion_uses_pending_child_close(outbox_context, git_history):
+    from conftest import git_command
+    from foragent.git import GitRepo
+    from foragent.runner import _batch_pr
+
+    ctx = outbox_context
+    ctx.repo = "owner/repo"
+    ctx.git = GitRepo(git_history.clone)
+    base = git_history.tip
+    git_history.update({"feature.txt": "done\n"})
+    git_command(git_history.origin, "update-ref", "refs/heads/foragent/batch-2", git_history.tip)
+    git_command(git_history.origin, "update-ref", "refs/heads/main", base)
+    ctx.remote.add_issue(2, "Batch parent")
+    ctx.remote.set_parent(1, 2)
+    ctx.tracker.refresh_issues()
+    ctx.tracker.close_issue(1)
+    assert ctx.remote.get_issue(1).state == "open"
+
+    _batch_pr(2, ctx)
+
+    assert [pr.head for pr in ctx.remote.created_prs] == ["foragent/batch-2"]
+    assert ctx.remote.get_issue(1).state == "open"
+
+
+@pytest.mark.parametrize("change", ["labels", "state"])
+def test_outbox_refresh_drops_human_label_or_state_change_in_same_second(outbox_context, change):
+    from foragent import orch
+
+    ctx = outbox_context
+    ctx.tracker.add_labels(1, ["ready"])
+    ctx.clock[0] = NOW + timedelta(milliseconds=900)
+    value = {"labels": frozenset({"needs-human"}), "state": "closed"}[change]
+    ctx.remote.issues[1] = replace(ctx.remote.get_issue(1), **{change: value})
+    ctx.remote.issues[1] = replace(ctx.remote.get_issue(1), updated_at=NOW.isoformat())
+    human = ctx.remote.get_issue(1)
+    ctx.clock[0] = ctx.reset
+    ctx.tracker.refresh_issues()
+    ctx.tracker.flush_outbox()
+
+    assert ctx.store.github_outbox() == []
+    assert ctx.remote.get_issue(1) == human
+    row, = ctx.store.local_issues()
+    assert row["labels"] == sorted(human.labels)
+    assert (row["title"], row["body"], row["state"]) == (human.title, human.body, human.state)
+    assert [event["kind"] for event in orch.log(ctx)] == ["outbox-dropped"]
+
+
+@pytest.mark.parametrize("change", ["title", "body", "comments"])
+def test_outbox_refresh_keeps_label_and_close_writes_after_human_content_change(outbox_context, change):
+    from foragent import orch
+
+    ctx = outbox_context
+    ctx.tracker.add_labels(1, ["blocked"])
+    ctx.tracker.close_issue(1)
+    ctx.clock[0] = NOW + timedelta(milliseconds=900)
+    if change == "comments":
+        ctx.remote.comment(1, "Human evidence")
+    else:
+        ctx.remote.issues[1] = replace(ctx.remote.get_issue(1), **{change: f"Human {change}"})
+    human = ctx.remote.get_issue(1)
+    ctx.clock[0] = ctx.reset
+    ctx.tracker.refresh_issues()
+    assert len(ctx.store.github_outbox()) == 2
+
+    ctx.tracker.flush_outbox()
+    ctx.tracker.refresh_issues()
+
+    assert ctx.store.github_outbox() == []
+    current = ctx.remote.get_issue(1)
+    assert (current.title, current.body) == (human.title, human.body)
+    assert current.labels == {"blocked"} and current.state == "closed"
+    assert [comment.body for comment in ctx.remote.list_comments(1)] == (
+        ["Human evidence"] if change == "comments" else []
+    )
+    row, = ctx.store.local_issues()
+    assert (row["title"], row["body"], row["labels"], row["state"]) == (
+        human.title, human.body, ["blocked"], "closed",
+    )
+    assert orch.log(ctx) == []
+
+
+def test_outbox_partial_delivery_does_not_hide_human_label_before_ack(outbox_context, monkeypatch):
+    from foragent import orch
+
+    ctx = outbox_context
+    ctx.tracker.comment(1, "Foragent evidence")
+    ctx.tracker.remove_labels(1, ["blocked"])
+    comment = ctx.remote.comment
+    next_reset = ctx.reset + timedelta(minutes=1)
+
+    def interleaved(number, body):
+        identity = comment(number, body)
+        ctx.clock[0] += timedelta(seconds=1)
+        ctx.remote.record_label(number, "blocked", "human")
+        ctx.remote.issues[number] = replace(ctx.remote.get_issue(number), updated_at=ctx.clock[0].isoformat())
+        ctx.clock[0] += timedelta(seconds=1)
+        return identity
+
+    def limited(*args):
+        raise TrackerError("API rate limit exceeded (HTTP 403)",
+                           stdout=f"X-RateLimit-Reset: {int(next_reset.timestamp())}\r\n")
+
+    ctx.clock[0] = ctx.reset
+    with monkeypatch.context() as patch:
+        patch.setattr(ctx.remote, "comment", interleaved)
+        patch.setattr(ctx.remote, "remove_labels", limited)
+        ctx.tracker.flush_outbox()
+    assert [entry["action"] for entry in ctx.store.github_outbox()] == ["remove_labels"]
+    assert ctx.store.local_issues()[0]["comments"][0]["id"] > 0
+
+    ctx.clock[0] = next_reset
+    ctx.tracker.refresh_issues()
+    ctx.tracker.flush_outbox()
+    assert ctx.store.github_outbox() == []
+    assert ctx.remote.get_issue(1).labels == frozenset({"blocked"})
+    assert ctx.store.local_issues()[0]["labels"] == ["blocked"]
+    assert len(ctx.remote.list_comments(1)) == 1
+    assert [event["kind"] for event in orch.log(ctx)] == ["outbox-dropped"]
+
+
+@pytest.mark.parametrize("action", ["add_labels", "remove_labels", "comment", "close_issue", "update_issue"])
+def test_outbox_existing_issue_queue_serializes_default_tracker_writes(outbox_context, action):
+    from foragent import orch
+    from foragent.tracker import RecordingTracker
+
+    ctx = outbox_context
+    ctx.tracker.add_labels(1, ["ready"])
+    original = ctx.remote.get_issue(1)
+    ctx.clock[0] = ctx.reset
+    writer = RecordingTracker(ctx.remote, ctx)
+    if action == "update_issue":
+        writer.update_issue(1, title="New title", body="New body")
+    else:
+        payload = {"add_labels": ["blocked"], "remove_labels": ["ready"],
+                   "comment": "Runner evidence", "close_issue": "Done"}[action]
+        getattr(writer, action)(1, payload)
+
+    assert ctx.remote.get_issue(1) == original
+    assert ctx.remote.list_comments(1) == []
+    assert [entry["action"] for entry in ctx.store.github_outbox()] == ["add_labels", action]
+    ctx.tracker.refresh_issues()
+    assert len(ctx.store.github_outbox()) == 2
+    ctx.tracker.flush_outbox()
+    ctx.tracker.refresh_issues()
+    assert ctx.store.github_outbox() == []
+    assert orch.log(ctx) == []
+    row, = ctx.store.local_issues()
+    assert row["labels"] == sorted(ctx.remote.get_issue(1).labels)
+    assert [item["body"] for item in row["comments"]] == [item.body for item in ctx.remote.list_comments(1)]
+
+
+def test_outbox_enqueue_publishes_local_intent_atomically(outbox_context, monkeypatch):
+    ctx = outbox_context
+    queue = ctx.store.queue_github_write
+    snapshots = []
+
+    def interleaved(*args, **kwargs):
+        entry = queue(*args, **kwargs)
+        snapshots.append(ctx.store.local_issues()[0]["labels"])
+        if entry["action"] == "add_labels":
+            ctx.tracker.remove_labels(1, ["ready"])
+        return entry
+
+    monkeypatch.setattr(ctx.store, "queue_github_write", interleaved)
+    ctx.tracker.add_labels(1, ["ready"])
+    assert snapshots == [["ready"], []]
+    assert ctx.store.local_issues()[0]["labels"] == []
+    ctx.clock[0] = ctx.reset
+    ctx.tracker.refresh_issues()
+    ctx.tracker.flush_outbox()
+    assert ctx.remote.get_issue(1).labels == frozenset()
+    assert ctx.store.local_issues()[0]["labels"] == []
+
+
+def test_outbox_refresh_ignores_timestamp_changes_without_content_changes(outbox_context):
+    from foragent import orch
+
+    ctx = outbox_context
+    ctx.tracker.add_labels(1, ["ready"])
+    ctx.remote.issues[1] = replace(ctx.remote.get_issue(1), updated_at=(ctx.reset + timedelta(hours=1)).isoformat())
+    ctx.clock[0] = ctx.reset
+    ctx.tracker.refresh_issues()
+    assert len(ctx.store.github_outbox()) == 1
+    assert orch.log(ctx) == []
+    ctx.tracker.flush_outbox()
+    assert ctx.remote.get_issue(1).labels == frozenset({"ready"})
+
+
+@pytest.mark.parametrize("action", ["comment", "close_issue", "update_issue"])
+def test_outbox_partial_delivery_advances_content_baseline_across_processes(outbox_context, monkeypatch, action):
+    from foragent import orch
+    from foragent.state import StateStore
+
+    ctx = outbox_context
+    if action == "update_issue":
+        ctx.tracker.update_issue(1, title="New title", body="New body")
+    else:
+        getattr(ctx.tracker, action)(1, "Foragent evidence")
+    ctx.tracker.add_labels(1, ["ready"])
+    next_reset = ctx.reset + timedelta(minutes=1)
+
+    def limited(*args):
+        raise TrackerError("API rate limit exceeded (HTTP 403)",
+                           stdout=f"X-RateLimit-Reset: {int(next_reset.timestamp())}\r\n")
+
+    ctx.clock[0] = ctx.reset
+    ctx.tracker.refresh_issues()
+    with monkeypatch.context() as patch:
+        patch.setattr(ctx.remote, "add_labels", limited)
+        ctx.tracker.flush_outbox()
+    assert [entry["action"] for entry in ctx.store.github_outbox()] == ["add_labels"]
+
+    ctx.store = StateStore(ctx.store.root, now=ctx.now)
+    ctx.clock[0] = next_reset
+    ctx.tracker.refresh_issues()
+    assert len(ctx.store.github_outbox()) == 1
+    assert orch.log(ctx) == []
+    ctx.tracker.flush_outbox()
+    assert ctx.store.github_outbox() == []
+    assert ctx.remote.get_issue(1).labels == frozenset({"ready"})
+    assert len(ctx.remote.list_comments(1)) == (action != "update_issue")
+
+
+def test_outbox_delivery_preserves_concurrent_append(outbox_context, monkeypatch):
+    ctx = outbox_context
+    ctx.tracker.add_labels(1, ["ready"])
+    add = ctx.remote.add_labels
+
+    def append(number, labels):
+        ctx.tracker.comment(number, "Appended during delivery")
+        return add(number, labels)
+
+    ctx.clock[0] = ctx.reset
+    with monkeypatch.context() as patch:
+        patch.setattr(ctx.remote, "add_labels", append)
+        ctx.tracker.flush_outbox()
+    assert [entry["action"] for entry in ctx.store.github_outbox()] == ["comment"]
+    ctx.tracker.refresh_issues()
+    ctx.tracker.flush_outbox()
+    assert ctx.store.github_outbox() == []
+    assert [item.body for item in ctx.remote.list_comments(1)] == ["Appended during delivery"]
+    assert ctx.store.local_issues()[0]["comments"][0]["id"] > 0
+
+
+def test_outbox_other_issue_does_not_defer_default_tracker_write(outbox_context):
+    from foragent.tracker import RecordingTracker
+
+    ctx = outbox_context
+    ctx.tracker.add_labels(1, ["ready"])
+    ctx.remote.add_issue(2, "Other issue")
+    writer = RecordingTracker(ctx.remote, ctx)
+    writer.get_issue(2)
+    writer.comment(2, "Independent evidence")
+    assert [entry["issue"] for entry in ctx.store.github_outbox()] == [1]
+    assert [item.body for item in ctx.remote.list_comments(2)] == ["Independent evidence"]
+
+
+@pytest.mark.parametrize("first_missing", [False, True])
+@pytest.mark.parametrize("failure", [403, 429])
+def test_recording_label_removal_preserves_each_success_before_failure(tmp_path, first_missing, failure):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path, now=lambda: NOW)
+    store.record_issue(Issue(1, "Feature", "body", frozenset({"blocked", "ready", "running"}), "open"), {})
+    run = ScriptedRun(gh_error("HTTP 404") if first_missing else "[]", gh_error(f"HTTP {failure}"))
+    tracker = RecordingTracker(GhTracker(REPO, run), SimpleNamespace(store=store, config=Config()))
+    with pytest.raises(TrackerError, match=str(failure)):
+        tracker.remove_labels(1, iter(["ready", "running"]))
+    row, = StateStore(tmp_path).local_issues()
+    assert row["labels"] == ["blocked", "running"]
+    assert run.calls == [
+        (["api", "-X", "DELETE", "repos/owner/repo/issues/1/labels/ready"], None),
+        (["api", "-X", "DELETE", "repos/owner/repo/issues/1/labels/running"], None),
+    ]
+
+
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("previously_merged", [False, True])
+def test_recording_pr_observation_publishes_one_complete_update(tmp_path, monkeypatch, merged, previously_merged):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    remote = FakeTracker(now=lambda: NOW)
+    remote.add_issue(1, "Feature")
+    pr = remote.create_pr(head="foragent/issue-1", base="main", title="Feature", body="Closes #1")
+    if merged:
+        remote.merge_pr(pr, expected_head_sha=remote.pr_head_sha(pr))
+    store = StateStore(tmp_path, now=lambda: NOW)
+    store.update_local_issue(1, pr_number=pr, merged=previously_merged)
+    tracker = RecordingTracker(remote, SimpleNamespace(store=store, config=Config()))
+    write = store._write_json
+    observations = []
+
+    def observe(path, value):
+        write(path, value)
+        observations.append(StateStore(tmp_path).local_issues()[0])
+
+    monkeypatch.setattr(store, "_write_json", observe)
+    tracker.list_prs("merged" if merged else "open", "foragent/")
+    assert len(observations) == 1
+    assert observations[0]["pr_number"] == pr
+    assert observations[0]["pr_head"] == "foragent/issue-1"
+    assert observations[0]["pr_base"] == "main" and observations[0]["merged"] is merged
 
 
 def test_pr_renames_include_old_path_for_merge_policy():
@@ -100,6 +609,39 @@ def test_gh_failed_log_errors_propagate():
 
 def gh_error(stderr, stdout="", code=1):
     return subprocess.CalledProcessError(code, ["gh"], output=stdout, stderr=stderr)
+
+
+@pytest.mark.parametrize("message,limited", [
+    ("gh: API rate limit exceeded for user (HTTP 403)", True),
+    ("GraphQL: API rate limit already exceeded for user", True),
+    ("You have exceeded a secondary rate limit", True),
+    ("gh: HTTP 429 Too Many Requests", True),
+    ("gh: HTTP 403 Resource not accessible by integration", False),
+    ("gh: HTTP 422 Validation Failed", False),
+    ("request timed out", False),
+])
+def test_tracker_rate_limit_diagnostics_exclude_other_errors(message, limited):
+    assert TrackerError(message).is_rate_limit is limited
+
+
+def test_tracker_rate_limit_reset_header_survives_the_real_error_boundary():
+    header = f"HTTP/2 403\r\nx-RaTeLiMiT-ReSeT: {int(NOW.timestamp())}\r\n\r\n"
+    run = ScriptedRun(gh_error("API rate limit exceeded (HTTP 403)", header))
+    with pytest.raises(TrackerError) as caught:
+        GhTracker(REPO, run).get_issue(1)
+    assert caught.value.is_rate_limit
+    assert caught.value.reset_at == NOW
+    assert len(run.calls) == 1
+
+
+def test_tracker_rate_limit_probe_uses_injected_runner_and_only_exhausted_resources():
+    run = ScriptedRun(json.dumps({"resources": {
+        "core": {"remaining": 0, "reset": int(NOW.timestamp())},
+        "graphql": {"remaining": 0, "reset": int((NOW + timedelta(minutes=5)).timestamp())},
+        "search": {"remaining": 10, "reset": int((NOW + timedelta(hours=1)).timestamp())},
+    }}))
+    assert GhTracker(REPO, run).rate_limit_reset() == NOW + timedelta(minutes=5)
+    assert run.calls == [(["api", "rate_limit"], None)]
 
 
 def issue_json(number=1, **overrides):

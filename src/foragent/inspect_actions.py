@@ -5,13 +5,14 @@ from dataclasses import replace
 from datetime import UTC
 
 from foragent.inspect_data import (
-    ACTIONABLE, DECISION_MARKER, RETRY_MARKER, InspectContext, collect,
+    DECISION_MARKER, RETRY_MARKER, InspectContext, Item, collect,
     comment_key, counts_line, has_marker, latest_flag, pending_signature,
 )
 from foragent import notify as notifications
 from foragent.labels import NEEDS_HUMAN
 from foragent.inspect_runtime import prepare, serve, stop
 from foragent.reasons import GROUP
+from foragent.tracker import RecordingTracker
 
 
 class InspectError(ValueError):
@@ -25,6 +26,7 @@ def _nonempty(text: str, name: str) -> str:
 
 
 def answer(ctx: InspectContext, number: int, text: str) -> int:
+    ctx = replace(ctx, tracker=RecordingTracker(ctx.tracker, ctx))
     text = _nonempty(text, "decision text")
     ctx.tracker.get_issue(number)
     comments = ctx.tracker.list_comments(number)
@@ -38,6 +40,7 @@ def answer(ctx: InspectContext, number: int, text: str) -> int:
 
 
 def retry(ctx: InspectContext, number: int) -> None:
+    ctx = replace(ctx, tracker=RecordingTracker(ctx.tracker, ctx))
     issue = ctx.tracker.get_issue(number)
     comments = ctx.tracker.list_comments(number)
     flag = latest_flag(comments)
@@ -59,6 +62,7 @@ def retry(ctx: InspectContext, number: int) -> None:
 
 
 def feedback(ctx: InspectContext, title: str, body: str, about: int | None = None) -> int:
+    ctx = replace(ctx, tracker=RecordingTracker(ctx.tracker, ctx))
     title, body = _nonempty(title, "feedback title"), _nonempty(body, "feedback body")
     if about is not None:
         body += f"\n\nAbout #{about}."
@@ -74,34 +78,61 @@ def mark_seen(ctx: InspectContext) -> str:
     return since
 
 
+def _push_item(item: Item) -> bool:
+    # The orchestrator owns D71 judgment; legacy failure flags are evidence.
+    return not item.answered and (
+        item.reason in {"escalated", "orchestrator-timeout"}
+        or (item.group == "review" and item.pr is not None)
+    )
+
+
+def _item_line(item: Item, language: str) -> str:
+    label = f"#{item.number} {item.title}"
+    if item.group == "review" and item.pr is not None:
+        action = "병합할지 확인해요" if language == "ko" else "Decide whether to merge"
+        label += f" · PR #{item.pr}: {action}"
+    if item.reason:
+        summary = " ".join((item.summary or "").split())
+        reason = ": ".join(part for part in (item.reason, summary) if part)
+        label += f" ({reason})"
+    return " ".join(label.split())
+
+
 def notify(ctx: InspectContext, notifier: Callable[[str, str], None] | None = None) -> str | None:
     with ctx.store.notify_lock():
         inbox = collect(ctx)
-        signature = pending_signature(inbox)
-        previous = ctx.store.load_inspect().notified_signature
-        if signature == previous:
-            return None
-        pending = [item for item in inbox.items if item.group in ACTIONABLE]
-        if not pending:
-            ctx.store.update_inspect(notified_signature=signature)
-            return None
-        items = []
-        for item in pending[:3]:
-            label = f"#{item.number} {item.title}"
-            if item.reason:
-                summary = " ".join((item.summary or "").split())
-                reason = ": ".join(part for part in (item.reason, summary) if part)
-                label += f" ({reason})"
-            items.append(label)
-        if len(pending) > 3:
-            items.append(f"+{len(pending) - 3}")
-        line = " ".join(" · ".join([counts_line(inbox), *items]).split())
-        if notifier is not None:
-            notifier(line, f"Foragent {ctx.repo}")
-        elif not notifications.send(
-            replace(ctx.config, repo=ctx.repo), f"Foragent {ctx.repo}", line,
-            f"https://github.com/{ctx.repo}/issues",
-        ):
-            return line
-        ctx.store.update_inspect(notified_signature=signature)
-        return line
+        state = ctx.store.load_inspect()
+        delivered = set(state.notified_items)
+        lines = []
+        all_sent = True
+
+        def send(line: str, link: str, *, summary: bool = False) -> bool:
+            title = f"Foragent {ctx.repo}"
+            if summary:
+                title += " · 아침 요약이에요" if ctx.config.language == "ko" else " · Morning summary"
+            lines.append(line)
+            if notifier is not None:
+                notifier(line, title)
+                return True
+            return notifications.send(replace(ctx.config, repo=ctx.repo), title, line, link)
+
+        for item in inbox.items:
+            if not _push_item(item) or item.notification_id is None or item.notification_id in delivered:
+                continue
+            if send(_item_line(item, ctx.config.language), item.url):
+                delivered.add(item.notification_id)
+                # Persist each success: a later delivery failure must not repeat it.
+                ctx.store.update_inspect(notified_items=sorted(delivered))
+            else:
+                all_sent = False
+
+        local_now = ctx.now().astimezone()
+        today = local_now.date().isoformat()
+        if local_now.hour == ctx.config.notify_summary_hour and state.summary_date != today:
+            if send(counts_line(inbox), f"https://github.com/{ctx.repo}/issues", summary=True):
+                ctx.store.update_inspect(summary_date=today)
+            else:
+                all_sent = False
+        if all_sent:
+            ctx.store.update_inspect(notified_signature=pending_signature(inbox))
+        return "\n".join(lines) or None

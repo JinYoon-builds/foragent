@@ -1,6 +1,7 @@
 """Acceptance test for gate-open-view. Locked by Foragent; do not edit."""
 
 import os
+from datetime import timedelta
 
 
 def gate_case(git_history, tmp_path, monkeypatch):
@@ -70,6 +71,8 @@ def test_live_watch_suppresses_opening_while_runs_still_start_then_reopens_when_
     case.tracker.close_issue(1)
     case.tracker.add_issue(2, "Next task", case.tracker.get_issue(1).body)
     case.tracker.record_label(2, "approved", "human")
+    # A person's direct GitHub change is picked up by the next 5-minute refresh (local-truth rule).
+    case.clock[0] += timedelta(minutes=5)
     report = tick(ctx)
     assert launched == [1, 2] and case.store.get_run(2).pid == 7002, report.actions
     assert_opened(commands, case.root)
@@ -88,6 +91,8 @@ def test_idle_tick_opens_nothing_then_approved_work_opens_the_view(
     assert commands.calls() == []
     # Pair the idle contract with a real start so a missing opener cannot pass.
     case.tracker.record_label(1, "approved", "human")
+    # A person's direct GitHub change is picked up by the next 5-minute refresh (local-truth rule).
+    case.clock[0] += timedelta(minutes=5)
     report = tick(ctx)
     assert launched == [1], report.actions
     assert_opened(commands, case.root)

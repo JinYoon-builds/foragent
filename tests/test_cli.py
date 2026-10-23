@@ -138,7 +138,7 @@ def test_status_groups_latest_reason_active_runs_and_last_ten(app, capsys, json_
         store.start_run(number, branch="old", worktree="old")
         store.finish_run(number, "not-implemented")
     store.start_run(2, branch="foragent/issue-2", worktree=store.worktree_path(2), pid=123)
-    args = ["gate", "status", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    args = ["gate", "status", "--live", "--repo-root", str(root)] + (["--json"] if json_output else [])
     assert cli.main(args) == 0
     output = capsys.readouterr().out
     if json_output:
@@ -176,7 +176,7 @@ def test_status_groups_issues_awaiting_pr_review(app, capsys, json_output, label
     root, git, tracker, store, calls = app
     tracker.add_issue(1, "Awaiting review", BODY, labels)
     tracker.create_pr(head="foragent/issue-1", base="main", title="PR", body="Closes #1")
-    args = ["gate", "status", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    args = ["gate", "status", "--live", "--repo-root", str(root)] + (["--json"] if json_output else [])
     assert cli.main(args) == 0
     output = capsys.readouterr().out
     if json_output:
@@ -228,7 +228,7 @@ def test_cli_dispatches_to_runner_and_returns_failure_code(app, monkeypatch, out
 
     def runner(number, ctx):
         calls.append(number)
-        assert ctx.repo_root == root and ctx.git is git and ctx.tracker is tracker
+        assert ctx.repo_root == root and ctx.git is git and ctx.tracker._tracker is tracker
         assert ctx.store is store and store.get_run(number).pid == os.getpid()
         return outcome
 
@@ -251,7 +251,7 @@ def test_error_exit_code_and_single_stderr_line(app, monkeypatch, capsys, error)
     if isinstance(error, ConfigError):
         monkeypatch.setattr(cli, "load_config", fail)
     elif isinstance(error, TrackerError):
-        monkeypatch.setattr(tracker, "list_open_issues", fail)
+        monkeypatch.setattr(tracker, "list_issues", fail)
     else:
         monkeypatch.setattr(git, "fetch", fail)
     assert cli.main(["gate", "tick", "--repo-root", str(root), "--no-start"]) == 1
@@ -373,7 +373,7 @@ def test_init_view_metadata_failure_keeps_success(app, monkeypatch, capsys):
     assert cli.main(["init", "--repo-root", str(root)]) == 0
     output = capsys.readouterr()
     assert "Foragent setup:" in output.out
-    assert output.err == "foragent: 레인 화면을 열지 못했습니다: origin unavailable try again\n"
+    assert output.err == "foragent: 레인 화면을 열지 못했어요(origin unavailable try again). 다시 시도해요\n"
 
 
 @pytest.mark.parametrize("command", ["publish", "orch"])
@@ -400,14 +400,15 @@ def test_automatic_view_failure_keeps_command_success(app, monkeypatch, capsys, 
         ))
         argv = ["order", "publish", str(plan)]
     else:
-        tracker.add_issue(1, "Waiting for repair", labels=["blocked"])
+        issue = tracker.add_issue(1, "Waiting for repair", labels=["blocked"])
+        store.record_issue(issue, {})
         argv = ["orch", "watch"]
 
     assert cli.main([*argv, "--repo-root", str(root)]) == 0
     output = capsys.readouterr()
     assert opened == ([] if opt_out else [(root, store, "ko")])
     assert output.err == ("" if opt_out else
-                          "foragent: 레인 화면을 열지 못했습니다: terminal unavailable try again\n")
+                          "foragent: 레인 화면을 열지 못했어요(terminal unavailable try again). 다시 시도해요\n")
     if command == "publish":
         assert output.out.startswith("Published: View task\nParent: #1\n")
     else:
@@ -670,7 +671,10 @@ def test_inspect_retry_existing_failed_pr_can_be_scheduled_on_next_tick(app, mon
 def test_inspect_cli_notify_logs_failure_and_retries_then_dedupes(app, monkeypatch, capsys, caplog):
     root, git, tracker, store, _ = app
     tracker.add_issue(1, "Issue 1", labels=["needs-human"])
-    monkeypatch.setattr(cli, "load_config", lambda root: Config(notify="command:/offline/notifier"))
+    tracker.comment(1, "<!-- foragent:needs-human reason=escalated -->\nChoose a format")
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(
+        notify="command:/offline/notifier", notify_summary_hour=(datetime.now().astimezone().hour + 1) % 24,
+    ))
     args = ["inspect", "notify", "--repo-root", str(root)]
     calls = []
 
@@ -680,11 +684,11 @@ def test_inspect_cli_notify_logs_failure_and_retries_then_dedupes(app, monkeypat
     monkeypatch.setattr(subprocess, "run", fail)
     assert cli.main(args) == 0
     assert "notifier unavailable" in caplog.text
-    assert capsys.readouterr().out == "Decision 1 · #1 Issue 1\n"
+    assert capsys.readouterr().out == "#1 Issue 1 (escalated: Choose a format)\n"
     assert store.load_inspect().notified_signature is None
     monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
     assert cli.main(args) == cli.main(args) == 0
-    assert capsys.readouterr().out == "Decision 1 · #1 Issue 1\n"
+    assert capsys.readouterr().out == "#1 Issue 1 (escalated: Choose a format)\n"
     assert len(calls) == 1
     assert calls[0][1]["env"]["FA_TITLE"] == "Foragent owner/repo"
 
@@ -774,7 +778,9 @@ def test_status_groups_running_and_ready_by_lane(app, capsys):
     tracker.add_issue(3, "Data ready", BODY, ["approved", "ready", "lane:data"])
     tracker.add_issue(4, "Unknown ready", BODY, ["approved", "ready", "lane:missing"])
     store.start_run(2, branch="foragent/issue-2", worktree="wt", lane="ui")
-    status = cli._status(tracker, store, Config(lanes={"ui": {}, "data": {}}))
+    config = Config(lanes={"ui": {}, "data": {}})
+    cli._refresh_status(tracker, store, config)
+    status = cli._status(tracker, store, config)
     assert list(status["lanes"]) == ["data", "ui", "main"]
     assert [item["number"] for item in status["lanes"]["main"]["ready"]] == [1, 4]
     assert [item["number"] for item in status["lanes"]["data"]["ready"]] == [3]
@@ -790,6 +796,7 @@ def test_orch_watch_follow_prints_only_changes_and_stops_cleanly(app, monkeypatc
 
     root, git, tracker, store, calls = app
     add_approved(tracker)
+    store.record_issue(tracker.get_issue(1), {})
     output, polls = [], []
 
     def sleep(seconds):
@@ -799,7 +806,7 @@ def test_orch_watch_follow_prints_only_changes_and_stops_cleanly(app, monkeypatc
         assert len(lines) == (0 if len(polls) == 2 else 1)
         output.extend(json.loads(line) for line in lines)
         if len(polls) == 2:
-            tracker.add_labels(1, ["blocked"])
+            store.record_labels(1, ["blocked"], remove=False, lanes={})
         if len(polls) == 3:
             raise KeyboardInterrupt
         assert len(polls) <= 3

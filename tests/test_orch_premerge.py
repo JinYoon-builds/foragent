@@ -69,6 +69,38 @@ def test_test_artifacts_do_not_affect_trial_merge(merge_case):
     assert c.tracker.pr_head_sha(c.pr) == c.head
 
 
+@pytest.mark.parametrize("action", ["premerge", "merge"])
+@pytest.mark.parametrize("content,blocked", [
+    ("<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> target\n", True),
+    (">>>>>>> A valid nested blockquote\n||||||| text\nHeading\n=======\n", False),
+])
+def test_publication_checks_actual_pr_contents_before_direct_merge(merge_case, action, content, blocked):
+    c = merge_case
+    base = c.history.tip
+    c.history.update({"notes.md": content})
+    c.head = c.history.tip
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/batch-1", c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    c.history.tip = base
+    c.tracker.set_pr_head_sha(c.pr, c.head)
+    # Neither the caller's index nor test-generated files represent the PR.
+    c.ctx.config = replace(c.ctx.config, test_command="test -f suite-ok; printf clean > notes.md")
+    if action == "premerge":
+        report = orch.premerge(c.ctx, c.pr)
+        assert report["tests"] == "pass" and report["ci"] == "pass"
+        assert report["ready"] is not blocked
+        if blocked:
+            assert any("notes.md:1" in item for item in report["conflicts"])
+        assert not c.tracker.comments and not c.tracker.merged_prs
+    elif blocked:
+        with pytest.raises(orch.OrchError, match="notes.md:1"):
+            orch.merge(c.ctx, c.pr, approved_by="jin")
+        assert not c.tracker.comments and not c.tracker.merged_prs
+    else:
+        orch.merge(c.ctx, c.pr, approved_by="jin")
+        assert c.tracker.merged_prs == [c.pr]
+
+
 @pytest.mark.parametrize("change", ["head", "base", "retarget", "closed", "ci-fail", "ci-pending"])
 def test_changes_during_premerge_refuse_merge_before_attribution(merge_case, monkeypatch, change):
     c = merge_case
@@ -197,3 +229,57 @@ def test_invalid_attribution_is_rejected_before_checks(merge_case, approval, at)
     with pytest.raises(orch.OrchError):
         orch.merge(c.ctx, c.pr, approved_by=approval, at=at)
     assert not c.tracker.comments and not c.tracker.merged_prs
+
+
+@pytest.mark.parametrize("body,closed", [("Closes #10", True), ("Related to #10", False)])
+def test_orch_merge_records_linked_issue_state_returned_by_github(merge_case, monkeypatch, body, closed):
+    c = merge_case
+    c.tracker.add_issue(10, "Feature", labels=["blocked", "needs-human"])
+    c.ctx.tracker.get_issue(10)
+    c.tracker.created_prs = [replace(pr, head="foragent/issue-10", body=body)
+                             for pr in c.tracker.created_prs]
+    merge = c.tracker.merge_pr
+
+    def github_merge(pr, **kwargs):
+        merge(pr, **kwargs)
+        if closed:
+            c.tracker.close_issue(10)
+
+    monkeypatch.setattr(c.tracker, "merge_pr", github_merge)
+    orch.merge(c.ctx, c.pr, approved_by="jin")
+    row, = c.ctx.store.local_issues()
+    assert row["number"] == 10 and row["pr_number"] == c.pr and row["merged"] is True
+    assert row["state"] == ("closed" if closed else "open")
+    watched, = orch.watch(c.ctx)
+    assert watched["blocked"] == ([] if closed else [10])
+
+
+@pytest.mark.parametrize("failure", [403, 429])
+def test_orch_merge_completes_when_linked_issue_refresh_fails(merge_case, monkeypatch, failure):
+    c = merge_case
+    c.tracker.add_issue(10, "Feature", labels=["blocked", "needs-human"])
+    c.ctx.tracker.get_issue(10)
+    c.tracker.created_prs = [replace(pr, head="foragent/issue-10", body="Closes #10")
+                             for pr in c.tracker.created_prs]
+    finished = []
+    get_issue = c.tracker.get_issue
+
+    def unavailable(number):
+        if number != 10:
+            return get_issue(number)
+        assert number == 10 and c.tracker.merged_prs == [c.pr]
+        raise TrackerError(f"HTTP {failure}")
+
+    def after_merge(ctx, pr, base):
+        event = json.loads((ctx.store.root / "orch-events.jsonl").read_text())
+        assert event["kind"] == "merge" and c.head in event["summary"]
+        finished.append((pr, base))
+
+    monkeypatch.setattr(c.tracker, "get_issue", unavailable)
+    monkeypatch.setattr(orch, "after_merge", after_merge)
+    summary = orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert "merged" in summary
+    assert c.tracker.merged_prs == [c.pr]
+    assert finished == [(c.pr, "main")]
+    row, = c.ctx.store.local_issues()
+    assert row["number"] == 10 and row["pr_number"] == c.pr and row["merged"] is True

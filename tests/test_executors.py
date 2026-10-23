@@ -164,6 +164,40 @@ def test_claude_agent_preserves_native_arguments(tmp_path, monkeypatch):
     assert kwargs["prompt"] == "/goal complete"
 
 
+@pytest.mark.parametrize("resume_session_id", [None, "saved-session"])
+def test_claude_goal_has_its_own_turn_and_resume_only_sends_updates(tmp_path, monkeypatch, resume_session_id):
+    calls = []
+    goal = 'Every command in "Done when" exits 0.'
+    prompt = 'Implement the migration for 연구 프로젝트.\n\nPreserve "saved settings".'
+
+    def execute(args, **kwargs):
+        calls.append((args, kwargs))
+        # A local slash-command result can precede the actual implementation.
+        kwargs["stdout_path"].write_text("\n".join(json.dumps(event) for event in [
+            {"type": "result", "num_turns": 0, "result": "Goal set"},
+            {"type": "result", "num_turns": 2, "result": "Implemented"},
+        ]) + "\n")
+        return 0, False, ""
+
+    monkeypatch.setattr("foragent.executors.run_logged", execute)
+    result = ClaudeExecutor().run(
+        worktree=tmp_path, prompt=prompt, goal=goal, model=None, timeout_s=60,
+        log_path=tmp_path / "run.log", resume_session_id=resume_session_id,
+    )
+    args, kwargs = calls[0]
+    if resume_session_id is None:
+        assert args[-2:] == ["--input-format", "stream-json"]
+        assert [json.loads(line) for line in kwargs["prompt"].splitlines()] == [
+            {"type": "user", "message": {"role": "user", "content": content}}
+            for content in (f"/goal {goal}", prompt)
+        ]
+    else:
+        assert args == claude_command(resume_session_id=resume_session_id)
+        assert kwargs["prompt"] == prompt
+        assert goal not in kwargs["prompt"]
+    assert result.last_message == "Implemented" and result.num_turns == 2
+
+
 @pytest.mark.parametrize("model", [None, "review model"])
 @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
 def test_exact_claude_review_command(level, model):

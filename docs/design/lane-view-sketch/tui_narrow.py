@@ -31,8 +31,13 @@ def read_key(timeout):
     if ch == "\x1b":
         seq = sys.stdin.read(2)
         if seq == "[M":  # X10 mouse report: button, x, y
-            sys.stdin.read(3)
-            return "click"
+            b = ord(sys.stdin.read(1)) - 32
+            STATE["mx"], STATE["my"] = ord(sys.stdin.read(1)) - 33, ord(sys.stdin.read(1)) - 33
+            if b == 64:
+                return "wheel-up"
+            if b == 65:
+                return "wheel-down"
+            return "click" if (b & 3) == 0 else None
         return None
     return ch
 
@@ -47,12 +52,35 @@ def enter_pressed(timeout):
         k = read_key(left)
         if k in ("\n", "\r"):
             return True
-        if k in ("l", "L", "click"):
+        if k == "click":
+            hit = acorn_at(STATE.get("mx", -1), STATE.get("my", -1))
+            if STATE.get("detail") is not None:
+                STATE["detail"] = None
+            elif isinstance(hit, tuple):
+                STATE.setdefault("open", set()).symmetric_difference_update({hit[1]})
+            elif hit is not None:
+                STATE["detail"] = hit
+            else:
+                STATE["log"] = not STATE["log"]
+            return False
+        if k in ("a", "A"):
+            STATE["all_open"] = not STATE.get("all_open")
+            return False
+        if k in ("x", "\x7f"):
+            STATE["detail"] = None
+            return False
+        if k in ("l", "L"):
             STATE["log"] = not STATE["log"]
+            return False
+        if k in ("wheel-up", "k"):
+            STATE["scroll"] = max(0, STATE.get("scroll", 0) - 3)
+            return False
+        if k in ("wheel-down", "j"):
+            STATE["scroll"] = STATE.get("scroll", 0) + 3
             return False
 
 
-def hint(text="Enter ▶ 다음 장면 · l 또는 말풍선 클릭 ▶ 기록"):
+def hint(text="Enter 다음 · 도토리 클릭 이슈 · ▸ 펼치기 · a 모두 · l 기록"):
     return f" {DIM}{text}{RESET}"
 
 
@@ -68,6 +96,52 @@ def fit(t, n):
             return out + "…"
         out += ch
     return out
+
+
+HITS = []  # (line_index, col_start, col_end, issue)
+ISSUES = {
+    96: ("Read plan usage and wait exactly until reset", "구현 중 · 12분", "orch",
+         "실행기 출력에서 사용량과 리셋 시각을 읽고, 한도에 닿으면 리셋까지 쉬었다가 다시 돌린다.",
+         "uv run pytest tests/acceptance/test_usage_read.py"),
+    100: ("One-page voice standard", "머지할까요? ← Jin", "view",
+          "말투 기준 한 장을 쓰고 화면·알림 문구를 그 기준으로 고친다.",
+          "uv run pytest tests/acceptance/test_voice.py"),
+}
+
+
+def wrap(text, n):
+    out, cur = [], ""
+    for word in text.split(" "):
+        if cur and vis(cur + " " + word) > n:
+            out.append(cur)
+            cur = word
+        else:
+            cur = (cur + " " + word).strip()
+    return out + ([cur] if cur else [])
+
+
+def acorn_at(x, y):
+    top = STATE.get("scroll", 0)
+    line = top + y
+    for li, c0, c1, num in HITS:
+        if li == line and c0 <= x < c1:
+            return num
+    return None
+
+
+def detail_box(num):
+    title, state, lane_name, goal, done = ISSUES.get(num, (f"이슈 #{num}", "기다리는 중", "?", "(내용은 로컬 기록에서 읽어요)", "-"))
+    inner = min(46, width() - 6)
+    def row(t):
+        return f"  {DIM}│{RESET} {pad(fit(t, inner - 2), inner - 2)} {DIM}│{RESET}"
+    nut = "\x1b[48;2;%d;%d;%dm\x1b[38;2;255;240;200m\x1b[1m" % COL["A"]
+    return [f"  {DIM}╭{'─' * inner}╮{RESET}",
+            f"  {DIM}│{RESET} {nut}#{num}{RESET} {pad(fit(title, inner - 8), inner - 4 - len(str(num)))} {DIM}│{RESET}",
+            row(f"{lane_name} 레인 · {state}"), row(""),
+            row("목표"), *[row("  " + w) for w in wrap(goal, inner - 6)], row(""),
+            row("끝났다는 기준"), row(f"  {done}"), row(""),
+            row("GitHub에서 보기 ↗   [x] 또는 클릭으로 닫기"),
+            f"  {DIM}╰{'─' * inner}╯{RESET}"]
 
 
 def rule():
@@ -94,8 +168,19 @@ def lane(name, pose, nums, done, line1, line2, f):
     icon = cells(frames[f % len(frames)])
     chips = [acorn_chip(n, i < done) for i, n in enumerate(nums)]
     room = width() - 18
-    per_row, used, rows_of_chips, cur = 0, 0, [], []
-    for c in chips:
+    opened = STATE.get("all_open") or name in STATE.setdefault("open", set())
+    per_row = max(1, room // 7)
+    toggle = None
+    if not opened and len(chips) > per_row:
+        keep = max(1, per_row - 1)  # leave room for the toggle chip
+        hidden = len(chips) - keep
+        start = max(0, min(done - 1, len(chips) - keep))  # last finished, the current one, then what comes next
+        chips = chips[start:start + keep]
+        toggle = ("", f"{DIM}▸ {hidden}개 더{RESET}", "")
+    elif opened and len(chips) > per_row:
+        toggle = ("", f"{DIM}▾ 접기{RESET}", "")
+    rows_of_chips, cur, used = [], [], 0
+    for c in chips + ([toggle] if toggle else []):
         w = len(re.sub(r"\x1b\[[0-9;]*m", "", c[1])) + 1
         if cur and used + w > room:
             rows_of_chips.append(cur)
@@ -105,9 +190,19 @@ def lane(name, pose, nums, done, line1, line2, f):
     if cur:
         rows_of_chips.append(cur)
     right = [line1, line2]
-    for group in rows_of_chips:
+    rel_hits = []
+    for g, group in enumerate(rows_of_chips):
+        col = 18
+        for c in group:
+            w = len(re.sub(r"\x1b\[[0-9;]*m", "", c[1]))
+            label = re.sub(r"\x1b\[[0-9;]*m", "", c[1])
+            num = ("lane", name) if label.startswith(("▸", "▾")) else int(label.strip("▐▌#"))
+            for k in range(3):
+                rel_hits.append((2 + g * 3 + k, col, col + w, num))
+            col += w + 1
         for k in range(3):
             right.append(" ".join(c[k] for c in group))
+    lane.last_hits = rel_hits
     out = []
     for i in range(max(len(icon), len(right))):
         left = f" {BOLD}{name:<6}{RESET}" if i == 1 else " " * 7
@@ -116,8 +211,36 @@ def lane(name, pose, nums, done, line1, line2, f):
     return out
 
 
+def progress_block(done=7, total=20, last_hour=3):
+    """Plain words: how far, when it ends (clock time), and why; plus quota in words."""
+    import datetime
+    w = max(10, min(24, width() - 22))
+    filled = round(w * done / total)
+    bar = GRN + "█" * filled + RESET + DIM + "░" * (w - filled) + RESET
+    left = total - done
+    out = [f" {BOLD}진행{RESET}  {bar} {done}/{total}"]
+    if last_hour:
+        end = datetime.datetime.now() + datetime.timedelta(hours=left / last_hour)
+        ampm = "새벽" if end.hour < 6 else ("오전" if end.hour < 12 else ("오후" if end.hour < 18 else "밤"))
+        h = end.hour % 12 or 12
+        out += [f"       이 속도면 {BOLD}{ampm} {h}시 {end.minute // 10 * 10}분쯤{RESET} 끝나요",
+                f"       {DIM}(최근 1시간에 {last_hour}개 끝냈어요){RESET}"]
+    else:
+        out += [f"       {DIM}끝나는 시각은 아직 몰라요 (최근 1시간에 끝낸 게 없어요){RESET}"]
+    out.append(f" {BOLD}쿼터{RESET}  Codex 67% · 일요일 리셋 전에 다 써요")
+    return out
+
+
 def draw(lines):
-    sys.stdout.write("\x1b[H\x1b[J" + "\n".join(lines) + "\n")
+    rows = shutil.get_terminal_size((48, 40)).lines - 1
+    if len(lines) <= rows:
+        STATE["scroll"] = 0
+        view = lines
+    else:
+        top = min(STATE.get("scroll", 0), len(lines) - rows)
+        STATE["scroll"] = top
+        view = lines[top:top + rows - 1] + [f" {DIM}휠 또는 j/k로 스크롤 · {top + 1}–{top + rows - 1}/{len(lines)}줄{RESET}"]
+    sys.stdout.write("\x1b[H\x1b[2J" + "\n".join(view))
     sys.stdout.flush()
 
 
@@ -132,11 +255,11 @@ def prep():
         steps = [("✓", "문서 읽고 작업 정리"), ("✓" if n == total else "⛏", f"완료 시험 {n}/{total}"),
                  ("·", "실패하는지 확인"), ("·", f"Jin 승인 {YEL}← Jin 필요{RESET}"), ("·", "발행")]
         lines += [f"   {a} {b}" for a, b in steps] + [""]
-        row = [acorn_chip(90 + i, True) for i in range(min(n, 5))]
-        for k in range(3):
-            lines.append("  " + " ".join(r[k] for r in row))
-        if n > 5:
-            lines.append(f"  {DIM}+{n - 5}개 더{RESET}")
+        chips = [acorn_chip(90 + i, True) for i in range(n)]
+        per = max(1, (width() - 4) // 7)
+        for g in range(0, len(chips), per):
+            for k in range(3):
+                lines.append("  " + " ".join(r[k] for r in chips[g:g + per]))
         lines += foot() + [hint()]
         draw(lines)
         if enter_pressed(1.0):
@@ -172,7 +295,7 @@ def publish(issues):
 
 
 LANES = [
-    ("orch", "gnaw", [93, 94, 95, 96, 97, 98], 3, f"{BOLD}#96{RESET} 사용량 읽기", f"{DIM}구현 중 · 12분{RESET}"),
+    ("orch", "gnaw", list(range(93, 99)) + list(range(120, 131)), 3, f"{BOLD}#96{RESET} 사용량 읽기", f"{DIM}구현 중 · 12분{RESET}"),
     ("view", "wave", [99, 100, 101, 102, 103, 104], 1, f"{YEL}{BOLD}#100 머지할까요? ← Jin{RESET}", f"{DIM}말투 기준{RESET}"),
     ("order", "sit", [105, 106, 107, 108], 1, f"{BOLD}#106{RESET} 인터뷰 다시 쓰기", f"{DIM}⏳ #96이 끝나길 기다려요{RESET}"),
     ("skills", "gnaw", [109, 110, 111], 1, f"{BOLD}#110{RESET} 링크로 스킬 가져오기", f"{DIM}리뷰 중{RESET}"),
@@ -216,9 +339,14 @@ def running(seconds=None):
                       f"        {DIM}항상 열기로 Jin이 정했어요.{RESET}",
                       f"  {DIM}19:10{RESET} #93 머지했어요",
                       f"  {DIM}18:55{RESET} #92 리뷰 지적 1개를 고쳐서 다시 맡겼어요"]
-        lines += [rule()]
+        lines += [rule()] + progress_block() + [rule()]
+        if STATE.get("detail") is not None:
+            lines += detail_box(STATE["detail"]) + [rule()]
+        HITS.clear()
         for ln in LANES:
-            lines += lane(*ln, f) + [""]
+            block = lane(*ln, f)
+            HITS.extend((len(lines) + r, c0, c1, n) for r, c0, c1, n in lane.last_hits)
+            lines += block + [""]
         lines += foot() + [hint()]
         draw(lines)
         if enter_pressed(0.45):
@@ -262,7 +390,7 @@ if __name__ == "__main__":
     import tty
     saved = termios.tcgetattr(sys.stdin)
     tty.setcbreak(sys.stdin.fileno())
-    sys.stdout.write("\x1b[?25l\x1b[?1000h")
+    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?1000h")
     try:
         while True:
             prep()
@@ -272,5 +400,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        sys.stdout.write("\x1b[?25h\x1b[?1000l")
+        sys.stdout.write("\x1b[?1000l\x1b[?25h\x1b[?1049l")
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved)

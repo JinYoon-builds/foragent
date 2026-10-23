@@ -118,7 +118,7 @@ def plan():
                 {"key": "api", "title": "Login API", "goal": "Implement login.", "out_of_scope": "Payments.",
                  "done_when": [f"uv run pytest -q {FILE}", "true"], "checklist": ["Looks right"],
                  "lane": "api", "size": "m", "blocked_by": [], "acceptance_files": {FILE: "assert True\n"}},
-                {"key": "client", "title": "Login client", "goal": "Call login.", "out_of_scope": "", "done_when": ["true"],
+                {"key": "client", "title": "Login client", "goal": "Call login.", "out_of_scope": "Payments.", "done_when": ["true"],
                  "checklist": [], "lane": "main", "size": "s", "blocked_by": ["api"], "acceptance_files": {}},
             ], "edits": []}
 
@@ -126,6 +126,43 @@ def plan():
 def publish(case, plan, **kwargs):
     root, config, tracker, git, _ = case
     return order.publish(plan, root, config, tracker, repo="owner/repo", git=git, **kwargs)
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_interactive_requires_boolean_before_writes(publishing, plan, value, dry_run):
+    plan["issues"][0]["interactive"] = value
+    with pytest.raises(order.PlanError, match=r"issues\[0\]\.interactive must be a boolean"):
+        publish(publishing, plan, dry_run=dry_run)
+    assert publishing[4] == []
+    assert publishing[2].issues == {} and publishing[2].labels == {}
+
+
+@pytest.mark.parametrize("disable", [False, None])
+def test_interactive_republication_syncs_label_without_duplicate_children(publishing, plan, disable):
+    tracker = publishing[2]
+    plan["issues"][0]["interactive"] = True
+    publish(publishing, plan, approve=True)
+    assert "interactive" in tracker.labels
+    assert "interactive" in tracker.get_issue(2).labels
+    assert "interactive" not in tracker.get_issue(3).labels
+    tracker.add_labels(2, ["ready", "custom"])
+    prior_events = tracker.label_events(2)
+    publish(publishing, plan)
+    assert tracker.label_events(2) == prior_events
+    if disable is None:
+        del plan["issues"][0]["interactive"]
+    else:
+        plan["issues"][0]["interactive"] = disable
+    preview = publish(publishing, plan, dry_run=True)
+    assert preview.rows[0]["interactive"] is False
+    assert "interactive" in tracker.get_issue(2).labels
+    publish(publishing, plan)
+    assert len(tracker.issues) == 3
+    assert tracker.get_issue(2).labels == {"lane:api", "size:m", "custom"}
+    plan["issues"][0]["interactive"] = True
+    publish(publishing, plan)
+    assert "interactive" in tracker.get_issue(2).labels
 
 
 def test_publish_order_contract_labels_native_links_and_summary(publishing, plan):
@@ -210,6 +247,57 @@ def test_dry_run_has_no_writes(publishing, plan, kicks):
     assert before == {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+def test_publish_preserves_issue_files_as_metadata(publishing, plan, kind):
+    paths = ["src/new module.py", "skills/**", "src/[ab].py", "docs/설계.md"]
+    if kind == "edits":
+        publish(publishing, plan)
+        item = {"number": 2, "goal": "Updated login.", "out_of_scope": "Payments.",
+                "done_when": ["true"], "checklist": ["Looks right"], "files": paths}
+        plan["id"] = "2026-10-21-login-update"
+        plan["issues"], plan["edits"] = [], [item]
+    else:
+        item = plan["issues"][0]
+        item["files"] = paths
+    report = publish(publishing, plan)
+    body = publishing[2].get_issue(2).body
+    assert "## Files\n" + "\n".join(f"- {path}" for path in paths) in body
+    parsed = parse_body(body)
+    assert parsed.files == paths
+    assert parsed.goal == item["goal"] and parsed.out_of_scope == item["out_of_scope"]
+    assert parsed.done_when_commands == item["done_when"]
+    assert [check.text for check in parsed.done_when_checklist] == item["checklist"]
+    assert not set(paths) & set(report.paths)
+    assert all(not (publishing[0] / path).exists() for path in paths)
+
+
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("files", [None, ["../outside.py"], ["src/../outside.py"],
+                                   ["/outside.py"], ["src\\file.py"], ["src/\0file.py"],
+                                   ["src/file.py\n## Goal\nWrong goal"]])
+def test_invalid_issue_files_are_rejected_before_writes(publishing, plan, kind, dry_run, files):
+    if kind == "edits":
+        plan["edits"] = [{"number": 9, "goal": "Updated goal", "out_of_scope": "Payments.",
+                          "done_when": ["true"], "files": files}]
+    else:
+        plan["issues"][0]["files"] = files
+    with pytest.raises(order.PlanError, match=rf"{kind}\[\d+\]\.files"):
+        publish(publishing, plan, dry_run=dry_run)
+    assert publishing[-1] == [] and publishing[2].issues == {}
+    assert not (publishing[0] / "docs").exists()
+
+
+def test_files_section_keeps_first_list_and_respects_other_sections():
+    parsed = parse_body(
+        "## Goal\nChange the code.\n## Files\n- src/file.py\n* skills/**\n"
+        "## Notes\n- excluded.py\n## Files\n- also-excluded.py\n"
+        "## Done when\n```sh\n## Files\n- command-not-path\n```\n"
+    )
+    assert parsed.files == ["src/file.py", "skills/**"]
+    assert parsed.done_when_commands == ["## Files\n- command-not-path"]
+
+
 @pytest.mark.parametrize("mutate,error", [
     (lambda p: p.update(extra=True), "unknown fields"),
     (lambda p: p.update(id="../escape"), "plan.id"),
@@ -228,13 +316,29 @@ def test_dry_run_has_no_writes(publishing, plan, kicks):
     (lambda p: p["issues"][0].update(done_when=["pytest --file=tests/acceptance/missing.py; true"]), "missing acceptance"),
     (lambda p: p["issues"][0].update(checklist=["a\nb"]), "single line"),
     (lambda p: p["issues"][0].update(done_when=["true\n```\nfalse"]), "code fences"),
-    (lambda p: p.update(edits=[{"number": True, "goal": "g", "out_of_scope": "", "done_when": ["true"]}]), "number"),
+    (lambda p: p.update(edits=[{"number": True, "goal": "g", "out_of_scope": "Payments.", "done_when": ["true"]}]), "number"),
 ])
 def test_validation_errors_precede_writes(publishing, plan, mutate, error):
     mutate(plan)
     with pytest.raises(order.PlanError, match=error):
         publish(publishing, plan)
     assert publishing[-1] == [] and publishing[2].issues == {}
+
+
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+@pytest.mark.parametrize("value", ["", "   ", "\n\t "])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_empty_out_of_scope_is_rejected_before_writes(publishing, plan, kind, value, dry_run):
+    if kind == "edits":
+        plan["edits"] = [{"number": 9, "goal": "Fixed goal", "out_of_scope": value, "done_when": ["true"]}]
+    else:
+        plan["issues"][1]["out_of_scope"] = value
+    with pytest.raises(order.PlanError, match=rf"{kind}\[\d+\]\.out_of_scope must be a nonempty string"):
+        publish(publishing, plan, dry_run=dry_run)
+    root, _, tracker, _, events = publishing
+    assert events == [] and tracker.issues == {}
+    assert not (root / "docs").exists()
+    assert not (root / "tests").exists()
 
 
 def test_acceptance_symlink_escape_is_rejected(publishing, plan, tmp_path):
@@ -445,7 +549,7 @@ def test_push_failure_prevents_any_issue_creation(publishing, plan, monkeypatch)
 def test_approval_variants_and_edits_invalidate_approval(publishing, plan, options, approved):
     tracker = publishing[2]
     tracker.add_issue(3, "Keep this title", "old", ["approved", "needs-human", "ready", "size:l"])
-    plan["edits"] = [{"number": 3, "goal": "New goal", "out_of_scope": "", "done_when": ["true"],
+    plan["edits"] = [{"number": 3, "goal": "New goal", "out_of_scope": "Payments.", "done_when": ["true"],
                       "checklist": [], "acceptance_files": {"tests/acceptance/edited.py": "edited\n"}}]
     publish(publishing, plan, **options)
     # Parent is #4, children are #5 and #6 because #3 existed before publication.
@@ -512,7 +616,7 @@ def test_interrupted_lane_commit_is_completed_before_issues(publishing, plan, mo
 def test_edit_with_changed_acceptance_invalidates_approval_on_retry(publishing, plan):
     tracker = publishing[2]
     tracker.add_issue(9, "Existing", "old", ["approved", "needs-human"])
-    edit = {"number": 9, "goal": "Fixed goal", "out_of_scope": "", "done_when": ["true"],
+    edit = {"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.", "done_when": ["true"],
             "acceptance_files": {"tests/acceptance/edit.py": "first\n"}}
     plan["edits"] = [edit]
     publish(publishing, plan, approve=True)
@@ -528,7 +632,7 @@ def test_edit_reverting_to_a_prior_revision_still_refreshes_approval(publishing,
     root, _, tracker, git, _ = publishing
     tracker.add_issue(9, "Existing", "old", ["approved", "needs-human"])
     name = "tests/acceptance/edit.py"
-    edit = {"number": 9, "goal": "Fixed goal", "out_of_scope": "", "done_when": ["true"],
+    edit = {"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.", "done_when": ["true"],
             "acceptance_files": {name: "first\n"}}
     plan["edits"] = [edit]
     publish(publishing, plan, approve=True)
@@ -739,3 +843,94 @@ def test_profile_cli_rejects_invalid_config_without_overwriting(tmp_path, monkey
                      "--priority", "speed", "--repo-root", str(tmp_path)]) == 1
     assert "review" in capsys.readouterr().err
     assert path.read_text() == "review: invalid\n"
+
+
+@pytest.mark.parametrize("step,fields", [
+    ("unknown", {}), ("start", {"title": "  "}),
+    ("ledger", {"add": ""}), ("chunk", {"add": "\n"}),
+    ("cell", {"chunk": "missing", "slot": "goal", "filled": True}),
+    ("cell", {"chunk": "API", "slot": "unknown", "filled": True}),
+    ("cell", {"chunk": "API", "slot": "goal"}),
+    ("cell", {"chunk": "API", "slot": "goal", "ask": "?", "filled": True}),
+    ("cell", {"chunk": "API", "slot": "goal", "ask": "  "}),
+    ("tests", {"done": -1, "total": 2}), ("tests", {"done": 3, "total": 2}),
+    ("tests", {"done": 0, "total": -1}), ("tests", {"done": True, "total": 2}),
+    ("tests", {"done": 0}), ("publish", {"issue": 0}), ("publish", {"issue": True}),
+])
+def test_order_progress_rejected_fact_preserves_saved_bytes(tmp_path, step, fields):
+    store = StateStore(tmp_path / "state")
+    order.progress(store, "start", title="API order")
+    order.progress(store, "chunk", add="API")
+    path = store.root / "order-progress.json"
+    before = path.read_bytes()
+    with pytest.raises(order.PlanError):
+        order.progress(store, step, **fields)
+    assert path.read_bytes() == before
+
+
+def test_order_progress_duplicate_chunk_preserves_answers_and_questions_reopen_cells(tmp_path):
+    store = StateStore(tmp_path)
+    order.progress(store, "start", title="API order")
+    order.progress(store, "chunk", add="API")
+    order.progress(store, "cell", chunk="API", slot="goal", filled=True)
+    order.progress(store, "chunk", add="API")
+    assert store.order_progress()["cells_left"] == 4
+    order.progress(store, "cell", chunk="API", slot="goal", ask="Which endpoint?")
+    assert store.order_progress()["cells_left"] == 5
+    assert store.order_progress()["cells"]["API"]["goal"]["ask"] == "Which endpoint?"
+    order.progress(store, "cell", chunk="API", slot="goal", filled=True)
+    assert store.order_progress()["cells"]["API"]["goal"] == {"filled": True, "ask": None}
+    for _ in range(2):
+        order.progress(store, "ledger", add="D1: REST")
+        order.progress(store, "publish", issue=42)
+    assert store.order_progress()["ledger"] == ["D1: REST"]
+    assert store.order_progress()["published"] == [42]
+
+
+def test_order_progress_requires_start_and_new_start_resets_only_preparation(tmp_path):
+    store = StateStore(tmp_path)
+    with pytest.raises(order.PlanError, match="progress start"):
+        order.progress(store, "check")
+    assert store.order_progress() is None
+    store.start_run(42, branch="issue-42", worktree=tmp_path / "worktree")
+    order.progress(store, "start", title="Old")
+    order.progress(store, "ledger", add="Old decision")
+    order.progress(store, "start", title="New")
+    state = StateStore(tmp_path).order_progress()
+    assert state["title"] == "New" and state["ledger"] == [] and state["cells_left"] == 0
+    order.progress(store, "end")
+    order.progress(store, "end")
+    assert StateStore(tmp_path).order_progress() is None
+    assert store.get_run(42).status == "running"
+
+
+def test_order_progress_concurrent_writers_do_not_lose_facts(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    order.progress(StateStore(tmp_path), "start", title="Concurrent order")
+
+    def add_decision(number):
+        order.progress(StateStore(tmp_path), "ledger", add=f"Decision {number}")
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        list(workers.map(add_decision, range(20)))
+    assert set(StateStore(tmp_path).order_progress()["ledger"]) == {
+        f"Decision {number}" for number in range(20)}
+
+
+def test_order_progress_cli_uses_configured_repo_without_external_services(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(repo="owner/repo"))
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo: cls(tmp_path / repo)))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("progress must not initialize Git/GitHub, call an LLM or open a view")
+
+    monkeypatch.setattr(cli, "GitRepo", unexpected)
+    monkeypatch.setattr(cli, "GhTracker", unexpected)
+    monkeypatch.setattr(cli.watch_open, "open_view", unexpected)
+    monkeypatch.setattr(subprocess, "Popen", unexpected)
+    assert cli.main(["order", "progress", "start", "--title", "주문 준비"]) == 0
+    assert json.loads(capsys.readouterr().out)["title"] == "주문 준비"
+    assert cli.main(["order", "progress", "tests", "--done", "3", "--total", "2"]) == 1
+    assert "0 <= done <= total" in capsys.readouterr().err
+    assert StateStore(tmp_path / "owner/repo").order_progress()["step"] == "start"

@@ -126,6 +126,16 @@ class Setup:
 def setup(tmp_path, monkeypatch):
     # Isolate global config reads as well as all writes from the real home.
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    run = subprocess.run
+
+    def offline_tools(argv, *args, **kwargs):
+        if argv == ["codex", "login", "status"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="Logged in using ChatGPT\n", stderr="")
+        if argv == ["claude", "auth", "status"]:
+            return subprocess.CompletedProcess(argv, 0, stdout='{"loggedIn": true}', stderr="")
+        return run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", offline_tools)
     origin, root = tmp_path / "origin.git", tmp_path / "project"
     git_command(tmp_path, "init", "--bare", "--initial-branch=main", str(origin))
     GitHistory(origin, root).update({"README.md": "Original\n"})
@@ -155,6 +165,54 @@ def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     assert ["push", "origin", "refs/heads/main:refs/heads/main"] in setup.git_calls
     assert report.committed and report.pushed and setup.installs == [setup.root]
     assert "Created: .foragent.yml" in report.summary()
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError("codex"), subprocess.TimeoutExpired("codex", 10)])
+def test_claude_default_when_codex_is_missing_or_probe_times_out(setup, monkeypatch, error):
+    run = subprocess.run
+
+    def probe(argv, *args, **kwargs):
+        if argv == ["codex", "login", "status"]:
+            raise error
+        return run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", probe)
+    report = setup.init(dry_run=True)
+    assert report.created == PATHS and not (setup.root / PATHS[0]).exists()
+    setup.init()
+    config = load_config(setup.root)
+    assert config.executor == config.reviewer == "claude"
+
+
+@pytest.mark.parametrize("status", ['{"loggedIn": false}', 'not JSON', '[]'])
+def test_successful_exit_without_claude_login_is_not_authenticated(setup, monkeypatch, status):
+    run = subprocess.run
+
+    def probe(argv, *args, **kwargs):
+        if argv == ["codex", "login", "status"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="Not logged in")
+        if argv == ["claude", "auth", "status"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=status, stderr="")
+        return run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", probe)
+    with pytest.raises(ConfigError, match="No logged-in coding tool"):
+        setup.init()
+    assert not (setup.root / PATHS[0]).exists() and not setup.tracker.labels
+
+
+def test_existing_config_does_not_probe_tools_or_change_worker_and_reviewer(setup, monkeypatch):
+    original = "# Keep my choices\nexecutor: claude\nreviewer: codex\n"
+    (setup.root / PATHS[0]).write_text(original)
+    run = subprocess.run
+
+    def no_probes(argv, *args, **kwargs):
+        assert argv[0] not in {"codex", "claude"}, "Existing choices do not need tool detection"
+        return run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", no_probes)
+    setup.init()
+    assert (setup.root / PATHS[0]).read_text() == original
 
 
 def test_board_default_is_persisted_and_idempotent(setup):
@@ -239,6 +297,7 @@ def test_only_nondefault_keys_and_explicit_approvers_are_written(setup):
     setup.init(review="fast", executor="claude", run_hours="22-08", approvers=["alice", "bob"])
     assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {
         "review": "fast", "executor": "claude", "approvers": ["alice", "bob"], "run_hours": "22-08",
+        "reviewer": "claude",
     }
     assert setup.gh_calls == [(["auth", "status"], None)]
 

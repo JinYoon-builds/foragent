@@ -6,3 +6,6 @@ dist/
 src/foragent/_build.py
 build/
 *.egg-info/
+/.claude/skills/toss-ux-writing/
+/.claude/skills/principle-prove-it-works/
+/.claude/skills/skill-creator/

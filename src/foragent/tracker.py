@@ -1,7 +1,7 @@
 """Issue tracking interfaces, an in-memory fake, and an offline-testable gh adapter."""
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import json
 import re
@@ -23,6 +23,7 @@ class Issue:
     labels: frozenset[str]
     state: IssueState
     is_pull_request: bool = False
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ class PullRequest:
 
 
 class Tracker(Protocol):
+    def rate_limit_reset(self) -> datetime | None: ...
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]: ...
     def list_open_issues(self) -> list[Issue]: ...
     def list_issues(self, state: str = "all") -> list[Issue]: ...
@@ -80,8 +82,8 @@ class Tracker(Protocol):
     def blocked_by(self, n: int) -> list[Dependency]: ...
     def parent_of(self, n: int) -> int | None: ...
     def sub_issues(self, n: int) -> list[Issue]: ...
-    def add_labels(self, n: int, labels: Iterable[str]) -> None: ...
-    def remove_labels(self, n: int, labels: Iterable[str]) -> None: ...
+    def add_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
+    def remove_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
     def comment(self, n: int, body: str) -> int: ...
     def list_comments(self, n: int) -> list[Comment]: ...
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int: ...
@@ -107,6 +109,304 @@ class TrackerError(RuntimeError):
         self.stdout = stdout
         self.returncode = returncode
 
+    @property
+    def is_rate_limit(self) -> bool:
+        diagnostic = f"{self}\n{self.stdout}"
+        return bool(re.search(
+            r"(?:API rate limit (?:already )?exceeded|secondary rate limit|\bHTTP(?:/\S+)?\s+429\b)",
+            diagnostic, re.I,
+        ))
+
+    @property
+    def is_not_found(self) -> bool:
+        return bool(re.search(r"\bHTTP(?:/\S+)?\s+404\b", f"{self}\n{self.stdout}", re.I))
+
+    @property
+    def reset_at(self) -> datetime | None:
+        match = re.search(r"^x-ratelimit-reset:\s*(\d+)\s*$", f"{self.stdout}\n{self}", re.I | re.M)
+        if match is not None:
+            try:
+                return datetime.fromtimestamp(int(match[1]), UTC)
+            except (ValueError, OverflowError, OSError):
+                pass
+        return None
+
+
+def pr_issue_number(head: str) -> int | None:
+    match = re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", head)
+    return int(match[1]) if match else None
+
+
+def local_issue_models(store) -> list[Issue]:
+    return [Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
+            for row in store.local_issues()]
+
+
+class RecordingTracker:
+    """Record writes locally, optionally deferring rate-limited gate/orchestrator writes."""
+
+    def __init__(self, tracker, context, *, queue_writes=False):
+        self._tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
+        self._context = context
+        self.queue_writes = queue_writes
+
+    @property
+    def _now(self):
+        return self._tracker._now
+
+    @_now.setter
+    def _now(self, value):
+        self._tracker._now = value
+
+    def __getattr__(self, name):
+        value = getattr(self._tracker, name)
+        if not callable(value):
+            return value
+
+        def observe(*args, **kwargs):
+            result = value(*args, **kwargs)
+            if isinstance(result, Issue):
+                self._context.store.record_issue(result, self._context.config.lanes)
+            return result
+
+        return observe
+
+    def _pending_issues(self):
+        pending = {entry["issue"] for entry in self._context.store.github_outbox()}
+        if not pending:
+            return {}
+        return {issue.number: issue for issue in local_issue_models(self._context.store)
+                if issue.number in pending}
+
+    def current_issue(self, n):
+        """Read local intent while delivery is pending, otherwise observe GitHub."""
+        if (issue := self._pending_issues().get(n)) is not None:
+            return issue
+        return self.get_issue(n)
+
+    def sub_issues(self, n):
+        children = self._tracker.sub_issues(n)
+        pending = self._pending_issues()
+        return [pending.get(child.number, child) for child in children]
+
+    def _outbox_dropped(self, number, reason):
+        from foragent.orch_events import append_event
+
+        append_event(self._context.store, self._context.now(), number, "outbox-dropped",
+                     f"#{number}: dropped queued GitHub writes: {reason}")
+
+    def refresh_issues(self):
+        """Publish a bulk observation once, preserving writes made during its reads.
+
+        A failed read leaves the last snapshot intact and records the failure,
+        so local readers report stale data instead of an empty queue.
+        """
+        try:
+            self._refresh_issues()
+        except TrackerError as exc:
+            self._context.store.record_issues_refresh_failure(" ".join(str(exc).split()), self._context.now())
+            raise
+
+    def _refresh_issues(self):
+        from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY
+
+        store = self._context.store
+        revision = store.issues_revision()
+        pending = {entry["issue"] for entry in store.github_outbox()}
+        issues = self.list_issues()
+        # These observations belong to the batch; recording them individually
+        # would overwrite concurrent writes before the final version check.
+        # Open PRs come last so a new PR wins over an older merged one for the same issue.
+        prs = self._tracker.list_prs("merged", "foragent/") + self._tracker.list_prs("open", "foragent/")
+        comments, missing = {}, set()
+        for issue in issues:
+            if issue.is_pull_request or not (
+                issue.number in pending or issue.state == "open" and issue.labels & {BLOCKED, NEEDS_HUMAN}
+            ):
+                continue
+            try:
+                comments[issue.number] = [asdict(comment) for comment in self._tracker.list_comments(issue.number)]
+            except TrackerError as exc:
+                if not exc.is_not_found or not self._issue_missing(issue.number):
+                    raise
+                missing.add(issue.number)
+        issues = [issue for issue in issues if issue.number not in missing]
+        # Order edges and dependencies let views group work without per-frame reads.
+        open_issues = [issue for issue in issues if issue.state == "open" and not issue.is_pull_request]
+        parents = {child.number: issue.number for issue in open_issues
+                   for child in self._tracker.sub_issues(issue.number)}
+        blocked_by = {issue.number: [{"number": dep.number, "state": dep.state}
+                                     for dep in self._tracker.blocked_by(issue.number)]
+                      for issue in open_issues if issue.labels & {APPROVED, READY}}
+        dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, self._context.now(),
+                                            comments=comments, since_revision=revision, parents=parents,
+                                            blocked_by=blocked_by, complete_prs=True)
+        observed = {issue.number for issue in issues}
+        for number in dropped:
+            reason = "remote change" if number in observed else "issue not found"
+            self._outbox_dropped(number, reason)
+
+    def _issue_missing(self, number):
+        """A missing write resource alone does not prove that its issue is gone."""
+        try:
+            self._tracker.get_issue(number)
+        except TrackerError as exc:
+            if exc.is_not_found:
+                return True
+            raise
+        return False
+
+    def _write(self, n, action, operation, **payload):
+        store = self._context.store
+        pending = store.github_outbox()
+        if (any(entry["issue"] == n for entry in pending)
+                or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
+            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+        try:
+            return operation(), None
+        except TrackerError as exc:
+            if not self.queue_writes or not exc.is_rate_limit:
+                raise
+            from foragent.orch_github import pause
+
+            pause(self._context, exc)
+            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+
+    def flush_outbox(self):
+        """Deliver an already refreshed FIFO; a renewed limit leaves its tail intact."""
+        from foragent.orch_github import pause
+
+        store = self._context.store
+        dropped = set()
+        for entry in store.github_outbox():
+            number, action = entry["issue"], entry["action"]
+            if number in dropped:
+                continue
+            try:
+                if action == "remove_labels":
+                    labels = entry["labels"]
+                    for index, label in enumerate(labels):
+                        self._tracker.remove_labels(number, [label])
+                        store.deliver_github_write(entry, remaining_labels=labels[index + 1:])
+                elif action == "update_issue":
+                    self._tracker.update_issue(number, title=entry["title"], body=entry["body"])
+                    store.deliver_github_write(entry)
+                else:
+                    payload = entry["labels"] if action == "add_labels" else entry["body"]
+                    result = getattr(self._tracker, action)(number, payload)
+                    store.deliver_github_write(entry, comment_id=result if action == "comment" else None)
+            except TrackerError as exc:
+                try:
+                    if exc.is_not_found and self._issue_missing(number):
+                        store.drop_missing_github_issue(number)
+                        self._outbox_dropped(number, "issue not found")
+                        dropped.add(number)
+                        continue
+                except TrackerError as lookup_error:
+                    exc = lookup_error
+                if not exc.is_rate_limit:
+                    raise exc
+                pause(self._context, exc)
+                return
+
+    def add_labels(self, n, labels):
+        labels = list(labels)
+        if not labels:
+            return
+        result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), labels=labels)
+        if queued:
+            return
+        if isinstance(result, Issue):
+            self._context.store.record_issue(result, self._context.config.lanes)
+        self._context.store.record_labels(n, labels, remove=False, lanes=self._context.config.lanes)
+
+    def remove_labels(self, n, labels):
+        labels = list(labels)
+        for index, label in enumerate(labels):
+            result, queued = self._write(n, "remove_labels", lambda: self._tracker.remove_labels(n, [label]),
+                                         labels=labels[index:])
+            if queued:
+                break
+            if isinstance(result, Issue):
+                self._context.store.record_issue(result, self._context.config.lanes)
+            self._context.store.record_labels(n, [label], remove=True, lanes=self._context.config.lanes)
+
+    def list_comments(self, n):
+        comments = self._tracker.list_comments(n)
+        self._context.store.record_comments(n, [asdict(comment) for comment in comments])
+        return comments
+
+    def comment(self, n, body):
+        identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), body=body)
+        if queued:
+            return -queued["id"]
+        self._context.store.record_comments(n, [{"id": identity, "body": body,
+            "author": "foragent", "created_at": self._context.now().astimezone(UTC).isoformat()}], append=True)
+        return identity
+
+    def create_issue(self, title, body, labels):
+        labels = list(labels)
+        n = self._tracker.create_issue(title, body, labels)
+        self._context.store.record_issue(Issue(n, title, body, frozenset(labels), "open"),
+                                         self._context.config.lanes)
+        return n
+
+    def update_issue(self, n, *, title, body):
+        _, queued = self._write(n, "update_issue", lambda: self._tracker.update_issue(n, title=title, body=body),
+                                title=title, body=body)
+        if not queued:
+            self._context.store.update_local_issue(n, title=title, body=body)
+
+    def close_issue(self, n, comment=None):
+        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
+                               else self._tracker.close_issue(n, comment), body=comment)
+        if not queued:
+            self._context.store.update_local_issue(n, state="closed")
+
+    def record_board_value(self, n, project, field, value):
+        self._context.store.record_board_value(n, project, field, value)
+
+    def _record_pr(self, pr, head, base=None, *, merged=False):
+        if (number := pr_issue_number(head)) is not None:
+            fields = {"pr_number": pr, "pr_head": head, "merged": merged}
+            if base is not None:
+                fields["pr_base"] = base
+            self._context.store.update_local_issue(number, **fields)
+
+    def find_pr(self, head):
+        pr = self._tracker.find_pr(head)
+        if pr is not None:
+            self._record_pr(pr, head)
+        return pr
+
+    def list_prs(self, state="open", head_prefix=""):
+        prs = self._tracker.list_prs(state, head_prefix)
+        for pr in prs:
+            self._record_pr(pr.number, pr.head, pr.base, merged=pr.merged_at is not None)
+        return prs
+
+    def create_pr(self, *, head, base, title, body):
+        pr = self._tracker.create_pr(head=head, base=base, title=title, body=body)
+        self._record_pr(pr, head, base)
+        return pr
+
+    def update_pr(self, pr, *, base, title, body):
+        self._tracker.update_pr(pr, base=base, title=title, body=body)
+        self._record_pr_state(pr, pr_base=base)
+
+    def _record_pr_state(self, pr, **fields):
+        for row in self._context.store.local_issues():
+            if row["pr_number"] == pr:
+                self._context.store.update_local_issue(row["number"], **fields)
+
+    def close_pr(self, pr, comment=None):
+        self._tracker.close_pr(pr, comment)
+        self._record_pr_state(pr, pr_number=None, merged=False)
+
+    def merge_pr(self, pr, *, expected_head_sha, method="squash"):
+        self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
+        self._record_pr_state(pr, merged=True)
+
 
 def _merge_flag(method: str) -> str:
     if method not in {"squash", "merge", "rebase"}:
@@ -115,6 +415,9 @@ def _merge_flag(method: str) -> str:
 
 
 class FakeTracker:
+    def rate_limit_reset(self) -> datetime | None:
+        return None
+
     def __init__(
         self, actor: str = "foragent-bot", now: Callable[[], datetime] | None = None,
         *, strict: bool = False,
@@ -180,11 +483,12 @@ class FakeTracker:
     def get_issue(self, n: int) -> Issue:
         return self.issues[n]
 
-    def edit_body(self, n: int, body: str) -> None:
+    def edit_body(self, n: int, body: str) -> Issue:
         issue = self.get_issue(n)
         if issue.body != body:
             self.issues[n] = replace(issue, body=body)
             self._body_edits[n] = self._timestamp()
+        return self.get_issue(n)
 
     def body_last_edited_at(self, n: int) -> str | None:
         return self._body_edits.get(n)
@@ -208,25 +512,28 @@ class FakeTracker:
     def sub_issues(self, n: int) -> list[Issue]:
         return [self.get_issue(child) for child, parent in self._parents.items() if parent == n]
 
-    def record_label(self, n: int, label: str, actor: str) -> None:
+    def record_label(self, n: int, label: str, actor: str) -> Issue:
         issue = self.get_issue(n)
         self._events.setdefault(n, []).append(LabelEvent(label, "labeled", actor, self._timestamp()))
         self.issues[n] = replace(issue, labels=issue.labels | {label})
+        return self.issues[n]
 
-    def add_labels(self, n: int, labels: Iterable[str]) -> None:
+    def add_labels(self, n: int, labels: Iterable[str]) -> Issue:
         labels = list(labels)
         if self.strict and "approved" in labels:
             raise AssertionError("gate and runner must never add the approved label")
         for label in labels:
             if label not in self.get_issue(n).labels:
                 self.record_label(n, label, self.actor)
+        return self.get_issue(n)
 
-    def remove_labels(self, n: int, labels: Iterable[str]) -> None:
+    def remove_labels(self, n: int, labels: Iterable[str]) -> Issue:
         for label in labels:
             issue = self.get_issue(n)
             if label in issue.labels:
                 self._events.setdefault(n, []).append(LabelEvent(label, "unlabeled", self.actor, self._timestamp()))
                 self.issues[n] = replace(issue, labels=issue.labels - {label})
+        return self.get_issue(n)
 
     def comment(self, n: int, body: str) -> int:
         comment = Comment(self._next_comment_id, self.actor, body, self._timestamp())
@@ -340,7 +647,7 @@ def _issue(data: dict[str, Any]) -> Issue:
     return Issue(
         data["number"], data["title"], data.get("body") or "",
         frozenset(label["name"] for label in data.get("labels", [])),
-        data["state"], "pull_request" in data,
+        data["state"], "pull_request" in data, data.get("updated_at"),
     )
 
 
@@ -359,6 +666,15 @@ class GhTracker:
             ) from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise TrackerError(str(exc)) from exc
+
+    def rate_limit_reset(self) -> datetime | None:
+        data = json.loads(self._call(["api", "rate_limit"]))
+        resets = [
+            datetime.fromtimestamp(window["reset"], UTC)
+            for window in data.get("resources", {}).values()
+            if window.get("remaining") == 0 and isinstance(window.get("reset"), (int, float))
+        ]
+        return max(resets, default=None)
 
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         output = self._call(["api", "graphql", "--input", "-"],

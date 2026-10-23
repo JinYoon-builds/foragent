@@ -19,6 +19,8 @@ class ExecResult:
     full_message: str | None = None
     log_tail: str = ""
     error_kind: str = "normal"
+    session_id: str | None = None
+    num_turns: int | None = None
 
 
 def classify_result(result: ExecResult) -> str:
@@ -38,8 +40,9 @@ def _error_kind(message: str) -> str:
     return "normal"
 
 
-def _events(path: Path):
+def _events(path: Path, *, offset: int = 0):
     with path.open(encoding="utf-8", errors="replace") as stream:
+        stream.seek(offset)
         for line in stream:
             try:
                 event = json.loads(line)
@@ -47,6 +50,30 @@ def _events(path: Path):
                 continue
             if isinstance(event, dict):
                 yield event
+
+
+def stream_session_id(path: Path, executor: str, *, offset: int = 0) -> str | None:
+    """Read an initialized session's identity, never an error's echoed ID."""
+    fallback = None
+    started = False
+    for event in _events(path, offset=offset):
+        if executor == "codex":
+            value = event.get("thread_id") if event.get("type") == "thread.started" else None
+        else:
+            if event.get("type") == "system" and event.get("subtype") == "init":
+                started = True
+                value = event.get("session_id")
+            else:
+                value = None
+            if event.get("type") == "result":
+                turns = event.get("num_turns")
+                initialized = started or not event.get("is_error") or (isinstance(turns, int) and turns > 0)
+                candidate = event.get("session_id")
+                if initialized and isinstance(candidate, str) and candidate.strip():
+                    fallback = candidate
+        if isinstance(value, str) and value.strip():
+            return value
+    return fallback
 
 
 def _event_error_kind(event: dict, executor: str) -> str:
@@ -96,13 +123,17 @@ def _structured_error_kind(path: Path, executor: str, *, document: bool = False)
 class Executor(Protocol):
     def run(
         self, *, worktree: Path, prompt: str, model: str | None,
-        timeout_s: int, log_path: Path,
+        timeout_s: int, log_path: Path, resume_session_id: str | None = None,
     ) -> ExecResult: ...
 
 
 def codex_command(worktree: Path, output_path: Path, model: str | None = None,
-                  effort: str | None = None) -> list[str]:
+                  effort: str | None = None, *, resume_session_id: str | None = None) -> list[str]:
+    # Resume has its own CLI options; cwd is supplied by run_logged.
     args = [
+        "codex", "exec", "resume", resume_session_id, "-", "--skip-git-repo-check",
+        "--json", "-o", str(output_path), "-c", 'sandbox_mode="workspace-write"',
+    ] if resume_session_id is not None else [
         "codex", "exec", "-", "-C", str(worktree), "-s", "workspace-write",
         "--skip-git-repo-check", "--json", "-o", str(output_path),
     ]
@@ -113,12 +144,15 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
 
 def claude_command(
     model: str | None = None, settings_path: Path | None = None, agent: str | None = None,
+    *, resume_session_id: str | None = None,
 ) -> list[str]:
     args = ["claude", "-p", "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
     if settings_path is not None:
         args += ["--settings", str(settings_path)]
     if agent is not None:
         args += ["--agent", agent]
+    if resume_session_id is not None:
+        args += ["--resume", resume_session_id]
     return args + (["--model", model] if model is not None else [])
 
 
@@ -128,18 +162,12 @@ def claude_review_command(level: str, model: str | None = None, *, pr: int | Non
     return args + (["--model", model] if model is not None else [])
 
 
-def claude_stream_result(path: Path) -> str:
+def claude_stream_result(path: Path) -> dict:
     """Read the last result event, without loading the session transcript."""
-    result = ""
-    with path.open(encoding="utf-8", errors="replace") as stream:
-        for line in stream:
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(event, dict) and event.get("type") == "result":
-                value = event.get("result")
-                result = value if isinstance(value, str) else ""
+    result = {}
+    for event in _events(path):
+        if event.get("type") == "result":
+            result = event
     return result
 
 
@@ -147,18 +175,22 @@ class CodexExecutor:
     def run(
         self, *, worktree: Path, prompt: str, model: str | None,
         timeout_s: int, log_path: Path, effort: str | None = None,
+        resume_session_id: str | None = None,
     ) -> ExecResult:
         with tempfile.TemporaryDirectory(prefix="foragent-codex-") as temporary:
             output_path = Path(temporary) / "last-message.txt"
             events_path = Path(temporary) / "events.jsonl"
+            options = {"resume_session_id": resume_session_id} if resume_session_id is not None else {}
             code, timed_out, _ = run_logged(
-                codex_command(worktree, output_path, model, effort), cwd=worktree, prompt=prompt,
+                codex_command(worktree, output_path, model, effort, **options), cwd=worktree, prompt=prompt,
                 timeout_s=timeout_s, log_path=log_path,
                 capture_stdout=True, stdout_path=events_path,
             )
             last_message = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
             error_kind = _structured_error_kind(events_path, "codex")
-        return ExecResult(code, timed_out, last_message, log_path, last_message, error_kind=error_kind)
+            session_id = stream_session_id(events_path, "codex")
+        return ExecResult(code, timed_out, last_message, log_path, last_message,
+                          error_kind=error_kind, session_id=session_id)
 
 
 class ClaudeExecutor:
@@ -167,19 +199,38 @@ class ClaudeExecutor:
         timeout_s: int, log_path: Path,
         settings_path: Path | None = None, review_level: str | None = None,
         agent: str | None = None, review_pr: int | None = None,
+        resume_session_id: str | None = None,
+        goal: str | None = None,
     ) -> ExecResult:
         output_path = log_path.with_suffix(".stdout")
+        options = {}
+        if agent is not None:
+            options["agent"] = agent
+        if resume_session_id is not None:
+            options["resume_session_id"] = resume_session_id
         command = (claude_review_command(review_level, model, pr=review_pr) if review_level is not None
-                   else claude_command(model, settings_path, agent) if agent is not None
-                   else claude_command(model, settings_path))
+                   else claude_command(model, settings_path, **options))
+        if review_level is None and resume_session_id is None and goal is not None:
+            # Text stdin is one message: blank lines do not end /goal's argument.
+            # Stream input gives the command and task their own user turns.
+            command += ["--input-format", "stream-json"]
+            prompt = "".join(json.dumps({
+                "type": "user", "message": {"role": "user", "content": content},
+            }, ensure_ascii=False) + "\n" for content in (f"/goal {goal}", prompt))
         code, timed_out, _ = run_logged(
             command, cwd=worktree, prompt=None if review_level is not None else prompt, timeout_s=timeout_s,
             log_path=log_path, capture_stdout=True, stdout_path=output_path,
         )
+        result = claude_stream_result(output_path) if review_level is None else {}
+        value = result.get("result")
         message = (output_path.read_text(encoding="utf-8", errors="replace") if review_level is not None
-                   else claude_stream_result(output_path))
+                   else value if isinstance(value, str) else "")
+        turns = result.get("num_turns")
         error_kind = _structured_error_kind(output_path, "claude", document=review_level is not None)
-        return ExecResult(code, timed_out, message, log_path, message, error_kind=error_kind)
+        session_id = stream_session_id(output_path, "claude") if review_level is None else None
+        return ExecResult(code, timed_out, message, log_path, message,
+                          error_kind=error_kind, session_id=session_id,
+                          num_turns=turns if type(turns) is int else None)
 
 
 def executor_for(name: str) -> Executor:

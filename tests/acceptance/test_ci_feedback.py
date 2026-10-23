@@ -1,5 +1,7 @@
 """Acceptance test for ci-feedback (D50). Locked by Foragent; do not edit."""
 
+import re
+
 
 def make_case(git_history, tmp_path, monkeypatch, **config_values):
     """Offline runner/CLI dependencies, shared by these acceptance files.
@@ -112,8 +114,14 @@ def test_prompt_names_the_full_test_command():
     body = ("<!-- foragent:v1 -->\n## Goal\nDo it.\n## Out of scope\nNothing.\n## Done when\n"
             "```sh\ntrue\n```\n")
     prompt = build_prompt(1, parse_body(body), "tests/acceptance/", test_command="uv run pytest -q")
-    assert "Before you finish, also run the full test suite: `uv run pytest -q`." in prompt
-    assert "Before you finish" not in build_prompt(1, parse_body(body), "tests/acceptance/")
+    # #272: CI runs the full suite; the worker is told so, not invited to run it.
+    flat = " ".join(prompt.split())
+    assert "`uv run pytest -q`" in flat
+    assert re.search(r"\bCI\b[^.]{0,120}`uv run pytest -q`|`uv run pytest -q`[^.]{0,120}\bCI\b", flat), (
+        "Name the full test command as what CI runs")
+    assert "Before you finish, also run the full test suite" not in flat
+    without = " ".join(build_prompt(1, parse_body(body), "tests/acceptance/").split())
+    assert "Before you finish, also run the full test suite" not in without
 
 
 def test_runner_passes_configured_test_command(git_history, tmp_path, monkeypatch):
