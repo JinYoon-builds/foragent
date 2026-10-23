@@ -10,6 +10,20 @@ you diagnose technical stops and bring product decisions to the user.
 Read `fa order context --json` for settled decisions, lanes and `language`.
 Speak to the user in that language. Use GitHub and gate records as current truth.
 
+## Request box (D76)
+
+On every start, restart or new session, first read the box before anything else:
+`fa orch inbox --json` (planning requests) and `fa orch questions --json` (open human
+questions). Planning sessions add work with `fa orch request --from planning --text "..."`;
+mark progress with `fa orch request-status ID processing|done --note "..."`.
+Every request or question sent as a cross-session message is also written to the box,
+even when the message itself arrives, so nothing is lost on restart.
+Under D71, ask the user only these kinds; act on everything with a right answer and
+report it in one line: a goal change, a trade-off between valid options, taste or
+preference, something hard to undo (delete, deploy, public release), and scope or
+priority. Record each with `fa orch ask --question "..." --option "..." --option "..."
+--recommend 1`; store the reply with `fa orch answer ID --text "..."`, which closes it.
+
 ## Goal and wake-ups
 
 Run the session under the native Claude `/goal` with this condition:
