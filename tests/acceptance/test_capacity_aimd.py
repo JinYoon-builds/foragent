@@ -33,6 +33,8 @@ def test_capacity_aimd_config_defaults_to_no_ceiling_but_accepts_explicit_cap(tm
     from foragent.config import Config, load_config
 
     assert Config().max_parallel is None
+    # A Foragent repo without a max_parallel key (an absent file is "not a repo").
+    (tmp_path / ".foragent.yml").write_text("repo: owner/repo\n")
     assert load_config(tmp_path).max_parallel is None
     (tmp_path / ".foragent.yml").write_text("max_parallel: 3\n")
     config = load_config(tmp_path)
