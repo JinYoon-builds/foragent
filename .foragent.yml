@@ -1,5 +1,5 @@
 review: fast
-executor: claude  # 2026-10-23: Claude quota idle (5h 3%, week 5%); reviewer becomes codex. D74 will choose per issue
+executor: codex  # 2026-10-23: back to codex — the Claude worker got "/goal" + the whole prompt (30k chars) and refused every run ("Goal condition is limited to 4000 characters"); switch back after the fix issue merges
 language: ko
 approvers:
 - JinYoon-builds
