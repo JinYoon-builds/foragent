@@ -24,6 +24,9 @@ def isolated_test_slots(tmp_path, monkeypatch):
     from foragent import capacity
 
     monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path / "machine-data")
+    # A suite started by `fa test` or the runner inherits the parent's held slot;
+    # slot tests must take real locks, not skip them.
+    monkeypatch.delenv(capacity.TEST_SLOT_ENV, raising=False)
 
 
 @pytest.fixture(autouse=True)

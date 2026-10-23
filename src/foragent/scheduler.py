@@ -215,6 +215,28 @@ def _snapshot(
     return approval
 
 
+_SNAPSHOT_CACHE: dict[Path, tuple[tuple[int, int, int], dict[int, Issue]]] = {}
+
+
+def _current_issue(ctx: TickContext, number: int) -> Issue | None:
+    """Re-read one issue from the local snapshot, which the runner updates as it works.
+
+    A tick lists issues once, but a runner process may change labels while the
+    tick visits other issues. Reparse only when the snapshot file was replaced.
+    """
+    path = ctx.store.root / "issues.json"
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    key = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    cached = _SNAPSHOT_CACHE.get(path)
+    if cached is None or cached[0] != key:
+        cached = (key, {issue.number: issue for issue in local_issue_models(ctx.store)})
+        _SNAPSHOT_CACHE[path] = cached
+    return cached[1].get(number)
+
+
 def _crash_detail(ctx: TickContext, number: int) -> str:
     # The label generation makes retries after tracker failures idempotent.
     generation = sum(
@@ -341,6 +363,9 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 dead = False
             else:
                 dead = False
+        current = ctx.store.get_run(run.number)
+        if current is None or current.status != "running" or current.started_at != run.started_at:
+            continue  # The runner recorded its own end after the list was read.
         if not dead:
             waiting = run.waiting_until is not None and ctx.now() < datetime.fromisoformat(run.waiting_until)
             runtime = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
@@ -446,6 +471,10 @@ def tick(ctx: TickContext) -> TickReport:
 def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
     if BLOCKED not in issue.labels or NEEDS_HUMAN in issue.labels:
         return issue
+    current = _current_issue(ctx, issue.number)
+    if current is None or current.state != "open" or BLOCKED not in current.labels or NEEDS_HUMAN in current.labels:
+        return current or issue
+    issue = current
     row = next(row for row in ctx.store.local_issues() if row["number"] == issue.number)
     comments = [
         comment for comment in (Comment(**item) for item in row["comments"])
@@ -668,8 +697,10 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                     unknown.add(label)
         return issue_lane(issue.labels, ctx.config.lanes)
 
-    for issue in local_issue_models(ctx.store):
-        if issue.state != "open":
+    for listed in local_issue_models(ctx.store):
+        # Act on current facts: a runner may have ended while this tick visited earlier issues.
+        issue = _current_issue(ctx, listed.number)
+        if issue is None or issue.state != "open":
             continue
         issue = _recover_orphan(ctx, issue, report)
         issue = _escalate_overdue_blocker(ctx, issue, report)
@@ -818,6 +849,13 @@ def _start_ready(
                 or issue.labels & {BLOCKED, NEEDS_HUMAN, RUNNING} or lane_for(issue) != lane
             ):
                 continue
+            local = _current_issue(ctx, number)
+            run = ctx.store.get_run(number)
+            if (
+                local is None or local.state != "open" or local.labels & {BLOCKED, NEEDS_HUMAN, RUNNING}
+                or READY not in local.labels or (run is not None and run.status == "running")
+            ):
+                continue  # A runner or person changed it locally after this tick listed it.
             if not _can_start_in_lane(ctx, lane, issue, len(ready[lane])):
                 continue
             approval = ctx.store.load_approval(number)

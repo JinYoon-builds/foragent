@@ -91,3 +91,6 @@
 
 - #217: `orch.watch()`는 읽기 예외를 `{"unknown": true, "error": str}`로 내고 `orch-watch.json`은 건드리지 않는다. 회복 강제 출력은 프로세스를 넘어 유지돼야 하므로 별도 `<state>/orch-watch-unknown.json` 표식을 쓴다(인수 시험이 orch-watch.json의 바이트 동일성을 검사). follow는 같은 오류를 반복 출력하지 않고, CLI는 one-shot에서 unknown이면 1을 반환한다. 시험: `tests/acceptance/test_watch_never_silent.py` 3개, `tests/test_orch_watcher.py` 4개.
 - #217 재시도: runner의 관련 시험 묶음에서 `test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands[True]`가 `os.killpg` EPERM으로 간헐 실패한다. 변경 전 소스에서도 3회 중 2회 재현되므로 REBUTTAL로 처리했다. 기준선을 잡을 때는 runner가 이미 커밋했을 수 있으니 HEAD가 아니라 이슈 커밋 이전 SHA를 `git archive`해야 한다.
+
+- #295: tick은 시작 때 이슈 목록을 한 번 읽지만 runner 프로세스가 tick 도중 로컬 라벨·실행 기록을 바꾼다. `scheduler._current_issue()`가 `issues.json`의 (inode, mtime, size)가 바뀔 때만 다시 파싱해 각 이슈 처리 직전·blocker 에스컬레이션·시작 직전에 최신 로컬 상태를 쓴다. `_recover_runs()`도 행동 전에 `get_run()`으로 같은 started_at의 running인지 재확인한다. 시험: `tests/acceptance/test_runner_local_labels.py` 3개, `tests/test_scheduler.py` 188개 통과.
+- 테스트 슬롯: runner·`fa test`는 하위 시험에 `FORAGENT_TEST_SLOT=held`를 물려주므로 `hold_test_slot()`이 잠금 없이 통과한다. `tests/conftest.py`의 `isolated_test_slots` fixture가 이 변수를 지워야 `tests/test_capacity.py`의 슬롯 배타성 시험 3개가 runner 안에서도 통과한다(#295 재시도에서 발견).
