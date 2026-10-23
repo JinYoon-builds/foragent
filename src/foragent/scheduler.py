@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from foragent import board, watch_open
+from foragent import board, orch_github, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitRepo
@@ -238,6 +238,11 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
     if run is not None and run.outcome == "merged":
         ctx.tracker.remove_labels(issue.number, [READY, RUNNING])
         return ctx.tracker.get_issue(issue.number)
+    if run is not None and run.outcome == "limit-wait":
+        if not issue.labels & {BLOCKED, NEEDS_HUMAN}:
+            ctx.tracker.add_labels(issue.number, [READY])
+        ctx.tracker.remove_labels(issue.number, [RUNNING])
+        return ctx.tracker.get_issue(issue.number)
     if run is not None and run.outcome in {"stalled-restart", "stalled"}:
         _restore_stalled(ctx, issue.number, run.restarts, report)
         return ctx.tracker.get_issue(issue.number)
@@ -382,7 +387,15 @@ def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired:
         if not acquired:
             return TickReport(skipped="another tick is running")
-        return _tick_locked(ctx)
+        if until := ctx.store.github_wait_until(ctx.now()):
+            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
+        try:
+            return _tick_locked(ctx)
+        except TrackerError as exc:
+            if not exc.is_rate_limit:
+                raise
+            until = orch_github.pause(ctx, exc)
+            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
 
 
 def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
@@ -439,6 +452,8 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
         try:
             _batch_pr(parent, ctx)
         except TrackerError as exc:
+            if exc.is_rate_limit:
+                raise
             report.actions.append(f"#{parent} batch PR finalization deferred: {exc}")
 
 
@@ -540,9 +555,24 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             if not _check_prerequisites(ctx, issue, approval, report):
                 continue
 
-            ctx.tracker.remove_labels(number, [READY])
-            ctx.tracker.add_labels(number, [RUNNING])
-            board.sync_status(ctx, number, "Running")
+            try:
+                ctx.tracker.remove_labels(number, [READY])
+                ctx.tracker.add_labels(number, [RUNNING])
+                board.sync_status(ctx, number, "Running")
+            except TrackerError as exc:
+                if not exc.is_rate_limit:
+                    raise
+                until = orch_github.pause(ctx, exc)
+                # A label may already say running even though no process started.
+                # Record availability, so recovery does not charge a crash.
+                ctx.store.start_run(
+                    number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number),
+                    lane=lane, tier=issue_size(issue.labels),
+                )
+                orch_github.wait_run(ctx, number, until)
+                ctx.store.finish_run(number, "limit-wait")
+                report.skipped = f"GitHub rate limit until {until.isoformat()}"
+                return report
             ctx.store.start_run(
                 number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
                 tier=issue_size(issue.labels),

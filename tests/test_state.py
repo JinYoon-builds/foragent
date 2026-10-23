@@ -115,6 +115,16 @@ def test_limit_wait_resumptions_preserve_attempts_and_restarts(store):
     assert (run.attempts, run.restarts) == (1, 0)
 
 
+def test_github_pause_is_persisted_project_wide_and_cannot_be_shortened(store):
+    until = NOW + timedelta(minutes=10)
+    assert store.pause_github(until) == until
+    reopened = StateStore(store.root)
+    assert reopened.pause_github(NOW + timedelta(minutes=1)) == until
+    assert store.github_wait_until(until - timedelta(seconds=1)) == until
+    assert reopened.github_wait_until(until) is None
+    assert not store.lane_paused("main", NOW)
+
+
 def test_executor_wait_counter_persists_separately_and_old_runs_default_to_zero(store):
     store.start_run(1, branch="branch", worktree="worktree")
     store.update_run(1, waited_seconds=1980, executor_waited_seconds=120)

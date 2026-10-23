@@ -67,6 +67,7 @@ class PullRequest:
 
 
 class Tracker(Protocol):
+    def rate_limit_reset(self) -> datetime | None: ...
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]: ...
     def list_open_issues(self) -> list[Issue]: ...
     def list_issues(self, state: str = "all") -> list[Issue]: ...
@@ -107,6 +108,24 @@ class TrackerError(RuntimeError):
         self.stdout = stdout
         self.returncode = returncode
 
+    @property
+    def is_rate_limit(self) -> bool:
+        diagnostic = f"{self}\n{self.stdout}"
+        return bool(re.search(
+            r"(?:API rate limit (?:already )?exceeded|secondary rate limit|\bHTTP(?:/\S+)?\s+429\b)",
+            diagnostic, re.I,
+        ))
+
+    @property
+    def reset_at(self) -> datetime | None:
+        match = re.search(r"^x-ratelimit-reset:\s*(\d+)\s*$", f"{self.stdout}\n{self}", re.I | re.M)
+        if match is not None:
+            try:
+                return datetime.fromtimestamp(int(match[1]), UTC)
+            except (ValueError, OverflowError, OSError):
+                pass
+        return None
+
 
 def _merge_flag(method: str) -> str:
     if method not in {"squash", "merge", "rebase"}:
@@ -115,6 +134,9 @@ def _merge_flag(method: str) -> str:
 
 
 class FakeTracker:
+    def rate_limit_reset(self) -> datetime | None:
+        return None
+
     def __init__(
         self, actor: str = "foragent-bot", now: Callable[[], datetime] | None = None,
         *, strict: bool = False,
@@ -359,6 +381,15 @@ class GhTracker:
             ) from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise TrackerError(str(exc)) from exc
+
+    def rate_limit_reset(self) -> datetime | None:
+        data = json.loads(self._call(["api", "rate_limit"]))
+        resets = [
+            datetime.fromtimestamp(window["reset"], UTC)
+            for window in data.get("resources", {}).values()
+            if window.get("remaining") == 0 and isinstance(window.get("reset"), (int, float))
+        ]
+        return max(resets, default=None)
 
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         output = self._call(["api", "graphql", "--input", "-"],

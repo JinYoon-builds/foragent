@@ -83,6 +83,46 @@ def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch):
     assert calls == []
 
 
+@pytest.mark.parametrize("entry,operation", [
+    ("review-only", "get_issue"), ("review-only", "pr_checks"),
+    ("rerun-review", "pr_checks"), ("resolve", "merge_pr"),
+])
+def test_review_rate_limit_remains_a_local_wait_including_audit_cleanup(review_case, monkeypatch, entry, operation):
+    c = review_case
+    until = c.now[0] + timedelta(minutes=10)
+    failed = False
+    followups = []
+
+    def limited(*args, **kwargs):
+        nonlocal failed
+        failed = True
+        raise runner.TrackerError("API rate limit exceeded (HTTP 403)",
+                                  stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    with monkeypatch.context() as patch:
+        for method in ("get_issue", "pr_head_sha", "add_labels", "remove_labels", "comment"):
+            original = getattr(c.tracker, method)
+
+            def tracked(*args, _method=method, _original=original, **kwargs):
+                if failed:
+                    followups.append(_method)
+                return _original(*args, **kwargs)
+
+            patch.setattr(c.tracker, method, tracked)
+        patch.setattr(c.tracker, operation, limited)
+        if entry == "review-only":
+            assert runner.review_only(1, c.ctx) == "limit-wait"
+        elif entry == "rerun-review":
+            assert "limit-wait" in orch.rerun_review(c.ctx, 1)
+        else:
+            assert "limit-wait" in orch.resolve(c.ctx, 1, "pass", "Reviewed this head")
+        assert followups == []
+    assert failed
+    assert c.store.get_run(1).waiting_until == until.isoformat()
+    assert c.store.get_run(1).outcome == "limit-wait"
+    assert c.store.load_flag(1) is None
+
+
 def test_resolve_queues_ci_repair_without_changing_the_verdict_head(review_case):
     c = review_case
     logs = "FAILED existing tests: preserve the original failure output"

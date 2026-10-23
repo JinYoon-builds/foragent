@@ -102,6 +102,39 @@ def gh_error(stderr, stdout="", code=1):
     return subprocess.CalledProcessError(code, ["gh"], output=stdout, stderr=stderr)
 
 
+@pytest.mark.parametrize("message,limited", [
+    ("gh: API rate limit exceeded for user (HTTP 403)", True),
+    ("GraphQL: API rate limit already exceeded for user", True),
+    ("You have exceeded a secondary rate limit", True),
+    ("gh: HTTP 429 Too Many Requests", True),
+    ("gh: HTTP 403 Resource not accessible by integration", False),
+    ("gh: HTTP 422 Validation Failed", False),
+    ("request timed out", False),
+])
+def test_tracker_rate_limit_diagnostics_exclude_other_errors(message, limited):
+    assert TrackerError(message).is_rate_limit is limited
+
+
+def test_tracker_rate_limit_reset_header_survives_the_real_error_boundary():
+    header = f"HTTP/2 403\r\nx-RaTeLiMiT-ReSeT: {int(NOW.timestamp())}\r\n\r\n"
+    run = ScriptedRun(gh_error("API rate limit exceeded (HTTP 403)", header))
+    with pytest.raises(TrackerError) as caught:
+        GhTracker(REPO, run).get_issue(1)
+    assert caught.value.is_rate_limit
+    assert caught.value.reset_at == NOW
+    assert len(run.calls) == 1
+
+
+def test_tracker_rate_limit_probe_uses_injected_runner_and_only_exhausted_resources():
+    run = ScriptedRun(json.dumps({"resources": {
+        "core": {"remaining": 0, "reset": int(NOW.timestamp())},
+        "graphql": {"remaining": 0, "reset": int((NOW + timedelta(minutes=5)).timestamp())},
+        "search": {"remaining": 10, "reset": int((NOW + timedelta(hours=1)).timestamp())},
+    }}))
+    assert GhTracker(REPO, run).rate_limit_reset() == NOW + timedelta(minutes=5)
+    assert run.calls == [(["api", "rate_limit"], None)]
+
+
 def issue_json(number=1, **overrides):
     return {"number": number, "title": f"Issue {number}", "body": "body", "labels": [{"name": "approved"}], "state": "open", **overrides}
 

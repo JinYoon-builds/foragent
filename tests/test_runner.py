@@ -158,7 +158,62 @@ def run_case(git_history, tmp_path, monkeypatch):
         assert not Path(run.worktree).exists()
         assert run.worktree not in git_command(git_history.clone, "worktree", "list")
         assert store.get_run(run.number).status == "finished"
-        assert "running" not in tracker.get_issue(run.number).labels
+        current = store.get_run(run.number)
+        # GitHub waits defer remote label cleanup until the reset.
+        assert "running" not in tracker.get_issue(run.number).labels or (
+            current.outcome == "limit-wait" and current.waiting_until is not None
+            and store.github_wait_until(now[0]) is not None
+        )
+
+
+@pytest.mark.parametrize("operation", ["get_issue", "pr_checks", "merge_pr", "board"])
+def test_github_limit_from_runner_stages_waits_without_followup_calls(run_case, monkeypatch, operation):
+    c = run_case
+    c.store.update_run(1, attempts=3, restarts=1)
+    until = c.now[0] + timedelta(minutes=45)
+    failed = False
+    followups = []
+
+    def limited(*args, **kwargs):
+        nonlocal failed
+        failed = True
+        raise TrackerError("API rate limit exceeded (HTTP 403)",
+                           stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    with monkeypatch.context() as patch:
+        for method in ("get_issue", "pr_head_sha", "add_labels", "remove_labels", "comment"):
+            original = getattr(c.tracker, method)
+
+            def tracked(*args, _method=method, _original=original, **kwargs):
+                if failed:
+                    followups.append(_method)
+                return _original(*args, **kwargs)
+
+            patch.setattr(c.tracker, method, tracked)
+        if operation == "board":
+            c.ctx.config = replace(c.ctx.config, board="project")
+            patch.setattr("foragent.board.set_status", limited)
+        else:
+            patch.setattr(c.tracker, operation, limited)
+        assert run_issue(1, c.ctx) == "limit-wait"
+        assert followups == []
+    assert failed
+    run = StateStore(c.store.root).get_run(1)
+    assert run.waiting_until == until.isoformat() and run.outcome == "limit-wait"
+    assert (run.attempts, run.restarts) == (3, 1)
+    assert c.store.load_flag(1) is None
+    assert not c.tracker.get_issue(1).labels & {"blocked", "needs-human"}
+
+
+def test_runner_launched_during_persisted_github_wait_stays_offline(run_case, monkeypatch):
+    c = run_case
+    until = c.now[0] + timedelta(minutes=10)
+    c.store.pause_github(until)
+    with monkeypatch.context() as patch:
+        patch.setattr(c.tracker, "get_issue", lambda *args: pytest.fail("waiting runner must stay offline"))
+        assert run_issue(1, c.ctx) == "limit-wait"
+    assert c.executor.calls == []
+    assert c.store.get_run(1).waiting_until == until.isoformat()
 
 
 @pytest.mark.parametrize("ci", ["pass", "none"])

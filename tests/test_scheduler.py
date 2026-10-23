@@ -56,6 +56,78 @@ def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
     ctx.tracker.record_label(number, "approved", actor)
 
 
+@pytest.mark.parametrize("message,limited", [
+    ("API rate limit exceeded (HTTP 403)", True),
+    ("HTTP 422 Validation Failed", False),
+])
+def test_tick_rate_limit_persists_wait_but_other_tracker_errors_raise(ctx, monkeypatch, message, limited):
+    calls = []
+    until = NOW + timedelta(minutes=10)
+
+    def unavailable():
+        calls.append("issues")
+        raise TrackerError(message, stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    monkeypatch.setattr(ctx.tracker, "list_open_issues", unavailable)
+    if not limited:
+        with pytest.raises(TrackerError, match=message):
+            tick(ctx)
+        assert ctx.store.github_wait_until(NOW) is None
+        return
+    assert "GitHub rate limit" in tick(ctx).skipped
+    ctx.store = StateStore(ctx.store.root, now=ctx.now)
+    ctx.now = lambda: until - timedelta(seconds=1)
+    monkeypatch.setattr(ctx.git, "fetch", lambda *args: pytest.fail("waiting tick must stay offline"))
+    assert "GitHub rate limit" in tick(ctx).skipped
+    assert calls == ["issues"]
+    assert ctx.store.active_runs() == []
+
+
+def test_github_wait_repairs_running_label_without_crash_or_stall_cost(ctx):
+    approve(ctx, labels=["running"])
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.update_run(1, attempts=3, restarts=1, waiting_until=NOW.isoformat())
+    ctx.store.finish_run(1, "limit-wait")
+    ctx.tracker.create_pr(head="foragent/issue-1", base="main", title="Already published", body="Closes #1")
+    ctx.start_runs = True
+    report = tick(ctx)
+    assert any("started running" in action for action in report.actions)
+    run = ctx.store.get_run(1)
+    assert (run.attempts, run.restarts, run.status) == (3, 1, "running")
+    assert ctx.store.load_flag(1) is None
+
+
+def test_github_limit_during_launch_labels_defers_without_creating_a_crash(ctx, monkeypatch):
+    approve(ctx)
+    tick(ctx)
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.update_run(1, attempts=3, restarts=1)
+    ctx.store.finish_run(1, "limit-wait")
+    ctx.start_runs = True
+    ctx.config = replace(ctx.config, board="project")
+    launches = []
+    ctx.launcher = lambda n: launches.append(n) or 7001
+    until = NOW + timedelta(minutes=10)
+
+    def status(issue, value):
+        if value == "Running":
+            raise TrackerError("API rate limit exceeded (HTTP 403)",
+                               stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    monkeypatch.setattr("foragent.board.set_status", status)
+    assert "GitHub rate limit" in tick(ctx).skipped
+    assert launches == []
+    assert ctx.tracker.get_issue(1).labels == {"approved", "running"}
+    run = ctx.store.get_run(1)
+    assert (run.outcome, run.attempts, run.restarts) == ("limit-wait", 3, 1)
+    ctx.now = lambda: until
+    monkeypatch.setattr("foragent.board.set_status", lambda *args: None)
+    tick(ctx)
+    assert launches == [1]
+    assert (ctx.store.get_run(1).attempts, ctx.store.get_run(1).restarts) == (3, 1)
+    assert ctx.store.load_flag(1) is None
+
+
 @pytest.mark.parametrize("failure,reason", [("crashed", Reason.RETRIES_EXCEEDED), ("stalled", Reason.STALLED)])
 def test_interrupted_runner_with_open_pr_stays_visible(ctx, monkeypatch, failure, reason):
     approve(ctx)
