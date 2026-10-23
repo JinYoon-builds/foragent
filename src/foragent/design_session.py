@@ -236,7 +236,7 @@ def _open_page(store: StateStore, directory: Path, args, token: str) -> str:
     with (directory / "server.log").open("w", encoding="utf-8") as log:
         process = subprocess.Popen([
             sys.executable, "-m", "foragent.cli", "design", "_serve", "--repo-root", str(args.repo_root.resolve()),
-            "--directory", str(directory), "--topic", args.topic, "--token", token,
+            "--directory", str(directory), f"--topic={args.topic}", f"--token={token}",
         ], cwd=args.repo_root.resolve(), stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
