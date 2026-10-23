@@ -4,6 +4,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import timedelta
 import json
 import shlex
+import subprocess
 
 import pytest
 
@@ -56,6 +57,12 @@ def finished_stops(git_history, tmp_path, monkeypatch, offline_acceptance):
     git_command(git_history.clone, "merge", "-q", "--ff-only", "origin/main")
     cases = {}
     for stop, outcome in STOPS.items():
+        # Cases share one origin; #270 keeps a stopped run's work on the issue
+        # branch, so start every case from a fresh branch.
+        for root, ref in ((git_history.origin, "refs/heads/foragent/issue-1"),
+                          (git_history.clone, "refs/heads/foragent/issue-1"),
+                          (git_history.clone, "refs/remotes/origin/foragent/issue-1")):
+            subprocess.run(["git", "-C", str(root), "update-ref", "-d", ref], capture_output=True)
         with monkeypatch.context() as patch:
             case = make_case(
                 git_history, tmp_path / stop, patch, skill_libraries=[],

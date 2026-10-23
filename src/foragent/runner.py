@@ -220,10 +220,12 @@ def build_prompt(
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     acceptance_rule = "" if acceptance_locked else f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
     test_rule = (
-        f"- Optional additional check: Before you finish, also run the full test suite: `{test_command}`. "
-        "Each attempt checks Done when, the acceptance baseline and related unit tests; "
-        "CI runs the full suite after publication and sends failures back for repair.\n"
-        if test_command is not None else ""
+        "- The runner runs Done when, the previously passing acceptance tests and related unit tests. "
+        f"CI runs the full suite after publication (`{test_command}`) and sends failures back for repair. "
+        if test_command is not None else "- The runner runs Done when. "
+    )
+    test_rule += (
+        "You run only the Done when tests and the tests for files you change; no parallel test helper is needed.\n"
     )
     prompt = (
         f"You are implementing GitHub issue #{n} in this repository.\n"
@@ -1599,7 +1601,7 @@ def _implement_and_publish(
             except TrackerError as exc:
                 if exc.is_rate_limit:
                     raise
-                if ctx.tracker.get_issue(n).state != "closed":
+                if ctx.tracker.current_issue(n).state != "closed":
                     raise
             ctx.tracker.remove_labels(n, [READY, RUNNING])
             board.sync_status(ctx, n, "Done")
@@ -1903,7 +1905,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         except TrackerError as exc:
             if exc.is_rate_limit:
                 raise
-            if ctx.tracker.get_issue(n).state != "closed":
+            if ctx.tracker.current_issue(n).state != "closed":
                 raise
         ctx.tracker.remove_labels(n, [READY, RUNNING, BLOCKED])
         if pr.base == batch_branch and parent is not None:
@@ -1983,7 +1985,7 @@ def review_only(
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
                     if outcome != "limit-wait":
-                        current = ctx.tracker.get_issue(n)
+                        current = ctx.tracker.current_issue(n)
                         if current.state == "open" and not current.labels & {BLOCKED, READY}:
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
                         ctx.tracker.remove_labels(n, [RUNNING])
@@ -2034,6 +2036,9 @@ def run_issue(n: int, ctx: RunContext) -> str:
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Runner exited: {exc}"
+        # A handled stop must not look like an orphan to the next tick.
+        ctx.tracker.add_labels(n, [BLOCKED])
+        ctx.tracker.remove_labels(n, [READY, RUNNING])
         raise
     finally:
         # A tick may already have finished the record while terminating this runner.

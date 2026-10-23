@@ -75,5 +75,5 @@ lanes:
     skills:
     - skill-creator
     - principle-prove-it-works
-max_parallel: 3  # 2026-10-23: 4 parallel runs made tests 4x slower (machine contention); #106 will adjust automatically
+max_parallel: 2  # 2026-10-23 20:08: swap 3.5/5 GB, related unit tests 3x slower (1,941 tests 33 min vs ~10); back up when #106/#243 manage machine capacity
 # board: PVT_kwHODvdhm84BoMtn  # paused 2026-10-23: each tick rewrote every Status (58% of GitHub calls); restore after the tick only writes changes

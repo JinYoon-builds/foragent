@@ -197,6 +197,79 @@ def test_github_wait_repairs_running_label_without_crash_or_stall_cost(ctx):
     assert ctx.store.load_flag(1) is None
 
 
+@pytest.mark.parametrize("human_change", [False, True])
+def test_outbox_reset_refreshes_before_delivery_inside_the_snapshot_window(ctx, monkeypatch, human_change):
+    remote = ctx.tracker._tracker
+    remote.add_issue(1, "Feature", labels=["blocked"])
+    tick(ctx)
+    until = NOW + timedelta(minutes=1)
+    close = remote.close_issue
+    attempts = []
+
+    def limited(number, comment=None):
+        attempts.append((number, comment))
+        if ctx.now() < until:
+            raise TrackerError("API rate limit exceeded (HTTP 403)",
+                               stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+        return close(number, comment)
+
+    monkeypatch.setattr(remote, "close_issue", limited)
+    ctx.tracker.close_issue(1, "Merged")
+    assert ctx.store.local_issues()[0]["state"] == "closed"
+    ctx.now = lambda: until - timedelta(seconds=1)
+    if human_change:
+        remote.issues[1] = replace(remote.get_issue(1), title="Human revision", labels=frozenset(),
+                                   updated_at=ctx.now().isoformat())
+    assert "GitHub rate limit" in tick(ctx).skipped
+    assert attempts == [(1, "Merged")]
+    ctx.now = lambda: until
+    tick(ctx)
+    assert ctx.store.github_outbox() == []
+    row, = ctx.store.local_issues()
+    if human_change:
+        assert attempts == [(1, "Merged")]
+        assert row["state"] == "open" and row["title"] == "Human revision"
+        assert row["comments"] == []
+        events = [json.loads(line) for line in (ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+        assert [(event["kind"], event["issue"]) for event in events] == [("outbox-dropped", 1)]
+    else:
+        assert attempts == [(1, "Merged"), (1, "Merged")]
+        assert row["state"] == remote.get_issue(1).state == "closed"
+
+
+def test_deleted_issue_outbox_does_not_block_tick_progress(ctx, monkeypatch):
+    from foragent import orch
+
+    remote = ctx.tracker._tracker
+    for number in (1, 2):
+        remote.add_issue(number, f"Question {number}", labels=["blocked"])
+    tick(ctx)
+    until = NOW + timedelta(minutes=1)
+    ctx.store.pause_github(until)
+    ctx.tracker.comment(1, "Deleted issue evidence")
+    ctx.tracker.comment(2, "Surviving evidence")
+    approve(ctx, 3)
+    del remote.issues[1]
+    comment = remote.comment
+
+    def write(number, body):
+        if number not in remote.issues:
+            raise TrackerError("gh: Not Found (HTTP 404)")
+        return comment(number, body)
+
+    monkeypatch.setattr(remote, "comment", write)
+    ctx.now = lambda: until
+    report = tick(ctx)
+
+    assert report.skipped is None
+    assert ctx.store.github_outbox() == []
+    assert [item.body for item in remote.list_comments(2)] == ["Surviving evidence"]
+    assert "ready" in remote.get_issue(3).labels
+    assert all(row["number"] != 1 for row in ctx.store.local_issues())
+    assert any(event["kind"] == "outbox-dropped" and event["issue"] == 1
+               and "issue not found" in event["summary"] for event in orch.log(ctx))
+
+
 def test_github_limit_during_launch_labels_defers_without_creating_a_crash(ctx, monkeypatch):
     approve(ctx)
     tick(ctx)
@@ -454,6 +527,56 @@ def test_running_overtime_backstop_kills_alive_runner(ctx, monkeypatch, seconds,
         assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     else:
         assert ctx.store.get_run(1).status == "running"
+
+
+def test_runtime_backstop_outbox_survives_uncollected_old_comment_after_reset(ctx, monkeypatch):
+    approve(ctx)
+    remote = ctx.tracker._tracker
+    old_comment = remote.comment(1, "Earlier discussion")
+    tick(ctx)
+    mark_running(ctx, pid=5432)
+    assert all(comment["id"] != old_comment for comment in ctx.store.local_issues()[0]["comments"])
+
+    ctx.now = lambda: NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 11)
+    ctx.store.update_run(1, last_progress_at=ctx.now().isoformat())
+    until = ctx.now() + timedelta(minutes=1)
+    add_labels = remote.add_labels
+    attempts, killed, launches = [], [], []
+    ctx.kill_runner = killed.append
+    ctx.launcher = lambda number: launches.append(number) or 7000 + number
+    ctx.start_runs = True
+
+    def limited(number, labels):
+        labels = list(labels)
+        attempts.append((number, labels))
+        if ctx.now() < until:
+            raise TrackerError("API rate limit exceeded (HTTP 403)",
+                               stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+        return add_labels(number, labels)
+
+    monkeypatch.setattr(remote, "add_labels", limited)
+    tick(ctx)
+    assert killed == [5432]
+    assert ctx.store.get_run(1).outcome == "killed"
+    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert [entry["action"] for entry in ctx.store.github_outbox()] == [
+        "add_labels", "remove_labels", "comment",
+    ]
+    assert remote.get_issue(1).labels == {"approved", "running"}
+
+    ctx.now = lambda: until
+    report = tick(ctx)
+
+    assert attempts == [(1, ["blocked"]), (1, ["blocked"])]
+    assert ctx.store.github_outbox() == []
+    assert remote.get_issue(1).labels == {"approved", "blocked"}
+    assert ctx.store.local_issues()[0]["labels"] == ["approved", "blocked"]
+    assert parse_reason(remote.list_comments(1)[-1].body) == Reason.TIMEOUT
+    assert ctx.store.get_run(1).outcome == "killed"
+    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert [run.outcome for run in ctx.store.read_history()] == ["killed"]
+    assert launches == []
+    assert report.actions == []
 
 
 @pytest.mark.parametrize("trigger", ["integrity", "timeout"])

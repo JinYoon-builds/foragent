@@ -24,6 +24,7 @@ class Issue:
     labels: frozenset[str]
     state: IssueState
     is_pull_request: bool = False
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,10 @@ class TrackerError(RuntimeError):
         ))
 
     @property
+    def is_not_found(self) -> bool:
+        return bool(re.search(r"\bHTTP(?:/\S+)?\s+404\b", f"{self}\n{self.stdout}", re.I))
+
+    @property
     def reset_at(self) -> datetime | None:
         match = re.search(r"^x-ratelimit-reset:\s*(\d+)\s*$", f"{self.stdout}\n{self}", re.I | re.M)
         if match is not None:
@@ -139,11 +144,12 @@ def local_issue_models(store) -> list[Issue]:
 
 
 class RecordingTracker:
-    """Record successful operations using their existing inputs and results, with no extra reads."""
+    """Record writes locally, optionally deferring rate-limited gate/orchestrator writes."""
 
-    def __init__(self, tracker, context):
+    def __init__(self, tracker, context, *, queue_writes=False):
         self._tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
         self._context = context
+        self.queue_writes = queue_writes
 
     @property
     def _now(self):
@@ -166,32 +172,142 @@ class RecordingTracker:
 
         return observe
 
+    def _pending_issues(self):
+        pending = {entry["issue"] for entry in self._context.store.github_outbox()}
+        if not pending:
+            return {}
+        return {issue.number: issue for issue in local_issue_models(self._context.store)
+                if issue.number in pending}
+
+    def current_issue(self, n):
+        """Read local intent while delivery is pending, otherwise observe GitHub."""
+        if (issue := self._pending_issues().get(n)) is not None:
+            return issue
+        return self.get_issue(n)
+
+    def sub_issues(self, n):
+        children = self._tracker.sub_issues(n)
+        pending = self._pending_issues()
+        return [pending.get(child.number, child) for child in children]
+
+    def _outbox_dropped(self, number, reason):
+        from foragent.orch_events import append_event
+
+        append_event(self._context.store, self._context.now(), number, "outbox-dropped",
+                     f"#{number}: dropped queued GitHub writes: {reason}")
+
     def refresh_issues(self):
         """Publish a bulk observation once, preserving writes made during its reads."""
         from foragent.labels import BLOCKED
 
         store = self._context.store
         revision = store.issues_revision()
+        pending = {entry["issue"] for entry in store.github_outbox()}
         issues = self.list_issues()
         # These observations belong to the batch; recording them individually
         # would overwrite concurrent writes before the final version check.
         prs = self._tracker.list_prs("merged", "foragent/")
-        comments = {issue.number: [asdict(comment) for comment in self._tracker.list_comments(issue.number)]
-                    for issue in issues
-                    if issue.state == "open" and not issue.is_pull_request and BLOCKED in issue.labels}
-        store.refresh_local_issues(issues, prs, self._context.config.lanes, self._context.now(),
-                                   comments=comments, since_revision=revision)
+        comments, missing = {}, set()
+        for issue in issues:
+            if issue.is_pull_request or not (
+                issue.number in pending or issue.state == "open" and BLOCKED in issue.labels
+            ):
+                continue
+            try:
+                comments[issue.number] = [asdict(comment) for comment in self._tracker.list_comments(issue.number)]
+            except TrackerError as exc:
+                if not exc.is_not_found or not self._issue_missing(issue.number):
+                    raise
+                missing.add(issue.number)
+        issues = [issue for issue in issues if issue.number not in missing]
+        dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, self._context.now(),
+                                            comments=comments, since_revision=revision)
+        observed = {issue.number for issue in issues}
+        for number in dropped:
+            reason = "remote change" if number in observed else "issue not found"
+            self._outbox_dropped(number, reason)
+
+    def _issue_missing(self, number):
+        """A missing write resource alone does not prove that its issue is gone."""
+        try:
+            self._tracker.get_issue(number)
+        except TrackerError as exc:
+            if exc.is_not_found:
+                return True
+            raise
+        return False
+
+    def _write(self, n, action, operation, **payload):
+        store = self._context.store
+        pending = store.github_outbox()
+        if (any(entry["issue"] == n for entry in pending)
+                or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
+            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+        try:
+            return operation(), None
+        except TrackerError as exc:
+            if not self.queue_writes or not exc.is_rate_limit:
+                raise
+            from foragent.orch_github import pause
+
+            pause(self._context, exc)
+            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+
+    def flush_outbox(self):
+        """Deliver an already refreshed FIFO; a renewed limit leaves its tail intact."""
+        from foragent.orch_github import pause
+
+        store = self._context.store
+        dropped = set()
+        for entry in store.github_outbox():
+            number, action = entry["issue"], entry["action"]
+            if number in dropped:
+                continue
+            try:
+                if action == "remove_labels":
+                    labels = entry["labels"]
+                    for index, label in enumerate(labels):
+                        self._tracker.remove_labels(number, [label])
+                        store.deliver_github_write(entry, remaining_labels=labels[index + 1:])
+                elif action == "update_issue":
+                    self._tracker.update_issue(number, title=entry["title"], body=entry["body"])
+                    store.deliver_github_write(entry)
+                else:
+                    payload = entry["labels"] if action == "add_labels" else entry["body"]
+                    result = getattr(self._tracker, action)(number, payload)
+                    store.deliver_github_write(entry, comment_id=result if action == "comment" else None)
+            except TrackerError as exc:
+                try:
+                    if exc.is_not_found and self._issue_missing(number):
+                        store.drop_missing_github_issue(number)
+                        self._outbox_dropped(number, "issue not found")
+                        dropped.add(number)
+                        continue
+                except TrackerError as lookup_error:
+                    exc = lookup_error
+                if not exc.is_rate_limit:
+                    raise exc
+                pause(self._context, exc)
+                return
 
     def add_labels(self, n, labels):
         labels = list(labels)
-        result = self._tracker.add_labels(n, labels)
+        if not labels:
+            return
+        result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), labels=labels)
+        if queued:
+            return
         if isinstance(result, Issue):
             self._context.store.record_issue(result, self._context.config.lanes)
         self._context.store.record_labels(n, labels, remove=False, lanes=self._context.config.lanes)
 
     def remove_labels(self, n, labels):
-        for label in labels:
-            result = self._tracker.remove_labels(n, [label])
+        labels = list(labels)
+        for index, label in enumerate(labels):
+            result, queued = self._write(n, "remove_labels", lambda: self._tracker.remove_labels(n, [label]),
+                                         labels=labels[index:])
+            if queued:
+                break
             if isinstance(result, Issue):
                 self._context.store.record_issue(result, self._context.config.lanes)
             self._context.store.record_labels(n, [label], remove=True, lanes=self._context.config.lanes)
@@ -202,7 +318,9 @@ class RecordingTracker:
         return comments
 
     def comment(self, n, body):
-        identity = self._tracker.comment(n, body)
+        identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), body=body)
+        if queued:
+            return -queued["id"]
         self._context.store.record_comments(n, [{"id": identity, "body": body,
             "author": "foragent", "created_at": self._context.now().astimezone(UTC).isoformat()}], append=True)
         return identity
@@ -215,15 +333,16 @@ class RecordingTracker:
         return n
 
     def update_issue(self, n, *, title, body):
-        self._tracker.update_issue(n, title=title, body=body)
-        self._context.store.update_local_issue(n, title=title, body=body)
+        _, queued = self._write(n, "update_issue", lambda: self._tracker.update_issue(n, title=title, body=body),
+                                title=title, body=body)
+        if not queued:
+            self._context.store.update_local_issue(n, title=title, body=body)
 
     def close_issue(self, n, comment=None):
-        if comment is None:
-            self._tracker.close_issue(n)
-        else:
-            self._tracker.close_issue(n, comment)
-        self._context.store.update_local_issue(n, state="closed")
+        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
+                               else self._tracker.close_issue(n, comment), body=comment)
+        if not queued:
+            self._context.store.update_local_issue(n, state="closed")
 
     def record_board_value(self, n, project, field, value):
         self._context.store.record_board_value(n, project, field, value)
@@ -509,7 +628,7 @@ def _issue(data: dict[str, Any]) -> Issue:
     return Issue(
         data["number"], data["title"], data.get("body") or "",
         frozenset(label["name"] for label in data.get("labels", [])),
-        data["state"], "pull_request" in data,
+        data["state"], "pull_request" in data, data.get("updated_at"),
     )
 
 

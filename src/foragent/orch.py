@@ -19,7 +19,7 @@ from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.processes import run_logged
 from foragent.runner import RunContext, review_only
-from foragent.tracker import Comment, Issue, PullRequest, TrackerError, pr_issue_number
+from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
 
 class OrchError(ValueError):
@@ -65,7 +65,7 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
 
 
 def _issue(ctx: RunContext, n: int) -> Issue:
-    issue = ctx.tracker.get_issue(n)
+    issue = RecordingTracker(ctx.tracker, ctx).get_issue(n)
     if issue.is_pull_request or issue.state != "open":
         raise OrchError(f"#{n} must be an open issue")
     run = ctx.store.get_run(n)
@@ -82,10 +82,11 @@ def _text(value: str, name: str) -> str:
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = ()) -> dict:
     event = append_event(ctx.store, ctx.now(), n, kind, summary)
-    if ctx.store.github_wait_until(ctx.now()) is not None:
+    if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
         return event
+    tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     for number in ([n] if n is not None else issues):
-        ctx.tracker.comment(number, "<!-- foragent:orch -->\n" + event["summary"])
+        tracker.comment(number, "<!-- foragent:orch -->\n" + event["summary"])
     return event
 
 
@@ -119,6 +120,7 @@ def list_blocked(ctx: RunContext) -> list[dict]:
 
 
 def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
+    tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     path = ctx.store.root / "hints" / f"{n}.txt"
     if hint is not None:
         ctx.store._atomic_write(path, hint)
@@ -127,8 +129,8 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         ctx.tracker.close_pr(pr, "Closed by Foragent orchestrator retry")
     # Establish the destination before clearing the old state, including on errors.
-    ctx.tracker.add_labels(n, [READY])
-    ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
+    tracker.add_labels(n, [READY])
+    tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
 
 
 def retry(ctx: RunContext, n: int, hint: str | None = None) -> str:
@@ -160,7 +162,8 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str) -> str:
     if pr is None:
         raise OrchError(f"issue #{n} has no open Foragent PR")
     head = ctx.tracker.pr_head_sha(pr)
-    ctx.tracker.comment(n, f"<!-- foragent:orch-verdict pr={pr} head={head} verdict={verdict} -->\n{note}")
+    RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
+        n, f"<!-- foragent:orch-verdict pr={pr} head={head} verdict={verdict} -->\n{note}")
     outcome = "interrupted"
     try:
         if verdict == "fail":
@@ -191,9 +194,10 @@ def escalate(ctx: RunContext, n: int, summary: str, tried: str,
     if options:
         lines.extend(["", "Options:", *(f"{i}. {option}" + (" (recommended)" if i == recommend else "")
                                            for i, option in enumerate(options, 1))])
-    ctx.tracker.comment(n, "\n".join(lines))
-    ctx.tracker.add_labels(n, [NEEDS_HUMAN])
-    ctx.tracker.remove_labels(n, [READY])
+    tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
+    tracker.comment(n, "\n".join(lines))
+    tracker.add_labels(n, [NEEDS_HUMAN])
+    tracker.remove_labels(n, [READY])
     event_summary = f"#{n}: escalated to human; {summary}; tried: {tried}"
     _event(ctx, n, "escalate", event_summary)
     return event_summary
@@ -310,8 +314,9 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     ci = ctx.tracker.pr_checks(n)
     if ci not in {"pass", "none"}:
         raise OrchError(f"PR #{n} is not ready: CI {ci}")
-    ctx.tracker.comment(n, f"Approved by {approved_by} in the orchestrator ({at}). "
-                          f"Pre-merge: tests pass, no conflicts, CI {ci}.")
+    RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
+        n, f"Approved by {approved_by} in the orchestrator ({at}). "
+           f"Pre-merge: tests pass, no conflicts, CI {ci}.")
     ctx.tracker.merge_pr(n, expected_head_sha=checked.head)
     summary = f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; tests pass, no conflicts, CI {ci}"
     _event(ctx, None, "merge", summary)
