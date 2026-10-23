@@ -4541,3 +4541,24 @@ def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp
     run = store.get_run(1)
     assert run.waited_seconds == 600.0
     assert run.waiting_until is None
+
+
+def test_bug_fix_steps_only_for_bug_label_and_points_to_reference_when_present(tmp_path):
+    from foragent.runner import BUG_FIX_REFERENCE, bug_fix_steps
+
+    assert bug_fix_steps({"approved", "running"}, tmp_path) is None
+    steps = bug_fix_steps({"approved", "bug"}, tmp_path)
+    assert steps is not None and "Reproduce" in steps and "failing regression test first" in steps
+    assert BUG_FIX_REFERENCE not in steps
+    reference = tmp_path / BUG_FIX_REFERENCE
+    reference.parent.mkdir(parents=True)
+    reference.write_text("# Bug fix\n", encoding="utf-8")
+    assert BUG_FIX_REFERENCE in bug_fix_steps(["bug"], tmp_path)
+
+
+def test_build_prompt_carries_procedure_only_when_given():
+    parsed = parse_body(BODY)
+    plain = build_prompt(1, parsed, "tests/acceptance/")
+    with_steps = build_prompt(1, parsed, "tests/acceptance/", procedure="This issue is a bug.\n")
+    assert "This issue is a bug." not in plain
+    assert with_steps == plain + "\nThis issue is a bug.\n"

@@ -1,6 +1,6 @@
 """Execute, independently check and review one approved snapshot."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -210,6 +210,31 @@ def goal_condition(acceptance_dir: str) -> str:
     return prefix + acceptance_dir[:3500 - len(prefix) - len(suffix)] + suffix
 
 
+BUG_LABEL = "bug"
+BUG_FIX_REFERENCE = "skills/fa-orchestrator/references/bug-fix.md"
+# Key steps of the adapted pstack bug-fix procedure (MIT); the full text is BUG_FIX_REFERENCE.
+BUG_FIX_STEPS = (
+    "This issue is a bug. Follow these steps:\n"
+    "1. Reproduce the bug on the surface where it was reported before changing anything.\n"
+    "2. Rule out hypotheses with runtime evidence until one survives. Do not guess; when the state is "
+    "unclear, add logging or instrumentation and read its output.\n"
+    "3. Plan the smallest fix of the root cause that the evidence justifies; revert changes "
+    "that refuted hypotheses motivated.\n"
+    "4. Write a failing regression test first, and see it fail before you change the code.\n"
+    "5. Confirm the fix on the same surface as the reproduction.\n"
+    "6. Report the root cause and the evidence (failing-then-passing output) in your final message.\n"
+)
+
+
+def bug_fix_steps(labels: Iterable[str], worktree: Path) -> str | None:
+    """Return the bug-fix procedure for bug-labeled issues, else None."""
+    if BUG_LABEL not in labels:
+        return None
+    if (worktree / BUG_FIX_REFERENCE).is_file():
+        return BUG_FIX_STEPS + f"The full procedure is in `{BUG_FIX_REFERENCE}`.\n"
+    return BUG_FIX_STEPS
+
+
 def build_prompt(
     n: int, parsed: ParsedIssue, acceptance_dir: str, failure: str = "", language: str = "en",
     *, native_goal: bool = False, acceptance_locked: bool = False,
@@ -217,6 +242,7 @@ def build_prompt(
     reviewer_text: str | None = None,
     orchestrator_hint: str | None = None,
     test_command: str | None = None,
+    procedure: str | None = None,
     acceptance_baseline: tuple[str, ...] = (),
     failure_limit: int | None = 4000,
 ) -> str:
@@ -266,6 +292,8 @@ def build_prompt(
         "  steps:\n"
         "  - <what to click or type>\n"
     )
+    if procedure is not None:
+        prompt += "\n" + procedure
     if reviewer_text is not None:
         prompt += "\nA reviewer said (verbatim):\n" + reviewer_text
     elif failure:
@@ -1369,6 +1397,7 @@ def _implement_and_publish(
             reviewer_text=reviewer_text,
             orchestrator_hint=hint,
             test_command=test_command,
+            procedure=bug_fix_steps(issue.labels, worktree),
             acceptance_baseline=baseline.node_ids if baseline else (),
             failure_limit=None if isinstance(failure, CIFailure) else 4000,
         )

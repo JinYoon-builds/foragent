@@ -97,3 +97,5 @@
 - #201(D76 요청함): `orch_inbox.py`가 `<state>/inbox/requests|questions/<id>.json`에 한 건씩 저장한다(id `r1`·`q1`, state lock 안 순번). CLI는 Git·GhTracker 준비 전 `INBOX_ACTIONS`로 먼저 분기해 GitHub 호출이 없다. 인수 시험은 실패한 명령 뒤 state 아래 모든 `*.json` 바이트 동일성을 보므로 검증은 쓰기 전에 끝낸다. 경계 시험 `tests/test_orch_inbox_unit.py`. 스킬 정규식 관련 인수 시험 28개는 변경 전후 동일하게 실패(다른 이슈 미구현). 이전 시도가 GitHub 403 한도로 PR 생성에 실패하면 작업공간이 재생성되어 미커밋 변경은 사라진다.
 
 - #202: `orch_inbox`에 `plan-heartbeat.json`(120초 이내면 alive)과 `route_question()`을 두고, CLI `ask`가 기획 세션이 없을 때만 `notify.send`를 호출한다(모듈 속성 호출이라 시험의 send 교체가 먹힌다). `fa brief`는 #113 전이라 `brief.py`에 `questions_open`만 있는 최소 판으로 만들었다; #113이 같은 payload를 확장한다. `tests/acceptance/test_orch_ask_rule.py` 3개는 HEAD 스킬에서도 실패하는 다른 이슈 범위다.
+
+- #274(D79): pstack 절차서 4개는 `skills/fa-orchestrator/references/`. SKILL.md는 150줄 상한(test_orch_skill)이라 새 규칙을 넣을 땐 기존 문단을 다시 줄바꿈해 맞춘다. Foragent는 skills를 패키지 데이터로 싣지 않으므로 runner의 `BUG_FIX_STEPS`(bug 라벨용) 본문은 runner에 두고, 작업공간에 참조 파일이 있을 때만 경로를 덧붙인다. 같은 스킬 인수 묶음의 fa_entry·orch_ask_rule·fa_order_break_it 9개는 변경 전에도 실패. `tests/test_runner.py` 전체는 약 34분.
