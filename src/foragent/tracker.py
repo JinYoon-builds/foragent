@@ -1,7 +1,7 @@
 """Issue tracking interfaces, an in-memory fake, and an offline-testable gh adapter."""
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import json
 import re
@@ -81,8 +81,8 @@ class Tracker(Protocol):
     def blocked_by(self, n: int) -> list[Dependency]: ...
     def parent_of(self, n: int) -> int | None: ...
     def sub_issues(self, n: int) -> list[Issue]: ...
-    def add_labels(self, n: int, labels: Iterable[str]) -> None: ...
-    def remove_labels(self, n: int, labels: Iterable[str]) -> None: ...
+    def add_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
+    def remove_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
     def comment(self, n: int, body: str) -> int: ...
     def list_comments(self, n: int) -> list[Comment]: ...
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int: ...
@@ -125,6 +125,148 @@ class TrackerError(RuntimeError):
             except (ValueError, OverflowError, OSError):
                 pass
         return None
+
+
+def pr_issue_number(head: str) -> int | None:
+    match = re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", head)
+    return int(match[1]) if match else None
+
+
+def local_issue_models(store) -> list[Issue]:
+    return [Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
+            for row in store.local_issues()]
+
+
+class RecordingTracker:
+    """Record successful operations using their existing inputs and results, with no extra reads."""
+
+    def __init__(self, tracker, context):
+        self._tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
+        self._context = context
+
+    @property
+    def _now(self):
+        return self._tracker._now
+
+    @_now.setter
+    def _now(self, value):
+        self._tracker._now = value
+
+    def __getattr__(self, name):
+        value = getattr(self._tracker, name)
+        if not callable(value):
+            return value
+
+        def observe(*args, **kwargs):
+            result = value(*args, **kwargs)
+            if isinstance(result, Issue):
+                self._context.store.record_issue(result, self._context.config.lanes)
+            return result
+
+        return observe
+
+    def refresh_issues(self):
+        """Publish a bulk observation once, preserving writes made during its reads."""
+        from foragent.labels import BLOCKED
+
+        store = self._context.store
+        revision = store.issues_revision()
+        issues = self.list_issues()
+        # These observations belong to the batch; recording them individually
+        # would overwrite concurrent writes before the final version check.
+        prs = self._tracker.list_prs("merged", "foragent/")
+        comments = {issue.number: [asdict(comment) for comment in self._tracker.list_comments(issue.number)]
+                    for issue in issues
+                    if issue.state == "open" and not issue.is_pull_request and BLOCKED in issue.labels}
+        store.refresh_local_issues(issues, prs, self._context.config.lanes, self._context.now(),
+                                   comments=comments, since_revision=revision)
+
+    def add_labels(self, n, labels):
+        labels = list(labels)
+        result = self._tracker.add_labels(n, labels)
+        if isinstance(result, Issue):
+            self._context.store.record_issue(result, self._context.config.lanes)
+        self._context.store.record_labels(n, labels, remove=False, lanes=self._context.config.lanes)
+
+    def remove_labels(self, n, labels):
+        for label in labels:
+            result = self._tracker.remove_labels(n, [label])
+            if isinstance(result, Issue):
+                self._context.store.record_issue(result, self._context.config.lanes)
+            self._context.store.record_labels(n, [label], remove=True, lanes=self._context.config.lanes)
+
+    def list_comments(self, n):
+        comments = self._tracker.list_comments(n)
+        self._context.store.record_comments(n, [asdict(comment) for comment in comments])
+        return comments
+
+    def comment(self, n, body):
+        identity = self._tracker.comment(n, body)
+        self._context.store.record_comments(n, [{"id": identity, "body": body,
+            "author": "foragent", "created_at": self._context.now().astimezone(UTC).isoformat()}], append=True)
+        return identity
+
+    def create_issue(self, title, body, labels):
+        labels = list(labels)
+        n = self._tracker.create_issue(title, body, labels)
+        self._context.store.record_issue(Issue(n, title, body, frozenset(labels), "open"),
+                                         self._context.config.lanes)
+        return n
+
+    def update_issue(self, n, *, title, body):
+        self._tracker.update_issue(n, title=title, body=body)
+        self._context.store.update_local_issue(n, title=title, body=body)
+
+    def close_issue(self, n, comment=None):
+        if comment is None:
+            self._tracker.close_issue(n)
+        else:
+            self._tracker.close_issue(n, comment)
+        self._context.store.update_local_issue(n, state="closed")
+
+    def record_board_value(self, n, project, field, value):
+        self._context.store.record_board_value(n, project, field, value)
+
+    def _record_pr(self, pr, head, base=None, *, merged=False):
+        if (number := pr_issue_number(head)) is not None:
+            fields = {"pr_number": pr, "pr_head": head, "merged": merged}
+            if base is not None:
+                fields["pr_base"] = base
+            self._context.store.update_local_issue(number, **fields)
+
+    def find_pr(self, head):
+        pr = self._tracker.find_pr(head)
+        if pr is not None:
+            self._record_pr(pr, head)
+        return pr
+
+    def list_prs(self, state="open", head_prefix=""):
+        prs = self._tracker.list_prs(state, head_prefix)
+        for pr in prs:
+            self._record_pr(pr.number, pr.head, pr.base, merged=pr.merged_at is not None)
+        return prs
+
+    def create_pr(self, *, head, base, title, body):
+        pr = self._tracker.create_pr(head=head, base=base, title=title, body=body)
+        self._record_pr(pr, head, base)
+        return pr
+
+    def update_pr(self, pr, *, base, title, body):
+        self._tracker.update_pr(pr, base=base, title=title, body=body)
+        self._record_pr_state(pr, pr_base=base)
+
+    def _record_pr_state(self, pr, **fields):
+        for row in self._context.store.local_issues():
+            if row["pr_number"] == pr:
+                self._context.store.update_local_issue(row["number"], **fields)
+
+    def close_pr(self, pr, comment=None):
+        self._tracker.close_pr(pr, comment)
+        self._record_pr_state(pr, pr_number=None, merged=False)
+
+    def merge_pr(self, pr, *, expected_head_sha, method="squash"):
+        self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
+        self._record_pr_state(pr, merged=True)
 
 
 def _merge_flag(method: str) -> str:
@@ -202,11 +344,12 @@ class FakeTracker:
     def get_issue(self, n: int) -> Issue:
         return self.issues[n]
 
-    def edit_body(self, n: int, body: str) -> None:
+    def edit_body(self, n: int, body: str) -> Issue:
         issue = self.get_issue(n)
         if issue.body != body:
             self.issues[n] = replace(issue, body=body)
             self._body_edits[n] = self._timestamp()
+        return self.get_issue(n)
 
     def body_last_edited_at(self, n: int) -> str | None:
         return self._body_edits.get(n)
@@ -230,25 +373,28 @@ class FakeTracker:
     def sub_issues(self, n: int) -> list[Issue]:
         return [self.get_issue(child) for child, parent in self._parents.items() if parent == n]
 
-    def record_label(self, n: int, label: str, actor: str) -> None:
+    def record_label(self, n: int, label: str, actor: str) -> Issue:
         issue = self.get_issue(n)
         self._events.setdefault(n, []).append(LabelEvent(label, "labeled", actor, self._timestamp()))
         self.issues[n] = replace(issue, labels=issue.labels | {label})
+        return self.issues[n]
 
-    def add_labels(self, n: int, labels: Iterable[str]) -> None:
+    def add_labels(self, n: int, labels: Iterable[str]) -> Issue:
         labels = list(labels)
         if self.strict and "approved" in labels:
             raise AssertionError("gate and runner must never add the approved label")
         for label in labels:
             if label not in self.get_issue(n).labels:
                 self.record_label(n, label, self.actor)
+        return self.get_issue(n)
 
-    def remove_labels(self, n: int, labels: Iterable[str]) -> None:
+    def remove_labels(self, n: int, labels: Iterable[str]) -> Issue:
         for label in labels:
             issue = self.get_issue(n)
             if label in issue.labels:
                 self._events.setdefault(n, []).append(LabelEvent(label, "unlabeled", self.actor, self._timestamp()))
                 self.issues[n] = replace(issue, labels=issue.labels - {label})
+        return self.get_issue(n)
 
     def comment(self, n: int, body: str) -> int:
         comment = Comment(self._next_comment_id, self.actor, body, self._timestamp())
