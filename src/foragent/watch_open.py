@@ -99,10 +99,20 @@ def open_view(repo_root: Path, store: StateStore, language: str = "en") -> None:
             _call([executable, "terminal", "split", "--terminal", handle,
                    "--direction", "horizontal", "--command", command], root)
         else:
+            tmux = shutil.which("tmux") if os.environ.get("TMUX") else None
+            if tmux:
+                _call([tmux, "split-window", "-h", "-c", str(root), command], root)
+                return
             osascript = shutil.which("osascript")
             if not osascript:
-                raise OSError("no terminal opener available")
-            script = 'tell application "Terminal" to do script ' + json.dumps(command, ensure_ascii=False)
+                manual = shlex.join(["fa", "gate", "watch", "--repo-root", str(root)])
+                print("foragent: " + text("watch_open_manual", language, command=manual), file=sys.stderr)
+                return
+            quoted = json.dumps(command, ensure_ascii=False)
+            if os.environ.get("TERM_PROGRAM") == "iTerm.app":
+                script = 'tell application "iTerm2" to create window with default profile command ' + quoted
+            else:
+                script = 'tell application "Terminal" to do script ' + quoted
             _call([osascript, "-e", script], root)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         # Subprocess output is suppressed; every failure stays on one short line.
