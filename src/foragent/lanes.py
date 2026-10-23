@@ -95,7 +95,8 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     destination.write_text(
         f"---\n{header}---\n"
         f"You implement one GitHub issue at a time in this repository's {name} lane ({areas}).\n"
-        "Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.\n",
+        "Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.\n"
+        "Run tests with `fa test <pytest args>`; it waits for a machine-wide test slot.\n",
         encoding="utf-8",
     )
     published = lane_files(root, name, installed)

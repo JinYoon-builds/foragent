@@ -197,8 +197,19 @@ class RecordingTracker:
                      f"#{number}: dropped queued GitHub writes: {reason}")
 
     def refresh_issues(self):
-        """Publish a bulk observation once, preserving writes made during its reads."""
-        from foragent.labels import BLOCKED
+        """Publish a bulk observation once, preserving writes made during its reads.
+
+        A failed read leaves the last snapshot intact and records the failure,
+        so local readers report stale data instead of an empty queue.
+        """
+        try:
+            self._refresh_issues()
+        except TrackerError as exc:
+            self._context.store.record_issues_refresh_failure(" ".join(str(exc).split()), self._context.now())
+            raise
+
+    def _refresh_issues(self):
+        from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY
 
         store = self._context.store
         revision = store.issues_revision()
@@ -206,11 +217,12 @@ class RecordingTracker:
         issues = self.list_issues()
         # These observations belong to the batch; recording them individually
         # would overwrite concurrent writes before the final version check.
-        prs = self._tracker.list_prs("merged", "foragent/")
+        # Open PRs come last so a new PR wins over an older merged one for the same issue.
+        prs = self._tracker.list_prs("merged", "foragent/") + self._tracker.list_prs("open", "foragent/")
         comments, missing = {}, set()
         for issue in issues:
             if issue.is_pull_request or not (
-                issue.number in pending or issue.state == "open" and BLOCKED in issue.labels
+                issue.number in pending or issue.state == "open" and issue.labels & {BLOCKED, NEEDS_HUMAN}
             ):
                 continue
             try:
@@ -220,8 +232,16 @@ class RecordingTracker:
                     raise
                 missing.add(issue.number)
         issues = [issue for issue in issues if issue.number not in missing]
+        # Order edges and dependencies let views group work without per-frame reads.
+        open_issues = [issue for issue in issues if issue.state == "open" and not issue.is_pull_request]
+        parents = {child.number: issue.number for issue in open_issues
+                   for child in self._tracker.sub_issues(issue.number)}
+        blocked_by = {issue.number: [{"number": dep.number, "state": dep.state}
+                                     for dep in self._tracker.blocked_by(issue.number)]
+                      for issue in open_issues if issue.labels & {APPROVED, READY}}
         dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, self._context.now(),
-                                            comments=comments, since_revision=revision)
+                                            comments=comments, since_revision=revision, parents=parents,
+                                            blocked_by=blocked_by, complete_prs=True)
         observed = {issue.number for issue in issues}
         for number in dropped:
             reason = "remote change" if number in observed else "issue not found"

@@ -1,15 +1,22 @@
-"""Promote approved issues and launch one runner per available lane."""
+"""Promote approved issues and launch runners within lane and project budgets."""
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from fnmatch import translate
+from glob import has_magic
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
 from foragent import board, orch_github, watch_open
 from foragent.actions import flag, invalidate_approval
+from foragent.capacity import (
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, machine_load, machine_lock, machine_runs, next_parallel, read_state,
+    update_test_slots, write_state,
+)
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
@@ -322,7 +329,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
     for run in ctx.store.active_runs():
         if run.pid is None:
             dead = (
-                ctx.now() - datetime.fromisoformat(run.started_at) >= timedelta(minutes=2)
+                ctx.now() - datetime.fromisoformat(run.started_at) >= LAUNCH_GRACE
                 and not ctx.runner_process_exists(run.number)
             )
         else:
@@ -498,12 +505,153 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
             report.actions.append(f"#{parent} batch PR finalization deferred: {exc}")
 
 
+def _filesystem_case_sensitive(repo_root: Path) -> bool | None:
+    """Probe an existing root entry without creating or modifying any files."""
+    try:
+        for entry in repo_root.iterdir():
+            alternate = entry.with_name(entry.name.swapcase())
+            if alternate == entry:
+                continue
+            try:
+                original_stat = entry.stat()
+                try:
+                    alternate_stat = alternate.stat()
+                except FileNotFoundError:
+                    return True
+            except OSError:
+                continue
+            return not os.path.samestat(original_stat, alternate_stat)
+    except OSError:
+        pass
+    return None
+
+
+def _file_patterns_overlap(left: str, right: str, *, case_sensitive: bool = True) -> bool:
+    """Intersect path globs, including files that do not exist yet.
+
+    As in policy._matches, * and ? stay in a component; ** spans components.
+    Walking pairs of glob positions accounts for both patterns' wildcards.
+    """
+    def intersect(a, b, star: str, compatible: Callable[[str, str], bool]) -> bool:
+        pending, seen = [(0, 0)], set()
+        while pending:
+            i, j = pending.pop()
+            if (i, j) in seen:
+                continue
+            seen.add((i, j))
+            if i == len(a) and j == len(b):
+                return True
+            if i < len(a) and a[i] == star:
+                pending.append((i + 1, j))
+            if j < len(b) and b[j] == star:
+                pending.append((i, j + 1))
+            if i < len(a) and j < len(b) and compatible(a[i], b[j]):
+                pending.append((i + (a[i] != star), j + (b[j] != star)))
+        return False
+
+    def tokens(pattern: str):
+        i = 0
+        while i < len(pattern):
+            start, i = i, i + 1
+            if pattern[start] == "[":
+                end = i
+                if end < len(pattern) and pattern[end] == "!":
+                    end += 1
+                if end < len(pattern) and pattern[end] == "]":
+                    end += 1
+                while end < len(pattern) and pattern[end] != "]":
+                    end += 1
+                if end < len(pattern):
+                    i = end + 1
+            yield pattern[start:i]
+
+    def components_overlap(a: str, b: str) -> bool:
+        # Full case folding covers literal filesystem aliases such as ß/ss.
+        # Leave globs unchanged so ? and character classes keep their width.
+        if (
+            not case_sensitive and not (a + b).isascii()
+            and not has_magic(a) and not has_magic(b) and a.casefold() == b.casefold()
+        ):
+            return True
+        # Literal/range endpoints and their successors represent every distinct
+        # character class membership when matching case-sensitively.
+        alphabet = {"\x01"} | {
+            chr(code) for char in a + b for code in (ord(char), ord(char) + 1)
+            if 0 < code <= 0x10ffff and code != ord("/")
+        }
+        if not case_sensitive:
+            alphabet.update(chr(code) for code in range(1, 128) if code != ord("/"))
+        a_tokens, b_tokens = tuple(tokens(a)), tuple(tokens(b))
+        # Apply case equivalence to each token, preserving its width and the
+        # original character classes (including punctuation inside [A-z]).
+        matchers = {
+            token: re.compile(translate(token), 0 if case_sensitive else re.IGNORECASE)
+            for token in set(a_tokens + b_tokens)
+        }
+
+        def compatible(x: str, y: str) -> bool:
+            if any(matchers[x].fullmatch(c) and matchers[y].fullmatch(c) for c in alphabet):
+                return True
+            # Unicode case mappings inside classes need not be monotonic, so
+            # endpoints alone cannot prove two nonliteral tokens disjoint.
+            return (
+                not case_sensitive and not (x + y).isascii()
+                and (len(x) > 1 or x in ("*", "?"))
+                and (len(y) > 1 or y in ("*", "?"))
+            )
+
+        return intersect(
+            a_tokens, b_tokens, "*", compatible,
+        )
+
+    return intersect(PurePosixPath(left).parts, PurePosixPath(right).parts, "**", components_overlap)
+
+
+def _lane_has_room(running: int, waiting: int) -> bool:
+    """A lane runs one issue, or a second clone while two or more issues wait."""
+    return running == 0 or (running == 1 and waiting >= 2)
+
+
+def _can_start_in_lane(ctx: TickContext, lane: str, issue: Issue, waiting: int) -> bool:
+    running = [run for run in ctx.store.active_runs() if run.lane == lane]
+    if not running:
+        return True
+    if not _lane_has_room(len(running), waiting):
+        return False
+    approval = ctx.store.load_approval(issue.number)
+    run = running[0]
+    running_approval = ctx.store.load_approval(run.number)
+    if approval is None or running_approval is None:
+        return False
+    # The approval file can be replaced while the runner retains its old body.
+    # Legacy records can use a snapshot approved no later than the run start.
+    if run.approval_body_sha is None:
+        if (
+            datetime.fromisoformat(running_approval.approved_at)
+            > datetime.fromisoformat(run.started_at)
+        ):
+            return False
+    elif run.approval_body_sha != running_approval.body_sha:
+        return False
+    files = parse_body(approval.body).files
+    running_files = parse_body(running_approval.body).files
+    if not files or not running_files:
+        return False
+    case_sensitive = _filesystem_case_sensitive(ctx.repo_root)
+    return case_sensitive is not None and not any(
+        _file_patterns_overlap(candidate, active, case_sensitive=case_sensitive)
+        for candidate in files for active in running_files
+    )
+
+
 def _tick_locked(ctx: TickContext) -> TickReport:
     report = TickReport()
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
     if ctx.store.issues_refresh_due(ctx.now()) or ctx.store.github_outbox():
-        ctx.tracker.refresh_issues()
+        # Keep an existing recorder; wrapping again would bypass its own state.
+        recorder = ctx.tracker if isinstance(ctx.tracker, RecordingTracker) else RecordingTracker(ctx.tracker, ctx)
+        recorder.refresh_issues()
     ctx.tracker.flush_outbox()
     if until := ctx.store.github_wait_until(ctx.now()):
         return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
@@ -585,17 +733,82 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if until := ctx.store.github_wait_until(ctx.now()):
         report.skipped = f"GitHub rate limit until {until.isoformat()}"
         return report
+    # One sensor sample per tick sizes both the test slots and the run budget.
+    sample = machine_load()
+    update_test_slots(ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1])
     if not ctx.start_runs or not ready:
         return report
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         return report
 
+    started = _start_ready(ctx, ready, lane_for, base_ref, report, sample)
+    if started is None:
+        return report
+    if started:
+        try:
+            watch_open.open_view(ctx.repo_root, ctx.store, ctx.config.language)
+        except Exception as exc:
+            # Optional progress display must never hide successfully started runs.
+            error = " ".join(str(exc).split())[:200]
+            report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
+    return report
+
+
+def _machine_budget(
+    ctx: TickContext, ready: dict[str, list[int]], sample: tuple[str, float] | None = None,
+) -> int:
+    """Update the machine-wide AIMD value once per tick and return this tick's machine budget."""
+    now = ctx.now()
+    lane_runs = Counter(run.lane for run in ctx.store.active_runs())
+    # A crowded lane may add a clone; the file-overlap check runs at start time.
+    waiting = sum(
+        1 for lane, numbers in ready.items()
+        if _lane_has_room(lane_runs[lane], len(numbers)) and not ctx.store.lane_paused(lane, now)
+    )
+    pressure, load = sample if sample is not None else machine_load()
+    with machine_lock(ctx.store):
+        state = read_state(ctx.store)
+        current = int(state["parallel"]) if state else INITIAL_PARALLEL
+        changed_at = datetime.fromisoformat(state["changed_at"]) if state else now
+        demand = machine_runs(ctx.store, now) + waiting
+        # Work only caps growth: the shared value never drops below itself for lack
+        # of work here, so it stays the pressure- and load-driven value.
+        value = next_parallel(
+            current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
+            ceiling=None, increase_ok=now - changed_at >= INCREASE_INTERVAL,
+        )
+        if state is None or value != current:
+            write_state(ctx.store, value, now)
+    return max(1, min(value, demand))
+
+
+def _has_slot(ctx: TickContext, budget: int) -> bool:
+    """Machine-wide runs stay under the shared budget; this project's under its ceiling."""
+    if machine_runs(ctx.store, ctx.now()) >= budget:
+        return False
+    return ctx.config.max_parallel is None or len(ctx.store.active_runs()) < ctx.config.max_parallel
+
+
+def _reserve_slot(ctx: TickContext, number: int, budget: int) -> bool:
+    """Recount and journal the start under the machine lock; GitHub work happens outside."""
+    with machine_lock(ctx.store):
+        if not _has_slot(ctx, budget):
+            return False
+        ctx.store.prepare_run_start(number)
+        return True
+
+
+def _start_ready(
+    ctx: TickContext, ready: dict[str, list[int]], lane_for: Callable[[Issue], str], base_ref: str,
+    report: TickReport, sample: tuple[str, float] | None = None,
+) -> bool | None:
+    """Start ready lanes within the machine budget; None means a GitHub wait began."""
+    budget = _machine_budget(ctx, ready, sample)
     started = False
     for lane in sorted(ready, key=lane_order):
-        active = ctx.store.active_runs()
-        if len(active) >= ctx.config.max_parallel:
+        if not _has_slot(ctx, budget):
             break
-        if any(run.lane == lane for run in active) or ctx.store.lane_paused(lane, ctx.now()):
+        if ctx.store.lane_paused(lane, ctx.now()):
             continue
         for number in ready[lane]:
             issue = ctx.tracker.get_issue(number)
@@ -604,6 +817,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                 or not {APPROVED, READY}.issubset(issue.labels)
                 or issue.labels & {BLOCKED, NEEDS_HUMAN, RUNNING} or lane_for(issue) != lane
             ):
+                continue
+            if not _can_start_in_lane(ctx, lane, issue, len(ready[lane])):
                 continue
             approval = ctx.store.load_approval(number)
             event, _ = _latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
@@ -614,14 +829,15 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             if not _check_prerequisites(ctx, issue, approval, report):
                 continue
 
-            ctx.store.prepare_run_start(number)
+            if not _reserve_slot(ctx, number, budget):
+                return started
             try:
                 ctx.tracker.remove_labels(number, [READY])
                 ctx.tracker.add_labels(number, [RUNNING])
                 board.sync_status(ctx, number, "Running")
                 if until := ctx.store.github_wait_until(ctx.now()):
                     report.skipped = f"GitHub rate limit until {until.isoformat()}"
-                    return report
+                    return None
             except TrackerError as exc:
                 if not exc.is_rate_limit:
                     raise
@@ -636,7 +852,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                 orch_github.wait_run(ctx, number, until)
                 ctx.store.finish_run(number, "limit-wait", detail=str(exc))
                 report.skipped = f"GitHub rate limit until {until.isoformat()}"
-                return report
+                return None
             ctx.store.start_run(
                 number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
                 tier=issue_size(issue.labels),
@@ -647,11 +863,4 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             report.actions.append(f"#{number} started running (pid={pid})")
             started = True
             break
-    if started:
-        try:
-            watch_open.open_view(ctx.repo_root, ctx.store, ctx.config.language)
-        except Exception as exc:
-            # Optional progress display must never hide successfully started runs.
-            error = " ".join(str(exc).split())[:200]
-            report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
-    return report
+    return started
