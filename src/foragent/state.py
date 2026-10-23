@@ -60,6 +60,11 @@ class Run:
     phase_started_at: str | None = None
     last_activity_at: str | None = None
     executor_pgid: int | None = None
+    session_id: str | None = None
+    session_executor: str | None = None
+    session_ids: list[str] = field(default_factory=list)
+    session_body: str | None = None
+    resume_reason: str = ""
 
 
 class StateStore:
@@ -174,10 +179,23 @@ class StateStore:
             restarts = previous.restarts if previous is not None and previous.outcome in {"stalled-restart", "crashed", "limit-wait"} else 0
             attempts = previous.attempts if previous is not None and previous.outcome == "limit-wait" else 1
             resumed = previous is not None and previous.outcome == "limit-wait"
+            session = {}
+            if previous is not None:
+                reason = "\n".join(value for value in (
+                    previous.outcome, previous.detail, previous.resume_reason,
+                ) if value)
+                session = {
+                    "session_id": previous.session_id, "session_executor": previous.session_executor,
+                    "session_ids": previous.session_ids, "session_body": previous.session_body,
+                    "resume_reason": reason + (
+                        "\nThe runner recreated the worktree from its target branch; "
+                        "earlier uncommitted changes are no longer present."
+                    ),
+                }
             run = Run(number, branch, str(worktree), pid, timestamp, timestamp, attempts=attempts,
                       restarts=restarts, lane=lane, tier=previous.tier if resumed else tier,
                       attempt_tiers=previous.attempt_tiers if resumed else {},
-                      last_activity_at=timestamp)
+                      last_activity_at=timestamp, **session)
             self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
             return run
 
