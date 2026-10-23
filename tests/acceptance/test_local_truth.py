@@ -214,6 +214,63 @@ def test_local_truth_gate_refreshes_remote_changes_only_after_five_minutes(
     assert "needs-human" in local_rows(case.store)[1]["labels"]
 
 
+def test_local_truth_person_change_on_github_wins_over_foragent_local_record(
+    git_history, tmp_path, monkeypatch,
+):
+    from foragent import orch
+    from foragent.scheduler import tick
+    from foragent.state import StateStore
+
+    record_gh(monkeypatch)
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
+    case.store.finish_run(1, outcome="spec-question")
+    case.tracker.remove_labels(1, ["running"])
+    case.tracker.add_labels(1, ["blocked"])
+    case.tracker.record_label(1, "approved", "human")
+    case.tracker.add_issue(2, "A person will close this issue")
+    ctx = tick_context(case, start_runs=False)
+    tick(ctx)
+
+    writes = []
+    for name in ("add_labels", "remove_labels"):
+        original = getattr(case.tracker, name)
+
+        def write(number, labels, _name=name, _original=original):
+            labels = list(labels)
+            writes.append((number, _name, labels))
+            return _original(number, labels)
+
+        monkeypatch.setattr(case.tracker, name, write)
+
+    case.clock[0] += timedelta(seconds=1)
+    orch.retry(case.ctx, 1)
+    rows = local_rows(StateStore(case.store.root))
+    assert set(rows[1]["labels"]) == set(case.tracker.get_issue(1).labels) == {"approved", "ready"}
+    assert rows[2]["state"] == "open"
+    assert any(number == 1 and action == "add_labels" for number, action, _ in writes)
+
+    case.clock[0] += timedelta(seconds=1)
+    with monkeypatch.context() as human:
+        human.setattr(case.tracker, "actor", "human")
+        case.tracker.remove_labels(1, ["ready"])
+        case.tracker.record_label(1, "needs-human", "human")
+        case.tracker.close_issue(2)
+    human_issues = {number: case.tracker.get_issue(number) for number in (1, 2)}
+    before_refresh = len(writes)
+
+    # Check the first refresh and later ticks, including another refresh window.
+    for elapsed in (timedelta(minutes=5), timedelta(seconds=1), timedelta(minutes=5)):
+        case.clock[0] += elapsed
+        tick(ctx)
+        rows = local_rows(StateStore(case.store.root))
+        for number, expected in human_issues.items():
+            remote = case.tracker.get_issue(number)
+            assert (rows[number]["title"], rows[number]["state"], set(rows[number]["labels"])) == (
+                expected.title, expected.state, set(expected.labels))
+            assert remote == expected, "A later tick overwrote the person's GitHub change"
+        assert writes[before_refresh:] == [], "A tick re-applied Foragent's earlier label writes"
+
+
 def test_local_truth_fresh_watchers_stay_offline_until_first_gate_tick(
     git_history, tmp_path, monkeypatch, capsys,
 ):
