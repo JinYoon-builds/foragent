@@ -240,6 +240,21 @@ class StateStore:
             return False
         return lane in pauses and now < datetime.fromisoformat(pauses[lane])
 
+    def pause_github(self, until: datetime) -> datetime:
+        """Share a reset deadline across runners and ticks without shortening it."""
+        with self._state_lock():
+            until = (self.github_wait_until(until) or until).astimezone(UTC)
+            self._write_json(self.root / "github-pause.json", {"until": until.isoformat()})
+            return until
+
+    def github_wait_until(self, now: datetime) -> datetime | None:
+        try:
+            value = (self.root / "github-pause.json").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        until = datetime.fromisoformat(json.loads(value)["until"])
+        return until if now < until else None
+
     def finish_run(self, number: int, outcome: str, detail: str = "") -> Run:
         with self._state_lock():
             run = self.get_run(number)

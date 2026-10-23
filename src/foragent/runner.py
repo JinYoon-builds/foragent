@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board
+from foragent import board, orch_github
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -1459,7 +1459,9 @@ def _implement_and_publish(
             _phase(n, ctx, "merging")
             try:
                 ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha)
-            except TrackerError:
+            except TrackerError as exc:
+                if exc.is_rate_limit:
+                    raise
                 if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
                     return _hold_changed_head(n, ctx, link)
                 raise
@@ -1471,7 +1473,9 @@ def _implement_and_publish(
                     ctx.tracker.close_issue(n, f"Merged into {batch_branch} (PR #{pr})")
                 else:
                     ctx.tracker.close_issue(n)
-            except TrackerError:
+            except TrackerError as exc:
+                if exc.is_rate_limit:
+                    raise
                 if ctx.tracker.get_issue(n).state != "closed":
                     raise
             ctx.tracker.remove_labels(n, [READY, RUNNING])
@@ -1480,6 +1484,8 @@ def _implement_and_publish(
                 try:
                     _batch_pr(parent, ctx)
                 except TrackerError as exc:
+                    if exc.is_rate_limit:
+                        raise
                     _append(log, f"Batch PR finalization deferred to tick: {exc}")
             _progress(n, ctx)
             return "merged"
@@ -1705,7 +1711,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             return _timeout(n, ctx)
         try:
             ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head)
-        except TrackerError:
+        except TrackerError as exc:
+            if exc.is_rate_limit:
+                raise
             if ctx.tracker.pr_head_sha(pr.number) != head:
                 return _hold_changed_head(n, ctx, link)
             raise
@@ -1716,7 +1724,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
                 ctx.tracker.close_issue(n, f"Merged into {batch_branch} (PR #{pr.number})")
             else:
                 ctx.tracker.close_issue(n)
-        except TrackerError:
+        except TrackerError as exc:
+            if exc.is_rate_limit:
+                raise
             if ctx.tracker.get_issue(n).state != "closed":
                 raise
         ctx.tracker.remove_labels(n, [READY, RUNNING, BLOCKED])
@@ -1724,6 +1734,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             try:
                 _batch_pr(parent, ctx)
             except TrackerError as exc:
+                if exc.is_rate_limit:
+                    raise
                 _append(log, f"Batch PR finalization deferred to tick: {exc}")
         return "merged"
 
@@ -1734,15 +1746,25 @@ def review_only(
     """Review a PR, optionally repairing CI inline instead of returning its failure."""
     worktree = ctx.store.worktree_path(n)
     outcome = "error"
-    issue = ctx.tracker.get_issue(n)
     previous = ctx.store.get_run(n)
-    if issue.state != "open" or issue.is_pull_request:
-        raise ValueError(f"#{n} must be an open issue")
-    if RUNNING in issue.labels or (previous is not None and previous.status == "running"):
-        raise TrackerError(f"issue #{n} already has a running execution")
-    ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree, pid=os.getpid(),
-                        lane=issue_lane(issue.labels, ctx.config.lanes))
+    started = False
     try:
+        if previous is not None and previous.status == "running":
+            raise TrackerError(f"issue #{n} already has a running execution")
+        if until := ctx.store.github_wait_until(ctx.now()):
+            ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
+                                lane=previous.lane if previous is not None else "main")
+            started = True
+            outcome = orch_github.wait_run(ctx, n, until)
+            return outcome
+        issue = ctx.tracker.get_issue(n)
+        if issue.state != "open" or issue.is_pull_request:
+            raise ValueError(f"#{n} must be an open issue")
+        if RUNNING in issue.labels:
+            raise TrackerError(f"issue #{n} already has a running execution")
+        ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree, pid=os.getpid(),
+                            lane=issue_lane(issue.labels, ctx.config.lanes))
+        started = True
         ctx.tracker.add_labels(n, [RUNNING])
         ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
         ctx.git.remove_worktree(worktree)
@@ -1759,20 +1781,36 @@ def review_only(
     except ExecutorStopped as exc:
         outcome = exc.outcome
     except Exception as exc:
-        _append(ctx.store.log_path(n), traceback.format_exc())
-        flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
+        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            if not started:
+                ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
+                                    lane=previous.lane if previous is not None else "main")
+                started = True
+            outcome = orch_github.wait_run(ctx, n, orch_github.pause(ctx, exc))
+        elif not started:
+            raise
+        else:
+            _append(ctx.store.log_path(n), traceback.format_exc())
+            flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
     finally:
-        try:
-            ctx.git.remove_worktree(worktree)
-        finally:
-            # Includes executor interruption and every early return. Open work
-            # must remain discoverable by the scheduler or the orchestrator.
-            current = ctx.tracker.get_issue(n)
-            if current.state == "open" and not current.labels & {BLOCKED, READY}:
-                flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
-            ctx.tracker.remove_labels(n, [RUNNING])
-            ctx.store.finish_run(n, outcome=outcome)
-            kick_tick(ctx.repo_root)
+        if started:
+            try:
+                ctx.git.remove_worktree(worktree)
+            finally:
+                try:
+                    # A rate-limit wait is discoverable locally; defer label repair.
+                    if outcome != "limit-wait":
+                        current = ctx.tracker.get_issue(n)
+                        if current.state == "open" and not current.labels & {BLOCKED, READY}:
+                            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
+                        ctx.tracker.remove_labels(n, [RUNNING])
+                except TrackerError as exc:
+                    if not exc.is_rate_limit:
+                        raise
+                    outcome = orch_github.wait_run(ctx, n, orch_github.pause(ctx, exc))
+                finally:
+                    ctx.store.finish_run(n, outcome=outcome)
+                    kick_tick(ctx.repo_root)
     return outcome
 
 
@@ -1782,6 +1820,9 @@ def run_issue(n: int, ctx: RunContext) -> str:
     log = ctx.store.log_path(n)
     try:
         run = ctx.store.update_run(n, pid=os.getpid())
+        if until := ctx.store.github_wait_until(ctx.now()):
+            outcome = orch_github.wait_run(ctx, n, until)
+            return outcome
         board.sync_status(ctx, n, "Running")
         lane = ctx.config.lanes.get(run.lane, {}) if run.lane != "main" else {}
         ctx = replace(ctx, config=replace(
@@ -1796,8 +1837,11 @@ def run_issue(n: int, ctx: RunContext) -> str:
         outcome = exc.outcome
     except Exception as exc:
         _append(log, traceback.format_exc())
-        flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
-        outcome = "error"
+        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            outcome = orch_github.wait_run(ctx, n, orch_github.pause(ctx, exc))
+        else:
+            flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
+            outcome = "error"
     except SystemExit:
         outcome = "killed"
         raise

@@ -86,6 +86,8 @@ def _text(value: str, name: str) -> str:
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = ()) -> dict:
     event = append_event(ctx.store, ctx.now(), n, kind, summary)
+    if ctx.store.github_wait_until(ctx.now()) is not None:
+        return event
     for number in ([n] if n is not None else issues):
         ctx.tracker.comment(number, "<!-- foragent:orch -->\n" + event["summary"])
     return event

@@ -183,7 +183,9 @@ def sync_status(ctx: BoardContext, issue: Issue | int, status: str) -> None:
     token = _current.set(Project(ctx.tracker, ctx.repo, ctx.config.board))
     try:
         set_status(issue, status)
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            raise
         log.warning("Could not set board Status to %s for issue %s", status,
                     getattr(issue, "number", issue), exc_info=True)
     finally:
