@@ -4,6 +4,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from difflib import SequenceMatcher
 from itertools import islice
 import ast
 import json
@@ -23,7 +24,7 @@ import yaml
 from foragent import board
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
-from foragent.executors import ExecResult, Executor, classify_result, executor_for
+from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
 from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
@@ -272,6 +273,34 @@ def build_prompt(
     if orchestrator_hint is not None:
         prompt = "Orchestrator hint:\n" + orchestrator_hint + "\n\n" + prompt
     return f"/goal {goal_condition(acceptance_dir)}\n\n{prompt}" if native_goal else prompt
+
+
+def build_resume_prompt(
+    n: int, previous_body: str | None, body: str, failure: str = "", *,
+    reviewer_text: str | None = None, orchestrator_hint: str | None = None,
+    merge_conflicts: list[str] | None = None,
+) -> str:
+    """Deliver exact specification edits and feedback to an existing session."""
+    parts = [f"Continue implementing GitHub issue #{n} in this repository."]
+    if previous_body is not None and previous_body != body:
+        old, new = previous_body.splitlines(), body.splitlines()
+        for tag, start, end, new_start, new_end in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+            if tag == "equal":
+                continue
+            location = f"{start + 1}-{end}" if start != end else f"after {start}"
+            parts.append(f"Specification update at previous issue body lines {location}:\n" + (
+                "\n".join(new[new_start:new_end]) if new_start != new_end else
+                "Remove these previous requirements:\n" + "\n".join(old[start:end])
+            ))
+    if reviewer_text is not None:
+        parts.append("A reviewer said (verbatim):\n" + reviewer_text)
+    elif failure:
+        parts.append("A previous attempt failed. Output or stop reason:\n" + failure)
+    if orchestrator_hint is not None:
+        parts.append("Orchestrator hint:\n" + orchestrator_hint)
+    if merge_conflicts is not None:
+        parts.append("Resolve the conflict markers in these files:\n" + "\n".join(merge_conflicts))
+    return "\n\n".join(parts)
 
 
 def _append(log: Path, text: str) -> None:
@@ -662,14 +691,74 @@ def _merge_lock(n: int, ctx: RunContext):
         yield
 
 
-def _available_executor(n: int, ctx: RunContext, executor: Executor, *, reviewer: bool = False, **kwargs) -> ExecResult:
+def _available_executor(
+    n: int, ctx: RunContext, executor: Executor, *, reviewer: bool = False,
+    session_body: str | None = None, resume_prompt: str | None = None, **kwargs,
+) -> ExecResult:
     errors = 0
+    full_prompt = kwargs["prompt"]
+
+    def execute() -> ExecResult:
+        log = kwargs["log_path"]
+        offset = log.stat().st_size if log.exists() else 0
+        try:
+            return _run_executor(n, ctx, executor, **kwargs)
+        except BaseException:
+            # run_logged flushes stdout into the log during interruption cleanup.
+            # Recover this call's lifecycle before run_issue finishes its history.
+            if session_body is not None and not reviewer and log.exists():
+                identity = stream_session_id(log, ctx.config.executor, offset=offset)
+                if identity is not None:
+                    current = ctx.store.get_run(n)
+                    ctx.store.update_run(
+                        n, session_id=identity, session_executor=ctx.config.executor,
+                        session_ids=[*current.session_ids, identity], session_body=session_body,
+                    )
+            raise
+
     while True:
         run = ctx.store.get_run(n)
         if not reviewer and run.fallback_model is not None:
             kwargs["model"] = run.fallback_model
         kwargs["timeout_s"] = _remaining(n, ctx)
-        result = _run_executor(n, ctx, executor, **kwargs)
+        session_id = (run.session_id if session_body is not None and resume_prompt is not None and not reviewer
+                      and run.session_executor == ctx.config.executor else None)
+        kwargs["prompt"] = resume_prompt if session_id is not None else full_prompt
+        if session_id is not None:
+            kwargs["resume_session_id"] = session_id
+        else:
+            kwargs.pop("resume_session_id", None)
+        try:
+            result = execute()
+        except OSError as exc:
+            if session_id is None:
+                raise
+            _append(kwargs["log_path"], f"Session resume could not launch; starting fresh: {exc}")
+            result = None
+        if session_id is not None and (result is None or (
+            result.session_id is None and result.exit_code not in {None, 0}
+            and not result.timed_out and classify_result(result) == "normal"
+        )):
+            if result is not None:
+                _append(kwargs["log_path"], f"Session resume failed; starting fresh:\n{result.last_message}\n{result.log_tail}")
+            session_id = None
+            kwargs.pop("resume_session_id")
+            kwargs["prompt"] = full_prompt
+            kwargs["timeout_s"] = _remaining(n, ctx)
+            result = execute()
+        if session_body is not None and not reviewer:
+            identity = result.session_id or session_id
+            reason = (f"Executor exit_code={result.exit_code}, timed_out={result.timed_out}\n"
+                      f"{result.last_message}\n{result.log_tail}" if result.exit_code != 0 or result.timed_out else "")
+            run = ctx.store.update_run(
+                n, session_id=identity, session_executor=ctx.config.executor,
+                session_ids=[*run.session_ids, *([identity] if identity is not None else [])],
+                session_body=(session_body if result.session_id is not None or (
+                    result.exit_code == 0 and not result.timed_out
+                ) else run.session_body), resume_reason=reason,
+            )
+            if reason:
+                resume_prompt = (resume_prompt or "") + "\n\n" + reason
         kind = classify_result(result)
         if kind == "normal":
             return result
@@ -1000,11 +1089,12 @@ def _implement_and_publish(
             missing_skills.extend(name for name in missing if name not in missing_skills)
         hint_path = ctx.store.root / "hints" / f"{n}.txt"
         hint = hint_path.read_text(encoding="utf-8") if hint_path.is_file() else None
+        failure_context = str(failure) or run.resume_reason
         test_command = ctx.config.test_command
         if test_command is None:
             test_command = next(iter(detect_test_commands(worktree)), None)
         prompt = build_prompt(
-            n, parsed, ctx.config.acceptance_dir, str(failure), ctx.config.language,
+            n, parsed, ctx.config.acceptance_dir, failure_context, ctx.config.language,
             native_goal=native_claude or ctx.config.codex_goal, acceptance_locked=native_claude,
             merge_conflicts=merge_conflicts,
             reviewer_text=reviewer_text,
@@ -1016,6 +1106,11 @@ def _implement_and_publish(
         result = _available_executor(
             n, ctx, executor, worktree=worktree,
             prompt=prompt if native_claude else notes + prompt,
+            session_body=approval.body,
+            resume_prompt=build_resume_prompt(
+                n, run.session_body, approval.body, failure_context,
+                reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
+            ),
             model=model, timeout_s=remaining, log_path=log, **options,
         )
         # A prepared prompt has not been delivered yet. Keep its hint through
@@ -1451,6 +1546,7 @@ def _implement_and_publish(
         if rebuilt:
             return block_rebuild(str(failure))
         _append(log, f"Attempt {run.attempts} failed:\n{failure}")
+        ctx.store.update_run(n, resume_reason=str(failure))
         if run.attempts < ctx.config.max_retries + 1:
             ctx.store.update_run(n, attempts=run.attempts + 1)
             continue
