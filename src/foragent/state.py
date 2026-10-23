@@ -70,6 +70,7 @@ class Run:
     resume_reason: str = ""
     merge_conflicts: list[str] = field(default_factory=list)
     local_skill_paths: list[str] = field(default_factory=list)
+    approval_body_sha: str | None = None
 
 
 class StateStore:
@@ -429,6 +430,7 @@ class StateStore:
     ) -> Run:
         with self._state_lock():
             timestamp = self._timestamp()
+            approval = self.load_approval(number)
             previous = self.get_run(number)
             restarts = previous.restarts if previous is not None and previous.outcome in {"stalled-restart", "crashed", "limit-wait"} else 0
             attempts = previous.attempts if previous is not None and previous.outcome == "limit-wait" else 1
@@ -451,6 +453,7 @@ class StateStore:
             run = Run(number, branch, str(worktree), pid, timestamp, timestamp, attempts=attempts,
                       restarts=restarts, lane=lane, tier=previous.tier if resumed else tier,
                       attempt_tiers=previous.attempt_tiers if resumed else {},
+                      approval_body_sha=approval.body_sha if approval is not None else None,
                       last_activity_at=timestamp, **session)
             self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
             return run
