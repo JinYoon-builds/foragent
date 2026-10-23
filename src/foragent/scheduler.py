@@ -425,16 +425,20 @@ def tick(ctx: TickContext) -> TickReport:
         if not acquired:
             return TickReport(skipped="another tick is running")
         if until := ctx.store.github_wait_until(ctx.now()):
-            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
-        if not isinstance(ctx.tracker, RecordingTracker):
-            ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-        try:
-            return _tick_locked(ctx)
-        except TrackerError as exc:
-            if not exc.is_rate_limit:
-                raise
-            until = orch_github.pause(ctx, exc)
-            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
+            report = TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
+        else:
+            if not isinstance(ctx.tracker, RecordingTracker):
+                ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
+            try:
+                report = _tick_locked(ctx)
+            except TrackerError as exc:
+                if not exc.is_rate_limit:
+                    raise
+                until = orch_github.pause(ctx, exc)
+                report = TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
+        # Local only, so a GitHub rate-limit wait does not leave orphans running.
+        _reap_orphans(ctx, report)
+        return report
 
 
 def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
@@ -532,7 +536,6 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
     _recover_runs(ctx, report)
     _reconcile_batches(ctx, report)
-    _reap_orphans(ctx, report)
     ready: dict[str, list[int]] = {}
     unknown: set[str] = set()
 

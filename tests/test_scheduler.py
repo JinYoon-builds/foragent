@@ -2130,3 +2130,33 @@ def test_overdue_blocker_escalation_is_journaled_once(ctx):
     assert "needs-human" in ctx.tracker.get_issue(1).labels
     tick(ctx)
     assert recovery_events(ctx) == events
+
+
+@pytest.mark.parametrize("wait", ["recorded", "raised"])
+def test_rate_limited_tick_still_reaps_inactive_worktree_orphans(ctx, monkeypatch, wait):
+    path = ctx.store.worktree_path(7)
+    path.mkdir(parents=True)
+    seen = []
+
+    def reap(worktrees, protected):
+        seen.append(dict(worktrees))
+        return {7: {4242, 4343}}
+
+    ctx.reap_orphans = reap
+    until = NOW + timedelta(minutes=10)
+    if wait == "recorded":
+        ctx.store.pause_github(until)
+    else:
+        def unavailable():
+            raise TrackerError("API rate limit exceeded (HTTP 403)",
+                               stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+        monkeypatch.setattr(ctx.tracker, "list_issues", unavailable)
+    report = tick(ctx)
+    assert "GitHub rate limit" in report.skipped
+    assert seen == [{7: path}]
+    events = [json.loads(line) for line in (ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [(event["issue"], event["kind"]) for event in events if event["kind"] == "orphans-reaped"] == [
+        (7, "orphans-reaped")
+    ]
+    assert "#7 orphans reaped: 2" in report.actions

@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 
 
 _process_group_callback: ContextVar[Callable[[int | None], None] | None] = ContextVar(
@@ -39,6 +40,9 @@ class ProcessInfo:
     pgid: int
     uid: int
     argv: tuple[str, ...] | None  # None: read lazily with process_argv().
+    # macOS never reuses these and keeps the original parent's id after reparenting.
+    unique: int | None = None
+    parent_unique: int | None = None
 
 
 def process_table() -> dict[int, ProcessInfo]:
@@ -92,25 +96,30 @@ def _darwin_table() -> dict[int, ProcessInfo]:
         return {}
     pids = (ctypes.c_int * (count * 2))()
     count = lib.proc_listallpids(pids, ctypes.sizeof(pids))
-    # struct proc_bsdinfo (136 bytes): status@4, pid@12, ppid@16, uid@20, pgid@100.
-    info = ctypes.create_string_buffer(136)
+    # struct proc_bsdinfowithuniqid (192 bytes): proc_bsdinfo with status@4, ppid@16,
+    # uid@20, pgid@100, then proc_uniqidentifierinfo with p_uniqueid@152, p_puniqueid@160.
+    size = 192
+    info = ctypes.create_string_buffer(size)
     table = {}
     for pid in pids[:max(count, 0)]:
-        if pid <= 0 or lib.proc_pidinfo(pid, 3, ctypes.c_uint64(0), info, 136) != 136:  # PROC_PIDTBSDINFO
-            continue
-        status, = struct.unpack_from("I", info.raw, 4)
+        if pid <= 0 or lib.proc_pidinfo(pid, 18, ctypes.c_uint64(0), info, size) != size:
+            continue  # PROC_PIDT_BSDINFOWITHUNIQID; unreadable processes are not ours.
+        raw = info.raw
+        status, = struct.unpack_from("I", raw, 4)
         if status == 5:  # SZOMB
             continue
-        ppid, uid = struct.unpack_from("II", info.raw, 16)
-        pgid, = struct.unpack_from("I", info.raw, 100)
-        table[pid] = ProcessInfo(pid, ppid, pgid, uid, None)
+        ppid, uid = struct.unpack_from("II", raw, 16)
+        pgid, = struct.unpack_from("I", raw, 100)
+        unique, parent_unique = struct.unpack_from("QQ", raw, 152)
+        table[pid] = ProcessInfo(pid, ppid, pgid, uid, None, unique, parent_unique)
     return table
 
 
-def _darwin_argv(pid: int) -> tuple[str, ...]:
+def _darwin_procargs(pid: int) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return (argv, environment) of a process, or empty tuples when unreadable."""
     libc = _libproc()  # libproc re-exports libSystem's sysctl.
     if not libc:
-        return ()
+        return (), ()
     global _ARGS_BUFFER
     if _ARGS_BUFFER is None:
         _ARGS_BUFFER = ctypes.create_string_buffer(1 << 20)  # >= KERN_ARGMAX
@@ -118,19 +127,43 @@ def _darwin_argv(pid: int) -> tuple[str, ...]:
     size = ctypes.c_size_t(len(buffer))
     mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
     if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0 or size.value < 4:
-        return ()
-    argc, = struct.unpack_from("i", buffer.raw, 0)
-    rest = buffer.raw[4:size.value]
-    # Executable path, NUL padding, then argc arguments.
-    _, _, rest = rest.partition(b"\0")
-    rest = rest.lstrip(b"\0")
-    return tuple(os.fsdecode(arg) for arg in rest.split(b"\0")[:argc])
+        return (), ()
+    raw = ctypes.string_at(buffer, size.value)
+    argc, = struct.unpack_from("i", raw, 0)
+    # Executable path, NUL padding, argc arguments, then the environment.
+    _, _, rest = raw[4:].partition(b"\0")
+    strings = rest.lstrip(b"\0").split(b"\0")
+    environment = []
+    for item in strings[argc:]:
+        if not item:
+            break
+        environment.append(os.fsdecode(item))
+    return tuple(os.fsdecode(arg) for arg in strings[:argc]), tuple(environment)
 
 
 def process_argv(info: ProcessInfo) -> tuple[str, ...]:
     if info.argv is not None:
         return info.argv
-    return _darwin_argv(info.pid) if sys.platform == "darwin" else ()
+    return _darwin_procargs(info.pid)[0] if sys.platform == "darwin" else ()
+
+
+# Inherited by every process an executor starts, even after setsid or after its
+# parent exits, so a stop can find descendants that parent links no longer show.
+TREE_MARK = "FORAGENT_PROCESS_TREE"
+
+
+def process_tree_mark(pid: int) -> str | None:
+    if sys.platform == "darwin":
+        environment = _darwin_procargs(pid)[1]
+    else:
+        try:
+            environment = tuple(
+                os.fsdecode(item) for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+            )
+        except OSError:
+            return None
+    prefix = TREE_MARK + "="
+    return next((item[len(prefix):] for item in environment if item.startswith(prefix)), None) or None
 
 
 def _own_lineage() -> set[int]:
@@ -144,30 +177,82 @@ def _own_lineage() -> set[int]:
     return lineage
 
 
-def descendants(table: dict[int, ProcessInfo], roots: set[int]) -> set[int]:
-    """All processes reachable through parent links, whatever group or session they joined."""
+def descendants(table: dict[int, ProcessInfo], roots: set[int], exclude: set[int] = frozenset()) -> set[int]:
+    """All processes reachable through parent links, whatever group or session they joined.
+
+    Excluded processes are neither returned nor walked through.
+    """
     children: dict[int, list[int]] = {}
     for info in table.values():
         children.setdefault(info.ppid, []).append(info.pid)
     found: set[int] = set()
-    pending = list(roots)
+    pending = list(set(roots) - exclude)
     while pending:
         for child in children.get(pending.pop(), ()):
-            if child not in found:
+            if child not in found and child not in exclude:
                 found.add(child)
                 pending.append(child)
     return found
 
 
-def _escaped_tree(pgid: int) -> set[int]:
-    """Descendants of a process group that moved to another group or session."""
-    table = process_table()
-    members = {info.pid for info in table.values() if info.pgid == pgid} | {pgid}
+@dataclass(frozen=True)
+class TreeSnapshot:
+    escaped: set[int]  # Descendants that left the group.
+    uniques: set[int]  # macOS unique ids of the whole tree.
+    marks: set[str]  # Tree marks the whole tree carries.
+
+
+def _is_gate(info: ProcessInfo) -> bool:
+    """A gate tick or runner is a separate job, e.g. the tick a stopping runner kicks."""
+    argv = process_argv(info)
+    return any(argv[i] == "gate" and argv[i + 1] in {"tick", "run-issue"} for i in range(len(argv) - 1))
+
+
+def _later_tree(table: dict[int, ProcessInfo], snapshot: TreeSnapshot, lineage: set[int]) -> set[int]:
+    """Processes started by the tree after the snapshot, even if their parent already exited."""
     uid = os.getuid()
-    return {
-        pid for pid in descendants(table, members)
-        if table[pid].pgid != pgid and table[pid].uid == uid
-    } - _own_lineage()
+    known = set(snapshot.uniques)
+    blocked = {table[pid].unique for pid in lineage if pid in table} - {None}
+    found: set[int] = set()
+    changed = True
+    while changed:  # Follow original-parent links through processes that are still alive.
+        changed = False
+        for info in table.values():
+            if info.pid in found or info.pid in lineage or info.uid != uid or info.unique in blocked:
+                continue
+            if info.unique in known or info.parent_unique in known:
+                if _is_gate(info):
+                    blocked.add(info.unique)
+                    continue
+                found.add(info.pid)
+                known.add(info.unique)
+                changed = True
+    if snapshot.marks:
+        found |= {
+            info.pid for info in table.values()
+            if info.uid == uid and info.pid not in lineage
+            and process_tree_mark(info.pid) in snapshot.marks and not _is_gate(info)
+        }
+    return found
+
+
+def _snapshot_tree(pgid: int) -> TreeSnapshot:
+    table = process_table()
+    lineage = _own_lineage()
+    members = {info.pid for info in table.values() if info.pgid == pgid} | {pgid}
+    tree = descendants(table, members, exclude=lineage)
+    gates = {pid for pid in tree - members if _is_gate(table[pid])}
+    if gates:
+        tree = descendants(table, members, exclude=lineage | gates)
+    uid = os.getuid()
+    escaped = {pid for pid in tree if table[pid].pgid != pgid and table[pid].uid == uid}
+    everyone = (members | tree) - lineage
+    uniques = {table[pid].unique for pid in everyone if pid in table} - {None}
+    marks: set[str] = set()
+    if not sys.platform == "darwin":  # macOS hides platform binaries' environments.
+        own_marks = {process_tree_mark(pid) for pid in lineage}
+        marks = {process_tree_mark(pid) for pid in everyone} - own_marks - {None}
+    return TreeSnapshot(escaped, uniques, marks)
 
 
 def _signal_each(pids: set[int], sig: int) -> set[int]:
@@ -181,24 +266,27 @@ def _signal_each(pids: set[int], sig: int) -> set[int]:
     return alive
 
 
-def _kill_escaped(pids: set[int]) -> None:
-    if not pids:
+def _kill_escaped(snapshot: TreeSnapshot) -> None:
+    if not (snapshot.escaped or snapshot.uniques or snapshot.marks):
         return
-    # Include anything they spawned while the group was being stopped.
-    _signal_each((pids | descendants(process_table(), pids)) - _own_lineage(), signal.SIGKILL)
+    table = process_table()
+    lineage = _own_lineage()
+    targets = (snapshot.escaped - lineage) | _later_tree(table, snapshot, lineage)
+    gates = {info.pid for info in table.values() if info.ppid in targets and _is_gate(info)}
+    _signal_each(targets | descendants(table, targets, exclude=lineage | gates), signal.SIGKILL)
 
 
 def kill_process_group(pid: int) -> None:
     # Take the snapshot before signalling: once a parent exits, its escaped
-    # descendants are reparented and no longer traceable to this run.
+    # descendants are reparented and parent links no longer show them.
     # Freeze them so their exit cannot look like a normal executor finish
     # while the runner is still shutting down.
-    escaped = _escaped_tree(pid)
-    _signal_each(escaped, signal.SIGSTOP)
+    snapshot = _snapshot_tree(pid)
+    _signal_each(snapshot.escaped, signal.SIGSTOP)
     try:
         _kill_group(pid)
     finally:
-        _kill_escaped(escaped)
+        _kill_escaped(snapshot)
 
 
 def _kill_group(pid: int) -> None:
@@ -274,7 +362,8 @@ def worktree_processes(
     if not worktrees:
         return {}
     table = process_table()
-    skip = set(protected) | descendants(table, set(protected)) | _own_lineage()
+    lineage = _own_lineage()
+    skip = set(protected) | descendants(table, set(protected), exclude=lineage) | lineage
     uid = os.getuid()
     forms = {number: _forms(path) for number, path in worktrees.items()}
     patterns = {
@@ -364,7 +453,7 @@ def run_logged(
             argv, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
             stdout=output if capture_stdout else log,
             stderr=errors if errors is not None else log if capture_stdout else subprocess.STDOUT,
-            start_new_session=True, env=_child_environment(cwd),
+            start_new_session=True, env={**_child_environment(cwd), TREE_MARK: uuid.uuid4().hex},
         )
         # Executors have their own session, so relay tick termination to them.
         previous = None

@@ -16,3 +16,8 @@ metadata:
 
 **Why:** 같은 영역(#243 시험 수 제한, #221)이 이어서 이 코드를 건드린다.
 **How to apply:** processes.py·scheduler 종료 경로를 고칠 때 위 제약을 먼저 확인한다.
+- 실행이 두 번 `stalled`로 멈췄다. 출력 없이 오래 도는 전체 `uv run pytest`(백그라운드 포함, 약 50분)가 원인이었다. Done when과 변경 파일의 시험만 포그라운드로 돌린다. 전체 시험은 CI가 맡는다. `.foragent/TRY.md`는 작업공간 재생성 때 사라지므로 다시 쓴다.
+- 리뷰 지적: 스냅샷 뒤 SIGTERM 처리기가 띄운 setsid 자식이 남았다. macOS는 `PROC_PIDT_BSDINFOWITHUNIQID`(18, 192바이트)의 `p_puniqueid`를 재부모화 뒤에도 보존하므로 이 연결로 추적한다. macOS는 `/bin/sleep` 같은 플랫폼 실행 파일의 환경 변수를 KERN_PROCARGS2로 보여 주지 않아 환경 표식(`FORAGENT_PROCESS_TREE`)은 Linux에서만 쓴다.
+- 러너는 종료 중 `kick_tick()`으로 `gate tick`을 띄운다. 트리 종료와 탐색에서 `gate tick`·`gate run-issue` 프로세스를 빼고 그 아래로 내려가지 않는다. 자기 lineage도 탐색에서 제외한다.
+- 고아 정리는 `tick()`에서 GitHub 한도 대기 두 경로(기록된 대기·도중 한도 오류)에도 실행한다(로컬 작업).
+- 리뷰가 runner.py·tests/acceptance 변경을 지적하면 먼저 `git log HEAD..origin/main`을 본다. 병합 뒤 main이 앞서 나가면 diff가 되돌린 것처럼 보인다. REBUTTAL로 답한다.
