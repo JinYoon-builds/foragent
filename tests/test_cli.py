@@ -138,7 +138,7 @@ def test_status_groups_latest_reason_active_runs_and_last_ten(app, capsys, json_
         store.start_run(number, branch="old", worktree="old")
         store.finish_run(number, "not-implemented")
     store.start_run(2, branch="foragent/issue-2", worktree=store.worktree_path(2), pid=123)
-    args = ["gate", "status", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    args = ["gate", "status", "--live", "--repo-root", str(root)] + (["--json"] if json_output else [])
     assert cli.main(args) == 0
     output = capsys.readouterr().out
     if json_output:
@@ -176,7 +176,7 @@ def test_status_groups_issues_awaiting_pr_review(app, capsys, json_output, label
     root, git, tracker, store, calls = app
     tracker.add_issue(1, "Awaiting review", BODY, labels)
     tracker.create_pr(head="foragent/issue-1", base="main", title="PR", body="Closes #1")
-    args = ["gate", "status", "--repo-root", str(root)] + (["--json"] if json_output else [])
+    args = ["gate", "status", "--live", "--repo-root", str(root)] + (["--json"] if json_output else [])
     assert cli.main(args) == 0
     output = capsys.readouterr().out
     if json_output:
@@ -778,7 +778,9 @@ def test_status_groups_running_and_ready_by_lane(app, capsys):
     tracker.add_issue(3, "Data ready", BODY, ["approved", "ready", "lane:data"])
     tracker.add_issue(4, "Unknown ready", BODY, ["approved", "ready", "lane:missing"])
     store.start_run(2, branch="foragent/issue-2", worktree="wt", lane="ui")
-    status = cli._status(tracker, store, Config(lanes={"ui": {}, "data": {}}))
+    config = Config(lanes={"ui": {}, "data": {}})
+    cli._refresh_status(tracker, store, config)
+    status = cli._status(tracker, store, config)
     assert list(status["lanes"]) == ["data", "ui", "main"]
     assert [item["number"] for item in status["lanes"]["main"]["ready"]] == [1, 4]
     assert [item["number"] for item in status["lanes"]["data"]["ready"]] == [3]

@@ -1,11 +1,20 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
 from foragent import cli
 from foragent.config import Config
 from foragent.state import StateStore
-from foragent.tracker import Dependency, FakeTracker
+from foragent.tracker import Dependency, FakeTracker, RecordingTracker
+
+
+def local_status(tracker, store, config=None):
+    """Status reads only local records, so first record what the gate would observe."""
+    config = config or Config()
+    context = SimpleNamespace(store=store, config=config, now=lambda: datetime.now(UTC))
+    RecordingTracker(tracker, context).refresh_issues()
+    return cli._status(tracker, store, config)
 
 
 NOW = datetime(2026, 10, 21, 9, tzinfo=UTC)
@@ -19,7 +28,7 @@ def test_same_lane_keeps_active_issue_and_counts_all_queued_work(tmp_path):
     tracker.add_issue(2, "Later", labels=["approved", "lane:web"])
     tracker.add_issue(3, "Active", labels=["approved", "running", "lane:web"])
     store.start_run(3, branch="branch", worktree="wt", lane="web")
-    status = cli._status(tracker, store, config)
+    status = local_status(tracker, store, config)
     assert status["summary"] == dict(working=1, blocked=0, waiting_human=0, queued=2)
     assert status["lanes"]["web"]["issue"] == 3
     assert status["lanes"]["web"]["state"] == "working"
@@ -35,7 +44,7 @@ def test_queue_only_waits_for_open_dependencies_and_ignores_old_execution(tmp_pa
     store.start_run(1, branch="branch", worktree="wt")
     store.update_run(1, phase="implementing", phase_started_at=(NOW - timedelta(seconds=10)).isoformat())
     store.finish_run(1, "limit-wait")
-    row = cli._status(tracker, store)["lanes"]["main"]
+    row = local_status(tracker, store)["lanes"]["main"]
     assert row["state"] == "queued" and row["waiting_for"] == [2, 3]
     assert row["phase"] is None and row["elapsed_seconds"] is None
 
@@ -49,7 +58,7 @@ def test_blockers_override_running_labels_and_unapproved_work_stays_idle(tmp_pat
     tracker.add_issue(3, labels=["lane:docs"])
     for number, slug in ((1, "api"), (2, "web")):
         store.start_run(number, branch="branch", worktree="wt", lane=slug)
-    status = cli._status(tracker, store, config)
+    status = local_status(tracker, store, config)
     assert status["summary"] == dict(working=0, blocked=1, waiting_human=1, queued=0)
     assert status["lanes"]["api"]["state"] == "blocked"
     assert status["lanes"]["web"]["state"] == "waiting-human"
@@ -61,7 +70,7 @@ def test_open_pr_waits_for_human_and_language_variants_translate(tmp_path, capsy
     store = StateStore(tmp_path, now=lambda: NOW)
     tracker.add_issue(1, "Review this", labels=["approved"])
     tracker.create_pr(head="foragent/issue-1", base="main", title="Review", body="")
-    status = cli._status(tracker, store, Config(language="ko-KR"))
+    status = local_status(tracker, store, Config(language="ko-KR"))
     assert status["lanes"]["main"]["state"] == "waiting-human"
     cli._print_status(status | {"launchd": {"loaded": False}}, "ko-KR")
     assert capsys.readouterr().out.startswith("일하는 중 0 · 확인할 일 1 · 기다리는 일 0\n")
@@ -85,13 +94,13 @@ def test_finished_run_does_not_show_stale_phase_or_ages(tmp_path, capsys, labels
         phase_started_at=(NOW - timedelta(seconds=120)).isoformat(),
         last_activity_at=(NOW - timedelta(seconds=660)).isoformat(),
     )
-    active_row = cli._status(tracker, store)["lanes"]["main"]
+    active_row = local_status(tracker, store)["lanes"]["main"]
     assert active_row["phase"] == "reviewing"
     assert active_row["elapsed_seconds"] is not None
     assert active_row["last_activity_seconds"] is not None
 
     store.finish_run(1, "pr-open")
-    status = cli._status(tracker, store)
+    status = local_status(tracker, store)
     row = status["lanes"]["main"]
     assert row["state"] == expected_state
     assert {key: row[key] for key in ("phase", "elapsed_seconds", "last_activity_seconds")} == {
@@ -104,3 +113,18 @@ def test_finished_run_does_not_show_stale_phase_or_ages(tmp_path, capsys, labels
     assert "reviewing" not in output
     assert "elapsed" not in output
     assert "last activity" not in output
+
+
+def test_new_open_pr_wins_over_an_older_merged_pr_for_the_same_issue(tmp_path):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    tracker.add_issue(1, "Reopened work", labels=["approved"])
+    old = tracker.create_pr(head="foragent/issue-1", base="main", title="First", body="Closes #1")
+    tracker.merge_pr(old, expected_head_sha=tracker.pr_head_sha(old))
+    tracker.issues[1] = tracker.issues[1].__class__(1, "Reopened work", "", frozenset({"approved"}), "open")
+    new = tracker.create_pr(head="foragent/issue-1", base="main", title="Second", body="Closes #1")
+    status = local_status(tracker, store)
+    assert [item["number"] for item in status["issues"]["pr-open"]] == [1]
+    assert status["summary"]["queued"] == 0 and status["summary"]["waiting_human"] == 1
+    row = next(row for row in store.local_issues() if row["number"] == 1)
+    assert row["pr_number"] == new and row["merged"] is False
