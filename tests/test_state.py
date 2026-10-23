@@ -118,6 +118,39 @@ def test_recovery_metadata_survives_restart_and_old_records_default_to_empty(sto
         assert run.merge_conflicts == [] and run.local_skill_paths == []
 
 
+def test_run_approval_hash_is_pinned_until_next_execution(store):
+    assert store.start_run(1, branch="branch", worktree="worktree").approval_body_sha is None
+    store.finish_run(1, "no-approval")
+    store.save_approval(1, body="original", body_sha=body_hash("original"), acceptance_blobs={},
+                        approved_by="human", approved_at=NOW.isoformat())
+    original = store.load_approval(1)
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.save_approval(1, body="replacement", body_sha=body_hash("replacement"), acceptance_blobs={},
+                        approved_by="human", approved_at=(NOW + timedelta(seconds=1)).isoformat())
+    store.update_run(1, pid=7001)
+    reopened = StateStore(store.root, now=lambda: NOW + timedelta(seconds=2))
+    assert reopened.get_run(1).approval_body_sha == original.body_sha
+    reopened.finish_run(1, "crashed")
+    assert reopened.read_history()[-1].approval_body_sha == original.body_sha
+    run = reopened.start_run(1, branch="branch", worktree="worktree")
+    assert run.approval_body_sha == reopened.load_approval(1).body_sha != original.body_sha
+
+
+def test_legacy_run_and_history_do_not_infer_approval_hash(store):
+    store.save_approval(1, body="approved", body_sha=body_hash("approved"), acceptance_blobs={},
+                        approved_by="human", approved_at=NOW.isoformat())
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.finish_run(1, "merged")
+    path = store.root / "runs/1.json"
+    record = json.loads(path.read_text())
+    del record["approval_body_sha"]
+    path.write_text(json.dumps(record))
+    (store.root / "runs.jsonl").write_text(json.dumps(record) + "\n")
+    reopened = StateStore(store.root)
+    assert reopened.get_run(1).approval_body_sha is None
+    assert reopened.read_history()[0].approval_body_sha is None
+
+
 def test_limit_wait_resumptions_preserve_attempts_and_restarts(store):
     store.start_run(1, branch="branch", worktree="worktree")
     store.update_run(1, attempts=2, restarts=1, waited_seconds=120, executor_waited_seconds=120)
