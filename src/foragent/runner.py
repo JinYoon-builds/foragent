@@ -438,17 +438,22 @@ def run_tests(root: Path, config: Config, args: list[str]) -> int:
                               cwd=root, check=False, env={**os.environ, **capacity.HELD_ENV}).returncode
 
 
-def _passing_acceptance_ids(report: Path) -> tuple[str, ...]:
+def junit_node_id(case: ET.Element) -> str | None:
     """Legacy JUnit provides exact file paths; classname adds nested classes."""
+    file, name = case.get("file"), case.get("name")
+    if not file or not name:
+        return None
+    module = file.removesuffix(".py").replace("/", ".")
+    classname = case.get("classname", "")
+    classes = classname.removeprefix(module).lstrip(".").replace(".", "::")
+    return "::".join(part for part in (file, classes, name) if part)
+
+
+def _passing_acceptance_ids(report: Path) -> tuple[str, ...]:
     passed, failed = set(), set()
     for case in ET.parse(report).iter("testcase"):
-        file, name = case.get("file"), case.get("name")
-        if not file or not name:
+        if (node_id := junit_node_id(case)) is None:
             continue
-        module = file.removesuffix(".py").replace("/", ".")
-        classname = case.get("classname", "")
-        classes = classname.removeprefix(module).lstrip(".").replace(".", "::")
-        node_id = "::".join(part for part in (file, classes, name) if part)
         (failed if any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) else passed).add(node_id)
     return tuple(sorted(passed - failed))
 

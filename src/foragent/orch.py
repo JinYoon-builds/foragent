@@ -8,8 +8,10 @@ import json
 import math
 from pathlib import Path
 import re
+import shlex
 from tempfile import TemporaryDirectory
 import time
+import xml.etree.ElementTree as ET
 
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -18,7 +20,7 @@ from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.processes import run_logged
-from foragent.runner import RunContext, review_only
+from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
 from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
 
@@ -258,6 +260,43 @@ class _Premerge:
     report: dict
 
 
+@dataclass(frozen=True)
+class _SuiteRun:
+    passed: bool
+    failing: frozenset[str] | None  # None: no per-test result to compare
+
+
+def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Path,
+               log_path: Path, label: str) -> _SuiteRun:
+    """Run one full-suite command; pytest also reports its failing node ids."""
+    pytest = _pytest_command(command) is not None
+    if pytest:
+        junit.unlink(missing_ok=True)
+        command = (f"{command} --rootdir=. -o junit_family=legacy --junit-prefix= "
+                   f"--junitxml={shlex.quote(str(junit.resolve()))}")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
+    code, timed_out, _ = run_logged(
+        ["/bin/sh", "-c", command], cwd=worktree,
+        timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path,
+    )
+    passed = code == 0 and not timed_out
+    if not pytest or timed_out:
+        return _SuiteRun(passed, None)
+    try:
+        cases = list(ET.parse(junit).iter("testcase"))
+    except (OSError, ET.ParseError):
+        return _SuiteRun(passed, None)
+    failing = frozenset(node_id for case in cases
+                        if any(case.find(tag) is not None for tag in ("failure", "error"))
+                        and (node_id := junit_node_id(case)) is not None)
+    # Exit 1 is pytest's "some tests failed"; other codes are session failures.
+    if code not in (0, 1) or (code == 1 and not failing):
+        return _SuiteRun(False, None)
+    return _SuiteRun(passed, failing)
+
+
 def _premerge(ctx: RunContext, n: int) -> _Premerge:
     pr = _open_pr(ctx, n)
     head = ctx.tracker.pr_head_sha(n)
@@ -266,38 +305,20 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
     ctx.git._call(["fetch", "origin", head])
     base = ctx.git.ref_sha(f"refs/remotes/origin/{pr.base}")
     log_path = ctx.store.root / "runs" / f"premerge-pr-{n}.log"
+    broken: list[str] = []
+    failing_on_base: list[str] = []
     with TemporaryDirectory(prefix=f"foragent-premerge-{n}-") as directory:
         worktree = Path(directory) / "worktree"
         ctx.git.add_detached_worktree(worktree, head)
         try:
-            publication_conflicts = []
-            try:
-                ctx.git.at(worktree).check_publication(base)
-            except PublicationError as exc:
-                publication_conflicts = [f"{path}:{line}" for path, line in exc.markers]
-            commands = ([ctx.config.test_command] if ctx.config.test_command is not None
-                        else detect_test_commands(worktree))
-            if not commands:
-                raise OrchError("no full test command detected; set test_command in .foragent.yml")
-            tests = "pass"
-            for command in commands:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                with log_path.open("a", encoding="utf-8") as stream:
-                    stream.write(f"\nPre-merge PR #{n} head={head} base={base}\n$ {command}\n")
-                code, timed_out, _ = run_logged(
-                    ["/bin/sh", "-c", command], cwd=worktree,
-                    timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path,
-                )
-                if code != 0 or timed_out:
-                    tests = "fail"
-        finally:
-            ctx.git.remove_worktree(worktree)
-        # Tests may generate files. Use a fresh checkout of the same SHA for
-        # the merge probe so those files cannot hide or create conflicts.
-        ctx.git.add_detached_worktree(worktree, head)
-        try:
             probe = ctx.git.at(worktree)
-            conflicts = list(publication_conflicts)
+            conflicts = []
+            try:
+                probe.check_publication(base)
+            except PublicationError as exc:
+                conflicts = [f"{path}:{line}" for path, line in exc.markers]
+            # Test what merging produces: the PR head combined with the current base.
+            merged = True
             try:
                 probe._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
                              "merge", "--no-commit", "--no-ff", base])
@@ -306,10 +327,40 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 if not merge_conflicts:
                     raise
                 conflicts.extend(merge_conflicts)
+                probe._call(["merge", "--abort"])
+                merged = False
+            commands = ([ctx.config.test_command] if ctx.config.test_command is not None
+                        else detect_test_commands(worktree))
+            if not commands:
+                raise OrchError("no full test command detected; set test_command in .foragent.yml")
+            label = f"head={head} merged with base={base}" if merged else f"head={head} (base merge conflicts)"
+            runs = [(command, _run_suite(ctx, n, command, worktree, Path(directory) / f"head-{i}.xml",
+                                         log_path, label))
+                    for i, command in enumerate(commands)]
         finally:
             ctx.git.remove_worktree(worktree)
+        tests = "pass"
+        for i, (command, run) in enumerate(runs):
+            if run.passed:
+                continue
+            if run.failing is None:
+                tests = "fail"
+                continue
+            # D53: failures the base already has do not block; any other failure does.
+            ctx.git.add_detached_worktree(worktree, base)
+            try:
+                on_base = _run_suite(ctx, n, command, worktree, Path(directory) / f"base-{i}.xml",
+                                     log_path, f"base={base}")
+            finally:
+                ctx.git.remove_worktree(worktree)
+            base_failing = on_base.failing or frozenset()
+            broken.extend(sorted(run.failing - base_failing))
+            failing_on_base.extend(sorted(run.failing & base_failing))
+            if run.failing - base_failing:
+                tests = "fail"
     ci = ctx.tracker.pr_checks(n)
     report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
+              "broken": broken, "failing_on_base": failing_on_base,
               "ready": tests == "pass" and not conflicts and ci in {"pass", "none"}}
     return _Premerge(pr, head, base, report)
 
@@ -317,6 +368,11 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
 def premerge(ctx: RunContext, n: int) -> dict:
     """Check the PR head in isolation without posting or changing GitHub state."""
     return _premerge(ctx, n).report
+
+
+def _base_note(report: dict) -> str:
+    count = len(report["failing_on_base"])
+    return f" ({count} failing on the base too)" if count else ""
 
 
 def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -> str:
@@ -330,7 +386,8 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     checked = _premerge(ctx, n)
     report = checked.report
     if not report["ready"]:
-        raise OrchError(f"PR #{n} is not ready: tests {report['tests']}; "
+        broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
+        raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
                         f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
     current = _open_pr(ctx, n)
     ctx.git.fetch("origin", current.base)
@@ -343,9 +400,10 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
         raise OrchError(f"PR #{n} is not ready: CI {ci}")
     RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
         n, f"Approved by {approved_by} in the orchestrator ({at}). "
-           f"Pre-merge: tests pass, no conflicts, CI {ci}.")
+           f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
     ctx.tracker.merge_pr(n, expected_head_sha=checked.head)
-    summary = f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; tests pass, no conflicts, CI {ci}"
+    summary = (f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; "
+               f"tests pass{_base_note(report)}, no conflicts, CI {ci}")
     _event(ctx, None, "merge", summary)
     after_merge(ctx, n, current.base)
     if (number := pr_issue_number(current.head)) is not None:
