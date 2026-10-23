@@ -1239,8 +1239,27 @@ def test_empty_open_listing_after_nonempty_all_listing_is_trusted(local_records)
 
 
 def test_empty_open_listing_after_all_listing_with_open_issue_raises(local_records):
-    replies = [json.dumps([issue_json(1, state="open")]), "[]", "[]"]
+    still_open = json.dumps([issue_json(1, state="open")])
+    replies = [still_open, "[]", "[]", still_open]
     tracker = GhTracker("owner/repo", run=lambda args, input=None: replies.pop(0))
     assert [issue.number for issue in tracker.list_issues("all")] == [1]
     with pytest.raises(TrackerError, match="empty listing"):
         tracker.list_open_issues()
+    assert replies == [], "The earlier sighting is checked against a fresh full listing"
+
+
+def test_empty_open_listing_is_trusted_when_earlier_open_issue_was_closed_since(local_records):
+    calls = []
+    replies = [json.dumps([issue_json(1, state="open")]), "[]", "[]",
+               json.dumps([issue_json(1, state="closed")]), "[]", "[]"]
+
+    def run(args, input=None):
+        calls.append(args[-1])
+        return replies.pop(0)
+
+    tracker = GhTracker("owner/repo", run=run)
+    assert [issue.number for issue in tracker.list_open_issues()] == [1]
+    assert tracker.list_open_issues() == [], "Closing the last open issue is not a GitHub hiccup"
+    assert "state=all" in calls[3]
+    assert tracker.list_open_issues() == [], "Once settled, the old sighting is not checked again"
+    assert replies == []
