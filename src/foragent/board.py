@@ -109,6 +109,9 @@ class Project:
               updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
             }""", {"input": {"projectId": self.id, "itemId": item["id"], "fieldId": field["id"],
                              "value": {"singleSelectOptionId": option["id"]}}})
+            # At this boundary the issue, field and confirmed value are still known.
+            if (record := getattr(self.tracker, "record_board_value", None)) is not None:
+                record(number, self.id, name, value)
 
 
 def ensure(tracker: Tracker, repo: str, lanes: Iterable[str] = (), project_id: str | None = None) -> str | None:

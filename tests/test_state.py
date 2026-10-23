@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta, timezone
 import errno
 import fcntl
@@ -519,3 +519,48 @@ def test_tick_lock_released_on_exception(store):
             raise RuntimeError("interrupted")
     with store.tick_lock() as acquired:
         assert acquired
+
+
+def test_issue_snapshot_is_shared_and_remote_refresh_replaces_local_labels(store):
+    from foragent.tracker import Issue
+
+    issue = Issue(1, "Feature", "body", frozenset({"approved"}), "open")
+    assert store.local_issues() == []
+    assert store.issues_refresh_due(NOW)
+    store.refresh_local_issues([issue], [], {}, NOW)
+    other = StateStore(store.root, now=lambda: NOW)
+    other.record_labels(1, ["ready"], remove=False, lanes={})
+    assert store.local_issues()[0]["labels"] == ["approved", "ready"]
+    assert not other.issues_refresh_due(NOW + timedelta(minutes=5, microseconds=-1))
+    assert other.issues_refresh_due(NOW + timedelta(minutes=5))
+    human = replace(issue, title="Human title", labels=frozenset({"needs-human"}), state="closed")
+    other.refresh_local_issues([human], [], {}, NOW + timedelta(minutes=5))
+    row, = store.local_issues()
+    assert (row["title"], row["labels"], row["state"]) == ("Human title", ["needs-human"], "closed")
+
+
+@pytest.mark.parametrize("method,fields", [
+    ("update_local_issue", {"state": "closed", "pr_number": 42, "merged": True}),
+    ("record_labels", {"labels": ["blocked", "needs-human"], "remove": True, "lanes": {}}),
+    ("record_comments", {"comments": [{"id": 1, "body": "New local evidence"}]}),
+    ("record_board_value", {"project": "project", "field": "Status", "value": "Todo"}),
+])
+def test_refresh_preserves_each_kind_of_concurrent_local_write(store, method, fields):
+    from foragent.tracker import Issue, PullRequest
+
+    issue = Issue(1, "Question", "body", frozenset({"blocked", "needs-human"}), "open")
+    store.refresh_local_issues([issue], [], {}, NOW)
+    revision = store.issues_revision()
+    writer = StateStore(store.root, now=lambda: NOW)
+    getattr(writer, method)(1, **fields)
+    written, = writer.local_issues()
+    stale_pr = PullRequest(99, "foragent/issue-1", "main", "Old PR", "Old body")
+    store.refresh_local_issues([issue], [stale_pr], {}, NOW,
+                               comments={1: []}, since_revision=revision)
+    assert store.local_issues() == [written]
+
+    revision = store.issues_revision()
+    human = replace(issue, title="Human revision", labels=frozenset({"needs-human"}), state="closed")
+    store.refresh_local_issues([human], [], {}, NOW + timedelta(minutes=5), since_revision=revision)
+    row, = writer.local_issues()
+    assert (row["title"], row["labels"], row["state"]) == ("Human revision", ["needs-human"], "closed")

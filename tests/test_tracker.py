@@ -33,6 +33,81 @@ def test_find_existing_open_pr_fake():
     assert tracker.find_pr("feature") is None
 
 
+def test_recording_gh_writes_need_no_extra_reads_and_failed_writes_leave_snapshot(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path, now=lambda: NOW)
+    store.record_issue(Issue(1, "Feature", "body", frozenset({"approved"}), "open"), {})
+    run = ScriptedRun("[]", gh_error("HTTP 422 validation failed", code=422), "")
+    tracker = RecordingTracker(GhTracker(REPO, run),
+                               SimpleNamespace(store=store, config=Config(), now=lambda: NOW))
+    tracker.add_labels(1, ["blocked"])
+    with pytest.raises(TrackerError, match="422"):
+        tracker.remove_labels(1, ["approved"])
+    tracker.close_issue(1)
+    row, = StateStore(tmp_path).local_issues()
+    assert row["labels"] == ["approved", "blocked"] and row["state"] == "closed"
+    assert [args[:3] for args, _ in run.calls] == [
+        ["api", "-X", "POST"], ["api", "-X", "DELETE"], ["issue", "close", "1"],
+    ]
+
+
+@pytest.mark.parametrize("first_missing", [False, True])
+@pytest.mark.parametrize("failure", [403, 429])
+def test_recording_label_removal_preserves_each_success_before_failure(tmp_path, first_missing, failure):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path, now=lambda: NOW)
+    store.record_issue(Issue(1, "Feature", "body", frozenset({"blocked", "ready", "running"}), "open"), {})
+    run = ScriptedRun(gh_error("HTTP 404") if first_missing else "[]", gh_error(f"HTTP {failure}"))
+    tracker = RecordingTracker(GhTracker(REPO, run), SimpleNamespace(store=store, config=Config()))
+    with pytest.raises(TrackerError, match=str(failure)):
+        tracker.remove_labels(1, iter(["ready", "running"]))
+    row, = StateStore(tmp_path).local_issues()
+    assert row["labels"] == ["blocked", "running"]
+    assert run.calls == [
+        (["api", "-X", "DELETE", "repos/owner/repo/issues/1/labels/ready"], None),
+        (["api", "-X", "DELETE", "repos/owner/repo/issues/1/labels/running"], None),
+    ]
+
+
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("previously_merged", [False, True])
+def test_recording_pr_observation_publishes_one_complete_update(tmp_path, monkeypatch, merged, previously_merged):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    remote = FakeTracker(now=lambda: NOW)
+    remote.add_issue(1, "Feature")
+    pr = remote.create_pr(head="foragent/issue-1", base="main", title="Feature", body="Closes #1")
+    if merged:
+        remote.merge_pr(pr, expected_head_sha=remote.pr_head_sha(pr))
+    store = StateStore(tmp_path, now=lambda: NOW)
+    store.update_local_issue(1, pr_number=pr, merged=previously_merged)
+    tracker = RecordingTracker(remote, SimpleNamespace(store=store, config=Config()))
+    write = store._write_json
+    observations = []
+
+    def observe(path, value):
+        write(path, value)
+        observations.append(StateStore(tmp_path).local_issues()[0])
+
+    monkeypatch.setattr(store, "_write_json", observe)
+    tracker.list_prs("merged" if merged else "open", "foragent/")
+    assert len(observations) == 1
+    assert observations[0]["pr_number"] == pr
+    assert observations[0]["pr_head"] == "foragent/issue-1"
+    assert observations[0]["pr_base"] == "main" and observations[0]["merged"] is merged
+
+
 def test_pr_renames_include_old_path_for_merge_policy():
     run = ScriptedRun('[{"filename":"src/new.py","previous_filename":"tests/acceptance/old.py"}]')
     assert GhTracker(REPO, run).pr_changed_files(42) == ["src/new.py", "tests/acceptance/old.py"]

@@ -3,7 +3,7 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import fcntl
 import json
 import os
@@ -103,6 +103,115 @@ class StateStore:
 
     def _write_json(self, path: Path, value: dict[str, Any]) -> None:
         self._atomic_write(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+    def _issue_snapshot(self) -> dict[str, Any]:
+        try:
+            return json.loads((self.root / "issues.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"refreshed_at": None, "issues": {}}
+
+    def local_issues(self) -> list[dict[str, Any]]:
+        """Read the last observed issue facts without contacting the tracker."""
+        return sorted(self._issue_snapshot()["issues"].values(), key=lambda row: row["number"])
+
+    def issues_revision(self) -> int:
+        return self._issue_snapshot().get("revision", 0)
+
+    def _save_local_issue(self, snapshot: dict[str, Any], row: dict[str, Any]) -> None:
+        snapshot["revision"] = snapshot.get("revision", 0) + 1
+        row.update(revision=snapshot["revision"], updated_at=self._timestamp())
+        self._write_json(self.root / "issues.json", snapshot)
+
+    def issues_refresh_due(self, now: datetime) -> bool:
+        refreshed = self._issue_snapshot()["refreshed_at"]
+        return refreshed is None or now - datetime.fromisoformat(refreshed) >= timedelta(minutes=5)
+
+    def update_local_issue(self, number: int, **fields: Any) -> None:
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            row = snapshot["issues"].setdefault(str(number), {
+                "number": number, "title": "", "body": "", "labels": [], "lane": "main",
+                "state": "open", "pr_number": None, "merged": False, "comments": [],
+            })
+            row.update(fields)
+            self._save_local_issue(snapshot, row)
+
+    def record_issue(self, issue: Any, lanes: dict) -> None:
+        from foragent.labels import issue_lane
+
+        if not issue.is_pull_request:
+            self.update_local_issue(issue.number, title=issue.title, body=issue.body,
+                                    labels=sorted(issue.labels), state=issue.state,
+                                    lane=issue_lane(issue.labels, lanes))
+
+    def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict) -> None:
+        from foragent.labels import READY, issue_lane
+
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            row = snapshot["issues"].setdefault(str(number), {
+                "number": number, "title": "", "body": "", "labels": [], "lane": "main",
+                "state": "open", "pr_number": None, "merged": False, "comments": [],
+            })
+            current = set(row["labels"])
+            row["labels"] = sorted(current - set(labels) if remove else current | set(labels))
+            row["lane"] = issue_lane(row["labels"], lanes)
+            if READY in labels:
+                approval = self.load_approval(number)
+                row["ready_approval"] = None if remove or approval is None else approval.approved_at
+            self._save_local_issue(snapshot, row)
+
+    def record_comments(self, number: int, comments: list[dict], *, append: bool = False) -> None:
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            row = snapshot["issues"].get(str(number))
+            if row is not None:
+                row["comments"] = row["comments"] + comments if append else comments
+                self._save_local_issue(snapshot, row)
+
+    def record_board_value(self, number: int, project: str, field: str, value: str) -> None:
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            row = snapshot["issues"].get(str(number))
+            if row is not None:
+                row.setdefault("board_values", {}).setdefault(project, {})[field] = value
+                self._save_local_issue(snapshot, row)
+
+    def refresh_local_issues(
+        self, issues: list, prs: list, lanes: dict, now: datetime,
+        *, comments: dict[int, list[dict]] | None = None, since_revision: int | None = None,
+    ) -> None:
+        """Replace remote facts, preserving local changes made since the refresh began."""
+        from foragent.labels import issue_lane
+        from foragent.tracker import pr_issue_number
+
+        comments = comments or {}
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            previous = snapshot["issues"]
+            rows = {}
+            for issue in issues:
+                if issue.is_pull_request:
+                    continue
+                old = previous.get(str(issue.number), {})
+                rows[str(issue.number)] = {
+                    **old, "number": issue.number, "title": issue.title, "body": issue.body,
+                    "labels": sorted(issue.labels), "lane": issue_lane(issue.labels, lanes),
+                    "state": issue.state, "pr_number": old.get("pr_number"),
+                    "merged": old.get("merged", False),
+                    "comments": comments.get(issue.number, old.get("comments", [])),
+                    "updated_at": self._timestamp(),
+                }
+            for pr in prs:
+                if (row := rows.get(str(pr_issue_number(pr.head)))) is not None:
+                    row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
+                               merged=pr.merged_at is not None)
+            if since_revision is not None:
+                rows.update({number: row for number, row in previous.items()
+                             if row.get("revision", 0) > since_revision})
+            self._write_json(self.root / "issues.json", {
+                **snapshot, "refreshed_at": now.isoformat(), "issues": rows,
+            })
 
     def order_progress(self) -> dict[str, Any] | None:
         """Read order preparation facts shared by the CLI and lane view."""

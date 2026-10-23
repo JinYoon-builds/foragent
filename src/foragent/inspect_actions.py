@@ -12,6 +12,7 @@ from foragent import notify as notifications
 from foragent.labels import NEEDS_HUMAN
 from foragent.inspect_runtime import prepare, serve, stop
 from foragent.reasons import GROUP
+from foragent.tracker import RecordingTracker
 
 
 class InspectError(ValueError):
@@ -25,6 +26,7 @@ def _nonempty(text: str, name: str) -> str:
 
 
 def answer(ctx: InspectContext, number: int, text: str) -> int:
+    ctx = replace(ctx, tracker=RecordingTracker(ctx.tracker, ctx))
     text = _nonempty(text, "decision text")
     ctx.tracker.get_issue(number)
     comments = ctx.tracker.list_comments(number)
@@ -38,6 +40,7 @@ def answer(ctx: InspectContext, number: int, text: str) -> int:
 
 
 def retry(ctx: InspectContext, number: int) -> None:
+    ctx = replace(ctx, tracker=RecordingTracker(ctx.tracker, ctx))
     issue = ctx.tracker.get_issue(number)
     comments = ctx.tracker.list_comments(number)
     flag = latest_flag(comments)
@@ -59,6 +62,7 @@ def retry(ctx: InspectContext, number: int) -> None:
 
 
 def feedback(ctx: InspectContext, title: str, body: str, about: int | None = None) -> int:
+    ctx = replace(ctx, tracker=RecordingTracker(ctx.tracker, ctx))
     title, body = _nonempty(title, "feedback title"), _nonempty(body, "feedback body")
     if about is not None:
         body += f"\n\nAbout #{about}."

@@ -36,7 +36,7 @@ from foragent.processes import run_logged, track_process_group
 from foragent.reasons import Reason
 from foragent.skills import SkillManager, copy_lane_skills
 from foragent.state import Approval, StateStore
-from foragent.tracker import Tracker, TrackerError
+from foragent.tracker import RecordingTracker, Tracker, TrackerError
 
 
 def poll_executor[T](execute: Callable[[], T], poll: Callable[[], None]) -> T:
@@ -69,6 +69,9 @@ class RunContext:
     sleep: Callable[[float], None] = time.sleep
     poll_hook: Callable[[Callable[[], ExecResult], Callable[[], None]], ExecResult] = poll_executor
     monotonic: Callable[[], float] = time.monotonic
+
+    def __post_init__(self) -> None:
+        self.tracker = RecordingTracker(self.tracker, self)
 
 
 @dataclass(frozen=True)

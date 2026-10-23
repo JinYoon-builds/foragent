@@ -20,7 +20,7 @@ from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import kill_process_group
 from foragent.runner import _batch_pr
 from foragent.state import Approval, StateStore
-from foragent.tracker import Issue, LabelEvent, Tracker, TrackerError
+from foragent.tracker import Comment, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
 
 
 def runner_process_exists(number: int) -> bool:
@@ -53,6 +53,9 @@ class TickContext:
     start_runs: bool = True
     runner_process_exists: Callable[[int], bool] = runner_process_exists
     kill_runner: Callable[[int], None] = kill_process_group
+
+    def __post_init__(self) -> None:
+        self.tracker = RecordingTracker(self.tracker, self)
 
 
 @dataclass
@@ -411,8 +414,9 @@ def tick(ctx: TickContext) -> TickReport:
 def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
     if BLOCKED not in issue.labels or NEEDS_HUMAN in issue.labels:
         return issue
+    row = next(row for row in ctx.store.local_issues() if row["number"] == issue.number)
     comments = [
-        comment for comment in ctx.tracker.list_comments(issue.number)
+        comment for comment in (Comment(**item) for item in row["comments"])
         if re.fullmatch(
             r"<!-- foragent:blocked reason=[a-z-]+ -->",
             comment.body.partition("\n")[0].removesuffix("\r"),
@@ -438,9 +442,11 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
 
 
 def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
-    issues = {issue.number: issue for issue in ctx.tracker.list_open_issues()}
+    issues = {issue.number: issue for issue in local_issue_models(ctx.store) if issue.state == "open"}
     parents: set[int] = set()
-    for pr in ctx.tracker.list_prs("merged", "foragent/issue-"):
+    prs = [PullRequest(row["pr_number"], row["pr_head"], row["pr_base"], row["title"], row["body"])
+           for row in ctx.store.local_issues() if row["merged"] and row.get("pr_head") and row.get("pr_base")]
+    for pr in prs:
         child_match = re.fullmatch(r"foragent/issue-(\d+)", pr.head)
         batch_match = re.fullmatch(r"foragent/batch-(\d+)", pr.base)
         if child_match is None or batch_match is None:
@@ -471,6 +477,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     report = TickReport()
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
+    if ctx.store.issues_refresh_due(ctx.now()):
+        ctx.tracker.refresh_issues()
     _recover_runs(ctx, report)
     _reconcile_batches(ctx, report)
     ready: dict[str, list[int]] = {}
@@ -484,7 +492,9 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                     unknown.add(label)
         return issue_lane(issue.labels, ctx.config.lanes)
 
-    for issue in sorted(ctx.tracker.list_open_issues(), key=lambda issue: issue.number):
+    for issue in local_issue_models(ctx.store):
+        if issue.state != "open":
+            continue
         issue = _recover_orphan(ctx, issue, report)
         issue = _escalate_overdue_blocker(ctx, issue, report)
         lane = lane_for(issue)
@@ -495,7 +505,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         ):
             board.sync_status(ctx, issue, "Needs human" if NEEDS_HUMAN in waiting_labels else "Blocked")
             continue
-        if APPROVED not in issue.labels:
+        if APPROVED not in issue.labels and not waiting_labels:
             continue
         event, ignored = _latest_approval(ctx.tracker.label_events(issue.number), ctx.config.approvers)
         if ignored:
@@ -507,13 +517,18 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         if waiting_labels:
             if datetime.fromisoformat(event.created_at) <= datetime.fromisoformat(previous_flag.flagged_at):
                 continue
+            # A new approval is a new generation even between full refreshes.
+            issue = ctx.tracker.get_issue(issue.number)
+            if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
+                continue
             ctx.tracker.remove_labels(issue.number, waiting_labels)
             issue = replace(issue, labels=issue.labels - waiting_labels)
             report.actions.append(f"#{issue.number} resumed after re-approval")
 
         approval = ctx.store.load_approval(issue.number)
         if approval is None or approval.approved_at != event.created_at:
-            issue = ctx.tracker.get_issue(issue.number)
+            if not waiting_labels:
+                issue = ctx.tracker.get_issue(issue.number)
             if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
                 continue
             approval = _snapshot(ctx, issue, event, base_ref, report)
@@ -531,6 +546,9 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             ready.setdefault(lane, []).append(issue.number)
             continue
 
+        row = next(row for row in ctx.store.local_issues() if row["number"] == issue.number)
+        if row.get("ready_approval") == approval.approved_at:
+            continue  # This approval already promoted it; the remote removal wins.
         ctx.tracker.add_labels(issue.number, [READY])
         board.sync_status(ctx, issue, "Ready")
         report.actions.append(f"#{issue.number} promoted to ready")

@@ -56,6 +56,91 @@ def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
     ctx.tracker.record_label(number, "approved", actor)
 
 
+@pytest.mark.parametrize("needs_human", [False, True])
+def test_refresh_populates_blocker_evidence_and_listing_stays_offline(ctx, monkeypatch, needs_human):
+    from foragent import orch
+
+    remote = ctx.tracker._tracker
+    remote.add_issue(1, "Question", labels=["blocked", *(["needs-human"] if needs_human else [])])
+    question = "<!-- foragent:blocked reason=spec-question -->\nWhich locale should we use?"
+    remote.comment(1, question)
+    assert ctx.store.local_issues() == []
+    reads = []
+    list_comments = remote.list_comments
+
+    def read(number):
+        reads.append(number)
+        return list_comments(number)
+
+    monkeypatch.setattr(remote, "list_comments", read)
+    tick(ctx)
+    assert reads == [1]
+    with monkeypatch.context() as patch:
+        patch.setattr(remote, "list_comments", lambda n: pytest.fail("orch list must stay offline"))
+        item, = orch.list_blocked(ctx)
+    assert item["reason"] == "spec-question" and item["details"] == question
+    ctx.now = lambda: NOW + timedelta(minutes=4, seconds=59)
+    tick(ctx)
+    assert reads == [1]
+    revised = "<!-- foragent:blocked reason=spec-question -->\nShould we support both locales?"
+    remote.comment(1, revised)
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    tick(ctx)
+    assert reads == [1, 1]
+    assert orch.list_blocked(ctx)[0]["details"] == revised
+
+
+@pytest.mark.parametrize("during", ["list_prs", "list_comments"])
+def test_refresh_preserves_local_writes_during_remote_reads(ctx, monkeypatch, during):
+    from types import SimpleNamespace
+    from foragent import orch
+    from foragent.tracker import RecordingTracker
+
+    remote = ctx.tracker._tracker
+    for number in (1, 2):
+        remote.add_issue(number, f"Question {number}", labels=["blocked", "needs-human"])
+    tick(ctx)
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    remote.update_issue(2, title="Human revision before refresh", body="Human body")
+    writer = RecordingTracker(remote, SimpleNamespace(
+        store=StateStore(ctx.store.root, now=ctx.now), config=ctx.config, now=ctx.now,
+    ))
+    read = getattr(remote, during)
+    written = {}
+
+    def interleaved(*args, **kwargs):
+        result = read(*args, **kwargs)
+        if not written:
+            writer.remove_labels(1, ["blocked", "needs-human"])
+            writer.update_issue(1, title="Local revision during refresh", body="Local body")
+            writer.comment(1, "Local evidence during refresh")
+            writer.record_board_value(1, "project", "Status", "Todo")
+            number = writer.create_issue("Created during refresh", "New body", [])
+            assert number == 3
+            written.update({row["number"]: row for row in writer._context.store.local_issues()})
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(remote, during, interleaved)
+        tick(ctx)
+    rows = {row["number"]: row for row in StateStore(ctx.store.root).local_issues()}
+    assert rows[1] == written[1]
+    assert rows[3] == written[3]
+    assert rows[2]["title"] == "Human revision before refresh"
+    assert remote.get_issue(1).labels == frozenset()
+    watched, = orch.watch(ctx)
+    assert watched["blocked"] == watched["needs_human"] == [2]
+
+    remote.update_issue(1, title="Human revision after refresh", body="Latest human body")
+    remote.add_labels(1, ["needs-human"])
+    ctx.now = lambda: NOW + timedelta(minutes=10)
+    tick(ctx)
+    row = ctx.store.local_issues()[0]
+    assert (row["title"], row["body"], row["labels"]) == (
+        "Human revision after refresh", "Latest human body", ["needs-human"],
+    )
+
+
 @pytest.mark.parametrize("message,limited", [
     ("API rate limit exceeded (HTTP 403)", True),
     ("HTTP 422 Validation Failed", False),
@@ -68,7 +153,7 @@ def test_tick_rate_limit_persists_wait_but_other_tracker_errors_raise(ctx, monke
         calls.append("issues")
         raise TrackerError(message, stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
 
-    monkeypatch.setattr(ctx.tracker, "list_open_issues", unavailable)
+    monkeypatch.setattr(ctx.tracker, "list_issues", unavailable)
     if not limited:
         with pytest.raises(TrackerError, match=message):
             tick(ctx)
@@ -155,6 +240,24 @@ def test_interrupted_runner_with_open_pr_stays_visible(ctx, monkeypatch, failure
 
 def edit_body(ctx, number, body):
     ctx.tracker.edit_body(number, body)
+
+
+def test_human_ready_removal_is_not_promoted_again_for_the_same_approval(ctx, monkeypatch):
+    approve(ctx)
+    tick(ctx)
+    remote = ctx.tracker._tracker
+    remote.remove_labels(1, ["ready"])
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    with monkeypatch.context() as patch:
+        patch.setattr(remote, "add_labels", lambda *args: pytest.fail("replayed the earlier promotion"))
+        tick(ctx)
+        ctx.now = lambda: NOW + timedelta(minutes=10)
+        tick(ctx)
+    assert ctx.store.local_issues()[0]["labels"] == ["approved"]
+    ctx.now = lambda: NOW + timedelta(minutes=11)
+    ctx.tracker.record_label(1, "approved", "human")
+    tick(ctx)
+    assert remote.get_issue(1).labels == {"approved", "ready"}
 
 
 @pytest.mark.parametrize("actor,allowed", [("human", True), ("HuMaN", True), ("stranger", False)])
@@ -1011,7 +1114,8 @@ def test_hash_mismatch_reapproval_is_one_human_action_and_survives_restart(ctx):
     assert ctx.store.load_flag(1).reason == Reason.HASH_MISMATCH
     ctx.store = StateStore(ctx.store.root, now=lambda: ctx.now())
     ctx.now = lambda: NOW + timedelta(minutes=3)
-    ctx.tracker.record_label(1, "approved", "HUMAN")
+    # A person re-approves remotely before the next full snapshot refresh.
+    ctx.tracker._tracker.record_label(1, "approved", "HUMAN")
     report = tick(ctx)
     assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
     assert ctx.store.load_approval(1).approved_at == ctx.now().isoformat()
@@ -1527,7 +1631,11 @@ def test_crash_recovery_replays_after_tracker_failures_without_double_counting(c
     assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
     assert [run.outcome for run in ctx.store.read_history()] == ["crashed"]
     assert ctx.store.load_flag(1) is None
-    assert "#1 orphaned running label recovered as crashed" in report.actions
+    if operation == "get_issue":
+        # The successful label writes were already recorded before the read failed.
+        assert report.actions == []
+    else:
+        assert "#1 orphaned running label recovered as crashed" in report.actions
 
 
 def test_ready_issue_reapproved_without_machine_check_is_flagged(ctx):
@@ -1636,23 +1744,25 @@ def test_new_approval_snapshots_fresh_body_after_stale_issue_list(ctx, monkeypat
     approve(ctx)
     if existing_snapshot:
         tick(ctx)
-    list_open_issues = ctx.tracker.list_open_issues
+    list_issues = ctx.tracker.list_issues
+    refresh_at = NOW + (timedelta(minutes=5) if existing_snapshot else timedelta())
+    ctx.now = lambda: refresh_at
     new_body = BODY.replace("Implement the feature.", "Implement the approved revision.")
 
     def stale_issues():
-        issues = list_open_issues()
-        ctx.now = lambda: NOW + timedelta(seconds=1)
+        issues = list_issues()
+        ctx.now = lambda: refresh_at + timedelta(seconds=1)
         ctx.tracker.remove_labels(1, ["approved"])
         edit_body(ctx, 1, new_body)
-        ctx.now = lambda: NOW + timedelta(seconds=2)
+        ctx.now = lambda: refresh_at + timedelta(seconds=2)
         ctx.tracker.record_label(1, "approved", "human")
         return issues
 
-    monkeypatch.setattr(ctx.tracker, "list_open_issues", stale_issues)
+    monkeypatch.setattr(ctx.tracker, "list_issues", stale_issues)
     ctx.start_runs = True
     tick(ctx)
     assert ctx.store.load_approval(1).body == new_body
-    assert ctx.store.load_approval(1).approved_at == (NOW + timedelta(seconds=2)).isoformat()
+    assert ctx.store.load_approval(1).approved_at == (refresh_at + timedelta(seconds=2)).isoformat()
     assert ctx.store.load_flag(1) is None
     assert ctx.tracker.get_issue(1).labels == {"approved", "running"}
     assert ctx.store.get_run(1).pid == 7001

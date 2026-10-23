@@ -228,7 +228,7 @@ def test_cli_dispatches_to_runner_and_returns_failure_code(app, monkeypatch, out
 
     def runner(number, ctx):
         calls.append(number)
-        assert ctx.repo_root == root and ctx.git is git and ctx.tracker is tracker
+        assert ctx.repo_root == root and ctx.git is git and ctx.tracker._tracker is tracker
         assert ctx.store is store and store.get_run(number).pid == os.getpid()
         return outcome
 
@@ -251,7 +251,7 @@ def test_error_exit_code_and_single_stderr_line(app, monkeypatch, capsys, error)
     if isinstance(error, ConfigError):
         monkeypatch.setattr(cli, "load_config", fail)
     elif isinstance(error, TrackerError):
-        monkeypatch.setattr(tracker, "list_open_issues", fail)
+        monkeypatch.setattr(tracker, "list_issues", fail)
     else:
         monkeypatch.setattr(git, "fetch", fail)
     assert cli.main(["gate", "tick", "--repo-root", str(root), "--no-start"]) == 1
@@ -400,7 +400,8 @@ def test_automatic_view_failure_keeps_command_success(app, monkeypatch, capsys, 
         ))
         argv = ["order", "publish", str(plan)]
     else:
-        tracker.add_issue(1, "Waiting for repair", labels=["blocked"])
+        issue = tracker.add_issue(1, "Waiting for repair", labels=["blocked"])
+        store.record_issue(issue, {})
         argv = ["orch", "watch"]
 
     assert cli.main([*argv, "--repo-root", str(root)]) == 0
@@ -793,6 +794,7 @@ def test_orch_watch_follow_prints_only_changes_and_stops_cleanly(app, monkeypatc
 
     root, git, tracker, store, calls = app
     add_approved(tracker)
+    store.record_issue(tracker.get_issue(1), {})
     output, polls = [], []
 
     def sleep(seconds):
@@ -802,7 +804,7 @@ def test_orch_watch_follow_prints_only_changes_and_stops_cleanly(app, monkeypatc
         assert len(lines) == (0 if len(polls) == 2 else 1)
         output.extend(json.loads(line) for line in lines)
         if len(polls) == 2:
-            tracker.add_labels(1, ["blocked"])
+            store.record_labels(1, ["blocked"], remove=False, lanes={})
         if len(polls) == 3:
             raise KeyboardInterrupt
         assert len(polls) <= 3

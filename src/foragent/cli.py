@@ -497,6 +497,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.action == "context":
                 print(json.dumps(order.context(root, config, tracker), ensure_ascii=False))
             else:
+                tracker = RunContext(repo=repo, repo_root=root, tracker=tracker,
+                                     store=StateStore.for_repo(repo), config=config, git=git,
+                                     now=lambda: datetime.now(UTC)).tracker
                 plan = order.read_plan(args.plan)
                 print(order.publish(
                     plan, root, config, tracker, repo=repo, git=git,

@@ -19,7 +19,7 @@ from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.processes import run_logged
 from foragent.runner import RunContext, review_only
-from foragent.tracker import Issue, PullRequest
+from foragent.tracker import Comment, Issue, PullRequest, TrackerError, pr_issue_number
 
 
 class OrchError(ValueError):
@@ -27,17 +27,13 @@ class OrchError(ValueError):
 
 
 def _watch_snapshot(ctx: RunContext) -> dict:
-    issues = [issue for issue in ctx.tracker.list_open_issues() if not issue.is_pull_request]
-    merged = {
-        int(match[1]) for pr in ctx.tracker.list_prs("merged", "foragent/")
-        if pr.merged_at is not None
-        and (match := re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", pr.head))
-    }
+    rows = ctx.store.local_issues()
+    issues = [row for row in rows if row["state"] == "open"]
     return {
-        "blocked": sorted(issue.number for issue in issues if BLOCKED in issue.labels),
-        "needs_human": sorted(issue.number for issue in issues if NEEDS_HUMAN in issue.labels),
-        "merged": sorted(merged),
-        "queue_empty": not any(issue.labels & {APPROVED, READY, RUNNING} for issue in issues)
+        "blocked": sorted(row["number"] for row in issues if BLOCKED in row["labels"]),
+        "needs_human": sorted(row["number"] for row in issues if NEEDS_HUMAN in row["labels"]),
+        "merged": sorted(row["number"] for row in rows if row["merged"]),
+        "queue_empty": not any(set(row["labels"]) & {APPROVED, READY, RUNNING} for row in issues)
                        and not ctx.store.active_runs(),
     }
 
@@ -96,10 +92,12 @@ def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: I
 def list_blocked(ctx: RunContext) -> list[dict]:
     """Inspect blocked evidence and audit the lookup, as orch-verbs requires."""
     items = []
-    for issue in sorted(ctx.tracker.list_open_issues(), key=lambda issue: issue.number):
-        if issue.is_pull_request or BLOCKED not in issue.labels:
+    for row in ctx.store.local_issues():
+        if row["state"] != "open" or BLOCKED not in row["labels"]:
             continue
-        flags = [(comment, match[1]) for comment in ctx.tracker.list_comments(issue.number)
+        issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
+        comments = [Comment(**item) for item in row["comments"]]
+        flags = [(comment, match[1]) for comment in comments
                  if (match := re.fullmatch(r"<!-- foragent:blocked reason=([a-z-]+) -->",
                                            comment.body.splitlines()[0] if comment.body else ""))]
         latest = max(flags, key=lambda item: (datetime.fromisoformat(item[0].created_at), item[0].id), default=None)
@@ -111,12 +109,12 @@ def list_blocked(ctx: RunContext) -> list[dict]:
         if log.is_file():
             with log.open(encoding="utf-8", errors="replace") as stream:
                 tail = "".join(deque(stream, maxlen=60))
-        items.append({"number": issue.number, "title": issue.title, "lane": issue_lane(issue.labels, ctx.config.lanes),
+        items.append({"number": issue.number, "title": issue.title, "lane": row["lane"],
                       "reason": latest[1] if latest else None,
                       "blocked_at": latest[0].created_at if latest else None,
                       "details": latest[0].body if latest else "",
                       "reviews": reviews, "log_path": str(log), "log_tail": tail})
-    _event(ctx, None, "list", f"Listed {len(items)} blocked issues", issues=[item["number"] for item in items])
+    append_event(ctx.store, ctx.now(), None, "list", f"Listed {len(items)} blocked issues")
     return items
 
 
@@ -312,4 +310,10 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     summary = f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; tests pass, no conflicts, CI {ci}"
     _event(ctx, None, "merge", summary)
     after_merge(ctx, n, current.base)
+    if (number := pr_issue_number(current.head)) is not None:
+        # GitHub applies closing references only on eligible merges; observe its result.
+        try:
+            ctx.tracker.get_issue(number)
+        except TrackerError as exc:
+            print(f"issue #{number} refresh failed after merge: {exc}")
     return summary
