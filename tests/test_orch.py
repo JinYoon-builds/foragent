@@ -470,7 +470,9 @@ def test_hint_keeps_native_goal_and_is_consumed_once(run_case, native):
     assert runner.run_issue(1, c.ctx) == "merged"
     first, second = [call["prompt"] for call in c.executor.calls]
     assert "Orchestrator hint:\nUse existing locale" in first
-    assert first.startswith("/goal " if native else "Orchestrator hint:")
+    assert first.startswith("Orchestrator hint:")
+    if native:
+        assert c.executor.calls[0]["goal"] == runner.goal_condition(c.ctx.config.acceptance_dir)
     assert "Use existing locale" not in second
     assert not hint.exists()
 
