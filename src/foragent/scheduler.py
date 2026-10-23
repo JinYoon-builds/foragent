@@ -503,7 +503,9 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
     if ctx.store.issues_refresh_due(ctx.now()) or ctx.store.github_outbox():
-        ctx.tracker.refresh_issues()
+        # Keep an existing recorder; wrapping again would bypass its own state.
+        recorder = ctx.tracker if isinstance(ctx.tracker, RecordingTracker) else RecordingTracker(ctx.tracker, ctx)
+        recorder.refresh_issues()
     ctx.tracker.flush_outbox()
     if until := ctx.store.github_wait_until(ctx.now()):
         return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
