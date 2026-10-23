@@ -1,7 +1,7 @@
 """Execute, independently check and review one approved snapshot."""
 
 from collections.abc import Callable
-from contextlib import contextmanager, ExitStack
+from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -23,7 +24,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board, orch_github
+from foragent import board, capacity, orch_github
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -227,7 +228,8 @@ def build_prompt(
         if test_command is not None else "- The runner runs Done when. "
     )
     test_rule += (
-        "You run only the Done when tests and the tests for files you change; no parallel test helper is needed.\n"
+        "You run only the Done when tests and the tests for files you change; no parallel test helper is needed. "
+        "Run tests with `fa test <pytest args>`; it waits for a machine-wide test slot.\n"
     )
     prompt = (
         f"You are implementing GitHub issue #{n} in this repository.\n"
@@ -324,14 +326,19 @@ def _append(log: Path, text: str) -> None:
 def _check(
     command: str, worktree: Path, log: Path, timeout_s: int,
     *, progress: Callable[[], None] | None = None,
+    slot: AbstractContextManager | None = None,
 ) -> CheckResult:
     _append(log, f"\nDone when command:\n{command}")
     offset = log.stat().st_size
 
     def execute():
-        return run_logged(
-            ["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
-        )
+        # The slot covers only the command; timeout_s counts execution, not the queue.
+        if slot is None:
+            return run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log)
+        with slot:
+            # A nested `fa test` in the command shares this slot instead of waiting for another.
+            return run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
+                              env=capacity.HELD_ENV)
 
     # A quiet check is still running; keep the scheduler informed while it waits.
     code, timed_out, _ = poll_executor(execute, progress) if progress is not None else execute()
@@ -390,6 +397,45 @@ def _pytest_command(command: str) -> str | None:
     prefix.append("PYTEST_ADDOPTS=")
     # Stable, repository-relative JUnit paths are also valid pytest selectors.
     return " ".join([*prefix, shlex.join(result), "-o addopts= --rootdir=. --maxfail=0 -p no:cacheprovider"])
+
+
+def _pytest_invocation(command: str | None) -> str | None:
+    """The shell prefix that starts pytest (environment, launcher, executable), without its options."""
+    if command is None:
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        words = list(lexer)
+    except ValueError:
+        return None
+    index = next((i for i, word in enumerate(words) if Path(word).name == "pytest"), None)
+    if index is None or any(word and all(char in "();<>|&" for char in word) for word in words):
+        return None
+    words = words[:index + 1]
+    prefix = []
+    while words and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", words[0], re.S):
+        name, value = words.pop(0).split("=", 1)
+        prefix.append(f"{name}={shlex.quote(value)}")
+    return " ".join([*prefix, shlex.join(words)])
+
+
+def run_tests(root: Path, config: Config, args: list[str]) -> int:
+    """`fa test`: wait for a machine-wide test slot, then run pytest with these arguments."""
+    command = config.test_command or next(iter(detect_test_commands(root)), None)
+    invocation = _pytest_invocation(command) or "pytest"
+    announced = False
+
+    def waiting() -> None:
+        nonlocal announced
+        if not announced:
+            announced = True
+            print("foragent: waiting for a machine-wide test slot", file=sys.stderr, flush=True)
+
+    with capacity.hold_test_slot(config.test_slots, waiting=waiting):
+        # A test that itself runs `fa test` shares this slot instead of waiting for another.
+        return subprocess.run(["/bin/sh", "-c", f"{invocation} {shlex.join(args)}".rstrip()],
+                              cwd=root, check=False, env={**os.environ, **capacity.HELD_ENV}).returncode
 
 
 def _passing_acceptance_ids(report: Path) -> tuple[str, ...]:
@@ -483,8 +529,11 @@ def _capture_acceptance_baseline(
     cached_ids = cache.root / f"{key}.json"
     with (cache.root / f"{key}.lock").open("a", encoding="utf-8") as lock:
         _phase(n, ctx, "checking")
-        poll_executor(lambda: fcntl.flock(lock.fileno(), fcntl.LOCK_EX),
-                      lambda: _progress(n, ctx))
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Another run builds this baseline (possibly queued for a test slot); not our run time.
+            _credited_wait(n, ctx, lambda: fcntl.flock(lock.fileno(), fcntl.LOCK_EX))
         try:
             saved = json.loads(cached_ids.read_text(encoding="utf-8"))
             saved_ids = saved["node_ids"]
@@ -516,7 +565,7 @@ def _capture_acceptance_baseline(
                 )
                 offset = log.stat().st_size if log.exists() else 0
                 result = _check(baseline_command, worktree, log, min(900, _remaining(n, ctx)),
-                                progress=lambda: _progress(n, ctx))
+                                progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
                 _progress(n, ctx)
                 # Read this execution's collection count from the full log: a long
                 # traceback can push it out of CheckResult's bounded output tail.
@@ -702,6 +751,38 @@ def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str)
     raise failure
 
 
+@contextmanager
+def _test_slot(n: int, ctx: RunContext):
+    """Hold a machine-wide test slot; credit the queue time as waited, not run time."""
+    run = ctx.store.get_run(n)
+    started = ctx.now()
+    waited = False
+
+    def credit() -> datetime:
+        now = ctx.now()
+        ctx.store.update_run(
+            n, waited_seconds=run.waited_seconds + max(0.0, (now - started).total_seconds()),
+            last_progress_at=now.astimezone(UTC).isoformat(),
+        )
+        return now
+
+    def waiting() -> None:
+        nonlocal waited
+        waited = True
+        now = credit()
+        # Tick reads a future waiting_until as alive; refresh it while queued.
+        ctx.store.update_run(n, waiting_until=(now + timedelta(seconds=60)).astimezone(UTC).isoformat())
+
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting))
+        finally:
+            if waited:
+                credit()
+                ctx.store.update_run(n, waiting_until=None)
+        yield
+
+
 def _progress(n: int, ctx: RunContext) -> None:
     ctx.store.update_run(n, last_progress_at=ctx.now().astimezone(UTC).isoformat())
 
@@ -770,8 +851,8 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
         )
 
 
-@contextmanager
-def _merge_lock(n: int, ctx: RunContext):
+def _credited_wait(n: int, ctx: RunContext, acquire: Callable[[], object]) -> None:
+    """Block in acquire; credit the time as waited and keep tick informed meanwhile."""
     run = ctx.store.get_run(n)
     started = ctx.monotonic()
 
@@ -782,16 +863,21 @@ def _merge_lock(n: int, ctx: RunContext):
             waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat(),
         )
 
+    progress()
+    try:
+        poll_executor(acquire, progress)
+    finally:
+        ctx.store.update_run(
+            n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
+            waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
+        )
+
+
+@contextmanager
+def _merge_lock(n: int, ctx: RunContext):
     # Keep tick informed during an unbounded blocking flock acquisition.
     with ExitStack() as stack:
-        progress()
-        try:
-            poll_executor(lambda: stack.enter_context(ctx.store.merge_lock()), progress)
-        finally:
-            ctx.store.update_run(
-                n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
-                waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
-            )
+        _credited_wait(n, ctx, lambda: stack.enter_context(ctx.store.merge_lock()))
         yield
 
 
@@ -1405,11 +1491,13 @@ def _implement_and_publish(
         for verification in range(2):
             checks = []
             for command in parsed.done_when_commands:
-                checks.append(_check(command, worktree, log, 900, progress=lambda: _progress(n, ctx)))
+                checks.append(_check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
+                                     slot=_test_slot(n, ctx)))
                 _progress(n, ctx)
             if baseline and baseline.node_ids:
                 command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
-                result = _check(command, worktree, log, 900, progress=lambda: _progress(n, ctx))
+                result = _check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
+                                slot=_test_slot(n, ctx))
                 checks.append(result)
                 _append(log, f"Acceptance baseline verification count={len(baseline.node_ids)}, "
                         f"exit_code={result.exit_code}, timed_out={result.timed_out}")
@@ -1422,7 +1510,7 @@ def _implement_and_publish(
             if unit_tests and unit_command:
                 limit = max(900, _remaining(n, ctx))
                 result = _check(f"{unit_command} {shlex.join(unit_tests)}", worktree, log, limit,
-                                progress=lambda: _progress(n, ctx))
+                                progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
                 checks.append(result)
                 _progress(n, ctx)
                 if result.timed_out:
@@ -1874,7 +1962,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     for command in parsed.done_when_commands:
         if _remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
-        check = _check(command, worktree, log, min(900, _remaining(n, ctx)), progress=lambda: _progress(n, ctx))
+        check = _check(command, worktree, log, min(900, _remaining(n, ctx)), progress=lambda: _progress(n, ctx),
+                       slot=_test_slot(n, ctx))
         _progress(n, ctx)
         if check.timed_out or _remaining(n, ctx) <= 0:
             return _timeout(n, ctx)

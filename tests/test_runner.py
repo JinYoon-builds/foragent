@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import timedelta
 import fcntl
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -4443,3 +4444,100 @@ def test_claude_tier_model_and_lane_precedence(run_case, lane_model, expected):
     assert kinds == ["claude"]
     assert [call["model"] for call in c.executor.calls] == expected
     assert all("effort" not in call for call in c.executor.calls)
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("pytest -q --ignore=tests/acceptance", "pytest"),
+    ("UV_CACHE_DIR='/a b' uv run --offline pytest -x tests", "UV_CACHE_DIR='/a b' uv run --offline pytest"),
+    ("make test", None), ("pytest && rm -rf x", None), (None, None),
+])
+def test_fa_test_keeps_only_the_pytest_launcher(command, expected):
+    from foragent.runner import _pytest_invocation
+
+    assert _pytest_invocation(command) == expected
+
+
+def test_fa_test_runs_pytest_in_a_slot_and_returns_its_exit_code(tmp_path, monkeypatch, capfd):
+    from foragent import capacity
+    from foragent.runner import run_tests
+
+    binary = tmp_path / "bin/pytest"
+    binary.parent.mkdir()
+    binary.write_text(f"#!{sys.executable}\nimport sys\nprint(sys.argv[1:])\nraise SystemExit(3)\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binary.parent) + os.pathsep + os.environ["PATH"])
+    held = []
+    original = capacity.hold_test_slot
+
+    @contextmanager
+    def observed(ceiling, **kwargs):
+        with original(ceiling, **kwargs):
+            held.append(ceiling)
+            yield
+
+    monkeypatch.setattr(capacity, "hold_test_slot", observed)
+    assert run_tests(tmp_path, Config(test_command="pytest -q", test_slots=3), ["-k", "a b"]) == 3
+    assert held == [3]
+    assert "['-k', 'a b']" in capfd.readouterr().out
+
+
+def test_check_tells_its_command_that_a_test_slot_is_held(tmp_path, monkeypatch):
+    from foragent import capacity
+    from foragent.runner import _check
+
+    monkeypatch.delenv(capacity.TEST_SLOT_ENV, raising=False)
+    log = tmp_path / "check.log"
+    _check(f'echo "slot=${capacity.TEST_SLOT_ENV}"', tmp_path, log, 30, slot=capacity.hold_test_slot(1))
+    assert "slot=held" in log.read_text()
+    _check(f'echo "free=${capacity.TEST_SLOT_ENV}"', tmp_path, log, 30)
+    assert "free=\n" in log.read_text()
+
+
+def test_fa_test_inside_a_held_slot_runs_without_waiting(tmp_path, monkeypatch, capfd):
+    from foragent import capacity
+    from foragent.runner import run_tests
+
+    binary = tmp_path / "bin/pytest"
+    binary.parent.mkdir()
+    binary.write_text(f"#!{sys.executable}\nimport os\nprint('child=' + os.environ.get({capacity.TEST_SLOT_ENV!r}, ''))\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binary.parent) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv(capacity.TEST_SLOT_ENV, "held")
+    with capacity.hold_test_slot(1):
+        monkeypatch.setattr(capacity, "SLOT_POLL_SECONDS", 60)  # Any wait would hang the test.
+        assert run_tests(tmp_path, Config(test_command="pytest", test_slots=1), []) == 0
+    assert "child=held" in capfd.readouterr().out
+
+
+def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp_path):
+    from foragent.runner import _baseline_environment, _capture_acceptance_baseline
+
+    command = f"{shlex.quote(sys.executable)} -m pytest -q"
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    mono = [0.0]
+    ctx = RunContext(
+        repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
+        config=Config(test_command=command), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
+        monotonic=lambda: mono[0],
+    )
+    key = sha256(json.dumps(
+        [git_history.tip, command, ctx.config.acceptance_dir, _baseline_environment(git_history.clone)],
+        sort_keys=True,
+    ).encode()).hexdigest()
+    lock_path = store.root.parent / "baselines" / f"{key}.lock"
+    lock_path.parent.mkdir(parents=True)
+    with ThreadPoolExecutor(max_workers=1) as pool, lock_path.open("a") as lock:
+        # Another run holds the baseline lock (for example while it queues for a test slot).
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        future = pool.submit(_capture_acceptance_baseline, 1, ctx, command, git_history.tip)
+        deadline = time.monotonic() + 10
+        while store.get_run(1).waiting_until is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert store.get_run(1).waiting_until is not None, "a run waiting on the baseline lock looks stalled"
+        mono[0] = 600.0
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        future.result(timeout=60)
+    run = store.get_run(1)
+    assert run.waited_seconds == 600.0
+    assert run.waiting_until is None

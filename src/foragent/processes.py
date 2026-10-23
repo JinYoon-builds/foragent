@@ -77,9 +77,9 @@ def run_logged(
     argv: list[str], *, cwd: Path, timeout_s: int, log_path: Path,
     prompt: str | None = None, capture_stdout: bool = False,
     stdout_path: Path | None = None, terminate_children: bool = False,
-    stderr_path: Path | None = None,
+    stderr_path: Path | None = None, env: dict[str, str] | None = None,
 ) -> tuple[int | None, bool, str]:
-    """Append output without buffering an unbounded session in memory."""
+    """Append output without buffering an unbounded session in memory; env adds variables."""
     on_process_group = _process_group_callback.get()
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("ab") as log, (
@@ -89,7 +89,7 @@ def run_logged(
             argv, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
             stdout=output if capture_stdout else log,
             stderr=errors if errors is not None else log if capture_stdout else subprocess.STDOUT,
-            start_new_session=True, env=_child_environment(cwd),
+            start_new_session=True, env={**_child_environment(cwd), **(env or {})},
         )
         # Executors have their own session, so relay tick termination to them.
         previous = None

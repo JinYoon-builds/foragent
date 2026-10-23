@@ -19,6 +19,14 @@ def no_view_windows(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_test_slots(tmp_path, monkeypatch):
+    """Keep machine-wide test slots away from the real data root and live runs."""
+    from foragent import capacity
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path / "machine-data")
+
+
+@pytest.fixture(autouse=True)
 def kicks(monkeypatch):
     """Record event hooks without starting background ticks in any test."""
     from foragent import cli, orch, order, runner
