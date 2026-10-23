@@ -1,0 +1,7 @@
+# Notifications only when the person has something to do; the lane view opens anywhere
+
+Evidence (2026-10-23): push-outbox.jsonl held 78 pushes in one day. `inspect_actions.py:80` re-sends the whole list whenever the set of items changes, so a technical-failure count change or a resolved question re-pushes every remaining question. "Human check 3" listed #6, #8 and #112, all closed: `inspect_data.py:233` collects unchecked "Needs a human check" boxes from recently merged PR bodies without checking that the linked issue is still open.
+
+Principle (Jin, D71, D36): a notification always means the person has something to do.
+1. notify-only-actions: push once per NEW item that needs the person — a D71 question escalated by the orchestrator, or a PR waiting for a human merge decision — naming the issue and the decision. Count changes, orchestrator-resolved work and closed issues never push; resolving one item never re-pushes the others. One morning summary per local day at `notify_summary_hour` (default 8). Closed issues never enter the human-check list.
+2. view-open-terminals: the lane view opener keeps Orca first, splits a pane inside tmux (`tmux split-window -h`), uses iTerm's AppleScript in iTerm, falls back to Terminal.app on macOS, and with no opener prints the exact `fa gate watch --repo-root <root>` command on one line. Orca's own app notifications are the person's settings, not the product's.
