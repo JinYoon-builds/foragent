@@ -220,10 +220,12 @@ def build_prompt(
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     acceptance_rule = "" if acceptance_locked else f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
     test_rule = (
-        f"- Optional additional check: Before you finish, also run the full test suite: `{test_command}`. "
-        "Each attempt checks Done when, the acceptance baseline and related unit tests; "
-        "CI runs the full suite after publication and sends failures back for repair.\n"
-        if test_command is not None else ""
+        "- The runner runs Done when, the previously passing acceptance tests and related unit tests. "
+        f"CI runs the full suite after publication (`{test_command}`) and sends failures back for repair. "
+        if test_command is not None else "- The runner runs Done when. "
+    )
+    test_rule += (
+        "You run only the Done when tests and the tests for files you change; no parallel test helper is needed.\n"
     )
     prompt = (
         f"You are implementing GitHub issue #{n} in this repository.\n"
