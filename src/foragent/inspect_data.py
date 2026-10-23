@@ -66,6 +66,8 @@ def load_prepared(store: StateStore, number: int) -> Prepared | None:
 def inbox_payload(inbox: "Inbox") -> dict:
     payload = asdict(inbox)
     for item in payload["items"]:
+        # Delivery identity is local bookkeeping, not part of the inbox API.
+        item.pop("notification_id")
         if item["prepared"] is not None:
             for result in item["prepared"]["results"]:
                 if result["exit_code"] == 0:
@@ -100,6 +102,7 @@ class Item:
     prepared: Prepared | None = None
     lane: str = "main"
     lane_display: str = ""
+    notification_id: str | None = None
 
 
 @dataclass
@@ -200,6 +203,8 @@ def collect(ctx: InspectContext) -> Inbox:
         items.append(Item(
             group, issue.number, issue.title, url, reason, summary, details,
             pr.number if pr else None, answered,
+            notification_id=(f"pr:{pr.number}" if group == "review" and pr else
+                             f"issue:{issue.number}:comment:{comment.id}" if flag else None),
         ))
 
     for pr in open_prs:
@@ -207,11 +212,12 @@ def collect(ctx: InspectContext) -> Inbox:
         if not match:
             continue
         number = int(match[1])
-        if number in issues and issues[number].labels & {BLOCKED, NEEDS_HUMAN}:
+        if number not in issues or issues[number].labels & {BLOCKED, NEEDS_HUMAN}:
             continue
         items.append(Item(
             "review", number, pr.title, pr.url or f"https://github.com/{ctx.repo}/pull/{pr.number}",
-            None, "PR awaits human review", pr.body.strip()[:4000], pr.number, False,
+            None, "PR awaits a human merge decision", pr.body.strip()[:4000], pr.number, False,
+            notification_id=f"pr:{pr.number}",
         ))
 
     merged_prs = [pr for pr in ctx.tracker.list_prs("merged", HEAD_PREFIX) if pr.merged_at is not None]
@@ -230,7 +236,7 @@ def collect(ctx: InspectContext) -> Inbox:
                 _try_card(ctx, number, pr.body), load_prepared(ctx.store, number),
             ))
             tried_issues.add(number)
-        if checks := _human_checks(pr.body):
+        if number in issues and (checks := _human_checks(pr.body)):
             items.append(Item(
                 "human-check", number, pr.title, url, None, "Unchecked human checks",
                 checks, pr.number, False,
