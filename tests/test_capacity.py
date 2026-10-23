@@ -30,19 +30,27 @@ def test_next_parallel_never_goes_below_one():
                                   ceiling=None, increase_ok=True) == 1
 
 
-@pytest.mark.parametrize("level,expected", [("1\n", "normal"), ("2\n", "warn"), ("4\n", "critical"),
-                                            ("garbage", "normal")])
+@pytest.mark.parametrize("level,expected", [(1, "normal"), (2, "warn"), (4, "critical"),
+                                            (None, "normal"), (7, "normal")])
 def test_darwin_pressure_maps_sysctl_levels(monkeypatch, level, expected):
     monkeypatch.setattr(capacity.sys, "platform", "darwin")
-    calls = []
+    monkeypatch.setattr(capacity, "_darwin_pressure_level", lambda: level)
 
-    def run(argv, **kwargs):
-        calls.append(argv)
-        return SimpleNamespace(stdout=level)
+    def no_subprocess(*args, **kwargs):
+        raise AssertionError("memory pressure must not start a subprocess")
 
-    monkeypatch.setattr(capacity.subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "run", no_subprocess)
+    monkeypatch.setattr(subprocess, "Popen", no_subprocess)
     assert capacity.memory_pressure() == expected
-    assert calls == [["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="reads the macOS kernel sysctl")
+def test_darwin_pressure_level_reads_kernel_in_process(monkeypatch):
+    def no_subprocess(*args, **kwargs):
+        raise AssertionError("memory pressure must not start a subprocess")
+
+    monkeypatch.setattr(subprocess, "Popen", no_subprocess)
+    assert capacity._darwin_pressure_level() in capacity._DARWIN_PRESSURE
 
 
 @pytest.mark.parametrize("text,expected", [
