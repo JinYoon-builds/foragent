@@ -56,7 +56,7 @@ class TickContext:
     reap_orphans: Callable[..., dict[int, set[int]]] = reap_worktree_processes
 
     def __post_init__(self) -> None:
-        self.tracker = RecordingTracker(self.tracker, self)
+        self.tracker = RecordingTracker(self.tracker, self, queue_writes=True)
 
 
 @dataclass
@@ -426,6 +426,8 @@ def tick(ctx: TickContext) -> TickReport:
             return TickReport(skipped="another tick is running")
         if until := ctx.store.github_wait_until(ctx.now()):
             return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
+        if not isinstance(ctx.tracker, RecordingTracker):
+            ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
         try:
             return _tick_locked(ctx)
         except TrackerError as exc:
@@ -523,8 +525,11 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     report = TickReport()
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
-    if ctx.store.issues_refresh_due(ctx.now()):
+    if ctx.store.issues_refresh_due(ctx.now()) or ctx.store.github_outbox():
         ctx.tracker.refresh_issues()
+    ctx.tracker.flush_outbox()
+    if until := ctx.store.github_wait_until(ctx.now()):
+        return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
     _recover_runs(ctx, report)
     _reconcile_batches(ctx, report)
     _reap_orphans(ctx, report)
@@ -601,6 +606,9 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         report.actions.append(f"#{issue.number} promoted to ready")
         ready.setdefault(lane, []).append(issue.number)
 
+    if until := ctx.store.github_wait_until(ctx.now()):
+        report.skipped = f"GitHub rate limit until {until.isoformat()}"
+        return report
     if not ctx.start_runs or not ready:
         return report
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
@@ -635,6 +643,9 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                 ctx.tracker.remove_labels(number, [READY])
                 ctx.tracker.add_labels(number, [RUNNING])
                 board.sync_status(ctx, number, "Running")
+                if until := ctx.store.github_wait_until(ctx.now()):
+                    report.skipped = f"GitHub rate limit until {until.isoformat()}"
+                    return report
             except TrackerError as exc:
                 if not exc.is_rate_limit:
                     raise

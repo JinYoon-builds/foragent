@@ -446,6 +446,20 @@ def test_failed_replace_preserves_previous_record_and_removes_temp(store, monkey
     assert list(store.root.rglob("*.tmp")) == []
 
 
+def test_outbox_refresh_preserves_issue_created_after_bulk_read_started(store):
+    from foragent.tracker import Issue
+
+    revision = store.issues_revision()
+    issue = Issue(1, "New issue", "body", frozenset(), "open")
+    store.record_issue(issue, {})
+    store.queue_github_write(1, "comment", body="New evidence")
+    pending = store.github_outbox()
+
+    assert store.refresh_local_issues([], [], {}, NOW, since_revision=revision) == []
+    assert store.github_outbox() == pending
+    assert store.local_issues()[0]["number"] == 1
+
+
 @pytest.mark.parametrize("method,fields", [
     ("start_run", {"branch": "new", "worktree": "new"}),
     ("update_run", {"pid": 999}),
@@ -554,6 +568,33 @@ def test_issue_snapshot_is_shared_and_remote_refresh_replaces_local_labels(store
     other.refresh_local_issues([human], [], {}, NOW + timedelta(minutes=5))
     row, = store.local_issues()
     assert (row["title"], row["labels"], row["state"]) == ("Human title", ["needs-human"], "closed")
+
+
+def test_outbox_refresh_uses_first_queued_write_and_drops_only_changed_issue(store):
+    from foragent.tracker import Issue
+
+    issues = [Issue(number, "Feature", "body", frozenset({"blocked"}), "open", updated_at=NOW.isoformat())
+              for number in (1, 2)]
+    store.refresh_local_issues(issues, [], {}, NOW)
+    for issue in issues:
+        store.queue_github_write(issue.number, "add_labels", labels=["ready"])
+    first = store.github_outbox()
+    assert store.refresh_local_issues(issues, [], {}, NOW) == []
+    assert all(row["labels"] == ["blocked", "ready"] for row in store.local_issues())
+    assert store.github_outbox() == first
+
+    revision = store.issues_revision()
+    later = StateStore(store.root, now=lambda: NOW + timedelta(minutes=2))
+    later.queue_github_write(1, "comment", body="Pending evidence")
+    # The person's edit predates the later comment, but follows the first queued write.
+    changed = replace(issues[0], labels=frozenset({"needs-human"}),
+                      updated_at=(NOW + timedelta(minutes=1)).isoformat())
+    assert later.refresh_local_issues([changed, issues[1]], [], {}, NOW + timedelta(minutes=3),
+                                      since_revision=revision) == [1]
+    assert later.github_outbox() == [first[1]]
+    row, untouched = later.local_issues()
+    assert row["labels"] == ["needs-human"] and row["comments"] == []
+    assert untouched["labels"] == ["blocked", "ready"]
 
 
 @pytest.mark.parametrize("method,fields", [

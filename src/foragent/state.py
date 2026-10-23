@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 import fcntl
@@ -116,6 +117,88 @@ class StateStore:
         """Read the last observed issue facts without contacting the tracker."""
         return sorted(self._issue_snapshot()["issues"].values(), key=lambda row: row["number"])
 
+    def github_outbox(self) -> list[dict[str, Any]]:
+        """Read pending GitHub writes in their persisted delivery order."""
+        return self._issue_snapshot().get("outbox", [])
+
+    def drop_missing_github_issue(self, number: int) -> None:
+        """Remove a confirmed missing issue and all its pending writes atomically."""
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            snapshot["outbox"] = [entry for entry in snapshot.get("outbox", [])
+                                  if entry["issue"] != number]
+            snapshot.get("outbox_base", {}).pop(str(number), None)
+            snapshot["issues"].pop(str(number), None)
+            snapshot["revision"] = snapshot.get("revision", 0) + 1
+            self._write_json(self.root / "issues.json", snapshot)
+
+    def _local_issue(self, snapshot: dict[str, Any], number: int) -> dict[str, Any]:
+        return snapshot["issues"].setdefault(str(number), {
+            "number": number, "title": "", "body": "", "labels": [], "lane": "main",
+            "state": "open", "pr_number": None, "merged": False, "comments": [],
+        })
+
+    def _apply_github_write(self, row: dict[str, Any], entry: dict[str, Any], lanes: dict) -> None:
+        """Apply the same write facts to local intent and its delivery baseline."""
+        action = entry["action"]
+        if action in {"add_labels", "remove_labels"}:
+            self._record_labels(row, entry["labels"], remove=action == "remove_labels", lanes=lanes)
+        elif action == "update_issue":
+            row.update(title=entry["title"], body=entry["body"])
+        elif action == "close_issue":
+            row["state"] = "closed"
+        if action == "comment" or action == "close_issue" and entry.get("body") is not None:
+            row["comments"] = row.get("comments", []) + [{
+                "id": -entry["id"], "body": entry["body"], "author": "foragent",
+                "created_at": entry["queued_at"],
+            }]
+
+    def queue_github_write(self, number: int, action: str, *, lanes: dict | None = None,
+                           **payload: Any) -> dict[str, Any]:
+        """Persist the FIFO entry and its local effect in one transaction."""
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            row = self._local_issue(snapshot, number)
+            snapshot.setdefault("outbox_base", {}).setdefault(str(number), deepcopy(row))
+            identity = snapshot.get("outbox_sequence", 0) + 1
+            entry = {"id": identity, "issue": number, "action": action,
+                     "queued_at": self._timestamp(), **payload}
+            snapshot.setdefault("outbox", []).append(entry)
+            snapshot["outbox_sequence"] = identity
+            self._apply_github_write(row, entry, lanes or {})
+            self._save_local_issue(snapshot, row)
+            return entry
+
+    def deliver_github_write(self, entry: dict[str, Any], *, comment_id: int | None = None,
+                             remaining_labels: list[str] | None = None) -> None:
+        """Acknowledge delivery without losing concurrent appends or later local intent."""
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            pending = snapshot.get("outbox", [])
+            item = next((item for item in pending if item["id"] == entry["id"]), None)
+            if item is None:
+                return
+            delivered = dict(item)
+            if remaining_labels is not None:
+                delivered["labels"] = item["labels"][:len(item["labels"]) - len(remaining_labels)]
+                item["labels"] = remaining_labels
+            baseline = snapshot.get("outbox_base", {}).get(str(entry["issue"]))
+            if baseline is not None:
+                self._apply_github_write(baseline, delivered, {})
+            if not remaining_labels:
+                snapshot["outbox"] = [item for item in pending if item["id"] != entry["id"]]
+            row = self._local_issue(snapshot, entry["issue"])
+            if comment_id is not None:
+                for facts in (row, baseline or {}):
+                    for comment in facts.get("comments", []):
+                        if comment["id"] == -entry["id"]:
+                            comment["id"] = comment_id
+            if not any(item["issue"] == entry["issue"] for item in snapshot.get("outbox", [])):
+                snapshot.get("outbox_base", {}).pop(str(entry["issue"]), None)
+            elif baseline is not None:
+                baseline["revision"] = snapshot.get("revision", 0) + 1
+            self._save_local_issue(snapshot, row)
+
     def issues_revision(self) -> int:
         return self._issue_snapshot().get("revision", 0)
 
@@ -131,41 +214,46 @@ class StateStore:
     def update_local_issue(self, number: int, **fields: Any) -> None:
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            row = snapshot["issues"].setdefault(str(number), {
-                "number": number, "title": "", "body": "", "labels": [], "lane": "main",
-                "state": "open", "pr_number": None, "merged": False, "comments": [],
-            })
+            row = self._local_issue(snapshot, number)
             row.update(fields)
             self._save_local_issue(snapshot, row)
 
     def record_issue(self, issue: Any, lanes: dict) -> None:
         from foragent.labels import issue_lane
 
-        if not issue.is_pull_request:
-            self.update_local_issue(issue.number, title=issue.title, body=issue.body,
-                                    labels=sorted(issue.labels), state=issue.state,
-                                    lane=issue_lane(issue.labels, lanes))
-
-    def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict) -> None:
-        from foragent.labels import READY, issue_lane
-
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            row = snapshot["issues"].setdefault(str(number), {
-                "number": number, "title": "", "body": "", "labels": [], "lane": "main",
-                "state": "open", "pr_number": None, "merged": False, "comments": [],
-            })
-            current = set(row["labels"])
-            row["labels"] = sorted(current - set(labels) if remove else current | set(labels))
-            row["lane"] = issue_lane(row["labels"], lanes)
-            if READY in labels:
-                approval = self.load_approval(number)
-                row["ready_approval"] = None if remove or approval is None else approval.approved_at
+            if issue.is_pull_request or any(
+                entry["issue"] == issue.number for entry in snapshot.get("outbox", [])
+            ):
+                return
+            row = self._local_issue(snapshot, issue.number)
+            row.update(title=issue.title, body=issue.body, labels=sorted(issue.labels),
+                       state=issue.state, lane=issue_lane(issue.labels, lanes))
             self._save_local_issue(snapshot, row)
+
+    def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict) -> None:
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            row = self._local_issue(snapshot, number)
+            self._record_labels(row, labels, remove=remove, lanes=lanes)
+            self._save_local_issue(snapshot, row)
+
+    def _record_labels(self, row: dict[str, Any], labels: list[str], *, remove: bool, lanes: dict) -> None:
+        from foragent.labels import READY, issue_lane
+
+        current = set(row["labels"])
+        row["labels"] = sorted(current - set(labels) if remove else current | set(labels))
+        row["lane"] = issue_lane(row["labels"], lanes)
+        if READY in labels:
+            approval = self.load_approval(row["number"])
+            row["ready_approval"] = None if remove or approval is None else approval.approved_at
 
     def record_comments(self, number: int, comments: list[dict], *, append: bool = False) -> None:
         with self._state_lock():
             snapshot = self._issue_snapshot()
+            if not append and any(entry["issue"] == number for entry in snapshot.get("outbox", [])):
+                return
             row = snapshot["issues"].get(str(number))
             if row is not None:
                 row["comments"] = row["comments"] + comments if append else comments
@@ -182,7 +270,7 @@ class StateStore:
     def refresh_local_issues(
         self, issues: list, prs: list, lanes: dict, now: datetime,
         *, comments: dict[int, list[dict]] | None = None, since_revision: int | None = None,
-    ) -> None:
+    ) -> list[int]:
         """Replace remote facts, preserving local changes made since the refresh began."""
         from foragent.labels import issue_lane
         from foragent.tracker import pr_issue_number
@@ -192,28 +280,57 @@ class StateStore:
             snapshot = self._issue_snapshot()
             previous = snapshot["issues"]
             rows = {}
+            observed = {issue.number for issue in issues if not issue.is_pull_request}
+            dropped = {entry["issue"] for entry in snapshot.get("outbox", [])
+                       if entry["issue"] not in observed and (
+                           since_revision is None or snapshot.get("outbox_base", {}).get(
+                               str(entry["issue"]), {}).get("revision", 0) <= since_revision)}
             for issue in issues:
                 if issue.is_pull_request:
                     continue
                 old = previous.get(str(issue.number), {})
-                rows[str(issue.number)] = {
+                pending = [entry for entry in snapshot.get("outbox", []) if entry["issue"] == issue.number]
+                old_comments = old.get("comments", [])
+                queued_ids = {-entry["id"] for entry in pending}
+                old_comments = [comment for comment in old_comments if comment["id"] not in queued_ids]
+                remote = {
                     **old, "number": issue.number, "title": issue.title, "body": issue.body,
                     "labels": sorted(issue.labels), "lane": issue_lane(issue.labels, lanes),
                     "state": issue.state, "pr_number": old.get("pr_number"),
                     "merged": old.get("merged", False),
-                    "comments": comments.get(issue.number, old.get("comments", [])),
+                    "comments": comments.get(issue.number, old_comments),
                     "updated_at": self._timestamp(),
                 }
+                if pending:
+                    # Pending effects are already in old. Compare GitHub with
+                    # the same snapshot before those effects, advanced only by
+                    # acknowledged writes, so a partial delivery cannot hide a
+                    # person's change under the remaining local intent.
+                    # Only labels and open/closed state conflict here; discussion
+                    # content is independent, and comment snapshots may be incomplete.
+                    expected = snapshot.get("outbox_base", {}).get(str(issue.number), {})
+                    concurrent = since_revision is not None and expected.get("revision", 0) > since_revision
+                    fields = ("labels", "state")
+                    matches = all(remote[key] == expected.get(key) for key in fields)
+                    if concurrent or matches:
+                        rows[str(issue.number)] = dict(old)
+                        continue
+                    dropped.add(issue.number)
+                rows[str(issue.number)] = remote
             for pr in prs:
                 if (row := rows.get(str(pr_issue_number(pr.head)))) is not None:
                     row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
                                merged=pr.merged_at is not None)
             if since_revision is not None:
                 rows.update({number: row for number, row in previous.items()
-                             if row.get("revision", 0) > since_revision})
+                             if row.get("revision", 0) > since_revision and int(number) not in dropped})
             self._write_json(self.root / "issues.json", {
                 **snapshot, "refreshed_at": now.isoformat(), "issues": rows,
+                "outbox": [entry for entry in snapshot.get("outbox", []) if entry["issue"] not in dropped],
+                "outbox_base": {number: row for number, row in snapshot.get("outbox_base", {}).items()
+                                if int(number) not in dropped},
             })
+            return sorted(dropped)
 
     def order_progress(self) -> dict[str, Any] | None:
         """Read order preparation facts shared by the CLI and lane view."""
