@@ -42,6 +42,11 @@
 - #91 리뷰 보완: 네 자동 열기 경로 모두 `cli._open_lane_view(root)`를 거친다. 이 함수가 `FORAGENT_VIEW=off`일 때 준비·열기 자체를 생략하고 `OSError`를 격리한다. `order publish`·`orch watch`에서 직접 `open_view`를 호출하면 이 보호를 우회하므로 공통 함수를 재사용한다. `tests/test_cli.py -k automatic_view_failure`는 열기를 끈 경우와 열기 자체가 실패한 경우의 발행 성공·실제 감시 조회·한 줄 한국어 오류를 검증한다.
 - #91 최종 검증(리뷰 보완 포함): `UV_CACHE_DIR=/tmp/foragent-issue-38-uv-cache UV_OFFLINE=1 uv run pytest tests/acceptance/test_view_open_triggers.py tests/test_cli.py`는 82 passed, 같은 환경의 `uv run pytest`는 2,108 passed다. `tests/test_cli.py -k 'init_view or automatic_view_failure'`의 7개는 저장소 루트 보정·설정된 repo/language·dry-run·화면 준비와 열기 실패 격리·자동 열기 끄기를 확인한다.
 
+- #116 watch 색상 원본은 `watch_terminal.color_pairs(colors)`이며 `watch`가 다시 내보낸다(#198 분리 뒤 이동). `_terminal`은 `watch.color_pairs`를 읽고 `start_color()` → `use_default_colors()` 뒤 반환 목록을 순서대로 등록한다. 모든 배경은 `-1`, 기본 글자·대기 작업의 전경도 `-1`로 터미널 테마를 따른다. 구분선·주의는 청록, Claude는 자홍이며 8색·256색 모두 기본 8색 강조를 사용한다. 스타일 키와 `_frame` 배치는 유지한다. 지정 검증: `UV_CACHE_DIR=/tmp/foragent-issue-38-uv-cache UV_OFFLINE=1 uv run pytest tests/acceptance/test_view_theme_colors.py` (6 passed).
+- #116 전체 검증은 같은 환경의 `uv run pytest`에서 2,137 passed·89 failed다. `git archive HEAD src`를 임시 폴더에 풀고 그 `src`를 `PYTHONPATH`로 지정해 색상 테스트를 제외한 인수 테스트를 실행하면 152 passed·89 failed다. JUnit 실패 목록과 전체 실행의 `.pytest_cache/v/cache/lastfailed`를 대조해 실패 식별자 89개가 정확히 같고 새 실패 0개임을 확인했다. `.foragent/TRY.md`는 외부 연결 없이 실제 팔레트의 ANSI 미리보기와 지정 테스트를 실행한다.
+
+- #116 리뷰 확인: `_frame`의 queue는 ` #번호 `, hit는 현재 작업 번호, claude/codex는 `▐ 배지 이름 ▌`를 그리므로 공백 배경에 의존하지 않는다. 배경 복구는 기본 배경 요구와 충돌한다. `color_pairs(colors)`의 색 수 인자는 고정 인수 테스트가 사용하는 공개 인터페이스이며, 8색·256색 공통 기본 ANSI 팔레트를 의도적으로 반환한다. 관련 이유는 함수 설명과 `.foragent/REBUTTAL.md`에 남긴다.
+- #116 리뷰 후 재검증: 지정 색상·기존 watch·compact 테스트 32개 통과, TRY 명령의 색상 테스트 6개 통과. 전체 `uv run pytest`는 2,137 passed·89 failed이며, HEAD 소스를 별도 임시 폴더에서 읽어 실행한 인수 테스트는 152 passed·89 failed다. 두 실행 로그의 FAILED 식별자 89개가 정확히 일치해 새 실패 0개를 확인했다.
 - #112 문체 원본은 `docs/voice.md`다. 한국어 안내·빈 화면 설명은 해요체, 영어 안내는 대화체로 쓴다. 짧은 상태 라벨은 동작을 나타내는 구로 유지하고, 문구를 바꿀 때 i18n 키·자리표시자와 JSON 상태 값은 보존한다. 오류의 진단 내용도 유지한다. 고정 인수 테스트 대신 일반 테스트의 옛 문구 기대값만 함께 갱신한다.
 - #112 `watch_eta`의 `{time}`에는 실제 시각뿐 아니라 `watch_estimating`이나 `—`도 들어간다. 시간에만 맞는 `쯤 끝나요` 같은 어미를 붙이면 빈 화면에 `—쯤 끝나요`가 나온다. `끝날 시간 {time}`처럼 세 경우 모두 자연스러운 라벨을 쓰고, `.foragent/TRY.md`의 FakeTracker 예제로 실제 화면도 확인한다.
 - #112 `watch_open_failed`는 CLI·watch_open뿐 아니라 scheduler의 `report.actions`에도 들어간다. 문구를 바꿀 때 `tests/test_scheduler.py`의 `view_opener` 5개도 확인한다. 옛 문구의 소비처는 해당 레인 파일에 한정하지 말고 `tests/` 전체에서 검색한다.
@@ -77,3 +82,5 @@
 - #139 긴 세션은 시간 초과로 작업 트리가 기준 브랜치에서 다시 만들어져 미커밋 변경이 사라질 수 있다. 전체 테스트 대신 Done-when과 바꾼 파일의 테스트만 돌린다(관련 묶음 약 6분). 리뷰가 main 대비 "삭제"를 지적하면 먼저 기준 커밋이 main보다 뒤인지 확인한다.
 - #139 리뷰 보완: `refresh_issues`는 병합된 PR을 먼저, 열린 PR을 나중에 적용한다. 같은 이슈에 옛 병합 PR과 새 열린 PR이 있으면 열린 PR이 이겨야 pr-open(검토 대기)으로 묶인다. 회귀 검증: `tests/test_status.py -k new_open_pr`.
 - #139 관련 단위 테스트 검사가 부하로 시간 초과되면 러너가 작업을 WIP 커밋으로 브랜치에 남기고 작업 트리를 다시 만든다. 이때 커밋되지 않는 `.foragent/TRY.md`·`REBUTTAL.md`만 사라지므로 `git log`로 WIP 커밋을 확인한 뒤 그 두 파일만 다시 쓴다.
+- #116 main 병합: #198로 `watch.py`가 분리돼 충돌하면 main의 `watch.py`를 그대로 쓰고, 색상 변경은 `watch_terminal.py`에 다시 적용한 뒤 `watch.py`의 import에 `color_pairs`를 더한다.
+- 목표에 "저장소 밖 파일 변경 없음"이 있으면 `/tmp` 캐시나 기본 uv 캐시를 쓰지 않는다. `UV_CACHE_DIR=<저장소>/.uv-cache`처럼 저장소 안에 두고 임시 파일도 저장소 안(gitignore 대상)에 만든다. #116 병합 때 `/tmp` 캐시를 써서 조건을 되돌릴 수 없게 됐다.
