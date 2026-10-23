@@ -1,6 +1,6 @@
 ---
 name: fa-design-session
-description: Guide design mode in the planning session when the user wants to choose a visual direction, compare references or refine UI drafts. Build a local reference board, compare running drafts in the real medium, and leave an implementation handoff for the orchestrator.
+description: Start a design interview in the planning session when the user wants to choose a visual direction, compare references or refine UI drafts. Build a local reference board, compare running drafts in the real medium, and leave an implementation handoff for the orchestrator.
 ---
 
 # fa-design-session
@@ -16,12 +16,51 @@ choices with a recommendation when a product decision needs the user's answer.
 Use the project's language. Carry settled decisions forward instead of repeating
 the interview.
 
+## Start with a design interview
+
+Ask 2–3 short questions: who will see this and when, which medium they will use,
+and what it should feel like. Offer a few choices with a recommendation; let the
+user answer in their own words too. Use answers already given rather than asking
+again. People often recognise their taste only after seeing examples, so keep
+these questions brief and let the reference comparison reveal the rest.
+
+As soon as the first answers reveal the medium, open its research pack below
+and read `~/.local/share/foragent/media/<medium>.md` if it exists. Resolve `media/`
+relative to this `SKILL.md` when the skill is installed in another project; the
+table shows the source repository paths. The pack gives places to look for
+references and pitfalls to check. The external file holds lessons shared across
+projects; a missing file does not block the interview.
+
+| Medium | Research pack | External lesson filename |
+| --- | --- | --- |
+| Web | `skills/fa-design-session/media/web.md` | `web.md` |
+| Mobile | `skills/fa-design-session/media/mobile.md` | `mobile.md` |
+| Terminal UI (TUI) | `skills/fa-design-session/media/tui.md` | `tui.md` |
+| Pixel art | `skills/fa-design-session/media/pixel.md` | `pixel.md` |
+| Plain CLI output | `skills/fa-design-session/media/cli.md` | `cli.md` |
+
+For mixed media, read the relevant packs together, for example terminal UI and
+pixel art. Sources include Mobbin for web/mobile, lazygit for terminal UI, and
+Lospec for pixel palettes; use the pack to choose sources for this project.
+While questions continue, have another agent research references in the background.
+Give it the medium, audience, constraints, relevant pack and existing lessons;
+ask for source links, contrasting directions, reasons each reference fits, and
+pitfalls to check in the preview. Bring its findings into this conversation;
+the planning session keeps the user's context and presents the choices.
+
 ## References before drafts
 
 Collect references in deliberately different directions, including neighbouring
-fields where useful. Start around three directions with three references each;
-the purpose is to make taste visible, not to meet a quota. Choose appropriate
-sources for the medium rather than treating every project as a website.
+fields such as games, print, objects and pixel art. Spread about nine references
+over three directions, roughly three each. Stretch axes such as cute–serious,
+dense–airy and colourful–mono so the alternatives reveal real differences;
+the numbers are defaults, while the purpose is to make taste visible. Choose
+appropriate sources for the medium rather than treating every project as a website.
+
+Never commit third-party reference images. Keep source links and notes of what
+was referenced in `docs/design/<topic>/`; images stay in external local state.
+Do not copy reference art: draw new art, using the references to understand
+qualities such as shape, spacing, colour and hierarchy.
 
 Build a local browser reference board. Supply a JSON file outside the checkout:
 
@@ -49,14 +88,18 @@ fa design picks --topic dashboard --json
 Have the user click 👍/👎. Likes and dislikes are saved to a file (`picks.json`)
 in the project's external state directory and can be read by the planning session
 with `fa design picks`. Read those saved picks, ask what matters in ambiguous
-choices, and record a short set of principles. Do not infer an entire visual
+choices, and extract shared principles in words. Treat dislikes as equally useful
+evidence; the user can pick likes and dislikes without explaining each click.
+Record the principles in `docs/design/<topic>/HANDOFF.md`, with reference links
+and notes explaining what to carry forward or avoid. Do not infer an entire visual
 style from one click or make the user retype their selections.
 
 ## Compare running drafts
 
-Make 2–3 runnable code drafts in `docs/design/<topic>/`, linking each to its
-reference direction. Never show only one draft and ask “how is it?” during the
-comparison. Drafts are running code in the real medium: use them to discover
+Make 2–3 runnable code drafts in `docs/design/<topic>/`; each draft names the
+reference it builds on and the extracted principles it explores. Never show only
+one draft and ask “how is it?” during the comparison. Drafts are running code in
+the real medium: use them to discover
 movement, clicks, colour, layout and width problems before implementation.
 Choose a suitable tool; find a tool and propose it if the needed capability is
 missing.
