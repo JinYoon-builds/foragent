@@ -1,7 +1,9 @@
 """Small, injectable Git adapter for approval integrity checks."""
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import os
 from pathlib import Path
 import re
@@ -454,6 +456,30 @@ class GitRepo:
         self._call(["add", "-f", "--", *paths])
         self._exclude_artifacts()
         self._call([*identity, "commit", "--only", "-m", title, "--", *paths, f":!{REVIEW_SCOPE_FILE}"])
+
+    @contextmanager
+    def publish_lock(self) -> Iterator[None]:
+        """Serialize base-branch publication across processes sharing this repository."""
+        path = Path(self._call(["rev-parse", "--git-common-dir"]).strip())
+        path = (path if path.is_absolute() else self.root / path) / "foragent-publish.lock"
+        with path.open("a", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    def update_base(self, branch: str) -> None:
+        """Fetch the remote base and fast-forward to it, keeping unrelated local edits."""
+        self.fetch("origin", branch)
+        remote = f"refs/remotes/origin/{branch}"
+        if self.is_ancestor(remote, "HEAD"):
+            return
+        try:
+            self._call(["merge", "--ff-only", "--no-edit", remote])
+        except GitError as exc:
+            raise GitError(f"cannot fast-forward {branch} to origin/{branch}; "
+                           f"local commits or edits conflict with the latest {branch}: {exc}") from exc
 
     def push_base(self, branch: str) -> None:
         self._call(["push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"])
