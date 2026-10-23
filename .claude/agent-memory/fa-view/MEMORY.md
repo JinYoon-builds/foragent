@@ -84,3 +84,5 @@
 - #139 관련 단위 테스트 검사가 부하로 시간 초과되면 러너가 작업을 WIP 커밋으로 브랜치에 남기고 작업 트리를 다시 만든다. 이때 커밋되지 않는 `.foragent/TRY.md`·`REBUTTAL.md`만 사라지므로 `git log`로 WIP 커밋을 확인한 뒤 그 두 파일만 다시 쓴다.
 - #116 main 병합: #198로 `watch.py`가 분리돼 충돌하면 main의 `watch.py`를 그대로 쓰고, 색상 변경은 `watch_terminal.py`에 다시 적용한 뒤 `watch.py`의 import에 `color_pairs`를 더한다.
 - 목표에 "저장소 밖 파일 변경 없음"이 있으면 `/tmp` 캐시나 기본 uv 캐시를 쓰지 않는다. `UV_CACHE_DIR=<저장소>/.uv-cache`처럼 저장소 안에 두고 임시 파일도 저장소 안(gitignore 대상)에 만든다. #116 병합 때 `/tmp` 캐시를 써서 조건을 되돌릴 수 없게 됐다.
+
+- #117 `open_view` 순서: Orca(`--direction vertical`) → tmux(`TMUX`) → WezTerm(`WEZTERM_PANE`, `cli split-pane --right --cwd <root> -- <argv>`) → Kitty(`KITTY_WINDOW_ID`, `@ [--to KITTY_LISTEN_ON] launch --location=vsplit --cwd <root> <argv>`) → iTerm2(`tell current session of current window to split vertically ...`) → Terminal.app 새 창. WezTerm·Kitty는 셸 문자열 대신 argv 목록(`program`)을 그대로 넘긴다. 검증: `uv run pytest -q tests/acceptance/test_view_split.py tests/test_watch_open.py tests/acceptance/test_view_open_terminals.py tests/acceptance/test_view_open.py tests/acceptance/test_view_open_triggers.py` (45 passed).
