@@ -1,5 +1,5 @@
 review: fast
-executor: codex  # 2026-10-23: back to codex — the Claude worker got "/goal" + the whole prompt (30k chars) and refused every run ("Goal condition is limited to 4000 characters"); switch back after the fix issue merges
+executor: claude  # 2026-10-23 14:4x: #247 fixed the /goal prompt (live-checked); Claude quota idle. Reviewer becomes codex. D74 will choose per issue
 language: ko
 approvers:
 - JinYoon-builds
