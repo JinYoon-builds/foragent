@@ -83,7 +83,7 @@ def _invalidate_approval(
 ) -> None:
     run = ctx.store.get_run(issue.number)
     if run is not None and run.status == "running":
-        _kill_run(ctx, run.number, report)
+        _kill_run(ctx, run.number, report, detail=summary)
     invalidate_approval(ctx, issue.number, summary, details)
     report.actions.append(f"#{issue.number} flagged hash-mismatch: {summary}")
 
@@ -98,7 +98,7 @@ def _kill_executor(ctx: TickContext, number: int) -> None:
 
 def _kill_run(
     ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
-    count_stall: bool = False,
+    count_stall: bool = False, detail: str = "",
 ) -> None:
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
@@ -114,7 +114,7 @@ def _kill_run(
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         raise
     ctx.git.remove_worktree(Path(run.worktree))
-    ctx.store.finish_run(number, outcome=outcome)
+    ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
     report.actions.append(f"#{number} runner killed")
 
 
@@ -233,6 +233,15 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
 
 def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
     run = ctx.store.get_run(issue.number)
+    if ctx.store.run_start_pending(issue.number):
+        if run is None or run.status != "running":
+            # The label request may have succeeded even when its reply was lost.
+            # No run record means this scheduler never reached the launcher.
+            ctx.tracker.remove_labels(issue.number, [RUNNING])
+            ctx.store.clear_run_start(issue.number)
+            report.actions.append(f"#{issue.number} incomplete start recovered before launch")
+            return ctx.tracker.get_issue(issue.number)
+        ctx.store.clear_run_start(issue.number)
     if RUNNING not in issue.labels or (run is not None and run.status == "running"):
         return issue
     if run is not None and run.outcome == "merged":
@@ -303,7 +312,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             waiting = run.waiting_until is not None and ctx.now() < datetime.fromisoformat(run.waiting_until)
             runtime = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
-                _kill_run(ctx, run.number, report)
+                _kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit.")
                 flag(ctx, run.number, Reason.TIMEOUT, "Too big for one session; split it in order")
                 report.actions.append(f"#{run.number} flagged timeout")
             elif run.pid is not None and not waiting and ctx.now() - datetime.fromisoformat(
@@ -311,7 +320,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             ) > timedelta(minutes=ctx.config.stall_minutes):
                 restarts = run.restarts + 1
                 outcome = "stalled-restart" if restarts <= 1 else "stalled"
-                _kill_run(ctx, run.number, report, outcome=outcome, count_stall=True)
+                _kill_run(ctx, run.number, report, outcome=outcome, count_stall=True,
+                          detail="Runner stopped making progress past the stall limit.")
                 _restore_stalled(ctx, run.number, restarts, report)
             continue
         # Clean up a crashed group or finish an interrupted stall termination.
@@ -555,6 +565,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             if not _check_prerequisites(ctx, issue, approval, report):
                 continue
 
+            ctx.store.prepare_run_start(number)
             try:
                 ctx.tracker.remove_labels(number, [READY])
                 ctx.tracker.add_labels(number, [RUNNING])
@@ -569,14 +580,16 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                     number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number),
                     lane=lane, tier=issue_size(issue.labels),
                 )
+                ctx.store.clear_run_start(number)
                 orch_github.wait_run(ctx, number, until)
-                ctx.store.finish_run(number, "limit-wait")
+                ctx.store.finish_run(number, "limit-wait", detail=str(exc))
                 report.skipped = f"GitHub rate limit until {until.isoformat()}"
                 return report
             ctx.store.start_run(
                 number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
                 tier=issue_size(issue.labels),
             )
+            ctx.store.clear_run_start(number)
             pid = ctx.launcher(number)
             ctx.store.update_run(number, pid=pid)
             report.actions.append(f"#{number} started running (pid={pid})")

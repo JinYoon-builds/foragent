@@ -122,7 +122,8 @@ class CIFailure(AttemptFailure):
 
 
 class ExecutorStopped(Exception):
-    def __init__(self, outcome: str):
+    def __init__(self, outcome: str, detail: str = ""):
+        super().__init__(detail)
         self.outcome = outcome
 
 
@@ -601,7 +602,7 @@ def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str)
     _append(ctx.store.log_path(n), f"Attempt {run.attempts} failed:\n{failure}")
     if run.attempts >= ctx.config.max_retries + 1:
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "CI failed after all attempts.", f"{failure}\n\n{link}")
-        raise ExecutorStopped("ci-failed")
+        raise ExecutorStopped("ci-failed", str(failure))
     ctx.store.update_run(n, attempts=run.attempts + 1)
     raise failure
 
@@ -642,6 +643,14 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
     finally:
         poll()
         _progress(n, ctx)
+
+
+def wait_for_rate_limit(n: int, ctx: RunContext, error: TrackerError) -> bool:
+    """Persist a resumable wait through the shared GitHub availability mechanism."""
+    if not error.is_rate_limit:
+        return False
+    orch_github.wait_run(ctx, n, orch_github.pause(ctx, error))
+    return True
 
 
 def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
@@ -765,6 +774,7 @@ def _available_executor(
         if kind == "transient" and _remaining(n, ctx) <= 0:
             return replace(result, timed_out=True)
         if kind == "limit" and not reviewer:
+            ctx.store.update_run(n, detail=result.last_message or result.log_tail or "Executor usage limit reached.")
             ctx.store.pause_lane(run.lane, ctx.now() + timedelta(minutes=ctx.config.limit_wait_minutes))
             ctx.tracker.add_labels(n, [READY])
             ctx.tracker.remove_labels(n, [RUNNING])
@@ -779,7 +789,8 @@ def _available_executor(
         if budget <= 0:
             if reviewer and kind == "limit":
                 return replace(result, exit_code=result.exit_code or 1)
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Executor unavailable (transient errors)")
+            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Executor unavailable (transient errors)",
+                 result.last_message or result.log_tail)
             raise ExecutorStopped("retries-exceeded")
         _executor_wait(n, ctx, min(120 * 2 ** min(errors, 3), budget))
         errors += 1
@@ -998,6 +1009,7 @@ def _acceptance_matches(
 def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     approval = ctx.store.load_approval(n)
     if approval is None:
+        ctx.store.update_run(n, detail="No approved snapshot is available.")
         ctx.tracker.remove_labels(n, [RUNNING])
         return "no-approval"
 
@@ -1400,6 +1412,7 @@ def _implement_and_publish(
             flag(ctx, n, decision.reason, decision.summary, link)
             return "held"
         if decision.kind == "hold_mode" and (decision.mode == "careful" or not batch_branch):
+            ctx.store.update_run(n, detail=f"PR #{pr} is waiting for your review.")
             ctx.tracker.comment(n, f"PR #{pr} is waiting for your review\n\n{link}")
             ctx.tracker.remove_labels(n, [RUNNING])
             return "pr-open"
@@ -1452,6 +1465,7 @@ def _implement_and_publish(
                     flag(ctx, n, decision.reason, decision.summary, link)
                     return "held"
                 if decision.kind == "hold_mode" and (decision.mode == "careful" or not batch_branch):
+                    ctx.store.update_run(n, detail=f"PR #{pr} is waiting for your review.")
                     ctx.tracker.comment(n, f"PR #{pr} is waiting for your review\n\n{link}")
                     ctx.tracker.remove_labels(n, [RUNNING])
                     return "pr-open"
@@ -1746,6 +1760,7 @@ def review_only(
     """Review a PR, optionally repairing CI inline instead of returning its failure."""
     worktree = ctx.store.worktree_path(n)
     outcome = "error"
+    detail = ""
     previous = ctx.store.get_run(n)
     started = False
     try:
@@ -1773,25 +1788,31 @@ def review_only(
         except CIFailure as exc:
             if not repair_ci:
                 # Let the caller schedule repair without changing the verdict's head.
-                raise ExecutorStopped("ci-failed") from exc
+                raise ExecutorStopped("ci-failed", str(exc)) from exc
             git = ctx.git.at(worktree)
             git.attach_branch(f"foragent/issue-{n}")
             _inject_lane_skills(ctx, n, git)
             outcome = _implement_and_publish(n, ctx, git, target_branch=exc.target_branch, failure=exc)
     except ExecutorStopped as exc:
         outcome = exc.outcome
+        detail = str(exc)
     except Exception as exc:
-        if isinstance(exc, TrackerError) and exc.is_rate_limit:
-            if not started:
-                ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
-                                    lane=previous.lane if previous is not None else "main")
-                started = True
-            outcome = orch_github.wait_run(ctx, n, orch_github.pause(ctx, exc))
-        elif not started:
-            raise
+        detail = str(exc) or type(exc).__name__
+        if not started:
+            if not isinstance(exc, TrackerError) or not exc.is_rate_limit:
+                raise
+            ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
+                                lane=previous.lane if previous is not None else "main")
+            started = True
+        _append(ctx.store.log_path(n), traceback.format_exc())
+        if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
+            outcome = "limit-wait"
         else:
-            _append(ctx.store.log_path(n), traceback.format_exc())
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
+    except SystemExit as exc:
+        outcome = "killed"
+        detail = f"Review runner exited: {exc}"
+        raise
     finally:
         if started:
             try:
@@ -1805,17 +1826,21 @@ def review_only(
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
                         ctx.tracker.remove_labels(n, [RUNNING])
                 except TrackerError as exc:
-                    if not exc.is_rate_limit:
+                    if not wait_for_rate_limit(n, ctx, exc):
                         raise
-                    outcome = orch_github.wait_run(ctx, n, orch_github.pause(ctx, exc))
+                    detail = str(exc) or type(exc).__name__
+                    outcome = "limit-wait"
                 finally:
-                    ctx.store.finish_run(n, outcome=outcome)
-                    kick_tick(ctx.repo_root)
+                    try:
+                        ctx.store.finish_run(n, outcome=outcome, detail=detail)
+                    finally:
+                        kick_tick(ctx.repo_root)
     return outcome
 
 
 def run_issue(n: int, ctx: RunContext) -> str:
     outcome = "error"
+    detail = ""
     worktree = ctx.store.worktree_path(n)
     log = ctx.store.log_path(n)
     try:
@@ -1835,22 +1860,25 @@ def run_issue(n: int, ctx: RunContext) -> str:
             ctx.git.remove_worktree(worktree)
     except ExecutorStopped as exc:
         outcome = exc.outcome
+        detail = str(exc)
     except Exception as exc:
+        detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())
-        if isinstance(exc, TrackerError) and exc.is_rate_limit:
-            outcome = orch_github.wait_run(ctx, n, orch_github.pause(ctx, exc))
+        if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
+            outcome = "limit-wait"
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
             outcome = "error"
-    except SystemExit:
+    except SystemExit as exc:
         outcome = "killed"
+        detail = f"Runner exited: {exc}"
         raise
     finally:
         # A tick may already have finished the record while terminating this runner.
         try:
             run = ctx.store.get_run(n)
             if run is not None and run.status != "finished":
-                ctx.store.finish_run(n, outcome=run.outcome or outcome)
+                ctx.store.finish_run(n, outcome=run.outcome or outcome, detail=detail)
         finally:
             kick_tick(ctx.repo_root)
     return outcome
