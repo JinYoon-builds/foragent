@@ -96,6 +96,20 @@ def _runs_scripts(directory: Path) -> bool:
                for path in directory.rglob("*"))
 
 
+def _frontmatter(path: Path) -> dict[str, Any]:
+    try:
+        match = re.match(r"\A---\s*\n(.*?)\n---(?:\s*\n|$)", path.read_text(encoding="utf-8"), re.S)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SkillError(f"could not read skill: {exc}") from exc
+    try:
+        meta = yaml.safe_load(match[1]) if match else None
+    except yaml.YAMLError as exc:
+        raise SkillError(f"invalid skill frontmatter: {exc}") from exc
+    if not isinstance(meta, dict) or any(not isinstance(meta.get(key), str) for key in ("name", "description")):
+        raise SkillError("skill requires name and description frontmatter")
+    return meta
+
+
 class SkillManager:
     def __init__(self, config: Config | None = None, *, libraries_dir: Path | None = None,
                  run: Callable[[list[str]], str] | None = None):
@@ -149,6 +163,10 @@ class SkillManager:
         return result
 
     def _library_skills(self, library: Library) -> list[Skill]:
+        return self._scan(library)[0]
+
+    def _scan(self, library: Library) -> tuple[list[Skill], list[dict[str, str]]]:
+        """Return the library's valid skills and a one-line error for each unreadable SKILL.md."""
         paths = {path for pattern in ("*/skills/*/SKILL.md", "skills/*/SKILL.md") for path in library.path.glob(pattern)}
         groups: dict[str, list[Path]] = {}
         # Prefer the shared copy when present; otherwise select a tool copy deterministically.
@@ -156,22 +174,20 @@ class SkillManager:
             relative = path.relative_to(library.path).parts
             identity = path.parent.name if len(relative) == 3 or relative[0].startswith(".") else f"{relative[0]}/{path.parent.name}"
             groups.setdefault(identity, []).append(path.parent)
-        result = []
+        result, skipped = [], []
         for identity, copies in sorted(groups.items()):
             path = copies[0] / "SKILL.md"
-            match = re.match(r"\A---\s*\n(.*?)\n---(?:\s*\n|$)", path.read_text(encoding="utf-8"), re.S)
             try:
-                meta = yaml.safe_load(match[1]) if match else None
-            except yaml.YAMLError as exc:
-                raise SkillError(f"invalid skill frontmatter: {path}: {exc}") from exc
-            if not isinstance(meta, dict) or any(not isinstance(meta.get(key), str) for key in ("name", "description")):
-                raise SkillError(f"skill requires name and description frontmatter: {path}")
+                meta = _frontmatter(path)
+            except SkillError as exc:
+                skipped.append({"path": path.relative_to(library.path).as_posix(), "error": " ".join(str(exc).split())})
+                continue
             license_id, license_file = _license(path.parent, library.path)
             skill_id = f"{library.prefix}:{identity}"
             result.append(Skill(skill_id, meta["name"], meta["description"], library, path.parent,
                                 license_id, license_file, tuple(copies), any(_runs_scripts(copy) for copy in copies),
                                 self.config.skill_roles.get(skill_id)))
-        return result
+        return result, skipped
 
     @staticmethod
     def _summary(skill: Skill) -> dict[str, Any]:
@@ -201,7 +217,10 @@ class SkillManager:
         with TemporaryDirectory(prefix="foragent-skills-") as directory:
             preview = replace(library, path=Path(directory) / library.name)
             self._clone(preview)
-            skills = self._library_skills(preview)
+            skills, skipped = self._scan(preview)
+            if skipped and not skills:
+                raise SkillError(f"no valid skills in library {library.name}: "
+                                 + "; ".join(f"{item['path']}: {item['error']}" for item in skipped))
             if not skills:
                 raise SkillError(f"no skills found in library {library.name}")
             confirmed = {}
@@ -219,7 +238,7 @@ class SkillManager:
                 if library not in self.libraries:
                     self.libraries.append(library)
             return {"source": source, "skills": [self._summary(replace(skill, role=confirmed.get(skill.id, skill.role)))
-                                                 for skill in skills], "approved": approve}
+                                                 for skill in skills], "skipped": skipped, "approved": approve}
 
     def _select(self, identity: str, *, skills: list[Skill] | None = None) -> Skill:
         skills = self.skills() if skills is None else skills
