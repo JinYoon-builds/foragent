@@ -1064,14 +1064,18 @@ def test_implementation_prompt_full_suite_from_worktree(run_case, files, configu
     c.ctx.config = replace(c.ctx.config, test_command=configured)
     assert run_issue(1, c.ctx) == "merged"
     prompt = c.executor.calls[0]["prompt"]
+    assert "Optional additional check" not in prompt
+    assert "run the full test suite" not in prompt
+    assert "You run only the Done when tests and the tests for files you change" in prompt
+    assert "no parallel test helper is needed" in prompt
     if expected is None:
-        assert "Before you finish" not in prompt
+        assert "The runner runs Done when." in prompt
+        assert "previously passing acceptance tests" not in prompt
+        assert "related unit tests" not in prompt
+        assert "CI runs the full suite after publication" not in prompt
     else:
-        assert prompt.splitlines().count(
-            f"- Optional additional check: Before you finish, also run the full test suite: `{expected}`. "
-            "Each attempt checks Done when, the acceptance baseline and related unit tests; "
-            "CI runs the full suite after publication and sends failures back for repair."
-        ) == 1
+        assert "The runner runs Done when, the previously passing acceptance tests and related unit tests." in prompt
+        assert f"CI runs the full suite after publication (`{expected}`)" in prompt
 
 
 @pytest.mark.parametrize("source", ["src/demo/service.py", "demo/service.py"])
@@ -1412,6 +1416,8 @@ def test_ci_retry_preserves_worktree_logs_and_all_checks(run_case, monkeypatch, 
     assert worktree_identity[0] == worktree_identity[1]
     assert "CI failed:\n" + logs in c.executor.calls[1]["prompt"]
     assert "`make check`" in c.executor.calls[1]["prompt"]
+    assert "CI runs the full suite after publication" in c.executor.calls[1]["prompt"]
+    assert "You run only the Done when tests and the tests for files you change" in c.executor.calls[1]["prompt"]
     assert len(reviews) == (2 if repair_passes_done_when else 1)
     assert c.store.get_run(1).attempts == 2
     assert len(c.tracker.created_prs) == 1
