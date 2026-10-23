@@ -51,6 +51,27 @@ def assert_blocked(c, reason):
     assert len(c.tracker.created_prs) == 1
 
 
+def test_review_pending_close_finishes_without_failure_flag(review_case):
+    c = review_case
+    c.ctx.tracker.remove_labels(1, ["blocked"])
+    c.ctx.tracker.refresh_issues()
+    c.store.queue_github_write(1, "comment", body="Pending evidence")
+
+    assert runner.review_only(1, c.ctx) == "merged"
+
+    assert c.tracker.merged_prs == [c.pr]
+    assert c.tracker.get_issue(1).state == "open"
+    row, = c.store.local_issues()
+    assert row["state"] == "closed"
+    assert not set(row["labels"]) & {"blocked", "ready", "running", "needs-human"}
+    assert c.store.load_flag(1) is None
+    c.ctx.tracker.flush_outbox()
+    assert c.tracker.get_issue(1).state == "closed"
+    assert not c.tracker.get_issue(1).labels & {"blocked", "ready", "running", "needs-human"}
+    assert not any("retries-exceeded" in comment.body for comment in c.tracker.list_comments(1))
+    assert c.store.github_outbox() == []
+
+
 @pytest.mark.parametrize("entry", ["review-only", "resolve"])
 def test_fast_review_merge_reuses_post_merge_reinstall(review_case, monkeypatch, entry):
     c = review_case
