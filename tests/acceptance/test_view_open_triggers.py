@@ -25,7 +25,9 @@ def foreground_case(git_history, tmp_path, monkeypatch):
     monkeypatch.setattr(case.git, "remote_slug", lambda: "owner/repo")
     monkeypatch.setattr(cli, "init_repo", lambda root, **kw: init_repo(
         root, git=case.git, tracker=case.tracker, gh_run=lambda *a, **kw: "human", **kw))
-    return case, main, commands
+    from test_publish_own_paths import with_clean_preread
+
+    return case, with_clean_preread(main, monkeypatch), commands
 
 
 def foreground_argv(case, command, sequence=1):
