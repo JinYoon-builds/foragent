@@ -524,6 +524,8 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"{skill['id']}\t{skill['name']}\t{skill['license']}\t{description}\t"
                               f"{skill['role'] or 'unassigned'}\t{'yes' if skill['runs_scripts'] else 'no'}\t"
                               + ", ".join(skill["copies"]))
+                    for item in payload.get("skipped", []) if args.action == "add" else []:
+                        print(f"Skipped: {item['path']}: {item['error']}")
             else:
                 print("Installed: " + manager.install(args.id, args.repo_root.resolve(), commit=args.commit))
             return 0
