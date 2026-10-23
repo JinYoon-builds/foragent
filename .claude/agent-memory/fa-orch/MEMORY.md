@@ -88,3 +88,5 @@
 
 - [#106 machine AIMD budget](project_106_capacity.md) — capacity.py, data-root state, per-repo ceiling, grace window, lock scope
 - [#243 machine-wide test slots](project_243_test_slots.md) — Path.home() data root, flock slots, waited credit, conftest isolation
+
+- #217: `orch.watch()`는 읽기 예외를 `{"unknown": true, "error": str}`로 내고 `orch-watch.json`은 건드리지 않는다. 회복 강제 출력은 프로세스를 넘어 유지돼야 하므로 별도 `<state>/orch-watch-unknown.json` 표식을 쓴다(인수 시험이 orch-watch.json의 바이트 동일성을 검사). follow는 같은 오류를 반복 출력하지 않고, CLI는 one-shot에서 unknown이면 1을 반환한다. 시험: `tests/acceptance/test_watch_never_silent.py` 3개, `tests/test_orch_watcher.py` 4개.

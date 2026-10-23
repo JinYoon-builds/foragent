@@ -25,6 +25,9 @@ The first invocation emits a snapshot. Later invocations share
 Alternatively monitor `fa orch watch --interval 5 --follow` as a continuous stream.
 Its fields are `blocked`, `needs_human`, `merged` (sorted issue numbers), and
 `queue_empty` (no open approved/ready/running issues and no active runs).
+A line `{"unknown": true, "error": ...}` means the state could not be read: treat it
+as unknown, not empty. One-shot watch then exits non-zero; `--follow` keeps retrying.
+The next good read always prints the real snapshot.
 Read fresh status after a wake-up; a snapshot is a signal to inspect, not a report.
 
 ## Handle blocked items first

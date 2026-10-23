@@ -43,20 +43,47 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
 
     The persisted snapshot lets a Monitor until-loop invoke this repeatedly
     without receiving the same event. Titles, timestamps and logs are excluded.
+    A failed read yields ``{"unknown": true, "error": ...}`` instead of empty
+    sets, leaves the persisted snapshot alone, and makes the next good read
+    print even when it equals the last known snapshot.
     """
     if not math.isfinite(interval) or interval <= 0:
         raise OrchError("interval must be a finite positive number")
     path = ctx.store.root / "orch-watch.json"
+    unknown_path = ctx.store.root / "orch-watch-unknown.json"
+    last_error = None
     while True:
-        snapshot = _watch_snapshot(ctx)
-        with ctx.store._state_lock():
+        try:
+            snapshot = _watch_snapshot(ctx)
+            with ctx.store._state_lock():
+                try:
+                    previous = json.loads(path.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    previous = None
+                recovered = unknown_path.exists()
+                changed = recovered or snapshot != previous
+                if changed:
+                    ctx.store._write_json(path, snapshot)
+                if recovered:
+                    unknown_path.unlink(missing_ok=True)
+        except Exception as error:  # an unreadable state must never look like empty sets
+            message = str(error) or type(error).__name__
+            reading = {"unknown": True, "error": message}
             try:
-                previous = json.loads(path.read_text(encoding="utf-8"))
-            except FileNotFoundError:
-                previous = None
-            changed = snapshot != previous
-            if changed:
-                ctx.store._write_json(path, snapshot)
+                with ctx.store._state_lock():
+                    ctx.store._write_json(unknown_path, reading)
+            except Exception:
+                pass  # the in-memory flag below still forces the next good print
+            if not follow or message != last_error:
+                yield reading
+            if not follow:
+                return
+            last_error = message
+            time.sleep(interval)
+            continue
+        if last_error is not None:
+            changed = True
+            last_error = None
         if changed:
             yield snapshot
             if not follow:
