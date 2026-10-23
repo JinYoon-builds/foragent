@@ -1,14 +1,19 @@
 """Load repository settings over optional global settings."""
 
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
+from io import StringIO
 from pathlib import Path
 import re
 from tempfile import NamedTemporaryFile
 from typing import Any
 
 import yaml
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
+from ruamel.yaml.error import YAMLError as _RoundTripError
+from ruamel.yaml.util import load_yaml_guess_indent
 
 
 class ConfigError(ValueError):
@@ -73,6 +78,114 @@ class Config:
 DEFAULTS: dict[str, Any] = asdict(Config())
 _REVIEW_LEVELS = {"fast", "batch", "careful"}
 _EXECUTORS = {"codex", "claude"}
+
+
+class SettingsDocument:
+    """A settings file loaded for editing that keeps comments and untouched lines."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._yaml = YAML()
+        self._yaml.preserve_quotes = True
+        self._yaml.width = 4096
+        try:
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+            _, sequence, offset = load_yaml_guess_indent(text) if text.strip() else (None, None, None)
+            data = self._yaml.load(text) if text.strip() else None
+        except (OSError, _RoundTripError) as exc:
+            raise ConfigError(f"cannot read {path}: {exc}") from exc
+        if data is None:
+            data = CommentedMap()
+        if not isinstance(data, CommentedMap):
+            raise ConfigError(f"{path} must contain a mapping")
+        self.data: CommentedMap = data
+        # Re-emit untouched lines with the file's own indentation.
+        nested = [len(line) - len(line.lstrip(" ")) for line in text.splitlines()
+                  if line.strip() and line.lstrip(" ")[0] not in "#-" and line.startswith(" ")]
+        mapping = min(nested, default=2)
+        self._yaml.indent(mapping=mapping, sequence=sequence or mapping, offset=offset or 0)
+
+    @staticmethod
+    def inline(values: list[Any]) -> CommentedSeq:
+        """Return a list written on one line, like the lane lists `fa` creates."""
+        sequence = CommentedSeq(values)
+        sequence.fa.set_flow_style()
+        return sequence
+
+    def set(self, mapping: CommentedMap, key: str, value: Any) -> None:
+        """Set one key; a new last key takes over the comments that ended the mapping."""
+        if key in mapping:
+            old = mapping[key]
+            if isinstance(value, CommentedSeq) and isinstance(old, CommentedSeq) and not old.fa.flow_style():
+                value.fa.set_block_style()
+            tail = _take_tail(old)
+            mapping[key] = value
+        else:
+            tail = _take_tail(mapping)
+            mapping[key] = value
+        if tail is not None:
+            _put_tail(mapping, tail, key)
+
+    def save(self) -> None:
+        stream = StringIO()
+        self._yaml.dump(self.data, stream)
+        self.path.write_text(stream.getvalue(), encoding="utf-8")
+
+
+def _take_tail(node: Any) -> Any:
+    """Detach the comment lines that follow the deepest last item of a collection."""
+    if isinstance(node, CommentedMap) and node:
+        key = list(node)[-1]
+        found = _take_tail(node[key])
+        if found is not None:
+            return found
+        entry = node.ca.items.get(key)
+        if entry and len(entry) > 2 and entry[2] is not None:
+            return _split_tail(entry, 2)
+    elif isinstance(node, CommentedSeq) and node:
+        index = len(node) - 1
+        found = _take_tail(node[index])
+        if found is not None:
+            return found
+        entry = node.ca.items.get(index)
+        if entry and entry[0] is not None:
+            return _split_tail(entry, 0)
+    return None
+
+
+def _split_tail(entry: list, slot: int) -> Any:
+    """Detach the lines after an item, leaving its same-line comment in place."""
+    token = entry[slot]
+    if token.value.startswith("\n"):
+        entry[slot] = None
+        return token
+    head, _, rest = token.value.partition("\n")
+    if not rest:
+        return None
+    tail = copy(token)
+    token.value = head + "\n"
+    tail.value = "\n" + rest
+    return tail
+
+
+def _put_tail(node: Any, token: Any, key: Any = None) -> None:
+    """Attach detached comment lines after `key` (default: the last item), as deep as it goes."""
+    if isinstance(node, CommentedMap) and node:
+        key = list(node)[-1] if key is None else key
+        value = node[key]
+        if isinstance(value, (CommentedMap, CommentedSeq)) and value and not value.fa.flow_style():
+            _put_tail(value, token)
+        else:
+            entry = node.ca.items.setdefault(key, [None, None, None, None])
+            entry[2] = token
+    elif isinstance(node, CommentedSeq) and node:
+        index = len(node) - 1
+        value = node[index]
+        if isinstance(value, (CommentedMap, CommentedSeq)) and value and not value.fa.flow_style():
+            _put_tail(value, token)
+        else:
+            entry = node.ca.items.setdefault(index, [None, None])
+            entry[0] = token
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:

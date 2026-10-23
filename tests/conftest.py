@@ -24,6 +24,9 @@ def isolated_test_slots(tmp_path, monkeypatch):
     from foragent import capacity
 
     monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path / "machine-data")
+    # A gate or `fa test` parent marks its slot as held; that slot is not in this
+    # isolated root, so the mark must not turn the tests' own slots into no-ops.
+    monkeypatch.delenv(capacity.TEST_SLOT_ENV, raising=False)
 
 
 @pytest.fixture(autouse=True)

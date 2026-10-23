@@ -677,3 +677,39 @@ def test_copy_lane_skills_prefers_local_then_cache_and_preserves_checkout(librar
     assert copy_lane_skills(tmp_path / "fresh-repo", cached, ["testing-strategy"], SkillManager(config)) == copied
     assert (cached / copied[0] / "references/example.md").read_text() == "Example\n"
     assert (cached / copied[0] / "SKILL.md").read_bytes() == (source / "engineering/skills/testing-strategy/SKILL.md").read_bytes()
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("# top\nrepo: o/r  # keep\n",
+     "# top\nrepo: o/r  # keep\nlanes:\n  docs:\n    paths: [docs/**]\n"),
+    ("lanes:\n    api:\n        paths:\n          - 'api/**'\n\n# tail\nmax_parallel: 1\n",
+     "lanes:\n    api:\n        paths:\n          - 'api/**'\n    docs:\n        paths: [docs/**]\n\n# tail\nmax_parallel: 1\n"),
+    ("lanes:\n  api:\n    paths:\n    - api/**\n# tail\n",
+     "lanes:\n  api:\n    paths:\n    - api/**\n  docs:\n    paths: [docs/**]\n# tail\n"),
+])
+def test_settings_document_adds_a_lane_without_moving_other_lines(tmp_path, text, expected):
+    from foragent.config import SettingsDocument
+    from ruamel.yaml.comments import CommentedMap
+
+    path = tmp_path / ".foragent.yml"
+    path.write_text(text)
+    settings = SettingsDocument(path)
+    lanes = settings.data.get("lanes")
+    if lanes is None:
+        lanes = CommentedMap()
+        settings.set(settings.data, "lanes", lanes)
+    lane = CommentedMap(paths=settings.inline(["docs/**"]))
+    settings.set(lanes, "docs", lane)
+    settings.save()
+    assert path.read_text() == expected
+
+
+def test_settings_document_replaces_a_block_list_in_place(tmp_path):
+    from foragent.config import SettingsDocument
+
+    path = tmp_path / ".foragent.yml"
+    path.write_text("lanes:\n  api:\n    skills:\n    - tone\n    agent: fa-api  # keep\n# tail\n")
+    settings = SettingsDocument(path)
+    settings.set(settings.data["lanes"]["api"], "skills", settings.inline(["polish"]))
+    settings.save()
+    assert path.read_text() == "lanes:\n  api:\n    skills:\n    - polish\n    agent: fa-api  # keep\n# tail\n"
