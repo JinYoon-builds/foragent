@@ -1,5 +1,5 @@
 review: fast
-executor: codex
+executor: claude  # 2026-10-23: Claude quota idle (5h 3%, week 5%); reviewer becomes codex. D74 will choose per issue
 language: ko
 approvers:
 - JinYoon-builds
