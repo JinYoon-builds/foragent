@@ -78,8 +78,9 @@ Work done outside the gate (a session implementing an issue by hand) skips the g
 acceptance-regression check. Before merging such a PR, run `fa orch premerge PR --json`
 and merge only when it passes: acceptance tests that pass on the base still pass, and
 related unit tests and CI are green. On 2026-10-23 an outside merge broke eight acceptance
-tests on main that this check would have caught. Remove `approved` from an issue while
-it is worked outside the gate so the gate does not start it too, and reinstall Foragent
+tests on main that this check would have caught. Remove `approved` (and `blocked`/`needs-human`,
+or the blocker timeout escalates it to the person) from an issue while it is worked
+outside the gate so the gate does not start it too, and reinstall Foragent
 after an outside merge (only gate merges reinstall by themselves).
 
 ## Route every user message
