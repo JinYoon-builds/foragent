@@ -1,9 +1,53 @@
 ---
 name: fa-design-session
-description: Guide design mode in the planning session when the user wants to choose a visual direction, compare references or refine UI drafts. Build a local reference board, compare running drafts in the real medium, and leave an implementation handoff for the orchestrator.
+description: Guide design mode in the planning session when the user wants to choose a visual direction, compare references or refine UI work. Start with a short design interview, open the research pack for the medium, build a local reference board, compare running drafts in the real medium, and leave an implementation handoff for the orchestrator.
 ---
 
 # fa-design-session
+
+Every design session starts with a design interview. Do it before any board,
+mockup or code. The interview is short and concrete:
+
+1. Ask 2–3 short questions: what the screen is for, who uses it and where
+   (web, mobile, terminal UI, pixel art or plain CLI output), and what must
+   stay as it is. Skip questions that project decisions already answer.
+2. Show about nine references over three directions, three per direction.
+   Spread them wide: include neighbouring fields (a game HUD for a dashboard,
+   print layout for a CLI report) and stretch each axis to its ends (dense vs
+   airy, quiet vs loud, playful vs serious).
+3. Let the user mark each reference like or dislike, and ask one question only
+   where a choice is ambiguous.
+4. Extract the shared principles from the likes and dislikes, in a few short
+   lines the user confirms.
+5. Only then make drafts, and tie each draft to the reference it builds on.
+
+Never commit reference images. Keep the link and a short note on what to take
+from each reference; images stay in local state outside git. Learn from a
+reference; do not copy its art, icons, illustrations or text.
+
+### Open the research pack for the medium
+
+When the first answers reveal the medium, open that medium's research pack:
+`skills/fa-design-session/media/<medium>.md` (web, mobile, tui, pixel, cli) plus
+the cross-project lessons in `~/.local/share/foragent/media/<medium>.md` if that
+file exists. A pack says where to look for references and which pitfalls to
+check:
+
+- Web: Mobbin, Godly, Awwwards; screen widths, accessibility, dark mode.
+- Mobile: Mobbin, Apple HIG, Material; platform conventions, touch size.
+- Terminal UI: lazygit, btop, k9s, Bubble Tea and Ratatui examples;
+  ambiguous-width glyphs, minimum widths, alternate screen, wheel vs click,
+  no-colour terminals.
+- Pixel art: Lospec palettes; half-block resolution, outlines on dark
+  backgrounds.
+- Plain CLI output: strip colour when piped, long lines.
+
+While the interview questions go on, start another agent in the background to
+research references from the pack's sources, so the nine references are ready
+when the questions end. When a lesson recurs across projects, add it to
+`~/.local/share/foragent/media/<medium>.md`.
+
+## Design mode
 
 Design mode continues in the same window as the planning session. Keep the
 conversation here while the right pane shows references or running drafts next
@@ -14,7 +58,7 @@ Read the request, project decisions, existing screens and `docs/design/CONTRACT.
 if present. Establish the intended medium and what remains undecided. Offer
 choices with a recommendation when a product decision needs the user's answer.
 Use the project's language. Carry settled decisions forward instead of repeating
-the interview.
+the design interview.
 
 ## References before drafts
 
