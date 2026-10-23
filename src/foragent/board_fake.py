@@ -66,7 +66,21 @@ class FakeProjects:
         elif operation == "ForagentBoardIssue":
             number = variables["number"]
             tracker.get_issue(number)
-            result = {"repository": {"issue": {"id": f"I_{variables['owner']}/{variables['name']}#{number}"}}}
+            content_id = f"I_{variables['owner']}/{variables['name']}#{number}"
+            items = []
+            for project in self.projects.values():
+                for item in project["items"].values():
+                    if item["contentId"] != content_id:
+                        continue
+                    status = next((field for field in project["fields"].values()
+                                   if field["name"] == "Status"), None)
+                    option = next((option for option in status["options"]
+                                   if option["id"] == item["values"].get(status["id"])), None) if status else None
+                    items.append({"id": item["id"], "project": {"id": project["id"]},
+                                  "fieldValueByName": {"name": option["name"], "optionId": option["id"]}
+                                  if option else None})
+            result = {"repository": {"issue": {"id": content_id, "projectItems": self._connection(
+                items, variables.get("cursor"))}}}
         elif operation == "ForagentAddBoardItem":
             project = self.projects[data["projectId"]]
             item = next((item for item in project["items"].values() if item["contentId"] == data["contentId"]), None)

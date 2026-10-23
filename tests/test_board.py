@@ -37,13 +37,14 @@ def test_board_field_writes_record_confirmed_values_and_timestamp(recording_boar
     clock[0] += timedelta(seconds=1)
     board.sync_status(ctx, 1, "PR open")
     row, = StateStore(ctx.store.root).local_issues()
-    assert row.get("board_values") == {ctx.config.board: {"Status": "PR open"}}
+    assert row.get("board_values") == {ctx.config.board: {"Status": board.board_column("PR open")}}
     assert row["updated_at"] == clock[0].isoformat()
     clock[0] += timedelta(seconds=1)
     board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 1, "main", "m")
     row, = StateStore(ctx.store.root).local_issues()
     assert row["board_values"][ctx.config.board] == item_values(remote, ctx.config.board, 1)
-    assert row["board_values"][ctx.config.board] == {"Status": "PR open", "Lane": "main", "Size": "m"}
+    assert row["board_values"][ctx.config.board] == {"Status": board.board_column("PR open"),
+                                                     "Lane": "main", "Size": "m"}
     assert row["updated_at"] == clock[0].isoformat() and row["labels"] == ["blocked"]
 
 
@@ -99,7 +100,7 @@ def test_reuses_owner_board_and_preserves_option_ids_and_item_values_when_adding
     board.add_issue(tracker, "team/repo", project_id, 1, "api", "m")
     board.sync_status(context, 1, "Ready")
     original = board.Project(tracker, "team/repo", project_id).fields()
-    assert [option["name"] for option in original["Status"]["options"]] == list(board.STATUSES)
+    assert [option["name"] for option in original["Status"]["options"]] == list(board.COLUMNS)
     assert board.ensure(tracker, "team/repo", ["api", "web"]) == project_id
     assert board.ensure(tracker, "other/repo") != project_id
     updated = board.Project(tracker, "team/repo", project_id).fields()
@@ -107,7 +108,7 @@ def test_reuses_owner_board_and_preserves_option_ids_and_item_values_when_adding
     assert updated["Status"] == original["Status"]
     board.add_issue(tracker, "team/repo", project_id, 1, "web", "l")
     assert len(snapshot(tracker, project_id)["items"]["nodes"]) == 1
-    assert item_values(tracker, project_id, 1) == {"Lane": "web", "Size": "l", "Status": "Ready"}
+    assert item_values(tracker, project_id, 1) == {"Lane": "web", "Size": "l", "Status": "🌰 Up next"}
 
 
 @pytest.mark.parametrize("operation", ["discover", "saved_id", "set_status"])
@@ -139,18 +140,18 @@ def test_existing_status_options_and_card_values_survive_field_repairs(operation
                          "value": {"singleSelectOptionId": option["id"]}}})
 
     tracker.add_issue(10)
-    context = board.ProjectContext(tracker, "team/repo", Config(board=project_id))
+    context = board.ProjectContext(tracker, "team/repo", Config(board=project_id, board_map={"In progress": "In Progress"}))
     previous = None
     for _ in range(2):
         if operation == "set_status":
             board.sync_status(context, 10, "Running")
-            assert item_values(tracker, project_id, 10) == {"Status": "Running"}
+            assert item_values(tracker, project_id, 10) == {"Status": "In Progress"}
         else:
             saved_id = project_id if operation == "saved_id" else None
             assert board.ensure(tracker, "team/repo", ["api"], saved_id) == project_id
         updated = project.fields()["Status"]
         by_name = {option["name"]: option for option in updated["options"]}
-        assert [option["name"] for option in updated["options"][:7]] == list(board.STATUSES)
+        assert updated == status
         for number, option in enumerate(status["options"], 1):
             assert by_name[option["name"]] == option
             assert item_values(tracker, project_id, number) == {"Status": option["name"]}
@@ -203,6 +204,57 @@ def test_unconfigured_board_makes_no_transport_calls():
     board.add_issue(tracker, "owner/repo", None, 1, "main", "s")
 
 
+def test_status_reads_persisted_card_and_repairs_manual_moves_without_duplicate_adds():
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    project_id = board.ensure(tracker, "owner/repo")
+    context = board.ProjectContext(tracker, "owner/repo", Config(board=project_id))
+    board.add_issue(tracker, "owner/repo", project_id, 1)
+    assert item_values(tracker, project_id, 1)["Status"] == board.board_column("unapproved")
+    board.sync_status(context, 1, "Running")
+    graphql = tracker.graphql
+    calls = []
+
+    def recorded(query, variables):
+        calls.append(query)
+        return graphql(query, variables)
+
+    tracker.graphql = recorded
+    # A fresh context simulates the next scheduler process, with no local cache.
+    board.sync_status(replace(context), 1, "Blocked")
+    assert not any("mutation" in query for query in calls)
+    board.Project(tracker, "owner/repo", project_id).set_values(1, {"Status": board.board_column("Done")})
+    calls.clear()
+    board.sync_status(context, 1, "Running")
+    assert sum("ForagentSetBoardValue" in query for query in calls) == 1
+    assert not any("ForagentAddBoardItem" in query for query in calls)
+    assert item_values(tracker, project_id, 1)["Status"] == board.board_column("Running")
+
+
+def test_issue_project_membership_paginates():
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    for index in range(101):
+        project_id = board.ensure(tracker, f"owner/repo-{index}")
+        # Use the same issue repository, with a different target project each time.
+        board.add_issue(tracker, "owner/repo", project_id, 1)
+    context = board.ProjectContext(tracker, "owner/repo", Config(board=project_id))
+    board.sync_status(context, 1, "Running")
+    assert item_values(tracker, project_id, 1)["Status"] == board.board_column("Running")
+
+
+def test_missing_target_column_warns_without_changing_the_board(caplog):
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    project_id = board.ensure(tracker, "owner/repo")
+    board.add_issue(tracker, "owner/repo", project_id, 1)
+    before = snapshot(tracker, project_id)
+    config = Config(board=project_id, board_map={"In progress": "Removed column"})
+    board.sync_status(board.ProjectContext(tracker, "owner/repo", config), 1, "Running")
+    assert snapshot(tracker, project_id) == before
+    assert len(caplog.records) == 1 and caplog.records[0].exc_info is None
+
+
 def test_status_context_is_restored_after_failure_and_between_repositories(monkeypatch, caplog):
     tracker = FakeTracker()
     tracker.add_issue(1)
@@ -220,10 +272,10 @@ def test_status_context_is_restored_after_failure_and_between_repositories(monke
     monkeypatch.setattr(board, "set_status", original)
     board.sync_status(replace(context, repo="owner/two", config=Config(board=second)), 1, "Running")
     board.sync_status(context, 1, "Done")
-    assert item_values(tracker, first, 1)["Status"] == "Done"
-    assert item_values(tracker, second, 1)["Status"] == "Running"
+    assert item_values(tracker, first, 1)["Status"] == "📦 Done"
+    assert item_values(tracker, second, 1)["Status"] == "🐿 In progress"
     board.set_status(1, "Blocked")  # No repository context is left behind.
-    assert item_values(tracker, first, 1)["Status"] == "Done"
+    assert item_values(tracker, first, 1)["Status"] == "📦 Done"
 
 
 def test_gh_graphql_sends_typed_variables_over_stdin():

@@ -392,16 +392,16 @@ def test_scheduler_projects_follow_ready_running_and_blocked_labels(ctx):
     ctx.config = replace(ctx.config, board=project_id)
     approve(ctx)
     tick(ctx)
-    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Ready"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🌰 Up next"
     ctx.start_runs = True
     tick(ctx)
-    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Running"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🐿 In progress"
     flag(ctx, 1, Reason.SPEC_QUESTION, "Choose a behavior")
-    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Blocked"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🐿 In progress"
     ctx.store.finish_run(1, outcome="blocked")
     ctx.now = lambda: NOW + timedelta(minutes=31)
     tick(ctx)
-    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Needs human"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "✋ Your turn"
 
 
 def test_scheduler_repairs_board_after_transport_recovers(ctx, caplog):
@@ -421,7 +421,7 @@ def test_scheduler_repairs_board_after_transport_recovers(ctx, caplog):
     assert "Could not set board Status" in caplog.text
     ctx.tracker.graphql = graphql
     assert tick(ctx).skipped is None
-    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Ready"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🌰 Up next"
 
 
 def test_latest_approver_event_is_the_snapshot_identity(ctx):

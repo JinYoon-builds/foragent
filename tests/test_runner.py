@@ -284,12 +284,12 @@ def test_merge_explicitly_closes_issue_and_removes_ready_and_running(run_case, m
     assert c.store.load_flag(1) is None
 
 
-@pytest.mark.parametrize("mode,question,outcome,statuses", [
-    ("fast", False, "merged", ["Running", "PR open", "Done"]),
-    ("careful", False, "pr-open", ["Running", "PR open"]),
-    ("fast", True, "spec-question", ["Running", "Blocked"]),
+@pytest.mark.parametrize("mode,question,outcome,statuses,column", [
+    ("fast", False, "merged", ["Running", "PR open", "Done"], "📦 Done"),
+    ("careful", False, "pr-open", ["Running", "PR open"], "🐿 In progress"),
+    ("fast", True, "spec-question", ["Running", "Blocked"], "🐿 In progress"),
 ])
-def test_runner_updates_project_on_execution_pr_merge_and_block(run_case, monkeypatch, mode, question, outcome, statuses):
+def test_runner_updates_project_on_execution_pr_merge_and_block(run_case, monkeypatch, mode, question, outcome, statuses, column):
     from foragent import board
     from test_board import item_values
 
@@ -308,7 +308,7 @@ def test_runner_updates_project_on_execution_pr_merge_and_block(run_case, monkey
     monkeypatch.setattr(board, "set_status", recorded)
     assert run_issue(1, c.ctx) == outcome
     assert calls == statuses
-    assert item_values(c.tracker, project_id, 1)["Status"] == statuses[-1]
+    assert item_values(c.tracker, project_id, 1)["Status"] == column
 
 
 def test_board_transport_failure_does_not_fail_runner(run_case, caplog):

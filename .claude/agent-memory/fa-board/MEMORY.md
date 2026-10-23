@@ -14,3 +14,7 @@
 - 새 저장소의 `init` 기본 도구는 설치 여부가 아니라 `codex login status`의 종료 코드와 `claude auth status`의 JSON `loggedIn`으로 확인한다. 누락·시간 초과·잘못된 응답은 로그인 사실로 인정하지 않는다. 기존 설정은 재탐지하지 않고 보존한다.
 - Claude 작업자에 기본 교차 리뷰를 그대로 두면 `resolved_reviewer`가 Codex를 고르므로, Claude를 고를 때 `reviewer: claude`도 저장한다. 리뷰의 새 세션은 기존 `ClaudeExecutor`의 별도 `claude -p /code-review ...` 프로세스로 보장된다.
 - `tests/test_init.py::setup`은 도구 상태 확인을 subprocess 경계에서 오프라인으로 대체한다. 이 fixture를 가져오는 잠긴 인수 테스트는 같은 경계에서 로그인 사실을 다시 주입하므로, 초기화 함수 자체를 가짜로 바꾸지 않는다. 집중 검증은 `uv run pytest tests/acceptance/test_claude_only.py`다.
+- 재시도에서 "작업 트리를 다시 만들었다"는 안내가 오면 `origin/foragent/issue-<N>`에 이전 시도 커밋이 있는지 본다. `git cherry-pick --no-commit <sha>` 뒤 `git reset -q`로 커밋 없이 가져온다. 전체 테스트(약 25분)는 실행 예산을 넘겨 작업 트리를 잃게 하므로 돌리지 않는다. 완료 기준과 바꾼 파일의 테스트만 돌린다.
+- 보드 Status는 #184부터 사람용 다섯 칸이다(`board.board_column`). 팀 보드는 `.foragent.yml`의 `board_map`을 쓴다. 막힌 카드의 ⚠는 기존 `blocked` 라벨로 대신한다(소유자 결정). `card_warning()`은 다른 화면용 공개 판정 함수다.
+- init은 남의 보드를 처음 받아들일 때만 `board_map`을 저장한다(`board_id != config.board`이고 `board.ensure(..., created=set)`에 없을 때). 칸이 Foragent 다섯 칸과 같으면 묻지 않고 `DEFAULT_MAP`을 저장한다. 새로 만든 보드와 이미 저장된 보드는 설정을 다시 쓰지 않는다(`test_board_default_is_persisted_and_idempotent`).
+- 리뷰가 "acceptance 파일 삭제"를 지적하면 `git diff --name-status HEAD origin/main -- <file>`을 본다. `A`면 기준 커밋 뒤 main에 추가된 파일이므로 `.foragent/REBUTTAL.md`로 반박한다.

@@ -12,6 +12,31 @@ from foragent.tracker import Issue, Tracker, TrackerError
 
 log = logging.getLogger(__name__)
 STATUSES = ("Approved", "Ready", "Running", "Blocked", "Needs human", "PR open", "Done")
+DEFAULT_MAP = {"Backlog": "🗂 Backlog", "Up next": "🌰 Up next", "In progress": "🐿 In progress",
+               "Your turn": "✋ Your turn", "Done": "📦 Done"}
+COLUMNS = tuple(DEFAULT_MAP.values())
+STATE_GROUPS = {"unapproved": "Backlog", "Approved": "Up next", "Ready": "Up next",
+                "Running": "In progress", "PR open": "In progress", "Blocked": "In progress",
+                "Needs human": "Your turn", "Done": "Done", "merged": "Done", "closed": "Done"}
+
+
+def board_column(state: str, board_map: dict[str, str] | None = None) -> str | None:
+    """Translate gate state without changing it; a custom map is authoritative."""
+    if state not in STATE_GROUPS:
+        raise ValueError(f"unknown board status: {state}")
+    return (DEFAULT_MAP if board_map is None else board_map).get(STATE_GROUPS[state])
+
+
+def card_warning(state: str) -> bool:
+    """Whether a card in the progress column needs the blocked warning (⚠).
+
+    On the GitHub board the issue's existing ``blocked`` label is that ⚠: a
+    Status card holds one option, so blocked cards stay in 🐿 In progress and
+    no sixth option is added. Other views use this predicate to draw ⚠.
+    """
+    return state == "Blocked"
+
+
 FIELD_SELECTION = """... on ProjectV2SingleSelectField {
   id name options { id name color description }
 } ... on ProjectV2Field { id name } ... on ProjectV2IterationField { id name }"""
@@ -33,6 +58,7 @@ class Project:
     tracker: Tracker
     repo: str
     id: str
+    board_map: dict[str, str] | None = None
 
     def fields(self) -> dict[str, dict]:
         fields = {}
@@ -56,10 +82,12 @@ class Project:
     def ensure_fields(self, desired: dict[str, Iterable[str]], *, new_project: bool = False) -> dict[str, dict]:
         fields = self.fields()
         for name, names in desired.items():
-            if name == "Status":
-                names = STATUSES
             names = list(dict.fromkeys(names))
             field = fields.get(name)
+            # Team columns and their metadata belong to the team. Only replace
+            # GitHub's unused defaults on a project created in this call.
+            if name == "Status" and not new_project:
+                continue
             if field is None:
                 field = _data(self.tracker, """mutation ForagentCreateBoardField($input: CreateProjectV2FieldInput!) {
                   createProjectV2Field(input: $input) { projectV2Field { """ + FIELD_SELECTION + """ } }
@@ -72,10 +100,6 @@ class Project:
                 missing = [value for value in names if value not in existing]
                 if name == "Status":
                     options = [existing.get(value, _option(value)) for value in names]
-                    # Only a board just created by us has unused defaults to replace.
-                    # Reused boards may have cards using any of their existing options.
-                    if not new_project:
-                        options.extend(option for option in field["options"] if option["name"] not in names)
                 else:
                     options = [*field["options"], *(_option(value) for value in missing)]
                 if options != field["options"]:
@@ -86,25 +110,53 @@ class Project:
             fields[name] = field
         return fields
 
-    def set_values(self, issue: Issue | int, values: dict[str, str]) -> None:
+    def set_values(self, issue: Issue | int, values: dict[str, str], *, initial_status: bool = False) -> None:
         number = issue.number if isinstance(issue, Issue) else issue
         owner, name = self.repo.split("/", 1)
-        content = _data(self.tracker, """query ForagentBoardIssue($owner: String!, $name: String!, $number: Int!) {
-          repository(owner: $owner, name: $name) { issue(number: $number) { id } }
-        }""", {"owner": owner, "name": name, "number": number})["repository"]["issue"]
-        try:
-            item = _data(self.tracker, """mutation ForagentAddBoardItem($input: AddProjectV2ItemByIdInput!) {
-              addProjectV2ItemById(input: $input) { item { id } }
-            }""", {"input": {"projectId": self.id, "contentId": content["id"]}})["addProjectV2ItemById"]["item"]
-        except TrackerError as exc:
-            if "Content already exists in this project" not in str(exc):
-                raise
-            # GitHub confirmed membership but did not return an item ID to update.
+        fields = self.fields()
+        if "Status" in values and not any(option["name"] == values["Status"]
+                                         for option in fields.get("Status", {}).get("options", [])):
+            log.warning("Board column %s is unavailable; skipping issue #%s", values["Status"], number)
             return
-        fields = self.ensure_fields({key: [value] for key, value in values.items()})
+        cursor = None
+        item = None
+        while True:
+            content = _data(self.tracker, """query ForagentBoardIssue(
+              $owner: String!, $name: String!, $number: Int!, $cursor: String
+            ) {
+              repository(owner: $owner, name: $name) { issue(number: $number) {
+                id projectItems(first: 100, after: $cursor) {
+                  nodes { id project { id } fieldValueByName(name: "Status") {
+                    ... on ProjectV2ItemFieldSingleSelectValue { name optionId }
+                  } } pageInfo { hasNextPage endCursor }
+                }
+              } }
+            }""", {"owner": owner, "name": name, "number": number, "cursor": cursor})["repository"]["issue"]
+            connection = content["projectItems"]
+            item = next((node for node in connection["nodes"] if node["project"]["id"] == self.id), None)
+            if item or not connection["pageInfo"]["hasNextPage"]:
+                break
+            cursor = connection["pageInfo"]["endCursor"]
+        if item is None:
+            try:
+                item = _data(self.tracker, """mutation ForagentAddBoardItem($input: AddProjectV2ItemByIdInput!) {
+                  addProjectV2ItemById(input: $input) { item { id } }
+                }""", {"input": {"projectId": self.id, "contentId": content["id"]}})["addProjectV2ItemById"]["item"]
+            except TrackerError as exc:
+                if "Content already exists in this project" not in str(exc):
+                    raise
+                # Concurrent addition confirmed membership without an item ID.
+                return
+        other_fields = {key: [value] for key, value in values.items() if key != "Status"}
+        if other_fields:
+            fields = self.ensure_fields(other_fields)
         for name, value in values.items():
             field = fields[name]
             option = next(option for option in field["options"] if option["name"] == value)
+            if name == "Status":
+                current = item.get("fieldValueByName")
+                if current and (initial_status or current["optionId"] == option["id"]):
+                    continue
             _data(self.tracker, """mutation ForagentSetBoardValue($input: UpdateProjectV2ItemFieldValueInput!) {
               updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
             }""", {"input": {"projectId": self.id, "itemId": item["id"], "fieldId": field["id"],
@@ -114,8 +166,12 @@ class Project:
                 record(number, self.id, name, value)
 
 
-def ensure(tracker: Tracker, repo: str, lanes: Iterable[str] = (), project_id: str | None = None) -> str | None:
-    """Find/create the owner's board and repair missing fields, without blocking init."""
+def ensure(tracker: Tracker, repo: str, lanes: Iterable[str] = (), project_id: str | None = None,
+           *, created: set[str] | None = None) -> str | None:
+    """Find/create the owner's board and repair missing fields, without blocking init.
+
+    A board created by this call is added to ``created`` when given.
+    """
     new_project = False
     try:
         if not project_id:
@@ -147,8 +203,10 @@ def ensure(tracker: Tracker, repo: str, lanes: Iterable[str] = (), project_id: s
                 }""", {"input": {"ownerId": owner_id, "repositoryId": repository["id"],
                                  "title": title}})["createProjectV2"]["projectV2"]["id"]
                 new_project = True
+                if created is not None:
+                    created.add(project_id)
         Project(tracker, repo, project_id).ensure_fields({
-            "Lane": ["main", *lanes], "Size": ["s", "m", "l"], "Status": STATUSES,
+            "Status": COLUMNS, "Lane": ["main", *lanes], "Size": ["s", "m", "l"],
         }, new_project=new_project)
     except Exception:
         log.warning("Could not configure board for %s", repo, exc_info=True)
@@ -174,16 +232,21 @@ _current: ContextVar[Project | None] = ContextVar("foragent_board", default=None
 
 def set_status(issue: Issue | int, status: str) -> None:
     """Set Status within the repository context established by sync_status."""
-    if status not in STATUSES:
-        raise ValueError(f"unknown board status: {status}")
     if (project := _current.get()) is not None:
-        project.set_values(issue, {"Status": status})
+        column = board_column(status, project.board_map)
+        if column is None:
+            log.warning("Board map is missing group %s; skipping issue #%s", STATE_GROUPS[status],
+                        getattr(issue, "number", issue))
+            return
+        project.set_values(issue, {"Status": column})
+    else:
+        board_column(status)  # Validate even when there is no repository context.
 
 
 def sync_status(ctx: BoardContext, issue: Issue | int, status: str) -> None:
     if not ctx.config.board:
         return
-    token = _current.set(Project(ctx.tracker, ctx.repo, ctx.config.board))
+    token = _current.set(Project(ctx.tracker, ctx.repo, ctx.config.board, ctx.config.board_map))
     try:
         set_status(issue, status)
     except Exception as exc:
@@ -196,12 +259,18 @@ def sync_status(ctx: BoardContext, issue: Issue | int, status: str) -> None:
 
 
 def add_issue(tracker: Tracker, repo: str, project_id: str | None, issue: int,
-              lane: str | None = None, size: str | None = None) -> None:
+              lane: str | None = None, size: str | None = None,
+              board_map: dict[str, str] | None = None) -> None:
     if not project_id:
         return
     try:
         values = {name: value for name, value in (("Lane", lane), ("Size", size)) if value is not None}
-        Project(tracker, repo, project_id).set_values(issue, values)
+        column = board_column("unapproved", board_map)
+        if column is None:
+            log.warning("Board map is missing group Backlog; skipping issue #%s", issue)
+            return
+        values["Status"] = column
+        Project(tracker, repo, project_id, board_map).set_values(issue, values, initial_status=True)
     except TrackerError:
         raise
     except Exception:
