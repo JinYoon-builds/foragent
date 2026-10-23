@@ -76,3 +76,4 @@
 - #139 scheduler는 `ctx.tracker`가 이미 RecordingTracker면 다시 감싸지 않는다(테스트가 인스턴스에 덧씌운 함수를 우회함). `gate watch`는 기록·실패가 모두 없을 때만 시작 시 한 번 읽는다. 고정 `test_view_compact`가 tick 없이 watch를 실행하기 때문이며, 리뷰 지적은 REBUTTAL로 근거를 남겼다. 일반 테스트에서 FakeTracker로 상태를 만들려면 먼저 `refresh_issues()`나 `--live`를 쓴다.
 - #139 긴 세션은 시간 초과로 작업 트리가 기준 브랜치에서 다시 만들어져 미커밋 변경이 사라질 수 있다. 전체 테스트 대신 Done-when과 바꾼 파일의 테스트만 돌린다(관련 묶음 약 6분). 리뷰가 main 대비 "삭제"를 지적하면 먼저 기준 커밋이 main보다 뒤인지 확인한다.
 - #139 리뷰 보완: `refresh_issues`는 병합된 PR을 먼저, 열린 PR을 나중에 적용한다. 같은 이슈에 옛 병합 PR과 새 열린 PR이 있으면 열린 PR이 이겨야 pr-open(검토 대기)으로 묶인다. 회귀 검증: `tests/test_status.py -k new_open_pr`.
+- #139 관련 단위 테스트 검사가 부하로 시간 초과되면 러너가 작업을 WIP 커밋으로 브랜치에 남기고 작업 트리를 다시 만든다. 이때 커밋되지 않는 `.foragent/TRY.md`·`REBUTTAL.md`만 사라지므로 `git log`로 WIP 커밋을 확인한 뒤 그 두 파일만 다시 쓴다.
