@@ -20,3 +20,5 @@
 - #111: native 인터뷰의 기준은 `docs/decisions.md` D58과 보강 2다. 문서 장부는 출처·날짜와 함께 한 번 확인하고, 명시적 변경은 재승인 없이 반영한다. 불명확한 충돌만 Change / Keep / Exception this once로 한 번 묻고 영구 변경은 대체 결정 기록을 남긴다.
 - #111: `new_lanes[].skills`와 `fa lanes skills`에는 사람이 고른 고정 스타일만 둔다. 도구·검토·분야 스킬은 승인된 목록에서 레인 에이전트가 이슈마다 선택한다. `fa skills add URL --json`으로 미리 보고 모든 스킬의 역할을 확인한 뒤 `--approve --role SKILL=ROLE`로 등록한다.
 - #111 스킬 재작성 때 `files`, `interactive`, 시작 직후 뷰 열기와 progress 전체 단계를 유지한다. 빠른 검증: `uv run pytest tests/acceptance/test_fa_order_interview.py tests/acceptance/test_fa_order_skill.py tests/acceptance/test_order_progress.py tests/acceptance/test_issue_files.py tests/acceptance/test_interactive_flag.py`.
+- #237: `fa order preread`는 이슈별 프롬프트의 sha256으로 결과를 저장소 안 `.foragent/preread.json`(자체 `.gitignore` `*`)에 둔다. 시험이 HOME을 격리하지 않아 `StateStore.for_repo`에 쓰면 저장소 밖이 바뀐다. 관문은 `order.require_clean_preread`이며 `tests/test_order.py`는 autouse로 끈다. 실행기 `read_only=True`는 codex `-s read-only`, claude `--permission-mode plan`.
+- #237: 전체 `fa test tests/`는 10분 제한을 넘는다. 관련 파일만 골라 돌린다. 승인 발행을 쓰는 잠긴 인수 시험(`test_publish_own_paths.py`, `test_view_open_triggers.py`)은 preread 관문과 충돌해 QUESTION.md로 넘겼다.

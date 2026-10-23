@@ -515,3 +515,12 @@ def test_tick_group_already_gone(monkeypatch):
     monkeypatch.setattr("foragent.processes.os.killpg", lambda *args: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: pytest.fail("must not wait"))
     kill_process_group(321)
+
+
+def test_read_only_commands_cannot_edit_files():
+    codex = codex_command(Path("/w"), Path("/o"), read_only=True)
+    assert codex[codex.index("-s") + 1] == "read-only"
+    resumed = codex_command(Path("/w"), Path("/o"), resume_session_id="s", read_only=True)
+    assert 'sandbox_mode="read-only"' in resumed
+    claude = claude_command(read_only=True)
+    assert claude[claude.index("--permission-mode") + 1] == "plan"

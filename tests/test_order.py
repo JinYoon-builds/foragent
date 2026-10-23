@@ -24,6 +24,14 @@ from conftest import BASE_TIME, git_command
 
 FILE = "tests/acceptance/test_login.py"
 
+REQUIRE_CLEAN_PREREAD = order.require_clean_preread
+
+
+@pytest.fixture(autouse=True)
+def preread_done(monkeypatch):
+    """Publication tests here assume a clean preread; the gate is tested on its own."""
+    monkeypatch.setattr(order, "require_clean_preread", lambda plan, root, items: None)
+
 
 class PublishingGit:
     """Record authoring operations, keeping all real Git writes offline."""
@@ -934,3 +942,53 @@ def test_order_progress_cli_uses_configured_repo_without_external_services(tmp_p
     assert cli.main(["order", "progress", "tests", "--done", "3", "--total", "2"]) == 1
     assert "0 <= done <= total" in capsys.readouterr().err
     assert StateStore(tmp_path / "owner/repo").order_progress()["step"] == "start"
+
+
+def _record_preread(root, plan, item, unknowns):
+    path = root / order.PREREAD_FILE
+    records = json.loads(path.read_text()) if path.exists() else {}
+    records[order._preread_hash(plan, item)] = {"key": item["key"], "unknowns": unknowns}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(records))
+
+
+def test_preread_gate_checks_only_the_approved_keys(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root = publishing[0]
+    _record_preread(root, plan, plan["issues"][0], [])
+    _record_preread(root, plan, plan["issues"][1], ["Which locale?"])
+    publish(publishing, plan, approve_keys=["api"])
+    assert publishing[4]
+    with pytest.raises(order.PlanError, match=r"client: Which locale\?"):
+        publish(publishing, deepcopy(plan), approve=True)
+
+
+def test_preread_gate_does_not_apply_without_approval(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    publish(publishing, plan)
+    with pytest.raises(order.PlanError, match="run fa order preread"):
+        REQUIRE_CLEAN_PREREAD(plan, publishing[0], plan["issues"])
+
+
+@pytest.mark.parametrize("message,unknowns", [
+    ("NONE", []), ("  NONE\n", []),
+    ("- Which region?\n\n2. Which error?\n", ["Which region?", "Which error?"]),
+])
+def test_preread_reply_lists_one_unknown_per_line(message, unknowns):
+    assert order._unknowns(message) == unknowns
+
+
+def test_preread_failed_execution_records_nothing(publishing, plan, monkeypatch):
+    from foragent.executors import ExecResult
+
+    class Failing:
+        def run(self, **kwargs):
+            assert kwargs["read_only"] is True
+            return ExecResult(1, False, "", kwargs["log_path"])
+
+    monkeypatch.setattr(order, "executor_for", lambda name: Failing())
+    root, config = publishing[0], publishing[1]
+    with pytest.raises(order.PlanError, match="preread of issue api"):
+        order.preread(plan, root, config)
+    assert not (root / order.PREREAD_FILE).exists()
+    assert (root / ".foragent/.gitignore").read_text() == "*\n"
