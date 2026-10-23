@@ -515,3 +515,17 @@ def test_tick_group_already_gone(monkeypatch):
     monkeypatch.setattr("foragent.processes.os.killpg", lambda *args: (_ for _ in ()).throw(ProcessLookupError()))
     monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: pytest.fail("must not wait"))
     kill_process_group(321)
+
+
+def test_codex_turns_counts_completed_turns_only_after_thread_start(tmp_path):
+    from foragent.executors import codex_turns
+
+    events = tmp_path / "events.jsonl"
+    events.write_text("\n".join(json.dumps(event) for event in [
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "turn.started"}, {"type": "turn.completed"},
+        {"type": "turn.started"}, {"type": "turn.completed"},
+    ]) + "\nnot json\n")
+    assert codex_turns(events) == 2
+    events.write_text(json.dumps({"type": "error", "message": "boom"}) + "\n")
+    assert codex_turns(events) is None

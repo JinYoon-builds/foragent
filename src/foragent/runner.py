@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1910,3 +1912,88 @@ def run_issue(n: int, ctx: RunContext) -> str:
         finally:
             kick_tick(ctx.repo_root)
     return outcome
+
+
+SMOKE_FILE = "hello.txt"
+SMOKE_CHECK = f'test "$(cat {SMOKE_FILE})" = ok'
+
+
+@dataclass(frozen=True)
+class LiveCheck:
+    executor: str
+    passed: bool
+    detail: str
+
+    def line(self) -> str:
+        return f"{'PASS' if self.passed else 'FAIL'} {self.executor}: {self.detail}"
+
+
+def _one_line(text: str) -> str:
+    return " / ".join(line.strip() for line in text.strip().splitlines() if line.strip())
+
+
+def live_check(repo_root: Path, config: Config, executor_name: str, *, timeout_s: int = 900) -> LiveCheck:
+    """Run one executor on a throwaway task in a temporary clone, through the issue prompt path."""
+    if shutil.which(executor_name) is None:
+        return LiveCheck(executor_name, False, f"`{executor_name}` executable not found on PATH")
+    native_claude = executor_name == "claude"
+    parsed = ParsedIssue(
+        version=None,
+        goal=(f"Doctor smoke task: create the file {SMOKE_FILE} at the repository root "
+              "containing exactly the line `ok`. The Done when command below checks it."),
+        out_of_scope="Changing any other file.",
+        done_when_commands=[SMOKE_CHECK],
+        done_when_checklist=[],
+    )
+    prompt = build_prompt(
+        0, parsed, config.acceptance_dir, language=config.language,
+        native_goal=not native_claude and config.codex_goal, acceptance_locked=native_claude,
+    )
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="foragent-doctor-") as temporary:
+        clone = Path(temporary) / "repo"
+        log = Path(temporary) / "executor.log"
+        # A clone, unlike a worktree, leaves the user's repository metadata untouched.
+        cloned = subprocess.run(
+            ["git", "clone", "--quiet", "--no-hardlinks", str(repo_root), str(clone)],
+            capture_output=True, text=True,
+        )
+        if cloned.returncode != 0:
+            return LiveCheck(executor_name, False, "temporary clone failed: " + _one_line(cloned.stderr))
+        # Without a remote, nothing the executor does can reach the original repository.
+        subprocess.run(["git", "-C", str(clone), "remote", "remove", "origin"], capture_output=True)
+        # A committed artifact must not let an executor that did nothing pass the check.
+        (clone / SMOKE_FILE).unlink(missing_ok=True)
+        options: dict = {}
+        if native_claude:
+            settings = Path(temporary) / "claude-settings.json"
+            settings.write_text(json.dumps({"permissions": {"deny": [
+                "Bash(git commit:*)", "Bash(git push:*)", "Bash(git checkout:*)", "Bash(git switch:*)",
+            ]}}) + "\n", encoding="utf-8")
+            options = {"settings_path": settings, "goal": goal_condition(config.acceptance_dir)}
+        try:
+            result = executor_for(executor_name).run(
+                worktree=clone, prompt=prompt, model=config.executor_model,
+                timeout_s=timeout_s, log_path=log, **options,
+            )
+        except OSError as exc:
+            return LiveCheck(executor_name, False, f"`{executor_name}` could not start (not found or not executable): {exc}")
+        seconds = time.monotonic() - started
+        tail = log.read_text(encoding="utf-8", errors="replace")[-4000:] if log.is_file() else ""
+        said = _one_line(result.last_message or result.log_tail or tail)
+        turns = "unknown turns" if result.num_turns is None else (
+            f"{result.num_turns} turn" + ("" if result.num_turns == 1 else "s"))
+        stats = f"{turns}, {seconds:.1f} seconds"
+        if result.timed_out:
+            return LiveCheck(executor_name, False, f"timed out after {stats}; executor said: {said}")
+        if result.exit_code != 0:
+            return LiveCheck(executor_name, False,
+                             f"exit code {result.exit_code} ({stats}); executor said: {said}")
+        if result.num_turns == 0:
+            return LiveCheck(executor_name, False,
+                             f"stopped before any work ({stats}); executor said: {said}")
+        check = _check(SMOKE_CHECK, clone, log, 60)
+        if check.exit_code != 0 or check.timed_out:
+            return LiveCheck(executor_name, False,
+                             f"Done when check failed: {SMOKE_CHECK} ({stats}); executor said: {said}")
+        return LiveCheck(executor_name, True, f"smoke task done in {stats}; executor said: {said}")

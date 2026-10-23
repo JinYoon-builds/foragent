@@ -24,7 +24,7 @@ from foragent.launcher import spawn_notify, spawn_runner
 from foragent.reasons import parse_reason
 from foragent.inspect_runtime import InspectRuntimeError
 from foragent.scheduler import TickContext, tick
-from foragent.runner import RunContext, check_done, run_issue
+from foragent.runner import RunContext, check_done, live_check, run_issue
 from foragent.state import StateStore
 from foragent.status import collect_lanes
 from foragent.tracker import GhTracker, Tracker, TrackerError
@@ -91,6 +91,12 @@ def _parser() -> argparse.ArgumentParser:
     report = bench_actions.add_parser("report")
     report.add_argument("scenario_dir", type=Path)
     report.add_argument("--json", action="store_true")
+    doctor = commands.add_parser("doctor", help="Check that the executors can do real work")
+    doctor.add_argument("--live", action="store_true", required=True,
+                        help="Run each executor once on a throwaway task in a temporary clone")
+    doctor.add_argument("--executor", choices=("codex", "claude"),
+                        help="Executor to check (default: the configured executor)")
+    doctor.add_argument("--repo-root", type=Path, default=Path.cwd())
     init = commands.add_parser("init", help="Set up this repository for Foragent")
     init.add_argument("--repo-root", type=Path, default=Path.cwd())
     init.add_argument("--approver", nargs="+", action="extend", dest="approvers")
@@ -452,6 +458,12 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(order.progress(StateStore.for_repo(repo), args.step, **fields),
                              ensure_ascii=False))
             return 0
+        if args.command == "doctor":
+            config = load_config(root)
+            checks = [live_check(root, config, name) for name in [args.executor or config.executor]]
+            for check in checks:
+                print(check.line(), flush=True)
+            return 0 if all(check.passed for check in checks) else 1
         if args.command == "init":
             report = init_repo(
                 root, approvers=args.approvers, review=args.review, executor=args.executor,
