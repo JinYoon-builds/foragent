@@ -53,6 +53,7 @@ class Config:
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
+    notify_summary_hour: int = 8
     run_hours: str = "always"
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
@@ -100,6 +101,8 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 
 
 def _validate(values: dict[str, Any]) -> None:
+    if type(values["notify_summary_hour"]) is not int or not 0 <= values["notify_summary_hour"] <= 23:
+        raise ConfigError("notify_summary_hour must be an integer from 0 to 23")
     if values["profile"] is not None and not isinstance(values["profile"], dict):
         raise ConfigError("profile must be a mapping or null")
     if values["test_command"] is not None and (

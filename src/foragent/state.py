@@ -33,6 +33,8 @@ class Flag:
 class InspectState:
     since: str | None = None
     notified_signature: str | None = None
+    notified_items: list[str] = field(default_factory=list)
+    summary_date: str | None = None
 
 
 @dataclass(frozen=True)
