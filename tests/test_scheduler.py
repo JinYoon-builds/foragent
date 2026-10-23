@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+from foragent.capacity import write_state
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.issue import body_hash
@@ -63,6 +64,8 @@ def ctx(git_history, tmp_path, monkeypatch):
     context.tracker._now = lambda: context.now()
     context.store._now = lambda: context.now()
     monkeypatch.setattr("foragent.scheduler.os.kill", lambda pid, signal: None)
+    # Scheduler behavior must not depend on this machine's live memory and load.
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: ("normal", 0.0))
     return context
 
 
@@ -1931,6 +1934,8 @@ def test_unknown_lane_reports_once_per_tick_and_uses_main_slot(ctx):
 @pytest.mark.parametrize("cap,expected", [(1, [2]), (2, [2, 4]), (3, [2, 4, 1])])
 def test_lane_single_run_cap_order_and_lowest_issue(ctx, cap, expected):
     ctx.config = replace(ctx.config, lanes={"beta": {}, "alpha": {}}, max_parallel=cap)
+    # A roomy machine-wide AIMD value leaves the project ceiling as the binding cap.
+    write_state(ctx.store, 8, NOW - timedelta(hours=1))
     for number, lane in [(1, "main"), (3, "alpha"), (2, "alpha"), (4, "beta")]:
         approve(ctx, number, labels=[f"lane:{lane}"])
     launches = []
@@ -2130,3 +2135,58 @@ def test_overdue_blocker_escalation_is_journaled_once(ctx):
     assert "needs-human" in ctx.tracker.get_issue(1).labels
     tick(ctx)
     assert recovery_events(ctx) == events
+
+
+def test_project_ceiling_counts_only_this_repositorys_runs(ctx, tmp_path):
+    other = StateStore(tmp_path / "other")
+    for number in (1, 2):
+        other.start_run(number, branch=f"b{number}", worktree=other.worktree_path(number), pid=8000 + number)
+    write_state(ctx.store, 4, NOW - timedelta(hours=1))
+    ctx.config = replace(ctx.config, lanes={"alpha": {}, "beta": {}}, max_parallel=2)
+    for number, lane in [(1, "main"), (2, "alpha"), (3, "beta")]:
+        approve(ctx, number, labels=[f"lane:{lane}"])
+    ctx.start_runs = True
+    tick(ctx)
+    # Machine: 2 elsewhere + 2 here fills the shared 4; the ceiling of 2 is per repository.
+    assert sorted(run.number for run in ctx.store.active_runs()) == [2, 3]
+    tick(ctx)
+    assert len(ctx.store.active_runs()) == 2
+
+
+def test_start_checks_and_github_writes_run_outside_the_machine_lock(ctx, monkeypatch):
+    import fcntl
+
+    from foragent import capacity, scheduler
+
+    held = []
+
+    def probe(name):
+        with (ctx.store.root.parent / capacity.LOCK_FILE).open("a") as stream:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held.append(name)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    def wrap(owner, name):
+        original = getattr(owner, name)
+
+        def call(*args, **kwargs):
+            probe(name)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, call)
+
+    ctx.config = replace(ctx.config, lanes={"alpha": {}})
+    approve(ctx, 1)
+    approve(ctx, 2, labels=["lane:alpha"])
+    ctx.start_runs = True
+    for name in ("get_issue", "label_events", "add_labels", "remove_labels"):
+        wrap(ctx.tracker, name)
+    for name in ("_check_integrity", "_check_prerequisites"):
+        wrap(scheduler, name)
+    wrap(scheduler.board, "sync_status")
+    tick(ctx)
+    assert sorted(run.number for run in ctx.store.active_runs()) == [1, 2]
+    assert held == []
