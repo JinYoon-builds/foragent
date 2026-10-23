@@ -95,3 +95,4 @@
 - #152: `orch._premerge()`는 head 작업공간 하나에서 base를 `merge --no-commit`한 결과를 시험한다(충돌 시 abort 후 head만). pytest 명령(`_pytest_command`로 판별)에는 legacy JUnit 옵션을 덧붙여 실패 ID를 모으고, 실패가 있을 때만 base 작업공간에서 같은 명령을 다시 돌려 `broken`/`failing_on_base`를 나눈다. JUnit 없음·세션 오류·비 pytest 명령은 종료 코드로 판정한다. 노드 ID는 runner의 공용 `junit_node_id()`를 쓴다. 두 번째 작업공간은 base 비교 때만 생기므로 생성 실패 경계 시험은 실패 JUnit을 쓰는 가짜 `pytest`로 그 경로에 도달시킨다.
 
 - #201(D76 요청함): `orch_inbox.py`가 `<state>/inbox/requests|questions/<id>.json`에 한 건씩 저장한다(id `r1`·`q1`, state lock 안 순번). CLI는 Git·GhTracker 준비 전 `INBOX_ACTIONS`로 먼저 분기해 GitHub 호출이 없다. 인수 시험은 실패한 명령 뒤 state 아래 모든 `*.json` 바이트 동일성을 보므로 검증은 쓰기 전에 끝낸다. 경계 시험 `tests/test_orch_inbox_unit.py`. 스킬 정규식 관련 인수 시험 28개는 변경 전후 동일하게 실패(다른 이슈 미구현). 이전 시도가 GitHub 403 한도로 PR 생성에 실패하면 작업공간이 재생성되어 미커밋 변경은 사라진다.
+- [#143 runner split](project_143_runner_split.md) — runner_* sibling modules, _RunnerFacade patch forwarding, line limits
