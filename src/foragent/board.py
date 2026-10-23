@@ -86,8 +86,7 @@ class Project:
             fields[name] = field
         return fields
 
-    def set_values(self, issue: Issue | int, values: dict[str, str]) -> None:
-        number = issue.number if isinstance(issue, Issue) else issue
+    def _item(self, number: int) -> str | None:
         owner, name = self.repo.split("/", 1)
         content = _data(self.tracker, """query ForagentBoardIssue($owner: String!, $name: String!, $number: Int!) {
           repository(owner: $owner, name: $name) { issue(number: $number) { id } }
@@ -100,18 +99,48 @@ class Project:
             if "Content already exists in this project" not in str(exc):
                 raise
             # GitHub confirmed membership but did not return an item ID to update.
+            return None
+        return item["id"]
+
+    def set_values(self, issue: Issue | int, values: dict[str, str]) -> None:
+        number = issue.number if isinstance(issue, Issue) else issue
+        # Values Foragent already wrote cost no calls; the card ID is reused.
+        facts = getattr(self.tracker, "board_facts", None)
+        item, written = facts(number, self.id) if facts is not None else (None, {})
+        values = {key: value for key, value in values.items() if written.get(key) != value}
+        if not values:
+            return
+        cached = recorded = item is not None
+        if item is None and (item := self._item(number)) is None:
             return
         fields = self.ensure_fields({key: [value] for key, value in values.items()})
         for name, value in values.items():
             field = fields[name]
             option = next(option for option in field["options"] if option["name"] == value)
-            _data(self.tracker, """mutation ForagentSetBoardValue($input: UpdateProjectV2ItemFieldValueInput!) {
-              updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
-            }""", {"input": {"projectId": self.id, "itemId": item["id"], "fieldId": field["id"],
-                             "value": {"singleSelectOptionId": option["id"]}}})
-            # At this boundary the issue, field and confirmed value are still known.
+            update = {"projectId": self.id, "fieldId": field["id"], "value": {"singleSelectOptionId": option["id"]}}
+            try:
+                self._update(item, update)
+            except TrackerError as exc:
+                if not cached or exc.is_rate_limit:
+                    raise
+                # The cached card may have been removed from the board; look it up once.
+                cached = recorded = False
+                if (record := getattr(self.tracker, "record_board_item", None)) is not None:
+                    record(number, self.id, None)
+                if (item := self._item(number)) is None:
+                    return
+                self._update(item, update)
+            # At this boundary the issue, card, field and confirmed value are still known.
+            if not recorded and (record := getattr(self.tracker, "record_board_item", None)) is not None:
+                record(number, self.id, item)
+                recorded = True
             if (record := getattr(self.tracker, "record_board_value", None)) is not None:
                 record(number, self.id, name, value)
+
+    def _update(self, item: str, update: dict) -> None:
+        _data(self.tracker, """mutation ForagentSetBoardValue($input: UpdateProjectV2ItemFieldValueInput!) {
+          updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+        }""", {"input": {**update, "itemId": item}})
 
 
 def ensure(tracker: Tracker, repo: str, lanes: Iterable[str] = (), project_id: str | None = None) -> str | None:

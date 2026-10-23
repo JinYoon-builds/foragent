@@ -2190,3 +2190,28 @@ def test_start_checks_and_github_writes_run_outside_the_machine_lock(ctx, monkey
     tick(ctx)
     assert sorted(run.number for run in ctx.store.active_runs()) == [1, 2]
     assert held == []
+
+
+def test_unchanged_refresh_tick_reuses_reads_and_a_kick_tick_reads_live(ctx, monkeypatch):
+    remote = ctx.tracker._tracker
+    remote.add_issue(9, "Blocker")
+    approve(ctx)
+    remote.add_blocked_by(1, 9)
+    clock = [NOW]
+    ctx.now = lambda: clock[0]
+    for _ in range(2):  # Snapshot the approval, then confirm it with a later refresh.
+        tick(ctx)
+        clock[0] += timedelta(minutes=5)
+    reads = []
+    for name in ("label_events", "blocked_by", "find_pr"):
+        original = getattr(remote, name)
+        monkeypatch.setattr(remote, name, lambda arg, _name=name, _original=original: (
+            reads.append(_name), _original(arg))[1])
+    tick(ctx)
+    assert reads == []
+    assert remote.get_issue(1).labels == {"approved"}
+    clock[0] += timedelta(minutes=1)
+    remote.close_issue(9)
+    tick(ctx)  # No refresh is due: nothing new is known, so the gate reads GitHub.
+    assert set(reads) == {"label_events", "blocked_by", "find_pr"}
+    assert remote.get_issue(1).labels == {"approved", "ready"}

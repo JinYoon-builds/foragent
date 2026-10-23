@@ -293,3 +293,33 @@ def test_board_addition_propagates_other_github_errors(operation, message):
     with pytest.raises(TrackerError) as error:
         board.add_issue(tracker, "owner/repo", project_id, 1, "main", "s")
     assert str(error.value) == message
+
+
+def test_board_repeated_status_costs_no_calls_and_reuses_the_card(recording_board, monkeypatch):
+    ctx, remote, clock = recording_board
+    board.sync_status(ctx, 1, "Blocked")
+    queries = []
+    graphql = remote.graphql
+    monkeypatch.setattr(remote, "graphql", lambda query, variables: queries.append(query) or graphql(query, variables))
+    board.sync_status(ctx, 1, "Blocked")
+    assert queries == []
+    board.sync_status(ctx, 1, "Needs human")
+    assert not any("ForagentBoardIssue" in query or "ForagentAddBoardItem" in query for query in queries)
+    assert StateStore(ctx.store.root).board_facts(1, ctx.config.board)[1] == {"Status": "Needs human"}
+
+
+def test_board_removed_cached_card_is_looked_up_once(recording_board, monkeypatch):
+    ctx, remote, clock = recording_board
+    board.sync_status(ctx, 1, "Blocked")
+    ctx.store.record_board_item(1, ctx.config.board, "PVTI_gone")
+    graphql = remote.graphql
+
+    def fail_stale(query, variables):
+        if "ForagentSetBoardValue" in query and variables["input"]["itemId"] == "PVTI_gone":
+            return {"errors": [{"message": "Could not resolve to a node"}]}
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", fail_stale)
+    board.sync_status(ctx, 1, "Ready")
+    item, values = StateStore(ctx.store.root).board_facts(1, ctx.config.board)
+    assert item not in {None, "PVTI_gone"} and values == {"Status": "Ready"}

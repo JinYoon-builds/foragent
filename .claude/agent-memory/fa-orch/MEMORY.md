@@ -88,3 +88,4 @@
 
 - [#106 machine AIMD budget](project_106_capacity.md) — capacity.py, data-root state, per-repo ceiling, grace window, lock scope
 - [#243 machine-wide test slots](project_243_test_slots.md) — Path.home() data root, flock slots, waited credit, conftest isolation
+- [#221 tick GitHub budget](project_221_tick_budget.md) — listing change detection, orch_reads cache, board dedupe, empty-body fixture conflict

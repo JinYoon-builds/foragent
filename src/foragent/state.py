@@ -217,6 +217,21 @@ class StateStore:
     def issues_revision(self) -> int:
         return self._issue_snapshot().get("revision", 0)
 
+    def issues_refresh_sequence(self) -> int:
+        """Count completed bulk refreshes; a newer one confirms earlier observations."""
+        return self._issue_snapshot().get("refresh_sequence", 0)
+
+    def issue_reads(self) -> dict[str, Any]:
+        """Per-issue GitHub reads the gate may reuse while their issue is unchanged."""
+        try:
+            return json.loads((self.root / "issue-reads.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+
+    def save_issue_reads(self, reads: dict[str, Any]) -> None:
+        with self._state_lock():
+            self._write_json(self.root / "issue-reads.json", reads)
+
     def _save_local_issue(self, snapshot: dict[str, Any], row: dict[str, Any]) -> None:
         snapshot["revision"] = snapshot.get("revision", 0) + 1
         row.update(revision=snapshot["revision"], updated_at=self._timestamp())
@@ -282,11 +297,29 @@ class StateStore:
                 row.setdefault("board_values", {}).setdefault(project, {})[field] = value
                 self._save_local_issue(snapshot, row)
 
+    def record_board_item(self, number: int, project: str, item: str | None) -> None:
+        """Remember the board card of an issue so later writes skip its lookup."""
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            row = snapshot["issues"].get(str(number))
+            if row is not None:
+                items = row.setdefault("board_items", {})
+                if item is None:
+                    items.pop(project, None)
+                else:
+                    items[project] = item
+                self._save_local_issue(snapshot, row)
+
+    def board_facts(self, number: int, project: str) -> tuple[str | None, dict[str, str]]:
+        """The cached card ID and the values Foragent last wrote to it."""
+        row = self._issue_snapshot()["issues"].get(str(number)) or {}
+        return row.get("board_items", {}).get(project), row.get("board_values", {}).get(project, {})
+
     def refresh_local_issues(
         self, issues: list, prs: list, lanes: dict, now: datetime,
         *, comments: dict[int, list[dict]] | None = None, since_revision: int | None = None,
         parents: dict[int, int] | None = None, blocked_by: dict[int, list[dict]] | None = None,
-        complete_prs: bool = False,
+        complete_prs: bool = False, children: dict[int, list[int]] | None = None,
     ) -> list[int]:
         """Replace remote facts, preserving local changes made since the refresh began."""
         from foragent.labels import issue_lane
@@ -318,6 +351,8 @@ class StateStore:
                     "merged": False if complete_prs else old.get("merged", False),
                     "comments": comments.get(issue.number, old_comments),
                     "updated_at": self._timestamp(),
+                    # GitHub's own change time lets the next refresh skip unchanged issues.
+                    "remote_updated_at": issue.updated_at,
                 }
                 if pending:
                     # Pending effects are already in old. Compare GitHub with
@@ -341,6 +376,11 @@ class StateStore:
                     row["parent"] = parents.get(int(number))
                 if blocked_by is not None:
                     row["blocked_by"] = blocked_by.get(int(number), [])
+                if children is not None:
+                    if int(number) in children:
+                        row["children"] = children[int(number)]
+                    else:
+                        row.pop("children", None)
             for pr in prs:
                 if (row := rows.get(str(pr_issue_number(pr.head)))) is not None:
                     row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
@@ -351,6 +391,7 @@ class StateStore:
             snapshot.pop("refresh_failure", None)
             self._write_json(self.root / "issues.json", {
                 **snapshot, "refreshed_at": now.isoformat(), "issues": rows,
+                "refresh_sequence": snapshot.get("refresh_sequence", 0) + 1,
                 "outbox": [entry for entry in snapshot.get("outbox", []) if entry["issue"] not in dropped],
                 "outbox_base": {number: row for number, row in snapshot.get("outbox_base", {}).items()
                                 if int(number) not in dropped},

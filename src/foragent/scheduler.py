@@ -23,6 +23,7 @@ from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
 from foragent.orch_events import append_event
+from foragent.orch_reads import IssueReads
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import kill_process_group
 from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
@@ -377,8 +378,9 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
 
 
 def _check_prerequisites(
-    ctx: TickContext, issue: Issue, approval: Approval, report: TickReport,
+    ctx: TickContext, issue: Issue, approval: Approval, report: TickReport, reads=None,
 ) -> bool:
+    reads = reads or ctx.tracker
     latest_run = next(
         (run for run in reversed(ctx.store.read_history()) if run.number == issue.number), None,
     )
@@ -391,7 +393,7 @@ def _check_prerequisites(
         board.sync_status(ctx, issue, "Done")
         return False
     if (
-        ctx.tracker.find_pr(f"foragent/issue-{issue.number}") is not None
+        reads.find_pr(f"foragent/issue-{issue.number}") is not None
         and (latest_run is None or latest_run.outcome != "limit-wait")
     ):
         if READY in issue.labels:
@@ -405,7 +407,7 @@ def _check_prerequisites(
         )
         report.actions.append(f"#{issue.number} flagged no-machine-check")
         return False
-    dependencies = ctx.tracker.blocked_by(issue.number)
+    dependencies = reads.blocked_by(issue.number)
     cancelled = next(
         (dependency for dependency in dependencies
          if dependency.state == "closed" and dependency.state_reason == "not_planned"), None,
@@ -648,7 +650,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     report = TickReport()
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
-    if ctx.store.issues_refresh_due(ctx.now()) or ctx.store.github_outbox():
+    refreshed = ctx.store.issues_refresh_due(ctx.now()) or bool(ctx.store.github_outbox())
+    if refreshed:
         # Keep an existing recorder; wrapping again would bypass its own state.
         recorder = ctx.tracker if isinstance(ctx.tracker, RecordingTracker) else RecordingTracker(ctx.tracker, ctx)
         recorder.refresh_issues()
@@ -668,6 +671,40 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                     unknown.add(label)
         return issue_lane(issue.labels, ctx.config.lanes)
 
+    reads = IssueReads(ctx.tracker, ctx.store, refreshed=refreshed)
+    try:
+        _evaluate_issues(ctx, base_ref, report, ready, lane_for, reads)
+    finally:
+        reads.save()
+
+    if until := ctx.store.github_wait_until(ctx.now()):
+        report.skipped = f"GitHub rate limit until {until.isoformat()}"
+        return report
+    # One sensor sample per tick sizes both the test slots and the run budget.
+    sample = machine_load()
+    update_test_slots(ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1])
+    if not ctx.start_runs or not ready:
+        return report
+    if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+        return report
+
+    started = _start_ready(ctx, ready, lane_for, base_ref, report, sample)
+    if started is None:
+        return report
+    if started:
+        try:
+            watch_open.open_view(ctx.repo_root, ctx.store, ctx.config.language)
+        except Exception as exc:
+            # Optional progress display must never hide successfully started runs.
+            error = " ".join(str(exc).split())[:200]
+            report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
+    return report
+
+
+def _evaluate_issues(
+    ctx: TickContext, base_ref: str, report: TickReport, ready: dict[str, list[int]],
+    lane_for: Callable[[Issue], str], reads: IssueReads,
+) -> None:
     for issue in local_issue_models(ctx.store):
         if issue.state != "open":
             continue
@@ -683,7 +720,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             continue
         if APPROVED not in issue.labels and not waiting_labels:
             continue
-        event, ignored = _latest_approval(ctx.tracker.label_events(issue.number), ctx.config.approvers)
+        event, ignored = _latest_approval(reads.label_events(issue.number), ctx.config.approvers)
         if ignored:
             report.actions.append(
                 f"#{issue.number} ignored approved label from non-approver(s): {', '.join(sorted(ignored))}"
@@ -715,7 +752,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         if RUNNING in issue.labels:
             board.sync_status(ctx, issue, "Running")
             continue
-        if not _check_prerequisites(ctx, issue, approval, report):
+        if not _check_prerequisites(ctx, issue, approval, report, reads):
             continue
         if READY in issue.labels:
             board.sync_status(ctx, issue, "Ready")
@@ -729,29 +766,6 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         board.sync_status(ctx, issue, "Ready")
         report.actions.append(f"#{issue.number} promoted to ready")
         ready.setdefault(lane, []).append(issue.number)
-
-    if until := ctx.store.github_wait_until(ctx.now()):
-        report.skipped = f"GitHub rate limit until {until.isoformat()}"
-        return report
-    # One sensor sample per tick sizes both the test slots and the run budget.
-    sample = machine_load()
-    update_test_slots(ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1])
-    if not ctx.start_runs or not ready:
-        return report
-    if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
-        return report
-
-    started = _start_ready(ctx, ready, lane_for, base_ref, report, sample)
-    if started is None:
-        return report
-    if started:
-        try:
-            watch_open.open_view(ctx.repo_root, ctx.store, ctx.config.language)
-        except Exception as exc:
-            # Optional progress display must never hide successfully started runs.
-            error = " ".join(str(exc).split())[:200]
-            report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
-    return report
 
 
 def _machine_budget(

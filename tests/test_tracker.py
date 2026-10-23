@@ -1199,3 +1199,38 @@ def test_remove_blocked_by_propagates_api_failure():
     run = ScriptedRun('{"id":12345}', gh_error("HTTP 403: forbidden"))
     with pytest.raises(TrackerError, match="HTTP 403"):
         GhTracker(REPO, run).remove_blocked_by(1, 2)
+
+
+def test_refresh_rereads_only_changed_issues_and_dependents_of_changed_blockers(tmp_path, monkeypatch):
+    from collections import Counter
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    clock = [NOW]
+    remote = FakeTracker(now=lambda: clock[0])
+    remote.add_issue(9, "Blocker")
+    for number in (1, 2):
+        remote.add_issue(number, f"Dependent {number}", labels=["approved"])
+        remote.add_blocked_by(number, 9)
+    remote.add_issue(3, "Held", labels=["blocked"])
+    ctx = SimpleNamespace(config=Config(), now=lambda: clock[0], store=StateStore(tmp_path, now=lambda: clock[0]))
+    ctx.tracker = RecordingTracker(remote, ctx)
+    ctx.tracker.refresh_issues()
+    reads = Counter()
+    for name in ("blocked_by", "sub_issues", "list_comments"):
+        original = getattr(remote, name)
+        monkeypatch.setattr(remote, name, lambda n, _name=name, _original=original: (
+            reads.update([(_name, n)]), _original(n))[1])
+    clock[0] += timedelta(minutes=5)
+    ctx.tracker.refresh_issues()
+    assert reads == Counter()
+    remote.comment(3, "A person explains the hold")
+    remote.close_issue(9)
+    clock[0] += timedelta(minutes=5)
+    ctx.tracker.refresh_issues()
+    assert {number for _, number in reads} == {1, 2, 3}
+    rows = {row["number"]: row for row in ctx.store.local_issues()}
+    assert rows[1]["blocked_by"] == [{"number": 9, "state": "closed"}]
+    assert rows[3]["comments"][-1]["body"] == "A person explains the hold"
