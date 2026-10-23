@@ -30,7 +30,7 @@ from foragent.watch_cells import Line, Span, _beside, _cells, _clean, _columns, 
 from foragent.watch_data import Snapshot, collect, recent_events
 from foragent.watch_layout import PICK, _activity, _frame, _has_work, render_detail, render_frame
 from foragent.watch_open import registered
-from foragent.watch_terminal import _terminal
+from foragent.watch_terminal import _terminal, color_pairs
 
 
 def _installed_build() -> str:
