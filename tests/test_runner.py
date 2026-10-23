@@ -11,6 +11,7 @@ import shlex
 import sys
 import threading
 from types import SimpleNamespace
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -661,6 +662,128 @@ def test_related_unit_failure_uses_implementation_budget_and_reaches_next_prompt
     assert bool(c.tracker.merged_prs) == repaired
 
 
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkeypatch, timed_out):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command="pytest -q")
+    c.executor.steps = [{"feature.txt": "done", "tests/test_new.py": "def test_new():\n    assert True\n"}]
+    c.now[0] += timedelta(minutes=60)
+    c.store.update_run(1, waited_seconds=600)
+    calls = []
+
+    def check(command, worktree, log, timeout_s, **kwargs):
+        selected = "tests/test_new.py" in shlex.split(command)
+        if worktree == c.store.worktree_path(1):
+            calls.append((command, timeout_s))
+            c.now[0] += timedelta(seconds=120)
+        killed = selected and timed_out
+        return CheckResult(command, -9 if killed else 0, killed, "")
+
+    monkeypatch.setattr("foragent.runner._check", check)
+    assert run_issue(1, c.ctx) == ("timeout" if timed_out else "merged")
+    assert [limit for _, limit in calls] == [900, 900, 2160]
+    assert "tests/test_new.py" in shlex.split(calls[-1][0])
+    assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
+    if timed_out:
+        assert c.store.load_flag(1).reason == Reason.TIMEOUT
+        assert c.store.get_run(1).detail == "Related unit tests timed out after 2160 s (1 selected tests)."
+        assert c.tracker.created_prs == []
+
+
+@pytest.mark.parametrize("max_retries", [0, 1])
+def test_related_check_timeout_preserves_implementation_before_cleanup(run_case, monkeypatch, max_retries):
+    c = run_case
+    c.history.update({
+        "src/sample.py": "VALUE = 1\n",
+        "tests/test_sample.py": "from sample import VALUE\n",
+    })
+    c.ctx.config = replace(c.ctx.config, test_command="pytest -q", max_retries=max_retries)
+    c.executor.steps = [{"feature.txt": "done", "src/sample.py": "VALUE = 2\n"}]
+    c.now[0] += timedelta(minutes=70)
+
+    def check(command, worktree, log, timeout_s, **kwargs):
+        timed_out = "tests/test_sample.py" in shlex.split(command)
+        if timed_out:
+            assert timeout_s == 1200
+            c.now[0] += timedelta(seconds=timeout_s)
+        return CheckResult(command, -9 if timed_out else 0, timed_out, "")
+
+    monkeypatch.setattr("foragent.runner._check", check)
+    assert run_issue(1, c.ctx) == "timeout"
+    assert not c.store.worktree_path(1).exists()
+    assert git_command(c.history.clone, "show", "foragent/issue-1:src/sample.py") == "VALUE = 2"
+    assert git_command(c.history.origin, "show", "foragent/issue-1:src/sample.py") == "VALUE = 2"
+    assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
+    assert c.store.load_flag(1).reason == Reason.TIMEOUT
+    assert c.store.get_run(1).detail == "Related unit tests timed out after 1200 s (1 selected tests)."
+    assert c.tracker.created_prs == c.tracker.merged_prs == []
+
+
+@pytest.mark.parametrize("slow_check", ["baseline", "done-when", "related"])
+def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_case, monkeypatch, slow_check):
+    from foragent.scheduler import TickContext, TickReport, _recover_runs
+
+    c = run_case
+    stall_minutes = 30 if slow_check == "related" else 1
+    c.ctx.config = replace(c.ctx.config, test_command="pytest -q", stall_minutes=stall_minutes)
+    if slow_check == "related":
+        c.now[0] += timedelta(minutes=30)
+    c.executor.steps = [{"feature.txt": "done", "tests/test_new.py": "def test_new():\n    assert True\n"}]
+    killed = []
+    scheduler = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, kill_runner=killed.append,
+        launcher=lambda number: pytest.fail("check must keep the current runner"), start_runs=False,
+    )
+    polls = []
+    observed = []
+
+    def watch(execute, poll):
+        polls.append(poll)
+        try:
+            return execute()
+        finally:
+            polls.pop()
+
+    def check_process(argv, *, cwd, timeout_s, log_path, **kwargs):
+        command = argv[2]
+        words = shlex.split(command)
+        report = next((word.split("=", 1)[1] for word in words if word.startswith("--junitxml=")), None)
+        if report:
+            kind = "baseline"
+        elif command == COMMAND:
+            kind = "done-when"
+        elif "tests/test_new.py" in words:
+            kind = "related"
+        else:
+            kind = "other"
+        if kind == slow_check and not observed:
+            assert timeout_s >= (stall_minutes + 1) * 60
+            if kind == "related":
+                assert timeout_s == 3600
+            for _ in range(stall_minutes + 1):
+                c.now[0] += timedelta(minutes=1)
+                if polls:
+                    polls[-1]()
+                observed.append(c.store.get_run(1).last_progress_at)
+            _recover_runs(scheduler, TickReport())
+            assert killed == []
+            assert c.store.get_run(1).status == "running"
+            assert observed[-1] == c.now[0].isoformat()
+        if report:
+            suite = ET.Element("testsuite")
+            ET.SubElement(suite, "testcase", file=ACCEPTANCE, name="test_feature",
+                          classname=ACCEPTANCE.removesuffix(".py").replace("/", "."))
+            ET.ElementTree(suite).write(report, encoding="unicode")
+        return 0, False, ""
+
+    monkeypatch.setattr("foragent.runner.poll_executor", watch)
+    monkeypatch.setattr("foragent.runner.run_logged", check_process)
+    assert run_issue(1, c.ctx) == "merged", c.store.log_path(1).read_text()
+    assert len(set(observed)) == stall_minutes + 1
+    assert killed == []
+
+
 @pytest.mark.parametrize("options", ["", "--rootdir=tests --junit-prefix=project"])
 def test_baseline_preserves_exact_parameterized_ids_and_excludes_nonpasses(run_case, options):
     c = run_case
@@ -1030,7 +1153,7 @@ def test_check_timeout_uses_retry_limit_and_reports_command(run_case, monkeypatc
     c.executor.steps = [{"feature.txt": "done"}, {}]
     calls = []
 
-    def check(command, worktree, log, timeout_s):
+    def check(command, worktree, log, timeout_s, **kwargs):
         calls.append((command, timeout_s))
         return CheckResult(command, -9, True, "slow check output")
 
@@ -1047,9 +1170,9 @@ def test_retry_gets_remaining_budget_after_checks_spend_time(run_case, monkeypat
     c.executor.steps = [{"feature.txt": "wrong"}, {"feature.txt": "done"}]
     from foragent.runner import _check
 
-    def check(*args):
+    def check(*args, **kwargs):
         c.now[0] += timedelta(minutes=1)
-        return _check(*args)
+        return _check(*args, **kwargs)
 
     monkeypatch.setattr("foragent.runner._check", check)
     assert run_issue(1, c.ctx) == "merged"

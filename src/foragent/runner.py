@@ -310,12 +310,20 @@ def _append(log: Path, text: str) -> None:
         stream.write(text + "\n")
 
 
-def _check(command: str, worktree: Path, log: Path, timeout_s: int) -> CheckResult:
+def _check(
+    command: str, worktree: Path, log: Path, timeout_s: int,
+    *, progress: Callable[[], None] | None = None,
+) -> CheckResult:
     _append(log, f"\nDone when command:\n{command}")
     offset = log.stat().st_size
-    code, timed_out, _ = run_logged(
-        ["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
-    )
+
+    def execute():
+        return run_logged(
+            ["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
+        )
+
+    # A quiet check is still running; keep the scheduler informed while it waits.
+    code, timed_out, _ = poll_executor(execute, progress) if progress is not None else execute()
     with log.open("rb") as stream:
         stream.seek(max(offset, log.stat().st_size - 16000))
         tail = stream.read().decode("utf-8", errors="replace")[-4000:]
@@ -455,7 +463,8 @@ def _capture_acceptance_baseline(
                 f"{command} {shlex.quote(ctx.config.acceptance_dir)} "
                 f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(report.resolve()))}"
             )
-            result = _check(baseline_command, worktree, log, min(900, _remaining(n, ctx)))
+            result = _check(baseline_command, worktree, log, min(900, _remaining(n, ctx)),
+                            progress=lambda: _progress(n, ctx))
             _progress(n, ctx)
             try:
                 node_ids = _passing_acceptance_ids(report)
@@ -1222,6 +1231,13 @@ def _implement_and_publish(
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Rebuilt implementation failed; no attempts remain.", details)
         return "retries-exceeded"
 
+    def preserve_failed_implementation() -> None:
+        # Preserve the failed implementation, rather than pushing an unchanged base.
+        if paths and git.has_staged_changes():
+            title = ctx.tracker.get_issue(n).title
+            git.commit(f"{title} (#{n})")
+        push_branch()
+
     def verify() -> str:
         nonlocal checks, paths
         _phase(n, ctx, "checking")
@@ -1237,11 +1253,11 @@ def _implement_and_publish(
         for verification in range(2):
             checks = []
             for command in parsed.done_when_commands:
-                checks.append(_check(command, worktree, log, 900))
+                checks.append(_check(command, worktree, log, 900, progress=lambda: _progress(n, ctx)))
                 _progress(n, ctx)
             if baseline and baseline.node_ids:
                 command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
-                result = _check(command, worktree, log, 900)
+                result = _check(command, worktree, log, 900, progress=lambda: _progress(n, ctx))
                 checks.append(result)
                 _append(log, f"Acceptance baseline verification count={len(baseline.node_ids)}, "
                         f"exit_code={result.exit_code}, timed_out={result.timed_out}")
@@ -1252,8 +1268,17 @@ def _implement_and_publish(
             unit_command = _pytest_command(test_command) if test_command else None
             unit_tests = _related_unit_tests(worktree, paths, ctx.config.acceptance_dir)
             if unit_tests and unit_command:
-                checks.append(_check(f"{unit_command} {shlex.join(unit_tests)}", worktree, log, 900))
+                limit = max(900, _remaining(n, ctx))
+                result = _check(f"{unit_command} {shlex.join(unit_tests)}", worktree, log, limit,
+                                progress=lambda: _progress(n, ctx))
+                checks.append(result)
                 _progress(n, ctx)
+                if result.timed_out:
+                    detail = f"Related unit tests timed out after {limit} s ({len(unit_tests)} selected tests)."
+                    git.stage_changes()
+                    preserve_failed_implementation()
+                    flag(ctx, n, Reason.TIMEOUT, detail)
+                    raise ExecutorStopped("timeout", detail)
             elif unit_tests:
                 _append(log, "Related unit tests skipped: no supported pytest command is known")
             git.stage_changes()
@@ -1571,11 +1596,7 @@ def _implement_and_publish(
             ctx.store.update_run(n, attempts=run.attempts + 1)
             continue
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", failure)
-        # Preserve the failed implementation, rather than pushing an unchanged base.
-        if paths and git.has_staged_changes():
-            title = ctx.tracker.get_issue(n).title
-            git.commit(f"{title} (#{n})")
-        git.push(branch)
+        preserve_failed_implementation()
         return "retries-exceeded"
 
 
@@ -1635,7 +1656,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     for command in parsed.done_when_commands:
         if _remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
-        check = _check(command, worktree, log, min(900, _remaining(n, ctx)))
+        check = _check(command, worktree, log, min(900, _remaining(n, ctx)), progress=lambda: _progress(n, ctx))
         _progress(n, ctx)
         if check.timed_out or _remaining(n, ctx) <= 0:
             return _timeout(n, ctx)

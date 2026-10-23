@@ -253,9 +253,9 @@ def test_failed_rerun_preserves_pr_and_raw_review_with_visible_reason(review_cas
 def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch, entry, failure, reason):
     c = review_case
     if failure == "checks":
-        monkeypatch.setattr(runner, "_check", lambda command, *args: runner.CheckResult(command, 1, False, "Broken feature"))
+        monkeypatch.setattr(runner, "_check", lambda command, *args, **kwargs: runner.CheckResult(command, 1, False, "Broken feature"))
     elif failure == "check-timeout":
-        monkeypatch.setattr(runner, "_check", lambda command, *args: runner.CheckResult(command, None, True, "Timed out"))
+        monkeypatch.setattr(runner, "_check", lambda command, *args, **kwargs: runner.CheckResult(command, None, True, "Timed out"))
     elif failure == "ci":
         c.ctx.config = replace(c.ctx.config, max_retries=0)
         c.tracker.set_pr_checks(c.pr, "fail")
@@ -277,7 +277,7 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
         c.tracker.edit_body(1, body)
         c.store.save_approval(**{**approval.__dict__, "body": body, "body_sha": body_hash(body)})
     elif failure == "error":
-        monkeypatch.setattr(runner, "_check", lambda *args: (_ for _ in ()).throw(RuntimeError("check crashed")))
+        monkeypatch.setattr(runner, "_check", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("check crashed")))
 
     if entry == "rerun-review":
         orch.rerun_review(c.ctx, 1)
@@ -330,7 +330,7 @@ def test_resolve_preserves_normal_merge_policy(review_case, mode, always_human, 
 @pytest.mark.parametrize("entry", ["review-only", "rerun-review", "resolve"])
 def test_interruption_leaves_visible_state_and_cleans_worktree(review_case, monkeypatch, entry):
     c = review_case
-    def interrupted(*args):
+    def interrupted(*args, **kwargs):
         raise SystemExit(1)
     monkeypatch.setattr(runner, "_check", interrupted)
     with pytest.raises(SystemExit):
