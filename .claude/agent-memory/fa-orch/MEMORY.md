@@ -88,3 +88,8 @@
 
 - [#106 machine AIMD budget](project_106_capacity.md) — capacity.py, data-root state, per-repo ceiling, grace window, lock scope
 - [#243 machine-wide test slots](project_243_test_slots.md) — Path.home() data root, flock slots, waited credit, conftest isolation
+
+- #217: `orch.watch()`는 읽기 예외를 `{"unknown": true, "error": str}`로 내고 `orch-watch.json`은 건드리지 않는다. 회복 강제 출력은 프로세스를 넘어 유지돼야 하므로 별도 `<state>/orch-watch-unknown.json` 표식을 쓴다(인수 시험이 orch-watch.json의 바이트 동일성을 검사). follow는 같은 오류를 반복 출력하지 않고, CLI는 one-shot에서 unknown이면 1을 반환한다. 시험: `tests/acceptance/test_watch_never_silent.py` 3개, `tests/test_orch_watcher.py` 4개.
+- #217 재시도: runner의 관련 시험 묶음에서 `test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands[True]`가 `os.killpg` EPERM으로 간헐 실패한다. 변경 전 소스에서도 3회 중 2회 재현되므로 REBUTTAL로 처리했다. 기준선을 잡을 때는 runner가 이미 커밋했을 수 있으니 HEAD가 아니라 이슈 커밋 이전 SHA를 `git archive`해야 한다.
+
+- #152: `orch._premerge()`는 head 작업공간 하나에서 base를 `merge --no-commit`한 결과를 시험한다(충돌 시 abort 후 head만). pytest 명령(`_pytest_command`로 판별)에는 legacy JUnit 옵션을 덧붙여 실패 ID를 모으고, 실패가 있을 때만 base 작업공간에서 같은 명령을 다시 돌려 `broken`/`failing_on_base`를 나눈다. JUnit 없음·세션 오류·비 pytest 명령은 종료 코드로 판정한다. 노드 ID는 runner의 공용 `junit_node_id()`를 쓴다. 두 번째 작업공간은 base 비교 때만 생기므로 생성 실패 경계 시험은 실패 JUnit을 쓰는 가짜 `pytest`로 그 경로에 도달시킨다.

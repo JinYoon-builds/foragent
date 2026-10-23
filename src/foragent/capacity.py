@@ -2,12 +2,12 @@
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+import ctypes
 from datetime import UTC, datetime, timedelta
 import fcntl
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import time
@@ -58,17 +58,26 @@ def next_parallel(
     return max(1, value)
 
 
+def _darwin_pressure_level() -> int | None:
+    """Read kern.memorystatus_vm_pressure_level in-process; a tick starts no subprocess for it."""
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        value = ctypes.c_int(0)
+        size = ctypes.c_size_t(ctypes.sizeof(value))
+        if libc.sysctlbyname(
+            b"kern.memorystatus_vm_pressure_level", ctypes.byref(value), ctypes.byref(size),
+            None, ctypes.c_size_t(0),
+        ) != 0:
+            return None
+    except (OSError, AttributeError):
+        return None
+    return value.value
+
+
 def memory_pressure() -> str:
     """Return normal, warn or critical; an unreadable sensor reads as normal."""
     if sys.platform == "darwin":
-        try:
-            output = subprocess.run(
-                ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
-                check=True, capture_output=True, text=True, timeout=5,
-            ).stdout
-            return _DARWIN_PRESSURE.get(int(output.strip()), "normal")
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return "normal"
+        return _DARWIN_PRESSURE.get(_darwin_pressure_level(), "normal")
     try:
         lines = Path("/proc/pressure/memory").read_text(encoding="utf-8").splitlines()
     except OSError:

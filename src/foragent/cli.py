@@ -556,11 +556,15 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{event['at']} [{event['kind']}] {event['summary']}")
             elif args.action == "watch":
                 _open_lane_view(root)
+                unknown = False
                 try:
                     for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow):
                         print(json.dumps(snapshot, ensure_ascii=False), flush=True)
+                        unknown = bool(snapshot.get("unknown"))
                 except KeyboardInterrupt:
                     pass
+                if unknown and not args.follow:
+                    return 1
             elif args.action == "retry":
                 print(orch.retry(ctx, args.number, args.hint))
             elif args.action == "rerun-review":
