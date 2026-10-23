@@ -236,9 +236,42 @@ def test_executor_choice_limit_hands_next_attempt_to_other_executor_with_summary
     previous = prompt.partition("Previous attempt")[2]
     assert "parser skeleton" in previous and "empty input" in previous, prompt
     assert launches[0] == ("codex", "claude")
-    assert [call["executor"] for call in calls if call["phase"] == "reviewing"] == ["codex"]
+    # Codex is exhausted (100 % of its weekly window), so it cannot review either:
+    # the review also goes to Claude, and that same-model review is recorded.
+    assert [call["executor"] for call in calls if call["phase"] == "reviewing"] == ["claude"]
     run = StateStore(case.store.root).get_run(1)
-    assert (run.executor, run.reviewer) == ("claude", "codex")
+    assert (run.executor, run.reviewer) == ("claude", "claude")
+    assert same_model_events(case, 1), "A same-model review must be recorded with its reason"
+
+
+def same_model_events(case, issue):
+    import json
+
+    path = case.store.root / "orch-events.jsonl"
+    events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    return [event for event in events
+            if event["issue"] == issue and event["kind"] == "same-model-review"]
+
+
+def test_executor_choice_exhausted_side_hands_worker_and_reviewer_to_the_other(
+    git_history, tmp_path, monkeypatch,
+):
+    from foragent.scheduler import choose_executor
+
+    case = executor_choice_case(git_history, tmp_path, monkeypatch, executor="codex")
+    # Ample on both sides: cross review as today.
+    assert choose_executor(case.store, case.config, "orch", case.clock[0]) in {
+        ("codex", "claude"), ("claude", "codex")}
+    # One side fully used up: worker and reviewer both go to the side with quota left.
+    case.usage = recorded_usage(case.clock[0], codex=(("7d", 100, 72),))
+    assert choose_executor(case.store, case.config, "orch", case.clock[0]) == ("claude", "claude")
+    case.usage = recorded_usage(case.clock[0], claude=(("five_hour", 100, 4),))
+    assert choose_executor(case.store, case.config, "orch", case.clock[0]) == ("codex", "codex")
+    # After the reset the pair goes back to cross review without any config change.
+    case.clock[0] += timedelta(hours=73)
+    case.usage = recorded_usage(case.clock[0])
+    worker, reviewer = choose_executor(case.store, case.config, "orch", case.clock[0])
+    assert worker != reviewer
 
 
 def test_executor_choice_no_recorded_usage_uses_configured_default(
