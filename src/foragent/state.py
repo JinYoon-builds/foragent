@@ -199,6 +199,18 @@ class StateStore:
             self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
             return run
 
+    def prepare_run_start(self, number: int) -> None:
+        """Journal the label transition before a runner or run record exists."""
+        self._write_json(self.root / "run-starts" / f"{number}.json", {
+            "number": number, "prepared_at": self._timestamp(),
+        })
+
+    def run_start_pending(self, number: int) -> bool:
+        return (self.root / "run-starts" / f"{number}.json").exists()
+
+    def clear_run_start(self, number: int) -> None:
+        (self.root / "run-starts" / f"{number}.json").unlink(missing_ok=True)
+
     def update_run(self, number: int, **fields: Any) -> Run:
         with self._state_lock():
             run = self.get_run(number)
@@ -206,6 +218,12 @@ class StateStore:
                 raise KeyError(number)
             if run.status == "finished":
                 return run
+            if "detail" in fields:
+                fields["detail"] = (
+                    " ".join(fields["detail"].split())[:500]
+                    or " ".join(run.detail.split())[:500]
+                    or "Run detail unavailable."
+                )
             updated = replace(run, **fields)
             self._write_json(self.root / "runs" / f"{number}.json", asdict(updated))
             return updated
@@ -262,6 +280,9 @@ class StateStore:
                 raise KeyError(number)
             if run.status == "finished":
                 return run
+            detail = " ".join(detail.split())[:500]
+            if not detail and outcome != "merged":
+                detail = " ".join(run.detail.split())[:500] or f"Run finished with outcome {outcome}."
             finished = replace(run, status="finished", outcome=outcome, detail=detail)
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
