@@ -2036,6 +2036,9 @@ def run_issue(n: int, ctx: RunContext) -> str:
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Runner exited: {exc}"
+        # A handled stop must not look like an orphan to the next tick.
+        ctx.tracker.add_labels(n, [BLOCKED])
+        ctx.tracker.remove_labels(n, [READY, RUNNING])
         raise
     finally:
         # A tick may already have finished the record while terminating this runner.
