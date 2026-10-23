@@ -1,10 +1,13 @@
-"""Promote approved issues and launch one runner per available lane."""
+"""Promote approved issues and launch runners within lane and project budgets."""
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from fnmatch import translate
+from glob import has_magic
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
@@ -502,6 +505,145 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
             report.actions.append(f"#{parent} batch PR finalization deferred: {exc}")
 
 
+def _filesystem_case_sensitive(repo_root: Path) -> bool | None:
+    """Probe an existing root entry without creating or modifying any files."""
+    try:
+        for entry in repo_root.iterdir():
+            alternate = entry.with_name(entry.name.swapcase())
+            if alternate == entry:
+                continue
+            try:
+                original_stat = entry.stat()
+                try:
+                    alternate_stat = alternate.stat()
+                except FileNotFoundError:
+                    return True
+            except OSError:
+                continue
+            return not os.path.samestat(original_stat, alternate_stat)
+    except OSError:
+        pass
+    return None
+
+
+def _file_patterns_overlap(left: str, right: str, *, case_sensitive: bool = True) -> bool:
+    """Intersect path globs, including files that do not exist yet.
+
+    As in policy._matches, * and ? stay in a component; ** spans components.
+    Walking pairs of glob positions accounts for both patterns' wildcards.
+    """
+    def intersect(a, b, star: str, compatible: Callable[[str, str], bool]) -> bool:
+        pending, seen = [(0, 0)], set()
+        while pending:
+            i, j = pending.pop()
+            if (i, j) in seen:
+                continue
+            seen.add((i, j))
+            if i == len(a) and j == len(b):
+                return True
+            if i < len(a) and a[i] == star:
+                pending.append((i + 1, j))
+            if j < len(b) and b[j] == star:
+                pending.append((i, j + 1))
+            if i < len(a) and j < len(b) and compatible(a[i], b[j]):
+                pending.append((i + (a[i] != star), j + (b[j] != star)))
+        return False
+
+    def tokens(pattern: str):
+        i = 0
+        while i < len(pattern):
+            start, i = i, i + 1
+            if pattern[start] == "[":
+                end = i
+                if end < len(pattern) and pattern[end] == "!":
+                    end += 1
+                if end < len(pattern) and pattern[end] == "]":
+                    end += 1
+                while end < len(pattern) and pattern[end] != "]":
+                    end += 1
+                if end < len(pattern):
+                    i = end + 1
+            yield pattern[start:i]
+
+    def components_overlap(a: str, b: str) -> bool:
+        # Full case folding covers literal filesystem aliases such as ß/ss.
+        # Leave globs unchanged so ? and character classes keep their width.
+        if (
+            not case_sensitive and not (a + b).isascii()
+            and not has_magic(a) and not has_magic(b) and a.casefold() == b.casefold()
+        ):
+            return True
+        # Literal/range endpoints and their successors represent every distinct
+        # character class membership when matching case-sensitively.
+        alphabet = {"\x01"} | {
+            chr(code) for char in a + b for code in (ord(char), ord(char) + 1)
+            if 0 < code <= 0x10ffff and code != ord("/")
+        }
+        if not case_sensitive:
+            alphabet.update(chr(code) for code in range(1, 128) if code != ord("/"))
+        a_tokens, b_tokens = tuple(tokens(a)), tuple(tokens(b))
+        # Apply case equivalence to each token, preserving its width and the
+        # original character classes (including punctuation inside [A-z]).
+        matchers = {
+            token: re.compile(translate(token), 0 if case_sensitive else re.IGNORECASE)
+            for token in set(a_tokens + b_tokens)
+        }
+
+        def compatible(x: str, y: str) -> bool:
+            if any(matchers[x].fullmatch(c) and matchers[y].fullmatch(c) for c in alphabet):
+                return True
+            # Unicode case mappings inside classes need not be monotonic, so
+            # endpoints alone cannot prove two nonliteral tokens disjoint.
+            return (
+                not case_sensitive and not (x + y).isascii()
+                and (len(x) > 1 or x in ("*", "?"))
+                and (len(y) > 1 or y in ("*", "?"))
+            )
+
+        return intersect(
+            a_tokens, b_tokens, "*", compatible,
+        )
+
+    return intersect(PurePosixPath(left).parts, PurePosixPath(right).parts, "**", components_overlap)
+
+
+def _lane_has_room(running: int, waiting: int) -> bool:
+    """A lane runs one issue, or a second clone while two or more issues wait."""
+    return running == 0 or (running == 1 and waiting >= 2)
+
+
+def _can_start_in_lane(ctx: TickContext, lane: str, issue: Issue, waiting: int) -> bool:
+    running = [run for run in ctx.store.active_runs() if run.lane == lane]
+    if not running:
+        return True
+    if not _lane_has_room(len(running), waiting):
+        return False
+    approval = ctx.store.load_approval(issue.number)
+    run = running[0]
+    running_approval = ctx.store.load_approval(run.number)
+    if approval is None or running_approval is None:
+        return False
+    # The approval file can be replaced while the runner retains its old body.
+    # Legacy records can use a snapshot approved no later than the run start.
+    if run.approval_body_sha is None:
+        if (
+            datetime.fromisoformat(running_approval.approved_at)
+            > datetime.fromisoformat(run.started_at)
+        ):
+            return False
+    elif run.approval_body_sha != running_approval.body_sha:
+        return False
+    files = parse_body(approval.body).files
+    running_files = parse_body(running_approval.body).files
+    if not files or not running_files:
+        return False
+    case_sensitive = _filesystem_case_sensitive(ctx.repo_root)
+    return case_sensitive is not None and not any(
+        _file_patterns_overlap(candidate, active, case_sensitive=case_sensitive)
+        for candidate in files for active in running_files
+    )
+
+
 def _tick_locked(ctx: TickContext) -> TickReport:
     report = TickReport()
     ctx.git.fetch("origin", ctx.config.base_branch)
@@ -617,8 +759,12 @@ def _machine_budget(
 ) -> int:
     """Update the machine-wide AIMD value once per tick and return this tick's machine budget."""
     now = ctx.now()
-    busy_lanes = {run.lane for run in ctx.store.active_runs()}
-    waiting = sum(1 for lane in ready if lane not in busy_lanes and not ctx.store.lane_paused(lane, now))
+    lane_runs = Counter(run.lane for run in ctx.store.active_runs())
+    # A crowded lane may add a clone; the file-overlap check runs at start time.
+    waiting = sum(
+        1 for lane, numbers in ready.items()
+        if _lane_has_room(lane_runs[lane], len(numbers)) and not ctx.store.lane_paused(lane, now)
+    )
     pressure, load = sample if sample is not None else machine_load()
     with machine_lock(ctx.store):
         state = read_state(ctx.store)
@@ -662,8 +808,7 @@ def _start_ready(
     for lane in sorted(ready, key=lane_order):
         if not _has_slot(ctx, budget):
             break
-        active = ctx.store.active_runs()
-        if any(run.lane == lane for run in active) or ctx.store.lane_paused(lane, ctx.now()):
+        if ctx.store.lane_paused(lane, ctx.now()):
             continue
         for number in ready[lane]:
             issue = ctx.tracker.get_issue(number)
@@ -672,6 +817,8 @@ def _start_ready(
                 or not {APPROVED, READY}.issubset(issue.labels)
                 or issue.labels & {BLOCKED, NEEDS_HUMAN, RUNNING} or lane_for(issue) != lane
             ):
+                continue
+            if not _can_start_in_lane(ctx, lane, issue, len(ready[lane])):
                 continue
             approval = ctx.store.load_approval(number)
             event, _ = _latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
