@@ -2011,12 +2011,13 @@ def test_claude_native_goal_settings_and_independent_retry(run_case, acceptance_
     }
     assert not settings_path.is_relative_to(c.store.worktree_path(1))
     assert (settings_path.parent / "stop-block-count").read_text() == "0"
-    expected = (f'/goal Every command in the "Done when" list below exits 0 when run from the repository root, '
+    expected = ('Every command in the "Done when" list below exits 0 when run from the repository root, '
                 f'nothing under {acceptance_dir} is modified, and no files outside this repository are changed. '
-                'Or stop after 40 turns.\n\nYou are implementing GitHub issue #1')
+                'Or stop after 40 turns.')
     assert len(c.executor.calls) == 2
     for call in c.executor.calls:
-        assert call["prompt"].startswith(expected)
+        assert call["goal"] == expected
+        assert call["prompt"].startswith("You are implementing GitHub issue #1")
         assert "Do not modify anything under" not in call["prompt"]
         assert COMMAND in call["prompt"] and "Other features." in call["prompt"]
         assert ".foragent/TRY.md" in call["prompt"]
@@ -2527,7 +2528,8 @@ def test_lane_executor_model_agent_notes_and_outside_paths(run_case, kind):
     assert call["model"] == "lane-model"
     if kind == "claude":
         assert call["agent"] == "fa-ui" and "settings_path" in call
-        assert call["prompt"].startswith("/goal ")
+        assert call["goal"] == goal_condition(c.ctx.config.acceptance_dir)
+        assert call["prompt"].startswith("You are implementing GitHub issue #1")
     else:
         assert "agent" not in call
         assert call["prompt"].startswith("Lane notes:\nUse the UI skills.")
@@ -2587,7 +2589,8 @@ def test_lane_skills_come_from_worktree_and_only_extend_codex_prompts(run_case, 
         assert "agent" not in call
     else:
         assert call["agent"] == "fa-ui"
-        assert call["prompt"].startswith("/goal ")
+        assert call["goal"] == goal_condition(c.ctx.config.acceptance_dir)
+        assert call["prompt"].startswith("You are implementing GitHub issue #1")
         assert "Lane skills (read the file" not in call["prompt"]
         assert "Configured strategy." not in call["prompt"] and "Agent strategy." not in call["prompt"]
         assert "missing skill:" not in pr.body

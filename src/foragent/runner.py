@@ -764,6 +764,11 @@ def _available_executor(
             kwargs["prompt"] = full_prompt
             kwargs["timeout_s"] = _remaining(n, ctx)
             result = execute()
+        kind = classify_result(result)
+        if not reviewer and result.num_turns == 0 and not result.timed_out and kind == "normal":
+            detail = result.last_message or result.log_tail or "Executor returned without an implementation turn."
+            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Executor stopped before implementation started.", detail)
+            raise ExecutorStopped("executor-error", detail)
         if session_body is not None and not reviewer:
             identity = result.session_id or session_id
             reason = (f"Executor exit_code={result.exit_code}, timed_out={result.timed_out}\n"
@@ -777,7 +782,6 @@ def _available_executor(
             )
             if reason:
                 resume_prompt = (resume_prompt or "") + "\n\n" + reason
-        kind = classify_result(result)
         if kind == "normal":
             return result
         if kind == "transient" and _remaining(n, ctx) <= 0:
@@ -1063,7 +1067,10 @@ def _implement_and_publish(
     start_ref = f"origin/{target_branch}"
     executor = ctx.executor_factory(ctx.config.executor)
     native_claude = ctx.config.executor == "claude"
-    options = {"settings_path": _write_claude_settings(n, ctx, worktree)} if native_claude else {}
+    options = {
+        "settings_path": _write_claude_settings(n, ctx, worktree),
+        "goal": goal_condition(ctx.config.acceptance_dir),
+    } if native_claude else {}
     log = ctx.store.log_path(n)
     reviews: list[ReviewResult] = []
     review_failures = 0
@@ -1116,7 +1123,7 @@ def _implement_and_publish(
             test_command = next(iter(detect_test_commands(worktree)), None)
         prompt = build_prompt(
             n, parsed, ctx.config.acceptance_dir, failure_context, ctx.config.language,
-            native_goal=native_claude or ctx.config.codex_goal, acceptance_locked=native_claude,
+            native_goal=not native_claude and ctx.config.codex_goal, acceptance_locked=native_claude,
             merge_conflicts=merge_conflicts,
             reviewer_text=reviewer_text,
             orchestrator_hint=hint,

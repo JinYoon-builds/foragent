@@ -20,6 +20,7 @@ class ExecResult:
     log_tail: str = ""
     error_kind: str = "normal"
     session_id: str | None = None
+    num_turns: int | None = None
 
 
 def classify_result(result: ExecResult) -> str:
@@ -161,18 +162,12 @@ def claude_review_command(level: str, model: str | None = None, *, pr: int | Non
     return args + (["--model", model] if model is not None else [])
 
 
-def claude_stream_result(path: Path) -> str:
+def claude_stream_result(path: Path) -> dict:
     """Read the last result event, without loading the session transcript."""
-    result = ""
-    with path.open(encoding="utf-8", errors="replace") as stream:
-        for line in stream:
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(event, dict) and event.get("type") == "result":
-                value = event.get("result")
-                result = value if isinstance(value, str) else ""
+    result = {}
+    for event in _events(path):
+        if event.get("type") == "result":
+            result = event
     return result
 
 
@@ -205,6 +200,7 @@ class ClaudeExecutor:
         settings_path: Path | None = None, review_level: str | None = None,
         agent: str | None = None, review_pr: int | None = None,
         resume_session_id: str | None = None,
+        goal: str | None = None,
     ) -> ExecResult:
         output_path = log_path.with_suffix(".stdout")
         options = {}
@@ -214,16 +210,27 @@ class ClaudeExecutor:
             options["resume_session_id"] = resume_session_id
         command = (claude_review_command(review_level, model, pr=review_pr) if review_level is not None
                    else claude_command(model, settings_path, **options))
+        if review_level is None and resume_session_id is None and goal is not None:
+            # Text stdin is one message: blank lines do not end /goal's argument.
+            # Stream input gives the command and task their own user turns.
+            command += ["--input-format", "stream-json"]
+            prompt = "".join(json.dumps({
+                "type": "user", "message": {"role": "user", "content": content},
+            }, ensure_ascii=False) + "\n" for content in (f"/goal {goal}", prompt))
         code, timed_out, _ = run_logged(
             command, cwd=worktree, prompt=None if review_level is not None else prompt, timeout_s=timeout_s,
             log_path=log_path, capture_stdout=True, stdout_path=output_path,
         )
+        result = claude_stream_result(output_path) if review_level is None else {}
+        value = result.get("result")
         message = (output_path.read_text(encoding="utf-8", errors="replace") if review_level is not None
-                   else claude_stream_result(output_path))
+                   else value if isinstance(value, str) else "")
+        turns = result.get("num_turns")
         error_kind = _structured_error_kind(output_path, "claude", document=review_level is not None)
         session_id = stream_session_id(output_path, "claude") if review_level is None else None
         return ExecResult(code, timed_out, message, log_path, message,
-                          error_kind=error_kind, session_id=session_id)
+                          error_kind=error_kind, session_id=session_id,
+                          num_turns=turns if type(turns) is int else None)
 
 
 def executor_for(name: str) -> Executor:
