@@ -7,13 +7,24 @@ session restarts, so a new orchestrator reads the box before anything else.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from foragent import notify
+from foragent.config import Config
 from foragent.orch_events import append_event
 from foragent.state import StateStore
 
 REQUEST_STATUSES = ("new", "processing", "done")
+# A planning session that renewed its heartbeat this recently can still read a
+# cross-session message, so a new question does not need a push.
+PLAN_HEARTBEAT_SECONDS = 120
+_QUESTION_PUSH = {
+    "en": ("A question needs your answer", "{id}: {question}"),
+    "ko": ("답할 질문이 있어요", "{id}: {question}"),
+}
 
 
 class InboxError(ValueError):
@@ -99,6 +110,42 @@ def ask(store: StateStore, question: str, options: list[str], recommend: int | N
     })
     append_event(store, store._now(), None, "ask", f"{record['id']}: {question}")
     return _public(record)
+
+
+def plan_heartbeat_path(store: StateStore) -> Path:
+    return store.root / "plan-heartbeat.json"
+
+
+def write_plan_heartbeat(store: StateStore) -> dict[str, str]:
+    """Overwrite the planning session's heartbeat with the current time."""
+    record = {"at": store._timestamp()}
+    store.root.mkdir(parents=True, exist_ok=True)
+    store._write_json(plan_heartbeat_path(store), record)
+    return record
+
+
+def planning_alive(store: StateStore) -> bool:
+    """True when the planning heartbeat is at most PLAN_HEARTBEAT_SECONDS old."""
+    try:
+        at = datetime.fromisoformat(json.loads(plan_heartbeat_path(store).read_text(encoding="utf-8"))["at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if at.tzinfo is None:
+        return False
+    return store._now() - at <= timedelta(seconds=PLAN_HEARTBEAT_SECONDS)
+
+
+def route_question(store: StateStore, config: Config, repo: str, record: dict[str, Any]) -> bool:
+    """Push a new question to the person only when no planning session is alive.
+
+    Returns whether a push was attempted. A live planning session reads the box
+    through a cross-session message instead.
+    """
+    if planning_alive(store):
+        return False
+    title, line = _QUESTION_PUSH.get(config.language, _QUESTION_PUSH["en"])
+    notify.send(replace(config, repo=repo), title, line.format(**record))
+    return True
 
 
 def questions(store: StateStore, *, include_closed: bool = False) -> list[dict[str, Any]]:

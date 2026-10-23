@@ -11,7 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import __version__, adopt, bench, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, order, watch, watch_open
+from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, order, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -261,6 +261,14 @@ files lists repository-relative paths or globs expected to change; absolute path
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
         if command in (inbox, questions):
             command.add_argument("--json", action="store_true")
+    plan_command = commands.add_parser("plan", help="Planning-session signals for the orchestrator")
+    plan_actions = plan_command.add_subparsers(dest="action", required=True)
+    heartbeat = plan_actions.add_parser(
+        "heartbeat", help="Mark the planning session alive; questions reach it by message, not push")
+    heartbeat.add_argument("--repo-root", type=Path, default=Path.cwd())
+    briefing = commands.add_parser("brief", help="Show the start-of-session facts for planning")
+    briefing.add_argument("--json", action="store_true")
+    briefing.add_argument("--repo-root", type=Path, default=Path.cwd())
     # Listed for `fa --help` only; main() hands `fa test ...` to pytest before parsing.
     test = commands.add_parser(
         "test", help="Wait for a machine-wide test slot, then run pytest with the given arguments",
@@ -293,7 +301,7 @@ files lists repository-relative paths or globs expected to change; absolute path
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer"}
 
 
-def _orch_inbox(args: argparse.Namespace, store: StateStore) -> None:
+def _orch_inbox(args: argparse.Namespace, store: StateStore, config: Config, repo: str) -> None:
     """Local request/question box; never reads GitHub or starts an executor."""
     if args.action == "request":
         record = orch_inbox.add_request(store, args.source, args.text)
@@ -303,7 +311,9 @@ def _orch_inbox(args: argparse.Namespace, store: StateStore) -> None:
         print(f"Request {record['id']}: {record['status']}.")
     elif args.action == "ask":
         record = orch_inbox.ask(store, args.question, args.option, args.recommend)
-        print(f"Question {record['id']} saved (open).")
+        pushed = orch_inbox.route_question(store, config, repo, record)
+        print(f"Question {record['id']} saved (open)"
+              + ("; no planning session is alive, so a notification was sent." if pushed else "."))
     elif args.action == "answer":
         record = orch_inbox.answer(store, args.id, args.text)
         print(f"Question {record['id']} closed.")
@@ -543,10 +553,21 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(order.progress(StateStore.for_repo(repo), args.step, **fields),
                              ensure_ascii=False))
             return 0
+        if args.command in {"plan", "brief"}:
+            config = load_config(root)
+            store = StateStore.for_repo(config.repo or GitRepo(root).remote_slug())
+            if args.command == "plan":
+                record = orch_inbox.write_plan_heartbeat(store)
+                print(f"Planning session alive at {record['at']}.")
+            else:
+                facts = brief.collect(store)
+                print(json.dumps(facts, ensure_ascii=False) if args.json
+                      else brief.render(facts, config.language))
+            return 0
         if args.command == "orch" and args.action in INBOX_ACTIONS:
             config = load_config(root)
             repo = config.repo or GitRepo(root).remote_slug()
-            _orch_inbox(args, StateStore.for_repo(repo))
+            _orch_inbox(args, StateStore.for_repo(repo), config, repo)
             return 0
         if args.command == "init":
             report = init_repo(

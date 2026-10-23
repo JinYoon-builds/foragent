@@ -23,6 +23,10 @@ report it in one line: a goal change, a trade-off between valid options, taste o
 preference, something hard to undo (delete, deploy, public release), and scope or
 priority. Record each with `fa orch ask --question "..." --option "..." --option "..."
 --recommend 1`; store the reply with `fa orch answer ID --text "..."`, which closes it.
+The planning session runs `fa plan heartbeat`; it counts as alive for 120 seconds. If it is
+alive, also send the question to it as a cross-session message and do not push; `fa orch ask`
+already skips the push. If the planning session is absent or its heartbeat is stale,
+`fa orch ask` sends the push notification itself, so do not add a separate `fa notify`.
 
 ## Goal and wake-ups
 
