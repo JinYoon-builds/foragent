@@ -431,3 +431,32 @@ def test_local_view_failed_refresh_counts_runs_started_after_last_snapshot(
     assert payload["stale"] is True and payload["error"]
     assert datetime.fromisoformat(payload["as_of"]) == loaded_at
     assert calls == []
+
+
+def test_local_view_waiting_approved_issues_and_open_prs_need_no_github(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    """Measured 2026-10-23: one open lane view made ~100 gh calls a minute, mostly a PR
+    lookup per approved issue (state_group -> find_pr). Groups come from the local snapshot."""
+    from foragent import watch
+    from foragent.scheduler import tick
+    from foragent.tracker import GhTracker
+    from test_orch_review_handoff import tick_context
+
+    case = snapshot_case(git_history, tmp_path, monkeypatch)
+    for number in range(5, 25):
+        case.tracker.add_issue(number, f"Waiting task {number}", labels=["approved", "lane:api"])
+    case.tracker.create_pr(head="foragent/issue-6", base="main", title="Waiting task 6", body="Closes #6")
+    case.clock[0] += timedelta(minutes=5, seconds=1)
+    tick(tick_context(case, start_runs=False))  # The gate refresh records PRs locally.
+    main = local_cli(case, monkeypatch)
+    calls = record_gh(monkeypatch)
+    tracker = GhTracker("owner/repo")
+    for frame_tick in range(20):
+        assert main(["gate", "status", "--json"]) == 0
+        status = json.loads(capsys.readouterr().out)
+        assert [item["number"] for item in status["issues"]["pr-open"]] == [6]
+        assert 7 in [item["number"] for item in status["issues"]["approved-waiting"]]
+        snapshot = watch.collect(status, tracker, case.store, case.config, case.clock[0])
+        watch.render_frame(snapshot, case.config, case.root, tick=frame_tick, width=160)
+    assert calls == [], f"The lane view called GitHub {len(calls)} times: {calls[:3]}"
