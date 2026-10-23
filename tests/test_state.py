@@ -101,6 +101,23 @@ def test_restart_budget_survives_crash_recovery_but_resets_after_completion(stor
     assert store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1)).restarts == 0
 
 
+def test_recovery_metadata_survives_restart_and_old_records_default_to_empty(store):
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.update_run(1, merge_conflicts=["notes.txt"], local_skill_paths=[".claude/skills/testing"])
+    store.finish_run(1, "timeout")
+    reopened = StateStore(store.root)
+    run = reopened.start_run(1, branch="branch", worktree="worktree")
+    assert run.merge_conflicts == ["notes.txt"]
+    assert run.local_skill_paths == [".claude/skills/testing"]
+    path = store.root / "runs/1.json"
+    old_run = json.loads(path.read_text())
+    del old_run["merge_conflicts"], old_run["local_skill_paths"]
+    path.write_text(json.dumps(old_run))
+    (store.root / "runs.jsonl").write_text(json.dumps(old_run) + "\n")
+    for run in (reopened.get_run(1), *reopened.read_history()):
+        assert run.merge_conflicts == [] and run.local_skill_paths == []
+
+
 def test_limit_wait_resumptions_preserve_attempts_and_restarts(store):
     store.start_run(1, branch="branch", worktree="worktree")
     store.update_run(1, attempts=2, restarts=1, waited_seconds=120, executor_waited_seconds=120)

@@ -11,14 +11,14 @@ import subprocess
 from foragent import board, orch_github, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
-from foragent.git import GitRepo
+from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
 from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import kill_process_group
-from foragent.runner import _batch_pr
+from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
 from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
 
@@ -99,6 +99,25 @@ def _kill_executor(ctx: TickContext, number: int) -> None:
         ctx.store.update_run(number, executor_pgid=None)
 
 
+def _remove_run_worktree(
+    ctx: TickContext, number: int, worktree: Path, report: TickReport, *, outcome: str,
+) -> None:
+    try:
+        if worktree.exists() and outcome != "merged":
+            try:
+                _preserve_failed_implementation(
+                    number, ctx, ctx.git.at(worktree), outcome, approval=ctx.store.load_approval(number),
+                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None,
+                )
+            except Exception as exc:
+                detail = f"WIP preservation failed before worktree cleanup: {exc}"
+                _append(ctx.store.log_path(number), detail)
+                append_event(ctx.store, ctx.now(), number, "wip-preservation-failed", detail)
+                report.actions.append(f"#{number} {detail}")
+    finally:
+        ctx.git.remove_worktree(worktree)
+
+
 def _kill_run(
     ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
     count_stall: bool = False, detail: str = "",
@@ -116,7 +135,7 @@ def _kill_run(
         if count_stall:
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         raise
-    ctx.git.remove_worktree(Path(run.worktree))
+    _remove_run_worktree(ctx, number, Path(run.worktree), report, outcome=outcome)
     ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
     report.actions.append(f"#{number} runner killed")
 
@@ -247,6 +266,10 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         ctx.store.clear_run_start(issue.number)
     if RUNNING not in issue.labels or (run is not None and run.status == "running"):
         return issue
+    _remove_run_worktree(
+        ctx, issue.number, Path(run.worktree) if run is not None else ctx.store.worktree_path(issue.number),
+        report, outcome=(run.outcome or "crashed") if run is not None else "crashed",
+    )
     if run is not None and run.outcome == "merged":
         ctx.tracker.remove_labels(issue.number, [READY, RUNNING])
         return ctx.tracker.get_issue(issue.number)
@@ -332,8 +355,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         if run.pid is not None and run.outcome in {None, "crashed", "stalled-restart", "stalled"}:
             ctx.kill_runner(run.pid)
         _kill_executor(ctx, run.number)
-        ctx.git.remove_worktree(Path(run.worktree))
         outcome = run.outcome or "crashed"
+        _remove_run_worktree(ctx, run.number, Path(run.worktree), report, outcome=outcome)
         detail = _crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
         finished = ctx.store.finish_run(run.number, outcome=outcome, detail=detail)
         if finished.outcome in {"stalled-restart", "stalled"}:
@@ -467,8 +490,8 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
             continue
         try:
             _batch_pr(parent, ctx)
-        except TrackerError as exc:
-            if exc.is_rate_limit:
+        except (GitError, TrackerError) as exc:
+            if isinstance(exc, TrackerError) and exc.is_rate_limit:
                 raise
             report.actions.append(f"#{parent} batch PR finalization deferred: {exc}")
 

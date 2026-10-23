@@ -22,10 +22,10 @@ import xml.etree.ElementTree as ET
 import yaml
 
 from foragent import board, orch_github
-from foragent.actions import flag, invalidate_approval
+from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
-from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE
+from foragent.git import GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
@@ -111,7 +111,11 @@ class PatchReplayError(GitError):
 
 
 class AttemptFailure(Exception):
-    """Checks on a refreshed base failed and need another implementation attempt."""
+    """Checks failed and need another implementation attempt."""
+
+    def __init__(self, message: str, target_branch: str = ""):
+        super().__init__(message)
+        self.target_branch = target_branch
 
 
 class ConflictBudgetExhausted(Exception):
@@ -846,12 +850,16 @@ def _lane_skill_names(ctx: RunContext, n: int, worktree: Path, agent: str | None
     return [name for name in skills if isinstance(name, str)] if isinstance(skills, list) else []
 
 
-def _inject_lane_skills(ctx: RunContext, n: int, git: GitRepo) -> None:
+def _inject_lane_skills(ctx: RunContext, n: int, git: GitRepo, target_ref: str | None = None) -> None:
+    target_ref = target_ref or f"origin/{ctx.config.base_branch}"
+    git.local_skill_paths.update(ctx.store.get_run(n).local_skill_paths)
+    git.reconcile_local_skills(target_ref)
     agent, _ = _lane_notes(ctx, n, git.root)
     names = _lane_skill_names(ctx, n, git.root, agent)
-    git.local_skill_paths = (
-        set(copy_lane_skills(ctx.repo_root, git.root, names, SkillManager(ctx.config))) if names else set()
-    )
+    names = [name for name in names if git.blob_sha(target_ref, f".claude/skills/{name}") is None]
+    copied = copy_lane_skills(ctx.repo_root, git.root, names, SkillManager(ctx.config)) if names else []
+    git.local_skill_paths.update(copied)
+    ctx.store.update_run(n, local_skill_paths=sorted(git.local_skill_paths))
 
 
 def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
@@ -993,6 +1001,17 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
     branch = f"foragent/batch-{parent}"
     if any(pr.head == branch for pr in ctx.tracker.list_prs("merged", branch)):
         return
+    ctx.git.fetch("origin", ctx.config.base_branch)
+    ctx.git.fetch("origin", branch)
+    base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+    head = ctx.git.ref_sha(f"origin/{branch}")
+    with tempfile.TemporaryDirectory(prefix=f"foragent-batch-{parent}-", dir=ctx.store.root) as directory:
+        worktree = Path(directory) / "worktree"
+        ctx.git.add_detached_worktree(worktree, head)
+        try:
+            ctx.git.at(worktree).check_publication(base)
+        finally:
+            ctx.git.remove_worktree(worktree)
     prs = {pr.head: pr for pr in ctx.tracker.list_prs("merged", "foragent/issue-") if pr.base == branch}
     lines = [f"Closes #{parent}", "", "## Children", ""]
     for child in sorted(children, key=lambda child: child.number):
@@ -1022,6 +1041,48 @@ def _acceptance_matches(
     return not mismatches
 
 
+def _check_publication(git: GitRepo, target_branch: str) -> None:
+    try:
+        git.check_publication(f"origin/{target_branch}")
+    except PublicationError as exc:
+        raise AttemptFailure(str(exc), target_branch) from exc
+
+
+def _preserve_failed_implementation(
+    n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
+    approved_ref: str = "HEAD", title: str | None = None, pushed_head: str | None = None,
+    tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
+) -> None:
+    """Save stopped work before cleanup, including after the runner has died."""
+    branch = f"foragent/issue-{n}"
+    run = ctx.store.get_run(n)
+    git.local_skill_paths.update(run.local_skill_paths if run is not None else ())
+    conflicts = sorted(set(git.conflict_paths()) | set(run.merge_conflicts if run is not None else ()))
+    if conflicts:
+        ctx.store.update_run(n, merge_conflicts=conflicts)
+        if git.merge_in_progress():
+            # Save the exact partial resolution without declaring its target merged.
+            git.quit_merge()
+    git.stage_changes()
+    if approval is not None:
+        git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
+    if git.has_staged_changes():
+        git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
+    if git.head_sha() == pushed_head or not tracker_available:
+        return
+    try:
+        pr = ctx.tracker.find_pr(branch)
+    except TrackerError as exc:
+        _append(ctx.store.log_path(n), f"WIP kept on local branch {branch}; open PR lookup failed: {exc}")
+        return
+    # An unverified WIP must not replace the head seen by an open PR's CI/review.
+    if pr is None:
+        if push_branch is not None:
+            push_branch()
+        else:
+            git.push(branch)
+
+
 def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
     approval = ctx.store.load_approval(n)
     if approval is None:
@@ -1042,11 +1103,14 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         ctx.git.ensure_batch_branch(batch_branch, base_ref)
         target_branch = batch_branch
     start_ref = f"origin/{target_branch}"
+    if saved_head := ctx.git.local_branch_sha(branch):
+        start_ref = saved_head
+    elif ctx.git.remote_branch_sha(branch) is not None:
+        ctx.git.fetch("origin", branch)
+        start_ref = f"origin/{branch}"
     ctx.git.add_worktree(worktree, branch, start_ref)
     git = ctx.git.at(worktree)
-    _inject_lane_skills(ctx, n, git)
-    if not _acceptance_matches(n, ctx, git, approval):
-        return "hash-mismatch"
+    _inject_lane_skills(ctx, n, git, f"origin/{target_branch}")
     _progress(n, ctx)
 
     parsed = parse_body(approval.body)
@@ -1068,6 +1132,7 @@ def _implement_and_publish(
     parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
     batch_branch = f"foragent/batch-{parent}" if parent is not None else None
     start_ref = f"origin/{target_branch}"
+    approved_ref = start_ref
     executor = ctx.executor_factory(ctx.config.executor)
     native_claude = ctx.config.executor == "claude"
     options = {
@@ -1088,7 +1153,10 @@ def _implement_and_publish(
     conflict_attempts = 0
     rebuilt = False
     rebuild_lease: str | None = None
-    size = issue_size(ctx.tracker.get_issue(n).labels)
+    pushed_head: str | None = None
+    tracker_available = True
+    issue = ctx.tracker.get_issue(n)
+    size = issue_size(issue.labels)
     baseline_test_command = ctx.config.test_command
     if baseline_test_command is None:
         baseline_test_command = next(iter(detect_test_commands(worktree)), None)
@@ -1166,7 +1234,8 @@ def _implement_and_publish(
                      if (path := worktree / ".foragent" / name).is_file()}
         ctx.git.remove_worktree(worktree)
         ctx.git.add_worktree(worktree, branch, start_ref)
-        _inject_lane_skills(ctx, n, git)
+        ctx.store.update_run(n, merge_conflicts=[])
+        _inject_lane_skills(ctx, n, git, f"origin/{target_branch}")
         for name, content in artifacts.items():
             path = worktree / ".foragent" / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1229,24 +1298,18 @@ def _implement_and_publish(
         )
 
     def push_branch() -> None:
-        nonlocal rebuild_lease
+        nonlocal rebuild_lease, pushed_head
         if rebuilt:
             git.push(branch, lease=rebuild_lease)
             rebuild_lease = git.head_sha()
         else:
             git.push(branch)
+        pushed_head = git.head_sha()
 
     def block_rebuild(details: str) -> str:
         _append(log, f"Rebuilt attempt failed:\n{details}")
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Rebuilt implementation failed; no attempts remain.", details)
         return "retries-exceeded"
-
-    def preserve_failed_implementation() -> None:
-        # Preserve the failed implementation, rather than pushing an unchanged base.
-        if paths and git.has_staged_changes():
-            title = ctx.tracker.get_issue(n).title
-            git.commit(f"{title} (#{n})")
-        push_branch()
 
     def verify() -> str:
         nonlocal checks, paths
@@ -1285,8 +1348,6 @@ def _implement_and_publish(
                 _progress(n, ctx)
                 if result.timed_out:
                     detail = f"Related unit tests timed out after {limit} s ({len(unit_tests)} selected tests)."
-                    git.stage_changes()
-                    preserve_failed_implementation()
                     flag(ctx, n, Reason.TIMEOUT, detail)
                     raise ExecutorStopped("timeout", detail)
             elif unit_tests:
@@ -1306,6 +1367,10 @@ def _implement_and_publish(
             if failures:
                 check = failures[-1]
                 return f"Command: {check.command}\n{check.output}" + ("\nCheck timed out." if check.timed_out else "")
+            try:
+                _check_publication(git, target_branch)
+            except AttemptFailure as exc:
+                return str(exc)
             return "" if paths else "The session made no changes."
         raise AssertionError("unreachable verification state")
 
@@ -1324,6 +1389,7 @@ def _implement_and_publish(
         )
 
     def open_or_update_pr(title: str, body: str) -> int:
+        _check_publication(git, target_branch)
         pr = ctx.tracker.find_pr(branch)
         if pr is None:
             pr = ctx.tracker.create_pr(head=branch, base=target_branch, title=title, body=body)
@@ -1331,6 +1397,40 @@ def _implement_and_publish(
             ctx.tracker.update_pr(pr, base=target_branch, title=title, body=body)
         board.sync_status(ctx, n, "PR open")
         return pr
+
+    def resolve_conflicts(conflicts: list[str]) -> None:
+        nonlocal conflict_attempts
+        conflicts = sorted(set(conflicts) | set(ctx.store.get_run(n).merge_conflicts))
+        ctx.store.update_run(n, merge_conflicts=conflicts)
+        title = f"{issue.title} (#{n})"
+        pending_merge = git.merge_in_progress()
+        check_failure = f"Merge conflict with {target_branch}: {', '.join(conflicts)}"
+        while True:
+            if rebuilt:
+                raise ExecutorStopped(block_rebuild(check_failure))
+            if conflict_attempts >= ctx.config.conflict_retries:
+                raise ConflictBudgetExhausted(check_failure)
+            conflict_attempts += 1
+            _append(log, f"Conflict attempt {conflict_attempts}/{ctx.config.conflict_retries}:\n{check_failure}")
+            implement(check_failure, merge_conflicts=conflicts)
+            # Retain the merge's paths even if the executor stages them.
+            markers = git.conflict_marker_paths(conflicts)
+            if markers:
+                check_failure = f"Conflict markers remain in: {', '.join(markers)}"
+                continue
+            git.stage_changes()
+            if pending_merge:
+                git.continue_merge()
+                pending_merge = False
+            elif git.has_staged_changes():
+                git.commit(title)
+            check_failure = verify()
+            markers = git.conflict_marker_paths(conflicts)
+            if markers:
+                check_failure = f"Conflict markers remain in: {', '.join(markers)}"
+            if not check_failure:
+                ctx.store.update_run(n, merge_conflicts=[])
+                return
 
     def publish() -> str:
         with _merge_lock(n, ctx):
@@ -1346,36 +1446,6 @@ def _implement_and_publish(
         verified_head_sha = git.head_sha()
         base_merges = 0
 
-        def resolve_conflicts(conflicts: list[str]) -> None:
-            nonlocal conflict_attempts
-            pending_merge = True
-            check_failure = f"Merge conflict with {target_branch}: {', '.join(conflicts)}"
-            while True:
-                if rebuilt:
-                    raise ExecutorStopped(block_rebuild(check_failure))
-                if conflict_attempts >= ctx.config.conflict_retries:
-                    raise ConflictBudgetExhausted(check_failure)
-                conflict_attempts += 1
-                _append(log, f"Conflict attempt {conflict_attempts}/{ctx.config.conflict_retries}:\n{check_failure}")
-                implement(check_failure, merge_conflicts=conflicts)
-                # Retain the merge's paths even if the executor stages them.
-                markers = git.conflict_marker_paths(conflicts)
-                if markers:
-                    check_failure = f"Conflict markers remain in: {', '.join(markers)}"
-                    continue
-                git.stage_changes()
-                if pending_merge:
-                    git.continue_merge()
-                    pending_merge = False
-                elif git.has_staged_changes():
-                    git.commit(title)
-                check_failure = verify()
-                markers = git.conflict_marker_paths(conflicts)
-                if markers:
-                    check_failure = f"Conflict markers remain in: {', '.join(markers)}"
-                if not check_failure:
-                    return
-
         def refresh_base() -> str | None:
             nonlocal verified_head_sha, base_merges
             ctx.git.fetch("origin", target_branch)
@@ -1386,6 +1456,7 @@ def _implement_and_publish(
             if base_merges == 3:
                 flag(ctx, n, Reason.TIMEOUT, "base kept moving")
                 raise ExecutorStopped("timeout")
+            _inject_lane_skills(ctx, n, git, target_ref)
             try:
                 git.merge_base(target_ref)
             except GitError:
@@ -1408,6 +1479,7 @@ def _implement_and_publish(
         target_sha = refresh_base() if not review_hold else None
         if not review_hold and _remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
+        _check_publication(git, target_branch)
         push_branch()
         _progress(n, ctx)
         _append(log, f"Pushed verified HEAD: {verified_head_sha}")
@@ -1484,6 +1556,7 @@ def _implement_and_publish(
             target_sha = refresh_base()
             target_ref = f"origin/{target_branch}"
             if target_sha is not None:
+                _check_publication(git, target_branch)
                 push_branch()
                 _progress(n, ctx)
                 _append(log, f"Pushed verified HEAD: {verified_head_sha}")
@@ -1505,6 +1578,7 @@ def _implement_and_publish(
                     ctx.tracker.remove_labels(n, [RUNNING])
                     return "pr-open"
                 continue
+            _check_publication(git, target_branch)
             _phase(n, ctx, "merging")
             try:
                 ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha)
@@ -1532,82 +1606,137 @@ def _implement_and_publish(
             if target_branch == batch_branch and parent is not None:
                 try:
                     _batch_pr(parent, ctx)
-                except TrackerError as exc:
-                    if exc.is_rate_limit:
+                except (GitError, TrackerError) as exc:
+                    if isinstance(exc, TrackerError) and exc.is_rate_limit:
                         raise
                     _append(log, f"Batch PR finalization deferred to tick: {exc}")
             _progress(n, ctx)
             return "merged"
         raise AssertionError("unreachable refresh state")
 
-    while True:
-        implement(failure, reviewer_text=reviewer_text)
-        reviewer_text = None
-        run = ctx.store.get_run(n)
-
-        try:
-            failure = verify()
-        except PatchReplayError as exc:
-            failure = recover_replay(exc)
-        if not failure and ctx.config.reviewer != "none":
-            if _remaining(n, ctx) <= 0:
-                return _timeout(n, ctx)
-            pr = None
-            if ctx.config.review_scope == "pr-body":
-                title = f"{ctx.tracker.get_issue(n).title} (#{n})"
-                if git.has_staged_changes():
-                    git.commit(title)
-                push_branch()
-                pr = open_or_update_pr(title, render_pr_body())
-                _progress(n, ctx)
-            review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx), pr=pr)
-            if review.verdict == "UNUSABLE":
-                review = replace(review, findings=review.raw)
-            reviews.append(review)
-            if pr is not None:
-                ctx.tracker.comment(pr, "\n".join([
-                    f"Round {len(reviews)}: VERDICT: {review.verdict}", review.findings, *review.notes,
-                ]))
-            if review.verdict != "PASS":
-                review_failures += 1
+    outcome = "error"
+    try:
+        resume_verified = False
+        conflicts = ctx.store.get_run(n).merge_conflicts
+        if conflicts or not git.is_ancestor(git.ref_sha(start_ref), git.head_sha()):
+            # A saved implementation must see the same target as its acceptance
+            # baseline before the worker starts. Keep its history and reuse the
+            # publish path's conflict resolution and rebuild budget.
+            with _merge_lock(n, ctx):
+                if not git.is_ancestor(git.ref_sha(start_ref), git.head_sha()):
+                    try:
+                        # A saved partial resolution still needs its marker checks,
+                        # even when Git can merge the target without index conflicts.
+                        git.merge_base(start_ref, commit=not conflicts)
+                    except GitError:
+                        unmerged = git.conflict_paths()
+                        if not unmerged:
+                            raise
+                        conflicts = sorted(set(conflicts) | set(unmerged))
+                if conflicts:
+                    try:
+                        resolve_conflicts(conflicts)
+                    except ConflictBudgetExhausted as exc:
+                        failure = rebuild(exc)
+                    else:
+                        resume_verified = True
+        if not _acceptance_matches(n, ctx, git, approval):
+            raise ExecutorStopped("hash-mismatch")
+        approved_ref = git.head_sha()
+        while True:
+            if resume_verified:
+                failure = ""
+                resume_verified = False
+            else:
+                implement(failure, reviewer_text=reviewer_text)
+                try:
+                    failure = verify()
+                except PatchReplayError as exc:
+                    failure = recover_replay(exc)
+            reviewer_text = None
+            run = ctx.store.get_run(n)
+            if not failure and ctx.config.reviewer != "none":
+                if _remaining(n, ctx) <= 0:
+                    outcome = _timeout(n, ctx)
+                    return outcome
+                pr = None
+                if ctx.config.review_scope == "pr-body":
+                    title = f"{ctx.tracker.get_issue(n).title} (#{n})"
+                    if git.has_staged_changes():
+                        git.commit(title)
+                    push_branch()
+                    pr = open_or_update_pr(title, render_pr_body())
+                    _progress(n, ctx)
+                review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx), pr=pr)
                 if review.verdict == "UNUSABLE":
-                    reviewer_text = review.raw
-                    failure = "A reviewer said (verbatim):\n" + review.raw
-                else:
-                    failure = review.findings or "Reviewer found defects (no findings provided)."
-                findings = _normalized_findings(review) if _read_rebuttals(worktree).strip() else set()
-                if findings & previous_rebutted_findings:
-                    review_hold = True
-                    review_hold_reason = Reason.REVIEW_DISPUTE
-                previous_rebutted_findings = findings
-                if review_failures > ctx.config.review_max:
-                    review_hold = True
-        if rebuilt and failure:
-            return block_rebuild(str(failure))
-        if not failure or review_hold:
-            try:
-                return publish()
-            except ConflictBudgetExhausted as exc:
-                failure = rebuild(exc)
+                    review = replace(review, findings=review.raw)
+                reviews.append(review)
+                if pr is not None:
+                    ctx.tracker.comment(pr, "\n".join([
+                        f"Round {len(reviews)}: VERDICT: {review.verdict}", review.findings, *review.notes,
+                    ]))
+                if review.verdict != "PASS":
+                    review_failures += 1
+                    if review.verdict == "UNUSABLE":
+                        reviewer_text = review.raw
+                        failure = "A reviewer said (verbatim):\n" + review.raw
+                    else:
+                        failure = review.findings or "Reviewer found defects (no findings provided)."
+                    findings = _normalized_findings(review) if _read_rebuttals(worktree).strip() else set()
+                    if findings & previous_rebutted_findings:
+                        review_hold = True
+                        review_hold_reason = Reason.REVIEW_DISPUTE
+                    previous_rebutted_findings = findings
+                    if review_failures > ctx.config.review_max:
+                        review_hold = True
+            if rebuilt and failure:
+                outcome = block_rebuild(str(failure))
+                return outcome
+            if not failure or review_hold:
+                try:
+                    outcome = publish()
+                    return outcome
+                except ConflictBudgetExhausted as exc:
+                    failure = rebuild(exc)
+                    continue
+                except CIFailure as exc:
+                    if rebuilt:
+                        outcome = block_rebuild(str(exc))
+                        return outcome
+                    failure = exc
+                    continue
+                except (AttemptFailure, PatchReplayError) as exc:
+                    failure = recover_replay(exc) if isinstance(exc, PatchReplayError) else str(exc)
+                    run = ctx.store.get_run(n)
+            if rebuilt:
+                outcome = block_rebuild(str(failure))
+                return outcome
+            _append(log, f"Attempt {run.attempts} failed:\n{failure}")
+            ctx.store.update_run(n, resume_reason=str(failure))
+            if run.attempts < ctx.config.max_retries + 1:
+                ctx.store.update_run(n, attempts=run.attempts + 1)
                 continue
-            except CIFailure as exc:
-                if rebuilt:
-                    return block_rebuild(str(exc))
-                failure = exc
-                continue
-            except (AttemptFailure, PatchReplayError) as exc:
-                failure = recover_replay(exc) if isinstance(exc, PatchReplayError) else str(exc)
-                run = ctx.store.get_run(n)
-        if rebuilt:
-            return block_rebuild(str(failure))
-        _append(log, f"Attempt {run.attempts} failed:\n{failure}")
-        ctx.store.update_run(n, resume_reason=str(failure))
-        if run.attempts < ctx.config.max_retries + 1:
-            ctx.store.update_run(n, attempts=run.attempts + 1)
-            continue
-        flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", failure)
-        preserve_failed_implementation()
-        return "retries-exceeded"
+            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", failure)
+            outcome = "retries-exceeded"
+            return outcome
+    except ExecutorStopped as exc:
+        outcome = exc.outcome
+        raise
+    except TrackerError as exc:
+        tracker_available = False
+        outcome = "limit-wait" if exc.is_rate_limit else "error"
+        raise
+    except (SystemExit, KeyboardInterrupt):
+        outcome = "killed"
+        raise
+    finally:
+        if outcome != "merged":
+            run = ctx.store.get_run(n)
+            _preserve_failed_implementation(
+                n, ctx, git, run.outcome or outcome, approval=approval, approved_ref=approved_ref,
+                title=issue.title, pushed_head=pushed_head, tracker_available=tracker_available,
+                push_branch=push_branch,
+            )
 
 
 def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | None) -> str:
@@ -1678,6 +1807,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if git.head_sha() != head or git.has_staged_changes():
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when changed the verified PR contents.", link)
         return "checks-failed"
+    _check_publication(git, pr.base)
 
     if verdict_head is None and ctx.config.reviewer != "none":
         if _remaining(n, ctx) <= 0:
@@ -1754,6 +1884,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             return stopped
         if _remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
+        _check_publication(git, pr.base)
         try:
             ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head)
         except TrackerError as exc:
@@ -1778,8 +1909,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         if pr.base == batch_branch and parent is not None:
             try:
                 _batch_pr(parent, ctx)
-            except TrackerError as exc:
-                if exc.is_rate_limit:
+            except (GitError, TrackerError) as exc:
+                if isinstance(exc, TrackerError) and exc.is_rate_limit:
                     raise
                 _append(log, f"Batch PR finalization deferred to tick: {exc}")
         return "merged"
@@ -1816,13 +1947,13 @@ def review_only(
         ctx.git.remove_worktree(worktree)
         try:
             outcome = _review_only(n, ctx, worktree, verdict_head)
-        except CIFailure as exc:
+        except AttemptFailure as exc:
             if not repair_ci:
                 # Let the caller schedule repair without changing the verdict's head.
                 raise ExecutorStopped("ci-failed", str(exc)) from exc
             git = ctx.git.at(worktree)
             git.attach_branch(f"foragent/issue-{n}")
-            _inject_lane_skills(ctx, n, git)
+            _inject_lane_skills(ctx, n, git, f"origin/{exc.target_branch}")
             outcome = _implement_and_publish(n, ctx, git, target_branch=exc.target_branch, failure=exc)
     except ExecutorStopped as exc:
         outcome = exc.outcome

@@ -110,6 +110,24 @@ def test_blobs_present_missing_and_invalid_ref(git_history):
         git.blob_sha("not-a-ref", ACCEPTANCE)
 
 
+def test_restore_staged_paths_handles_absence_and_literal_names_without_losing_other_changes(git_history):
+    root = git_history.clone
+    git = GitRepo(root)
+    added = "tests/acceptance/new[1].py"
+    absent = "tests/acceptance/not_yet.py"
+    (root / added).write_text("unapproved addition\n")
+    (root / ACCEPTANCE).unlink()
+    (root / "feature.txt").write_text("partial implementation\n")
+    git.stage_changes()
+    git.restore_staged_paths("HEAD", iter([absent, added, ACCEPTANCE]))
+    assert git.changed_paths("HEAD") == ["feature.txt"]
+    assert git_command(root, "show", f":{ACCEPTANCE}") == "def test_feature():\n    assert True"
+    assert (root / added).read_text() == "unapproved addition\n"
+    git.restore_staged_paths("HEAD", [absent])
+    with pytest.raises(GitError):
+        git.restore_staged_paths("invalid-ref", [absent])
+
+
 @pytest.mark.parametrize("replacement", ["ordinary", "file-to-directory", "directory-to-file", "directory-to-symlink", "unmerged"])
 def test_review_restore_preserves_index_unstaged_files_modes_and_symlinks(git_history, replacement):
     root = git_history.clone
@@ -438,7 +456,7 @@ def test_conflict_markers_use_path_attributes_and_include_ancestor(git_history, 
     if attribute:
         (root / ".gitattributes").write_text(f"*.txt {attribute}\n")
     name = "odd\nname.txt"
-    (root / name).write_bytes(f"content\r\n{marker * width} ancestor\r\n".encode())
+    (root / name).write_bytes(f"content\r\n{'<' * width} HEAD\r\n{marker * width} ancestor\r\n{'>' * width} target\r\n".encode())
     assert GitRepo(root).conflict_marker_paths([name]) == [name]
     (root / name).write_text("resolved content\n")
     assert GitRepo(root).conflict_marker_paths([name]) == []
@@ -447,6 +465,63 @@ def test_conflict_markers_use_path_attributes_and_include_ancestor(git_history, 
 def test_conflict_marker_width_is_selected_per_file(git_history):
     root = git_history.clone
     (root / ".gitattributes").write_text("small.txt conflict-marker-size=5\nwide.txt conflict-marker-size=12\n")
-    (root / "small.txt").write_text("<<<<< HEAD\n")
-    (root / "wide.txt").write_text("|||||||||||| ancestor\n")
+    (root / "small.txt").write_text("<<<<< HEAD\n>>>>> target\n")
+    (root / "wide.txt").write_text("<<<<<<<<<<<< HEAD\n|||||||||||| ancestor\n>>>>>>>>>>>> target\n")
     assert GitRepo(root).conflict_marker_paths(["wide.txt", "small.txt", "small.txt"]) == ["small.txt", "wide.txt"]
+
+
+@pytest.mark.parametrize("content", [">>>>>>> A valid nested blockquote\n", "||||||| ancestor\n", "Heading\n=======\n"])
+def test_conflict_marker_paths_allow_standalone_markdown(git_history, content):
+    root = git_history.clone
+    (root / "notes.md").write_text(content)
+    assert GitRepo(root).conflict_marker_paths(["notes.md"]) == []
+
+
+@pytest.mark.parametrize("width", [5, 7, 12])
+def test_publication_marker_lines_scan_staged_blobs_with_exact_locations(git_history, width):
+    root = git_history.clone
+    name = "odd\tname\nfile.txt"
+    (root / ".gitattributes").write_text(f"*.txt conflict-marker-size={width}\n")
+    markers = "\n".join(("text", "<" * width + " HEAD", "ours", "|" * width + " ancestor",
+                          "base", "=" * width, "theirs", ">" * width + " target", ""))
+    (root / name).write_bytes(markers.replace("\n", "\r\n").encode())
+    git_command(root, "add", "--", name)
+    # Publication must inspect the index even if the worktree is now clean.
+    (root / name).write_text("resolved but unstaged\n")
+    git = GitRepo(root)
+    assert git.conflict_marker_lines([name, name]) == [(name, line) for line in (2, 4, 6, 8)]
+    git_command(root, "add", "--", name)
+    assert git.conflict_marker_lines([name]) == []
+
+
+@pytest.mark.parametrize("content,lines", [
+    ("||||||| ancestor\n", []),
+    (">>>>>>> A valid nested blockquote\n", []),
+    ("<<<<<<< HEAD\n", []),
+    ("Heading\n=======\n", []),
+    ("  <<<<<<< example\n<<<<<<<\n>>>>>>>\n|||||||\n", [2, 3]),
+    ("<<<<<<< HEAD\n=======\n>>>>>>> target\n=======\n", [1, 2, 3]),
+    (">>>>>>> quote\n||||||| text\n<<<<<<< HEAD\nours\n>>>>>>> target\n", [3, 5]),
+    ("<<<<<<< one\n>>>>>>> two\ntext\n<<<<<<< three\n>>>>>>> four\n", [1, 2, 4, 5]),
+    (">>>>>>> before\n<<<<<<< unclosed\n||||||| ancestor\n=======\n", []),
+    ("literal <<<<<<< HEAD\n", []),
+])
+def test_publication_markers_distinguish_git_syntax_from_documentation(git_history, content, lines):
+    root = git_history.clone
+    name = "notes.txt"
+    (root / name).write_text(content)
+    git_command(root, "add", "--", name)
+    assert GitRepo(root).conflict_marker_lines([name]) == [(name, line) for line in lines]
+
+
+def test_publication_markers_skip_deleted_files_and_symlinks(git_history):
+    root = git_history.clone
+    (root / ACCEPTANCE).unlink()
+    markers = "<<<<<<< HEAD\n=======\n>>>>>>> target\n"
+    (root / "local.txt").write_text(markers)
+    (root / "link").symlink_to("local.txt")
+    (root / "compiled.bin").write_bytes(b"\xcb\x00\n" + markers.encode())
+    git_command(root, "add", "--", ACCEPTANCE, "link", "compiled.bin")
+    git = GitRepo(root)
+    assert git.conflict_marker_lines(git.changed_paths("HEAD")) == []
+    assert git.conflict_marker_lines([]) == []
