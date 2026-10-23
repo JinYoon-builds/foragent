@@ -13,3 +13,4 @@
 - 디자인 모드 검증: `uv run pytest tests/acceptance/test_design_session.py tests/test_design_preview.py tests/test_design.py`. 인수 테스트와 유닛 테스트의 파일명을 같게 만들면 pytest 기본 import 방식에서 충돌하므로 새 유닛 파일은 `test_design_preview.py`로 둔다. `fa orch request --from planning --text ...`는 별도 오케스트레이터 inbox 기능의 인계 인터페이스다.
 - 이 저장소의 전체 테스트에는 아직 구현되지 않은 다른 주문의 고정 인수 테스트도 포함된다. 전체 실패 수와 새 회귀를 구분할 때는 주문에 제공된 기존 통과 목록, 해당 이슈의 Done when, 수정 전 HEAD 사본의 동일 실패를 함께 확인한다.
 - 전체 2천여 테스트의 직렬 검증은 오래 걸린다. pytest-xdist를 임시 가상환경에만 추가한 `uv run pytest -n 6 --junitxml=/tmp/results.xml`로 전체를 검증하고, XML의 노드 ID로 기존 통과 목록 보존 여부를 대조할 수 있다. 저장소 의존성 파일은 바꿀 필요가 없다.
+- 스킬 문서 인수 테스트는 YAML 머리말(description)까지 포함한 전체 글을 읽는다. "A가 B보다 먼저" 순서 검사는 머리말의 낱말도 센다. 디자인 인터뷰 검증: `fa test tests/acceptance/test_design_interview.py tests/acceptance/test_design_session.py`.
