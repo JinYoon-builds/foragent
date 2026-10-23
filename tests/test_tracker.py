@@ -765,3 +765,48 @@ def test_remove_blocked_by_propagates_api_failure():
     run = ScriptedRun('{"id":12345}', gh_error("HTTP 403: forbidden"))
     with pytest.raises(TrackerError, match="HTTP 403"):
         GhTracker(REPO, run).remove_blocked_by(1, 2)
+
+
+@pytest.fixture
+def local_records(tmp_path, monkeypatch):
+    from foragent import tracker as tracker_module
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    monkeypatch.setattr(tracker_module, "_EMPTY_RETRY_DELAY", 0)
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kwargs: store))
+    return store
+
+
+@pytest.mark.parametrize(("local_state", "state", "raises"), [
+    ("open", "open", True),
+    ("closed", "open", False),
+    ("closed", "all", True),
+    (None, "all", False),
+])
+def test_empty_listing_checks_local_issue_records(local_records, local_state, state, raises):
+    if local_state is not None:
+        local_records.update_local_issue(1, state=local_state)
+    calls = []
+    tracker = GhTracker("owner/repo", run=lambda args, input=None: calls.append(args) or "[]")
+    if raises:
+        with pytest.raises(TrackerError, match="empty listing"):
+            tracker.list_issues(state)
+    else:
+        assert tracker.list_issues(state) == []
+    assert len(calls) == 2
+
+
+def test_empty_open_listing_after_nonempty_all_listing_is_trusted(local_records):
+    replies = [json.dumps([issue_json(1, state="closed")]), "[]", "[]"]
+    tracker = GhTracker("owner/repo", run=lambda args, input=None: replies.pop(0))
+    assert [issue.number for issue in tracker.list_issues("all")] == [1]
+    assert tracker.list_open_issues() == [], "Every issue may be closed"
+
+
+def test_empty_open_listing_after_all_listing_with_open_issue_raises(local_records):
+    replies = [json.dumps([issue_json(1, state="open")]), "[]", "[]"]
+    tracker = GhTracker("owner/repo", run=lambda args, input=None: replies.pop(0))
+    assert [issue.number for issue in tracker.list_issues("all")] == [1]
+    with pytest.raises(TrackerError, match="empty listing"):
+        tracker.list_open_issues()
