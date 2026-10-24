@@ -319,3 +319,26 @@ def test_reviewer_limit_with_exhausted_usage_waits_for_reset_without_retrying(ru
     assert not c.store.executor_paused("claude", c.now[0])
     assert c.store.load_flag(1) is None
     assert "ready" in c.tracker.get_issue(1).labels and "running" not in c.tracker.get_issue(1).labels
+
+
+def test_running_issue_does_not_launch_an_executor_paused_by_another_run(run_case):
+    c = run_case
+    reset = c.now[0] + timedelta(hours=1)
+    calls = enable_reviewer(c, ["VERDICT: PASS"])
+    c.store.pause_executor("codex", reset)  # e.g. another lane's reviewer hit the codex limit
+    assert run_issue(1, c.ctx) == "limit-wait"
+    assert calls == [] and c.store.get_run(1).waited_seconds == 0
+    assert c.store.lane_paused("main", reset - timedelta(seconds=1))
+    assert not c.store.lane_paused("main", reset)
+    assert "ready" in c.tracker.get_issue(1).labels and c.store.load_flag(1) is None
+    assert c.tracker.created_prs == []
+
+
+def test_paused_implementer_is_not_launched_until_its_reset(run_case):
+    c = run_case
+    reset = c.now[0] + timedelta(minutes=30)
+    c.store.pause_executor(c.ctx.config.executor, reset)
+    before = list(c.executor.steps)
+    assert run_issue(1, c.ctx) == "limit-wait"
+    assert c.executor.steps == before
+    assert c.store.executor_pause_until(c.ctx.config.executor, c.now[0]) == reset

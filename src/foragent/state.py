@@ -715,12 +715,17 @@ class StateStore:
                 pauses[executor] = timestamp
             self._write_json(path, pauses)
 
-    def executor_paused(self, executor: str, now: datetime) -> bool:
+    def executor_pause_until(self, executor: str, now: datetime) -> datetime | None:
+        """When a usage-limit pause of ``executor`` ends, or None when it is not paused."""
         try:
             pauses = json.loads((self.root / "executor-pauses.json").read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return False
-        return executor in pauses and now < datetime.fromisoformat(pauses[executor])
+            return None
+        until = datetime.fromisoformat(pauses[executor]) if executor in pauses else None
+        return until if until is not None and now < until else None
+
+    def executor_paused(self, executor: str, now: datetime) -> bool:
+        return self.executor_pause_until(executor, now) is not None
 
     def pause_github(self, until: datetime) -> datetime:
         """Share a reset deadline across runners and ticks without shortening it."""
