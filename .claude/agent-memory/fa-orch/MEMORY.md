@@ -97,3 +97,5 @@
 - #201(D76 요청함): `orch_inbox.py`가 `<state>/inbox/requests|questions/<id>.json`에 한 건씩 저장한다(id `r1`·`q1`, state lock 안 순번). CLI는 Git·GhTracker 준비 전 `INBOX_ACTIONS`로 먼저 분기해 GitHub 호출이 없다. 인수 시험은 실패한 명령 뒤 state 아래 모든 `*.json` 바이트 동일성을 보므로 검증은 쓰기 전에 끝낸다. 경계 시험 `tests/test_orch_inbox_unit.py`. 스킬 정규식 관련 인수 시험 28개는 변경 전후 동일하게 실패(다른 이슈 미구현). 이전 시도가 GitHub 403 한도로 PR 생성에 실패하면 작업공간이 재생성되어 미커밋 변경은 사라진다.
 
 - #202: `orch_inbox`에 `plan-heartbeat.json`(120초 이내면 alive)과 `route_question()`을 두고, CLI `ask`가 기획 세션이 없을 때만 `notify.send`를 호출한다(모듈 속성 호출이라 시험의 send 교체가 먹힌다). `fa brief`는 #113 전이라 `brief.py`에 `questions_open`만 있는 최소 판으로 만들었다; #113이 같은 payload를 확장한다. `tests/acceptance/test_orch_ask_rule.py` 3개는 HEAD 스킬에서도 실패하는 다른 이슈 범위다.
+
+- #156(D71 질문 규칙): `skills/fa-orchestrator/SKILL.md`는 `test_orch_skill.py`가 150줄 이하를 강제하며 9개 인수 파일이 이 스킬을 정규식으로 읽는다. 문구를 늘릴 땐 인라인 코드를 쪼개지 않는 줄바꿈(백틱 구간을 한 토큰으로)으로 문단을 다시 맞춘다. 정규식은 단어 순서까지 본다(`(own|wrote).{0,120}tests?` → "you own or wrote a test"). 변경 전후로 9개 파일의 PASSED/FAILED 집합을 비교해 회귀를 확인한다. 이 환경에서 `git checkout <file>`은 권한 거부되므로 `git show HEAD:<path> > <path>`로 되돌린다.
