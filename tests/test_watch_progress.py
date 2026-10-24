@@ -183,3 +183,43 @@ def test_appended_output_does_not_make_an_older_reading_newer(tmp_path):
     with older.open("a") as stream:
         stream.write(reading(80, 1) + "\n")
     assert round(progress.quota(logs, NOW)["codex"][0]) == 80
+
+
+def claude_reading(five_hour, five_reset, weekly, weekly_reset):
+    return json.dumps({"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": {
+        "five_hour": {"utilization": five_hour, "resetsAt": five_reset},
+        "seven_day": {"utilization": weekly, "resetsAt": weekly_reset}}}})
+
+
+def test_expired_peak_in_one_window_does_not_hide_a_newer_reading_of_it(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    old_reset = int((NOW - timedelta(hours=1)).timestamp())
+    new_reset = int((NOW + timedelta(hours=4)).timestamp())
+    weekly = int((NOW + timedelta(days=3)).timestamp())
+    old = claude_reading(0.9, old_reset, 0.10, weekly)
+    new = claude_reading(0.2, new_reset, 0.12, weekly)
+    # Same weekly reset: only the five-hour window tells which reading is newer.
+    (logs / "issue-1.log").write_text(new + "\n" + old + "\n")
+    assert progress.quota(logs, NOW) == {"claude": (20.0, datetime.fromtimestamp(new_reset, UTC))}
+    (logs / "issue-1.log").write_text(new + "\n")
+    (logs / "issue-2.log").write_text(old + "\n")
+    assert progress.quota(logs, NOW) == {"claude": (20.0, datetime.fromtimestamp(new_reset, UTC))}
+
+
+def test_each_window_keeps_its_own_newest_reading_by_event_time(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    old_reset = int((NOW - timedelta(minutes=5)).timestamp())
+    new_reset = int((NOW + timedelta(hours=4)).timestamp())
+    weekly = int((NOW + timedelta(days=3)).timestamp())
+
+    def reading(minutes, primary, primary_reset, secondary):
+        return json.dumps({"timestamp": (NOW - timedelta(minutes=minutes)).isoformat(), "type": "event_msg",
+                           "payload": {"type": "token_count", "rate_limits": {
+                               "primary": {"used_percent": primary, "resets_at": primary_reset},
+                               "secondary": {"used_percent": secondary, "resets_at": weekly}}}})
+
+    (logs / "issue-1.log").write_text(reading(2, 15, new_reset, 31) + "\n")
+    (logs / "issue-2.log").write_text(reading(60, 95, old_reset, 30) + "\n")
+    assert progress.quota(logs, NOW) == {"codex": (31.0, datetime.fromtimestamp(weekly, UTC))}

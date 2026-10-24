@@ -17,9 +17,11 @@ ORDER = 15
 BAR_CELLS = 20
 RATE_WINDOW = timedelta(hours=1)
 # Logs are append-only: remember each file's parsed prefix (offset and the newest
-# reading per executor) so a refresh every few seconds reads only new bytes.
-Reading = tuple[tuple[float, float, float], list[tuple[float, float]]]
-_LOGS: dict[Path, tuple[tuple[int, bytes], int, dict[str, Reading]]] = {}
+# reading of each executor window) so a refresh every few seconds reads only new bytes.
+# Window = (key, percent, reset epoch); keyed by executor, then by window name.
+Window = tuple[tuple[float, float, float], float, float]
+Windows = dict[str, dict[str, Window]]
+_LOGS: dict[Path, tuple[tuple[int, bytes], int, Windows]] = {}
 HEAD_BYTES = 64
 
 
@@ -50,22 +52,23 @@ def finish_time(remaining: int, recent: int, now: datetime, window: timedelta = 
     return now + window * (remaining / recent)
 
 
-def _windows(executor: str, event: dict[str, Any]) -> list[tuple[float, float]]:
-    """Every (percent, reset epoch) window of one executor usage event."""
-    windows: list[tuple[Any, Any]] = []
+def _windows(executor: str, event: dict[str, Any]) -> list[tuple[str, float, float]]:
+    """Every (window name, percent, reset epoch) of one executor usage event."""
+    windows: list[tuple[str, Any, Any]] = []
     if executor == "claude":
         info = event.get("rate_limit_info") or {}
         unified = info.get("unifiedWindows") or {}
-        windows = [(item.get("utilization"), item.get("resetsAt")) for item in unified.values()
-                   if isinstance(item, dict)]
+        windows = [(str(name), item.get("utilization"), item.get("resetsAt"))
+                   for name, item in unified.items() if isinstance(item, dict)]
         if not windows and "utilization" in info:
-            windows = [(info.get("utilization"), info.get("resetsAt"))]
-        windows = [(value * 100 if isinstance(value, (int, float)) else None, reset) for value, reset in windows]
+            windows = [(str(info.get("rateLimitType") or "window"), info.get("utilization"), info.get("resetsAt"))]
+        windows = [(name, value * 100 if isinstance(value, (int, float)) else None, reset)
+                   for name, value, reset in windows]
     else:
         limits = (event.get("payload") or {}).get("rate_limits") or {}
-        windows = [(item.get("used_percent"), item.get("resets_at")) for item in
-                   (limits.get("primary"), limits.get("secondary")) if isinstance(item, dict)]
-    return [(float(value), float(reset)) for value, reset in windows
+        windows = [(name, item.get("used_percent"), item.get("resets_at")) for name in ("primary", "secondary")
+                   if isinstance(item := limits.get(name), dict)]
+    return [(name, float(value), float(reset)) for name, value, reset in windows
             if isinstance(value, (int, float)) and isinstance(reset, (int, float))]
 
 
@@ -95,40 +98,42 @@ def _reading_time(event: dict[str, Any]) -> float:
     return float("-inf")
 
 
-def _key(event: dict[str, Any], windows: list[tuple[float, float]]) -> tuple[float, float, float]:
-    """How new a reading is: its own time first; without one (Claude records none), a later
-    reset means a later window and, within one window, usage only grows until it resets."""
-    return (_reading_time(event), max(reset for _, reset in windows),
-            max(percent for percent, _ in windows))
+def _newer(found: dict[str, Window], name: str, window: Window) -> None:
+    if name not in found or window[0] >= found[name][0]:
+        found[name] = window
 
 
-def _parse(line: bytes, latest: dict[str, Reading]) -> None:
+def _parse(line: bytes, latest: Windows) -> None:
+    """Keep the newest reading of each window separately. Without its own time (Claude
+    records none), a later reset means a later window and usage within one window only
+    grows until it resets. Windows are never ranked together: an old five-hour peak must
+    not make a whole reading look newer than one taken after that window reset."""
     if b'"rate_limit' not in line:
         return
     try:
         event = json.loads(line.decode("utf-8", errors="replace"))
     except json.JSONDecodeError:
         return
-    if (executor := _executor(event)) and (windows := _windows(executor, event)):
-        key = _key(event, windows)
-        if executor not in latest or key >= latest[executor][0]:
-            latest[executor] = (key, windows)
+    if executor := _executor(event):
+        at = _reading_time(event)
+        for name, percent, reset in _windows(executor, event):
+            _newer(latest.setdefault(executor, {}), name, ((at, reset, percent), percent, reset))
 
 
-def _log_windows(path: Path, inode: int, size: int) -> dict[str, Reading]:
-    """The newest reading per executor in one whole log, reading only appended bytes."""
+def _log_windows(path: Path, inode: int, size: int) -> Windows:
+    """The newest reading of each executor window in one whole log, reading only appended bytes."""
     with path.open("rb") as stream:
         identity = (inode, stream.read(HEAD_BYTES))
         cached, offset, known = _LOGS.get(path, (identity, 0, {}))
         if cached != identity or size < offset:
             offset, known = 0, {}  # replaced, rewritten or truncated: read it all again
-        latest = dict(known)
+        latest = {executor: dict(found) for executor, found in known.items()}
         stream.seek(offset)
         data = stream.read(max(0, size - offset))
     complete = data.rfind(b"\n") + 1
     for line in data[:complete].splitlines():
         _parse(line, latest)
-    _LOGS[path] = (identity, offset + complete, dict(latest))
+    _LOGS[path] = (identity, offset + complete, {executor: dict(found) for executor, found in latest.items()})
     # A line still being written counts now but is parsed again once it is complete.
     _parse(data[complete:], latest)
     return latest
@@ -151,20 +156,20 @@ def quota(logs: Path, now: datetime) -> dict[str, tuple[float, datetime]]:
     present = {path for _, path in files}
     for path in [path for path in _LOGS if path.parent == logs and path not in present]:
         del _LOGS[path]
-    newest: dict[str, Reading] = {}
+    newest: Windows = {}
     for stat, path in sorted(files, key=lambda item: item[1].name):
         try:
             found = _log_windows(path, stat.st_ino, stat.st_size)
         except OSError:
             continue
-        for executor, reading in found.items():
-            if executor not in newest or reading[0] > newest[executor][0]:
-                newest[executor] = reading
+        for executor, windows in found.items():
+            for name, window in windows.items():
+                _newer(newest.setdefault(executor, {}), name, window)
     # Drop windows that already reset before choosing the most-used one: an expired
     # primary window must not hide a still-valid secondary window.
     usage: dict[str, tuple[float, datetime]] = {}
-    for executor, (_, windows) in newest.items():
-        current = [(percent, at) for percent, reset in windows
+    for executor, windows in newest.items():
+        current = [(percent, at) for _, percent, reset in windows.values()
                    if (at := datetime.fromtimestamp(reset, UTC)) > now]
         if current:
             usage[executor] = max(current)
