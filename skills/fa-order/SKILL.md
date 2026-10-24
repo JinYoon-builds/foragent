@@ -216,6 +216,10 @@ use that checkout, and its files must stay untouched. Put the final contents int
 `acceptance_files` and `spec_markdown`, under their acceptance-dir paths. Test observable behaviour through the
 project's real entry points (CLI, HTTP, public functions), not internals. Each test must
 fail today and pass only when the goal is met. Prefer 2–4 sharp cases including one edge.
+Judge every test by the break-it rule (from pstack's
+principle-test-behavior-not-implementation, MIT): Make the code return a wrong value, skip an
+effect, or do the effect twice. If the test still passes, it proves nothing. Rewrite such a
+test so that each of those breaks makes it fail.
 When a behaviour cannot be checked by a machine (visual taste, real device), add it as a
 checklist item and keep at least one executable command anyway (e.g. the build or a smoke
 check). Done when commands must run with the repo's normal tooling from the repo root.
