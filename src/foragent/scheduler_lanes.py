@@ -115,36 +115,36 @@ def _file_patterns_overlap(left: str, right: str, *, case_sensitive: bool = True
     return intersect(scheduler.PurePosixPath(left).parts, scheduler.PurePosixPath(right).parts, "**", components_overlap)
 
 
-def _lane_has_room(running: int, waiting: int) -> bool:
-    """A lane runs one issue, or a second clone while two or more issues wait."""
-    return running == 0 or (running == 1 and waiting >= 2)
-
-
-def _can_start_in_lane(ctx: TickContext, lane: str, issue: Issue, waiting: int) -> bool:
+def _can_start_in_lane(ctx: TickContext, lane: str, issue: Issue) -> bool:
+    """Start beside every running issue in the lane only when no declared files overlap."""
     running = [run for run in ctx.store.active_runs() if run.lane == lane]
     if not running:
         return True
-    if not scheduler._lane_has_room(len(running), waiting):
-        return False
     approval = ctx.store.load_approval(issue.number)
-    run = running[0]
-    running_approval = ctx.store.load_approval(run.number)
-    if approval is None or running_approval is None:
-        return False
-    # The approval file can be replaced while the runner retains its old body.
-    # Legacy records can use a snapshot approved no later than the run start.
-    if run.approval_body_sha is None:
-        if (
-            scheduler.datetime.fromisoformat(running_approval.approved_at)
-            > scheduler.datetime.fromisoformat(run.started_at)
-        ):
-            return False
-    elif run.approval_body_sha != running_approval.body_sha:
+    if approval is None:
         return False
     files = scheduler.parse_body(approval.body).files
-    running_files = scheduler.parse_body(running_approval.body).files
-    if not files or not running_files:
+    if not files:
         return False
+    running_files: list[str] = []
+    for run in running:
+        running_approval = ctx.store.load_approval(run.number)
+        if running_approval is None:
+            return False
+        # The approval file can be replaced while the runner retains its old body.
+        # Legacy records can use a snapshot approved no later than the run start.
+        if run.approval_body_sha is None:
+            if (
+                scheduler.datetime.fromisoformat(running_approval.approved_at)
+                > scheduler.datetime.fromisoformat(run.started_at)
+            ):
+                return False
+        elif run.approval_body_sha != running_approval.body_sha:
+            return False
+        declared = scheduler.parse_body(running_approval.body).files
+        if not declared:
+            return False
+        running_files.extend(declared)
     case_sensitive = scheduler._filesystem_case_sensitive(ctx.repo_root)
     return case_sensitive is not None and not any(
         scheduler._file_patterns_overlap(candidate, active, case_sensitive=case_sensitive)
