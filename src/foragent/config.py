@@ -1,19 +1,14 @@
 """Load repository settings over optional global settings."""
 
-from copy import copy, deepcopy
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
-from io import StringIO
 from pathlib import Path
 import re
 from tempfile import NamedTemporaryFile
 from typing import Any
 
 import yaml
-from ruamel.yaml import YAML
-from ruamel.yaml.comments import CommentedMap, CommentedSeq
-from ruamel.yaml.error import YAMLError as _RoundTripError
-from ruamel.yaml.util import load_yaml_guess_indent
 
 
 class ConfigError(ValueError):
@@ -82,112 +77,190 @@ _REVIEW_LEVELS = {"fast", "batch", "careful"}
 _EXECUTORS = {"codex", "claude"}
 
 
-class SettingsDocument:
-    """A settings file loaded for editing that keeps comments and untouched lines."""
+class LaneSettings:
+    """Edit lanes in a settings file by lines; every untouched line keeps its bytes."""
 
     def __init__(self, path: Path):
         self.path = path
-        self._yaml = YAML()
-        self._yaml.preserve_quotes = True
-        self._yaml.width = 4096
         try:
-            text = path.read_text(encoding="utf-8") if path.exists() else ""
-            _, sequence, offset = load_yaml_guess_indent(text) if text.strip() else (None, None, None)
-            data = self._yaml.load(text) if text.strip() else None
-        except (OSError, _RoundTripError) as exc:
+            # Bytes, not text mode: text mode would turn CRLF line ends into LF.
+            text = path.read_bytes().decode("utf-8") if path.exists() else ""
+            root = yaml.compose(text)
+            data = yaml.safe_load(text)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
             raise ConfigError(f"cannot read {path}: {exc}") from exc
-        if data is None:
-            data = CommentedMap()
-        if not isinstance(data, CommentedMap):
+        if root is not None and not isinstance(root, yaml.MappingNode):
             raise ConfigError(f"{path} must contain a mapping")
-        self.data: CommentedMap = data
-        # Re-emit untouched lines with the file's own indentation.
-        nested = [len(line) - len(line.lstrip(" ")) for line in text.splitlines()
-                  if line.strip() and line.lstrip(" ")[0] not in "#-" and line.startswith(" ")]
-        mapping = min(nested, default=2)
-        self._yaml.indent(mapping=mapping, sequence=sequence or mapping, offset=offset or 0)
+        self.root = root
+        self.data: dict[str, Any] = data or {}
+        # Split only where YAML breaks lines, so node marks index these lines.
+        self.lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z", text)
+        self.newline = next((line[len(line.rstrip("\r\n")):] for line in self.lines
+                             if line.endswith(("\r", "\n"))), "\n")
+        self.expected = deepcopy(self.data)
 
-    @staticmethod
-    def inline(values: list[Any]) -> CommentedSeq:
-        """Return a list written on one line, like the lane lists `fa` creates."""
-        sequence = CommentedSeq(values)
-        sequence.fa.set_flow_style()
-        return sequence
-
-    def set(self, mapping: CommentedMap, key: str, value: Any) -> None:
-        """Set one key; a new last key takes over the comments that ended the mapping."""
-        if key in mapping:
-            old = mapping[key]
-            if isinstance(value, CommentedSeq) and isinstance(old, CommentedSeq) and not old.fa.flow_style():
-                value.fa.set_block_style()
-            tail = _take_tail(old)
-            mapping[key] = value
+    def add_lane(self, name: str, lane: dict[str, Any], inherited: dict[str, dict[str, Any]]) -> None:
+        """Add one lane after the file's last lane, or create `lanes` with inherited lanes."""
+        found = _pair(self.root, "lanes")
+        if found is not None and isinstance(found[1], yaml.MappingNode):
+            key, lanes = found
+            self.expected["lanes"] = {**self.data["lanes"], name: lane}
+            if lanes.flow_style:
+                self._flow_add(lanes, name, lane)
+                return
+            first_key, first_lane = lanes.value[0]
+            indent = first_key.start_mark.column
+            step = (first_lane.value[0][0].start_mark.column - indent
+                    if _block(first_lane, yaml.MappingNode) else 2)
+            self._insert(_last_line(*lanes.value[-1]) + 1, self._mapping({name: lane}, indent, step))
+            return
+        value = {**inherited, name: lane}
+        self.expected["lanes"] = value
+        if found is not None:
+            # `lanes:` with no value: keep its line and put the lanes below it.
+            key = found[0]
+            self._insert(key.end_mark.line + 1, self._mapping(value, key.start_mark.column + 2, 2))
+        elif self.root is not None and self.root.flow_style:
+            self._flow_add(self.root, "lanes", value)
         else:
-            tail = _take_tail(mapping)
-            mapping[key] = value
-        if tail is not None:
-            _put_tail(mapping, tail, key)
+            self._insert(len(self.lines), ["lanes:" + self.newline, *self._mapping(value, 2, 2)])
+
+    def set_skills(self, name: str, skills: list[str], lane: dict[str, Any],
+                   inherited: dict[str, dict[str, Any]]) -> None:
+        """Replace one lane's `skills` value in place, keeping comments around it."""
+        found = _pair(self.root, "lanes")
+        pair = _pair(found[1], name) if found and isinstance(found[1], yaml.MappingNode) else None
+        if pair is None:
+            self.add_lane(name, lane, inherited)
+            return
+        node = pair[1]
+        if not isinstance(node, yaml.MappingNode):
+            raise ConfigError(f"invalid lanes entry: {name}")
+        self.expected["lanes"][name] = {**self.data["lanes"][name], "skills": skills}
+        skill = _pair(node, "skills")
+        if skill is None and node.flow_style:
+            self._flow_add(node, "skills", skills)
+        elif skill is None:
+            indent = node.value[0][0].start_mark.column
+            self._insert(_last_line(*node.value[-1]) + 1, [" " * indent + "skills: " + _flow(skills) + self.newline])
+        elif _block(skill[1], yaml.SequenceNode):
+            self._replace_items(skill[0], skill[1], skills)
+        elif _empty(skill[1]):
+            self._after_colon(skill[0], _flow(skills))
+        else:
+            self._replace(skill[1], _flow(skills))
+
+    def check(self) -> str:
+        """Return the edited text after confirming it reads back as exactly the intended settings."""
+        text = "".join(self.lines)
+        try:
+            written = yaml.safe_load(text) or {}
+        except yaml.YAMLError:
+            written = None
+        if written != self.expected:
+            raise ConfigError(f"cannot update lanes in {self.path} without rewriting other lines; edit it by hand")
+        return text
 
     def save(self) -> None:
-        stream = StringIO()
-        self._yaml.dump(self.data, stream)
-        self.path.write_text(stream.getvalue(), encoding="utf-8")
+        self.path.write_bytes(self.check().encode("utf-8"))
+
+    def _mapping(self, lanes: dict[str, Any], indent: int, step: int) -> list[str]:
+        lines = []
+        for name, lane in lanes.items():
+            if not isinstance(lane, dict):
+                lines.append(f"{' ' * indent}{_flow(name)}: {_flow(lane)}{self.newline}")
+                continue
+            lines.append(f"{' ' * indent}{_flow(name)}:{self.newline}")
+            lines += [f"{' ' * (indent + step)}{_flow(key)}: {_flow(value)}{self.newline}"
+                      for key, value in lane.items()]
+        return lines
+
+    def _insert(self, line: int, lines: list[str]) -> None:
+        if 0 < line <= len(self.lines) and not self.lines[line - 1].endswith(("\r", "\n")):
+            self.lines[line - 1] += self.newline
+        self.lines[line:line] = lines
+
+    def _flow_add(self, mapping: yaml.MappingNode, key: str, value: Any) -> None:
+        """Add `key: value` to a `{...}` mapping right after its last value, leaving the rest as is."""
+        entry = f"{_flow(key)}: {_flow(value)}"
+        if mapping.value:
+            mark, text = mapping.value[-1][1].end_mark, ", " + entry
+        else:
+            mark, text = mapping.start_mark, entry
+            mark = yaml.Mark(mark.name, mark.index + 1, mark.line, mark.column + 1, None, None)  # after `{`
+        line = self.lines[mark.line]
+        self.lines[mark.line] = line[:mark.column] + text + line[mark.column:]
+
+    def _replace(self, node: yaml.Node, text: str) -> None:
+        start, end = node.start_mark, node.end_mark
+        self.lines[start.line:end.line + 1] = [
+            self.lines[start.line][:start.column] + text + self.lines[end.line][end.column:]]
+
+    def _after_colon(self, key: yaml.Node, text: str) -> None:
+        line = self.lines[key.end_mark.line]
+        colon = line.index(":", key.end_mark.column) + 1
+        self.lines[key.end_mark.line] = line[:colon] + " " + text + line[colon:]
+
+    def _replace_items(self, key: yaml.Node, sequence: yaml.SequenceNode, skills: list[str]) -> None:
+        """Keep unchanged item lines; removed items leave their comments behind."""
+        items = sequence.value
+        old = [item.value if isinstance(item, yaml.ScalarNode) else None for item in items]
+        kept = [value for value in old if value in skills]
+        keep = (len(set(kept)) == len(kept) and skills[:len(kept)] == kept
+                and all(item.start_mark.line == item.end_mark.line for item in items))
+        added = skills[len(kept):] if keep else skills
+        first = self.lines[items[0].start_mark.line]
+        dash = " " * first.rindex("-", 0, items[0].start_mark.column)
+        self._insert(_last_line(items[-1], items[-1]) + 1,
+                     [f"{dash}- {_flow(value)}{self.newline}" for value in added])
+        for item in reversed(items):
+            if keep and item.value in skills:
+                continue
+            start, end = item.start_mark, item.end_mark
+            line = self.lines[end.line]
+            if start.line == end.line and line[end.column:].lstrip(" \t").startswith("#"):
+                # Blank out `- item` only; the comment keeps its column and bytes.
+                column = line.rindex("-", 0, start.column)
+                self.lines[end.line] = line[:column] + " " * (end.column - column) + line[end.column:]
+            else:
+                del self.lines[start.line:end.line + 1]
+        if not skills:
+            self._after_colon(key, "[]")
 
 
-def _take_tail(node: Any) -> Any:
-    """Detach the comment lines that follow the deepest last item of a collection."""
-    if isinstance(node, CommentedMap) and node:
-        key = list(node)[-1]
-        found = _take_tail(node[key])
-        if found is not None:
-            return found
-        entry = node.ca.items.get(key)
-        if entry and len(entry) > 2 and entry[2] is not None:
-            return _split_tail(entry, 2)
-    elif isinstance(node, CommentedSeq) and node:
-        index = len(node) - 1
-        found = _take_tail(node[index])
-        if found is not None:
-            return found
-        entry = node.ca.items.get(index)
-        if entry and entry[0] is not None:
-            return _split_tail(entry, 0)
-    return None
-
-
-def _split_tail(entry: list, slot: int) -> Any:
-    """Detach the lines after an item, leaving its same-line comment in place."""
-    token = entry[slot]
-    if token.value.startswith("\n"):
-        entry[slot] = None
-        return token
-    head, _, rest = token.value.partition("\n")
-    if not rest:
+def _pair(mapping: yaml.Node | None, name: str) -> tuple[yaml.Node, yaml.Node] | None:
+    if not isinstance(mapping, yaml.MappingNode):
         return None
-    tail = copy(token)
-    token.value = head + "\n"
-    tail.value = "\n" + rest
-    return tail
+    return next(((key, value) for key, value in mapping.value
+                 if isinstance(key, yaml.ScalarNode) and key.value == name), None)
 
 
-def _put_tail(node: Any, token: Any, key: Any = None) -> None:
-    """Attach detached comment lines after `key` (default: the last item), as deep as it goes."""
-    if isinstance(node, CommentedMap) and node:
-        key = list(node)[-1] if key is None else key
-        value = node[key]
-        if isinstance(value, (CommentedMap, CommentedSeq)) and value and not value.fa.flow_style():
-            _put_tail(value, token)
-        else:
-            entry = node.ca.items.setdefault(key, [None, None, None, None])
-            entry[2] = token
-    elif isinstance(node, CommentedSeq) and node:
-        index = len(node) - 1
-        value = node[index]
-        if isinstance(value, (CommentedMap, CommentedSeq)) and value and not value.fa.flow_style():
-            _put_tail(value, token)
-        else:
-            entry = node.ca.items.setdefault(index, [None, None])
-            entry[0] = token
+def _block(node: yaml.Node | None, kind: type) -> bool:
+    return isinstance(node, kind) and not node.flow_style and bool(node.value)
+
+
+def _empty(node: yaml.Node) -> bool:
+    return isinstance(node, yaml.ScalarNode) and node.start_mark.index == node.end_mark.index
+
+
+def _last_line(key: yaml.Node, value: yaml.Node) -> int:
+    """Return the last source line of a key's value, before any following comments."""
+    if _block(value, yaml.MappingNode):
+        return _last_line(*value.value[-1])
+    if _block(value, yaml.SequenceNode):
+        return _last_line(value.value[-1], value.value[-1])
+    if _empty(value):
+        return key.end_mark.line
+    end = value.end_mark
+    return end.line - 1 if end.column == 0 and end.line > value.start_mark.line else end.line
+
+
+def _flow(value: Any) -> str:
+    """Render a value on one line, as `fa` writes lane settings."""
+    text = yaml.safe_dump(value, default_flow_style=True, sort_keys=False, allow_unicode=True, width=1 << 30)
+    if text.endswith("\n...\n"):
+        text = text[:-5]
+    return text.strip()
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:

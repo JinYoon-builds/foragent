@@ -24,5 +24,5 @@
 - 레인 에이전트는 삭제되거나 처음부터 없을 수 있다. `set_lane_skills()`는 설치 전에 `read_text()`의 `OSError`를 경로가 포함된 `LaneError`로 변환한다. 누락·미생성·디렉터리 경로의 CLI 오류와 프로젝트 파일 무변경을 함께 검증한다.
 - 설정 `_overlay()`는 `tiers`만 깊게 병합하며 `lanes`는 전역 → 로컬 순으로 목록 전체를 교체한다. 로컬 `lanes`가 있으면 `config.lanes`에 전역 전용 레인이 섞이지 않는다. 목록을 처음 로컬에 저장할 때는 상속한 다른 레인을 보존해야 한다. 전역·로컬 혼합 회귀는 `test_set_lane_skills_does_not_copy_overridden_global_lanes`다.
 - `SkillManager._scan()`은 (유효 스킬, 건너뜀 `{path, error}`)를 돌려준다. 깨진 SKILL.md는 catalog·install에서 조용히 빠지고, `add`는 `skipped`로 알린다. 유효 스킬 0개+건너뜀 있음일 때만 모든 경로를 담아 실패한다. #232 검증: `fa test tests/acceptance/test_skills_add_partial_pack.py`. `fa test`는 슬롯 대기로 10분을 넘길 수 있으니 백그라운드로 돌린다.
-- [.foragent.yml 왕복 편집](settings_roundtrip.md) — lanes add/skills의 ruamel 편집기, 따옴표·끝 주석 함정 (#233)
+- [.foragent.yml 줄 단위 편집](settings_roundtrip.md) — lanes add/skills는 compose 위치로 줄만 고치고 다시 읽어 확인; ruamel 왕복은 거절됨 (#233)
 - [게이트 슬롯 환경 변수](gate_slot_env.md) — FORAGENT_TEST_SLOT=held가 시험에 새면 capacity 슬롯 시험이 게이트에서만 실패

@@ -680,36 +680,75 @@ def test_copy_lane_skills_prefers_local_then_cache_and_preserves_checkout(librar
 
 
 @pytest.mark.parametrize("text, expected", [
-    ("# top\nrepo: o/r  # keep\n",
-     "# top\nrepo: o/r  # keep\nlanes:\n  docs:\n    paths: [docs/**]\n"),
+    ("# top\nrepo:    o/r  # keep\n",
+     "# top\nrepo:    o/r  # keep\nlanes:\n  docs:\n    paths: [docs/**]\n"),
     ("lanes:\n    api:\n        paths:\n          - 'api/**'\n\n# tail\nmax_parallel: 1\n",
-     "lanes:\n    api:\n        paths:\n          - 'api/**'\n    docs:\n        paths: [docs/**]\n\n# tail\nmax_parallel: 1\n"),
+     "lanes:\n    api:\n        paths:\n          - 'api/**'\n    docs:\n        paths: [docs/**]\n"
+     "\n# tail\nmax_parallel: 1\n"),
     ("lanes:\n  api:\n    paths:\n    - api/**\n# tail\n",
      "lanes:\n  api:\n    paths:\n    - api/**\n  docs:\n    paths: [docs/**]\n# tail\n"),
+    ("lanes: {}  # none yet\nrepo: o/r\n",
+     "lanes: {docs: {paths: [docs/**]}}  # none yet\nrepo: o/r\n"),
+    ("# top\n{}\n", "# top\n{lanes: {docs: {paths: [docs/**]}}}\n"),
+    ("lanes: {api: {paths: [api/**]},  # api\n  web: {paths: [web/**]}}  # end\n",
+     "lanes: {api: {paths: [api/**]},  # api\n  web: {paths: [web/**]}, docs: {paths: [docs/**]}}  # end\n"),
+    ("lanes:   # soon\nrepo: o/r\n", "lanes:   # soon\n  docs:\n    paths: [docs/**]\nrepo: o/r\n"),
+    ("repo:    o/r\r\nlanes:\r\n  api:  # a \r\n    paths: [api/**]\r\n# tail\r\n",
+     "repo:    o/r\r\nlanes:\r\n  api:  # a \r\n    paths: [api/**]\r\n  docs:\r\n    paths: [docs/**]\r\n# tail\r\n"),
+    ("{repo: o/r}  # flow\n", "{repo: o/r, lanes: {docs: {paths: [docs/**]}}}  # flow\n"),
 ])
 def test_settings_document_adds_a_lane_without_moving_other_lines(tmp_path, text, expected):
-    from foragent.config import SettingsDocument
-    from ruamel.yaml.comments import CommentedMap
+    from foragent.config import LaneSettings
 
     path = tmp_path / ".foragent.yml"
+    path.write_bytes(text.encode())
+    settings = LaneSettings(path)
+    settings.add_lane("docs", {"paths": ["docs/**"]}, {})
+    settings.save()
+    assert path.read_bytes() == expected.encode()
+
+
+@pytest.mark.parametrize("text, skills, expected", [
+    ("lanes:\n  api:\n    skills:\n    - tone\n    agent: fa-api  # keep\n# tail\n", ["polish"],
+     "lanes:\n  api:\n    skills:\n    - polish\n    agent: fa-api  # keep\n# tail\n"),
+    ("repo:    o/r\nlanes:\n  api:\n    skills: [tone]  # fixed\n", ["polish", "x"],
+     "repo:    o/r\nlanes:\n  api:\n    skills: [polish, x]  # fixed\n"),
+    ("lanes:\n  api:\n    skills:\n    - tone # Keep tone note\n    - keep\n", ["keep", "polish"],
+     "lanes:\n  api:\n    skills:\n           # Keep tone note\n    - keep\n    - polish\n"),
+    ("lanes:\n  api:\n    skills:\n    - tone   #  spaced note  \n", ["polish"],
+     "lanes:\n  api:\n    skills:\n             #  spaced note  \n    - polish\n"),
+    ("lanes:\n  api: {paths: [api/**],\n    # why\n    skills: [tone]}  # c\n", ["polish"],
+     "lanes:\n  api: {paths: [api/**],\n    # why\n    skills: [polish]}  # c\n"),
+    ("lanes:\n  api: {paths: [api/**],  # why\n    agent: fa-api}\n", ["polish"],
+     "lanes:\n  api: {paths: [api/**],  # why\n    agent: fa-api, skills: [polish]}\n"),
+    ("lanes:\r\n  api:\r\n    skills: [tone]  # c \r\n    agent: fa-api\r\n", [],
+     "lanes:\r\n  api:\r\n    skills: []  # c \r\n    agent: fa-api\r\n"),
+    ("lanes:\n  api:\n    skills:\n    - tone\n# trailing\nmax_parallel: 1\n", [],
+     "lanes:\n  api:\n    skills: []\n# trailing\nmax_parallel: 1\n"),
+    ("lanes:\n  api:\n    paths: [api/**]\n\n# tail\n", ["polish"],
+     "lanes:\n  api:\n    paths: [api/**]\n    skills: [polish]\n\n# tail\n"),
+    ("lanes:\n  api:\n    skills:\n    agent: fa-api\n", ["polish"],
+     "lanes:\n  api:\n    skills: [polish]\n    agent: fa-api\n"),
+])
+def test_settings_document_replaces_a_block_list_in_place(tmp_path, text, skills, expected):
+    from foragent.config import LaneSettings
+
+    path = tmp_path / ".foragent.yml"
+    path.write_bytes(text.encode())
+    settings = LaneSettings(path)
+    settings.set_skills("api", skills, {}, {})
+    settings.save()
+    assert path.read_bytes() == expected.encode()
+
+
+def test_settings_document_refuses_an_edit_that_would_change_other_settings(tmp_path):
+    from foragent.config import ConfigError, LaneSettings
+
+    path = tmp_path / ".foragent.yml"
+    text = "base: &shared\n  skills: [tone]\nlanes:\n  api: *shared\n"
     path.write_text(text)
-    settings = SettingsDocument(path)
-    lanes = settings.data.get("lanes")
-    if lanes is None:
-        lanes = CommentedMap()
-        settings.set(settings.data, "lanes", lanes)
-    lane = CommentedMap(paths=settings.inline(["docs/**"]))
-    settings.set(lanes, "docs", lane)
-    settings.save()
-    assert path.read_text() == expected
-
-
-def test_settings_document_replaces_a_block_list_in_place(tmp_path):
-    from foragent.config import SettingsDocument
-
-    path = tmp_path / ".foragent.yml"
-    path.write_text("lanes:\n  api:\n    skills:\n    - tone\n    agent: fa-api  # keep\n# tail\n")
-    settings = SettingsDocument(path)
-    settings.set(settings.data["lanes"]["api"], "skills", settings.inline(["polish"]))
-    settings.save()
-    assert path.read_text() == "lanes:\n  api:\n    skills:\n    - polish\n    agent: fa-api  # keep\n# tail\n"
+    settings = LaneSettings(path)
+    settings.set_skills("api", ["polish"], {}, {})
+    with pytest.raises(ConfigError, match="edit it by hand"):
+        settings.save()
+    assert path.read_text() == text

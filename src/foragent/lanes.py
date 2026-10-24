@@ -5,9 +5,8 @@ from pathlib import Path
 import re
 
 import yaml
-from ruamel.yaml.comments import CommentedMap
 
-from foragent.config import Config, SettingsDocument, _validate, load_config
+from foragent.config import Config, LaneSettings, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
@@ -59,27 +58,6 @@ def lane_files(root: Path, name: str, skills: list[str]) -> list[str]:
     return paths
 
 
-def _node(value):
-    """Convert plain lane values to editable YAML, keeping lists on one line."""
-    if isinstance(value, dict):
-        mapping = CommentedMap()
-        for key, item in value.items():
-            mapping[key] = _node(item)
-        return mapping
-    if isinstance(value, list):
-        return SettingsDocument.inline([_node(item) for item in value])
-    return value
-
-
-def _local_lanes(settings: SettingsDocument, config: Config) -> CommentedMap:
-    """Return the file's `lanes` mapping, first copying inherited lanes when it has none."""
-    lanes = settings.data.get("lanes")
-    if not isinstance(lanes, CommentedMap):
-        lanes = _node(config.lanes) if config.lanes else CommentedMap()
-        settings.set(settings.data, "lanes", lanes)
-    return lanes
-
-
 def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | None = None,
              executor: str | None = None, model: str | None = None,
              git: GitRepo | None = None, manager: SkillManager | None = None,
@@ -91,8 +69,6 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"lanes add must run on the base branch {config.base_branch!r}")
-    for identity in skills:
-        manager.install(identity, root)
     lane = {"paths": paths, "agent": f"fa-{name}", "skills": installed}
     if executor is not None:
         lane["executor"] = executor
@@ -102,8 +78,11 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
         if value is not None:
             lane[key] = value
     _validate({**asdict(config), "lanes": {**config.lanes, name: lane}})
-    settings = SettingsDocument(repo_path(root, ".foragent.yml"))
-    settings.set(_local_lanes(settings, config), name, _node(lane))
+    settings = LaneSettings(repo_path(root, ".foragent.yml"))
+    settings.add_lane(name, lane, config.lanes)
+    settings.check()
+    for identity in skills:
+        manager.install(identity, root)
     settings.save()
     areas = ", ".join(paths)
     # Keep the agent definition readable and its skill list inline.
@@ -153,12 +132,9 @@ def set_lane_skills(root: Path, name: str, skills: list[str], *,
     installed = _check_skills(root, skills, manager)
     lane["skills"] = installed
     _validate({**asdict(config), "lanes": {**config.lanes, name: lane}})
-    settings = SettingsDocument(repo_path(root, ".foragent.yml"))
-    lanes = _local_lanes(settings, config)
-    if isinstance(lanes.get(name), dict):
-        settings.set(lanes[name], "skills", settings.inline(installed))
-    else:
-        settings.set(lanes, name, _node(lane))
+    settings = LaneSettings(repo_path(root, ".foragent.yml"))
+    settings.set_skills(name, installed, lane, config.lanes)
+    settings.check()
     header["skills"] = installed
     agent_content = ("---\n" + yaml.safe_dump(header, sort_keys=False, allow_unicode=True)
                      + "---\n" + content[match.end():])
