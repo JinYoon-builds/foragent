@@ -4,6 +4,8 @@ Ideas Jin wants to keep but not order yet. An idea moves to `decisions.md` when 
 
 ## 2026-10-24
 
+- **`fa` checks for updates (needed before the open-source release).** Users install with `uv tool install` and never learn about new versions. On `/fa` or `fa`, check the latest release once a day and offer a one-line update. After updating, restart the gate between ticks and let running runners finish on the old code; the self-merge reinstall (`orch_reinstall.after_merge`) already does this and can be reused.
+
 - **Docs that explain Foragent through operating-system concepts (for the open-source release).** One page per element, mapped to the OS idea it mirrors: policy vs mechanism (orchestrator plan vs gate, D80), the scheduler and run queues (lanes, including the priority inversion behind #138), AIMD parallelism as TCP congestion control (#106), test slots as semaphores (#243), lanes as mutual exclusion by file ownership, plan expiry as a lease, crash/stall recovery as process supervision. Each page also says where the analogy breaks: the "processes" judge and can be wrong, and the scarce resources are token quotas and API limits rather than CPU. Back the claims with scorecard numbers (merges per hour, regressions caught). Write after the core is stable.
 
 ## 2026-10-23
