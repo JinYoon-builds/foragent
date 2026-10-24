@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board, capacity, orch_github
+from foragent import board, capacity, orch_events, orch_github
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -794,7 +794,26 @@ def _progress(n: int, ctx: RunContext) -> None:
 
 def _phase(n: int, ctx: RunContext, phase: str) -> None:
     if ctx.store.get_run(n).phase != phase:
+        _end_phase(n, ctx)
         ctx.store.update_run(n, phase=phase, phase_started_at=ctx.now().astimezone(UTC).isoformat())
+
+
+def _end_phase(n: int, ctx: RunContext) -> None:
+    """Journal the time spent in the run's current phase and the machine load at its end."""
+    run = ctx.store.get_run(n)
+    if run is None or run.status == "finished" or not run.phase or not run.phase_started_at:
+        return
+    now = ctx.now()
+    seconds = round((now - datetime.fromisoformat(run.phase_started_at)).total_seconds(), 3)
+    try:
+        load: float | None = float(os.getloadavg()[0])
+    except OSError:
+        load = None
+    orch_events.append_event(
+        ctx.store, now, n, "phase",
+        f"{run.phase} ended after {seconds:g}s (load {'unknown' if load is None else f'{load:g}'})",
+        phase=run.phase, seconds=seconds, load=load,
+    )
 
 
 def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> ExecResult:
@@ -1141,6 +1160,9 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     if edited:
         review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
     _append(ctx.store.log_path(n), f"Review: VERDICT: {review.verdict}\n{review.findings}")
+    # Durable before any next round, so a scorecard sees every verdict.
+    orch_events.append_event(ctx.store, ctx.now(), n, "review",
+                             f"Review round {round_number}: VERDICT: {review.verdict}")
     _progress(n, ctx)
     return replace(review, raw=raw, timed_out=result.timed_out)
 
@@ -2167,7 +2189,10 @@ def review_only(
                     outcome = "limit-wait"
                 finally:
                     try:
-                        ctx.store.finish_run(n, outcome=outcome, detail=detail)
+                        try:
+                            _end_phase(n, ctx)
+                        finally:
+                            ctx.store.finish_run(n, outcome=outcome, detail=detail)
                     finally:
                         kick_tick(ctx.repo_root)
     return outcome
@@ -2216,7 +2241,10 @@ def run_issue(n: int, ctx: RunContext) -> str:
         try:
             run = ctx.store.get_run(n)
             if run is not None and run.status != "finished":
-                ctx.store.finish_run(n, outcome=run.outcome or outcome, detail=detail)
+                try:
+                    _end_phase(n, ctx)
+                finally:
+                    ctx.store.finish_run(n, outcome=run.outcome or outcome, detail=detail)
         finally:
             kick_tick(ctx.repo_root)
     return outcome

@@ -1199,3 +1199,34 @@ def test_remove_blocked_by_propagates_api_failure():
     run = ScriptedRun('{"id":12345}', gh_error("HTTP 403: forbidden"))
     with pytest.raises(TrackerError, match="HTTP 403"):
         GhTracker(REPO, run).remove_blocked_by(1, 2)
+
+
+def test_gh_tracker_on_call_runs_before_every_gh_invocation_including_failures():
+    from foragent.tracker import GhTracker
+
+    events = []
+
+    def run(args, input=None):
+        events.append("run")
+        raise subprocess.CalledProcessError(1, ["gh", *args], stderr="boom")
+
+    tracker = GhTracker("owner/repo", run=run)
+    assert tracker.on_call is None  # Injected transports are not counted by default.
+    tracker.on_call = lambda: events.append("count")
+    with pytest.raises(TrackerError):
+        tracker.list_open_issues()
+    assert events == ["count", "run"]
+
+
+def test_default_gh_tracker_counts_calls_in_the_repo_state(tmp_path, monkeypatch):
+    from foragent import tracker as tracker_module
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path, now=lambda: datetime(2026, 10, 20, 9, 30, tzinfo=UTC))
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kw: store))
+    monkeypatch.setattr(tracker_module, "_run_gh", lambda args, input=None: "[]")
+    tracker = tracker_module.GhTracker("owner/repo")
+    tracker._run = tracker_module._run_gh
+    tracker.list_open_issues()
+    tracker.list_issues("closed")
+    assert store.github_calls() == [{"hour": "2026-10-20T09:00:00+00:00", "calls": 2}]

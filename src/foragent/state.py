@@ -540,6 +540,26 @@ class StateStore:
         until = datetime.fromisoformat(json.loads(value)["until"])
         return until if now < until else None
 
+    def count_github_call(self, at: datetime | None = None) -> None:
+        """Add one gh call to the counter of its UTC hour (default: now)."""
+        hour = datetime.fromisoformat(self._timestamp()) if at is None else at.astimezone(UTC)
+        hour = hour.replace(minute=0, second=0, microsecond=0).isoformat()
+        with self._state_lock():
+            counts = self._github_call_counts()
+            counts[hour] = counts.get(hour, 0) + 1
+            self._write_json(self.root / "github-calls.json", counts)
+
+    def github_calls(self) -> list[dict[str, Any]]:
+        """Return one ``{"hour", "calls"}`` record per UTC hour, oldest first."""
+        return [{"hour": hour, "calls": calls} for hour, calls in sorted(self._github_call_counts().items())]
+
+    def _github_call_counts(self) -> dict[str, int]:
+        try:
+            value = json.loads((self.root / "github-calls.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        return {str(hour): int(calls) for hour, calls in value.items()}
+
     def finish_run(self, number: int, outcome: str, detail: str = "") -> Run:
         with self._state_lock():
             run = self.get_run(number)

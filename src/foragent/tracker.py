@@ -9,6 +9,8 @@ import subprocess
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
+from foragent.state import StateStore
+
 
 IssueState = Literal["open", "closed"]
 CheckStatus = Literal["pass", "fail", "pending", "none"]
@@ -656,8 +658,14 @@ class GhTracker:
         self.repo = repo
         self._run = run or _run_gh
         self._path = f"repos/{repo}"
+        # Called once before every gh invocation; real gh calls feed the local hourly counter.
+        self.on_call: Callable[[], None] | None = (
+            None if run is not None else lambda: StateStore.for_repo(repo).count_github_call()
+        )
 
     def _call(self, args: list[str], input: str | None = None) -> str:
+        if self.on_call is not None:
+            self.on_call()
         try:
             return self._run(args, input=input)
         except subprocess.CalledProcessError as exc:

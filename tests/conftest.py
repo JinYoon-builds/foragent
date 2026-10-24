@@ -27,6 +27,24 @@ def isolated_test_slots(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_github_call_counter(tmp_path, monkeypatch):
+    """Count real-GhTracker calls in a temporary store unless a test injects its own."""
+    from foragent import tracker
+    from foragent.state import StateStore
+
+    original = StateStore.__dict__["for_repo"]
+
+    class CounterStores:
+        @staticmethod
+        def for_repo(repo, **kwargs):
+            if StateStore.__dict__["for_repo"] is not original:
+                return StateStore.for_repo(repo, **kwargs)
+            return StateStore(tmp_path / "github-call-state" / repo.replace("/", "__"), **kwargs)
+
+    monkeypatch.setattr(tracker, "StateStore", CounterStores)
+
+
+@pytest.fixture(autouse=True)
 def kicks(monkeypatch):
     """Record event hooks without starting background ticks in any test."""
     from foragent import cli, orch, order, runner

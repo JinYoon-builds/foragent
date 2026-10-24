@@ -655,3 +655,17 @@ def test_refresh_preserves_each_kind_of_concurrent_local_write(store, method, fi
     store.refresh_local_issues([human], [], {}, NOW + timedelta(minutes=5), since_revision=revision)
     row, = writer.local_issues()
     assert (row["title"], row["labels"], row["state"]) == ("Human revision", ["needs-human"], "closed")
+
+
+def test_github_calls_counts_one_record_per_utc_hour(tmp_path):
+    clock = [datetime(2026, 10, 20, 9, 59, tzinfo=timezone(timedelta(hours=9)))]
+    store = StateStore(tmp_path, now=lambda: clock[0])
+    assert store.github_calls() == []
+    store.count_github_call()
+    store.count_github_call(datetime(2026, 10, 20, 0, 5, tzinfo=UTC))
+    clock[0] += timedelta(minutes=1)
+    store.count_github_call()
+    assert StateStore(tmp_path).github_calls() == [
+        {"hour": "2026-10-20T00:00:00+00:00", "calls": 2},
+        {"hour": "2026-10-20T01:00:00+00:00", "calls": 1},
+    ]
