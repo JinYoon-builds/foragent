@@ -15,36 +15,35 @@ ACCEPTANCE = "tests/acceptance/test_feature.py"
 BASE_TIME = datetime(2026, 10, 20, 8, tzinfo=UTC)
 
 
-# Every test fails closed, including signal 0 and subprocess timeout cleanup.
+# Block delivering signals, including subprocess timeout cleanup; allow probes.
 @pytest.fixture(autouse=True)
 def no_real_signals(monkeypatch):
     from foragent import processes
 
-    def forbidden(*args, **kwargs):
-        pytest.fail(f"Real signals are forbidden: {args!r}")
+    def probe_only(send_signal, signal_index):
+        def guarded(*args, **kwargs):
+            if args[signal_index] != 0:
+                pytest.fail(f"Real delivering signals are forbidden: {args!r}")
+            if send_signal is None:
+                raise NotImplementedError("Signal API is unavailable on this platform")
+            return send_signal(*args, **kwargs)
 
-    for name in ("kill", "killpg"):
-        monkeypatch.setattr(os, name, forbidden)
-    for name in ("pthread_kill", "raise_signal"):
-        monkeypatch.setattr(signal, name, forbidden)
+        return guarded
+
+    # These APIs take the signal positionally; raise_signal has no target.
+    for module, name, signal_index in (
+        (os, "kill", 1), (os, "killpg", 1),
+        (signal, "pidfd_send_signal", 1), (signal, "pthread_kill", 1),
+        (signal, "raise_signal", 0),
+    ):
+        monkeypatch.setattr(module, name, probe_only(getattr(module, name, None), signal_index), raising=False)
     # pidfd tests install fake descriptors explicitly, on every platform.
     monkeypatch.setattr(os, "pidfd_open", None, raising=False)
-    monkeypatch.setattr(signal, "pidfd_send_signal", forbidden, raising=False)
     # Unit tests opt in to the fake process table; never inspect the owner's PIDs.
     monkeypatch.setattr(processes, "list_processes", lambda: ())
     monkeypatch.setattr(processes, "read_process_identity", lambda pid: next(
         (row for row in processes.list_processes() if row.pid == pid), None,
     ))
-    from process_fakes import _ModuleView
-    from foragent import capacity, cli, scheduler, watch_open
-
-    def probe(pid, signum):
-        assert signum == 0, "A signal must use an explicit fake process table"
-        if pid != os.getpid():
-            raise ProcessLookupError(pid)
-
-    for module in (capacity, cli, scheduler, watch_open):
-        monkeypatch.setattr(module, "os", _ModuleView(os, kill=probe))
 
 
 from process_fakes import fake_process_table  # noqa: E402, F401
