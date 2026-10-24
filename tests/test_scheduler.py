@@ -1218,6 +1218,38 @@ def test_start_rechecks_local_eligibility_after_collecting_ready_issues(ctx, mon
         assert calls == [1, 1]
 
 
+@pytest.mark.parametrize("missing_at", ["before-live-read", "before-reservation"])
+def test_start_keeps_live_issue_when_local_snapshot_row_is_missing(ctx, monkeypatch, missing_at):
+    from foragent import scheduler
+
+    approve(ctx)
+    tick(ctx)
+    if missing_at == "before-live-read":
+        ctx.store.drop_missing_github_issue(1)
+    else:
+        prerequisites = scheduler._check_prerequisites
+
+        def check(*args, **kwargs):
+            result = prerequisites(*args, **kwargs)
+            ctx.store.drop_missing_github_issue(1)
+            return result
+
+        monkeypatch.setattr(scheduler, "_check_prerequisites", check)
+    launched = []
+    ctx.launcher = lambda number: launched.append(number) or 7000 + number
+    report = scheduler.TickReport()
+
+    started = scheduler._start_ready(
+        ctx, {"main": [1]}, lambda issue: issue_lane(issue.labels, ctx.config.lanes),
+        "origin/main", report, ("normal", 0.0),
+    )
+
+    assert started is True
+    assert launched == [1]
+    assert ctx.store.get_run(1).status == "running"
+    assert ctx.tracker.get_issue(1).labels == {"approved", "running"}
+
+
 def test_flag_only_changes_labels_and_posts_a_reason(ctx):
     approve(ctx, labels=["ready", "running"])
     original = ctx.tracker.get_issue(1)
@@ -1813,6 +1845,43 @@ def test_orphan_recovery_rechecks_local_labels_before_recording_a_crash(ctx, mon
     assert issue.labels == {"approved", "blocked"}
     assert (store.root / "runs.jsonl").read_text() == history
     assert report.actions == []
+
+
+@pytest.mark.parametrize("action", ["orphan", "crash", "blocker"])
+def test_recovery_keeps_supplied_issue_when_local_snapshot_row_is_missing(ctx, action):
+    from foragent.scheduler import TickReport, _escalate_overdue_blocker, _recover_orphan, _restore_after_crash
+
+    # Seed and read through the raw tracker so no recorder has observed the issue.
+    tracker = ctx.tracker._tracker
+    tracker.add_issue(1, "Issue 1", BODY, labels=["blocked" if action == "blocker" else "running"])
+    tracker.record_label(1, "approved", "human")
+    issue = tracker.get_issue(1)
+    assert ctx.store.local_issues() == []
+    report = TickReport()
+    if action == "orphan":
+        path = ctx.store.worktree_path(1)
+        ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+        ctx.store.start_run(1, branch="foragent/issue-1", worktree=path)
+        ctx.store.finish_run(1, "error")
+
+        recovered = _recover_orphan(ctx, issue, report)
+
+        assert not path.exists()
+        assert recovered.labels == {"approved", "ready"}
+        assert ctx.store.get_run(1).outcome == "crashed"
+    elif action == "crash":
+        _restore_after_crash(ctx, issue, report)
+
+        assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
+        assert report.actions == ["#1 returned to ready after runner crash"]
+    else:
+        ctx.now = lambda: NOW + timedelta(minutes=ctx.config.orchestrator_timeout_minutes + 1)
+
+        current = _escalate_overdue_blocker(ctx, issue, report)
+
+        assert current is issue
+        assert ctx.store.local_issues() == []
+        assert report.actions == []
 
 
 @pytest.mark.parametrize("change", ["blocked", "needs-human", "closed", "finished"])

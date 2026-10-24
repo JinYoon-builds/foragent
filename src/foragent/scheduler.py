@@ -228,14 +228,14 @@ def _crash_detail(ctx: TickContext, number: int) -> str:
 
 
 def _local_issue(ctx: TickContext, number: int) -> Issue | None:
-    """Re-read runner writes; a tick's issue list can be minutes old."""
+    """Read newer runner writes; a missing row supplies no update to caller facts."""
     return next((issue for issue in local_issue_models(ctx.store) if issue.number == number), None)
 
 
 def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> None:
     number = issue.number
-    issue = _local_issue(ctx, number)
-    if issue is None or RUNNING not in issue.labels:
+    issue = _local_issue(ctx, number) or issue
+    if RUNNING not in issue.labels:
         return
     if issue.state != "open" or issue.labels & {BLOCKED, NEEDS_HUMAN}:
         ctx.tracker.remove_labels(number, [RUNNING])
@@ -271,10 +271,8 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
                      "Runner crashed; returned to ready for restart.")
 
 
-def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue | None:
-    issue = _local_issue(ctx, issue.number)
-    if issue is None:
-        return None
+def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
+    issue = _local_issue(ctx, issue.number) or issue
     run = ctx.store.get_run(issue.number)
     if ctx.store.run_start_pending(issue.number):
         if run is None or run.status != "running":
@@ -505,13 +503,13 @@ def tick(ctx: TickContext) -> TickReport:
             return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
 
 
-def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue | None:
-    issue = _local_issue(ctx, issue.number)
-    if issue is None or issue.state != "open" or BLOCKED not in issue.labels or NEEDS_HUMAN in issue.labels:
+def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
+    issue = _local_issue(ctx, issue.number) or issue
+    if issue.state != "open" or BLOCKED not in issue.labels or NEEDS_HUMAN in issue.labels:
         return issue
-    row = next(row for row in ctx.store.local_issues() if row["number"] == issue.number)
+    row = next((row for row in ctx.store.local_issues() if row["number"] == issue.number), {})
     comments = [
-        comment for comment in (Comment(**item) for item in row["comments"])
+        comment for comment in (Comment(**item) for item in row.get("comments", []))
         if re.fullmatch(
             r"<!-- foragent:blocked reason=[a-z-]+ -->",
             comment.body.partition("\n")[0].removesuffix("\r"),
@@ -741,10 +739,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         if issue.state != "open":
             continue
         issue = _recover_orphan(ctx, issue, report)
-        if issue is None:
-            continue
         issue = _escalate_overdue_blocker(ctx, issue, report)
-        if issue is None or issue.state != "open":
+        if issue.state != "open":
             continue
         lane = lane_for(issue)
         waiting_labels = issue.labels & {BLOCKED, NEEDS_HUMAN}
@@ -878,9 +874,9 @@ def _start_ready(
     report: TickReport, sample: tuple[str, float] | None = None,
 ) -> bool | None:
     """Start ready lanes within the machine budget; None means a GitHub wait began."""
-    def eligible(issue: Issue | None, lane: str) -> bool:
+    def eligible(issue: Issue, lane: str) -> bool:
         return (
-            issue is not None and issue.state == "open" and not issue.is_pull_request
+            issue.state == "open" and not issue.is_pull_request
             and {APPROVED, READY}.issubset(issue.labels)
             and not issue.labels & {BLOCKED, NEEDS_HUMAN, RUNNING} and lane_for(issue) == lane
         )
@@ -893,7 +889,8 @@ def _start_ready(
         if ctx.store.lane_paused(lane, ctx.now()):
             continue
         for number in ready[lane]:
-            if not eligible(_local_issue(ctx, number), lane):
+            local = _local_issue(ctx, number)
+            if local is not None and not eligible(local, lane):
                 continue
             issue = ctx.tracker.get_issue(number)
             if not eligible(issue, lane):
@@ -909,7 +906,7 @@ def _start_ready(
             if not _check_prerequisites(ctx, issue, approval, report):
                 continue
 
-            if not eligible(_local_issue(ctx, number), lane):
+            if not eligible(_local_issue(ctx, number) or issue, lane):
                 continue
             if not _reserve_slot(ctx, number, budget):
                 return started
