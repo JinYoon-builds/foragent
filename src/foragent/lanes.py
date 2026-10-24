@@ -6,7 +6,7 @@ import re
 
 import yaml
 
-from foragent.config import Config, _read_yaml, _validate, load_config
+from foragent.config import Config, LaneSettings, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
@@ -69,8 +69,6 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"lanes add must run on the base branch {config.base_branch!r}")
-    for identity in skills:
-        manager.install(identity, root)
     lane = {"paths": paths, "agent": f"fa-{name}", "skills": installed}
     if executor is not None:
         lane["executor"] = executor
@@ -79,10 +77,13 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     for key, value in (("title", title), ("emoji", emoji)):
         if value is not None:
             lane[key] = value
-    local = _read_yaml(root / ".foragent.yml")
-    local["lanes"] = {**config.lanes, name: lane}
-    _validate({**asdict(config), "lanes": local["lanes"]})
-    (root / ".foragent.yml").write_text(yaml.safe_dump(local, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    _validate({**asdict(config), "lanes": {**config.lanes, name: lane}})
+    settings = LaneSettings(repo_path(root, ".foragent.yml"))
+    settings.add_lane(name, lane, config.lanes)
+    settings.check()
+    for identity in skills:
+        manager.install(identity, root)
+    settings.save()
     areas = ", ".join(paths)
     # Keep the agent definition readable and its skill list inline.
     header = yaml.safe_dump({
@@ -130,14 +131,15 @@ def set_lane_skills(root: Path, name: str, skills: list[str], *,
     manager = manager or (SkillManager(config) if skills else None)
     installed = _check_skills(root, skills, manager)
     lane["skills"] = installed
-    local = _read_yaml(repo_path(root, ".foragent.yml"))
-    local["lanes"] = {**config.lanes, name: lane}
-    _validate({**asdict(config), "lanes": local["lanes"]})
+    _validate({**asdict(config), "lanes": {**config.lanes, name: lane}})
+    settings = LaneSettings(repo_path(root, ".foragent.yml"))
+    settings.set_skills(name, installed, lane, config.lanes)
+    settings.check()
     header["skills"] = installed
     agent_content = ("---\n" + yaml.safe_dump(header, sort_keys=False, allow_unicode=True)
                      + "---\n" + content[match.end():])
     for identity in skills:
         manager.install(identity, root)
-    (root / ".foragent.yml").write_text(yaml.safe_dump(local, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    settings.save()
     agent.write_text(agent_content, encoding="utf-8")
     return lane
