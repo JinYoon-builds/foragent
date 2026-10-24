@@ -9,8 +9,9 @@ from foragent.executors import classify_result
 from foragent.issue import parse_body
 from foragent.labels import attempt_tier, issue_size
 from foragent.reasons import Reason
-from foragent.run_attempt import CIFailure, ExecutorStopped, Implementation
+from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation
 from foragent.run_baseline import _capture_acceptance_baseline
+from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
 from foragent.run_lane_skills import _lane_notes, _lane_skills
 from foragent.run_prompts import build_prompt, build_resume_prompt
@@ -48,7 +49,13 @@ def _prepare_implementation(
     baseline_test_command = ctx.config.test_command
     if baseline_test_command is None:
         baseline_test_command = next(iter(runner.detect_test_commands(worktree)), None)
-    baseline = _capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
+    try:
+        baseline = _capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
+    except AttemptFailure as exc:
+        _append(log, str(exc))
+        reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+        flag(ctx, n, reason, "acceptance baseline unavailable", str(exc))
+        raise ExecutorStopped(reason.value, str(exc)) from exc
     return Implementation(
         n=n,
         ctx=ctx,

@@ -16,9 +16,9 @@ import tempfile
 from typing import TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
-from foragent.run_attempt import ExecutorStopped
-from foragent.run_checks import _append, _passing_acceptance_ids, _pytest_command
-from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot, _timeout
+from foragent.run_attempt import AttemptFailure
+from foragent.run_checks import _append, _passing_acceptance_ids, _pytest_command, junit_node_id
+from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot
 from foragent.state import StateStore
 
 if TYPE_CHECKING:
@@ -55,8 +55,20 @@ def _capture_acceptance_baseline(
         _append(log, f"Acceptance baseline skipped (count=0): {reason}")
         return None
     base_sha = ctx.git.ref_sha(target_ref)
+    merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
+    owners: dict[str, set[int]] = {}
+    for path in (ctx.store.root / "approvals").glob("*.json"):
+        approval = ctx.store.load_approval(int(path.stem))
+        if approval is None or approval.number in merged:
+            continue
+        for name in approval.acceptance_blobs:
+            owners.setdefault(name, set()).add(approval.number)
+    excluded = sorted(name for name in owners if ctx.git.blob_sha(base_sha, name) is not None)
+    open_issues = sorted({number for name in excluded for number in owners[name]})
+    _append(log, f"Acceptance baseline skipped {len(excluded)} files owned by open issues: "
+                 + " ".join(f"#{number}" for number in open_issues))
     key = sha256(json.dumps(
-        [base_sha, test_command, ctx.config.acceptance_dir, _baseline_environment(ctx.repo_root)],
+        [base_sha, test_command, ctx.config.acceptance_dir, _baseline_environment(ctx.repo_root), excluded],
         sort_keys=True,
     ).encode()).hexdigest()
     # Repository stores share this parent (normally ~/.local/share/foragent).
@@ -93,8 +105,9 @@ def _capture_acceptance_baseline(
                     _append(log, "Acceptance baseline skipped (count=0): acceptance directory does not exist")
                     return None
                 if runner._remaining(n, ctx) <= 0:
-                    raise ExecutorStopped(_timeout(n, ctx))
+                    raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before capture")
                 selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)}"
+                selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
                 baseline_command = (
                     f"{selection} "
                     f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(report.resolve()))}"
@@ -106,6 +119,7 @@ def _capture_acceptance_baseline(
                 # Read this execution's collection count from the full log: a long
                 # traceback can push it out of CheckResult's bounded output tail.
                 collected = None
+                cacheable = False
                 try:
                     with log.open(encoding="utf-8", errors="replace") as stream:
                         stream.seek(offset)
@@ -127,22 +141,34 @@ def _capture_acceptance_baseline(
                     expected_exit = int(any(case.find(tag) is not None
                                             for case in junit.iter("testcase")
                                             for tag in ("failure", "error")))
+                    # Ignoring all locked files can leave a valid, empty suite.
+                    if recorded == 0 and result.exit_code == 5:
+                        expected_exit = 5
                     # --continue-on-collection-errors can make collection failures exit 1.
                     collection_errors = junit.find(".//error[@message='collection failure']") is not None
+                    usable_report = (junit.getroot().tag in {"testsuites", "testsuite"}
+                                     and all(junit_node_id(case) is not None for case in junit.iter("testcase")))
                 except (OSError, ET.ParseError) as exc:
                     _append(log, f"Acceptance baseline count=0: no usable JUnit report ({exc})")
                     node_ids = ()
                 else:
                     # JUnit and the exit status are the subprocess contract;
                     # terminal collection output is an optional cross-check.
-                    if (not result.timed_out and result.exit_code == expected_exit and not collection_errors
-                            and (collected is None or collected == recorded)):
+                    cacheable = (usable_report and not result.timed_out
+                            and result.exit_code == expected_exit and not collection_errors
+                            and (collected is None or collected == recorded))
+                    if cacheable:
                         cache._atomic_write(cached_ids, json.dumps({
                             "node_ids": node_ids, "created_at": ctx.now().isoformat(),
                         }) + "\n")
                     else:
                         _append(log, f"Acceptance baseline not cached: collected={collected}, recorded={recorded}")
                 _append(log, f"Acceptance baseline count={len(node_ids)}, exit_code={result.exit_code}, timed_out={result.timed_out}")
+                if not cacheable:
+                    raise AttemptFailure(
+                        f"acceptance baseline unavailable: exit_code={result.exit_code}, timed_out={result.timed_out}; "
+                        "capture did not produce a complete, usable JUnit report"
+                    )
                 return AcceptanceBaseline(command, node_ids)
             finally:
                 ctx.git.remove_worktree(worktree)
