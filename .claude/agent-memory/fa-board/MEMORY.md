@@ -19,3 +19,4 @@
 - init은 남의 보드를 처음 받아들일 때만 `board_map`을 저장한다(`board_id != config.board`이고 `board.ensure(..., created=set)`에 없을 때). 칸이 Foragent 다섯 칸과 같으면 묻지 않고 `DEFAULT_MAP`을 저장한다. 새로 만든 보드와 이미 저장된 보드는 설정을 다시 쓰지 않는다(`test_board_default_is_persisted_and_idempotent`).
 - 리뷰가 "acceptance 파일 삭제"를 지적하면 `git diff --name-status HEAD origin/main -- <file>`을 본다. `A`면 기준 커밋 뒤 main에 추가된 파일이므로 `.foragent/REBUTTAL.md`로 반박한다.
 - main을 병합하면 새로 들어온 보드 테스트가 옛 상태 이름(`"Ready"`, `"PR open"`)을 기대하는 경우가 있다. #184 뒤로 보드 값은 칸 이름이다. 기대값은 `board.board_column(state)`로 쓰고, 같은 칸 안의 이동(Approved→Ready)은 쓰기가 없어야 한다. 테스트 이름은 유지한다.
+- 리뷰가 "내가 안 건드린 파일의 삭제"를 지적하면 `git diff origin/main...HEAD -- <file>`(점 세 개, 브랜치 쪽 변경만)으로 확인한다. 비어 있으면 main이 앞서간 것이다. `git merge`는 권한이 막혀 있으므로 `git log HEAD..origin/main`의 커밋을 `git cherry-pick --no-commit` 후 `git reset -q`로 가져온다.

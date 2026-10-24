@@ -4,6 +4,8 @@ Ideas Jin wants to keep but not order yet. An idea moves to `decisions.md` when 
 
 ## 2026-10-24
 
+- **One merge path (retire premerge as a separate command).** The regression check on the merged result is always needed (industry: merge queues — GitHub Merge Queue, GitLab merge trains, Bors, Zuul). But today it exists twice: inside the runner (gate merges) and in `fa orch premerge` (human or outside merges), and the copies drift (premerge missed test slots, #331). Let people only approve ("merge when ready") and let the runner do every merge, like GitHub Merge Queue; then one check, no premerge command. After #331.
+
 - **Smaller squirrel pixels.** Jin finds the pixels large. Quadrant (2x2) and sextant (2x3) glyphs were previewed on 2026-10-24 and break the art (two colours per cell smear outlines and eyes), so keep half blocks. If size still matters, redraw smaller sprites in the same half-block style (e.g. orchestrator 18x15 to about 12x10) in a design session with 2-3 drafts side by side (D72).
 
 - **Architect squirrel in the lane view (D82).** Appears only while the architect is called, with one line on what it examines ("runner.py: 7 issues waiting — reviewing structure"), leaves its result (e.g. "2 tidy orders proposed") in Jin's decision list, then disappears. Normally only a status-line count ("next tidy in 12 merges"). Visually distinct from the big orchestrator squirrel (#311), e.g. glasses or a blueprint; the look is Jin's call. After #157.
