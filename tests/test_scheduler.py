@@ -74,6 +74,43 @@ def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
     ctx.tracker.record_label(number, "approved", actor)
 
 
+@pytest.mark.parametrize("floor,pressure,expected", [(2, "warn", 2), (2, "critical", 1), (1, "warn", 1)])
+def test_tick_applies_configured_test_slots_floor_without_starting_runs(ctx, monkeypatch, floor, pressure, expected):
+    from foragent import capacity
+
+    ctx.config = replace(ctx.config, test_slots=2, test_slots_floor=floor)
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(pressure, 0.5, 60))
+    capacity.write_state(ctx.store, 4, NOW)
+    assert tick(ctx).skipped is None
+    assert capacity.effective_test_slots(2) == expected
+    rows = [json.loads(line) for line in (capacity.machine_root() / capacity.HISTORY_FILE).read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["wanted"] == 1 and rows[0]["to"] == expected
+    assert rows[0]["swapins"] == 60
+    assert capacity.read_state(ctx.store) == {"parallel": 4, "changed_at": NOW.isoformat()}
+
+
+@pytest.mark.parametrize("floor,pressure,expected", [(3, "warn", 3), (3, "critical", 1), (1, "warn", 1)])
+def test_tick_applies_configured_parallel_floor_when_starting_workers(ctx, monkeypatch, floor, pressure, expected):
+    from foragent import capacity
+
+    lanes = {f"lane-{number}": {} for number in range(1, 5)}
+    ctx.config = replace(ctx.config, parallel_floor=floor, max_parallel=3, test_slots=1, lanes=lanes)
+    for number in range(1, 5):
+        approve(ctx, number, labels=[f"lane:lane-{number}"])
+    capacity.write_state(ctx.store, 3, NOW)
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(pressure, 0.5, 60))
+    ctx.start_runs = True
+    assert tick(ctx).skipped is None
+    assert len(ctx.store.active_runs()) == expected
+    assert capacity.read_state(ctx.store)["parallel"] == expected
+    rows = [json.loads(line) for line in (ctx.store.root.parent / capacity.HISTORY_FILE).read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["budget"] == "parallel"
+    assert rows[0]["wanted"] == 1 and rows[0]["to"] == expected
+    assert rows[0]["swapins"] == 60
+
+
 @pytest.mark.parametrize("needs_human", [False, True])
 def test_refresh_populates_blocker_evidence_and_listing_stays_offline(ctx, monkeypatch, needs_human):
     from foragent import orch
@@ -1161,6 +1198,95 @@ def test_issue_must_still_be_eligible_before_start(ctx, monkeypatch, change):
     assert ctx.store.active_runs() == []
 
 
+@pytest.mark.parametrize("during", ["budget", "prerequisites"])
+@pytest.mark.parametrize("change", ["blocked", "closed", "running", "unapproved"])
+def test_start_rechecks_local_eligibility_after_collecting_ready_issues(ctx, monkeypatch, during, change):
+    from foragent import scheduler
+
+    approve(ctx)
+    tick(ctx)
+    ctx.start_runs = True
+    launches = []
+    ctx.launcher = launches.append
+    store = StateStore(ctx.store.root)
+
+    def update_local():
+        # The remote deliberately stays ready: the runner's local write is truth.
+        if change == "closed":
+            store.update_local_issue(1, state="closed")
+        else:
+            store.record_labels(1, ["ready", "approved"] if change == "unapproved" else ["ready"],
+                                remove=True, lanes=ctx.config.lanes)
+            if change != "unapproved":
+                store.record_labels(1, [change], remove=False, lanes=ctx.config.lanes)
+
+    if during == "budget":
+        budget = scheduler._machine_budget
+
+        def machine_budget(*args):
+            result = budget(*args)
+            update_local()
+            return result
+
+        monkeypatch.setattr(scheduler, "_machine_budget", machine_budget)
+    else:
+        prerequisites = scheduler._check_prerequisites
+        calls = []
+
+        def check(*args, **kwargs):
+            result = prerequisites(*args, **kwargs)
+            calls.append(args[1].number)
+            if len(calls) == 2:  # The live pre-start check, after the promotion check.
+                update_local()
+            return result
+
+        monkeypatch.setattr(scheduler, "_check_prerequisites", check)
+
+    tick(ctx)
+
+    assert launches == []
+    assert ctx.store.active_runs() == []
+    row, = store.local_issues()
+    if change == "closed":
+        assert row["state"] == "closed"
+    else:
+        assert "ready" not in row["labels"]
+    if during == "prerequisites":
+        assert calls == [1, 1]
+
+
+@pytest.mark.parametrize("missing_at", ["before-live-read", "before-reservation"])
+def test_start_keeps_live_issue_when_local_snapshot_row_is_missing(ctx, monkeypatch, missing_at):
+    from foragent import scheduler
+
+    approve(ctx)
+    tick(ctx)
+    if missing_at == "before-live-read":
+        ctx.store.drop_missing_github_issue(1)
+    else:
+        prerequisites = scheduler._check_prerequisites
+
+        def check(*args, **kwargs):
+            result = prerequisites(*args, **kwargs)
+            ctx.store.drop_missing_github_issue(1)
+            return result
+
+        monkeypatch.setattr(scheduler, "_check_prerequisites", check)
+    launched = []
+    ctx.launcher = lambda number: launched.append(number) or 7000 + number
+    report = scheduler.TickReport()
+
+    started = scheduler._start_ready(
+        ctx, {"main": [1]}, lambda issue: issue_lane(issue.labels, ctx.config.lanes),
+        "origin/main", report, ("normal", 0.0),
+    )
+
+    assert started is True
+    assert launched == [1]
+    assert ctx.store.get_run(1).status == "running"
+    assert ctx.tracker.get_issue(1).labels == {"approved", "running"}
+
+
 def test_flag_only_changes_labels_and_posts_a_reason(ctx):
     approve(ctx, labels=["ready", "running"])
     original = ctx.tracker.get_issue(1)
@@ -1736,6 +1862,121 @@ def test_orphan_running_without_record_returns_to_ready(ctx, approved):
     assert len(ctx.store.read_history()) == 1
 
 
+def test_orphan_recovery_rechecks_local_labels_before_recording_a_crash(ctx, monkeypatch):
+    from foragent.scheduler import TickReport, _recover_orphan
+
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx)
+    stale = ctx.tracker.get_issue(1)
+    store = StateStore(ctx.store.root)
+    store.finish_run(1, "timeout")
+    store.record_labels(1, ["blocked"], remove=False, lanes=ctx.config.lanes)
+    store.record_labels(1, ["running"], remove=True, lanes=ctx.config.lanes)
+    history = (store.root / "runs.jsonl").read_text()
+    monkeypatch.setattr(ctx.tracker, "get_issue", lambda n: pytest.fail("Recheck must be local"))
+    report = TickReport()
+
+    issue = _recover_orphan(ctx, stale, report)
+
+    assert issue.labels == {"approved", "blocked"}
+    assert (store.root / "runs.jsonl").read_text() == history
+    assert report.actions == []
+
+
+@pytest.mark.parametrize("action", ["orphan", "crash", "blocker"])
+def test_recovery_keeps_supplied_issue_when_local_snapshot_row_is_missing(ctx, action):
+    from foragent.scheduler import TickReport, _escalate_overdue_blocker, _recover_orphan, _restore_after_crash
+
+    # Seed and read through the raw tracker so no recorder has observed the issue.
+    tracker = ctx.tracker._tracker
+    tracker.add_issue(1, "Issue 1", BODY, labels=["blocked" if action == "blocker" else "running"])
+    tracker.record_label(1, "approved", "human")
+    issue = tracker.get_issue(1)
+    assert ctx.store.local_issues() == []
+    report = TickReport()
+    if action == "orphan":
+        path = ctx.store.worktree_path(1)
+        ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+        ctx.store.start_run(1, branch="foragent/issue-1", worktree=path)
+        ctx.store.finish_run(1, "error")
+
+        recovered = _recover_orphan(ctx, issue, report)
+
+        assert not path.exists()
+        assert recovered.labels == {"approved", "ready"}
+        assert ctx.store.get_run(1).outcome == "crashed"
+    elif action == "crash":
+        _restore_after_crash(ctx, issue, report)
+
+        assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
+        assert report.actions == ["#1 returned to ready after runner crash"]
+    else:
+        ctx.now = lambda: NOW + timedelta(minutes=ctx.config.orchestrator_timeout_minutes + 1)
+
+        current = _escalate_overdue_blocker(ctx, issue, report)
+
+        assert current is issue
+        assert ctx.store.local_issues() == []
+        assert report.actions == []
+
+
+@pytest.mark.parametrize("change", ["blocked", "needs-human", "closed", "finished"])
+def test_crash_restore_rechecks_local_issue_before_changing_labels(ctx, change):
+    from foragent.scheduler import TickReport, _restore_after_crash
+
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx)
+    stale = ctx.tracker.get_issue(1)
+    store = StateStore(ctx.store.root)
+    if change == "closed":
+        store.update_local_issue(1, state="closed")
+    else:
+        store.record_labels(1, ["ready"], remove=True, lanes=ctx.config.lanes)
+        store.record_labels(1, ["blocked" if change == "finished" else change],
+                            remove=False, lanes=ctx.config.lanes)
+    if change == "finished":
+        store.finish_run(1, "timeout")
+        store.record_labels(1, ["running"], remove=True, lanes=ctx.config.lanes)
+    report = TickReport()
+
+    _restore_after_crash(ctx, stale, report)
+
+    row, = store.local_issues()
+    assert not set(row["labels"]) & {"ready", "running"}
+    assert report.actions == []
+    assert recovery_events(ctx) == []
+
+
+def test_runner_finishing_during_process_probe_is_not_recovered(ctx, monkeypatch):
+    from foragent.scheduler import TickReport, _recover_runs
+
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx)
+    store = StateStore(ctx.store.root)
+    probes, killed = [], []
+
+    def finish(pid, sig):
+        probes.append((pid, sig))
+        store.finish_run(1, "timeout")
+        store.record_labels(1, ["blocked"], remove=False, lanes=ctx.config.lanes)
+        store.record_labels(1, ["running"], remove=True, lanes=ctx.config.lanes)
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr("foragent.scheduler.os.kill", finish)
+    ctx.kill_runner = killed.append
+    report = TickReport()
+
+    _recover_runs(ctx, report)
+
+    assert probes == [(123, 0)]
+    assert killed == []
+    assert report.actions == []
+    assert [run.outcome for run in store.read_history()] == ["timeout"]
+
+
 def test_two_distinct_orphan_running_labels_count_as_consecutive_crashes(ctx):
     approve(ctx, labels=["running"])
     tick(ctx)
@@ -2135,6 +2376,32 @@ def test_overdue_blocker_escalation_is_journaled_once(ctx):
     assert "needs-human" in ctx.tracker.get_issue(1).labels
     tick(ctx)
     assert recovery_events(ctx) == events
+
+
+@pytest.mark.parametrize("change", ["ready", "closed", "needs-human"])
+def test_blocker_escalation_rechecks_local_state_before_escalating(ctx, change):
+    from foragent.scheduler import TickReport, _escalate_overdue_blocker
+
+    approve(ctx)
+    tick(ctx)
+    flag(ctx, 1, Reason.STALLED, "Runner stalled again.")
+    stale = ctx.tracker.get_issue(1)
+    ctx.now = lambda: NOW + timedelta(minutes=ctx.config.orchestrator_timeout_minutes + 1)
+    store = StateStore(ctx.store.root)
+    if change == "closed":
+        store.update_local_issue(1, state="closed")
+    else:
+        if change == "ready":
+            store.record_labels(1, ["blocked"], remove=True, lanes=ctx.config.lanes)
+        store.record_labels(1, [change], remove=False, lanes=ctx.config.lanes)
+    before = store.local_issues()
+    report = TickReport()
+
+    _escalate_overdue_blocker(ctx, stale, report)
+
+    assert store.local_issues() == before
+    assert report.actions == []
+    assert recovery_events(ctx) == []
 
 
 def test_project_ceiling_counts_only_this_repositorys_runs(ctx, tmp_path):

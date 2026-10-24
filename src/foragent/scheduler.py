@@ -14,7 +14,8 @@ import subprocess
 from foragent import board, orch_github, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.capacity import (
-    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, machine_load, machine_lock, machine_runs, next_parallel, read_state,
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, decrease_allowed,
+    machine_load, machine_lock, machine_runs, next_parallel, read_state,
     update_test_slots, write_state,
 )
 from foragent.config import Config, in_run_hours
@@ -227,8 +228,16 @@ def _crash_detail(ctx: TickContext, number: int) -> str:
     return f"Crash recovery for running label generation {generation}."
 
 
+def _local_issue(ctx: TickContext, number: int) -> Issue | None:
+    """Read newer runner writes; a missing row supplies no update to caller facts."""
+    return next((issue for issue in local_issue_models(ctx.store) if issue.number == number), None)
+
+
 def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> None:
     number = issue.number
+    issue = _local_issue(ctx, number) or issue
+    if RUNNING not in issue.labels:
+        return
     if issue.state != "open" or issue.labels & {BLOCKED, NEEDS_HUMAN}:
         ctx.tracker.remove_labels(number, [RUNNING])
         return
@@ -264,6 +273,7 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
 
 
 def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
+    issue = _local_issue(ctx, issue.number) or issue
     run = ctx.store.get_run(issue.number)
     if ctx.store.run_start_pending(issue.number):
         if run is None or run.status != "running":
@@ -344,6 +354,10 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 dead = False
             else:
                 dead = False
+        # The runner may have finished while another run or its process was checked.
+        run = ctx.store.get_run(run.number)
+        if run is None or run.status != "running":
+            continue
         if not dead:
             waiting = run.waiting_until is not None and ctx.now() < datetime.fromisoformat(run.waiting_until)
             runtime = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
@@ -491,11 +505,12 @@ def tick(ctx: TickContext) -> TickReport:
 
 
 def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
-    if BLOCKED not in issue.labels or NEEDS_HUMAN in issue.labels:
+    issue = _local_issue(ctx, issue.number) or issue
+    if issue.state != "open" or BLOCKED not in issue.labels or NEEDS_HUMAN in issue.labels:
         return issue
-    row = next(row for row in ctx.store.local_issues() if row["number"] == issue.number)
+    row = next((row for row in ctx.store.local_issues() if row["number"] == issue.number), {})
     comments = [
-        comment for comment in (Comment(**item) for item in row["comments"])
+        comment for comment in (Comment(**item) for item in row.get("comments", []))
         if re.fullmatch(
             r"<!-- foragent:blocked reason=[a-z-]+ -->",
             comment.body.partition("\n")[0].removesuffix("\r"),
@@ -726,6 +741,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             continue
         issue = _recover_orphan(ctx, issue, report)
         issue = _escalate_overdue_blocker(ctx, issue, report)
+        if issue.state != "open":
+            continue
         lane = lane_for(issue)
         waiting_labels = issue.labels & {BLOCKED, NEEDS_HUMAN}
         previous_flag = ctx.store.load_flag(issue.number) if waiting_labels else None
@@ -790,7 +807,10 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         return report
     # One sensor sample per tick sizes both the test slots and the run budget.
     sample = machine_load()
-    update_test_slots(ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1])
+    update_test_slots(
+        ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
+        swapins=getattr(sample, "swapins", None), floor=ctx.config.test_slots_floor,
+    )
     if not ctx.start_runs or not ready:
         return report
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
@@ -820,7 +840,8 @@ def _machine_budget(
         1 for lane, numbers in ready.items()
         if _lane_has_room(lane_runs[lane], len(numbers)) and not ctx.store.lane_paused(lane, now)
     )
-    pressure, load = sample if sample is not None else machine_load()
+    sample = sample if sample is not None else machine_load()
+    pressure, load = sample
     with machine_lock(ctx.store):
         state = read_state(ctx.store)
         current = int(state["parallel"]) if state else INITIAL_PARALLEL
@@ -828,12 +849,20 @@ def _machine_budget(
         demand = machine_runs(ctx.store, now) + waiting
         # Work only caps growth: the shared value never drops below itself for lack
         # of work here, so it stays the pressure- and load-driven value.
-        value = next_parallel(
+        wanted = next_parallel(
             current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
             ceiling=None, increase_ok=now - changed_at >= INCREASE_INTERVAL,
         )
+        if wanted < current and not decrease_allowed(state, now):
+            wanted = current
+        value = wanted if pressure == "critical" else max(ctx.config.parallel_floor, wanted)
         if state is None or value != current:
-            write_state(ctx.store, value, now)
+            decreased_at = now.astimezone(UTC).isoformat() if value < current else (state or {}).get("decreased_at")
+            write_state(ctx.store, value, now, decreased_at=decreased_at)
+        append_budget_history(
+            ctx.store.root.parent, now, "parallel", current, value,
+            pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None), wanted=wanted,
+        )
     return max(1, min(value, demand))
 
 
@@ -858,6 +887,13 @@ def _start_ready(
     report: TickReport, sample: tuple[str, float] | None = None,
 ) -> bool | None:
     """Start ready lanes within the machine budget; None means a GitHub wait began."""
+    def eligible(issue: Issue, lane: str) -> bool:
+        return (
+            issue.state == "open" and not issue.is_pull_request
+            and {APPROVED, READY}.issubset(issue.labels)
+            and not issue.labels & {BLOCKED, NEEDS_HUMAN, RUNNING} and lane_for(issue) == lane
+        )
+
     budget = _machine_budget(ctx, ready, sample)
     started = False
     for lane in sorted(ready, key=lane_order):
@@ -866,12 +902,11 @@ def _start_ready(
         if ctx.store.lane_paused(lane, ctx.now()):
             continue
         for number in ready[lane]:
+            local = _local_issue(ctx, number)
+            if local is not None and not eligible(local, lane):
+                continue
             issue = ctx.tracker.get_issue(number)
-            if (
-                issue.state != "open" or issue.is_pull_request
-                or not {APPROVED, READY}.issubset(issue.labels)
-                or issue.labels & {BLOCKED, NEEDS_HUMAN, RUNNING} or lane_for(issue) != lane
-            ):
+            if not eligible(issue, lane):
                 continue
             if not _can_start_in_lane(ctx, lane, issue, len(ready[lane])):
                 continue
@@ -884,6 +919,8 @@ def _start_ready(
             if not _check_prerequisites(ctx, issue, approval, report):
                 continue
 
+            if not eligible(_local_issue(ctx, number) or issue, lane):
+                continue
             if not _reserve_slot(ctx, number, budget):
                 return started
             try:
