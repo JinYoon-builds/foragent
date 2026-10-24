@@ -22,6 +22,7 @@ from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.processes import run_logged
+from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_checks import CheckResult, trusts_ci
@@ -131,7 +132,7 @@ def list_blocked(ctx: RunContext) -> list[dict]:
         if row["state"] != "open" or BLOCKED not in row["labels"]:
             continue
         issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
-        comments = [Comment(**item) for item in row["comments"]]
+        comments = [load_record(Comment, item) for item in row["comments"]]
         flags = [(comment, match[1]) for comment in comments
                  if (match := re.fullmatch(r"<!-- foragent:blocked reason=([a-z-]+) -->",
                                            comment.body.splitlines()[0] if comment.body else ""))]
