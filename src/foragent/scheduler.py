@@ -14,7 +14,8 @@ import subprocess
 from foragent import board, orch_github, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.capacity import (
-    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, machine_load, machine_lock, machine_runs, next_parallel, read_state,
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, decrease_allowed,
+    machine_load, machine_lock, machine_runs, next_parallel, read_state,
     update_test_slots, write_state,
 )
 from foragent.config import Config, in_run_hours
@@ -806,7 +807,10 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         return report
     # One sensor sample per tick sizes both the test slots and the run budget.
     sample = machine_load()
-    update_test_slots(ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1])
+    update_test_slots(
+        ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
+        swapins=getattr(sample, "swapins", None),
+    )
     if not ctx.start_runs or not ready:
         return report
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
@@ -836,7 +840,8 @@ def _machine_budget(
         1 for lane, numbers in ready.items()
         if _lane_has_room(lane_runs[lane], len(numbers)) and not ctx.store.lane_paused(lane, now)
     )
-    pressure, load = sample if sample is not None else machine_load()
+    sample = sample if sample is not None else machine_load()
+    pressure, load = sample
     with machine_lock(ctx.store):
         state = read_state(ctx.store)
         current = int(state["parallel"]) if state else INITIAL_PARALLEL
@@ -848,8 +853,15 @@ def _machine_budget(
             current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
             ceiling=None, increase_ok=now - changed_at >= INCREASE_INTERVAL,
         )
+        if value < current and not decrease_allowed(state, now):
+            value = current
         if state is None or value != current:
-            write_state(ctx.store, value, now)
+            decreased_at = now.astimezone(UTC).isoformat() if value < current else (state or {}).get("decreased_at")
+            write_state(ctx.store, value, now, decreased_at=decreased_at)
+            append_budget_history(
+                ctx.store.root.parent, now, "parallel", current, value,
+                pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None),
+            )
     return max(1, min(value, demand))
 
 

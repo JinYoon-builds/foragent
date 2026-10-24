@@ -1,4 +1,6 @@
 from datetime import UTC, datetime, timedelta
+import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -57,7 +59,19 @@ def test_darwin_pressure_level_reads_kernel_in_process(monkeypatch):
         raise AssertionError("memory pressure must not start a subprocess")
 
     monkeypatch.setattr(subprocess, "Popen", no_subprocess)
-    assert capacity._darwin_pressure_level() in capacity._DARWIN_PRESSURE
+    assert capacity._darwin_pressure_level() in {*capacity._DARWIN_PRESSURE, None}
+
+
+@pytest.mark.parametrize("result,expected", [(0, 2), (1, None)])
+def test_darwin_pressure_reads_sysctl_value_and_handles_errors(monkeypatch, result, expected):
+    def sysctl(name, output, size, new_value, new_size):
+        assert name == b"kern.memorystatus_vm_pressure_level"
+        assert size._obj.value == ctypes.sizeof(ctypes.c_int)
+        output._obj.value = 2
+        return result
+
+    monkeypatch.setattr(capacity.ctypes, "CDLL", lambda *args, **kwargs: SimpleNamespace(sysctlbyname=sysctl))
+    assert capacity._darwin_pressure_level() == expected
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -288,3 +302,112 @@ def test_test_slot_held_by_the_parent_command_is_not_taken_twice(monkeypatch):
         # A Done-when command that runs `fa test` inherits the slot instead of waiting forever.
         with capacity.hold_test_slot(1):
             pass
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("pgpgin 500\npswpin 7\npswpout 100\n", 7),
+    ("pswpin 0\n", 0), ("pswpin -1\n", None),
+    ("pswpin broken\n", None), ("pswpin\n", None), ("pgpgin 500\n", None),
+])
+def test_linux_swapins_reads_only_swapped_in_pages(tmp_path, monkeypatch, text, expected):
+    path = tmp_path / "vmstat"
+    path.write_text(text)
+    monkeypatch.setattr(capacity.sys, "platform", "linux")
+    monkeypatch.setattr(capacity, "Path", lambda _: path)
+    assert capacity.swapins_total() == expected
+
+
+def test_linux_swapins_unreadable_counter_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(capacity.sys, "platform", "linux")
+    monkeypatch.setattr(capacity, "Path", lambda _: tmp_path / "missing")
+    assert capacity.swapins_total() is None
+
+
+@pytest.mark.parametrize("result,expected", [(0, 2**40 + 7), (1, None)])
+def test_darwin_swapins_uses_mach_64_bit_counter_and_releases_host_port(monkeypatch, result, expected):
+    released = []
+
+    def statistics(host, flavor, output, count):
+        assert (host, flavor) == (123, 4)
+        assert count._obj.value == 38
+        output._obj.pageins = 999
+        output._obj.swapins = 2**40 + 7
+        return result
+
+    libc = SimpleNamespace(
+        mach_host_self=lambda: 123, host_statistics64=statistics,
+        mach_port_deallocate=lambda task, host: released.append((task, host)),
+    )
+    class UInt32(ctypes.c_uint):
+        @classmethod
+        def in_dll(cls, *args):
+            return SimpleNamespace(value=456)
+
+    monkeypatch.setattr(capacity.sys, "platform", "darwin")
+    monkeypatch.setattr(capacity.ctypes, "CDLL", lambda *args, **kwargs: libc)
+    monkeypatch.setattr(capacity.ctypes, "c_uint32", UInt32)
+    assert capacity.swapins_total() == expected
+    assert released == [(456, 123)]
+
+
+def test_machine_load_rebases_after_unreadable_sample_and_corrupt_state(monkeypatch):
+    total = [100]
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "warn")
+    monkeypatch.setattr(capacity, "swapins_total", lambda: total[0])
+    monkeypatch.setattr(capacity, "load_per_cpu", lambda: 0.5)
+    assert capacity.machine_load().swapins is None
+    total[0] = None
+    assert capacity.machine_load() == ("warn", 0.5)
+    total[0] = 200
+    assert capacity.machine_load().swapins is None
+    assert capacity.machine_load() == ("normal", 0.5)
+    (capacity.machine_root() / capacity.SENSOR_FILE).write_text("{broken")
+    assert capacity.machine_load() == ("warn", 0.5)
+
+
+@pytest.mark.parametrize("budget", ["parallel", "test_slots"])
+@pytest.mark.parametrize("pressure,load", [("warn", 0.5), ("critical", 0.5), ("normal", 2.0)])
+def test_budget_decreases_are_rate_limited_across_repositories(tmp_path, monkeypatch, budget, pressure, load):
+    root = capacity.machine_root()
+    root.mkdir(parents=True)
+    contexts = [budget_ctx(root, NOW), budget_ctx(root, NOW)]
+    contexts[1].store = StateStore(root / "other")
+    if budget == "parallel":
+        capacity.write_state(contexts[0].store, 8, NOW)
+    else:
+        (root / capacity.TEST_SLOTS_FILE).write_text(json.dumps({"slots": 8, "changed_at": NOW.isoformat()}))
+    monkeypatch.setattr(scheduler, "machine_load", lambda: capacity.LoadSample(pressure, load, 7))
+
+    def update(now, context):
+        if budget == "parallel":
+            context.now = lambda: now
+            return scheduler._machine_budget(context, {f"lane-{i}": [i] for i in range(8)})
+        return capacity.update_test_slots(8, now, pressure=pressure, load_per_cpu=load, swapins=7)
+
+    after = 4 if budget == "parallel" else 7
+    assert update(NOW, contexts[0]) == after
+    state_path = root / (capacity.STATE_FILE if budget == "parallel" else capacity.TEST_SLOTS_FILE)
+    unchanged_state = state_path.read_bytes()
+    unchanged_history = (root / capacity.HISTORY_FILE).read_bytes()
+    for moment in (NOW, NOW + capacity.DECREASE_INTERVAL - timedelta(microseconds=1)):
+        assert update(moment, contexts[1]) == after
+        assert state_path.read_bytes() == unchanged_state
+        assert (root / capacity.HISTORY_FILE).read_bytes() == unchanged_history
+    assert update(NOW + capacity.DECREASE_INTERVAL, contexts[1]) == (2 if budget == "parallel" else 6)
+    rows = [json.loads(line) for line in (root / capacity.HISTORY_FILE).read_text().splitlines()]
+    assert len(rows) == 2
+    assert [row["swapins"] for row in rows] == [7, 7]
+
+
+def test_test_slots_decrease_immediately_after_growth_and_retain_decrease_clock():
+    root = capacity.machine_root()
+    root.mkdir(parents=True)
+    (root / capacity.TEST_SLOTS_FILE).write_text(json.dumps({
+        "slots": 4, "changed_at": (NOW - capacity.INCREASE_INTERVAL).isoformat(),
+    }))
+    assert capacity.update_test_slots(8, NOW, pressure="normal", load_per_cpu=0.5) == 5
+    assert capacity.update_test_slots(8, NOW + timedelta(seconds=1), pressure="warn", load_per_cpu=0.5) == 4
+    state = capacity.read_test_slots()
+    grown_at = NOW + capacity.INCREASE_INTERVAL + timedelta(seconds=1)
+    assert capacity.update_test_slots(8, grown_at, pressure="normal", load_per_cpu=0.5) == 5
+    assert capacity.read_test_slots()["decreased_at"] == state["decreased_at"]
