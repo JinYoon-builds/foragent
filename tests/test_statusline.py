@@ -115,3 +115,89 @@ def test_nested_wrapper_inside_a_script_runs_previous_only_once(tmp_path):
     assert statusline.run(io.BytesIO(b"{}"), out) == 0
     assert out.getvalue() == b"mine"
     assert calls.read_text() == "x\n"
+
+
+def test_failed_settings_write_is_not_remembered_and_next_init_installs(tmp_path, monkeypatch):
+    (tmp_path / "claude").mkdir()
+    settings = statusline.claude_settings_path()
+    settings.write_text(json.dumps({"statusLine": {"type": "command", "command": "echo old"}}))
+    real_write = statusline._write_json
+
+    def settings_unwritable(path, value):
+        if path.name == "settings.json":
+            raise PermissionError(13, "Permission denied", str(path))
+        real_write(path, value)
+
+    monkeypatch.setattr(statusline, "_write_json", settings_unwritable)
+    with pytest.raises(PermissionError):
+        statusline.offer_install(lambda prompt: "y")
+    assert statusline.load_record() is None
+    assert json.loads(settings.read_text())["statusLine"]["command"] == "echo old"
+    monkeypatch.setattr(statusline, "_write_json", real_write)
+    assert statusline.offer_install(lambda prompt: "y") == "installed"
+    assert json.loads(settings.read_text())["statusLine"]["command"] == "fa statusline"
+    assert statusline.load_record() == {"enabled": True, "previous_command": "echo old"}
+
+
+def test_init_reports_failed_install_without_crashing(tmp_path, monkeypatch, capsys):
+    from foragent import cli
+
+    def unwritable(ask):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(statusline, "offer_install", unwritable)
+    cli._offer_statusline("yes")
+    assert "ask again" in capsys.readouterr().out
+
+
+def test_concurrent_init_keeps_the_first_install_and_its_previous_command(tmp_path):
+    """A second init that asked before the first finished must not save the wrapper as previous."""
+    (tmp_path / "claude").mkdir()
+    settings = statusline.claude_settings_path()
+    settings.write_text(json.dumps({"statusLine": {"type": "command", "command": "echo old"}}))
+
+    def answer_while_other_init_installs(prompt):
+        assert statusline.offer_install(lambda prompt: "y") == "installed"
+        return "y"
+
+    assert statusline.offer_install(answer_while_other_init_installs) == "kept"
+    assert statusline.load_record() == {"enabled": True, "previous_command": "echo old"}
+    assert json.loads(settings.read_text())["statusLine"]["command"] == "fa statusline"
+
+
+def test_concurrent_refusal_does_not_undo_an_install(tmp_path):
+    (tmp_path / "claude").mkdir()
+    statusline.claude_settings_path().write_text(json.dumps({}))
+
+    def refuse_after_other_init_installs(prompt):
+        assert statusline.offer_install(lambda prompt: "y") == "installed"
+        return "n"
+
+    assert statusline.offer_install(refuse_after_other_init_installs) == "kept"
+    assert statusline.load_record() == {"enabled": True, "previous_command": None}
+
+
+def test_install_waits_for_another_process_holding_the_lock(tmp_path):
+    import subprocess
+
+    (tmp_path / "claude").mkdir()
+    settings = statusline.claude_settings_path()
+    settings.write_text(json.dumps({"statusLine": {"type": "command", "command": "echo old"}}))
+    # The other process records an install inside the lock, then holds it a moment longer.
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import time; from foragent import statusline\n"
+         "with statusline._install_lock():\n"
+         "    print('held', flush=True)\n"
+         "    time.sleep(0.3)\n"
+         "    statusline._write_json(statusline.record_path(), "
+         "{'enabled': True, 'previous_command': 'echo old'})\n"
+         "    statusline._write_json(statusline.claude_settings_path(), "
+         "{'statusLine': {'type': 'command', 'command': 'fa statusline'}})\n"],
+        stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert statusline.offer_install(lambda prompt: "y") == "kept"
+    finally:
+        assert holder.wait(timeout=15) == 0
+    assert statusline.load_record() == {"enabled": True, "previous_command": "echo old"}

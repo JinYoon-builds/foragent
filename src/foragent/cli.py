@@ -538,7 +538,11 @@ def _test_command(argv: list[str]) -> int:
 
 def _offer_statusline(answer: str | None) -> None:
     from foragent import statusline
-    outcome = statusline.offer_install(input if answer is None else lambda _prompt: answer)
+    try:
+        outcome = statusline.offer_install(input if answer is None else lambda _prompt: answer)
+    except OSError as exc:
+        print(f"Claude statusline: not installed ({exc}); fa init will ask again next time.")
+        return
     if outcome == "installed":
         print("Claude statusline: installed (your previous statusline still shows).")
     elif outcome == "declined":

@@ -5,8 +5,10 @@ Account-wide files under $XDG_DATA_HOME/foragent (default ~/.local/share/foragen
   statusline-wrapper.json  {enabled: bool, previous_command: str | null}
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -117,33 +119,63 @@ def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 
+@contextmanager
+def _install_lock() -> Iterator[None]:
+    """Serialize concurrent `fa init` runs across processes for the decide-and-write step."""
+    path = data_dir() / "statusline-wrapper.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _read_settings(settings_file: Path) -> dict | None:
+    settings = _read_json(settings_file) if settings_file.exists() else {}
+    return settings if isinstance(settings, dict) else None
+
+
 def offer_install(ask: Callable[[str], str] = input) -> str:
     """Ask once whether to wrap Claude Code's statusline; remember either answer.
 
     Returns "installed", "declined", "kept" (already decided), "skipped" (no
-    usable Claude settings) or "unanswered" (no answer could be read).
+    usable Claude settings) or "unanswered" (no answer could be read). Raises
+    OSError when a file cannot be written; then nothing is remembered, so the
+    next init asks again.
     """
     if load_record() is not None:
         return "kept"
     settings_file = claude_settings_path()
-    if not settings_file.parent.is_dir():
-        return "skipped"
-    settings = _read_json(settings_file) if settings_file.exists() else {}
-    if not isinstance(settings, dict):
+    if not settings_file.parent.is_dir() or _read_settings(settings_file) is None:
         return "skipped"
     try:
         answer = ask(PROMPT)
     except (EOFError, OSError):
         return "unanswered"
-    if answer.strip().lower() not in {"y", "yes"}:
-        _write_json(record_path(), {"enabled": False, "previous_command": None})
-        return "declined"
-    current = settings.get("statusLine")
-    current = current if isinstance(current, dict) else {}
-    command = current.get("command") if current.get("type") == "command" else None
-    previous = command if isinstance(command, str) and command.strip() and not is_wrapper(command) else None
-    # Record first: a wrapper in settings without its record would hide the user's statusline.
-    _write_json(record_path(), {"enabled": True, "previous_command": previous})
-    settings["statusLine"] = {**current, "type": "command", "command": WRAPPER_COMMAND}
-    _write_json(settings_file.resolve(), settings)
+    with _install_lock():
+        # Another init may have decided while this one waited for the answer or the lock;
+        # its record and settings are the truth, so re-read both here.
+        if load_record() is not None:
+            return "kept"
+        if answer.strip().lower() not in {"y", "yes"}:
+            _write_json(record_path(), {"enabled": False, "previous_command": None})
+            return "declined"
+        settings = _read_settings(settings_file)
+        if settings is None:
+            return "skipped"
+        current = settings.get("statusLine")
+        current = current if isinstance(current, dict) else {}
+        command = current.get("command") if current.get("type") == "command" else None
+        previous = command if isinstance(command, str) and command.strip() and not is_wrapper(command) else None
+        # Record first: a wrapper in settings without its record would hide the user's statusline.
+        _write_json(record_path(), {"enabled": True, "previous_command": previous})
+        settings["statusLine"] = {**current, "type": "command", "command": WRAPPER_COMMAND}
+        try:
+            _write_json(settings_file.resolve(), settings)
+        except OSError:
+            # Not installed: forget the answer so a later init can finish the install.
+            record_path().unlink(missing_ok=True)
+            raise
     return "installed"
