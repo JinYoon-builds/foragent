@@ -240,3 +240,205 @@ def test_premerge_slots_reuse_runner_cached_base_and_preserve_verdict(
         "Premerge reran base acceptance tests despite a matching runner baseline cache: "
         f"{base_acceptance_runs}"
     )
+
+
+# #331 extends D81 to premerge: CI owns units; local checks compare acceptance.
+UNIT_SUITE = "tests/test_premerge_unit.py"
+UNIT_ID = f"{UNIT_SUITE}::test_unit"
+QUEUED_SUITE = "tests/acceptance/test_queued_feature.py"
+QUEUED_ID = f"{QUEUED_SUITE}::test_queued_feature"
+
+
+def configure_ci_premerge(slotted_premerge, *, workflow, setting="auto", files=None):
+    """Use real PR/base suites, including a unit regression that CI must own."""
+    case, main, pr, head = slotted_premerge
+    case.history.update({
+        ".github/workflows/ci.yml": workflow,
+        UNIT_SUITE: (
+            "from pathlib import Path\n\n"
+            "def test_unit():\n"
+            "    assert Path('feature.txt').read_text() == 'old', 'unit regression belongs to CI'\n"
+        ),
+        **(files or {}),
+    })
+    case.git.fetch()
+    git_command(case.root, "merge", "-q", "--ff-only", "origin/main")
+    case.ctx.config = replace(case.ctx.config, runner_unit_tests=setting)
+    return case, main, pr, head
+
+
+def suite_executions(checks, side):
+    # Collection probes are allowed, but must never disguise a full-suite run.
+    return [call for call in checks.calls if call.side == side
+            and not {"--collect-only", "--co"}.intersection(call.words)]
+
+
+def assert_ci_acceptance_only(case, checks, *, cached):
+    unit_runs = [call.words for call in checks.calls if UNIT_ID in call.executed]
+    assert unit_runs == [], (
+        "Trusted PR CI must own the unit suite; premerge launched local unit pytest: "
+        f"{unit_runs}"
+    )
+    head_runs = suite_executions(checks, "head")
+    head_ids = {node for call in head_runs for node in call.executed}
+    assert {EXISTING, PENDING} <= head_ids, (
+        f"Premerge must still execute head acceptance with trusted CI: {head_runs}"
+    )
+    assert all(node.startswith(case.ctx.config.acceptance_dir) for node in head_ids), head_ids
+    base_runs = suite_executions(checks, "base")
+    if cached:
+        assert base_runs == [], (
+            "Trusted PR CI premerge reran the cached base instead of comparing acceptance IDs: "
+            f"{[call.words for call in base_runs]}"
+        )
+    else:
+        base_ids = {node for call in base_runs for node in call.executed}
+        assert {EXISTING, PENDING} <= base_ids, "A missing acceptance baseline must be built"
+        assert all(node.startswith(case.ctx.config.acceptance_dir) for node in base_ids), base_ids
+
+
+@pytest.mark.parametrize("setting", ["auto", "ci"])
+def test_premerge_slots_trusted_ci_runs_acceptance_and_caches_missing_base(
+    slotted_premerge, monkeypatch, isolated_home, capsys, setting,
+):
+    from test_ci_trusted_checks import PR_WORKFLOW
+
+    case, main, pr, _ = configure_ci_premerge(
+        slotted_premerge, workflow=PR_WORKFLOW, setting=setting,
+    )
+    checks = SuiteProcesses(case, monkeypatch)
+    assert not list((case.store.root.parent / "baselines").glob("*.json"))
+
+    result, report = premerge_report(main, pr, capsys)
+
+    assert_ci_acceptance_only(case, checks, cached=False)
+    assert_verdict(result, report)
+    assert_cache_written(isolated_home)
+    checks.calls.clear()
+
+    result, report = premerge_report(main, pr, capsys)
+
+    assert_ci_acceptance_only(case, checks, cached=True)
+    assert_verdict(result, report)
+
+
+@pytest.mark.parametrize("scenario,broken,ci,conflicts", [
+    pytest.param("preexisting-failure", (), "pass", [], id="preexisting-failure"),
+    pytest.param("regression", (EXISTING,), "pass", [], id="regression"),
+    pytest.param("new-failure", (NEW_FAILURE,), "pass", [], id="new-failure"),
+    pytest.param("red-ci", (), "fail", [], id="red-ci"),
+    pytest.param("conflict", (), "pass", ["feature.txt"], id="conflict"),
+])
+def test_premerge_slots_trusted_ci_reuses_runner_baseline_and_preserves_verdict(
+    slotted_premerge, tmp_path, monkeypatch, isolated_home, capsys,
+    scenario, broken, ci, conflicts,
+):
+    import json
+
+    from test_ci_trusted_checks import PR_WORKFLOW
+
+    case, main, pr, head = configure_ci_premerge(slotted_premerge, workflow=PR_WORKFLOW)
+    if scenario == "conflict":
+        case.history.update({"feature.txt": "competing base version\n"})
+    case.tracker.set_pr_checks(pr, ci)
+    checks = SuiteProcesses(case, monkeypatch)
+    warm_runner_baseline(case, tmp_path, monkeypatch, isolated_home)
+    assert any(call.side == "base" and EXISTING in call.executed for call in checks.calls)
+    # The warmer uses the same issue branch in its independent repository.
+    # Introduce PR regressions only after it has populated the healthy base.
+    if scenario == "regression":
+        update_pr_head(case, pr, head, {"existing-feature.txt": "broken\n"})
+    elif scenario == "new-failure":
+        update_pr_head(case, pr, head, {
+            ADDED: "def test_new_feature():\n    assert False, 'new acceptance regression'\n",
+        })
+    checks.calls.clear()
+
+    result = main(["orch", "premerge", str(pr), "--json"])
+    report = json.loads(capsys.readouterr().out)
+
+    assert_ci_acceptance_only(case, checks, cached=True)
+    assert report["pr"] == pr and report["ci"] == ci, report
+    assert report["tests"] == ("fail" if broken else "pass"), report
+    assert report["broken"] == list(broken), report
+    assert report["failing_on_base"] == [PENDING], report
+    assert report["conflicts"] == conflicts, report
+    ready = not broken and ci == "pass" and not conflicts
+    assert report["ready"] is ready and result == int(not ready), report
+
+
+@pytest.mark.parametrize("mode", ["no-workflow", "push-only", "all"])
+def test_premerge_slots_switch_from_full_suite_to_trusted_ci(
+    slotted_premerge, monkeypatch, capsys, mode,
+):
+    from test_ci_trusted_checks import PR_WORKFLOW, PUSH_ONLY_WORKFLOW
+
+    workflow = {"no-workflow": None, "push-only": PUSH_ONLY_WORKFLOW, "all": PR_WORKFLOW}[mode]
+    case, main, pr, _ = configure_ci_premerge(
+        slotted_premerge, workflow=workflow, setting="all" if mode == "all" else "auto",
+    )
+    checks = SuiteProcesses(case, monkeypatch)
+
+    result, report = premerge_report(main, pr, capsys)
+
+    # Keep today's full-suite behaviour, including its unit-regression verdict.
+    assert_verdict(result, report, broken=(UNIT_ID,))
+    for side in ("head", "base"):
+        assert any(UNIT_ID in call.executed for call in suite_executions(checks, side)), (
+            f"Without trusted PR CI, {side} must retain the unit suite ({mode})"
+        )
+
+    # Enabling PR CI/the automatic setting must change what premerge executes.
+    # Keeping the transition here makes each control a red test on today's main.
+    case.history.update({".github/workflows/ci.yml": PR_WORKFLOW})
+    case.git.fetch()
+    git_command(case.root, "merge", "-q", "--ff-only", "origin/main")
+    case.ctx.config = replace(case.ctx.config, runner_unit_tests="auto")
+    checks.calls.clear()
+
+    result, report = premerge_report(main, pr, capsys)
+
+    assert_ci_acceptance_only(case, checks, cached=False)
+    assert_verdict(result, report)
+
+
+def test_premerge_slots_trusted_ci_excludes_locked_tests_of_approved_unmerged_issues(
+    slotted_premerge, tmp_path, monkeypatch, isolated_home, capsys,
+):
+    from foragent.issue import body_hash
+    from test_ci_trusted_checks import PR_WORKFLOW
+
+    case, main, pr, _ = configure_ci_premerge(slotted_premerge, workflow=PR_WORKFLOW, files={
+        QUEUED_SUITE: (
+            '"""Acceptance test for queued-feature. Locked by Foragent; do not edit."""\n'
+            "def test_queued_feature():\n    assert False, 'approved issue is not merged yet'\n"
+        ),
+    })
+    body = (
+        "<!-- foragent:v1 -->\n## Goal\nImplement the queued feature.\n"
+        "## Out of scope\nOther features.\n## Done when\n"
+        f"```sh\npytest {QUEUED_SUITE}\n```\n"
+        f"[{QUEUED_SUITE}](https://github.com/owner/repo/blob/main/{QUEUED_SUITE})\n"
+    )
+    case.tracker.add_issue(100, "Queued feature", body, labels=["approved"])
+    case.store.save_approval(
+        100, body=body, body_sha=body_hash(body),
+        acceptance_blobs=case.git.blob_shas("origin/main", [QUEUED_SUITE]),
+        approved_by="human", approved_at=case.clock[0].isoformat(),
+    )
+    assert case.store.load_approval(100).acceptance_blobs.keys() == {QUEUED_SUITE}
+    assert case.tracker.get_issue(100).state == "open"
+    assert case.tracker.find_pr("foragent/issue-100") is None
+    checks = SuiteProcesses(case, monkeypatch)
+    warm_runner_baseline(case, tmp_path, monkeypatch, isolated_home)
+    checks.calls.clear()
+
+    result, report = premerge_report(main, pr, capsys)
+
+    queued_runs = [call.words for call in checks.calls if QUEUED_ID in call.executed]
+    assert queued_runs == [], (
+        "Premerge executed a locked acceptance file owned by an approved, unmerged issue: "
+        f"{queued_runs}"
+    )
+    assert_ci_acceptance_only(case, checks, cached=True)
+    assert_verdict(result, report)
