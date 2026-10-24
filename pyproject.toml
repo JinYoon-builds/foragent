@@ -7,7 +7,10 @@ authors = [
     { name = "Jin.Yoon", email = "jin.yoon.builds@gmail.com" }
 ]
 requires-python = ">=3.12"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 dependencies = [
+    "psutil>=7.1.0",
     "pyyaml>=6.0.3",
 ]
 

@@ -53,6 +53,7 @@ class Run:
     phase_started_at: str | None = None
     last_activity_at: str | None = None
     executor_pgid: int | None = None
+    process_identities: list[dict] = field(default_factory=list)
     session_id: str | None = None
     session_executor: str | None = None
     session_ids: list[str] = field(default_factory=list)

@@ -7,7 +7,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
-import signal
 import subprocess
 import sys
 
@@ -15,6 +14,7 @@ import yaml
 
 from foragent.config import Config, ConfigError, load_config
 from foragent.git import GitError, GitRepo
+from foragent.processes import kill_process_group, observe_tree, recorded_tree
 
 
 def _scaffold(path: str, acceptance_dir: str) -> bool:
@@ -323,15 +323,14 @@ def baseline(root: Path, command: str | None = None, timeout: int = 900) -> dict
         ["/bin/sh", "-c", command], cwd=root, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
     ) as process:
+        identities = observe_tree(roots=(process.pid,))
         try:
             output, _ = process.communicate(timeout=timeout)
             exit_code = process.returncode
         except subprocess.TimeoutExpired:
             # Kill the shell and its test runner, including inherited output pipes.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            with recorded_tree(identities):
+                kill_process_group(process.pid)
             output, _ = process.communicate()
             exit_code = 124
     failing = []

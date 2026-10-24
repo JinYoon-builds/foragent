@@ -1,4 +1,4 @@
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 import errno
 import fcntl
@@ -21,7 +21,29 @@ def store(tmp_path):
     return StateStore(tmp_path / "state", now=lambda: NOW)
 
 
+@pytest.mark.parametrize("invalid", [
+    {"node_ids": "passing"},
+    {"collected_ids": []},
+    {"failing_ids": ["passing"]},
+    {"failing_ids": ["absent"]},
+    {"excluded": "tests/acceptance/test_pending.py"},
+])
+def test_acceptance_baseline_cache_rejects_inconsistent_coverage(store, invalid):
+    saved = {
+        "created_at": NOW.isoformat(), "node_ids": ["passing"],
+        "collected_ids": ["passing", "failing", "skipped"], "failing_ids": ["failing"],
+        "excluded": ["tests/acceptance/test_pending.py"],
+    }
+    store._write_json(store.root / "baseline.json", saved)
+    assert store.load_acceptance_baseline("baseline") == saved
+    store._write_json(store.root / "baseline.json", {**saved, **invalid})
+    assert store.load_acceptance_baseline("baseline") is None
+
+
 def _mutate_run(root, method, number, fields, connection, pause_read):
+    from foragent import processes
+
+    processes.list_processes = lambda: ()  # PIDs here are serialization fixtures.
     store = StateStore(root)
     if pause_read:
         original_get = store.get_run
@@ -738,11 +760,12 @@ def test_facade_globals_patched_on_foragent_state_reach_the_split_implementation
     built = []
     original_run = state_module.Run
 
-    def recording_run(*args, **kwargs):
-        built.append(args[0] if args else kwargs["number"])
-        return original_run(*args, **kwargs)
+    @dataclass(frozen=True)
+    class RecordingRun(original_run):
+        def __post_init__(self):
+            built.append(self.number)
 
-    monkeypatch.setattr(state_module, "Run", recording_run)
+    monkeypatch.setattr(state_module, "Run", RecordingRun)
     store.start_run(3, branch="foragent/issue-3", worktree=store.worktree_path(3))
     assert built == [3]
     assert store.get_run(3).branch == "foragent/issue-3"

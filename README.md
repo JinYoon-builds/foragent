@@ -41,3 +41,12 @@ ID 없이 `fa lanes skills <lane>`을 실행하면 목록을 비운다. `style` 
 Say what you want. Agents build it while you're away, and show you exactly what to check.
 Multi-agent lanes, isolated worktrees and task graphs — without setting up any of it.
 -->
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

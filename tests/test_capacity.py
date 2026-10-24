@@ -1,4 +1,6 @@
 from datetime import UTC, datetime, timedelta
+import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -57,7 +59,19 @@ def test_darwin_pressure_level_reads_kernel_in_process(monkeypatch):
         raise AssertionError("memory pressure must not start a subprocess")
 
     monkeypatch.setattr(subprocess, "Popen", no_subprocess)
-    assert capacity._darwin_pressure_level() in capacity._DARWIN_PRESSURE
+    assert capacity._darwin_pressure_level() in {*capacity._DARWIN_PRESSURE, None}
+
+
+@pytest.mark.parametrize("result,expected", [(0, 2), (1, None)])
+def test_darwin_pressure_reads_sysctl_value_and_handles_errors(monkeypatch, result, expected):
+    def sysctl(name, output, size, new_value, new_size):
+        assert name == b"kern.memorystatus_vm_pressure_level"
+        assert size._obj.value == ctypes.sizeof(ctypes.c_int)
+        output._obj.value = 2
+        return result
+
+    monkeypatch.setattr(capacity.ctypes, "CDLL", lambda *args, **kwargs: SimpleNamespace(sysctlbyname=sysctl))
+    assert capacity._darwin_pressure_level() == expected
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -112,9 +126,9 @@ def test_state_round_trip_and_unreadable_state(tmp_path):
     assert capacity.read_state(store) is None
 
 
-def budget_ctx(tmp_path, now, max_parallel=None):
+def budget_ctx(tmp_path, now, max_parallel=None, parallel_floor=1):
     return SimpleNamespace(store=StateStore(tmp_path / "repo"), now=lambda: now,
-                           config=Config(max_parallel=max_parallel))
+                           config=Config(max_parallel=max_parallel, parallel_floor=parallel_floor))
 
 
 def test_budget_starts_at_initial_value_and_spaces_increases(tmp_path, monkeypatch):
@@ -157,8 +171,8 @@ def test_budget_demand_excludes_busy_and_paused_lanes(tmp_path, monkeypatch):
     capacity.write_state(ctx.store, 5, NOW)
     ctx.store.start_run(1, branch="b", worktree=ctx.store.worktree_path(1), lane="busy", pid=os.getpid())
     ctx.store.pause_lane("paused", NOW + timedelta(hours=1))
-    # One live run plus one free ready lane caps this tick at 2.
-    assert scheduler._machine_budget(ctx, {"busy": [2], "paused": [3], "free": [4]}) == 2
+    # One live run plus every ready issue in unpaused lanes (busy lanes included) caps this tick at 3.
+    assert scheduler._machine_budget(ctx, {"busy": [2], "paused": [3], "free": [4]}) == 3
     assert seen["ceiling"] is None and seen["increase_ok"] is False
 
 
@@ -189,6 +203,72 @@ def test_lanes_cap_limits_the_tick_but_not_the_shared_value(tmp_path, monkeypatc
     ctx = budget_ctx(tmp_path, NOW)
     assert scheduler._machine_budget(ctx, {"a": [1], "b": [2]}) == 2
     assert capacity.read_state(ctx.store) == {"parallel": 5, "changed_at": changed.isoformat()}
+
+
+@pytest.mark.parametrize("floor,current,pressure,load,wanted,expected", [
+    (3, 3, "warn", 0.5, 1, 3), (3, 3, "normal", 2.0, 1, 3),
+    (3, 3, "critical", 0.5, 1, 1), (1, 3, "warn", 0.5, 1, 1),
+    (3, 8, "warn", 0.5, 4, 4),
+])
+def test_parallel_floor_records_wanted_and_applied_budget(tmp_path, floor, current, pressure, load, wanted, expected):
+    ctx = budget_ctx(tmp_path, NOW, parallel_floor=floor)
+    capacity.write_state(ctx.store, current, NOW)
+    sample = capacity.LoadSample(pressure, load, 60)
+    assert scheduler._machine_budget(ctx, {f"lane-{n}": [n] for n in range(8)}, sample) == expected
+    assert capacity.read_state(ctx.store)["parallel"] == expected
+    rows = [json.loads(line) for line in (tmp_path / capacity.HISTORY_FILE).read_text().splitlines()]
+    assert rows == [{
+        "at": NOW.isoformat(), "budget": "parallel", "from": current, "to": expected,
+        "wanted": wanted, "pressure": pressure, "load_per_cpu": load, "swapins": 60,
+    }]
+
+
+def test_parallel_floor_logs_repeated_holds_without_resetting_decrease_clock(tmp_path):
+    ctx = budget_ctx(tmp_path, NOW, parallel_floor=3)
+    capacity.write_state(ctx.store, 6, NOW)
+
+    def update(now, pressure="warn"):
+        ctx.now = lambda: now
+        return scheduler._machine_budget(ctx, {f"lane-{n}": [n] for n in range(8)},
+                                         capacity.LoadSample(pressure, 0.5, 60))
+
+    assert update(NOW) == 3
+    state = capacity.read_state(ctx.store)
+    path = tmp_path / capacity.HISTORY_FILE
+    unchanged = path.read_bytes()
+    assert update(NOW + timedelta(seconds=1)) == 3
+    assert path.read_bytes() == unchanged
+    for moment in (NOW + capacity.DECREASE_INTERVAL, NOW + capacity.DECREASE_INTERVAL + timedelta(seconds=1)):
+        assert update(moment) == 3
+        assert capacity.read_state(ctx.store) == state
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [(row["from"], row["wanted"], row["to"]) for row in rows] == [(6, 3, 3), (3, 1, 3), (3, 1, 3)]
+    assert update(NOW + capacity.DECREASE_INTERVAL + timedelta(seconds=2), "critical") == 1
+
+
+@pytest.mark.parametrize("pressure", ["normal", "warn"])
+def test_parallel_floor_restores_budget_after_critical_without_waiting_for_growth(tmp_path, pressure):
+    ctx = budget_ctx(tmp_path, NOW, parallel_floor=3)
+    capacity.write_state(ctx.store, 3, NOW)
+    ready = {f"lane-{n}": [n] for n in range(8)}
+    assert scheduler._machine_budget(ctx, ready, capacity.LoadSample("critical", 0.5, 60)) == 1
+    ctx.now = lambda: NOW + timedelta(seconds=1)
+    assert scheduler._machine_budget(ctx, ready, capacity.LoadSample(pressure, 0.5, 0)) == 3
+
+
+def test_parallel_floor_applies_on_initialization_and_allows_growth(tmp_path):
+    ctx = budget_ctx(tmp_path, NOW, parallel_floor=3)
+    ready = {f"lane-{n}": [n] for n in range(8)}
+    sample = capacity.LoadSample("normal", 0.5, 0)
+    assert scheduler._machine_budget(ctx, ready, sample) == 3
+    ctx.now = lambda: NOW + capacity.INCREASE_INTERVAL
+    assert scheduler._machine_budget(ctx, ready, sample) == 4
+
+
+def test_parallel_floor_preserves_tick_demand_limit(tmp_path):
+    ctx = budget_ctx(tmp_path, NOW, parallel_floor=3)
+    assert scheduler._machine_budget(ctx, {"only": [1]}, capacity.LoadSample("warn", 0.5, 60)) == 1
+    assert capacity.read_state(ctx.store)["parallel"] == 3
 
 
 @pytest.mark.parametrize("pressure,load,increase_ok,expected", [
@@ -264,18 +344,21 @@ def test_test_slot_of_a_killed_holder_is_released():
     directory.mkdir(parents=True)
     holder = subprocess.Popen([
         sys.executable, "-c",
-        "import fcntl, sys, time\n"
+        "import fcntl, os, sys\n"
         f"stream = open({str(directory / 'slot-0.lock')!r}, 'a')\n"
         "fcntl.flock(stream.fileno(), fcntl.LOCK_EX)\n"
         "print('held', flush=True)\n"
-        "time.sleep(60)\n",
-    ], stdout=subprocess.PIPE, text=True)
+        "sys.stdin.readline()\n"
+        "os._exit(9)\n",
+    ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline() == "held\n"
         assert capacity._take_test_slot(1) is None
     finally:
-        holder.kill()
-        holder.wait(timeout=10)
+        holder.stdin.write("release\n")
+        holder.stdin.flush()
+        assert holder.wait(timeout=10) == 9
+        holder.stdin.close()
         holder.stdout.close()
     stream = capacity._take_test_slot(1)
     assert stream is not None
@@ -288,3 +371,161 @@ def test_test_slot_held_by_the_parent_command_is_not_taken_twice(monkeypatch):
         # A Done-when command that runs `fa test` inherits the slot instead of waiting forever.
         with capacity.hold_test_slot(1):
             pass
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("pgpgin 500\npswpin 7\npswpout 100\n", 7),
+    ("pswpin 0\n", 0), ("pswpin -1\n", None),
+    ("pswpin broken\n", None), ("pswpin\n", None), ("pgpgin 500\n", None),
+])
+def test_linux_swapins_reads_only_swapped_in_pages(tmp_path, monkeypatch, text, expected):
+    path = tmp_path / "vmstat"
+    path.write_text(text)
+    monkeypatch.setattr(capacity.sys, "platform", "linux")
+    monkeypatch.setattr(capacity, "Path", lambda _: path)
+    assert capacity.swapins_total() == expected
+
+
+def test_linux_swapins_unreadable_counter_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(capacity.sys, "platform", "linux")
+    monkeypatch.setattr(capacity, "Path", lambda _: tmp_path / "missing")
+    assert capacity.swapins_total() is None
+
+
+@pytest.mark.parametrize("result,expected", [(0, 2**40 + 7), (1, None)])
+def test_darwin_swapins_uses_mach_64_bit_counter_and_releases_host_port(monkeypatch, result, expected):
+    released = []
+
+    def statistics(host, flavor, output, count):
+        assert (host, flavor) == (123, 4)
+        assert count._obj.value == 38
+        output._obj.pageins = 999
+        output._obj.swapins = 2**40 + 7
+        return result
+
+    libc = SimpleNamespace(
+        mach_host_self=lambda: 123, host_statistics64=statistics,
+        mach_port_deallocate=lambda task, host: released.append((task, host)),
+    )
+    class UInt32(ctypes.c_uint):
+        @classmethod
+        def in_dll(cls, *args):
+            return SimpleNamespace(value=456)
+
+    monkeypatch.setattr(capacity.sys, "platform", "darwin")
+    monkeypatch.setattr(capacity.ctypes, "CDLL", lambda *args, **kwargs: libc)
+    monkeypatch.setattr(capacity.ctypes, "c_uint32", UInt32)
+    assert capacity.swapins_total() == expected
+    assert released == [(456, 123)]
+
+
+def test_machine_load_rebases_after_unreadable_sample_and_corrupt_state(monkeypatch):
+    total = [100]
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "warn")
+    monkeypatch.setattr(capacity, "swapins_total", lambda: total[0])
+    monkeypatch.setattr(capacity, "load_per_cpu", lambda: 0.5)
+    assert capacity.machine_load().swapins is None
+    total[0] = None
+    assert capacity.machine_load() == ("warn", 0.5)
+    total[0] = 200
+    assert capacity.machine_load().swapins is None
+    assert capacity.machine_load() == ("normal", 0.5)
+    (capacity.machine_root() / capacity.SENSOR_FILE).write_text("{broken")
+    assert capacity.machine_load() == ("warn", 0.5)
+
+
+@pytest.mark.parametrize("budget", ["parallel", "test_slots"])
+@pytest.mark.parametrize("pressure,load", [("warn", 0.5), ("critical", 0.5), ("normal", 2.0)])
+def test_budget_decreases_are_rate_limited_across_repositories(tmp_path, monkeypatch, budget, pressure, load):
+    root = capacity.machine_root()
+    root.mkdir(parents=True)
+    contexts = [budget_ctx(root, NOW), budget_ctx(root, NOW)]
+    contexts[1].store = StateStore(root / "other")
+    if budget == "parallel":
+        capacity.write_state(contexts[0].store, 8, NOW)
+    else:
+        (root / capacity.TEST_SLOTS_FILE).write_text(json.dumps({"slots": 8, "changed_at": NOW.isoformat()}))
+    monkeypatch.setattr(scheduler, "machine_load", lambda: capacity.LoadSample(pressure, load, 7))
+
+    def update(now, context):
+        if budget == "parallel":
+            context.now = lambda: now
+            return scheduler._machine_budget(context, {f"lane-{i}": [i] for i in range(8)})
+        return capacity.update_test_slots(8, now, pressure=pressure, load_per_cpu=load, swapins=7)
+
+    after = 4 if budget == "parallel" else 7
+    assert update(NOW, contexts[0]) == after
+    state_path = root / (capacity.STATE_FILE if budget == "parallel" else capacity.TEST_SLOTS_FILE)
+    unchanged_state = state_path.read_bytes()
+    unchanged_history = (root / capacity.HISTORY_FILE).read_bytes()
+    for moment in (NOW, NOW + capacity.DECREASE_INTERVAL - timedelta(microseconds=1)):
+        assert update(moment, contexts[1]) == after
+        assert state_path.read_bytes() == unchanged_state
+        assert (root / capacity.HISTORY_FILE).read_bytes() == unchanged_history
+    assert update(NOW + capacity.DECREASE_INTERVAL, contexts[1]) == (2 if budget == "parallel" else 6)
+    rows = [json.loads(line) for line in (root / capacity.HISTORY_FILE).read_text().splitlines()]
+    assert len(rows) == 2
+    assert [row["swapins"] for row in rows] == [7, 7]
+
+
+def test_test_slots_decrease_immediately_after_growth_and_retain_decrease_clock():
+    root = capacity.machine_root()
+    root.mkdir(parents=True)
+    (root / capacity.TEST_SLOTS_FILE).write_text(json.dumps({
+        "slots": 4, "changed_at": (NOW - capacity.INCREASE_INTERVAL).isoformat(),
+    }))
+    assert capacity.update_test_slots(8, NOW, pressure="normal", load_per_cpu=0.5) == 5
+    assert capacity.update_test_slots(8, NOW + timedelta(seconds=1), pressure="warn", load_per_cpu=0.5) == 4
+    state = capacity.read_test_slots()
+    grown_at = NOW + capacity.INCREASE_INTERVAL + timedelta(seconds=1)
+    assert capacity.update_test_slots(8, grown_at, pressure="normal", load_per_cpu=0.5) == 5
+    assert capacity.read_test_slots()["decreased_at"] == state["decreased_at"]
+
+
+@pytest.mark.parametrize("floor,pressure,load,expected", [
+    (2, "warn", 0.5, 2), (2, "normal", 2.0, 2),
+    (2, "critical", 0.5, 1), (1, "warn", 0.5, 1),
+])
+def test_test_slots_floor_records_wanted_and_applied_slots(floor, pressure, load, expected):
+    assert capacity.update_test_slots(
+        2, NOW, pressure=pressure, load_per_cpu=load, swapins=60, floor=floor,
+    ) == expected
+    assert capacity.effective_test_slots(2) == expected
+    rows = [json.loads(line) for line in (capacity.machine_root() / capacity.HISTORY_FILE).read_text().splitlines()]
+    assert rows == [{
+        "at": NOW.isoformat(), "budget": "test_slots", "from": 2, "to": expected,
+        "wanted": 1, "pressure": pressure, "load_per_cpu": load, "swapins": 60,
+    }]
+
+
+def test_test_slots_floor_logs_repeated_holds_without_resetting_decrease_clock():
+    def update(now, pressure="warn"):
+        return capacity.update_test_slots(3, now, pressure=pressure, load_per_cpu=0.5, swapins=60, floor=2)
+
+    assert update(NOW) == 2
+    state = capacity.read_test_slots()
+    path = capacity.machine_root() / capacity.HISTORY_FILE
+    unchanged = path.read_bytes()
+    assert update(NOW + timedelta(seconds=1)) == 2
+    assert path.read_bytes() == unchanged  # The existing decrease cooldown still applies.
+    for moment in (NOW + capacity.DECREASE_INTERVAL, NOW + capacity.DECREASE_INTERVAL + timedelta(seconds=1)):
+        assert update(moment) == 2
+        assert capacity.read_test_slots() == state
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [(row["from"], row["wanted"], row["to"]) for row in rows] == [(3, 2, 2), (2, 1, 2), (2, 1, 2)]
+    assert update(NOW + capacity.DECREASE_INTERVAL + timedelta(seconds=2), "critical") == 1
+
+
+@pytest.mark.parametrize("pressure", ["normal", "warn"])
+def test_test_slots_floor_restores_slots_after_critical_without_waiting_for_growth(pressure):
+    assert capacity.update_test_slots(2, NOW, pressure="critical", load_per_cpu=0.5, floor=2) == 1
+    assert capacity.update_test_slots(
+        2, NOW + timedelta(seconds=1), pressure=pressure, load_per_cpu=0.5, floor=2,
+    ) == 2
+
+
+def test_test_slots_floor_allows_growth_with_headroom():
+    assert capacity.update_test_slots(3, NOW, pressure="warn", load_per_cpu=0.5, floor=2) == 2
+    assert capacity.update_test_slots(
+        3, NOW + capacity.INCREASE_INTERVAL, pressure="normal", load_per_cpu=0.5, floor=2,
+    ) == 3

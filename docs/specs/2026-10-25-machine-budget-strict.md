@@ -1,0 +1,3 @@
+# Machine budgets: strict reading without machine.yml (edit to #365)
+
+#365 stopped with a spec question: its goal says a repository value never changes the shared budget files and machine.yml-less machines use today's defaults, while older locked tests (test_test_slots.py, test_adaptive_budgets.py) expected the repository's test_slots to size the shared slots. Jin's direction (machine budgets come from one machine-level config; repositories may only lower) settles it as the strict reading. As test owner I changed the two older tests to write machine.yml in their setup; test names unchanged; both still pass on main.

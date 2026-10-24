@@ -1,0 +1,62 @@
+"""The current-work table beside the handled-events log."""
+
+from pathlib import Path
+from typing import Any
+
+from foragent.config import Config
+from foragent.status import _age
+from foragent.watch_cells import Line
+from foragent.watch_data import Snapshot
+from foragent.watch_layout import _clones, _lane_issues, _lane_name, _split, _widths
+
+ORDER = 40
+
+
+def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
+    from foragent import watch
+
+    language = config.language
+    status = snapshot.status
+    t = lambda key, **values: watch.text(key, language, **values)
+    side_by_side, _, _, table_width, events_width = _widths(context["width"])
+    busy, _ = _split(status)
+    clones = _clones(status)
+    age = max(0, (context["now"] - snapshot.captured_at).total_seconds())
+    runs = {run["number"]: run for run in status["active_runs"]}
+    inner = table_width - 2
+    lane_width = min(13, inner // 6)
+    phase_width = min(11, inner // 6)
+    activity_width = min(24, inner // 3)
+    widths = [lane_width, inner - lane_width - phase_width - activity_width - 3, phase_width, activity_width]
+    table = watch._columns([t("watch_lane"), t("watch_now"), t("watch_phase"), ""], widths, "bold")
+    for _, row in busy:
+        titles = {item["number"]: item.get("title") for item in row.get("running", [])}
+        for number in _lane_issues(row, clones) or [row["issue"]]:
+            run = runs.get(number)
+            if number == row["issue"]:
+                shown = row
+            else:
+                # A clone run: its own phase and title, judged as a working run.
+                shown = {**row, "state": "working", "issue": number, "title": titles.get(number) or "",
+                         "phase": run.get("phase") if run else None,
+                         "last_activity_seconds": _age(run.get("last_activity_at") or run.get("started_at"),
+                                                       snapshot.captured_at) if run else None}
+            phase = "" if shown["state"] == "blocked" else watch.text(shown["phase"] or shown["state"], language)
+            task = f"#{number} {shown['title'] or ''}".rstrip() if number is not None else "—"
+            if run and run["attempts"] > 1:
+                task += " · " + t("watch_retry", count=run["attempts"])
+            activity = watch._activity(shown, language, age, config.stall_minutes, run.get("pid") if run else None)
+            table += watch._columns([_lane_name(row, clones), task, phase, activity], widths,
+                                    "yellow" if activity.startswith("○") or shown["state"] == "blocked" else "")
+    if not busy:
+        table.append(watch._line(t("watch_all_idle")))
+    events: list[Line] = []
+    for event in snapshot.events:
+        when = watch.datetime.fromisoformat(event["at"]).astimezone().strftime("%H:%M") if event.get("at") else "—"
+        number = f" #{event['issue']}" if event.get("issue") is not None else ""
+        events.extend(watch._wrap(f"{when}{number} {event['summary']} ✓", events_width - 2))
+    if not events:
+        events.append(watch._line(t("watch_no_events")))
+    work = watch._panel(table, table_width, t("watch_now"))
+    handled = watch._panel(events, events_width, t("watch_events"))
+    return watch._beside(work, handled, table_width) if side_by_side else work + handled

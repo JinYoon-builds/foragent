@@ -29,16 +29,16 @@ def finish(tracker, store, number, parent, lane="api"):
     tracker.add_issue(number, f"Finished task {number}", labels=[f"lane:{lane}"], state="closed")
     tracker.set_parent(number, parent)
     store.start_run(number, branch=f"issue-{number}", worktree="unused", lane=lane)
-    store.update_run(number, last_progress_at=(NOW + timedelta(minutes=4)).isoformat())
+    store.update_run(number, last_progress_at=(NOW - timedelta(minutes=4)).isoformat())
     store.finish_run(number, "merged")
 
 
-def test_order_progress_and_lane_totals_use_full_history_without_other_orders(tmp_path):
+def test_order_progress_and_lane_totals_use_full_history_without_closed_orders(tmp_path):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
     config = Config(lanes={"api": {"title": "Server"}}, max_parallel=2)
     tracker.add_issue(90, "Current order")
-    tracker.add_issue(91, "Other order")
+    tracker.add_issue(91, "Other order", state="closed")
     for number in range(1, 14):
         finish(tracker, store, number, 90)
     finish(tracker, store, 14, 91)
@@ -50,7 +50,8 @@ def test_order_progress_and_lane_totals_use_full_history_without_other_orders(tm
     assert result.order.number == 90
     assert (result.completed, result.total) == (13, 14)
     assert [issue.number for issue in result.done["api"]] == list(range(1, 14))
-    assert result.eta == NOW + timedelta(minutes=4)
+    # All 14 merges finished in the last hour; one issue is left.
+    assert result.recent == 14 and result.eta == NOW + timedelta(hours=1 / 14)
     output = watch.render_frame(result, config, tmp_path)
     assert "13/14" in output and "✓ 13 done" in output and "Finished task 13" in output
     assert "Finished task 14" not in output

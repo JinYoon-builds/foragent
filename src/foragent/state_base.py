@@ -1,10 +1,12 @@
-"""Shared storage primitives and locks for the local state store."""
+"""Shared storage primitives for the local state store."""
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from foragent.state_records import Run
 
 
 class StateBase:
@@ -38,55 +40,38 @@ class StateBase:
     def _write_json(self, path: Path, value: dict[str, Any]) -> None:
         self._atomic_write(path, _state.json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
+    def _write_mapping(self, path: Path, cls: type, value: dict[str, Any]) -> dict[str, Any]:
+        """Write a record mapping, keeping fields a newer version stored in the file."""
+        try:
+            saved = _state.json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            saved = {}
+        value = _state.write_back(cls, saved, value)
+        self._write_json(path, value)
+        return value
+
+    def _write_record(self, path: Path, record: Any) -> dict[str, Any]:
+        return self._write_mapping(path, type(record), _state.asdict(record))
+
+    def _run_value(self, run: "Run") -> dict[str, Any]:
+        """A run's fields merged over the unknown fields its file holds on disk."""
+        try:
+            saved = _state.json.loads((self.root / "runs" / f"{run.number}.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            saved = {}
+        return _state.write_back(type(run), saved, _state.asdict(run))
+
+    def _write_run(self, run: "Run", value: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The one writer of run files; unknown fields always survive."""
+        value = self._run_value(run) if value is None else value
+        self._write_json(self.root / "runs" / f"{run.number}.json", value)
+        return value
+
     def worktree_path(self, number: int) -> Path:
         return self.root / "worktrees" / f"issue-{number}"
 
     def log_path(self, number: int) -> Path:
         return self.root / "logs" / f"issue-{number}.log"
-
-    @contextmanager
-    def _state_lock(self) -> Iterator[None]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / "state.lock").open("a", encoding="utf-8") as stream:
-            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
-
-    @contextmanager
-    def merge_lock(self) -> Iterator[None]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / "merge.lock").open("a", encoding="utf-8") as stream:
-            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
-
-    @contextmanager
-    def notify_lock(self) -> Iterator[None]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / "notify.lock").open("a", encoding="utf-8") as stream:
-            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
-
-    @contextmanager
-    def tick_lock(self) -> Iterator[bool]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / "tick.lock").open("a", encoding="utf-8") as stream:
-            try:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX | _state.fcntl.LOCK_NB)
-            except BlockingIOError:
-                yield False
-            else:
-                try:
-                    yield True
-                finally:
-                    _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
 
 
 # Bound last: foragent.state imports this module, and lookups happen at call time

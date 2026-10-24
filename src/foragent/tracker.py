@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import json
 import re
 import subprocess
+import time
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
@@ -134,6 +135,21 @@ class TrackerError(RuntimeError):
             except (ValueError, OverflowError, OSError):
                 pass
         return None
+
+
+_FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
+_NOT_STARTED = re.compile(r"\bjob was not started\b", re.I)
+
+
+class CIEvidence(str):
+    """Failed CI text. ``not_started`` marks evidence where no failed job ever ran."""
+
+    not_started: bool
+
+    def __new__(cls, text: str = "", *, not_started: bool = False) -> "CIEvidence":
+        evidence = super().__new__(cls, text)
+        evidence.not_started = not_started
+        return evidence
 
 
 def pr_issue_number(head: str) -> int | None:
@@ -716,11 +732,15 @@ def _issue(data: dict[str, Any]) -> Issue:
     )
 
 
+_EMPTY_RETRY_DELAY = 0.5
+
+
 class GhTracker:
     def __init__(self, repo: str, run: Callable[..., str] | None = None):
         self.repo = repo
         self._run = run or _run_gh
         self._path = f"repos/{repo}"
+        self._seen_states: set[str] = set()
 
     def _call(self, args: list[str], input: str | None = None) -> str:
         try:
@@ -762,8 +782,54 @@ class GhTracker:
     def list_issues(self, state: str = "all") -> list[Issue]:
         if state not in {"open", "closed", "all"}:
             raise ValueError(f"unsupported issue state: {state}")
+        issues = self._fetch_issues(state)
+        if not issues:
+            # GitHub sometimes answers a listing with an empty page by mistake.
+            # One retry separates that hiccup from a repository that is empty.
+            time.sleep(_EMPTY_RETRY_DELAY)
+            issues = self._fetch_issues(state)
+        if issues:
+            states = {issue.state for issue in issues}
+            # A listing of every issue is the whole truth; a filtered one adds to it.
+            self._seen_states = states if state == "all" else self._seen_states | states
+            return issues
+        if state != "all" and state in self._seen_states:
+            # Open and closed issues change state, so an earlier sighting can be
+            # out of date. A listing of every issue settles it.
+            if any(issue.state == state for issue in self.list_issues("all")):
+                raise self._untrusted_empty(state, "a fresh listing of all issues")
+            return issues
+        if evidence := self._evidence_of_issues(state):
+            raise self._untrusted_empty(state, evidence)
+        self._seen_states.discard(state)
+        return issues
+
+    def _untrusted_empty(self, state: str, evidence: str) -> TrackerError:
+        return TrackerError(
+            f"GitHub returned an empty listing of {state} issues for {self.repo} twice, "
+            f"but {evidence} shows such issues exist; not trusting it, try again later"
+        )
+
+    def _fetch_issues(self, state: str) -> list[Issue]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues?state={state}&per_page=100"]))
         return [_issue(item) for item in data if "pull_request" not in item]
+
+    def _evidence_of_issues(self, state: str) -> str | None:
+        """Name what proves `state` issues exist, or None when nothing does."""
+        if state == "all" and self._seen_states:
+            # Issues are not removed, so having seen any is lasting proof.
+            return "an earlier listing"
+        from foragent.state import StateStore
+
+        try:
+            rows = StateStore.for_repo(self.repo).local_issues()
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        # The gate refreshes this record from a listing of all issues, which this
+        # check never blocks, so a stale open or closed row is corrected there.
+        if any(state == "all" or row.get("state") == state for row in rows):
+            return "the local issue record"
+        return None
 
     def update_issue(self, n: int, *, title: str, body: str) -> None:
         self._call(["api", "-X", "PATCH", f"{self._path}/issues/{n}", "--input", "-"],
@@ -960,18 +1026,63 @@ class GhTracker:
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
 
-    def pr_failed_logs(self, pr: int) -> str:
+    def pr_failed_logs(self, pr: int) -> CIEvidence:
+        """Failed Actions evidence for the PR head: jobs, annotations and log tails.
+
+        ``not_started`` is true only when every failed job never ran (no steps or a
+        "job was not started" annotation); such jobs have no code failure to repair.
+        """
         head = self.pr_head_sha(pr)
         runs = _items(self._call([
             "api", "--paginate", "--jq", ".workflow_runs",
             f"{self._path}/actions/runs?head_sha={head}&per_page=100",
         ]))
-        logs = []
+        parts = []
+        failed_runs = 0
+        code_failure = False
         for run in runs:
-            if run["conclusion"] in {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}:
-                output = self._call(["run", "view", str(run["id"]), "-R", self.repo, "--log-failed"])
-                logs.append(output[-4000:])
-        return "\n\n".join(logs)
+            if run["conclusion"] not in _FAILED_CONCLUSIONS:
+                continue
+            failed_runs += 1
+            jobs = _items(self._call([
+                "api", "--paginate", "--jq", ".jobs",
+                f"{self._path}/actions/runs/{run['id']}/jobs?per_page=100",
+            ]))
+            url = run.get("html_url") or run.get("url") or ""
+            lines = [f"Actions run {run['id']} ({run.get('name') or 'workflow'}) {run['conclusion']} {url}".rstrip()]
+            started_failure = False
+            failed_jobs = 0
+            for job in jobs:
+                if job.get("conclusion") not in _FAILED_CONCLUSIONS:
+                    continue
+                failed_jobs += 1
+                steps = job.get("steps") or []
+                messages = self._job_annotations(job)
+                job_url = job.get("html_url") or job.get("url") or ""
+                if not steps or any(_NOT_STARTED.search(message) for message in messages):
+                    lines.append(f"Job {job.get('name')} did not start ({len(steps)} steps) {job_url}".rstrip())
+                else:
+                    started_failure = True
+                    lines.append(f"Job {job.get('name')} failed {job_url}".rstrip())
+                lines.extend(f"  annotation: {message}" for message in messages)
+            # A failed run without failed jobs (e.g. an invalid workflow file) is
+            # still a failure the implementer may be able to repair.
+            if started_failure or not failed_jobs:
+                code_failure = True
+                try:
+                    output = self._call(["run", "view", str(run["id"]), "-R", self.repo, "--log-failed"])
+                except TrackerError as exc:
+                    if "log not found" not in f"{exc}\n{exc.stdout}".lower():
+                        raise
+                    output = f"(failed log unavailable: {str(exc).strip()})"
+                lines.append(output[-4000:])
+            parts.append("\n".join(lines))
+        return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
+
+    def _job_annotations(self, job: dict[str, Any]) -> list[str]:
+        check_run = job.get("check_run_url") or f"{self._path}/check-runs/{job['id']}"
+        annotations = _items(self._call(["api", "--paginate", f"{check_run}/annotations"]))
+        return [item["message"] for item in annotations if isinstance(item.get("message"), str)]
 
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None:
         self._call([

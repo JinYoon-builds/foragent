@@ -12,6 +12,7 @@ from foragent import orch_inbox
 from foragent.config import Config
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
+from foragent.watch_sections import progress
 
 
 @dataclass
@@ -26,6 +27,10 @@ class Snapshot:
     captured_at: datetime
     # The durable request box (D76), oldest first.
     requests: list[dict[str, Any]] = field(default_factory=list)
+    # Every open order together: their count, merges in the last hour, and quota by executor.
+    orders: int = 0
+    recent: int = 0
+    quota: dict[str, tuple[float, datetime]] = field(default_factory=dict)
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -82,8 +87,10 @@ def collect(
             if candidate.state == "open" and (children := sub_issues(candidate.number)):
                 order = candidate
                 break
-    child_numbers = {issue.number for issue in children}
-    completed = sum(issue.state == "closed" for issue in children)
+    # One bar sums every open order; the representative order above only names the work.
+    completed, total, orders = progress.totals(list(rows.values()))
+    open_orders = {number for number, issue in issues.items() if issue.state == "open"}
+    child_numbers = {number for number, row in rows.items() if row.get("parent") in open_orders}
     history = store.read_history()  # status.history deliberately contains only ten entries
     merged = {}
     for run in history:
@@ -91,27 +98,16 @@ def collect(
             merged.pop(run.number, None)
             merged[run.number] = run
     done: dict[str, list[Issue]] = {}
-    durations = []
     for number, run in merged.items():
-        if order is not None and number not in child_numbers:
+        if child_numbers and number not in child_numbers:
             continue
-        issue = issues.get(number)
-        if issue is None:
-            continue
-        done.setdefault(run.lane, []).append(issue)
-        duration = (watch.datetime.fromisoformat(run.last_progress_at) - watch.datetime.fromisoformat(run.started_at)).total_seconds()
-        if duration > 0:
-            durations.append(duration)
-    eta = None
-    if order is not None and durations and completed < len(children):
-        # A lane is serial; max_parallel (or else the lane count) caps throughput. Historical
-        # run duration is an estimate, so the UI explicitly prefixes the time ~.
-        workloads = watch.Counter(watch.issue_lane(issue.labels, config.lanes) for issue in children if issue.state == "open")
-        batches = max(max(workloads.values()), sum(workloads.values()) / (config.max_parallel or len(workloads)))
-        eta = now + watch.timedelta(seconds=batches * sum(durations) / len(durations))
+        if (issue := issues.get(number)) is not None:
+            done.setdefault(run.lane, []).append(issue)
+    recent = progress.recent_merges(history, now)
+    eta = progress.finish_time(total - completed, recent, now)
     try:
         requests = orch_inbox.requests(store)
     except (OSError, ValueError):
         requests = []  # An unreadable box must not take the whole view down.
-    return watch.Snapshot(status, done, order, completed, len(children), eta, watch.recent_events(store), now,
-                          requests)
+    return watch.Snapshot(status, done, order, completed, total, eta, watch.recent_events(store), now,
+                          requests, orders, recent, progress.quota(store.root / "logs", now))

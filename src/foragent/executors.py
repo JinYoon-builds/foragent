@@ -21,6 +21,7 @@ class ExecResult:
     error_kind: str = "normal"
     session_id: str | None = None
     num_turns: int | None = None
+    usage: dict | None = None
 
 
 def classify_result(result: ExecResult) -> str:
@@ -76,6 +77,28 @@ def stream_session_id(path: Path, executor: str, *, offset: int = 0) -> str | No
     return fallback
 
 
+def codex_turns(path: Path) -> int | None:
+    """Count completed Codex turns once a thread has started; unknown otherwise."""
+    started, turns = False, 0
+    for event in _events(path):
+        started = started or event.get("type") == "thread.started"
+        turns += event.get("type") == "turn.completed"
+    return turns if started else None
+
+
+def codex_error_text(path: Path) -> str:
+    """Quote Codex's own error events when it ended without a last message."""
+    messages = []
+    for event in _events(path):
+        if event.get("type") not in ("error", "turn.failed"):
+            continue
+        error = event.get("error")
+        for value in (event.get("message"), error.get("message") if isinstance(error, dict) else error):
+            if isinstance(value, str) and value.strip() and value not in messages:
+                messages.append(value)
+    return "\n".join(messages)
+
+
 def _event_error_kind(event: dict, executor: str) -> str:
     kind = event.get("type")
     if executor == "codex":
@@ -124,17 +147,20 @@ class Executor(Protocol):
     def run(
         self, *, worktree: Path, prompt: str, model: str | None,
         timeout_s: int, log_path: Path, resume_session_id: str | None = None,
+        read_only: bool = False,
     ) -> ExecResult: ...
 
 
 def codex_command(worktree: Path, output_path: Path, model: str | None = None,
-                  effort: str | None = None, *, resume_session_id: str | None = None) -> list[str]:
+                  effort: str | None = None, *, resume_session_id: str | None = None,
+                  read_only: bool = False) -> list[str]:
     # Resume has its own CLI options; cwd is supplied by run_logged.
+    sandbox = "read-only" if read_only else "workspace-write"
     args = [
         "codex", "exec", "resume", resume_session_id, "-", "--skip-git-repo-check",
-        "--json", "-o", str(output_path), "-c", 'sandbox_mode="workspace-write"',
+        "--json", "-o", str(output_path), "-c", f'sandbox_mode="{sandbox}"',
     ] if resume_session_id is not None else [
-        "codex", "exec", "-", "-C", str(worktree), "-s", "workspace-write",
+        "codex", "exec", "-", "-C", str(worktree), "-s", sandbox,
         "--skip-git-repo-check", "--json", "-o", str(output_path),
     ]
     return args + (["-m", model] if model is not None else []) + (
@@ -144,9 +170,11 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
 
 def claude_command(
     model: str | None = None, settings_path: Path | None = None, agent: str | None = None,
-    *, resume_session_id: str | None = None,
+    *, resume_session_id: str | None = None, read_only: bool = False,
 ) -> list[str]:
-    args = ["claude", "-p", "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
+    # Plan mode lets Claude read and answer without editing files or running commands.
+    mode = "plan" if read_only else "auto"
+    args = ["claude", "-p", "--permission-mode", mode, "--output-format", "stream-json", "--verbose"]
     if settings_path is not None:
         args += ["--settings", str(settings_path)]
     if agent is not None:
@@ -175,12 +203,14 @@ class CodexExecutor:
     def run(
         self, *, worktree: Path, prompt: str, model: str | None,
         timeout_s: int, log_path: Path, effort: str | None = None,
-        resume_session_id: str | None = None,
+        resume_session_id: str | None = None, read_only: bool = False,
     ) -> ExecResult:
         with tempfile.TemporaryDirectory(prefix="foragent-codex-") as temporary:
             output_path = Path(temporary) / "last-message.txt"
             events_path = Path(temporary) / "events.jsonl"
             options = {"resume_session_id": resume_session_id} if resume_session_id is not None else {}
+            if read_only:
+                options["read_only"] = True
             code, timed_out, _ = run_logged(
                 codex_command(worktree, output_path, model, effort, **options), cwd=worktree, prompt=prompt,
                 timeout_s=timeout_s, log_path=log_path,
@@ -189,8 +219,11 @@ class CodexExecutor:
             last_message = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
             error_kind = _structured_error_kind(events_path, "codex")
             session_id = stream_session_id(events_path, "codex")
+            turns = codex_turns(events_path)
+            if not last_message.strip():
+                last_message = codex_error_text(events_path)
         return ExecResult(code, timed_out, last_message, log_path, last_message,
-                          error_kind=error_kind, session_id=session_id)
+                          error_kind=error_kind, session_id=session_id, num_turns=turns)
 
 
 class ClaudeExecutor:
@@ -200,10 +233,12 @@ class ClaudeExecutor:
         settings_path: Path | None = None, review_level: str | None = None,
         agent: str | None = None, review_pr: int | None = None,
         resume_session_id: str | None = None,
-        goal: str | None = None,
+        goal: str | None = None, read_only: bool = False,
     ) -> ExecResult:
         output_path = log_path.with_suffix(".stdout")
         options = {}
+        if read_only:
+            options["read_only"] = True
         if agent is not None:
             options["agent"] = agent
         if resume_session_id is not None:

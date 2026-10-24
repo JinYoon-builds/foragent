@@ -2,29 +2,78 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from foragent.actions import flag
 from foragent.executors import classify_result
 from foragent.issue import parse_body
 from foragent.labels import attempt_tier, issue_size
 from foragent.reasons import Reason
-from foragent.run_attempt import CIFailure, ExecutorStopped, Implementation
+from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation
 from foragent.run_baseline import _capture_acceptance_baseline
+from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
-from foragent.run_lane_skills import _lane_notes, _lane_skills
+from foragent.run_lane_skills import lane_notes, lane_skills
 from foragent.run_prompts import build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
 from foragent.run_waits import _phase, _timeout
 
 if TYPE_CHECKING:
+    from foragent.config import Config
     from foragent.runner import RunContext
     from foragent.git import GitRepo
 
 
+def lane_config(config: Config, lane: str) -> Config:
+    """The configuration a run on this lane uses: the lane's executor and model win."""
+    settings = config.lanes.get(lane, {}) if lane != "main" else {}
+    return replace(
+        config, executor=settings.get("executor") or config.executor,
+        executor_model=settings.get("model") if settings.get("model") is not None else config.executor_model,
+    )
+
+
+@dataclass
+class ImplementerSetup:
+    """How an issue's implementer is started; shared by implementation and order preread."""
+
+    executor: str
+    model: str | None
+    options: dict[str, Any] = field(default_factory=dict)
+    notes: str = ""
+    missing_skills: list[str] = field(default_factory=list)
+
+
+def implementer_setup(config: Config, lane: str, tier: str, worktree: Path) -> ImplementerSetup:
+    """Choose executor, model, lane agent, lane instructions and skills from a lane-adjusted config."""
+    native_claude = config.executor == "claude"
+    settings = config.tiers[tier]
+    model = config.executor_model
+    options: dict[str, Any] = {}
+    if native_claude:
+        model = (config.lanes.get(lane, {}) if lane != "main" else {}).get("model") or settings["claude_model"] or model
+    else:
+        options["effort"] = settings["codex_effort"]
+    agent, notes = lane_notes(config, lane, worktree)
+    missing: list[str] = []
+    if native_claude:
+        # Claude reads the lane agent itself; its notes are not prepended.
+        if agent is not None:
+            options["agent"] = agent
+        notes = ""
+    else:
+        skill_notes, missing = lane_skills(config, lane, worktree, agent)
+        notes += skill_notes
+    return ImplementerSetup(config.executor, model, options, notes, missing)
+
+
 def _prepare_implementation(
     n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
+    capture_baseline: bool = True,
 ) -> Implementation:
+    """Set up an implementer; a throwaway doctor task has no acceptance baseline to keep."""
     from foragent import runner
 
     approval = ctx.store.load_approval(n)
@@ -48,7 +97,14 @@ def _prepare_implementation(
     baseline_test_command = ctx.config.test_command
     if baseline_test_command is None:
         baseline_test_command = next(iter(runner.detect_test_commands(worktree)), None)
-    baseline = _capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
+    try:
+        baseline = (_capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
+                    if capture_baseline else None)
+    except AttemptFailure as exc:
+        _append(log, str(exc))
+        reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+        flag(ctx, n, reason, "acceptance baseline unavailable", str(exc))
+        raise ExecutorStopped(reason.value, str(exc)) from exc
     return Implementation(
         n=n,
         ctx=ctx,
@@ -89,20 +145,10 @@ def _implement(
     run = ctx.store.get_run(n)
     tier = attempt_tier(attempt.size, run.attempts)
     ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, str(run.attempts): tier})
-    settings = ctx.config.tiers[tier]
-    lane = ctx.config.lanes.get(run.lane, {})
-    model = ctx.config.executor_model
-    if attempt.native_claude:
-        model = lane.get("model") or settings["claude_model"] or model
-    else:
-        attempt.options["effort"] = settings["codex_effort"]
-    agent, notes = _lane_notes(ctx, n, worktree)
-    if attempt.native_claude and agent is not None:
-        attempt.options["agent"] = agent
-    if not attempt.native_claude:
-        skill_notes, missing = _lane_skills(ctx, n, worktree, agent)
-        notes += skill_notes
-        attempt.missing_skills.extend(name for name in missing if name not in attempt.missing_skills)
+    setup = implementer_setup(ctx.config, run.lane, tier, worktree)
+    model, notes = setup.model, setup.notes
+    attempt.options.update(setup.options)
+    attempt.missing_skills.extend(name for name in setup.missing_skills if name not in attempt.missing_skills)
     hint_path = ctx.store.root / "hints" / f"{n}.txt"
     hint = hint_path.read_text(encoding="utf-8") if hint_path.is_file() else None
     failure_context = str(failure) or run.resume_reason

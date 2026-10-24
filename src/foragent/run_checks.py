@@ -24,6 +24,7 @@ from foragent.config import Config
 from foragent.git import GitRepo
 from foragent.issue import ParsedIssue, has_machine_check, parse_body
 from foragent.reasons import Reason
+from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
 from foragent.run_execution import _claude_run_dir
 from foragent.run_waits import _phase, _progress, _test_slot, _timeout
@@ -58,14 +59,19 @@ def _check(
     _append(log, f"\nDone when command:\n{command}")
     offset = log.stat().st_size
 
+    # Checks run in the implementation worktree, whose changes are staged and
+    # published afterwards. Bytecode written by the checks must not join them.
+    environment = {"PYTHONDONTWRITEBYTECODE": "1"}
+
     def execute():
         # The slot covers only the command; timeout_s counts execution, not the queue.
         if slot is None:
-            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log)
+            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
+                                     env=environment)
         with slot:
             # A nested `fa test` in the command shares this slot instead of waiting for another.
             return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
-                              env=capacity.HELD_ENV)
+                                     env={**environment, **capacity.HELD_ENV})
 
     # A quiet check is still running; keep the scheduler informed while it waits.
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
@@ -282,7 +288,7 @@ def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
         if blocked >= 8:
             print("Done when: Stop hook block cap reached; runner verification will decide.")
             return 0
-        approval = Approval(**json.loads(snapshot.read_text(encoding="utf-8")))
+        approval = load_record(Approval, json.loads(snapshot.read_text(encoding="utf-8")))
         parsed = parse_body(approval.body)
         if not has_machine_check(parsed):
             raise ValueError("Done when has no machine check")
