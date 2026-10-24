@@ -156,6 +156,7 @@ def _available_executor(
             result.session_id is None and result.exit_code not in {None, 0}
             and not result.timed_out and classify_result(result) == "normal"
         )):
+            ctx.store.update_run(n, resume_failures=run.resume_failures + 1)
             if result is not None:
                 _append(kwargs["log_path"], f"Session resume failed; starting fresh:\n{result.last_message}\n{result.log_tail}")
             session_id = None

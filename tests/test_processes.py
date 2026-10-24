@@ -1,7 +1,11 @@
 """Kill safety regressions use only immutable fake identities and fake signals."""
 
 from dataclasses import replace
+import io
 import signal
+import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -10,9 +14,383 @@ from foragent import processes
 from foragent.state import StateStore
 
 
+@pytest.mark.parametrize("capture_stdout", [False, True])
+def test_large_prompt_reaches_slow_reader_without_blocking_identity_recording(tmp_path, monkeypatch, capture_stdout):
+    prompt = "한국어 prompt\n" * 32768
+    received = tmp_path / "received"
+    started = tmp_path / "started"
+    release = tmp_path / "identity-recorded"
+    assert len(prompt.encode("utf-8")) > 65536
+    observations = []
+
+    def observe_tree(identities=(), roots=()):
+        if roots:
+            # The child pauses after its first chunk until both callbacks run.
+            # A synchronous writer would fill the pipe and never reach here.
+            deadline = time.monotonic() + 10
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert started.exists(), "stdin delivery must begin before the launch scan"
+            assert not received.exists()
+            observations.append("observe")
+        return []
+
+    def process_group(pid):
+        if pid is not None:
+            assert not received.exists()
+            observations.append("group")
+
+    def process_tree(identities):
+        if not release.exists():
+            assert not received.exists()
+            observations.append("tree")
+            release.touch()
+
+    monkeypatch.setattr(processes, "observe_tree", observe_tree)
+    script = (
+        "from pathlib import Path\nimport sys, time\n"
+        "chunks = [sys.stdin.buffer.read(4096)]\nPath('started').touch()\n"
+        "deadline = time.monotonic() + 10\n"
+        "while not Path('identity-recorded').exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.005)\n"
+        "while chunk := sys.stdin.buffer.read(4096):\n"
+        "    chunks.append(chunk)\n    time.sleep(0.001)\n"
+        "Path('received').write_bytes(b''.join(chunks))\n"
+    )
+    with processes.track_process_group(process_group, tree_callback=process_tree):
+        code, timed_out, _ = processes.run_logged(
+            [sys.executable, "-c", script], cwd=tmp_path, timeout_s=20,
+            log_path=tmp_path / "run.log", prompt=prompt, capture_stdout=capture_stdout,
+        )
+    assert code == 0 and not timed_out
+    assert observations == ["observe", "group", "tree"]
+    assert received.read_bytes() == prompt.encode("utf-8")
+
+
+def test_fast_prompt_launcher_records_helper_before_reaping(fake_process_table, tmp_path, monkeypatch):
+    table = fake_process_table
+    prompt_read = threading.Event()
+    recorded, waiters = [], []
+
+    class Stdin(io.BytesIO):
+        def close(self):
+            assert self.getvalue() == b"task"
+            super().close()
+            prompt_read.set()
+
+    class Process:
+        pid = 42000
+        returncode = None
+
+        def __init__(self, *args, **kwargs):
+            self.stdin = Stdin()
+            table.add(self.pid, cwd=tmp_path, start_time=10)
+            table.add(42001, ppid=self.pid, cwd=tmp_path, start_time=11)
+
+        def wait(self, timeout=None):
+            assert prompt_read.wait(2)
+            waiters.append(threading.current_thread())
+            # Reaping removes the launcher and reparents its surviving helper.
+            table.exit(self.pid)
+            self.returncode = 0
+            return 0
+
+        def communicate(self, input=None, **kwargs):
+            self.stdin.write(input)
+            self.stdin.close()
+            self.wait()
+
+        def poll(self):
+            return self.returncode
+
+    observe = processes.observe_tree
+
+    def observe_after_prompt(identities=(), roots=()):
+        if roots:
+            assert prompt_read.wait(2), "The launcher must receive stdin before the launch scan"
+        return observe(identities, roots)
+
+    monkeypatch.setattr(processes.subprocess, "Popen", Process)
+    monkeypatch.setattr(processes, "observe_tree", observe_after_prompt)
+    with processes.track_process_group(lambda pid: None, tree_callback=recorded.append):
+        assert processes.run_logged(["offline-executor"], cwd=tmp_path, timeout_s=10,
+                                    log_path=tmp_path / "run.log", prompt="task")[:2] == (0, False)
+    expected = [{"pid": 42000, "start_time": 10}, {"pid": 42001, "start_time": 11}]
+    assert recorded == [expected, expected]
+    assert waiters == [threading.main_thread()]
+    assert table.rows[42001].ppid == 1 and 42001 in table.live
+    assert not table.calls
+
+
+@pytest.mark.parametrize("capture_stdout", [False, True])
+def test_exited_root_with_nonreading_stdin_descendant_has_bounded_cleanup(tmp_path, monkeypatch, capture_stdout):
+    from process_fakes import _ModuleView
+
+    children, writers = [], []
+    original_popen = processes.subprocess.Popen
+    release = tmp_path / "release-descendant"
+    finished = tmp_path / "descendant-finished"
+
+    def popen(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    class Thread(threading.Thread):
+        def __init__(self, *, target, daemon):
+            super().__init__(target=target, daemon=daemon)
+            if target.__name__ in {"communicate_prompt", "write_prompt"}:
+                writers.append(self)
+
+    def interrupted(pid):
+        if pid is not None:
+            assert children[0].wait(timeout=2) == 0
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+    script = (
+        "import os, time\nfrom pathlib import Path\n"
+        "if os.fork() == 0:\n"
+        "    deadline = time.monotonic() + 5\n"
+        "    while not Path('release-descendant').exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n"
+        "    Path('descendant-finished').touch()\n"
+        "    os._exit(0)\n"
+    )
+    prompt = "x" * (1024 * 1024)
+    previous = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(processes.subprocess, "Popen", popen)
+    monkeypatch.setattr(processes, "threading", _ModuleView(threading, Thread=Thread))
+    try:
+        before = time.monotonic()
+        with processes.track_process_group(interrupted), pytest.raises(SystemExit) as exc:
+            processes.run_logged([sys.executable, "-c", script], cwd=tmp_path, timeout_s=60,
+                                 log_path=tmp_path / "run.log", prompt=prompt, capture_stdout=capture_stdout)
+        assert time.monotonic() - before < 2
+        assert exc.value.code == 128 + signal.SIGTERM
+        assert not finished.exists(), "Cleanup must finish while the descendant still holds stdin"
+        assert children[0].stdin.closed
+        assert signal.getsignal(signal.SIGTERM) == previous
+    finally:
+        release.touch()
+        for writer in writers:
+            writer.join(2)
+            assert not writer.is_alive()
+        deadline = time.monotonic() + 2
+        while not finished.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert finished.exists()
+
+
 def owned_stop(pid, identities):
     with processes.recorded_tree(identities):
         return processes.kill_process_group(pid)
+
+
+def test_prompt_timeout_still_stops_only_verified_identities(fake_process_table, tmp_path, monkeypatch):
+    from process_fakes import install_popen
+
+    install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["offline-executor"],
+                  timeout=True, children=(42001,))
+    code, timed_out, _ = processes.run_logged(
+        ["offline-executor"], cwd=tmp_path, timeout_s=1, log_path=tmp_path / "run.log", prompt="task",
+    )
+    assert code == -signal.SIGKILL and timed_out
+    assert not {42000, 42001} & fake_process_table.live
+    assert all(kind == "pid" and signum != 0 for kind, _, signum in fake_process_table.signals)
+
+
+@pytest.mark.parametrize("failure", [BrokenPipeError, OSError, ValueError])
+@pytest.mark.parametrize("operation", ["write", "close"])
+def test_prompt_writer_records_io_errors_without_failing_on_broken_pipe(tmp_path, monkeypatch, failure, operation):
+    closed = threading.Event()
+
+    class Stdin:
+        def write(self, data):
+            if operation == "write":
+                raise failure("stdin unavailable")
+            return len(data)
+
+        def close(self):
+            closed.set()
+            if operation == "close":
+                raise failure("stdin unavailable")
+
+    class Process:
+        pid = 42000
+        returncode = 0
+        stdin = Stdin()
+
+        def wait(self, timeout=None):
+            assert threading.current_thread() is threading.main_thread()
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(processes.subprocess, "Popen", lambda *args, **kwargs: Process())
+
+    def run():
+        return processes.run_logged(["offline-executor"], cwd=tmp_path, timeout_s=1,
+                                    log_path=tmp_path / "run.log", prompt="task")
+
+    if failure is BrokenPipeError:
+        assert run()[:2] == (0, False)
+    else:
+        with pytest.raises(failure, match="stdin unavailable"):
+            run()
+    assert closed.is_set()
+
+
+def test_unbuffered_prompt_writer_retries_partial_writes(tmp_path, monkeypatch):
+    received = bytearray()
+    closed = threading.Event()
+
+    class Stdin:
+        def write(self, data):
+            received.extend(data[:3])
+            return len(data[:3])
+
+        def close(self):
+            closed.set()
+
+    class Process:
+        pid = 42000
+        returncode = 0
+        stdin = Stdin()
+
+        def wait(self, timeout=None):
+            assert closed.wait(2)
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(processes.subprocess, "Popen", lambda *args, **kwargs: Process())
+    prompt = "한국어 prompt\n"
+    assert processes.run_logged(["offline-executor"], cwd=tmp_path, timeout_s=1,
+                                log_path=tmp_path / "run.log", prompt=prompt)[:2] == (0, False)
+    assert received == prompt.encode("utf-8")
+
+
+@pytest.mark.parametrize("capture_stdout", [False, True])
+def test_interrupted_prompt_refused_stop_does_not_wait_for_live_child(tmp_path, monkeypatch, capture_stdout):
+    started, release = threading.Event(), threading.Event()
+    workers = []
+
+    class Stdin:
+        closed = False
+
+        def write(self, data):
+            workers.append(threading.current_thread())
+            started.set()
+            release.wait(5)  # Bound the regression test even with an unbounded join.
+            return len(data)
+
+        def close(self):
+            self.closed = True
+
+    class Process:
+        pid = 42000
+        returncode = None
+        stdin = Stdin()
+
+        def poll(self):
+            return None  # Refusing the stop leaves this fake child alive.
+
+    child = Process()
+    monkeypatch.setattr(processes.subprocess, "Popen", lambda *args, **kwargs: child)
+    monkeypatch.setattr(processes, "observe_tree", lambda *args, **kwargs: [])
+    monkeypatch.setattr(processes, "kill_process_group", lambda pid: pytest.fail("Unverified stop must not signal"))
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def interrupted(pid):
+        assert started.wait(2)
+        # Call the installed handler directly; never deliver a real signal.
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+    try:
+        before = time.monotonic()
+        with processes.track_process_group(interrupted), pytest.raises(PermissionError, match="Cannot verify executor identity"):
+            processes.run_logged(["offline-executor"], cwd=tmp_path, timeout_s=3600,
+                                 log_path=tmp_path / "run.log", prompt="task", capture_stdout=capture_stdout)
+        assert time.monotonic() - before < 3
+        assert child.poll() is None
+        assert child.stdin.closed
+        assert workers[0].daemon and workers[0].is_alive()
+        assert signal.getsignal(signal.SIGTERM) == previous
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(2)
+            assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_completed_prompt_cleanup_joins_communicator_fully(fake_process_table, tmp_path, monkeypatch, timeout):
+    from process_fakes import _ModuleView, install_popen
+
+    joins = []
+
+    class Thread(threading.Thread):
+        def __init__(self, *, target, daemon):
+            super().__init__(target=target, daemon=daemon)
+            self.kind = target.__name__
+
+        def join(self, timeout=None):
+            if self.kind == "write_prompt":
+                joins.append(timeout)
+            result = super().join(timeout)
+            if self.kind == "write_prompt":
+                assert not self.is_alive()
+            return result
+
+    install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["offline-executor"], timeout=timeout)
+    monkeypatch.setattr(processes, "threading", _ModuleView(threading, Thread=Thread))
+    code, timed_out, _ = processes.run_logged(
+        ["offline-executor"], cwd=tmp_path, timeout_s=1, log_path=tmp_path / "run.log", prompt="task",
+    )
+    assert code == (-signal.SIGKILL if timeout else 0) and timed_out is timeout
+    assert joins == [1]
+
+
+def test_prompt_communication_error_propagates_after_verified_cleanup(fake_process_table, tmp_path, monkeypatch):
+    from process_fakes import install_popen
+
+    def communicate(process):
+        raise RuntimeError("prompt communication failed")
+
+    install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["offline-executor"],
+                  communicate=communicate, children=(42001,))
+    with pytest.raises(RuntimeError, match="prompt communication failed"):
+        processes.run_logged(["offline-executor"], cwd=tmp_path, timeout_s=1,
+                             log_path=tmp_path / "run.log", prompt="task")
+    assert not {42000, 42001} & fake_process_table.live
+
+
+def test_prompt_communication_cannot_record_a_reused_pid_as_its_birth(fake_process_table, tmp_path, monkeypatch):
+    from process_fakes import install_popen
+
+    def communicate(process):
+        fake_process_table.exit(process.pid)
+        fake_process_table.add(process.pid, cwd=tmp_path, start_time=20)
+        process.returncode = 0
+
+    install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["offline-executor"],
+                  communicate=communicate)
+    recorded = []
+    observe_tree = processes.observe_tree
+
+    def observe_before_reaping(identities=(), roots=()):
+        if roots:
+            assert fake_process_table.rows[42000].start_time == 10
+        return observe_tree(identities, roots)
+
+    monkeypatch.setattr(processes, "observe_tree", observe_before_reaping)
+    with processes.track_process_group(lambda pid: None, tree_callback=recorded.append):
+        assert processes.run_logged(["offline-executor"], cwd=tmp_path, timeout_s=1, prompt="task",
+                                    log_path=tmp_path / "run.log", terminate_children=True)[:2] == (0, False)
+    assert recorded == [[{"pid": 42000, "start_time": 10}]] * 2
+    assert 42000 in fake_process_table.live and not fake_process_table.calls
 
 
 def test_empty_recorded_ownership_does_not_authorize_a_signal(fake_process_table, tmp_path):

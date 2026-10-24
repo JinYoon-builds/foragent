@@ -153,7 +153,9 @@ class Executor(Protocol):
 
 def codex_command(worktree: Path, output_path: Path, model: str | None = None,
                   effort: str | None = None, *, resume_session_id: str | None = None,
-                  read_only: bool = False) -> list[str]:
+                  read_only: bool = False, prompt: str | None = None) -> list[str]:
+    if resume_session_id is not None and (prompt is None or not prompt.strip()):
+        raise ValueError("Session resume requires a non-empty prompt")
     # Resume has its own CLI options; cwd is supplied by run_logged.
     sandbox = "read-only" if read_only else "workspace-write"
     args = [
@@ -170,8 +172,10 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
 
 def claude_command(
     model: str | None = None, settings_path: Path | None = None, agent: str | None = None,
-    *, resume_session_id: str | None = None, read_only: bool = False,
+    *, resume_session_id: str | None = None, read_only: bool = False, prompt: str | None = None,
 ) -> list[str]:
+    if resume_session_id is not None and (prompt is None or not prompt.strip()):
+        raise ValueError("Session resume requires a non-empty prompt")
     # Plan mode lets Claude read and answer without editing files or running commands.
     mode = "plan" if read_only else "auto"
     args = ["claude", "-p", "--permission-mode", mode, "--output-format", "stream-json", "--verbose"]
@@ -208,7 +212,7 @@ class CodexExecutor:
         with tempfile.TemporaryDirectory(prefix="foragent-codex-") as temporary:
             output_path = Path(temporary) / "last-message.txt"
             events_path = Path(temporary) / "events.jsonl"
-            options = {"resume_session_id": resume_session_id} if resume_session_id is not None else {}
+            options = {"resume_session_id": resume_session_id, "prompt": prompt} if resume_session_id is not None else {}
             if read_only:
                 options["read_only"] = True
             code, timed_out, _ = run_logged(
@@ -243,6 +247,7 @@ class ClaudeExecutor:
             options["agent"] = agent
         if resume_session_id is not None:
             options["resume_session_id"] = resume_session_id
+            options["prompt"] = prompt
         command = (claude_review_command(review_level, model, pr=review_pr) if review_level is not None
                    else claude_command(model, settings_path, **options))
         if review_level is None and resume_session_id is None and goal is not None:
