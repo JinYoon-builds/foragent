@@ -63,6 +63,7 @@ class Config:
     run_hours: str = "always"
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
+    tick_failure_alert: int = 3
     max_runtime_minutes: int = 90
     max_retries: int = 2
     conflict_retries: int = 2
@@ -397,7 +398,8 @@ def _validate(values: dict[str, Any]) -> None:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
                 "max_parallel", "transient_max_wait_minutes", "limit_wait_minutes",
-                "orchestrator_timeout_minutes", "test_slots", "test_slots_floor", "parallel_floor"):
+                "orchestrator_timeout_minutes", "tick_failure_alert", "test_slots", "test_slots_floor",
+                "parallel_floor"):
         if key == "max_parallel" and values[key] is None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
