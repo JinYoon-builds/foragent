@@ -503,10 +503,67 @@ def test_scheduler_never_adds_cards_for_unknown_closed_or_unapproved_issues(ctx,
 
     monkeypatch.setattr(remote, "graphql", counted)
     tick(ctx)
+    assert not any("ForagentAddBoardItem" in query or "ForagentSetBoardValue" in query for query in touched)
+    touched.clear()
     tick(ctx)
-    assert touched == [], "unknown issues need no board call"
+    assert touched == [], "an issue already checked for its column needs no board call"
     numbers = {item["content"]["number"] for item in snapshot(ctx.tracker, project_id)["items"]["nodes"]}
     assert not numbers & {7, 8}
+
+
+@pytest.mark.parametrize("change", ["unapproved", "closed"])
+def test_scheduler_moves_existing_cards_without_a_local_record(ctx, monkeypatch, change):
+    from foragent import board
+    from test_board import item_values
+
+    project_id = board.ensure(ctx.tracker, ctx.repo)
+    ctx.config = replace(ctx.config, board=project_id)
+    approve(ctx)
+    tick(ctx)
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🌰 Up next"
+    ctx.store.update_local_issue(1, board_values={})  # Adopted card: no local record.
+    if change == "unapproved":
+        ctx.tracker.remove_labels(1, ["approved", "ready"])
+    else:
+        ctx.tracker.close_issue(1)
+    writes = _board_writes(ctx, monkeypatch)
+    tick(ctx)
+    wanted = "🗂 Backlog" if change == "unapproved" else "📦 Done"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == wanted
+    assert len(writes) == 1
+    writes.clear()
+    tick(ctx)
+    assert writes == []
+
+
+def test_scheduler_moves_a_card_people_add_after_the_board_had_none(ctx, monkeypatch):
+    from foragent import board
+    from test_board import item_values
+
+    project_id = board.ensure(ctx.tracker, ctx.repo)
+    ctx.config = replace(ctx.config, board=project_id)
+    ctx.tracker.add_issue(8, "Closed without a card")
+    ctx.tracker.close_issue(8)
+    tick(ctx)
+    assert ctx.tracker.board_value(8, project_id, "Status") == board.NO_CARD
+    # Someone adds the closed issue's card in 🐿 In progress on GitHub.
+    status = board.Project(ctx.tracker, ctx.repo, project_id).fields()["Status"]
+    option = next(option for option in status["options"] if option["name"] == "🐿 In progress")
+    item = ctx.tracker.graphql("""mutation ForagentAddBoardItem($input: AddProjectV2ItemByIdInput!) {
+      addProjectV2ItemById(input: $input) { item { id } }
+    }""", {"input": {"projectId": project_id, "contentId": "I_owner/repo#8"}})["data"]["addProjectV2ItemById"]["item"]
+    ctx.tracker.graphql("""mutation ForagentSetBoardValue($input: UpdateProjectV2ItemFieldValueInput!) {
+      updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+    }""", {"input": {"projectId": project_id, "itemId": item["id"], "fieldId": status["id"],
+                     "value": {"singleSelectOptionId": option["id"]}}})
+    writes = _board_writes(ctx, monkeypatch)
+    ctx.now = lambda: NOW + timedelta(minutes=6)  # The next periodic refresh reads the board.
+    tick(ctx)
+    assert item_values(ctx.tracker, project_id, 8)["Status"] == "📦 Done"
+    assert len(writes) == 1
+    writes.clear()
+    tick(ctx)
+    assert writes == []
 
 
 def test_scheduler_repairs_board_after_transport_recovers(ctx, caplog):

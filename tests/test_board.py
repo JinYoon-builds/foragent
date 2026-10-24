@@ -377,17 +377,42 @@ def test_known_only_sync_moves_recorded_cards_and_never_adds_cards(recording_boa
         return graphql(query, variables)
 
     monkeypatch.setattr(remote, "graphql", counted)
-    board.sync_status(ctx, 1, "closed", known_only=True)
-    assert calls == [], "an issue with no recorded card needs no board call"
+    board.sync_status(ctx, 1, "closed", existing_only=True)
+    assert not any("ForagentAddBoardItem" in query or "ForagentSetBoardValue" in query for query in calls)
     assert snapshot(remote, ctx.config.board)["items"]["nodes"] == []
+    calls.clear()
+    board.sync_status(ctx, 1, "merged", existing_only=True)  # Same column, already checked.
+    assert calls == [], "an issue checked for this column needs no further board call"
     board.sync_status(ctx, 1, "Ready")
     calls.clear()
-    board.sync_status(ctx, 1, "closed", known_only=True)
+    board.sync_status(ctx, 1, "closed", existing_only=True)
     assert item_values(remote, ctx.config.board, 1)["Status"] == board.board_column("closed")
     assert sum("ForagentSetBoardValue" in query for query in calls) == 1
     calls.clear()
-    board.sync_status(ctx, 1, "merged", known_only=True)  # Same 📦 Done column.
+    board.sync_status(ctx, 1, "merged", existing_only=True)  # Same 📦 Done column.
     assert calls == []
+
+
+def test_existing_only_sync_adopts_cards_without_a_local_record(recording_board, monkeypatch):
+    ctx, remote, clock = recording_board
+    board.sync_status(ctx, 1, "Ready")
+    ctx.store.update_local_issue(1, board_values={})  # A card placed before local records existed.
+    writes = []
+    graphql = remote.graphql
+
+    def counted(query, variables):
+        if "ForagentSetBoardValue" in query:
+            writes.append(variables)
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", counted)
+    board.sync_status(ctx, 1, "unapproved", existing_only=True)
+    assert item_values(remote, ctx.config.board, 1)["Status"] == board.board_column("unapproved")
+    assert len(writes) == 1
+    board.sync_status(ctx, 1, "unapproved", existing_only=True)
+    assert len(writes) == 1, "the moved card is recorded; a repeat sync writes nothing"
+    board.sync_status(ctx, 1, "closed", existing_only=True)
+    assert item_values(remote, ctx.config.board, 1)["Status"] == board.board_column("closed")
 
 
 def test_confirmed_unchanged_card_is_recorded_so_the_next_sync_needs_no_call(recording_board, monkeypatch):
@@ -407,3 +432,14 @@ def test_confirmed_unchanged_card_is_recorded_so_the_next_sync_needs_no_call(rec
     calls.clear()
     board.sync_status(ctx, 1, "Ready")
     assert calls == []
+
+
+def test_refresh_cards_records_every_card_and_marks_issues_without_one(recording_board):
+    ctx, remote, clock = recording_board
+    remote.add_issue(2, "No card")
+    ctx.store.record_issue(remote.get_issue(2), {})
+    board.sync_status(ctx, 1, "Running")
+    ctx.store.update_local_issue(1, board_values={})
+    board.refresh_cards(ctx)
+    assert ctx.tracker.board_value(1, ctx.config.board, "Status") == board.board_column("Running")
+    assert ctx.tracker.board_value(2, ctx.config.board, "Status") == board.NO_CARD

@@ -81,6 +81,20 @@ class FakeProjects:
                                   if option else None})
             result = {"repository": {"issue": {"id": content_id, "projectItems": self._connection(
                 items, variables.get("cursor"))}}}
+        elif operation == "ForagentBoardCards":
+            project = self.projects.get(variables["id"])
+            node = None
+            if project:
+                status = next((field for field in project["fields"].values() if field["name"] == "Status"), None)
+                items = []
+                for item in project["items"].values():
+                    repository, _, number = item["contentId"].removeprefix("I_").rpartition("#")
+                    option = next((option for option in status["options"]
+                                   if option["id"] == item["values"].get(status["id"])), None) if status else None
+                    items.append({"content": {"number": int(number), "repository": {"nameWithOwner": repository}},
+                                  "fieldValueByName": {"name": option["name"]} if option else None})
+                node = {"items": self._connection(items, variables.get("cursor"))}
+            result = {"node": node}
         elif operation == "ForagentAddBoardItem":
             project = self.projects[data["projectId"]]
             item = next((item for item in project["items"].values() if item["contentId"] == data["contentId"]), None)

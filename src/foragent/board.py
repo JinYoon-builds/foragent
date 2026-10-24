@@ -15,6 +15,9 @@ STATUSES = ("Approved", "Ready", "Running", "Blocked", "Needs human", "PR open",
 DEFAULT_MAP = {"Backlog": "🗂 Backlog", "Up next": "🌰 Up next", "In progress": "🐿 In progress",
                "Your turn": "✋ Your turn", "Done": "📦 Done"}
 COLUMNS = tuple(DEFAULT_MAP.values())
+# Recorded as an issue's Status when the board had no card for it. The periodic
+# board read (refresh_cards) replaces it, so a card added later is picked up.
+NO_CARD = "no card"
 STATE_GROUPS = {"unapproved": "Backlog", "Approved": "Up next", "Ready": "Up next",
                 "Running": "In progress", "PR open": "In progress", "Blocked": "In progress",
                 "Needs human": "Your turn", "Done": "Done", "merged": "Done", "closed": "Done"}
@@ -113,15 +116,20 @@ class Project:
     def set_values(self, issue: Issue | int, values: dict[str, str], *, initial_status: bool = False,
                    add: bool = True) -> None:
         number = issue.number if isinstance(issue, Issue) else issue
+        recorded = getattr(self.tracker, "board_value", None)
+        record = getattr(self.tracker, "record_board_value", None)
         # A card already set to every wanted value needs no board call.
-        if values and (recorded := getattr(self.tracker, "board_value", None)) is not None and all(
+        if values and recorded is not None and all(
             recorded(number, self.id, name) == value for name, value in values.items()
         ):
             return
+        if not add and recorded is not None and recorded(number, self.id, "Status") == NO_CARD:
+            return  # The last board read found no card for this issue.
         owner, name = self.repo.split("/", 1)
-        fields = self.fields()
-        if "Status" in values and not any(option["name"] == values["Status"]
-                                         for option in fields.get("Status", {}).get("options", [])):
+        fields = self.fields() if add else None
+        if fields is not None and "Status" in values and not any(
+            option["name"] == values["Status"] for option in fields.get("Status", {}).get("options", [])
+        ):
             log.warning("Board column %s is unavailable; skipping issue #%s", values["Status"], number)
             return
         cursor = None
@@ -144,7 +152,16 @@ class Project:
                 break
             cursor = connection["pageInfo"]["endCursor"]
         if item is None and not add:
-            return  # Only move an existing card; never add one here.
+            # Only move an existing card; never add one here. Remember the check.
+            if record is not None:
+                record(number, self.id, "Status", NO_CARD)
+            return
+        if fields is None:
+            fields = self.fields()
+            if not any(option["name"] == values["Status"]
+                       for option in fields.get("Status", {}).get("options", [])):
+                log.warning("Board column %s is unavailable; skipping issue #%s", values["Status"], number)
+                return
         if item is None:
             try:
                 item = _data(self.tracker, """mutation ForagentAddBoardItem($input: AddProjectV2ItemByIdInput!) {
@@ -254,22 +271,21 @@ def set_status(issue: Issue | int, status: str) -> None:
         board_column(status)  # Validate even when there is no repository context.
 
 
-def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, known_only: bool = False) -> None:
+def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_only: bool = False) -> None:
     """Move the issue's card to the column for ``status`` when the column differs.
 
-    ``known_only`` limits the sync to cards this repository has recorded, so
-    closed or unapproved issues never add cards or query the board for issues
-    Foragent never placed there.
+    ``existing_only`` moves a card that is already on the board, recorded
+    locally or not, and never adds one. A tracker that records board values is
+    required. An issue the last board read found without a card is skipped
+    until refresh_cards reads the board again.
     """
     if not ctx.config.board:
         return
-    if known_only:
-        recorded = getattr(ctx.tracker, "board_value", None)
-        if recorded is None or recorded(getattr(issue, "number", issue), ctx.config.board, "Status") is None:
-            return
+    if existing_only and getattr(ctx.tracker, "board_value", None) is None:
+        return
     token = _current.set(Project(ctx.tracker, ctx.repo, ctx.config.board, ctx.config.board_map))
     try:
-        if not known_only:
+        if not existing_only:
             set_status(issue, status)
         elif (column := board_column(status, ctx.config.board_map)) is not None:
             _current.get().set_values(issue, {"Status": column}, add=False)
@@ -280,6 +296,50 @@ def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, known_onl
                     getattr(issue, "number", issue), exc_info=True)
     finally:
         _current.reset(token)
+
+
+def refresh_cards(ctx: BoardContext, tracker: Tracker | None = None) -> None:
+    """Record every issue's card Status from one paged read of the whole board.
+
+    Issues with no card on the board get NO_CARD. Run with the periodic issue
+    refresh, this picks up cards that people added or moved on the board.
+    """
+    tracker = tracker or ctx.tracker
+    record = getattr(tracker, "record_board_value", None)
+    recorded = getattr(tracker, "board_value", None)
+    if not ctx.config.board or record is None or recorded is None:
+        return
+    cards: dict[int, str] = {}
+    cursor = None
+    try:
+        while True:
+            node = _data(tracker, """query ForagentBoardCards($id: ID!, $cursor: String) {
+              node(id: $id) { ... on ProjectV2 { items(first: 100, after: $cursor) {
+                nodes { content { ... on Issue { number repository { nameWithOwner } } }
+                  fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } }
+                pageInfo { hasNextPage endCursor }
+              } } }
+            }""", {"id": ctx.config.board, "cursor": cursor})["node"]
+            if node is None:
+                return
+            connection = node["items"]
+            for item in connection["nodes"]:
+                content = item.get("content") or {}
+                repository = (content.get("repository") or {}).get("nameWithOwner", "")
+                if content.get("number") is not None and repository.lower() == ctx.repo.lower():
+                    cards[content["number"]] = (item.get("fieldValueByName") or {}).get("name") or ""
+            if not connection["pageInfo"]["hasNextPage"]:
+                break
+            cursor = connection["pageInfo"]["endCursor"]
+    except Exception as exc:
+        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            raise
+        log.warning("Could not read board cards for %s", ctx.repo, exc_info=True)
+        return
+    for row in ctx.store.local_issues():
+        value = cards.get(row["number"], NO_CARD)
+        if recorded(row["number"], ctx.config.board, "Status") != value:
+            record(row["number"], ctx.config.board, "Status", value)
 
 
 def add_issue(tracker: Tracker, repo: str, project_id: str | None, issue: int,
