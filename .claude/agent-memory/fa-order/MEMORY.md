@@ -20,4 +20,15 @@
 - #111: native 인터뷰의 기준은 `docs/decisions.md` D58과 보강 2다. 문서 장부는 출처·날짜와 함께 한 번 확인하고, 명시적 변경은 재승인 없이 반영한다. 불명확한 충돌만 Change / Keep / Exception this once로 한 번 묻고 영구 변경은 대체 결정 기록을 남긴다.
 - #111: `new_lanes[].skills`와 `fa lanes skills`에는 사람이 고른 고정 스타일만 둔다. 도구·검토·분야 스킬은 승인된 목록에서 레인 에이전트가 이슈마다 선택한다. `fa skills add URL --json`으로 미리 보고 모든 스킬의 역할을 확인한 뒤 `--approve --role SKILL=ROLE`로 등록한다.
 - #111 스킬 재작성 때 `files`, `interactive`, 시작 직후 뷰 열기와 progress 전체 단계를 유지한다. 빠른 검증: `uv run pytest tests/acceptance/test_fa_order_interview.py tests/acceptance/test_fa_order_skill.py tests/acceptance/test_order_progress.py tests/acceptance/test_issue_files.py tests/acceptance/test_interactive_flag.py`.
+- #237: `fa order preread`는 이슈별 프롬프트의 sha256으로 결과를 저장소 안 `.foragent/preread.json`(자체 `.gitignore` `*`)에 둔다. 시험이 HOME을 격리하지 않아 `StateStore.for_repo`에 쓰면 저장소 밖이 바뀐다. 관문은 `order.require_clean_preread`이며 `tests/test_order.py`는 autouse로 끈다. 실행기 `read_only=True`는 codex `-s read-only`, claude `--permission-mode plan`.
+- #237: 전체 `fa test tests/`는 10분 제한을 넘는다. 관련 파일만 골라 돌린다. 승인 발행을 쓰는 잠긴 인수 시험(`test_publish_own_paths.py`, `test_view_open_triggers.py`)은 preread 관문과 충돌해 QUESTION.md로 넘겼다.
 - #259: 발행 Git 단계는 `order._publish_files`에 있고 `git.publish_lock()`(git common dir의 flock) 안에서 `git.update_base(branch)`(fetch 후 ff-only)를 먼저 한다. 덕 타입 가짜 Git(`tests/test_order.py::PublishingGit`)에 메서드를 추가해야 한다. 검증: `fa test tests/acceptance/test_publish_own_paths.py`. `test_listing_sanity`·`test_order_preread`는 미구현 기능이라 원래 실패한다.
+- 2026-10-24 D81/#307 이후 러너는 Done when, 인수 기준선, 수정한 파일의 자체 시험만 돌린다. 재시도 때 작업 트리가 다시 만들어지면 `.foragent/TRY.md`도 사라지므로 다시 쓴다.
+- #237 리뷰: preread와 승인 관문은 `order.preread_target`을 함께 쓴다. edits도 대상이며(key `#N`, 트래커에서 제목·레인), 해시에는 실행기·모델(레인 설정 우선, 러너와 동일)과 blocked_by·interactive·new_lanes가 든 프롬프트가 들어간다.
+- 레인 브랜치가 main보다 뒤처지면 main에 새로 생긴 인수 파일이 diff에서 "삭제"로 보여 리뷰가 거절한다. `git restore --source=origin/main --worktree -- <파일>`로 가져오고 `git hash-object`로 같은지 확인한다. 모르는 점은 스킬이 스스로 답하지 않고 사용자에게 묻는다(#237 제외 범위).
+- #237 3차: preread 증거 키에는 계획 전체(정렬한 JSON)가 들어가 어떤 이슈의 변경도 이전 결과를 무효로 한다. `--approve-numbers`에 아직 매핑되지 않은 번호가 있으면 이번에 만들 자식 전부에 깨끗한 preread를 요구한다.
+- 재시도를 시작할 때마다 `git fetch origin && git diff --name-only HEAD...origin/main`을 먼저 본다. 나온 파일이 내 변경과 겹치지 않으면 zsh에서 `files=(${(f)"$(...)"})`로 나눈 뒤 `git restore --source=origin/main --worktree -- $files`로 가져온다(#237에서 두 번 "인수 시험 삭제"로 거절됨).
+- 위 동기화 뒤 main에서 새로 생긴 파일은 `git add -N`(내용 없이 추적 표시)으로 표시한다. 그래야 `git diff origin/main`이 내 파일만 보여 리뷰가 "삭제"로 오해하지 않는다. main에서 지워진 파일은 `git cat-file -e origin/main:<파일>`로 가려 지운다.
+- #237 4차: preread는 `run_implementation.lane_config` + `implementer_setup(config, lane, tier, worktree)`를 구현과 함께 쓴다(첫 시도 tier = 이슈 크기). 필드를 따로 흉내 내면 리뷰마다 어긋남이 새로 나온다. 비교 시험은 `tests/test_order.py::test_preread_setup_matches_the_implementation_setup`.
+- 병합 중(MERGE_HEAD 있음)에 main이 또 움직였으면 `git diff --name-only MERGE_HEAD origin/main`만 가져온다. `git checkout --theirs`는 권한이 막히므로 `git restore --source=origin/main --worktree`를 쓴다.
+- #237 5차: 이번 주문이 만드는 레인(`new_lanes` 중 설정에 아직 없는 것)의 이슈는 preread와 승인 모두 거절한다. 레인 에이전트·스킬은 `add_lane`이 설치하므로 미리 흉내 내지 않는다. 순서: `--approve` 없이 발행 → preread → `--approve`로 재발행.

@@ -5,7 +5,7 @@ from __future__ import annotations
 from itertools import islice
 from pathlib import Path
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -13,12 +13,21 @@ from foragent.git import GitRepo
 from foragent.skills import SkillManager, copy_lane_skills
 
 if TYPE_CHECKING:
+    from foragent.config import Config
     from foragent.runner import RunContext
 
 
+def _lane_settings(config: Config, lane: str) -> dict[str, Any]:
+    return config.lanes.get(lane, {}) if lane != "main" else {}
+
+
 def _lane_notes(ctx: RunContext, n: int, worktree: Path) -> tuple[str | None, str]:
-    lane = ctx.store.get_run(n).lane
-    settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
+    return lane_notes(ctx.config, ctx.store.get_run(n).lane, worktree)
+
+
+def lane_notes(config: Config, lane: str, worktree: Path) -> tuple[str | None, str]:
+    """The lane agent and its instructions and memory, as read from the worktree."""
+    settings = _lane_settings(config, lane)
     agent = settings.get("agent")
     if not isinstance(agent, str) or not re.fullmatch(r"fa-[a-z0-9-]+", agent):
         return None, ""
@@ -35,8 +44,11 @@ def _lane_notes(ctx: RunContext, n: int, worktree: Path) -> tuple[str | None, st
 
 
 def _lane_skill_names(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> list[str]:
-    lane = ctx.store.get_run(n).lane
-    settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
+    return lane_skill_names(ctx.config, ctx.store.get_run(n).lane, worktree, agent)
+
+
+def lane_skill_names(config: Config, lane: str, worktree: Path, agent: str | None) -> list[str]:
+    settings = _lane_settings(config, lane)
     skills = settings.get("skills", [])
     frontmatter = re.compile(r"\A---[^\S\n]*\n(.*?)^---[^\S\n]*(?:\n|$)", re.DOTALL | re.MULTILINE)
     if not skills and agent is not None:
@@ -63,8 +75,12 @@ def _inject_lane_skills(ctx: RunContext, n: int, git: GitRepo, target_ref: str |
 
 
 def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
+    return lane_skills(ctx.config, ctx.store.get_run(n).lane, worktree, agent)
+
+
+def lane_skills(config: Config, lane: str, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
     """List installed skills so Codex can read them when relevant."""
-    skills = _lane_skill_names(ctx, n, worktree, agent)
+    skills = lane_skill_names(config, lane, worktree, agent)
     frontmatter = re.compile(r"\A---[^\S\n]*\n(.*?)^---[^\S\n]*(?:\n|$)", re.DOTALL | re.MULTILINE)
     sections, missing = [], []
     for name in skills:

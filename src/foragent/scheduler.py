@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, tidy, watch_open
+from foragent import board, orch_github, orch_queue, tidy, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -81,7 +81,7 @@ class TickReport:
 from foragent.scheduler_approval import _check_integrity, _invalidate_approval, _latest_approval, _snapshot  # noqa: E402
 from foragent.scheduler_recovery import (  # noqa: E402
     _crash_detail, _kill_executor, _kill_run, _local_issue, _recover_orphan, _recover_runs, _remove_run_worktree,
-    _restore_after_crash, _restore_stalled,
+    _restore_after_crash, _restore_stalled, _reap_inactive_runs,
 )
 from foragent.scheduler_checks import (  # noqa: E402
     _blockers, _check_prerequisites, _confirmed_read, _escalate_overdue_blocker, _label_events, _open_pr,
@@ -96,17 +96,20 @@ def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired:
         if not acquired:
             return TickReport(skipped="another tick is running")
+        cleanup = TickReport()
+        _reap_inactive_runs(ctx, cleanup)
         if until := ctx.store.github_wait_until(ctx.now()):
-            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
+            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
         if not isinstance(ctx.tracker, RecordingTracker):
             ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
         try:
             report = _tick_locked(ctx)
+            report.actions[:0] = cleanup.actions
         except TrackerError as exc:
             if not exc.is_rate_limit:
                 raise
             until = orch_github.pause(ctx, exc)
-            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
+            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
         # After this tick's starts, so idle lanes are really idle. A due tidy is a
         # request for the orchestrator's judgment, never a launch or an order.
         if request := tidy.post_if_due(ctx.store):
@@ -231,6 +234,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         return report
 
+    # A lane's local queue picks the order; startability was already checked above.
+    ready = {lane: orch_queue.ordered(ctx.store, lane, numbers) for lane, numbers in ready.items()}
     started = _start_ready(ctx, ready, lane_for, base_ref, report, sample)
     if started is None:
         return report

@@ -12,7 +12,7 @@ import pytest
 from foragent.executors import (
     ClaudeExecutor, CodexExecutor, ExecResult, classify_result, claude_command, claude_review_command, codex_command, executor_for,
 )
-from foragent.processes import kill_process_group, run_logged
+from foragent.processes import kill_process_group, observe_tree, recorded_tree, run_logged
 
 
 @pytest.mark.parametrize("model", [None, "model with spaces"])
@@ -213,6 +213,7 @@ def test_claude_review_uses_devnull_and_preserves_json(tmp_path, monkeypatch, pr
     message = json.dumps({"result": "(none)", "is_error": False})
 
     class Process:
+        pid = 54321
         returncode = 0
 
         def __init__(self, args, **kwargs):
@@ -390,128 +391,112 @@ def test_done_when_child_uses_clean_environment_and_project_path(tmp_path, monke
 
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize("already_gone", [False, True])
-def test_timeout_kills_whole_process_group(tmp_path, monkeypatch, capture, already_gone):
-    calls = []
+def test_timeout_kills_whole_process_group(tmp_path, monkeypatch, fake_process_table, capture, already_gone):
+    from process_fakes import install_popen
 
-    class Process:
-        pid = 54321
-        returncode = None
-
-        def __init__(self, *args, **kwargs):
-            assert kwargs["start_new_session"]
-
-        def communicate(self, **kwargs):
-            calls.append(kwargs)
-            if len(calls) == 1:
-                raise subprocess.TimeoutExpired("offline child", 1)
-            self.returncode = -9
-
-        def poll(self):
-            return self.returncode
-
-    monkeypatch.setattr("foragent.processes.subprocess.Popen", Process)
-    killed = []
-
-    def kill(pid, sig):
-        killed.append((pid, sig))
+    def communicate(process):
         if already_gone:
-            raise ProcessLookupError
+            for pid in (42000, 42001):
+                fake_process_table.exit(pid)
+            process.returncode = -9
 
-    monkeypatch.setattr("foragent.processes.os.killpg", kill)
+    install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["offline child"],
+                  timeout=True, children=(42001,), communicate=communicate)
     code, timed_out, _ = run_logged(
         ["offline child"], cwd=tmp_path, timeout_s=1, log_path=tmp_path / "log", capture_stdout=capture,
     )
-    assert timed_out and code == -9 and killed == [(54321, signal.SIGKILL)]
-    assert len(calls) == 2
+    assert timed_out and code == -9
+    assert not {42000, 42001} & fake_process_table.live
+    assert bool(fake_process_table.signals) is not already_gone
+    assert all(kind == "pid" for kind, _, _ in fake_process_table.signals)
 
 
-def test_termination_signal_kills_executor_group_and_restores_handler(tmp_path, monkeypatch):
-    calls = []
-    handlers = []
+def test_termination_signal_kills_executor_group_and_restores_handler(tmp_path, monkeypatch, fake_process_table):
+    from process_fakes import install_popen
 
-    class Process:
-        pid = 12345
-        returncode = None
+    previous = signal.getsignal(signal.SIGTERM)
 
-        def __init__(self, *args, **kwargs):
-            pass
+    def communicate(process):
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
 
-        def communicate(self, **kwargs):
-            handlers[0](signal.SIGTERM, None)
-
-        def poll(self):
-            return self.returncode
-
-        def wait(self):
-            calls.append("wait")
-            self.returncode = -9
-
-    def install(sig, handler):
-        assert sig == signal.SIGTERM
-        handlers.append(handler)
-        return "previous handler"
-
-    monkeypatch.setattr("foragent.processes.subprocess.Popen", Process)
-    monkeypatch.setattr("foragent.processes.signal.signal", install)
-    monkeypatch.setattr("foragent.processes.os.killpg", lambda pid, sig: calls.append((pid, sig)))
+    install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["offline child"],
+                  children=(42001,), communicate=communicate)
     with pytest.raises(SystemExit) as exc:
         run_logged(["offline child"], cwd=tmp_path, timeout_s=3, log_path=tmp_path / "log")
     assert exc.value.code == 128 + signal.SIGTERM
-    assert calls == [(12345, signal.SIGKILL), "wait"]
-    assert handlers[-1] == "previous handler"
+    assert not {42000, 42001} & fake_process_table.live
+    assert signal.getsignal(signal.SIGTERM) == previous
 
 
 @pytest.mark.parametrize("alive", [False, True])
-def test_tick_group_kill_escalates_after_ten_seconds(monkeypatch, alive):
-    calls = []
-    running = [alive]
+def test_tick_group_kill_escalates_after_ten_seconds(monkeypatch, fake_process_table, tmp_path, alive):
+    from foragent import processes
 
-    def killpg(pid, sig):
-        calls.append((pid, sig))
-        if sig == signal.SIGKILL:
-            running[0] = False
-        if sig == 0 and not running[0]:
-            raise ProcessLookupError
-
-    monkeypatch.setattr("foragent.processes.os.killpg", killpg)
-    monkeypatch.setattr("foragent.processes.os.waitpid", lambda *args: (0, 0))
-    monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: calls.append(("sleep", seconds)))
-    kill_process_group(321)
-    assert calls == [(321, signal.SIGTERM), ("sleep", 10), (321, 0)] + (
-        [(321, signal.SIGKILL), (321, 0)] if alive else []
-    )
-
-
-def test_forced_termination_waits_for_confirmed_exit(monkeypatch):
-    probes = iter([True, True, False])
+    table = fake_process_table
+    table.add(42000, cwd=tmp_path, start_time=10)
     waits = []
-    reaped = []
+    monkeypatch.setattr(processes.time, "sleep", waits.append)
+    if alive:
+        table.ignore_term.add(42000)
+    with recorded_tree(observe_tree(roots=(42000,))):
+        kill_process_group(42000)
+    assert table.signals == [("pid", 42000, signal.SIGTERM)] + (
+        [("pid", 42000, signal.SIGKILL)] if alive else []
+    )
+    assert waits == ([10] if alive else [])
 
-    def killpg(pid, sig):
-        if sig == 0 and not next(probes):
-            raise ProcessLookupError
 
-    monkeypatch.setattr("foragent.processes.os.killpg", killpg)
-    monkeypatch.setattr("foragent.processes.os.waitpid", lambda *args: reaped.append(args))
-    monkeypatch.setattr("foragent.processes.time.sleep", waits.append)
-    kill_process_group(321)
+def test_forced_termination_waits_for_confirmed_exit(monkeypatch, fake_process_table, tmp_path):
+    from foragent import processes
+
+    table = fake_process_table
+    row = table.add(42000, cwd=tmp_path, start_time=10)
+    table.ignore_term.add(row.pid)
+    waits = []
+
+    def delayed_exit(call):
+        if call[-1] == signal.SIGKILL:
+            table.add(row.pid, cwd=tmp_path, start_time=row.start_time)
+
+    table.after_signal = delayed_exit
+
+    def sleep(seconds):
+        waits.append(seconds)
+        if seconds == 0.1:
+            table.exit(row.pid)
+
+    monkeypatch.setattr(processes.time, "sleep", sleep)
+    with recorded_tree(observe_tree(roots=(row.pid,))):
+        kill_process_group(row.pid)
     assert waits == [10, 0.1]
-    assert reaped == [(321, os.WNOHANG)] * 3
+    assert row.pid not in table.live
 
 
-def test_unconfirmed_forced_termination_raises(monkeypatch):
-    monkeypatch.setattr("foragent.processes.os.killpg", lambda *args: None)
-
-    def not_child(*args):
-        raise ChildProcessError
-
-    monkeypatch.setattr("foragent.processes.os.waitpid", not_child)
-    monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: None)
-    with pytest.raises(TimeoutError, match="did not terminate"):
-        kill_process_group(321)
+def test_unconfirmed_forced_termination_raises(monkeypatch, fake_process_table, tmp_path):
+    table = fake_process_table
+    row = table.add(42000, cwd=tmp_path, start_time=10)
+    table.ignore_term.add(row.pid)
+    table.after_signal = lambda call: table.add(row.pid, cwd=tmp_path, start_time=row.start_time)
+    with recorded_tree(observe_tree(roots=(row.pid,))), pytest.raises(TimeoutError, match="did not terminate"):
+        kill_process_group(row.pid)
 
 
-def test_tick_group_already_gone(monkeypatch):
-    monkeypatch.setattr("foragent.processes.os.killpg", lambda *args: (_ for _ in ()).throw(ProcessLookupError()))
-    monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: pytest.fail("must not wait"))
-    kill_process_group(321)
+def test_tick_group_already_gone(monkeypatch, fake_process_table, tmp_path):
+    from foragent import processes
+
+    root = fake_process_table.add(42000, cwd=tmp_path, start_time=10)
+    identities = observe_tree(roots=(root.pid,))
+    fake_process_table.exit(root.pid)
+    monkeypatch.setattr(processes.time, "sleep", lambda seconds: pytest.fail("must not wait"))
+    with recorded_tree(identities):
+        kill_process_group(root.pid)
+    assert not fake_process_table.calls
+
+
+def test_read_only_commands_cannot_edit_files():
+    codex = codex_command(Path("/w"), Path("/o"), read_only=True)
+    assert codex[codex.index("-s") + 1] == "read-only"
+    resumed = codex_command(Path("/w"), Path("/o"), resume_session_id="s", read_only=True)
+    assert 'sandbox_mode="read-only"' in resumed
+    claude = claude_command(read_only=True)
+    assert claude[claude.index("--permission-mode") + 1] == "plan"

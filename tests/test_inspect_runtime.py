@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 
-REAL_SIGNALS_SKIP = pytest.mark.skip(reason='Sends real signals to real process groups; group numbers can be reused by other processes (PermissionError seen 2026-10-24). Rewrite on a fake process table with #261.')
 
 from foragent import inspect_actions, inspect_runtime as runtime
 from foragent.config import Config
@@ -162,53 +161,56 @@ def test_prepare_scrubs_runner_environment_and_bounds_separate_output(ctx, monke
     assert result.stderr == "끝\n"
 
 
-def test_prepare_timeout_uses_60_seconds_and_kills_child_group(ctx, monkeypatch):
-    merged(ctx, card="## Try it\n```sh\nprintf 'started\\n'; sleep 30\n```\n")
-    run = runtime.run_logged
-    calls = []
+def test_prepare_timeout_uses_60_seconds_and_kills_child_group(ctx, monkeypatch, fake_process_table):
+    from process_fakes import install_popen
 
-    def fast_timeout(argv, **kwargs):
+    command = "offline-timed-out-worker"
+
+    def output(process):
+        if process.calls == 1:
+            process.kwargs["stdout"].write(b"started\n")
+
+    install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["/bin/sh", "-c", command],
+                  timeout=True, children=(42001,), communicate=output)
+    merged(ctx, card=f"## Try it\n```sh\n{command}\n```\n")
+    run, calls = runtime.run_logged, []
+
+    def record(argv, **kwargs):
         calls.append((argv, kwargs["timeout_s"]))
-        return run(argv, **{**kwargs, "timeout_s": 0.2})
+        return run(argv, **kwargs)
 
-    monkeypatch.setattr(runtime, "run_logged", fast_timeout)
+    monkeypatch.setattr(runtime, "run_logged", record)
     assert runtime.prepare(ctx) == [1]
     result = collect(ctx).items[0].prepared.results[0]
-    assert calls == [(["/bin/sh", "-c", "printf 'started\\n'; sleep 30"], 60)]
+    assert calls == [(["/bin/sh", "-c", command], 60)]
     assert result.timed_out and result.exit_code != 0 and "started" in result.output
+    assert not {42000, 42001} & fake_process_table.live
     assert not list((ctx.store.root / "inspect/wt").iterdir())
 
 
-@REAL_SIGNALS_SKIP
 @pytest.mark.parametrize("exit_code", [0, 7])
-def test_prepare_terminates_background_children_before_removing_worktree(ctx, tmp_path, monkeypatch, exit_code):
-    pid_file = tmp_path / "background.pid"
-    command = f'sleep 300 &\nprintf "%s" "$!" > {shlex.quote(str(pid_file))}\nexit {exit_code}'
+def test_prepare_terminates_background_children_before_removing_worktree(ctx, tmp_path, monkeypatch, fake_process_table, exit_code):
+    from process_fakes import install_popen
+
+    command = "offline-background-worker"
+    install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["/bin/sh", "-c", command],
+                  exit_code=exit_code, children=(42001,))
     merged(ctx, card=f"## Try it\nkind: cli\n```sh\n{command}\n```\n")
     remove = ctx.git.remove_worktree
     removals = []
 
     def remove_after_exit(worktree):
-        pid = int(pid_file.read_text())
-        with pytest.raises(ProcessLookupError):
-            os.kill(pid, 0)
+        assert 42001 not in fake_process_table.live
         removals.append(worktree)
         remove(worktree)
 
     monkeypatch.setattr(ctx.git, "remove_worktree", remove_after_exit)
-    try:
-        assert runtime.prepare(ctx) == [1]
-        result = collect(ctx).items[0].prepared.results[0]
-        assert result.exit_code == exit_code and not result.timed_out
-        runtime.stop(ctx)
-        assert len(removals) == 1
-        assert not list((ctx.store.root / "inspect/wt").iterdir())
-    finally:
-        if pid_file.exists():
-            try:
-                os.kill(int(pid_file.read_text()), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    assert runtime.prepare(ctx) == [1]
+    result = collect(ctx).items[0].prepared.results[0]
+    assert result.exit_code == exit_code and not result.timed_out
+    runtime.stop(ctx)
+    assert len(removals) == 1
+    assert not list((ctx.store.root / "inspect/wt").iterdir())
 
 
 def test_prepare_cleans_up_on_command_error_and_does_not_cache(ctx, monkeypatch):
@@ -295,7 +297,7 @@ def test_serve_with_injected_launcher_waiter_and_stop_all(ctx, monkeypatch, avai
     assert waits == [(8765, 90), (8766, 90)]
     assert all(call[0] == ["/bin/sh", "-c", "python app.py --host 0.0.0.0"] for call in calls)
     records = ctx.store.root / "inspect/served.json"
-    assert json.loads(records.read_text()) == {"1": {"pid": 5001, "port": 8765}, "2": {"pid": 5002, "port": 8766}}
+    assert json.loads(records.read_text()) == {"1": {"pid": 5001, "port": 8765, "process_identities": []}, "2": {"pid": 5002, "port": 8766, "process_identities": []}}
     runtime.stop(ctx, killer=kills.append)
     runtime.stop(ctx, killer=kills.append)
     assert kills == [5001, 5002] and json.loads(records.read_text()) == {}
@@ -336,6 +338,9 @@ def test_mark_seen_stops_served_apps(ctx, monkeypatch):
 
 
 def _preview_operation(repo_root, store_root, operation, number, connection, pause):
+    from foragent import processes
+
+    processes.list_processes = lambda: ()  # The injected launcher has no real PID.
     ctx = InspectContext(FakeTracker(strict=True, now=lambda: BASE_TIME), StateStore(store_root),
                          "owner/repo", Config(), lambda: BASE_TIME, repo_root, GitRepo(repo_root))
     merged(ctx, card=WEB)
@@ -418,9 +423,9 @@ def test_preview_registry_operations_are_serialized_across_processes(
     assert first.recv() == ([5001] if first_operation == "stop" else [])
     assert second.poll(10)
     assert second.recv() == ([5001] if (first_operation, second_operation) == ("serve", "stop") else [])
-    expected = {"2": {"pid": 5002, "port": 8766}} if second_operation == "serve" else {}
+    expected = {"2": {"pid": 5002, "port": 8766, "process_identities": []}} if second_operation == "serve" else {}
     if first_operation == second_operation == "serve":
-        expected["1"] = {"pid": 5001, "port": 8765}
+        expected["1"] = {"pid": 5001, "port": 8765, "process_identities": []}
     assert runtime._served(ctx) == expected
     killed = []
     runtime.stop(ctx, killer=killed.append)
