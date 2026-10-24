@@ -75,5 +75,5 @@ lanes:
     skills:
     - skill-creator
     - principle-prove-it-works
-max_parallel: 3  # 2026-10-23 21:05: back to 3 — swapouts flat for an hour, pressure normal with one outside job; #106 will set this from machine headroom
-# board: PVT_kwHODvdhm84BoMtn  # paused 2026-10-23: each tick rewrote every Status (58% of GitHub calls); restore after the tick only writes changes
+board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards
+test_slots: 3  # 2026-10-24: 6 runs waited ~1 h for 2 test slots while load was ~0.7/CPU; back to default once #325 prebuilds baselines
