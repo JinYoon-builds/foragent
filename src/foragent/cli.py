@@ -25,6 +25,7 @@ from foragent.launcher import spawn_notify, spawn_runner
 from foragent.inspect_runtime import InspectRuntimeError
 from foragent.scheduler import TickContext, tick
 from foragent.runner import RunContext, check_done, run_issue, run_tests
+from foragent.run_baseline import start_baseline_process
 from foragent.state import StateStore
 from foragent.status import collect as collect_status, summary_values, unknown as status_unknown
 from foragent.tracker import GhTracker, RecordingTracker, Tracker, TrackerError
@@ -701,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo=repo, repo_root=root, tracker=tracker, store=store, config=config,
                 git=git, now=lambda: datetime.now(UTC), launcher=spawn_runner(root, store),
                 start_runs=not args.no_start,
+                baseline_launcher=start_baseline_process,
             ))
             if args.json:
                 print(json.dumps(asdict(report)))

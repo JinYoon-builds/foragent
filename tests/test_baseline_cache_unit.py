@@ -2,9 +2,12 @@
 
 from datetime import timedelta
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 import json
 import shlex
+import subprocess
 import sys
+import time
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
@@ -370,3 +373,150 @@ def test_runner_reuses_legacy_cache_but_premerge_rebuilds_unknown_outcomes(basel
     )
     assert baseline.collected_ids == PASSING_IDS and baseline.failing_ids == ()
     assert "collected_ids" in json.loads(entry.read_text())
+
+
+def test_concurrent_prebuild_scheduling_reserves_key_before_launch(baseline_case):
+    from foragent.run_baseline import prebuild_acceptance_baseline
+
+    c = baseline_case
+    c.ctx.config = replace(c.ctx.config, test_command=COMMAND)
+    launches = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: prebuild_acceptance_baseline(
+            c.ctx, "origin/main", lambda *args: launches.append(args)), range(4)))
+    try:
+        assert len(launches) == 1
+        _, build, _ = launches[0]
+        assert build.base_sha == c.ctx.git.ref_sha("origin/main")
+        events = [json.loads(line) for line in (c.ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+        assert len(events) == 1 and events[0]["kind"] == "baseline-build"
+        assert build.base_sha in events[0]["summary"]
+    finally:
+        for _, _, lock in launches:
+            lock.close()
+
+
+def test_failed_prebuild_launch_releases_key_for_later_tick(baseline_case):
+    from foragent.run_baseline import prebuild_acceptance_baseline
+
+    c = baseline_case
+    c.ctx.config = replace(c.ctx.config, test_command=COMMAND)
+    attempts = []
+
+    def unavailable(ctx, build, lock):
+        attempts.append(build.key)
+        raise OSError("worker could not start")
+
+    for _ in range(2):
+        prebuild_acceptance_baseline(c.ctx, "origin/main", unavailable)
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert not list(c.cache.glob("*.json"))
+    assert "worker could not start" in (c.ctx.store.root / "baseline-build.log").read_text()
+
+
+def test_queued_prebuild_keeps_original_exclusions_and_sha(baseline_case):
+    from foragent.run_baseline import _build_baseline, prebuild_acceptance_baseline
+
+    c = baseline_case
+    c.ctx.config = replace(c.ctx.config, test_command=COMMAND)
+    launches = []
+    prebuild_acceptance_baseline(c.ctx, "origin/main", lambda *args: launches.append(args))
+    _, build, lock = launches[0]
+    try:
+        c.ctx.store.save_approval(
+            2, body="pending", body_sha="body", acceptance_blobs={FIRST: "blob"},
+            approved_by="human", approved_at=BASE_TIME.isoformat(),
+        )
+        c.prepare({LAST: "def test_last():\n    assert False\n"})
+        assert c.ctx.git.ref_sha("origin/main") != build.base_sha
+        _build_baseline(c.ctx, build, lock)
+        saved = json.loads((c.cache / f"{build.key}.json").read_text())
+        assert saved["node_ids"] == list(PASSING_IDS)
+        assert saved["excluded"] == []
+        assert saved["scope"] == build.scope
+    finally:
+        lock.close()
+
+
+def test_prebuild_caches_all_files_excluded_without_starting_pytest(baseline_case, monkeypatch):
+    from foragent.run_baseline import _build_baseline, prebuild_acceptance_baseline
+
+    c = baseline_case
+    c.ctx.config = replace(c.ctx.config, test_command=COMMAND)
+    c.ctx.store.save_approval(
+        2, body="Approved tests", body_sha="approved",
+        acceptance_blobs=c.ctx.git.blob_shas("origin/main", [FIRST, LAST]),
+        approved_by="human", approved_at=BASE_TIME.isoformat(),
+    )
+
+    def no_pytest(*args, **kwargs):
+        pytest.fail("An empty prebuild must not start pytest")
+
+    monkeypatch.setattr("foragent.runner._check", no_pytest)
+    launches = []
+    launch = lambda *args: launches.append(args)
+    prebuild_acceptance_baseline(c.ctx, "origin/main", launch)
+    ctx, build, lock = launches[0]
+    _build_baseline(ctx, build, lock)
+    prebuild_acceptance_baseline(c.ctx, "origin/main", launch)
+    assert len(launches) == 1
+    saved = json.loads((c.cache / f"{build.key}.json").read_text())
+    assert saved["node_ids"] == saved["collected_ids"] == saved["failing_ids"] == []
+    assert saved["excluded"] == [FIRST, LAST]
+    assert saved["scope"] == build.scope
+    assert not (c.cache / f"{build.key}.xml").exists()
+
+
+def test_detached_prebuild_outlives_scheduler_and_retains_reservation(baseline_case, tmp_path):
+    c = baseline_case
+    release, entered = tmp_path / "release", tmp_path / "entered"
+    c.prepare({FIRST: (
+        "from pathlib import Path\nimport time\n"
+        "def test_first():\n"
+        f"    Path({str(entered)!r}).touch()\n"
+        f"    while not Path({str(release)!r}).exists():\n"
+        "        time.sleep(0.01)\n"
+    )})
+    # A real short-lived scheduler process: neither its Python threads nor its
+    # open descriptors can be responsible for completing the eventual cache.
+    script = "\n".join([
+        "from pathlib import Path",
+        "from types import SimpleNamespace",
+        "from datetime import UTC, datetime",
+        "from foragent import capacity",
+        "from foragent.config import Config",
+        "from foragent.git import GitRepo",
+        "from foragent.state import StateStore",
+        "from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_process",
+        f"capacity.machine_root = lambda: Path({str(tmp_path / 'slots')!r})",
+        f"root = Path({str(c.root)!r})",
+        f"ctx = SimpleNamespace(repo_root=root, store=StateStore(Path({str(c.ctx.store.root)!r})),",
+        f"    config=Config(test_command={COMMAND!r}, acceptance_dir={ACCEPTANCE_DIR!r}, test_slots=1),",
+        "    git=GitRepo(root), now=lambda: datetime.now(UTC))",
+        "prebuild_acceptance_baseline(ctx, 'origin/main', start_baseline_process)",
+    ])
+    try:
+        subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True, timeout=10)
+        deadline = time.monotonic() + 10
+        while not entered.exists():
+            assert time.monotonic() < deadline, [p.read_text() for p in c.cache.glob("*.log")]
+            time.sleep(0.01)
+        key, = [p.stem for p in c.cache.glob("*.lock")]
+        cache = StateStore(c.cache)
+        assert cache.lock_acceptance_baseline(key, blocking=False) is None
+        assert not list(c.cache.glob("*.json"))
+        # The detached worker must take its own slot rather than inherit the
+        # enclosing `fa test` command's FORAGENT_TEST_SLOT=held shortcut.
+        assert (tmp_path / "slots/test-slots").is_dir()
+    finally:
+        release.touch()
+        deadline = time.monotonic() + 10
+        while not list(c.cache.glob("*.json")):
+            assert time.monotonic() < deadline, [p.read_text() for p in c.cache.glob("*.log")]
+            time.sleep(0.01)
+    assert cache.load_acceptance_baseline(key)["node_ids"] == list(PASSING_IDS)
+    deadline = time.monotonic() + 10
+    while (lock := cache.lock_acceptance_baseline(key, blocking=False)) is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    lock.close()
