@@ -69,6 +69,6 @@ def test_live_run_uses_replaced_facade_frame_and_clock(tmp_path, monkeypatch):
     watch.run(lambda: {}, tracker, store, config, tmp_path, now=lambda: BASE_TIME)
 
     frame.assert_called_once_with(snapshot, config, tmp_path, tick=0, width=79,
-                                  selected=None, now=BASE_TIME)
+                                  selected=None, now=BASE_TIME, layout={})
     assert screen.addstr.call_args_list[0].args[:3] == (0, 0, "facade live frame")
     assert not (tmp_path / "watch.pid").exists()

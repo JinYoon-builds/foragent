@@ -86,3 +86,9 @@
 - 목표에 "저장소 밖 파일 변경 없음"이 있으면 `/tmp` 캐시나 기본 uv 캐시를 쓰지 않는다. `UV_CACHE_DIR=<저장소>/.uv-cache`처럼 저장소 안에 두고 임시 파일도 저장소 안(gitignore 대상)에 만든다. #116 병합 때 `/tmp` 캐시를 써서 조건을 되돌릴 수 없게 됐다.
 
 - #117 `open_view` 순서: Orca(`--direction vertical`) → tmux(`TMUX`) → WezTerm(`WEZTERM_PANE`, `cli split-pane --right --cwd <root> -- <argv>`) → Kitty(`KITTY_WINDOW_ID`, `@ [--to KITTY_LISTEN_ON] launch --location=vsplit --cwd <root> <argv>`) → iTerm2(`tell current session of current window to split vertically ...`) → Terminal.app 새 창. WezTerm·Kitty는 셸 문자열 대신 argv 목록(`program`)을 그대로 넘긴다. 검증: `uv run pytest -q tests/acceptance/test_view_split.py tests/test_watch_open.py tests/acceptance/test_view_open_terminals.py tests/acceptance/test_view_open.py tests/acceptance/test_view_open_triggers.py` (45 passed).
+
+- #146 한 레인의 여러 실행(복제)은 `status["active_runs"]`의 `lane`으로 `watch_layout._frame`에서 묶는다. 2개 이상이면 도로·표의 레인 이름에 ` ×N`을 붙이고, 도로 꼬리에 모든 번호를, 표에는 실행마다 한 줄을 그린다. 레인 행(`collect_lanes`)은 대표 작업 하나뿐이라 status는 바꾸지 않았다. 검증: `fa test tests/acceptance/test_view_clone.py` (4 passed) + watch 관련 40 passed.
+
+- #203 d76 시험은 미구현 선행 이슈(#155 `fa orch note`, #170 `hit_test`·`handle_mouse`, #167 큰 다람쥐)의 계약에 기댔다. 그 고정 시험(test_orch_note·test_acorn_interact·test_squirrel_running)의 계약만 보고 최소 부분을 만들었다. 메모는 `orch_inbox.write_note/read_note`(`<state>/orch-note.json`), 클릭은 `watch_mouse.py`, layout은 `{"hits": [(x0,y0,x1,y1,target)]}`(끝 제외, 뒤 항목 우선). 큰 다람쥐 무대(`watch_layout._stage`)는 처리 중 요청이 있을 때만 그린다(56칸↑ 옆, 44칸↑ 아래, 그 미만 글자).
+- `test_watch_split`은 `watch.py`가 `watch_` 아닌 새 foragent 모듈을 import하면 실패한다(orch_inbox는 watch_data·watch_mouse에서 직접 import). `render_frame`은 layout이 None이면 `_frame`에 예전 kwargs만 넘겨야 한다. `_terminal`에 인자를 더할 때는 위치 인자로 넘긴다(test_watch_compat의 가짜 wrapper가 kwargs를 받지 않음).
+- "저장소 밖 변경 없음" 조건에서는 TRY 확인용 임시 파일도 `/tmp`가 아니라 `.foragent/` 안에 둔다.

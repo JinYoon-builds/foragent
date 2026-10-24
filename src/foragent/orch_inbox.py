@@ -7,13 +7,24 @@ session restarts, so a new orchestrator reads the box before anything else.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from foragent import notify
+from foragent.config import Config
 from foragent.orch_events import append_event
 from foragent.state import StateStore
 
 REQUEST_STATUSES = ("new", "processing", "done")
+# A planning session that renewed its heartbeat this recently can still read a
+# cross-session message, so a new question does not need a push.
+PLAN_HEARTBEAT_SECONDS = 120
+_QUESTION_PUSH = {
+    "en": ("A question needs your answer", "{id}: {question}"),
+    "ko": ("답할 질문이 있어요", "{id}: {question}"),
+}
 
 
 class InboxError(ValueError):
@@ -101,6 +112,42 @@ def ask(store: StateStore, question: str, options: list[str], recommend: int | N
     return _public(record)
 
 
+def plan_heartbeat_path(store: StateStore) -> Path:
+    return store.root / "plan-heartbeat.json"
+
+
+def write_plan_heartbeat(store: StateStore) -> dict[str, str]:
+    """Overwrite the planning session's heartbeat with the current time."""
+    record = {"at": store._timestamp()}
+    store.root.mkdir(parents=True, exist_ok=True)
+    store._write_json(plan_heartbeat_path(store), record)
+    return record
+
+
+def planning_alive(store: StateStore) -> bool:
+    """True when the planning heartbeat is at most PLAN_HEARTBEAT_SECONDS old."""
+    try:
+        at = datetime.fromisoformat(json.loads(plan_heartbeat_path(store).read_text(encoding="utf-8"))["at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if at.tzinfo is None:
+        return False
+    return store._now() - at <= timedelta(seconds=PLAN_HEARTBEAT_SECONDS)
+
+
+def route_question(store: StateStore, config: Config, repo: str, record: dict[str, Any]) -> bool:
+    """Push a new question to the person only when no planning session is alive.
+
+    Returns whether a push was attempted. A live planning session reads the box
+    through a cross-session message instead.
+    """
+    if planning_alive(store):
+        return False
+    title, line = _QUESTION_PUSH.get(config.language, _QUESTION_PUSH["en"])
+    notify.send(replace(config, repo=repo), title, line.format(**record))
+    return True
+
+
 def questions(store: StateStore, *, include_closed: bool = False) -> list[dict[str, Any]]:
     rows = [_public(row) for row in _records(store, "questions")]
     return rows if include_closed else [row for row in rows if row["status"] == "open"]
@@ -119,3 +166,39 @@ def answer(store: StateStore, question_id: str, text: str) -> dict[str, Any]:
 
 def _public(record: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in record.items() if key != "seq"}
+
+
+def note_path(store: StateStore) -> Path:
+    return store.root / "orch-note.json"
+
+
+def note_location(environ: dict[str, str], title: str | None = None,
+                  tmux_pane: str | None = None) -> dict[str, Any]:
+    """Where this orchestrator session runs, from facts in its environment only."""
+    handle = environ.get("ORCA_TERMINAL_HANDLE")
+    if handle:
+        return {"kind": "orca", "handle": handle,
+                "title": title or environ.get("FORAGENT_ORCH_TITLE")}
+    pane = tmux_pane or (environ.get("TMUX_PANE") if environ.get("TMUX") else None)
+    if pane:
+        return {"kind": "tmux", "pane": pane}
+    return {"kind": "terminal"}
+
+
+def write_note(store: StateStore, now: str, why: str | None, next_step: str | None,
+               where: dict[str, Any]) -> dict[str, Any]:
+    """Overwrite the orchestrator's latest note: what it does, why, what next, where."""
+    if not now.strip():
+        raise InboxError("--now must not be empty")
+    record = {"now": now, "why": why, "next": next_step, "at": store._timestamp(), "where": where}
+    store.root.mkdir(parents=True, exist_ok=True)
+    store._write_json(note_path(store), record)
+    return record
+
+
+def read_note(store: StateStore) -> dict[str, Any] | None:
+    try:
+        record = _read(note_path(store))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None

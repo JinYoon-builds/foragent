@@ -1,6 +1,5 @@
 review: fast
 executor: claude  # 2026-10-23 14:4x: #247 fixed the /goal prompt (live-checked); Claude quota idle. Reviewer becomes codex. D74 will choose per issue
-reviewer: claude  # 2026-10-23 21:3x: Codex weekly quota at 100% until 10-30 02:09; same-model review until then (Jin chose A). Remove this line after the reset
 language: ko
 approvers:
 - JinYoon-builds
@@ -76,5 +75,4 @@ lanes:
     skills:
     - skill-creator
     - principle-prove-it-works
-max_parallel: 3  # 2026-10-23 21:05: back to 3 — swapouts flat for an hour, pressure normal with one outside job; #106 will set this from machine headroom
-# board: PVT_kwHODvdhm84BoMtn  # paused 2026-10-23: each tick rewrote every Status (58% of GitHub calls); restore after the tick only writes changes
+board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards

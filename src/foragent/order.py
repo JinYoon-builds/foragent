@@ -404,6 +404,39 @@ class PublishReport:
         return "\n".join(lines)
 
 
+def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str],
+                   manager: SkillManager | None) -> dict[str, str]:
+    """Commit only this order's own paths on the latest base and push them."""
+    for lane in plan.get("new_lanes", []):
+        if lane["name"] not in config.lanes:
+            add_lane(root, lane["name"], lane["paths"], skills=lane["skills"], git=git, manager=manager, push=False)
+        else:
+            # Recover a lane whose files were written before an interrupted commit.
+            paths = lane_files(root, lane["name"], config.lanes[lane["name"]].get("skills", []))
+            if not repo_path(root, paths[1]).is_file():
+                raise PlanError(f"existing lane agent is missing: {paths[1]}")
+            git.ensure_tracked(paths)
+            pending = git.uncommitted_paths(paths)
+            if pending:
+                git.commit_paths(pending, f"Foragent lane {lane['name']}")
+    for name, content in files.items():
+        path = repo_path(root, name)
+        if not path.exists() or path.read_text(encoding="utf-8") != content:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+    git.ensure_tracked(list(files))
+    changed = git.uncommitted_paths(list(files))
+    if changed:
+        git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests and spec")
+    published_blobs = git.blob_shas(git.head_sha(), files)
+    missing = [name for name in files if published_blobs.get(name, "missing") == "missing"]
+    if missing:
+        raise PlanError(f"published commit is missing files: {', '.join(sorted(missing))}")
+    # Also retry a previously failed push when the files already match HEAD.
+    git.push_base(config.base_branch)
+    return published_blobs
+
+
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
             git: GitRepo | None = None, manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
@@ -483,33 +516,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
-    for lane in plan.get("new_lanes", []):
-        if lane["name"] not in config.lanes:
-            add_lane(root, lane["name"], lane["paths"], skills=lane["skills"], git=git, manager=manager, push=False)
-        else:
-            # Recover a lane whose files were written before an interrupted commit.
-            paths = lane_files(root, lane["name"], config.lanes[lane["name"]].get("skills", []))
-            if not repo_path(root, paths[1]).is_file():
-                raise PlanError(f"existing lane agent is missing: {paths[1]}")
-            git.ensure_tracked(paths)
-            pending = git.uncommitted_paths(paths)
-            if pending:
-                git.commit_paths(pending, f"Foragent lane {lane['name']}")
-    for name, content in files.items():
-        path = repo_path(root, name)
-        if not path.exists() or path.read_text(encoding="utf-8") != content:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
-    git.ensure_tracked(list(files))
-    changed = git.uncommitted_paths(list(files))
-    if changed:
-        git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests and spec")
-    published_blobs = git.blob_shas(git.head_sha(), files)
-    missing = [name for name in files if published_blobs.get(name, "missing") == "missing"]
-    if missing:
-        raise PlanError(f"published commit is missing files: {', '.join(sorted(missing))}")
-    # Also retry a previously failed push when the files already match HEAD.
-    git.push_base(config.base_branch)
+    with git.publish_lock():
+        git.update_base(config.base_branch)
+        published_blobs = _publish_files(plan, root, config, git, files, manager)
     lane_names = {item["lane"] for item in plan["issues"]} - {"main"}
     tracker.ensure_labels([*LABELS, *(LabelSpec(f"lane:{name}", "ededed", f"Foragent lane {name}.") for name in sorted(lane_names))])
     if any(item.get("interactive", False) for item in plan["issues"]):
