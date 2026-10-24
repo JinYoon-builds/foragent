@@ -83,3 +83,19 @@ def test_reprepared_repeated_commands_keep_their_own_unknown_fields_in_order(tmp
     commands = [PreparedCommand("true", "", 0)] * 3
     record = _prepared_write_back(path, Prepared("new", commands))
     assert [item.get("nested") for item in record["results"]] == ["first", "second", None]
+
+
+def test_run_resumed_by_start_run_after_limit_wait_keeps_unknown_fields(tmp_path):
+    store = StateStore(tmp_path)
+    store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "wt")
+    path = tmp_path / "runs/7.json"
+    seed(path, {**read(path), **EXTRA})
+    store.update_run(7, attempts=2)
+    store.finish_run(7, "limit-wait", "waiting for the executor limit")
+    history = [json.loads(line) for line in (tmp_path / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert history[-1]["future_record_metadata"] == EXTRA["future_record_metadata"]
+
+    resumed = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "wt")
+    assert resumed.attempts == 2 and resumed.status == "running"
+    assert read(path)["future_record_metadata"] == EXTRA["future_record_metadata"]
+    assert read(path)["status"] == "running"

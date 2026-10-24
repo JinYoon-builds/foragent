@@ -10,9 +10,17 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 from typing import IO, Any
 
-from foragent.records import load_record, unknown_fields, write_back
+from foragent.records import load_record, write_back
+
+# Tick-lock paths this thread holds through StateStore.hold_tick_lock.
+_TICK_LOCKS_HELD = threading.local()
+
+
+def _held_tick_locks() -> set[str]:
+    return _TICK_LOCKS_HELD.__dict__.setdefault("paths", set())
 
 
 @dataclass(frozen=True)
@@ -562,6 +570,20 @@ class StateStore:
     def _write_record(self, path: Path, record: Any) -> dict[str, Any]:
         return self._write_mapping(path, type(record), asdict(record))
 
+    def _run_value(self, run: "Run") -> dict[str, Any]:
+        """A run's fields merged over the unknown fields its file holds on disk."""
+        try:
+            saved = json.loads((self.root / "runs" / f"{run.number}.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            saved = {}
+        return write_back(type(run), saved, asdict(run))
+
+    def _write_run(self, run: "Run", value: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The one writer of run files; unknown fields always survive."""
+        value = self._run_value(run) if value is None else value
+        self._write_json(self.root / "runs" / f"{run.number}.json", value)
+        return value
+
     def update_inspect(self, **fields: Any) -> InspectState:
         with self._state_lock():
             updated = replace(self.load_inspect(), **fields)
@@ -603,7 +625,7 @@ class StateStore:
                       attempt_tiers=previous.attempt_tiers if resumed else {},
                       approval_body_sha=approval.body_sha if approval is not None else None,
                       last_activity_at=timestamp, process_identities=identities, **session)
-            self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
+            self._write_run(run)
             return run
 
     def prepare_run_start(self, number: int) -> None:
@@ -649,7 +671,7 @@ class StateStore:
             )}
             fields["process_identities"] = observe_tree(list(identities.values()))
             updated = replace(run, **fields)
-            self._write_record(self.root / "runs" / f"{number}.json", updated)
+            self._write_run(updated)
             return updated
 
     def get_run(self, number: int) -> Run | None:
@@ -713,10 +735,9 @@ class StateStore:
                                process_identities=observe_tree(run.process_identities))
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
-            snapshot = {**unknown_fields(type(finished), json.loads(
-                (self.root / "runs" / f"{number}.json").read_text(encoding="utf-8"))), **asdict(finished)}
+            snapshot = self._run_value(finished)
             self._atomic_write(history_path, history + json.dumps(snapshot, ensure_ascii=False) + "\n")
-            self._write_json(self.root / "runs" / f"{number}.json", snapshot)
+            self._write_run(finished, snapshot)
             return finished
 
     def read_history(self) -> list[Run]:
@@ -796,8 +817,48 @@ class StateStore:
 
     @contextmanager
     def tick_lock(self) -> Iterator[bool]:
+        """Try the tick lock without waiting; yield whether this tick may run.
+
+        Inside ``hold_tick_lock()`` on the same thread the lock is already held,
+        so it yields True without taking it again.
+        """
+        path = self._tick_lock_path()
+        if str(path.resolve()) in _held_tick_locks():
+            yield True
+            return
+        with self._try_tick_lock(path) as acquired:
+            yield acquired
+
+    @contextmanager
+    def hold_tick_lock(self) -> Iterator[bool]:
+        """Take the tick lock so nested ``tick_lock()`` calls on this thread reenter it.
+
+        The gate command holds it around a tick and the record of its outcome,
+        so overlapping ticks record outcomes in the order they ran.
+        """
+        path = self._tick_lock_path()
+        key, held = str(path.resolve()), _held_tick_locks()
+        if key in held:
+            yield True
+            return
+        with self._try_tick_lock(path) as acquired:
+            if not acquired:
+                yield False
+                return
+            held.add(key)
+            try:
+                yield True
+            finally:
+                held.discard(key)
+
+    def _tick_lock_path(self) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / "tick.lock").open("a", encoding="utf-8") as stream:
+        return self.root / "tick.lock"
+
+    @staticmethod
+    @contextmanager
+    def _try_tick_lock(path: Path) -> Iterator[bool]:
+        with path.open("a", encoding="utf-8") as stream:
             try:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
