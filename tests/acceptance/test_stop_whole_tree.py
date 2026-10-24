@@ -382,9 +382,19 @@ def test_stop_never_signals_group_after_leader_exits(tmp_path, fake_processes, l
         replace_group()
     else:
         table.after_signal = replace_group
-    _try_stop(lambda: processes.kill_process_group(leader.pid))
+    # Callers stop a group through its recorded identity (pid plus start time).
+    with processes.recorded_tree([{"pid": leader.pid, "start_time": 10}]):
+        _try_stop(lambda: processes.kill_process_group(leader.pid))
     assert 44000 in table.live, "A group number outlived its leader and killed an unrelated process"
     assert not table.leaderless_group_calls, "killpg used a numeric group after its leader was gone"
+
+
+def test_stop_without_recorded_identity_signals_nothing(tmp_path, fake_processes):
+    table = fake_processes
+    leader = table.add(42000, cwd=tmp_path, start_time=10)
+    _try_stop(lambda: processes.kill_process_group(leader.pid))
+    assert not table.signals, f"A pid without a recorded identity was signaled: {table.signals}"
+    assert leader.pid in table.live
 
 
 def test_stop_treats_permission_denied_group_probe_as_not_ours(tmp_path, fake_processes):
