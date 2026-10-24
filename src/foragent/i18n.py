@@ -37,6 +37,10 @@ MESSAGES = {
         "watch_open_failed": "Couldn't open the lane view ({error}). Try again.",
         "watch_open_manual": "To open the lane view, run: {command}",
         "watch_refresh_failed": "Couldn't refresh ({error}). I'll try again.",
+        "tidy_due": "Tidying is due ({reason}): {merges} merges since the last tidy ({last}).",
+        "tidy_not_due": "Tidying isn't due yet: {merges} merges since the last tidy ({last}).",
+        "tidy_never": "never",
+        "tidy_done": "Tidy recorded at {at}. The merge count starts again.",
     },
     "ko": {
         "summary": "일하는 중 {working} · 확인할 일 {waiting_human} · 기다리는 일 {queued}",
@@ -73,6 +77,10 @@ MESSAGES = {
         "watch_open_failed": "레인 화면을 열지 못했어요({error}). 다시 시도해요",
         "watch_open_manual": "이 명령으로 레인 화면을 열어요: {command}",
         "watch_refresh_failed": "새로고침을 못했어요({error}). 다시 시도할게요",
+        "tidy_due": "정리할 때가 됐어요({reason}). 지난 정리 뒤 머지가 {merges}건이에요(마지막 정리: {last})",
+        "tidy_not_due": "아직 정리할 때가 아니에요. 지난 정리 뒤 머지가 {merges}건이에요(마지막 정리: {last})",
+        "tidy_never": "없음",
+        "tidy_done": "{at}에 정리를 기록했어요. 머지 수를 처음부터 다시 셀게요",
     },
 }
 
