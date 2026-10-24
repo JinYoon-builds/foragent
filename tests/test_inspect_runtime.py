@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+REAL_SIGNALS_SKIP = pytest.mark.skip(reason='Sends real signals to real process groups; group numbers can be reused by other processes (PermissionError seen 2026-10-24). Rewrite on a fake process table with #261.')
+
 from foragent import inspect_actions, inspect_runtime as runtime
 from foragent.config import Config
 from foragent.git import GitRepo
@@ -177,6 +179,7 @@ def test_prepare_timeout_uses_60_seconds_and_kills_child_group(ctx, monkeypatch)
     assert not list((ctx.store.root / "inspect/wt").iterdir())
 
 
+@REAL_SIGNALS_SKIP
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_prepare_terminates_background_children_before_removing_worktree(ctx, tmp_path, monkeypatch, exit_code):
     pid_file = tmp_path / "background.pid"

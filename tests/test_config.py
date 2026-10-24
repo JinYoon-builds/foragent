@@ -28,7 +28,7 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
-        "repo": None, "board": None, "language": "en", "codex_goal": False, "review_level": "low",
+        "repo": None, "board": None, "board_map": None, "language": "en", "codex_goal": False, "review_level": "low",
         "review_scope": "claude-local", "test_command": None, "runner_unit_tests": "auto",
         "interview": "native", "ouroboros_version": None, "profile": None,
         "skill_roles": {},
