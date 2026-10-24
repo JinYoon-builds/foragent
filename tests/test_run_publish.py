@@ -218,9 +218,11 @@ def test_interrupted_worker_preserves_unstaged_work_with_recorded_reason(run_cas
         assert f"[{reason}]" in git_command(root, "log", "-1", "--format=%B", branch)
         assert git_command(root, "rev-list", "--count", f"{c.history.tip}..{branch}") == "1"
     assert c.store.get_run(1).outcome == reason
-    assert c.tracker.get_issue(1).labels == {"approved", "blocked"}
+    # A first stall leaves its labels to the next tick, which restarts it.
+    labels = {"approved", "running"} if reason == "stalled-restart" else {"approved", "blocked"}
+    assert c.tracker.get_issue(1).labels == labels
     local, = StateStore(c.store.root).local_issues()
-    assert set(local["labels"]) == {"approved", "blocked"}
+    assert set(local["labels"]) == labels
     assert not c.tracker.created_prs and not c.tracker.merged_prs
 
 

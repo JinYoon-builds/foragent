@@ -23,12 +23,8 @@ def _machine_budget(
 ) -> int:
     """Update the machine-wide AIMD value once per tick and return this tick's machine budget."""
     now = ctx.now()
-    lane_runs = scheduler.Counter(run.lane for run in ctx.store.active_runs())
-    # A crowded lane may add a clone; the file-overlap check runs at start time.
-    waiting = sum(
-        1 for lane, numbers in ready.items()
-        if scheduler._lane_has_room(lane_runs[lane], len(numbers)) and not ctx.store.lane_paused(lane, now)
-    )
+    # Every ready issue in an unpaused lane may start; the file-overlap check runs at start time.
+    waiting = sum(len(numbers) for lane, numbers in ready.items() if not ctx.store.lane_paused(lane, now))
     sample = sample if sample is not None else scheduler.machine_load()
     pressure, load = sample
     with scheduler.machine_lock(ctx.store):
@@ -99,7 +95,7 @@ def _start_ready(
             issue = ctx.tracker.get_issue(number)
             if not eligible(issue, lane):
                 continue
-            if not scheduler._can_start_in_lane(ctx, lane, issue, len(ready[lane])):
+            if not scheduler._can_start_in_lane(ctx, lane, issue):
                 continue
             approval = ctx.store.load_approval(number)
             event, _ = scheduler._latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
@@ -145,5 +141,6 @@ def _start_ready(
             ctx.store.update_run(number, pid=pid)
             report.actions.append(f"#{number} started running (pid={pid})")
             started = True
-            break
+            if not scheduler._has_slot(ctx, budget):
+                return started
     return started

@@ -154,11 +154,12 @@ def run_case(git_history, tmp_path, monkeypatch):
         assert run.worktree not in git_command(git_history.clone, "worktree", "list")
         assert store.get_run(run.number).status == "finished"
         current = store.get_run(run.number)
-        # GitHub waits defer remote label cleanup until the reset.
+        # GitHub waits defer remote label cleanup until the reset; a first
+        # stall leaves it to the next tick, which restarts the issue.
         assert "running" not in tracker.get_issue(run.number).labels or (
             current.outcome == "limit-wait" and current.waiting_until is not None
             and store.github_wait_until(now[0]) is not None
-        )
+        ) or current.outcome == "stalled-restart"
 
 
 def set_done_when(case, commands):
