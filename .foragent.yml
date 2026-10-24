@@ -76,3 +76,4 @@ lanes:
     - skill-creator
     - principle-prove-it-works
 board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards
+test_slots: 3  # 2026-10-24: 6 runs waited ~1 h for 2 test slots while load was ~0.7/CPU; back to default once #325 prebuilds baselines

@@ -213,17 +213,21 @@ def test_plan_width_lets_a_lane_run_three_disjoint_issues(queue_case, capsys, mo
     assert case.gh_calls == []
 
 
-def test_lane_width_defaults_to_two_without_a_live_plan_width(queue_case, capsys, monkeypatch):
+def test_lane_width_is_only_a_cap_set_by_a_live_plan(queue_case, capsys, monkeypatch):
+    """Planning addendum r10 (Jin): no fixed per-lane cap; fill free slots with any ready
+    issue whose Files do not overlap a running one. A plan width is an optional cap."""
     case = queue_case
     wide_lane(case, monkeypatch, {3: ["src/foragent/state.py"], 5: ["src/foragent/order.py"],
                                   7: ["src/foragent/watch.py"]})
     assert plan(case, capsys).get("width", {}) == {}
-    fa_ok(case, capsys, "plan", "--width", "orch=3", "--expires", at(case, hours=1))
-    assert plan(case, capsys)["width"]["orch"] == 3
-    # An expired plan's width lapses; the lane falls back to today's two runs.
-    case.clock[0] += timedelta(hours=1, seconds=1)
+    fa_ok(case, capsys, "plan", "--width", "orch=2", "--expires", at(case, hours=1))
+    assert plan(case, capsys)["width"]["orch"] == 2
     running, actions = tick_lane(case)
     assert len(running) == 2, actions
+    # Once the plan expires its width lapses; with no fixed cap all disjoint issues run.
+    case.clock[0] += timedelta(hours=1, seconds=1)
+    running, actions = tick_lane(case)
+    assert running == [3, 5, 7], actions
     assert sorted(case.launched) == running, actions
     assert case.gh_calls == []
 
