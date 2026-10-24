@@ -78,4 +78,4 @@ lanes:
 board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards
 test_slots: 3  # 2026-10-24: 6 runs waited ~1 h for 2 test slots while load was ~0.7/CPU; back to default once #325 prebuilds baselines
 test_slots_floor: 2  # 2026-10-24: pinned while collecting budget-history; remove after choosing a threshold
-parallel_floor: 3  # 2026-10-24: pinned while collecting budget-history; remove after choosing a threshold
+parallel_floor: 5  # 2026-10-24 evening: raised 3->5 for tonight (machine ~70% free, runs <=750 MB; kernel critical still lowers it). Remove after choosing a threshold
