@@ -11,7 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, order, watch, watch_open
+from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, order, tidy, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -23,6 +23,7 @@ from foragent.paths import PathError
 from foragent.skills import SkillError, SkillManager
 from foragent.launcher import spawn_notify, spawn_runner
 from foragent.inspect_runtime import InspectRuntimeError
+from foragent.processes import observe_tree
 from foragent.scheduler import TickContext, tick
 from foragent.runner import RunContext, check_done, run_issue, run_tests
 from foragent.run_baseline import start_baseline_process
@@ -277,6 +278,13 @@ files lists repository-relative paths or globs expected to change; absolute path
     heartbeat = plan_actions.add_parser(
         "heartbeat", help="Mark the planning session alive; questions reach it by message, not push")
     heartbeat.add_argument("--repo-root", type=Path, default=Path.cwd())
+    tidy_command = commands.add_parser("tidy", help="Check from local facts whether tidying is due")
+    tidy_actions = tidy_command.add_subparsers(dest="action", required=True)
+    tidy_due = tidy_actions.add_parser("due", help="Report whether tidying is due and why")
+    tidy_due.add_argument("--json", action="store_true")
+    tidy_due.add_argument("--repo-root", type=Path, default=Path.cwd())
+    tidy_done = tidy_actions.add_parser("done", help="Record a finished tidy and start a new count")
+    tidy_done.add_argument("--repo-root", type=Path, default=Path.cwd())
     briefing = commands.add_parser("brief", help="Show the start-of-session facts for planning")
     briefing.add_argument("--json", action="store_true")
     briefing.add_argument("--repo-root", type=Path, default=Path.cwd())
@@ -310,6 +318,23 @@ files lists repository-relative paths or globs expected to change; absolute path
 
 
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note"}
+
+
+def _tidy(args: argparse.Namespace, store: StateStore, language: str) -> None:
+    """Local tidy schedule; never reads GitHub or starts an executor."""
+    if args.action == "done":
+        facts = tidy.done(store)
+        print(text("tidy_done", language, at=facts["last_tidy_at"]))
+        return
+    facts = tidy.status(store)
+    if args.json:
+        print(json.dumps(tidy.public(facts), ensure_ascii=False))
+        return
+    last = facts["last_tidy_at"] or text("tidy_never", language)
+    key = "tidy_due" if facts["due"] else "tidy_not_due"
+    print(text(key, language, reason=facts["reason"], merges=facts["merges_since"], last=last))
+    for line in facts["evidence"]:
+        print(f"- {line}")
 
 
 def _orch_inbox(args: argparse.Namespace, store: StateStore, config: Config, repo: str) -> None:
@@ -583,6 +608,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(order.progress(StateStore.for_repo(repo), args.step, **fields),
                              ensure_ascii=False))
             return 0
+        if args.command == "tidy":
+            config = load_config(root)
+            store = StateStore.for_repo(config.repo or GitRepo(root).remote_slug())
+            _tidy(args, store, config.language)
+            return 0
         if args.command in {"plan", "brief"}:
             config = load_config(root)
             store = StateStore.for_repo(config.repo or GitRepo(root).remote_slug())
@@ -759,7 +789,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if store.get_run(args.number) is None:
                 raise ConfigError(f"no run record for issue #{args.number}")
-            store.update_run(args.number, pid=os.getpid())
+            store.update_run(args.number, pid=os.getpid(),
+                             process_identities=observe_tree(roots=(os.getpid(),)))
             outcome = run_issue(args.number, RunContext(
                 repo=repo, repo_root=root, tracker=tracker, store=store,
                 config=config, git=git, now=lambda: datetime.now(UTC),

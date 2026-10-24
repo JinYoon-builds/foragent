@@ -13,7 +13,7 @@ import time
 
 from foragent.git import GitRepo
 from foragent.inspect_data import InspectContext, Prepared, PreparedCommand, collect, load_prepared
-from foragent.processes import _child_environment, kill_process_group, run_logged
+from foragent.processes import _child_environment, kill_process_group, observe_tree, recorded_tree, run_logged
 
 
 class InspectRuntimeError(ValueError):
@@ -114,7 +114,8 @@ def _served_lock(ctx: InspectContext) -> Iterator[None]:
 
 
 def _stop_one(ctx: InspectContext, number: str, records: dict, killer: Callable[[int], None]) -> None:
-    killer(records[number]["pid"])
+    with recorded_tree(records[number].get("process_identities", [])):
+        killer(records[number]["pid"])
     _git(ctx).remove_worktree(ctx.store.root / "inspect" / f"serve-{int(number)}")
     del records[number]
     _save_served(ctx, records)
@@ -168,7 +169,8 @@ def serve(
                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
-            records[str(number)] = {"pid": process.pid, "port": web.port}
+            records[str(number)] = {"pid": process.pid, "port": web.port,
+                                    "process_identities": observe_tree(roots=(process.pid,))}
             _save_served(ctx, records)
             if not (port_waiter or wait_for_port)(web.port, 90):
                 raise InspectRuntimeError(f"#{number} did not open port {web.port} within 90 s")
