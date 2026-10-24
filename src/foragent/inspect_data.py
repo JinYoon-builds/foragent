@@ -13,6 +13,7 @@ from foragent.config import Config
 from foragent.git import GitRepo
 from foragent.labels import BLOCKED, NEEDS_HUMAN, issue_lane, lane_display
 from foragent.reasons import GROUP
+from foragent.records import load_record
 from foragent.state import StateStore
 from foragent.tracker import Comment, Tracker
 from foragent.trycard import TryCard, parse_try, pr_try_text
@@ -58,7 +59,8 @@ class Prepared:
 def load_prepared(store: StateStore, number: int) -> Prepared | None:
     try:
         data = json.loads((store.root / "inspect/prepared" / f"{number}.json").read_text(encoding="utf-8"))
-        return Prepared(data["base_sha"], [PreparedCommand(**result) for result in data["results"]])
+        results = [load_record(PreparedCommand, result) for result in data["results"]]
+        return load_record(Prepared, {**data, "results": results})
     except (OSError, ValueError, KeyError, TypeError):
         return None
 

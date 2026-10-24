@@ -10,7 +10,17 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 from typing import IO, Any
+
+from foragent.records import load_record, write_back
+
+# Tick-lock paths this thread holds through StateStore.hold_tick_lock.
+_TICK_LOCKS_HELD = threading.local()
+
+
+def _held_tick_locks() -> set[str]:
+    return _TICK_LOCKS_HELD.__dict__.setdefault("paths", set())
 
 
 @dataclass(frozen=True)
@@ -63,6 +73,7 @@ class Run:
     phase_started_at: str | None = None
     last_activity_at: str | None = None
     executor_pgid: int | None = None
+    process_identities: list[dict] = field(default_factory=list)
     session_id: str | None = None
     session_executor: str | None = None
     session_ids: list[str] = field(default_factory=list)
@@ -513,7 +524,7 @@ class StateStore:
             "number": number, "body": body, "body_sha": body_sha, "acceptance_blobs": acceptance_blobs,
             "approved_by": approved_by, "approved_at": approved_at,
         }
-        self._write_json(self.root / "approvals" / f"{number}.json", snapshot)
+        self._write_mapping(self.root / "approvals" / f"{number}.json", Approval, snapshot)
 
     def load_approval(self, number: int) -> Approval | None:
         path = self.root / "approvals" / f"{number}.json"
@@ -521,13 +532,13 @@ class StateStore:
             snapshot = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
-        return Approval(**snapshot)
+        return load_record(Approval, snapshot)
 
     def clear_approval(self, number: int) -> None:
         (self.root / "approvals" / f"{number}.json").unlink(missing_ok=True)
 
     def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None) -> None:
-        self._write_json(self.root / "flags" / f"{number}.json", {
+        self._write_mapping(self.root / "flags" / f"{number}.json", Flag, {
             "number": number, "reason": reason,
             "flagged_at": flagged_at if flagged_at is not None else self._timestamp(),
         })
@@ -537,25 +548,53 @@ class StateStore:
             value = (self.root / "flags" / f"{number}.json").read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        return Flag(**json.loads(value))
+        return load_record(Flag, json.loads(value))
 
     def load_inspect(self) -> InspectState:
         try:
             value = (self.root / "inspect.json").read_text(encoding="utf-8")
         except FileNotFoundError:
             return InspectState()
-        return InspectState(**json.loads(value))
+        return load_record(InspectState, json.loads(value))
+
+    def _write_mapping(self, path: Path, cls: type, value: dict[str, Any]) -> dict[str, Any]:
+        """Write a record mapping, keeping fields a newer version stored in the file."""
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            saved = {}
+        value = write_back(cls, saved, value)
+        self._write_json(path, value)
+        return value
+
+    def _write_record(self, path: Path, record: Any) -> dict[str, Any]:
+        return self._write_mapping(path, type(record), asdict(record))
+
+    def _run_value(self, run: "Run") -> dict[str, Any]:
+        """A run's fields merged over the unknown fields its file holds on disk."""
+        try:
+            saved = json.loads((self.root / "runs" / f"{run.number}.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            saved = {}
+        return write_back(type(run), saved, asdict(run))
+
+    def _write_run(self, run: "Run", value: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The one writer of run files; unknown fields always survive."""
+        value = self._run_value(run) if value is None else value
+        self._write_json(self.root / "runs" / f"{run.number}.json", value)
+        return value
 
     def update_inspect(self, **fields: Any) -> InspectState:
         with self._state_lock():
             updated = replace(self.load_inspect(), **fields)
-            self._write_json(self.root / "inspect.json", asdict(updated))
+            self._write_record(self.root / "inspect.json", updated)
             return updated
 
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
         lane: str = "main", tier: str = "m",
     ) -> Run:
+        """Create a run; pid attests self or a newly spawned, unreaped child."""
         with self._state_lock():
             timestamp = self._timestamp()
             approval = self.load_approval(number)
@@ -578,12 +617,15 @@ class StateStore:
                         "earlier uncommitted changes are no longer present."
                     ),
                 }
+            from foragent.processes import observe_tree
+
+            identities = observe_tree(roots=(pid,)) if pid is not None else []
             run = Run(number, branch, str(worktree), pid, timestamp, timestamp, attempts=attempts,
                       restarts=restarts, lane=lane, tier=previous.tier if resumed else tier,
                       attempt_tiers=previous.attempt_tiers if resumed else {},
                       approval_body_sha=approval.body_sha if approval is not None else None,
-                      last_activity_at=timestamp, **session)
-            self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
+                      last_activity_at=timestamp, process_identities=identities, **session)
+            self._write_run(run)
             return run
 
     def prepare_run_start(self, number: int) -> None:
@@ -619,8 +661,17 @@ class StateStore:
                     or " ".join(run.detail.split())[:500]
                     or "Run detail unavailable."
                 )
+            from foragent.processes import observe_tree
+
+            # Numeric fields describe a run; only birth evidence supplied by a
+            # launcher (or descendants of verified identities) proves ownership.
+            # An explicit new birth may reuse an earlier executor's PID.
+            identities = {item["pid"]: item for item in (
+                *run.process_identities, *fields.get("process_identities", []),
+            )}
+            fields["process_identities"] = observe_tree(list(identities.values()))
             updated = replace(run, **fields)
-            self._write_json(self.root / "runs" / f"{number}.json", asdict(updated))
+            self._write_run(updated)
             return updated
 
     def get_run(self, number: int) -> Run | None:
@@ -628,7 +679,7 @@ class StateStore:
             value = (self.root / "runs" / f"{number}.json").read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        return Run(**json.loads(value))
+        return load_record(Run, json.loads(value))
 
     def active_runs(self) -> list[Run]:
         runs = []
@@ -652,22 +703,6 @@ class StateStore:
         except FileNotFoundError:
             return False
         return lane in pauses and now < datetime.fromisoformat(pauses[lane])
-
-    def record_usage(self, snapshots: dict[str, dict]) -> None:
-        """Keep the latest usage snapshot for each executor."""
-        if not snapshots:
-            return
-        with self._state_lock():
-            usage = self.usage()
-            usage.update(deepcopy(snapshots))
-            self._write_json(self.root / "usage.json", usage)
-
-    def usage(self) -> dict[str, dict]:
-        try:
-            value = json.loads((self.root / "usage.json").read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError):
-            return {}
-        return value if isinstance(value, dict) else {}
 
     def pause_executor(self, executor: str, until: datetime) -> None:
         """Hold every lane that needs ``executor`` until its usage window resets."""
@@ -712,11 +747,15 @@ class StateStore:
             detail = " ".join(detail.split())[:500]
             if not detail and outcome != "merged":
                 detail = " ".join(run.detail.split())[:500] or f"Run finished with outcome {outcome}."
-            finished = replace(run, status="finished", outcome=outcome, detail=detail)
+            from foragent.processes import observe_tree
+
+            finished = replace(run, status="finished", outcome=outcome, detail=detail,
+                               process_identities=observe_tree(run.process_identities))
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
-            self._atomic_write(history_path, history + json.dumps(asdict(finished), ensure_ascii=False) + "\n")
-            self._write_json(self.root / "runs" / f"{number}.json", asdict(finished))
+            snapshot = self._run_value(finished)
+            self._atomic_write(history_path, history + json.dumps(snapshot, ensure_ascii=False) + "\n")
+            self._write_run(finished, snapshot)
             return finished
 
     def read_history(self) -> list[Run]:
@@ -727,9 +766,36 @@ class StateStore:
             return []
         runs: dict[tuple[int, str], Run] = {}
         for line in history.splitlines():
-            run = Run(**json.loads(line))
+            run = load_record(Run, json.loads(line))
             runs[run.number, run.started_at] = run
         return list(runs.values())
+
+    def usage(self) -> dict[str, Any]:
+        """The latest recorded plan usage per executor, as executors reported it."""
+        try:
+            return json.loads((self.root / "usage.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+
+    def record_usage(self, executor: str, windows: list[dict[str, Any]]) -> None:
+        with self._state_lock():
+            usage = self.usage()
+            usage[executor] = {"seen_at": self._timestamp(), "windows": windows}
+            self._write_json(self.root / "usage.json", usage)
+
+    def tidy_state(self) -> dict[str, Any]:
+        try:
+            return json.loads((self.root / "tidy.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+
+    def update_tidy_state(self, change: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+        """Apply ``change`` under the state lock; it returns whether to save."""
+        with self._state_lock():
+            state = self.tidy_state()
+            if change(state):
+                self._write_json(self.root / "tidy.json", state)
+            return state
 
     def worktree_path(self, number: int) -> Path:
         return self.root / "worktrees" / f"issue-{number}"
@@ -769,8 +835,48 @@ class StateStore:
 
     @contextmanager
     def tick_lock(self) -> Iterator[bool]:
+        """Try the tick lock without waiting; yield whether this tick may run.
+
+        Inside ``hold_tick_lock()`` on the same thread the lock is already held,
+        so it yields True without taking it again.
+        """
+        path = self._tick_lock_path()
+        if str(path.resolve()) in _held_tick_locks():
+            yield True
+            return
+        with self._try_tick_lock(path) as acquired:
+            yield acquired
+
+    @contextmanager
+    def hold_tick_lock(self) -> Iterator[bool]:
+        """Take the tick lock so nested ``tick_lock()`` calls on this thread reenter it.
+
+        The gate command holds it around a tick and the record of its outcome,
+        so overlapping ticks record outcomes in the order they ran.
+        """
+        path = self._tick_lock_path()
+        key, held = str(path.resolve()), _held_tick_locks()
+        if key in held:
+            yield True
+            return
+        with self._try_tick_lock(path) as acquired:
+            if not acquired:
+                yield False
+                return
+            held.add(key)
+            try:
+                yield True
+            finally:
+                held.discard(key)
+
+    def _tick_lock_path(self) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / "tick.lock").open("a", encoding="utf-8") as stream:
+        return self.root / "tick.lock"
+
+    @staticmethod
+    @contextmanager
+    def _try_tick_lock(path: Path) -> Iterator[bool]:
+        with path.open("a", encoding="utf-8") as stream:
             try:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:

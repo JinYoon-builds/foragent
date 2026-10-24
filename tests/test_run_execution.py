@@ -206,11 +206,10 @@ def test_implementer_limit_pauses_lane_and_returns_ready_without_attempt(run_cas
     assert c.store.load_flag(1) is None and c.tracker.created_prs == []
 
 
-@pytest.mark.parametrize("message", ["overloaded", "429 quota"])
-def test_reviewer_availability_waits_then_uses_recovered_verdict(run_case, message):
+def test_reviewer_availability_waits_then_uses_recovered_verdict(run_case):
     c = run_case
-    calls = enable_reviewer(c, [ExecResult(1, False, message, Path("unused"),
-                                        error_kind="limit" if "429" in message else "transient"), "VERDICT: PASS"])
+    calls = enable_reviewer(c, [ExecResult(1, False, "overloaded", Path("unused"), error_kind="transient"),
+                                "VERDICT: PASS"])
     assert run_issue(1, c.ctx) == "merged"
     assert len(calls) == 2 and c.store.get_run(1).attempts == 1
     assert c.store.get_run(1).waited_seconds == 120
@@ -219,17 +218,17 @@ def test_reviewer_availability_waits_then_uses_recovered_verdict(run_case, messa
     assert "Round 2" not in c.tracker.created_prs[0].body
 
 
-def test_reviewer_limit_only_becomes_unusable_after_wait_budget(run_case):
+def test_reviewer_unreadable_limit_pauses_its_executor_for_configured_wait(run_case):
     c = run_case
-    c.executor.steps.append({})
-    c.ctx.config = replace(c.ctx.config, transient_max_wait_minutes=2)
+    c.ctx.config = replace(c.ctx.config, limit_wait_minutes=15)
     limit = ExecResult(1, False, "usage limit", Path("unused"), error_kind="limit")
-    calls = enable_reviewer(c, [limit, limit, limit])
-    assert run_issue(1, c.ctx) == "retries-exceeded"
-    assert len(calls) == 3 and c.store.get_run(1).waited_seconds == 120
-    assert c.store.get_run(1).attempts == 2
-    assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
-    assert not c.store.lane_paused("main", c.now[0])
+    calls = enable_reviewer(c, [limit, limit])
+    assert run_issue(1, c.ctx) == "limit-wait"
+    assert len(calls) == 1 and c.store.get_run(1).waited_seconds == 0
+    assert c.store.executor_paused("codex", c.now[0] + timedelta(minutes=14))
+    assert not c.store.executor_paused("codex", c.now[0] + timedelta(minutes=15))
+    assert not c.store.executor_paused("claude", c.now[0])
+    assert c.store.load_flag(1) is None
 
 
 def test_reviewer_transient_exhaustion_uses_executor_unavailable_flag(run_case):

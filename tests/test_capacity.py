@@ -171,8 +171,8 @@ def test_budget_demand_excludes_busy_and_paused_lanes(tmp_path, monkeypatch):
     capacity.write_state(ctx.store, 5, NOW)
     ctx.store.start_run(1, branch="b", worktree=ctx.store.worktree_path(1), lane="busy", pid=os.getpid())
     ctx.store.pause_lane("paused", NOW + timedelta(hours=1))
-    # One live run plus one free ready lane caps this tick at 2.
-    assert scheduler._machine_budget(ctx, {"busy": [2], "paused": [3], "free": [4]}) == 2
+    # One live run plus every ready issue in unpaused lanes (busy lanes included) caps this tick at 3.
+    assert scheduler._machine_budget(ctx, {"busy": [2], "paused": [3], "free": [4]}) == 3
     assert seen["ceiling"] is None and seen["increase_ok"] is False
 
 
@@ -344,18 +344,21 @@ def test_test_slot_of_a_killed_holder_is_released():
     directory.mkdir(parents=True)
     holder = subprocess.Popen([
         sys.executable, "-c",
-        "import fcntl, sys, time\n"
+        "import fcntl, os, sys\n"
         f"stream = open({str(directory / 'slot-0.lock')!r}, 'a')\n"
         "fcntl.flock(stream.fileno(), fcntl.LOCK_EX)\n"
         "print('held', flush=True)\n"
-        "time.sleep(60)\n",
-    ], stdout=subprocess.PIPE, text=True)
+        "sys.stdin.readline()\n"
+        "os._exit(9)\n",
+    ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline() == "held\n"
         assert capacity._take_test_slot(1) is None
     finally:
-        holder.kill()
-        holder.wait(timeout=10)
+        holder.stdin.write("release\n")
+        holder.stdin.flush()
+        assert holder.wait(timeout=10) == 9
+        holder.stdin.close()
         holder.stdout.close()
     stream = capacity._take_test_slot(1)
     assert stream is not None

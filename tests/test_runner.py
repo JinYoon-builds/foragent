@@ -50,12 +50,12 @@ def test_happy_path_merges_and_records_results(run_case, monkeypatch, ci):
     assert c.now[0] == BASE_TIME + timedelta(hours=1)
 
 
-@pytest.mark.parametrize("mode,question,outcome,statuses", [
-    ("fast", False, "merged", ["Running", "PR open", "Done"]),
-    ("careful", False, "pr-open", ["Running", "PR open"]),
-    ("fast", True, "spec-question", ["Running", "Blocked"]),
+@pytest.mark.parametrize("mode,question,outcome,statuses,column", [
+    ("fast", False, "merged", ["Running", "PR open", "Done"], "📦 Done"),
+    ("careful", False, "pr-open", ["Running", "PR open"], "🐿 In progress"),
+    ("fast", True, "spec-question", ["Running", "Blocked"], "🐿 In progress"),
 ])
-def test_runner_updates_project_on_execution_pr_merge_and_block(run_case, monkeypatch, mode, question, outcome, statuses):
+def test_runner_updates_project_on_execution_pr_merge_and_block(run_case, monkeypatch, mode, question, outcome, statuses, column):
     from foragent import board
     from test_board import item_values
 
@@ -74,7 +74,7 @@ def test_runner_updates_project_on_execution_pr_merge_and_block(run_case, monkey
     monkeypatch.setattr(board, "set_status", recorded)
     assert run_issue(1, c.ctx) == outcome
     assert calls == statuses
-    assert item_values(c.tracker, project_id, 1)["Status"] == statuses[-1]
+    assert item_values(c.tracker, project_id, 1)["Status"] == column
 
 
 def test_board_transport_failure_does_not_fail_runner(run_case, caplog):
@@ -131,67 +131,46 @@ def test_retry_reads_saved_branch_before_worker_even_without_both_copies(run_cas
 
 @pytest.mark.parametrize("cleanup", ["kill", "crash", "orphan"])
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGKILL])
-def test_scheduler_preserves_wip_after_real_process_death(run_case, cleanup, signum):
-    c = run_case
+def test_scheduler_preserves_wip_after_real_process_death(run_case, fake_process_table, cleanup, signum):
+    c, table = run_case, fake_process_table
     path = c.store.worktree_path(1)
     c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
-    ready = c.store.root / "ready"
-    unwound = c.store.root / "unwound"
-    script = """
-from pathlib import Path
-import sys, time
-root, ready, unwound = map(Path, sys.argv[1:])
-try:
-    (root / 'unfinished.txt').write_text('partial implementation\\n')
-    (root / 'tests/acceptance/test_feature.py').write_text('tampered\\n')
-    (root / '.foragent').mkdir()
-    (root / '.foragent/session.log').write_text('runner artifact')
-    ready.touch()
-    time.sleep(60)
-finally:
-    unwound.touch()
-"""
-    with subprocess.Popen([sys.executable, "-c", script, str(path), str(ready), str(unwound)]) as process:
-        def terminate(pid):
-            if process.poll() is None:
-                process.send_signal(signum)
-                process.wait(timeout=5)
+    (path / "unfinished.txt").write_text("partial implementation\n")
+    (path / ACCEPTANCE).write_text("tampered\n")
+    (path / ".foragent").mkdir()
+    (path / ".foragent/session.log").write_text("runner artifact")
+    root = table.add(42000, cwd=path, start_time=10)
+    c.store.update_run(1, pid=root.pid)
 
-        ctx = TickContext(
-            repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
-            config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
-            kill_runner=terminate,
+    def terminate(pid):
+        if pid in table.live:
+            table.kill(pid, signum)
+
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+        kill_runner=terminate,
+    )
+    report = TickReport()
+    if cleanup == "kill":
+        _kill_run(ctx, 1, report)
+    else:
+        terminate(root.pid)
+        if cleanup == "crash":
+            _recover_runs(ctx, report)
+        else:
+            c.store.finish_run(1, "error")
+            c.now[0] += timedelta(seconds=1)
+            _recover_orphan(ctx, c.tracker.get_issue(1), report)
+    assert root.pid not in table.live
+    assert not path.exists()
+    for root in (c.history.clone, c.history.origin):
+        assert git_command(root, "show", "foragent/issue-1:unfinished.txt") == "partial implementation"
+        assert git_command(root, "rev-parse", f"foragent/issue-1:{ACCEPTANCE}") == (
+            c.store.load_approval(1).acceptance_blobs[ACCEPTANCE]
         )
-        try:
-            for _ in range(500):
-                if ready.exists() or process.poll() is not None:
-                    break
-                time.sleep(0.01)
-            assert ready.exists(), "runner did not write WIP"
-            c.store.update_run(1, pid=process.pid)
-            report = TickReport()
-            if cleanup == "kill":
-                _kill_run(ctx, 1, report)
-            else:
-                terminate(process.pid)
-                if cleanup == "crash":
-                    _recover_runs(ctx, report)
-                else:
-                    c.store.finish_run(1, "error")
-                    c.now[0] += timedelta(seconds=1)
-                    _recover_orphan(ctx, c.tracker.get_issue(1), report)
-            assert process.returncode == -signum and not unwound.exists()
-            assert not path.exists()
-            for root in (c.history.clone, c.history.origin):
-                assert git_command(root, "show", "foragent/issue-1:unfinished.txt") == "partial implementation"
-                assert git_command(root, "rev-parse", f"foragent/issue-1:{ACCEPTANCE}") == (
-                    c.store.load_approval(1).acceptance_blobs[ACCEPTANCE]
-                )
-                assert ".foragent" not in git_command(root, "ls-tree", "-r", "--name-only", "foragent/issue-1")
-        finally:
-            terminate(process.pid)
-            c.ctx.git.remove_worktree(path)
-            c.tracker.remove_labels(1, ["running"])
+        assert ".foragent" not in git_command(root, "ls-tree", "-r", "--name-only", "foragent/issue-1")
+    c.tracker.remove_labels(1, ["running"])
 
 
 @pytest.mark.parametrize("cleanup", ["kill", "crash", "orphan"])
@@ -300,6 +279,28 @@ def test_runner_kicks_after_cleanup_and_finish_for_every_outcome(run_case, monke
     assert c.store.get_run(1).outcome == (
         "killed" if isinstance(result, SystemExit) else "error" if isinstance(result, Exception) else result
     )
+
+
+@pytest.mark.parametrize(("recorded", "labels"), [
+    ("stalled-restart", {"running"}),
+    ("stalled", {"blocked"}),
+    (None, {"blocked"}),
+])
+def test_runner_stop_leaves_first_stall_labels_to_the_tick(run_case, monkeypatch, recorded, labels):
+    c = run_case
+
+    def execute(number, ctx, worktree):
+        if recorded is not None:
+            ctx.store.update_run(number, outcome=recorded)
+        raise SystemExit(143)
+
+    monkeypatch.setattr("foragent.runner._execute", execute)
+    monkeypatch.setattr("foragent.runner.kick_tick", lambda root: None)
+    with pytest.raises(SystemExit):
+        run_issue(1, c.ctx)
+    assert c.tracker.get_issue(1).labels & {"running", "ready", "blocked"} == labels
+    assert c.store.get_run(1).outcome == (recorded or "killed")
+    c.tracker.remove_labels(1, ["running"])  # the next tick restores it to ready
 
 
 def test_runner_still_kicks_when_a_tick_already_finished_its_record(run_case, monkeypatch, kicks):

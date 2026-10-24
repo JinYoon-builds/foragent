@@ -11,7 +11,7 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board
+from foragent import board, usage_events
 from foragent.actions import flag
 from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
@@ -20,7 +20,6 @@ from foragent.processes import track_process_group
 from foragent.reasons import Reason
 from foragent.run_attempt import ExecutorStopped
 from foragent.run_waits import _executor_wait, _progress
-from foragent.usage import exhausted, limit_reset, read_usage
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
@@ -68,13 +67,16 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         size = current
 
     def execute():
-        with track_process_group(lambda pgid: ctx.store.update_run(n, executor_pgid=pgid)):
+        with track_process_group(
+            lambda pgid: ctx.store.update_run(n, executor_pgid=pgid),
+            tree_callback=lambda identities: ctx.store.update_run(n, process_identities=identities),
+        ):
             return executor.run(**kwargs)
 
+    usage: dict = {}
     try:
         result = ctx.poll_hook(execute, poll)
-        result.usage = read_usage(log, ctx.now(), offset=offset)
-        ctx.store.record_usage(result.usage)
+        result.usage = usage  # filled in ``finally`` once the log is complete
         if log.exists():
             with log.open("rb") as stream:
                 stream.seek(max(offset, log.stat().st_size - 16000))
@@ -82,6 +84,8 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         return result
     finally:
         poll()
+        # Executors report plan usage in their own output; keep the latest numbers.
+        usage.update(usage_events.record_from_log(ctx.store, log, offset, ctx.now()))
         _progress(n, ctx)
 
 
@@ -167,11 +171,10 @@ def _available_executor(
             return replace(result, timed_out=True)
         name = resolved_reviewer(ctx.config) if reviewer else ctx.config.executor
         snapshot = (result.usage or {}).get(name)
-        # A reviewer without readable usage keeps its bounded availability retries below.
-        if kind == "limit" and (not reviewer or exhausted(snapshot)):
+        if kind == "limit":
             ctx.store.update_run(n, detail=result.last_message or result.log_tail or "Executor usage limit reached.")
             now = ctx.now()
-            until = limit_reset(snapshot, now, now + timedelta(minutes=ctx.config.limit_wait_minutes))
+            until = usage_events.limit_reset(snapshot, now, now + timedelta(minutes=ctx.config.limit_wait_minutes))
             ctx.store.pause_executor(name, until)
             ctx.store.pause_lane(run.lane, until)
             ctx.tracker.add_labels(n, [READY])
@@ -185,8 +188,6 @@ def _available_executor(
                 _append(kwargs["log_path"], f"Executor fallback model: {ctx.config.executor_fallback_model}")
         budget = ctx.config.transient_max_wait_minutes * 60 - ctx.store.get_run(n).executor_waited_seconds
         if budget <= 0:
-            if reviewer and kind == "limit":
-                return replace(result, exit_code=result.exit_code or 1)
             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Executor unavailable (transient errors)",
                  result.last_message or result.log_tail)
             raise ExecutorStopped("retries-exceeded")
