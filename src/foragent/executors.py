@@ -21,6 +21,7 @@ class ExecResult:
     error_kind: str = "normal"
     session_id: str | None = None
     num_turns: int | None = None
+    usage: dict | None = None
 
 
 def classify_result(result: ExecResult) -> str:

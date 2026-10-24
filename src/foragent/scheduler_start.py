@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from foragent import scheduler
@@ -11,11 +13,21 @@ from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, decrease_allowed, machine_load,
     machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
 )
+from foragent.config import resolved_reviewer
 from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
 from foragent.tracker import Issue
 
 if TYPE_CHECKING:
     from foragent.scheduler import TickContext, TickReport
+
+
+def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
+    """A lane waits while it, its implementer or its reviewer is paused for a usage limit."""
+    if ctx.store.lane_paused(lane, now):
+        return True
+    settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
+    config = replace(ctx.config, executor=settings.get("executor") or ctx.config.executor)
+    return any(ctx.store.executor_paused(name, now) for name in {config.executor, resolved_reviewer(config)})
 
 
 def _machine_budget(
@@ -24,7 +36,7 @@ def _machine_budget(
     """Update the machine-wide AIMD value once per tick and return this tick's machine budget."""
     now = ctx.now()
     # Every ready issue in an unpaused lane may start; the file-overlap check runs at start time.
-    waiting = sum(len(numbers) for lane, numbers in ready.items() if not ctx.store.lane_paused(lane, now))
+    waiting = sum(len(numbers) for lane, numbers in ready.items() if not _lane_held(ctx, lane, now))
     sample = sample if sample is not None else scheduler.machine_load()
     pressure, load = sample
     with scheduler.machine_lock(ctx.store):
@@ -86,7 +98,7 @@ def _start_ready(
     for lane in sorted(ready, key=scheduler.lane_order):
         if not scheduler._has_slot(ctx, budget):
             break
-        if ctx.store.lane_paused(lane, ctx.now()):
+        if _lane_held(ctx, lane, ctx.now()):
             continue
         for number in ready[lane]:
             local = scheduler._local_issue(ctx, number)
