@@ -11,7 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, orch_queue, orch_tick_outcome, order, tidy, watch, watch_open
+from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_inbox, orch_queue, orch_tick_outcome, order, tidy, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -825,6 +825,7 @@ def main(argv: list[str] | None = None) -> int:
             status = _status(tracker, store, config)
             status["launchd"] = asdict(launchd.status(root, repo=repo))
             status["test_slots"] = capacity.effective_test_slots(config.test_slots)
+            status["machine_budget"] = machine_budget.sources(config)
             status["tick_outcome"] = orch_tick_outcome.read(store)
             if args.json:
                 print(json.dumps(status))

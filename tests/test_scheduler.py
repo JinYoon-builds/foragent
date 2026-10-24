@@ -116,7 +116,8 @@ def test_tick_applies_configured_test_slots_floor_without_starting_runs(ctx, mon
     assert len(rows) == 1
     assert rows[0]["wanted"] == 1 and rows[0]["to"] == expected
     assert rows[0]["swapins"] == 60
-    assert capacity.read_state(ctx.store) == {"parallel": 4, "changed_at": NOW.isoformat()}
+    # A tick that starts nothing still applies pressure to the shared worker budget (#365).
+    assert capacity.read_state(ctx.store)["parallel"] == 2
 
 
 @pytest.mark.parametrize("floor,pressure,expected", [(3, "warn", 3), (3, "critical", 1), (1, "warn", 1)])
@@ -2804,3 +2805,15 @@ def test_periodic_tick_300_seconds_later_is_a_refresh_tick_despite_fetch_delay(c
         assert ctx.store.issues_observation()["as_of"] == started.isoformat(), \
             "Each periodic tick refreshes, stamped with its start"
     assert reads == [], "The periodic refresh confirms the earlier reads"
+
+
+def test_tick_without_ready_work_still_applies_machine_parallel_ceiling(ctx):
+    from foragent import capacity, machine_budget
+
+    path = machine_budget.machine_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("max_parallel: 2\n", encoding="utf-8")
+    capacity.write_state(ctx.store, 5, NOW - timedelta(hours=1))
+    assert not ctx.start_runs
+    tick(ctx)
+    assert capacity.read_state(ctx.store)["parallel"] == 2

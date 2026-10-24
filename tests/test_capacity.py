@@ -529,3 +529,17 @@ def test_test_slots_floor_allows_growth_with_headroom():
     assert capacity.update_test_slots(
         3, NOW + capacity.INCREASE_INTERVAL, pressure="normal", load_per_cpu=0.5, floor=2,
     ) == 3
+
+
+def test_machine_max_parallel_caps_the_shared_value_during_decrease_cooldown(tmp_path):
+    from foragent import machine_budget
+
+    path = machine_budget.machine_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("max_parallel: 2\n", encoding="utf-8")
+    ctx = budget_ctx(tmp_path, NOW)
+    # A decrease just happened, so the cooldown would otherwise hold the value at 8.
+    capacity.write_state(ctx.store, 8, NOW - timedelta(hours=1), decreased_at=NOW.isoformat())
+    ready = {f"lane-{n}": [n] for n in range(8)}
+    assert scheduler._machine_budget(ctx, ready, capacity.LoadSample("normal", 0.5, 0)) == 2
+    assert capacity.read_state(ctx.store)["parallel"] == 2

@@ -306,7 +306,11 @@ def read_test_slots() -> dict[str, Any] | None:
 
 
 def effective_test_slots(ceiling: int) -> int:
-    """The shared AIMD value, capped by this repository's configured ceiling."""
+    """The shared AIMD value, capped by machine.yml and this repository's lower ceiling."""
+    from foragent import machine_budget
+
+    if (machine := machine_budget.configured()) is not None:
+        ceiling = min(ceiling, machine["test_slots"])
     state = read_test_slots()
     return max(1, min(state["slots"], ceiling)) if state else max(1, ceiling)
 

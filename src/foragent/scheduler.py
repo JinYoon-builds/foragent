@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, orch_queue, tidy, watch_open
+from foragent import board, machine_budget, orch_github, orch_queue, tidy, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -223,16 +223,15 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if until := ctx.store.github_wait_until(ctx.now()):
         report.skipped = f"GitHub rate limit until {until.isoformat()}"
         return report
-    # One sensor sample per tick sizes both the test slots and the run budget.
-    sample = machine_load()
+    # One sensor sample per tick sizes both the test slots and the run budget; machine.yml alone sizes the shared files.
+    sample, machine = machine_load(), machine_budget.values(ctx.config)
     update_test_slots(
-        ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
-        swapins=getattr(sample, "swapins", None), floor=ctx.config.test_slots_floor,
+        machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
+        swapins=getattr(sample, "swapins", None), floor=machine["test_slots_floor"],
     )
     prebuild_acceptance_baseline(ctx, base_ref, ctx.baseline_launcher)
-    if not ctx.start_runs or not ready:
-        return report
-    if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+    if not ctx.start_runs or not ready or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+        _machine_budget(ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
 
     # A lane's local queue picks the order; startability was already checked above.
