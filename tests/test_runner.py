@@ -131,67 +131,46 @@ def test_retry_reads_saved_branch_before_worker_even_without_both_copies(run_cas
 
 @pytest.mark.parametrize("cleanup", ["kill", "crash", "orphan"])
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGKILL])
-def test_scheduler_preserves_wip_after_real_process_death(run_case, cleanup, signum):
-    c = run_case
+def test_scheduler_preserves_wip_after_real_process_death(run_case, fake_process_table, cleanup, signum):
+    c, table = run_case, fake_process_table
     path = c.store.worktree_path(1)
     c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
-    ready = c.store.root / "ready"
-    unwound = c.store.root / "unwound"
-    script = """
-from pathlib import Path
-import sys, time
-root, ready, unwound = map(Path, sys.argv[1:])
-try:
-    (root / 'unfinished.txt').write_text('partial implementation\\n')
-    (root / 'tests/acceptance/test_feature.py').write_text('tampered\\n')
-    (root / '.foragent').mkdir()
-    (root / '.foragent/session.log').write_text('runner artifact')
-    ready.touch()
-    time.sleep(60)
-finally:
-    unwound.touch()
-"""
-    with subprocess.Popen([sys.executable, "-c", script, str(path), str(ready), str(unwound)]) as process:
-        def terminate(pid):
-            if process.poll() is None:
-                process.send_signal(signum)
-                process.wait(timeout=5)
+    (path / "unfinished.txt").write_text("partial implementation\n")
+    (path / ACCEPTANCE).write_text("tampered\n")
+    (path / ".foragent").mkdir()
+    (path / ".foragent/session.log").write_text("runner artifact")
+    root = table.add(42000, cwd=path, start_time=10)
+    c.store.update_run(1, pid=root.pid)
 
-        ctx = TickContext(
-            repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
-            config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
-            kill_runner=terminate,
+    def terminate(pid):
+        if pid in table.live:
+            table.kill(pid, signum)
+
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+        kill_runner=terminate,
+    )
+    report = TickReport()
+    if cleanup == "kill":
+        _kill_run(ctx, 1, report)
+    else:
+        terminate(root.pid)
+        if cleanup == "crash":
+            _recover_runs(ctx, report)
+        else:
+            c.store.finish_run(1, "error")
+            c.now[0] += timedelta(seconds=1)
+            _recover_orphan(ctx, c.tracker.get_issue(1), report)
+    assert root.pid not in table.live
+    assert not path.exists()
+    for root in (c.history.clone, c.history.origin):
+        assert git_command(root, "show", "foragent/issue-1:unfinished.txt") == "partial implementation"
+        assert git_command(root, "rev-parse", f"foragent/issue-1:{ACCEPTANCE}") == (
+            c.store.load_approval(1).acceptance_blobs[ACCEPTANCE]
         )
-        try:
-            for _ in range(500):
-                if ready.exists() or process.poll() is not None:
-                    break
-                time.sleep(0.01)
-            assert ready.exists(), "runner did not write WIP"
-            c.store.update_run(1, pid=process.pid)
-            report = TickReport()
-            if cleanup == "kill":
-                _kill_run(ctx, 1, report)
-            else:
-                terminate(process.pid)
-                if cleanup == "crash":
-                    _recover_runs(ctx, report)
-                else:
-                    c.store.finish_run(1, "error")
-                    c.now[0] += timedelta(seconds=1)
-                    _recover_orphan(ctx, c.tracker.get_issue(1), report)
-            assert process.returncode == -signum and not unwound.exists()
-            assert not path.exists()
-            for root in (c.history.clone, c.history.origin):
-                assert git_command(root, "show", "foragent/issue-1:unfinished.txt") == "partial implementation"
-                assert git_command(root, "rev-parse", f"foragent/issue-1:{ACCEPTANCE}") == (
-                    c.store.load_approval(1).acceptance_blobs[ACCEPTANCE]
-                )
-                assert ".foragent" not in git_command(root, "ls-tree", "-r", "--name-only", "foragent/issue-1")
-        finally:
-            terminate(process.pid)
-            c.ctx.git.remove_worktree(path)
-            c.tracker.remove_labels(1, ["running"])
+        assert ".foragent" not in git_command(root, "ls-tree", "-r", "--name-only", "foragent/issue-1")
+    c.tracker.remove_labels(1, ["running"])
 
 
 @pytest.mark.parametrize("cleanup", ["kill", "crash", "orphan"])

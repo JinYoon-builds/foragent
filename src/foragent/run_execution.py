@@ -66,7 +66,10 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         size = current
 
     def execute():
-        with track_process_group(lambda pgid: ctx.store.update_run(n, executor_pgid=pgid)):
+        with track_process_group(
+            lambda pgid: ctx.store.update_run(n, executor_pgid=pgid),
+            tree_callback=lambda identities: ctx.store.update_run(n, process_identities=identities),
+        ):
             return executor.run(**kwargs)
 
     try:

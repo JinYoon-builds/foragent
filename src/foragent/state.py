@@ -63,6 +63,7 @@ class Run:
     phase_started_at: str | None = None
     last_activity_at: str | None = None
     executor_pgid: int | None = None
+    process_identities: list[dict] = field(default_factory=list)
     session_id: str | None = None
     session_executor: str | None = None
     session_ids: list[str] = field(default_factory=list)
@@ -556,6 +557,7 @@ class StateStore:
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
         lane: str = "main", tier: str = "m",
     ) -> Run:
+        """Create a run; pid attests self or a newly spawned, unreaped child."""
         with self._state_lock():
             timestamp = self._timestamp()
             approval = self.load_approval(number)
@@ -578,11 +580,14 @@ class StateStore:
                         "earlier uncommitted changes are no longer present."
                     ),
                 }
+            from foragent.processes import observe_tree
+
+            identities = observe_tree(roots=(pid,)) if pid is not None else []
             run = Run(number, branch, str(worktree), pid, timestamp, timestamp, attempts=attempts,
                       restarts=restarts, lane=lane, tier=previous.tier if resumed else tier,
                       attempt_tiers=previous.attempt_tiers if resumed else {},
                       approval_body_sha=approval.body_sha if approval is not None else None,
-                      last_activity_at=timestamp, **session)
+                      last_activity_at=timestamp, process_identities=identities, **session)
             self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
             return run
 
@@ -619,6 +624,15 @@ class StateStore:
                     or " ".join(run.detail.split())[:500]
                     or "Run detail unavailable."
                 )
+            from foragent.processes import observe_tree
+
+            # Numeric fields describe a run; only birth evidence supplied by a
+            # launcher (or descendants of verified identities) proves ownership.
+            # An explicit new birth may reuse an earlier executor's PID.
+            identities = {item["pid"]: item for item in (
+                *run.process_identities, *fields.get("process_identities", []),
+            )}
+            fields["process_identities"] = observe_tree(list(identities.values()))
             updated = replace(run, **fields)
             self._write_json(self.root / "runs" / f"{number}.json", asdict(updated))
             return updated
@@ -678,7 +692,10 @@ class StateStore:
             detail = " ".join(detail.split())[:500]
             if not detail and outcome != "merged":
                 detail = " ".join(run.detail.split())[:500] or f"Run finished with outcome {outcome}."
-            finished = replace(run, status="finished", outcome=outcome, detail=detail)
+            from foragent.processes import observe_tree
+
+            finished = replace(run, status="finished", outcome=outcome, detail=detail,
+                               process_identities=observe_tree(run.process_identities))
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
             self._atomic_write(history_path, history + json.dumps(asdict(finished), ensure_ascii=False) + "\n")

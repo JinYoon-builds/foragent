@@ -23,6 +23,7 @@ from foragent.paths import PathError
 from foragent.skills import SkillError, SkillManager
 from foragent.launcher import spawn_notify, spawn_runner
 from foragent.inspect_runtime import InspectRuntimeError
+from foragent.processes import observe_tree
 from foragent.scheduler import TickContext, tick
 from foragent.runner import RunContext, check_done, run_issue, run_tests
 from foragent.run_baseline import start_baseline_process
@@ -769,7 +770,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if store.get_run(args.number) is None:
                 raise ConfigError(f"no run record for issue #{args.number}")
-            store.update_run(args.number, pid=os.getpid())
+            store.update_run(args.number, pid=os.getpid(),
+                             process_identities=observe_tree(roots=(os.getpid(),)))
             outcome = run_issue(args.number, RunContext(
                 repo=repo, repo_root=root, tracker=tracker, store=store,
                 config=config, git=git, now=lambda: datetime.now(UTC),

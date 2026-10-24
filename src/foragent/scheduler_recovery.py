@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import scheduler
+from foragent import processes, scheduler
 from foragent.tracker import Issue
 
 if TYPE_CHECKING:
@@ -16,7 +16,8 @@ def _kill_executor(ctx: TickContext, number: int) -> None:
     # Re-read after stopping the runner: it may have spawned or reaped an executor.
     run = ctx.store.get_run(number)
     if run.executor_pgid is not None:
-        ctx.kill_runner(run.executor_pgid)
+        with processes.recorded_tree(run.process_identities):
+            ctx.kill_runner(run.executor_pgid)
         ctx.store.update_run(number, executor_pgid=None)
 
 
@@ -50,7 +51,8 @@ def _kill_run(
         ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
     try:
         if run.pid is not None:
-            ctx.kill_runner(run.pid)
+            with processes.recorded_tree(run.process_identities):
+                ctx.kill_runner(run.pid)
         scheduler._kill_executor(ctx, number)
     except Exception:
         if count_stall:
@@ -182,11 +184,18 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
     for run in ctx.store.active_runs():
+        # Keep witnessed descendants across subsequent reparenting or runner death.
+        run = ctx.store.update_run(run.number)
+        identities = {item["pid"]: item["start_time"] for item in run.process_identities}
         if run.pid is None:
             dead = (
                 ctx.now() - scheduler.datetime.fromisoformat(run.started_at) >= scheduler.LAUNCH_GRACE
                 and not ctx.runner_process_exists(run.number)
             )
+        elif run.pid in identities and not any(
+            row.pid == run.pid and row.start_time == identities[run.pid] for row in processes.list_processes()
+        ):
+            dead = True  # Never probe a replacement as if it were the recorded runner.
         else:
             try:
                 scheduler.os.kill(run.pid, 0)
@@ -219,7 +228,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         # Clean up a crashed group or finish an interrupted stall termination.
         # A recorded completion does not need another signal.
         if run.pid is not None and run.outcome in {None, "crashed", "stalled-restart", "stalled"}:
-            ctx.kill_runner(run.pid)
+            with processes.recorded_tree(run.process_identities):
+                ctx.kill_runner(run.pid)
         scheduler._kill_executor(ctx, run.number)
         outcome = run.outcome or "crashed"
         scheduler._remove_run_worktree(ctx, run.number, scheduler.Path(run.worktree), report, outcome=outcome)
@@ -233,3 +243,19 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         report.actions.append(f"#{run.number} runner crashed")
         issue = ctx.tracker.get_issue(run.number)
         scheduler._restore_after_crash(ctx, issue, report)
+
+
+def _reap_inactive_runs(ctx: TickContext, report: TickReport) -> None:
+    """Only recorded ownership authorizes cleanup, including closed issues."""
+    for run in ctx.store.read_history():
+        current = ctx.store.get_run(run.number)
+        if current is not None and current.status == "running":
+            continue
+        if not run.process_identities:
+            continue
+        with processes.recorded_tree(run.process_identities):
+            count = processes.kill_process_group(run.pid or run.executor_pgid or run.process_identities[0]["pid"])
+        if count:
+            summary = f"Reaped {count} owned processes from inactive run."
+            scheduler.append_event(ctx.store, ctx.now(), run.number, "orphans-reaped", summary)
+            report.actions.append(f"#{run.number} {summary}")

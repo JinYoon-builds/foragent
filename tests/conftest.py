@@ -2,8 +2,9 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from functools import cache
 from pathlib import Path
+import os
+import signal
 import shutil
 import subprocess
 
@@ -12,6 +13,41 @@ import pytest
 
 ACCEPTANCE = "tests/acceptance/test_feature.py"
 BASE_TIME = datetime(2026, 10, 20, 8, tzinfo=UTC)
+
+
+# Every test fails closed, including signal 0 and subprocess timeout cleanup.
+@pytest.fixture(autouse=True)
+def no_real_signals(monkeypatch):
+    from foragent import processes
+
+    def forbidden(*args, **kwargs):
+        pytest.fail(f"Real signals are forbidden: {args!r}")
+
+    for name in ("kill", "killpg"):
+        monkeypatch.setattr(os, name, forbidden)
+    for name in ("pthread_kill", "raise_signal"):
+        monkeypatch.setattr(signal, name, forbidden)
+    # pidfd tests install fake descriptors explicitly, on every platform.
+    monkeypatch.setattr(os, "pidfd_open", None, raising=False)
+    monkeypatch.setattr(signal, "pidfd_send_signal", forbidden, raising=False)
+    # Unit tests opt in to the fake process table; never inspect the owner's PIDs.
+    monkeypatch.setattr(processes, "list_processes", lambda: ())
+    monkeypatch.setattr(processes, "read_process_identity", lambda pid: next(
+        (row for row in processes.list_processes() if row.pid == pid), None,
+    ))
+    from process_fakes import _ModuleView
+    from foragent import capacity, cli, scheduler, watch_open
+
+    def probe(pid, signum):
+        assert signum == 0, "A signal must use an explicit fake process table"
+        if pid != os.getpid():
+            raise ProcessLookupError(pid)
+
+    for module in (capacity, cli, scheduler, watch_open):
+        monkeypatch.setattr(module, "os", _ModuleView(os, kill=probe))
+
+
+from process_fakes import fake_process_table  # noqa: E402, F401
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +79,7 @@ def kicks(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def no_forbidden_git_commands(monkeypatch):
+def no_forbidden_git_commands(monkeypatch, no_real_signals):
     """Keep the run's command restrictions true even inside temporary repos."""
     popen = subprocess.Popen
 
@@ -86,7 +122,6 @@ class GitHistory:
         self.tip = git_command(self.origin, "rev-parse", "refs/heads/main")
 
 
-@cache
 def _git_history_template(session_root: Path) -> GitHistory:
     root = session_root / "git-history-template"
     root.mkdir()
@@ -101,9 +136,8 @@ def _git_history_template(session_root: Path) -> GitHistory:
 
 @pytest.fixture
 def git_history(tmp_path):
-    # pytest gives every session (and xdist worker) its own tmp_path parent.
-    # Only the template is cached; each test owns its files, objects and refs.
-    template = _git_history_template(tmp_path.parent)
+    # Signal-safe fixtures permit Git only inside this test's own directory.
+    template = _git_history_template(tmp_path)
     origin = shutil.copytree(template.origin, tmp_path / "origin.git")
     clone = shutil.copytree(template.clone, tmp_path / "clone")
     git_command(clone, "config", "remote.origin.url", str(origin))
