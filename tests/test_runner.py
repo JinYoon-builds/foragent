@@ -1247,6 +1247,9 @@ def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_cas
     from foragent.scheduler import TickContext, TickReport, _recover_runs
 
     c = run_case
+    baseline_file = "tests/acceptance/test_keep.py"
+    if slow_check == "baseline":
+        c.history.update({baseline_file: "def test_keep():\n    assert True\n"})
     stall_minutes = 30 if slow_check == "related" else 1
     c.ctx.config = replace(c.ctx.config, test_command="pytest -q", stall_minutes=stall_minutes)
     if slow_check == "related":
@@ -1295,8 +1298,8 @@ def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_cas
             assert observed[-1] == c.now[0].isoformat()
         if report:
             suite = ET.Element("testsuite")
-            ET.SubElement(suite, "testcase", file=ACCEPTANCE, name="test_feature",
-                          classname=ACCEPTANCE.removesuffix(".py").replace("/", "."))
+            ET.SubElement(suite, "testcase", file=baseline_file, name="test_keep",
+                          classname=baseline_file.removesuffix(".py").replace("/", "."))
             ET.ElementTree(suite).write(report, encoding="unicode")
         return 0, False, ""
 
@@ -1376,6 +1379,7 @@ def test_baseline_cache_rebuilds_collection_errors_even_when_pytest_continues(gi
 ])
 def test_unusable_baseline_stops_before_publish_without_retry(run_case, monkeypatch, unusable):
     c = run_case
+    c.history.update({"tests/acceptance/test_keep.py": "def test_keep():\n    assert True\n"})
     c.ctx.config = replace(c.ctx.config, test_command="pytest", max_runtime_minutes=1)
     captures = []
 
@@ -1444,6 +1448,7 @@ def test_baseline_uses_a_prebuilt_cache_before_implementation(run_case, monkeypa
 
 def test_baseline_budget_exhausted_before_capture_stops_with_unavailable_reason(run_case, monkeypatch):
     c = run_case
+    c.history.update({"tests/acceptance/test_keep.py": "def test_keep():\n    assert True\n"})
     c.ctx.config = replace(c.ctx.config, test_command="pytest", max_runtime_minutes=1)
     c.now[0] += timedelta(minutes=1)
     monkeypatch.setattr("foragent.runner._check", lambda *args, **kwargs: pytest.fail("no capture budget remains"))
@@ -1523,7 +1528,7 @@ def test_baseline_cache_key_tracks_sorted_excluded_paths_and_caches_zero_tests(g
         assert _capture_acceptance_baseline(1, ctx, command, git_history.tip).node_ids == ()
     assert len(list((store.root.parent / "baselines").glob("*.json"))) == 2
     log = store.log_path(1).read_text()
-    assert "Acceptance baseline count=0, exit_code=5" in log
+    assert "Acceptance baseline count=0: no acceptance test files remain after exclusions" in log
     assert log.count("cache=hit") == 1
 
 

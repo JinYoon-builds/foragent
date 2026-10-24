@@ -58,6 +58,29 @@ def gated_test(variable):
     )
 
 
+@pytest.mark.parametrize("budget_exhausted", [False, True])
+def test_baseline_caches_all_files_excluded_without_starting_pytest(baseline_case, monkeypatch, budget_exhausted):
+    c = baseline_case
+    c.ctx.store.save_approval(
+        1, body="Approved tests", body_sha="approved",
+        acceptance_blobs=c.ctx.git.blob_shas("origin/main", [FIRST, LAST]),
+        approved_by="human", approved_at=BASE_TIME.isoformat(),
+    )
+    if budget_exhausted:
+        c.now[0] += timedelta(minutes=c.ctx.config.max_runtime_minutes)
+    monkeypatch.setattr("foragent.runner._check", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+
+    first = c.capture("uv run pytest -q")
+    assert first is not None and first.node_ids == ()
+    assert c.capture("uv run pytest -q") == first
+    entry, = c.cache.glob("*.json")
+    assert json.loads(entry.read_text()) == {"node_ids": [], "created_at": c.now[0].isoformat()}
+    assert not c.report.exists()
+    log = c.log.read_text()
+    assert log.count("no acceptance test files remain after exclusions") == 1
+    assert log.count("Acceptance baseline count=0, cache=hit") == 1
+
+
 def test_baseline_cache_rebuilds_when_pytest_environment_changes(baseline_case, monkeypatch):
     c = baseline_case
     c.prepare({LAST: gated_test("PYTEST_BASELINE_FEATURE")})

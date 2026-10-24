@@ -104,6 +104,16 @@ def _capture_acceptance_baseline(
                 if not (worktree / ctx.config.acceptance_dir).is_dir():
                     _append(log, "Acceptance baseline skipped (count=0): acceptance directory does not exist")
                     return None
+                # Prove the selection empty from the checkout, without relying on pytest being installed.
+                # Any remaining file may be an input to project-specific collectors.
+                excluded_paths = set(excluded)
+                if not any(path.is_file() and path.relative_to(worktree).as_posix() not in excluded_paths
+                           for path in (worktree / ctx.config.acceptance_dir).rglob("*")):
+                    cache._atomic_write(cached_ids, json.dumps({
+                        "node_ids": [], "created_at": ctx.now().isoformat(),
+                    }) + "\n")
+                    _append(log, "Acceptance baseline count=0: no acceptance test files remain after exclusions")
+                    return AcceptanceBaseline(command, ())
                 if runner._remaining(n, ctx) <= 0:
                     raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before capture")
                 selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)}"
