@@ -11,7 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, order, tidy, watch, watch_open
+from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, orch_queue, order, tidy, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -270,6 +270,12 @@ files lists repository-relative paths or globs expected to change; absolute path
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
         if command in (inbox, questions):
             command.add_argument("--json", action="store_true")
+    queue = orch_actions.add_parser("queue", help="Set, show or clear a lane's preferred start order")
+    queue.add_argument("lane")
+    queue.add_argument("numbers", type=int, nargs="*", help="Issue numbers in start order; none shows the queue")
+    queue.add_argument("--clear", action="store_true")
+    queue.add_argument("--json", action="store_true")
+    queue.add_argument("--repo-root", type=Path, default=Path.cwd())
     plan_command = commands.add_parser("plan", help="Planning-session signals for the orchestrator")
     plan_actions = plan_command.add_subparsers(dest="action", required=True)
     heartbeat = plan_actions.add_parser(
@@ -314,7 +320,7 @@ files lists repository-relative paths or globs expected to change; absolute path
     return parser
 
 
-INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note"}
+INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue"}
 
 
 def _tidy(args: argparse.Namespace, store: StateStore, language: str) -> None:
@@ -336,6 +342,18 @@ def _tidy(args: argparse.Namespace, store: StateStore, language: str) -> None:
 
 def _orch_inbox(args: argparse.Namespace, store: StateStore, config: Config, repo: str) -> None:
     """Local request/question box; never reads GitHub or starts an executor."""
+    if args.action == "queue":
+        if args.clear and args.numbers:
+            raise SystemExit("fa orch queue: give issue numbers or --clear, not both")
+        order = orch_queue.set_order(store, args.lane, []) if args.clear else (
+            orch_queue.set_order(store, args.lane, args.numbers) if args.numbers else orch_queue.get(store, args.lane))
+        if args.json:
+            print(json.dumps({"lane": args.lane, "order": order}))
+        elif order:
+            print(f"lane:{args.lane} queue: " + " ".join(f"#{n}" for n in order))
+        else:
+            print(f"lane:{args.lane} queue is empty; issues start by number.")
+        return
     if args.action == "request":
         record = orch_inbox.add_request(store, args.source, args.text)
         print(f"Request {record['id']} saved ({record['status']}).")

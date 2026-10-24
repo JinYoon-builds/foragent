@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, tidy, watch_open
+from foragent import board, orch_github, orch_queue, tidy, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -234,6 +234,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         return report
 
+    # A lane's local queue picks the order; startability was already checked above.
+    ready = {lane: orch_queue.ordered(ctx.store, lane, numbers) for lane, numbers in ready.items()}
     started = _start_ready(ctx, ready, lane_for, base_ref, report, sample)
     if started is None:
         return report
