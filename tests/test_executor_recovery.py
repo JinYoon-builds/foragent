@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+REAL_SIGNALS_SKIP = pytest.mark.skip(reason='Sends real signals to real process groups; group numbers can be reused by other processes (PermissionError seen 2026-10-24). Rewrite on a fake process table with #261.')
+
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.processes import run_logged, track_process_group
@@ -53,6 +55,7 @@ def reap_orphans():
         assert libc.prctl(36, previous.value, 0, 0, 0) == 0
 
 
+@REAL_SIGNALS_SKIP
 def test_crash_recovery_terminates_real_executor_in_its_own_session(recovery, reap_orphans):
     ctx = recovery
     ready = ctx.repo_root / "executor-ready"
@@ -127,6 +130,7 @@ with track_process_group(lambda pgid: store.update_run(1, executor_pgid=pgid)):
                     pass
 
 
+@REAL_SIGNALS_SKIP
 @pytest.mark.parametrize("executor", ["codex", "claude"])
 @pytest.mark.parametrize("timeout", [False, True])
 def test_runner_persists_and_clears_real_executor_group(recovery, monkeypatch, executor, timeout):
@@ -162,6 +166,7 @@ if sys.argv[3] == 'timeout':
         os.kill(pgid, 0)
 
 
+@REAL_SIGNALS_SKIP
 def test_persistence_failure_terminates_the_spawned_process(recovery):
     groups = []
 
@@ -180,6 +185,7 @@ def test_persistence_failure_terminates_the_spawned_process(recovery):
         os.killpg(groups[0], 0)
 
 
+@REAL_SIGNALS_SKIP
 @pytest.mark.parametrize("trigger", ["crash", "stall", "timeout"])
 @pytest.mark.parametrize("failure", [False, True])
 def test_gate_cleans_executor_before_worktree_for_every_termination(recovery, trigger, failure):
