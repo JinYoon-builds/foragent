@@ -128,6 +128,27 @@ class StateStore:
     def _write_json(self, path: Path, value: dict[str, Any]) -> None:
         self._atomic_write(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
+    def load_acceptance_baseline(self, key: str) -> dict[str, Any] | None:
+        """Read a complete, unexpired baseline; old passing-only entries remain usable."""
+        try:
+            saved = json.loads((self.root / f"{key}.json").read_text(encoding="utf-8"))
+            age = self._now() - datetime.fromisoformat(saved["created_at"])
+            if not timedelta() <= age < timedelta(hours=6):
+                return None
+            for field in ("node_ids", "collected_ids", "failing_ids", "excluded"):
+                if field != "node_ids" and field not in saved:
+                    continue
+                if not isinstance(saved[field], list) or not all(isinstance(node, str) for node in saved[field]):
+                    return None
+            if "collected_ids" in saved and "failing_ids" in saved:
+                collected, passing, failing = (set(saved[field]) for field in
+                                               ("collected_ids", "node_ids", "failing_ids"))
+                if not passing <= collected or not failing <= collected or passing & failing:
+                    return None
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+        return saved
+
     def _issue_snapshot(self) -> dict[str, Any]:
         try:
             return json.loads((self.root / "issues.json").read_text(encoding="utf-8"))

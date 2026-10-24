@@ -20,3 +20,4 @@
 - 리뷰가 "acceptance 파일 삭제"를 지적하면 `git diff --name-status HEAD origin/main -- <file>`을 본다. `A`면 기준 커밋 뒤 main에 추가된 파일이므로 `.foragent/REBUTTAL.md`로 반박한다.
 - main을 병합하면 새로 들어온 보드 테스트가 옛 상태 이름(`"Ready"`, `"PR open"`)을 기대하는 경우가 있다. #184 뒤로 보드 값은 칸 이름이다. 기대값은 `board.board_column(state)`로 쓰고, 같은 칸 안의 이동(Approved→Ready)은 쓰기가 없어야 한다. 테스트 이름은 유지한다.
 - 리뷰가 "내가 안 건드린 파일의 삭제"를 지적하면 `git diff origin/main...HEAD -- <file>`(점 세 개, 브랜치 쪽 변경만)으로 확인한다. 비어 있으면 main이 앞서간 것이다. `git merge`는 권한이 막혀 있으므로 `git log HEAD..origin/main`의 커밋을 `git cherry-pick --no-commit` 후 `git reset -q`로 가져온다.
+- main은 #346에서 `tests/test_runner.py`를 `tests/test_run_*.py`로 나눴다. 병합 충돌에서 HEAD 쪽에만 있는 테스트는 먼저 `git grep -n 'def <name>' MERGE_HEAD -- tests`로 옮겨진 곳을 찾는다. 옮겨졌으면 main대로 빼고 이 브랜치의 변경만 남긴다.

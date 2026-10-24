@@ -23,6 +23,8 @@ OVERLOAD_LOAD = 1.5
 INITIAL_PARALLEL = 2
 # A new run takes minutes to grow its memory; space additive increases.
 INCREASE_INTERVAL = timedelta(minutes=2)
+# Independent of increases: pressure after growth still decreases immediately.
+DECREASE_INTERVAL = INCREASE_INTERVAL
 # A run without a pid, or a reserved start, may still launch for this long.
 LAUNCH_GRACE = timedelta(minutes=2)
 STATE_FILE = "capacity.json"
@@ -30,6 +32,9 @@ LOCK_FILE = "capacity.lock"
 TEST_SLOTS_FILE = "test-slots.json"
 TEST_SLOTS_LOCK = "test-slots.lock"
 TEST_SLOTS_DIR = "test-slots"
+SENSOR_FILE = "memory-sample.json"
+SENSOR_LOCK = "memory-sample.lock"
+HISTORY_FILE = "budget-history.jsonl"
 # Set for a command that runs inside a held slot, so a nested `fa test` reuses it.
 TEST_SLOT_ENV = "FORAGENT_TEST_SLOT"
 HELD_ENV = {TEST_SLOT_ENV: "held"}
@@ -97,6 +102,70 @@ def memory_pressure() -> str:
     return "normal"
 
 
+def kernel_pressure() -> str:
+    """The raw kernel pressure level, before swap-in window classification."""
+    return memory_pressure()
+
+
+class _VMStatistics64(ctypes.Structure):
+    # mach/vm_statistics.h: natural_t is 32 bits, counters are 64 bits.
+    _fields_ = (
+        [(name, ctypes.c_uint32) for name in (
+            "free_count", "active_count", "inactive_count", "wire_count",
+        )]
+        + [(name, ctypes.c_uint64) for name in (
+            "zero_fill_count", "reactivations", "pageins", "pageouts", "faults",
+            "cow_faults", "lookups", "hits", "purges",
+        )]
+        + [(name, ctypes.c_uint32) for name in ("purgeable_count", "speculative_count")]
+        + [(name, ctypes.c_uint64) for name in (
+            "decompressions", "compressions", "swapins", "swapouts",
+        )]
+        + [(name, ctypes.c_uint32) for name in (
+            "compressor_page_count", "throttled_count", "external_page_count", "internal_page_count",
+        )]
+        + [("total_uncompressed_pages_in_compressor", ctypes.c_uint64)]
+    )
+
+
+def swapins_total() -> int | None:
+    """Cumulative swapped-in pages, read in-process from Mach or /proc/vmstat."""
+    if sys.platform == "darwin":
+        try:
+            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+            statistics = _VMStatistics64()
+            count = ctypes.c_uint32(ctypes.sizeof(statistics) // ctypes.sizeof(ctypes.c_int))
+            host = libc.mach_host_self()
+            try:
+                if libc.host_statistics64(host, 4, ctypes.byref(statistics), ctypes.byref(count)) != 0:
+                    return None
+                return statistics.swapins
+            finally:
+                libc.mach_port_deallocate(ctypes.c_uint32.in_dll(libc, "mach_task_self_").value, host)
+        except (OSError, AttributeError, ValueError):
+            return None
+    try:
+        for line in Path("/proc/vmstat").read_text(encoding="utf-8").splitlines():
+            fields = line.split()
+            if fields[:1] == ["pswpin"]:
+                total = int(fields[1])
+                return total if total >= 0 else None
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+class LoadSample(tuple[str, float]):
+    """Keep the public (pressure, load) pair and its exact swap-in window together."""
+
+    swapins: int | None
+
+    def __new__(cls, pressure: str, load: float, swapins: int | None):
+        sample = super().__new__(cls, (pressure, load))
+        sample.swapins = swapins
+        return sample
+
+
 def load_per_cpu() -> float:
     """One-minute load average divided by the CPU count (vm.loadavg, /proc/loadavg)."""
     try:
@@ -106,8 +175,23 @@ def load_per_cpu() -> float:
     return max(0.0, load) / (os.cpu_count() or 1)
 
 
-def machine_load() -> tuple[str, float]:
-    return memory_pressure(), load_per_cpu()
+def machine_load() -> LoadSample:
+    root = machine_root()
+    with _flock(root / SENSOR_LOCK):
+        pressure, total = kernel_pressure(), swapins_total()
+        try:
+            previous = json.loads((root / SENSOR_FILE).read_text(encoding="utf-8"))["swapins_total"]
+            if type(previous) is not int or previous < 0:
+                previous = None
+        except (OSError, ValueError, TypeError, KeyError):
+            previous = None
+        # A reset (e.g. reboot) establishes a new baseline without negative activity.
+        swapins = max(0, total - previous) if total is not None and previous is not None else None
+        (root / SENSOR_FILE).write_text(json.dumps({"swapins_total": total}), encoding="utf-8")
+    if pressure != "critical":
+        if swapins is not None:
+            pressure = "warn" if swapins else "normal"
+    return LoadSample(pressure, load_per_cpu(), swapins)
 
 
 def _within_grace(timestamp: str | None, now: datetime) -> bool:
@@ -170,10 +254,15 @@ def read_state(store: StateStore) -> dict[str, Any] | None:
     return value
 
 
-def write_state(store: StateStore, parallel: int, changed_at: datetime) -> None:
-    store._write_json(store.root.parent / STATE_FILE, {
+def write_state(
+    store: StateStore, parallel: int, changed_at: datetime, *, decreased_at: str | None = None,
+) -> None:
+    value = {
         "parallel": parallel, "changed_at": changed_at.astimezone(UTC).isoformat(),
-    })
+    }
+    if decreased_at is not None:
+        value["decreased_at"] = decreased_at
+    store._write_json(store.root.parent / STATE_FILE, value)
 
 
 def machine_root() -> Path:
@@ -222,7 +311,33 @@ def effective_test_slots(ceiling: int) -> int:
     return max(1, min(state["slots"], ceiling)) if state else max(1, ceiling)
 
 
-def update_test_slots(ceiling: int, now: datetime, *, pressure: str, load_per_cpu: float) -> int:
+def decrease_allowed(state: dict[str, Any] | None, now: datetime) -> bool:
+    """Rate-limit decreases across ticks and repositories, separately from growth."""
+    try:
+        return now - datetime.fromisoformat(state["decreased_at"]) >= DECREASE_INTERVAL
+    except (TypeError, ValueError, KeyError):
+        return True
+
+
+def append_budget_history(
+    root: Path, now: datetime, budget: str, current: int, value: int, *,
+    pressure: str, load_per_cpu: float, swapins: int | None,
+) -> None:
+    if current == value:
+        return
+    # Both budgets and all repository gates share one append lock.
+    with _flock(root / "budget-history.lock"):
+        with (root / HISTORY_FILE).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "at": now.astimezone(UTC).isoformat(), "budget": budget,
+                "from": current, "to": value, "pressure": pressure,
+                "load_per_cpu": load_per_cpu, "swapins": swapins,
+            }) + "\n")
+
+
+def update_test_slots(
+    ceiling: int, now: datetime, *, pressure: str, load_per_cpu: float, swapins: int | None = None,
+) -> int:
     """Adjust the machine-wide test slot count once per tick and return it."""
     root = machine_root()
     with _flock(root / TEST_SLOTS_LOCK):
@@ -233,11 +348,21 @@ def update_test_slots(ceiling: int, now: datetime, *, pressure: str, load_per_cp
             current, pressure=pressure, load_per_cpu=load_per_cpu, ceiling=ceiling,
             increase_ok=now - changed_at >= INCREASE_INTERVAL,
         )
+        if value < current and not decrease_allowed(state, now):
+            value = current
         if state is None or value != state["slots"]:
+            updated = {"slots": value, "changed_at": now.astimezone(UTC).isoformat()}
+            decreased_at = now.astimezone(UTC).isoformat() if value < current else (state or {}).get("decreased_at")
+            if decreased_at is not None:
+                updated["decreased_at"] = decreased_at
             descriptor, temporary = tempfile.mkstemp(dir=root, prefix=f".{TEST_SLOTS_FILE}.")
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump({"slots": value, "changed_at": now.astimezone(UTC).isoformat()}, stream)
+                json.dump(updated, stream)
             os.replace(temporary, root / TEST_SLOTS_FILE)
+            append_budget_history(
+                root, now, "test_slots", state["slots"] if state else current, value,
+                pressure=pressure, load_per_cpu=load_per_cpu, swapins=swapins,
+            )
     return value
 
 
