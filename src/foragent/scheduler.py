@@ -89,7 +89,7 @@ from foragent.scheduler_checks import (  # noqa: E402
     _reconcile_batches,
 )
 from foragent.scheduler_lanes import (  # noqa: E402
-    _can_start_in_lane, _file_patterns_overlap, _filesystem_case_sensitive, _lane_has_room,
+    _can_start_in_lane, _file_patterns_overlap, _filesystem_case_sensitive,
 )
 
 

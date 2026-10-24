@@ -171,8 +171,8 @@ def test_budget_demand_excludes_busy_and_paused_lanes(tmp_path, monkeypatch):
     capacity.write_state(ctx.store, 5, NOW)
     ctx.store.start_run(1, branch="b", worktree=ctx.store.worktree_path(1), lane="busy", pid=os.getpid())
     ctx.store.pause_lane("paused", NOW + timedelta(hours=1))
-    # One live run plus one free ready lane caps this tick at 2.
-    assert scheduler._machine_budget(ctx, {"busy": [2], "paused": [3], "free": [4]}) == 2
+    # One live run plus every ready issue in unpaused lanes (busy lanes included) caps this tick at 3.
+    assert scheduler._machine_budget(ctx, {"busy": [2], "paused": [3], "free": [4]}) == 3
     assert seen["ceiling"] is None and seen["increase_ok"] is False
 
 
