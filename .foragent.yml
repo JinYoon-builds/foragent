@@ -1,6 +1,5 @@
 review: fast
 executor: claude  # 2026-10-23 14:4x: #247 fixed the /goal prompt (live-checked); Claude quota idle. Reviewer becomes codex. D74 will choose per issue
-reviewer: claude  # 2026-10-23 21:3x: Codex weekly quota at 100% until 10-30 02:09; same-model review until then (Jin chose A). Remove this line after the reset
 language: ko
 approvers:
 - JinYoon-builds
