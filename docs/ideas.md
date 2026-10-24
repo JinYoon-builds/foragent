@@ -2,6 +2,10 @@
 
 Ideas Jin wants to keep but not order yet. An idea moves to `decisions.md` when Jin decides it, and to an order after that. Newest first.
 
+## 2026-10-24
+
+- **Docs that explain Foragent through operating-system concepts (for the open-source release).** One page per element, mapped to the OS idea it mirrors: policy vs mechanism (orchestrator plan vs gate, D80), the scheduler and run queues (lanes, including the priority inversion behind #138), AIMD parallelism as TCP congestion control (#106), test slots as semaphores (#243), lanes as mutual exclusion by file ownership, plan expiry as a lease, crash/stall recovery as process supervision. Each page also says where the analogy breaks: the "processes" judge and can be wrong, and the scarce resources are token quotas and API limits rather than CPU. Back the claims with scorecard numbers (merges per hour, regressions caught). Write after the core is stable.
+
 ## 2026-10-23
 
 - **Lane workers using the harness's own multi-agent features.** A Claude worker could fan out subagents inside its run (investigate, implement, test in parallel) and use the idle Claude quota. Risks seen the same day: more processes and machine contention, orphaned background shells (#184), subagents editing the same worktree at once (the conflict lanes exist to prevent), and runs the gate and scorecard cannot see. Revisit after #106 (machine budget), #243 (test slots) and #261 (orphan cleanup). Open read-only helpers (investigation, review) first, for large issues only.
