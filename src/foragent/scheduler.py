@@ -27,6 +27,7 @@ from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import kill_process_group
 from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
+from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread
 from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
 
@@ -64,6 +65,7 @@ class TickContext:
     start_runs: bool = True
     runner_process_exists: Callable[[int], bool] = runner_process_exists
     kill_runner: Callable[[int], None] = kill_process_group
+    baseline_launcher: Callable = start_baseline_thread
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self, queue_writes=True)
@@ -811,6 +813,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
         swapins=getattr(sample, "swapins", None), floor=ctx.config.test_slots_floor,
     )
+    prebuild_acceptance_baseline(ctx, base_ref, ctx.baseline_launcher)
     if not ctx.start_runs or not ready:
         return report
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
