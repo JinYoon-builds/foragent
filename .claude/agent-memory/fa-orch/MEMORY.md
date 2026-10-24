@@ -99,3 +99,5 @@
 - #202: `orch_inbox`에 `plan-heartbeat.json`(120초 이내면 alive)과 `route_question()`을 두고, CLI `ask`가 기획 세션이 없을 때만 `notify.send`를 호출한다(모듈 속성 호출이라 시험의 send 교체가 먹힌다). `fa brief`는 #113 전이라 `brief.py`에 `questions_open`만 있는 최소 판으로 만들었다; #113이 같은 payload를 확장한다. `tests/acceptance/test_orch_ask_rule.py` 3개는 HEAD 스킬에서도 실패하는 다른 이슈 범위다.
 
 - #156(D71 질문 규칙): `skills/fa-orchestrator/SKILL.md`는 `test_orch_skill.py`가 150줄 이하를 강제하며 9개 인수 파일이 이 스킬을 정규식으로 읽는다. 문구를 늘릴 땐 인라인 코드를 쪼개지 않는 줄바꿈(백틱 구간을 한 토큰으로)으로 문단을 다시 맞춘다. 정규식은 단어 순서까지 본다(`(own|wrote).{0,120}tests?` → "you own or wrote a test"). 변경 전후로 9개 파일의 PASSED/FAILED 집합을 비교해 회귀를 확인한다. 이 환경에서 `git checkout <file>`은 권한 거부되므로 `git show HEAD:<path> > <path>`로 되돌린다.
+
+- #197: scheduler.py는 facade(226줄)와 `scheduler_approval/recovery/checks/lanes/start.py`로 나눴다. 분할 모듈은 모듈 수준 `from foragent import scheduler`(순환 import 허용, 호출 시점 조회)로 서로·`has_machine_check`·`machine_load`·`next_parallel`·`_check_prerequisites`·`_machine_budget`·`_filesystem_case_sensitive` 등을 `scheduler.X(`로 불러 facade 패치가 닿게 한다. 재노출 import는 facade 하단에 둔다. 인수 `test_scheduler_split.py` 4개와 scheduler 관련 단위 1,150개 통과(32분).
