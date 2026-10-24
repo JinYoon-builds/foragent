@@ -31,7 +31,7 @@ REQUIRE_CLEAN_PREREAD = order.require_clean_preread
 @pytest.fixture(autouse=True)
 def preread_done(monkeypatch):
     """Publication tests here assume a clean preread; the gate is tested on its own."""
-    monkeypatch.setattr(order, "require_clean_preread", lambda plan, root, items: None)
+    monkeypatch.setattr(order, "require_clean_preread", lambda plan, root, config, items: None)
 
 
 class PublishingGit:
@@ -952,10 +952,10 @@ def test_order_progress_cli_uses_configured_repo_without_external_services(tmp_p
     assert StateStore(tmp_path / "owner/repo").order_progress()["step"] == "start"
 
 
-def _record_preread(root, plan, item, unknowns):
+def _record_preread(root, config, plan, item, unknowns):
     path = root / order.PREREAD_FILE
     records = json.loads(path.read_text()) if path.exists() else {}
-    records[order._preread_hash(plan, item)] = {"key": item["key"], "unknowns": unknowns}
+    records[order.preread_target(plan, item, config)[3]] = {"key": item["key"], "unknowns": unknowns}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(records))
 
@@ -963,8 +963,8 @@ def _record_preread(root, plan, item, unknowns):
 def test_preread_gate_checks_only_the_approved_keys(publishing, plan, monkeypatch):
     monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
     root = publishing[0]
-    _record_preread(root, plan, plan["issues"][0], [])
-    _record_preread(root, plan, plan["issues"][1], ["Which locale?"])
+    _record_preread(root, publishing[1], plan, plan["issues"][0], [])
+    _record_preread(root, publishing[1], plan, plan["issues"][1], ["Which locale?"])
     publish(publishing, plan, approve_keys=["api"])
     assert publishing[4]
     with pytest.raises(order.PlanError, match=r"client: Which locale\?"):
@@ -975,7 +975,7 @@ def test_preread_gate_does_not_apply_without_approval(publishing, plan, monkeypa
     monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
     publish(publishing, plan)
     with pytest.raises(order.PlanError, match="run fa order preread"):
-        REQUIRE_CLEAN_PREREAD(plan, publishing[0], plan["issues"])
+        REQUIRE_CLEAN_PREREAD(plan, publishing[0], publishing[1], plan["issues"])
 
 
 @pytest.mark.parametrize("message,unknowns", [
@@ -1000,3 +1000,58 @@ def test_preread_failed_execution_records_nothing(publishing, plan, monkeypatch)
         order.preread(plan, root, config)
     assert not (root / order.PREREAD_FILE).exists()
     assert (root / ".foragent/.gitignore").read_text() == "*\n"
+
+
+class _NoUnknowns:
+    def __init__(self):
+        self.calls = []
+
+    def run(self, **kwargs):
+        from foragent.executors import ExecResult
+
+        self.calls.append(kwargs)
+        return ExecResult(0, False, "NONE", kwargs["log_path"])
+
+
+def test_preread_reads_and_gates_approved_edits(publishing, plan, monkeypatch):
+    root, config, tracker = publishing[0], publishing[1], publishing[2]
+    tracker.add_issue(3, "Keep this title", "old", ["size:l", "lane:api"])
+    plan["issues"] = []
+    plan["edits"] = [{"number": 3, "goal": "New goal", "out_of_scope": "Payments.", "done_when": ["true"],
+                      "checklist": [], "acceptance_files": {}}]
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    with pytest.raises(order.PlanError, match="#3"):
+        publish(publishing, plan, approve_numbers=[3])
+    assert publishing[4] == []
+    worker = _NoUnknowns()
+    monkeypatch.setattr(order, "executor_for", lambda name: worker)
+    assert order.preread(plan, root, config, lambda: tracker) == [{"key": "#3", "unknowns": []}]
+    assert "Edit of existing issue #3: Keep this title" in worker.calls[0]["prompt"]
+    assert "Lane: api" in worker.calls[0]["prompt"]
+    publish(publishing, plan, approve_numbers=[3])
+    assert "approved" in tracker.get_issue(3).labels
+
+
+@pytest.mark.parametrize("change", ["blocked_by", "interactive", "new_lanes"])
+def test_preread_evidence_follows_dependency_interactive_and_lane_changes(publishing, plan, change):
+    config, item = publishing[1], plan["issues"][1]
+    before = order.preread_target(plan, item, config)[3]
+    if change == "blocked_by":
+        item["blocked_by"] = []
+    elif change == "interactive":
+        item["interactive"] = True
+    else:
+        plan["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": []}]
+    assert order.preread_target(plan, item, config)[3] != before
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+def test_preread_uses_the_lane_executor_and_model_like_the_runner(publishing, plan, executor):
+    config = replace(publishing[1], executor="codex", executor_model="base-model",
+                     lanes={"api": {"paths": ["api/**"], "agent": "fa-api",
+                                    "executor": executor, "model": "lane-model"}})
+    name, model, _, digest = order.preread_target(plan, plan["issues"][0], config)
+    assert (name, model) == (executor, "lane-model")
+    assert order.preread_target(plan, plan["issues"][1], config)[:2] == ("codex", "base-model")
+    other = replace(config, lanes={"api": {**config.lanes["api"], "model": "other-model"}})
+    assert order.preread_target(plan, plan["issues"][0], other)[3] != digest

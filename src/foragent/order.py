@@ -1,5 +1,6 @@
 """Deterministic context gathering and publication for the fa-order skill."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
@@ -516,9 +517,12 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
         return PublishReport(plan["title"], parent, rows, sorted(files), True)
-    require_clean_preread(plan, root, [item for item in plan["issues"]
-                                       if approve or item["key"] in selected_keys
-                                       or mapping.get(item["key"]) in selected_numbers])
+    require_clean_preread(plan, root, config, [
+        *(item for item in plan["issues"]
+          if approve or item["key"] in selected_keys or mapping.get(item["key"]) in selected_numbers),
+        *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
+          if approve or item["number"] in selected_numbers),
+    ])
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
@@ -617,6 +621,13 @@ PREREAD_FILE = ".foragent/preread.json"
 PREREAD_TIMEOUT_S = 15 * 60
 
 
+def edit_view(item: dict, issue, config: Config) -> dict:
+    """An edit read as the issue its implementer will receive."""
+    return {**item, "key": f"#{item['number']}", "title": issue.title,
+            "lane": issue_lane(issue.labels, config.lanes), "interactive": "interactive" in issue.labels,
+            "edit": True}
+
+
 def preread_prompt(plan: dict, item: dict) -> str:
     """What the implementer would receive, asked read-only for its unknowns."""
     commands = "\n".join(item.get("done_when", []))
@@ -624,6 +635,11 @@ def preread_prompt(plan: dict, item: dict) -> str:
                     for path, content in item.get("acceptance_files", {}).items()) or "\n(none)\n"
     files = "\n".join(f"- {path}" for path in item.get("files", [])) or "(not listed)"
     checklist = "\n".join(f"- {line}" for line in item.get("checklist", [])) or "(none)"
+    titles = {issue["key"]: issue["title"] for issue in plan["issues"]}
+    blocked = "\n".join(f"- {key}: {titles.get(key, '')}" for key in item.get("blocked_by", [])) or "(none)"
+    lanes = json.dumps(plan.get("new_lanes", []), ensure_ascii=False, sort_keys=True)
+    heading = (f"# Edit of existing issue {item['key']}: {item['title']}" if item.get("edit")
+               else f"# Issue {item['key']}: {item['title']}")
     return (
         "You will implement the issue below later. Do not implement it now and do not change any file.\n"
         "Read the issue and the repository read-only, then list every unknown: a question whose answer\n"
@@ -632,10 +648,13 @@ def preread_prompt(plan: dict, item: dict) -> str:
         "If there are no unknowns, reply with exactly NONE.\n\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n"
         f"## Spec\n{plan.get('spec_markdown', '')}\n\n"
-        f"# Issue {item['key']}: {item['title']}\n"
-        f"Lane: {item['lane']}\n\n"
+        f"New lanes in this order: {lanes}\n\n"
+        f"{heading}\n"
+        f"Lane: {item['lane']}\n"
+        f"Interactive (needs back-and-forth with the user): {'yes' if item.get('interactive') else 'no'}\n\n"
         f"## Goal\n{item['goal']}\n\n"
         f"## Out of scope\n{item['out_of_scope']}\n\n"
+        f"## Blocked by\n{blocked}\n\n"
         f"## Files\n{files}\n\n"
         f"## Done when\n```sh\n{commands}\n```\n\n"
         f"## Checklist\n{checklist}\n\n"
@@ -643,8 +662,15 @@ def preread_prompt(plan: dict, item: dict) -> str:
     )
 
 
-def _preread_hash(plan: dict, item: dict) -> str:
-    return hashlib.sha256(preread_prompt(plan, item).encode("utf-8")).hexdigest()
+def preread_target(plan: dict, item: dict, config: Config) -> tuple[str, str | None, str, str]:
+    """The implementer the runner would use for this issue, its prompt and the evidence key."""
+    lane = config.lanes.get(item["lane"], {})
+    name = lane.get("executor") or config.executor
+    # Same choice as the runner's per-lane executor configuration.
+    model = lane.get("model") if lane.get("model") is not None else config.executor_model
+    prompt = preread_prompt(plan, item)
+    digest = hashlib.sha256(json.dumps([name, model, prompt], ensure_ascii=False).encode("utf-8")).hexdigest()
+    return name, model, prompt, digest
 
 
 def _preread_records(root: Path) -> dict:
@@ -664,12 +690,22 @@ def _unknowns(message: str) -> list[str]:
     return [line for line in lines if line and line != "NONE"]
 
 
-def preread(plan: dict, root: Path, config: Config) -> list[dict]:
-    """Ask each issue's implementer, read-only, for its unknowns and record them by content."""
+def preread(plan: dict, root: Path, config: Config,
+            tracker: Callable[[], Tracker] | None = None) -> list[dict]:
+    """Ask each issue's implementer, read-only, for its unknowns and record them by content.
+
+    Edits need the tracker for each existing issue's title and lane; it is opened only then.
+    """
     try:
         validate_plan(plan, root, config)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
+    items = list(plan["issues"])
+    if plan.get("edits"):
+        if tracker is None:
+            raise PlanError("prereading edits needs the tracker for the existing issues")
+        source = tracker()
+        items += [edit_view(item, source.get_issue(item["number"]), config) for item in plan["edits"]]
     directory = root / ".foragent"
     logs = directory / "preread-logs"
     logs.mkdir(parents=True, exist_ok=True)
@@ -677,13 +713,10 @@ def preread(plan: dict, root: Path, config: Config) -> list[dict]:
     if not ignore.exists():
         ignore.write_text("*\n", encoding="utf-8")
     results = []
-    for item in plan["issues"]:
-        lane = config.lanes.get(item["lane"], {})
-        name = lane.get("executor") or config.executor
-        model = (lane.get("model") if name == "claude" else None) or config.executor_model
-        digest = _preread_hash(plan, item)
-        log = logs / f"{item['key']}-{digest[:12]}.log"
-        result = executor_for(name).run(worktree=root, prompt=preread_prompt(plan, item), model=model,
+    for item in items:
+        name, model, prompt, digest = preread_target(plan, item, config)
+        log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
+        result = executor_for(name).run(worktree=root, prompt=prompt, model=model,
                                         timeout_s=PREREAD_TIMEOUT_S, log_path=log, read_only=True)
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
             raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
@@ -698,12 +731,12 @@ def preread(plan: dict, root: Path, config: Config) -> list[dict]:
     return results
 
 
-def require_clean_preread(plan: dict, root: Path, items: list[dict]) -> None:
+def require_clean_preread(plan: dict, root: Path, config: Config, items: list[dict]) -> None:
     """Approval needs the latest preread of each issue's current content to have no unknowns."""
     records = _preread_records(root)
     missing, open_items = [], []
     for item in items:
-        record = records.get(_preread_hash(plan, item))
+        record = records.get(preread_target(plan, item, config)[3])
         if not isinstance(record, dict) or not isinstance(record.get("unknowns"), list):
             missing.append(item["key"])
         elif record["unknowns"]:

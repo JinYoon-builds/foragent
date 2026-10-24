@@ -571,7 +571,9 @@ def main(argv: list[str] | None = None) -> int:
                              ensure_ascii=False))
             return 0
         if args.command == "order" and args.action == "preread":
-            results = order.preread(order.read_plan(args.plan), root, load_config(root))
+            config = load_config(root)
+            results = order.preread(order.read_plan(args.plan), root, config,
+                                    lambda: GhTracker(config.repo or GitRepo(root).remote_slug()))
             if args.json:
                 print(json.dumps({"issues": results}, ensure_ascii=False))
             else:

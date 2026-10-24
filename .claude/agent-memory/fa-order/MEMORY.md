@@ -23,3 +23,6 @@
 - #237: `fa order preread`는 이슈별 프롬프트의 sha256으로 결과를 저장소 안 `.foragent/preread.json`(자체 `.gitignore` `*`)에 둔다. 시험이 HOME을 격리하지 않아 `StateStore.for_repo`에 쓰면 저장소 밖이 바뀐다. 관문은 `order.require_clean_preread`이며 `tests/test_order.py`는 autouse로 끈다. 실행기 `read_only=True`는 codex `-s read-only`, claude `--permission-mode plan`.
 - #237: 전체 `fa test tests/`는 10분 제한을 넘는다. 관련 파일만 골라 돌린다. 승인 발행을 쓰는 잠긴 인수 시험(`test_publish_own_paths.py`, `test_view_open_triggers.py`)은 preread 관문과 충돌해 QUESTION.md로 넘겼다.
 - #259: 발행 Git 단계는 `order._publish_files`에 있고 `git.publish_lock()`(git common dir의 flock) 안에서 `git.update_base(branch)`(fetch 후 ff-only)를 먼저 한다. 덕 타입 가짜 Git(`tests/test_order.py::PublishingGit`)에 메서드를 추가해야 한다. 검증: `fa test tests/acceptance/test_publish_own_paths.py`. `test_listing_sanity`·`test_order_preread`는 미구현 기능이라 원래 실패한다.
+- 2026-10-24 D81/#307 이후 러너는 Done when, 인수 기준선, 수정한 파일의 자체 시험만 돌린다. 재시도 때 작업 트리가 다시 만들어지면 `.foragent/TRY.md`도 사라지므로 다시 쓴다.
+- #237 리뷰: preread와 승인 관문은 `order.preread_target`을 함께 쓴다. edits도 대상이며(key `#N`, 트래커에서 제목·레인), 해시에는 실행기·모델(레인 설정 우선, 러너와 동일)과 blocked_by·interactive·new_lanes가 든 프롬프트가 들어간다.
+- 레인 브랜치가 main보다 뒤처지면 main에 새로 생긴 인수 파일이 diff에서 "삭제"로 보여 리뷰가 거절한다. `git restore --source=origin/main --worktree -- <파일>`로 가져오고 `git hash-object`로 같은지 확인한다. 모르는 점은 스킬이 스스로 답하지 않고 사용자에게 묻는다(#237 제외 범위).
