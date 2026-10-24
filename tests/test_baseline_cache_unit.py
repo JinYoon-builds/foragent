@@ -12,6 +12,7 @@ import pytest
 from conftest import BASE_TIME, git_command
 from foragent.config import Config
 from foragent.git import GitRepo
+from foragent.run_attempt import AttemptFailure
 from foragent.runner import RunContext, _capture_acceptance_baseline
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker
@@ -55,6 +56,29 @@ def gated_test(variable):
         f"@pytest.mark.skipif(not os.environ.get({variable!r}), reason='environment disabled')\n"
         "def test_last():\n    pass\n"
     )
+
+
+@pytest.mark.parametrize("budget_exhausted", [False, True])
+def test_baseline_caches_all_files_excluded_without_starting_pytest(baseline_case, monkeypatch, budget_exhausted):
+    c = baseline_case
+    c.ctx.store.save_approval(
+        1, body="Approved tests", body_sha="approved",
+        acceptance_blobs=c.ctx.git.blob_shas("origin/main", [FIRST, LAST]),
+        approved_by="human", approved_at=BASE_TIME.isoformat(),
+    )
+    if budget_exhausted:
+        c.now[0] += timedelta(minutes=c.ctx.config.max_runtime_minutes)
+    monkeypatch.setattr("foragent.runner._check", lambda *args, **kwargs: pytest.fail("pytest must not run"))
+
+    first = c.capture("uv run pytest -q")
+    assert first is not None and first.node_ids == ()
+    assert c.capture("uv run pytest -q") == first
+    entry, = c.cache.glob("*.json")
+    assert json.loads(entry.read_text()) == {"node_ids": [], "created_at": c.now[0].isoformat()}
+    assert not c.report.exists()
+    log = c.log.read_text()
+    assert log.count("no acceptance test files remain after exclusions") == 1
+    assert log.count("Acceptance baseline count=0, cache=hit") == 1
 
 
 def test_baseline_cache_rebuilds_when_pytest_environment_changes(baseline_case, monkeypatch):
@@ -179,8 +203,9 @@ def test_baseline_does_not_cache_early_stop_from_pytest_plugin(baseline_case, te
         "    item.session.shouldfail = 'stop with a partial JUnit report'\n"
     )})
     command = COMMAND if terminal else f"{shlex.quote(sys.executable)} -m pytest -p no:terminal"
-    assert c.capture(command).node_ids == PASSING_IDS[:1]
-    assert c.capture(command).node_ids == PASSING_IDS[:1]
+    for _ in range(2):
+        with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+            c.capture(command)
     assert len(list(ET.parse(c.report).iter("testcase"))) == 1
     assert not list(c.cache.glob("*.json"))
     assert c.log.read_text().count("Acceptance baseline count=1, exit_code=1") == 2
@@ -196,12 +221,14 @@ def test_baseline_does_not_cache_duplicate_junit_records_after_early_stop(baseli
             "    assert False, 'teardown failed'\n"
         ),
     })
-    assert c.capture().node_ids == ()
+    with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+        c.capture()
     cases = list(ET.parse(c.report).iter("testcase"))
     assert len(cases) == 2
     assert {case.get("name") for case in cases} == {"test_first"}
     assert not list(c.cache.glob("*.json"))
-    assert c.capture().node_ids == ()
+    with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+        c.capture()
     assert c.log.read_text().count("Acceptance baseline count=0, exit_code=1") == 2
     assert "cache=hit" not in c.log.read_text()
 
