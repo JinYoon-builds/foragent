@@ -71,7 +71,9 @@ def implementer_setup(config: Config, lane: str, tier: str, worktree: Path) -> I
 
 def _prepare_implementation(
     n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
+    capture_baseline: bool = True,
 ) -> Implementation:
+    """Set up an implementer; a throwaway doctor task has no acceptance baseline to keep."""
     from foragent import runner
 
     approval = ctx.store.load_approval(n)
@@ -96,7 +98,8 @@ def _prepare_implementation(
     if baseline_test_command is None:
         baseline_test_command = next(iter(runner.detect_test_commands(worktree)), None)
     try:
-        baseline = _capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
+        baseline = (_capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
+                    if capture_baseline else None)
     except AttemptFailure as exc:
         _append(log, str(exc))
         reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE

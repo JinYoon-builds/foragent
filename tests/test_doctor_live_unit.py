@@ -1,6 +1,8 @@
 import json
 import sys
 
+from dataclasses import replace
+
 from foragent.config import Config
 from foragent.executors import codex_error_text
 from foragent.runner import live_check
@@ -43,3 +45,25 @@ def test_codex_error_text_reads_error_and_failed_turn_events(tmp_path):
         {"type": "turn.failed", "error": {"message": "second"}},
     ]) + "\n")
     assert codex_error_text(events) == "first\nsecond"
+
+
+def test_claude_gets_the_runner_settings_stop_hook_and_tier_model(git_history, tmp_path, monkeypatch):
+    record = tmp_path / "claude-call.json"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _fake(bin_dir, "claude",
+          "from pathlib import Path\n"
+          "argv = sys.argv[1:]\n"
+          "settings = Path(argv[argv.index('--settings') + 1]).read_text()\n"
+          f"Path({str(record)!r}).write_text(json.dumps({{'argv': argv, 'settings': settings}}))\n"
+          "Path('hello.txt').write_text('ok\\n')\n"
+          "print(json.dumps({'type': 'result', 'num_turns': 2, 'result': 'Created it'}))")
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    config = Config(executor="claude")
+    config = replace(config, tiers={**config.tiers, "m": {**config.tiers["m"], "claude_model": "tier-m-model"}})
+    check = live_check(git_history.origin, config, "claude", timeout_s=60)
+    assert check.passed, check.line()
+    call = json.loads(record.read_text())
+    assert call["argv"][call["argv"].index("--model") + 1] == "tier-m-model"
+    hooks = json.loads(call["settings"])["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert "gate check-done" in hooks and "--snapshot" in hooks
