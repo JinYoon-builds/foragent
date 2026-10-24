@@ -88,6 +88,11 @@ class Project:
 
     def set_values(self, issue: Issue | int, values: dict[str, str]) -> None:
         number = issue.number if isinstance(issue, Issue) else issue
+        # A card already set to every wanted value needs no board call.
+        if values and (recorded := getattr(self.tracker, "board_value", None)) is not None and all(
+            recorded(number, self.id, name) == value for name, value in values.items()
+        ):
+            return
         owner, name = self.repo.split("/", 1)
         content = _data(self.tracker, """query ForagentBoardIssue($owner: String!, $name: String!, $number: Int!) {
           repository(owner: $owner, name: $name) { issue(number: $number) { id } }

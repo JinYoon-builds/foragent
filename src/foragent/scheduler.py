@@ -2,7 +2,7 @@
 
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from fnmatch import translate
 from glob import has_magic
@@ -27,7 +27,10 @@ from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import kill_process_group
 from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
 from foragent.state import Approval, StateStore
-from foragent.tracker import Comment, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
+from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
+
+
+TICK_JITTER = timedelta(milliseconds=500)
 
 
 def runner_process_exists(number: int) -> bool:
@@ -376,8 +379,52 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         _restore_after_crash(ctx, issue, report)
 
 
+def _confirmed_read(
+    ctx: TickContext, number: int, name: str, read: Callable[[], object], *, confirmed: bool,
+    links: Callable[[object], list[int | str]] = lambda value: [],
+):
+    """Read GitHub unless this tick's fresh listing confirmed the remembered read unchanged.
+
+    Only a listing taken this tick is current enough to confirm a read; between
+    refreshes the remote may have changed without a sign, so the read is live.
+    Every live read is remembered so that the next refresh can confirm it.
+    """
+    if confirmed and (hit := ctx.store.confirmed_read(number, name)) is not None:
+        return hit[0]
+    # Facts before the read: a refresh during the read must not vouch for its value.
+    baseline = ctx.store.read_baseline()
+    value = read()
+    ctx.store.record_read(number, name, value, baseline=baseline, links=links(value))
+    return value
+
+
+def _label_events(ctx: TickContext, number: int, *, confirmed: bool) -> list[LabelEvent]:
+    events = _confirmed_read(
+        ctx, number, "label_events", lambda: [asdict(event) for event in ctx.tracker.label_events(number)],
+        confirmed=confirmed,
+    )
+    return [LabelEvent(**event) for event in events]
+
+
+def _open_pr(ctx: TickContext, number: int, *, confirmed: bool) -> int | None:
+    branch = f"foragent/issue-{number}"
+    return _confirmed_read(ctx, number, "open_pr", lambda: ctx.tracker.find_pr(branch), confirmed=confirmed)
+
+
+def _blockers(ctx: TickContext, number: int, *, confirmed: bool) -> list[Dependency]:
+    # Each blocker is a fact link: a change to any blocker voids the remembered list.
+    dependencies = _confirmed_read(
+        ctx, number, "blocked_by", lambda: [asdict(dependency) for dependency in ctx.tracker.blocked_by(number)],
+        confirmed=confirmed, links=lambda value: [
+            dependency["number"] if dependency.get("repository") is None
+            else f"{dependency['repository']}#{dependency['number']}" for dependency in value
+        ],
+    )
+    return [Dependency(**dependency) for dependency in dependencies]
+
+
 def _check_prerequisites(
-    ctx: TickContext, issue: Issue, approval: Approval, report: TickReport,
+    ctx: TickContext, issue: Issue, approval: Approval, report: TickReport, *, confirmed: bool = False,
 ) -> bool:
     latest_run = next(
         (run for run in reversed(ctx.store.read_history()) if run.number == issue.number), None,
@@ -391,7 +438,7 @@ def _check_prerequisites(
         board.sync_status(ctx, issue, "Done")
         return False
     if (
-        ctx.tracker.find_pr(f"foragent/issue-{issue.number}") is not None
+        _open_pr(ctx, issue.number, confirmed=confirmed) is not None
         and (latest_run is None or latest_run.outcome != "limit-wait")
     ):
         if READY in issue.labels:
@@ -405,7 +452,7 @@ def _check_prerequisites(
         )
         report.actions.append(f"#{issue.number} flagged no-machine-check")
         return False
-    dependencies = ctx.tracker.blocked_by(issue.number)
+    dependencies = _blockers(ctx, issue.number, confirmed=confirmed)
     cancelled = next(
         (dependency for dependency in dependencies
          if dependency.state == "closed" and dependency.state_reason == "not_planned"), None,
@@ -646,12 +693,18 @@ def _can_start_in_lane(ctx: TickContext, lane: str, issue: Issue, waiting: int) 
 
 def _tick_locked(ctx: TickContext) -> TickReport:
     report = TickReport()
+    started = ctx.now()  # The tick's own time; the fetch below can take seconds.
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
-    if ctx.store.issues_refresh_due(ctx.now()) or ctx.store.github_outbox():
+    # A listing taken this tick can confirm remembered per-issue reads.
+    # A periodic tick starts within process start-up jitter of its nominal 300 s
+    # cadence, and its refresh is stamped with its start; it is the next refresh tick.
+    listing_current = (ctx.store.issues_refresh_due(started + TICK_JITTER)
+                       or bool(ctx.store.github_outbox()))
+    if listing_current:
         # Keep an existing recorder; wrapping again would bypass its own state.
         recorder = ctx.tracker if isinstance(ctx.tracker, RecordingTracker) else RecordingTracker(ctx.tracker, ctx)
-        recorder.refresh_issues()
+        recorder.refresh_issues(observed_at=started)
     ctx.tracker.flush_outbox()
     if until := ctx.store.github_wait_until(ctx.now()):
         return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
@@ -683,7 +736,9 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             continue
         if APPROVED not in issue.labels and not waiting_labels:
             continue
-        event, ignored = _latest_approval(ctx.tracker.label_events(issue.number), ctx.config.approvers)
+        event, ignored = _latest_approval(
+            _label_events(ctx, issue.number, confirmed=listing_current), ctx.config.approvers,
+        )
         if ignored:
             report.actions.append(
                 f"#{issue.number} ignored approved label from non-approver(s): {', '.join(sorted(ignored))}"
@@ -715,7 +770,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         if RUNNING in issue.labels:
             board.sync_status(ctx, issue, "Running")
             continue
-        if not _check_prerequisites(ctx, issue, approval, report):
+        if not _check_prerequisites(ctx, issue, approval, report, confirmed=listing_current):
             continue
         if READY in issue.labels:
             board.sync_status(ctx, issue, "Ready")
