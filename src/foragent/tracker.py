@@ -1,11 +1,12 @@
 """Issue tracking interfaces, an in-memory fake, and an offline-testable gh adapter."""
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import json
 import re
 import subprocess
+import time
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
@@ -23,6 +24,10 @@ class Issue:
     labels: frozenset[str]
     state: IssueState
     is_pull_request: bool = False
+    updated_at: str | None = None
+    # Link counts GitHub lists with each issue; they change when a link changes.
+    sub_issues_summary: tuple[tuple[str, int], ...] | None = None
+    dependencies_summary: tuple[tuple[str, int], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +51,7 @@ class Dependency:
     number: int
     state: IssueState
     state_reason: str | None = None
+    repository: str | None = None  # "owner/name" when GitHub names it; None means this repository.
 
 
 @dataclass(frozen=True)
@@ -81,8 +87,8 @@ class Tracker(Protocol):
     def blocked_by(self, n: int) -> list[Dependency]: ...
     def parent_of(self, n: int) -> int | None: ...
     def sub_issues(self, n: int) -> list[Issue]: ...
-    def add_labels(self, n: int, labels: Iterable[str]) -> None: ...
-    def remove_labels(self, n: int, labels: Iterable[str]) -> None: ...
+    def add_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
+    def remove_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
     def comment(self, n: int, body: str) -> int: ...
     def list_comments(self, n: int) -> list[Comment]: ...
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int: ...
@@ -117,6 +123,10 @@ class TrackerError(RuntimeError):
         ))
 
     @property
+    def is_not_found(self) -> bool:
+        return bool(re.search(r"\bHTTP(?:/\S+)?\s+404\b", f"{self}\n{self.stdout}", re.I))
+
+    @property
     def reset_at(self) -> datetime | None:
         match = re.search(r"^x-ratelimit-reset:\s*(\d+)\s*$", f"{self.stdout}\n{self}", re.I | re.M)
         if match is not None:
@@ -125,6 +135,316 @@ class TrackerError(RuntimeError):
             except (ValueError, OverflowError, OSError):
                 pass
         return None
+
+
+def pr_issue_number(head: str) -> int | None:
+    match = re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", head)
+    return int(match[1]) if match else None
+
+
+def local_issue_models(store) -> list[Issue]:
+    return [Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
+            for row in store.local_issues()]
+
+
+class RecordingTracker:
+    """Record writes locally, optionally deferring rate-limited gate/orchestrator writes."""
+
+    def __init__(self, tracker, context, *, queue_writes=False):
+        self._tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
+        self._context = context
+        self.queue_writes = queue_writes
+
+    @property
+    def _now(self):
+        return self._tracker._now
+
+    @_now.setter
+    def _now(self, value):
+        self._tracker._now = value
+
+    def __getattr__(self, name):
+        value = getattr(self._tracker, name)
+        if not callable(value):
+            return value
+
+        def observe(*args, **kwargs):
+            result = value(*args, **kwargs)
+            if isinstance(result, Issue):
+                self._context.store.record_issue(result, self._context.config.lanes)
+            return result
+
+        return observe
+
+    def _pending_issues(self):
+        pending = {entry["issue"] for entry in self._context.store.github_outbox()}
+        if not pending:
+            return {}
+        return {issue.number: issue for issue in local_issue_models(self._context.store)
+                if issue.number in pending}
+
+    def current_issue(self, n):
+        """Read local intent while delivery is pending, otherwise observe GitHub."""
+        if (issue := self._pending_issues().get(n)) is not None:
+            return issue
+        return self.get_issue(n)
+
+    def sub_issues(self, n):
+        children = self._tracker.sub_issues(n)
+        pending = self._pending_issues()
+        return [pending.get(child.number, child) for child in children]
+
+    def _outbox_dropped(self, number, reason):
+        from foragent.orch_events import append_event
+
+        append_event(self._context.store, self._context.now(), number, "outbox-dropped",
+                     f"#{number}: dropped queued GitHub writes: {reason}")
+
+    def refresh_issues(self, *, observed_at=None):
+        """Publish a bulk observation once, preserving writes made during its reads.
+
+        The snapshot is stamped when the observation began (``observed_at``, or
+        now), never after its reads, so the next periodic tick finds it due.
+        A failed read leaves the last snapshot intact and records the failure,
+        so local readers report stale data instead of an empty queue.
+        """
+        try:
+            self._refresh_issues(observed_at or self._context.now())
+        except TrackerError as exc:
+            self._context.store.record_issues_refresh_failure(" ".join(str(exc).split()), self._context.now())
+            raise
+
+    def _refresh_issues(self, observed_at):
+        from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY
+        from foragent.state import observed_issue_facts
+
+        store = self._context.store
+        revision = store.issues_revision()
+        pending = {entry["issue"] for entry in store.github_outbox()}
+        previous = {row["number"]: row for row in store.local_issues()}
+        issues = self.list_issues()
+        # The listing is the change signal: an issue whose listed facts match the
+        # last listing keeps its last per-issue reads. A changed issue also marks
+        # the issues it blocks, because a dependent does not change when its blocker closes.
+        def listed_change(issue):
+            before = (previous.get(issue.number) or {}).get("observed")
+            return before is None or any(before.get(key) != value
+                                         for key, value in observed_issue_facts(issue).items())
+
+        changed = {issue.number for issue in issues if issue.number in pending or listed_change(issue)}
+        dependents = {number for number, row in previous.items()
+                      if any(dep["number"] in changed and dep.get("repository") is None
+                             for dep in row.get("blocked_by") or [])}
+        # These observations belong to the batch; recording them individually
+        # would overwrite concurrent writes before the final version check.
+        # Open PRs come last so a new PR wins over an older merged one for the same issue.
+        prs = self._tracker.list_prs("merged", "foragent/") + self._tracker.list_prs("open", "foragent/")
+        comments, missing = {}, set()
+        for issue in issues:
+            if issue.is_pull_request or not (
+                issue.number in pending or issue.state == "open" and issue.labels & {BLOCKED, NEEDS_HUMAN}
+            ) or issue.number not in changed:
+                continue
+            try:
+                comments[issue.number] = [asdict(comment) for comment in self._tracker.list_comments(issue.number)]
+            except TrackerError as exc:
+                if not exc.is_not_found or not self._issue_missing(issue.number):
+                    raise
+                missing.add(issue.number)
+        issues = [issue for issue in issues if issue.number not in missing]
+        # Order edges and dependencies let views group work without per-frame reads.
+        open_issues = [issue for issue in issues if issue.state == "open" and not issue.is_pull_request]
+        children = {}
+        for issue in open_issues:
+            known = (previous.get(issue.number) or {}).get("children")
+            children[issue.number] = (
+                [child.number for child in self._tracker.sub_issues(issue.number)]
+                if issue.number in changed or known is None else known
+            )
+        parents = {child: parent for parent, numbers in children.items() for child in numbers}
+        blocked_by = {}
+        for issue in open_issues:
+            if not issue.labels & {APPROVED, READY}:
+                continue
+            known = (previous.get(issue.number) or {}).get("blocked_by")
+            if issue.number in changed | dependents or known is None:
+                known = [{"number": dep.number, "state": dep.state, "state_reason": dep.state_reason,
+                          **({"repository": dep.repository} if dep.repository else {})}
+                         for dep in self._tracker.blocked_by(issue.number)]
+            blocked_by[issue.number] = known
+        dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, observed_at,
+                                            comments=comments, since_revision=revision, parents=parents,
+                                            blocked_by=blocked_by, children=children, complete_prs=True)
+        observed = {issue.number for issue in issues}
+        for number in dropped:
+            reason = "remote change" if number in observed else "issue not found"
+            self._outbox_dropped(number, reason)
+
+    def _issue_missing(self, number):
+        """A missing write resource alone does not prove that its issue is gone."""
+        try:
+            self._tracker.get_issue(number)
+        except TrackerError as exc:
+            if exc.is_not_found:
+                return True
+            raise
+        return False
+
+    def _write(self, n, action, operation, **payload):
+        store = self._context.store
+        pending = store.github_outbox()
+        if (any(entry["issue"] == n for entry in pending)
+                or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
+            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+        try:
+            return operation(), None
+        except TrackerError as exc:
+            if not self.queue_writes or not exc.is_rate_limit:
+                raise
+            from foragent.orch_github import pause
+
+            pause(self._context, exc)
+            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+
+    def flush_outbox(self):
+        """Deliver an already refreshed FIFO; a renewed limit leaves its tail intact."""
+        from foragent.orch_github import pause
+
+        store = self._context.store
+        dropped = set()
+        for entry in store.github_outbox():
+            number, action = entry["issue"], entry["action"]
+            if number in dropped:
+                continue
+            try:
+                if action == "remove_labels":
+                    labels = entry["labels"]
+                    for index, label in enumerate(labels):
+                        self._tracker.remove_labels(number, [label])
+                        store.deliver_github_write(entry, remaining_labels=labels[index + 1:])
+                elif action == "update_issue":
+                    self._tracker.update_issue(number, title=entry["title"], body=entry["body"])
+                    store.deliver_github_write(entry)
+                else:
+                    payload = entry["labels"] if action == "add_labels" else entry["body"]
+                    result = getattr(self._tracker, action)(number, payload)
+                    store.deliver_github_write(entry, comment_id=result if action == "comment" else None)
+            except TrackerError as exc:
+                try:
+                    if exc.is_not_found and self._issue_missing(number):
+                        store.drop_missing_github_issue(number)
+                        self._outbox_dropped(number, "issue not found")
+                        dropped.add(number)
+                        continue
+                except TrackerError as lookup_error:
+                    exc = lookup_error
+                if not exc.is_rate_limit:
+                    raise exc
+                pause(self._context, exc)
+                return
+
+    def add_labels(self, n, labels):
+        labels = list(labels)
+        if not labels:
+            return
+        result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), labels=labels)
+        if queued:
+            return
+        if isinstance(result, Issue):
+            self._context.store.record_issue(result, self._context.config.lanes)
+        self._context.store.record_labels(n, labels, remove=False, lanes=self._context.config.lanes)
+
+    def remove_labels(self, n, labels):
+        labels = list(labels)
+        for index, label in enumerate(labels):
+            result, queued = self._write(n, "remove_labels", lambda: self._tracker.remove_labels(n, [label]),
+                                         labels=labels[index:])
+            if queued:
+                break
+            if isinstance(result, Issue):
+                self._context.store.record_issue(result, self._context.config.lanes)
+            self._context.store.record_labels(n, [label], remove=True, lanes=self._context.config.lanes)
+
+    def list_comments(self, n):
+        comments = self._tracker.list_comments(n)
+        self._context.store.record_comments(n, [asdict(comment) for comment in comments])
+        return comments
+
+    def comment(self, n, body):
+        identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), body=body)
+        if queued:
+            return -queued["id"]
+        self._context.store.record_comments(n, [{"id": identity, "body": body,
+            "author": "foragent", "created_at": self._context.now().astimezone(UTC).isoformat()}], append=True)
+        return identity
+
+    def create_issue(self, title, body, labels):
+        labels = list(labels)
+        n = self._tracker.create_issue(title, body, labels)
+        self._context.store.record_issue(Issue(n, title, body, frozenset(labels), "open"),
+                                         self._context.config.lanes)
+        return n
+
+    def update_issue(self, n, *, title, body):
+        _, queued = self._write(n, "update_issue", lambda: self._tracker.update_issue(n, title=title, body=body),
+                                title=title, body=body)
+        if not queued:
+            self._context.store.update_local_issue(n, title=title, body=body)
+
+    def close_issue(self, n, comment=None):
+        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
+                               else self._tracker.close_issue(n, comment), body=comment)
+        if not queued:
+            self._context.store.update_local_issue(n, state="closed")
+
+    def record_board_value(self, n, project, field, value):
+        self._context.store.record_board_value(n, project, field, value)
+
+    def board_value(self, n, project, field):
+        """The value this repository last confirmed setting on the issue's card."""
+        row = next((row for row in self._context.store.local_issues() if row["number"] == n), {})
+        return (row.get("board_values") or {}).get(project, {}).get(field)
+
+    def _record_pr(self, pr, head, base=None, *, merged=False):
+        if (number := pr_issue_number(head)) is not None:
+            fields = {"pr_number": pr, "pr_head": head, "merged": merged}
+            if base is not None:
+                fields["pr_base"] = base
+            self._context.store.update_local_issue(number, **fields)
+
+    def find_pr(self, head):
+        pr = self._tracker.find_pr(head)
+        if pr is not None:
+            self._record_pr(pr, head)
+        return pr
+
+    def list_prs(self, state="open", head_prefix=""):
+        prs = self._tracker.list_prs(state, head_prefix)
+        for pr in prs:
+            self._record_pr(pr.number, pr.head, pr.base, merged=pr.merged_at is not None)
+        return prs
+
+    def create_pr(self, *, head, base, title, body):
+        pr = self._tracker.create_pr(head=head, base=base, title=title, body=body)
+        self._record_pr(pr, head, base)
+        return pr
+
+    def update_pr(self, pr, *, base, title, body):
+        self._tracker.update_pr(pr, base=base, title=title, body=body)
+        self._record_pr_state(pr, pr_base=base)
+
+    def _record_pr_state(self, pr, **fields):
+        for row in self._context.store.local_issues():
+            if row["pr_number"] == pr:
+                self._context.store.update_local_issue(row["number"], **fields)
+
+    def close_pr(self, pr, comment=None):
+        self._tracker.close_pr(pr, comment)
+        self._record_pr_state(pr, pr_number=None, merged=False)
+
+    def merge_pr(self, pr, *, expected_head_sha, method="squash"):
+        self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
+        self._record_pr_state(pr, merged=True)
 
 
 def _merge_flag(method: str) -> str:
@@ -168,6 +488,11 @@ class FakeTracker:
     def _timestamp(self) -> str:
         return self._now().astimezone(UTC).isoformat()
 
+    def _touch(self, n: int) -> None:
+        """Like GitHub, any change to an issue or its timeline advances updated_at."""
+        if n in self.issues:
+            self.issues[n] = replace(self.issues[n], updated_at=self._timestamp())
+
     def add_issue(
         self, number: int, title: str = "", body: str = "", labels: Iterable[str] = (),
         state: IssueState = "open", is_pull_request: bool = False,
@@ -195,18 +520,22 @@ class FakeTracker:
     def add_blocked_by(self, n: int, blocker: int) -> None:
         if not any(dep.number == blocker for dep in self.blocked_by(n)):
             self._dependencies.setdefault(n, []).append(Dependency(blocker, self.get_issue(blocker).state))
+            self._touch(n)
 
     def remove_blocked_by(self, n: int, blocker: int) -> None:
         self._dependencies[n] = [dep for dep in self._dependencies.get(n, []) if dep.number != blocker]
+        self._touch(n)
 
     def get_issue(self, n: int) -> Issue:
         return self.issues[n]
 
-    def edit_body(self, n: int, body: str) -> None:
+    def edit_body(self, n: int, body: str) -> Issue:
         issue = self.get_issue(n)
         if issue.body != body:
             self.issues[n] = replace(issue, body=body)
             self._body_edits[n] = self._timestamp()
+            self._touch(n)
+        return self.get_issue(n)
 
     def body_last_edited_at(self, n: int) -> str | None:
         return self._body_edits.get(n)
@@ -216,13 +545,17 @@ class FakeTracker:
 
     def set_blocked_by(self, n: int, deps: list[Dependency]) -> None:
         self._dependencies[n] = list(deps)
+        self._touch(n)
 
     def blocked_by(self, n: int) -> list[Dependency]:
         return [replace(dep, state=self.issues[dep.number].state) if dep.number in self.issues else dep
                 for dep in self._dependencies.get(n, [])]
 
     def set_parent(self, n: int, parent: int) -> None:
+        previous = self._parents.get(n)
         self._parents[n] = parent
+        for number in {n, parent, previous} - {None}:
+            self._touch(number)
 
     def parent_of(self, n: int) -> int | None:
         return self._parents.get(n)
@@ -230,30 +563,36 @@ class FakeTracker:
     def sub_issues(self, n: int) -> list[Issue]:
         return [self.get_issue(child) for child, parent in self._parents.items() if parent == n]
 
-    def record_label(self, n: int, label: str, actor: str) -> None:
+    def record_label(self, n: int, label: str, actor: str) -> Issue:
         issue = self.get_issue(n)
-        self._events.setdefault(n, []).append(LabelEvent(label, "labeled", actor, self._timestamp()))
-        self.issues[n] = replace(issue, labels=issue.labels | {label})
+        at = self._timestamp()
+        self._events.setdefault(n, []).append(LabelEvent(label, "labeled", actor, at))
+        self.issues[n] = replace(issue, labels=issue.labels | {label}, updated_at=at)
+        return self.issues[n]
 
-    def add_labels(self, n: int, labels: Iterable[str]) -> None:
+    def add_labels(self, n: int, labels: Iterable[str]) -> Issue:
         labels = list(labels)
         if self.strict and "approved" in labels:
             raise AssertionError("gate and runner must never add the approved label")
         for label in labels:
             if label not in self.get_issue(n).labels:
                 self.record_label(n, label, self.actor)
+        return self.get_issue(n)
 
-    def remove_labels(self, n: int, labels: Iterable[str]) -> None:
+    def remove_labels(self, n: int, labels: Iterable[str]) -> Issue:
         for label in labels:
             issue = self.get_issue(n)
             if label in issue.labels:
-                self._events.setdefault(n, []).append(LabelEvent(label, "unlabeled", self.actor, self._timestamp()))
-                self.issues[n] = replace(issue, labels=issue.labels - {label})
+                at = self._timestamp()
+                self._events.setdefault(n, []).append(LabelEvent(label, "unlabeled", self.actor, at))
+                self.issues[n] = replace(issue, labels=issue.labels - {label}, updated_at=at)
+        return self.get_issue(n)
 
     def comment(self, n: int, body: str) -> int:
         comment = Comment(self._next_comment_id, self.actor, body, self._timestamp())
         self._next_comment_id += 1
         self.comments.setdefault(n, []).append(comment)
+        self._touch(n)
         return comment.id
 
     def list_comments(self, n: int) -> list[Comment]:
@@ -265,7 +604,7 @@ class FakeTracker:
     def close_issue(self, n: int, comment: str | None = None) -> None:
         if comment is not None:
             self.comment(n, comment)
-        self.issues[n] = replace(self.get_issue(n), state="closed")
+        self.issues[n] = replace(self.get_issue(n), state="closed", updated_at=self._timestamp())
 
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int:
         number = max([*self.issues, *(pr.number for pr in self.created_prs)], default=0) + 1
@@ -358,12 +697,27 @@ def _items(output: str) -> list[dict[str, Any]]:
     return items
 
 
+def _summary(value: Any) -> tuple[tuple[str, int], ...] | None:
+    if not isinstance(value, dict):
+        return None
+    return tuple(sorted((key, count) for key, count in value.items() if isinstance(count, int)))
+
+
+def _repository(url: Any) -> str | None:
+    match = re.fullmatch(r"https://[^/]+/repos/([^/]+/[^/]+)", url) if isinstance(url, str) else None
+    return match[1] if match else None
+
+
 def _issue(data: dict[str, Any]) -> Issue:
     return Issue(
         data["number"], data["title"], data.get("body") or "",
         frozenset(label["name"] for label in data.get("labels", [])),
-        data["state"], "pull_request" in data,
+        data["state"], "pull_request" in data, data.get("updated_at"),
+        _summary(data.get("sub_issues_summary")), _summary(data.get("issue_dependencies_summary")),
     )
+
+
+_EMPTY_RETRY_DELAY = 0.5
 
 
 class GhTracker:
@@ -371,6 +725,7 @@ class GhTracker:
         self.repo = repo
         self._run = run or _run_gh
         self._path = f"repos/{repo}"
+        self._seen_states: set[str] = set()
 
     def _call(self, args: list[str], input: str | None = None) -> str:
         try:
@@ -412,8 +767,54 @@ class GhTracker:
     def list_issues(self, state: str = "all") -> list[Issue]:
         if state not in {"open", "closed", "all"}:
             raise ValueError(f"unsupported issue state: {state}")
+        issues = self._fetch_issues(state)
+        if not issues:
+            # GitHub sometimes answers a listing with an empty page by mistake.
+            # One retry separates that hiccup from a repository that is empty.
+            time.sleep(_EMPTY_RETRY_DELAY)
+            issues = self._fetch_issues(state)
+        if issues:
+            states = {issue.state for issue in issues}
+            # A listing of every issue is the whole truth; a filtered one adds to it.
+            self._seen_states = states if state == "all" else self._seen_states | states
+            return issues
+        if state != "all" and state in self._seen_states:
+            # Open and closed issues change state, so an earlier sighting can be
+            # out of date. A listing of every issue settles it.
+            if any(issue.state == state for issue in self.list_issues("all")):
+                raise self._untrusted_empty(state, "a fresh listing of all issues")
+            return issues
+        if evidence := self._evidence_of_issues(state):
+            raise self._untrusted_empty(state, evidence)
+        self._seen_states.discard(state)
+        return issues
+
+    def _untrusted_empty(self, state: str, evidence: str) -> TrackerError:
+        return TrackerError(
+            f"GitHub returned an empty listing of {state} issues for {self.repo} twice, "
+            f"but {evidence} shows such issues exist; not trusting it, try again later"
+        )
+
+    def _fetch_issues(self, state: str) -> list[Issue]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues?state={state}&per_page=100"]))
         return [_issue(item) for item in data if "pull_request" not in item]
+
+    def _evidence_of_issues(self, state: str) -> str | None:
+        """Name what proves `state` issues exist, or None when nothing does."""
+        if state == "all" and self._seen_states:
+            # Issues are not removed, so having seen any is lasting proof.
+            return "an earlier listing"
+        from foragent.state import StateStore
+
+        try:
+            rows = StateStore.for_repo(self.repo).local_issues()
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        # The gate refreshes this record from a listing of all issues, which this
+        # check never blocks, so a stale open or closed row is corrected there.
+        if any(state == "all" or row.get("state") == state for row in rows):
+            return "the local issue record"
+        return None
 
     def update_issue(self, n: int, *, title: str, body: str) -> None:
         self._call(["api", "-X", "PATCH", f"{self._path}/issues/{n}", "--input", "-"],
@@ -471,7 +872,10 @@ class GhTracker:
 
     def blocked_by(self, n: int) -> list[Dependency]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues/{n}/dependencies/blocked_by?per_page=100"]))
-        return [Dependency(item["number"], item["state"], item.get("state_reason")) for item in data]
+        # A blocker in another repository keeps its name; this repository's blockers stay bare numbers.
+        return [Dependency(item["number"], item["state"], item.get("state_reason"),
+                           None if (repo := _repository(item.get("repository_url"))) in {None, self.repo} else repo)
+                for item in data]
 
     def parent_of(self, n: int) -> int | None:
         try:

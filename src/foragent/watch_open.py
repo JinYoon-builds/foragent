@@ -79,10 +79,11 @@ def open_view(repo_root: Path, store: StateStore, language: str = "en") -> None:
         root = repo_root.resolve()
         # Use this installation even when a launchd PATH cannot find fa.
         fa = Path(sys.executable).with_name("fa")
-        command = shlex.join([
+        program = [
             *([str(fa)] if fa.is_file() else [sys.executable, "-m", "foragent.cli"]),
             "gate", "watch", "--repo-root", str(root),
-        ])
+        ]
+        command = shlex.join(program)
         handle = os.environ.get("ORCA_TERMINAL_HANDLE")
         executable = shutil.which("orca") if handle else None
         terminal = None
@@ -97,11 +98,22 @@ def open_view(repo_root: Path, store: StateStore, language: str = "en") -> None:
         if terminal:
             executable, handle = terminal
             _call([executable, "terminal", "split", "--terminal", handle,
-                   "--direction", "horizontal", "--command", command], root)
+                   "--direction", "vertical", "--command", command], root)
         else:
+            # The innermost multiplexer owns the current pane, so check it first.
             tmux = shutil.which("tmux") if os.environ.get("TMUX") else None
             if tmux:
                 _call([tmux, "split-window", "-h", "-c", str(root), command], root)
+                return
+            wezterm = shutil.which("wezterm") if os.environ.get("WEZTERM_PANE") else None
+            if wezterm:
+                _call([wezterm, "cli", "split-pane", "--right", "--cwd", str(root), "--", *program], root)
+                return
+            kitty = shutil.which("kitty") if os.environ.get("KITTY_WINDOW_ID") else None
+            if kitty:
+                listen = os.environ.get("KITTY_LISTEN_ON")
+                _call([kitty, "@", *(["--to", listen] if listen else []), "launch",
+                       "--location=vsplit", "--cwd", str(root), *program], root)
                 return
             osascript = shutil.which("osascript")
             if not osascript:
@@ -110,7 +122,8 @@ def open_view(repo_root: Path, store: StateStore, language: str = "en") -> None:
                 return
             quoted = json.dumps(command, ensure_ascii=False)
             if os.environ.get("TERM_PROGRAM") == "iTerm.app":
-                script = 'tell application "iTerm2" to create window with default profile command ' + quoted
+                script = ('tell application "iTerm2" to tell current session of current window'
+                          ' to split vertically with default profile command ' + quoted)
             else:
                 script = 'tell application "Terminal" to do script ' + quoted
             _call([osascript, "-e", script], root)

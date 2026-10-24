@@ -82,3 +82,24 @@ def test_unchanged_poll_order_and_closed_prs_do_not_wake_but_batch_merges_do(ctx
     monkeypatch.setattr(orch.time, "sleep", sleep)
     assert list(orch.watch(ctx, interval=0.01))[0]["merged"] == [42]
     assert polls == [0.01]
+
+
+def test_repeated_failed_reads_print_once_in_follow_and_recover_with_the_real_snapshot(ctx, monkeypatch):
+    ctx.tracker.add_issue(4, labels=["blocked"])
+    known = list(orch.watch(ctx))[0]
+    original = ctx.store.local_issues
+    errors = ["disk busy", "disk busy"]
+
+    def local_issues():
+        if errors:
+            raise OSError(errors.pop())
+        return original()
+
+    monkeypatch.setattr(ctx.store, "local_issues", local_issues)
+    monkeypatch.setattr(orch.time, "sleep", lambda seconds: None)
+    stream = orch.watch(ctx, interval=1, follow=True)
+    assert next(stream) == {"unknown": True, "error": "disk busy"}
+    # The second identical failure stays quiet; the recovered read prints although unchanged.
+    assert next(stream) == known
+    assert not (ctx.store.root / "orch-watch-unknown.json").exists()
+    assert json.loads((ctx.store.root / "orch-watch.json").read_text()) == known

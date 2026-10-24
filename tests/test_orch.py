@@ -21,9 +21,9 @@ def review_case(run_case):
     c.ctx.config = replace(c.ctx.config, repo="owner/repo")
     c.store.finish_run(1, outcome="blocked")
     c.now[0] += timedelta(seconds=1)
-    c.tracker.remove_labels(1, ["running"])
-    c.tracker.add_labels(1, ["blocked"])
-    c.tracker.comment(1, "<!-- foragent:blocked reason=review-dispute -->\nOriginal details")
+    c.ctx.tracker.remove_labels(1, ["running"])
+    c.ctx.tracker.add_labels(1, ["blocked"])
+    c.ctx.tracker.comment(1, "<!-- foragent:blocked reason=review-dispute -->\nOriginal details")
     base = c.history.tip
     c.history.update({"feature.txt": "done"})
     c.head = c.history.tip
@@ -49,6 +49,27 @@ def assert_blocked(c, reason):
     assert c.store.load_flag(1).reason == reason
     assert c.tracker.get_issue(c.pr).state == "open"
     assert len(c.tracker.created_prs) == 1
+
+
+def test_review_pending_close_finishes_without_failure_flag(review_case):
+    c = review_case
+    c.ctx.tracker.remove_labels(1, ["blocked"])
+    c.ctx.tracker.refresh_issues()
+    c.store.queue_github_write(1, "comment", body="Pending evidence")
+
+    assert runner.review_only(1, c.ctx) == "merged"
+
+    assert c.tracker.merged_prs == [c.pr]
+    assert c.tracker.get_issue(1).state == "open"
+    row, = c.store.local_issues()
+    assert row["state"] == "closed"
+    assert not set(row["labels"]) & {"blocked", "ready", "running", "needs-human"}
+    assert c.store.load_flag(1) is None
+    c.ctx.tracker.flush_outbox()
+    assert c.tracker.get_issue(1).state == "closed"
+    assert not c.tracker.get_issue(1).labels & {"blocked", "ready", "running", "needs-human"}
+    assert not any("retries-exceeded" in comment.body for comment in c.tracker.list_comments(1))
+    assert c.store.github_outbox() == []
 
 
 @pytest.mark.parametrize("entry", ["review-only", "resolve"])
@@ -427,7 +448,7 @@ def test_escalation_options_and_immutable_approval(review_case):
 def test_list_uses_latest_unknown_reason_and_only_last_sixty_lines(review_case):
     c = review_case
     c.now[0] += timedelta(seconds=5)
-    c.tracker.comment(1, "<!-- foragent:blocked reason=future-code -->\r\nNewest details")
+    c.ctx.tracker.comment(1, "<!-- foragent:blocked reason=future-code -->\r\nNewest details")
     log = c.store.log_path(1)
     log.parent.mkdir(parents=True)
     log.write_text("".join(f"line {i}\n" for i in range(100)))
@@ -455,7 +476,7 @@ def test_inspection_audits_follow_spec_without_resetting_blocked_evidence(review
     assert all(event["issue"] is None for event in events)
     comments = [comment.body for comment in c.tracker.list_comments(1)
                 if comment.body.startswith("<!-- foragent:orch -->")]
-    assert comments == ["<!-- foragent:orch -->\n" + event["summary"] for event in prior_events]
+    assert comments == []  # Observation is audited locally and stays offline.
     assert c.tracker.get_issue(1) == original
 
 

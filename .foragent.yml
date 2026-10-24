@@ -75,5 +75,7 @@ lanes:
     skills:
     - skill-creator
     - principle-prove-it-works
-max_parallel: 3  # 2026-10-23: 4 parallel runs made tests 4x slower (machine contention); #106 will adjust automatically
-# board: PVT_kwHODvdhm84BoMtn  # paused 2026-10-23: each tick rewrote every Status (58% of GitHub calls); restore after the tick only writes changes
+board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards
+test_slots: 3  # 2026-10-24 night: parallel_floor 5 shares slots; ceiling 3 until slot-wait numbers decide (2026-10-25)
+test_slots_floor: 2  # 2026-10-24: pinned while collecting budget-history; remove after choosing a threshold
+parallel_floor: 5  # 2026-10-24 evening: raised 3->5 for tonight (machine ~70% free, runs <=750 MB; kernel critical still lowers it). Remove after choosing a threshold

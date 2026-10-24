@@ -10,7 +10,22 @@ from foragent.config import Config
 from foragent.watch_data import Snapshot
 
 
-def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, config: Config, repo_root: Path, now):
+def color_pairs(colors: int) -> list[tuple[int, int]]:
+    """Use the terminal's default text/background with base ANSI accents.
+
+    The public API accepts the terminal's color count, but 8- and 256-color
+    terminals deliberately share this palette; extended colors aren't needed.
+    """
+    import curses
+
+    return [(-1, -1), (curses.COLOR_CYAN, -1),
+            (curses.COLOR_GREEN, -1), (-1, -1),
+            (curses.COLOR_MAGENTA, -1), (curses.COLOR_GREEN, -1),
+            (curses.COLOR_BLUE, -1)]
+
+
+def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, config: Config, repo_root: Path, now,
+              store=None):
     from foragent import watch
 
     import curses
@@ -18,14 +33,8 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     styles = {"bold": curses.A_BOLD, "edge": curses.A_BOLD}
     if curses.has_colors():
         curses.start_color()
-        # Asphalt background; white queue blocks and fixed yellow lane dividers.
-        asphalt = 236 if curses.COLORS >= 256 else curses.COLOR_BLACK
-        orange = 208 if curses.COLORS >= 256 else curses.COLOR_YELLOW
-        palette = [(curses.COLOR_WHITE, asphalt), (curses.COLOR_YELLOW, asphalt),
-                   (curses.COLOR_GREEN, asphalt), (curses.COLOR_BLACK, curses.COLOR_WHITE),
-                   (curses.COLOR_BLACK, orange), (curses.COLOR_BLACK, curses.COLOR_GREEN),
-                   (curses.COLOR_BLUE, asphalt)]
-        for index, (foreground, background) in enumerate(palette, 1):
+        curses.use_default_colors()
+        for index, (foreground, background) in enumerate(watch.color_pairs(curses.COLORS), 1):
             curses.init_pair(index, foreground, background)
         styles.update(road=curses.color_pair(1), edge=curses.color_pair(1) | curses.A_BOLD,
                       divider=curses.color_pair(2), yellow=curses.color_pair(2),
@@ -38,6 +47,11 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     except curses.error:
         pass
     screen.keypad(True)
+    if store is not None:
+        try:
+            curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+        except curses.error:
+            pass  # A terminal without mouse support keeps the keyboard view.
     screen.timeout(300)
     selected = None
     show_detail = False
@@ -64,7 +78,9 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 pending = worker.submit(refresh)
             tick = int((watch.time.monotonic() - animation_started) / 0.3)
             height, width = screen.getmaxyx()
-            frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(40, width - 1), selected=selected, now=now())
+            layout: dict = {}
+            frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(40, width - 1), selected=selected,
+                                 now=now(), **({} if store is None else {"layout": layout}))
             # Keep keyboard help on screen even when there are more lanes than rows.
             body, footer = frame[:-1], frame[-1]
             if error:
@@ -88,6 +104,14 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             slugs = list(snapshot.status["lanes"])
             if key in (ord("q"), ord("Q"), 27):
                 return
+            if key == curses.KEY_MOUSE and store is not None:
+                try:
+                    _, x, y, _, buttons = curses.getmouse()
+                except curses.error:
+                    continue
+                if y < height - 1 and buttons & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                    watch.handle_mouse("left", x, offset + y, layout, store, config)
+                continue
             if key in (curses.KEY_DOWN, curses.KEY_NPAGE):
                 offset += 1 if key == curses.KEY_DOWN else max(1, height - 2)
             elif key in (curses.KEY_UP, curses.KEY_PPAGE):

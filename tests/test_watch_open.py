@@ -17,6 +17,8 @@ def opening(tmp_path, monkeypatch):
     monkeypatch.delenv("FORAGENT_VIEW")
     monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
     monkeypatch.delenv("TMUX", raising=False)
+    for key in ("WEZTERM_PANE", "KITTY_WINDOW_ID", "KITTY_LISTEN_ON"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("TERM_PROGRAM", raising=False)
     monkeypatch.setattr(watch_open.shutil, "which", lambda name: None)
     calls = []
@@ -57,7 +59,8 @@ def test_terminal_command_preserves_shell_and_applescript_special_characters(ope
         command = argv[5]
     else:
         assert argv[:2] == ["/fake/osascript", "-e"]
-        prefix = ('tell application "iTerm2" to create window with default profile command '
+        prefix = ('tell application "iTerm2" to tell current session of current window'
+                  ' to split vertically with default profile command '
                   if terminal == "iTerm.app" else 'tell application "Terminal" to do script ')
         assert argv[2].startswith(prefix)
         command = json.loads(argv[2][len(prefix):])
@@ -65,6 +68,27 @@ def test_terminal_command_preserves_shell_and_applescript_special_characters(ope
     assert "--open" not in shlex.split(command)
     assert Path(shlex.split(command)[0]).is_absolute()
     assert cwd == root
+
+
+@pytest.mark.parametrize("terminal", ["wezterm", "kitty"])
+def test_pane_terminals_pass_special_paths_as_arguments(opening, tmp_path, monkeypatch, terminal):
+    store, calls = opening
+    root = tmp_path / '한글 "double" $HOME `echo nope` repo'
+    root.mkdir()
+    # Kitty without a listen address still reaches its own window through the tty.
+    monkeypatch.setenv("WEZTERM_PANE" if terminal == "wezterm" else "KITTY_WINDOW_ID", "7")
+    monkeypatch.setenv("TERM_PROGRAM", "iTerm.app")
+    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/" + name if name in {"osascript", terminal} else None)
+    watch_open.open_view(root, store)
+    argv, cwd = calls[0]
+    if terminal == "wezterm":
+        assert argv[:6] == ["/fake/wezterm", "cli", "split-pane", "--right", "--cwd", str(root)]
+        assert argv[6] == "--"
+    else:
+        assert argv[:6] == ["/fake/kitty", "@", "launch", "--location=vsplit", "--cwd", str(root)]
+        assert "--to" not in argv
+    assert argv[-4:] == ["gate", "watch", "--repo-root", str(root)]
+    assert len(calls) == 1 and cwd == root
 
 
 @pytest.mark.parametrize("content", ["not a pid", "0", "-1", str(2**100)])

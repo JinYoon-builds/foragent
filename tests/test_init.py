@@ -258,6 +258,47 @@ def test_board_failure_does_not_stop_init(setup, caplog):
     assert "Could not configure board" in caplog.text
 
 
+def test_existing_board_mapping_is_chosen_once_and_saved_locally(setup, monkeypatch):
+    from foragent import board
+
+    project_id = setup.tracker.graphql("""mutation ForagentCreateBoard($input: CreateProjectV2Input!) {
+      createProjectV2(input: $input) { projectV2 { id } }
+    }""", {"input": {"ownerId": "O_owner", "title": "Foragent: repo"}})["data"]["createProjectV2"]["projectV2"]["id"]
+    original = board.Project(setup.tracker, "owner/repo", project_id).fields()["Status"]
+    answers = iter(["1", "1", "2", "2", "3"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    setup.init(no_board=False)
+    config = load_config(setup.root)
+    assert config.board == project_id
+    assert config.board_map == {"Backlog": "Todo", "Up next": "Todo", "In progress": "In Progress",
+                                "Your turn": "In Progress", "Done": "Done"}
+    monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("mapping must only be asked once"))
+    assert not setup.init(no_board=False).committed
+    assert board.Project(setup.tracker, "owner/repo", project_id).fields()["Status"] == original
+
+
+def test_existing_board_with_foragent_columns_saves_default_mapping_once(setup, monkeypatch):
+    from foragent import board
+
+    project_id = setup.tracker.graphql("""mutation ForagentCreateBoard($input: CreateProjectV2Input!) {
+      createProjectV2(input: $input) { projectV2 { id } }
+    }""", {"input": {"ownerId": "O_owner", "title": "Foragent: repo"}})["data"]["createProjectV2"]["projectV2"]["id"]
+    board.Project(setup.tracker, "owner/repo", project_id).ensure_fields({"Status": board.COLUMNS}, new_project=True)
+    monkeypatch.setattr("builtins.input", lambda *a: pytest.fail("Foragent's own columns have one mapping"))
+    report = setup.init(no_board=False)
+    config = load_config(setup.root)
+    assert config.board == project_id and config.board_map == board.DEFAULT_MAP
+    assert "board_map" in (setup.root / ".foragent.yml").read_text() and report.committed
+    assert not setup.init(no_board=False).committed
+
+
+@pytest.mark.parametrize("value", ["Backlog=Todo", "Backlog=Todo,Backlog=Doing", "Unknown=Todo", "Backlog="])
+def test_invalid_board_map_fails_before_external_calls(setup, value):
+    with pytest.raises(ConfigError, match="--board-map"):
+        setup.init(no_board=False, board_map=value)
+    assert not setup.git_calls and not setup.gh_calls
+
+
 def test_second_init_is_idempotent_and_preserves_config_and_mtimes(setup):
     setup.init(executor="codex", run_hours="always")
     before = {path: ((setup.root / path).read_bytes(), (setup.root / path).stat().st_mtime_ns) for path in PATHS}

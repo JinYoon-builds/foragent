@@ -1,0 +1,2 @@
+# Lane memory indexes only gain lines; keep both sides when lane clones merge.
+.claude/agent-memory/**/MEMORY.md merge=union

@@ -1,76 +1,46 @@
-"""Human-facing status vocabulary, following docs/voice.md."""
+"""Human-facing text lookup over the per-feature catalogues in foragent.messages.
+
+No strings live here. ``MESSAGES`` is the merged mapping of every discovered
+feature module, keyed by language and then message key.
+"""
+
+import importlib
+import pkgutil
+
+MESSAGES: dict[str, dict[str, str]] = {}
 
 
-MESSAGES = {
-    "en": {
-        "summary": "working {working} · waiting for you {waiting_human} · queued {queued}",
-        "working": "working", "blocked": "handled by the orchestrator",
-        "waiting-human": "waiting for you", "queued": "queued", "idle": "idle",
-        "implementing": "implementing", "checking": "checking", "reviewing": "reviewing",
-        "ci": "waiting for CI", "merging": "merging", "resolving-conflict": "resolving conflicts",
-        "elapsed": "elapsed {seconds}s", "activity": "last activity {seconds}s ago",
-        "waiting_for": "waiting for {issues}",
-        "watch_orchestrator": "orchestrator",
-        "watch_monitoring": "watching", "watch_handling": "handling issues",
-        "watch_order": "current order", "watch_no_order": "no open order",
-        "watch_waiting": "waiting for you {count}",
-        "watch_eta": "ETA {time}", "watch_estimating": "estimating",
-        "watch_complete": "all done", "watch_lanes": "lanes",
-        "watch_agent": "{lane} agent",
-        "watch_idle_lanes": "idle lanes", "watch_all_idle": "all lanes are idle",
-        "watch_done": "✓ {count} done · just now: {title}",
-        "watch_stalled": "○ looks stalled {minutes} min",
-        "watch_runner_gone": "○ runner gone",
-        "watch_now": "now doing", "watch_lane": "lane", "watch_phase": "phase",
-        "watch_events": "handled by the orchestrator", "watch_no_events": "none yet",
-        "watch_retry": "retry {count}", "watch_detail": "agent detail",
-        "watch_paths": "paths", "watch_executor": "executor", "watch_model": "model",
-        "watch_skills": "skills", "watch_done_count": "done {count}",
-        "watch_memory": "memory", "watch_no_memory": "no memory yet",
-        "watch_default_model": "executor default", "watch_none": "none",
-        "watch_help": "1–{count}: agent details · ↑/↓: scroll · q: quit",
-        "watch_help_many": "type 1–{count}, Enter: details · ↑/↓: scroll · q: quit",
-        "watch_terminal": "You can watch live in a terminal. Use --once for plain text.",
-        "watch_open_failed": "Couldn't open the lane view ({error}). Try again.",
-        "watch_open_manual": "To open the lane view, run: {command}",
-        "watch_refresh_failed": "Couldn't refresh ({error}). I'll try again.",
-    },
-    "ko": {
-        "summary": "일하는 중 {working} · 확인할 일 {waiting_human} · 기다리는 일 {queued}",
-        "working": "일하는 중", "blocked": "오케스트레이터가 보는 중",
-        "waiting-human": "확인할 일", "queued": "기다리는 중", "idle": "쉬는 중",
-        "implementing": "만드는 중", "checking": "확인하는 중", "reviewing": "리뷰하는 중",
-        "ci": "CI 기다려요", "merging": "합치는 중", "resolving-conflict": "충돌 풀어요",
-        "elapsed": "{seconds}초 경과", "activity": "마지막 움직임 {seconds}초 전",
-        "waiting_for": "{issues} 기다려요",
-        "watch_orchestrator": "오케스트레이터",
-        "watch_monitoring": "지켜보는 중", "watch_handling": "문제 푸는 중",
-        "watch_order": "이번 주문", "watch_no_order": "새 주문을 기다려요",
-        "watch_waiting": "확인할 일 {count}",
-        "watch_eta": "끝날 시간 {time}", "watch_estimating": "계산하는 중",
-        "watch_complete": "모두 끝냈어요", "watch_lanes": "레인",
-        "watch_agent": "{lane} 담당",
-        "watch_idle_lanes": "쉬는 레인", "watch_all_idle": "모든 레인이 쉬는 중이에요",
-        "watch_done": "✓ {count}개 끝냈어요 · 방금: {title}",
-        "watch_stalled": "○ 멈춘 듯 {minutes}분",
-        "watch_runner_gone": "○ 실행기가 끝났어요",
-        "watch_now": "지금 하는 일", "watch_lane": "레인", "watch_phase": "단계",
-        "watch_events": "오케스트레이터가 처리한 일", "watch_no_events": "처리한 일이 생기면 보여줄게요",
-        "watch_retry": "재시도 {count}", "watch_detail": "담당 에이전트 보기",
-        "watch_paths": "영역", "watch_executor": "실행기", "watch_model": "모델",
-        "watch_skills": "쓰는 스킬", "watch_done_count": "{count}개 끝냈어요",
-        "watch_memory": "기억", "watch_no_memory": "아직 기억이 없어요",
-        "watch_default_model": "실행기 기본값", "watch_none": "없음",
-        "watch_help": "1–{count}: 담당 보기 · ↑/↓: 스크롤 · q: 종료",
-        "watch_help_many": "1–{count} 입력 후 Enter: 담당 보기 · ↑/↓: 스크롤 · q: 종료",
-        "watch_terminal": "실시간 화면은 터미널에서 볼 수 있어요. 일반 텍스트는 --once로 확인해요",
-        "watch_open_failed": "레인 화면을 열지 못했어요({error}). 다시 시도해요",
-        "watch_open_manual": "이 명령으로 레인 화면을 열어요: {command}",
-        "watch_refresh_failed": "새로고침을 못했어요({error}). 다시 시도할게요",
-    },
-}
+def reload_messages() -> dict[str, dict[str, str]]:
+    """Rediscover every foragent.messages module and rebuild MESSAGES in place.
+
+    A (language, key) pair defined by two modules raises ValueError naming the
+    key and both modules. On error MESSAGES keeps its previous contents.
+    """
+    package = importlib.import_module("foragent.messages")
+    merged: dict[str, dict[str, str]] = {}
+    owners: dict[tuple[str, str], str] = {}
+    prefix = package.__name__ + "."
+    for info in sorted(pkgutil.iter_modules(package.__path__, prefix), key=lambda item: item.name):
+        if info.ispkg:
+            continue
+        module = importlib.import_module(info.name)
+        for language, catalogue in getattr(module, "MESSAGES", {}).items():
+            target = merged.setdefault(language, {})
+            for key, template in catalogue.items():
+                owner = owners.setdefault((language, key), info.name)
+                if owner != info.name:
+                    raise ValueError(
+                        f"message key {key!r} ({language}) is defined in both {owner} and {info.name}"
+                    )
+                target[key] = template
+    MESSAGES.clear()
+    MESSAGES.update(merged)
+    return MESSAGES
 
 
 def text(key: str, language: str = "en", **values) -> str:
     language = language.lower().split("-")[0]
     return MESSAGES.get(language, MESSAGES["en"])[key].format(**values)
+
+
+reload_messages()

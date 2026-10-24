@@ -1,19 +1,28 @@
 from datetime import UTC, datetime, timedelta
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from foragent import cli, watch
 from foragent.config import Config, ConfigError
 from foragent.state import StateStore
-from foragent.tracker import FakeTracker
+from foragent.tracker import FakeTracker, RecordingTracker
+
+
+def local_status(tracker, store, config=None):
+    """Status reads only local records, so first record what the gate would observe."""
+    config = config or Config()
+    context = SimpleNamespace(store=store, config=config, now=lambda: datetime.now(UTC))
+    RecordingTracker(tracker, context).refresh_issues()
+    return cli._status(tracker, store, config)
 
 
 NOW = datetime(2026, 10, 21, 9, tzinfo=UTC)
 
 
 def snapshot(tracker, store, config):
-    return watch.collect(cli._status(tracker, store, config), tracker, store, config, NOW)
+    return watch.collect(local_status(tracker, store, config), tracker, store, config, NOW)
 
 
 def finish(tracker, store, number, parent, lane="api"):
@@ -134,7 +143,7 @@ def test_live_liveness_crosses_ten_minutes_between_refreshes(tmp_path):
     store.start_run(1, branch="active", worktree="unused")
     store.update_run(1, last_activity_at=(NOW - timedelta(seconds=599)).isoformat())
     # Use a frozen status clock, just as the CLI's live refresh does.
-    status = cli._status(tracker, store, config)
+    status = local_status(tracker, store, config)
     status["lanes"]["main"]["last_activity_seconds"] = 599
     result = watch.collect(status, tracker, store, config, NOW)
     before = watch.render_frame(result, config, tmp_path, now=NOW)
@@ -242,3 +251,18 @@ def test_live_watch_without_a_terminal_explains_once_option(tmp_path, monkeypatc
     monkeypatch.setattr(watch.sys.stdin, "isatty", lambda: False)
     with pytest.raises(ConfigError, match="--once"):
         watch.run(lambda: {}, FakeTracker(), StateStore(tmp_path), Config(), tmp_path)
+
+
+def test_first_line_shows_snapshot_time_and_warns_when_nothing_was_read(tmp_path):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config()
+    empty = watch.collect(cli._status(tracker, store, config), tracker, store, config, NOW)
+    first = watch.render_frame(empty, config, tmp_path).splitlines()[0]
+    assert first.startswith("⚠ Couldn't read the status") and "working ?" in first
+    tracker.add_issue(1, "Queued", labels=["approved"])
+    observed = local_status(tracker, store, config)
+    first = watch.render_frame(watch.collect(observed, tracker, store, config, NOW),
+                               config, tmp_path).splitlines()[0]
+    local_time = datetime.fromisoformat(observed["as_of"]).astimezone().strftime("%H:%M")
+    assert first.endswith(f"queued 1 · as of {local_time}") and "⚠" not in first

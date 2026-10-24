@@ -2,24 +2,31 @@
 
 from collections import deque
 from collections.abc import Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import math
 from pathlib import Path
 import re
+import shlex
 from tempfile import TemporaryDirectory
 import time
+import xml.etree.ElementTree as ET
 
-from foragent.git import GitError
+from foragent import capacity
+from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.processes import run_logged
-from foragent.runner import RunContext, review_only
-from foragent.tracker import Issue, PullRequest
+from foragent.run_attempt import AttemptFailure
+from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
+from foragent.run_checks import CheckResult, trusts_ci
+from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
+from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
 
 class OrchError(ValueError):
@@ -27,17 +34,13 @@ class OrchError(ValueError):
 
 
 def _watch_snapshot(ctx: RunContext) -> dict:
-    issues = [issue for issue in ctx.tracker.list_open_issues() if not issue.is_pull_request]
-    merged = {
-        int(match[1]) for pr in ctx.tracker.list_prs("merged", "foragent/")
-        if pr.merged_at is not None
-        and (match := re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", pr.head))
-    }
+    rows = ctx.store.local_issues()
+    issues = [row for row in rows if row["state"] == "open"]
     return {
-        "blocked": sorted(issue.number for issue in issues if BLOCKED in issue.labels),
-        "needs_human": sorted(issue.number for issue in issues if NEEDS_HUMAN in issue.labels),
-        "merged": sorted(merged),
-        "queue_empty": not any(issue.labels & {APPROVED, READY, RUNNING} for issue in issues)
+        "blocked": sorted(row["number"] for row in issues if BLOCKED in row["labels"]),
+        "needs_human": sorted(row["number"] for row in issues if NEEDS_HUMAN in row["labels"]),
+        "merged": sorted(row["number"] for row in rows if row["merged"]),
+        "queue_empty": not any(set(row["labels"]) & {APPROVED, READY, RUNNING} for row in issues)
                        and not ctx.store.active_runs(),
     }
 
@@ -47,20 +50,47 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
 
     The persisted snapshot lets a Monitor until-loop invoke this repeatedly
     without receiving the same event. Titles, timestamps and logs are excluded.
+    A failed read yields ``{"unknown": true, "error": ...}`` instead of empty
+    sets, leaves the persisted snapshot alone, and makes the next good read
+    print even when it equals the last known snapshot.
     """
     if not math.isfinite(interval) or interval <= 0:
         raise OrchError("interval must be a finite positive number")
     path = ctx.store.root / "orch-watch.json"
+    unknown_path = ctx.store.root / "orch-watch-unknown.json"
+    last_error = None
     while True:
-        snapshot = _watch_snapshot(ctx)
-        with ctx.store._state_lock():
+        try:
+            snapshot = _watch_snapshot(ctx)
+            with ctx.store._state_lock():
+                try:
+                    previous = json.loads(path.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    previous = None
+                recovered = unknown_path.exists()
+                changed = recovered or snapshot != previous
+                if changed:
+                    ctx.store._write_json(path, snapshot)
+                if recovered:
+                    unknown_path.unlink(missing_ok=True)
+        except Exception as error:  # an unreadable state must never look like empty sets
+            message = str(error) or type(error).__name__
+            reading = {"unknown": True, "error": message}
             try:
-                previous = json.loads(path.read_text(encoding="utf-8"))
-            except FileNotFoundError:
-                previous = None
-            changed = snapshot != previous
-            if changed:
-                ctx.store._write_json(path, snapshot)
+                with ctx.store._state_lock():
+                    ctx.store._write_json(unknown_path, reading)
+            except Exception:
+                pass  # the in-memory flag below still forces the next good print
+            if not follow or message != last_error:
+                yield reading
+            if not follow:
+                return
+            last_error = message
+            time.sleep(interval)
+            continue
+        if last_error is not None:
+            changed = True
+            last_error = None
         if changed:
             yield snapshot
             if not follow:
@@ -69,7 +99,7 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
 
 
 def _issue(ctx: RunContext, n: int) -> Issue:
-    issue = ctx.tracker.get_issue(n)
+    issue = RecordingTracker(ctx.tracker, ctx).get_issue(n)
     if issue.is_pull_request or issue.state != "open":
         raise OrchError(f"#{n} must be an open issue")
     run = ctx.store.get_run(n)
@@ -86,20 +116,23 @@ def _text(value: str, name: str) -> str:
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = ()) -> dict:
     event = append_event(ctx.store, ctx.now(), n, kind, summary)
-    if ctx.store.github_wait_until(ctx.now()) is not None:
+    if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
         return event
+    tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     for number in ([n] if n is not None else issues):
-        ctx.tracker.comment(number, "<!-- foragent:orch -->\n" + event["summary"])
+        tracker.comment(number, "<!-- foragent:orch -->\n" + event["summary"])
     return event
 
 
 def list_blocked(ctx: RunContext) -> list[dict]:
     """Inspect blocked evidence and audit the lookup, as orch-verbs requires."""
     items = []
-    for issue in sorted(ctx.tracker.list_open_issues(), key=lambda issue: issue.number):
-        if issue.is_pull_request or BLOCKED not in issue.labels:
+    for row in ctx.store.local_issues():
+        if row["state"] != "open" or BLOCKED not in row["labels"]:
             continue
-        flags = [(comment, match[1]) for comment in ctx.tracker.list_comments(issue.number)
+        issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
+        comments = [Comment(**item) for item in row["comments"]]
+        flags = [(comment, match[1]) for comment in comments
                  if (match := re.fullmatch(r"<!-- foragent:blocked reason=([a-z-]+) -->",
                                            comment.body.splitlines()[0] if comment.body else ""))]
         latest = max(flags, key=lambda item: (datetime.fromisoformat(item[0].created_at), item[0].id), default=None)
@@ -111,16 +144,17 @@ def list_blocked(ctx: RunContext) -> list[dict]:
         if log.is_file():
             with log.open(encoding="utf-8", errors="replace") as stream:
                 tail = "".join(deque(stream, maxlen=60))
-        items.append({"number": issue.number, "title": issue.title, "lane": issue_lane(issue.labels, ctx.config.lanes),
+        items.append({"number": issue.number, "title": issue.title, "lane": row["lane"],
                       "reason": latest[1] if latest else None,
                       "blocked_at": latest[0].created_at if latest else None,
                       "details": latest[0].body if latest else "",
                       "reviews": reviews, "log_path": str(log), "log_tail": tail})
-    _event(ctx, None, "list", f"Listed {len(items)} blocked issues", issues=[item["number"] for item in items])
+    append_event(ctx.store, ctx.now(), None, "list", f"Listed {len(items)} blocked issues")
     return items
 
 
 def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
+    tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     path = ctx.store.root / "hints" / f"{n}.txt"
     if hint is not None:
         ctx.store._atomic_write(path, hint)
@@ -129,8 +163,8 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         ctx.tracker.close_pr(pr, "Closed by Foragent orchestrator retry")
     # Establish the destination before clearing the old state, including on errors.
-    ctx.tracker.add_labels(n, [READY])
-    ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
+    tracker.add_labels(n, [READY])
+    tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
 
 
 def retry(ctx: RunContext, n: int, hint: str | None = None) -> str:
@@ -162,7 +196,8 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str) -> str:
     if pr is None:
         raise OrchError(f"issue #{n} has no open Foragent PR")
     head = ctx.tracker.pr_head_sha(pr)
-    ctx.tracker.comment(n, f"<!-- foragent:orch-verdict pr={pr} head={head} verdict={verdict} -->\n{note}")
+    RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
+        n, f"<!-- foragent:orch-verdict pr={pr} head={head} verdict={verdict} -->\n{note}")
     outcome = "interrupted"
     try:
         if verdict == "fail":
@@ -193,9 +228,10 @@ def escalate(ctx: RunContext, n: int, summary: str, tried: str,
     if options:
         lines.extend(["", "Options:", *(f"{i}. {option}" + (" (recommended)" if i == recommend else "")
                                            for i, option in enumerate(options, 1))])
-    ctx.tracker.comment(n, "\n".join(lines))
-    ctx.tracker.add_labels(n, [NEEDS_HUMAN])
-    ctx.tracker.remove_labels(n, [READY])
+    tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
+    tracker.comment(n, "\n".join(lines))
+    tracker.add_labels(n, [NEEDS_HUMAN])
+    tracker.remove_labels(n, [READY])
     event_summary = f"#{n}: escalated to human; {summary}; tried: {tried}"
     _event(ctx, n, "escalate", event_summary)
     return event_summary
@@ -229,6 +265,53 @@ class _Premerge:
     report: dict
 
 
+@dataclass(frozen=True)
+class _SuiteRun:
+    passed: bool
+    failing: frozenset[str] | None  # None: no per-test result to compare
+
+
+def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
+                   log_path: Path, label: str, slot: AbstractContextManager) -> CheckResult:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
+    with slot:
+        code, timed_out, output = run_logged(
+            ["/bin/sh", "-c", command], cwd=worktree,
+            timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path, env=capacity.HELD_ENV,
+        )
+    return CheckResult(command, code, timed_out, output)
+
+
+def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Path,
+               log_path: Path, label: str, slot: AbstractContextManager, *, allow_empty: bool = False) -> _SuiteRun:
+    """Run one suite inside a slot; pytest also reports its failing node ids."""
+    pytest = _pytest_command(command) is not None
+    if pytest:
+        junit.unlink(missing_ok=True)
+        command = (f"{command} --rootdir=. -o junit_family=legacy --junit-prefix= "
+                   f"--junitxml={shlex.quote(str(junit.resolve()))}")
+    result = _suite_process(ctx, n, command, worktree, log_path, label, slot)
+    code, timed_out = result.exit_code, result.timed_out
+    passed = code == 0 and not timed_out
+    if not pytest or timed_out:
+        return _SuiteRun(passed, None)
+    try:
+        cases = list(ET.parse(junit).iter("testcase"))
+    except (OSError, ET.ParseError):
+        return _SuiteRun(passed, None)
+    failing = frozenset(node_id for case in cases
+                        if any(case.find(tag) is not None for tag in ("failure", "error"))
+                        and (node_id := junit_node_id(case)) is not None)
+    if allow_empty and code == 5 and not cases:
+        return _SuiteRun(True, frozenset())
+    # Exit 1 is pytest's "some tests failed"; other codes are session failures.
+    if code not in (0, 1) or (code == 1 and not failing):
+        return _SuiteRun(False, None)
+    return _SuiteRun(passed, failing)
+
+
 def _premerge(ctx: RunContext, n: int) -> _Premerge:
     pr = _open_pr(ctx, n)
     head = ctx.tracker.pr_head_sha(n)
@@ -237,44 +320,126 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
     ctx.git._call(["fetch", "origin", head])
     base = ctx.git.ref_sha(f"refs/remotes/origin/{pr.base}")
     log_path = ctx.store.root / "runs" / f"premerge-pr-{n}.log"
+    waited_seconds = 0.0
+
+    def wait(acquire):
+        nonlocal waited_seconds
+        started = ctx.now()
+        try:
+            return acquire()
+        finally:
+            waited_seconds += max(0.0, (ctx.now() - started).total_seconds())
+
+    @contextmanager
+    def test_slot():
+        nonlocal waited_seconds
+        started = ctx.now()
+        queued = False
+
+        def waiting():
+            nonlocal queued
+            queued = True
+
+        with capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting):
+            if queued:
+                waited_seconds += max(0.0, (ctx.now() - started).total_seconds())
+            yield
+
+    broken: list[str] = []
+    failing_on_base: list[str] = []
     with TemporaryDirectory(prefix=f"foragent-premerge-{n}-") as directory:
         worktree = Path(directory) / "worktree"
-        ctx.git.add_detached_worktree(worktree, head)
-        try:
-            commands = ([ctx.config.test_command] if ctx.config.test_command is not None
-                        else detect_test_commands(worktree))
-            if not commands:
-                raise OrchError("no full test command detected; set test_command in .foragent.yml")
-            tests = "pass"
-            for command in commands:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                with log_path.open("a", encoding="utf-8") as stream:
-                    stream.write(f"\nPre-merge PR #{n} head={head} base={base}\n$ {command}\n")
-                code, timed_out, _ = run_logged(
-                    ["/bin/sh", "-c", command], cwd=worktree,
-                    timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path,
-                )
-                if code != 0 or timed_out:
-                    tests = "fail"
-        finally:
-            ctx.git.remove_worktree(worktree)
-        # Tests may generate files. Use a fresh checkout of the same SHA for
-        # the merge probe so those files cannot hide or create conflicts.
         ctx.git.add_detached_worktree(worktree, head)
         try:
             probe = ctx.git.at(worktree)
             conflicts = []
             try:
+                probe.check_publication(base)
+            except PublicationError as exc:
+                conflicts = [f"{path}:{line}" for path, line in exc.markers]
+            # Test what merging produces: the PR head combined with the current base.
+            merged = True
+            try:
                 probe._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
                              "merge", "--no-commit", "--no-ff", base])
             except GitError:
-                conflicts = sorted(probe.conflict_paths())
-                if not conflicts:
+                merge_conflicts = sorted(probe.conflict_paths())
+                if not merge_conflicts:
                     raise
+                conflicts.extend(merge_conflicts)
+                probe._call(["merge", "--abort"])
+                merged = False
+            commands = ([ctx.config.test_command] if ctx.config.test_command is not None
+                        else detect_test_commands(worktree))
+            if not commands:
+                raise OrchError("no full test command detected; set test_command in .foragent.yml")
+            ci_units = trusts_ci(ctx.repo_root, ctx.config)
+            excluded = _baseline_exclusions(ctx, base, log_path)
+            label = f"head={head} merged with base={base}" if merged else f"head={head} (base merge conflicts)"
+            runs = []
+            for i, command in enumerate(commands):
+                pytest_command = _pytest_command(command)
+                acceptance_only = ci_units and pytest_command is not None
+                selection = command
+                if acceptance_only:
+                    selection = f"{pytest_command} {shlex.quote(ctx.config.acceptance_dir)}"
+                    selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
+                if acceptance_only and not (worktree / ctx.config.acceptance_dir).is_dir():
+                    run = _SuiteRun(True, frozenset())
+                else:
+                    run = _run_suite(ctx, n, selection, worktree, Path(directory) / f"head-{i}.xml",
+                                     log_path, label, test_slot(), allow_empty=acceptance_only)
+                runs.append((command, run, acceptance_only))
         finally:
             ctx.git.remove_worktree(worktree)
+        tests = "pass"
+        for i, (command, run, acceptance_only) in enumerate(runs):
+            if run.passed and not acceptance_only:
+                continue
+            if not run.passed and run.failing is None:
+                tests = "fail"
+                continue
+            # D53: failures the base already has do not block; any other failure does.
+            head_failing = run.failing or frozenset()
+            base_failing = frozenset()
+            if acceptance_only:
+                try:
+                    baseline = _capture_baseline(
+                        ctx, command, base, log=log_path, report=Path(directory) / f"base-{i}.xml",
+                        check=lambda selection, root: _suite_process(
+                            ctx, n, selection, root, log_path, f"base={base}", test_slot()),
+                        prepare=lambda: None, wait=wait, required_ids=head_failing,
+                    )
+                except AttemptFailure:
+                    tests = "fail"
+                    broken.extend(sorted(head_failing))
+                    continue
+                if baseline is not None:
+                    base_failing = frozenset(baseline.failing_ids)
+            else:
+                selection = command
+                if _pytest_command(command) is not None:
+                    saved = _premerge_baseline(ctx, command, base, excluded, head_failing)
+                    if saved is not None:
+                        base_failing = frozenset(saved["failing_ids"])
+                        # Keep units and uncached/locked tests in the original full suite.
+                        selection += "".join(f" {shlex.quote('--deselect=' + node)}"
+                                             for node in [*saved["collected_ids"], *saved["excluded"]])
+                ctx.git.add_detached_worktree(worktree, base)
+                try:
+                    on_base = _run_suite(ctx, n, selection, worktree, Path(directory) / f"base-{i}.xml",
+                                         log_path, f"base={base}", test_slot())
+                finally:
+                    ctx.git.remove_worktree(worktree)
+                base_failing |= on_base.failing or frozenset()
+            broken.extend(sorted(head_failing - base_failing))
+            failing_on_base.extend(sorted(head_failing & base_failing))
+            if head_failing - base_failing:
+                tests = "fail"
     ci = ctx.tracker.pr_checks(n)
     report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
+              "broken": broken, "failing_on_base": failing_on_base,
+              "waited_seconds": waited_seconds,
               "ready": tests == "pass" and not conflicts and ci in {"pass", "none"}}
     return _Premerge(pr, head, base, report)
 
@@ -282,6 +447,11 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
 def premerge(ctx: RunContext, n: int) -> dict:
     """Check the PR head in isolation without posting or changing GitHub state."""
     return _premerge(ctx, n).report
+
+
+def _base_note(report: dict) -> str:
+    count = len(report["failing_on_base"])
+    return f" ({count} failing on the base too)" if count else ""
 
 
 def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -> str:
@@ -295,7 +465,8 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     checked = _premerge(ctx, n)
     report = checked.report
     if not report["ready"]:
-        raise OrchError(f"PR #{n} is not ready: tests {report['tests']}; "
+        broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
+        raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
                         f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
     current = _open_pr(ctx, n)
     ctx.git.fetch("origin", current.base)
@@ -306,10 +477,18 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     ci = ctx.tracker.pr_checks(n)
     if ci not in {"pass", "none"}:
         raise OrchError(f"PR #{n} is not ready: CI {ci}")
-    ctx.tracker.comment(n, f"Approved by {approved_by} in the orchestrator ({at}). "
-                          f"Pre-merge: tests pass, no conflicts, CI {ci}.")
+    RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
+        n, f"Approved by {approved_by} in the orchestrator ({at}). "
+           f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
     ctx.tracker.merge_pr(n, expected_head_sha=checked.head)
-    summary = f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; tests pass, no conflicts, CI {ci}"
+    summary = (f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; "
+               f"tests pass{_base_note(report)}, no conflicts, CI {ci}")
     _event(ctx, None, "merge", summary)
     after_merge(ctx, n, current.base)
+    if (number := pr_issue_number(current.head)) is not None:
+        # GitHub applies closing references only on eligible merges; observe its result.
+        try:
+            ctx.tracker.get_issue(number)
+        except TrackerError as exc:
+            print(f"issue #{number} refresh failed after merge: {exc}")
     return summary

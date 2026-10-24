@@ -4,10 +4,11 @@ Runtime dependencies resolve through foragent.watch to preserve its patch points
 """
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from foragent import orch_inbox
 from foragent.config import Config
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
@@ -23,6 +24,8 @@ class Snapshot:
     eta: datetime | None
     events: list[dict[str, Any]]
     captured_at: datetime
+    # The durable request box (D76), oldest first.
+    requests: list[dict[str, Any]] = field(default_factory=list)
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -47,29 +50,36 @@ def recent_events(store: StateStore) -> list[dict[str, Any]]:
 def collect(
     status: dict[str, Any], tracker: Tracker, store: StateStore, config: Config, now: datetime,
 ) -> Snapshot:
-    """Supplement the shared status JSON with native order edges and completions."""
+    """Supplement the shared status JSON with order edges and completions from local records.
+
+    The tracker is accepted for compatibility; refreshes never read it.
+    """
     from foragent import watch
 
-    issues = {issue.number: issue for issue in tracker.list_issues()}
-    rows = status["lanes"]
+    rows = {row["number"]: row for row in store.local_issues()}
+    issues = {number: Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
+              for number, row in rows.items()}
+
+    def sub_issues(number: int) -> list[Issue]:
+        return [issues[child] for child, row in rows.items() if row.get("parent") == number]
+
+    lanes = status["lanes"]
     # Prefer the order currently executing, then other visible work. Never add
     # progress from a different order into this order's denominator.
     candidates = [run["number"] for run in status["active_runs"]]
-    candidates += [row["issue"] for row in rows.values() if row["issue"] is not None]
+    candidates += [row["issue"] for row in lanes.values() if row["issue"] is not None]
     candidates += [issue.number for issue in issues.values() if issue.state == "open"]
     order = None
     for number in dict.fromkeys(candidates):
-        parent = tracker.parent_of(number)
-        if parent is not None:
-            candidate = issues.get(parent) or tracker.get_issue(parent)
-            if candidate.state == "open":
-                order = candidate
-                break
-    children = tracker.sub_issues(order.number) if order else []
+        parent = rows.get(number, {}).get("parent")
+        if parent is not None and (candidate := issues.get(parent)) is not None and candidate.state == "open":
+            order = candidate
+            break
+    children = sub_issues(order.number) if order else []
     if order is None:
         # An order can remain open after its last child has finished.
         for candidate in sorted(issues.values(), key=lambda issue: issue.number):
-            if candidate.state == "open" and (children := tracker.sub_issues(candidate.number)):
+            if candidate.state == "open" and (children := sub_issues(candidate.number)):
                 order = candidate
                 break
     child_numbers = {issue.number for issue in children}
@@ -94,9 +104,14 @@ def collect(
             durations.append(duration)
     eta = None
     if order is not None and durations and completed < len(children):
-        # A lane is serial; max_parallel also caps total throughput. Historical
+        # A lane is serial; max_parallel (or else the lane count) caps throughput. Historical
         # run duration is an estimate, so the UI explicitly prefixes the time ~.
         workloads = watch.Counter(watch.issue_lane(issue.labels, config.lanes) for issue in children if issue.state == "open")
-        batches = max(max(workloads.values()), sum(workloads.values()) / config.max_parallel)
+        batches = max(max(workloads.values()), sum(workloads.values()) / (config.max_parallel or len(workloads)))
         eta = now + watch.timedelta(seconds=batches * sum(durations) / len(durations))
-    return watch.Snapshot(status, done, order, completed, len(children), eta, watch.recent_events(store), now)
+    try:
+        requests = orch_inbox.requests(store)
+    except (OSError, ValueError):
+        requests = []  # An unreadable box must not take the whole view down.
+    return watch.Snapshot(status, done, order, completed, len(children), eta, watch.recent_events(store), now,
+                          requests)
