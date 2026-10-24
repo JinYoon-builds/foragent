@@ -10,7 +10,15 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 from typing import IO, Any
+
+# Tick-lock paths this thread holds through StateStore.hold_tick_lock.
+_TICK_LOCKS_HELD = threading.local()
+
+
+def _held_tick_locks() -> set[str]:
+    return _TICK_LOCKS_HELD.__dict__.setdefault("paths", set())
 
 
 @dataclass(frozen=True)
@@ -779,8 +787,48 @@ class StateStore:
 
     @contextmanager
     def tick_lock(self) -> Iterator[bool]:
+        """Try the tick lock without waiting; yield whether this tick may run.
+
+        Inside ``hold_tick_lock()`` on the same thread the lock is already held,
+        so it yields True without taking it again.
+        """
+        path = self._tick_lock_path()
+        if str(path.resolve()) in _held_tick_locks():
+            yield True
+            return
+        with self._try_tick_lock(path) as acquired:
+            yield acquired
+
+    @contextmanager
+    def hold_tick_lock(self) -> Iterator[bool]:
+        """Take the tick lock so nested ``tick_lock()`` calls on this thread reenter it.
+
+        The gate command holds it around a tick and the record of its outcome,
+        so overlapping ticks record outcomes in the order they ran.
+        """
+        path = self._tick_lock_path()
+        key, held = str(path.resolve()), _held_tick_locks()
+        if key in held:
+            yield True
+            return
+        with self._try_tick_lock(path) as acquired:
+            if not acquired:
+                yield False
+                return
+            held.add(key)
+            try:
+                yield True
+            finally:
+                held.discard(key)
+
+    def _tick_lock_path(self) -> Path:
         self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / "tick.lock").open("a", encoding="utf-8") as stream:
+        return self.root / "tick.lock"
+
+    @staticmethod
+    @contextmanager
+    def _try_tick_lock(path: Path) -> Iterator[bool]:
+        with path.open("a", encoding="utf-8") as stream:
             try:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:

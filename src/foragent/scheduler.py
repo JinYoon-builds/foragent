@@ -31,6 +31,7 @@ from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
 
 TICK_JITTER = timedelta(milliseconds=500)
+BUSY_TICK = "another tick is running"
 
 
 def runner_process_exists(number: int) -> bool:
@@ -95,7 +96,7 @@ from foragent.scheduler_lanes import (  # noqa: E402
 def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired:
         if not acquired:
-            return TickReport(skipped="another tick is running")
+            return TickReport(skipped=BUSY_TICK)
         cleanup = TickReport()
         _reap_inactive_runs(ctx, cleanup)
         if until := ctx.store.github_wait_until(ctx.now()):
