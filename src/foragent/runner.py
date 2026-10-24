@@ -379,9 +379,13 @@ def run_issue(n: int, ctx: RunContext) -> str:
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Runner exited: {exc}"
-        # A handled stop must not look like an orphan to the next tick.
-        ctx.tracker.add_labels(n, [BLOCKED])
-        ctx.tracker.remove_labels(n, [READY, RUNNING])
+        stopped = ctx.store.get_run(n)
+        if stopped is None or stopped.outcome != "stalled-restart":
+            # A handled stop must not look like an orphan to the next tick.
+            ctx.tracker.add_labels(n, [BLOCKED])
+            ctx.tracker.remove_labels(n, [READY, RUNNING])
+        # A first stall was recorded before the signal; the tick owns its
+        # restart decision (ready, or blocked with an open PR), so keep labels.
         raise
     finally:
         # A tick may already have finished the record while terminating this runner.
