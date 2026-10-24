@@ -26,3 +26,6 @@
 - 2026-10-24 D81/#307 이후 러너는 Done when, 인수 기준선, 수정한 파일의 자체 시험만 돌린다. 재시도 때 작업 트리가 다시 만들어지면 `.foragent/TRY.md`도 사라지므로 다시 쓴다.
 - #237 리뷰: preread와 승인 관문은 `order.preread_target`을 함께 쓴다. edits도 대상이며(key `#N`, 트래커에서 제목·레인), 해시에는 실행기·모델(레인 설정 우선, 러너와 동일)과 blocked_by·interactive·new_lanes가 든 프롬프트가 들어간다.
 - 레인 브랜치가 main보다 뒤처지면 main에 새로 생긴 인수 파일이 diff에서 "삭제"로 보여 리뷰가 거절한다. `git restore --source=origin/main --worktree -- <파일>`로 가져오고 `git hash-object`로 같은지 확인한다. 모르는 점은 스킬이 스스로 답하지 않고 사용자에게 묻는다(#237 제외 범위).
+- #237 3차: preread 증거 키에는 계획 전체(정렬한 JSON)가 들어가 어떤 이슈의 변경도 이전 결과를 무효로 한다. `--approve-numbers`에 아직 매핑되지 않은 번호가 있으면 이번에 만들 자식 전부에 깨끗한 preread를 요구한다.
+- 재시도를 시작할 때마다 `git fetch origin && git diff --name-only HEAD...origin/main`을 먼저 본다. 나온 파일이 내 변경과 겹치지 않으면 zsh에서 `files=(${(f)"$(...)"})`로 나눈 뒤 `git restore --source=origin/main --worktree -- $files`로 가져온다(#237에서 두 번 "인수 시험 삭제"로 거절됨).
+- 위 동기화 뒤 main에서 새로 생긴 파일은 `git add -N`(내용 없이 추적 표시)으로 표시한다. 그래야 `git diff origin/main`이 내 파일만 보여 리뷰가 "삭제"로 오해하지 않는다. main에서 지워진 파일은 `git cat-file -e origin/main:<파일>`로 가려 지운다.

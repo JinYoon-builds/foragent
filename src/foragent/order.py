@@ -517,9 +517,13 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
         return PublishReport(plan["title"], parent, rows, sorted(files), True)
+    # A selected number not mapped yet is a child created now; its number is unknown
+    # until creation, so every child still to be created needs a clean preread.
+    new_numbers = bool(selected_numbers - edit_numbers - set(mapping.values()))
     require_clean_preread(plan, root, config, [
         *(item for item in plan["issues"]
-          if approve or item["key"] in selected_keys or mapping.get(item["key"]) in selected_numbers),
+          if approve or item["key"] in selected_keys or mapping.get(item["key"]) in selected_numbers
+          or (new_numbers and item["key"] not in mapping)),
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
           if approve or item["number"] in selected_numbers),
     ])
@@ -669,7 +673,9 @@ def preread_target(plan: dict, item: dict, config: Config) -> tuple[str, str | N
     # Same choice as the runner's per-lane executor configuration.
     model = lane.get("model") if lane.get("model") is not None else config.executor_model
     prompt = preread_prompt(plan, item)
-    digest = hashlib.sha256(json.dumps([name, model, prompt], ensure_ascii=False).encode("utf-8")).hexdigest()
+    # The whole plan is part of the key: any change to any issue needs a new preread.
+    digest = hashlib.sha256(json.dumps([name, model, prompt, plan], ensure_ascii=False,
+                                       sort_keys=True).encode("utf-8")).hexdigest()
     return name, model, prompt, digest
 
 

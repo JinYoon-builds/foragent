@@ -1055,3 +1055,52 @@ def test_preread_uses_the_lane_executor_and_model_like_the_runner(publishing, pl
     assert order.preread_target(plan, plan["issues"][1], config)[:2] == ("codex", "base-model")
     other = replace(config, lanes={"api": {**config.lanes["api"], "model": "other-model"}})
     assert order.preread_target(plan, plan["issues"][0], other)[3] != digest
+
+
+@pytest.mark.parametrize("change", ["own_size", "other_goal", "other_size", "other_acceptance"])
+def test_preread_evidence_covers_the_whole_plan(publishing, plan, change):
+    config, item = publishing[1], plan["issues"][0]
+    before = order.preread_target(plan, item, config)[3]
+    if change == "own_size":
+        item["size"] = "l"
+    elif change == "other_goal":
+        plan["issues"][1]["goal"] += " Keep the locale."
+    elif change == "other_size":
+        plan["issues"][1]["size"] = "m"
+    else:
+        plan["issues"][1]["acceptance_files"] = {"tests/acceptance/other.py": "assert True\n"}
+    assert order.preread_target(plan, item, config)[3] != before
+
+
+def test_preread_gate_rejects_stale_evidence_after_another_issue_changes(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config = publishing[0], publishing[1]
+    for item in plan["issues"]:
+        _record_preread(root, config, plan, item, [])
+    plan["issues"][1]["size"] = "l"
+    with pytest.raises(order.PlanError, match="no preread of the current content"):
+        publish(publishing, plan, approve_keys=["api"])
+    assert publishing[4] == []
+
+
+@pytest.mark.parametrize("recorded", [None, "client_unknown"])
+def test_preread_gate_covers_numbers_of_children_created_now(publishing, plan, monkeypatch, recorded):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config = publishing[0], publishing[1]
+    if recorded:
+        _record_preread(root, config, plan, plan["issues"][0], [])
+        _record_preread(root, config, plan, plan["issues"][1], ["Which locale?"])
+    # First publication: #3 will be the new client child, so the gate must not let it through.
+    with pytest.raises(order.PlanError, match="client"):
+        publish(publishing, plan, approve_numbers=[3])
+    assert publishing[4] == [] and publishing[2].issues == {}
+
+
+def test_preread_gate_passes_numbers_of_new_children_after_clean_preread(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config = publishing[0], publishing[1]
+    for item in plan["issues"]:
+        _record_preread(root, config, plan, item, [])
+    publish(publishing, plan, approve_numbers=[3])
+    assert "approved" in publishing[2].get_issue(3).labels
+    assert "approved" not in publishing[2].get_issue(2).labels
