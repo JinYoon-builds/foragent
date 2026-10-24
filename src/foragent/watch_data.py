@@ -4,10 +4,11 @@ Runtime dependencies resolve through foragent.watch to preserve its patch points
 """
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from foragent import orch_inbox
 from foragent.config import Config
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
@@ -23,6 +24,8 @@ class Snapshot:
     eta: datetime | None
     events: list[dict[str, Any]]
     captured_at: datetime
+    # The durable request box (D76), oldest first.
+    requests: list[dict[str, Any]] = field(default_factory=list)
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -106,4 +109,9 @@ def collect(
         workloads = watch.Counter(watch.issue_lane(issue.labels, config.lanes) for issue in children if issue.state == "open")
         batches = max(max(workloads.values()), sum(workloads.values()) / (config.max_parallel or len(workloads)))
         eta = now + watch.timedelta(seconds=batches * sum(durations) / len(durations))
-    return watch.Snapshot(status, done, order, completed, len(children), eta, watch.recent_events(store), now)
+    try:
+        requests = orch_inbox.requests(store)
+    except (OSError, ValueError):
+        requests = []  # An unreadable box must not take the whole view down.
+    return watch.Snapshot(status, done, order, completed, len(children), eta, watch.recent_events(store), now,
+                          requests)

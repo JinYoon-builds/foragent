@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date, timedelta
@@ -68,6 +69,13 @@ class PublishingGit:
 
     def push_base(self, branch):
         self.events.append(("push", branch))
+
+    @contextmanager
+    def publish_lock(self):
+        yield
+
+    def update_base(self, branch):
+        pass
 
 
 class PublishingTracker(FakeTracker):

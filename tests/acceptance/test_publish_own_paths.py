@@ -14,6 +14,36 @@ from test_publish_out_of_scope import publish_cli
 from test_skills_autosync import isolated_home
 
 
+def with_clean_preread(main, monkeypatch):
+    """Publishing with --approve needs a clean preread (#237). These tests are about
+    other behaviour, so record one with a worker that has no unknowns first. Before
+    the preread command exists, the extra call is a no-op."""
+    from foragent import executors
+    from foragent.executors import ExecResult
+
+    class NoUnknowns:
+        def run(self, **kwargs):
+            return ExecResult(0, False, "NONE", kwargs.get("log_path"))
+
+    import foragent.cli as cli_module
+    import foragent.order as order_module
+
+    for module in (executors, cli_module, order_module):
+        if hasattr(module, "executor_for"):
+            monkeypatch.setattr(module, "executor_for", lambda name: NoUnknowns())
+
+    def wrapped(argv):
+        if argv[:2] == ["order", "publish"] and "--approve" in argv and "--dry-run" not in argv:
+            extra = ["--repo-root", argv[argv.index("--repo-root") + 1]] if "--repo-root" in argv else []
+            try:
+                main(["order", "preread", argv[2], *extra])
+            except SystemExit:
+                pass  # No preread command yet: nothing to record.
+        return main(argv)
+
+    return wrapped
+
+
 def draft_plan(directory, value):
     """The interviewer supplies a plan outside the shared clone."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -36,7 +66,7 @@ def test_publish_own_paths_preserves_other_session_work_on_latest_main(
     # Scope isolation already works on an unchanged main. Exercise it together
     # with remote advancement so this regression test is red on current code.
     root, _, _, _, _, origin = offline_publication
-    main = publish_cli(offline_publication[:5], monkeypatch)
+    main = with_clean_preread(publish_cli(offline_publication[:5], monkeypatch), monkeypatch)
     path = draft_plan(root.parent / "interview-drafts", plan)
     initial = git_command(root, "rev-parse", "HEAD")
     tracked = root / ACCEPTANCE
@@ -82,7 +112,7 @@ def test_publish_own_paths_simultaneous_publishes_both_land_in_order(
     offline_publication, plan, monkeypatch, capsys,
 ):
     root, _, tracker, _, _, origin = offline_publication
-    main = publish_cli(offline_publication[:5], monkeypatch)
+    main = with_clean_preread(publish_cli(offline_publication[:5], monkeypatch), monkeypatch)
     initial = git_command(origin, "rev-parse", "main")
     second_plan = deepcopy(plan)
     second_plan["id"] = "2026-10-23-second-order"
