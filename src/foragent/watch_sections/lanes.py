@@ -20,17 +20,12 @@ def _overview(snapshot: Snapshot, language: str) -> list[Line]:
     state = "watch_handling" if status["summary"]["blocked"] else "watch_monitoring"
     overview = [watch._line(t(state), "yellow" if status["summary"]["blocked"] else "green")]
     if snapshot.order:
-        filled = round(10 * snapshot.completed / snapshot.total) if snapshot.total else 0
+        # The combined bar and finish time live in the progress section.
         overview += [watch._line(t("watch_order") + f" #{snapshot.order.number}"),
-                     watch._line(snapshot.order.title),
-                     watch._line("▓" * filled + "░" * (10 - filled) + f" {snapshot.completed}/{snapshot.total}", "green")]
+                     watch._line(snapshot.order.title)]
     else:
         overview.append(watch._line(t("watch_no_order")))
     overview.append(watch._line(t("watch_waiting", **summary_values({"count": status["summary"]["waiting_human"]})), "bold"))
-    eta = (t("watch_complete") if snapshot.order and snapshot.completed == snapshot.total
-           else t("watch_eta", time="~" + snapshot.eta.astimezone().strftime("%H:%M") if snapshot.eta
-                  else t("watch_estimating") if snapshot.order else "—"))
-    overview.append(watch._line(eta))
     if snapshot.requests:
         count = lambda name: sum(row.get("status") == name for row in snapshot.requests)
         overview.append(watch._line(t("watch_requests", processing=count("processing"), done=count("done"))))

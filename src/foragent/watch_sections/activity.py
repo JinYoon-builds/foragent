@@ -38,7 +38,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             else:
                 # A clone run: its own phase and title, judged as a working run.
                 shown = {**row, "state": "working", "issue": number, "title": titles.get(number) or "",
-                         "phase": run["phase"] if run else None,
+                         "phase": run.get("phase") if run else None,
                          "last_activity_seconds": _age(run.get("last_activity_at") or run.get("started_at"),
                                                        snapshot.captured_at) if run else None}
             phase = "" if shown["state"] == "blocked" else watch.text(shown["phase"] or shown["state"], language)
