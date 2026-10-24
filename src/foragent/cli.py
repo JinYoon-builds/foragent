@@ -25,6 +25,7 @@ from foragent.launcher import spawn_notify, spawn_runner
 from foragent.inspect_runtime import InspectRuntimeError
 from foragent.scheduler import TickContext, tick
 from foragent.runner import RunContext, check_done, run_issue, run_tests
+from foragent.run_baseline import start_baseline_process
 from foragent.state import StateStore
 from foragent.status import collect as collect_status, summary_values, unknown as status_unknown
 from foragent.tracker import GhTracker, RecordingTracker, Tracker, TrackerError
@@ -101,6 +102,7 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--no-push", action="store_true")
     init.add_argument("--no-launchd", action="store_true")
     init.add_argument("--no-board", action="store_true")
+    init.add_argument("--board-map", help="Existing board columns: Backlog=Todo,Up next=Todo,In progress=Doing,Your turn=Review,Done=Done")
     init.add_argument("--dry-run", action="store_true")
     init.add_argument("--statusline", choices=("yes", "no"),
                       help="Answer the Claude statusline question without a prompt")
@@ -602,6 +604,7 @@ def main(argv: list[str] | None = None) -> int:
                 root, approvers=args.approvers, review=args.review, executor=args.executor,
                 run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
                 dry_run=args.dry_run, language=args.language, no_board=args.no_board,
+                board_map=args.board_map,
             )
             print(report.summary())
             if not args.dry_run:
@@ -718,6 +721,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo=repo, repo_root=root, tracker=tracker, store=store, config=config,
                 git=git, now=lambda: datetime.now(UTC), launcher=spawn_runner(root, store),
                 start_runs=not args.no_start,
+                baseline_launcher=start_baseline_process,
             ))
             if args.json:
                 print(json.dumps(asdict(report)))

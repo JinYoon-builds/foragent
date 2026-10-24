@@ -2,7 +2,9 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
@@ -24,6 +26,9 @@ def isolated_test_slots(tmp_path, monkeypatch):
     from foragent import capacity
 
     monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path / "machine-data")
+    # A gate or `fa test` parent marks its slot as held; that slot is not in this
+    # isolated root, so the mark must not turn the tests' own slots into no-ops.
+    monkeypatch.delenv(capacity.TEST_SLOT_ENV, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -81,12 +86,25 @@ class GitHistory:
         self.tip = git_command(self.origin, "rev-parse", "refs/heads/main")
 
 
-@pytest.fixture
-def git_history(tmp_path):
-    origin = tmp_path / "origin.git"
-    clone = tmp_path / "clone"
-    git_command(tmp_path, "init", "--bare", "--initial-branch=main", str(origin))
+@cache
+def _git_history_template(session_root: Path) -> GitHistory:
+    root = session_root / "git-history-template"
+    root.mkdir()
+    origin = root / "origin.git"
+    clone = root / "clone"
+    git_command(root, "init", "--bare", "--initial-branch=main", str(origin))
     history = GitHistory(origin, clone)
     history.update({ACCEPTANCE: "def test_feature():\n    assert True\n"})
-    git_command(tmp_path, "clone", str(origin), str(clone))
+    git_command(root, "clone", str(origin), str(clone))
     return history
+
+
+@pytest.fixture
+def git_history(tmp_path):
+    # pytest gives every session (and xdist worker) its own tmp_path parent.
+    # Only the template is cached; each test owns its files, objects and refs.
+    template = _git_history_template(tmp_path.parent)
+    origin = shutil.copytree(template.origin, tmp_path / "origin.git")
+    clone = shutil.copytree(template.clone, tmp_path / "clone")
+    git_command(clone, "config", "remote.origin.url", str(origin))
+    return GitHistory(origin, clone, template.tip)

@@ -10,12 +10,15 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
 from typing import Any, BinaryIO
 
 WRAPPER_COMMAND = "fa statusline"
+# Set while the previous command runs, so a nested wrapper never runs it again.
+NESTED_ENV = "FORAGENT_STATUSLINE_ACTIVE"
 PROMPT = ("Install the Foragent statusline in Claude Code? It records Claude's rate limits "
           "and still shows your current statusline unchanged. [y/N] ")
 
@@ -58,6 +61,22 @@ def _read_json(path: Path) -> Any:
         return None
 
 
+def is_wrapper(command: str) -> bool:
+    """True when a shell command runs `fa statusline` (any spacing, quoting or path to fa)."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    while words and "=" in words[0] and not words[0].startswith("="):
+        words = words[1:]  # leading VAR=value assignments
+    if not words:
+        return False
+    program = Path(words[0]).name
+    if program == "fa":
+        return words[1:] == ["statusline"]
+    return program.startswith("python") and words[1:] == ["-m", "foragent.cli", "statusline"]
+
+
 def load_record() -> dict | None:
     record = _read_json(record_path())
     return record if isinstance(record, dict) else None
@@ -88,9 +107,11 @@ def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
         print(f"fa statusline: could not record rate limits: {exc}", file=sys.stderr)
     record = load_record() or {}
     previous = record.get("previous_command")
-    if not isinstance(previous, str) or not previous.strip():
+    if (not isinstance(previous, str) or not previous.strip() or is_wrapper(previous)
+            or os.environ.get(NESTED_ENV)):
         return 0
-    result = subprocess.run(previous, shell=True, input=raw, stdout=subprocess.PIPE, check=False)
+    env = {**os.environ, NESTED_ENV: "1"}
+    result = subprocess.run(previous, shell=True, input=raw, stdout=subprocess.PIPE, env=env, check=False)
     stdout.write(result.stdout)
     stdout.flush()
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
@@ -120,7 +141,7 @@ def offer_install(ask: Callable[[str], str] = input) -> str:
     current = settings.get("statusLine")
     current = current if isinstance(current, dict) else {}
     command = current.get("command") if current.get("type") == "command" else None
-    previous = command if isinstance(command, str) and command.strip() != WRAPPER_COMMAND else None
+    previous = command if isinstance(command, str) and command.strip() and not is_wrapper(command) else None
     # Record first: a wrapper in settings without its record would hide the user's statusline.
     _write_json(record_path(), {"enabled": True, "previous_command": previous})
     settings["statusLine"] = {**current, "type": "command", "command": WRAPPER_COMMAND}

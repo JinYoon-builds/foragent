@@ -20,12 +20,20 @@ description: Set up a project folder for Foragent.
    - Executor: codex (recommended), or claude.
 
 3. Run `fa init --review <mode> --executor <executor>` in the project folder and
-   show its summary. `fa init` offers one optional account-wide step: wrapping
+   show its summary. New boards get five Status columns: 🗂 Backlog, 🌰 Up next,
+   🐿 In progress, ✋ Your turn, 📦 Done. A blocked card stays in 🐿 In progress;
+   its `blocked` label is the ⚠. If init stops because an existing team
+   board needs a mapping, show its column names and ask once which column each
+   group uses (Backlog, Up next, In progress, Your turn, Done). Then rerun
+   `fa init ... --board-map 'Backlog=<col>,Up next=<col>,In progress=<col>,Your turn=<col>,Done=<col>'`.
+   An existing board that already has these five columns is mapped without asking.
+   The mapping is saved as `board_map` in `.foragent.yml`; later inits do not ask again.
+   `fa init` offers one optional account-wide step: wrapping
    Claude Code's statusline with `fa statusline`, which records Claude's rate
    limits and still runs the person's current statusline unchanged. When the
    command cannot prompt (no terminal), ask this once with AskUserQuestion (or the
-   available question tool): Yes (recommended) or No, then rerun with `--statusline yes|no`. Either answer is remembered and
-   never asked again; skip the question if the summary already reports a decision.
+   available question tool): Yes (recommended) or No, then rerun with
+   `--statusline yes|no`. Either answer is remembered and never asked again; skip the question if the summary already reports a decision.
 
 4. Run `fa adopt survey --json` after setup. When `kind` is `existing`,
    complete steps 5–8 in order. When it is `empty`, go to step 9.
