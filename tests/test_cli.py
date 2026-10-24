@@ -300,7 +300,7 @@ def test_init_cli_passes_all_flags_and_prints_summary(tmp_path, monkeypatch, cap
     ]) == 0
     assert calls == [(tmp_path, {
         "approvers": ["alice", "bob", "carol"], "review": "careful", "executor": "claude",
-        "run_hours": "22-08", "language": "ko", "no_push": True, "no_launchd": True, "no_board": True, "dry_run": True,
+        "run_hours": "22-08", "language": "ko", "no_push": True, "no_launchd": True, "no_board": True, "board_map": None, "dry_run": True,
     })]
     assert capsys.readouterr().out == "Setup summary\n"
 
@@ -314,7 +314,7 @@ def test_init_cli_defaults_to_cwd_and_default_options(tmp_path, monkeypatch, cap
         assert root == tmp_path
         assert kwargs == {
             "approvers": None, "review": None, "executor": None, "run_hours": None,
-            "no_push": False, "no_launchd": False, "no_board": False, "dry_run": False, "language": None,
+            "no_push": False, "no_launchd": False, "no_board": False, "board_map": None, "dry_run": False, "language": None,
         }
         return InitReport([], [], False)
 
