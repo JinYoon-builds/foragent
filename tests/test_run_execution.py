@@ -275,3 +275,48 @@ def test_implementation_text_does_not_pause_or_backoff(run_case, monkeypatch, me
     run = c.store.get_run(1)
     assert run.waited_seconds == 0 and run.attempts == (1 if success else 2)
     assert not c.store.lane_paused("main", c.now[0])
+
+
+def _codex_usage(reset, percent=100):
+    return json.dumps({"type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
+        "primary": {"used_percent": percent, "window_minutes": 300, "resets_at": int(reset.timestamp())}}}})
+
+
+def _claude_usage(reset):
+    return json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "rejected", "resetsAt": int(reset.timestamp()), "rateLimitType": "five_hour"}})
+
+
+def test_implementer_limit_pauses_its_executor_until_reported_reset(run_case, monkeypatch):
+    c = run_case
+    reset = (c.now[0] + timedelta(hours=2)).replace(microsecond=0)
+    event = _claude_usage(reset) if c.ctx.config.executor == "claude" else _codex_usage(reset)
+    scripted_results(c, monkeypatch, [(event, "limit")], log_only=True)
+    assert run_issue(1, c.ctx) == "limit-wait"
+    assert c.store.executor_paused(c.ctx.config.executor, reset - timedelta(seconds=1))
+    assert not c.store.executor_paused(c.ctx.config.executor, reset)
+    assert c.store.lane_paused("main", reset - timedelta(seconds=1))
+
+
+def test_reviewer_limit_with_exhausted_usage_waits_for_reset_without_retrying(run_case):
+    c = run_case
+    reset = (c.now[0] + timedelta(hours=3)).replace(microsecond=0)
+    calls = []
+
+    def review(**kwargs):
+        calls.append(kwargs)
+        kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        with kwargs["log_path"].open("a") as stream:
+            stream.write(_codex_usage(reset) + "\n")
+        return ExecResult(1, False, "usage limit", kwargs["log_path"], error_kind="limit")
+
+    enable_reviewer(c, [])
+    reviewer = c.ctx.executor_factory("codex")
+    reviewer.run = review
+    assert run_issue(1, c.ctx) == "limit-wait"
+    assert len(calls) == 1 and c.store.get_run(1).waited_seconds == 0
+    assert c.store.executor_paused("codex", reset - timedelta(seconds=1))
+    assert not c.store.executor_paused("codex", reset)
+    assert not c.store.executor_paused("claude", c.now[0])
+    assert c.store.load_flag(1) is None
+    assert "ready" in c.tracker.get_issue(1).labels and "running" not in c.tracker.get_issue(1).labels

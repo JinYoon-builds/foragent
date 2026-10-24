@@ -18,7 +18,7 @@ from foragent.capacity import (
     machine_load, machine_lock, machine_runs, next_parallel, read_state,
     update_test_slots, write_state,
 )
-from foragent.config import Config, in_run_hours
+from foragent.config import Config, in_run_hours, resolved_reviewer
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
@@ -832,6 +832,15 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     return report
 
 
+def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
+    """A lane waits while it, its implementer or its reviewer is paused for a usage limit."""
+    if ctx.store.lane_paused(lane, now):
+        return True
+    settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
+    config = replace(ctx.config, executor=settings.get("executor") or ctx.config.executor)
+    return any(ctx.store.executor_paused(name, now) for name in {config.executor, resolved_reviewer(config)})
+
+
 def _machine_budget(
     ctx: TickContext, ready: dict[str, list[int]], sample: tuple[str, float] | None = None,
 ) -> int:
@@ -841,7 +850,7 @@ def _machine_budget(
     # A crowded lane may add a clone; the file-overlap check runs at start time.
     waiting = sum(
         1 for lane, numbers in ready.items()
-        if _lane_has_room(lane_runs[lane], len(numbers)) and not ctx.store.lane_paused(lane, now)
+        if _lane_has_room(lane_runs[lane], len(numbers)) and not _lane_held(ctx, lane, now)
     )
     sample = sample if sample is not None else machine_load()
     pressure, load = sample
@@ -902,7 +911,7 @@ def _start_ready(
     for lane in sorted(ready, key=lane_order):
         if not _has_slot(ctx, budget):
             break
-        if ctx.store.lane_paused(lane, ctx.now()):
+        if _lane_held(ctx, lane, ctx.now()):
             continue
         for number in ready[lane]:
             local = _local_issue(ctx, number)
