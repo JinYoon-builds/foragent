@@ -754,7 +754,8 @@ def test_tick_returns_while_notification_child_is_still_running(app, monkeypatch
 
     def slow_notification(args, **kwargs):
         # Replace GitHub/osascript with a real offline child that stays busy.
-        child = popen([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+        child = popen([sys.executable, "-c", "import sys; sys.stdin.readline()"],
+                      **{**kwargs, "stdin": subprocess.PIPE})
         children.append(child)
         return child
 
@@ -769,8 +770,10 @@ def test_tick_returns_while_notification_child_is_still_running(app, monkeypatch
         assert store.load_inspect().notified_signature is None
     finally:
         for child in children:
-            child.terminate()
+            child.stdin.write(b"release\n")
+            child.stdin.flush()
             child.wait(timeout=5)
+            child.stdin.close()
 
 
 def test_status_groups_running_and_ready_by_lane(app, capsys):

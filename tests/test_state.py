@@ -41,6 +41,9 @@ def test_acceptance_baseline_cache_rejects_inconsistent_coverage(store, invalid)
 
 
 def _mutate_run(root, method, number, fields, connection, pause_read):
+    from foragent import processes
+
+    processes.list_processes = lambda: ()  # PIDs here are serialization fixtures.
     store = StateStore(root)
     if pause_read:
         original_get = store.get_run

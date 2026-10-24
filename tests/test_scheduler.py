@@ -10,7 +10,6 @@ import time
 
 import pytest
 
-REAL_SIGNALS_SKIP = pytest.mark.skip(reason='Sends real signals to real process groups; group numbers can be reused by other processes (PermissionError seen 2026-10-24). Rewrite on a fake process table with #261.')
 
 from foragent.capacity import write_state
 from foragent.config import Config
@@ -748,36 +747,21 @@ def test_runtime_backstop_outbox_survives_uncollected_old_comment_after_reset(ct
 
 @pytest.mark.parametrize("trigger", ["integrity", "timeout"])
 @pytest.mark.parametrize("force", [False, True])
-def test_tick_removes_registered_worktree_after_runner_termination(ctx, monkeypatch, trigger, force):
+def test_tick_removes_registered_worktree_after_runner_termination(ctx, monkeypatch, fake_process_table, trigger, force):
+    fake_process_table.add(4321, cwd=ctx.repo_root, start_time=10)
+    if force:
+        fake_process_table.ignore_term.add(4321)
     approve(ctx)
     tick(ctx)
     run = mark_running(ctx, pid=4321)
     path = ctx.store.worktree_path(1)
     ctx.git.add_worktree(path, run.branch, "origin/main")
     (path / "unfinished.txt").write_text("unfinished")
-    alive = [True]
-    signals = []
-
-    def killpg(pid, sig):
-        assert pid == 4321
-        if not alive[0]:
-            raise ProcessLookupError(pid)
-        signals.append(sig)
-        if sig == signal.SIGKILL or (sig == signal.SIGTERM and not force):
-            alive[0] = False
-
-    monkeypatch.setattr("foragent.processes.os.killpg", killpg)
-    waitpid = os.waitpid
-    monkeypatch.setattr(
-        "foragent.processes.os.waitpid",
-        lambda pid, options: (0, 0) if pid == 4321 else waitpid(pid, options),
-    )
-    monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: None)
     ctx.kill_runner = kill_process_group
     finish = ctx.store.finish_run
 
     def finish_after_cleanup(*args, **kwargs):
-        assert not alive[0] and not path.exists()
+        assert 4321 not in fake_process_table.live and not path.exists()
         assert str(path) not in git_command(ctx.repo_root, "worktree", "list")
         return finish(*args, **kwargs)
 
@@ -787,55 +771,36 @@ def test_tick_removes_registered_worktree_after_runner_termination(ctx, monkeypa
     else:
         ctx.now = lambda: NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 11)
     tick(ctx)
-    assert (signal.SIGKILL in signals) == force
+    assert any(sig == signal.SIGKILL for _, _, sig in fake_process_table.signals) == force
     assert ctx.store.get_run(1).outcome == "killed"
 
 
-@REAL_SIGNALS_SKIP
 @pytest.mark.parametrize("force", [False, True])
-def test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands(ctx, tmp_path, monkeypatch, force):
+def test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands(ctx, tmp_path, monkeypatch, fake_process_table, force):
+    from process_fakes import install_popen
+    from foragent import processes
+
     approve(ctx)
     tick(ctx)
     path = ctx.store.worktree_path(1)
     ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
-    ready = tmp_path / "polling"
-    script = """
-from pathlib import Path
-import signal, sys, time
-from foragent.processes import run_logged
-root, ready = map(Path, sys.argv[1:3])
-run_logged(['/bin/sh', '-c', 'true'], cwd=root, timeout_s=5, log_path=root / 'session.log')
-assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
-if sys.argv[3] == 'force':
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-ready.touch()
-time.sleep(60)
-"""
-    real_sleep = time.sleep
-    with subprocess.Popen(
-        [sys.executable, "-c", script, str(path), str(ready), "force" if force else "term"],
-        start_new_session=True,
-    ) as process:
-        try:
-            for _ in range(500):
-                if ready.exists() or process.poll() is not None:
-                    break
-                real_sleep(0.01)
-            assert ready.exists(), "runner did not reach CI polling"
-            mark_running(ctx, pid=process.pid)
-            edit_body(ctx, 1, BODY + "Changed scope\n")
-            ctx.kill_runner = kill_process_group
-            monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: real_sleep(min(seconds, 0.02)))
-            tick(ctx)
-            assert process.poll() is not None
-            assert ctx.store.get_run(1).outcome == "killed"
-            assert not path.exists()
-            assert str(path) not in git_command(ctx.repo_root, "worktree", "list")
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
-            ctx.git.remove_worktree(path)
+    # Complete one logged command and verify that its SIGTERM handler is restored.
+    previous = signal.getsignal(signal.SIGTERM)
+    install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["offline-executor"])
+    processes.run_logged(["offline-executor"], cwd=path, timeout_s=5, log_path=path / "session.log")
+    assert signal.getsignal(signal.SIGTERM) == previous
+    root = fake_process_table.add(42010, cwd=path, start_time=20)
+    if force:
+        fake_process_table.ignore_term.add(root.pid)
+    mark_running(ctx, pid=root.pid)
+    edit_body(ctx, 1, BODY + "Changed scope\n")
+    ctx.kill_runner = kill_process_group
+    tick(ctx)
+    assert root.pid not in fake_process_table.live
+    assert any(sig == signal.SIGKILL for _, _, sig in fake_process_table.signals) is force
+    assert ctx.store.get_run(1).outcome == "killed"
+    assert not path.exists()
+    assert str(path) not in git_command(ctx.repo_root, "worktree", "list")
 
 
 def test_failed_termination_keeps_worktree_and_active_record(ctx):
@@ -1678,7 +1643,9 @@ def test_stall_intent_survives_runner_finishing_during_termination(ctx):
 
 
 @pytest.mark.parametrize("previous_restarts", [0, 1])
-def test_successful_stall_kill_keeps_count_when_locked_worktree_cleanup_fails(ctx, monkeypatch, previous_restarts):
+def test_successful_stall_kill_keeps_count_when_locked_worktree_cleanup_fails(ctx, monkeypatch, fake_process_table, previous_restarts):
+    fake_process_table.add(4321, cwd=ctx.repo_root, start_time=10)
+    fake_process_table.ignore_term.add(4321)
     approve(ctx)
     tick(ctx)
     run = mark_running(ctx, pid=4321)
@@ -1686,28 +1653,14 @@ def test_successful_stall_kill_keeps_count_when_locked_worktree_cleanup_fails(ct
     path = ctx.store.worktree_path(1)
     ctx.git.add_worktree(path, run.branch, "origin/main")
     git_command(ctx.repo_root, "worktree", "lock", str(path))
-    alive = [True]
-    signals = []
-
-    def killpg(pid, sig):
-        assert pid == 4321
-        signals.append(sig)
-        if not alive[0]:
-            raise ProcessLookupError(pid)
-        if sig == signal.SIGKILL:
-            alive[0] = False
-
-    waitpid = os.waitpid
-    monkeypatch.setattr("foragent.processes.os.killpg", killpg)
-    monkeypatch.setattr("foragent.processes.os.waitpid", lambda pid, options: (0, 0) if pid == 4321 else waitpid(pid, options))
-    monkeypatch.setattr("foragent.processes.time.sleep", lambda seconds: None)
     ctx.kill_runner = kill_process_group
     ctx.now = lambda: NOW + timedelta(minutes=31)
     with pytest.raises(GitError, match="locked"):
         tick(ctx)
     stalled = ctx.store.get_run(1)
     outcome = "stalled-restart" if previous_restarts == 0 else "stalled"
-    assert not alive[0] and signal.SIGKILL in signals
+    assert 4321 not in fake_process_table.live
+    assert ("pid", 4321, signal.SIGKILL) in fake_process_table.signals
     assert stalled.status == "running" and stalled.restarts == previous_restarts + 1
     assert stalled.outcome == outcome
     git_command(ctx.repo_root, "worktree", "unlock", str(path))
@@ -2457,11 +2410,13 @@ def test_dead_run_with_recorded_completion_does_not_signal_group(ctx, monkeypatc
     assert recovery_events(ctx) == []
 
 
-def test_crash_recovery_with_default_killer_tolerates_missing_group(ctx, monkeypatch):
+def test_crash_recovery_with_default_killer_tolerates_missing_group(ctx, monkeypatch, fake_process_table):
+    fake_process_table.add(4321, cwd=ctx.repo_root, start_time=10)
     approve(ctx)
     tick(ctx)
     run = mark_running(ctx, pid=4321)
     ctx.git.add_worktree(ctx.store.worktree_path(1), run.branch, "origin/main")
+    fake_process_table.exit(4321)
     monkeypatch.setattr("foragent.scheduler.os.kill", dead_process)
     calls = []
 
@@ -2476,7 +2431,7 @@ def test_crash_recovery_with_default_killer_tolerates_missing_group(ctx, monkeyp
     remove_worktree = ctx.git.remove_worktree
 
     def remove_after_kill(path):
-        assert calls == [(4321, signal.SIGTERM)]
+        assert calls == []
         remove_worktree(path)
 
     monkeypatch.setattr(ctx.git, "remove_worktree", remove_after_kill)
@@ -2487,7 +2442,7 @@ def test_crash_recovery_with_default_killer_tolerates_missing_group(ctx, monkeyp
     assert not ctx.store.worktree_path(1).exists()
     assert [event["kind"] for event in recovery_events(ctx)] == ["crash-restart"]
     tick(ctx)
-    assert calls == [(4321, signal.SIGTERM)]
+    assert calls == []
 
 
 def test_overdue_blocker_escalation_is_journaled_once(ctx):
