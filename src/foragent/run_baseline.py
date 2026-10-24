@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
-import fcntl
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING
+import threading
+from typing import IO, TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
 from foragent.run_attempt import AttemptFailure
@@ -31,6 +33,100 @@ class AcceptanceBaseline:
     node_ids: tuple[str, ...]
     collected_ids: tuple[str, ...] | None = None
     failing_ids: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class BaselineBuild:
+    """Freeze the cache identity before a background build queues for a slot."""
+
+    base_sha: str
+    test_command: str
+    excluded: list[str]
+    key: str
+    scope: str
+
+
+def _baseline_build(ctx: RunContext, test_command: str, target_ref: str, log: Path) -> BaselineBuild:
+    base_sha = ctx.git.ref_sha(target_ref)
+    excluded = _baseline_exclusions(ctx, base_sha, log)
+    _, key = _baseline_cache(ctx, test_command, base_sha, excluded)
+    scope = sha256(json.dumps(_baseline_identity(ctx, test_command, base_sha), sort_keys=True).encode()).hexdigest()
+    return BaselineBuild(base_sha, test_command, excluded, key, scope)
+
+
+def _build_baseline(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> None:
+    from foragent import capacity, runner
+
+    cache = StateStore(ctx.store.root.parent / "baselines", now=ctx.now)
+    log = cache.root / f"{build.key}.log"
+    with lock:
+        try:
+            _capture_baseline(
+                ctx, build.test_command, build.base_sha, log=log,
+                report=cache.root / f"{build.key}.xml",
+                check=lambda command, root: runner._check(
+                    command, root, log, 900, slot=capacity.hold_test_slot(ctx.config.test_slots)),
+                prepare=lambda: None, wait=lambda acquire: acquire(), build=build, lock=lock,
+            )
+        except Exception as exc:
+            # No failure marker is cached: a later tick can reserve the key again.
+            _append(log, f"Acceptance baseline build failed for {build.base_sha}: {exc}")
+
+
+def start_baseline_thread(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> None:
+    """Background launcher for callers that own a persistent Python process."""
+    threading.Thread(target=_build_baseline, args=(ctx, build, lock), daemon=True).start()
+
+
+def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> None:
+    """The short-lived gate CLI hands its reservation to an independent process."""
+    from dataclasses import asdict
+    from foragent import capacity
+
+    request = {
+        "repo_root": str(ctx.repo_root.resolve()), "store_root": str(ctx.store.root.resolve()),
+        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots,
+        "machine_root": str(capacity.machine_root().resolve()),
+        "build": asdict(build),
+    }
+    log = ctx.store.root.parent / "baselines" / f"{build.key}.log"
+    with log.open("ab") as stream:
+        subprocess.Popen(
+            [sys.executable, "-m", "foragent.run_baseline", json.dumps(request), str(lock.fileno())],
+            pass_fds=(lock.fileno(),), stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
+            start_new_session=True,
+            env={name: value for name, value in os.environ.items() if name != capacity.TEST_SLOT_ENV},
+        )
+    lock.close()
+
+
+def prebuild_acceptance_baseline(ctx: RunContext, target_ref: str, launch: Callable) -> None:
+    """Reserve one cold key and start it without waiting for either tests or slots."""
+    from foragent import runner
+    from foragent.orch_events import append_event
+
+    test_command = ctx.config.test_command or next(iter(runner.detect_test_commands(ctx.repo_root)), None)
+    if test_command is None or _pytest_command(test_command) is None:
+        return
+    log = ctx.store.root / "baseline-build.log"
+    build = _baseline_build(ctx, test_command, target_ref, log)
+    cache = StateStore(ctx.store.root.parent / "baselines", now=ctx.now)
+    if cache.load_acceptance_baseline(build.key) is not None:
+        return
+    lock = cache.lock_acceptance_baseline(build.key, blocking=False)
+    if lock is None:
+        return
+    try:
+        # A producer may have published between our initial read and reservation.
+        if cache.load_acceptance_baseline(build.key) is not None:
+            lock.close()
+            return
+        append_event(ctx.store, ctx.now(), None, "baseline-build",
+                     f"Building acceptance baseline for {build.base_sha} (key={build.key})")
+        launch(ctx, build, lock)
+    except Exception as exc:
+        lock.close()
+        _append(log, f"Acceptance baseline launch failed for {build.base_sha}: {exc}")
 
 
 def _baseline_environment(root: Path) -> dict:
@@ -126,6 +222,7 @@ def _capture_baseline(
     ctx: RunContext, test_command: str | None, target_ref: str, *, log: Path, report: Path,
     check: Callable[[str, Path], CheckResult], prepare: Callable[[], None],
     wait: Callable[[Callable[[], object]], None], required_ids: frozenset[str] | None = None,
+    build: BaselineBuild | None = None, lock: IO[str] | None = None,
 ) -> AcceptanceBaseline | None:
     """Share capture, safety validation and cache identity across runner and premerge."""
     command = _pytest_command(test_command) if test_command else None
@@ -133,10 +230,9 @@ def _capture_baseline(
         reason = "no test command is known" if test_command is None else f"not a supported pytest command: {test_command}"
         _append(log, f"Acceptance baseline skipped (count=0): {reason}")
         return None
-    base_sha = ctx.git.ref_sha(target_ref)
-    excluded = _baseline_exclusions(ctx, base_sha, log)
-    cache, key = _baseline_cache(ctx, test_command, base_sha, excluded)
-    cache.root.mkdir(parents=True, exist_ok=True)
+    build = build or _baseline_build(ctx, test_command, target_ref, log)
+    base_sha, excluded, key = build.base_sha, build.excluded, build.key
+    cache = StateStore(ctx.store.root.parent / "baselines", now=ctx.now)
     cached_ids = cache.root / f"{key}.json"
 
     def save_baseline(node_ids: tuple[str, ...], collected_ids: tuple[str, ...],
@@ -144,18 +240,23 @@ def _capture_baseline(
         cache._atomic_write(cached_ids, json.dumps({
             "node_ids": node_ids, "collected_ids": collected_ids, "failing_ids": failing_ids,
             "excluded": excluded,
-            "scope": sha256(json.dumps(_baseline_identity(ctx, test_command, base_sha),
-                                       sort_keys=True).encode()).hexdigest(),
+            "scope": build.scope,
             "created_at": ctx.now().isoformat(),
         }) + "\n")
 
-    with (cache.root / f"{key}.lock").open("a", encoding="utf-8") as lock:
-        prepare()
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    prepare()
+    if lock is None:
+        lock = cache.lock_acceptance_baseline(key, blocking=False)
+        if lock is None:
             # Another run builds this baseline (possibly queued for a test slot); not our run time.
-            wait(lambda: fcntl.flock(lock.fileno(), fcntl.LOCK_EX))
+            def acquire():
+                nonlocal lock
+                lock = cache.lock_acceptance_baseline(key)
+            wait(acquire)
+        ownership = lock
+    else:
+        ownership = nullcontext(lock)
+    with ownership:
         saved = cache.load_acceptance_baseline(key)
         if saved is not None and (required_ids is None or
                                   {"collected_ids", "failing_ids", "excluded"} <= saved.keys()):
@@ -253,3 +354,21 @@ def _capture_baseline(
                 return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids)
             finally:
                 ctx.git.remove_worktree(worktree)
+
+
+if __name__ == "__main__":
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.git import GitRepo
+    from foragent import capacity
+
+    request = json.loads(sys.argv[1])
+    capacity.machine_root = lambda: Path(request["machine_root"])
+    root = Path(request["repo_root"])
+    context = SimpleNamespace(
+        repo_root=root, store=StateStore(Path(request["store_root"])), git=GitRepo(root),
+        config=Config(acceptance_dir=request["acceptance_dir"], test_slots=request["test_slots"]),
+        now=lambda: datetime.now(UTC),
+    )
+    _build_baseline(context, BaselineBuild(**request["build"]), os.fdopen(int(sys.argv[2]), "a"))
