@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
+from foragent.scheduler_stop import (
+    _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes,
+)
+from foragent.state import Run
 from foragent.tracker import Issue
 
 if TYPE_CHECKING:
@@ -43,24 +47,28 @@ def _remove_run_worktree(
 def _kill_run(
     ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
     count_stall: bool = False, detail: str = "",
-) -> None:
+) -> bool:
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
-        return
+        return False
     if count_stall:
         ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
     try:
-        if run.pid is not None:
-            with processes.recorded_tree(run.process_identities):
-                ctx.kill_runner(run.pid)
-        scheduler._kill_executor(ctx, number)
+        stopped = _stop_run_processes(ctx, run, report)
     except Exception:
         if count_stall:
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         raise
+    if stopped != "stopped":
+        if count_stall:
+            ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
+        if stopped == "gone":
+            _finish_dead_run(ctx, run, report)
+        return False
     scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome)
     ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
     report.actions.append(f"#{number} runner killed")
+    return True
 
 
 def _crash_detail(ctx: TickContext, number: int) -> str:
@@ -197,49 +205,48 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         ):
             dead = True  # Never probe a replacement as if it were the recorded runner.
         else:
-            try:
-                scheduler.os.kill(run.pid, 0)
-            except ProcessLookupError:
-                dead = True
-            except PermissionError:
-                dead = False
-            else:
-                dead = False
+            dead = not _pid_exists(run.pid)
         # The runner may have finished while another run or its process was checked.
         run = ctx.store.get_run(run.number)
         if run is None or run.status != "running":
             continue
         if not dead:
+            if _stop_already_refused(ctx, run):
+                continue
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
             runtime = (ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
-                scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit.")
-                scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
-                report.actions.append(f"#{run.number} flagged timeout")
+                if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit."):
+                    scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
+                    report.actions.append(f"#{run.number} flagged timeout")
             elif run.pid is not None and not waiting and ctx.now() - scheduler.datetime.fromisoformat(
                 run.last_progress_at or run.started_at,
             ) > scheduler.timedelta(minutes=ctx.config.stall_minutes):
                 restarts = run.restarts + 1
                 outcome = "stalled-restart" if restarts <= 1 else "stalled"
-                scheduler._kill_run(ctx, run.number, report, outcome=outcome, count_stall=True,
-                          detail="Runner stopped making progress past the stall limit.")
-                scheduler._restore_stalled(ctx, run.number, restarts, report)
+                if scheduler._kill_run(ctx, run.number, report, outcome=outcome, count_stall=True,
+                          detail="Runner stopped making progress past the stall limit."):
+                    scheduler._restore_stalled(ctx, run.number, restarts, report)
             continue
         # Clean up a crashed group or finish an interrupted stall termination.
         # A recorded completion does not need another signal.
-        if run.pid is not None and run.outcome in {None, "crashed", "stalled-restart", "stalled"}:
-            with processes.recorded_tree(run.process_identities):
-                ctx.kill_runner(run.pid)
-        scheduler._kill_executor(ctx, run.number)
-        outcome = run.outcome or "crashed"
-        scheduler._remove_run_worktree(ctx, run.number, scheduler.Path(run.worktree), report, outcome=outcome)
-        detail = scheduler._crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
-        finished = ctx.store.finish_run(run.number, outcome=outcome, detail=detail)
-        if finished.outcome in {"stalled-restart", "stalled"}:
-            scheduler._restore_stalled(ctx, run.number, finished.restarts, report)
-            continue
-        if finished.outcome != "crashed":
-            continue
+        stopped = _stop_run_processes(
+            ctx, run, report, stop_runner=run.outcome in {None, "crashed", "stalled-restart", "stalled"},
+        )
+        if stopped != "refused":
+            _finish_dead_run(ctx, run, report)
+
+
+def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
+    outcome = run.outcome or "crashed"
+    if run.executor_pgid is not None:
+        ctx.store.update_run(run.number, executor_pgid=None)
+    scheduler._remove_run_worktree(ctx, run.number, scheduler.Path(run.worktree), report, outcome=outcome)
+    detail = scheduler._crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
+    finished = ctx.store.finish_run(run.number, outcome=outcome, detail=detail)
+    if finished.outcome in {"stalled-restart", "stalled"}:
+        scheduler._restore_stalled(ctx, run.number, finished.restarts, report)
+    elif finished.outcome == "crashed":
         report.actions.append(f"#{run.number} runner crashed")
         issue = ctx.tracker.get_issue(run.number)
         scheduler._restore_after_crash(ctx, issue, report)
@@ -253,8 +260,19 @@ def _reap_inactive_runs(ctx: TickContext, report: TickReport) -> None:
             continue
         if not run.process_identities:
             continue
-        with processes.recorded_tree(run.process_identities):
-            count = processes.kill_process_group(run.pid or run.executor_pgid or run.process_identities[0]["pid"])
+        if _stop_already_refused(ctx, run):
+            continue
+        try:
+            with processes.recorded_tree(run.process_identities):
+                count = processes.kill_process_group(run.pid or run.executor_pgid or run.process_identities[0]["pid"])
+        except (ValueError, PermissionError, TimeoutError) as exc:
+            try:
+                if not _run_processes_exist(run):
+                    continue
+            except PermissionError:
+                pass
+            _flag_stop_refused(ctx, run, report, exc)
+            continue
         if count:
             summary = f"Reaped {count} owned processes from inactive run."
             scheduler.append_event(ctx.store, ctx.now(), run.number, "orphans-reaped", summary)
