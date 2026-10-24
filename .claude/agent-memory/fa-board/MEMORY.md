@@ -14,3 +14,5 @@
 - 새 저장소의 `init` 기본 도구는 설치 여부가 아니라 `codex login status`의 종료 코드와 `claude auth status`의 JSON `loggedIn`으로 확인한다. 누락·시간 초과·잘못된 응답은 로그인 사실로 인정하지 않는다. 기존 설정은 재탐지하지 않고 보존한다.
 - Claude 작업자에 기본 교차 리뷰를 그대로 두면 `resolved_reviewer`가 Codex를 고르므로, Claude를 고를 때 `reviewer: claude`도 저장한다. 리뷰의 새 세션은 기존 `ClaudeExecutor`의 별도 `claude -p /code-review ...` 프로세스로 보장된다.
 - `tests/test_init.py::setup`은 도구 상태 확인을 subprocess 경계에서 오프라인으로 대체한다. 이 fixture를 가져오는 잠긴 인수 테스트는 같은 경계에서 로그인 사실을 다시 주입하므로, 초기화 함수 자체를 가짜로 바꾸지 않는다. 집중 검증은 `uv run pytest tests/acceptance/test_claude_only.py`다.
+- `fa statusline`(statusline.py)는 Claude Code가 매 갱신마다 부르므로 `cli.main`에서 parser 전에 분기한다. init의 설치 질문은 `builtins.input`으로 하고 EOF/OSError(pytest 캡처 stdin)는 "unanswered"로 기억하지 않는다. 비대화형은 `fa init --statusline yes|no`. 집중 확인: `fa test tests/acceptance/test_statusline_wrapper.py tests/test_statusline.py`.
+- 재시도 사유가 "내가 안 건드린 테스트/인수 파일 삭제"라면 작업 브랜치가 뒤처진 main 기준이라서다. `git fetch` 후 겹치는 파일이 없고 HEAD가 origin/main의 조상이면 `git reset --keep origin/main`으로 앞당긴다(커밋·브랜치 전환 없음, 작업 변경 유지).

@@ -1,0 +1,128 @@
+"""Claude Code statusline wrapper: record rate limits, pass the user's statusline through.
+
+Account-wide files under $XDG_DATA_HOME/foragent (default ~/.local/share/foragent):
+  claude-rate-limits.json  {seen_at: ISO UTC, rate_limits: the input object unchanged}
+  statusline-wrapper.json  {enabled: bool, previous_command: str | null}
+"""
+
+from collections.abc import Callable
+from datetime import UTC, datetime
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from typing import Any, BinaryIO
+
+WRAPPER_COMMAND = "fa statusline"
+PROMPT = ("Install the Foragent statusline in Claude Code? It records Claude's rate limits "
+          "and still shows your current statusline unchanged. [y/N] ")
+
+
+def data_dir() -> Path:
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
+    return Path(base) / "foragent"
+
+
+def usage_path() -> Path:
+    return data_dir() / "claude-rate-limits.json"
+
+
+def record_path() -> Path:
+    return data_dir() / "statusline-wrapper.json"
+
+
+def claude_settings_path() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    return Path(base) / "settings.json"
+
+
+def _write_json(path: Path, value: Any) -> None:
+    """Replace the file atomically so a concurrent reader never sees half a file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def load_record() -> dict | None:
+    record = _read_json(record_path())
+    return record if isinstance(record, dict) else None
+
+
+def record_usage(raw: bytes, now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> bool:
+    """Save rate_limits from statusline input; leave the last observation when absent."""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return False
+    limits = payload.get("rate_limits") if isinstance(payload, dict) else None
+    if not isinstance(limits, dict):
+        return False
+    _write_json(usage_path(), {"seen_at": now().astimezone(UTC).isoformat(), "rate_limits": limits})
+    return True
+
+
+def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
+    """Entry point for `fa statusline`; stdout is the previous command's bytes only."""
+    stdin = stdin or sys.stdin.buffer
+    stdout = stdout or sys.stdout.buffer
+    raw = stdin.read()
+    try:
+        record_usage(raw)
+    except OSError as exc:
+        # Recording is a side channel; the user's statusline must keep working.
+        print(f"fa statusline: could not record rate limits: {exc}", file=sys.stderr)
+    record = load_record() or {}
+    previous = record.get("previous_command")
+    if not isinstance(previous, str) or not previous.strip():
+        return 0
+    result = subprocess.run(previous, shell=True, input=raw, stdout=subprocess.PIPE, check=False)
+    stdout.write(result.stdout)
+    stdout.flush()
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+def offer_install(ask: Callable[[str], str] = input) -> str:
+    """Ask once whether to wrap Claude Code's statusline; remember either answer.
+
+    Returns "installed", "declined", "kept" (already decided), "skipped" (no
+    usable Claude settings) or "unanswered" (no answer could be read).
+    """
+    if load_record() is not None:
+        return "kept"
+    settings_file = claude_settings_path()
+    if not settings_file.parent.is_dir():
+        return "skipped"
+    settings = _read_json(settings_file) if settings_file.exists() else {}
+    if not isinstance(settings, dict):
+        return "skipped"
+    try:
+        answer = ask(PROMPT)
+    except (EOFError, OSError):
+        return "unanswered"
+    if answer.strip().lower() not in {"y", "yes"}:
+        _write_json(record_path(), {"enabled": False, "previous_command": None})
+        return "declined"
+    current = settings.get("statusLine")
+    current = current if isinstance(current, dict) else {}
+    command = current.get("command") if current.get("type") == "command" else None
+    previous = command if isinstance(command, str) and command.strip() != WRAPPER_COMMAND else None
+    # Record first: a wrapper in settings without its record would hide the user's statusline.
+    _write_json(record_path(), {"enabled": True, "previous_command": previous})
+    settings["statusLine"] = {**current, "type": "command", "command": WRAPPER_COMMAND}
+    _write_json(settings_file.resolve(), settings)
+    return "installed"

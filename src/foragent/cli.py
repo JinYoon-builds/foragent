@@ -102,6 +102,9 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--no-launchd", action="store_true")
     init.add_argument("--no-board", action="store_true")
     init.add_argument("--dry-run", action="store_true")
+    init.add_argument("--statusline", choices=("yes", "no"),
+                      help="Answer the Claude statusline question without a prompt")
+    commands.add_parser("statusline", help="Claude Code statusline: record rate limits, show your statusline")
     profile_command = commands.add_parser("profile", help="Save the project's confirmed profile")
     profile_actions = profile_command.add_subparsers(dest="action", required=True)
     profile_set = profile_actions.add_parser("set")
@@ -506,10 +509,25 @@ def _test_command(argv: list[str]) -> int:
         return 1
 
 
+def _offer_statusline(answer: str | None) -> None:
+    from foragent import statusline
+    outcome = statusline.offer_install(input if answer is None else lambda _prompt: answer)
+    if outcome == "installed":
+        print("Claude statusline: installed (your previous statusline still shows).")
+    elif outcome == "declined":
+        print("Claude statusline: not installed; Foragent will not ask again.")
+    elif outcome == "unanswered":
+        print("Claude statusline: not asked (no terminal); rerun with --statusline yes|no.")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["test"]:
         return _test_command(argv[1:])
+    if argv == ["statusline"]:
+        # Claude Code runs this on every refresh; keep it repository-free and byte-exact.
+        from foragent import statusline
+        return statusline.run()
     args = _parser().parse_args(argv)
     try:
         if args.command == "design":
@@ -587,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(report.summary())
             if not args.dry_run:
+                _offer_statusline(args.statusline)
                 _open_lane_view(report.normalized_root or root)
             return 0
         if args.command == "lanes":

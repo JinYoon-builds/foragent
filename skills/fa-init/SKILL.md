@@ -20,7 +20,12 @@ description: Set up a project folder for Foragent.
    - Executor: codex (recommended), or claude.
 
 3. Run `fa init --review <mode> --executor <executor>` in the project folder and
-   show its summary.
+   show its summary. `fa init` offers one optional account-wide step: wrapping
+   Claude Code's statusline with `fa statusline`, which records Claude's rate
+   limits and still runs the person's current statusline unchanged. When the
+   command cannot prompt (no terminal), ask this once with AskUserQuestion (or the
+   available question tool): Yes (recommended) or No, then rerun with `--statusline yes|no`. Either answer is remembered and
+   never asked again; skip the question if the summary already reports a decision.
 
 4. Run `fa adopt survey --json` after setup. When `kind` is `existing`,
    complete steps 5–8 in order. When it is `empty`, go to step 9.
