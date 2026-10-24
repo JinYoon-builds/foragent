@@ -3,12 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
-from fnmatch import translate
-from glob import has_magic
-import os
-from pathlib import Path, PurePosixPath
-import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from foragent import scheduler
@@ -16,6 +11,7 @@ from foragent.tracker import Issue
 
 if TYPE_CHECKING:
     from foragent.scheduler import TickContext
+
 
 def _filesystem_case_sensitive(repo_root: Path) -> bool | None:
     """Probe an existing root entry without creating or modifying any files."""
@@ -32,7 +28,7 @@ def _filesystem_case_sensitive(repo_root: Path) -> bool | None:
                     return True
             except OSError:
                 continue
-            return not os.path.samestat(original_stat, alternate_stat)
+            return not scheduler.os.path.samestat(original_stat, alternate_stat)
     except OSError:
         pass
     return None
@@ -82,7 +78,7 @@ def _file_patterns_overlap(left: str, right: str, *, case_sensitive: bool = True
         # Leave globs unchanged so ? and character classes keep their width.
         if (
             not case_sensitive and not (a + b).isascii()
-            and not has_magic(a) and not has_magic(b) and a.casefold() == b.casefold()
+            and not scheduler.has_magic(a) and not scheduler.has_magic(b) and a.casefold() == b.casefold()
         ):
             return True
         # Literal/range endpoints and their successors represent every distinct
@@ -97,7 +93,7 @@ def _file_patterns_overlap(left: str, right: str, *, case_sensitive: bool = True
         # Apply case equivalence to each token, preserving its width and the
         # original character classes (including punctuation inside [A-z]).
         matchers = {
-            token: re.compile(translate(token), 0 if case_sensitive else re.IGNORECASE)
+            token: scheduler.re.compile(scheduler.translate(token), 0 if case_sensitive else scheduler.re.IGNORECASE)
             for token in set(a_tokens + b_tokens)
         }
 
@@ -116,7 +112,7 @@ def _file_patterns_overlap(left: str, right: str, *, case_sensitive: bool = True
             a_tokens, b_tokens, "*", compatible,
         )
 
-    return intersect(PurePosixPath(left).parts, PurePosixPath(right).parts, "**", components_overlap)
+    return intersect(scheduler.PurePosixPath(left).parts, scheduler.PurePosixPath(right).parts, "**", components_overlap)
 
 
 def _lane_has_room(running: int, waiting: int) -> bool:
@@ -139,8 +135,8 @@ def _can_start_in_lane(ctx: TickContext, lane: str, issue: Issue, waiting: int) 
     # Legacy records can use a snapshot approved no later than the run start.
     if run.approval_body_sha is None:
         if (
-            datetime.fromisoformat(running_approval.approved_at)
-            > datetime.fromisoformat(run.started_at)
+            scheduler.datetime.fromisoformat(running_approval.approved_at)
+            > scheduler.datetime.fromisoformat(run.started_at)
         ):
             return False
     elif run.approval_body_sha != running_approval.body_sha:

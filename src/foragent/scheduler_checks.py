@@ -3,21 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict, replace
-from datetime import datetime, timedelta
-import re
 from typing import TYPE_CHECKING
 
-from foragent import board, scheduler
-from foragent.git import GitError
-from foragent.labels import BLOCKED, NEEDS_HUMAN, READY, RUNNING
-from foragent.orch_events import append_event
-from foragent.reasons import Reason, format_comment
+from foragent import scheduler
 from foragent.state import Approval
-from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, TrackerError, local_issue_models
+from foragent.tracker import Dependency, Issue, LabelEvent
 
 if TYPE_CHECKING:
     from foragent.scheduler import TickContext, TickReport
+
 
 def _confirmed_read(
     ctx: TickContext, number: int, name: str, read: Callable[[], object], *, confirmed: bool,
@@ -40,10 +34,10 @@ def _confirmed_read(
 
 def _label_events(ctx: TickContext, number: int, *, confirmed: bool) -> list[LabelEvent]:
     events = scheduler._confirmed_read(
-        ctx, number, "label_events", lambda: [asdict(event) for event in ctx.tracker.label_events(number)],
+        ctx, number, "label_events", lambda: [scheduler.asdict(event) for event in ctx.tracker.label_events(number)],
         confirmed=confirmed,
     )
-    return [LabelEvent(**event) for event in events]
+    return [scheduler.LabelEvent(**event) for event in events]
 
 
 def _open_pr(ctx: TickContext, number: int, *, confirmed: bool) -> int | None:
@@ -54,13 +48,13 @@ def _open_pr(ctx: TickContext, number: int, *, confirmed: bool) -> int | None:
 def _blockers(ctx: TickContext, number: int, *, confirmed: bool) -> list[Dependency]:
     # Each blocker is a fact link: a change to any blocker voids the remembered list.
     dependencies = scheduler._confirmed_read(
-        ctx, number, "blocked_by", lambda: [asdict(dependency) for dependency in ctx.tracker.blocked_by(number)],
+        ctx, number, "blocked_by", lambda: [scheduler.asdict(dependency) for dependency in ctx.tracker.blocked_by(number)],
         confirmed=confirmed, links=lambda value: [
             dependency["number"] if dependency.get("repository") is None
             else f"{dependency['repository']}#{dependency['number']}" for dependency in value
         ],
     )
-    return [Dependency(**dependency) for dependency in dependencies]
+    return [scheduler.Dependency(**dependency) for dependency in dependencies]
 
 
 def _check_prerequisites(
@@ -71,23 +65,23 @@ def _check_prerequisites(
     )
     if (
         latest_run is not None and latest_run.outcome == "merged"
-        and datetime.fromisoformat(approval.approved_at) <= datetime.fromisoformat(latest_run.started_at)
+        and scheduler.datetime.fromisoformat(approval.approved_at) <= scheduler.datetime.fromisoformat(latest_run.started_at)
     ):
-        if READY in issue.labels:
-            ctx.tracker.remove_labels(issue.number, [READY])
-        board.sync_status(ctx, issue, "Done")
+        if scheduler.READY in issue.labels:
+            ctx.tracker.remove_labels(issue.number, [scheduler.READY])
+        scheduler.board.sync_status(ctx, issue, "Done")
         return False
     if (
         scheduler._open_pr(ctx, issue.number, confirmed=confirmed) is not None
         and (latest_run is None or latest_run.outcome != "limit-wait")
     ):
-        if READY in issue.labels:
-            ctx.tracker.remove_labels(issue.number, [READY])
-        board.sync_status(ctx, issue, "PR open")
+        if scheduler.READY in issue.labels:
+            ctx.tracker.remove_labels(issue.number, [scheduler.READY])
+        scheduler.board.sync_status(ctx, issue, "PR open")
         return False
     if not scheduler.has_machine_check(scheduler.parse_body(approval.body)):
         scheduler.flag(
-            ctx, issue.number, Reason.NO_MACHINE_CHECK,
+            ctx, issue.number, scheduler.Reason.NO_MACHINE_CHECK,
             "Cannot promote: Done when has no machine check. Add an executable code block before resuming.",
         )
         report.actions.append(f"#{issue.number} flagged no-machine-check")
@@ -99,59 +93,59 @@ def _check_prerequisites(
     )
     if cancelled is not None:
         scheduler.flag(
-            ctx, issue.number, Reason.SPEC_QUESTION,
+            ctx, issue.number, scheduler.Reason.SPEC_QUESTION,
             f"Cannot promote: blocker #{cancelled.number} was closed as not planned. Clarify the dependency.",
         )
         report.actions.append(f"#{issue.number} flagged spec-question: blocker #{cancelled.number} was closed as not planned")
         return False
     if any(dependency.state == "open" for dependency in dependencies):
-        if READY in issue.labels:
-            ctx.tracker.remove_labels(issue.number, [READY])
+        if scheduler.READY in issue.labels:
+            ctx.tracker.remove_labels(issue.number, [scheduler.READY])
             report.actions.append(f"#{issue.number} returned to approved waiting for open blockers")
-        board.sync_status(ctx, issue, "Approved")
+        scheduler.board.sync_status(ctx, issue, "Approved")
         return False
     return True
 
 
 def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
     issue = scheduler._local_issue(ctx, issue.number) or issue
-    if issue.state != "open" or BLOCKED not in issue.labels or NEEDS_HUMAN in issue.labels:
+    if issue.state != "open" or scheduler.BLOCKED not in issue.labels or scheduler.NEEDS_HUMAN in issue.labels:
         return issue
     row = next((row for row in ctx.store.local_issues() if row["number"] == issue.number), {})
     comments = [
-        comment for comment in (Comment(**item) for item in row.get("comments", []))
-        if re.fullmatch(
+        comment for comment in (scheduler.Comment(**item) for item in row.get("comments", []))
+        if scheduler.re.fullmatch(
             r"<!-- foragent:blocked reason=[a-z-]+ -->",
             comment.body.partition("\n")[0].removesuffix("\r"),
         )
     ]
-    latest = max(comments, key=lambda c: (datetime.fromisoformat(c.created_at), c.id), default=None)
-    if latest is None or ctx.now() - datetime.fromisoformat(latest.created_at) <= timedelta(
+    latest = max(comments, key=lambda c: (scheduler.datetime.fromisoformat(c.created_at), c.id), default=None)
+    if latest is None or ctx.now() - scheduler.datetime.fromisoformat(latest.created_at) <= scheduler.timedelta(
         minutes=ctx.config.orchestrator_timeout_minutes,
     ):
         return issue
-    ctx.tracker.add_labels(issue.number, [NEEDS_HUMAN])
-    board.sync_status(ctx, issue, "Needs human")
-    ctx.tracker.comment(issue.number, format_comment(
-        Reason.ORCHESTRATOR_TIMEOUT,
+    ctx.tracker.add_labels(issue.number, [scheduler.NEEDS_HUMAN])
+    scheduler.board.sync_status(ctx, issue, "Needs human")
+    ctx.tracker.comment(issue.number, scheduler.format_comment(
+        scheduler.Reason.ORCHESTRATOR_TIMEOUT,
         "The orchestrator has not responded to this blocker.",
         f"Blocked since {latest.created_at}; timeout: {ctx.config.orchestrator_timeout_minutes} minutes.\n\n"
         f"Latest blocker:\n{latest.body}",
     ))
     report.actions.append(f"#{issue.number} flagged orchestrator-timeout")
-    append_event(ctx.store, ctx.now(), issue.number, "orchestrator-timeout",
+    scheduler.append_event(ctx.store, ctx.now(), issue.number, "orchestrator-timeout",
                  "Orchestrator did not respond to the blocker in time; escalated to needs-human.")
-    return replace(issue, labels=issue.labels | {NEEDS_HUMAN})
+    return scheduler.replace(issue, labels=issue.labels | {scheduler.NEEDS_HUMAN})
 
 
 def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
-    issues = {issue.number: issue for issue in local_issue_models(ctx.store) if issue.state == "open"}
+    issues = {issue.number: issue for issue in scheduler.local_issue_models(ctx.store) if issue.state == "open"}
     parents: set[int] = set()
-    prs = [PullRequest(row["pr_number"], row["pr_head"], row["pr_base"], row["title"], row["body"])
+    prs = [scheduler.PullRequest(row["pr_number"], row["pr_head"], row["pr_base"], row["title"], row["body"])
            for row in ctx.store.local_issues() if row["merged"] and row.get("pr_head") and row.get("pr_base")]
     for pr in prs:
-        child_match = re.fullmatch(r"foragent/issue-(\d+)", pr.head)
-        batch_match = re.fullmatch(r"foragent/batch-(\d+)", pr.base)
+        child_match = scheduler.re.fullmatch(r"foragent/issue-(\d+)", pr.head)
+        batch_match = scheduler.re.fullmatch(r"foragent/batch-(\d+)", pr.base)
         if child_match is None or batch_match is None:
             continue
         number, parent = int(child_match[1]), int(batch_match[1])
@@ -160,8 +154,8 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
         if number not in issues or ctx.tracker.parent_of(number) != parent:
             continue
         ctx.tracker.close_issue(number, f"Merged into {pr.base} (PR #{pr.number})")
-        ctx.tracker.remove_labels(number, [READY, RUNNING])
-        board.sync_status(ctx, number, "Done")
+        ctx.tracker.remove_labels(number, [scheduler.READY, scheduler.RUNNING])
+        scheduler.board.sync_status(ctx, number, "Done")
         del issues[number]
         report.actions.append(f"#{number} closed after batch PR #{pr.number} merged")
     for parent in sorted(parents):
@@ -170,7 +164,7 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
             continue
         try:
             scheduler._batch_pr(parent, ctx)
-        except (GitError, TrackerError) as exc:
-            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+        except (scheduler.GitError, scheduler.TrackerError) as exc:
+            if isinstance(exc, scheduler.TrackerError) and exc.is_rate_limit:
                 raise
             report.actions.append(f"#{parent} batch PR finalization deferred: {exc}")
