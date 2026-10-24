@@ -1111,6 +1111,32 @@ def test_related_units_include_importers_of_deleted_modules_and_existing_changed
     )
 
 
+@pytest.mark.parametrize("own_only", [False, True])
+def test_related_units_exclude_other_modules_tests_after_main_moves(git_history, own_only):
+    from foragent.runner import _related_unit_tests
+
+    files = {
+        "src/demo/state.py": "def load():\n    return 'old'\n",
+        "src/demo/runner.py": "def run():\n    return 'old'\n",
+        "tests/test_state.py": "from demo.state import load\n",
+        "tests/test_runner.py": "from demo.runner import run\n",
+    }
+    git_history.update(files)
+    git = GitRepo(git_history.clone)
+    git.fetch()
+    git.merge_base("origin/main", commit=False)
+    (git.root / "src/demo/state.py").write_text("def load():\n    return 'changed'\n")
+    git.stage_changes()
+    git_history.update({
+        "src/demo/runner.py": "def run():\n    return 'other run'\n",
+        "tests/test_runner.py": "from demo.runner import run\n# another run's test\n",
+        "tests/test_other.py": "from demo.runner import run\n",
+    })
+    git.fetch()
+    assert _related_unit_tests(git.root, git.changed_paths("origin/main"), "tests/acceptance",
+                               own_only=own_only) == ("tests/test_state.py",)
+
+
 def test_related_units_own_only_keeps_changed_tests_and_module_counterparts(tmp_path):
     from foragent.runner import _related_unit_tests
 

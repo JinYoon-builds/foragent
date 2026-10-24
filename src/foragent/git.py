@@ -169,8 +169,18 @@ class GitRepo:
             path.write_bytes(original + (b"\n" if original and not original.endswith(b"\n") else b"") + rule + b"\n")
 
     def changed_paths(self, base_ref: str) -> list[str]:
+        # A fetched target can move independently of this branch. Compare the
+        # index with their shared history so target-only changes are excluded.
+        # Pending merge parents already contribute to the index before HEAD moves.
+        parents = ["HEAD", "MERGE_HEAD"] if self.merge_in_progress() else ["HEAD"]
+        try:
+            diff_base = self._call(["merge-base", base_ref, *parents]).strip()
+        except GitError as exc:
+            if not isinstance(exc.__cause__, subprocess.CalledProcessError) or exc.__cause__.returncode != 1:
+                raise
+            diff_base = base_ref  # Unrelated histories have no merge base.
         # NUL delimiters retain filenames containing tabs, quotes, or newlines.
-        output = self._call(["diff", "--cached", "--name-only", "--no-renames", "-z", base_ref])
+        output = self._call(["diff", "--cached", "--name-only", "--no-renames", "-z", diff_base])
         return [path for path in output.split("\0") if path]
 
     def staged_tree_sha(self) -> str:
@@ -349,7 +359,7 @@ class GitRepo:
         return remaining
 
     def check_publication(self, base_ref: str) -> None:
-        """Validate staged PR contents in files changed against the actual base."""
+        """Validate staged PR contents in this branch's own changed files."""
         markers = self.conflict_marker_lines(self.changed_paths(base_ref))
         if markers:
             raise PublicationError(markers)

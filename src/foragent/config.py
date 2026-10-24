@@ -52,7 +52,7 @@ class Config:
     review_level: str = "low"
     review_scope: str = "claude-local"
     test_command: str | None = None
-    # D81: auto trusts pull_request CI when the repository has it; ci always; all never.
+    # Runner and premerge: auto trusts pull_request CI; ci always trusts it; all runs units locally.
     runner_unit_tests: str = "auto"
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
