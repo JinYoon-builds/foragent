@@ -10,6 +10,13 @@ from foragent import capacity, scheduler
 from foragent.config import Config
 from foragent.state import StateStore
 
+
+@pytest.fixture(autouse=True)
+def no_inherited_test_slot(monkeypatch):
+    """`fa test` marks its children as holding a slot; these tests take slots themselves."""
+    monkeypatch.delenv(capacity.TEST_SLOT_ENV, raising=False)
+
+
 NOW = datetime(2026, 10, 23, 12, tzinfo=UTC)
 
 

@@ -11,7 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import __version__, adopt, bench, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, order, watch, watch_open
+from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, order, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -240,6 +240,42 @@ files lists repository-relative paths or globs expected to change; absolute path
             command.add_argument("--tried", required=True)
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
+    request = orch_actions.add_parser("request", help="Put a planning request in the durable box")
+    request.add_argument("--from", dest="source", required=True, help="Sending session, e.g. planning")
+    request.add_argument("--text", required=True)
+    inbox = orch_actions.add_parser("inbox", help="List requests in the box (read this first on start)")
+    inbox.add_argument("--pending", action="store_true", help="Hide requests marked done")
+    request_status = orch_actions.add_parser("request-status", help="Mark a request processing or done")
+    request_status.add_argument("id")
+    request_status.add_argument("status", choices=orch_inbox.REQUEST_STATUSES)
+    request_status.add_argument("--note")
+    ask = orch_actions.add_parser("ask", help="Record a D71 human question in the box")
+    ask.add_argument("--question", required=True)
+    ask.add_argument("--option", action="append", default=[])
+    ask.add_argument("--recommend", type=int)
+    questions = orch_actions.add_parser("questions", help="List open human questions")
+    questions.add_argument("--all", action="store_true", help="Include answered questions")
+    answer = orch_actions.add_parser("answer", help="Record the answer and close one question")
+    answer.add_argument("id")
+    answer.add_argument("--text", required=True)
+    note = orch_actions.add_parser("note", help="Record what the orchestrator does now, why, next and where")
+    note.add_argument("--now", required=True)
+    note.add_argument("--why")
+    note.add_argument("--next", dest="next_step")
+    note.add_argument("--where-title", "--orca-title", dest="where_title", help="Orca tab title, e.g. orch: <project>")
+    note.add_argument("--tmux-pane", help="tmux pane id when not taken from TMUX_PANE")
+    for command in (request, inbox, request_status, ask, questions, answer, note):
+        command.add_argument("--repo-root", type=Path, default=Path.cwd())
+        if command in (inbox, questions):
+            command.add_argument("--json", action="store_true")
+    plan_command = commands.add_parser("plan", help="Planning-session signals for the orchestrator")
+    plan_actions = plan_command.add_subparsers(dest="action", required=True)
+    heartbeat = plan_actions.add_parser(
+        "heartbeat", help="Mark the planning session alive; questions reach it by message, not push")
+    heartbeat.add_argument("--repo-root", type=Path, default=Path.cwd())
+    briefing = commands.add_parser("brief", help="Show the start-of-session facts for planning")
+    briefing.add_argument("--json", action="store_true")
+    briefing.add_argument("--repo-root", type=Path, default=Path.cwd())
     # Listed for `fa --help` only; main() hands `fa test ...` to pytest before parsing.
     test = commands.add_parser(
         "test", help="Wait for a machine-wide test slot, then run pytest with the given arguments",
@@ -267,6 +303,55 @@ files lists repository-relative paths or globs expected to change; absolute path
             command.add_argument("--body", required=True)
             command.add_argument("--about", type=int)
     return parser
+
+
+INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note"}
+
+
+def _orch_inbox(args: argparse.Namespace, store: StateStore, config: Config, repo: str) -> None:
+    """Local request/question box; never reads GitHub or starts an executor."""
+    if args.action == "request":
+        record = orch_inbox.add_request(store, args.source, args.text)
+        print(f"Request {record['id']} saved ({record['status']}).")
+    elif args.action == "request-status":
+        record = orch_inbox.set_request_status(store, args.id, args.status, args.note)
+        print(f"Request {record['id']}: {record['status']}.")
+    elif args.action == "note":
+        where = orch_inbox.note_location(dict(os.environ), args.where_title, args.tmux_pane)
+        record = orch_inbox.write_note(store, args.now, args.why, args.next_step, where)
+        print(f"Note saved at {record['at']} ({where['kind']}).")
+    elif args.action == "ask":
+        record = orch_inbox.ask(store, args.question, args.option, args.recommend)
+        pushed = orch_inbox.route_question(store, config, repo, record)
+        print(f"Question {record['id']} saved (open)"
+              + ("; no planning session is alive, so a notification was sent." if pushed else "."))
+    elif args.action == "answer":
+        record = orch_inbox.answer(store, args.id, args.text)
+        print(f"Question {record['id']} closed.")
+    elif args.action == "inbox":
+        rows = orch_inbox.requests(store, pending=args.pending)
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False))
+        elif not rows:
+            print("No requests.")
+        for row in [] if args.json else rows:
+            print(f"{row['id']} [{row['status']}] from {row['from']} · {row['created_at']}")
+            print(row["text"])
+            for note in row.get("notes", []):
+                print(f"  {note['at']} {note['status']}: {note['note']}")
+    else:
+        rows = orch_inbox.questions(store, include_closed=args.all)
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False))
+        elif not rows:
+            print("No open questions.")
+        for row in [] if args.json else rows:
+            print(f"{row['id']} [{row['status']}] {row['question']}")
+            for index, option in enumerate(row["options"], 1):
+                mark = " (recommended)" if index == row["recommend"] else ""
+                print(f"  {index}. {option}{mark}")
+            if row.get("answer"):
+                print(f"  answer: {row['answer']}")
 
 
 def _comma_keys(value: str) -> list[str]:
@@ -460,6 +545,8 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"{skill['id']}\t{skill['name']}\t{skill['license']}\t{description}\t"
                               f"{skill['role'] or 'unassigned'}\t{'yes' if skill['runs_scripts'] else 'no'}\t"
                               + ", ".join(skill["copies"]))
+                    for item in payload.get("skipped", []) if args.action == "add" else []:
+                        print(f"Skipped: {item['path']}: {item['error']}")
             else:
                 print("Installed: " + manager.install(args.id, args.repo_root.resolve(), commit=args.commit))
             return 0
@@ -476,6 +563,22 @@ def main(argv: list[str] | None = None) -> int:
                       if hasattr(args, name)}
             print(json.dumps(order.progress(StateStore.for_repo(repo), args.step, **fields),
                              ensure_ascii=False))
+            return 0
+        if args.command in {"plan", "brief"}:
+            config = load_config(root)
+            store = StateStore.for_repo(config.repo or GitRepo(root).remote_slug())
+            if args.command == "plan":
+                record = orch_inbox.write_plan_heartbeat(store)
+                print(f"Planning session alive at {record['at']}.")
+            else:
+                facts = brief.collect(store)
+                print(json.dumps(facts, ensure_ascii=False) if args.json
+                      else brief.render(facts, config.language))
+            return 0
+        if args.command == "orch" and args.action in INBOX_ACTIONS:
+            config = load_config(root)
+            repo = config.repo or GitRepo(root).remote_slug()
+            _orch_inbox(args, StateStore.for_repo(repo), config, repo)
             return 0
         if args.command == "init":
             report = init_repo(
@@ -558,11 +661,15 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{event['at']} [{event['kind']}] {event['summary']}")
             elif args.action == "watch":
                 _open_lane_view(root)
+                unknown = False
                 try:
                     for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow):
                         print(json.dumps(snapshot, ensure_ascii=False), flush=True)
+                        unknown = bool(snapshot.get("unknown"))
                 except KeyboardInterrupt:
                     pass
+                if unknown and not args.follow:
+                    return 1
             elif args.action == "retry":
                 print(orch.retry(ctx, args.number, args.hint))
             elif args.action == "rerun-review":
@@ -640,7 +747,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError, design_session.DesignError,
             inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError,
-            order.PlanError, orch.OrchError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:
+            order.PlanError, orch.OrchError, orch_inbox.InboxError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
         return 1
 

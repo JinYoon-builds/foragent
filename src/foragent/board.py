@@ -112,6 +112,11 @@ class Project:
 
     def set_values(self, issue: Issue | int, values: dict[str, str], *, initial_status: bool = False) -> None:
         number = issue.number if isinstance(issue, Issue) else issue
+        # A card already set to every wanted value needs no board call.
+        if values and (recorded := getattr(self.tracker, "board_value", None)) is not None and all(
+            recorded(number, self.id, name) == value for name, value in values.items()
+        ):
+            return
         owner, name = self.repo.split("/", 1)
         fields = self.fields()
         if "Status" in values and not any(option["name"] == values["Status"]

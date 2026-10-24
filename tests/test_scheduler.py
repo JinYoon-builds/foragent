@@ -2190,3 +2190,72 @@ def test_start_checks_and_github_writes_run_outside_the_machine_lock(ctx, monkey
     tick(ctx)
     assert sorted(run.number for run in ctx.store.active_runs()) == [1, 2]
     assert held == []
+
+
+def test_refresh_tick_reuses_confirmed_reads_and_a_kick_tick_reads_live(ctx, monkeypatch):
+    ctx.tracker.add_issue(1, "Blocker")
+    approve(ctx, 2)
+    ctx.tracker.set_blocked_by(2, [Dependency(1, "open")])
+    remote = ctx.tracker._tracker
+    reads = []
+    for name in ("label_events", "blocked_by", "find_pr"):
+        def counted(arg, _name=name, _original=getattr(remote, name)):
+            reads.append((_name, arg))
+            return _original(arg)
+        monkeypatch.setattr(remote, name, counted)
+    tick(ctx)
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    tick(ctx)
+    reads.clear()
+    ctx.now = lambda: NOW + timedelta(minutes=10)
+    tick(ctx)
+    assert reads == [], "A refresh that shows no change confirms the remembered reads"
+    ctx.now = lambda: NOW + timedelta(minutes=11)
+    tick(ctx)
+    assert {name for name, _ in reads} == {"label_events", "blocked_by", "find_pr"}, \
+        "Between refreshes nothing confirms a read, so the tick reads live"
+
+
+def test_closed_blocker_releases_a_dependent_whose_own_facts_did_not_change(ctx):
+    ctx.tracker.add_issue(1, "Blocker")
+    approve(ctx, 2)
+    ctx.tracker.add_blocked_by(2, 1)
+    for minutes in (0, 5):
+        ctx.now = lambda minutes=minutes: NOW + timedelta(minutes=minutes)
+        tick(ctx)
+    assert ctx.tracker.get_issue(2).labels == {"approved"}
+    ctx.tracker.close_issue(1)
+    ctx.now = lambda: NOW + timedelta(minutes=10)
+    tick(ctx)
+    assert ctx.tracker.get_issue(2).labels == {"approved", "ready"}
+
+
+@pytest.mark.parametrize("jitter", [timedelta(), timedelta(milliseconds=-300)])
+def test_periodic_tick_300_seconds_later_is_a_refresh_tick_despite_fetch_delay(ctx, monkeypatch, jitter):
+    clock = [NOW]
+    ctx.now = lambda: clock[0]
+    fetch = ctx.git.fetch
+
+    def slow_fetch(*args):
+        clock[0] += timedelta(seconds=3)  # git fetch takes time before the refresh runs
+        return fetch(*args)
+
+    monkeypatch.setattr(ctx.git, "fetch", slow_fetch)
+    ctx.tracker.add_issue(1, "Blocker")
+    approve(ctx, 2)
+    ctx.tracker.set_blocked_by(2, [Dependency(1, "open")])
+    remote = ctx.tracker._tracker
+    reads = []
+    for name in ("label_events", "blocked_by", "find_pr"):
+        def counted(arg, _name=name, _original=getattr(remote, name)):
+            reads.append((_name, arg))
+            return _original(arg)
+        monkeypatch.setattr(remote, name, counted)
+    for cycle in range(3):  # Two ticks settle the approval snapshot; the third has nothing new.
+        reads.clear()
+        clock[0] = NOW + cycle * (timedelta(seconds=300) + jitter)
+        started = clock[0]
+        tick(ctx)
+        assert ctx.store.issues_observation()["as_of"] == started.isoformat(), \
+            "Each periodic tick refreshes, stamped with its start"
+    assert reads == [], "The periodic refresh confirms the earlier reads"

@@ -14,6 +14,8 @@ PER_ISSUE = ("get_issue", "label_events", "blocked_by", "find_pr", "list_comment
              "parent_of", "sub_issues")
 DEPENDENTS = range(30, 42)
 BLOCKER = 50
+DEPENDENT_BODY = ("<!-- foragent:v1 -->\n## Goal\nWait for the blocker.\n## Out of scope\nNothing.\n"
+                  "## Done when\n```sh\ntrue\n```\n")
 
 
 @pytest.fixture(autouse=True)
@@ -36,7 +38,8 @@ def budget_case(git_history, tmp_path, monkeypatch):
     case.tracker.remove_labels(1, ["running", "approved"])
     case.tracker.add_issue(BLOCKER, "Blocker still in progress")
     for number in DEPENDENTS:
-        case.tracker.add_issue(number, f"Dependent {number}")
+        # A real approved issue has a machine check; an empty body is blocked as no-machine-check.
+        case.tracker.add_issue(number, f"Dependent {number}", DEPENDENT_BODY)
         case.tracker.record_label(number, "approved", "human")
         case.tracker.add_blocked_by(number, BLOCKER)
     calls = record_board_gh(case.tracker, monkeypatch)

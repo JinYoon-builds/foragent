@@ -209,8 +209,11 @@ including executable check commands and the skills policy above. Keep reporting 
 corresponding `fa order progress` facts; unanswered cells stay open.
 
 ## 5. Write the final checks before any code exists
-For every issue, write the acceptance test file(s) under the acceptance dir now. They are
-the goal; the implementer cannot change them. Test observable behaviour through the
+For every issue, write the acceptance test file(s) now. They are the goal; the implementer
+cannot change them. Draft the acceptance tests and the spec in a temporary folder outside the
+main checkout (for example `mktemp -d`), never in the shared working tree: other sessions
+use that checkout, and its files must stay untouched. Put the final contents into the plan's
+`acceptance_files` and `spec_markdown`, under their acceptance-dir paths. Test observable behaviour through the
 project's real entry points (CLI, HTTP, public functions), not internals. Each test must
 fail today and pass only when the goal is met. Prefer 2–4 sharp cases including one edge.
 When a behaviour cannot be checked by a machine (visual taste, real device), add it as a
@@ -236,7 +239,11 @@ the dry-run and present the revised scope for approval.
 
 ## 7. Publish
 Run the validated `fa order publish PLAN.json` for real with
-`--approve` (or `--approve-keys` for a partial approval). Decisions and feedback that change
+`--approve` (or `--approve-keys` for a partial approval). `fa order publish` places the
+acceptance files and the spec in the checkout itself: it takes a publish lock, fetches and
+fast-forwards to the latest base branch, writes and commits only this order's own paths,
+and pushes. Other sessions' edits stay out of the commit, so no manual rebase is needed. If
+it cannot fast-forward, report the error instead of rebasing or committing by hand. Decisions and feedback that change
 existing issues go into `edits`. Record `progress publish --issue <number>` for each
 published or updated issue in the result. Show the printed summary and one line on what
 happens next ("the gate starts within 5 minutes; /fa-inspect shows results"), then run

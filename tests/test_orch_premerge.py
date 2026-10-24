@@ -56,7 +56,10 @@ def test_detects_and_runs_every_full_suite_from_pr_head(merge_case, tmp_path, mo
     monkeypatch.setenv("PATH", str(programs) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("PREMERGE_RECORD", str(record))
     assert orch.premerge(c.ctx, c.pr)["ready"] is True
-    assert record.read_text().splitlines() == ["uv:run pytest", "pnpm:test", "go:test ./..."]
+    uv, *others = record.read_text().splitlines()
+    # pytest also writes JUnit so failures can be compared with the base.
+    assert uv.startswith("uv:run pytest --rootdir=. -o junit_family=legacy --junit-prefix= --junitxml=")
+    assert others == ["pnpm:test", "go:test ./..."]
     assert not c.tracker.comments
     assert not (c.ctx.store.root / "orch-events.jsonl").exists()
 
@@ -181,8 +184,20 @@ def test_failure_cleanup_never_leaves_temporary_worktrees(merge_case, monkeypatc
 
 @pytest.mark.parametrize("action", ["premerge", "merge"])
 @pytest.mark.parametrize("failed_attempt", [1, 2])
-def test_worktree_creation_failure_preserves_original_error(merge_case, monkeypatch, action, failed_attempt):
+def test_worktree_creation_failure_preserves_original_error(merge_case, monkeypatch, tmp_path,
+                                                           action, failed_attempt):
     c = merge_case
+    # A pytest failure on the merged head makes premerge check out the base too.
+    programs = tmp_path / "programs"
+    programs.mkdir()
+    (programs / "pytest").write_text(
+        "#!/bin/sh\nfor arg; do case $arg in --junitxml=*) out=${arg#--junitxml=};; esac; done\n"
+        "printf '<testsuite><testcase file=\"tests/test_a.py\" classname=\"tests.test_a\" name=\"test_x\">"
+        "<failure message=\"x\"/></testcase></testsuite>' > \"$out\"\nexit 1\n"
+    )
+    (programs / "pytest").chmod(0o755)
+    monkeypatch.setenv("PATH", str(programs) + os.pathsep + os.environ["PATH"])
+    c.ctx.config = replace(c.ctx.config, test_command="pytest")
     add_worktree = c.ctx.git.add_detached_worktree
     creation_error = GitError("PR head object is unavailable")
     attempts = 0
