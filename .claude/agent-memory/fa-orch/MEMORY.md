@@ -104,3 +104,5 @@
 - #197 리뷰: "모든 옛 이름 patchable"은 함수뿐 아니라 원래 scheduler의 모든 모듈 수준 이름(import한 `Counter`·`asdict`·`machine_runs`·상수 포함)을 뜻한다. facade에 원래 import를 전부 남기고, 분할 모듈 함수 본문의 모든 원래 전역 이름을 AST로 찾아 `scheduler.X`로 바꿨다(타입 주석은 `TYPE_CHECKING`). 기준 HEAD의 원본에서 전역 집합을 뽑아 `hasattr` 누락 0과 직접 참조 0을 확인한다.
 - #197 병합: 인수 `split_modules()`는 facade가 정적으로 import한 모듈 중 고정 BASE_MODULES에 없는 것을 모두 300줄 제한으로 잰다. 이후에 생긴 `capacity.py`(#342 뒤 419줄)·`run_baseline.py`(#357 뒤 374줄)가 걸렸으므로 그 이름들을 `scheduler_start.py`에서 import하고 facade는 거기서 재노출한다(같은 객체). 병합에서 main이 옮긴 함수를 고치면 충돌 블록은 내 쪽(빈 쪽)을 택하고 main diff를 분할 모듈에 `scheduler.X`로 옮긴다.
 - #197 병합: `TickContext`의 기본값(`start_baseline_thread`)처럼 클래스 정의 시점에 쓰는 재노출 이름은 facade 상단 import 블록에서 가져와야 한다. 분할 모듈은 `scheduler`를 호출 시점에만 읽으므로 일찍 import해도 안전하다. 작업공간 재생성 때 `.foragent/`가 지워지므로 REBUTTAL·TRY를 다시 쓴다.
+
+- #305: 첫 stall은 scheduler `_kill_run`이 신호 전에 run outcome을 `stalled-restart`로 기록한다. runner `run_issue`의 SystemExit 처리기는 이 기록을 보면 라벨을 건드리지 않고 다음 tick의 `_recover_orphan`→`_restore_stalled`가 ready로 돌린다(예전엔 무조건 blocked를 붙여 재시작을 막음). 인수 `tests/acceptance/test_first_stall_restarts.py` 3개, 단위 `test_runner_stop_leaves_first_stall_labels_to_the_tick`.

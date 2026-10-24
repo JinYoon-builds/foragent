@@ -302,6 +302,28 @@ def test_runner_kicks_after_cleanup_and_finish_for_every_outcome(run_case, monke
     )
 
 
+@pytest.mark.parametrize(("recorded", "labels"), [
+    ("stalled-restart", {"running"}),
+    ("stalled", {"blocked"}),
+    (None, {"blocked"}),
+])
+def test_runner_stop_leaves_first_stall_labels_to_the_tick(run_case, monkeypatch, recorded, labels):
+    c = run_case
+
+    def execute(number, ctx, worktree):
+        if recorded is not None:
+            ctx.store.update_run(number, outcome=recorded)
+        raise SystemExit(143)
+
+    monkeypatch.setattr("foragent.runner._execute", execute)
+    monkeypatch.setattr("foragent.runner.kick_tick", lambda root: None)
+    with pytest.raises(SystemExit):
+        run_issue(1, c.ctx)
+    assert c.tracker.get_issue(1).labels & {"running", "ready", "blocked"} == labels
+    assert c.store.get_run(1).outcome == (recorded or "killed")
+    c.tracker.remove_labels(1, ["running"])  # the next tick restores it to ready
+
+
 def test_runner_still_kicks_when_a_tick_already_finished_its_record(run_case, monkeypatch, kicks):
     c = run_case
 
