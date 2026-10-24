@@ -76,6 +76,28 @@ def stream_session_id(path: Path, executor: str, *, offset: int = 0) -> str | No
     return fallback
 
 
+def codex_turns(path: Path) -> int | None:
+    """Count completed Codex turns once a thread has started; unknown otherwise."""
+    started, turns = False, 0
+    for event in _events(path):
+        started = started or event.get("type") == "thread.started"
+        turns += event.get("type") == "turn.completed"
+    return turns if started else None
+
+
+def codex_error_text(path: Path) -> str:
+    """Quote Codex's own error events when it ended without a last message."""
+    messages = []
+    for event in _events(path):
+        if event.get("type") not in ("error", "turn.failed"):
+            continue
+        error = event.get("error")
+        for value in (event.get("message"), error.get("message") if isinstance(error, dict) else error):
+            if isinstance(value, str) and value.strip() and value not in messages:
+                messages.append(value)
+    return "\n".join(messages)
+
+
 def _event_error_kind(event: dict, executor: str) -> str:
     kind = event.get("type")
     if executor == "codex":
@@ -196,8 +218,11 @@ class CodexExecutor:
             last_message = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
             error_kind = _structured_error_kind(events_path, "codex")
             session_id = stream_session_id(events_path, "codex")
+            turns = codex_turns(events_path)
+            if not last_message.strip():
+                last_message = codex_error_text(events_path)
         return ExecResult(code, timed_out, last_message, log_path, last_message,
-                          error_kind=error_kind, session_id=session_id)
+                          error_kind=error_kind, session_id=session_id, num_turns=turns)
 
 
 class ClaudeExecutor:
