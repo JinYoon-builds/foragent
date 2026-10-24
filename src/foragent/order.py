@@ -1,6 +1,9 @@
 """Deterministic context gathering and publication for the fa-order skill."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -9,6 +12,7 @@ from urllib.parse import quote
 
 from foragent import board, design
 from foragent.config import Config
+from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
 from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, latest_flag
 from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
@@ -513,6 +517,16 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
         return PublishReport(plan["title"], parent, rows, sorted(files), True)
+    # A selected number not mapped yet is a child created now; its number is unknown
+    # until creation, so every child still to be created needs a clean preread.
+    new_numbers = bool(selected_numbers - edit_numbers - set(mapping.values()))
+    require_clean_preread(plan, root, config, [
+        *(item for item in plan["issues"]
+          if approve or item["key"] in selected_keys or mapping.get(item["key"]) in selected_numbers
+          or (new_numbers and item["key"] not in mapping)),
+        *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
+          if approve or item["number"] in selected_numbers),
+    ])
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
@@ -605,3 +619,167 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for row in rows:
         row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
     return PublishReport(plan["title"], parent, rows, sorted(files), False)
+
+
+PREREAD_FILE = ".foragent/preread.json"
+PREREAD_TIMEOUT_S = 15 * 60
+
+
+def edit_view(item: dict, issue, config: Config) -> dict:
+    """An edit read as the issue its implementer will receive."""
+    return {**item, "key": f"#{item['number']}", "title": issue.title,
+            "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
+            "interactive": "interactive" in issue.labels, "edit": True}
+
+
+def preread_prompt(plan: dict, item: dict) -> str:
+    """What the implementer would receive, asked read-only for its unknowns."""
+    commands = "\n".join(item.get("done_when", []))
+    tests = "".join(f"\n### {path}\n```\n{content}\n```\n"
+                    for path, content in item.get("acceptance_files", {}).items()) or "\n(none)\n"
+    files = "\n".join(f"- {path}" for path in item.get("files", [])) or "(not listed)"
+    checklist = "\n".join(f"- {line}" for line in item.get("checklist", [])) or "(none)"
+    titles = {issue["key"]: issue["title"] for issue in plan["issues"]}
+    blocked = "\n".join(f"- {key}: {titles.get(key, '')}" for key in item.get("blocked_by", [])) or "(none)"
+    lanes = json.dumps(plan.get("new_lanes", []), ensure_ascii=False, sort_keys=True)
+    heading = (f"# Edit of existing issue {item['key']}: {item['title']}" if item.get("edit")
+               else f"# Issue {item['key']}: {item['title']}")
+    return (
+        "You will implement the issue below later. Do not implement it now and do not change any file.\n"
+        "Read the issue and the repository read-only, then list every unknown: a question whose answer\n"
+        "is not in the issue text or the code and that you would otherwise have to guess.\n"
+        "Reply with one unknown per line and nothing else.\n"
+        "If there are no unknowns, reply with exactly NONE.\n\n"
+        f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n"
+        f"## Spec\n{plan.get('spec_markdown', '')}\n\n"
+        f"New lanes in this order: {lanes}\n\n"
+        f"{heading}\n"
+        f"Lane: {item['lane']}\n"
+        f"Interactive (needs back-and-forth with the user): {'yes' if item.get('interactive') else 'no'}\n\n"
+        f"## Goal\n{item['goal']}\n\n"
+        f"## Out of scope\n{item['out_of_scope']}\n\n"
+        f"## Blocked by\n{blocked}\n\n"
+        f"## Files\n{files}\n\n"
+        f"## Done when\n```sh\n{commands}\n```\n\n"
+        f"## Checklist\n{checklist}\n\n"
+        f"## Acceptance tests (locked){tests}"
+    )
+
+
+def preread_target(plan: dict, item: dict, config: Config, root: Path):
+    """The implementer the runner would start for this issue, its prompt and the evidence key.
+
+    Executor, model, lane agent, lane notes and skills come from the same function the
+    runner's first implementation attempt uses, so preread cannot differ from it.
+    """
+    from foragent.run_implementation import implementer_setup, lane_config
+
+    setup = implementer_setup(lane_config(config, item["lane"]), item["lane"], item["size"], root)
+    prompt = setup.notes + preread_prompt(plan, item)
+    # The whole plan is part of the key: any change to any issue needs a new preread.
+    digest = hashlib.sha256(json.dumps(
+        [setup.executor, setup.model, setup.options, prompt, plan], ensure_ascii=False, sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+    return setup, prompt, digest
+
+
+def _preread_records(root: Path) -> dict:
+    try:
+        records = json.loads((root / PREREAD_FILE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except ValueError as exc:
+        raise PlanError(f"{PREREAD_FILE} is not valid JSON; delete it and run fa order preread again") from exc
+    return records if isinstance(records, dict) else {}
+
+
+def _unknowns(message: str) -> list[str]:
+    if message.strip() == "NONE":
+        return []
+    lines = (re.sub(r"^(?:[-*•]|\d+[.)])\s+", "", line.strip()) for line in message.splitlines())
+    return [line for line in lines if line and line != "NONE"]
+
+
+def preread(plan: dict, root: Path, config: Config,
+            tracker: Callable[[], Tracker] | None = None) -> list[dict]:
+    """Ask each issue's implementer, read-only, for its unknowns and record them by content.
+
+    Edits need the tracker for each existing issue's title and lane; it is opened only then.
+    """
+    try:
+        validate_plan(plan, root, config)
+    except ValueError as exc:
+        raise PlanError(str(exc)) from exc
+    items = list(plan["issues"])
+    if plan.get("edits"):
+        if tracker is None:
+            raise PlanError("prereading edits needs the tracker for the existing issues")
+        source = tracker()
+        items += [edit_view(item, source.get_issue(item["number"]), config) for item in plan["edits"]]
+    waiting, lanes = _uncreated_lanes(plan, config, items)
+    if waiting:
+        # A generic reader is not the lane's implementer; record nothing rather than false evidence.
+        raise PlanError(f"cannot preread issue(s) {', '.join(waiting)}: new lane(s) {', '.join(lanes)} "
+                        f"do not exist yet; {NEW_LANE_STEPS}")
+    directory = root / ".foragent"
+    logs = directory / "preread-logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    ignore = directory / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("*\n", encoding="utf-8")
+    results = []
+    for item in items:
+        setup, prompt, digest = preread_target(plan, item, config, root)
+        log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
+        result = executor_for(setup.executor).run(
+            worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
+            log_path=log, read_only=True, **setup.options)
+        if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
+            raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
+        unknowns = _unknowns(result.last_message)
+        records = _preread_records(root)
+        records[digest] = {"key": item["key"], "unknowns": unknowns,
+                           "at": datetime.now(UTC).isoformat(timespec="seconds")}
+        temporary = root / (PREREAD_FILE + ".tmp")
+        temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, root / PREREAD_FILE)
+        results.append({"key": item["key"], "unknowns": unknowns})
+    return results
+
+
+def _uncreated_lanes(plan: dict, config: Config, items: list[dict]) -> tuple[list[str], list[str]]:
+    """Issues on a lane this order creates: their implementer does not exist before publication."""
+    new = {lane["name"] for lane in plan.get("new_lanes", [])} - set(config.lanes)
+    keys = [item["key"] for item in items if item["lane"] in new]
+    return keys, sorted({item["lane"] for item in items if item["lane"] in new})
+
+
+NEW_LANE_STEPS = ("publish the order without --approve first so the lane's agent and skills exist, "
+                  "then run fa order preread PLAN.json and publish again with --approve")
+
+
+def require_clean_preread(plan: dict, root: Path, config: Config, items: list[dict]) -> None:
+    """Approval needs the latest preread of each issue's current content to have no unknowns."""
+    records = _preread_records(root)
+    missing, open_items = [], []
+    waiting, lanes = _uncreated_lanes(plan, config, items)
+    for item in items:
+        if item["key"] in waiting:
+            continue
+        record = records.get(preread_target(plan, item, config, root)[2])
+        if not isinstance(record, dict) or not isinstance(record.get("unknowns"), list):
+            missing.append(item["key"])
+        elif record["unknowns"]:
+            open_items.append(f"{item['key']}: " + "; ".join(map(str, record["unknowns"])))
+    problems = []
+    if waiting:
+        problems.append(f"issue(s) {', '.join(waiting)} use new lane(s) {', '.join(lanes)} that do not exist "
+                        f"yet, so their implementer has not prereaded them; {NEW_LANE_STEPS}")
+    if missing:
+        problems.append(f"no preread of the current content for issue(s) {', '.join(missing)}; "
+                        "run fa order preread PLAN.json first")
+    if open_items:
+        problems.append("the implementer listed unknowns; resolve them in the plan, then run "
+                        "fa order preread PLAN.json again: " + " | ".join(open_items))
+    if problems:
+        raise PlanError("cannot approve: " + ". ".join(problems))

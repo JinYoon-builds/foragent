@@ -491,3 +491,12 @@ def test_tick_group_already_gone(monkeypatch, fake_process_table, tmp_path):
     with recorded_tree(identities):
         kill_process_group(root.pid)
     assert not fake_process_table.calls
+
+
+def test_read_only_commands_cannot_edit_files():
+    codex = codex_command(Path("/w"), Path("/o"), read_only=True)
+    assert codex[codex.index("-s") + 1] == "read-only"
+    resumed = codex_command(Path("/w"), Path("/o"), resume_session_id="s", read_only=True)
+    assert 'sandbox_mode="read-only"' in resumed
+    claude = claude_command(read_only=True)
+    assert claude[claude.index("--permission-mode") + 1] == "plan"
