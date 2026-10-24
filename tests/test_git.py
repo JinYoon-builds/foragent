@@ -228,6 +228,38 @@ def test_changed_paths_excludes_main_only_files_during_uncommitted_merge(git_his
     assert git.changed_paths("origin/main") == ["feature.txt"]
 
 
+@pytest.mark.parametrize("merge_state", ["before", "pending", "committed"])
+def test_staged_diff_and_patch_exclude_main_only_changes(git_history, merge_state, tmp_path):
+    from test_runner import import_index
+
+    git = GitRepo(git_history.clone)
+    (git.root / "feature.txt").write_text("run's committed change\n")
+    git.stage_changes()
+    import_index(git.root, "Run change")
+    git_history.update({"main-only.txt": "another run's change\n"})
+    git.fetch()
+    if merge_state != "before":
+        git.merge_base("origin/main", commit=False)
+        assert git.merge_in_progress()
+        if merge_state == "committed":
+            import_index(git.root, "Integrate main")
+    # The target can advance again even after this branch integrates it.
+    git_history.update({"later-main-only.txt": "later target change\n"})
+    git.fetch()
+    (git.root / "staged.txt").write_text("run's staged change\n")
+    git.stage_changes()
+    (git.root / ACCEPTANCE).write_text("unstaged change\n")
+
+    patch = tmp_path / "own.patch"
+    git.write_staged_patch("origin/main", patch)
+    diffs = [git.staged_diff("origin/main", binary=binary) for binary in (False, True)]
+    for diff in [*diffs, patch.read_text()]:
+        assert "diff --git a/feature.txt b/feature.txt" in diff
+        assert "diff --git a/staged.txt b/staged.txt" in diff
+        assert "main-only.txt" not in diff
+        assert ACCEPTANCE not in diff
+
+
 def test_changed_paths_falls_back_to_base_ref_for_unrelated_histories(git_history):
     git = GitRepo(git_history.clone)
     origin = git_history.origin.parent / "unrelated.git"
@@ -236,11 +268,21 @@ def test_changed_paths_falls_back_to_base_ref_for_unrelated_histories(git_histor
     unrelated.update({"unrelated.txt": "different root\n"})
     git_command(git.root, "fetch", str(origin), "+main:refs/remotes/origin/main")
     assert git.changed_paths("origin/main") == [ACCEPTANCE, "unrelated.txt"]
+    patch = git.root.parent / "unrelated.patch"
+    git.write_staged_patch("origin/main", patch)
+    for diff in [git.staged_diff("origin/main"), patch.read_text()]:
+        assert f"diff --git a/{ACCEPTANCE} b/{ACCEPTANCE}" in diff
+        assert "diff --git a/unrelated.txt b/unrelated.txt" in diff
 
 
 def test_changed_paths_propagates_invalid_base_ref(git_history):
+    git = GitRepo(git_history.clone)
     with pytest.raises(GitError):
-        GitRepo(git_history.clone).changed_paths("not-a-ref")
+        git.changed_paths("not-a-ref")
+    with pytest.raises(GitError):
+        git.staged_diff("not-a-ref")
+    with pytest.raises(GitError):
+        git.write_staged_patch("not-a-ref", git.root.parent / "invalid.patch")
 
 
 def test_fetch_stops_on_a_different_error_after_a_ref_race(tmp_path, monkeypatch):

@@ -168,19 +168,21 @@ class GitRepo:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(original + (b"\n" if original and not original.endswith(b"\n") else b"") + rule + b"\n")
 
-    def changed_paths(self, base_ref: str) -> list[str]:
+    def _own_base(self, base_ref: str) -> str:
         # A fetched target can move independently of this branch. Compare the
         # index with their shared history so target-only changes are excluded.
         # Pending merge parents already contribute to the index before HEAD moves.
         parents = ["HEAD", "MERGE_HEAD"] if self.merge_in_progress() else ["HEAD"]
         try:
-            diff_base = self._call(["merge-base", base_ref, *parents]).strip()
+            return self._call(["merge-base", base_ref, *parents]).strip()
         except GitError as exc:
             if not isinstance(exc.__cause__, subprocess.CalledProcessError) or exc.__cause__.returncode != 1:
                 raise
-            diff_base = base_ref  # Unrelated histories have no merge base.
+            return base_ref  # Unrelated histories have no merge base.
+
+    def changed_paths(self, base_ref: str) -> list[str]:
         # NUL delimiters retain filenames containing tabs, quotes, or newlines.
-        output = self._call(["diff", "--cached", "--name-only", "--no-renames", "-z", diff_base])
+        output = self._call(["diff", "--cached", "--name-only", "--no-renames", "-z", self._own_base(base_ref)])
         return [path for path in output.split("\0") if path]
 
     def staged_tree_sha(self) -> str:
@@ -201,11 +203,11 @@ class GitRepo:
             self._call(["--literal-pathspecs", "restore", "--source", ref, "--staged", "--", *paths])
 
     def staged_diff(self, base_ref: str, *, binary: bool = False) -> str:
-        return self._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", *(["--binary"] if binary else []), base_ref])
+        return self._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", *(["--binary"] if binary else []), self._own_base(base_ref)])
 
     def write_staged_patch(self, base_ref: str, patch: Path) -> None:
         # Keep patch bytes intact even when source files are not UTF-8.
-        self._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", "--binary", f"--output={patch}", base_ref])
+        self._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", "--binary", f"--output={patch}", self._own_base(base_ref)])
 
     def apply_staged_patch(self, patch: Path) -> None:
         self._call(["apply", "--3way", str(patch)])

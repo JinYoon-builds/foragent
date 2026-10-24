@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -955,7 +956,7 @@ def test_order_progress_cli_uses_configured_repo_without_external_services(tmp_p
 def _record_preread(root, config, plan, item, unknowns):
     path = root / order.PREREAD_FILE
     records = json.loads(path.read_text()) if path.exists() else {}
-    records[order.preread_target(plan, item, config)[3]] = {"key": item["key"], "unknowns": unknowns}
+    records[order.preread_target(plan, item, config, root)[2]] = {"key": item["key"], "unknowns": unknowns}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(records))
 
@@ -1035,32 +1036,92 @@ def test_preread_reads_and_gates_approved_edits(publishing, plan, monkeypatch):
 @pytest.mark.parametrize("change", ["blocked_by", "interactive", "new_lanes"])
 def test_preread_evidence_follows_dependency_interactive_and_lane_changes(publishing, plan, change):
     config, item = publishing[1], plan["issues"][1]
-    before = order.preread_target(plan, item, config)[3]
+    before = order.preread_target(plan, item, config, publishing[0])[2]
     if change == "blocked_by":
         item["blocked_by"] = []
     elif change == "interactive":
         item["interactive"] = True
     else:
         plan["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": []}]
-    assert order.preread_target(plan, item, config)[3] != before
+    assert order.preread_target(plan, item, config, publishing[0])[2] != before
 
 
-@pytest.mark.parametrize("executor", ["codex", "claude"])
-def test_preread_uses_the_lane_executor_and_model_like_the_runner(publishing, plan, executor):
-    config = replace(publishing[1], executor="codex", executor_model="base-model",
-                     lanes={"api": {"paths": ["api/**"], "agent": "fa-api",
-                                    "executor": executor, "model": "lane-model"}})
-    name, model, _, digest = order.preread_target(plan, plan["issues"][0], config)
-    assert (name, model) == (executor, "lane-model")
-    assert order.preread_target(plan, plan["issues"][1], config)[:2] == ("codex", "base-model")
-    other = replace(config, lanes={"api": {**config.lanes["api"], "model": "other-model"}})
-    assert order.preread_target(plan, plan["issues"][0], other)[3] != digest
+def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
+    """What the runner's first implementation attempt passes to the executor."""
+    from foragent import run_implementation, runner
+
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def capture(n, ctx, executor, **kwargs):
+        seen.update(kwargs, executor=ctx.config.executor)
+        raise Stop
+
+    monkeypatch.setattr(run_implementation, "_available_executor", capture)
+    monkeypatch.setattr(runner, "_remaining", lambda n, ctx: 60)
+    monkeypatch.setattr(run_implementation, "_phase", lambda *a, **kw: None)
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha="x", acceptance_blobs={}, approved_by="human",
+                        approved_at=BASE_TIME.isoformat())
+    store.start_run(1, branch="b", worktree=tmp_path / "w", lane=lane)
+    ctx = SimpleNamespace(config=run_implementation.lane_config(config, lane), store=store)
+    attempt = SimpleNamespace(n=1, ctx=ctx, worktree=tmp_path / "repo", log=tmp_path / "log",
+                              size=size, options={}, missing_skills=[], native_claude=ctx.config.executor == "claude",
+                              parsed=parse_body(body), baseline=None, executor=None,
+                              approval=store.load_approval(1))
+    monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
+    monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
+    with pytest.raises(Stop):
+        run_implementation._implement(attempt, "")
+    return seen
+
+
+@pytest.mark.parametrize("executor,lane,lane_model", [
+    ("codex", "api", None), ("claude", "api", None), ("claude", "api", "lane-model"), ("codex", "main", None),
+])
+def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_path, monkeypatch,
+                                                        executor, lane, lane_model):
+    repo = tmp_path / "repo"
+    (repo / ".claude/agents").mkdir(parents=True)
+    (repo / ".claude/agents/fa-api.md").write_text("---\nname: fa-api\nskills: [polish]\n---\nAPI lane rules.\n")
+    (repo / ".claude/skills/polish").mkdir(parents=True)
+    (repo / ".claude/skills/polish/SKILL.md").write_text("---\nname: polish\ndescription: Polish text\n---\nBody\n")
+    settings = {"paths": ["api/**"], "agent": "fa-api", **({"model": lane_model} if lane_model else {})}
+    tiers = {"s": {"codex_effort": "medium", "claude_model": "small-model"},
+             "m": {"codex_effort": "high", "claude_model": "tier-m-model"},
+             "l": {"codex_effort": "xhigh", "claude_model": "large-model"}}
+    config = replace(publishing[1], executor=executor, executor_model="base-model", tiers=tiers,
+                     lanes={"api": settings})
+    item = {**plan["issues"][0], "lane": lane, "size": "m"}
+    setup, prompt, _ = order.preread_target(plan, item, config, repo)
+    implementation = _implementation_setup(tmp_path, config, lane, "m", monkeypatch)
+    assert setup.executor == implementation["executor"] == executor
+    assert setup.model == implementation["model"]
+    if executor == "claude":
+        assert setup.model == (lane_model or "tier-m-model")
+    assert {key: implementation[key] for key in setup.options} == setup.options
+    if lane == "api":
+        assert ("agent" in setup.options) == (executor == "claude")
+    expected_prefix = implementation["prompt"].removesuffix("PROMPT")
+    assert prompt.startswith(expected_prefix) and prompt.removeprefix(expected_prefix) == order.preread_prompt(plan, item)
+    if executor == "codex" and lane == "api":
+        assert "API lane rules." in expected_prefix and "polish" in expected_prefix
+
+
+def test_preread_evidence_follows_the_lane_model(publishing, plan, tmp_path):
+    config = replace(publishing[1], lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "model": "one"}})
+    digest = order.preread_target(plan, plan["issues"][0], config, tmp_path)[2]
+    other = replace(config, lanes={"api": {**config.lanes["api"], "model": "two"}})
+    assert order.preread_target(plan, plan["issues"][0], other, tmp_path)[2] != digest
 
 
 @pytest.mark.parametrize("change", ["own_size", "other_goal", "other_size", "other_acceptance"])
 def test_preread_evidence_covers_the_whole_plan(publishing, plan, change):
     config, item = publishing[1], plan["issues"][0]
-    before = order.preread_target(plan, item, config)[3]
+    before = order.preread_target(plan, item, config, publishing[0])[2]
     if change == "own_size":
         item["size"] = "l"
     elif change == "other_goal":
@@ -1069,7 +1130,7 @@ def test_preread_evidence_covers_the_whole_plan(publishing, plan, change):
         plan["issues"][1]["size"] = "m"
     else:
         plan["issues"][1]["acceptance_files"] = {"tests/acceptance/other.py": "assert True\n"}
-    assert order.preread_target(plan, item, config)[3] != before
+    assert order.preread_target(plan, item, config, publishing[0])[2] != before
 
 
 def test_preread_gate_rejects_stale_evidence_after_another_issue_changes(publishing, plan, monkeypatch):

@@ -628,8 +628,8 @@ PREREAD_TIMEOUT_S = 15 * 60
 def edit_view(item: dict, issue, config: Config) -> dict:
     """An edit read as the issue its implementer will receive."""
     return {**item, "key": f"#{item['number']}", "title": issue.title,
-            "lane": issue_lane(issue.labels, config.lanes), "interactive": "interactive" in issue.labels,
-            "edit": True}
+            "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
+            "interactive": "interactive" in issue.labels, "edit": True}
 
 
 def preread_prompt(plan: dict, item: dict) -> str:
@@ -666,17 +666,21 @@ def preread_prompt(plan: dict, item: dict) -> str:
     )
 
 
-def preread_target(plan: dict, item: dict, config: Config) -> tuple[str, str | None, str, str]:
-    """The implementer the runner would use for this issue, its prompt and the evidence key."""
-    lane = config.lanes.get(item["lane"], {})
-    name = lane.get("executor") or config.executor
-    # Same choice as the runner's per-lane executor configuration.
-    model = lane.get("model") if lane.get("model") is not None else config.executor_model
-    prompt = preread_prompt(plan, item)
+def preread_target(plan: dict, item: dict, config: Config, root: Path):
+    """The implementer the runner would start for this issue, its prompt and the evidence key.
+
+    Executor, model, lane agent, lane notes and skills come from the same function the
+    runner's first implementation attempt uses, so preread cannot differ from it.
+    """
+    from foragent.run_implementation import implementer_setup, lane_config
+
+    setup = implementer_setup(lane_config(config, item["lane"]), item["lane"], item["size"], root)
+    prompt = setup.notes + preread_prompt(plan, item)
     # The whole plan is part of the key: any change to any issue needs a new preread.
-    digest = hashlib.sha256(json.dumps([name, model, prompt, plan], ensure_ascii=False,
-                                       sort_keys=True).encode("utf-8")).hexdigest()
-    return name, model, prompt, digest
+    digest = hashlib.sha256(json.dumps(
+        [setup.executor, setup.model, setup.options, prompt, plan], ensure_ascii=False, sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+    return setup, prompt, digest
 
 
 def _preread_records(root: Path) -> dict:
@@ -720,10 +724,11 @@ def preread(plan: dict, root: Path, config: Config,
         ignore.write_text("*\n", encoding="utf-8")
     results = []
     for item in items:
-        name, model, prompt, digest = preread_target(plan, item, config)
+        setup, prompt, digest = preread_target(plan, item, config, root)
         log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
-        result = executor_for(name).run(worktree=root, prompt=prompt, model=model,
-                                        timeout_s=PREREAD_TIMEOUT_S, log_path=log, read_only=True)
+        result = executor_for(setup.executor).run(
+            worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
+            log_path=log, read_only=True, **setup.options)
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
             raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
         unknowns = _unknowns(result.last_message)
@@ -742,7 +747,7 @@ def require_clean_preread(plan: dict, root: Path, config: Config, items: list[di
     records = _preread_records(root)
     missing, open_items = [], []
     for item in items:
-        record = records.get(preread_target(plan, item, config)[3])
+        record = records.get(preread_target(plan, item, config, root)[2])
         if not isinstance(record, dict) or not isinstance(record.get("unknowns"), list):
             missing.append(item["key"])
         elif record["unknowns"]:
