@@ -491,3 +491,26 @@ def test_tick_group_already_gone(monkeypatch, fake_process_table, tmp_path):
     with recorded_tree(identities):
         kill_process_group(root.pid)
     assert not fake_process_table.calls
+
+
+def test_read_only_commands_cannot_edit_files():
+    codex = codex_command(Path("/w"), Path("/o"), read_only=True)
+    assert codex[codex.index("-s") + 1] == "read-only"
+    resumed = codex_command(Path("/w"), Path("/o"), resume_session_id="s", read_only=True)
+    assert 'sandbox_mode="read-only"' in resumed
+    claude = claude_command(read_only=True)
+    assert claude[claude.index("--permission-mode") + 1] == "plan"
+
+
+def test_codex_turns_counts_completed_turns_only_after_thread_start(tmp_path):
+    from foragent.executors import codex_turns
+
+    events = tmp_path / "events.jsonl"
+    events.write_text("\n".join(json.dumps(event) for event in [
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "turn.started"}, {"type": "turn.completed"},
+        {"type": "turn.started"}, {"type": "turn.completed"},
+    ]) + "\nnot json\n")
+    assert codex_turns(events) == 2
+    events.write_text(json.dumps({"type": "error", "message": "boom"}) + "\n")
+    assert codex_turns(events) is None

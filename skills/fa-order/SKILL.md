@@ -216,6 +216,10 @@ use that checkout, and its files must stay untouched. Put the final contents int
 `acceptance_files` and `spec_markdown`, under their acceptance-dir paths. Test observable behaviour through the
 project's real entry points (CLI, HTTP, public functions), not internals. Each test must
 fail today and pass only when the goal is met. Prefer 2–4 sharp cases including one edge.
+Judge every test by the break-it rule (from pstack's
+principle-test-behavior-not-implementation, MIT): Make the code return a wrong value, skip an
+effect, or do the effect twice. If the test still passes, it proves nothing. Rewrite such a
+test so that each of those breaks makes it fail.
 When a behaviour cannot be checked by a machine (visual taste, real device), add it as a
 checklist item and keep at least one executable command anyway (e.g. the build or a smoke
 check). Done when commands must run with the repo's normal tooling from the repo root.
@@ -223,6 +227,15 @@ check). Done when commands must run with the repo's normal tooling from the repo
 ## 6. One approval
 Write the plan JSON (schema in `fa order publish --help`) to a temp file. Run
 `fa order publish PLAN.json --dry-run`, fix validation errors, then record `progress check`.
+Then run `fa order preread PLAN.json --json`. The implementer reads each issue read-only and
+lists what it would have to guess. Show every unknown to the user as it is and ask them to
+answer it; never answer an unknown yourself. Fold the user's answers into the plan, then run
+preread again until every issue has no unknowns.
+`--approve` refuses issues whose latest preread of the current content is missing or has
+unknowns; any plan edit needs a new preread. The dry-run is never blocked.
+Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
+so preread refuses them: publish once without `--approve` to create the lanes, run preread,
+then publish again with `--approve`.
 Show the order grouped by lane, work first:
 ```
 This order: 7 issues

@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, tidy, watch_open
+from foragent import board, orch_github, orch_queue, tidy, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -31,6 +31,7 @@ from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
 
 TICK_JITTER = timedelta(milliseconds=500)
+BUSY_TICK = "another tick is running"
 
 
 def runner_process_exists(number: int) -> bool:
@@ -95,7 +96,7 @@ from foragent.scheduler_lanes import (  # noqa: E402
 def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired:
         if not acquired:
-            return TickReport(skipped="another tick is running")
+            return TickReport(skipped=BUSY_TICK)
         cleanup = TickReport()
         _reap_inactive_runs(ctx, cleanup)
         if until := ctx.store.github_wait_until(ctx.now()):
@@ -234,6 +235,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         return report
 
+    # A lane's local queue picks the order; startability was already checked above.
+    ready = {lane: orch_queue.ordered(ctx.store, lane, numbers) for lane, numbers in ready.items()}
     started = _start_ready(ctx, ready, lane_for, base_ref, report, sample)
     if started is None:
         return report

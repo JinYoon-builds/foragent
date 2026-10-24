@@ -18,6 +18,7 @@ import threading
 from typing import IO, TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
+from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
 from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot
@@ -380,4 +381,4 @@ if __name__ == "__main__":
         config=Config(acceptance_dir=request["acceptance_dir"], test_slots=request["test_slots"]),
         now=lambda: datetime.now(UTC),
     )
-    _build_baseline(context, BaselineBuild(**request["build"]), os.fdopen(int(sys.argv[2]), "a"))
+    _build_baseline(context, load_record(BaselineBuild, request["build"]), os.fdopen(int(sys.argv[2]), "a"))
