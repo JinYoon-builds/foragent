@@ -83,12 +83,25 @@ def _hold_changed_head(n: int, ctx: RunContext, link: str) -> str:
     return "held"
 
 
+def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
+    """Jobs that never ran are infrastructure: hold with the evidence, keep the PR open."""
+    if not getattr(logs, "not_started", False):
+        return
+    link = f"https://github.com/{ctx.repo}/pull/{pr}"
+    _append(ctx.store.log_path(n), f"CI did not start:\n{logs}")
+    flag(ctx, n, Reason.CI_NOT_STARTED,
+         "CI jobs did not start; there is no code failure to repair.", f"{logs}\n\n{link}")
+    raise ExecutorStopped("held", str(logs))
+
+
 def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str) -> None:
     """Spend one implementation retry, preserving the raw logs from every run."""
-    failure = CIFailure(ctx.tracker.pr_failed_logs(pr), target_branch)
+    logs = ctx.tracker.pr_failed_logs(pr)
+    failure = CIFailure(logs, target_branch)
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     if ctx.tracker.pr_head_sha(pr) != head:
         raise ExecutorStopped(_hold_changed_head(n, ctx, link))
+    _hold_if_not_started(n, ctx, pr, logs)
     run = ctx.store.get_run(n)
     _append(ctx.store.log_path(n), f"Attempt {run.attempts} failed:\n{failure}")
     if run.attempts >= ctx.config.max_retries + 1:
@@ -350,7 +363,9 @@ def _publish_locked(attempt: Implementation) -> str:
                 break
             if status == "fail":
                 if attempt.rebuilt:
-                    raise ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{ctx.tracker.pr_failed_logs(pr)}"))
+                    logs = ctx.tracker.pr_failed_logs(pr)
+                    _hold_if_not_started(n, ctx, pr, logs)
+                    raise ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
                 _ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)
             remaining = deadline - ctx.now().timestamp()
             if remaining <= 0 or poll == 40:
