@@ -4,6 +4,8 @@ Ideas Jin wants to keep but not order yet. An idea moves to `decisions.md` when 
 
 ## 2026-10-24
 
+- **Several projects on one machine.** Jin expects to run about four projects at once. The machine-wide budgets (#106 parallel, #243 test slots) already stop projects from thrashing the machine together, but: each project has fixed memory (orchestrator, lane view, interviewer; roughly 0.5-1 GB per project), and when slots are short nobody decides which project gets them (first come today; the D80 plan orders work only inside one project). Needed later: a machine-level priority across projects that Jin sets ("project A first this week"), the facts dashboard (#333) across projects, and heavier offload of acceptance checks to GitHub Actions for public repos. Size the next machine from measurements once the bottlenecks are cleared.
+
 - **One merge path (retire premerge as a separate command).** The regression check on the merged result is always needed (industry: merge queues — GitHub Merge Queue, GitLab merge trains, Bors, Zuul). But today it exists twice: inside the runner (gate merges) and in `fa orch premerge` (human or outside merges), and the copies drift (premerge missed test slots, #331). Let people only approve ("merge when ready") and let the runner do every merge, like GitHub Merge Queue; then one check, no premerge command. After #331.
 
 - **Smaller squirrel pixels.** Jin finds the pixels large. Quadrant (2x2) and sextant (2x3) glyphs were previewed on 2026-10-24 and break the art (two colours per cell smear outlines and eyes), so keep half blocks. If size still matters, redraw smaller sprites in the same half-block style (e.g. orchestrator 18x15 to about 12x10) in a design session with 2-3 drafts side by side (D72).
