@@ -1061,8 +1061,10 @@ def test_ci_failure_and_timeout(run_case, status, outcome, reason):
     ({"package.json": '{"scripts":{"test":"vitest"}}'}, None, "npm test"),
     ({"pyproject.toml": "[project]\n"}, "make check", "make check"),
 ])
-def test_implementation_prompt_full_suite_from_worktree(run_case, files, configured, expected):
+def test_implementation_prompt_full_suite_from_worktree(run_case, monkeypatch, files, configured, expected):
     c = run_case
+    # Exercise prompt command detection without launching the placeholder projects' test tools.
+    monkeypatch.setattr("foragent.run_implementation._capture_acceptance_baseline", lambda *args: None)
     c.history.update(files)
     c.ctx.config = replace(c.ctx.config, test_command=configured)
     assert run_issue(1, c.ctx) == "merged"
@@ -1107,6 +1109,32 @@ def test_related_units_include_importers_of_deleted_modules_and_existing_changed
     assert _related_unit_tests(tmp_path, ["src/demo/__init__.py"], "tests/locked") == (
         "tests/test_direct.py", "tests/test_symbols.py", "tests/test_unrelated.py", "tests/unit/service_test.py",
     )
+
+
+@pytest.mark.parametrize("own_only", [False, True])
+def test_related_units_exclude_other_modules_tests_after_main_moves(git_history, own_only):
+    from foragent.runner import _related_unit_tests
+
+    files = {
+        "src/demo/state.py": "def load():\n    return 'old'\n",
+        "src/demo/runner.py": "def run():\n    return 'old'\n",
+        "tests/test_state.py": "from demo.state import load\n",
+        "tests/test_runner.py": "from demo.runner import run\n",
+    }
+    git_history.update(files)
+    git = GitRepo(git_history.clone)
+    git.fetch()
+    git.merge_base("origin/main", commit=False)
+    (git.root / "src/demo/state.py").write_text("def load():\n    return 'changed'\n")
+    git.stage_changes()
+    git_history.update({
+        "src/demo/runner.py": "def run():\n    return 'other run'\n",
+        "tests/test_runner.py": "from demo.runner import run\n# another run's test\n",
+        "tests/test_other.py": "from demo.runner import run\n",
+    })
+    git.fetch()
+    assert _related_unit_tests(git.root, git.changed_paths("origin/main"), "tests/acceptance",
+                               own_only=own_only) == ("tests/test_state.py",)
 
 
 def test_related_units_own_only_keeps_changed_tests_and_module_counterparts(tmp_path):
@@ -1187,6 +1215,9 @@ def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkey
     calls = []
 
     def check(command, worktree, log, timeout_s, **kwargs):
+        report = next((word.split("=", 1)[1] for word in shlex.split(command) if word.startswith("--junitxml=")), None)
+        if report:
+            ET.ElementTree(ET.Element("testsuite")).write(report, encoding="unicode")
         selected = "tests/test_new.py" in shlex.split(command)
         if worktree == c.store.worktree_path(1):
             calls.append((command, timeout_s))
@@ -1217,6 +1248,9 @@ def test_related_check_timeout_preserves_implementation_before_cleanup(run_case,
     c.now[0] += timedelta(minutes=70)
 
     def check(command, worktree, log, timeout_s, **kwargs):
+        report = next((word.split("=", 1)[1] for word in shlex.split(command) if word.startswith("--junitxml=")), None)
+        if report:
+            ET.ElementTree(ET.Element("testsuite")).write(report, encoding="unicode")
         timed_out = "tests/test_sample.py" in shlex.split(command)
         if timed_out:
             assert timeout_s == 1200
@@ -1239,6 +1273,9 @@ def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_cas
     from foragent.scheduler import TickContext, TickReport, _recover_runs
 
     c = run_case
+    baseline_file = "tests/acceptance/test_keep.py"
+    if slow_check == "baseline":
+        c.history.update({baseline_file: "def test_keep():\n    assert True\n"})
     stall_minutes = 30 if slow_check == "related" else 1
     c.ctx.config = replace(c.ctx.config, test_command="pytest -q", stall_minutes=stall_minutes)
     if slow_check == "related":
@@ -1287,8 +1324,8 @@ def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_cas
             assert observed[-1] == c.now[0].isoformat()
         if report:
             suite = ET.Element("testsuite")
-            ET.SubElement(suite, "testcase", file=ACCEPTANCE, name="test_feature",
-                          classname=ACCEPTANCE.removesuffix(".py").replace("/", "."))
+            ET.SubElement(suite, "testcase", file=baseline_file, name="test_keep",
+                          classname=baseline_file.removesuffix(".py").replace("/", "."))
             ET.ElementTree(suite).write(report, encoding="unicode")
         return 0, False, ""
 
@@ -1336,12 +1373,13 @@ def test_future():
     for excluded in ("test_skipped", "test_expected_failure", "test_failed_teardown", "test_future"):
         assert excluded not in prompt
     log = c.store.log_path(1).read_text()
-    assert "Acceptance baseline count=3, exit_code=1" in log
-    assert "Acceptance baseline verification count=3, exit_code=0" in log
+    assert "Acceptance baseline count=2, exit_code=1" in log
+    assert "Acceptance baseline verification count=2, exit_code=0" in log
     assert (c.store.root / "runs/issue-1-acceptance-baseline.xml").is_file()
 
 
 def test_baseline_cache_rebuilds_collection_errors_even_when_pytest_continues(git_history, tmp_path):
+    from foragent.run_attempt import AttemptFailure
     from foragent.runner import _capture_acceptance_baseline
 
     git_history.update({"tests/acceptance/test_broken.py": "def test_broken(:\n"})
@@ -1354,13 +1392,170 @@ def test_baseline_cache_rebuilds_collection_errors_even_when_pytest_continues(gi
         config=Config(test_command=command), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
     )
 
-    first = _capture_acceptance_baseline(1, ctx, command, git_history.tip)
-    second = _capture_acceptance_baseline(1, ctx, command, git_history.tip)
-
-    assert first == second
-    assert first.node_ids == (f"{ACCEPTANCE}::test_feature",)
+    for _ in range(2):
+        with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+            _capture_acceptance_baseline(1, ctx, command, git_history.tip)
     assert store.log_path(1).read_text().count("Acceptance baseline count=1, exit_code=1") == 2
     assert not list((store.root.parent / "baselines").glob("*.json"))
+
+
+@pytest.mark.parametrize("unusable", [
+    "timeout", "partial-timeout", "no-junit", "malformed-junit", "collection-error",
+    "incomplete", "session-error", "missing-node-id", "invalid-junit",
+])
+def test_unusable_baseline_stops_before_publish_without_retry(run_case, monkeypatch, unusable):
+    c = run_case
+    c.history.update({"tests/acceptance/test_keep.py": "def test_keep():\n    assert True\n"})
+    c.ctx.config = replace(c.ctx.config, test_command="pytest", max_runtime_minutes=1)
+    captures = []
+
+    def check(command, worktree, log, timeout_s, **kwargs):
+        words = shlex.split(command)
+        report = Path(next(word.split("=", 1)[1] for word in words if word.startswith("--junitxml=")))
+        captures.append(timeout_s)
+        c.now[0] += timedelta(seconds=20)
+        if unusable == "malformed-junit":
+            report.write_text("<testsuite")
+        elif unusable == "invalid-junit":
+            report.write_text("<unrelated/>")
+        elif unusable not in {"timeout", "no-junit"}:
+            suite = ET.Element("testsuite")
+            case = ET.SubElement(suite, "testcase", name="test_keep", classname="tests.acceptance.test_keep")
+            if unusable != "missing-node-id":
+                case.set("file", "tests/acceptance/test_keep.py")
+            if unusable == "collection-error":
+                ET.SubElement(case, "error", message="collection failure")
+            ET.ElementTree(suite).write(report, encoding="unicode")
+        if unusable == "incomplete":
+            with log.open("a") as stream:
+                stream.write("collected 2 items\n")
+        timed_out = unusable in {"timeout", "partial-timeout"}
+        code = -9 if timed_out else 1 if unusable in {"collection-error", "session-error"} else 0
+        return CheckResult(command, code, timed_out, "")
+
+    monkeypatch.setattr("foragent.runner._check", check)
+    assert run_issue(1, c.ctx) == "acceptance-baseline-unavailable"
+    assert captures == [60]
+    assert c.now[0] == BASE_TIME + timedelta(hours=1, seconds=20)
+    assert c.executor.calls == []
+    assert c.tracker.created_prs == c.tracker.merged_prs == []
+    assert c.store.load_flag(1).reason == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+    assert "acceptance baseline unavailable" in c.store.get_run(1).detail
+    assert parse_reason(c.tracker.list_comments(1)[-1].body) == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+    assert c.store.read_history()[-1].outcome == "acceptance-baseline-unavailable"
+    assert not list((c.store.root.parent / "baselines").glob("*.json"))
+
+
+def test_baseline_uses_a_prebuilt_cache_before_implementation(run_case, monkeypatch):
+    from foragent import runner
+
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    keep = "tests/acceptance/test_keep.py"
+    c.history.update({keep: "def test_keep():\n    assert True\n"})
+    git_command(c.history.clone, "fetch", "-q", "origin")
+    original_check = runner._check
+    builds = []
+
+    def check(command, worktree, log, timeout_s, **kwargs):
+        if any(word.startswith("--junitxml=") for word in shlex.split(command)):
+            builds.append(command)
+        return original_check(command, worktree, log, timeout_s, **kwargs)
+
+    monkeypatch.setattr(runner, "_check", check)
+    baseline = runner._capture_acceptance_baseline(1, c.ctx, c.ctx.config.test_command, c.history.tip)
+    assert baseline.node_ids == (f"{keep}::test_keep",)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(builds) == 1
+    assert f"{keep}::test_keep" in c.executor.calls[0]["prompt"]
+    assert "Acceptance baseline count=1, cache=hit" in c.store.log_path(1).read_text()
+    assert c.store.get_run(1).attempts == 1
+
+
+def test_baseline_budget_exhausted_before_capture_stops_with_unavailable_reason(run_case, monkeypatch):
+    c = run_case
+    c.history.update({"tests/acceptance/test_keep.py": "def test_keep():\n    assert True\n"})
+    c.ctx.config = replace(c.ctx.config, test_command="pytest", max_runtime_minutes=1)
+    c.now[0] += timedelta(minutes=1)
+    monkeypatch.setattr("foragent.runner._check", lambda *args, **kwargs: pytest.fail("no capture budget remains"))
+
+    assert run_issue(1, c.ctx) == "acceptance-baseline-unavailable"
+    assert c.executor.calls == []
+    assert c.tracker.created_prs == c.tracker.merged_prs == []
+    assert c.store.load_flag(1).reason == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+    assert "run budget exhausted before capture" in c.store.get_run(1).detail
+    assert c.store.read_history()[-1].outcome == "acceptance-baseline-unavailable"
+
+
+def test_baseline_missing_acceptance_directory_still_allows_run(run_case):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command="pytest", acceptance_dir="absent-on-base")
+    assert run_issue(1, c.ctx) == "merged"
+    assert "acceptance directory does not exist" in c.store.log_path(1).read_text()
+    assert not (c.store.root / "runs/issue-1-acceptance-baseline.xml").exists()
+
+
+def test_baseline_ignores_only_existing_files_owned_by_approved_unmerged_issues(git_history, tmp_path):
+    from foragent.runner import _capture_acceptance_baseline
+
+    other = "tests/acceptance/test_other issue.py"
+    merged = "tests/acceptance/test_merged.py"
+    unowned = "tests/acceptance/test_unowned.py"
+    missing = "tests/acceptance/test_missing.py"
+    git_history.update({path: "def test_keep():\n    assert True\n" for path in (other, merged, unowned)})
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    for number, paths in [(1, [ACCEPTANCE]), (2, [other]), (3, [other]), (10, [merged]), (11, [missing])]:
+        store.save_approval(
+            number, body=BODY, body_sha=body_hash(BODY),
+            acceptance_blobs=GitRepo(git_history.clone).blob_shas(git_history.tip, paths),
+            approved_by="human", approved_at=BASE_TIME.isoformat(),
+        )
+    store.start_run(10, branch="merged", worktree=store.worktree_path(10))
+    store.finish_run(10, "merged")
+    later = StateStore(store.root, now=lambda: BASE_TIME + timedelta(minutes=1))
+    later.start_run(10, branch="retried", worktree=store.worktree_path(10))
+    later.finish_run(10, "error")
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    command = f"{shlex.quote(sys.executable)} -m pytest -q"
+    ctx = RunContext(
+        repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
+        config=Config(test_command=command), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
+    )
+    baseline = _capture_acceptance_baseline(1, ctx, command, git_history.tip)
+    assert set(baseline.node_ids) == {f"{merged}::test_keep", f"{unowned}::test_keep"}
+    log = store.log_path(1).read_text()
+    words = shlex.split(log.split("Done when command:\n", 1)[1].splitlines()[0])
+    assert {word for word in words if word.startswith("--ignore=")} == {f"--ignore={ACCEPTANCE}", f"--ignore={other}"}
+    assert "Acceptance baseline skipped 2 files owned by open issues: #1 #2 #3" in log
+    assert "--ignore=" not in baseline.command
+
+
+def test_baseline_cache_key_tracks_sorted_excluded_paths_and_caches_zero_tests(git_history, tmp_path):
+    from foragent.runner import _capture_acceptance_baseline
+
+    other = "tests/acceptance/test_other.py"
+    git_history.update({other: "def test_other():\n    assert True\n"})
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    command = f"{shlex.quote(sys.executable)} -m pytest -q"
+    ctx = RunContext(
+        repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
+        config=Config(test_command=command), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
+    )
+    first = _capture_acceptance_baseline(1, ctx, command, git_history.tip)
+    assert len(first.node_ids) == 2
+    for paths in ([other, ACCEPTANCE], [ACCEPTANCE, other]):
+        store.save_approval(
+            1, body=BODY, body_sha=body_hash(BODY), acceptance_blobs=dict.fromkeys(paths, "locked"),
+            approved_by="human", approved_at=BASE_TIME.isoformat(),
+        )
+        assert _capture_acceptance_baseline(1, ctx, command, git_history.tip).node_ids == ()
+    assert len(list((store.root.parent / "baselines").glob("*.json"))) == 2
+    log = store.log_path(1).read_text()
+    assert "Acceptance baseline count=0: no acceptance test files remain after exclusions" in log
+    assert log.count("cache=hit") == 1
 
 
 def test_baseline_failure_exhausts_the_done_when_budget(run_case):
@@ -1376,7 +1571,7 @@ def test_keep():
     assert c.tracker.merged_prs == []
     assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
     assert "existing behavior regressed" in c.tracker.list_comments(1)[-1].body
-    assert "Acceptance baseline verification count=2, exit_code=1" in c.store.log_path(1).read_text()
+    assert "Acceptance baseline verification count=1, exit_code=1" in c.store.log_path(1).read_text()
 
 
 @pytest.mark.parametrize("command,reason", [(None, "no test command is known"), ("npm test", "pytest")])
@@ -1425,14 +1620,16 @@ def test_isolated():
     assert run_issue(1, c.ctx) == "merged"
     assert roots and all(root == c.store.worktree_path(1) for root in roots)
     assert "test_isolated" in c.executor.calls[0]["prompt"]
-    assert "Acceptance baseline count=2, exit_code=0" in c.store.log_path(1).read_text()
-    assert "Acceptance baseline verification count=2, exit_code=0" in c.store.log_path(1).read_text()
+    assert "Acceptance baseline count=1, exit_code=0" in c.store.log_path(1).read_text()
+    assert "Acceptance baseline verification count=1, exit_code=0" in c.store.log_path(1).read_text()
     assert not git_command(c.history.origin, "ls-tree", "--name-only", "foragent/issue-1", "probe-side-effect.txt")
 
 
 def test_baseline_is_captured_once_and_survives_review_retry(run_case):
     c = run_case
     c.ctx.config = replace(c.ctx.config, test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    keep = "tests/acceptance/test_keep.py"
+    c.history.update({keep: "def test_keep():\n    assert True\n"})
     c.executor.steps.append({})
     enable_reviewer(c, ["VERDICT: FAIL\nfeature.txt:1 — fix it", "VERDICT: PASS"])
     assert run_issue(1, c.ctx) == "merged"
@@ -1440,7 +1637,7 @@ def test_baseline_is_captured_once_and_survives_review_retry(run_case):
     assert log.count("Acceptance baseline count=") == 1
     assert log.count("Acceptance baseline verification count=1, exit_code=0") >= 2
     for call in c.executor.calls:
-        assert f"- {ACCEPTANCE}::test_feature" in call["prompt"]
+        assert f"- {keep}::test_keep" in call["prompt"]
 
 
 def test_empty_baseline_does_not_rerun_failing_tests_or_default_to_the_full_suite(run_case):
@@ -4570,7 +4767,7 @@ def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp
         monotonic=lambda: mono[0],
     )
     key = sha256(json.dumps(
-        [git_history.tip, command, ctx.config.acceptance_dir, _baseline_environment(git_history.clone)],
+        [git_history.tip, command, ctx.config.acceptance_dir, _baseline_environment(git_history.clone), []],
         sort_keys=True,
     ).encode()).hexdigest()
     lock_path = store.root.parent / "baselines" / f"{key}.lock"
