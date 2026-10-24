@@ -13,10 +13,6 @@ import subprocess
 
 from foragent import board, orch_github, watch_open
 from foragent.actions import flag, invalidate_approval
-from foragent.capacity import (
-    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, machine_load, machine_lock, machine_runs, next_parallel, read_state,
-    update_test_slots, write_state,
-)
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
@@ -88,7 +84,11 @@ from foragent.scheduler_checks import (  # noqa: E402
 from foragent.scheduler_lanes import (  # noqa: E402
     _can_start_in_lane, _file_patterns_overlap, _filesystem_case_sensitive, _lane_has_room,
 )
-from foragent.scheduler_start import _has_slot, _machine_budget, _reserve_slot, _start_ready  # noqa: E402
+from foragent.scheduler_start import (  # noqa: E402
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _has_slot, _machine_budget, _reserve_slot, _start_ready,
+    append_budget_history, decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel, read_state,
+    update_test_slots, write_state,
+)
 
 
 def tick(ctx: TickContext) -> TickReport:
@@ -209,7 +209,10 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         return report
     # One sensor sample per tick sizes both the test slots and the run budget.
     sample = machine_load()
-    update_test_slots(ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1])
+    update_test_slots(
+        ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
+        swapins=getattr(sample, "swapins", None),
+    )
     if not ctx.start_runs or not ready:
         return report
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
@@ -226,4 +229,3 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             error = " ".join(str(exc).split())[:200]
             report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
     return report
-

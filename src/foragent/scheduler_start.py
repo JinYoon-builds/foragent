@@ -6,6 +6,11 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from foragent import scheduler
+# The facade re-exports these capacity bindings from here; calls below go through it.
+from foragent.capacity import (  # noqa: F401
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, decrease_allowed, machine_load,
+    machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
+)
 from foragent.tracker import Issue
 
 if TYPE_CHECKING:
@@ -23,7 +28,8 @@ def _machine_budget(
         1 for lane, numbers in ready.items()
         if scheduler._lane_has_room(lane_runs[lane], len(numbers)) and not ctx.store.lane_paused(lane, now)
     )
-    pressure, load = sample if sample is not None else scheduler.machine_load()
+    sample = sample if sample is not None else scheduler.machine_load()
+    pressure, load = sample
     with scheduler.machine_lock(ctx.store):
         state = scheduler.read_state(ctx.store)
         current = int(state["parallel"]) if state else scheduler.INITIAL_PARALLEL
@@ -35,8 +41,17 @@ def _machine_budget(
             current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
             ceiling=None, increase_ok=now - changed_at >= scheduler.INCREASE_INTERVAL,
         )
+        if value < current and not scheduler.decrease_allowed(state, now):
+            value = current
         if state is None or value != current:
-            scheduler.write_state(ctx.store, value, now)
+            decreased_at = (
+                now.astimezone(scheduler.UTC).isoformat() if value < current else (state or {}).get("decreased_at")
+            )
+            scheduler.write_state(ctx.store, value, now, decreased_at=decreased_at)
+            scheduler.append_budget_history(
+                ctx.store.root.parent, now, "parallel", current, value,
+                pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None),
+            )
     return max(1, min(value, demand))
 
 
