@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, watch_open
+from foragent import board, orch_github, tidy, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -101,12 +101,17 @@ def tick(ctx: TickContext) -> TickReport:
         if not isinstance(ctx.tracker, RecordingTracker):
             ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
         try:
-            return _tick_locked(ctx)
+            report = _tick_locked(ctx)
         except TrackerError as exc:
             if not exc.is_rate_limit:
                 raise
             until = orch_github.pause(ctx, exc)
             return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
+        # After this tick's starts, so idle lanes are really idle. A due tidy is a
+        # request for the orchestrator's judgment, never a launch or an order.
+        if request := tidy.post_if_due(ctx.store):
+            report.actions.append(f"Tidy due; inbox request {request['id']}")
+        return report
 
 
 def _tick_locked(ctx: TickContext) -> TickReport:

@@ -69,11 +69,12 @@ def _update(store: StateStore, kind: str, record_id: str, change) -> dict[str, A
     return record
 
 
-def add_request(store: StateStore, source: str, text: str) -> dict[str, Any]:
+def add_request(store: StateStore, source: str, text: str,
+                extra: dict[str, Any] | None = None) -> dict[str, Any]:
     if not text.strip():
         raise InboxError("request text must not be empty")
     record = _create(store, "requests", "r", {
-        "from": source, "text": text, "status": "new", "notes": [],
+        **(extra or {}), "from": source, "text": text, "status": "new", "notes": [],
     })
     append_event(store, store._now(), None, "request", f"{record['id']} from {source}: {text}")
     return record
