@@ -12,6 +12,7 @@ import pytest
 from conftest import BASE_TIME, git_command
 from foragent.config import Config
 from foragent.git import GitRepo
+from foragent.run_attempt import AttemptFailure
 from foragent.runner import RunContext, _capture_acceptance_baseline
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker
@@ -179,8 +180,9 @@ def test_baseline_does_not_cache_early_stop_from_pytest_plugin(baseline_case, te
         "    item.session.shouldfail = 'stop with a partial JUnit report'\n"
     )})
     command = COMMAND if terminal else f"{shlex.quote(sys.executable)} -m pytest -p no:terminal"
-    assert c.capture(command).node_ids == PASSING_IDS[:1]
-    assert c.capture(command).node_ids == PASSING_IDS[:1]
+    for _ in range(2):
+        with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+            c.capture(command)
     assert len(list(ET.parse(c.report).iter("testcase"))) == 1
     assert not list(c.cache.glob("*.json"))
     assert c.log.read_text().count("Acceptance baseline count=1, exit_code=1") == 2
@@ -196,12 +198,14 @@ def test_baseline_does_not_cache_duplicate_junit_records_after_early_stop(baseli
             "    assert False, 'teardown failed'\n"
         ),
     })
-    assert c.capture().node_ids == ()
+    with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+        c.capture()
     cases = list(ET.parse(c.report).iter("testcase"))
     assert len(cases) == 2
     assert {case.get("name") for case in cases} == {"test_first"}
     assert not list(c.cache.glob("*.json"))
-    assert c.capture().node_ids == ()
+    with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+        c.capture()
     assert c.log.read_text().count("Acceptance baseline count=0, exit_code=1") == 2
     assert "cache=hit" not in c.log.read_text()
 
