@@ -1,6 +1,7 @@
 """Exercise baseline reuse against real pytest subprocesses and local Git history."""
 
 from datetime import timedelta
+from dataclasses import replace
 import json
 import shlex
 import sys
@@ -59,7 +60,10 @@ def gated_test(variable):
 
 
 @pytest.mark.parametrize("budget_exhausted", [False, True])
-def test_baseline_caches_all_files_excluded_without_starting_pytest(baseline_case, monkeypatch, budget_exhausted):
+@pytest.mark.parametrize("api", ["runner", "premerge"])
+def test_baseline_caches_all_files_excluded_without_starting_pytest(baseline_case, monkeypatch, budget_exhausted, api):
+    from foragent.run_baseline import _capture_baseline
+
     c = baseline_case
     c.ctx.store.save_approval(
         1, body="Approved tests", body_sha="approved",
@@ -68,17 +72,60 @@ def test_baseline_caches_all_files_excluded_without_starting_pytest(baseline_cas
     )
     if budget_exhausted:
         c.now[0] += timedelta(minutes=c.ctx.config.max_runtime_minutes)
-    monkeypatch.setattr("foragent.runner._check", lambda *args, **kwargs: pytest.fail("pytest must not run"))
 
-    first = c.capture("uv run pytest -q")
-    assert first is not None and first.node_ids == ()
-    assert c.capture("uv run pytest -q") == first
+    def no_pytest(*args, **kwargs):
+        pytest.fail("pytest must not run")
+
+    monkeypatch.setattr("foragent.runner._check", no_pytest)
+
+    def capture():
+        if api == "runner":
+            return c.capture("uv run pytest -q")
+        return _capture_baseline(
+            c.ctx, "uv run pytest -q", "origin/main", log=c.log, report=c.report,
+            check=no_pytest, prepare=lambda: None, wait=lambda acquire: acquire(),
+            required_ids=frozenset(),
+        )
+
+    first = capture()
+    assert first is not None and first.node_ids == first.collected_ids == first.failing_ids == ()
+    assert capture() == first
     entry, = c.cache.glob("*.json")
-    assert json.loads(entry.read_text()) == {"node_ids": [], "created_at": c.now[0].isoformat()}
+    saved = json.loads(entry.read_text())
+    assert saved["node_ids"] == saved["collected_ids"] == saved["failing_ids"] == []
+    assert saved["excluded"] == [FIRST, LAST]
+    assert saved["created_at"] == c.now[0].isoformat()
     assert not c.report.exists()
     log = c.log.read_text()
     assert log.count("no acceptance test files remain after exclusions") == 1
     assert log.count("Acceptance baseline count=0, cache=hit") == 1
+
+
+def test_premerge_empty_selection_is_cached_before_reusing_a_broader_baseline(baseline_case):
+    from foragent.run_baseline import _capture_baseline
+
+    c = baseline_case
+    assert c.capture().node_ids == PASSING_IDS
+    c.ctx.store.save_approval(
+        1, body="Approved tests", body_sha="approved",
+        acceptance_blobs=c.ctx.git.blob_shas("origin/main", [FIRST, LAST]),
+        approved_by="human", approved_at=BASE_TIME.isoformat(),
+    )
+
+    def no_pytest(*args, **kwargs):
+        pytest.fail("Empty premerge base must not spawn pytest")
+
+    for _ in range(2):
+        baseline = _capture_baseline(
+            c.ctx, COMMAND, "origin/main", log=c.log, report=c.report,
+            check=no_pytest, prepare=lambda: None, wait=lambda acquire: acquire(),
+            required_ids=frozenset(),
+        )
+        assert baseline.node_ids == baseline.collected_ids == baseline.failing_ids == ()
+    saved = [json.loads(path.read_text()) for path in c.cache.glob("*.json")]
+    empty, = [entry for entry in saved if entry["excluded"] == [FIRST, LAST]]
+    assert empty["node_ids"] == empty["collected_ids"] == empty["failing_ids"] == []
+    assert c.log.read_text().count("no acceptance test files remain after exclusions") == 1
 
 
 def test_baseline_cache_rebuilds_when_pytest_environment_changes(baseline_case, monkeypatch):
@@ -273,3 +320,53 @@ def test_baseline_caches_empty_passing_set_after_complete_execution(baseline_cas
     assert c.capture().node_ids == ()
     assert len(list(ET.parse(c.report).iter("testcase"))) == 2
     assert c.log.read_text().count("cache=hit") == 1
+
+
+def test_baseline_cache_preserves_failed_and_skipped_outcomes(baseline_case):
+    c = baseline_case
+    c.prepare({FIRST: "def test_first():\n    assert False\n",
+               LAST: "import pytest\n\n@pytest.mark.skip(reason='pending')\ndef test_last():\n    pass\n"})
+    for baseline in (c.capture(), c.capture()):
+        assert baseline.node_ids == ()
+        assert baseline.collected_ids == PASSING_IDS
+        assert baseline.failing_ids == PASSING_IDS[:1]
+    assert c.log.read_text().count("cache=hit") == 1
+
+
+def test_premerge_cache_reuses_only_covered_outcomes_across_approval_stores(baseline_case):
+    from foragent.run_baseline import _premerge_baseline
+
+    c = baseline_case
+    c.ctx.store.save_approval(
+        2, body="pending", body_sha="body", acceptance_blobs={FIRST: "blob"},
+        approved_by="human", approved_at=BASE_TIME.isoformat(),
+    )
+    assert c.capture().node_ids == PASSING_IDS[1:]
+    other = replace(c.ctx, store=StateStore(c.ctx.store.root.parent / "other", now=c.ctx.now))
+    base = c.ctx.git.ref_sha("origin/main")
+    saved = _premerge_baseline(other, COMMAND, base, [], frozenset(PASSING_IDS[1:]))
+    assert saved is not None and saved["excluded"] == [FIRST]
+    # The other approval store cannot use this cache to excuse a failure in FIRST.
+    assert _premerge_baseline(other, COMMAND, base, [], frozenset(PASSING_IDS[:1])) is None
+    assert _premerge_baseline(other, COMMAND + " -v", base, [], frozenset()) is None
+    other.config = replace(other.config, acceptance_dir="another/acceptance")
+    assert _premerge_baseline(other, COMMAND, base, [], frozenset()) is None
+
+
+def test_runner_reuses_legacy_cache_but_premerge_rebuilds_unknown_outcomes(baseline_case):
+    from foragent.run_baseline import _capture_baseline
+    from foragent.run_checks import _check
+
+    c = baseline_case
+    c.capture()
+    entry, = c.cache.glob("*.json")
+    entry.write_text(json.dumps({"node_ids": PASSING_IDS, "created_at": BASE_TIME.isoformat()}))
+    assert c.capture().node_ids == PASSING_IDS
+    assert c.log.read_text().count("cache=hit") == 1
+    baseline = _capture_baseline(
+        c.ctx, COMMAND, "origin/main", log=c.log, report=c.report,
+        check=lambda command, root: _check(command, root, c.log, 30),
+        prepare=lambda: None, wait=lambda acquire: acquire(), required_ids=frozenset(),
+    )
+    assert baseline.collected_ids == PASSING_IDS and baseline.failing_ids == ()
+    assert "collected_ids" in json.loads(entry.read_text())
