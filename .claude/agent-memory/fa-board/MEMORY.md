@@ -14,3 +14,5 @@
 - 새 저장소의 `init` 기본 도구는 설치 여부가 아니라 `codex login status`의 종료 코드와 `claude auth status`의 JSON `loggedIn`으로 확인한다. 누락·시간 초과·잘못된 응답은 로그인 사실로 인정하지 않는다. 기존 설정은 재탐지하지 않고 보존한다.
 - Claude 작업자에 기본 교차 리뷰를 그대로 두면 `resolved_reviewer`가 Codex를 고르므로, Claude를 고를 때 `reviewer: claude`도 저장한다. 리뷰의 새 세션은 기존 `ClaudeExecutor`의 별도 `claude -p /code-review ...` 프로세스로 보장된다.
 - `tests/test_init.py::setup`은 도구 상태 확인을 subprocess 경계에서 오프라인으로 대체한다. 이 fixture를 가져오는 잠긴 인수 테스트는 같은 경계에서 로그인 사실을 다시 주입하므로, 초기화 함수 자체를 가짜로 바꾸지 않는다. 집중 검증은 `uv run pytest tests/acceptance/test_claude_only.py`다.
+- 빈 목록 판정(#163): `GhTracker.list_issues`는 빈 결과를 한 번 재조회하고, 같은 인스턴스의 앞선 비어 있지 않은 목록이나 `StateStore.for_repo(repo).local_issues()`가 근거이면 `TrackerError("...empty listing...")`를 낸다. 단위 테스트는 `_EMPTY_RETRY_DELAY`를 0으로 바꾼다. 인수 테스트가 다른 레인의 미구현 API에 기대면 직접 만들지 말고 blocked-by를 제안한다. 재시작 때 작업 트리의 미커밋 변경이 사라질 수 있다.
+- 여러 테스트 파일을 한 pytest 호출로 돌리면 출력이 비는 경우가 있었다. 변경 전후 비교는 파일별로 `-rf`를 붙여 돌린다.
