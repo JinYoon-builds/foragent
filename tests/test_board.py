@@ -293,3 +293,21 @@ def test_board_addition_propagates_other_github_errors(operation, message):
     with pytest.raises(TrackerError) as error:
         board.add_issue(tracker, "owner/repo", project_id, 1, "main", "s")
     assert str(error.value) == message
+
+
+def test_board_calls_only_when_the_wanted_card_value_differs(recording_board, monkeypatch):
+    ctx, remote, clock = recording_board
+    board.sync_status(ctx, 1, "Approved")
+    calls = []
+    graphql = remote.graphql
+
+    def counted(query, variables):
+        calls.append(query)
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", counted)
+    board.sync_status(ctx, 1, "Approved")
+    assert calls == []
+    board.sync_status(ctx, 1, "Ready")
+    assert any("ForagentSetBoardValue" in query for query in calls)
+    assert item_values(remote, ctx.config.board, 1)["Status"] == "Ready"

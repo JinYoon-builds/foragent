@@ -1199,3 +1199,104 @@ def test_remove_blocked_by_propagates_api_failure():
     run = ScriptedRun('{"id":12345}', gh_error("HTTP 403: forbidden"))
     with pytest.raises(TrackerError, match="HTTP 403"):
         GhTracker(REPO, run).remove_blocked_by(1, 2)
+
+
+def test_fake_advances_updated_at_on_each_issue_change():
+    clock = [NOW]
+    tracker = FakeTracker(now=lambda: clock[0])
+    tracker.add_issue(1)
+    tracker.add_issue(2)
+    for change in (
+        lambda: tracker.record_label(1, "approved", "human"),
+        lambda: tracker.remove_labels(1, ["approved"]),
+        lambda: tracker.comment(1, "Note"),
+        lambda: tracker.edit_body(1, "New body"),
+        lambda: tracker.add_blocked_by(1, 2),
+        lambda: tracker.set_blocked_by(1, []),
+        lambda: tracker.set_parent(1, 2),
+        lambda: tracker.close_issue(1),
+    ):
+        clock[0] += timedelta(seconds=1)
+        change()
+        assert tracker.get_issue(1).updated_at == clock[0].isoformat()
+    assert tracker.get_issue(2).updated_at == (NOW + timedelta(seconds=7)).isoformat(), "A new child changes its parent"
+
+
+def test_refresh_reads_per_issue_facts_only_for_changed_issues_and_dependents_of_changed_blockers(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    clock = [NOW]
+    remote = FakeTracker(now=lambda: clock[0])
+    remote.add_issue(1, "Dependent", labels=["approved"])
+    remote.add_issue(2, "Approved alone", labels=["approved"])
+    remote.add_issue(3, "Blocker")
+    remote.add_issue(4, "Waiting", labels=["blocked"])
+    remote.add_blocked_by(1, 3)
+    ctx = SimpleNamespace(remote=remote, config=Config(), now=lambda: clock[0],
+                          store=StateStore(tmp_path, now=lambda: clock[0]))
+    tracker = RecordingTracker(remote, ctx)
+    tracker.refresh_issues()
+    reads = []
+    for name in ("list_comments", "sub_issues", "blocked_by"):
+        def counted(n, _name=name, _original=getattr(remote, name)):
+            reads.append((_name, n))
+            return _original(n)
+        setattr(remote, name, counted)
+
+    clock[0] += timedelta(minutes=5)
+    tracker.refresh_issues()
+    assert reads == [], "An unchanged listing needs no per-issue reads"
+
+    clock[0] += timedelta(minutes=5)
+    remote.close_issue(3)
+    tracker.refresh_issues()
+    assert reads == [("blocked_by", 1)], "Only the closed blocker's dependent is read again"
+    rows = {row["number"]: row for row in ctx.store.local_issues()}
+    assert rows[1]["blocked_by"] == [{"number": 3, "state": "closed", "state_reason": None}]
+
+    reads.clear()
+    clock[0] += timedelta(minutes=5)
+    remote.comment(4, "A person answered")
+    tracker.refresh_issues()
+    assert sorted(reads) == [("list_comments", 4), ("sub_issues", 4)]
+    assert [comment["body"] for comment in ctx.store.local_issues()[3]["comments"]] == ["A person answered"]
+
+
+def test_gh_issue_list_keeps_link_counts_and_blockers_name_other_repositories():
+    data = issue_json(1, sub_issues_summary={"total": 2, "completed": 1, "percent_completed": 50},
+                      issue_dependencies_summary={"blocked_by": 1, "total_blocked_by": 2,
+                                                  "blocking": 0, "total_blocking": 0})
+    issue, = GhTracker(REPO, ScriptedRun(json.dumps([data]))).list_issues()
+    assert dict(issue.sub_issues_summary) == {"total": 2, "completed": 1, "percent_completed": 50}
+    assert dict(issue.dependencies_summary)["blocked_by"] == 1
+    run = ScriptedRun(json.dumps([
+        {"number": 1, "state": "open", "repository_url": "https://api.github.com/repos/owner/repo"},
+        {"number": 2, "state": "closed", "repository_url": "https://api.github.com/repos/other/lib"},
+    ]))
+    assert GhTracker(REPO, run).blocked_by(4) == [Dependency(1, "open"), Dependency(2, "closed", None, "other/lib")]
+
+
+def test_refresh_rereads_links_when_only_a_link_count_changes(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    clock = [NOW]
+    remote = FakeTracker(now=lambda: clock[0])
+    remote.add_issue(1, "Dependent", labels=["approved"])
+    remote.add_issue(2, "Blocker")
+    remote.add_blocked_by(1, 2)
+    remote.issues[1] = replace(remote.issues[1], dependencies_summary=(("blocked_by", 1), ("total_blocked_by", 1)))
+    ctx = SimpleNamespace(config=Config(), now=lambda: clock[0], store=StateStore(tmp_path, now=lambda: clock[0]))
+    tracker = RecordingTracker(remote, ctx)
+    tracker.refresh_issues()
+    # GitHub may not advance updated_at for a removed link; the link count still changes.
+    remote._dependencies[1] = []
+    remote.issues[1] = replace(remote.issues[1], dependencies_summary=(("blocked_by", 0), ("total_blocked_by", 0)))
+    clock[0] += timedelta(minutes=5)
+    tracker.refresh_issues()
+    assert ctx.store.local_issues()[0]["blocked_by"] == []
