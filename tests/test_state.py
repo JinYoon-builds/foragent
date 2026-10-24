@@ -727,3 +727,30 @@ def test_link_count_change_alone_voids_a_read(store, field):
     store.record_read(1, "blocked_by", [], baseline=store.read_baseline())
     store.refresh_local_issues([replace(issue, **{field: (("total", 0),)})], [], {}, NOW + timedelta(minutes=5))
     assert store.confirmed_read(1, "blocked_by") is None
+
+
+def test_facade_globals_patched_on_foragent_state_reach_the_split_implementation(store, monkeypatch):
+    store.refresh_local_issues([], [], {}, NOW)
+    assert not store.issues_refresh_due(NOW)
+    monkeypatch.setattr(state_module, "REFRESH_INTERVAL", timedelta(0))
+    assert store.issues_refresh_due(NOW)
+
+    built = []
+    original_run = state_module.Run
+
+    def recording_run(*args, **kwargs):
+        built.append(args[0] if args else kwargs["number"])
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(state_module, "Run", recording_run)
+    store.start_run(3, branch="foragent/issue-3", worktree=store.worktree_path(3))
+    assert built == [3]
+    assert store.get_run(3).branch == "foragent/issue-3"
+    assert built == [3, 3]
+
+    facts = []
+    monkeypatch.setattr(state_module, "observed_issue_facts", lambda issue: facts.append(issue) or {})
+    issue = type("Issue", (), {"number": 5, "title": "t", "body": "b", "labels": [], "state": "open",
+                                "updated_at": None, "is_pull_request": False})()
+    store.refresh_local_issues([issue], [], {}, NOW)
+    assert facts == [issue]
