@@ -28,6 +28,12 @@ description: Set up a project folder for Foragent.
    `fa init ... --board-map 'Backlog=<col>,Up next=<col>,In progress=<col>,Your turn=<col>,Done=<col>'`.
    An existing board that already has these five columns is mapped without asking.
    The mapping is saved as `board_map` in `.foragent.yml`; later inits do not ask again.
+   `fa init` offers one optional account-wide step: wrapping
+   Claude Code's statusline with `fa statusline`, which records Claude's rate
+   limits and still runs the person's current statusline unchanged. When the
+   command cannot prompt (no terminal), ask this once with AskUserQuestion (or the
+   available question tool): Yes (recommended) or No, then rerun with
+   `--statusline yes|no`. Either answer is remembered and never asked again; skip the question if the summary already reports a decision.
 
 4. Run `fa adopt survey --json` after setup. When `kind` is `existing`,
    complete steps 5–8 in order. When it is `empty`, go to step 9.
