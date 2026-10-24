@@ -1,6 +1,6 @@
 """Atomic local snapshots and run records, independent of GitHub."""
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
@@ -73,6 +73,26 @@ class Run:
     approval_body_sha: str | None = None
 
 
+REFRESH_INTERVAL = timedelta(minutes=5)
+
+
+def observed_issue_facts(issue: Any) -> dict[str, Any]:
+    """The facts one bulk listing shows for an issue; a change in any of them marks it changed."""
+    def counts(summary: Any) -> dict[str, int] | None:
+        return dict(summary) if summary is not None else None
+
+    return {"title": issue.title, "body": issue.body, "labels": sorted(issue.labels),
+            "state": issue.state, "updated_at": issue.updated_at,
+            # Link counts change with a sub-issue or dependency change even if updated_at does not.
+            "sub_issues": counts(getattr(issue, "sub_issues_summary", None)),
+            "dependencies": counts(getattr(issue, "dependencies_summary", None))}
+
+
+def _forget_reads(row: dict[str, Any]) -> None:
+    """A local change to an issue makes its earlier per-issue reads unconfirmed."""
+    row.pop("reads", None)
+
+
 class StateStore:
     def __init__(self, root: Path, now: Callable[[], datetime] | None = None):
         self.root = Path(root)
@@ -142,6 +162,8 @@ class StateStore:
     def _apply_github_write(self, row: dict[str, Any], entry: dict[str, Any], lanes: dict) -> None:
         """Apply the same write facts to local intent and its delivery baseline."""
         action = entry["action"]
+        if action != "comment":
+            _forget_reads(row)
         if action in {"add_labels", "remove_labels"}:
             self._record_labels(row, entry["labels"], remove=action == "remove_labels", lanes=lanes)
         elif action == "update_issue":
@@ -224,12 +246,14 @@ class StateStore:
 
     def issues_refresh_due(self, now: datetime) -> bool:
         refreshed = self._issue_snapshot()["refreshed_at"]
-        return refreshed is None or now - datetime.fromisoformat(refreshed) >= timedelta(minutes=5)
+        return refreshed is None or now - datetime.fromisoformat(refreshed) >= REFRESH_INTERVAL
 
     def update_local_issue(self, number: int, **fields: Any) -> None:
         with self._state_lock():
             snapshot = self._issue_snapshot()
             row = self._local_issue(snapshot, number)
+            if any(row.get(key) != value for key, value in fields.items()):
+                _forget_reads(row)
             row.update(fields)
             self._save_local_issue(snapshot, row)
 
@@ -243,8 +267,10 @@ class StateStore:
             ):
                 return
             row = self._local_issue(snapshot, issue.number)
-            row.update(title=issue.title, body=issue.body, labels=sorted(issue.labels),
-                       state=issue.state, lane=issue_lane(issue.labels, lanes))
+            facts = dict(title=issue.title, body=issue.body, labels=sorted(issue.labels), state=issue.state)
+            if any(row.get(key) != value for key, value in facts.items()):
+                _forget_reads(row)
+            row.update(facts, lane=issue_lane(issue.labels, lanes))
             self._save_local_issue(snapshot, row)
 
     def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict) -> None:
@@ -259,6 +285,8 @@ class StateStore:
 
         current = set(row["labels"])
         row["labels"] = sorted(current - set(labels) if remove else current | set(labels))
+        if row["labels"] != sorted(current):
+            _forget_reads(row)
         row["lane"] = issue_lane(row["labels"], lanes)
         if READY in labels:
             approval = self.load_approval(row["number"])
@@ -286,7 +314,7 @@ class StateStore:
         self, issues: list, prs: list, lanes: dict, now: datetime,
         *, comments: dict[int, list[dict]] | None = None, since_revision: int | None = None,
         parents: dict[int, int] | None = None, blocked_by: dict[int, list[dict]] | None = None,
-        complete_prs: bool = False,
+        children: dict[int, list[int]] | None = None, complete_prs: bool = False,
     ) -> list[int]:
         """Replace remote facts, preserving local changes made since the refresh began."""
         from foragent.labels import issue_lane
@@ -297,6 +325,7 @@ class StateStore:
             snapshot = self._issue_snapshot()
             previous = snapshot["issues"]
             rows = {}
+            facts = {}
             observed = {issue.number for issue in issues if not issue.is_pull_request}
             dropped = {entry["issue"] for entry in snapshot.get("outbox", [])
                        if entry["issue"] not in observed and (
@@ -310,6 +339,7 @@ class StateStore:
                 old_comments = old.get("comments", [])
                 queued_ids = {-entry["id"] for entry in pending}
                 old_comments = [comment for comment in old_comments if comment["id"] not in queued_ids]
+                facts[str(issue.number)] = observed_issue_facts(issue)
                 remote = {
                     **old, "number": issue.number, "title": issue.title, "body": issue.body,
                     "labels": sorted(issue.labels), "lane": issue_lane(issue.labels, lanes),
@@ -341,10 +371,20 @@ class StateStore:
                     row["parent"] = parents.get(int(number))
                 if blocked_by is not None:
                     row["blocked_by"] = blocked_by.get(int(number), [])
+                if children is not None:
+                    row["children"] = children.get(int(number), [])
+            pr_facts: dict[str, dict[str, Any]] = {}
             for pr in prs:
                 if (row := rows.get(str(pr_issue_number(pr.head)))) is not None:
                     row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
                                merged=pr.merged_at is not None)
+                    pr_facts[str(pr_issue_number(pr.head))] = {
+                        "pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
+            for number, row in rows.items():
+                # What this listing showed, kept apart from later local intent.
+                listed = (pr_facts.get(number, {"pr_number": None, "pr_head": None, "merged": False})
+                          if complete_prs else {key: row.get(key) for key in ("pr_number", "pr_head", "merged")})
+                row["observed"] = {**facts[number], **listed}
             if since_revision is not None:
                 rows.update({number: row for number, row in previous.items()
                              if row.get("revision", 0) > since_revision and int(number) not in dropped})
@@ -356,6 +396,55 @@ class StateStore:
                                 if int(number) not in dropped},
             })
             return sorted(dropped)
+
+    def read_baseline(self) -> dict[str, Any]:
+        """Facts a per-issue read will depend on, taken before the read starts."""
+        snapshot = self._issue_snapshot()
+        return {"refresh": snapshot["refreshed_at"],
+                "observed": {key: row.get("observed") for key, row in snapshot["issues"].items()}}
+
+    def confirmed_read(self, number: int, name: str) -> tuple[Any] | None:
+        """Return a remembered per-issue read that a later bulk refresh confirmed.
+
+        A read stays valid while the latest listing, taken after the read, shows
+        the same facts (including GitHub's updated_at and link counts) for the
+        issue and for each linked issue, such as its blockers. A link that is
+        not a row of this repository's listing (another repository, or a missing
+        row) can never confirm a read. Without a refresh after the read,
+        nothing confirms it, so the caller reads again.
+        """
+        snapshot = self._issue_snapshot()
+        rows = snapshot["issues"]
+        entry = (rows.get(str(number)) or {}).get("reads", {}).get(name)
+        refreshed = snapshot["refreshed_at"]
+        if entry is None or refreshed is None or entry["refresh"] is None:
+            return None
+        if datetime.fromisoformat(refreshed) <= datetime.fromisoformat(entry["refresh"]):
+            return None
+        for key, facts in entry["observed"].items():
+            if facts is None or (rows.get(key) or {}).get("observed") != facts:
+                return None
+        return (entry["value"],)
+
+    def record_read(self, number: int, name: str, value: Any, *, baseline: dict[str, Any],
+                    links: Iterable[int | str] = ()) -> None:
+        """Remember a per-issue read with the facts captured before it began.
+
+        A link is this repository's issue number; any other link (such as
+        "owner/repo#5") names no row, so it keeps the read unconfirmed.
+        """
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            row = snapshot["issues"].get(str(number))
+            if row is None:
+                return
+            keys = [str(number), *(str(link) for link in links)]
+            row.setdefault("reads", {})[name] = {
+                "value": value, "refresh": baseline["refresh"],
+                "observed": {key: baseline["observed"].get(key) for key in keys},
+            }
+            # A remembered read is not an issue change; keep revisions for real writes.
+            self._write_json(self.root / "issues.json", snapshot)
 
     def order_progress(self) -> dict[str, Any] | None:
         """Read order preparation facts shared by the CLI and lane view."""

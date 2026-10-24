@@ -655,3 +655,75 @@ def test_refresh_preserves_each_kind_of_concurrent_local_write(store, method, fi
     store.refresh_local_issues([human], [], {}, NOW + timedelta(minutes=5), since_revision=revision)
     row, = writer.local_issues()
     assert (row["title"], row["labels"], row["state"]) == ("Human revision", ["needs-human"], "closed")
+
+
+def test_confirmed_read_needs_a_later_listing_with_the_same_issue_and_link_facts(store):
+    from foragent.tracker import Issue
+
+    issue = Issue(1, "Feature", "body", frozenset({"approved"}), "open", updated_at=NOW.isoformat())
+    blocker = Issue(2, "Blocker", "body", frozenset(), "open", updated_at=NOW.isoformat())
+    store.refresh_local_issues([issue, blocker], [], {}, NOW)
+    revision = store.issues_revision()
+    store.record_read(1, "blocked_by", [{"number": 2}], baseline=store.read_baseline(), links=[2])
+    assert store.issues_revision() == revision, "A remembered read is not an issue change"
+    assert store.confirmed_read(1, "blocked_by") is None, "No listing after the read confirms it yet"
+    store.refresh_local_issues([issue, blocker], [], {}, NOW + timedelta(minutes=5))
+    assert store.confirmed_read(1, "blocked_by") == ([{"number": 2}],)
+    closed = replace(blocker, state="closed", updated_at=(NOW + timedelta(minutes=6)).isoformat())
+    store.refresh_local_issues([issue, closed], [], {}, NOW + timedelta(minutes=10))
+    assert store.confirmed_read(1, "blocked_by") is None, "A changed blocker voids its dependent's read"
+
+
+@pytest.mark.parametrize("change", ["updated_at", "local_label", "pr"])
+def test_confirmed_read_is_void_after_any_issue_change(store, change):
+    from foragent.tracker import Issue, PullRequest
+
+    issue = Issue(1, "Feature", "body", frozenset({"approved"}), "open", updated_at=NOW.isoformat())
+    store.refresh_local_issues([issue], [], {}, NOW, complete_prs=True)
+    store.record_read(1, "label_events", [], baseline=store.read_baseline())
+    prs = []
+    if change == "updated_at":
+        issue = replace(issue, updated_at=(NOW + timedelta(minutes=1)).isoformat())
+    elif change == "local_label":
+        store.record_labels(1, ["ready"], remove=False, lanes={})
+    else:
+        prs = [PullRequest(7, "foragent/issue-1", "main", "PR", "")]
+    store.refresh_local_issues([issue], prs, {}, NOW + timedelta(minutes=5), complete_prs=True)
+    assert store.confirmed_read(1, "label_events") is None
+
+
+def test_read_baseline_taken_before_a_concurrent_refresh_keeps_a_stale_read_unconfirmed(store):
+    from foragent.tracker import Issue
+
+    issue = Issue(1, "Feature", "body", frozenset({"approved"}), "open", updated_at=NOW.isoformat())
+    store.refresh_local_issues([issue], [], {}, NOW)
+    baseline = store.read_baseline()
+    # Another process refreshes while the read is in flight and sees a change.
+    changed = replace(issue, updated_at=(NOW + timedelta(minutes=1)).isoformat())
+    store.refresh_local_issues([changed], [], {}, NOW + timedelta(minutes=1))
+    store.record_read(1, "label_events", ["value read before the change"], baseline=baseline)
+    store.refresh_local_issues([changed], [], {}, NOW + timedelta(minutes=6))
+    assert store.confirmed_read(1, "label_events") is None
+
+
+@pytest.mark.parametrize("link", ["other/repo#2", 3])
+def test_read_linked_to_an_issue_outside_this_snapshot_is_never_confirmed(store, link):
+    from foragent.tracker import Issue
+
+    issues = [Issue(number, "Feature", "body", frozenset(), "open", updated_at=NOW.isoformat()) for number in (1, 2)]
+    store.refresh_local_issues(issues, [], {}, NOW)
+    store.record_read(1, "blocked_by", [], baseline=store.read_baseline(), links=[link])
+    store.refresh_local_issues(issues, [], {}, NOW + timedelta(minutes=5))
+    assert store.confirmed_read(1, "blocked_by") is None
+
+
+@pytest.mark.parametrize("field", ["sub_issues_summary", "dependencies_summary"])
+def test_link_count_change_alone_voids_a_read(store, field):
+    from foragent.tracker import Issue
+
+    issue = Issue(1, "Feature", "body", frozenset(), "open", updated_at=NOW.isoformat(),
+                  **{field: (("total", 1),)})
+    store.refresh_local_issues([issue], [], {}, NOW)
+    store.record_read(1, "blocked_by", [], baseline=store.read_baseline())
+    store.refresh_local_issues([replace(issue, **{field: (("total", 0),)})], [], {}, NOW + timedelta(minutes=5))
+    assert store.confirmed_read(1, "blocked_by") is None
