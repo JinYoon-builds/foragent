@@ -74,6 +74,43 @@ def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
     ctx.tracker.record_label(number, "approved", actor)
 
 
+@pytest.mark.parametrize("floor,pressure,expected", [(2, "warn", 2), (2, "critical", 1), (1, "warn", 1)])
+def test_tick_applies_configured_test_slots_floor_without_starting_runs(ctx, monkeypatch, floor, pressure, expected):
+    from foragent import capacity
+
+    ctx.config = replace(ctx.config, test_slots=2, test_slots_floor=floor)
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(pressure, 0.5, 60))
+    capacity.write_state(ctx.store, 4, NOW)
+    assert tick(ctx).skipped is None
+    assert capacity.effective_test_slots(2) == expected
+    rows = [json.loads(line) for line in (capacity.machine_root() / capacity.HISTORY_FILE).read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["wanted"] == 1 and rows[0]["to"] == expected
+    assert rows[0]["swapins"] == 60
+    assert capacity.read_state(ctx.store) == {"parallel": 4, "changed_at": NOW.isoformat()}
+
+
+@pytest.mark.parametrize("floor,pressure,expected", [(3, "warn", 3), (3, "critical", 1), (1, "warn", 1)])
+def test_tick_applies_configured_parallel_floor_when_starting_workers(ctx, monkeypatch, floor, pressure, expected):
+    from foragent import capacity
+
+    lanes = {f"lane-{number}": {} for number in range(1, 5)}
+    ctx.config = replace(ctx.config, parallel_floor=floor, max_parallel=3, test_slots=1, lanes=lanes)
+    for number in range(1, 5):
+        approve(ctx, number, labels=[f"lane:lane-{number}"])
+    capacity.write_state(ctx.store, 3, NOW)
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(pressure, 0.5, 60))
+    ctx.start_runs = True
+    assert tick(ctx).skipped is None
+    assert len(ctx.store.active_runs()) == expected
+    assert capacity.read_state(ctx.store)["parallel"] == expected
+    rows = [json.loads(line) for line in (ctx.store.root.parent / capacity.HISTORY_FILE).read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["budget"] == "parallel"
+    assert rows[0]["wanted"] == 1 and rows[0]["to"] == expected
+    assert rows[0]["swapins"] == 60
+
+
 @pytest.mark.parametrize("needs_human", [False, True])
 def test_refresh_populates_blocker_evidence_and_listing_stays_offline(ctx, monkeypatch, needs_human):
     from foragent import orch

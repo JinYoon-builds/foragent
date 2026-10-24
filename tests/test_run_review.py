@@ -47,6 +47,34 @@ def test_review_pass_opens_pr_and_records_review(run_case, message, note):
         assert note in body
 
 
+@pytest.mark.parametrize("merge_state", ["before", "pending", "committed"])
+def test_review_prompt_excludes_main_only_changes(review_context, git_history, merge_state):
+    ctx = review_context
+    ctx.config = replace(ctx.config, reviewer="codex")
+    import_index(ctx.git.root, "Run change")
+    git_history.update({"main-only.txt": "another run's change\n"})
+    ctx.git.fetch()
+    if merge_state != "before":
+        ctx.git.merge_base("origin/main", commit=False)
+        assert ctx.git.merge_in_progress()
+        if merge_state == "committed":
+            import_index(ctx.git.root, "Integrate main")
+    git_history.update({"later-main-only.txt": "later target change\n"})
+    ctx.git.fetch()
+    calls = []
+
+    def review(**kwargs):
+        calls.append(kwargs)
+        return ExecResult(0, False, "VERDICT: PASS", kwargs["log_path"])
+
+    ctx.executor_factory = lambda name: SimpleNamespace(run=review)
+    assert _review(1, ctx, ctx.git, parse_body(BODY), "origin/main").verdict == "PASS"
+    assert len(calls) == 1
+    prompt = calls[0]["prompt"]
+    assert "diff --git a/feature.txt b/feature.txt" in prompt
+    assert "main-only.txt" not in prompt
+
+
 def test_review_failure_retries_implementation_and_done_when(run_case):
     c = run_case
     c.executor.steps.append({})

@@ -6,11 +6,12 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from foragent import scheduler
-# The facade re-exports these capacity bindings from here; calls below go through it.
+# The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, decrease_allowed, machine_load,
     machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
 )
+from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
 from foragent.tracker import Issue
 
 if TYPE_CHECKING:
@@ -37,21 +38,22 @@ def _machine_budget(
         demand = scheduler.machine_runs(ctx.store, now) + waiting
         # Work only caps growth: the shared value never drops below itself for lack
         # of work here, so it stays the pressure- and load-driven value.
-        value = scheduler.next_parallel(
+        wanted = scheduler.next_parallel(
             current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
             ceiling=None, increase_ok=now - changed_at >= scheduler.INCREASE_INTERVAL,
         )
-        if value < current and not scheduler.decrease_allowed(state, now):
-            value = current
+        if wanted < current and not scheduler.decrease_allowed(state, now):
+            wanted = current
+        value = wanted if pressure == "critical" else max(ctx.config.parallel_floor, wanted)
         if state is None or value != current:
             decreased_at = (
                 now.astimezone(scheduler.UTC).isoformat() if value < current else (state or {}).get("decreased_at")
             )
             scheduler.write_state(ctx.store, value, now, decreased_at=decreased_at)
-            scheduler.append_budget_history(
-                ctx.store.root.parent, now, "parallel", current, value,
-                pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None),
-            )
+        scheduler.append_budget_history(
+            ctx.store.root.parent, now, "parallel", current, value,
+            pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None), wanted=wanted,
+        )
     return max(1, min(value, demand))
 
 

@@ -321,35 +321,40 @@ def decrease_allowed(state: dict[str, Any] | None, now: datetime) -> bool:
 
 def append_budget_history(
     root: Path, now: datetime, budget: str, current: int, value: int, *,
-    pressure: str, load_per_cpu: float, swapins: int | None,
+    pressure: str, load_per_cpu: float, swapins: int | None, wanted: int | None = None,
 ) -> None:
-    if current == value:
+    if current == value and (wanted is None or wanted == value):
         return
+    row = {
+        "at": now.astimezone(UTC).isoformat(), "budget": budget,
+        "from": current, "to": value, "pressure": pressure,
+        "load_per_cpu": load_per_cpu, "swapins": swapins,
+    }
+    if wanted is not None:
+        row["wanted"] = wanted
     # Both budgets and all repository gates share one append lock.
     with _flock(root / "budget-history.lock"):
         with (root / HISTORY_FILE).open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({
-                "at": now.astimezone(UTC).isoformat(), "budget": budget,
-                "from": current, "to": value, "pressure": pressure,
-                "load_per_cpu": load_per_cpu, "swapins": swapins,
-            }) + "\n")
+            stream.write(json.dumps(row) + "\n")
 
 
 def update_test_slots(
     ceiling: int, now: datetime, *, pressure: str, load_per_cpu: float, swapins: int | None = None,
+    floor: int = 1,
 ) -> int:
-    """Adjust the machine-wide test slot count once per tick and return it."""
+    """Apply the guard and configured floor; critical pressure bypasses the floor."""
     root = machine_root()
     with _flock(root / TEST_SLOTS_LOCK):
         state = read_test_slots()
         current = min(state["slots"], ceiling) if state else ceiling
         changed_at = datetime.fromisoformat(state["changed_at"]) if state else now
-        value = next_test_slots(
+        wanted = next_test_slots(
             current, pressure=pressure, load_per_cpu=load_per_cpu, ceiling=ceiling,
             increase_ok=now - changed_at >= INCREASE_INTERVAL,
         )
-        if value < current and not decrease_allowed(state, now):
-            value = current
+        if wanted < current and not decrease_allowed(state, now):
+            wanted = current
+        value = wanted if pressure == "critical" else max(floor, wanted)
         if state is None or value != state["slots"]:
             updated = {"slots": value, "changed_at": now.astimezone(UTC).isoformat()}
             decreased_at = now.astimezone(UTC).isoformat() if value < current else (state or {}).get("decreased_at")
@@ -359,10 +364,10 @@ def update_test_slots(
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 json.dump(updated, stream)
             os.replace(temporary, root / TEST_SLOTS_FILE)
-            append_budget_history(
-                root, now, "test_slots", state["slots"] if state else current, value,
-                pressure=pressure, load_per_cpu=load_per_cpu, swapins=swapins,
-            )
+        append_budget_history(
+            root, now, "test_slots", state["slots"] if state else current, value,
+            pressure=pressure, load_per_cpu=load_per_cpu, swapins=swapins, wanted=wanted,
+        )
     return value
 
 

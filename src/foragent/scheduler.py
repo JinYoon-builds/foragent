@@ -22,6 +22,11 @@ from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import kill_process_group
 from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
+from foragent.scheduler_start import (
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _has_slot, _machine_budget, _reserve_slot, _start_ready,
+    append_budget_history, decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel,
+    prebuild_acceptance_baseline, read_state, start_baseline_thread, update_test_slots, write_state,
+)
 from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
 
@@ -58,6 +63,7 @@ class TickContext:
     start_runs: bool = True
     runner_process_exists: Callable[[int], bool] = runner_process_exists
     kill_runner: Callable[[int], None] = kill_process_group
+    baseline_launcher: Callable = start_baseline_thread
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self, queue_writes=True)
@@ -83,11 +89,6 @@ from foragent.scheduler_checks import (  # noqa: E402
 )
 from foragent.scheduler_lanes import (  # noqa: E402
     _can_start_in_lane, _file_patterns_overlap, _filesystem_case_sensitive, _lane_has_room,
-)
-from foragent.scheduler_start import (  # noqa: E402
-    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _has_slot, _machine_budget, _reserve_slot, _start_ready,
-    append_budget_history, decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel, read_state,
-    update_test_slots, write_state,
 )
 
 
@@ -211,8 +212,9 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     sample = machine_load()
     update_test_slots(
         ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
-        swapins=getattr(sample, "swapins", None),
+        swapins=getattr(sample, "swapins", None), floor=ctx.config.test_slots_floor,
     )
+    prebuild_acceptance_baseline(ctx, base_ref, ctx.baseline_launcher)
     if not ctx.start_runs or not ready:
         return report
     if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
