@@ -128,6 +128,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         # Keep an existing recorder; wrapping again would bypass its own state.
         recorder = ctx.tracker if isinstance(ctx.tracker, RecordingTracker) else RecordingTracker(ctx.tracker, ctx)
         recorder.refresh_issues(observed_at=started)
+        board.refresh_cards(ctx, recorder)
     ctx.tracker.flush_outbox()
     if until := ctx.store.github_wait_until(ctx.now()):
         return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
@@ -146,10 +147,13 @@ def _tick_locked(ctx: TickContext) -> TickReport:
 
     for issue in local_issue_models(ctx.store):
         if issue.state != "open":
+            # A manually closed card leaves its column; known cards only.
+            board.sync_status(ctx, issue, "closed", existing_only=True)
             continue
         issue = _recover_orphan(ctx, issue, report)
         issue = _escalate_overdue_blocker(ctx, issue, report)
         if issue.state != "open":
+            board.sync_status(ctx, issue, "closed", existing_only=True)
             continue
         lane = lane_for(issue)
         waiting_labels = issue.labels & {BLOCKED, NEEDS_HUMAN}
@@ -160,6 +164,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             board.sync_status(ctx, issue, "Needs human" if NEEDS_HUMAN in waiting_labels else "Blocked")
             continue
         if APPROVED not in issue.labels and not waiting_labels:
+            # Removing approval returns a known card to Backlog.
+            board.sync_status(ctx, issue, "unapproved", existing_only=True)
             continue
         event, ignored = _latest_approval(
             _label_events(ctx, issue.number, confirmed=listing_current), ctx.config.approvers,
