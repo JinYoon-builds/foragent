@@ -228,8 +228,8 @@ def test_publish_projects_are_idempotent_and_failure_does_not_stop_publication(p
         assert "Could not add issue" in caplog.text and "Could not set board Status" in caplog.text
     else:
         assert len(snapshot(tracker, project_id)["items"]["nodes"]) == 3
-        assert item_values(tracker, project_id, 2) == {"Lane": "api", "Size": "m", "Status": "Approved"}
-        assert item_values(tracker, project_id, 3) == {"Lane": "main", "Size": "s", "Status": "Approved"}
+        assert item_values(tracker, project_id, 2) == {"Lane": "api", "Size": "m", "Status": "🌰 Up next"}
+        assert item_values(tracker, project_id, 3) == {"Lane": "main", "Size": "s", "Status": "🌰 Up next"}
 
 
 @pytest.mark.parametrize("options,approved", [

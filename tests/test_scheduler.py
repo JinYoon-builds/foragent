@@ -431,16 +431,141 @@ def test_scheduler_projects_follow_ready_running_and_blocked_labels(ctx):
     ctx.config = replace(ctx.config, board=project_id)
     approve(ctx)
     tick(ctx)
-    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Ready"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🌰 Up next"
     ctx.start_runs = True
     tick(ctx)
-    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Running"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🐿 In progress"
     flag(ctx, 1, Reason.SPEC_QUESTION, "Choose a behavior")
-    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Blocked"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🐿 In progress"
     ctx.store.finish_run(1, outcome="blocked")
     ctx.now = lambda: NOW + timedelta(minutes=31)
     tick(ctx)
-    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Needs human"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "✋ Your turn"
+
+
+def _board_writes(ctx, monkeypatch):
+    """Count board value writes at the GraphQL boundary below any recorder."""
+    from foragent.tracker import RecordingTracker
+
+    remote = ctx.tracker._tracker if isinstance(ctx.tracker, RecordingTracker) else ctx.tracker
+    graphql = remote.graphql
+    writes = []
+
+    def counted(query, variables):
+        if "ForagentSetBoardValue" in query:
+            writes.append(variables)
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", counted)
+    return writes
+
+
+@pytest.mark.parametrize("change", ["unapproved", "closed"])
+def test_scheduler_moves_unapproved_and_closed_cards_once(ctx, monkeypatch, change):
+    from foragent import board
+    from test_board import item_values
+
+    project_id = board.ensure(ctx.tracker, ctx.repo)
+    ctx.config = replace(ctx.config, board=project_id)
+    approve(ctx)
+    tick(ctx)
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🌰 Up next"
+    if change == "unapproved":
+        ctx.tracker.remove_labels(1, ["approved", "ready"])
+    else:
+        ctx.tracker.close_issue(1)
+    writes = _board_writes(ctx, monkeypatch)
+    tick(ctx)
+    wanted = "🗂 Backlog" if change == "unapproved" else "📦 Done"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == wanted
+    assert len(writes) == 1
+    writes.clear()
+    tick(ctx)
+    assert writes == [], "a card already in its column needs no board write"
+
+
+def test_scheduler_never_adds_cards_for_unknown_closed_or_unapproved_issues(ctx, monkeypatch):
+    from foragent import board
+    from foragent.tracker import RecordingTracker
+    from test_board import snapshot
+
+    project_id = board.ensure(ctx.tracker, ctx.repo)
+    ctx.config = replace(ctx.config, board=project_id)
+    ctx.tracker.add_issue(7, "Never on the board")
+    ctx.tracker.add_issue(8, "Closed long ago")
+    ctx.tracker.close_issue(8)
+    remote = ctx.tracker._tracker if isinstance(ctx.tracker, RecordingTracker) else ctx.tracker
+    graphql = remote.graphql
+    touched = []
+
+    def counted(query, variables):
+        if variables.get("number") in {7, 8} or "ForagentAddBoardItem" in query:
+            touched.append(query)
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", counted)
+    tick(ctx)
+    assert not any("ForagentAddBoardItem" in query or "ForagentSetBoardValue" in query for query in touched)
+    touched.clear()
+    tick(ctx)
+    assert touched == [], "an issue already checked for its column needs no board call"
+    numbers = {item["content"]["number"] for item in snapshot(ctx.tracker, project_id)["items"]["nodes"]}
+    assert not numbers & {7, 8}
+
+
+@pytest.mark.parametrize("change", ["unapproved", "closed"])
+def test_scheduler_moves_existing_cards_without_a_local_record(ctx, monkeypatch, change):
+    from foragent import board
+    from test_board import item_values
+
+    project_id = board.ensure(ctx.tracker, ctx.repo)
+    ctx.config = replace(ctx.config, board=project_id)
+    approve(ctx)
+    tick(ctx)
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🌰 Up next"
+    ctx.store.update_local_issue(1, board_values={})  # Adopted card: no local record.
+    if change == "unapproved":
+        ctx.tracker.remove_labels(1, ["approved", "ready"])
+    else:
+        ctx.tracker.close_issue(1)
+    writes = _board_writes(ctx, monkeypatch)
+    tick(ctx)
+    wanted = "🗂 Backlog" if change == "unapproved" else "📦 Done"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == wanted
+    assert len(writes) == 1
+    writes.clear()
+    tick(ctx)
+    assert writes == []
+
+
+def test_scheduler_moves_a_card_people_add_after_the_board_had_none(ctx, monkeypatch):
+    from foragent import board
+    from test_board import item_values
+
+    project_id = board.ensure(ctx.tracker, ctx.repo)
+    ctx.config = replace(ctx.config, board=project_id)
+    ctx.tracker.add_issue(8, "Closed without a card")
+    ctx.tracker.close_issue(8)
+    tick(ctx)
+    assert ctx.tracker.board_value(8, project_id, "Status") == board.NO_CARD
+    # Someone adds the closed issue's card in 🐿 In progress on GitHub.
+    status = board.Project(ctx.tracker, ctx.repo, project_id).fields()["Status"]
+    option = next(option for option in status["options"] if option["name"] == "🐿 In progress")
+    item = ctx.tracker.graphql("""mutation ForagentAddBoardItem($input: AddProjectV2ItemByIdInput!) {
+      addProjectV2ItemById(input: $input) { item { id } }
+    }""", {"input": {"projectId": project_id, "contentId": "I_owner/repo#8"}})["data"]["addProjectV2ItemById"]["item"]
+    ctx.tracker.graphql("""mutation ForagentSetBoardValue($input: UpdateProjectV2ItemFieldValueInput!) {
+      updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+    }""", {"input": {"projectId": project_id, "itemId": item["id"], "fieldId": status["id"],
+                     "value": {"singleSelectOptionId": option["id"]}}})
+    writes = _board_writes(ctx, monkeypatch)
+    ctx.now = lambda: NOW + timedelta(minutes=6)  # The next periodic refresh reads the board.
+    tick(ctx)
+    assert item_values(ctx.tracker, project_id, 8)["Status"] == "📦 Done"
+    assert len(writes) == 1
+    writes.clear()
+    tick(ctx)
+    assert writes == []
 
 
 def test_scheduler_repairs_board_after_transport_recovers(ctx, caplog):
@@ -460,7 +585,7 @@ def test_scheduler_repairs_board_after_transport_recovers(ctx, caplog):
     assert "Could not set board Status" in caplog.text
     ctx.tracker.graphql = graphql
     assert tick(ctx).skipped is None
-    assert item_values(ctx.tracker, project_id, 1)["Status"] == "Ready"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🌰 Up next"
 
 
 def test_latest_approver_event_is_the_snapshot_identity(ctx):

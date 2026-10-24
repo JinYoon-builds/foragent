@@ -553,7 +553,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         parent = tracker.create_issue(plan["title"], parent_body(), [])
     else:
         tracker.update_issue(parent, title=plan["title"], body=parent_body())
-    board.add_issue(tracker, repo, config.board, parent)
+    board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
     for item in plan["issues"]:
         body = issue_body(item, repo, config.base_branch, config.acceptance_dir) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
@@ -579,7 +579,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             tracker.add_labels(number, labels)
             recorded_blobs[str(number)] = blobs
         tracker.add_sub_issue(parent, number)
-        board.add_issue(tracker, repo, config.board, number, item["lane"], item["size"])
+        board.add_issue(tracker, repo, config.board, number, item["lane"], item["size"], config.board_map)
     for item in plan["issues"]:
         number = mapping[item["key"]]
         desired = {mapping[key] for key in item.get("blocked_by", [])}

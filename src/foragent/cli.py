@@ -102,6 +102,7 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--no-push", action="store_true")
     init.add_argument("--no-launchd", action="store_true")
     init.add_argument("--no-board", action="store_true")
+    init.add_argument("--board-map", help="Existing board columns: Backlog=Todo,Up next=Todo,In progress=Doing,Your turn=Review,Done=Done")
     init.add_argument("--dry-run", action="store_true")
     profile_command = commands.add_parser("profile", help="Save the project's confirmed profile")
     profile_actions = profile_command.add_subparsers(dest="action", required=True)
@@ -605,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
                 root, approvers=args.approvers, review=args.review, executor=args.executor,
                 run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
                 dry_run=args.dry_run, language=args.language, no_board=args.no_board,
+                board_map=args.board_map,
             )
             print(report.summary())
             if not args.dry_run:
