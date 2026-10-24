@@ -1,6 +1,7 @@
 """Regression coverage for adoption reports and CI source preservation."""
 
 import json
+import os
 import shlex
 import sys
 import time
@@ -221,13 +222,37 @@ def test_baseline_pytest_reports_colored_parameterized_ids_and_quotes_ignore(tmp
     assert (tmp_path / "args").read_text().splitlines() == ["--ignore=checks/locked tests", "-rf"]
 
 
-def test_baseline_timeout_stops_shell_and_runner(tmp_path, capsys):
-    command = shlex.join([sys.executable, "-c", "import time; time.sleep(30)"])
-    started = time.monotonic()
+def test_baseline_timeout_stops_shell_and_runner(tmp_path, capsys, monkeypatch, fake_process_table):
+    import subprocess
+
+    class Process:
+        pid = 42000
+        returncode = None
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            fake_process_table.add(self.pid, cwd=tmp_path, start_time=10)
+            fake_process_table.add(42001, ppid=self.pid, pgid=self.pid, sid=self.pid,
+                                   cwd=tmp_path, start_time=11)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            assert not {42000, 42001} & fake_process_table.live
+
+        def communicate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired("offline baseline", 1)
+            return b"", None
+
+    monkeypatch.setattr(adopt.subprocess, "Popen", Process)
     assert cli.main(["adopt", "baseline", "--repo-root", str(tmp_path),
-                     "--command", command, "--timeout", "1", "--json"]) == 0
+                     "--command", "offline-baseline", "--timeout", "1", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["exit_code"] == 124
     assert report["passed"] is False
     assert report["failing"] == []
-    assert time.monotonic() - started < 5
+    assert not {42000, 42001} & fake_process_table.live
+    assert all(kind == "pid" and sig != 0 for kind, _, sig in fake_process_table.calls)

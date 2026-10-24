@@ -35,7 +35,7 @@ from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, atte
 from foragent.order import detect_test_commands
 from foragent.orch_reinstall import after_merge
 from foragent.policy import merge_decision, review_mode_for, touched
-from foragent.processes import run_logged, track_process_group
+from foragent.processes import observe_tree, run_logged, track_process_group
 from foragent.reasons import Reason
 from foragent.skills import SkillManager, copy_lane_skills
 from foragent.state import Approval, StateStore
@@ -351,7 +351,8 @@ def run_issue(n: int, ctx: RunContext) -> str:
     worktree = ctx.store.worktree_path(n)
     log = ctx.store.log_path(n)
     try:
-        run = ctx.store.update_run(n, pid=os.getpid())
+        run = ctx.store.update_run(n, pid=os.getpid(),
+                                   process_identities=observe_tree(roots=(os.getpid(),)))
         if until := ctx.store.github_wait_until(ctx.now()):
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
