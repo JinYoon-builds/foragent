@@ -58,8 +58,8 @@ def test_merge_uses_the_classified_commit_when_the_shared_ref_moves_again(publis
     classify = run_publish.base_move_is_neutral
     late = []
 
-    def classify_then_race(attempt, target_sha):
-        neutral = classify(attempt, target_sha)
+    def classify_then_race(attempt, move):
+        neutral = classify(attempt, move)
         if not late:
             case.history.update({"src/widget.py": "VALUE = 1\n"})
             late.append(case.history.tip)

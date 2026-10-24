@@ -16,7 +16,7 @@ from foragent.labels import BLOCKED, READY, RUNNING
 from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped
-from foragent.run_base_move import REUSED, REVERIFY, base_move_is_neutral
+from foragent.run_base_move import REUSED, REVERIFY, base_move_is_neutral, capture_move
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_lane_skills import _inject_lane_skills
 from foragent.run_prompts import review_scope_rules
@@ -249,8 +249,10 @@ def _publish_locked(attempt: Implementation) -> str:
         # Docs and other issues' pending locked tests cannot change this
         # branch's verified result, so they neither re-verify nor use the budget.
         # The shared remote-tracking ref can move again (another fetch) before
-        # the merge, so classify, prepare and merge this exact commit.
-        neutral = base_move_is_neutral(attempt, target_sha)
+        # the merge, so pin the range once, classify it, and merge exactly it.
+        move = capture_move(git, target_sha)
+        target_sha = move.target_sha
+        neutral = base_move_is_neutral(attempt, move)
         if not neutral and base_merges == 3:
             flag(ctx, n, Reason.TIMEOUT, "base kept moving")
             raise ExecutorStopped("timeout")
