@@ -13,6 +13,8 @@ import tempfile
 import threading
 from typing import IO, Any
 
+from foragent.records import load_record, write_back
+
 # Tick-lock paths this thread holds through StateStore.hold_tick_lock.
 _TICK_LOCKS_HELD = threading.local()
 
@@ -522,7 +524,7 @@ class StateStore:
             "number": number, "body": body, "body_sha": body_sha, "acceptance_blobs": acceptance_blobs,
             "approved_by": approved_by, "approved_at": approved_at,
         }
-        self._write_json(self.root / "approvals" / f"{number}.json", snapshot)
+        self._write_mapping(self.root / "approvals" / f"{number}.json", Approval, snapshot)
 
     def load_approval(self, number: int) -> Approval | None:
         path = self.root / "approvals" / f"{number}.json"
@@ -530,13 +532,13 @@ class StateStore:
             snapshot = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
-        return Approval(**snapshot)
+        return load_record(Approval, snapshot)
 
     def clear_approval(self, number: int) -> None:
         (self.root / "approvals" / f"{number}.json").unlink(missing_ok=True)
 
     def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None) -> None:
-        self._write_json(self.root / "flags" / f"{number}.json", {
+        self._write_mapping(self.root / "flags" / f"{number}.json", Flag, {
             "number": number, "reason": reason,
             "flagged_at": flagged_at if flagged_at is not None else self._timestamp(),
         })
@@ -546,19 +548,46 @@ class StateStore:
             value = (self.root / "flags" / f"{number}.json").read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        return Flag(**json.loads(value))
+        return load_record(Flag, json.loads(value))
 
     def load_inspect(self) -> InspectState:
         try:
             value = (self.root / "inspect.json").read_text(encoding="utf-8")
         except FileNotFoundError:
             return InspectState()
-        return InspectState(**json.loads(value))
+        return load_record(InspectState, json.loads(value))
+
+    def _write_mapping(self, path: Path, cls: type, value: dict[str, Any]) -> dict[str, Any]:
+        """Write a record mapping, keeping fields a newer version stored in the file."""
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            saved = {}
+        value = write_back(cls, saved, value)
+        self._write_json(path, value)
+        return value
+
+    def _write_record(self, path: Path, record: Any) -> dict[str, Any]:
+        return self._write_mapping(path, type(record), asdict(record))
+
+    def _run_value(self, run: "Run") -> dict[str, Any]:
+        """A run's fields merged over the unknown fields its file holds on disk."""
+        try:
+            saved = json.loads((self.root / "runs" / f"{run.number}.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            saved = {}
+        return write_back(type(run), saved, asdict(run))
+
+    def _write_run(self, run: "Run", value: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The one writer of run files; unknown fields always survive."""
+        value = self._run_value(run) if value is None else value
+        self._write_json(self.root / "runs" / f"{run.number}.json", value)
+        return value
 
     def update_inspect(self, **fields: Any) -> InspectState:
         with self._state_lock():
             updated = replace(self.load_inspect(), **fields)
-            self._write_json(self.root / "inspect.json", asdict(updated))
+            self._write_record(self.root / "inspect.json", updated)
             return updated
 
     def start_run(
@@ -596,7 +625,7 @@ class StateStore:
                       attempt_tiers=previous.attempt_tiers if resumed else {},
                       approval_body_sha=approval.body_sha if approval is not None else None,
                       last_activity_at=timestamp, process_identities=identities, **session)
-            self._write_json(self.root / "runs" / f"{number}.json", asdict(run))
+            self._write_run(run)
             return run
 
     def prepare_run_start(self, number: int) -> None:
@@ -642,7 +671,7 @@ class StateStore:
             )}
             fields["process_identities"] = observe_tree(list(identities.values()))
             updated = replace(run, **fields)
-            self._write_json(self.root / "runs" / f"{number}.json", asdict(updated))
+            self._write_run(updated)
             return updated
 
     def get_run(self, number: int) -> Run | None:
@@ -650,7 +679,7 @@ class StateStore:
             value = (self.root / "runs" / f"{number}.json").read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        return Run(**json.loads(value))
+        return load_record(Run, json.loads(value))
 
     def active_runs(self) -> list[Run]:
         runs = []
@@ -706,8 +735,9 @@ class StateStore:
                                process_identities=observe_tree(run.process_identities))
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
-            self._atomic_write(history_path, history + json.dumps(asdict(finished), ensure_ascii=False) + "\n")
-            self._write_json(self.root / "runs" / f"{number}.json", asdict(finished))
+            snapshot = self._run_value(finished)
+            self._atomic_write(history_path, history + json.dumps(snapshot, ensure_ascii=False) + "\n")
+            self._write_run(finished, snapshot)
             return finished
 
     def read_history(self) -> list[Run]:
@@ -718,7 +748,7 @@ class StateStore:
             return []
         runs: dict[tuple[int, str], Run] = {}
         for line in history.splitlines():
-            run = Run(**json.loads(line))
+            run = load_record(Run, json.loads(line))
             runs[run.number, run.started_at] = run
         return list(runs.values())
 

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from foragent import scheduler
+from foragent.records import load_record
 from foragent.state import Approval
 from foragent.tracker import Dependency, Issue, LabelEvent
 
@@ -37,7 +38,7 @@ def _label_events(ctx: TickContext, number: int, *, confirmed: bool) -> list[Lab
         ctx, number, "label_events", lambda: [scheduler.asdict(event) for event in ctx.tracker.label_events(number)],
         confirmed=confirmed,
     )
-    return [scheduler.LabelEvent(**event) for event in events]
+    return [load_record(scheduler.LabelEvent, event) for event in events]
 
 
 def _open_pr(ctx: TickContext, number: int, *, confirmed: bool) -> int | None:
@@ -54,7 +55,7 @@ def _blockers(ctx: TickContext, number: int, *, confirmed: bool) -> list[Depende
             else f"{dependency['repository']}#{dependency['number']}" for dependency in value
         ],
     )
-    return [scheduler.Dependency(**dependency) for dependency in dependencies]
+    return [load_record(scheduler.Dependency, dependency) for dependency in dependencies]
 
 
 def _check_prerequisites(
@@ -113,7 +114,7 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
         return issue
     row = next((row for row in ctx.store.local_issues() if row["number"] == issue.number), {})
     comments = [
-        comment for comment in (scheduler.Comment(**item) for item in row.get("comments", []))
+        comment for comment in (load_record(scheduler.Comment, item) for item in row.get("comments", []))
         if scheduler.re.fullmatch(
             r"<!-- foragent:blocked reason=[a-z-]+ -->",
             comment.body.partition("\n")[0].removesuffix("\r"),
