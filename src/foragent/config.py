@@ -69,6 +69,7 @@ class Config:
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None
+    board_map: dict[str, str] | None = None
     language: str = "en"
     interview: str = "native"
     ouroboros_version: str | None = None
@@ -350,6 +351,12 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 def _validate(values: dict[str, Any]) -> None:
     if type(values["notify_summary_hour"]) is not int or not 0 <= values["notify_summary_hour"] <= 23:
         raise ConfigError("notify_summary_hour must be an integer from 0 to 23")
+    board_map = values["board_map"]
+    if board_map is not None and (not isinstance(board_map, dict) or any(
+        key not in {"Backlog", "Up next", "In progress", "Your turn", "Done"}
+        or not isinstance(value, str) or not value.strip() for key, value in board_map.items()
+    )):
+        raise ConfigError("board_map must map board groups to nonempty column names or be null")
     if values["profile"] is not None and not isinstance(values["profile"], dict):
         raise ConfigError("profile must be a mapping or null")
     if values["test_command"] is not None and (
