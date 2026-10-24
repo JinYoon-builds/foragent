@@ -4,6 +4,8 @@ Ideas Jin wants to keep but not order yet. An idea moves to `decisions.md` when 
 
 ## 2026-10-24
 
+- **Write up how Foragent evolved.** Sources: `decisions.md` (D1-D81, each with date and reason), git history, research notes, scorecard numbers. Candidate threads: deterministic gate vs judging orchestrator (and why D80 came back to Jin's first instinct); building Foragent with Foragent; wrong diagnoses and what measurement fixed them (machine contention, GitHub limits, test counts); incidents and the safety lines they produced (the kill incident, unchecked outside merges); speed work as plumbing, not smarter models.
+
 - **Ask for a star once, after real value.** When Foragent has merged, say, 10 issues, show one line in a human-facing screen (interview or status report, never gate logs): "Foragent merged 10 issues. Star the repo? (yes / no, never ask again)". Only on an explicit yes does the agent star via `gh`; never star silently or offer rewards for stars (trust, and GitHub's rules on inflating stars). Ask once only.
 
 - **`fa` checks for updates (needed before the open-source release).** Users install with `uv tool install` and never learn about new versions. On `/fa` or `fa`, check the latest release once a day and offer a one-line update. After updating, restart the gate between ticks and let running runners finish on the old code; the self-merge reinstall (`orch_reinstall.after_merge`) already does this and can be reused.
