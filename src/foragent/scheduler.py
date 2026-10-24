@@ -809,7 +809,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     sample = machine_load()
     update_test_slots(
         ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
-        swapins=getattr(sample, "swapins", None),
+        swapins=getattr(sample, "swapins", None), floor=ctx.config.test_slots_floor,
     )
     if not ctx.start_runs or not ready:
         return report
@@ -849,19 +849,20 @@ def _machine_budget(
         demand = machine_runs(ctx.store, now) + waiting
         # Work only caps growth: the shared value never drops below itself for lack
         # of work here, so it stays the pressure- and load-driven value.
-        value = next_parallel(
+        wanted = next_parallel(
             current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
             ceiling=None, increase_ok=now - changed_at >= INCREASE_INTERVAL,
         )
-        if value < current and not decrease_allowed(state, now):
-            value = current
+        if wanted < current and not decrease_allowed(state, now):
+            wanted = current
+        value = wanted if pressure == "critical" else max(ctx.config.parallel_floor, wanted)
         if state is None or value != current:
             decreased_at = now.astimezone(UTC).isoformat() if value < current else (state or {}).get("decreased_at")
             write_state(ctx.store, value, now, decreased_at=decreased_at)
-            append_budget_history(
-                ctx.store.root.parent, now, "parallel", current, value,
-                pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None),
-            )
+        append_budget_history(
+            ctx.store.root.parent, now, "parallel", current, value,
+            pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None), wanted=wanted,
+        )
     return max(1, min(value, demand))
 
 
