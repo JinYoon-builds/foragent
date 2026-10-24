@@ -11,6 +11,7 @@ from foragent.config import Config
 from foragent.status import _age, summary_values, unknown as status_unknown
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
+from foragent.watch_sections import progress
 
 
 # Only the pickaxe moves. One hit every four 0.3-second frames.
@@ -93,17 +94,12 @@ def _frame(
     state = "watch_handling" if status["summary"]["blocked"] else "watch_monitoring"
     overview = [watch._line(t(state), "yellow" if status["summary"]["blocked"] else "green")]
     if snapshot.order:
-        filled = round(10 * snapshot.completed / snapshot.total) if snapshot.total else 0
+        # The combined bar and finish time live in the progress section.
         overview += [watch._line(t("watch_order") + f" #{snapshot.order.number}"),
-                     watch._line(snapshot.order.title),
-                     watch._line("▓" * filled + "░" * (10 - filled) + f" {snapshot.completed}/{snapshot.total}", "green")]
+                     watch._line(snapshot.order.title)]
     else:
         overview.append(watch._line(t("watch_no_order")))
     overview.append(watch._line(t("watch_waiting", **summary_values({"count": status["summary"]["waiting_human"]})), "bold"))
-    eta = (t("watch_complete") if snapshot.order and snapshot.completed == snapshot.total
-           else t("watch_eta", time="~" + snapshot.eta.astimezone().strftime("%H:%M") if snapshot.eta
-                  else t("watch_estimating") if snapshot.order else "—"))
-    overview.append(watch._line(eta))
     if snapshot.requests:
         count = lambda name: sum(row.get("status") == name for row in snapshot.requests)
         overview.append(watch._line(t("watch_requests", processing=count("processing"), done=count("done"))))
@@ -184,7 +180,7 @@ def _frame(
             else:
                 # A clone run: its own phase and title, judged as a working run.
                 shown = {**row, "state": "working", "issue": number, "title": titles.get(number) or "",
-                         "phase": run["phase"] if run else None,
+                         "phase": run.get("phase") if run else None,
                          "last_activity_seconds": _age(run.get("last_activity_at") or run.get("started_at"),
                                                        snapshot.captured_at) if run else None}
             phase = "" if shown["state"] == "blocked" else watch.text(shown["phase"] or shown["state"], language)
@@ -211,6 +207,9 @@ def _frame(
         summary += " · " + t("status_as_of", time=observed)
     first = [watch._line(t("status_unknown") + "  " + summary, "yellow")] if status_unknown(status) else []
     frame = (first or [watch._line(summary, "bold")]) + [[]]
+    if section := progress.render(snapshot, config, repo_root, tick=tick, width=width,
+                                  selected=selected, now=now, layout=layout):
+        frame += section + [[]]
     stage = watch._stage(snapshot, language, width)
     if stage:
         hits.append((0, len(frame), width if width < 44 else 18, len(frame) + len(stage), ("orchestrator", None)))
