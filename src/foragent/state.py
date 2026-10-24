@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any
+from typing import IO, Any
 
 
 @dataclass(frozen=True)
@@ -148,6 +148,24 @@ class StateStore:
         except (OSError, ValueError, TypeError, KeyError):
             return None
         return saved
+
+    def lock_acceptance_baseline(self, key: str, *, blocking: bool = True) -> IO[str] | None:
+        """Reserve a cache key until the last copy of the returned descriptor closes.
+
+        A detached builder can inherit the descriptor without a gap in ownership.
+        Closing the parent's copy must not explicitly unlock the child's copy.
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock = (self.root / f"{key}.lock").open("a", encoding="utf-8")
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            lock.close()
+            return None
+        except BaseException:
+            lock.close()
+            raise
+        return lock
 
     def _issue_snapshot(self) -> dict[str, Any]:
         try:

@@ -454,3 +454,141 @@ def test_orch_facts_idle_resources_and_one_binding_constraint_without_a_throughp
     assert str(goal_number) not in json.dumps(result)
     human = facts_without_plan(case, capsys, monkeypatch, human=True)
     assert str(goal_number) not in human, "Show resource facts without a plan throughput target"
+
+
+def recorded_related_checks(case, number, checks, *, started=None):
+    """Seed the runner's public Run.related_tests field, without a producer dependency.
+
+    Each execution stores a list of checks with changed_file_count,
+    selected_files, file_seconds, total_seconds and timed_out (the same schema
+    locked by test_related_tests_record.py). Update both existing public record
+    copies by execution identity, so repeated issues keep distinct measurements.
+
+    Facts preserves this list and exposes test_phase_share as checking_seconds /
+    runtime_seconds, including all checking work but excluding baseline/slot wait.
+    slowest_test_files totals only measured JUnit seconds across recent runs;
+    runs counts executions selecting the file once, even across repeated checks
+    or missing timeout timings. Its runtime_share divides by all recent runtime.
+    """
+    snapshot = case.store.root / "runs" / f"{number}.json"
+    current = json.loads(snapshot.read_text(encoding="utf-8"))
+    started_at = started.isoformat() if started is not None else current["started_at"]
+    if current["started_at"] == started_at:
+        current["related_tests"] = checks
+        snapshot.write_text(json.dumps(current) + "\n", encoding="utf-8")
+    history = case.store.root / "runs.jsonl"
+    if history.exists():
+        rows = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines()]
+        for row in rows:
+            if (row["number"], row["started_at"]) == (number, started_at):
+                row["related_tests"] = checks
+        history.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def related_check(changed_file_count, selected_files, file_seconds, total_seconds, *, timed_out=False):
+    return {"changed_file_count": changed_file_count, "selected_files": selected_files,
+            "file_seconds": file_seconds, "total_seconds": total_seconds, "timed_out": timed_out}
+
+
+def test_orch_facts_related_tests_preserve_each_check_and_test_phase_share(tmp_path, monkeypatch, capsys):
+    case = facts_case(tmp_path, monkeypatch)
+    checks = [
+        related_check(6, ["tests/test_reasons.py", "tests/test_runner.py"],
+                      {"tests/test_runner.py": 6.25, "tests/test_reasons.py": 1.75}, 13.25),
+        related_check(7, ["tests/test_runner.py"], {"tests/test_runner.py": 3}, 6.75),
+    ]
+    recorded_phase_run(case, 196, started=NOW - timedelta(hours=2), waited=10, phases=(
+        ("baseline", 10, {}), ("implementing", 40, {}),
+        ("test-slot-wait", 10, {}), ("checking", 40, {}),
+    ))
+    recorded_related_checks(case, 196, checks)
+
+    result = facts(case, capsys)
+    row, = result["runs"]
+    assert row["related_tests"] == checks, "Expose selection inputs and measured timings for every check"
+    assert row["runtime_seconds"] == 100
+    assert row["test_phase_share"] == pytest.approx(0.4), (
+        "Divide the 40s checking phase by 100s runtime; keep baseline, credited waits and related-only totals distinct")
+
+
+def test_orch_facts_related_tests_rank_files_across_recent_executions(tmp_path, monkeypatch, capsys):
+    case = facts_case(tmp_path, monkeypatch)
+    runner, reasons, cache = "tests/test_runner.py", "tests/test_reasons.py", "tests/test_baseline_cache_unit.py"
+    completed(case, 196, started=NOW - timedelta(hours=3), phases=(("implementing", 40), ("checking", 60)))
+    completed(case, 196, started=NOW - timedelta(hours=2), phases=(("implementing", 120), ("checking", 80)))
+    recorded_related_checks(case, 196, [
+        related_check(6, [reasons, runner], {runner: 30, reasons: 10}, 45),
+        related_check(6, [runner], {runner: 10}, 15),
+    ], started=NOW - timedelta(hours=3))
+    recorded_related_checks(case, 196, [related_check(2, [runner], {runner: 60}, 80)])
+    completed(case, 274, started=NOW - timedelta(hours=1), phases=(("implementing", 50), ("checking", 50)))
+    recorded_related_checks(case, 274, [related_check(1, [cache, reasons], {cache: 10, reasons: 30}, 50)])
+    # Huge measurements outside the dashboard window must affect neither rank,
+    # selection counts nor the denominator of the runtime share.
+    for number, started in ((98, NOW - timedelta(days=40)), (99, NOW + timedelta(days=2))):
+        completed(case, number, started=started, phases=(("checking", 10000),))
+        recorded_related_checks(case, number, [related_check(99, [cache], {cache: 9999}, 10000)])
+
+    result = facts(case, capsys)
+    ranked = result["slowest_test_files"]
+    assert [(item["file"], item["seconds"], item["runs"]) for item in ranked] == [
+        (runner, 100, 2), (reasons, 40, 2), (cache, 10, 1),
+    ], "Sum repeated checks, count executions selecting each file once, retain retries and sort by total seconds"
+    assert [item["runtime_share"] for item in ranked] == pytest.approx([0.25, 0.1, 0.025])
+    executions = [row for row in result["runs"] if row["issue"] == 196]
+    assert sorted(len(row["related_tests"]) for row in executions) == [1, 2], (
+        "The current snapshot and completion history must not duplicate or replace an execution's checks")
+
+
+def test_orch_facts_related_tests_timeouts_keep_missing_timings_unknown(tmp_path, monkeypatch, capsys):
+    case = facts_case(tmp_path, monkeypatch)
+    selected = ["tests/test_reasons.py", "tests/test_runner.py"]
+    partial = related_check(6, selected, {selected[1]: 30}, 900, timed_out=True)
+    missing = related_check(2, selected, {}, 100, timed_out=True)
+    for number, hours, check in ((184, 3, partial), (274, 2, missing)):
+        completed(case, number, started=NOW - timedelta(hours=hours), outcome="timeout",
+                  phases=(("implementing", 100), ("checking", check["total_seconds"])))
+        recorded_related_checks(case, number, [check])
+
+    result = facts(case, capsys)
+    rows = {row["issue"]: row for row in result["runs"]}
+    assert rows[184]["related_tests"] == [partial] and rows[274]["related_tests"] == [missing]
+    assert rows[184]["test_phase_share"] == pytest.approx(0.9)
+    assert rows[274]["test_phase_share"] == pytest.approx(0.5)
+    measured, = [item for item in result["slowest_test_files"] if item["file"] == selected[1]]
+    assert (measured["seconds"], measured["runs"]) == (30, 2), (
+        "Selection count includes the run without JUnit, but unknown timings do not become its 100s wall time")
+    assert measured["runtime_share"] == pytest.approx(30 / 1200)
+
+
+def test_orch_facts_related_tests_no_selection_and_legacy_run_are_empty(tmp_path, monkeypatch, capsys):
+    case = facts_case(tmp_path, monkeypatch)
+    completed(case, 7, started=NOW - timedelta(hours=2), phases=(("implementing", 10), ("checking", 2)))
+    recorded_related_checks(case, 7, [])
+    completed(case, 8, started=NOW - timedelta(hours=1))  # Legacy record has no field or phase measurements.
+
+    result = facts(case, capsys)
+    assert {row["issue"] for row in result["runs"]} == {7, 8}
+    assert all(row["related_tests"] == [] for row in result["runs"]), "No related check is an empty selection"
+    assert result["slowest_test_files"] == [], "Do not invent related files from a phase total or a log"
+    row, = [row for row in result["runs"] if row["issue"] == 7]
+    assert row["test_phase_share"] == pytest.approx(2 / 12), "Done-when checks can exist without related tests"
+    legacy, = [row for row in result["runs"] if row["issue"] == 8]
+    assert legacy["test_phase_share"] in (None, 0), "Unknown/zero runtime must not divide by zero"
+    assert facts(case, capsys) == result, "Repeated observation must leave the local records unchanged"
+
+
+def test_orch_facts_related_tests_human_line_names_slowest_file_and_runtime_share(tmp_path, monkeypatch, capsys):
+    case = facts_case(tmp_path, monkeypatch)
+    completed(case, 196, started=NOW - timedelta(hours=1), phases=(("implementing", 60), ("checking", 40)))
+    recorded_related_checks(case, 196, [
+        related_check(6, ["tests/test_reasons.py", "tests/test_runner.py"],
+                      {"tests/test_reasons.py": 5, "tests/test_runner.py": 25}, 40),
+    ])
+
+    output = facts(case, capsys, human=True)
+    summary = [line for line in output.splitlines() if "tests/test_runner.py" in line]
+    assert len(summary) == 1 and len(summary[0]) <= 160, "Name the slowest test file in one short line"
+    assert re.search(r"\b25(?:\.0+)?\s*%", summary[0]), (
+        f"Show its 25s / 100s runtime share beside the file, not its share of only measured tests: {summary[0]}")
+    assert len(output.splitlines()) <= 30
