@@ -10,15 +10,16 @@ from pathlib import Path
 from typing import Any
 
 from foragent.config import Config
-from foragent.messages.progress import text
+from foragent.i18n import text
 from foragent.watch_cells import Line
 
 ORDER = 15
 BAR_CELLS = 20
 RATE_WINDOW = timedelta(hours=1)
-# Logs are append-only: remember each file's parsed prefix (offset and the latest
-# windows per executor) so a refresh every few seconds reads only new bytes.
-_LOGS: dict[Path, tuple[tuple[int, bytes], int, dict[str, list[tuple[float, float]]]]] = {}
+# Logs are append-only: remember each file's parsed prefix (offset and the newest
+# reading per executor) so a refresh every few seconds reads only new bytes.
+Reading = tuple[tuple[float, float, float], list[tuple[float, float]]]
+_LOGS: dict[Path, tuple[tuple[int, bytes], int, dict[str, Reading]]] = {}
 HEAD_BYTES = 64
 
 
@@ -80,7 +81,28 @@ def _executor(event: Any) -> str | None:
     return None
 
 
-def _parse(line: bytes, latest: dict[str, list[tuple[float, float]]]) -> None:
+def _reading_time(event: dict[str, Any]) -> float:
+    """The event's own time in epoch seconds, or -inf when it records none."""
+    value = event.get("timestamp")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            at = datetime.fromisoformat(value)
+        except ValueError:
+            return float("-inf")
+        return (at if at.tzinfo else at.replace(tzinfo=UTC)).timestamp()
+    return float("-inf")
+
+
+def _key(event: dict[str, Any], windows: list[tuple[float, float]]) -> tuple[float, float, float]:
+    """How new a reading is: its own time first; without one (Claude records none), a later
+    reset means a later window and, within one window, usage only grows until it resets."""
+    return (_reading_time(event), max(reset for _, reset in windows),
+            max(percent for percent, _ in windows))
+
+
+def _parse(line: bytes, latest: dict[str, Reading]) -> None:
     if b'"rate_limit' not in line:
         return
     try:
@@ -88,11 +110,13 @@ def _parse(line: bytes, latest: dict[str, list[tuple[float, float]]]) -> None:
     except json.JSONDecodeError:
         return
     if (executor := _executor(event)) and (windows := _windows(executor, event)):
-        latest[executor] = windows
+        key = _key(event, windows)
+        if executor not in latest or key >= latest[executor][0]:
+            latest[executor] = (key, windows)
 
 
-def _log_windows(path: Path, inode: int, size: int) -> dict[str, list[tuple[float, float]]]:
-    """The latest windows per executor in one whole log, reading only appended bytes."""
+def _log_windows(path: Path, inode: int, size: int) -> dict[str, Reading]:
+    """The newest reading per executor in one whole log, reading only appended bytes."""
     with path.open("rb") as stream:
         identity = (inode, stream.read(HEAD_BYTES))
         cached, offset, known = _LOGS.get(path, (identity, 0, {}))
@@ -111,7 +135,10 @@ def _log_windows(path: Path, inode: int, size: int) -> dict[str, list[tuple[floa
 
 
 def quota(logs: Path, now: datetime) -> dict[str, tuple[float, datetime]]:
-    """Latest recorded usage per executor across every log; reset windows are dropped."""
+    """Newest recorded usage per executor across every log; reset windows are dropped.
+
+    Readings are ordered by their own time, never by the log file's modification
+    time: ordinary output appended to a log does not make its old reading newer."""
     files = []
     try:
         for path in logs.glob("*.log"):
@@ -124,16 +151,19 @@ def quota(logs: Path, now: datetime) -> dict[str, tuple[float, datetime]]:
     present = {path for _, path in files}
     for path in [path for path in _LOGS if path.parent == logs and path not in present]:
         del _LOGS[path]
-    latest: dict[str, list[tuple[float, float]]] = {}
-    for stat, path in sorted(files, key=lambda item: (item[0].st_mtime_ns, item[1].name)):
+    newest: dict[str, Reading] = {}
+    for stat, path in sorted(files, key=lambda item: item[1].name):
         try:
-            latest.update(_log_windows(path, stat.st_ino, stat.st_size))
+            found = _log_windows(path, stat.st_ino, stat.st_size)
         except OSError:
             continue
+        for executor, reading in found.items():
+            if executor not in newest or reading[0] > newest[executor][0]:
+                newest[executor] = reading
     # Drop windows that already reset before choosing the most-used one: an expired
     # primary window must not hide a still-valid secondary window.
     usage: dict[str, tuple[float, datetime]] = {}
-    for executor, windows in latest.items():
+    for executor, (_, windows) in newest.items():
         current = [(percent, at) for percent, reset in windows
                    if (at := datetime.fromtimestamp(reset, UTC)) > now]
         if current:

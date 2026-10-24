@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import json
 import re
 import subprocess
+import time
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
@@ -716,11 +717,15 @@ def _issue(data: dict[str, Any]) -> Issue:
     )
 
 
+_EMPTY_RETRY_DELAY = 0.5
+
+
 class GhTracker:
     def __init__(self, repo: str, run: Callable[..., str] | None = None):
         self.repo = repo
         self._run = run or _run_gh
         self._path = f"repos/{repo}"
+        self._seen_states: set[str] = set()
 
     def _call(self, args: list[str], input: str | None = None) -> str:
         try:
@@ -762,8 +767,54 @@ class GhTracker:
     def list_issues(self, state: str = "all") -> list[Issue]:
         if state not in {"open", "closed", "all"}:
             raise ValueError(f"unsupported issue state: {state}")
+        issues = self._fetch_issues(state)
+        if not issues:
+            # GitHub sometimes answers a listing with an empty page by mistake.
+            # One retry separates that hiccup from a repository that is empty.
+            time.sleep(_EMPTY_RETRY_DELAY)
+            issues = self._fetch_issues(state)
+        if issues:
+            states = {issue.state for issue in issues}
+            # A listing of every issue is the whole truth; a filtered one adds to it.
+            self._seen_states = states if state == "all" else self._seen_states | states
+            return issues
+        if state != "all" and state in self._seen_states:
+            # Open and closed issues change state, so an earlier sighting can be
+            # out of date. A listing of every issue settles it.
+            if any(issue.state == state for issue in self.list_issues("all")):
+                raise self._untrusted_empty(state, "a fresh listing of all issues")
+            return issues
+        if evidence := self._evidence_of_issues(state):
+            raise self._untrusted_empty(state, evidence)
+        self._seen_states.discard(state)
+        return issues
+
+    def _untrusted_empty(self, state: str, evidence: str) -> TrackerError:
+        return TrackerError(
+            f"GitHub returned an empty listing of {state} issues for {self.repo} twice, "
+            f"but {evidence} shows such issues exist; not trusting it, try again later"
+        )
+
+    def _fetch_issues(self, state: str) -> list[Issue]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues?state={state}&per_page=100"]))
         return [_issue(item) for item in data if "pull_request" not in item]
+
+    def _evidence_of_issues(self, state: str) -> str | None:
+        """Name what proves `state` issues exist, or None when nothing does."""
+        if state == "all" and self._seen_states:
+            # Issues are not removed, so having seen any is lasting proof.
+            return "an earlier listing"
+        from foragent.state import StateStore
+
+        try:
+            rows = StateStore.for_repo(self.repo).local_issues()
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        # The gate refreshes this record from a listing of all issues, which this
+        # check never blocks, so a stale open or closed row is corrected there.
+        if any(state == "all" or row.get("state") == state for row in rows):
+            return "the local issue record"
+        return None
 
     def update_issue(self, n: int, *, title: str, body: str) -> None:
         self._call(["api", "-X", "PATCH", f"{self._path}/issues/{n}", "--input", "-"],

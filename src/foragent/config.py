@@ -42,7 +42,9 @@ class Config:
     }])
     skill_roles: dict[str, str] = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
+    parallel_floor: int = 1
     test_slots: int = 2  # Machine-wide test command ceiling; AIMD lowers it under load (#243).
+    test_slots_floor: int = 1
     transient_max_wait_minutes: int = 30
     limit_wait_minutes: int = 60
     codex_goal: bool = False
@@ -61,12 +63,14 @@ class Config:
     run_hours: str = "always"
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
+    tick_failure_alert: int = 3
     max_runtime_minutes: int = 90
     max_retries: int = 2
     conflict_retries: int = 2
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None
+    board_map: dict[str, str] | None = None
     language: str = "en"
     interview: str = "native"
     ouroboros_version: str | None = None
@@ -348,6 +352,12 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 def _validate(values: dict[str, Any]) -> None:
     if type(values["notify_summary_hour"]) is not int or not 0 <= values["notify_summary_hour"] <= 23:
         raise ConfigError("notify_summary_hour must be an integer from 0 to 23")
+    board_map = values["board_map"]
+    if board_map is not None and (not isinstance(board_map, dict) or any(
+        key not in {"Backlog", "Up next", "In progress", "Your turn", "Done"}
+        or not isinstance(value, str) or not value.strip() for key, value in board_map.items()
+    )):
+        raise ConfigError("board_map must map board groups to nonempty column names or be null")
     if values["profile"] is not None and not isinstance(values["profile"], dict):
         raise ConfigError("profile must be a mapping or null")
     if values["test_command"] is not None and (
@@ -388,11 +398,16 @@ def _validate(values: dict[str, Any]) -> None:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
                 "max_parallel", "transient_max_wait_minutes", "limit_wait_minutes",
-                "orchestrator_timeout_minutes", "test_slots"):
+                "orchestrator_timeout_minutes", "tick_failure_alert", "test_slots", "test_slots_floor",
+                "parallel_floor"):
         if key == "max_parallel" and values[key] is None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
+    if values["test_slots_floor"] > values["test_slots"]:
+        raise ConfigError("test_slots_floor must be <= test_slots")
+    if values["max_parallel"] is not None and values["parallel_floor"] > values["max_parallel"]:
+        raise ConfigError("parallel_floor must be <= max_parallel")
     for key in ("always_human", "approvers"):
         if not isinstance(values[key], list) or any(not isinstance(item, str) for item in values[key]):
             raise ConfigError(f"{key} must be a list of strings")

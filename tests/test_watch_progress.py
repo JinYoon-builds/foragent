@@ -80,21 +80,22 @@ def test_quota_reads_latest_executor_events_and_drops_past_resets(tmp_path):
     claude = {"type": "rate_limit_event", "rate_limit_info": {"unifiedWindows": {
         "five_hour": {"utilization": 0.06, "resetsAt": future},
         "seven_day": {"utilization": 0.4, "resetsAt": future + 3600}}}}
-    codex = lambda percent, reset: {"type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
-        "primary": {"used_percent": percent, "resets_at": reset}, "secondary": None}}}
+    stamp = lambda minutes: (NOW - timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+    codex = lambda percent, reset, minutes: {"timestamp": stamp(minutes), "type": "event_msg", "payload": {
+        "type": "token_count", "rate_limits": {
+            "primary": {"used_percent": percent, "resets_at": reset}, "secondary": None}}}
     (logs / "issue-1.log").write_text("\n".join([
-        json.dumps(codex(10, future)), "{broken rate_limit", json.dumps(claude), json.dumps(codex(67, future)),
+        json.dumps(codex(10, future, 30)), "{broken rate_limit", json.dumps(claude), json.dumps(codex(67, future, 20)),
     ]) + "\n")
     (logs / "issue-2.log").write_text(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
         "unifiedWindows": {"five_hour": {"utilization": 0.9, "resetsAt": past}}}}) + "\n")
-    os.utime(logs / "issue-2.log", (1, 1))  # older log: the newer issue-1 events win
-    (logs / "issue-3.log").write_text(json.dumps(codex(99, past)) + "\n")
-    os.utime(logs / "issue-1.log", (100, 100))
-    os.utime(logs / "issue-3.log", (200, 200))
+    # issue-3 holds the newest codex reading by its own time; that window already reset.
+    (logs / "issue-3.log").write_text(json.dumps(codex(99, past, 5)) + "\n")
+    os.utime(logs / "issue-3.log", (1, 1))  # file times never decide which reading is newer
     usage = progress.quota(logs, NOW)
-    # issue-3 is newest; its codex window already reset, so codex has no current reading.
+    # Claude records no time: the window that resets later is the newer one.
     assert set(usage) == {"claude"} and round(usage["claude"][0]) == 40
-    os.utime(logs / "issue-3.log", (1, 1))
+    (logs / "issue-3.log").write_text(json.dumps(codex(99, past, 40)) + "\n")
     usage = progress.quota(logs, NOW)
     assert set(usage) == {"codex", "claude"}
     assert round(usage["codex"][0]) == 67 and round(usage["claude"][0]) == 40
@@ -158,3 +159,27 @@ def test_quota_reads_appended_lines_and_rewritten_logs(tmp_path):
     assert set(progress.quota(logs, NOW)) == {"claude"}
     log.unlink()
     assert progress.quota(logs, NOW) == {}
+
+
+def test_appended_output_does_not_make_an_older_reading_newer(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    future = int((NOW + timedelta(hours=3)).timestamp())
+
+    def reading(percent, minutes):
+        return json.dumps({"timestamp": (NOW - timedelta(minutes=minutes)).isoformat(), "type": "event_msg",
+                           "payload": {"type": "token_count", "rate_limits": {
+                               "primary": {"used_percent": percent, "resets_at": future}, "secondary": None}}})
+
+    older, newer = logs / "issue-1.log", logs / "issue-2.log"
+    older.write_text(reading(10, 30) + "\n")
+    newer.write_text(reading(67, 10) + "\n")
+    os.utime(newer, (100, 100))
+    with older.open("a") as stream:
+        stream.write("ordinary output from the still-running worker\n" * 50)
+    os.utime(older, (200, 200))  # the log with the older reading was written last
+    assert round(progress.quota(logs, NOW)["codex"][0]) == 67
+    # A genuinely newer reading appended later still wins, wherever it lands.
+    with older.open("a") as stream:
+        stream.write(reading(80, 1) + "\n")
+    assert round(progress.quota(logs, NOW)["codex"][0]) == 80

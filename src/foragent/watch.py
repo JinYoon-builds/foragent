@@ -31,7 +31,9 @@ from foragent.tracker import Issue, Tracker
 from foragent.watch_cells import Line, Span, _beside, _cells, _clean, _columns, _fit, _line, _panel, _wrap
 from foragent.watch_data import Snapshot, collect, recent_events
 from foragent.watch_art import ORCHESTRATOR, PALETTE, half_blocks
-from foragent.watch_layout import PICK, _activity, _frame, _has_work, _stage, render_detail, render_frame
+from foragent.watch_layout import PICK, _activity, _frame, _has_work, render_frame
+from foragent.watch_sections.detail import render_detail
+from foragent.watch_sections.stage import _stage
 from foragent.watch_mouse import handle_mouse, hit_test, switch_to_orchestrator
 from foragent.watch_open import registered
 from foragent.watch_terminal import _terminal, color_pairs

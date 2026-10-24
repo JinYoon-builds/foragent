@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 import json
+import logging
 from pathlib import Path
 import subprocess
 
@@ -31,6 +32,39 @@ about: Define a task for Foragent with executable acceptance checks.
 Commands must run in a CI-free shell; acceptance tests live in tests/acceptance/.
 """
 SETUP_PATHS = [".foragent.yml", ".github/ISSUE_TEMPLATE/foragent-task.md", "tests/acceptance/.gitkeep"]
+
+
+def _parse_board_map(value: str) -> dict[str, str]:
+    mapping = {}
+    for pair in value.split(","):
+        group, separator, column = pair.partition("=")
+        group, column = group.strip(), column.strip()
+        if not separator or group not in board.DEFAULT_MAP or not column or group in mapping:
+            raise ConfigError("--board-map requires Group=Column pairs for the five board groups")
+        mapping[group] = column
+    if mapping.keys() != board.DEFAULT_MAP.keys():
+        raise ConfigError("--board-map must include Backlog, Up next, In progress, Your turn, Done")
+    return mapping
+
+
+def _choose_board_map(columns: list[str]) -> dict[str, str]:
+    print("Map Foragent groups to existing team columns (saved in .foragent.yml):")
+    for number, column in enumerate(columns, 1):
+        print(f"  {number}. {column}")
+    mapping = {}
+    for group in board.DEFAULT_MAP:
+        while True:
+            try:
+                answer = input(f"{group} — column name or number: ").strip()
+            except (EOFError, OSError) as exc:
+                raise ConfigError("Existing board needs a mapping; retry init with --board-map Group=Column,...") from exc
+            if answer.isdecimal() and 1 <= int(answer) <= len(columns):
+                answer = columns[int(answer) - 1]
+            if answer in columns:
+                mapping[group] = answer
+                break
+            print("Choose one of the listed columns.")
+    return mapping
 
 
 @dataclass(frozen=True)
@@ -117,9 +151,11 @@ def init_repo(
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
     no_push: bool = False,
     no_launchd: bool = False, no_board: bool = False, dry_run: bool = False, git: GitRepo | None = None,
+    board_map: str | None = None,
     gh_run: Callable[..., str] | None = None, tracker: Tracker | None = None,
     install_launchd: Callable[[Path], str] | None = None,
 ) -> InitReport:
+    requested_map = _parse_board_map(board_map) if board_map is not None else None
     root = Path(repo_root).resolve()
     git = git or GitRepo(root)
     git.check_worktree()
@@ -202,13 +238,39 @@ def init_repo(
     tracker.ensure_labels(LABELS)
     board_id = config.board
     if not no_board:
-        board_id = board.ensure(tracker, repo, config.lanes, config.board)
+        created_boards: set[str] = set()
+        board_id = board.ensure(tracker, repo, config.lanes, config.board, created=created_boards)
+        board_changes = {}
         if board_id and board_id != config.board:
+            board_changes["board"] = board_id
+        if board_id and (requested_map is not None or config.board_map is None):
+            try:
+                status = board.Project(tracker, repo, board_id).fields().get("Status", {})
+                columns = [option["name"] for option in status.get("options", [])]
+            except Exception:
+                logging.getLogger(__name__).warning("Could not read board columns for %s", repo, exc_info=True)
+            else:
+                mapping = requested_map
+                if mapping is None and columns == list(board.COLUMNS):
+                    # Foragent's own five columns have exactly one mapping. A board
+                    # created now or already saved uses it by default; an existing
+                    # board adopted now records it without asking, once.
+                    if board_id != config.board and board_id not in created_boards:
+                        mapping = dict(board.DEFAULT_MAP)
+                elif mapping is None and columns:
+                    mapping = _choose_board_map(columns)
+                if mapping is not None:
+                    missing = set(mapping.values()) - set(columns)
+                    if missing:
+                        raise ConfigError(f"board_map refers to unavailable columns: {', '.join(sorted(missing))}")
+                    if mapping != config.board_map:
+                        board_changes["board_map"] = mapping
+        if board_changes:
             if config_path.exists():
-                added["board"] = board_id
+                added.update(board_changes)
                 updated_config = _add_config(config_path, local, added)
             else:
-                contents[".foragent.yml"] += yaml.safe_dump({"board": board_id}, sort_keys=False)
+                contents[".foragent.yml"] += yaml.safe_dump(board_changes, sort_keys=False, allow_unicode=True)
             pending = list(dict.fromkeys([*pending, ".foragent.yml"]))
             push_planned = not no_push
     for path in created:

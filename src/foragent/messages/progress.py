@@ -29,7 +29,3 @@ MESSAGES = {
     },
 }
 
-
-def text(key: str, language: str = "en", **values) -> str:
-    language = language.lower().split("-")[0]
-    return MESSAGES.get(language, MESSAGES["en"])[key].format(**values)

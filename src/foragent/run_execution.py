@@ -11,7 +11,7 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board
+from foragent import board, usage_events
 from foragent.actions import flag
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
 from foragent.labels import READY, RUNNING
@@ -66,7 +66,10 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         size = current
 
     def execute():
-        with track_process_group(lambda pgid: ctx.store.update_run(n, executor_pgid=pgid)):
+        with track_process_group(
+            lambda pgid: ctx.store.update_run(n, executor_pgid=pgid),
+            tree_callback=lambda identities: ctx.store.update_run(n, process_identities=identities),
+        ):
             return executor.run(**kwargs)
 
     try:
@@ -78,6 +81,8 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         return result
     finally:
         poll()
+        # Executors report plan usage in their own output; keep the latest numbers.
+        usage_events.record_from_log(ctx.store, log, offset)
         _progress(n, ctx)
 
 
