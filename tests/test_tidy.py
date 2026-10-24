@@ -70,3 +70,27 @@ def test_usage_events_read_both_formats_and_skip_unreadable_lines(tmp_path):
     assert usage["codex"]["seen_at"] == NOW.isoformat()
     usage_events.record_from_log(store, tmp_path / "missing.log")
     assert store.usage() == usage
+
+
+def test_failed_inbox_write_does_not_suppress_the_next_attempt(tmp_path, monkeypatch):
+    from foragent import orch_inbox
+
+    clock = [NOW]
+    store = store_at(tmp_path, clock)
+    for number in range(1, tidy.MERGE_THRESHOLD + 1):
+        merge(store, clock, number)
+    create = orch_inbox._create
+
+    def interrupted(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(orch_inbox, "_create", interrupted)
+    try:
+        tidy.post_if_due(store)
+    except OSError:
+        pass
+    assert requests(store) == []
+    monkeypatch.setattr(orch_inbox, "_create", create)
+    posted = tidy.post_if_due(StateStore(store.root, now=lambda: clock[0]))
+    assert posted and [row["id"] for row in requests(store)] == [posted["id"]]
+    assert tidy.post_if_due(store) is None

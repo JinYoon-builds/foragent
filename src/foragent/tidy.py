@@ -89,22 +89,17 @@ def request_text(facts: dict[str, Any]) -> str:
 
 
 def post_if_due(store: StateStore) -> dict[str, Any] | None:
-    """Put one 'tidy due' request in the inbox per due period; return it when posted."""
+    """Put one 'tidy due' request in the inbox per due period; return it when posted.
+
+    The request itself records its period, so the inbox is the only proof that a
+    period was posted: a failed or interrupted write leaves nothing that suppresses
+    the next tick's retry. Callers run under the tick lock, one at a time.
+    """
     facts = status(store)
     if not facts["due"]:
         return None
     period = facts["last_tidy_at"] or _START
-    claimed = False
-
-    def claim(state: dict[str, Any]) -> bool:
-        nonlocal claimed
-        if state.get("requested_period") == period:
-            return False
-        state["requested_period"] = period
-        claimed = True
-        return True
-
-    store.update_tidy_state(claim)
-    if not claimed:
+    if any(row["from"] == "gate" and row.get("tidy_period") == period
+           for row in orch_inbox.requests(store)):
         return None
-    return orch_inbox.add_request(store, "gate", request_text(facts))
+    return orch_inbox.add_request(store, "gate", request_text(facts), {"tidy_period": period})
