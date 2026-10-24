@@ -11,7 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, orch_queue, order, tidy, watch, watch_open
+from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, orch_queue, orch_tick_outcome, order, tidy, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -24,7 +24,7 @@ from foragent.skills import SkillError, SkillManager
 from foragent.launcher import spawn_notify, spawn_runner
 from foragent.inspect_runtime import InspectRuntimeError
 from foragent.processes import observe_tree
-from foragent.scheduler import TickContext, tick
+from foragent.scheduler import BUSY_TICK, TickContext, TickReport, tick
 from foragent.runner import RunContext, check_done, run_issue, run_tests
 from foragent.run_baseline import start_baseline_process
 from foragent.state import StateStore
@@ -789,12 +789,13 @@ def main(argv: list[str] | None = None) -> int:
             _inspect(args, inspect_ctx)
             return 0
         if args.action == "tick":
-            report = tick(TickContext(
+            # The outcome is recorded under the tick lock so overlapping ticks keep their order.
+            report = orch_tick_outcome.run_recorded(store, config, repo, lambda: tick(TickContext(
                 repo=repo, repo_root=root, tracker=tracker, store=store, config=config,
                 git=git, now=lambda: datetime.now(UTC), launcher=spawn_runner(root, store),
                 start_runs=not args.no_start,
                 baseline_launcher=start_baseline_process,
-            ))
+            ))) or TickReport(skipped=BUSY_TICK)
             if args.json:
                 print(json.dumps(asdict(report)))
             else:
@@ -812,6 +813,7 @@ def main(argv: list[str] | None = None) -> int:
             status = _status(tracker, store, config)
             status["launchd"] = asdict(launchd.status(root, repo=repo))
             status["test_slots"] = capacity.effective_test_slots(config.test_slots)
+            status["tick_outcome"] = orch_tick_outcome.read(store)
             if args.json:
                 print(json.dumps(status))
             else:
