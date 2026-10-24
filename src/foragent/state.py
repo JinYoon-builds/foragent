@@ -679,6 +679,33 @@ class StateStore:
             runs[run.number, run.started_at] = run
         return list(runs.values())
 
+    def usage(self) -> dict[str, Any]:
+        """The latest recorded plan usage per executor, as executors reported it."""
+        try:
+            return json.loads((self.root / "usage.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+
+    def record_usage(self, executor: str, windows: list[dict[str, Any]]) -> None:
+        with self._state_lock():
+            usage = self.usage()
+            usage[executor] = {"seen_at": self._timestamp(), "windows": windows}
+            self._write_json(self.root / "usage.json", usage)
+
+    def tidy_state(self) -> dict[str, Any]:
+        try:
+            return json.loads((self.root / "tidy.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+
+    def update_tidy_state(self, change: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+        """Apply ``change`` under the state lock; it returns whether to save."""
+        with self._state_lock():
+            state = self.tidy_state()
+            if change(state):
+                self._write_json(self.root / "tidy.json", state)
+            return state
+
     def worktree_path(self, number: int) -> Path:
         return self.root / "worktrees" / f"issue-{number}"
 
