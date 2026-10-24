@@ -223,6 +223,15 @@ check). Done when commands must run with the repo's normal tooling from the repo
 ## 6. One approval
 Write the plan JSON (schema in `fa order publish --help`) to a temp file. Run
 `fa order publish PLAN.json --dry-run`, fix validation errors, then record `progress check`.
+Then run `fa order preread PLAN.json --json`. The implementer reads each issue read-only and
+lists what it would have to guess. Show every unknown to the user as it is and ask them to
+answer it; never answer an unknown yourself. Fold the user's answers into the plan, then run
+preread again until every issue has no unknowns.
+`--approve` refuses issues whose latest preread of the current content is missing or has
+unknowns; any plan edit needs a new preread. The dry-run is never blocked.
+Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
+so preread refuses them: publish once without `--approve` to create the lanes, run preread,
+then publish again with `--approve`.
 Show the order grouped by lane, work first:
 ```
 This order: 7 issues

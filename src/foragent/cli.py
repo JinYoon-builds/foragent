@@ -136,6 +136,11 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--total", type=int, required=True)
         elif step == "publish":
             command.add_argument("--issue", type=int, required=True)
+    preread = order_actions.add_parser(
+        "preread", help="Ask each issue's implementer, read-only, to list unknowns before approval")
+    preread.add_argument("plan", type=Path)
+    preread.add_argument("--repo-root", type=Path, default=Path.cwd())
+    preread.add_argument("--json", action="store_true")
     publish = order_actions.add_parser(
         "publish", formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''PLAN.json schema (unknown fields are rejected):
@@ -152,6 +157,8 @@ def _parser() -> argparse.ArgumentParser:
 }
 new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
+--approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
+content; --dry-run never needs one.
 files lists repository-relative paths or globs expected to change; absolute paths and .. are rejected.''',
     )
     publish.add_argument("plan", type=Path)
@@ -607,6 +614,19 @@ def main(argv: list[str] | None = None) -> int:
                       if hasattr(args, name)}
             print(json.dumps(order.progress(StateStore.for_repo(repo), args.step, **fields),
                              ensure_ascii=False))
+            return 0
+        if args.command == "order" and args.action == "preread":
+            config = load_config(root)
+            results = order.preread(order.read_plan(args.plan), root, config,
+                                    lambda: GhTracker(config.repo or GitRepo(root).remote_slug()))
+            if args.json:
+                print(json.dumps({"issues": results}, ensure_ascii=False))
+            else:
+                for result in results:
+                    print(f"{result['key']}: " + ("no unknowns" if not result["unknowns"] else
+                                                  f"{len(result['unknowns'])} unknown(s)"))
+                    for unknown in result["unknowns"]:
+                        print(f"  - {unknown}")
             return 0
         if args.command == "tidy":
             config = load_config(root)
