@@ -3,6 +3,8 @@
 from dataclasses import replace
 import json
 import os
+import shlex
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -298,3 +300,63 @@ def test_orch_merge_completes_when_linked_issue_refresh_fails(merge_case, monkey
     assert finished == [(c.pr, "main")]
     row, = c.ctx.store.local_issues()
     assert row["number"] == 10 and row["pr_number"] == c.pr and row["merged"] is True
+
+
+def test_premerge_ci_accepts_and_caches_an_entirely_excluded_acceptance_suite(merge_case, monkeypatch):
+    from conftest import ACCEPTANCE
+
+    c = merge_case
+    c.ctx.config = replace(c.ctx.config, runner_unit_tests="ci",
+                           test_command=f"{shlex.quote(sys.executable)} -m pytest")
+    c.ctx.store.save_approval(
+        1, body="pending", body_sha="body", acceptance_blobs={ACCEPTANCE: "blob"},
+        approved_by="human", approved_at=BASE_TIME.isoformat(),
+    )
+    run_logged = orch.run_logged
+
+    def process(argv, *, cwd, **kwargs):
+        assert git_command(cwd, "rev-parse", "HEAD") != c.history.tip, "Empty base must not spawn pytest"
+        return run_logged(argv, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(orch, "run_logged", process)
+    for _ in range(2):
+        report = orch.premerge(c.ctx, c.pr)
+        assert report["ready"] is True and report["tests"] == "pass"
+        assert report["broken"] == [] and report["failing_on_base"] == []
+    log = (c.ctx.store.root / "runs" / f"premerge-pr-{c.pr}.log").read_text()
+    assert log.count("cache=hit") == 1
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_premerge_suite_releases_slot_and_propagates_it_to_nested_tests(merge_case, monkeypatch, failure):
+    from contextlib import contextmanager
+
+    from foragent import capacity
+
+    c = merge_case
+    holding = []
+
+    @contextmanager
+    def slot(ceiling, *, waiting):
+        assert ceiling == c.ctx.config.test_slots
+        holding.append(True)
+        try:
+            yield
+        finally:
+            holding.pop()
+
+    def process(*args, **kwargs):
+        assert holding == [True]
+        assert kwargs["env"] == capacity.HELD_ENV
+        if failure:
+            raise OSError("suite could not start")
+        return 0, False, ""
+
+    monkeypatch.setattr(capacity, "hold_test_slot", slot)
+    monkeypatch.setattr(orch, "run_logged", process)
+    if failure:
+        with pytest.raises(OSError, match="suite could not start"):
+            orch.premerge(c.ctx, c.pr)
+    else:
+        assert orch.premerge(c.ctx, c.pr)["waited_seconds"] == 0
+    assert holding == []

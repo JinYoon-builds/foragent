@@ -2,6 +2,7 @@
 
 from collections import deque
 from collections.abc import Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -13,6 +14,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
+from foragent import capacity
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
@@ -20,6 +22,9 @@ from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.processes import run_logged
+from foragent.run_attempt import AttemptFailure
+from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
+from foragent.run_checks import CheckResult, trusts_ci
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
 from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
@@ -266,21 +271,29 @@ class _SuiteRun:
     failing: frozenset[str] | None  # None: no per-test result to compare
 
 
+def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
+                   log_path: Path, label: str, slot: AbstractContextManager) -> CheckResult:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
+    with slot:
+        code, timed_out, output = run_logged(
+            ["/bin/sh", "-c", command], cwd=worktree,
+            timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path, env=capacity.HELD_ENV,
+        )
+    return CheckResult(command, code, timed_out, output)
+
+
 def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Path,
-               log_path: Path, label: str) -> _SuiteRun:
-    """Run one full-suite command; pytest also reports its failing node ids."""
+               log_path: Path, label: str, slot: AbstractContextManager, *, allow_empty: bool = False) -> _SuiteRun:
+    """Run one suite inside a slot; pytest also reports its failing node ids."""
     pytest = _pytest_command(command) is not None
     if pytest:
         junit.unlink(missing_ok=True)
         command = (f"{command} --rootdir=. -o junit_family=legacy --junit-prefix= "
                    f"--junitxml={shlex.quote(str(junit.resolve()))}")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as stream:
-        stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
-    code, timed_out, _ = run_logged(
-        ["/bin/sh", "-c", command], cwd=worktree,
-        timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path,
-    )
+    result = _suite_process(ctx, n, command, worktree, log_path, label, slot)
+    code, timed_out = result.exit_code, result.timed_out
     passed = code == 0 and not timed_out
     if not pytest or timed_out:
         return _SuiteRun(passed, None)
@@ -291,6 +304,8 @@ def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Pat
     failing = frozenset(node_id for case in cases
                         if any(case.find(tag) is not None for tag in ("failure", "error"))
                         and (node_id := junit_node_id(case)) is not None)
+    if allow_empty and code == 5 and not cases:
+        return _SuiteRun(True, frozenset())
     # Exit 1 is pytest's "some tests failed"; other codes are session failures.
     if code not in (0, 1) or (code == 1 and not failing):
         return _SuiteRun(False, None)
@@ -305,6 +320,31 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
     ctx.git._call(["fetch", "origin", head])
     base = ctx.git.ref_sha(f"refs/remotes/origin/{pr.base}")
     log_path = ctx.store.root / "runs" / f"premerge-pr-{n}.log"
+    waited_seconds = 0.0
+
+    def wait(acquire):
+        nonlocal waited_seconds
+        started = ctx.now()
+        try:
+            return acquire()
+        finally:
+            waited_seconds += max(0.0, (ctx.now() - started).total_seconds())
+
+    @contextmanager
+    def test_slot():
+        nonlocal waited_seconds
+        started = ctx.now()
+        queued = False
+
+        def waiting():
+            nonlocal queued
+            queued = True
+
+        with capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting):
+            if queued:
+                waited_seconds += max(0.0, (ctx.now() - started).total_seconds())
+            yield
+
     broken: list[str] = []
     failing_on_base: list[str] = []
     with TemporaryDirectory(prefix=f"foragent-premerge-{n}-") as directory:
@@ -333,34 +373,73 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                         else detect_test_commands(worktree))
             if not commands:
                 raise OrchError("no full test command detected; set test_command in .foragent.yml")
+            ci_units = trusts_ci(ctx.repo_root, ctx.config)
+            excluded = _baseline_exclusions(ctx, base, log_path)
             label = f"head={head} merged with base={base}" if merged else f"head={head} (base merge conflicts)"
-            runs = [(command, _run_suite(ctx, n, command, worktree, Path(directory) / f"head-{i}.xml",
-                                         log_path, label))
-                    for i, command in enumerate(commands)]
+            runs = []
+            for i, command in enumerate(commands):
+                pytest_command = _pytest_command(command)
+                acceptance_only = ci_units and pytest_command is not None
+                selection = command
+                if acceptance_only:
+                    selection = f"{pytest_command} {shlex.quote(ctx.config.acceptance_dir)}"
+                    selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
+                if acceptance_only and not (worktree / ctx.config.acceptance_dir).is_dir():
+                    run = _SuiteRun(True, frozenset())
+                else:
+                    run = _run_suite(ctx, n, selection, worktree, Path(directory) / f"head-{i}.xml",
+                                     log_path, label, test_slot(), allow_empty=acceptance_only)
+                runs.append((command, run, acceptance_only))
         finally:
             ctx.git.remove_worktree(worktree)
         tests = "pass"
-        for i, (command, run) in enumerate(runs):
-            if run.passed:
+        for i, (command, run, acceptance_only) in enumerate(runs):
+            if run.passed and not acceptance_only:
                 continue
-            if run.failing is None:
+            if not run.passed and run.failing is None:
                 tests = "fail"
                 continue
             # D53: failures the base already has do not block; any other failure does.
-            ctx.git.add_detached_worktree(worktree, base)
-            try:
-                on_base = _run_suite(ctx, n, command, worktree, Path(directory) / f"base-{i}.xml",
-                                     log_path, f"base={base}")
-            finally:
-                ctx.git.remove_worktree(worktree)
-            base_failing = on_base.failing or frozenset()
-            broken.extend(sorted(run.failing - base_failing))
-            failing_on_base.extend(sorted(run.failing & base_failing))
-            if run.failing - base_failing:
+            head_failing = run.failing or frozenset()
+            base_failing = frozenset()
+            if acceptance_only:
+                try:
+                    baseline = _capture_baseline(
+                        ctx, command, base, log=log_path, report=Path(directory) / f"base-{i}.xml",
+                        check=lambda selection, root: _suite_process(
+                            ctx, n, selection, root, log_path, f"base={base}", test_slot()),
+                        prepare=lambda: None, wait=wait, required_ids=head_failing,
+                    )
+                except AttemptFailure:
+                    tests = "fail"
+                    broken.extend(sorted(head_failing))
+                    continue
+                if baseline is not None:
+                    base_failing = frozenset(baseline.failing_ids)
+            else:
+                selection = command
+                if _pytest_command(command) is not None:
+                    saved = _premerge_baseline(ctx, command, base, excluded, head_failing)
+                    if saved is not None:
+                        base_failing = frozenset(saved["failing_ids"])
+                        # Keep units and uncached/locked tests in the original full suite.
+                        selection += "".join(f" {shlex.quote('--deselect=' + node)}"
+                                             for node in [*saved["collected_ids"], *saved["excluded"]])
+                ctx.git.add_detached_worktree(worktree, base)
+                try:
+                    on_base = _run_suite(ctx, n, selection, worktree, Path(directory) / f"base-{i}.xml",
+                                         log_path, f"base={base}", test_slot())
+                finally:
+                    ctx.git.remove_worktree(worktree)
+                base_failing |= on_base.failing or frozenset()
+            broken.extend(sorted(head_failing - base_failing))
+            failing_on_base.extend(sorted(head_failing & base_failing))
+            if head_failing - base_failing:
                 tests = "fail"
     ci = ctx.tracker.pr_checks(n)
     report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
               "broken": broken, "failing_on_base": failing_on_base,
+              "waited_seconds": waited_seconds,
               "ready": tests == "pass" and not conflicts and ci in {"pass", "none"}}
     return _Premerge(pr, head, base, report)
 
