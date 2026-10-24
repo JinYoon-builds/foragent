@@ -110,7 +110,8 @@ class Project:
             fields[name] = field
         return fields
 
-    def set_values(self, issue: Issue | int, values: dict[str, str], *, initial_status: bool = False) -> None:
+    def set_values(self, issue: Issue | int, values: dict[str, str], *, initial_status: bool = False,
+                   add: bool = True) -> None:
         number = issue.number if isinstance(issue, Issue) else issue
         # A card already set to every wanted value needs no board call.
         if values and (recorded := getattr(self.tracker, "board_value", None)) is not None and all(
@@ -142,6 +143,8 @@ class Project:
             if item or not connection["pageInfo"]["hasNextPage"]:
                 break
             cursor = connection["pageInfo"]["endCursor"]
+        if item is None and not add:
+            return  # Only move an existing card; never add one here.
         if item is None:
             try:
                 item = _data(self.tracker, """mutation ForagentAddBoardItem($input: AddProjectV2ItemByIdInput!) {
@@ -161,6 +164,9 @@ class Project:
             if name == "Status":
                 current = item.get("fieldValueByName")
                 if current and (initial_status or current["optionId"] == option["id"]):
+                    # Record the confirmed card value so later ticks need no board call.
+                    if (record := getattr(self.tracker, "record_board_value", None)) is not None:
+                        record(number, self.id, name, current["name"])
                     continue
             _data(self.tracker, """mutation ForagentSetBoardValue($input: UpdateProjectV2ItemFieldValueInput!) {
               updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
@@ -248,12 +254,25 @@ def set_status(issue: Issue | int, status: str) -> None:
         board_column(status)  # Validate even when there is no repository context.
 
 
-def sync_status(ctx: BoardContext, issue: Issue | int, status: str) -> None:
+def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, known_only: bool = False) -> None:
+    """Move the issue's card to the column for ``status`` when the column differs.
+
+    ``known_only`` limits the sync to cards this repository has recorded, so
+    closed or unapproved issues never add cards or query the board for issues
+    Foragent never placed there.
+    """
     if not ctx.config.board:
         return
+    if known_only:
+        recorded = getattr(ctx.tracker, "board_value", None)
+        if recorded is None or recorded(getattr(issue, "number", issue), ctx.config.board, "Status") is None:
+            return
     token = _current.set(Project(ctx.tracker, ctx.repo, ctx.config.board, ctx.config.board_map))
     try:
-        set_status(issue, status)
+        if not known_only:
+            set_status(issue, status)
+        elif (column := board_column(status, ctx.config.board_map)) is not None:
+            _current.get().set_values(issue, {"Status": column}, add=False)
     except Exception as exc:
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
             raise

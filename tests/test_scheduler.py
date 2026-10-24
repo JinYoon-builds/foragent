@@ -441,6 +441,74 @@ def test_scheduler_projects_follow_ready_running_and_blocked_labels(ctx):
     assert item_values(ctx.tracker, project_id, 1)["Status"] == "✋ Your turn"
 
 
+def _board_writes(ctx, monkeypatch):
+    """Count board value writes at the GraphQL boundary below any recorder."""
+    from foragent.tracker import RecordingTracker
+
+    remote = ctx.tracker._tracker if isinstance(ctx.tracker, RecordingTracker) else ctx.tracker
+    graphql = remote.graphql
+    writes = []
+
+    def counted(query, variables):
+        if "ForagentSetBoardValue" in query:
+            writes.append(variables)
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", counted)
+    return writes
+
+
+@pytest.mark.parametrize("change", ["unapproved", "closed"])
+def test_scheduler_moves_unapproved_and_closed_cards_once(ctx, monkeypatch, change):
+    from foragent import board
+    from test_board import item_values
+
+    project_id = board.ensure(ctx.tracker, ctx.repo)
+    ctx.config = replace(ctx.config, board=project_id)
+    approve(ctx)
+    tick(ctx)
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == "🌰 Up next"
+    if change == "unapproved":
+        ctx.tracker.remove_labels(1, ["approved", "ready"])
+    else:
+        ctx.tracker.close_issue(1)
+    writes = _board_writes(ctx, monkeypatch)
+    tick(ctx)
+    wanted = "🗂 Backlog" if change == "unapproved" else "📦 Done"
+    assert item_values(ctx.tracker, project_id, 1)["Status"] == wanted
+    assert len(writes) == 1
+    writes.clear()
+    tick(ctx)
+    assert writes == [], "a card already in its column needs no board write"
+
+
+def test_scheduler_never_adds_cards_for_unknown_closed_or_unapproved_issues(ctx, monkeypatch):
+    from foragent import board
+    from foragent.tracker import RecordingTracker
+    from test_board import snapshot
+
+    project_id = board.ensure(ctx.tracker, ctx.repo)
+    ctx.config = replace(ctx.config, board=project_id)
+    ctx.tracker.add_issue(7, "Never on the board")
+    ctx.tracker.add_issue(8, "Closed long ago")
+    ctx.tracker.close_issue(8)
+    remote = ctx.tracker._tracker if isinstance(ctx.tracker, RecordingTracker) else ctx.tracker
+    graphql = remote.graphql
+    touched = []
+
+    def counted(query, variables):
+        if variables.get("number") in {7, 8} or "ForagentAddBoardItem" in query:
+            touched.append(query)
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", counted)
+    tick(ctx)
+    tick(ctx)
+    assert touched == [], "unknown issues need no board call"
+    numbers = {item["content"]["number"] for item in snapshot(ctx.tracker, project_id)["items"]["nodes"]}
+    assert not numbers & {7, 8}
+
+
 def test_scheduler_repairs_board_after_transport_recovers(ctx, caplog):
     from foragent import board
     from test_board import item_values

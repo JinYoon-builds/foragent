@@ -365,3 +365,45 @@ def test_board_calls_only_when_the_wanted_card_value_differs(recording_board, mo
     board.sync_status(ctx, 1, "Running")
     assert any("ForagentSetBoardValue" in query for query in calls)
     assert item_values(remote, ctx.config.board, 1)["Status"] == board.board_column("Running")
+
+
+def test_known_only_sync_moves_recorded_cards_and_never_adds_cards(recording_board, monkeypatch):
+    ctx, remote, clock = recording_board
+    calls = []
+    graphql = remote.graphql
+
+    def counted(query, variables):
+        calls.append(query)
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", counted)
+    board.sync_status(ctx, 1, "closed", known_only=True)
+    assert calls == [], "an issue with no recorded card needs no board call"
+    assert snapshot(remote, ctx.config.board)["items"]["nodes"] == []
+    board.sync_status(ctx, 1, "Ready")
+    calls.clear()
+    board.sync_status(ctx, 1, "closed", known_only=True)
+    assert item_values(remote, ctx.config.board, 1)["Status"] == board.board_column("closed")
+    assert sum("ForagentSetBoardValue" in query for query in calls) == 1
+    calls.clear()
+    board.sync_status(ctx, 1, "merged", known_only=True)  # Same 📦 Done column.
+    assert calls == []
+
+
+def test_confirmed_unchanged_card_is_recorded_so_the_next_sync_needs_no_call(recording_board, monkeypatch):
+    ctx, remote, clock = recording_board
+    board.sync_status(ctx, 1, "Ready")
+    ctx.store.update_local_issue(1, board_values={})  # Forget the local record only.
+    calls = []
+    graphql = remote.graphql
+
+    def counted(query, variables):
+        calls.append(query)
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", counted)
+    board.sync_status(ctx, 1, "Approved")  # Same 🌰 Up next column: read, no write.
+    assert calls and not any("ForagentSetBoardValue" in query for query in calls)
+    calls.clear()
+    board.sync_status(ctx, 1, "Ready")
+    assert calls == []

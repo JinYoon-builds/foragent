@@ -22,3 +22,6 @@
 - 리뷰가 "내가 안 건드린 파일의 삭제"를 지적하면 `git diff origin/main...HEAD -- <file>`(점 세 개, 브랜치 쪽 변경만)으로 확인한다. 비어 있으면 main이 앞서간 것이다. `git merge`는 권한이 막혀 있으므로 `git log HEAD..origin/main`의 커밋을 `git cherry-pick --no-commit` 후 `git reset -q`로 가져온다.
 - main은 #346에서 `tests/test_runner.py`를 `tests/test_run_*.py`로 나눴다. 병합 충돌에서 HEAD 쪽에만 있는 테스트는 먼저 `git grep -n 'def <name>' MERGE_HEAD -- tests`로 옮겨진 곳을 찾는다. 옮겨졌으면 main대로 빼고 이 브랜치의 변경만 남긴다.
 - `test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands[True]`는 검사 환경이 `os.killpg`를 막으면 `PermissionError`로 실패한다. 환경에 따라 통과하기도 한다. 보드 변경과 무관하므로 실제 kill을 다시 돌리지 않고 REBUTTAL로 답한다.
+- 빈 목록 판정(#163): `GhTracker.list_issues`는 빈 결과를 한 번 재조회하고, 같은 인스턴스의 앞선 비어 있지 않은 목록이나 `StateStore.for_repo(repo).local_issues()`가 근거이면 `TrackerError("...empty listing...")`를 낸다. 단위 테스트는 `_EMPTY_RETRY_DELAY`를 0으로 바꾼다. 인수 테스트가 다른 레인의 미구현 API에 기대면 직접 만들지 말고 blocked-by를 제안한다. 재시작 때 작업 트리의 미커밋 변경이 사라질 수 있다.
+- 여러 테스트 파일을 한 pytest 호출로 돌리면 출력이 비는 경우가 있었다. 변경 전후 비교는 파일별로 `-rf`를 붙여 돌린다.
+- 닫힌 이슈와 미승인 이슈의 보드 동기화는 `board.sync_status(..., known_only=True)`로 한다(#184 리뷰). 로컬에 기록된 카드만 옮기고 카드를 새로 추가하지 않으므로, 옛 이슈에는 GitHub 호출이 없다. 잠긴 인수 테스트가 `board.set_status(issue, status)`를 인자 두 개짜리로 바꿔치기하므로, 공개 `set_status`의 모양은 바꾸지 않는다. 실제 kill 테스트는 `-k 'not real_runner_is_terminated'`로 뺀다.
