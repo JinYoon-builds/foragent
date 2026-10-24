@@ -1,5 +1,6 @@
 """Load repository settings over optional global settings."""
 
+from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
@@ -98,6 +99,7 @@ class LaneSettings:
         self.newline = next((line[len(line.rstrip("\r\n")):] for line in self.lines
                              if line.endswith(("\r", "\n"))), "\n")
         self.expected = deepcopy(self.data)
+        self.comments = _comments(self.lines)
 
     def add_lane(self, name: str, lane: dict[str, Any], inherited: dict[str, dict[str, Any]]) -> None:
         """Add one lane after the file's last lane, or create `lanes` with inherited lanes."""
@@ -112,7 +114,8 @@ class LaneSettings:
             indent = first_key.start_mark.column
             step = (first_lane.value[0][0].start_mark.column - indent
                     if _block(first_lane, yaml.MappingNode) else 2)
-            self._insert(_last_line(*lanes.value[-1]) + 1, self._mapping({name: lane}, indent, step))
+            self._insert(_last_line(*lanes.value[-1]) + 1, self._mapping({name: lane}, indent, step),
+                         before=first_key.start_mark.line)
             return
         value = {**inherited, name: lane}
         self.expected["lanes"] = value
@@ -123,7 +126,16 @@ class LaneSettings:
         elif self.root is not None and self.root.flow_style:
             self._flow_add(self.root, "lanes", value)
         else:
-            self._insert(len(self.lines), ["lanes:" + self.newline, *self._mapping(value, 2, 2)])
+            block = ["lanes:" + self.newline, *self._mapping(value, 2, 2)]
+            if self.root is not None:
+                # After the last setting, so trailing comments stay last and keep their bytes.
+                self._insert(_last_line(*self.root.value[-1]) + 1, block,
+                             before=self.root.value[0][0].start_mark.line)
+            elif self.lines and not self.lines[-1].endswith(("\r", "\n")):
+                # Appending would add a line end to the final comment; put lanes first instead.
+                self.lines[0:0] = block
+            else:
+                self._insert(len(self.lines), block)
 
     def set_skills(self, name: str, skills: list[str], lane: dict[str, Any],
                    inherited: dict[str, dict[str, Any]]) -> None:
@@ -138,11 +150,15 @@ class LaneSettings:
             raise ConfigError(f"invalid lanes entry: {name}")
         self.expected["lanes"][name] = {**self.data["lanes"][name], "skills": skills}
         skill = _pair(node, "skills")
+        if skill is not None and not _plain_skills(skill[1]):
+            raise ConfigError(f"lane {name}: its skills in {self.path} use a layout fa cannot change without "
+                              "touching other lines; edit .foragent.yml by hand")
         if skill is None and node.flow_style:
             self._flow_add(node, "skills", skills)
         elif skill is None:
             indent = node.value[0][0].start_mark.column
-            self._insert(_last_line(*node.value[-1]) + 1, [" " * indent + "skills: " + _flow(skills) + self.newline])
+            self._insert(_last_line(*node.value[-1]) + 1, [" " * indent + "skills: " + _flow(skills) + self.newline],
+                         before=node.value[0][0].start_mark.line)
         elif _block(skill[1], yaml.SequenceNode):
             self._replace_items(skill[0], skill[1], skills)
         elif _empty(skill[1]):
@@ -159,6 +175,8 @@ class LaneSettings:
             written = None
         if written != self.expected:
             raise ConfigError(f"cannot update lanes in {self.path} without rewriting other lines; edit it by hand")
+        if self.comments - _comments(self.lines):
+            raise ConfigError(f"cannot update lanes in {self.path} without changing or losing a comment; edit it by hand")
         return text
 
     def save(self) -> None:
@@ -175,9 +193,15 @@ class LaneSettings:
                       for key, value in lane.items()]
         return lines
 
-    def _insert(self, line: int, lines: list[str]) -> None:
+    def _insert(self, line: int, lines: list[str], *, before: int | None = None) -> None:
+        """Insert whole lines at `line`, or at `before` when that would add a line end to the file's last line."""
+        if not lines:
+            return
         if 0 < line <= len(self.lines) and not self.lines[line - 1].endswith(("\r", "\n")):
-            self.lines[line - 1] += self.newline
+            if before is None:
+                raise ConfigError(f"cannot update lanes in {self.path} without changing its last line, "
+                                  "which has no line end; edit it by hand")
+            line = before
         self.lines[line:line] = lines
 
     def _flow_add(self, mapping: yaml.MappingNode, key: str, value: Any) -> None:
@@ -226,6 +250,36 @@ class LaneSettings:
                 del self.lines[start.line:end.line + 1]
         if not skills:
             self._after_colon(key, "[]")
+
+
+def _plain_skills(node: yaml.Node) -> bool:
+    """Whether a skills value has a shape the line edits handle: one-line scalars or a one-line `[...]`."""
+    def one_line(item: yaml.Node) -> bool:
+        return (isinstance(item, yaml.ScalarNode) and item.style in (None, "'", '"')
+                and item.start_mark.line == item.end_mark.line)
+
+    if isinstance(node, yaml.SequenceNode) and not node.flow_style:
+        return all(one_line(item) for item in node.value)
+    if isinstance(node, yaml.SequenceNode):
+        return node.start_mark.line == node.end_mark.line
+    return _empty(node) or one_line(node)
+
+
+def _comments(lines: list[str]) -> Counter:
+    """Count each comment's exact bytes (from `#` through its line end) in settings lines."""
+    found: Counter = Counter()
+    for line in lines:
+        quote, previous = None, " "
+        for index, char in enumerate(line):
+            if quote:
+                quote = None if char == quote else quote
+            elif char in "'\"" and previous in " \t[{,:":
+                quote = char
+            elif char == "#" and previous in " \t":
+                found[line[index:]] += 1
+                break
+            previous = char
+    return found
 
 
 def _pair(mapping: yaml.Node | None, name: str) -> tuple[yaml.Node, yaml.Node] | None:
