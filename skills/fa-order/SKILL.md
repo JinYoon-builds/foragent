@@ -229,6 +229,9 @@ answer it; never answer an unknown yourself. Fold the user's answers into the pl
 preread again until every issue has no unknowns.
 `--approve` refuses issues whose latest preread of the current content is missing or has
 unknowns; any plan edit needs a new preread. The dry-run is never blocked.
+Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
+so preread refuses them: publish once without `--approve` to create the lanes, run preread,
+then publish again with `--approve`.
 Show the order grouped by lane, work first:
 ```
 This order: 7 issues

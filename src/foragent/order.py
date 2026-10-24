@@ -716,6 +716,11 @@ def preread(plan: dict, root: Path, config: Config,
             raise PlanError("prereading edits needs the tracker for the existing issues")
         source = tracker()
         items += [edit_view(item, source.get_issue(item["number"]), config) for item in plan["edits"]]
+    waiting, lanes = _uncreated_lanes(plan, config, items)
+    if waiting:
+        # A generic reader is not the lane's implementer; record nothing rather than false evidence.
+        raise PlanError(f"cannot preread issue(s) {', '.join(waiting)}: new lane(s) {', '.join(lanes)} "
+                        f"do not exist yet; {NEW_LANE_STEPS}")
     directory = root / ".foragent"
     logs = directory / "preread-logs"
     logs.mkdir(parents=True, exist_ok=True)
@@ -742,17 +747,34 @@ def preread(plan: dict, root: Path, config: Config,
     return results
 
 
+def _uncreated_lanes(plan: dict, config: Config, items: list[dict]) -> tuple[list[str], list[str]]:
+    """Issues on a lane this order creates: their implementer does not exist before publication."""
+    new = {lane["name"] for lane in plan.get("new_lanes", [])} - set(config.lanes)
+    keys = [item["key"] for item in items if item["lane"] in new]
+    return keys, sorted({item["lane"] for item in items if item["lane"] in new})
+
+
+NEW_LANE_STEPS = ("publish the order without --approve first so the lane's agent and skills exist, "
+                  "then run fa order preread PLAN.json and publish again with --approve")
+
+
 def require_clean_preread(plan: dict, root: Path, config: Config, items: list[dict]) -> None:
     """Approval needs the latest preread of each issue's current content to have no unknowns."""
     records = _preread_records(root)
     missing, open_items = [], []
+    waiting, lanes = _uncreated_lanes(plan, config, items)
     for item in items:
+        if item["key"] in waiting:
+            continue
         record = records.get(preread_target(plan, item, config, root)[2])
         if not isinstance(record, dict) or not isinstance(record.get("unknowns"), list):
             missing.append(item["key"])
         elif record["unknowns"]:
             open_items.append(f"{item['key']}: " + "; ".join(map(str, record["unknowns"])))
     problems = []
+    if waiting:
+        problems.append(f"issue(s) {', '.join(waiting)} use new lane(s) {', '.join(lanes)} that do not exist "
+                        f"yet, so their implementer has not prereaded them; {NEW_LANE_STEPS}")
     if missing:
         problems.append(f"no preread of the current content for issue(s) {', '.join(missing)}; "
                         "run fa order preread PLAN.json first")

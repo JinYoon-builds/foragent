@@ -1165,3 +1165,32 @@ def test_preread_gate_passes_numbers_of_new_children_after_clean_preread(publish
     publish(publishing, plan, approve_numbers=[3])
     assert "approved" in publishing[2].get_issue(3).labels
     assert "approved" not in publishing[2].get_issue(2).labels
+
+
+def test_new_lane_issue_is_prereaded_only_after_its_lane_exists(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config, tracker, _, events = publishing
+    plan["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": []}]
+    plan["issues"][1]["lane"] = "web"
+    worker = _NoUnknowns()
+    monkeypatch.setattr(order, "executor_for", lambda name: worker)
+    # Before publication there is no web implementer: no generic preread, no evidence.
+    with pytest.raises(order.PlanError, match=r"client.*new lane\(s\) web.*without --approve"):
+        order.preread(plan, root, config)
+    assert worker.calls == [] and not (root / order.PREREAD_FILE).exists()
+    with pytest.raises(order.PlanError, match=r"client.*new lane\(s\) web"):
+        publish(publishing, plan, approve=True)
+    assert events == [] and tracker.issues == {}
+    publish(publishing, plan)
+    created = load_config(root)
+    assert created.lanes["web"]["agent"] == "fa-web"
+    assert [item["key"] for item in order.preread(plan, root, created)] == ["api", "client"]
+    client = worker.calls[1]
+    setup, prompt, _ = order.preread_target(plan, plan["issues"][1], created, root)
+    assert client["prompt"] == prompt and setup.executor == created.executor
+    if created.executor == "codex":
+        assert "repository's web lane" in prompt, "The created lane agent's instructions reach the preread"
+    else:
+        assert client["agent"] == "fa-web"
+    publish((root, created, tracker, publishing[3], events), plan, approve=True)
+    assert all("approved" in tracker.get_issue(n).labels for n in (2, 3))

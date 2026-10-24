@@ -31,3 +31,4 @@
 - 위 동기화 뒤 main에서 새로 생긴 파일은 `git add -N`(내용 없이 추적 표시)으로 표시한다. 그래야 `git diff origin/main`이 내 파일만 보여 리뷰가 "삭제"로 오해하지 않는다. main에서 지워진 파일은 `git cat-file -e origin/main:<파일>`로 가려 지운다.
 - #237 4차: preread는 `run_implementation.lane_config` + `implementer_setup(config, lane, tier, worktree)`를 구현과 함께 쓴다(첫 시도 tier = 이슈 크기). 필드를 따로 흉내 내면 리뷰마다 어긋남이 새로 나온다. 비교 시험은 `tests/test_order.py::test_preread_setup_matches_the_implementation_setup`.
 - 병합 중(MERGE_HEAD 있음)에 main이 또 움직였으면 `git diff --name-only MERGE_HEAD origin/main`만 가져온다. `git checkout --theirs`는 권한이 막히므로 `git restore --source=origin/main --worktree`를 쓴다.
+- #237 5차: 이번 주문이 만드는 레인(`new_lanes` 중 설정에 아직 없는 것)의 이슈는 preread와 승인 모두 거절한다. 레인 에이전트·스킬은 `add_lane`이 설치하므로 미리 흉내 내지 않는다. 순서: `--approve` 없이 발행 → preread → `--approve`로 재발행.
