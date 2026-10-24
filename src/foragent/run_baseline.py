@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
 import os
@@ -33,6 +33,8 @@ class AcceptanceBaseline:
     node_ids: tuple[str, ...]
     collected_ids: tuple[str, ...] | None = None
     failing_ids: tuple[str, ...] | None = None
+    # Locked files this baseline did not run because open issues own them (#376).
+    excluded: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -141,8 +143,8 @@ def _baseline_environment(root: Path) -> dict:
     }
 
 
-def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]:
-    """Locked files owned by approved issues that have not merged (#327)."""
+def unmerged_acceptance_owners(ctx: RunContext) -> dict[str, set[int]]:
+    """Locked file -> approved issues that own it and have not merged (#327)."""
     merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
     owners: dict[str, set[int]] = {}
     for path in (ctx.store.root / "approvals").glob("*.json"):
@@ -151,6 +153,12 @@ def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]
             continue
         for name in approval.acceptance_blobs:
             owners.setdefault(name, set()).add(approval.number)
+    return owners
+
+
+def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]:
+    """Locked files owned by approved issues that have not merged (#327)."""
+    owners = unmerged_acceptance_owners(ctx)
     excluded = sorted(name for name in owners if ctx.git.blob_sha(base_sha, name) is not None)
     open_issues = sorted({number for name in excluded for number in owners[name]})
     _append(log, f"Acceptance baseline skipped {len(excluded)} files owned by open issues: "
@@ -194,7 +202,8 @@ def _premerge_baseline(ctx: RunContext, test_command: str, base_sha: str,
 def _saved_baseline(command: str, saved: dict) -> AcceptanceBaseline:
     return AcceptanceBaseline(command, tuple(saved["node_ids"]),
                               tuple(saved["collected_ids"]) if "collected_ids" in saved else None,
-                              tuple(saved["failing_ids"]) if "failing_ids" in saved else None)
+                              tuple(saved["failing_ids"]) if "failing_ids" in saved else None,
+                              tuple(saved.get("excluded", ())))
 
 
 def _capture_acceptance_baseline(
@@ -261,7 +270,7 @@ def _capture_baseline(
         if saved is not None and (required_ids is None or
                                   {"collected_ids", "failing_ids", "excluded"} <= saved.keys()):
             _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-            return _saved_baseline(command, saved)
+            return replace(_saved_baseline(command, saved), excluded=tuple(excluded))
         report.parent.mkdir(parents=True, exist_ok=True)
         report.unlink(missing_ok=True)
         # Use a fresh base checkout; tests can write files without touching the implementation.
@@ -279,14 +288,14 @@ def _capture_baseline(
                            for path in (worktree / ctx.config.acceptance_dir).rglob("*")):
                     save_baseline((), (), ())
                     _append(log, "Acceptance baseline count=0: no acceptance test files remain after exclusions")
-                    return AcceptanceBaseline(command, (), (), ())
+                    return AcceptanceBaseline(command, (), (), (), tuple(excluded))
                 # A compatible cache can cover a broader selection. Establish
                 # the current selection before reusing its recorded outcomes.
                 if required_ids is not None:
                     saved = _premerge_baseline(ctx, test_command, base_sha, excluded, required_ids)
                     if saved is not None:
                         _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-                        return _saved_baseline(command, saved)
+                        return replace(_saved_baseline(command, saved), excluded=tuple(excluded))
                 selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)}"
                 selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
                 baseline_command = (
@@ -351,7 +360,7 @@ def _capture_baseline(
                         f"acceptance baseline unavailable: exit_code={result.exit_code}, timed_out={result.timed_out}; "
                         "capture did not produce a complete, usable JUnit report"
                     )
-                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids)
+                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded))
             finally:
                 ctx.git.remove_worktree(worktree)
 

@@ -58,14 +58,19 @@ def _check(
     _append(log, f"\nDone when command:\n{command}")
     offset = log.stat().st_size
 
+    # Checks run in the implementation worktree, whose changes are staged and
+    # published afterwards. Bytecode written by the checks must not join them.
+    environment = {"PYTHONDONTWRITEBYTECODE": "1"}
+
     def execute():
         # The slot covers only the command; timeout_s counts execution, not the queue.
         if slot is None:
-            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log)
+            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
+                                     env=environment)
         with slot:
             # A nested `fa test` in the command shares this slot instead of waiting for another.
             return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
-                              env=capacity.HELD_ENV)
+                                     env={**environment, **capacity.HELD_ENV})
 
     # A quiet check is still running; keep the scheduler informed while it waits.
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
