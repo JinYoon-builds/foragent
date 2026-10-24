@@ -11,7 +11,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, order, tidy, watch, watch_open
+from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, notify, orch, orch_inbox, orch_queue, order, tidy, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -139,6 +139,11 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--total", type=int, required=True)
         elif step == "publish":
             command.add_argument("--issue", type=int, required=True)
+    preread = order_actions.add_parser(
+        "preread", help="Ask each issue's implementer, read-only, to list unknowns before approval")
+    preread.add_argument("plan", type=Path)
+    preread.add_argument("--repo-root", type=Path, default=Path.cwd())
+    preread.add_argument("--json", action="store_true")
     publish = order_actions.add_parser(
         "publish", formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''PLAN.json schema (unknown fields are rejected):
@@ -155,6 +160,8 @@ def _parser() -> argparse.ArgumentParser:
 }
 new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
+--approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
+content; --dry-run never needs one.
 files lists repository-relative paths or globs expected to change; absolute paths and .. are rejected.''',
     )
     publish.add_argument("plan", type=Path)
@@ -273,6 +280,12 @@ files lists repository-relative paths or globs expected to change; absolute path
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
         if command in (inbox, questions):
             command.add_argument("--json", action="store_true")
+    queue = orch_actions.add_parser("queue", help="Set, show or clear a lane's preferred start order")
+    queue.add_argument("lane")
+    queue.add_argument("numbers", type=int, nargs="*", help="Issue numbers in start order; none shows the queue")
+    queue.add_argument("--clear", action="store_true")
+    queue.add_argument("--json", action="store_true")
+    queue.add_argument("--repo-root", type=Path, default=Path.cwd())
     plan_command = commands.add_parser("plan", help="Planning-session signals for the orchestrator")
     plan_actions = plan_command.add_subparsers(dest="action", required=True)
     heartbeat = plan_actions.add_parser(
@@ -317,7 +330,7 @@ files lists repository-relative paths or globs expected to change; absolute path
     return parser
 
 
-INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note"}
+INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue"}
 
 
 def _tidy(args: argparse.Namespace, store: StateStore, language: str) -> None:
@@ -339,6 +352,18 @@ def _tidy(args: argparse.Namespace, store: StateStore, language: str) -> None:
 
 def _orch_inbox(args: argparse.Namespace, store: StateStore, config: Config, repo: str) -> None:
     """Local request/question box; never reads GitHub or starts an executor."""
+    if args.action == "queue":
+        if args.clear and args.numbers:
+            raise SystemExit("fa orch queue: give issue numbers or --clear, not both")
+        order = orch_queue.set_order(store, args.lane, []) if args.clear else (
+            orch_queue.set_order(store, args.lane, args.numbers) if args.numbers else orch_queue.get(store, args.lane))
+        if args.json:
+            print(json.dumps({"lane": args.lane, "order": order}))
+        elif order:
+            print(f"lane:{args.lane} queue: " + " ".join(f"#{n}" for n in order))
+        else:
+            print(f"lane:{args.lane} queue is empty; issues start by number.")
+        return
     if args.action == "request":
         record = orch_inbox.add_request(store, args.source, args.text)
         print(f"Request {record['id']} saved ({record['status']}).")
@@ -611,6 +636,19 @@ def main(argv: list[str] | None = None) -> int:
                       if hasattr(args, name)}
             print(json.dumps(order.progress(StateStore.for_repo(repo), args.step, **fields),
                              ensure_ascii=False))
+            return 0
+        if args.command == "order" and args.action == "preread":
+            config = load_config(root)
+            results = order.preread(order.read_plan(args.plan), root, config,
+                                    lambda: GhTracker(config.repo or GitRepo(root).remote_slug()))
+            if args.json:
+                print(json.dumps({"issues": results}, ensure_ascii=False))
+            else:
+                for result in results:
+                    print(f"{result['key']}: " + ("no unknowns" if not result["unknowns"] else
+                                                  f"{len(result['unknowns'])} unknown(s)"))
+                    for unknown in result["unknowns"]:
+                        print(f"  - {unknown}")
             return 0
         if args.command == "tidy":
             config = load_config(root)

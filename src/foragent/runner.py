@@ -357,11 +357,9 @@ def run_issue(n: int, ctx: RunContext) -> str:
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
         board.sync_status(ctx, n, "Running")
-        lane = ctx.config.lanes.get(run.lane, {}) if run.lane != "main" else {}
-        ctx = replace(ctx, config=replace(
-            ctx.config, executor=lane.get("executor") or ctx.config.executor,
-            executor_model=lane.get("model") if lane.get("model") is not None else ctx.config.executor_model,
-        ))
+        from foragent.run_implementation import lane_config
+
+        ctx = replace(ctx, config=lane_config(ctx.config, run.lane))
         try:
             outcome = _execute(n, ctx, worktree)
         finally:
