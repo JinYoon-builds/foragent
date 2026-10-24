@@ -10,6 +10,7 @@ import pytest
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.processes import observe_tree, run_logged, track_process_group
+from foragent.reasons import Reason
 from foragent.runner import _run_executor
 from foragent.scheduler import TickContext, TickReport, _recover_runs
 from foragent.state import StateStore
@@ -138,12 +139,14 @@ def test_gate_cleans_executor_before_worktree_for_every_termination(recovery, fa
 
     ctx.kill_runner = kill
     if failure:
-        with pytest.raises(TimeoutError, match="executor still alive"):
-            _recover_runs(ctx, TickReport())
+        _recover_runs(ctx, TickReport())
         assert ctx.store.get_run(1).status == "running"
         assert ctx.store.get_run(1).executor_pgid == 54321
         assert ctx.store.get_run(1).restarts == 0
         assert ctx.store.worktree_path(1).exists()
+        assert ctx.store.load_flag(1).reason == Reason.STOP_REFUSED
+        assert "executor still alive" in ctx.store.get_run(1).detail
+        _recover_runs(ctx, TickReport())  # A refusal must not retry signals next tick.
     else:
         def remove(path):
             assert actions == [root.pid, 54321]

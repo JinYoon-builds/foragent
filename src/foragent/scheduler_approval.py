@@ -34,7 +34,8 @@ def _invalidate_approval(
 ) -> None:
     run = ctx.store.get_run(issue.number)
     if run is not None and run.status == "running":
-        scheduler._kill_run(ctx, run.number, report, detail=summary)
+        if not scheduler._kill_run(ctx, run.number, report, detail=summary):
+            return
     scheduler.invalidate_approval(ctx, issue.number, summary, details)
     report.actions.append(f"#{issue.number} flagged hash-mismatch: {summary}")
 
