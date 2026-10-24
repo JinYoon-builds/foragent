@@ -1109,6 +1109,54 @@ def test_related_units_include_importers_of_deleted_modules_and_existing_changed
     )
 
 
+def test_related_units_own_only_keeps_changed_tests_and_module_counterparts(tmp_path):
+    from foragent.runner import _related_unit_tests
+
+    files = {
+        "tests/test_service.py": "import demo.service\n",
+        "tests/unit/service_test.py": "from demo import service\n",
+        "tests/test_direct.py": "import demo.service as service\n",
+        "tests/test_changed.py": "def test_changed():\n    pass\n",
+        "tests/test_demo.py": "import demo\n",
+        "tests/locked/test_service.py": "import demo.service\n",
+    }
+    for name, contents in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+    assert _related_unit_tests(tmp_path, ["src/demo/service.py", "tests/test_changed.py"], "tests/locked",
+                               own_only=True) == (
+        "tests/test_changed.py", "tests/test_service.py", "tests/unit/service_test.py",
+    )
+    assert _related_unit_tests(tmp_path, ["src/demo/__init__.py"], "tests/locked", own_only=True) == (
+        "tests/test_demo.py",
+    )
+    assert _related_unit_tests(tmp_path, ["README.md"], "tests/locked", own_only=True) == ()
+
+
+@pytest.mark.parametrize(("name", "workflow", "expected"), [
+    ("ci.yml", "on: pull_request\njobs: {}\n", True),
+    ("ci.yaml", "on: [push, pull_request]\njobs: {}\n", True),
+    ("ci.yml", "on:\n  pull_request:\n    branches: [main]\njobs: {}\n", True),
+    ("ci.yml", "'on':\n  pull_request: null\njobs: {}\n", True),
+    ("ci.yml", "on:\n  push:\n    branches: [main]\njobs: {}\n", False),
+    ("ci.yml", "on: [pull_request_target]\njobs: {}\n", False),
+    ("ci.yml", "on: [pull_request\n", False),
+    ("notes.txt", "on: pull_request\n", False),
+])
+def test_pull_request_ci_is_read_from_workflow_files(tmp_path, name, workflow, expected):
+    from foragent.runner import has_pull_request_ci, trusts_ci
+
+    assert has_pull_request_ci(tmp_path) is False
+    path = tmp_path / ".github" / "workflows" / name
+    path.parent.mkdir(parents=True)
+    path.write_text(workflow)
+    assert has_pull_request_ci(tmp_path) is expected
+    assert trusts_ci(tmp_path, Config()) is expected
+    assert trusts_ci(tmp_path, Config(runner_unit_tests="ci")) is True
+    assert trusts_ci(tmp_path, Config(runner_unit_tests="all")) is False
+
+
 @pytest.mark.parametrize("repaired", [True, False])
 def test_related_unit_failure_uses_implementation_budget_and_reaches_next_prompt(run_case, repaired):
     c = run_case
@@ -4544,7 +4592,7 @@ def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp
 
 
 def test_bug_fix_steps_only_for_bug_label_and_points_to_reference_when_present(tmp_path):
-    from foragent.runner import BUG_FIX_REFERENCE, bug_fix_steps
+    from foragent.run_prompts import BUG_FIX_REFERENCE, bug_fix_steps
 
     assert bug_fix_steps({"approved", "running"}, tmp_path) is None
     steps = bug_fix_steps({"approved", "bug"}, tmp_path)

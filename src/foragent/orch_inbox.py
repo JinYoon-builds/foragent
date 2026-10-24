@@ -166,3 +166,39 @@ def answer(store: StateStore, question_id: str, text: str) -> dict[str, Any]:
 
 def _public(record: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in record.items() if key != "seq"}
+
+
+def note_path(store: StateStore) -> Path:
+    return store.root / "orch-note.json"
+
+
+def note_location(environ: dict[str, str], title: str | None = None,
+                  tmux_pane: str | None = None) -> dict[str, Any]:
+    """Where this orchestrator session runs, from facts in its environment only."""
+    handle = environ.get("ORCA_TERMINAL_HANDLE")
+    if handle:
+        return {"kind": "orca", "handle": handle,
+                "title": title or environ.get("FORAGENT_ORCH_TITLE")}
+    pane = tmux_pane or (environ.get("TMUX_PANE") if environ.get("TMUX") else None)
+    if pane:
+        return {"kind": "tmux", "pane": pane}
+    return {"kind": "terminal"}
+
+
+def write_note(store: StateStore, now: str, why: str | None, next_step: str | None,
+               where: dict[str, Any]) -> dict[str, Any]:
+    """Overwrite the orchestrator's latest note: what it does, why, what next, where."""
+    if not now.strip():
+        raise InboxError("--now must not be empty")
+    record = {"now": now, "why": why, "next": next_step, "at": store._timestamp(), "where": where}
+    store.root.mkdir(parents=True, exist_ok=True)
+    store._write_json(note_path(store), record)
+    return record
+
+
+def read_note(store: StateStore) -> dict[str, Any] | None:
+    try:
+        record = _read(note_path(store))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
