@@ -51,6 +51,8 @@ class Config:
     review_level: str = "low"
     review_scope: str = "claude-local"
     test_command: str | None = None
+    # D81: auto trusts pull_request CI when the repository has it; ci always; all never.
+    runner_unit_tests: str = "auto"
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
@@ -112,6 +114,8 @@ def _validate(values: dict[str, Any]) -> None:
         not isinstance(values["test_command"], str) or not values["test_command"].strip()
     ):
         raise ConfigError("test_command must be a nonempty string or null")
+    if not isinstance(values["runner_unit_tests"], str) or values["runner_unit_tests"] not in {"auto", "ci", "all"}:
+        raise ConfigError("runner_unit_tests must be auto, ci, or all")
     if not isinstance(values["review_scope"], str) or values["review_scope"] not in {"claude-local", "pr-body"}:
         raise ConfigError("review_scope must be claude-local or pr-body")
     if not isinstance(values["interview"], str) or values["interview"] not in {"ouroboros", "native"}:

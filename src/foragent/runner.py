@@ -458,8 +458,42 @@ def _passing_acceptance_ids(report: Path) -> tuple[str, ...]:
     return tuple(sorted(passed - failed))
 
 
-def _related_unit_tests(worktree: Path, paths: list[str], acceptance_dir: str) -> tuple[str, ...]:
-    """Select changed pytest files and direct static importers of changed modules."""
+def has_pull_request_ci(root: Path) -> bool:
+    """Whether a GitHub Actions workflow in this checkout runs on pull_request (read from files)."""
+    workflows = root / ".github" / "workflows"
+    if not workflows.is_dir():
+        return False
+    for path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError):
+            continue
+        if not isinstance(document, dict):
+            continue
+        # YAML 1.1 reads the bare key `on` as the boolean true.
+        events = document.get("on", document.get(True))
+        if isinstance(events, str):
+            events = [events]
+        if isinstance(events, (list, dict)) and "pull_request" in events:
+            return True
+    return False
+
+
+def trusts_ci(root: Path, config: Config) -> bool:
+    """D81: leave importer-only unit tests to pull_request CI (`runner_unit_tests`)."""
+    if config.runner_unit_tests == "auto":
+        return has_pull_request_ci(root)
+    return config.runner_unit_tests == "ci"
+
+
+def _related_unit_tests(
+    worktree: Path, paths: list[str], acceptance_dir: str, *, own_only: bool = False,
+) -> tuple[str, ...]:
+    """Select changed pytest files and direct static importers of changed modules.
+
+    With `own_only` (CI runs the full suite), changed modules contribute only their own
+    test files (`test_<name>.py` or `<name>_test.py`) instead of every importer.
+    """
     acceptance = Path(acceptance_dir)
     tests = {
         path.relative_to(worktree).as_posix(): path
@@ -482,6 +516,10 @@ def _related_unit_tests(worktree: Path, paths: list[str], acceptance_dir: str) -
             modules.add(".".join(parts))
     if not modules:
         return tuple(sorted(selected))
+    if own_only:
+        stems = {module.rsplit(".", 1)[-1] for module in modules}
+        own = {f"test_{stem}.py" for stem in stems} | {f"{stem}_test.py" for stem in stems}
+        return tuple(sorted(selected | {name for name, path in tests.items() if path.name in own}))
     for name, path in tests.items():
         if name in selected:
             continue
@@ -1511,7 +1549,8 @@ def _implement_and_publish(
             if test_command is None:
                 test_command = next(iter(detect_test_commands(worktree)), None)
             unit_command = _pytest_command(test_command) if test_command else None
-            unit_tests = _related_unit_tests(worktree, paths, ctx.config.acceptance_dir)
+            unit_tests = _related_unit_tests(worktree, paths, ctx.config.acceptance_dir,
+                                             own_only=trusts_ci(worktree, ctx.config))
             if unit_tests and unit_command:
                 limit = max(900, _remaining(n, ctx))
                 result = _check(f"{unit_command} {shlex.join(unit_tests)}", worktree, log, limit,
