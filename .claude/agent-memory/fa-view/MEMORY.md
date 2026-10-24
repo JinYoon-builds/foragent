@@ -93,3 +93,4 @@
 - `test_watch_split`은 `watch.py`가 `watch_` 아닌 새 foragent 모듈을 import하면 실패한다(orch_inbox는 watch_data·watch_mouse에서 직접 import). `render_frame`은 layout이 None이면 `_frame`에 예전 kwargs만 넘겨야 한다. `_terminal`에 인자를 더할 때는 위치 인자로 넘긴다(test_watch_compat의 가짜 wrapper가 kwargs를 받지 않음).
 - "저장소 밖 변경 없음" 조건에서는 TRY 확인용 임시 파일도 `/tmp`가 아니라 `.foragent/` 안에 둔다.
 - #352 문구 원본은 `src/foragent/messages/<기능>.py`의 `MESSAGES`(en·ko)다. `i18n.reload_messages()`가 `foragent.messages.__path__`를 탐색해 `i18n.MESSAGES`를 제자리 갱신하고, 같은 (언어, 키)가 두 모듈에 있으면 키와 두 모듈 이름으로 ValueError를 낸다. `i18n.py`에는 문구 dict를 두지 않는다(고정 시험이 AST로 검사). 새 키는 기능 파일에 추가한다.
+- #352 main 병합: main이 `i18n.py`의 MESSAGES에 키를 더해 충돌하면 우리 `i18n.py`를 유지하고, 새 키는 `messages/<기능>.py`로 옮긴다(예: `tidy_*` → `messages/tidy.py`). `git show origin/main:src/foragent/i18n.py`의 MESSAGES와 합친 결과가 같은지 비교해 문구 무변경을 확인한다. `git checkout --ours`는 권한상 막혀 있어 `git show HEAD:<path> > <path>`로 대신한다.
