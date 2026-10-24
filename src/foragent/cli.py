@@ -257,7 +257,13 @@ files lists repository-relative paths or globs expected to change; absolute path
     answer = orch_actions.add_parser("answer", help="Record the answer and close one question")
     answer.add_argument("id")
     answer.add_argument("--text", required=True)
-    for command in (request, inbox, request_status, ask, questions, answer):
+    note = orch_actions.add_parser("note", help="Record what the orchestrator does now, why, next and where")
+    note.add_argument("--now", required=True)
+    note.add_argument("--why")
+    note.add_argument("--next", dest="next_step")
+    note.add_argument("--where-title", "--orca-title", dest="where_title", help="Orca tab title, e.g. orch: <project>")
+    note.add_argument("--tmux-pane", help="tmux pane id when not taken from TMUX_PANE")
+    for command in (request, inbox, request_status, ask, questions, answer, note):
         command.add_argument("--repo-root", type=Path, default=Path.cwd())
         if command in (inbox, questions):
             command.add_argument("--json", action="store_true")
@@ -298,7 +304,7 @@ files lists repository-relative paths or globs expected to change; absolute path
     return parser
 
 
-INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer"}
+INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note"}
 
 
 def _orch_inbox(args: argparse.Namespace, store: StateStore, config: Config, repo: str) -> None:
@@ -309,6 +315,10 @@ def _orch_inbox(args: argparse.Namespace, store: StateStore, config: Config, rep
     elif args.action == "request-status":
         record = orch_inbox.set_request_status(store, args.id, args.status, args.note)
         print(f"Request {record['id']}: {record['status']}.")
+    elif args.action == "note":
+        where = orch_inbox.note_location(dict(os.environ), args.where_title, args.tmux_pane)
+        record = orch_inbox.write_note(store, args.now, args.why, args.next_step, where)
+        print(f"Note saved at {record['at']} ({where['kind']}).")
     elif args.action == "ask":
         record = orch_inbox.ask(store, args.question, args.option, args.recommend)
         pushed = orch_inbox.route_question(store, config, repo, record)
