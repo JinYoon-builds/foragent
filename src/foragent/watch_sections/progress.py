@@ -1,12 +1,15 @@
 """Progress across every open order from local records only.
 
-One bar sums all open orders, the finish time comes from the recent merge rate
-(with the evidence it rests on), and quota is read from executor logs.
+One bar sums all open orders, the finish time sums each remaining approved issue's
+learned duration for its size (with the runs it rests on), and quota is read from
+executor logs.
 """
 
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import statistics
 from typing import Any
 
 from foragent.config import Config
@@ -15,7 +18,13 @@ from foragent.watch_cells import Line
 
 ORDER = 15
 BAR_CELLS = 20
-RATE_WINDOW = timedelta(hours=1)
+RATE_WINDOW = timedelta(hours=3)
+SIZES = ("s", "m", "l")
+DEFAULT_MINUTES = {"s": 30, "m": 90, "l": 180}
+LEARN_MIN = 3  # Below this many merged runs a size keeps its default.
+LEARN_LAST = 30
+LEARN_WINDOW = timedelta(days=14)
+APPROVED = "approved"
 # Logs are append-only: remember each file's parsed prefix (offset and the newest
 # reading of each executor window) so a refresh every few seconds reads only new bytes.
 # Window = (key, percent, reset epoch); keyed by executor, then by window name.
@@ -33,23 +42,121 @@ def totals(rows: list[dict[str, Any]]) -> tuple[int, int, int]:
     return sum(row["state"] == "closed" for row in children), len(children), len(parents)
 
 
-def recent_merges(history: list[Any], now: datetime, window: timedelta = RATE_WINDOW) -> int:
-    """Issues whose latest merged run finished within the window before now."""
-    finished: dict[int, datetime] = {}
-    for run in history:
-        if run.outcome != "merged":
-            continue
-        try:
-            finished[run.number] = datetime.fromisoformat(run.last_progress_at)
-        except (TypeError, ValueError):
-            continue
-    return sum(now - window <= at <= now for at in finished.values())
+def size_of(labels: Iterable[str]) -> str:
+    """The issue's size label; none, or several, count as size:m."""
+    sizes = {label.removeprefix("size:") for label in labels if label in {f"size:{size}" for size in SIZES}}
+    return sizes.pop() if len(sizes) == 1 else "m"
 
 
-def finish_time(remaining: int, recent: int, now: datetime, window: timedelta = RATE_WINDOW) -> datetime | None:
-    if remaining <= 0 or recent <= 0:
+def _time(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
         return None
-    return now + window * (remaining / recent)
+
+
+def _finished(run: Any) -> datetime | None:
+    """When a run finished; older records without finished_at use their latest recorded time."""
+    if (at := _time(getattr(run, "finished_at", None))) is not None:
+        return at
+    times = [at for value in (run.last_progress_at, run.phase_started_at, run.last_activity_at)
+             if (at := _time(value)) is not None]
+    return max(times, default=None)
+
+
+def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
+    """Every merge of one store: (number, size, started, merged), one entry per merge.
+
+    A gate merge is a run that finished as merged; a reopened issue merged three
+    times contributes three runs. A merge outside the gate is a recorded merged PR
+    that closed an approved issue; it starts at the issue's latest run recorded
+    before the merge and counts only when that run did not merge through the gate."""
+    rows = {row["number"]: row for row in store.local_issues()}
+    history = store.read_history()
+    runs: dict[tuple[int, str], Any] = {}
+    for path in (store.root / "runs").glob("*.json"):
+        try:
+            if (run := store.get_run(int(path.stem))) is not None:
+                runs[run.number, run.started_at] = run
+        except (OSError, ValueError):
+            continue
+    runs.update({(run.number, run.started_at): run for run in history})  # finished entries win
+    found: list[tuple[int, datetime, datetime]] = []
+    for run in history:
+        if run.outcome == "merged" and (start := _time(run.started_at)) and (end := _finished(run)):
+            found.append((run.number, start, end))
+    for number, row in rows.items():
+        for merge in (row.get("merges") or {}).values():
+            if not (merge.get("approved") and merge.get("closed")) or (end := _time(merge.get("merged_at"))) is None:
+                continue
+            before = [(start, run) for (issue, _), run in runs.items()
+                      if issue == number and (start := _time(run.started_at)) is not None and start <= end]
+            if before and (latest := max(before, key=lambda item: item[0]))[1].outcome != "merged":
+                found.append((number, latest[0], end))
+    return [(number, size_of(rows.get(number, {}).get("labels", ())), start, end)
+            for number, start, end in found]
+
+
+def machine_stores(store: Any) -> list[Any]:
+    """This store and every repository's store under the machine data root."""
+    from foragent import capacity
+
+    stores, seen = [store], {store.root.resolve()}
+    try:
+        paths = sorted(capacity.machine_root().iterdir())
+    except OSError:
+        paths = []
+    for path in paths:
+        if path.is_dir() and path.resolve() not in seen and (
+                (path / "runs.jsonl").exists() or (path / "issues.json").exists()):
+            seen.add(path.resolve())
+            stores.append(type(store)(path))
+    return stores
+
+
+def learned(stores: Iterable[Any], now: datetime) -> dict[str, list[float]]:
+    """Seconds from start to merge of each size's last runs merged within the window."""
+    samples: dict[str, list[tuple[datetime, float]]] = {size: [] for size in SIZES}
+    for store in stores:
+        try:
+            work = merged_work(store)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue  # An unreadable repository must not take the estimate down.
+        for _, size, start, end in work:
+            if now - LEARN_WINDOW <= end <= now and end >= start:
+                samples[size].append((end, (end - start).total_seconds()))
+    return {size: [seconds for _, seconds in sorted(items, key=lambda item: item[0])[-LEARN_LAST:]]
+            for size, items in samples.items()}
+
+
+def expected(seconds: list[float], size: str) -> tuple[float, float, float, int | None]:
+    """(25th percentile, median, 75th percentile, runs) or the size's default band."""
+    if len(seconds) >= LEARN_MIN:
+        low, _, high = statistics.quantiles(seconds, n=4, method="inclusive")
+        return low, statistics.median(seconds), high, len(seconds)
+    default = DEFAULT_MINUTES[size] * 60.0
+    return default / 2, default, default * 2, None
+
+
+def parallel_budget(store: Any, config: Config) -> int:
+    """The machine's current parallel budget, else the configured ceiling, else 1."""
+    from foragent import capacity
+
+    state = capacity.read_state(store)
+    value = int(state["parallel"]) if state else (config.max_parallel or 1)
+    return max(1, value)
+
+
+def estimate(
+    sizes: list[str], samples: dict[str, list[float]], budget: int, now: datetime,
+) -> tuple[datetime, datetime, datetime, dict[str, int | None]] | None:
+    """(finish, earliest, latest, runs per size) for the remaining sizes, or None without work."""
+    if not sizes:
+        return None
+    bands = {size: expected(samples.get(size, []), size) for size in SIZES if size in sizes}
+    low, mid, high = (sum(bands[size][index] for size in sizes) / budget for index in range(3))
+    basis = {size: band[3] for size, band in bands.items()}
+    return (now + timedelta(seconds=mid), now + timedelta(seconds=low), now + timedelta(seconds=high), basis)
 
 
 def _windows(executor: str, event: dict[str, Any]) -> list[tuple[str, float, float]]:
@@ -185,6 +292,11 @@ def _when(at: datetime, now: datetime, language: str, clock: str) -> str:
     return text("progress_on_day", language, month=local.month, day=local.day, time=clock)
 
 
+def _moment(at: datetime, now: datetime, language: str) -> str:
+    local = at.astimezone()
+    return _when(at, now, language, text("progress_clock", language, hour=local.hour, minute=local.minute))
+
+
 def render(snapshot: Any, config: Config, repo_root: Path, **context: Any) -> list[Line]:
     language = config.language
     now = context.get("now") or snapshot.captured_at
@@ -198,15 +310,24 @@ def render(snapshot: Any, config: Config, repo_root: Path, **context: Any) -> li
         if remaining <= 0:
             lines.append([(text("progress_done", language), "")])
         else:
+            # Without remaining approved work there is no estimate line.
             if snapshot.eta is not None:
-                local = snapshot.eta.astimezone()
-                clock = text("progress_clock", language, hour=local.hour, minute=local.minute)
-                finish = text("progress_finish", language, when=_when(snapshot.eta, now, language, clock))
+                low, high = snapshot.eta_range or (snapshot.eta, snapshot.eta)
+                lines.append([(text("progress_finish", language, when=_moment(snapshot.eta, now, language),
+                                    low=_moment(low, now, language), high=_moment(high, now, language)), "bold")])
+                items = [text("progress_basis_runs", language, size=size, count=count) if count is not None
+                         else text("progress_basis_default", language, size=size)
+                         for size, count in snapshot.eta_basis.items()]
+                lines.append([(text("progress_basis", language, items=" · ".join(items)), "")])
+            if snapshot.recent:
+                lines.append([(text("progress_evidence", language, count=snapshot.recent, remaining=remaining), "")])
             else:
-                finish = text("progress_unknown_finish", language)
-            lines.append([(finish, "bold")])
-            key = "progress_evidence" if snapshot.recent else "progress_no_evidence"
-            lines.append([(text(key, language, count=snapshot.recent, remaining=remaining), "")])
+                note = text("progress_no_evidence", language, count=0, remaining=remaining)
+                lines.append([(note + text("progress_today", language, count=snapshot.today), "")])
+                running = [f"#{run['number']}" + (f" {text(run['phase'], language)}" if run.get("phase") else "")
+                           for run in snapshot.status.get("active_runs", [])]
+                if running:
+                    lines.append([(text("progress_running", language, items=" · ".join(running)), "")])
     if snapshot.quota:
         items = []
         for executor, (percent, reset) in sorted(snapshot.quota.items()):

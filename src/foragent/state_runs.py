@@ -196,6 +196,7 @@ class RunRecordsMixin:
             from foragent.processes import observe_tree
 
             finished = _state.replace(run, status="finished", outcome=outcome, detail=detail,
+                                      finished_at=self._timestamp(),
                                       process_identities=observe_tree(run.process_identities))
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""

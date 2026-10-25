@@ -42,6 +42,7 @@ class IssueRefreshMixin:
                     "state": issue.state,
                     "pr_number": None if complete_prs else old.get("pr_number"),
                     "merged": False if complete_prs else old.get("merged", False),
+                    "merged_at": None if complete_prs else old.get("merged_at"),
                     "comments": comments.get(issue.number, old_comments),
                     "updated_at": self._timestamp(),
                 }
@@ -74,6 +75,8 @@ class IssueRefreshMixin:
                 if (row := rows.get(str(pr_issue_number(pr.head)))) is not None:
                     row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
                                merged=pr.merged_at is not None)
+                    if pr.merged_at is not None:
+                        _record_merge(row, pr)
                     pr_facts[str(pr_issue_number(pr.head))] = {
                         "pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
             for number, row in rows.items():
@@ -141,6 +144,32 @@ class IssueRefreshMixin:
             }
             # A remembered read is not an issue change; keep revisions for real writes.
             self._write_json(self.root / "issues.json", snapshot)
+
+
+def _merge_time(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_merge(row: dict[str, Any], pr: Any) -> None:
+    """Keep every merged PR of the issue, in any listing order and across reopening.
+
+    merged_at is the newest merge. Each merge remembers whether its issue was ever
+    seen approved and closed with it, so a later reopening keeps the merge."""
+    at = _merge_time(pr.merged_at)
+    latest = _merge_time(row.get("merged_at"))
+    if at is not None and (latest is None or at > latest):
+        row["merged_at"] = pr.merged_at
+    merges = dict(row.get("merges") or {})
+    seen = merges.get(str(pr.number), {})
+    merges[str(pr.number)] = {
+        "merged_at": pr.merged_at,
+        "approved": bool(seen.get("approved")) or "approved" in row.get("labels", ()),
+        "closed": bool(seen.get("closed")) or row.get("state") == "closed",
+    }
+    row["merges"] = merges
 
 
 # Bound last: foragent.state imports this module, and lookups happen at call time

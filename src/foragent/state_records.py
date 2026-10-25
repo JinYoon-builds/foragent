@@ -69,3 +69,5 @@ class Run:
     review_pass_to_merge_seconds: float | None = None
     merge_lock_held_seconds: float | None = None
     comparison: dict | None = None
+    # When the run finished (set by finish_run); older records have none.
+    finished_at: str | None = None
