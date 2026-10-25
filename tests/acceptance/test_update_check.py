@@ -1,10 +1,12 @@
 """Acceptance test for update-check. Locked by Foragent; do not edit."""
 
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
+import fcntl
 import importlib.metadata
 import json
 from pathlib import Path
-import shutil
+import plistlib
 import socket
 import subprocess
 import sys
@@ -15,8 +17,8 @@ import pytest
 
 from test_local_truth import record_gh
 from test_orch_review_handoff import bind_cli, make_case
-from test_skills_autosync import cli_exit, isolated_home
-from test_view_open import fake_commands
+from test_skills_autosync import cli_exit, isolated_home, write_global_config
+from test_view_open import CommandLog
 
 
 # Public names selected for this contract: /fa startup facts use `fa brief`;
@@ -25,8 +27,13 @@ from test_view_open import fake_commands
 # Machine data/update-check.json records checked_at as a UTC ISO timestamp.
 # A day means 24 elapsed hours; the release transport is the existing gh seam.
 # FORAGENT_UPDATE_CHECK=off opts out; the offered installation is `fa update`.
+# Jin's 2026-10-25 07:05 decision supersedes the original install assertions:
+# install the upstream release tag under machine data/install.lock, then restart
+# plist-discovered gates under their individual tick locks. Historical test
+# function names below remain locked, including the old reinstall/busy wording.
 CURRENT, LATEST = "0.1.9", "0.1.10"  # Lexical comparison would miss this update.
 RELEASE_API = "repos/JinYoon-builds/foragent/releases/latest"
+INSTALL_SOURCE = "git+https://github.com/JinYoon-builds/foragent@"
 MAX_CHECK_SECONDS = 5
 
 
@@ -36,7 +43,12 @@ def update_case(git_history, tmp_path, monkeypatch, isolated_home):
     from foragent.config import load_config
     from foragent.state import StateStore
 
-    commands = fake_commands(tmp_path, monkeypatch)
+    log = tmp_path / "commands.jsonl"
+    log.write_text("")
+    commands = CommandLog(log, isolated_home / ".local/share/uv/tools")
+    monkeypatch.setenv("UV_TOOL_DIR", str(commands.tool_dir))
+    monkeypatch.setenv("UV_TOOL_BIN_DIR", str(isolated_home / ".local/bin"))
+    monkeypatch.setenv("UV_CACHE_DIR", str(isolated_home / ".cache/uv"))
     monkeypatch.setenv("FORAGENT_VIEW", "off")
     monkeypatch.delenv("FORAGENT_UPDATE_CHECK", raising=False)
     case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], language="en")
@@ -78,6 +90,7 @@ def update_case(git_history, tmp_path, monkeypatch, isolated_home):
                     "html_url": f"https://github.com/JinYoon-builds/foragent/releases/tag/v{LATEST}"}
     case.failure = None
     case.requests = []
+    case.uv_reply = case.launchctl_reply = None
 
     def reply(argv):
         assert argv[:2] == ["api", RELEASE_API], f"Unexpected GitHub request: {argv}"
@@ -91,8 +104,23 @@ def update_case(git_history, tmp_path, monkeypatch, isolated_home):
     recorded_run = subprocess.run
 
     def run(argv, *args, **kwargs):
-        if isinstance(argv, (list, tuple)) and argv and str(argv[0]) == "gh":
+        assert isinstance(argv, (list, tuple)) and argv, f"Unexpected shell command: {argv}"
+        executable = Path(argv[0]).name
+        if executable == "gh":
             case.requests.append(dict(kwargs))
+            return recorded_run(["gh", *argv[1:]], *args, **kwargs)
+        if executable in {"uv", "launchctl"}:
+            row = {"executable": executable, "argv": list(argv[1:]),
+                   "cwd": str(Path(kwargs.get("cwd") or Path.cwd()).resolve())}
+            with log.open("a") as stream:
+                stream.write(json.dumps(row) + "\n")
+            handler = case.uv_reply if executable == "uv" else case.launchctl_reply
+            assert handler is not None, f"Routine observations must not run {executable}: {argv}"
+            result = handler(list(argv[1:]))
+            if kwargs.get("check") and result.returncode:
+                raise subprocess.CalledProcessError(result.returncode, argv,
+                                                    output=result.stdout, stderr=result.stderr)
+            return result
         return recorded_run(argv, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -107,28 +135,29 @@ def update_case(git_history, tmp_path, monkeypatch, isolated_home):
     monkeypatch.setattr(executors.ClaudeExecutor, "run", forbidden)
     monkeypatch.setattr(executors.CodexExecutor, "run", forbidden)
 
-    # Only local Git fixtures and the recorded installer may spawn processes.
-    # In particular, an unmocked gh/launchctl/model executable cannot escape.
+    # All uv/gh/launchctl calls return above without spawning any executable.
+    # Only local Git fixture processes may reach Popen.
     popen = subprocess.Popen
 
     def local_popen(argv, *args, **kwargs):
         assert isinstance(argv, (list, tuple)) and argv, f"Unexpected shell command: {argv}"
         executable = Path(argv[0]).name
-        assert executable in {"git", "uv"}, f"Unrecorded process: {argv}"
-        if executable == "git":
-            assert not any("://" in str(arg) or str(arg).startswith("git@") for arg in argv)
-        else:
-            assert Path(shutil.which(str(argv[0]))).resolve() == (tmp_path / "bin/uv").resolve()
+        assert executable == "git", f"Unrecorded process: {argv}"
+        assert not any("://" in str(arg) or str(arg).startswith("git@") for arg in argv)
         return popen(argv, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", local_popen)
-    monkeypatch.setattr(launchd, "_run_launchctl", forbidden)
+    monkeypatch.setattr(launchd, "_run_launchctl", lambda argv: subprocess.run(
+        ["launchctl", *argv], capture_output=True, text=True, check=False))
     return case
 
 
-def invoke(case, capsys, *args, root=None):
+def invoke(case, capsys, *args, root=None, with_repo_root=True):
     capsys.readouterr()
-    code = cli_exit(case.main, [*args, "--repo-root", str(root or case.root)])
+    argv = list(args)
+    if with_repo_root:
+        argv += ["--repo-root", str(root or case.root)]
+    code = cli_exit(case.main, argv)
     output = capsys.readouterr()
     return code, output
 
@@ -236,127 +265,216 @@ def test_update_check_equal_or_older_release_has_no_offer(update_case, capsys, l
     assert case.commands.calls() == []
 
 
+@pytest.mark.parametrize("switch", ["env", "global", "repo"])
 def test_update_check_env_opt_out_makes_no_request_and_does_not_consume_the_day(
-    update_case, monkeypatch, capsys,
+    update_case, monkeypatch, capsys, switch,
 ):
     case = update_case
-    monkeypatch.setenv("FORAGENT_UPDATE_CHECK", "off")
+    config = case.root / ".foragent.yml"
+    original = config.read_text()
+    if switch == "env":
+        monkeypatch.setenv("FORAGENT_UPDATE_CHECK", "off")
+    elif switch == "global":
+        write_global_config({"skill_libraries": [], "update_check": False})
+    else:
+        config.write_text(original + "update_check: false\n")
     assert facts(case, capsys, "brief").get("update") is None
     assert facts(case, capsys, "gate", "status").get("update") is None
     assert_lookup(case, 0)
     assert not (case.machine / "update-check.json").exists()
-    monkeypatch.delenv("FORAGENT_UPDATE_CHECK")
+    if switch == "env":
+        monkeypatch.delenv("FORAGENT_UPDATE_CHECK")
+    elif switch == "global":
+        write_global_config({"skill_libraries": []})
+    else:
+        config.write_text(original)
     assert_offer(facts(case, capsys, "brief"))
     assert_lookup(case, 1)  # Positive control: opting back in works on the same day.
     assert case.commands.calls() == []
 
 
+def assert_install_lock(case, *, held):
+    """Probe a second real descriptor; an in-memory/per-repo lock cannot pass."""
+    path = case.machine / "install.lock"
+    assert path.is_file(), "Use one install.lock in the machine data root, independent of the caller repo"
+    with path.open("a") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            acquired = False
+        else:
+            acquired = True
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    assert acquired == (not held), "The machine install lock must cover uv and be released on return"
+
+
 @pytest.fixture
-def installer(update_case, git_history, monkeypatch, tmp_path):
-    from conftest import git_command
+def installer(update_case, monkeypatch, tmp_path):
     from foragent import launchd, orch_reinstall
+    from foragent.config import load_config
     from foragent.state import StateStore
 
     case = update_case
-    source_init = f"__version__ = '{LATEST}'\n"
-    payload = "RELEASE_PAYLOAD = 'the new release, not the caller checkout'\n"
-    git_history.update({"pyproject.toml": f'[project]\nname = "foragent"\nversion = "{LATEST}"\n',
-                        "src/foragent/__init__.py": source_init,
-                        "src/foragent/release_payload.py": payload})
-    git_command(git_history.origin, "update-ref", f"refs/tags/v{LATEST}", git_history.tip)
-    before = git_command(case.root, "rev-parse", "HEAD")
+    case.jobs, case.busy, case.events = {}, set(), []
+    case.install_exit, case.install_succeeded = 0, False
+    case.outside = tmp_path / "unconfigured directory"
+    case.outside.mkdir()
+    case.receipt = case.commands.tool_dir / "foragent/uv-receipt.toml"
+    case.receipt.parent.mkdir(parents=True)
     local = case.root / "unrelated-local.txt"
     local.write_text("keep me\n")
-    events = []
-    original = orch_reinstall._reinstall
+    case.local = local
+    executable = Path.home() / ".local/bin/fa"
+    monkeypatch.setattr(launchd, "fa_executable", lambda: executable)
+    monkeypatch.setattr(launchd, "GitRepo", lambda root: SimpleNamespace(
+        remote_slug=lambda: load_config(Path(root)).repo))
+    for repo, root in (("owner/repo", case.root),
+                       ("owner/forgotten", tmp_path / "forgotten"),
+                       ("another/free", tmp_path / "free project")):
+        root.mkdir(exist_ok=True)
+        (root / ".foragent.yml").write_text(
+            f"repo: {repo}\nlanguage: en\nskill_libraries: []\nnotify: none\n")
+        job = launchd.Launchd(root, repo=repo, executable=executable)
+        job.plist_path.parent.mkdir(parents=True, exist_ok=True)
+        job.plist_path.write_bytes(job.plist())
+        case.jobs[repo] = job
+    agents = Path.home() / "Library/LaunchAgents"
+    (agents / "com.example.other.plist").write_bytes(plistlib.dumps({
+        "Label": "com.example.other", "ProgramArguments": ["true"]}))
+    # These machine records have no installed gate and must not be restarted.
+    (case.machine / "owner__state-only").mkdir(parents=True)
 
-    def assert_tick_held():
-        with StateStore(case.store.root).tick_lock() as acquired:
-            assert not acquired, "Install and gate restart must hold the actual gate tick lock"
+    def no_local_reinstall(*args, **kwargs):
+        pytest.fail("fa update must install the upstream release tag, not fetch/reinstall a local origin")
 
-    def reinstall(*args, **kwargs):
-        assert_tick_held()
-        events.append("reinstall")
-        result = original(*args, **kwargs)
-        assert result is not None, "fa update must install the Foragent release"
-        events.append("verified")
-        return result
+    monkeypatch.setattr(orch_reinstall, "_reinstall", no_local_reinstall)
+    monkeypatch.setattr(case.git, "fetch", no_local_reinstall)
 
-    monkeypatch.setattr(orch_reinstall, "_reinstall", reinstall)
-    monkeypatch.setattr(case.git, "remote_slug", lambda: "owner/repo")
-    monkeypatch.setattr(launchd, "GitRepo", lambda root: case.git)
-    monkeypatch.setattr(launchd, "fa_executable", lambda: tmp_path / "bin/fa")
-    monkeypatch.setattr(launchd, "status", lambda *a, **kw: launchd.LaunchdStatus("offline", True, True))
+    def uv(argv):
+        if argv == ["tool", "dir"]:
+            return subprocess.CompletedProcess(["uv", *argv], 0,
+                                               stdout=str(case.commands.tool_dir), stderr="")
+        assert argv == ["tool", "install", INSTALL_SOURCE + case.release["tag_name"]], (
+            "Install exactly the latest upstream tag regardless of receipt, cwd, or selected repository")
+        assert case.gh, "The install tag must come from the recorded upstream release lookup"
+        assert_lookup(case, len(case.gh))
+        assert_install_lock(case, held=True)
+        for repo, job in case.jobs.items():
+            with StateStore(job.state_root).tick_lock() as acquired:
+                assert acquired == (repo not in case.busy), (
+                    "Install under the machine lock before acquiring any gate's tick lock")
+        case.events.append(("install", case.release["tag_name"]))
+        if case.install_exit == "missing-uv":
+            raise FileNotFoundError("offline fake: uv is unavailable")
+        case.install_succeeded = case.install_exit == 0
+        return subprocess.CompletedProcess(["uv", *argv], case.install_exit,
+                                           stdout="installed" if case.install_succeeded else "",
+                                           stderr="" if case.install_succeeded else "offline install failed")
 
     def launchctl(argv):
-        assert_tick_held()
-        assert events and events[-1] in {"verified", "bootout", "bootstrap", "kickstart"}, (
-            "Restart only after the shared reinstaller verifies the installed package")
+        jobs = {job.target: (repo, job) for repo, job in case.jobs.items()}
+        if argv[0] == "bootstrap":
+            matches = [(repo, job) for repo, job in case.jobs.items()
+                       if str(job.plist_path) == argv[-1]]
+            assert len(matches) == 1, f"Only installed Foragent plists may restart: {argv}"
+            repo, job = matches[0]
+        else:
+            assert argv[-1] in jobs, f"Unknown gate or unrelated launch agent: {argv}"
+            repo, job = jobs[argv[-1]]
+        if argv[0] == "print":
+            return subprocess.CompletedProcess(["launchctl", *argv], 0,
+                                               stdout="state = waiting\n", stderr="")
         assert argv[0] in {"bootout", "bootstrap", "kickstart"}, argv
-        events.append(argv[0])
+        assert case.install_succeeded, "Never restart any gate before a successful install"
+        assert repo not in case.busy, f"Skip busy gate {repo}; never restart it mid-tick"
+        with StateStore(job.state_root).tick_lock() as acquired:
+            assert not acquired, f"Restart {repo} only while holding its own tick lock"
+        case.events.append((argv[0], repo))
         return subprocess.CompletedProcess(["launchctl", *argv], 0, stdout="", stderr="")
 
-    monkeypatch.setattr(launchd, "_run_launchctl", launchctl)
-    return SimpleNamespace(case=case, events=events, before=before, local=local,
-                           source_init=source_init, payload=payload)
+    case.uv_reply, case.launchctl_reply = uv, launchctl
+    return case
 
 
-def assert_installed(installer):
-    from conftest import git_command
-    from test_orch_reinstall import install_calls
+def assert_installed(case, *, restarted):
+    from foragent.state import StateStore
 
-    item, case = installer, installer.case
-    assert item.events.count("reinstall") == 1, "fa update must reuse orch_reinstall._reinstall exactly once"
-    calls = install_calls(case.commands)
-    assert len(calls) == 1 and calls[0]["argv"][:4] == ["tool", "install", "--force", "--reinstall"]
-    assert calls[0]["source_init"] == item.source_init
-    assert Path(calls[0]["source_root"]).resolve() != case.root.resolve()
-    package = case.commands.tool_dir / "foragent/lib/python3.12/site-packages/foragent"
-    assert (package / "__init__.py").read_text() == item.source_init
-    assert (package / "release_payload.py").read_text() == item.payload
-    assert any(row["argv"] == ["tool", "dir"] for row in case.commands.calls("uv"))
-    assert "bootstrap" in item.events or "kickstart" in item.events, "Updating must restart the gate"
-    assert item.events.index("verified") < next(
-        index for index, event in enumerate(item.events) if event in {"bootout", "bootstrap", "kickstart"})
-    assert git_command(case.root, "rev-parse", "HEAD") == item.before
-    assert item.local.read_text() == "keep me\n"
-    with case.store.tick_lock() as acquired:
-        assert acquired, "fa update must release the tick lock when finished"
+    calls = [row["argv"] for row in case.commands.calls("uv") if row["argv"][:2] == ["tool", "install"]]
+    assert calls == [["tool", "install", INSTALL_SOURCE + case.release["tag_name"]]], (
+        "fa update must run exactly one uv tool install for the latest upstream release tag")
+    assert case.events[0] == ("install", case.release["tag_name"])
+    actual = [repo for event, repo in case.events if event in {"bootstrap", "kickstart"}]
+    assert sorted(actual) == sorted(restarted), "Restart every free gate once, deduplicating --repo-root"
+    assert_install_lock(case, held=False)
+    assert case.local.read_text() == "keep me\n"
+    for repo, job in case.jobs.items():
+        with StateStore(job.state_root).tick_lock() as acquired:
+            assert acquired == (repo not in case.busy), f"Do not leave a tick lock held for {repo}"
 
 
-def test_update_check_explicit_fa_update_reuses_verified_reinstall_then_restarts_between_ticks(installer, capsys):
-    code, output = invoke(installer.case, capsys, "update")
+@pytest.mark.parametrize("receipt,tag", [
+    ("pypi", f"v{LATEST}"), ("editable", "v0.2.3"),
+    ("other-git", "v1.2.0"), ("missing", "v2.0.1"),
+])
+@pytest.mark.parametrize("entry", ["project-cwd", "explicit-root", "outside", "no-gates"])
+def test_update_check_explicit_fa_update_reuses_verified_reinstall_then_restarts_between_ticks(
+    installer, monkeypatch, capsys, receipt, tag, entry,
+):
+    case = installer
+    case.release["tag_name"] = tag
+    requirements = {
+        "pypi": 'name = "foragent", specifier = "==0.0.1"',
+        "editable": f'name = "foragent", editable = "{case.root}"',
+        "other-git": 'name = "foragent", git = "https://github.com/elsewhere/foragent", rev = "old"',
+    }
+    if receipt != "missing":
+        case.receipt.write_text("[tool]\nrequirements = [{" + requirements[receipt] + "}]\n")
+    if entry == "no-gates":
+        for job in case.jobs.values():
+            job.plist_path.unlink()
+        case.jobs.clear()
+    if entry != "project-cwd":
+        monkeypatch.chdir(case.outside)
+    code, output = invoke(case, capsys, "update", with_repo_root=entry == "explicit-root")
     assert code == 0, f"fa update must install and restart successfully (exit {code}): {output.err.strip()}"
-    assert_installed(installer)
+    assert_installed(case, restarted=case.jobs)
 
 
-def test_update_check_busy_tick_prevents_install_and_restart_then_allows_retry(installer, monkeypatch, capsys):
-    case = installer.case
+@pytest.mark.parametrize("busy", [("owner/forgotten",), ("owner/repo",),
+                                 ("owner/repo", "owner/forgotten", "another/free")],
+                         ids=["another-gate-busy", "selected-gate-busy", "all-gates-busy"])
+def test_update_check_busy_tick_prevents_install_and_restart_then_allows_retry(installer, capsys, busy):
+    from foragent.state import StateStore
 
-    def no_wait(seconds):
-        pytest.fail("A busy tick must return for retry rather than wait inside fa update")
-
-    # StateStore.tick_lock is nonblocking. Choose a nonzero, retryable busy exit.
-    with monkeypatch.context() as busy, case.store.tick_lock() as acquired:
-        busy.setattr(time, "sleep", no_wait)
-        assert acquired
+    case = installer
+    case.busy = set(busy)
+    with ExitStack() as locks:
+        for repo in busy:
+            assert locks.enter_context(StateStore(case.jobs[repo].state_root).tick_lock())
         code, output = invoke(case, capsys, "update")
-        assert code != 0, "fa update must defer while a gate tick owns the lock"
-        assert installer.events == [] and case.commands.calls() == []
-        assert "tick" in (output.out + output.err).lower(), "Explain the busy tick so the person can retry"
+        free = set(case.jobs) - case.busy
+        assert code == (0 if free else 75), "Exit 75 only when every installed gate is busy"
+        assert_installed(case, restarted=free)  # Even when all gates are busy, install once.
+        note = (output.out + output.err).lower()
+        for repo in busy:
+            assert (repo.lower() in note or str(case.jobs[repo].repo_root).lower() in note) and (
+                "busy" in note or "tick" in note), f"Name skipped busy gate {repo} in the output"
+    case.busy.clear()
+    case.events.clear()
+    case.commands.clear()
+    case.install_succeeded = False
     code, output = invoke(case, capsys, "update")
     assert code == 0, f"fa update must work once the tick finishes: {output.err.strip()}"
-    assert_installed(installer)
+    assert_installed(case, restarted=case.jobs)
 
 
-@pytest.mark.parametrize("mode", ["error", "mismatch"])
-def test_update_check_failed_install_or_verification_never_restarts_gate(installer, monkeypatch, capsys, mode):
-    from test_orch_reinstall import install_calls
-
-    monkeypatch.setenv("FA_D57_INSTALL_MODE", mode)
-    code, output = invoke(installer.case, capsys, "update")
-    assert installer.events == ["reinstall"], "fa update must attempt the shared installer and stop on failure"
-    assert len(install_calls(installer.case.commands)) == 1
-    assert code != 0 and (output.out + output.err).strip(), "Report installation/verification failure"
-    with installer.case.store.tick_lock() as acquired:
-        assert acquired, "Installation failure must release the tick lock"
+@pytest.mark.parametrize("install_exit", [1, 42, "missing-uv"])
+def test_update_check_failed_install_or_verification_never_restarts_gate(installer, capsys, install_exit):
+    case = installer
+    case.install_exit = install_exit
+    code, output = invoke(case, capsys, "update")
+    assert case.events == [("install", case.release["tag_name"])], (
+        "fa update must attempt the upstream install and never restart a gate on failure")
+    assert code == 1, "An installation failure must exit 1, regardless of uv's exit status"
+    assert (output.out + output.err).strip(), "Report the failed installation"
+    assert_installed(case, restarted=[])

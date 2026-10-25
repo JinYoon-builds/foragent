@@ -4,6 +4,8 @@ Ideas Jin wants to keep but not order yet. An idea moves to `decisions.md` when 
 
 ## 2026-10-25
 
+- **Speculative and batched merge queue (Jin, 2026-10-25).** After the short merge lock (checks and CI outside the lock, lock only for the final re-check and merge), the door itself takes seconds. What remains is re-checking when main moves between a PR's checks and its merge. Two known ways to cut that, to take out once 5 merges per hour is stable, or earlier when the share of merges that must re-check because main moved rises (it grows with the number of lanes: more lanes, more merges in between, more re-checks per PR) (Jin, 2026-10-25): (1) speculative: while PR1 is checked, PR2 is checked on top of main + PR1; if PR1 passes, PR2 is already verified; if PR1 fails, PR2 is re-checked without it (GitHub merge queue, Zuul); (2) batched: check PR1+PR2+PR3 together once; on failure, bisect to find the culprit (bors). Measure first with the review-PASS-to-merge and lock-held times the short-lock order records. OS analogy: shrink the critical section first; speculation is branch prediction.
+
 - **New roles: a separate agent only when it needs its own context (Jin, 2026-10-25).**
   Source: Anthropic, "Building agents: when to fold subagents into your main agent loop" (claude.com/resources/articles, read 2026-10-25). One loop with skills and tools often beats routers and domain subagents; each handoff loses detail ("telephone game"); move decisions from the harness into the model as models improve; put reference material behind lookup tools instead of pasting it into prompts; build evals before changing the structure.
 

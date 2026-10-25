@@ -59,6 +59,7 @@ class Run:
     session_ids: list[str] = field(default_factory=list)
     session_body: str | None = None
     resume_reason: str = ""
+    resume_failures: int = 0
     merge_conflicts: list[str] = field(default_factory=list)
     local_skill_paths: list[str] = field(default_factory=list)
     approval_body_sha: str | None = None

@@ -201,3 +201,50 @@ def test_install_waits_for_another_process_holding_the_lock(tmp_path):
     finally:
         assert holder.wait(timeout=15) == 0
     assert statusline.load_record() == {"enabled": True, "previous_command": "echo old"}
+
+
+def _installed(settings_text, previous):
+    statusline.claude_settings_path().parent.mkdir(parents=True, exist_ok=True)
+    statusline.claude_settings_path().write_text(settings_text, encoding="utf-8")
+    statusline._write_json(statusline.record_path(), {"enabled": True, "previous_command": previous})
+
+
+@pytest.mark.parametrize("before, after", [
+    ('{"theme": "dark",\n  "statusLine": {"type": "command", "command": "fa statusline"}\n}\n',
+     '{"theme": "dark"\n}\n'),
+    ('{ "statusLine": {"type": "command", "command": "fa statusline"} }', '{ }'),
+    ('{"statusLine": 1, "a": 2, "statusLine": {"type": "command", "command": "fa statusline"}}',
+     '{ "a": 2}'),
+    ('{"statusLine": {"type": "command", "command": "fa statusline"},\n "a": 2,\n'
+     ' "statusLine": {"type": "command", "command": "fa statusline"}}',
+     '{\n "a": 2}'),
+], ids=["last-member", "only-member", "duplicate-key", "duplicate-wrappers"])
+def test_uninstall_removes_statusline_member_anywhere(before, after):
+    _installed(before, None)
+    code, message = statusline.uninstall()
+    assert code == 0, message
+    assert statusline.claude_settings_path().read_text(encoding="utf-8") == after
+    assert statusline.load_record() == {"enabled": False, "previous_command": None}
+
+
+def test_uninstall_rejects_invalid_settings_without_writing():
+    _installed('{"statusLine": {"type": "command", "command": "fa statusline"},}', "true")
+    code, message = statusline.uninstall()
+    assert code == 1 and "settings.json" in message and "could not read" in message
+    assert statusline.load_record()["enabled"] is True
+
+
+def test_uninstall_speaks_korean():
+    _installed('{"statusLine": {"type": "command", "command": "fa statusline"}}', "echo hi")
+    code, message = statusline.uninstall("ko")
+    assert code == 0 and message == "예전 Claude 상태 줄로 되돌렸어요: echo hi"
+    assert json.loads(statusline.claude_settings_path().read_text()) == {
+        "statusLine": {"type": "command", "command": "echo hi"}}
+
+
+def test_uninstall_restore_with_duplicates_activates_the_previous_command():
+    _installed('{"statusLine": {"type": "command", "command": "fa statusline"}, '
+               '"statusLine": {"type": "command", "command": "fa statusline"}}', "echo hi")
+    code, message = statusline.uninstall()
+    assert code == 0, message
+    assert json.loads(statusline.claude_settings_path().read_text())["statusLine"]["command"] == "echo hi"

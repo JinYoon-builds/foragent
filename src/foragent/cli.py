@@ -113,7 +113,10 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--dry-run", action="store_true")
     init.add_argument("--statusline", choices=("yes", "no"),
                       help="Answer the Claude statusline question without a prompt")
-    commands.add_parser("statusline", help="Claude Code statusline: record rate limits, show your statusline")
+    statusline_command = commands.add_parser(
+        "statusline", help="Claude Code statusline: record rate limits, show your statusline")
+    statusline_command.add_argument("--uninstall", action="store_true",
+                                    help="Put back the statusline you had before Foragent's wrapper")
     profile_command = commands.add_parser("profile", help="Save the project's confirmed profile")
     profile_actions = profile_command.add_subparsers(dest="action", required=True)
     profile_set = profile_actions.add_parser("set")
@@ -243,6 +246,8 @@ files lists repository-relative paths or globs expected to change; absolute path
             command.add_argument("--follow", action="store_true", help="Keep printing changes until interrupted")
         elif name != "log":
             command.add_argument("number", type=int)
+        if name in ("retry", "rerun-review", "resolve", "escalate"):
+            command.add_argument("--say", help="One line for a person, shown in the view (docs/voice.md voice)")
         if name == "premerge":
             command.add_argument("--json", action="store_true")
         elif name == "merge":
@@ -582,6 +587,17 @@ def _offer_statusline(answer: str | None) -> None:
         print("Claude statusline: not asked (no terminal); rerun with --statusline yes|no.")
 
 
+def _uninstall_statusline() -> int:
+    from foragent import statusline
+    try:
+        language = load_config(Path.cwd()).language
+    except Exception:  # Any folder works: outside a Foragent repository, speak English.
+        language = "en"
+    code, message = statusline.uninstall(language)
+    print(message, file=sys.stderr if code else sys.stdout)
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["test"]:
@@ -591,6 +607,11 @@ def main(argv: list[str] | None = None) -> int:
         from foragent import statusline
         return statusline.run()
     args = _parser().parse_args(argv)
+    if args.command == "statusline":
+        if args.uninstall:
+            return _uninstall_statusline()
+        from foragent import statusline
+        return statusline.run()
     try:
         if args.command == "design":
             if args.action == "lint":
@@ -775,13 +796,14 @@ def main(argv: list[str] | None = None) -> int:
                 if unknown and not args.follow:
                     return 1
             elif args.action == "retry":
-                print(orch.retry(ctx, args.number, args.hint))
+                print(orch.retry(ctx, args.number, args.hint, say=args.say))
             elif args.action == "rerun-review":
-                print(orch.rerun_review(ctx, args.number))
+                print(orch.rerun_review(ctx, args.number, say=args.say))
             elif args.action == "resolve":
-                print(orch.resolve(ctx, args.number, args.verdict, args.note))
+                print(orch.resolve(ctx, args.number, args.verdict, args.note, say=args.say))
             elif args.action == "escalate":
-                print(orch.escalate(ctx, args.number, args.summary, args.tried, args.option, args.recommend))
+                print(orch.escalate(ctx, args.number, args.summary, args.tried, args.option, args.recommend,
+                                    say=args.say))
             elif args.action == "premerge":
                 report = orch.premerge(ctx, args.number)
                 if args.json:

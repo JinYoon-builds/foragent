@@ -1,4 +1,5 @@
 from pathlib import Path
+import io
 import json
 import os
 import signal
@@ -52,6 +53,17 @@ def test_executor_factory():
     assert isinstance(executor_for("claude"), ClaudeExecutor)
     with pytest.raises(ValueError, match="unknown executor"):
         executor_for("unknown")
+
+
+@pytest.mark.parametrize("builder", ["codex", "claude"])
+@pytest.mark.parametrize("prompt", [None, "", " \n\t"])
+def test_resume_builders_require_a_prompt(tmp_path, builder, prompt):
+    options = {"resume_session_id": "saved", "prompt": prompt}
+    with pytest.raises(ValueError, match="non-empty prompt"):
+        if builder == "codex":
+            codex_command(tmp_path, tmp_path / "message", **options)
+        else:
+            claude_command(**options)
 
 
 @pytest.mark.parametrize("message", [
@@ -192,7 +204,7 @@ def test_claude_goal_has_its_own_turn_and_resume_only_sends_updates(tmp_path, mo
             for content in (f"/goal {goal}", prompt)
         ]
     else:
-        assert args == claude_command(resume_session_id=resume_session_id)
+        assert args == claude_command(resume_session_id=resume_session_id, prompt=prompt)
         assert kwargs["prompt"] == prompt
         assert goal not in kwargs["prompt"]
     assert result.last_message == "Implemented" and result.num_turns == 2
@@ -220,8 +232,9 @@ def test_claude_review_uses_devnull_and_preserves_json(tmp_path, monkeypatch, pr
             calls.append((args, kwargs))
             kwargs["stdout"].write(message.encode())
 
-        def communicate(self, **kwargs):
-            assert kwargs == {"input": None, "timeout": 12}
+        def wait(self, **kwargs):
+            assert kwargs == {"timeout": 12}
+            return self.returncode
 
         def poll(self):
             return 0
@@ -250,12 +263,18 @@ def test_executor_uses_worktree_stdin_append_log_and_output(kind, tmp_path, monk
     log = tmp_path / "issue.log"
     log.write_text("earlier\n")
 
+    class Stdin(io.BytesIO):
+        def write(self, data):
+            assert data == b"approved prompt"
+            return super().write(data)
+
     class Process:
         pid = 123456
         returncode = 7
 
         def __init__(self, args, **kwargs):
             calls.append((args, kwargs))
+            self.stdin = Stdin()
             stdout = "session stdout\n" if kind == "codex" else json.dumps({"type": "result", "result": "session stdout\n"}) + "\n"
             kwargs["stdout"].write(stdout.encode())
             if kwargs["stderr"] != subprocess.STDOUT:
@@ -263,8 +282,9 @@ def test_executor_uses_worktree_stdin_append_log_and_output(kind, tmp_path, monk
             if kind == "codex":
                 Path(args[args.index("-o") + 1]).write_text("last codex message")
 
-        def communicate(self, **kwargs):
-            assert kwargs == {"input": b"approved prompt", "timeout": 21}
+        def wait(self, **kwargs):
+            assert kwargs == {"timeout": 21}
+            return self.returncode
 
         def poll(self):
             return self.returncode
@@ -496,7 +516,7 @@ def test_tick_group_already_gone(monkeypatch, fake_process_table, tmp_path):
 def test_read_only_commands_cannot_edit_files():
     codex = codex_command(Path("/w"), Path("/o"), read_only=True)
     assert codex[codex.index("-s") + 1] == "read-only"
-    resumed = codex_command(Path("/w"), Path("/o"), resume_session_id="s", read_only=True)
+    resumed = codex_command(Path("/w"), Path("/o"), resume_session_id="s", read_only=True, prompt="continue")
     assert 'sandbox_mode="read-only"' in resumed
     claude = claude_command(read_only=True)
     assert claude[claude.index("--permission-mode") + 1] == "plan"

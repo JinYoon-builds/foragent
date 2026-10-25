@@ -1,0 +1,3 @@
+# Progressing work is ended only by silence (D89)
+
+Jin (2026-10-25, D89): work that is still progressing is never ended by a fixed time or count. Stuck is judged by silence: no new output or progress AND no CPU-time growth across the recorded process tree, for a silence window measured from history (default 10 min); a 24 h safety net remains; ended work is kept and resumed. Evidence: the fixed 900 s baseline limit stopped every capture on 2026-10-25 and wedged merges; checks end at 900 s and restart; the 90-minute runtime kills progressing runs. This issue covers baseline capture, Done-when/related checks and run runtime; CI polling, the conflict reset, the turn cap and review rounds follow in a later issue. D88: this cuts redo.
