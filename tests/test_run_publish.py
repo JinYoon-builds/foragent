@@ -706,7 +706,7 @@ def test_batch_child_targets_shared_branch_closes_and_opens_parent_pr_once(run_c
     assert c.tracker.get_issue(1).state == "closed"
     assert c.tracker.list_comments(1)[-1].body == "Merged into foragent/batch-99 (PR #100)"
     assert batch.head == "foragent/batch-99" and batch.base == "main"
-    assert batch.title == "Batch: The whole feature"
+    assert batch.title == "Batch: The whole feature (#99)"
     assert "Closes #99" in batch.body and "#1: Implement feature (PR #100)" in batch.body
     _batch_pr(99, c.ctx)
     assert len(c.tracker.created_prs) == 2
@@ -1109,3 +1109,88 @@ def test_parallel_lanes_implement_while_merge_phase_serializes_and_rechecks(run_
     # Both lanes published before CI; the second failed fresh-base verification.
     second_log = c.store.log_path(2).read_text()
     assert second_log.count("Done when command:") == 2
+
+
+@pytest.mark.parametrize("failure", [None, "HTTP 422", "API rate limit exceeded"])
+def test_retitle_for_merge_falls_back_to_an_explicit_subject(failure):
+    from types import SimpleNamespace
+
+    from foragent.run_publish import retitle_for_merge
+
+    edits, notes = [], []
+
+    def update_pr(pr, **fields):
+        edits.append((pr, fields))
+        if failure:
+            raise TrackerError(failure)
+
+    ctx = SimpleNamespace(tracker=SimpleNamespace(update_pr=update_pr))
+
+    def retitle(current):
+        return retitle_for_merge(ctx, 2, title="Feature (#1)", current_title=current, base="main",
+                                 body=lambda: "Closes #1", note=notes.append)
+
+    assert retitle("Feature (#1)") == {} and not edits
+    if failure and "rate limit" in failure:
+        with pytest.raises(TrackerError):
+            retitle("WIP: old (#1) [timeout]")
+        assert not notes
+        return
+    expected = {"subject": "Feature (#1)"} if failure else {}
+    assert retitle("WIP: old (#1) [timeout]") == expected
+    assert edits == [(2, {"base": "main", "title": "Feature (#1)", "body": "Closes #1"})]
+    assert bool(notes) == bool(failure)
+
+
+def test_gate_merges_an_existing_wip_pr_with_an_explicit_subject_when_retitle_fails(run_case, monkeypatch):
+    c = run_case
+    wip = "WIP: Implement feature (#1) [timeout]"
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title=wip, body="Closes #1")
+    c.tracker.set_pr_checks(pr, "pass")
+    update, merge = c.tracker.update_pr, c.tracker.merge_pr
+    edits, merges = [], []
+
+    def update_pr(number, **fields):
+        edits.append(fields["title"])
+        if fields["title"] != wip:
+            raise TrackerError("HTTP 422: title rejected")
+        update(number, **fields)
+
+    def merge_pr(number, **kwargs):
+        merges.append(kwargs.get("subject"))
+        merge(number, **{key: value for key, value in kwargs.items() if key != "subject"})
+
+    monkeypatch.setattr(c.tracker, "update_pr", update_pr)
+    monkeypatch.setattr(c.tracker, "merge_pr", merge_pr)
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.tracker.merged_prs == [pr] and len(c.tracker.created_prs) == 1
+    assert merges == ["Implement feature (#1)"]
+    # The first refresh still retargets and updates the body under the old title.
+    assert edits[:2] == ["Implement feature (#1)", wip] and edits[-1] == "Implement feature (#1)"
+    assert "retitle failed" in c.store.log_path(1).read_text()
+
+
+def test_gate_merges_with_an_explicit_subject_when_every_pr_edit_fails(run_case, monkeypatch):
+    c = run_case
+    wip = "WIP: Implement feature (#1) [timeout]"
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title=wip, body="Closes #1")
+    c.tracker.set_pr_checks(pr, "pass")
+    merge = c.tracker.merge_pr
+    edits, merges = [], []
+
+    def update_pr(number, **fields):
+        edits.append(fields["title"])
+        raise TrackerError("HTTP 500: server error")
+
+    def merge_pr(number, **kwargs):
+        merges.append(kwargs.get("subject"))
+        merge(number, **{key: value for key, value in kwargs.items() if key != "subject"})
+
+    monkeypatch.setattr(c.tracker, "update_pr", update_pr)
+    monkeypatch.setattr(c.tracker, "merge_pr", merge_pr)
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.tracker.merged_prs == [pr] and len(c.tracker.created_prs) == 1
+    assert merges == ["Implement feature (#1)"]
+    assert edits[:2] == ["Implement feature (#1)", wip] and edits[-1] == "Implement feature (#1)"
+    log = c.store.log_path(1).read_text()
+    assert "retitle failed" in log and "HTTP 500" in log

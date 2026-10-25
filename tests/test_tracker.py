@@ -1033,7 +1033,8 @@ def test_gh_close_issue_with_optional_comment():
 
 
 def test_gh_pr_create_files_and_merge():
-    run = ScriptedRun("https://github.com/owner/repo/pull/42\n", '[{"filename": "src/a.py"}]\n[{"filename": "tests/a.py"}]', "")
+    run = ScriptedRun("https://github.com/owner/repo/pull/42\n", '[{"filename": "src/a.py"}]\n[{"filename": "tests/a.py"}]',
+                      json.dumps({"title": "Title (#1)"}), "")
     tracker = GhTracker(REPO, run)
     assert tracker.create_pr(head="feature", base="main", title="Title", body="Closes #1\nDetails") == 42
     assert tracker.pr_changed_files(42) == ["src/a.py", "tests/a.py"]
@@ -1041,8 +1042,19 @@ def test_gh_pr_create_files_and_merge():
     assert run.calls == [
         (["pr", "create", "-R", REPO, "--head", "feature", "--base", "main", "--title", "Title", "--body-file", "-"], "Closes #1\nDetails"),
         (["api", "--paginate", "repos/owner/repo/pulls/42/files?per_page=100"], None),
-        (["pr", "merge", "42", "-R", REPO, "--squash", "--delete-branch", "--match-head-commit", "a" * 40], None),
+        (["pr", "view", "42", "-R", REPO, "--json", "title"], None),
+        (["pr", "merge", "42", "-R", REPO, "--squash", "--delete-branch", "--match-head-commit", "a" * 40,
+          "--subject", "Title (#1)"], None),
     ]
+
+
+def test_gh_squash_merge_uses_an_explicit_subject_without_reading_the_title():
+    run = ScriptedRun("")
+    GhTracker(REPO, run).merge_pr(42, expected_head_sha="a" * 40, subject="Feature (#1)")
+    assert run.calls == [([
+        "pr", "merge", "42", "-R", REPO, "--squash", "--delete-branch",
+        "--match-head-commit", "a" * 40, "--subject", "Feature (#1)",
+    ], None)]
 
 
 def test_gh_unparseable_pr_url_is_an_error():
