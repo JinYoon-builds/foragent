@@ -1,8 +1,5 @@
 """`fa statusline`: Claude Code statusline wrapper; never needs a repository."""
 
-from pathlib import Path
-import sys
-
 from foragent.commands import facade
 
 ORDER = 60
@@ -16,19 +13,20 @@ def add(commands) -> None:
 
 
 def _uninstall_statusline() -> int:
+    cli = facade()
     from foragent import statusline
     try:
-        language = facade().load_config(Path.cwd()).language
+        language = cli.load_config(cli.Path.cwd()).language
     except Exception:  # Any folder works: outside a Foragent repository, speak English.
         language = "en"
     code, message = statusline.uninstall(language)
-    print(message, file=sys.stderr if code else sys.stdout)
+    print(message, file=cli.sys.stderr if code else cli.sys.stdout)
     return code
 
 
 def run(args) -> int:
     """``args`` is None for the bare refresh call Claude Code makes."""
     if args is not None and args.uninstall:
-        return _uninstall_statusline()
+        return facade()._uninstall_statusline()
     from foragent import statusline
     return statusline.run()

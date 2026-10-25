@@ -1,9 +1,5 @@
 """`fa order`: deterministic tools for fa-order."""
 
-import argparse
-import json
-from pathlib import Path
-
 from foragent.commands import facade, repo_store
 
 ORDER = 80
@@ -28,20 +24,22 @@ files lists repository-relative paths or globs expected to change; absolute path
 
 
 def _comma_keys(value: str) -> list[str]:
+    cli = facade()
     values = value.split(",")
     if any(not item.strip() for item in values):
-        raise argparse.ArgumentTypeError("expected comma-separated keys")
+        raise cli.argparse.ArgumentTypeError("expected comma-separated keys")
     return [item.strip() for item in values]
 
 
 def _comma_numbers(value: str) -> list[int]:
+    cli = facade()
     try:
         numbers = [int(item) for item in facade()._comma_keys(value)]
         if any(number <= 0 for number in numbers):
             raise ValueError
         return numbers
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("expected comma-separated positive issue numbers") from exc
+        raise cli.argparse.ArgumentTypeError("expected comma-separated positive issue numbers") from exc
 
 
 def add(commands) -> None:
@@ -49,13 +47,13 @@ def add(commands) -> None:
     order_command = commands.add_parser("order", help="Deterministic tools for fa-order")
     order_actions = order_command.add_subparsers(dest="action", required=True)
     context = order_actions.add_parser("context")
-    context.add_argument("--repo-root", type=Path, default=Path.cwd())
+    context.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     context.add_argument("--json", action="store_true")
     progress = order_actions.add_parser("progress", help="Record local order preparation facts")
     progress_steps = progress.add_subparsers(dest="step", required=True)
     for step in cli.order.PROGRESS_STEPS:
         command = progress_steps.add_parser(step)
-        command.add_argument("--repo-root", type=Path, default=Path.cwd())
+        command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         if step == "start":
             command.add_argument("--title", required=True)
         elif step in {"ledger", "chunk"}:
@@ -73,26 +71,26 @@ def add(commands) -> None:
             command.add_argument("--issue", type=int, required=True)
     preread = order_actions.add_parser(
         "preread", help="Ask each issue's implementer, read-only, to list unknowns before approval")
-    preread.add_argument("plan", type=Path)
-    preread.add_argument("--repo-root", type=Path, default=Path.cwd())
+    preread.add_argument("plan", type=cli.Path)
+    preread.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     preread.add_argument("--json", action="store_true")
     publish = order_actions.add_parser(
-        "publish", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=PUBLISH_EPILOG)
-    publish.add_argument("plan", type=Path)
-    publish.add_argument("--repo-root", type=Path, default=Path.cwd())
+        "publish", formatter_class=cli.argparse.RawDescriptionHelpFormatter, epilog=PUBLISH_EPILOG)
+    publish.add_argument("plan", type=cli.Path)
+    publish.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     publish.add_argument("--approve", action="store_true")
     publish.add_argument("--approve-keys", type=cli._comma_keys, default=[])
     publish.add_argument("--approve-numbers", type=cli._comma_numbers, default=[])
     publish.add_argument("--dry-run", action="store_true")
 
 
-def _preread(args, root: Path) -> int:
+def _preread(args, root) -> int:
     cli = facade()
     config = cli.load_config(root)
     results = cli.order.preread(cli.order.read_plan(args.plan), root, config,
                                 lambda: cli.GhTracker(config.repo or cli.GitRepo(root).remote_slug()))
     if args.json:
-        print(json.dumps({"issues": results}, ensure_ascii=False))
+        print(cli.json.dumps({"issues": results}, ensure_ascii=False))
     else:
         for result in results:
             print(f"{result['key']}: " + ("no unknowns" if not result["unknowns"] else
@@ -110,7 +108,7 @@ def run(args) -> int:
         fields = {name: getattr(args, name) for name in
                   ("title", "add", "chunk", "slot", "ask", "filled", "done", "total", "issue")
                   if hasattr(args, name)}
-        print(json.dumps(cli.order.progress(store, args.step, **fields), ensure_ascii=False))
+        print(cli.json.dumps(cli.order.progress(store, args.step, **fields), ensure_ascii=False))
         return 0
     if args.action == "preread":
         return _preread(args, root)
@@ -119,7 +117,7 @@ def run(args) -> int:
     repo = config.repo or git.remote_slug()
     tracker = cli.GhTracker(repo)
     if args.action == "context":
-        print(json.dumps(cli.order.context(root, config, tracker), ensure_ascii=False))
+        print(cli.json.dumps(cli.order.context(root, config, tracker), ensure_ascii=False))
         return 0
     tracker = cli.RunContext(repo=repo, repo_root=root, tracker=tracker,
                              store=cli.StateStore.for_repo(repo), config=config, git=git,

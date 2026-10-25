@@ -1,10 +1,5 @@
 """`fa test`: wait for a machine-wide test slot, then run pytest."""
 
-import argparse
-from pathlib import Path
-import subprocess
-import sys
-
 from foragent.commands import facade
 
 ORDER = 160
@@ -14,11 +9,12 @@ TEST_USAGE = "fa test [--repo-root DIR] <pytest args>"
 
 def add(commands) -> None:
     # Listed for `fa --help` only; main() hands `fa test ...` to pytest before parsing.
+    cli = facade()
     test = commands.add_parser(
         "test", help="Wait for a machine-wide test slot, then run pytest with the given arguments",
         usage=facade().TEST_USAGE, add_help=False,
     )
-    test.add_argument("pytest_args", nargs=argparse.REMAINDER)
+    test.add_argument("pytest_args", nargs=cli.argparse.REMAINDER)
 
 
 def _test_command(argv: list[str]) -> int:
@@ -26,19 +22,19 @@ def _test_command(argv: list[str]) -> int:
     cli = facade()
     root = None
     if argv[:1] == ["--repo-root"] and len(argv) > 1:
-        root, argv = Path(argv[1]), argv[2:]
+        root, argv = cli.Path(argv[1]), argv[2:]
     elif argv and argv[0].startswith("--repo-root="):
-        root, argv = Path(argv[0].split("=", 1)[1]), argv[1:]
+        root, argv = cli.Path(argv[0].split("=", 1)[1]), argv[1:]
     if argv[:1] == ["--"]:
         argv = argv[1:]
     if root is None:
-        cwd = Path.cwd()
+        cwd = cli.Path.cwd()
         root = next((path for path in (cwd, *cwd.parents) if (path / ".foragent.yml").is_file()), cwd)
     root = root.resolve()
     try:
         return cli.run_tests(root, cli.load_config(root), argv)
-    except (cli.ConfigError, OSError, subprocess.SubprocessError) as exc:
-        print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
+    except (cli.ConfigError, OSError, cli.subprocess.SubprocessError) as exc:
+        print(f"foragent: {' '.join(str(exc).split())}", file=cli.sys.stderr)
         return 1
 
 

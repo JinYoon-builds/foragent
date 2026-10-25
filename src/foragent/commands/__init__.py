@@ -10,7 +10,6 @@ they run, so names patched there keep reaching every command.
 import importlib
 from pathlib import Path
 import pkgutil
-import sys
 from types import ModuleType
 
 
@@ -51,4 +50,4 @@ def _open_lane_view(root: Path) -> None:
         cli.watch_open.open_view(root, cli.StateStore.for_repo(repo), language)
     except (cli.ConfigError, cli.GitError, OSError) as exc:
         error = " ".join(str(exc).split())[:200]
-        print("foragent: " + cli.text("watch_open_failed", language, error=error), file=sys.stderr)
+        print("foragent: " + cli.text("watch_open_failed", language, error=error), file=cli.sys.stderr)

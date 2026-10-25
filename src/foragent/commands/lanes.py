@@ -1,13 +1,12 @@
 """`fa lanes`: manage repository lanes."""
 
-from pathlib import Path
-
 from foragent.commands import facade
 
 ORDER = 90
 
 
 def add(commands) -> None:
+    cli = facade()
     lanes = commands.add_parser("lanes", help="Manage repository lanes")
     lane_actions = lanes.add_subparsers(dest="action", required=True)
     lane = lane_actions.add_parser("add")
@@ -18,11 +17,11 @@ def add(commands) -> None:
     lane.add_argument("--model")
     lane.add_argument("--title")
     lane.add_argument("--emoji")
-    lane.add_argument("--repo-root", type=Path, default=Path.cwd())
+    lane.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     fixed_skills = lane_actions.add_parser("skills", help="Replace the fixed skills a person chose for a lane")
     fixed_skills.add_argument("name")
     fixed_skills.add_argument("ids", nargs="*", help="Skill IDs; omit to clear the lane's fixed skills")
-    fixed_skills.add_argument("--repo-root", type=Path, default=Path.cwd())
+    fixed_skills.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
 
 def run(args) -> int:

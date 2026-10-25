@@ -1,12 +1,5 @@
 """`fa gate`: schedule and inspect approved issues."""
 
-from dataclasses import asdict
-from pathlib import Path
-import os
-import sys
-from types import SimpleNamespace
-from typing import Any
-
 from foragent.commands import facade
 
 ORDER = 110
@@ -14,11 +7,12 @@ LAUNCHD_ACTIONS = {"install", "uninstall", "launchd-status"}
 
 
 def add(commands) -> None:
+    cli = facade()
     gate = commands.add_parser("gate", help="Schedule and inspect approved issues")
     actions = gate.add_subparsers(dest="action", required=True)
     for name in ("tick", "status"):
         command = actions.add_parser(name)
-        command.add_argument("--repo-root", type=Path, default=Path.cwd())
+        command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         command.add_argument("--json", action="store_true")
         if name == "tick":
             command.add_argument("--no-start", action="store_true")
@@ -26,22 +20,22 @@ def add(commands) -> None:
             command.add_argument("--live", action="store_true",
                                  help="Read GitHub once and refresh the local snapshot first")
     watch_command = actions.add_parser("watch", help="Watch the lane conveyor")
-    watch_command.add_argument("--repo-root", type=Path, default=Path.cwd())
+    watch_command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     watch_command.add_argument("--once", action="store_true")
     watch_command.add_argument("--open", action="store_true", help="Open the view in a split or new window and return")
     run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
-    run_issue.add_argument("--repo-root", type=Path, required=True)
+    run_issue.add_argument("--repo-root", type=cli.Path, required=True)
     done = actions.add_parser("check-done", help="Check Done when for a native Stop hook")
-    done.add_argument("--snapshot", type=Path, required=True)
-    done.add_argument("--worktree", type=Path, required=True)
+    done.add_argument("--snapshot", type=cli.Path, required=True)
+    done.add_argument("--worktree", type=cli.Path, required=True)
     done.add_argument("--acceptance-dir", required=True)
     for name in ("install", "uninstall", "launchd-status"):
         command = actions.add_parser(name)
-        command.add_argument("--repo-root", type=Path, default=Path.cwd())
+        command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
 
-def _status(tracker, store, config=None) -> dict[str, Any]:
+def _status(tracker, store, config=None) -> dict:
     """Local status; the tracker is accepted for compatibility and never read."""
     cli = facade()
     return cli.collect_status(store, config or cli.Config(), cli.datetime.now(cli.UTC))
@@ -50,14 +44,14 @@ def _status(tracker, store, config=None) -> dict[str, Any]:
 def _refresh_status(tracker, store, config) -> None:
     """Read GitHub once for --live; a failure is recorded and the stale snapshot is shown."""
     cli = facade()
-    context = SimpleNamespace(store=store, config=config, now=lambda: cli.datetime.now(cli.UTC))
+    context = cli.SimpleNamespace(store=store, config=config, now=lambda: cli.datetime.now(cli.UTC))
     try:
         cli.RecordingTracker(tracker, context).refresh_issues()
     except cli.TrackerError:
         pass
 
 
-def _print_status(status: dict[str, Any], language: str = "en") -> None:
+def _print_status(status: dict, language: str = "en") -> None:
     cli = facade()
     text = cli.text
     if cli.status_unknown(status):
@@ -98,7 +92,7 @@ def _print_status(status: dict[str, Any], language: str = "en") -> None:
         print(f"  #{run['number']} {run['outcome']} started={run['started_at']}")
 
 
-def _launchd(args, root: Path) -> int:
+def _launchd(args, root) -> int:
     launchd = facade().launchd
     if args.action == "launchd-status":
         report = launchd.status(root)
@@ -123,7 +117,7 @@ def _tick(args, root, git, config, repo, tracker, store) -> None:
         baseline_launcher=cli.start_baseline_process,
     ))) or cli.TickReport(skipped=cli.BUSY_TICK)
     if args.json:
-        print(cli.json.dumps(asdict(report)))
+        print(cli.json.dumps(cli.asdict(report)))
     else:
         if report.skipped:
             print(report.skipped)
@@ -132,7 +126,7 @@ def _tick(args, root, git, config, repo, tracker, store) -> None:
     try:
         cli.spawn_notify(root, store)
     except Exception as exc:
-        print(f"foragent: inspect notify failed: {' '.join(str(exc).split())}", file=sys.stderr)
+        print(f"foragent: inspect notify failed: {' '.join(str(exc).split())}", file=cli.sys.stderr)
 
 
 def run(args) -> int:
@@ -153,7 +147,7 @@ def run(args) -> int:
         if args.live:
             cli._refresh_status(tracker, store, config)
         status = cli._status(tracker, store, config)
-        status["launchd"] = asdict(cli.launchd.status(root, repo=repo))
+        status["launchd"] = cli.asdict(cli.launchd.status(root, repo=repo))
         status["test_slots"] = cli.capacity.effective_test_slots(config.test_slots)
         status["tick_outcome"] = cli.orch_tick_outcome.read(store)
         if args.json:
@@ -175,8 +169,8 @@ def run(args) -> int:
     else:
         if store.get_run(args.number) is None:
             raise cli.ConfigError(f"no run record for issue #{args.number}")
-        store.update_run(args.number, pid=os.getpid(),
-                         process_identities=cli.observe_tree(roots=(os.getpid(),)))
+        store.update_run(args.number, pid=cli.os.getpid(),
+                         process_identities=cli.observe_tree(roots=(cli.os.getpid(),)))
         outcome = cli.run_issue(args.number, cli.RunContext(
             repo=repo, repo_root=root, tracker=tracker, store=store,
             config=config, git=git, now=lambda: cli.datetime.now(cli.UTC),

@@ -1,15 +1,14 @@
 """`fa init`: set up a repository for Foragent."""
 
-from pathlib import Path
-
 from foragent.commands import facade
 
 ORDER = 50
 
 
 def add(commands) -> None:
+    cli = facade()
     init = commands.add_parser("init", help="Set up this repository for Foragent")
-    init.add_argument("--repo-root", type=Path, default=Path.cwd())
+    init.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     init.add_argument("--approver", nargs="+", action="extend", dest="approvers")
     init.add_argument("--review", choices=("fast", "batch", "careful"))
     init.add_argument("--executor", choices=("codex", "claude"))

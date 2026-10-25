@@ -1,22 +1,19 @@
 """`fa inspect`: the human inbox and recorded answers."""
 
-import argparse
-import json
-from pathlib import Path
-
 from foragent.commands import facade
 
 ORDER = 180
 
 
 def add(commands) -> None:
+    cli = facade()
     inspect = commands.add_parser("inspect", help="Show the human inbox and record answers")
-    inspect.add_argument("--repo-root", type=Path, default=Path.cwd())
+    inspect.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     inspect.add_argument("--json", action="store_true")
     answers = inspect.add_subparsers(dest="action")
     for name in ("answer", "retry", "feedback", "mark-seen", "notify", "prepare", "serve", "stop"):
         command = answers.add_parser(name)
-        command.add_argument("--repo-root", type=Path, default=argparse.SUPPRESS)
+        command.add_argument("--repo-root", type=cli.Path, default=cli.argparse.SUPPRESS)
         if name in {"answer", "retry", "serve"}:
             command.add_argument("number", type=int)
         if name == "answer":
@@ -27,7 +24,7 @@ def add(commands) -> None:
             command.add_argument("--about", type=int)
 
 
-def _inspect(args: argparse.Namespace, ctx) -> None:
+def _inspect(args, ctx) -> None:
     cli = facade()
     actions, data = cli.inspect_actions, cli.inspect_data
     if args.action == "prepare":
@@ -58,7 +55,7 @@ def _inspect(args: argparse.Namespace, ctx) -> None:
     else:
         inbox = data.collect(ctx)
         if args.json:
-            print(json.dumps(data.inbox_payload(inbox)))
+            print(cli.json.dumps(data.inbox_payload(inbox)))
         else:
             print(data.counts_line(inbox, detailed=True))
             for item in inbox.items:

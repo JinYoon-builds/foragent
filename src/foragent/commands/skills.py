@@ -1,14 +1,12 @@
 """`fa skills`: manage skill libraries."""
 
-import json
-from pathlib import Path
-
 from foragent.commands import facade
 
 ORDER = 100
 
 
 def add(commands) -> None:
+    cli = facade()
     skills = commands.add_parser("skills", help="Manage skill libraries")
     skill_actions = skills.add_subparsers(dest="action", required=True)
     skill_actions.add_parser("sync")
@@ -22,7 +20,7 @@ def add(commands) -> None:
     catalog.add_argument("--json", action="store_true")
     install = skill_actions.add_parser("install")
     install.add_argument("id")
-    install.add_argument("--repo-root", type=Path, required=True)
+    install.add_argument("--repo-root", type=cli.Path, required=True)
     install.add_argument("--commit", action="store_true", help="Install for committing; requires an open-source license")
 
 
@@ -36,7 +34,7 @@ def run(args) -> int:
                    if args.action == "add" else manager.catalog())
         catalog = payload["skills"] if args.action == "add" else payload
         if args.json:
-            print(json.dumps(payload, ensure_ascii=False))
+            print(cli.json.dumps(payload, ensure_ascii=False))
         else:
             if args.action == "add":
                 print(("Registered: " if args.approve else "Preview: ") + args.source)

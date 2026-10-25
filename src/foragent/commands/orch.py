@@ -1,10 +1,5 @@
 """`fa orch`: diagnose and recover blocked issues; the local request and question box."""
 
-import argparse
-import json
-from pathlib import Path
-
-from foragent import orch_inbox
 from foragent.commands import facade, repo_store
 
 ORDER = 120
@@ -12,11 +7,12 @@ INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answ
 
 
 def add(commands) -> None:
+    cli = facade()
     orchestrator = commands.add_parser("orch", help="Diagnose and recover blocked issues")
     orch_actions = orchestrator.add_subparsers(dest="action", required=True)
     for name in ("list", "rerun-review", "retry", "resolve", "escalate", "log", "watch", "premerge", "merge"):
         command = orch_actions.add_parser(name)
-        command.add_argument("--repo-root", type=Path, default=Path.cwd())
+        command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         if name == "list":
             command.add_argument("--json", action="store_true")
         elif name == "watch":
@@ -45,6 +41,7 @@ def add(commands) -> None:
 
 
 def _add_inbox(orch_actions) -> None:
+    cli = facade()
     request = orch_actions.add_parser("request", help="Put a planning request in the durable box")
     request.add_argument("--from", dest="source", required=True, help="Sending session, e.g. planning")
     request.add_argument("--text", required=True)
@@ -52,7 +49,7 @@ def _add_inbox(orch_actions) -> None:
     inbox.add_argument("--pending", action="store_true", help="Hide requests marked done")
     request_status = orch_actions.add_parser("request-status", help="Mark a request processing or done")
     request_status.add_argument("id")
-    request_status.add_argument("status", choices=orch_inbox.REQUEST_STATUSES)
+    request_status.add_argument("status", choices=cli.orch_inbox.REQUEST_STATUSES)
     request_status.add_argument("--note")
     ask = orch_actions.add_parser("ask", help="Record a D71 human question in the box")
     ask.add_argument("--question", required=True)
@@ -70,7 +67,7 @@ def _add_inbox(orch_actions) -> None:
     note.add_argument("--where-title", "--orca-title", dest="where_title", help="Orca tab title, e.g. orch: <project>")
     note.add_argument("--tmux-pane", help="tmux pane id when not taken from TMUX_PANE")
     for command in (request, inbox, request_status, ask, questions, answer, note):
-        command.add_argument("--repo-root", type=Path, default=Path.cwd())
+        command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         if command in (inbox, questions):
             command.add_argument("--json", action="store_true")
     queue = orch_actions.add_parser("queue", help="Set, show or clear a lane's preferred start order")
@@ -78,10 +75,10 @@ def _add_inbox(orch_actions) -> None:
     queue.add_argument("numbers", type=int, nargs="*", help="Issue numbers in start order; none shows the queue")
     queue.add_argument("--clear", action="store_true")
     queue.add_argument("--json", action="store_true")
-    queue.add_argument("--repo-root", type=Path, default=Path.cwd())
+    queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
 
-def _orch_inbox(args: argparse.Namespace, store, config, repo: str) -> None:
+def _orch_inbox(args, store, config, repo: str) -> None:
     """Local request/question box; never reads GitHub or starts an executor."""
     cli = facade()
     box = cli.orch_inbox
@@ -92,7 +89,7 @@ def _orch_inbox(args: argparse.Namespace, store, config, repo: str) -> None:
             cli.orch_queue.set_order(store, args.lane, args.numbers) if args.numbers
             else cli.orch_queue.get(store, args.lane))
         if args.json:
-            print(json.dumps({"lane": args.lane, "order": order}))
+            print(cli.json.dumps({"lane": args.lane, "order": order}))
         elif order:
             print(f"lane:{args.lane} queue: " + " ".join(f"#{n}" for n in order))
         else:
@@ -119,7 +116,7 @@ def _orch_inbox(args: argparse.Namespace, store, config, repo: str) -> None:
     elif args.action == "inbox":
         rows = box.requests(store, pending=args.pending)
         if args.json:
-            print(json.dumps(rows, ensure_ascii=False))
+            print(cli.json.dumps(rows, ensure_ascii=False))
         elif not rows:
             print("No requests.")
         for row in [] if args.json else rows:
@@ -130,7 +127,7 @@ def _orch_inbox(args: argparse.Namespace, store, config, repo: str) -> None:
     else:
         rows = box.questions(store, include_closed=args.all)
         if args.json:
-            print(json.dumps(rows, ensure_ascii=False))
+            print(cli.json.dumps(rows, ensure_ascii=False))
         elif not rows:
             print("No open questions.")
         for row in [] if args.json else rows:
@@ -143,9 +140,10 @@ def _orch_inbox(args: argparse.Namespace, store, config, repo: str) -> None:
 
 
 def _list(ctx, args) -> None:
+    cli = facade()
     items = facade().orch.list_blocked(ctx)
     if args.json:
-        print(json.dumps(items, ensure_ascii=False))
+        print(cli.json.dumps(items, ensure_ascii=False))
     elif not items:
         print("No blocked issues.")
     else:
@@ -183,7 +181,7 @@ def run(args) -> int:
         unknown = False
         try:
             for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow):
-                print(json.dumps(snapshot, ensure_ascii=False), flush=True)
+                print(cli.json.dumps(snapshot, ensure_ascii=False), flush=True)
                 unknown = bool(snapshot.get("unknown"))
         except KeyboardInterrupt:
             pass
@@ -201,7 +199,7 @@ def run(args) -> int:
     elif args.action == "premerge":
         report = orch.premerge(ctx, args.number)
         if args.json:
-            print(json.dumps(report, ensure_ascii=False))
+            print(cli.json.dumps(report, ensure_ascii=False))
         else:
             print(f"PR #{report['pr']}: tests {report['tests']}; "
                   f"conflicts: {', '.join(report['conflicts']) or 'none'}; "
