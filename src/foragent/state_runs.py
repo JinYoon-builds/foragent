@@ -196,11 +196,12 @@ class RunRecordsMixin:
             from foragent.processes import observe_tree
 
             finished = _state.replace(run, status="finished", outcome=outcome, detail=detail,
-                                      finished_at=self._timestamp(),
                                       process_identities=observe_tree(run.process_identities))
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
-            snapshot = self._run_value(finished)
+            # The finish time is saved beside the record's fields, so the Run schema
+            # stays as it was; finish_times() reads it back.
+            snapshot = {**self._run_value(finished), "finished_at": self._timestamp()}
             self._atomic_write(history_path, history + _state.json.dumps(snapshot, ensure_ascii=False) + "\n")
             self._write_run(finished, snapshot)
             return finished
@@ -216,6 +217,21 @@ class RunRecordsMixin:
             run = _state.load_record(_state.Run, _state.json.loads(line))
             runs[run.number, run.started_at] = run
         return list(runs.values())
+
+    def finish_times(self) -> dict[tuple[int, str], str]:
+        """When each finished execution ended, by (number, started_at), from its latest entry.
+
+        Records written before finish times were saved have none."""
+        try:
+            history = (self.root / "runs.jsonl").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        times: dict[tuple[int, str], str] = {}
+        for line in history.splitlines():
+            value = _state.json.loads(line)
+            if isinstance(value.get("finished_at"), str):
+                times[value["number"], value["started_at"]] = value["finished_at"]
+        return times
 
     def prune_process_identities(self, *, inactive_only: bool = False) -> None:
         from foragent.state_processes import prune_process_identities

@@ -115,3 +115,5 @@
 - #503 3차 보완(D: 표본은 병합 시점 사실로 한 번만 기록): `_record_merge`는 PR을 처음 볼 때만 approved·closed·size·started_at(병합 전 최신 실행 시작)을 저장하고 이후 갱신하지 않는다. gate 병합 크기는 행의 `run_sizes[started_at]`에 첫 갱신 때 고정한다. 추정기는 현재 라벨·상태 대신 이 기록만 읽고, (번호, started_at)이 history의 merged 실행이면 바깥 병합에서 뺀다. 누적 플래그(or)는 다시 열기·재승인 뒤 표본을 새로 만들어 리뷰에서 3회 반려됐다. 회귀: `tests/test_watch_progress.py -k facts_seen_at_the_merge`.
 - 시간 초과로 작업 트리가 다시 만들어지면 이전 변경은 브랜치 커밋에 남아 있고 `.foragent/TRY.md`만 사라진다.
 - #503 4차 보완: 이슈 목록은 PR 목록보다 먼저 가져오므로, 병합을 처음 볼 때의 이슈 상태는 병합 이전 값일 수 있다. `closed`는 그 이슈의 `updated_at`이 merged_at 이상인 첫 관찰에서 정하고(닫기는 updated_at을 올린다), 그 전에는 None(미정, 표본 아님)이다. 정한 뒤에는 바꾸지 않는다. 회귀: `tests/test_watch_progress.py -k listed_before_the_merge`.
+- 고정 `test_state_records_tolerant`는 `finish_run`이 status·outcome·detail 외 Run 필드를 바꾸면 실패한다. Run에 새 필드를 넣지 말고 기록 옆 키(`runs.jsonl`의 `finished_at`, `StateStore.finish_times()`로 읽음)로 저장한다. `tests/test_state.py`의 history 비교도 이 키를 포함한다.
+- 러너는 base에서 통과하던 인수 시험을 모두 기준선으로 본다. 이슈가 옛 규칙을 바꾸는데 고정 시험(#503의 `test_progress_words` ETA 2개)이 옛 규칙을 지키면 구현으로 풀 수 없으니 QUESTION.md로 올린다.

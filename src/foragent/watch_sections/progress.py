@@ -55,9 +55,9 @@ def _time(value: Any) -> datetime | None:
         return None
 
 
-def _finished(run: Any) -> datetime | None:
-    """When a run finished; older records without finished_at use their latest recorded time."""
-    if (at := _time(getattr(run, "finished_at", None))) is not None:
+def _finished(run: Any, finished_at: str | None) -> datetime | None:
+    """When a run finished; older records without a finish time use their latest recorded time."""
+    if (at := _time(finished_at)) is not None:
         return at
     times = [at for value in (run.last_progress_at, run.phase_started_at, run.last_activity_at)
              if (at := _time(value)) is not None]
@@ -76,11 +76,12 @@ def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
     rows = {row["number"]: row for row in store.local_issues()}
     found: list[tuple[int, str, datetime, datetime]] = []
     gate: set[tuple[int, str]] = set()
+    finish_times = store.finish_times()
     for run in store.read_history():
         if run.outcome != "merged":
             continue
         gate.add((run.number, run.started_at))
-        if (start := _time(run.started_at)) and (end := _finished(run)):
+        if (start := _time(run.started_at)) and (end := _finished(run, finish_times.get((run.number, run.started_at)))):
             row = rows.get(run.number, {})
             # Before any refresh has seen the merge, the issue's current size stands in.
             size = (row.get("run_sizes") or {}).get(run.started_at) or size_of(row.get("labels", ()))
