@@ -17,6 +17,7 @@ from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN, lane_display, lane_order
 from foragent.state import StateStore
 from foragent.status import collect as collect_status
+from foragent.update_check import offer_line
 
 CONFIG_FILE = ".foragent.yml"
 # Distinct gate merges on this machine before `fa brief` asks once for a GitHub star.
@@ -130,6 +131,8 @@ def render(brief: dict[str, Any], language: str = "en") -> str:
     if brief.get("setup") is False:
         return text("brief_setup_missing", language)
     lines = []
+    if offer := brief.get("update"):
+        lines.append(offer_line(offer, language))
     if brief["questions_open"]:
         lines.append(text("brief_questions", language, count=brief["questions_open"]))
     if "working" not in brief:

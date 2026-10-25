@@ -76,6 +76,7 @@ class Config:
     language: str = "en"
     interview: str = "native"
     ouroboros_version: str | None = None
+    update_check: bool = True  # The daily release check (#417); FORAGENT_UPDATE_CHECK=off also opts out.
     profile: dict[str, Any] | None = None
 
 
@@ -418,6 +419,8 @@ def _validate(values: dict[str, Any]) -> None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
+    if type(values["update_check"]) is not bool:
+        raise ConfigError("update_check must be true or false")
     for key in ("always_human", "approvers"):
         if not isinstance(values[key], list) or any(not isinstance(item, str) for item in values[key]):
             raise ConfigError(f"{key} must be a list of strings")
