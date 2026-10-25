@@ -402,7 +402,7 @@ def test_checks_fallback_is_explicit_local_opt_in_and_validated(tmp_path):
             load_config(tmp_path, global_path)
 
 
-def init_case(git_history, tmp_path, monkeypatch, *, private, answer):
+def init_case(git_history, tmp_path, monkeypatch, *, private, readable=True):
     from foragent import cli
     from foragent import init as setup
 
@@ -412,13 +412,11 @@ def init_case(git_history, tmp_path, monkeypatch, *, private, answer):
     monkeypatch.setattr(setup, "_logged_in", lambda tool: True)
     monkeypatch.setattr(cli, "init_repo", lambda root, **kwargs: setup.init_repo(
         root, git=case.git, tracker=case.tracker, **kwargs))
-    case.prompts = []
 
-    def choose(prompt):
-        case.prompts.append(prompt)
-        return answer
+    def no_question(prompt=""):
+        pytest.fail(f"fa init must choose the checks mode without asking: {prompt!r}")
 
-    monkeypatch.setattr("builtins.input", choose)
+    monkeypatch.setattr("builtins.input", no_question)
 
     def github(args):
         if args == ["auth", "status"]:
@@ -433,47 +431,84 @@ def init_case(git_history, tmp_path, monkeypatch, *, private, answer):
         pytest.fail(f"Unrecorded init gh command: {args}")
 
     case.gh_calls = record_gh(monkeypatch, github)
+    if not readable:
+        recorded = subprocess.run
+
+        def unreadable(argv, *args, **kwargs):
+            if isinstance(argv, (list, tuple)) and argv and str(argv[0]) == "gh" and (
+                list(argv[1:3]) == ["repo", "view"] or (argv[1:2] == ["api"] and f"repos/{REPO}" in argv)
+            ):
+                case.gh_calls.append(list(argv))
+                if kwargs.get("check"):
+                    raise subprocess.CalledProcessError(1, argv, "", "HTTP 404: Not Found")
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="HTTP 404: Not Found")
+            return recorded(argv, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", unreadable)
     case.argv = ["init", "--repo-root", str(case.root), "--no-push", "--no-launchd", "--no-board",
                  "--approver", "human", "--language", "en", "--statusline", "no"]
     case.main = cli.main
     return case
 
 
-@pytest.mark.parametrize("private,recommended,reason", [(False, "ci", "free"), (True, "local", "minutes")],
+@pytest.mark.parametrize("private,chosen,reason", [(False, "ci", "free"), (True, "local", "minutes")],
                          ids=["public-ci-free", "private-local-paid-minutes"])
-def test_init_explains_visibility_recommendation_and_persists_enter_choice(
-    git_history, tmp_path, monkeypatch, capsys, private, recommended, reason,
+def test_init_chooses_checks_by_visibility_and_says_why_without_asking(
+    git_history, tmp_path, monkeypatch, capsys, private, chosen, reason,
 ):
-    case = init_case(git_history, tmp_path, monkeypatch, private=private, answer="")
+    # Both defaults cost nothing (public Actions are free; local uses no minutes),
+    # so init decides, writes the choice and prints one line on what, why and how to change it.
+    case = init_case(git_history, tmp_path, monkeypatch, private=private)
     assert case.main(case.argv) == 0
     written = yaml.safe_load((case.root / ".foragent.yml").read_text())
-    assert written.get("checks") == recommended, "Enter must accept and persist the visibility-based recommendation"
-    output = (capsys.readouterr().out + " ".join(case.prompts)).lower()
-    assert ("private" if private else "public") in output and reason in output
-    assert "ci" in output and "local" in output and "recommend" in output
-    assert case.prompts and case.gh_calls, "Init must discover visibility and offer a human choice"
-    assert (case.root / WORKFLOW).exists() is (recommended == "ci")
+    assert written.get("checks") == chosen, "Init must write the visibility-based choice"
+    output = capsys.readouterr().out
+    line = next((row for row in output.splitlines() if "checks" in row and chosen in row), "")
+    assert line, f"Init must print one line naming the chosen checks mode; got:\n{output}"
+    lowered = output.lower()
+    assert ("private" if private else "public") in lowered and reason in lowered, "Say why it chose this mode"
+    assert ".foragent.yml" in output, "Say how to change the choice"
+    if private:
+        assert "ci_runs_on" in output and "self-hosted" in lowered, (
+            "A private repository's line must mention the self-hosted runner option and ci_runs_on")
+    assert case.gh_calls, "Init must read the repository's visibility"
+    assert (case.root / WORKFLOW).exists() is (chosen == "ci")
+
+
+def test_init_without_readable_visibility_chooses_local_with_a_note(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    case = init_case(git_history, tmp_path, monkeypatch, private=False, readable=False)
+    assert case.main(case.argv) == 0
+    assert yaml.safe_load((case.root / ".foragent.yml").read_text()).get("checks") == "local", (
+        "Unknown visibility must fall back to local checks, which cost nothing")
+    output = capsys.readouterr().out.lower()
+    assert "visibility" in output and "local" in output, "Init must note that it could not read visibility"
+    assert not (case.root / WORKFLOW).exists()
 
 
 @pytest.mark.parametrize("private,answer", [(False, "local"), (True, "ci")], ids=["public-override", "private-override"])
 def test_init_honors_choice_over_recommendation_and_keeps_it_on_rerun(
     git_history, tmp_path, monkeypatch, private, answer,
 ):
-    case = init_case(git_history, tmp_path, monkeypatch, private=private, answer=answer)
+    # The person's choice is the checks key they wrote; init never overrides it.
+    case = init_case(git_history, tmp_path, monkeypatch, private=private)
     assert case.main(case.argv) == 0
     path = case.root / ".foragent.yml"
-    assert yaml.safe_load(path.read_text()).get("checks") == answer
-    assert (case.root / WORKFLOW).exists() is (answer == "ci")
-    before = path.read_bytes()
-    prompts = len(case.prompts)
+    settings = yaml.safe_load(path.read_text()) or {}
+    settings["checks"] = answer
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
     assert case.main(case.argv) == 0
-    assert path.read_bytes() == before and len(case.prompts) == prompts, "Init must retain the saved project choice"
+    assert yaml.safe_load(path.read_text()).get("checks") == answer, "Init must keep the person's checks choice"
+    before = path.read_bytes()
+    assert case.main(case.argv) == 0
+    assert path.read_bytes() == before, "Init must retain the saved project choice"
 
 
 def test_init_generates_pr_workflow_with_shards_and_machine_readable_comparison_outputs(
     git_history, tmp_path, monkeypatch,
 ):
-    case = init_case(git_history, tmp_path, monkeypatch, private=False, answer="ci")
+    case = init_case(git_history, tmp_path, monkeypatch, private=False)
     assert case.main(case.argv) == 0
     path = case.root / WORKFLOW
     assert path.is_file(), "Choosing ci must generate the acceptance comparison workflow"
@@ -702,4 +737,25 @@ def test_local_mode_keeps_capture_cache_regression_repair_and_records_local_comp
     assert list((case.store.root.parent / "baselines").glob("*.json")), "Local baseline caching must remain enabled"
     comparison_record(case, "local")
 
-
+@pytest.mark.parametrize("runs_on", [None, ["self-hosted", "linux"]], ids=["default-hosted", "self-hosted-label"])
+def test_generated_workflow_runs_on_the_configured_runner(git_history, tmp_path, monkeypatch, capsys, runs_on):
+    case = init_case(git_history, tmp_path, monkeypatch, private=runs_on is not None)
+    assert case.main(case.argv) == 0
+    output = capsys.readouterr()
+    if runs_on is not None:
+        # A private repository is told that a self-hosted runner avoids paid Actions minutes.
+        assert "self-hosted" in (output.out + output.err).lower()
+        config = yaml.safe_load((case.root / ".foragent.yml").read_text())
+        # The person switches the private repository to ci on a self-hosted runner.
+        config["checks"] = "ci"
+        config["ci_runs_on"] = runs_on
+        (case.root / ".foragent.yml").write_text(yaml.safe_dump(config))
+        assert case.main(["ci", "workflow", "--repo-root", str(case.root)]) == 0
+    document = yaml.safe_load((case.root / WORKFLOW).read_text())
+    sharded = [job for job in document["jobs"].values()
+               if "shard" in job.get("strategy", {}).get("matrix", {})]
+    assert sharded
+    expected = runs_on if runs_on is not None else "ubuntu-latest"
+    assert all(job.get("runs-on") == expected for job in sharded), (
+        f"Shard jobs must run on ci_runs_on ({expected!r}); got {[job.get('runs-on') for job in sharded]}"
+    )

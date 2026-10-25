@@ -21,6 +21,31 @@ def store(tmp_path):
     return StateStore(tmp_path / "state", now=lambda: NOW)
 
 
+@pytest.mark.parametrize("error", [PermissionError, OSError])
+def test_update_run_keeps_recorded_ownership_when_process_table_is_unreadable(
+    store, fake_process_table, tmp_path, monkeypatch, error,
+):
+    from foragent import processes
+
+    table = fake_process_table
+    root = table.add(42000, cwd=tmp_path, start_time=10)
+    table.add(42001, ppid=root.pid, cwd=tmp_path, start_time=11)
+    run = store.start_run(1, branch="branch", worktree=tmp_path, pid=root.pid)
+    child = table.add(42002, ppid=root.pid, cwd=tmp_path, start_time=12)
+    birth = {"pid": child.pid, "start_time": child.start_time}
+
+    def unavailable():
+        raise error("fake process table unavailable")
+
+    monkeypatch.setattr(processes, "list_processes", unavailable)
+    updated = store.update_run(1, detail="Stop refused: ownership unreadable", process_identities=[birth])
+    assert updated.detail == "Stop refused: ownership unreadable"
+    assert updated.process_identities == [*run.process_identities, birth]
+    assert store.get_run(1) == updated
+    assert updated.status == "running"
+    assert not store.read_history() and not table.signals
+
+
 @pytest.mark.parametrize("invalid", [
     {"node_ids": "passing"},
     {"collected_ids": []},

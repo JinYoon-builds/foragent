@@ -63,3 +63,5 @@ class Run:
     merge_conflicts: list[str] = field(default_factory=list)
     local_skill_paths: list[str] = field(default_factory=list)
     approval_body_sha: str | None = None
+    skills_reported: bool = False
+    skills_used: list[str] = field(default_factory=list)

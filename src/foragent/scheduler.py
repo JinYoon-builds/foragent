@@ -20,7 +20,8 @@ from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
 from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
-from foragent.processes import kill_process_group
+from foragent.processes import current_snapshot, kill_process_group, runner_commands_exist
+from foragent.scheduler_stop import runner_process_exists, tick_processes
 from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
 from foragent.scheduler_start import (
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _has_slot, _machine_budget, _reserve_slot, _start_ready,
@@ -32,23 +33,6 @@ from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest
 
 TICK_JITTER = timedelta(milliseconds=500)
 BUSY_TICK = "another tick is running"
-
-
-def runner_process_exists(number: int) -> bool:
-    try:
-        output = subprocess.run(
-            ["ps", "-axo", "pid,command"], check=True, capture_output=True, text=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError):
-        return True  # An unavailable process list cannot establish runner death.
-    pattern = re.compile(
-        rf"(?:^|\s)(?:\S*/)?(?:foragent|fa|foragent\.cli)\s+gate\s+run-issue\s+{number}(?=\s|$)"
-    )
-    for line in output.splitlines():
-        fields = line.split(maxsplit=1)
-        if len(fields) == 2 and fields[0].isdigit() and pattern.search(fields[1]):
-            return True
-    return False
 
 
 @dataclass
@@ -76,7 +60,6 @@ class TickReport:
     actions: list[str] = field(default_factory=list)
 
 
-
 # Preserve the original facade bindings for callers and monkeypatches.
 # Split modules call each other through this module, so patches here reach them.
 from foragent.scheduler_approval import _check_integrity, _invalidate_approval, _latest_approval, _snapshot  # noqa: E402
@@ -97,25 +80,27 @@ def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired:
         if not acquired:
             return TickReport(skipped=BUSY_TICK)
-        cleanup = TickReport()
-        _reap_inactive_runs(ctx, cleanup)
-        if until := ctx.store.github_wait_until(ctx.now()):
-            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
-        if not isinstance(ctx.tracker, RecordingTracker):
-            ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-        try:
-            report = _tick_locked(ctx)
-            report.actions[:0] = cleanup.actions
-        except TrackerError as exc:
-            if not exc.is_rate_limit:
-                raise
-            until = orch_github.pause(ctx, exc)
-            return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
-        # After this tick's starts, so idle lanes are really idle. A due tidy is a
-        # request for the orchestrator's judgment, never a launch or an order.
-        if request := tidy.post_if_due(ctx.store):
-            report.actions.append(f"Tidy due; inbox request {request['id']}")
-        return report
+        with tick_processes(ctx.store) as snapshot:
+            cleanup = TickReport()
+            if snapshot.available:
+                _reap_inactive_runs(ctx, cleanup)
+            if until := ctx.store.github_wait_until(ctx.now()):
+                return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
+            if not isinstance(ctx.tracker, RecordingTracker):
+                ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
+            try:
+                report = _tick_locked(ctx)
+                report.actions[:0] = cleanup.actions
+            except TrackerError as exc:
+                if not exc.is_rate_limit:
+                    raise
+                until = orch_github.pause(ctx, exc)
+                return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
+            # After this tick's starts, so idle lanes are really idle. A due tidy is a
+            # request for the orchestrator's judgment, never a launch or an order.
+            if request := tidy.post_if_due(ctx.store):
+                report.actions.append(f"Tidy due; inbox request {request['id']}")
+            return report
 
 
 def _tick_locked(ctx: TickContext) -> TickReport:
@@ -136,7 +121,11 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     ctx.tracker.flush_outbox()
     if until := ctx.store.github_wait_until(ctx.now()):
         return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
-    _recover_runs(ctx, report)
+    snapshot = current_snapshot()
+    processes_available = snapshot is None or snapshot.available
+    # Unknown liveness defers routine recovery while the queue keeps moving.
+    if processes_available:
+        _recover_runs(ctx, report)
     _reconcile_batches(ctx, report)
     ready: dict[str, list[int]] = {}
     unknown: set[str] = set()
@@ -154,7 +143,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             # A manually closed card leaves its column; known cards only.
             board.sync_status(ctx, issue, "closed", existing_only=True)
             continue
-        issue = _recover_orphan(ctx, issue, report)
+        if processes_available:
+            issue = _recover_orphan(ctx, issue, report)
         issue = _escalate_overdue_blocker(ctx, issue, report)
         if issue.state != "open":
             board.sync_status(ctx, issue, "closed", existing_only=True)

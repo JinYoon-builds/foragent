@@ -1,0 +1,3 @@
+# The tick snapshot serves only routine liveness (edit to #431)
+
+A third adversarial review reproduced five defects, all caused by cached listings used in destructive decisions (stop success, finish/gone, worktree removal, legacy group checks), one from the shared-stop-listing contract. New contract: the tick snapshot serves only routine positive liveness checks and prune candidates, where the hundreds of per-run reads came from. Every destructive or negative decision (stop, kill, gone/finish, cleanup, runner death) keeps today's fresh-listing code paths unchanged, with no fixed count. A tick that stops, finishes or cleans up nothing lists exactly once. The safety cases that pass on main stay as guards.

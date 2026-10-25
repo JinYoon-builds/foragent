@@ -192,20 +192,29 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
     for run in ctx.store.active_runs():
-        # Keep witnessed descendants across subsequent reparenting or runner death.
-        run = ctx.store.update_run(run.number)
-        identities = {item["pid"]: item["start_time"] for item in run.process_identities}
-        if run.pid is None:
-            dead = (
-                ctx.now() - scheduler.datetime.fromisoformat(run.started_at) >= scheduler.LAUNCH_GRACE
-                and not ctx.runner_process_exists(run.number)
-            )
-        elif run.pid in identities and not any(
-            row.pid == run.pid and row.start_time == identities[run.pid] for row in processes.list_processes()
+        snapshot = processes.current_snapshot()
+        cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
+        if cached is not None and any(
+            item["pid"] == run.pid and item["start_time"] == cached.start_time
+            for item in run.process_identities
         ):
-            dead = True  # Never probe a replacement as if it were the recorded runner.
+            run = ctx.store.update_run(run.number, routine=True)
+            dead = False  # Routine positive liveness needs no further enumeration.
         else:
-            dead = not _pid_exists(run.pid)
+            # Keep witnessed descendants across subsequent reparenting or runner death.
+            run = ctx.store.update_run(run.number)
+            identities = {item["pid"]: item["start_time"] for item in run.process_identities}
+            if run.pid is None:
+                dead = (
+                    ctx.now() - scheduler.datetime.fromisoformat(run.started_at) >= scheduler.LAUNCH_GRACE
+                    and not ctx.runner_process_exists(run.number)
+                )
+            elif run.pid in identities and not any(
+                row.pid == run.pid and row.start_time == identities[run.pid] for row in processes.list_processes()
+            ):
+                dead = True  # Never probe a replacement as if it were the recorded runner.
+            else:
+                dead = not _pid_exists(run.pid)
         # The runner may have finished while another run or its process was checked.
         run = ctx.store.get_run(run.number)
         if run is None or run.status != "running":
