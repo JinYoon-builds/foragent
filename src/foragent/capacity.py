@@ -1,4 +1,8 @@
-"""Machine-wide run budget and test slots: AIMD on memory pressure and load (D60, #243)."""
+"""Machine-wide run budget and test slots: AIMD on CPU load (D60, #243).
+
+Memory is a fact, not a budget input (#497): only the kernel's critical level
+matters, and it holds new starts and new test slots without changing a budget.
+"""
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -103,7 +107,7 @@ def memory_pressure() -> str:
 
 
 def kernel_pressure() -> str:
-    """The raw kernel pressure level, before swap-in window classification."""
+    """The raw kernel pressure level: normal, warn or critical."""
     return memory_pressure()
 
 
@@ -188,9 +192,7 @@ def machine_load() -> LoadSample:
         # A reset (e.g. reboot) establishes a new baseline without negative activity.
         swapins = max(0, total - previous) if total is not None and previous is not None else None
         (root / SENSOR_FILE).write_text(json.dumps({"swapins_total": total}), encoding="utf-8")
-    if pressure != "critical":
-        if swapins is not None:
-            pressure = "warn" if swapins else "normal"
+    # Swap-ins are recorded as a fact; they never reclassify the kernel level.
     return LoadSample(pressure, load_per_cpu(), swapins)
 
 
@@ -322,6 +324,19 @@ def decrease_allowed(state: dict[str, Any] | None, now: datetime) -> bool:
         return True
 
 
+def append_memory_hold(
+    root: Path, now: datetime, *, pressure: str, load_per_cpu: float, swapins: int | None,
+) -> None:
+    """Record a tick whose new starts the critical kernel level held back."""
+    row = {
+        "at": now.astimezone(UTC).isoformat(), "rule": "memory-critical", "pressure": pressure,
+        "load_per_cpu": load_per_cpu, "swapins": swapins,
+    }
+    with _flock(root / "budget-history.lock"):
+        with (root / HISTORY_FILE).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
+
+
 def append_budget_history(
     root: Path, now: datetime, budget: str, current: int, value: int, *,
     pressure: str, load_per_cpu: float, swapins: int | None, wanted: int | None = None,
@@ -350,9 +365,8 @@ def _write_test_slots(root: Path, value: dict[str, Any]) -> None:
 
 def update_test_slots(
     ceiling: int, now: datetime, *, pressure: str, load_per_cpu: float, swapins: int | None = None,
-    floor: int = 1,
 ) -> int:
-    """Apply the guard and configured floor; critical pressure bypasses the floor."""
+    """Apply the guard and the CPU-load step; ``pressure`` is only recorded in history."""
     root = machine_root()
     with _flock(root / TEST_SLOTS_LOCK):
         state = read_test_slots()
@@ -368,12 +382,12 @@ def update_test_slots(
         current = state["slots"] if state else ceiling
         changed_at = datetime.fromisoformat(state["changed_at"]) if state else now
         wanted = next_test_slots(
-            current, pressure=pressure, load_per_cpu=load_per_cpu, ceiling=ceiling,
+            current, pressure="normal", load_per_cpu=load_per_cpu, ceiling=ceiling,
             increase_ok=now - changed_at >= INCREASE_INTERVAL,
         )
         if wanted < current and not decrease_allowed(state, now):
             wanted = current
-        value = wanted if pressure == "critical" else max(floor, wanted)
+        value = wanted
         if state is None or value != state["slots"]:
             updated = {"slots": value, "changed_at": now.astimezone(UTC).isoformat()}
             decreased_at = now.astimezone(UTC).isoformat() if value < current else (state or {}).get("decreased_at")
@@ -428,7 +442,8 @@ def hold_test_slot(ceiling: int, *, waiting: Callable[[], None] | None = None) -
         yield
         return
     heartbeat = None
-    while (stream := _take_test_slot(effective_test_slots(ceiling))) is None:
+    # While the kernel reports critical memory pressure, a free slot stays unclaimed.
+    while kernel_pressure() == "critical" or (stream := _take_test_slot(effective_test_slots(ceiling))) is None:
         if waiting is not None and (heartbeat is None or time.monotonic() - heartbeat >= SLOT_HEARTBEAT_SECONDS):
             heartbeat = time.monotonic()
             waiting()
