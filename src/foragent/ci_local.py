@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
 
@@ -88,10 +89,38 @@ def capture_local_only(n, ctx, git, test_command, base_sha, excluded):
 
 def verify_local_only_units(attempt, command):
     from dataclasses import replace
+    from foragent import runner
+    from foragent.run_checks import CheckResult, _append
 
-    result = check(attempt.n, attempt.ctx,
-                   f"{command} -m local_only {shlex.quote('--ignore=' + attempt.ctx.config.acceptance_dir)}",
-                   attempt.worktree)
+    acceptance = Path(attempt.ctx.config.acceptance_dir)
+    if not any(not path.relative_to(attempt.worktree).is_relative_to(acceptance)
+               for path in attempt.worktree.rglob("*.py")):
+        return None
+    selection = f"{command} -m local_only {shlex.quote('--ignore=' + str(acceptance))}"
+    collection = f"{selection} --collect-only -q"
+
+    def collect():
+        with _test_slot(attempt.n, attempt.ctx):
+            try:
+                result = subprocess.run(
+                    ["/bin/sh", "-c", collection], cwd=attempt.worktree, check=False,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    timeout=max(1, runner._remaining(attempt.n, attempt.ctx)),
+                )
+            except subprocess.TimeoutExpired as exc:
+                return CheckResult(collection, None, True, str(exc))
+        return CheckResult(collection, result.returncode, False, result.stdout)
+
+    collected = runner.poll_executor(collect, lambda: _progress(attempt.n, attempt.ctx))
+    _append(attempt.ctx.store.log_path(attempt.n),
+            f"Local-only unit collection exit_code={collected.exit_code}\n{collected.output}")
+    if collected.exit_code == 5 and not collected.timed_out:
+        return None
+    if collected.exit_code != 0 or collected.timed_out:
+        return collected
+
+    result = check(attempt.n, attempt.ctx, selection, attempt.worktree)
     # pytest's no-tests-selected status is valid for this optional marker set.
     return replace(result, exit_code=0) if result.exit_code == 5 and not result.timed_out else result
 

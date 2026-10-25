@@ -371,7 +371,9 @@ def _verify_implementation(attempt: Implementation) -> str:
                                          own_only=ctx.config.runner_unit_tests != "all"
                                          and (enabled(ctx, attempt.target_branch) or trusts_ci(worktree, ctx.config)))
         if unit_command:
-            attempt.checks.append(verify_local_only_units(attempt, unit_command))
+            local_units = verify_local_only_units(attempt, unit_command)
+            if local_units is not None:
+                attempt.checks.append(local_units)
         if unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
             result = runner._check(f"{unit_command} {shlex.join(unit_tests)}", worktree, log, limit,

@@ -248,7 +248,8 @@ def review_checks(n, ctx, git, target_branch):
         raise ExecutorStopped("held", str(exc)) from exc
     attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=git.root, target_branch=target_branch,
                               baseline=baseline, log=ctx.store.log_path(n))
-    checks = [verify_local_only_units(attempt, baseline.command)]
+    local_units = verify_local_only_units(attempt, baseline.command)
+    checks = [local_units] if local_units is not None else []
     own = _related_unit_tests(git.root, git.changed_paths(base), ctx.config.acceptance_dir,
                               own_only=ctx.config.runner_unit_tests != "all"
                               and (enabled(ctx, target_branch) or trusts_ci(git.root, ctx.config)))

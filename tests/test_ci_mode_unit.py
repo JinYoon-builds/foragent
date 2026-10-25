@@ -161,7 +161,8 @@ def test_fork_check_results_are_unusable_without_fetching_checks():
     assert len(calls) == 1
 
 
-def test_local_only_base_failures_are_ignored_but_head_unit_failures_are_not(git_history, tmp_path, monkeypatch):
+@pytest.mark.parametrize('checks', ['local', 'ci'])
+def test_local_only_base_failures_are_ignored_but_head_unit_failures_are_not(git_history, tmp_path, monkeypatch, checks):
     from conftest import git_command
     from foragent.ci_local import capture_local_only, verify_local_only_units
     from foragent.git import GitRepo
@@ -179,7 +180,7 @@ def test_local_only_base_failures_are_ignored_but_head_unit_failures_are_not(git
     unit.write_text('import pytest\n@pytest.mark.local_only\ndef test_bad_unit(): assert False\n')
     store = StateStore(tmp_path / 'state')
     store.start_run(1, branch='test', worktree=root)
-    config = Config(checks='ci', test_command=f'{sys.executable} -m pytest')
+    config = Config(checks=checks, test_command=f'{sys.executable} -m pytest')
     ctx = RunContext('owner/repo', root, FakeTracker(), store, config, GitRepo(root), lambda: datetime.now(UTC))
     # Exercise a detached base via the existing no-commit history fixture.
     git_history.update({'tests/acceptance/test_machine.py': acceptance.read_text()})
@@ -189,6 +190,56 @@ def test_local_only_base_failures_are_ignored_but_head_unit_failures_are_not(git
     attempt = SimpleNamespace(n=1, ctx=ctx, worktree=root)
     result = verify_local_only_units(attempt, baseline.command)
     assert result.exit_code == 1
+
+
+@pytest.mark.parametrize('checks', ['local', 'ci'])
+@pytest.mark.parametrize('marking', ['absent', 'unmarked', 'decorator', 'module', 'hook', 'collection-error'])
+def test_local_only_unit_check_requires_selected_tests(tmp_path, monkeypatch, checks, marking):
+    from datetime import UTC, datetime
+    from foragent.ci_local import verify_local_only_units
+    from foragent.git import GitRepo
+    from foragent.run_checks import CheckResult, _pytest_command
+    from foragent.runner import RunContext
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker
+
+    root = tmp_path / 'repo'
+    tests = root / 'tests'
+    acceptance = tests / 'acceptance'
+    acceptance.mkdir(parents=True)
+    (acceptance / 'test_machine.py').write_text(
+        'import pytest\n@pytest.mark.local_only\ndef test_acceptance(): assert False\n')
+    if marking != 'absent':
+        source = 'def test_unit(): assert False\n'
+        if marking == 'decorator':
+            source = 'import pytest\n@pytest.mark.local_only\n' + source
+        elif marking == 'module':
+            source = 'import pytest\npytestmark = pytest.mark.local_only\n' + source
+        elif marking == 'hook':
+            (root / 'conftest.py').write_text(
+                'import pytest\ndef pytest_collection_modifyitems(items):\n'
+                '    for item in items: item.add_marker(pytest.mark.local_only)\n')
+        elif marking == 'collection-error':
+            source = 'def test_unit(:\n'
+        (tests / 'test_unit.py').write_text(source)
+    store = StateStore(tmp_path / 'state')
+    store.start_run(1, branch='test', worktree=root)
+    config = Config(checks=checks, test_command=f'{sys.executable} -m pytest')
+    ctx = RunContext('owner/repo', root, FakeTracker(), store, config, GitRepo(root), lambda: datetime.now(UTC))
+    calls = []
+
+    def check(n, ctx, command, worktree):
+        calls.append(command)
+        return CheckResult(command, 1, False, 'local unit failed')
+
+    monkeypatch.setattr('foragent.ci_local.check', check)
+    result = verify_local_only_units(SimpleNamespace(n=1, ctx=ctx, worktree=root),
+                                     _pytest_command(config.test_command))
+    assert len(calls) == int(marking in {'decorator', 'module', 'hook'})
+    if marking in {'absent', 'unmarked'}:
+        assert result is None
+    else:
+        assert result.exit_code == (2 if marking == 'collection-error' else 1)
 
 
 def test_tracker_reads_every_page_of_head_check_runs():

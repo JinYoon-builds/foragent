@@ -264,7 +264,9 @@ def test_related_unit_failure_uses_implementation_budget_and_reaches_next_prompt
 def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkeypatch, timed_out):
     c = run_case
     c.ctx.config = replace(c.ctx.config, test_command="pytest -q")
-    c.executor.steps = [{"feature.txt": "done", "tests/test_new.py": "def test_new():\n    assert True\n"}]
+    c.executor.steps = [{"feature.txt": "done", "tests/test_new.py": (
+        "import pytest\n@pytest.mark.local_only\ndef test_new():\n    assert True\n"
+    )}]
     c.now[0] += timedelta(minutes=60)
     c.store.update_run(1, waited_seconds=600)
     calls = []
