@@ -721,6 +721,10 @@ def main(argv: list[str] | None = None) -> int:
             store = StateStore.for_repo(config.repo or GitRepo(root).remote_slug())
             _tidy(args, store, config.language)
             return 0
+        if args.command == "brief" and not brief.configured(root):
+            facts = brief.unconfigured()
+            print(json.dumps(facts) if args.json else brief.render(facts, os.environ.get("LANG", "en")[:2]))
+            return 0
         if args.command in {"plan", "brief"}:
             config = load_config(root)
             store = StateStore.for_repo(config.repo or GitRepo(root).remote_slug())
@@ -728,7 +732,7 @@ def main(argv: list[str] | None = None) -> int:
                 record = orch_inbox.write_plan_heartbeat(store)
                 print(f"Planning session alive at {record['at']}.")
             else:
-                facts = brief.collect(store)
+                facts = brief.collect(store, config, datetime.now(UTC))
                 print(json.dumps(facts, ensure_ascii=False) if args.json
                       else brief.render(facts, config.language))
             return 0
