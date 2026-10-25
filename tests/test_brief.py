@@ -80,3 +80,12 @@ def test_default_configuration_reports_the_main_lane_with_used_skills():
     configured = brief._team(SimpleNamespace(read_history=lambda: [], active_runs=lambda: []),
                              Config(lanes={"api": {"paths": ["api/**"]}}))
     assert [member["lane"] for member in configured] == ["api"]
+
+
+def test_briefing_ends_with_the_named_choices_from_the_registry():
+    assert brief.render(sample(), "ko").splitlines()[-1] == "무엇을 할까요? [기획 인터뷰] [디자인 인터뷰] [볼 것 처리]"
+    assert brief.render(sample(), "en").splitlines()[-1] == (
+        "What should we do? [Planning interview] [Design interview] [Handle what to see]")
+    step = brief.next_step("ko")
+    assert step["question"] == "무엇을 할까요?"
+    assert [choice["id"] for choice in step["choices"]] == ["order", "design", "inspect"]

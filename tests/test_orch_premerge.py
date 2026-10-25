@@ -282,7 +282,8 @@ def test_orch_merge_completes_when_linked_issue_refresh_fails(merge_case, monkey
     get_issue = c.tracker.get_issue
 
     def unavailable(number):
-        if number != 10:
+        # The pre-merge read supplies the PR title; only the post-merge refresh fails.
+        if number != 10 or not c.tracker.merged_prs:
             return get_issue(number)
         assert number == 10 and c.tracker.merged_prs == [c.pr]
         raise TrackerError(f"HTTP {failure}")
