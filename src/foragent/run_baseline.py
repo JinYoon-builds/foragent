@@ -53,6 +53,13 @@ class BaselineBuild:
     scope: str
 
 
+def _validate_baseline_checkout(git, base_sha: str) -> None:
+    """A measurement must describe the requested base, including its index."""
+    if (git.head_sha() != base_sha
+            or git._call(["status", "--porcelain=v1", "--untracked-files=no"])):
+        raise AttemptFailure("acceptance baseline unavailable: capture modified tracked files")
+
+
 def _baseline_build(ctx: RunContext, test_command: str, target_ref: str, log: Path) -> BaselineBuild:
     base_sha = ctx.git.ref_sha(target_ref)
     excluded = _baseline_exclusions(ctx, base_sha, log)
@@ -113,6 +120,8 @@ def prebuild_acceptance_baseline(ctx: RunContext, target_ref: str, launch: Calla
     from foragent import runner
     from foragent.orch_events import append_event
 
+    if ctx.config.checks == "ci":
+        return
     test_command = ctx.config.test_command or next(iter(runner.detect_test_commands(ctx.repo_root)), None)
     if test_command is None or _pytest_command(test_command) is None:
         return
@@ -358,6 +367,7 @@ def _capture_baseline(
                 started = monotonic()
                 result = check(baseline_command, worktree)
                 duration_seconds = monotonic() - started
+                _validate_baseline_checkout(ctx.git.at(worktree), base_sha)
                 # Read this execution's collection count from the full log: a long
                 # traceback can push it out of CheckResult's bounded output tail.
                 collected = None

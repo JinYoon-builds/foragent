@@ -1,6 +1,7 @@
 """Open a lane view without making terminal availability a caller's failure."""
 
 from contextlib import contextmanager, suppress
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -67,6 +68,25 @@ def _recorded_terminal(store: StateStore, root: Path) -> tuple[str, str] | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return executable, handle
+
+
+REOPEN_SPACING = timedelta(minutes=5)
+
+
+def reopen(repo_root: Path, store: StateStore, language: str, now: datetime) -> None:
+    """Gate tick: open a missing view while work runs, one attempt per spacing."""
+    if os.environ.get("FORAGENT_VIEW") == "off" or not store.active_runs() or _running(store):
+        return
+    path = store.root / "watch-open.json"
+    try:
+        last = datetime.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["attempted_at"])
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        last = None
+    if last is not None and now - last < REOPEN_SPACING:
+        return
+    # Separate gate processes share this record; failures are retried after the spacing.
+    store._write_json(path, {"attempted_at": now.isoformat()})
+    open_view(repo_root, store, language)
 
 
 def open_view(repo_root: Path, store: StateStore, language: str = "en") -> None:

@@ -789,3 +789,7 @@
   2. CI 모드: 프로젝트마다 `checks: local | ci`. 기본은 local. `fa init`이 공개 저장소에는 ci(Actions 무료)를, 비공개에는 local(유료)을 추천하고 사용자가 고른다. ci 모드에서는 잠긴 시험 비교를 GitHub Actions에서 나눠 돌리고, macOS 전용 시험은 기계에 남긴다. 두 모드 모두 비교 없이는 머지하지 않는다(#327). GitHub가 멈추면 local로 돌아가거나 인프라 문제로 잡는다(#368).
   3. 순서: #431·#437 다음. 그 둘의 효과를 먼저 잰다.
   4. Foragent 저장소 자체는 CI 모드를 쓴다(공개 저장소, Jin). 코드가 머지되고 재설치한 뒤 설정 한 줄을 따로 올린다.
+
+### D92. Foragent의 분류 이름은 "메타 하네스" (2026-10-25, Jin) — 잠정
+- 계기: Jin이 이 시스템을 뭐라고 부를지 물었다("os는 너무 진부해"). 하네스(Claude Code, Codex, 가재코드, 우로보로스)는 모델 하나를 잘 일하게 하고, Foragent는 그런 하네스 여러 개를 일꾼으로 써서 저장소를 굴리는 한 층 위다. "스스로 하네스를 고친다"는 Foragent로 Foragent를 만드는 우리 경우일 뿐이고, 일반 사용자의 경험은 "말로 시키고, 객관식만 고르고, 자고 일어나면 검증된 작업이 머지돼 있다"이다.
+- 결정(잠정, Jin: "일단 그렇게 해놓자"): 분류 이름은 메타 하네스(meta-harness) — 하네스들을 묶어 굴리는 하네스. 처음 보는 사람이 하네스의 한 종류로 오해하지 않게 한 줄 설명을 붙인다: "Foragent — a meta-harness: it runs many coding-agent harnesses as one team on your repo." 경험을 말할 때는 "autopilot for your repo"를 함께 쓸 수 있다. README와 출시 글을 쓸 때 다시 본다.

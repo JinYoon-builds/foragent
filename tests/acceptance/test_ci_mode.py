@@ -1,8 +1,9 @@
-"""Acceptance test for ci-mode. Locked by Foragent; do not edit."""
+"""CI-mode acceptance: measurement-run artifacts authorize comparisons."""
 
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import timedelta
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -11,8 +12,9 @@ import signal
 import subprocess
 import sys
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 import xml.etree.ElementTree as ET
+from zipfile import ZipFile
 
 import pytest
 import yaml
@@ -27,14 +29,16 @@ from test_state_split import offline_acceptance
 
 
 # Wire contract chosen for this feature (no new production API is imported):
-# GET repos/{repo}/commits/{PR_HEAD}/check-runs, including every page, returns
-# completed check runs named foragent-acceptance/{zero-based shard index}.
-# output.text is JSON with the shape returned by ComparisonCI.payload below.
-# All shard_count distinct indices must report complete base AND head suites
-# for the same repository, base/head SHAs and exact locked-file exclusions.
-# A completed/success check means the measurement finished; compare passing_ids
-# independently of the ordinary CI bucket. An empty complete shard is valid.
-# Generated jobs expose this JSON as outputs.comparison and publish check runs.
+# GET repos/{repo}/actions/runs?head_sha={PR_HEAD} finds a completed/success
+# pull_request run of WORKFLOW. Its artifacts endpoint lists acceptance-{i};
+# each artifact's workflow_run.id must identify that measurement run. Download
+# actions/artifacts/{artifact_id}/zip and read shard-{i}.json, shaped like the
+# captured report in tests/fixtures/github_ci/shard-0.json.
+# Trusted config determines the expected indices; every report must match the
+# repository, base/head SHAs, scope and exact locked-file exclusions. Compare
+# passing_ids independently of ordinary CI. An empty complete shard is valid.
+# GET repos/{repo} supplies default_branch; run.repository does not have it.
+# Check runs are display only. No publisher workflow or checks: write is needed.
 # Run history and `fa orch facts --json` expose
 # comparison = {source: "local" | "ci", duration_seconds: nonnegative number}.
 # Machine-dependent tests use pytest.mark.local_only. CI excludes this marker;
@@ -51,6 +55,24 @@ OWN = "tests/test_demo.py::test_demo"
 OWN_ACCEPTANCE = f"{ACCEPTANCE}::test_feature"
 EXCLUDED = sorted([ACCEPTANCE, LOCKED])
 TEST_COMMAND = f"{shlex.quote(sys.executable)} -m pytest -q"
+CI_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/github_ci"
+
+
+def github_fixture(name):
+    # Keep GitHub's captured fields/nesting, rebasing repository identity onto
+    # the offline history. Scenario-specific values are changed by ComparisonCI.
+    recorded_repo = json.loads((CI_FIXTURES / "repo.json").read_text())["full_name"]
+    return json.loads((CI_FIXTURES / name).read_text().replace(recorded_repo, REPO))
+
+
+@pytest.fixture(autouse=True)
+def ci_evidence_recording():
+    """Replace conftest's legacy check/publisher enrichment in this module.
+
+    The recording below supplies scope and trusted shard config directly. In
+    particular, no fixture may inject default_branch into run.repository or
+    turn the captured pull_request run into a workflow_run publisher.
+    """
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +100,7 @@ def select_mode(case, mode, fallback):
         object.__setattr__(case.config, "checks", mode)
     if fallback is not None:
         object.__setattr__(case.config, "checks_fallback", fallback)
+    object.__setattr__(case.config, "ci_shards", 2)
 
 
 class CheckProcesses:
@@ -146,7 +169,7 @@ class CheckProcesses:
 
 
 class ComparisonCI:
-    """Real GhTracker reads; recorded check-run output; FakeTracker writes.
+    """Real GhTracker reads; captured Actions artifacts; FakeTracker writes.
 
     Existing CI-not-started recordings supply jobs, annotations and logs. New
     pr_* readers use the same real GitHub command seam, so a fake comparison
@@ -158,10 +181,15 @@ class ComparisonCI:
 
         self.case = case
         self.reads = []
+        self.repo_reads = []
+        self.artifact_reads = []
+        self.downloads = []
         self.damage = None
         self.regression = None
         self.repaired = False
         self.never_started = False
+        self.checks_only = False
+        self.run_id = github_fixture("measurement_run.json")["id"]
         self.legacy = RecordedCI(case, monkeypatch, [job(conclusion="success", annotation=None)])
         self.legacy.passing = True
         gh = GhTracker(REPO, self.command)
@@ -183,16 +211,21 @@ class ComparisonCI:
             head_passing.remove(KEEP)
             if self.regression == "deselected":
                 head_nodes.remove(KEEP)
-        return {
-            "schema_version": 1, "repository": REPO,
-            "base_sha": self.case.base_sha, "head_sha": self.case.tracker.pr_head_sha(2),
-            "shard_index": index, "shard_count": 2, "excluded": EXCLUDED,
-            "duration_seconds": 12.5 + index,
-            "base": {"complete": True, "collected_ids": nodes, "passing_ids": passing},
-            "head": {"complete": True, "collected_ids": head_nodes, "passing_ids": head_passing},
-        }
+        payload = github_fixture("shard-0.json")
+        payload.update(base_sha=self.case.base_sha, head_sha=self.case.tracker.pr_head_sha(2),
+                       shard_index=index, shard_count=self.case.config.ci_shards,
+                       excluded=EXCLUDED, duration_seconds=12.5 + index)
+        payload["scope"].update(
+            acceptance_dir=self.case.config.acceptance_dir,
+            command=f"PYTEST_ADDOPTS= {shlex.quote(sys.executable)} -m pytest "
+                    "-o addopts= --rootdir=. --maxfail=0 -p no:cacheprovider",
+            excluded=EXCLUDED, shard_count=self.case.config.ci_shards,
+        )
+        payload["base"].update(collected_ids=nodes, passing_ids=passing)
+        payload["head"].update(collected_ids=head_nodes, passing_ids=head_passing)
+        return payload
 
-    def check_runs(self):
+    def reports(self):
         payloads = [self.payload(0), self.payload(1)]
         damage = self.damage
         if damage == "missing":
@@ -225,21 +258,91 @@ class ComparisonCI:
         elif damage == "empty-shard":
             for side in ("base", "head"):
                 payloads[1][side].update(collected_ids=[], passing_ids=[])
-        checks = []
-        for index, payload in enumerate(payloads):
+        elif damage == "foreign-scope":
+            payloads[1]["scope"]["marker"] = "local_only"
+        elif damage == "self-declared-shards":
+            payloads.pop()
+            payloads[0]["shard_count"] = payloads[0]["scope"]["shard_count"] = 1
+        return payloads
+
+    def measurement_run(self):
+        run = github_fixture("measurement_run.json")
+        head = self.case.tracker.pr_head_sha(2)
+        run["head_sha"] = run["head_commit"]["id"] = head
+        if self.damage == "unfinished-run":
+            run.update(status="in_progress", conclusion=None)
+        elif self.damage == "failed-run":
+            run["conclusion"] = "failure"
+        elif self.damage == "foreign-workflow":
+            run["path"] = ".github/workflows/other.yml"
+        elif self.damage == "wrong-event":
+            run["event"] = "workflow_run"
+        elif self.damage == "stale-run-head":
+            run["head_sha"] = "a" * 40
+        return run
+
+    def runs_by_head(self):
+        response = github_fixture("runs_by_head.json")
+        ordinary = next(run for run in response["workflow_runs"] if run["path"] != WORKFLOW)
+        ordinary_id = ordinary["id"]
+        ordinary.update(id=RUN, head_sha=self.case.tracker.pr_head_sha(2),
+                        conclusion="success" if self.legacy.passing else "failure")
+        for key in ("url", "html_url", "jobs_url", "logs_url", "artifacts_url"):
+            ordinary[key] = ordinary[key].replace(str(ordinary_id), str(RUN))
+        response["workflow_runs"] = [self.measurement_run(), ordinary]
+        response["total_count"] = len(response["workflow_runs"])
+        return response
+
+    def artifacts(self):
+        response = github_fixture("artifacts.json")
+        recorded = {artifact["name"]: artifact for artifact in response["artifacts"]}
+        artifacts = []
+        for index, payload in enumerate([] if self.checks_only else self.reports()):
+            artifact = deepcopy(recorded[f"acceptance-{index}"])
+            artifact["name"] = f"acceptance-{payload['shard_index']}"
+            artifact["workflow_run"].update(id=self.run_id, head_sha=self.case.tracker.pr_head_sha(2))
+            if self.damage == "foreign-run" and index == 1:
+                artifact["workflow_run"]["id"] = self.run_id + 1
+            if self.damage == "expired" and index == 1:
+                artifact["expired"] = True
+            artifacts.append(artifact)
+        response.update(total_count=len(artifacts), artifacts=artifacts)
+        return response
+
+    def archive(self, artifact_id):
+        for artifact, payload in zip(self.artifacts()["artifacts"], self.reports(), strict=True):
+            if artifact["id"] != artifact_id:
+                continue
             text = json.dumps(payload)
-            if damage == "unparseable" and index == 1:
+            if self.damage == "unparseable" and payload["shard_index"] == 1:
                 text = "{truncated JSON"
+            # Use the captured ZIP's member metadata and compression, replacing
+            # only the report for this offline shard/scenario.
+            with ZipFile(CI_FIXTURES / "acceptance-0.zip") as captured:
+                member = captured.getinfo("shard-0.json")
+            member.filename = f"shard-{payload['shard_index']}.json"
+            output = BytesIO()
+            with ZipFile(output, "w") as archive:
+                archive.writestr(member, text)
+            return output.getvalue()
+        pytest.fail(f"Unrecorded artifact download: {artifact_id}")
+
+    def check_runs(self):
+        # Only the check-only negative case exposes display reports. Their
+        # suite really belongs to the pull_request measurement, not a publisher.
+        if not self.checks_only:
+            return []
+        run = self.measurement_run()
+        checks = []
+        for index in range(self.case.config.ci_shards):
             checks.append({
-                "id": 8100 + index, "name": f"foragent-acceptance/{payload['shard_index']}",
-                # The check belongs to this commit; its body can accidentally
-                # contain a report copied from an older head.
-                "head_sha": self.case.tracker.pr_head_sha(2), "status": "completed", "conclusion": "success",
-                "details_url": f"https://github.com/{REPO}/actions/runs/{RUN}",
-                "output": {"title": "Acceptance comparison", "summary": "Shard measurement", "text": text},
+                "id": 8100 + index, "name": f"foragent-acceptance/{index}",
+                "head_sha": run["head_sha"], "status": "completed", "conclusion": "success",
+                "app": {"slug": "github-actions"}, "check_suite": {"id": run["check_suite_id"]},
+                "details_url": run["html_url"],
+                "output": {"title": "Acceptance comparison", "summary": "Display only",
+                           "text": json.dumps(self.payload(index))},
             })
-        if damage == "unfinished-check":
-            checks[1].update(status="in_progress", conclusion=None)
         return checks
 
     def command(self, args, input=None):
@@ -247,12 +350,43 @@ class ComparisonCI:
             return "[]"
         if args[:1] == ["api"]:
             endpoint = next((arg for arg in args if arg.startswith(("repos/", "https://api.github.com/"))), "")
-            path = urlsplit(endpoint).path.removeprefix("/")
+            parsed = urlsplit(endpoint)
+            path = parsed.path.removeprefix("/")
             prefix = f"repos/{REPO}/"
+            value = None
+            if path == prefix.rstrip("/"):
+                self.repo_reads.append(list(args))
+                value = github_fixture("repo.json")
+            elif path == prefix + "actions/runs":
+                query = parse_qs(parsed.query)
+                value = self.runs_by_head()
+                if "head_sha" in query:
+                    self.reads.append((query["head_sha"][0], list(args)))
+                    if query["head_sha"] != [self.case.tracker.pr_head_sha(2)]:
+                        value.update(total_count=0, workflow_runs=[])
+                elif "check_suite_id" in query:
+                    # Serve GitHub's actual suite/run relationship even to the
+                    # old reader, so it fails the feature rather than the fake.
+                    value["workflow_runs"] = [run for run in value["workflow_runs"]
+                                              if str(run["check_suite_id"]) == query["check_suite_id"][0]]
+                    value["total_count"] = len(value["workflow_runs"])
+            elif path == prefix + f"actions/runs/{self.run_id}":
+                value = self.measurement_run()
+            elif path == prefix + f"actions/runs/{self.run_id}/artifacts":
+                self.artifact_reads.append(list(args))
+                value = self.artifacts()
+            elif path.startswith(prefix + "actions/artifacts/") and path.endswith("/zip"):
+                artifact_id = int(path.split("/")[-2])
+                self.downloads.append(artifact_id)
+                return self.archive(artifact_id)  # Binary HTTP response, not JSON/text.
+            if value is not None:
+                if "--jq" in args:
+                    projection = args[args.index("--jq") + 1]
+                    value = value[projection.removeprefix(".")]
+                return json.dumps(value)
             if path.startswith(prefix + "commits/") and path.endswith("/check-runs"):
-                self.reads.append((self.case.tracker.pr_head_sha(2), list(args)))
                 checks = self.check_runs()
-                value = {"total_count": len(self.check_runs()), "check_runs": checks}
+                value = {"total_count": len(checks), "check_runs": checks}
                 if "--jq" in args:
                     assert args[args.index("--jq") + 1] == ".check_runs", args
                     value = checks
@@ -445,6 +579,9 @@ def init_case(git_history, tmp_path, monkeypatch, *, private, readable=True):
             return recorded(argv, *args, **kwargs)
 
         monkeypatch.setattr(subprocess, "run", unreadable)
+    # Visibility-based init needs a known runner; keep this case's command
+    # explicit rather than relying on conftest's old publisher recording.
+    (case.root / ".foragent.yml").write_text("test_command: python -m pytest\n")
     case.argv = ["init", "--repo-root", str(case.root), "--no-push", "--no-launchd", "--no-board",
                  "--approver", "human", "--language", "en", "--statusline", "no"]
     case.main = cli.main
@@ -526,9 +663,14 @@ def test_init_generates_pr_workflow_with_shards_and_machine_readable_comparison_
         output = job_config.get("outputs", {}).get("comparison")
         assert isinstance(output, str) and "steps." in output and ".outputs." in output
         assert job_config.get("steps"), "Each shard must execute and publish its comparison"
+        assert any(step.get("uses", "").startswith("actions/upload-artifact@")
+                   and step.get("with", {}).get("name") == "acceptance-${{ matrix.shard }}"
+                   and "shard-" in step.get("with", {}).get("path", "")
+                   for step in job_config["steps"]), "Each shard must upload its JSON report as an artifact"
     permissions = [document.get("permissions", {}), *(job.get("permissions", {}) for job in jobs.values())]
-    assert any(isinstance(value, dict) and value.get("checks") == "write" for value in permissions), (
-        "The chosen check-run output transport needs permission to publish shard reports"
+    assert all(isinstance(value, dict) and set(value) <= {"contents", "actions"}
+               and all(access == "read" for access in value.values()) for value in permissions), (
+        "Measurement artifacts need only contents/actions read; the workflow must not request checks: write"
     )
 
 
@@ -562,6 +704,12 @@ def test_complete_ci_comparison_merges_without_local_baseline_and_runs_only_loca
     assert run(case) == "merged"
     assert_remote_only(case)
     assert case.ci.reads, "A green ordinary CI bucket is not an acceptance comparison"
+    assert {head for head, _ in case.ci.reads} == {case.tracker.pr_head_sha(2)}, (
+        "Discover measurement runs using the exact published PR head SHA"
+    )
+    assert case.ci.artifact_reads and len(set(case.ci.downloads)) == case.config.ci_shards, (
+        "Read every configured shard from the measurement run's artifact ZIPs"
+    )
     assert case.processes.head_ids == {LOCAL, LOCAL_ACCEPTANCE, OWN, OWN_ACCEPTANCE}, (
         "Select machine-only tests across acceptance and units, and the changed module's own tests; "
         f"observed {case.processes.head_ids}"
@@ -594,10 +742,42 @@ def test_ci_lost_passing_id_returns_to_worker_and_requires_fresh_head_comparison
     assert_remote_only(case)
 
 
+def test_check_runs_alone_without_artifacts_never_authorize_merge(git_history, tmp_path, monkeypatch):
+    case = mode_case(git_history, tmp_path, monkeypatch)
+    case.ci.checks_only = True
+    assert len(case.ci.check_runs()) == case.config.ci_shards
+    assert case.ci.artifacts()["artifacts"] == []
+    assert_infrastructure_hold(case, run(case))
+    assert_remote_only(case)
+
+
+def test_artifact_from_another_measurement_run_is_rejected(git_history, tmp_path, monkeypatch):
+    case = mode_case(git_history, tmp_path, monkeypatch)
+    case.ci.damage = "foreign-run"
+    assert_infrastructure_hold(case, run(case))
+    assert case.ci.artifact_reads, "Validate artifact workflow_run.id against the selected measurement run"
+    assert_remote_only(case)
+
+
+def test_ci_default_branch_comes_from_repo_endpoint_when_run_repository_lacks_it(
+    git_history, tmp_path, monkeypatch,
+):
+    case = mode_case(git_history, tmp_path, monkeypatch)
+    measurement = case.ci.measurement_run()
+    assert "default_branch" not in measurement["repository"]
+    assert "default_branch" not in measurement["head_repository"]
+    assert run(case) == "merged", "Captured pull_request artifacts must work without run.repository.default_branch"
+    assert case.ci.repo_reads, "Read the default branch from GET repos/{repo}"
+    assert case.ci.artifact_reads and case.ci.downloads, "Use the measurement's artifacts without a publisher"
+    assert_remote_only(case)
+
+
 @pytest.mark.parametrize("damage", [
     "missing", "partial", "unparseable", "duplicate", "stale-head", "stale-base",
     "foreign-repository", "shard-count", "incomplete-base", "incomplete-head",
-    "missing-exclusions", "extra-exclusions", "unknown-schema", "uncollected-pass", "unfinished-check",
+    "missing-exclusions", "extra-exclusions", "unknown-schema", "uncollected-pass", "unfinished-run",
+    "failed-run", "foreign-workflow", "wrong-event", "stale-run-head", "foreign-scope",
+    "self-declared-shards", "expired",
 ])
 def test_green_ci_without_usable_all_shard_comparison_holds_unprotected_merge(
     git_history, tmp_path, monkeypatch, damage,

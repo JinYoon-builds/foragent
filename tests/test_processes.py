@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from foragent import processes
+from foragent.processes import list_processes as kernel_listing
 from foragent.state import StateStore
 
 
@@ -579,6 +580,60 @@ def test_enumeration_uses_fresh_kernel_start_time_and_excludes_denied_or_zombie(
     monkeypatch.setattr(psutil, "process_iter", denied_table)
     with pytest.raises(PermissionError, match="ownership cannot be verified"):
         module.list_processes()
+
+
+@pytest.mark.parametrize("operation", [
+    "uids", "create_time", "cmdline", "ppid", "getpgid", "getsid", "confirm_create_time", "status",
+])
+@pytest.mark.parametrize("cause", ["permission", "access_denied", "nested_permission", "missing", None])
+def test_enumeration_isolates_per_process_system_errors(monkeypatch, operation, cause):
+    def failed_read(*args):
+        if cause == "permission":
+            error = PermissionError("force permission denied")
+        elif cause == "access_denied":
+            error = processes.psutil.AccessDenied(42000)
+        elif cause == "nested_permission":
+            error = RuntimeError("wrapped permission failure")
+            error.__cause__ = PermissionError("force permission denied")
+        elif cause == "missing":
+            error = processes.psutil.NoSuchProcess(42000)
+        else:
+            error = None
+        raise SystemError("process read failed") from error
+
+    def process(pid):
+        return SimpleNamespace(
+            pid=pid, uids=lambda: SimpleNamespace(real=501), create_time=lambda: 10,
+            cmdline=lambda: ["worker"], ppid=lambda: 1, status=lambda: "running",
+        )
+
+    before, failing, after = process(42001), process(42000), process(42002)
+    fresh = process(failing.pid)
+    fake_os = SimpleNamespace(getpgid=lambda pid: pid, getsid=lambda pid: pid)
+    if operation in {"getpgid", "getsid"}:
+        read = getattr(fake_os, operation)
+        setattr(fake_os, operation, lambda pid: failed_read() if pid == failing.pid else read(pid))
+    elif operation == "confirm_create_time":
+        fresh.create_time = failed_read
+    else:
+        setattr(failing, operation, failed_read)
+    by_pid = {before.pid: before, failing.pid: fresh, after.pid: after}
+    monkeypatch.setattr(processes.psutil, "process_iter", lambda: iter([before, failing, after]))
+    monkeypatch.setattr(processes.psutil, "Process", by_pid.__getitem__)
+    monkeypatch.setattr(processes, "os", fake_os)
+
+    table = kernel_listing()
+
+    expected = [processes.ProcessIdentity(pid, 1, pid, pid, 10, ("worker",), 501)
+                for pid in (before.pid, after.pid)]
+    if operation == "cmdline" and cause in {"permission", "access_denied", "nested_permission"}:
+        expected.insert(1, processes.ProcessIdentity(failing.pid, 1, failing.pid, failing.pid, 10, None, 501))
+        assert not table.unreadable
+        assert not table.unreadable_uids
+    else:
+        assert table.unreadable == frozenset({failing.pid})
+        assert table.unreadable_uids == ({} if operation == "uids" else {failing.pid: 501})
+    assert tuple(table) == tuple(expected)
 
 
 def test_parent_reuse_during_enumeration_does_not_authorize_new_children(fake_process_table, tmp_path, monkeypatch):
