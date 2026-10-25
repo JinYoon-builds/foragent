@@ -152,8 +152,6 @@ def _resolve_conflicts(attempt: Implementation, conflicts: list[str]) -> None:
 
 
 def _resume_implementation(attempt: Implementation) -> bool:
-    from foragent.run_publish import _merge_lock
-
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     conflicts = ctx.store.get_run(n).merge_conflicts
     # Own-path detection and replay follow the current target; publication
@@ -163,22 +161,23 @@ def _resume_implementation(attempt: Implementation) -> bool:
         # A saved implementation must see the same target as its acceptance
         # baseline before the worker starts. Keep its history and reuse the
         # publish path's conflict resolution and rebuild budget.
-        with _merge_lock(n, ctx):
-            if not git.is_ancestor(attempt.start_ref, git.head_sha()):
-                try:
-                    # A saved partial resolution still needs its marker checks,
-                    # even when Git can merge the target without index conflicts.
-                    git.merge_base(attempt.start_ref, commit=not conflicts)
-                except GitError:
-                    unmerged = git.conflict_paths()
-                    if not unmerged:
-                        raise
-                    conflicts = sorted(set(conflicts) | set(unmerged))
-            if conflicts:
-                try:
-                    _resolve_conflicts(attempt, conflicts)
-                except ConflictBudgetExhausted as exc:
-                    attempt.failure = _rebuild(attempt, exc)
-                else:
-                    return True
+        # Preparation stays unlocked; publication rechecks the verified base
+        # and all merge inputs under its final short merge lock.
+        if not git.is_ancestor(attempt.start_ref, git.head_sha()):
+            try:
+                # A saved partial resolution still needs its marker checks,
+                # even when Git can merge the target without index conflicts.
+                git.merge_base(attempt.start_ref, commit=not conflicts)
+            except GitError:
+                unmerged = git.conflict_paths()
+                if not unmerged:
+                    raise
+                conflicts = sorted(set(conflicts) | set(unmerged))
+        if conflicts:
+            try:
+                _resolve_conflicts(attempt, conflicts)
+            except ConflictBudgetExhausted as exc:
+                attempt.failure = _rebuild(attempt, exc)
+            else:
+                return True
     return False
