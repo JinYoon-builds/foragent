@@ -205,7 +205,7 @@ def test_acceptance_directory_allows_literal_paths(repo, directory):
 
 
 @pytest.mark.parametrize("key", ["stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries",
-                                 "review_max", "test_slots_floor", "parallel_floor"])
+                                 "review_max"])
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_integer_fields_are_positive_integers(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
@@ -214,32 +214,15 @@ def test_integer_fields_are_positive_integers(repo, key, value):
 
 
 @pytest.mark.parametrize("source", ["local", "global"])
-def test_test_slots_floor_cannot_exceed_ceiling(repo, tmp_path, source):
+@pytest.mark.parametrize("settings", [
+    {"test_slots": 2, "test_slots_floor": 3}, {"max_parallel": 2, "parallel_floor": 3},
+    {"test_slots_floor": 0, "parallel_floor": None},
+])
+def test_legacy_floor_keys_are_accepted_without_validation(repo, tmp_path, source, settings):
+    # Budgets back off only on sustained pressure (#470); floors are ignored, not checked.
     global_path = tmp_path / "global.yml"
-    path = repo / ".foragent.yml" if source == "local" else global_path
-    write_settings(path, {"test_slots": 2, "test_slots_floor": 3})
-    with pytest.raises(ConfigError, match="test_slots_floor.*test_slots"):
-        load_config(repo, global_path)
-
-
-def test_test_slots_floor_uses_merged_settings(repo, tmp_path):
-    global_path = tmp_path / "global.yml"
-    write_settings(global_path, {"test_slots": 3, "test_slots_floor": 2})
-    assert load_config(repo, global_path).test_slots_floor == 2
-    write_settings(repo / ".foragent.yml", {"test_slots_floor": 1})
-    assert load_config(repo, global_path).test_slots_floor == 1
-    write_settings(repo / ".foragent.yml", {"test_slots": 1})
-    with pytest.raises(ConfigError, match="test_slots_floor.*test_slots"):
-        load_config(repo, global_path)
-
-
-@pytest.mark.parametrize("source", ["local", "global"])
-def test_parallel_floor_cannot_exceed_project_ceiling(repo, tmp_path, source):
-    global_path = tmp_path / "global.yml"
-    path = repo / ".foragent.yml" if source == "local" else global_path
-    write_settings(path, {"max_parallel": 2, "parallel_floor": 3})
-    with pytest.raises(ConfigError, match="parallel_floor.*max_parallel"):
-        load_config(repo, global_path)
+    write_settings(repo / ".foragent.yml" if source == "local" else global_path, settings)
+    load_config(repo, global_path)
 
 
 @pytest.mark.parametrize("settings", [
@@ -251,17 +234,6 @@ def test_parallel_floor_accepts_no_ceiling_or_a_floor_equal_to_ceiling(repo, set
     config = load_config(repo)
     assert config.parallel_floor == settings["parallel_floor"]
     assert config.max_parallel == settings.get("max_parallel")
-
-
-def test_parallel_floor_uses_merged_settings(repo, tmp_path):
-    global_path = tmp_path / "global.yml"
-    write_settings(global_path, {"parallel_floor": 3})
-    assert load_config(repo, global_path).parallel_floor == 3
-    write_settings(repo / ".foragent.yml", {"max_parallel": 2})
-    with pytest.raises(ConfigError, match="parallel_floor.*max_parallel"):
-        load_config(repo, global_path)
-    write_settings(repo / ".foragent.yml", {"parallel_floor": 1, "max_parallel": 2})
-    assert load_config(repo, global_path).parallel_floor == 1
 
 
 def test_all_valid_overrides(repo):

@@ -13,6 +13,7 @@ from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, decrease_allowed, machine_load,
     machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
 )
+from foragent.capacity import decrease_fields
 from foragent.config import resolved_reviewer
 from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
 from foragent.tracker import Issue
@@ -33,7 +34,7 @@ def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
 def _apply_budgets(
     ctx: TickContext, ready: dict[str, list[int]], *, workers: bool = True,
 ) -> tuple[str, float]:
-    """Apply machine.yml and pressure to the shared budgets once per tick; return its sensor sample.
+    """Apply machine.yml and sustained pressure to the shared budgets once per tick; return its sensor sample.
 
     Every tick runs this, a GitHub wait included. ``workers=False`` leaves the
     worker budget to the caller, which sizes it with this sample right away.
@@ -44,7 +45,8 @@ def _apply_budgets(
     ctx._budget_sample = sample
     scheduler.update_test_slots(
         machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
-        swapins=getattr(sample, "swapins", None), floor=machine["test_slots_floor"],
+        swapins=getattr(sample, "swapins", None), hold=getattr(sample, "hold", False),
+        reason=decrease_fields(sample),
     )
     if workers:
         scheduler._machine_budget(ctx, ready, sample)
@@ -78,13 +80,14 @@ def _machine_budget(
         demand = scheduler.machine_runs(ctx.store, now) + waiting
         # Work only caps growth: the shared value never drops below itself for lack
         # of work here, so it stays the pressure- and load-driven value.
-        wanted = scheduler.next_parallel(
+        # A hot memory signal that is not sustained yet holds growth but never decreases.
+        value = scheduler.next_parallel(
             current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
-            ceiling=ceiling, increase_ok=now - changed_at >= scheduler.INCREASE_INTERVAL,
+            ceiling=ceiling,
+            increase_ok=not getattr(sample, "hold", False) and now - changed_at >= scheduler.INCREASE_INTERVAL,
         )
-        if wanted < current and not scheduler.decrease_allowed(state, now):
-            wanted = current
-        value = wanted if pressure == "critical" else max(machine["parallel_floor"], wanted)
+        if value < current and not scheduler.decrease_allowed(state, now):
+            value = current
         if state is None or value != current:
             decreased_at = (
                 now.astimezone(scheduler.UTC).isoformat() if value < current else (state or {}).get("decreased_at")
@@ -92,7 +95,8 @@ def _machine_budget(
             scheduler.write_state(ctx.store, value, now, decreased_at=decreased_at)
         scheduler.append_budget_history(
             ctx.store.root.parent, now, "parallel", current, value,
-            pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None), wanted=wanted,
+            pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None),
+            reason=decrease_fields(sample),
         )
     return max(1, min(value, demand))
 

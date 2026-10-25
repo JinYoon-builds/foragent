@@ -24,10 +24,7 @@ def report():
 
 def test_defaults_come_from_the_config_class():
     config = Config()
-    assert machine_budget.DEFAULTS == {
-        "test_slots": config.test_slots, "test_slots_floor": config.test_slots_floor,
-        "parallel_floor": config.parallel_floor, "max_parallel": config.max_parallel,
-    }
+    assert machine_budget.DEFAULTS == {"test_slots": config.test_slots, "max_parallel": config.max_parallel}
 
 
 def test_without_file_every_key_is_the_fixed_default():
@@ -36,12 +33,10 @@ def test_without_file_every_key_is_the_fixed_default():
 
 
 def test_file_values_win_and_missing_keys_use_defaults():
-    write("test_slots: 4\nparallel_floor: 2\n")
-    assert machine_budget.values() == {
-        "test_slots": 4, "test_slots_floor": 1, "parallel_floor": 2, "max_parallel": None,
-    }
+    write("test_slots: 4\n")
+    assert machine_budget.values() == {"test_slots": 4, "max_parallel": None}
     assert report()["test_slots"] == {"value": 4, "source": "machine"}
-    assert report()["test_slots_floor"]["source"] == "default"
+    assert report()["max_parallel"]["source"] == "default"
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "null", "two", "1.5", "true", "false", "[1]"])
@@ -61,13 +56,11 @@ def test_unreadable_file_marks_every_key_invalid(text):
     assert machine_budget.values() == machine_budget.DEFAULTS
 
 
-def test_floor_above_its_ceiling_marks_only_the_floor_invalid():
-    write("test_slots: 2\ntest_slots_floor: 3\nmax_parallel: 1\nparallel_floor: 2\n")
-    result = report()
-    assert result["test_slots"] == {"value": 2, "source": "machine"}
-    assert result["test_slots_floor"] == {"value": 1, "source": "invalid"}
-    assert result["max_parallel"] == {"value": 1, "source": "machine"}
-    assert result["parallel_floor"] == {"value": 1, "source": "invalid"}
+def test_legacy_floor_keys_are_ignored_silently():
+    write("test_slots: 2\ntest_slots_floor: 3\nmax_parallel: 1\nparallel_floor: 0\n")
+    assert report() == {
+        "test_slots": {"value": 2, "source": "machine"}, "max_parallel": {"value": 1, "source": "machine"},
+    }
 
 
 def test_unknown_keys_are_ignored_and_listed_once():
@@ -112,27 +105,21 @@ def test_lower_ceiling_clamps_stored_test_slots_at_once_without_decreased_at():
 
 
 @pytest.mark.parametrize("language", ["en", "ko"])
-def test_status_prints_machine_values_unknown_keys_and_ignored_repo_floors(tmp_path, capsys, language):
+def test_status_prints_machine_values_and_unknown_keys(capsys, language):
     from foragent import cli
 
     write("test_slots: 3\nparallel_floor: 0\nturbo: 1\n")
-    (tmp_path / ".foragent.yml").write_text("test_slots_floor: 2\n", encoding="utf-8")
-    status = {"machine_budget": report(), "repo_floors_ignored": cli._repo_floor_keys(tmp_path)}
-    cli._print_machine_budget(status, language)
+    cli._print_machine_budget({"machine_budget": report()}, language)
     lines = capsys.readouterr().out.splitlines()
-    assert len(lines) == 3
-    assert "test_slots 3" in lines[0] and "max_parallel" in lines[0]
-    assert "turbo" in lines[1]
-    assert "test_slots_floor" in lines[2]
+    assert len(lines) == 2
+    assert "test_slots 3" in lines[0] and "max_parallel" in lines[0] and "floor" not in lines[0]
+    assert "turbo" in lines[1] and "parallel_floor" not in lines[1]
 
 
-def test_status_omits_floor_line_when_repository_sets_no_floor(tmp_path, capsys):
+def test_status_prints_only_ceilings_by_default(capsys):
     from foragent import cli
 
-    (tmp_path / ".foragent.yml").write_text("test_slots: 4\n", encoding="utf-8")
-    assert cli._repo_floor_keys(tmp_path) == []
-    cli._print_machine_budget({"machine_budget": report(), "repo_floors_ignored": []}, "en")
+    cli._print_machine_budget({"machine_budget": report()}, "en")
     assert capsys.readouterr().out.splitlines() == [
-        "Machine budget (machine.yml): test_slots 2 (default), test_slots_floor 1 (default), "
-        "parallel_floor 1 (default), max_parallel none (default)",
+        "Machine budget (machine.yml): test_slots 2 (default), max_parallel none (default)",
     ]

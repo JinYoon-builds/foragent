@@ -1,4 +1,4 @@
-"""Machine-wide run budget and test slots: AIMD on memory pressure and load (D60, #243)."""
+"""Machine-wide run budget and test slots: AIMD on sustained memory pressure and load (D60, #243, #470)."""
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -35,6 +35,12 @@ TEST_SLOTS_DIR = "test-slots"
 SENSOR_FILE = "memory-sample.json"
 SENSOR_LOCK = "memory-sample.lock"
 HISTORY_FILE = "budget-history.jsonl"
+# Memory backs off only on a sustained signal: swap-ins above SWAPIN_PAGES in
+# SWAPIN_WINDOWS consecutive sampler windows, or kernel warn/critical for PRESSURE_DURATION.
+SAMPLE_WINDOW = timedelta(seconds=30)
+SWAPIN_PAGES = 100
+SWAPIN_WINDOWS = 3
+PRESSURE_DURATION = timedelta(minutes=5)
 # Set for a command that runs inside a held slot, so a nested `fa test` reuses it.
 TEST_SLOT_ENV = "FORAGENT_TEST_SLOT"
 HELD_ENV = {TEST_SLOT_ENV: "held"}
@@ -156,13 +162,29 @@ def swapins_total() -> int | None:
 
 
 class LoadSample(tuple[str, float]):
-    """Keep the public (pressure, load) pair and its exact swap-in window together."""
+    """Keep the public (pressure, load) pair and its sustained-memory classification together.
+
+    ``pressure`` is warn or critical only once a memory rule is sustained; ``hold``
+    marks a hot signal that is not sustained yet, which blocks growth but never
+    decreases. ``swapins`` is the last completed window's delta.
+    """
 
     swapins: int | None
+    rule: str | None
+    swap_windows: int
+    pressure_windows: int
+    hold: bool
 
-    def __new__(cls, pressure: str, load: float, swapins: int | None):
+    def __new__(
+        cls, pressure: str, load: float, swapins: int | None, *, rule: str | None = None,
+        swap_windows: int = 0, pressure_windows: int = 0, hold: bool = False,
+    ):
         sample = super().__new__(cls, (pressure, load))
         sample.swapins = swapins
+        sample.rule = rule
+        sample.swap_windows = swap_windows
+        sample.pressure_windows = pressure_windows
+        sample.hold = hold
         return sample
 
 
@@ -175,23 +197,81 @@ def load_per_cpu() -> float:
     return max(0.0, load) / (os.cpu_count() or 1)
 
 
+def _sample_state(root: Path) -> dict[str, Any]:
+    try:
+        value = json.loads((root / SENSOR_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _count(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _instant(value: Any) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
 def machine_load() -> LoadSample:
+    """Sample the sensors and classify memory by sustained rules (memory-backoff).
+
+    Swap-ins count per completed 30-second window: a longer gap is one window with
+    the whole delta, and a call inside an open window neither completes nor resets
+    it. Kernel warn/critical counts in wall-clock time from its first observation.
+    """
     root = machine_root()
+    now = datetime.now(UTC)
     with _flock(root / SENSOR_LOCK):
-        pressure, total = kernel_pressure(), swapins_total()
-        try:
-            previous = json.loads((root / SENSOR_FILE).read_text(encoding="utf-8"))["swapins_total"]
-            if type(previous) is not int or previous < 0:
-                previous = None
-        except (OSError, ValueError, TypeError, KeyError):
-            previous = None
-        # A reset (e.g. reboot) establishes a new baseline without negative activity.
-        swapins = max(0, total - previous) if total is not None and previous is not None else None
-        (root / SENSOR_FILE).write_text(json.dumps({"swapins_total": total}), encoding="utf-8")
-    if pressure != "critical":
-        if swapins is not None:
-            pressure = "warn" if swapins else "normal"
-    return LoadSample(pressure, load_per_cpu(), swapins)
+        kernel, total = kernel_pressure(), swapins_total()
+        state = _sample_state(root)
+        previous, started = _count(state.get("swapins_total")), _instant(state.get("window_started_at"))
+        streak, swapins = _count(state.get("swap_windows")) or 0, _count(state.get("last_swapins"))
+        if previous is not None and (started is None or now - started >= SAMPLE_WINDOW):
+            # A reset (e.g. reboot) establishes a new baseline without negative activity.
+            swapins = max(0, total - previous) if total is not None else None
+            streak = streak + 1 if swapins is not None and swapins > SWAPIN_PAGES else 0
+            previous, started = total, now
+        elif previous is None:
+            # No baseline yet: this sample starts the first window.
+            previous, started, streak, swapins = total, now, 0, None
+        hot = kernel in ("warn", "critical")
+        since = _instant(state.get("pressure_since")) if hot else None
+        if hot and since is None:
+            since = now
+        (root / SENSOR_FILE).write_text(json.dumps({
+            "swapins_total": previous, "window_started_at": started.isoformat(),
+            "swap_windows": streak, "last_swapins": swapins,
+            "pressure_since": since.isoformat() if since is not None else None,
+        }), encoding="utf-8")
+    pressure_windows = int((now - since) // SAMPLE_WINDOW) if since is not None else 0
+    if since is not None and now - since >= PRESSURE_DURATION:
+        pressure, rule = kernel, "sustained-pressure"
+    elif streak >= SWAPIN_WINDOWS:
+        pressure, rule = "warn", "sustained-swap"
+    else:
+        pressure, rule = "normal", None
+    return LoadSample(
+        pressure, load_per_cpu(), swapins, rule=rule, swap_windows=streak,
+        pressure_windows=pressure_windows, hold=rule is None and (streak > 0 or since is not None),
+    )
+
+
+def decrease_fields(sample: tuple[str, float]) -> dict[str, Any]:
+    """History fields naming why a budget decreased: the memory rule or cpu-load."""
+    if sample[0] == "normal":
+        rule = "cpu-load"
+    else:
+        rule = getattr(sample, "rule", None) or "sustained-pressure"
+    return {
+        "rule": rule,
+        "swap_windows": getattr(sample, "swap_windows", 0),
+        "pressure_windows": getattr(sample, "pressure_windows", 0),
+    }
 
 
 def _within_grace(timestamp: str | None, now: datetime) -> bool:
@@ -325,6 +405,7 @@ def decrease_allowed(state: dict[str, Any] | None, now: datetime) -> bool:
 def append_budget_history(
     root: Path, now: datetime, budget: str, current: int, value: int, *,
     pressure: str, load_per_cpu: float, swapins: int | None, wanted: int | None = None,
+    reason: dict[str, Any] | None = None,
 ) -> None:
     if current == value and (wanted is None or wanted == value):
         return
@@ -335,6 +416,8 @@ def append_budget_history(
     }
     if wanted is not None:
         row["wanted"] = wanted
+    if reason is not None and value < current:
+        row.update(reason)
     # Both budgets and all repository gates share one append lock.
     with _flock(root / "budget-history.lock"):
         with (root / HISTORY_FILE).open("a", encoding="utf-8") as stream:
@@ -350,9 +433,9 @@ def _write_test_slots(root: Path, value: dict[str, Any]) -> None:
 
 def update_test_slots(
     ceiling: int, now: datetime, *, pressure: str, load_per_cpu: float, swapins: int | None = None,
-    floor: int = 1,
+    hold: bool = False, reason: dict[str, Any] | None = None,
 ) -> int:
-    """Apply the guard and configured floor; critical pressure bypasses the floor."""
+    """Apply one AIMD step to the shared test slots; ``hold`` blocks growth only."""
     root = machine_root()
     with _flock(root / TEST_SLOTS_LOCK):
         state = read_test_slots()
@@ -367,13 +450,12 @@ def update_test_slots(
             return ceiling
         current = state["slots"] if state else ceiling
         changed_at = datetime.fromisoformat(state["changed_at"]) if state else now
-        wanted = next_test_slots(
+        value = next_test_slots(
             current, pressure=pressure, load_per_cpu=load_per_cpu, ceiling=ceiling,
-            increase_ok=now - changed_at >= INCREASE_INTERVAL,
+            increase_ok=not hold and now - changed_at >= INCREASE_INTERVAL,
         )
-        if wanted < current and not decrease_allowed(state, now):
-            wanted = current
-        value = wanted if pressure == "critical" else max(floor, wanted)
+        if value < current and not decrease_allowed(state, now):
+            value = current
         if state is None or value != state["slots"]:
             updated = {"slots": value, "changed_at": now.astimezone(UTC).isoformat()}
             decreased_at = now.astimezone(UTC).isoformat() if value < current else (state or {}).get("decreased_at")
@@ -382,7 +464,7 @@ def update_test_slots(
             _write_test_slots(root, updated)
         append_budget_history(
             root, now, "test_slots", state["slots"] if state else current, value,
-            pressure=pressure, load_per_cpu=load_per_cpu, swapins=swapins, wanted=wanted,
+            pressure=pressure, load_per_cpu=load_per_cpu, swapins=swapins, reason=reason,
         )
     return value
 
