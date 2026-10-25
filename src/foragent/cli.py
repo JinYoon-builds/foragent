@@ -102,6 +102,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="Executor to check (default: the configured executor)")
     doctor.add_argument("--repo-root", type=Path, default=Path.cwd())
     init = commands.add_parser("init", help="Set up this repository for Foragent")
+    ci = commands.add_parser("ci", help="Acceptance comparison workflow")
+    ci_actions = ci.add_subparsers(dest="action", required=True)
+    workflow = ci_actions.add_parser("workflow", help="Write or replace the generated workflow")
+    workflow.add_argument("--repo-root", type=Path, default=Path.cwd())
     init.add_argument("--repo-root", type=Path, default=Path.cwd())
     init.add_argument("--approver", nargs="+", action="extend", dest="approvers")
     init.add_argument("--review", choices=("fast", "batch", "careful"))
@@ -646,6 +650,10 @@ def main(argv: list[str] | None = None) -> int:
         from foragent import statusline
         return statusline.run()
     try:
+        if args.command == "ci":
+            from foragent.ci_workflow import write_workflow
+            print(f"Wrote {write_workflow(args.repo_root.resolve())}")
+            return 0
         if args.command == "design":
             if args.action == "lint":
                 return design.run(args)

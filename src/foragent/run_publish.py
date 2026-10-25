@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from foragent import board
 from foragent.actions import FlagContext, flag, invalidate_approval
+from foragent.ci_mode import ComparisonEvidence, enabled, require_comparison, stage_exclusions
 from foragent.git import GitError, GitRepo, PublicationError
 from foragent.issue import ParsedIssue, body_hash
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
@@ -146,30 +147,43 @@ def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float) -> str
 class _CIWait:
     started: float
     polls: int = 0
+    status: str = "pending"
+    infrastructure: str = ""
 
 
 def _wait_for_ci(
     n: int, ctx: RunContext, git: GitRepo, pr: int, head: str, ready_at: float,
     wait: _CIWait, failed: Callable[[], None], status: str | None = None,
+    *, comparison_mode: bool = False,
 ) -> str | None:
     """Consume even a status observed under the lock, but only wait unlocked."""
     from foragent import runner
 
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
+    wait.infrastructure = ""
     while True:
         if runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
         if status is None:
             status = _ci_status(ctx, pr, git.root, ready_at)
+        wait.status = status
         _progress(n, ctx)
         if ctx.tracker.pr_head_sha(pr) != head:
             return _hold_changed_head(n, ctx, link)
         if status in {"pass", "none"}:
             return None
         if status == "fail":
+            if comparison_mode:
+                evidence = ctx.tracker.pr_failed_logs(pr)
+                if getattr(evidence, "not_started", False):
+                    wait.infrastructure = str(evidence)
+                    return None
             failed()
         remaining = wait.started + 1200 - ctx.now().timestamp()
         if remaining <= 0 or wait.polls >= 40:
+            if comparison_mode and ctx.config.checks_fallback == "local":
+                wait.infrastructure = "CI did not finish before the poll deadline."
+                return None
             flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
             return "timeout"
         ctx.sleep(min(30, remaining, runner._remaining(n, ctx)))
@@ -192,19 +206,21 @@ class _MergeInputs:
     decision: Decision = Decision("merge")
     status: str = "pending"
     batch_branch: str | None = None
+    comparison_current: bool = True
 
 
 def _final_merge_inputs(
     n: int, ctx: RunContext, git: GitRepo, pr: int, branch: str, base: str,
     head: str, approval: Approval, ready_at: float, *, base_sha: str | None = None,
     approved_body_sha: str | None = None,
+    comparison: ComparisonEvidence | None = None,
 ) -> _MergeInputs:
     """Read every mutable prerequisite after acquiring the final merge lock.
 
     Re-read approval/labels (and live body for review-only), PR state/branches, local and remote head,
     fetched target SHA, approved acceptance blobs on head and configured base,
-    local and tracker paths, current policy config and batch parent, CI (including workflow
-    registration grace), and the remaining run budget. Verification/review
+    local and tracker paths, current policy config and batch parent, comparison evidence,
+    CI (including workflow registration grace), and the remaining run budget. Verification/review
     evidence stays pinned to the supplied head and approval snapshot.
     """
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
@@ -252,7 +268,14 @@ def _final_merge_inputs(
     from foragent import runner
     if runner._remaining(n, ctx) <= 0:
         return _MergeInputs(stop=lambda: _timeout(n, ctx))
-    return _MergeInputs(base_sha=target_sha, paths=paths, decision=decision, status=status, batch_branch=batch_branch)
+    comparison_current = True
+    if enabled(ctx, base):
+        comparison_current = comparison is not None and comparison.current(n, ctx, git, pr, head, target_sha, status)
+        if comparison_current and comparison.infrastructure:
+            # The unlocked comparison already handled this infrastructure state.
+            status = "pass"
+    return _MergeInputs(base_sha=target_sha, paths=paths, decision=decision, status=status,
+                        batch_branch=batch_branch, comparison_current=comparison_current)
 
 
 def _batch_pr(parent: int, ctx: RunContext) -> None:
@@ -389,6 +412,7 @@ def _publish_locked(attempt: Implementation) -> str:
     worktree, log = attempt.worktree, attempt.log
     issue = ctx.tracker.get_issue(n)
     title = f"{issue.title} (#{n})"
+    stage_exclusions(attempt)
     if git.has_staged_changes():
         git.commit(title)
     _progress(n, ctx)
@@ -399,6 +423,7 @@ def _publish_locked(attempt: Implementation) -> str:
         nonlocal verified_head_sha
         if runner._remaining(n, ctx) <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
+        stage_exclusions(attempt)
         if git.has_staged_changes():
             git.commit(title)
         verified_head_sha = git.head_sha()
@@ -522,7 +547,8 @@ def _publish_locked(attempt: Implementation) -> str:
     while True:
         _phase(n, ctx, "ci")
         if stopped := _wait_for_ci(n, ctx, git, pr, verified_head_sha, pr_ready_at,
-                                  ci_wait, ci_failed, queued_status):
+                                  ci_wait, ci_failed, queued_status,
+                                  comparison_mode=enabled(ctx, attempt.target_branch)):
             return stopped
         queued_status = None
 
@@ -536,10 +562,17 @@ def _publish_locked(attempt: Implementation) -> str:
                 return stopped
             continue
 
+        comparison = None
+        if enabled(ctx, attempt.target_branch):
+            comparison = require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
+                                            base_sha=verified_base_sha, status=ci_wait.status)
+            if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
+                return _hold_changed_head(n, ctx, link)
+
         with _merge_lock(n, ctx):
             inputs = _final_merge_inputs(
                 n, ctx, git, pr, attempt.branch, attempt.target_branch,
-                verified_head_sha, attempt.approval, pr_ready_at,
+                verified_head_sha, attempt.approval, pr_ready_at, comparison=comparison,
             )
             move = None
             continue_merge = (
@@ -549,7 +582,7 @@ def _publish_locked(attempt: Implementation) -> str:
             )
             if continue_merge and inputs.base_sha != verified_base_sha:
                 move = capture_move(git, inputs.base_sha)
-            if continue_merge and move is None:
+            if continue_merge and move is None and inputs.comparison_current:
                 _check_publication(git, attempt.target_branch, inputs.base_sha)
                 _phase(n, ctx, "merging")
                 try:
@@ -591,7 +624,7 @@ def _publish_locked(attempt: Implementation) -> str:
             return inputs.stop()
         if stopped := policy_hold(inputs.decision, inputs.batch_branch):
             return stopped
-        if not continue_merge:
+        if not continue_merge or (move is None and not inputs.comparison_current):
             queued_status = inputs.status
             continue
         if move is not None:
@@ -605,6 +638,7 @@ def _publish_locked(attempt: Implementation) -> str:
 def _publish_reviewed_head(
     n: int, ctx: RunContext, git: GitRepo, pr, head: str, base_ref: str, base_sha: str,
     approval: Approval, approved: Callable[[], bool], batch_branch: str | None, parent: int | None,
+    *, comparison_attempt=None,
 ) -> str:
     from foragent import runner
 
@@ -652,15 +686,23 @@ def _publish_reviewed_head(
         if stopped := _wait_for_ci(
             n, ctx, git, pr.number, head, started, ci_wait,
             lambda: _ci_failure(n, ctx, pr.number, head, pr.base), queued_status,
+            comparison_mode=comparison_attempt is not None,
         ):
             return stopped
+        comparison = None
+        if comparison_attempt is not None:
+            comparison = require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
+                                            base_sha=base_sha, status=ci_wait.status)
+            if stopped := unchanged():
+                return stopped
         with _merge_lock(n, ctx):
             inputs = _final_merge_inputs(
                 n, ctx, git, pr.number, pr.head, pr.base, head, approval, started, base_sha=base_sha,
                 approved_body_sha=approval.body_sha,
+                comparison=comparison,
             )
             continue_merge = (inputs.stop is None and _policy_allows(inputs.decision, pr.base, inputs.batch_branch)
-                              and inputs.status in {"pass", "none"})
+                              and inputs.status in {"pass", "none"} and inputs.comparison_current)
             if continue_merge:
                 _check_publication(git, pr.base, inputs.base_sha)
                 try:
