@@ -120,3 +120,4 @@
 - #503 스펙 갱신(2026-10-26): `test_progress_words` ETA 2개는 주문이 합계·로컬 관찰만 보도록 고쳤고 #503이 그 파일을 소유한다. 끝나는 줄은 범위 양 끝 시각만(`progress_finish`의 low·high), 오늘 수는 오늘 병합이 있을 때만 별도 줄(`progress_today`). `progress_unknown_finish`는 고정 시험이 `text()`로 읽어(없는 키는 KeyError) 지우지 않는다.
 - #503 gate 실행 자신의 PR은 시간 창(예: 끝+5분)으로 가려내지 않는다. 바로 뒤의 별도 바깥 병합까지 버려진다고 리뷰에서 반려됐다. 이슈당 가장 최근 병합 하나만 세므로, gate PR은 같은 실행에서 시작해 몇 초 차이로 끝나는 같은 병합이라 두 번째 표본이 되지 않는다. 회귀: `tests/test_watch_progress.py -k gate`.
 - `.foragent/acceptance-exclusions.json`은 러너가 브랜치 커밋에 섞어 넣는다. PR이 이 파일을 건드리면 리뷰가 CI 약화로 지적하므로 `git show origin/main:<path> >` 로 main과 같게 둔다.
+- #503 gate 병합의 끝은 `finish_run` 시각이 아니다(병합 뒤 설치·정리가 끝난 시각). `record_merge`가 실행 기록 옆 키 `merged_at`을 저장하고, finish_run이 history로 옮기며, `StateStore.merge_times()`로 읽는다. 같은 이슈의 다음 실행 파일은 이전 키를 물려받으므로 실행 시작보다 이른 merged_at은 무시한다. 회귀: `tests/test_watch_progress.py -k recorded_merge`.

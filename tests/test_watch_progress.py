@@ -398,3 +398,25 @@ def test_outside_merge_minutes_after_a_gate_finish_is_still_the_latest_merge(tmp
     _refresh(store, tracker, [outside, gate_pr])
     assert [(end, end - start) for *_, start, end in progress.merged_work(store)] == [
         (later, timedelta(hours=2, minutes=2))]
+
+
+def test_gate_merge_ends_at_the_recorded_merge_not_the_later_finish(tmp_path):
+    from foragent.state import StateStore
+
+    clock = [NOW - timedelta(hours=10)]
+    store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    merged_at = NOW - timedelta(hours=8)
+    store.record_merge(7, merged_at)
+    clock[0] = NOW - timedelta(hours=7)  # installation and cleanup after the merge
+    store.finish_run(7, "merged")
+    assert [(end, end - start) for *_, start, end in progress.merged_work(store)] == [
+        (merged_at, timedelta(hours=2))]
+    # A later run of the same issue inherits the saved key until its own merge; the
+    # old merge moment, before this run began, is not its end.
+    clock[0] = NOW - timedelta(hours=4)
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    clock[0] = NOW - timedelta(hours=1)
+    store.finish_run(7, "merged")
+    assert [(end, end - start) for *_, start, end in progress.merged_work(store)] == [
+        (clock[0], timedelta(hours=3))]

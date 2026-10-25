@@ -55,8 +55,13 @@ def _time(value: Any) -> datetime | None:
         return None
 
 
-def _finished(run: Any, finished_at: str | None) -> datetime | None:
-    """When a run finished; older records without a finish time use their latest recorded time."""
+def _finished(run: Any, merged_at: str | None, finished_at: str | None) -> datetime | None:
+    """When a gate run merged: the merge moment the runner recorded, else (older
+    records) its finish, else its latest recorded time. The finish comes after
+    post-merge installation and cleanup, so it only stands in for the merge."""
+    start = _time(run.started_at)
+    if (at := _time(merged_at)) is not None and (start is None or at >= start):
+        return at
     if (at := _time(finished_at)) is not None:
         return at
     times = [at for value in (run.last_progress_at, run.phase_started_at, run.last_activity_at)
@@ -87,11 +92,11 @@ def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
         if number not in latest or end > latest[number][0]:
             latest[number] = (end, size, start)
 
-    finish_times = store.finish_times()
+    finish_times, merge_times = store.finish_times(), store.merge_times()
     for run in history:
         if run.outcome != "merged":
             continue
-        if (end := _finished(run, finish_times.get((run.number, run.started_at)))) is not None:
+        if (end := _finished(run, merge_times.get(key := (run.number, run.started_at)), finish_times.get(key))) is not None:
             row = rows.get(run.number, {})
             # Before any refresh has seen the merge, the issue's current size stands in.
             size = (row.get("run_sizes") or {}).get(run.started_at) or size_of(row.get("labels", ()))

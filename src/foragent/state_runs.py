@@ -121,6 +121,13 @@ class RunRecordsMixin:
                 (merged_at - _state.datetime.fromisoformat(passed)).total_seconds() if passed else None
             ), merge_lock_held_seconds=self._merge_lock_seconds.get((number, run.started_at), 0),
         )
+        # The merge moment is saved beside the record's fields (the Run schema stays
+        # as it was); finish_run carries it into history and merge_times() reads it.
+        with self._state_lock():
+            path = self.root / "runs" / f"{number}.json"
+            value = _state.json.loads(path.read_text(encoding="utf-8"))
+            value["merged_at"] = merged_at.astimezone(_state.UTC).isoformat()
+            self._write_json(path, value)
 
     def active_runs(self) -> list[Run]:
         runs = []
@@ -222,6 +229,16 @@ class RunRecordsMixin:
         """When each finished execution ended, by (number, started_at), from its latest entry.
 
         Records written before finish times were saved have none."""
+        return self._history_times("finished_at")
+
+    def merge_times(self) -> dict[tuple[int, str], str]:
+        """When the gate merged each execution's PR, by (number, started_at).
+
+        A record keeps the key of an earlier execution of the same issue until its
+        own merge replaces it, so a time before the execution's start is not its own."""
+        return self._history_times("merged_at")
+
+    def _history_times(self, key: str) -> dict[tuple[int, str], str]:
         try:
             history = (self.root / "runs.jsonl").read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -229,8 +246,8 @@ class RunRecordsMixin:
         times: dict[tuple[int, str], str] = {}
         for line in history.splitlines():
             value = _state.json.loads(line)
-            if isinstance(value.get("finished_at"), str):
-                times[value["number"], value["started_at"]] = value["finished_at"]
+            if isinstance(value.get(key), str):
+                times[value["number"], value["started_at"]] = value[key]
         return times
 
     def prune_process_identities(self, *, inactive_only: bool = False) -> None:
