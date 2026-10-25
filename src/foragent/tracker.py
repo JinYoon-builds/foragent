@@ -109,7 +109,8 @@ class Tracker(Protocol):
     def pr_default_branch(self) -> str: ...
     def pr_failed_logs(self, pr: int) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
-    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None: ...
+    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
+                 subject: str | None = None) -> None: ...
 
 
 class TrackerError(RuntimeError):
@@ -463,8 +464,11 @@ class RecordingTracker:
         self._tracker.close_pr(pr, comment)
         self._record_pr_state(pr, pr_number=None, merged=False)
 
-    def merge_pr(self, pr, *, expected_head_sha, method="squash"):
-        self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
+    def merge_pr(self, pr, *, expected_head_sha, method="squash", subject=None):
+        if subject is None:
+            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
+        else:
+            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method, subject=subject)
         self._record_pr_state(pr, merged=True)
 
 
@@ -692,7 +696,8 @@ class FakeTracker:
     def pr_head_sha(self, pr: int) -> str:
         return self._pr_heads.get(pr, "0" * 40)
 
-    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None:
+    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
+                 subject: str | None = None) -> None:
         _merge_flag(method)
         if self.pr_head_sha(pr) != expected_head_sha:
             raise TrackerError("PR head changed after verification")
@@ -1241,8 +1246,14 @@ class GhTracker:
         annotations = _items(self._call(["api", "--paginate", f"{check_run}/annotations"]))
         return [item["message"] for item in annotations if isinstance(item.get("message"), str)]
 
-    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None:
+    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
+                 subject: str | None = None) -> None:
+        # An explicit subject stops GitHub from using a branch commit's message
+        # (single-commit PRs and repository defaults); the PR title is the subject.
+        if subject is None and method == "squash":
+            subject = json.loads(self._call(["pr", "view", str(pr), "-R", self.repo, "--json", "title"]))["title"]
         self._call([
             "pr", "merge", str(pr), "-R", self.repo, _merge_flag(method), "--delete-branch",
             "--match-head-commit", expected_head_sha,
+            *(["--subject", subject] if subject is not None else []),
         ])
