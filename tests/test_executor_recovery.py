@@ -61,13 +61,20 @@ def test_runner_persists_and_clears_real_executor_group(recovery, monkeypatch, f
     from process_fakes import install_popen
 
     ctx, observed = recovery, []
+    update_run = ctx.store.update_run
 
-    def communicate(process):
-        observed.append(StateStore(ctx.store.root).get_run(1).executor_pgid)
-        assert observed[-1] == process.pid
+    def record(number, **fields):
+        result = update_run(number, **fields)
+        # Stdin now starts before recording. Check persistence at its callback,
+        # without requiring the executor to wait for that callback to read stdin.
+        if fields.get("executor_pgid") is not None:
+            observed.append(StateStore(ctx.store.root).get_run(number).executor_pgid)
+            assert observed[-1] == fields["executor_pgid"]
+        return result
 
+    monkeypatch.setattr(ctx.store, "update_run", record)
     install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["offline-executor"],
-                  timeout=timeout, communicate=communicate)
+                  timeout=timeout)
     monkeypatch.setattr(f"foragent.executors.{executor}_command", lambda *args: ["offline-executor"])
     runner_ctx = SimpleNamespace(store=ctx.store, now=ctx.now, poll_hook=lambda execute, poll: execute())
     result = _run_executor(

@@ -261,8 +261,34 @@ def run_logged(
             argv, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
             stdout=output if capture_stdout else log,
             stderr=errors if errors is not None else log if capture_stdout else subprocess.STDOUT,
+            # Closing stdin during cancellation must not wait for a buffered
+            # writer's lock while a descendant keeps the pipe open.
+            bufsize=0,
             start_new_session=True, env={**_child_environment(cwd), **(env or {})},
         )
+        prompt_errors = []
+        prompt_cancelled = False
+
+        def write_prompt():
+            try:
+                pending = memoryview(prompt.encode("utf-8"))
+                while pending:
+                    written = process.stdin.write(pending)
+                    pending = pending[written:]
+            except (OSError, ValueError) as exc:
+                prompt_errors.append(exc)
+            finally:
+                try:
+                    process.stdin.close()
+                except (OSError, ValueError) as exc:
+                    prompt_errors.append(exc)
+
+        writer = None
+        if prompt is not None:
+            # Deliver stdin before scanning, but leave all waiting/reaping to
+            # the main thread so the launch snapshot can still record ownership.
+            writer = threading.Thread(target=write_prompt, daemon=True)
+            writer.start()
         try:
             identities = observe_tree(roots=(process.pid,))
         except PermissionError:
@@ -341,18 +367,18 @@ def run_logged(
             if on_process_tree is not None:
                 on_process_tree(identities)
             try:
-                process.communicate(input=prompt.encode("utf-8") if prompt is not None else None, timeout=timeout_s)
+                process.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 stop_children()
-                process.communicate()
+                process.wait()
             if observation_errors:
                 raise observation_errors[0]
         finally:
             stop_tracking.set()
             observer.join()
-            identities = observe_tree(identities)
             try:
+                identities = observe_tree(identities)
                 if process.poll() is None:
                     stop_children()
                     process.wait()
@@ -363,12 +389,27 @@ def run_logged(
                 if on_process_group is not None:
                     on_process_group(None)
             finally:
+                if writer is not None:
+                    # Root exit does not mean descendants have closed stdin.
+                    # Neither normal nor exceptional cleanup waits out their runtime.
+                    writer.join(timeout=1)
+                    if writer.is_alive():
+                        prompt_cancelled = True
+                        try:
+                            process.stdin.close()
+                        except (OSError, ValueError) as exc:
+                            prompt_errors.append(exc)
+                        writer.join(timeout=0.1)
                 if can_handle:
                     signal.signal(signal.SIGTERM, previous)
                 if follower is not None:
                     stop_forwarding.set()
                     follower.join()
                     forward_stdout()
+        if not prompt_cancelled:
+            for exc in prompt_errors:
+                if not isinstance(exc, BrokenPipeError):
+                    raise exc
         if capture_stdout:
             size = output.seek(0, 2)
             output.seek(max(0, size - 16000))

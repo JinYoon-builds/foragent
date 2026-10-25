@@ -13,6 +13,43 @@ from foragent.runner import run_issue
 from runner_support import COMMAND, enable_reviewer, run_case, scripted_results
 
 
+@pytest.mark.parametrize("failure", ["exit-error", "launch-error"])
+def test_failed_resume_is_counted_once_even_when_fresh_launch_also_fails(run_case, failure):
+    from foragent.run_execution import _available_executor
+    from foragent.state import StateStore
+
+    c = run_case
+    c.store.update_run(1, session_id="saved", session_executor=c.ctx.config.executor)
+    calls = []
+
+    class Executor:
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            if "resume_session_id" in kwargs:
+                if failure == "launch-error":
+                    raise OSError("resume executable unavailable")
+                kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+                kwargs["log_path"].write_text("CLI stderr: saved transcript unavailable\n")
+                return ExecResult(1, False, "resume refused", kwargs["log_path"])
+            raise OSError("fresh executable unavailable")
+
+    with pytest.raises(OSError, match="fresh executable unavailable"):
+        _available_executor(
+            1, c.ctx, Executor(), session_body="body", resume_prompt="continue",
+            worktree=c.ctx.repo_root, prompt="full task", model=None, log_path=c.store.log_path(1),
+        )
+    assert len(calls) == 2
+    assert calls[0]["prompt"] == "continue" and calls[1]["prompt"] == "full task"
+    assert StateStore(c.store.root).get_run(1).resume_failures == 1
+    log = c.store.log_path(1).read_text()
+    if failure == "launch-error":
+        assert "resume executable unavailable" in log
+    else:
+        assert "resume refused" in log and "CLI stderr: saved transcript unavailable" in log
+    c.store.finish_run(1, "executor-error")
+    c.tracker.remove_labels(1, ["running"])
+
+
 def test_executor_nonzero_exit_still_relies_on_independent_checks(run_case):
     c = run_case
     c.executor.exit_code = 1
