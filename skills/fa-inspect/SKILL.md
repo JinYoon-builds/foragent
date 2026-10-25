@@ -20,7 +20,7 @@ description: Walk through the Foragent human inbox and record decisions and feed
      then the options, recommended first, plus "Later", using AskUserQuestion.
      If evidence is absent, say so without inventing it.
      If `answered` is true, mention that a decision is already recorded
-     for the next `/fa-order`; ask for a replacement only if the user wants one.
+     for the next planning interview (`/fa`); ask for a replacement only if the user wants one.
      On an answer, run `fa inspect answer N --text "<chosen option, plus any note>"`.
      If the gate supplied no options, collect the user's own decision or Later.
    - **reapprove:** Show what changed from the summary and details. Give the
