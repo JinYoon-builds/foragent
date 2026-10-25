@@ -246,6 +246,8 @@ files lists repository-relative paths or globs expected to change; absolute path
             command.add_argument("--follow", action="store_true", help="Keep printing changes until interrupted")
         elif name != "log":
             command.add_argument("number", type=int)
+        if name in ("retry", "rerun-review", "resolve", "escalate"):
+            command.add_argument("--say", help="One line for a person, shown in the view (docs/voice.md voice)")
         if name == "premerge":
             command.add_argument("--json", action="store_true")
         elif name == "merge":
@@ -794,13 +796,14 @@ def main(argv: list[str] | None = None) -> int:
                 if unknown and not args.follow:
                     return 1
             elif args.action == "retry":
-                print(orch.retry(ctx, args.number, args.hint))
+                print(orch.retry(ctx, args.number, args.hint, say=args.say))
             elif args.action == "rerun-review":
-                print(orch.rerun_review(ctx, args.number))
+                print(orch.rerun_review(ctx, args.number, say=args.say))
             elif args.action == "resolve":
-                print(orch.resolve(ctx, args.number, args.verdict, args.note))
+                print(orch.resolve(ctx, args.number, args.verdict, args.note, say=args.say))
             elif args.action == "escalate":
-                print(orch.escalate(ctx, args.number, args.summary, args.tried, args.option, args.recommend))
+                print(orch.escalate(ctx, args.number, args.summary, args.tried, args.option, args.recommend,
+                                    say=args.say))
             elif args.action == "premerge":
                 report = orch.premerge(ctx, args.number)
                 if args.json:
