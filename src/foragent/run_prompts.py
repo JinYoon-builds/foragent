@@ -51,6 +51,7 @@ def build_prompt(
     test_command: str | None = None,
     acceptance_baseline: tuple[str, ...] = (),
     failure_limit: int | None = 4000,
+    skill_catalog: str = "",
 ) -> str:
     from foragent import runner
 
@@ -118,6 +119,7 @@ def build_prompt(
             + "\nPreserve both the features newly added on the base branch and the features for this issue. "
             "Do not commit. The runner will stage the resolution and create the merge commit."
         )
+    prompt += skill_catalog
     if orchestrator_hint is not None:
         prompt = "Orchestrator hint:\n" + orchestrator_hint + "\n\n" + prompt
     return f"/goal {runner.goal_condition(acceptance_dir)}\n\n{prompt}" if native_goal else prompt

@@ -166,6 +166,7 @@ def _implement(
     test_command = ctx.config.test_command
     if test_command is None:
         test_command = next(iter(runner.detect_test_commands(worktree)), None)
+    fixed = lane_skill_names(ctx.config, run.lane, worktree, lane_notes(ctx.config, run.lane, worktree)[0])
     prompt = build_prompt(
         n, attempt.parsed, ctx.config.acceptance_dir, failure_context, ctx.config.language,
         native_goal=not attempt.native_claude and ctx.config.codex_goal, acceptance_locked=attempt.native_claude,
@@ -175,9 +176,8 @@ def _implement(
         test_command=test_command,
         acceptance_baseline=attempt.baseline.node_ids if attempt.baseline else (),
         failure_limit=None if isinstance(failure, CIFailure) else 4000,
+        skill_catalog=catalog_section(available_skills(ctx.config, fixed)),
     )
-    fixed = lane_skill_names(ctx.config, run.lane, worktree, lane_notes(ctx.config, run.lane, worktree)[0])
-    prompt += catalog_section(available_skills(ctx.config, fixed))
     result = _available_executor(
         n, ctx, attempt.executor, worktree=worktree,
         prompt=prompt if attempt.native_claude else notes + prompt,
