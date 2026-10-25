@@ -52,13 +52,15 @@ def checked_tick(case, table):
     return scheduler.tick(stop_context(case, table))
 
 
-def assert_one_listing(table, stops=0):
-    # Routine liveness shares one snapshot; each tree being stopped may take one
-    # fresh listing of its own, because a snapshot can be minutes old and miss a
-    # child forked after it (that child would otherwise be orphaned to pid 1).
-    assert table.list_calls <= 1 + stops, (
-        f"One tick must share one process-table snapshot plus at most one fresh listing per stopped tree "
-        f"({stops} stopped); got {table.list_calls} listings"
+def assert_one_listing(table, stops=False):
+    # Routine liveness shares one snapshot. A tick that stops anything may take one
+    # more fresh listing, shared by every stop in that tick, because the snapshot can
+    # be minutes old and miss a child forked after it (that child would otherwise be
+    # orphaned to pid 1). A tick therefore lists at most twice, however many trees stop.
+    limit = 2 if stops else 1
+    assert table.list_calls <= limit, (
+        f"One tick must share one process-table snapshot, plus one fresh listing shared by all stops "
+        f"(stops={bool(stops)}); got {table.list_calls} listings"
     )
 
 
@@ -108,7 +110,7 @@ def test_tick_lists_once_for_five_runs_with_three_hundred_identities(
     assert active <= table.live, "Snapshot confused an active tree with an orphan"
     assert not orphaned & table.live, "Verified inactive tree members survived cleanup"
     assert_only_signaled(table, orphaned)
-    assert_one_listing(table)
+    assert_one_listing(table, stops=bool(orphaned))
 
 
 def test_tick_prunes_exited_identities_and_bounds_growth_across_ticks(
@@ -187,7 +189,7 @@ def test_tick_preserves_unknown_identities_until_a_readable_snapshot(
     else:
         assert not {root.pid, executor.pid} & table.live, "A readable tick must resume verified orphan cleanup"
         assert_only_signaled(table, {root.pid, executor.pid})
-    assert_one_listing(table)
+    assert_one_listing(table, stops=state != "running")
     if state == "finished":
         # A process stopped after enumeration can remain in that snapshot.
         # The next tick must see its exit and persist an empty ownership list.
@@ -211,7 +213,7 @@ def test_tick_snapshot_reaps_only_recorded_inactive_trees(
     assert case.store.get_run(3) is None, "Never-launched worktree must have no ownership record"
     assert not set(orphans) & table.live, "Recorded orphan descendants must be reaped"
     assert_only_signaled(table, set(orphans))
-    assert_one_listing(table, stops=1)
+    assert_one_listing(table, stops=True)
     signals = list(table.signals)
     checked_tick(case, table)
     assert identities(case) == set(), "The next snapshot must remove reaped orphan identities"
@@ -247,7 +249,7 @@ def test_tick_snapshot_preserves_reused_pid_and_its_unrecorded_child(
     assert {replacement.pid, child.pid} <= table.live, "Changed start time must reject a reused PID and its child"
     assert not owned & table.live, "PID reuse must not prevent cleanup of other recorded descendants"
     assert_only_signaled(table, owned)
-    assert_one_listing(table, stops=1)
+    assert_one_listing(table, stops=True)
 
 
 def test_tick_snapshot_rechecks_identity_if_pid_is_reused_during_stop(
@@ -278,7 +280,7 @@ def test_tick_snapshot_rechecks_identity_if_pid_is_reused_during_stop(
     owned = {row.pid for row in tree} - set(replaced)
     assert not owned & table.live, "Other verified members of the inactive tree survived"
     assert_only_signaled(table, owned)
-    assert_one_listing(table, stops=1)
+    assert_one_listing(table, stops=True)
 
 
 def test_tick_snapshot_never_signals_a_run_without_recorded_identities(
@@ -307,7 +309,7 @@ def test_tick_snapshot_never_signals_a_run_without_recorded_identities(
     owned = {row.pid for row in tree}
     assert not owned & table.live, "The independently recorded inactive run must still be cleaned up"
     assert_only_signaled(table, owned)
-    assert_one_listing(table)
+    assert_one_listing(table, stops=True)
 
 
 @pytest.mark.parametrize("failed", [False, True], ids=["success", "failure"])
@@ -396,4 +398,4 @@ def test_tick_stop_signals_a_child_forked_after_the_snapshot(
     owned = {row.pid for row in tree} | {late[0].pid}
     assert not owned & table.live, "Every member of the stopped tree must end"
     assert_only_signaled(table, owned)
-    assert_one_listing(table, stops=1)
+    assert_one_listing(table, stops=True)
