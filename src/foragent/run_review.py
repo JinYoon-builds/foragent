@@ -319,7 +319,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
                 pr.body + "\n\n## Review scope\n\n" + review_scope_rules(ctx.config.acceptance_dir))
             body = risks.refresh_notes(body, _risk_notes(git, base_ref))
             if body != pr.body:
-                ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=body)
+                pr = replace(pr, body=body)
+                ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
         review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx),
                          pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")

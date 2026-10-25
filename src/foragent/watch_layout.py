@@ -26,9 +26,22 @@ def _has_work(row: dict[str, Any]) -> bool:
             or row["state"] in {"working", "blocked", "waiting-human"})
 
 
+# Run phases in which the runner waits on checks, CI, a merge or a review.
+# Waits inside them (merge.lock, a test slot) need no phase of their own.
+WAITING_PHASES = frozenset({"checking", "ci", "merging", "reviewing"})
+
+
 def _activity(
     row: dict[str, Any], language: str, age: float, stall_minutes: float, pid: int | None,
+    log_seconds: float | None = None, progress_seconds: float | None = None,
+    phase_seconds: float | None = None,
 ) -> str:
+    """The activity cell, judged by evidence: a live PID, the worker's last activity
+    (its runner log when present) and the runner's own last progress (D67).
+
+    A run looks stalled or quiet only when both the worker and the runner have been
+    silent past the threshold. Otherwise a waiting phase shows the phase and its age.
+    """
     from foragent import watch
 
     if row["state"] == "blocked":
@@ -42,9 +55,28 @@ def _activity(
             return watch.text("watch_runner_gone", language)
         except PermissionError:
             pass  # A process owned by another user still exists.
-    seconds = row["last_activity_seconds"]
-    if seconds is not None and seconds + age > min(10, stall_minutes) * 60:
-        return watch.text("watch_stalled", language, minutes=int((seconds + age) // 60))
+    limit = min(10, stall_minutes) * 60
+
+    def silent(seconds: float | None) -> float | None:
+        if seconds is None:
+            return None
+        quiet = seconds + age
+        if progress_seconds is not None:
+            quiet = min(quiet, progress_seconds + age)
+        return quiet
+
+    if log_seconds is not None:
+        # The log's growth is the evidence; state metadata is not.
+        quiet = silent(log_seconds)
+        if quiet >= limit:
+            return watch.text("watch_quiet", language, minutes=int(quiet // 60))
+    else:
+        quiet = silent(row["last_activity_seconds"])
+        if quiet is not None and quiet > limit:
+            return watch.text("watch_stalled", language, minutes=int(quiet // 60))
+    if row.get("phase") in WAITING_PHASES and phase_seconds is not None:
+        return watch.text("watch_in_phase", language, phase=watch.text(row["phase"], language),
+                          minutes=int((phase_seconds + age) // 60))
     return "●"
 
 
@@ -69,9 +101,10 @@ def _split(status: dict[str, Any]) -> tuple[list[tuple[int, dict]], list[tuple[i
 
 
 def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """Active runs by lane in start order (ties by issue number); several runs are its workers."""
+    """Running runs by lane in start order; ties in start time break by issue number."""
     clones: dict[str, list[dict[str, Any]]] = {}
-    for run in sorted(status["active_runs"], key=lambda run: (run.get("started_at") or "", run["number"])):
+    running = [run for run in status["active_runs"] if run.get("status", "running") == "running"]
+    for run in sorted(running, key=lambda run: (run.get("started_at") or "", run["number"])):
         clones.setdefault(run["lane"], []).append(run)
     return clones
 
@@ -94,9 +127,13 @@ def _worker_rows(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -
 
 
 def _lane_issues(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[int]:
+    """The lane's shown issues: its current issue first, or its workers in start order when it has several."""
     current = row["issue"] if row["state"] in {"working", "blocked", "waiting-human"} else None
+    workers = [run["number"] for run in clones.get(row["slug"], [])]
+    if len(workers) > 1:
+        return workers + ([current] if current is not None and current not in workers else [])
     numbers = [current] if current is not None else []
-    return numbers + [run["number"] for run in clones.get(row["slug"], []) if run["number"] not in numbers]
+    return numbers + [number for number in workers if number not in numbers]
 
 
 def _sections() -> list[ModuleType]:
