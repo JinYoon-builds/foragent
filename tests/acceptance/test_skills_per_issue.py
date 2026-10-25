@@ -1,5 +1,6 @@
 """Acceptance test for skills-per-issue. Locked by Foragent; do not edit."""
 
+import json
 import pytest
 
 from test_skills_autosync import isolated_home, write_global_config
@@ -33,6 +34,8 @@ def issue_skills_case(git_history, tmp_path, monkeypatch):
         "repo": "owner/repo", "lanes": case.config.lanes,
     }))
     case.ctx.config = load_config(case.root)
+    # The Claude reviewer answers with a /code-review result event, as the real CLI does.
+    case.reviewer.steps = [json.dumps({"result": "(none)"})]
     return case, library, descriptions
 
 
