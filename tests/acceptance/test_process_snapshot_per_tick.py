@@ -52,9 +52,13 @@ def checked_tick(case, table):
     return scheduler.tick(stop_context(case, table))
 
 
-def assert_one_listing(table):
-    assert table.list_calls == 1, (
-        f"One tick must share one process-table snapshot; got {table.list_calls} listings"
+def assert_one_listing(table, stops=0):
+    # Routine liveness shares one snapshot; each tree being stopped may take one
+    # fresh listing of its own, because a snapshot can be minutes old and miss a
+    # child forked after it (that child would otherwise be orphaned to pid 1).
+    assert table.list_calls <= 1 + stops, (
+        f"One tick must share one process-table snapshot plus at most one fresh listing per stopped tree "
+        f"({stops} stopped); got {table.list_calls} listings"
     )
 
 
@@ -207,7 +211,7 @@ def test_tick_snapshot_reaps_only_recorded_inactive_trees(
     assert case.store.get_run(3) is None, "Never-launched worktree must have no ownership record"
     assert not set(orphans) & table.live, "Recorded orphan descendants must be reaped"
     assert_only_signaled(table, set(orphans))
-    assert_one_listing(table)
+    assert_one_listing(table, stops=1)
     signals = list(table.signals)
     checked_tick(case, table)
     assert identities(case) == set(), "The next snapshot must remove reaped orphan identities"
@@ -243,7 +247,7 @@ def test_tick_snapshot_preserves_reused_pid_and_its_unrecorded_child(
     assert {replacement.pid, child.pid} <= table.live, "Changed start time must reject a reused PID and its child"
     assert not owned & table.live, "PID reuse must not prevent cleanup of other recorded descendants"
     assert_only_signaled(table, owned)
-    assert_one_listing(table)
+    assert_one_listing(table, stops=1)
 
 
 def test_tick_snapshot_rechecks_identity_if_pid_is_reused_during_stop(
@@ -274,7 +278,7 @@ def test_tick_snapshot_rechecks_identity_if_pid_is_reused_during_stop(
     owned = {row.pid for row in tree} - set(replaced)
     assert not owned & table.live, "Other verified members of the inactive tree survived"
     assert_only_signaled(table, owned)
-    assert_one_listing(table)
+    assert_one_listing(table, stops=1)
 
 
 def test_tick_snapshot_never_signals_a_run_without_recorded_identities(
@@ -362,3 +366,34 @@ def test_gate_tick_records_duration_seconds_and_exposes_it_in_status(
         assert duration == pytest.approx(seconds), "Record elapsed seconds for this tick, preserving fractions"
         assert status["tick_outcome"]["duration_seconds"] == duration
         assert not fake_processes.signals, "Measuring an idle tick must not signal anything"
+
+def test_tick_stop_signals_a_child_forked_after_the_snapshot(
+    git_history, tmp_path, monkeypatch, fake_processes,
+):
+    case = stop_case(git_history, tmp_path, monkeypatch)
+    table = fake_processes
+    tree = record_tree(case, table)
+    case.store.finish_run(1, "killed")
+    case.tracker.remove_labels(1, ["approved", "running"])
+    case.tracker.close_issue(1)
+    listing = table.list_processes
+    late = []
+
+    def list_then_fork():
+        rows = listing()
+        if not late:
+            # A recorded member forks a child right after the tick's snapshot.
+            parent = tree[2]
+            late.append(table.add(45000, ppid=parent.pid, pgid=parent.pgid, sid=parent.sid,
+                                  cwd=case.store.worktree_path(1), start_time=parent.start_time + 50))
+        return rows
+
+    monkeypatch.setattr(processes, "list_processes", list_then_fork, raising=False)
+    checked_tick(case, table)
+
+    assert late, "Fixture must fork a child after the first listing"
+    assert late[0].pid not in table.live, "A child forked after the tick snapshot must be stopped with its tree"
+    owned = {row.pid for row in tree} | {late[0].pid}
+    assert not owned & table.live, "Every member of the stopped tree must end"
+    assert_only_signaled(table, owned)
+    assert_one_listing(table, stops=1)
