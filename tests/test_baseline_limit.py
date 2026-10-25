@@ -40,7 +40,8 @@ def capture_case(tmp_path, monkeypatch):
         path.write_text("def test_keep(): pass\n")
 
     git = SimpleNamespace(ref_sha=lambda ref: c.base, blob_sha=lambda *args: None,
-                          add_detached_worktree=add_worktree, remove_worktree=lambda root: None)
+                          add_detached_worktree=add_worktree, remove_worktree=lambda root: None,
+                          at=lambda root: SimpleNamespace(head_sha=lambda: c.base, _call=lambda args: ""))
     c.ctx = runner.RunContext(
         repo="owner/repo", repo_root=repo, tracker=FakeTracker(), store=store, git=git,
         config=Config(test_command="pytest", max_runtime_minutes=24 * 60), now=lambda: now[0],

@@ -68,3 +68,4 @@ class Run:
     last_review_pass_at: str | None = None
     review_pass_to_merge_seconds: float | None = None
     merge_lock_held_seconds: float | None = None
+    comparison: dict | None = None
