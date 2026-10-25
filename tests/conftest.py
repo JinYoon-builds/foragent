@@ -56,6 +56,12 @@ def no_view_windows(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_release_lookup(monkeypatch):
+    """Never ask GitHub for the latest release during the test suite (#417)."""
+    monkeypatch.setenv("FORAGENT_UPDATE_CHECK", "off")
+
+
+@pytest.fixture(autouse=True)
 def isolated_test_slots(tmp_path, monkeypatch):
     """Keep machine-wide test slots away from the real data root and live runs."""
     from foragent import capacity

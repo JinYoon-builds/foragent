@@ -32,7 +32,7 @@ def test_exact_defaults(repo):
         "repo": None, "board": None, "board_map": None, "language": "en", "codex_goal": False, "review_level": "low",
         "review_scope": "claude-local", "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
-        "interview": "native", "ouroboros_version": None, "profile": None,
+        "interview": "native", "ouroboros_version": None, "profile": None, "update_check": True,
         "skill_roles": {},
         "lanes": {}, "max_parallel": None, "parallel_floor": 1, "test_slots": 2, "test_slots_floor": 1,
         "executor_fallback_model": None,

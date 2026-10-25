@@ -13,7 +13,7 @@ from typing import Any
 
 import yaml
 
-from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_inbox, orch_queue, orch_tick_outcome, order, tidy, watch, watch_open
+from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_inbox, orch_queue, orch_tick_outcome, order, tidy, update_check, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -319,6 +319,8 @@ files lists repository-relative paths or globs expected to change; absolute path
     briefing.add_argument("--json", action="store_true")
     briefing.add_argument("--repo-root", type=Path, default=Path.cwd())
     # Listed for `fa --help` only; main() hands `fa test ...` to pytest before parsing.
+    updating = commands.add_parser("update", help="Install the latest Foragent release and restart the gates")
+    updating.add_argument("--repo-root", type=Path, default=None)
     test = commands.add_parser(
         "test", help="Wait for a machine-wide test slot, then run pytest with the given arguments",
         usage=TEST_USAGE, add_help=False,
@@ -483,6 +485,8 @@ def _print_machine_budget(status: dict[str, Any], language: str) -> None:
 
 
 def _print_status(status: dict[str, Any], language: str = "en") -> None:
+    if offer := status.get("update"):
+        print(update_check.offer_line(offer, language))
     if status_unknown(status):
         print(text("status_unknown", language) + (f": {status['error']}" if status.get("error") else ""))
     print(text("summary", language, **summary_values(status["summary"])))
@@ -650,6 +654,8 @@ def main(argv: list[str] | None = None) -> int:
         from foragent import statusline
         return statusline.run()
     try:
+        if args.command == "update":
+            return update_check.update(args.repo_root)
         if args.command == "ci":
             from foragent.ci_workflow import write_workflow
             print(f"Wrote {write_workflow(args.repo_root.resolve())}")
@@ -741,6 +747,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"Planning session alive at {record['at']}.")
             else:
                 facts = brief.collect(store, config, datetime.now(UTC))
+                if offer := update_check.check(config):
+                    facts["update"] = offer
                 print(json.dumps(facts, ensure_ascii=False) if args.json
                       else brief.render(facts, config.language))
             return 0
@@ -895,6 +903,8 @@ def main(argv: list[str] | None = None) -> int:
             status["machine_budget"] = machine_budget.read().report()
             status["repo_floors_ignored"] = _repo_floor_keys(root)
             status["tick_outcome"] = orch_tick_outcome.read(store)
+            if offer := update_check.check(config):
+                status["update"] = offer
             if args.json:
                 print(json.dumps(status))
             else:

@@ -78,6 +78,7 @@ class Config:
     language: str = "en"
     interview: str = "native"
     ouroboros_version: str | None = None
+    update_check: bool = True  # The daily release check (#417); FORAGENT_UPDATE_CHECK=off also opts out.
     profile: dict[str, Any] | None = None
 
 
@@ -419,6 +420,8 @@ def _validate(values: dict[str, Any]) -> None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
+    if type(values["update_check"]) is not bool:
+        raise ConfigError("update_check must be true or false")
     if values["test_slots_floor"] > values["test_slots"]:
         raise ConfigError("test_slots_floor must be <= test_slots")
     if values["max_parallel"] is not None and values["parallel_floor"] > values["max_parallel"]:
