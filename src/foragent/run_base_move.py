@@ -41,6 +41,13 @@ def capture_move(git: GitRepo, target_sha: str) -> BaseMove:
     return BaseMove(git.ref_sha("HEAD"), git.ref_sha(target_sha))
 
 
+def fetch_move(attempt: Implementation, verified_head: str) -> BaseMove:
+    """Keep the fetched base even when it is already in the verified head."""
+    attempt.ctx.git.fetch("origin", attempt.target_branch)
+    target = attempt.git.ref_sha(f"origin/{attempt.target_branch}")
+    return BaseMove(verified_head, target)
+
+
 def _nul_paths(output: str) -> list[str]:
     # Paths are taken verbatim between NUL bytes: a filename may start or end
     # with whitespace or newlines, so no character other than NUL is stripped.
