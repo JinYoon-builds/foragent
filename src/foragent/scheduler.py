@@ -24,7 +24,8 @@ from foragent.processes import current_snapshot, kill_process_group, runner_comm
 from foragent.scheduler_stop import runner_process_exists, tick_processes
 from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
 from foragent.scheduler_start import (
-    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _has_slot, _machine_budget, _reserve_slot, _start_ready,
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _apply_budgets, _has_slot, _machine_budget, _reserve_slot,
+    _start_ready,
     append_budget_history, decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel,
     prebuild_acceptance_baseline, read_state, start_baseline_thread, update_test_slots, write_state,
 )
@@ -81,10 +82,11 @@ def tick(ctx: TickContext) -> TickReport:
         if not acquired:
             return TickReport(skipped=BUSY_TICK)
         with tick_processes(ctx.store) as snapshot:
-            cleanup = TickReport()
+            cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
             if snapshot.available:
                 _reap_inactive_runs(ctx, cleanup)
             if until := ctx.store.github_wait_until(ctx.now()):
+                _apply_budgets(ctx, {})
                 return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
             if not isinstance(ctx.tracker, RecordingTracker):
                 ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
@@ -95,6 +97,7 @@ def tick(ctx: TickContext) -> TickReport:
                 if not exc.is_rate_limit:
                     raise
                 until = orch_github.pause(ctx, exc)
+                _apply_budgets(ctx, {})
                 return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
             # After this tick's starts, so idle lanes are really idle. A due tidy is a
             # request for the orchestrator's judgment, never a launch or an order.
@@ -104,7 +107,7 @@ def tick(ctx: TickContext) -> TickReport:
 
 
 def _tick_locked(ctx: TickContext) -> TickReport:
-    report = TickReport()
+    report, ctx._budget_sample = TickReport(), None
     started = ctx.now()  # The tick's own time; the fetch below can take seconds.
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
@@ -120,6 +123,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         board.refresh_cards(ctx, recorder)
     ctx.tracker.flush_outbox()
     if until := ctx.store.github_wait_until(ctx.now()):
+        _apply_budgets(ctx, {})
         return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}")
     snapshot = current_snapshot()
     processes_available = snapshot is None or snapshot.available
@@ -212,17 +216,12 @@ def _tick_locked(ctx: TickContext) -> TickReport:
 
     if until := ctx.store.github_wait_until(ctx.now()):
         report.skipped = f"GitHub rate limit until {until.isoformat()}"
+        _apply_budgets(ctx, ready)
         return report
-    # One sensor sample per tick sizes both the test slots and the run budget.
-    sample = machine_load()
-    update_test_slots(
-        ctx.config.test_slots, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
-        swapins=getattr(sample, "swapins", None), floor=ctx.config.test_slots_floor,
-    )
+    sample = _apply_budgets(ctx, ready, workers=False)  # The worker budget is sized below with this sample.
     prebuild_acceptance_baseline(ctx, base_ref, ctx.baseline_launcher)
-    if not ctx.start_runs or not ready:
-        return report
-    if not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+    if not ctx.start_runs or not ready or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+        _machine_budget(ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
 
     # A lane's local queue picks the order; startability was already checked above.

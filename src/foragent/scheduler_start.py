@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import scheduler
+from foragent import machine_budget, scheduler
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, decrease_allowed, machine_load,
@@ -30,6 +30,27 @@ def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
     return any(ctx.store.executor_paused(name, now) for name in {config.executor, resolved_reviewer(config)})
 
 
+def _apply_budgets(
+    ctx: TickContext, ready: dict[str, list[int]], *, workers: bool = True,
+) -> tuple[str, float]:
+    """Apply machine.yml and pressure to the shared budgets once per tick; return its sensor sample.
+
+    Every tick runs this, a GitHub wait included. ``workers=False`` leaves the
+    worker budget to the caller, which sizes it with this sample right away.
+    """
+    if (sample := getattr(ctx, "_budget_sample", None)) is not None:
+        return sample  # Already applied in this tick.
+    sample, machine = scheduler.machine_load(), machine_budget.values()
+    ctx._budget_sample = sample
+    scheduler.update_test_slots(
+        machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
+        swapins=getattr(sample, "swapins", None), floor=machine["test_slots_floor"],
+    )
+    if workers:
+        scheduler._machine_budget(ctx, ready, sample)
+    return sample
+
+
 def _machine_budget(
     ctx: TickContext, ready: dict[str, list[int]], sample: tuple[str, float] | None = None,
 ) -> int:
@@ -39,20 +60,31 @@ def _machine_budget(
     waiting = sum(len(numbers) for lane, numbers in ready.items() if not _lane_held(ctx, lane, now))
     sample = sample if sample is not None else scheduler.machine_load()
     pressure, load = sample
+    machine = machine_budget.values()  # The shared value follows machine.yml only.
+    ceiling = machine["max_parallel"]
     with scheduler.machine_lock(ctx.store):
         state = scheduler.read_state(ctx.store)
         current = int(state["parallel"]) if state else scheduler.INITIAL_PARALLEL
+        if state and ceiling is not None and current > ceiling:
+            # A lower ceiling applies at once and alone: no AIMD step, no decrease
+            # interval, no decreased_at. Running work keeps going; new starts see it.
+            scheduler.write_state(ctx.store, ceiling, now, decreased_at=state.get("decreased_at"))
+            scheduler.append_budget_history(
+                ctx.store.root.parent, now, "parallel", current, ceiling, pressure=pressure,
+                load_per_cpu=load, swapins=getattr(sample, "swapins", None), wanted=ceiling,
+            )
+            return max(1, min(ceiling, scheduler.machine_runs(ctx.store, now) + waiting))
         changed_at = scheduler.datetime.fromisoformat(state["changed_at"]) if state else now
         demand = scheduler.machine_runs(ctx.store, now) + waiting
         # Work only caps growth: the shared value never drops below itself for lack
         # of work here, so it stays the pressure- and load-driven value.
         wanted = scheduler.next_parallel(
             current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
-            ceiling=None, increase_ok=now - changed_at >= scheduler.INCREASE_INTERVAL,
+            ceiling=ceiling, increase_ok=now - changed_at >= scheduler.INCREASE_INTERVAL,
         )
         if wanted < current and not scheduler.decrease_allowed(state, now):
             wanted = current
-        value = wanted if pressure == "critical" else max(ctx.config.parallel_floor, wanted)
+        value = wanted if pressure == "critical" else max(machine["parallel_floor"], wanted)
         if state is None or value != current:
             decreased_at = (
                 now.astimezone(scheduler.UTC).isoformat() if value < current else (state or {}).get("decreased_at")
