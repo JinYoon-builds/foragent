@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -34,119 +33,13 @@ def _filesystem_case_sensitive(repo_root: Path) -> bool | None:
     return None
 
 
-def _file_patterns_overlap(left: str, right: str, *, case_sensitive: bool = True) -> bool:
-    """Intersect path globs, including files that do not exist yet.
+def _file_patterns_overlap(left: str, right: str, *others: str, case_sensitive: bool = True) -> bool:
+    from foragent.path_overlap import _file_patterns_overlap as intersect
 
-    As in policy._matches, * and ? stay in a component; ** spans components.
-    Walking pairs of glob positions accounts for both patterns' wildcards.
-    """
-    def intersect(a, b, star: str, compatible: Callable[[str, str], bool]) -> bool:
-        pending, seen = [(0, 0)], set()
-        while pending:
-            i, j = pending.pop()
-            if (i, j) in seen:
-                continue
-            seen.add((i, j))
-            if i == len(a) and j == len(b):
-                return True
-            if i < len(a) and a[i] == star:
-                pending.append((i + 1, j))
-            if j < len(b) and b[j] == star:
-                pending.append((i, j + 1))
-            if i < len(a) and j < len(b) and compatible(a[i], b[j]):
-                pending.append((i + (a[i] != star), j + (b[j] != star)))
-        return False
-
-    def tokens(pattern: str):
-        i = 0
-        while i < len(pattern):
-            start, i = i, i + 1
-            if pattern[start] == "[":
-                end = i
-                if end < len(pattern) and pattern[end] == "!":
-                    end += 1
-                if end < len(pattern) and pattern[end] == "]":
-                    end += 1
-                while end < len(pattern) and pattern[end] != "]":
-                    end += 1
-                if end < len(pattern):
-                    i = end + 1
-            yield pattern[start:i]
-
-    def components_overlap(a: str, b: str) -> bool:
-        # Full case folding covers literal filesystem aliases such as ß/ss.
-        # Leave globs unchanged so ? and character classes keep their width.
-        if (
-            not case_sensitive and not (a + b).isascii()
-            and not scheduler.has_magic(a) and not scheduler.has_magic(b) and a.casefold() == b.casefold()
-        ):
-            return True
-        # Literal/range endpoints and their successors represent every distinct
-        # character class membership when matching case-sensitively.
-        alphabet = {"\x01"} | {
-            chr(code) for char in a + b for code in (ord(char), ord(char) + 1)
-            if 0 < code <= 0x10ffff and code != ord("/")
-        }
-        if not case_sensitive:
-            alphabet.update(chr(code) for code in range(1, 128) if code != ord("/"))
-        a_tokens, b_tokens = tuple(tokens(a)), tuple(tokens(b))
-        # Apply case equivalence to each token, preserving its width and the
-        # original character classes (including punctuation inside [A-z]).
-        matchers = {
-            token: scheduler.re.compile(scheduler.translate(token), 0 if case_sensitive else scheduler.re.IGNORECASE)
-            for token in set(a_tokens + b_tokens)
-        }
-
-        def compatible(x: str, y: str) -> bool:
-            if any(matchers[x].fullmatch(c) and matchers[y].fullmatch(c) for c in alphabet):
-                return True
-            # Unicode case mappings inside classes need not be monotonic, so
-            # endpoints alone cannot prove two nonliteral tokens disjoint.
-            return (
-                not case_sensitive and not (x + y).isascii()
-                and (len(x) > 1 or x in ("*", "?"))
-                and (len(y) > 1 or y in ("*", "?"))
-            )
-
-        return intersect(
-            a_tokens, b_tokens, "*", compatible,
-        )
-
-    return intersect(scheduler.PurePosixPath(left).parts, scheduler.PurePosixPath(right).parts, "**", components_overlap)
+    return intersect(left, right, *others, case_sensitive=case_sensitive)
 
 
 def _can_start_in_lane(ctx: TickContext, lane: str, issue: Issue) -> bool:
-    """Start beside every running issue in the lane only when no declared files overlap."""
-    running = [run for run in ctx.store.active_runs() if run.lane == lane]
-    if not running:
-        return True
-    approval = ctx.store.load_approval(issue.number)
-    if approval is None:
-        return False
-    files = scheduler.parse_body(approval.body).files
-    if not files:
-        return False
-    running_files: list[str] = []
-    for run in running:
-        running_approval = ctx.store.load_approval(run.number)
-        if running_approval is None:
-            return False
-        # The approval file can be replaced while the runner retains its old body.
-        # Legacy records can use a snapshot approved no later than the run start.
-        if run.approval_body_sha is None:
-            if (
-                scheduler.datetime.fromisoformat(running_approval.approved_at)
-                > scheduler.datetime.fromisoformat(run.started_at)
-            ):
-                return False
-        elif run.approval_body_sha != running_approval.body_sha:
-            return False
-        declared = scheduler.parse_body(running_approval.body).files
-        if not declared:
-            return False
-        running_files.extend(declared)
-    case_sensitive = scheduler._filesystem_case_sensitive(ctx.repo_root)
-    return case_sensitive is not None and not any(
-        scheduler._file_patterns_overlap(candidate, active, case_sensitive=case_sensitive)
-        for candidate in files for active in running_files
-    )
+    from foragent.overlap_files import can_start
+
+    return can_start(ctx, lane, issue.number)

@@ -13,6 +13,7 @@ from foragent.reasons import Reason
 from foragent.run_attempt import ConflictBudgetExhausted, ExecutorStopped, PatchReplayError
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_lane_skills import _inject_lane_skills
+from foragent.run_overlap import conflict_resolution, record_redo
 
 if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
@@ -90,6 +91,7 @@ def _recover_replay(attempt: Implementation, exc: PatchReplayError) -> str:
 def _rebuild(attempt: Implementation, exc: ConflictBudgetExhausted) -> str:
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     log = attempt.log
+    record_redo(attempt)
     attempt.rebuilt = True
     _append(log, f"Rebuilding issue branch once from latest {attempt.target_branch}.\n{exc}")
     ctx.git.fetch("origin", attempt.target_branch)
@@ -118,13 +120,18 @@ def _block_rebuild(attempt: Implementation, details: str) -> str:
 
 
 def _resolve_conflicts(attempt: Implementation, conflicts: list[str]) -> None:
+    conflicts = sorted(set(conflicts) | set(attempt.ctx.store.get_run(attempt.n).merge_conflicts))
+    with conflict_resolution(attempt, conflicts):
+        _resolve_conflicts_inner(attempt, conflicts)
+
+
+def _resolve_conflicts_inner(attempt: Implementation, conflicts: list[str]) -> None:
     from foragent.ci_mode import commit_exclusions, enabled
     from foragent.run_checks import _verify_implementation
     from foragent.run_implementation import _implement
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     log = attempt.log
-    conflicts = sorted(set(conflicts) | set(ctx.store.get_run(n).merge_conflicts))
     ctx.store.update_run(n, merge_conflicts=conflicts)
     title = f"{attempt.issue.title} (#{n})"
     pending_merge = git.merge_in_progress()
