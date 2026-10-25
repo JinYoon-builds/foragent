@@ -51,6 +51,68 @@ def _run_launchctl(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["launchctl", *args], capture_output=True, text=True, check=False)
 
 
+def _bootout(call: Callable[[list[str]], subprocess.CompletedProcess[str]], target: str) -> None:
+    result = call(["bootout", target])
+    if result.returncode:
+        message = (result.stderr or result.stdout or "").strip()
+        if re.search(r"not loaded|could not find service|no such process|service not found", message, re.I):
+            return
+        if result.returncode == 3 and not message:
+            return
+        raise LaunchdError(f"launchctl bootout: {message or result.returncode}")
+
+
+@dataclass(frozen=True)
+class InstalledJob:
+    """A gate job exactly as its plist file names it, including legacy labels."""
+    plist_path: Path
+    label: str
+    repo_root: Path
+    domain: str
+
+    @property
+    def target(self) -> str:
+        return f"{self.domain}/{self.label}"
+
+    def _call(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        try:
+            return _run_launchctl(args)
+        except OSError as exc:
+            raise LaunchdError(f"launchctl: {exc}") from exc
+
+    def loaded(self) -> bool:
+        try:
+            return _run_launchctl(["print", self.target]).returncode == 0
+        except FileNotFoundError:
+            return False
+
+    def restart(self) -> None:
+        """Reload the plist as installed: bootout, then bootstrap the same file."""
+        _bootout(self._call, self.target)
+        result = self._call(["bootstrap", self.domain, str(self.plist_path)])
+        if result.returncode:
+            raise LaunchdError(f"launchctl bootstrap: {result.stderr or result.stdout or result.returncode}")
+
+
+def installed_jobs(home: Path | None = None, uid: int | None = None) -> list[InstalledJob]:
+    """Every dev.foragent.*.plist gate job on this machine, hashed or legacy label."""
+    directory = ((Path(home).expanduser() if home is not None else Path.home()) / "Library/LaunchAgents").resolve()
+    domain = f"gui/{os.getuid() if uid is None else uid}"
+    jobs = []
+    for path in sorted(directory.glob("dev.foragent.*.plist")):
+        try:
+            data = plistlib.loads(path.read_bytes())
+            arguments = list(data.get("ProgramArguments") or [])
+            root = Path(arguments[arguments.index("--repo-root") + 1]).expanduser().resolve()
+            label = data["Label"]
+        except (OSError, ValueError, IndexError, KeyError, TypeError, AttributeError,
+                plistlib.InvalidFileException):
+            continue
+        if isinstance(label, str) and label.startswith("dev.foragent."):
+            jobs.append(InstalledJob(path, label, root, domain))
+    return jobs
+
+
 class Launchd:
     def __init__(
         self, repo_root: Path, *, repo: str | None = None, git: GitRepo | None = None,
@@ -101,14 +163,7 @@ class Launchd:
             raise LaunchdError(f"launchctl: {exc}") from exc
 
     def _bootout(self, target: str | None = None) -> None:
-        result = self._call(["bootout", target or self.target])
-        if result.returncode:
-            message = (result.stderr or result.stdout or "").strip()
-            if re.search(r"not loaded|could not find service|no such process|service not found", message, re.I):
-                return
-            if result.returncode == 3 and not message:
-                return
-            raise LaunchdError(f"launchctl bootout: {message or result.returncode}")
+        _bootout(self._call, target or self.target)
 
     def _remove_legacy(self) -> None:
         if self.legacy_plist_path.exists():
