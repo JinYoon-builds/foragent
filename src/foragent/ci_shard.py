@@ -10,7 +10,6 @@ import tempfile
 from time import monotonic
 
 from foragent.ci_workflow import EXCLUSIONS, acceptance_command, measurement_scope
-from foragent.ci_transport import encode_report
 from foragent.config import load_config
 
 
@@ -51,6 +50,9 @@ def main():
                             check=True, capture_output=True, text=True).stdout.strip()
     if actual != head:
         raise ValueError("checkout is not the PR head")
+    if not (root / EXCLUSIONS).exists():
+        print("Acceptance comparisons run locally (PR head has no CI-mode exclusions).")
+        return
     with tempfile.TemporaryDirectory(prefix="foragent-ci-") as temporary:
         directory = Path(temporary)
         shutil.copyfile(Path(__file__).with_name("ci_pytest.py"), directory / "fa_measurement.py")
@@ -86,10 +88,10 @@ def main():
                "shard_index": int(os.environ["FA_SHARD"]), "shard_count": int(os.environ["FA_SHARDS"]),
                "excluded": excluded, "scope": scope, "duration_seconds": monotonic() - started,
                "base": base_result, "head": head_result}
-    output = encode_report(payload)
+    output = json.dumps(payload, separators=(",", ":"))
     Path(os.environ["FA_REPORT_FILE"]).write_text(output, encoding="utf-8")
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
-        stream.write(f"comparison={output}\n")
+        stream.write("comparison=true\n")
     print(output)
 
 

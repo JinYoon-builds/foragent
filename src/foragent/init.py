@@ -10,7 +10,7 @@ import subprocess
 import yaml
 
 from foragent import board, launchd
-from foragent.ci_workflow import PUBLISH_WORKFLOW, WORKFLOW, initial_checks, publisher_workflow_text, workflow_text, write_workflow
+from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.labels import LABELS
@@ -84,6 +84,7 @@ class InitReport:
     added_keys: list[str] = field(default_factory=list)
     board_id: str | None = None
     board_planned: bool = False
+    removed: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = ["Foragent setup plan:" if self.dry_run else "Foragent setup:"]
@@ -91,6 +92,7 @@ class InitReport:
             lines.append(f"Using repository root: {self.normalized_root}")
         lines.append("Would ensure labels." if self.dry_run else "Labels ensured.")
         lines.extend(f"{'Would create' if self.dry_run else 'Created'}: {path}" for path in self.created)
+        lines.extend(f"{'Would remove' if self.dry_run else 'Removed'}: {path}" for path in self.removed)
         lines.extend(f"Already exists: {path}" for path in self.existed)
         lines.extend(f"{'Would add' if self.dry_run else 'Added'} config key: {key}" for key in self.added_keys)
         if self.board_planned:
@@ -219,7 +221,6 @@ def init_repo(
         contents = {".foragent.yml": CONFIG_COMMENT + yaml.safe_dump(minimal, sort_keys=False), **contents}
     if config.checks == "ci":
         contents[WORKFLOW] = workflow_text(config)
-        contents[PUBLISH_WORKFLOW] = publisher_workflow_text(config)
     if not (root / "tests/acceptance").exists():
         contents["tests/acceptance/.gitkeep"] = ""
 
@@ -229,9 +230,19 @@ def init_repo(
         existed.insert(0, ".foragent.yml")
     if (root / "tests/acceptance").exists():
         existed.append("tests/acceptance/")
+    removed = obsolete_workflow_paths(root)
+    # A staged deletion is absent from the index but still belongs to HEAD.
+    tracked_removals = set()
+    if removed:
+        for command in (["ls-files", "--cached", "-z", "--", *removed],
+                        ["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", *removed]):
+            tracked_removals.update(git._call(command).split("\0"))
+    tracked_removals = [path for path in removed if path in tracked_removals]
+    # Also recover a deletion left uncommitted by an interrupted setup.
+    legacy_paths = [LEGACY_PUBLISH_WORKFLOW] if not (root / LEGACY_PUBLISH_WORKFLOW).exists() else []
     pending = list(dict.fromkeys([
-        *created, *([".foragent.yml"] if added else []),
-        *git.uncommitted_paths([*SETUP_PATHS, *([WORKFLOW, PUBLISH_WORKFLOW] if config.checks == "ci" else [])]),
+        *created, *tracked_removals, *([".foragent.yml"] if added else []),
+        *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
     if (pending or (board_planned and not config.board)) and git.current_branch() != base_branch:
@@ -242,7 +253,8 @@ def init_repo(
         board_change = board_planned and not config.board
         return InitReport(created, existed, True, push_planned=push_planned or (board_change and not no_push),
                           commit_planned=bool(pending) or board_change, launchd_planned=not no_launchd,
-                          normalized_root=normalized_root, added_keys=list(added), board_planned=board_planned)
+                          normalized_root=normalized_root, added_keys=list(added), board_planned=board_planned,
+                          removed=removed)
 
     tracker = tracker or GhTracker(repo, run=run)
     tracker.ensure_labels(LABELS)
@@ -286,10 +298,12 @@ def init_repo(
     for path in created:
         destination = root / path
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if path not in {WORKFLOW, PUBLISH_WORKFLOW}:
+        if path != WORKFLOW:
             with destination.open("x", encoding="utf-8") as stream:
                 stream.write(contents[path])
-    if {WORKFLOW, PUBLISH_WORKFLOW}.intersection(created):
+    for path in removed:
+        (root / path).unlink()
+    if WORKFLOW in created:
         write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:
         config_path.write_text(updated_config, encoding="utf-8")
@@ -299,4 +313,4 @@ def init_repo(
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     return InitReport(created, existed, False, bool(pending), push_planned, label,
-                      normalized_root=normalized_root, added_keys=list(added), board_id=board_id)
+                      normalized_root=normalized_root, added_keys=list(added), board_id=board_id, removed=removed)

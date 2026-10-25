@@ -4,7 +4,6 @@ name: foragent-acceptance
 - pull_request
 permissions:
   contents: read
-  checks: write
 jobs:
   acceptance:
     if: github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.event.pull_request.head.ref,
