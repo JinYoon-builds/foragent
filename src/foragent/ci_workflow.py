@@ -13,6 +13,7 @@ from foragent.git import GitError, GitRepo
 WORKFLOW = ".github/workflows/foragent-acceptance.yml"
 LEGACY_PUBLISH_WORKFLOW = ".github/workflows/foragent-acceptance-publish.yml"
 EXCLUSIONS = ".foragent/acceptance-exclusions.json"
+EXCLUSIONS_TRAILER = "Foragent-Acceptance-Excluded"
 TRUSTED_RUNNER = "uv run --no-project --python 3.12 --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent' python -m "
 
 
@@ -27,6 +28,21 @@ def acceptance_command(config, root):
 def measurement_scope(config, root, excluded):
     return {"acceptance_dir": config.acceptance_dir, "command": acceptance_command(config, root),
             "marker": "not local_only", "excluded": list(excluded), "shard_count": config.ci_shards}
+
+
+def read_exclusions(git, base_ref):
+    value = git.latest_trailer(EXCLUSIONS_TRAILER, base_ref)
+    if value is None:
+        return None
+    return parse_exclusions(value)
+
+
+def parse_exclusions(value):
+    excluded = json.loads(value)
+    if (not isinstance(excluded, list) or any(not isinstance(path, str) for path in excluded)
+            or excluded != sorted(set(excluded))):
+        raise ValueError("invalid acceptance exclusions")
+    return excluded
 
 
 def repository_private(repo, run=None):
