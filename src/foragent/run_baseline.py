@@ -40,6 +40,8 @@ class AcceptanceBaseline:
     failing_ids: tuple[str, ...] | None = None
     # Locked files this baseline did not run because open issues own them (#376).
     excluded: tuple[str, ...] = ()
+    # The base commit this set was measured on; None when unknown.
+    base_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -331,7 +333,7 @@ def _capture_baseline(
         if saved is not None and (required_ids is None or
                                   {"collected_ids", "failing_ids", "excluded"} <= saved.keys()):
             _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-            return replace(_saved_baseline(command, saved), excluded=tuple(excluded))
+            return replace(_saved_baseline(command, saved), excluded=tuple(excluded), base_sha=base_sha)
         report.parent.mkdir(parents=True, exist_ok=True)
         # Use a fresh base checkout; tests can write files without touching the implementation.
         with tempfile.TemporaryDirectory(prefix="foragent-baseline-") as directory:
@@ -349,14 +351,14 @@ def _capture_baseline(
                            for path in (worktree / ctx.config.acceptance_dir).rglob("*")):
                     save_baseline((), (), ())
                     _append(log, "Acceptance baseline count=0: no acceptance test files remain after exclusions")
-                    return AcceptanceBaseline(command, (), (), (), tuple(excluded))
+                    return AcceptanceBaseline(command, (), (), (), tuple(excluded), base_sha)
                 # A compatible cache can cover a broader selection. Establish
                 # the current selection before reusing its recorded outcomes.
                 if required_ids is not None:
                     saved = _premerge_baseline(ctx, test_command, base_sha, excluded, required_ids)
                     if saved is not None:
                         _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-                        return replace(_saved_baseline(command, saved), excluded=tuple(excluded))
+                        return replace(_saved_baseline(command, saved), excluded=tuple(excluded), base_sha=base_sha)
                 selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)}"
                 selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
                 baseline_command = (
@@ -431,9 +433,50 @@ def _capture_baseline(
                         f"acceptance baseline unavailable: exit_code={result.exit_code}, timed_out={result.timed_out}; "
                         "capture did not produce a complete, usable JUnit report"
                     )
-                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded))
+                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded), base_sha)
             finally:
                 ctx.git.remove_worktree(worktree)
+
+
+def surviving_baseline(baseline: AcceptanceBaseline, git, worktree: Path, acceptance_dir: str,
+                       check: Callable[[str, Path], CheckResult], log: Path) -> AcceptanceBaseline:
+    """Drop baseline node ids that the current tree no longer collects (#123).
+
+    A base sync can rename or delete a locked test. Selecting its old id makes
+    pytest stop with "not found" and hides the tests that still exist. Collect
+    the same selection the capture ran, but only when the staged acceptance
+    files differ from the measured base. When collection itself fails, keep
+    every id so the verification still reports that failure.
+    """
+    if not baseline.node_ids or baseline.base_sha is None:
+        return baseline
+    # Only a tree whose acceptance files differ from the measured base can lose ids.
+    if not git._call(["diff", "--cached", "--name-only", baseline.base_sha, "--", acceptance_dir]):
+        return baseline
+    if not (worktree / acceptance_dir).is_dir():
+        collected: set[str] | None = set()
+    else:
+        selection = f"{baseline.command} {shlex.quote(acceptance_dir)}"
+        selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in baseline.excluded)
+        offset = log.stat().st_size if log.exists() else 0
+        result = check(f"{selection} --collect-only --verbosity=-1", worktree)
+        collected = None
+        if not result.timed_out and result.exit_code in (0, 5):
+            with log.open(encoding="utf-8", errors="replace") as stream:
+                stream.seek(offset)
+                collected = {line.strip() for line in stream if "::" in line}
+        else:
+            _append(log, "Acceptance baseline collection failed; keeping every baseline node id")
+    if collected is None:
+        return baseline
+    missing = [node for node in baseline.node_ids if node not in collected]
+    for node in missing:
+        _append(log, f"Acceptance baseline dropped missing node id: {node}")
+    if not missing:
+        return baseline
+    kept = tuple(node for node in baseline.node_ids if node in collected)
+    _append(log, f"Acceptance baseline dropped {len(missing)} missing node ids; {len(kept)} remain")
+    return replace(baseline, node_ids=kept)
 
 
 if __name__ == "__main__":

@@ -373,3 +373,71 @@ def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp
     run = store.get_run(1)
     assert run.waited_seconds == 600.0
     assert run.waiting_until is None
+
+
+class _MovedGit:
+    def __init__(self, changed="tests/acceptance/test_b.py"):
+        self.changed, self.calls = changed, []
+
+    def _call(self, args):
+        self.calls.append(args)
+        return self.changed
+
+
+def _collector(log, exit_code, lines, timed_out=False):
+    from foragent.run_checks import CheckResult
+
+    calls = []
+
+    def check(command, root):
+        calls.append(command)
+        with log.open("a") as stream:
+            stream.write("\n".join(lines) + "\n")
+        return CheckResult(command, exit_code, timed_out, "")
+    return check, calls
+
+
+def test_surviving_baseline_drops_and_logs_only_missing_ids(tmp_path):
+    from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
+
+    (tmp_path / "tests/acceptance").mkdir(parents=True)
+    log = tmp_path / "run.log"
+    baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",
+                                             "tests/acceptance/test_b.py::test_b"),
+                                  excluded=("tests/acceptance/test_c.py",), base_sha="base")
+    check, calls = _collector(log, 0, ["tests/acceptance/test_a.py::test_a", "1 test collected"])
+    kept = surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log)
+    assert kept.node_ids == ("tests/acceptance/test_a.py::test_a",)
+    assert "--collect-only" in calls[0] and "--ignore=tests/acceptance/test_c.py" in calls[0]
+    assert "dropped missing node id: tests/acceptance/test_b.py::test_b" in log.read_text()
+
+
+def test_surviving_baseline_keeps_every_id_when_collection_fails(tmp_path):
+    from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
+
+    (tmp_path / "tests/acceptance").mkdir(parents=True)
+    log = tmp_path / "run.log"
+    baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
+    check, _ = _collector(log, 2, ["ERROR collecting tests/acceptance/test_a.py"])
+    assert surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log) is baseline
+
+
+def test_surviving_baseline_without_acceptance_dir_drops_all_without_pytest(tmp_path):
+    from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
+
+    log = tmp_path / "run.log"
+    baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
+    check, calls = _collector(log, 0, [])
+    assert surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log).node_ids == ()
+    assert calls == []
+
+
+def test_surviving_baseline_skips_collection_when_acceptance_files_match_the_base(tmp_path):
+    from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
+
+    log = tmp_path / "run.log"
+    baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
+    check, calls = _collector(log, 0, [])
+    git = _MovedGit(changed="")
+    assert surviving_baseline(baseline, git, tmp_path, "tests/acceptance", check, log) is baseline
+    assert calls == [] and git.calls == [["diff", "--cached", "--name-only", "base", "--", "tests/acceptance"]]
