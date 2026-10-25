@@ -85,6 +85,9 @@ class Run:
     approval_body_sha: str | None = None
     skills_reported: bool = False
     skills_used: list[str] = field(default_factory=list)
+    last_review_pass_at: str | None = None
+    review_pass_to_merge_seconds: float | None = None
+    merge_lock_held_seconds: float | None = None
 
 
 REFRESH_INTERVAL = timedelta(minutes=5)
@@ -111,6 +114,7 @@ class StateStore:
     def __init__(self, root: Path, now: Callable[[], datetime] | None = None):
         self.root = Path(root)
         self._now = now or (lambda: datetime.now(UTC))
+        self._merge_lock_seconds: dict[tuple[int, str], float] = {}
 
     @classmethod
     def for_repo(cls, repo: str, *, now: Callable[[], datetime] | None = None) -> "StateStore":
@@ -628,6 +632,7 @@ class StateStore:
                       attempt_tiers=previous.attempt_tiers if resumed else {},
                       approval_body_sha=approval.body_sha if approval is not None else None,
                       last_activity_at=timestamp, process_identities=identities, **session)
+            self._merge_lock_seconds.pop((number, timestamp), None)
             self._write_run(run)
             return run
 
@@ -688,6 +693,23 @@ class StateStore:
         except FileNotFoundError:
             return None
         return load_record(Run, json.loads(value))
+
+    def record_merge_lock(self, number: int, seconds: float) -> None:
+        run = self.get_run(number)
+        key = (number, run.started_at)
+        total = self._merge_lock_seconds.get(key, 0) + seconds
+        self._merge_lock_seconds[key] = total
+        if run.merge_lock_held_seconds is not None:
+            self.update_run(number, merge_lock_held_seconds=total)
+
+    def record_merge(self, number: int, merged_at: datetime) -> None:
+        run = self.get_run(number)
+        passed = run.last_review_pass_at
+        self.update_run(
+            number, review_pass_to_merge_seconds=(
+                (merged_at - datetime.fromisoformat(passed)).total_seconds() if passed else None
+            ), merge_lock_held_seconds=self._merge_lock_seconds.get((number, run.started_at), 0),
+        )
 
     def active_runs(self) -> list[Run]:
         runs = []
