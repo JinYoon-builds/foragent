@@ -125,7 +125,7 @@ from foragent.run_attempt import (
 from foragent.run_checks import _verify_implementation
 from foragent.run_conflicts import _block_rebuild, _rebuild, _recover_replay, _resume_implementation
 from foragent.run_implementation import _implement, _prepare_implementation
-from foragent.run_publish import _publish, _push_branch
+from foragent.run_publish import STOPPED, _publish, _push_branch
 from foragent.run_review import _review_implementation
 
 
@@ -320,6 +320,9 @@ def review_only(
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Review runner exited: {exc}"
+        if started and (stopped := ctx.store.get_run(n)) is not None and stopped.outcome == STOPPED:
+            # `fa orch stop` recorded its why before the signal and owns the labels.
+            outcome, detail = STOPPED, ""
         raise
     finally:
         if started:
@@ -328,7 +331,7 @@ def review_only(
             finally:
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
-                    if outcome != "limit-wait":
+                    if outcome not in {"limit-wait", STOPPED}:
                         current = ctx.tracker.current_issue(n)
                         if current.state == "open" and not current.labels & {BLOCKED, READY}:
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
@@ -380,19 +383,20 @@ def run_issue(n: int, ctx: RunContext) -> str:
         outcome = "killed"
         detail = f"Runner exited: {exc}"
         stopped = ctx.store.get_run(n)
-        if stopped is None or stopped.outcome != "stalled-restart":
+        if stopped is None or stopped.outcome not in {"stalled-restart", STOPPED}:
             # A handled stop must not look like an orphan to the next tick.
             ctx.tracker.add_labels(n, [BLOCKED])
             ctx.tracker.remove_labels(n, [READY, RUNNING])
-        # A first stall was recorded before the signal; the tick owns its
-        # restart decision (ready, or blocked with an open PR), so keep labels.
+        # A first stall or an orchestrator stop was recorded before the signal;
+        # the tick or `fa orch stop` owns the labels that follow.
         raise
     finally:
         # A tick may already have finished the record while terminating this runner.
         try:
             run = ctx.store.get_run(n)
             if run is not None and run.status != "finished":
-                ctx.store.finish_run(n, outcome=run.outcome or outcome, detail=detail)
+                ctx.store.finish_run(n, outcome=run.outcome or outcome,
+                                     detail="" if run.outcome == STOPPED else detail)
         finally:
             kick_tick(ctx.repo_root)
     return outcome

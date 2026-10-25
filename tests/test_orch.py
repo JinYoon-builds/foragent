@@ -574,3 +574,23 @@ def test_cli_routes_all_verbs_to_injected_context(review_case, monkeypatch, caps
     assert c.tracker.get_issue(1).labels & {"blocked", "ready"} == {"ready"}
     assert cli.main(["orch", "log"]) == 0
     assert "resolved review fail" in capsys.readouterr().out
+
+
+def test_review_only_stopped_by_orchestrator_keeps_reason_and_leaves_labels(review_case, monkeypatch):
+    c = review_case
+    flag_before = c.store.load_flag(1)
+
+    def review(n, ctx, worktree, verdict_head):
+        # `fa orch stop` records its why before signaling the review runner.
+        ctx.store.update_run(n, outcome="stopped", detail="stopped: reprioritize")
+        raise SystemExit(143)
+
+    monkeypatch.setattr(runner, "_review_only", review)
+    with pytest.raises(SystemExit):
+        runner.review_only(1, c.ctx)
+    run = c.store.get_run(1)
+    assert (run.status, run.outcome, run.detail) == ("finished", "stopped", "stopped: reprioritize")
+    assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"running"}
+    assert c.store.load_flag(1) == flag_before, "A stopped review must not be flagged blocked"
+    c.tracker.add_labels(1, ["ready"])  # `fa orch stop` then returns it to ready
+    c.tracker.remove_labels(1, ["running"])

@@ -99,17 +99,22 @@ def stop_target_refusal(run: Run) -> str | None:
     """Why a recorded runner or executor PID fails #261's rules, read without signaling.
 
     A live recorded PID must be a recorded identity outside PID 1 and this
-    process's own lineage, group and session. A dead one is left to the stop path.
+    process's own lineage, group and session. An unreadable one cannot be
+    verified and is refused; a dead one is left to the stop path.
     """
     try:
-        rows = {row.pid: row for row in processes.list_processes()}
+        table = processes.list_processes()
     except PermissionError as exc:
         return str(exc)
+    rows = {row.pid: row for row in table}
+    unreadable = getattr(table, "unreadable", frozenset())
     lineage, group, session = processes._protected(rows)
     identities = {item["pid"]: item["start_time"] for item in run.process_identities}
     for name, pid in (("runner", run.pid), ("executor", run.executor_pgid)):
         if pid is None:
             continue
+        if pid in unreadable:
+            return f"recorded {name} PID {pid} cannot be read; ownership cannot be verified"
         row = rows.get(pid)
         if pid <= 1 or pid in lineage or (row is not None and (
             identities.get(pid) != row.start_time or row.pgid in lineage or row.sid in lineage

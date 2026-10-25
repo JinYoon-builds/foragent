@@ -303,6 +303,24 @@ def test_runner_stop_leaves_first_stall_labels_to_the_tick(run_case, monkeypatch
     c.tracker.remove_labels(1, ["running"])  # the next tick restores it to ready
 
 
+def test_runner_stop_leaves_orchestrator_stop_labels_and_reason_to_the_verb(run_case, monkeypatch):
+    c = run_case
+
+    def execute(number, ctx, worktree):
+        # `fa orch stop` records its outcome and why before signaling the runner.
+        ctx.store.update_run(number, outcome="stopped", detail="stopped: reprioritize")
+        raise SystemExit(143)
+
+    monkeypatch.setattr("foragent.runner._execute", execute)
+    monkeypatch.setattr("foragent.runner.kick_tick", lambda root: None)
+    with pytest.raises(SystemExit):
+        run_issue(1, c.ctx)
+    assert c.tracker.get_issue(1).labels & {"running", "ready", "blocked"} == {"running"}
+    run = c.store.get_run(1)
+    assert (run.status, run.outcome, run.detail) == ("finished", "stopped", "stopped: reprioritize")
+    c.tracker.remove_labels(1, ["running"])  # `fa orch stop` then returns it to ready
+
+
 def test_runner_still_kicks_when_a_tick_already_finished_its_record(run_case, monkeypatch, kicks):
     c = run_case
 

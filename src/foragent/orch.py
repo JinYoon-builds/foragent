@@ -179,12 +179,38 @@ def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = No
     return summary
 
 
+STOP_LOCK_WAIT_S = 120
+
+
+@contextmanager
+def _tick_lock_for_stop(ctx: RunContext) -> Iterator[None]:
+    """Hold the gate's tick lock so no tick recovers or relaunches the run mid-stop."""
+    deadline = time.monotonic() + STOP_LOCK_WAIT_S
+    while True:
+        with ctx.store.hold_tick_lock() as acquired:
+            if acquired:
+                yield
+                return
+        if time.monotonic() >= deadline:
+            raise OrchError(f"a gate tick held the lock for {STOP_LOCK_WAIT_S}s; try the stop again")
+        time.sleep(1)
+
+
 def stop(ctx: RunContext, n: int, why: str) -> str:
     """Stop a running issue through the gate's kill path, keeping its work as WIP."""
+    why = _text(why, "--why")
+    with _tick_lock_for_stop(ctx):
+        summary = _stop_locked(ctx, n, why)
+    # The terminated runner's own kick found the lock held; wake the gate now.
+    kick_tick(ctx.repo_root)
+    return summary
+
+
+def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
     from foragent import scheduler
+    from foragent.run_publish import STOPPED
     from foragent.scheduler_stop import stop_target_refusal
 
-    why = _text(why, "--why")
     run = ctx.store.get_run(n)
     if run is None or run.status != "running":
         raise OrchError(f"issue #{n} is not running; nothing to stop")
@@ -195,16 +221,27 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
         config=ctx.config, git=ctx.git, now=ctx.now, launcher=lambda number: None,
     )
     report = scheduler.TickReport()
-    if not scheduler._kill_run(tick_ctx, n, report, outcome="stopped",
-                               detail=f"Stopped by the orchestrator: {why}", wip_reason=f"stopped: {why}"):
-        raise OrchError(f"#{n}: stop did not complete: {'; '.join(report.actions) or 'run already ended'}")
+    detail = f"{STOPPED}: {why}"
+    # Record the stop before any signal: a runner saving its own WIP on SIGTERM
+    # names this reason and leaves the labels to this verb, as for a first stall.
+    ctx.store.update_run(n, outcome=STOPPED, detail=detail)
+    try:
+        scheduler._kill_run(tick_ctx, n, report, outcome=STOPPED, detail=detail)
+    finally:
+        current = ctx.store.get_run(n)
+        if current is not None and current.status == "running":
+            ctx.store.update_run(n, outcome=run.outcome, detail=run.detail)
+    # Success is the finished record, whichever process wrote it, never the kill's return.
+    if current is None or current.status != "finished" or current.outcome != STOPPED:
+        state = "still running" if current is not None and current.status == "running" else (
+            f"finished as {current.outcome}" if current is not None else "no run record")
+        raise OrchError(f"#{n}: stop did not complete ({state}): {'; '.join(report.actions) or 'no action'}")
     # Ready is the destination; the next run resumes from the WIP on the issue branch.
     tick_ctx.tracker.add_labels(n, [READY])
     tick_ctx.tracker.remove_labels(n, [RUNNING])
     scheduler.board.sync_status(tick_ctx, n, "Ready")
     summary = f"#{n}: stopped and kept unfinished work on foragent/issue-{n}; why: {why}"
     _event(ctx, n, "stop", summary)
-    kick_tick(ctx.repo_root)
     return summary
 
 

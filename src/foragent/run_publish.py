@@ -26,6 +26,9 @@ from foragent.run_waits import _credited_wait, _phase, _progress, _timeout
 from foragent.state import Approval, Run
 from foragent.tracker import TrackerError
 
+# A run outcome `fa orch stop` records before signaling; its detail is the why.
+STOPPED = "stopped"
+
 if TYPE_CHECKING:
     from foragent.runner import RunContext
     from foragent.run_attempt import Implementation
@@ -364,6 +367,8 @@ def _preserve_failed_implementation(
     git.stage_changes()
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
+    if reason == STOPPED and run is not None and run.detail:
+        reason = run.detail  # `fa orch stop --why` records its reason before any signal.
     if git.has_staged_changes():
         git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
     if git.head_sha() == pushed_head or not tracker_available:
