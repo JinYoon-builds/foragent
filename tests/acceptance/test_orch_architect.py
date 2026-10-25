@@ -16,7 +16,13 @@ from test_skills_autosync import cli_exit, isolated_home
 
 
 WHY = "test_runner.py takes 65 % of unit-test time; six runs waited about an hour for test slots"
-PROPOSAL = "Proposal: share the heavy test_runner.py fixtures, then measure the unit-test time again."
+PROPOSAL = (
+    "Decision: person\n"
+    "Proposal: change lane boundaries so a shared testing lane owns the heavy test_runner.py fixtures. "
+    f"Evidence (2026-10-24 incident): {WHY}. "
+    "Expected measurable effect: reduce test_runner.py's share of unit-test time from 65 % to 40 %; "
+    "measure again with pytest --durations."
+)
 
 
 def architect_events(store):
@@ -29,13 +35,13 @@ def architect_case(tmp_path, monkeypatch):
     """Intercept the worker launcher boundary and run its child only on demand.
 
     No Popen, executor turn, notification or process signal reaches the machine.
-    The fake agent uses the existing ask tool, rather than requiring a script to
-    interpret model prose as a decision or to publish an order.
+    The fake agent delivers a proposal through the existing request tool for the
+    orchestrator to judge, without a script interpreting prose or publishing orders.
     """
     from foragent import executors, notify, runner
     from foragent.executors import ExecResult
     from foragent.launcher import spawn_runner
-    from foragent.orch_inbox import write_plan_heartbeat
+    from foragent.state import StateStore
 
     case = offline_local_cli(tmp_path, monkeypatch)
     (case.root / ".foragent.yml").write_text(
@@ -76,10 +82,9 @@ def architect_case(tmp_path, monkeypatch):
     def execute(**kwargs):
         case.turns.append(kwargs)
         if case.propose:
-            assert inbox_command(case, "ask", "--question", PROPOSAL,
-                                 "--option", "Approve a tidy order (recommended)",
-                                 "--option", "Defer", "--recommend", "1") == 0
-        return ExecResult(0, False, "Proposal recorded; waiting for the person's decision.",
+            assert inbox_command(case, "request", "--from", "architect", "--text", PROPOSAL) == 0
+        return ExecResult(0, False, "Proposal recorded for the orchestrator's judgment."
+                          if case.propose else "Nothing to change.",
                           kwargs["log_path"], session_id="offline-architect-session")
 
     fake_executor = SimpleNamespace(run=execute)
@@ -93,10 +98,11 @@ def architect_case(tmp_path, monkeypatch):
     monkeypatch.setattr(notify, "send", lambda *a, **kw: case.pushes.append((a, kw)))
     monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")
     case.gh_calls = record_gh(monkeypatch)
-    write_plan_heartbeat(case.store)  # Proposals go to the live planning session's box.
-
-    # Obtain the real worker entrypoint prefix without starting any worker.
-    spawn_runner(case.root, case.store)(999)
+    # The real launcher now records process identity on an existing run. Keep
+    # this probe in its own store so the architect still starts with no lane work.
+    probe_store = StateStore(tmp_path / "worker-probe")
+    probe_store.start_run(999, branch="foragent/issue-999", worktree=probe_store.worktree_path(999))
+    spawn_runner(case.root, probe_store)(999)
     worker = case.launches.pop()
     assert worker.args[1:3] == ["-m", "foragent.cli"]
     case.worker_prefix = worker.args[:3]
@@ -144,34 +150,117 @@ def test_orch_architect_launches_with_evidence_measurements_refactor_and_a_local
         assert command in prompt, f"Give the architect the existing measurement/procedure tool: {command}"
     assert re.search(r"hot[ -]files", prompt, re.I), "Measure file contention before proposing a split"
     assert re.search(r"pytest\b.{0,160}--durations", prompt, re.I | re.S), "Measure slow tests as well as hot files"
-    assert "fa orch ask" in prompt and re.search(r"propos", prompt, re.I), "Send proposals to the person's decision list"
-    assert re.search(r"(?:human|person|user|jin).{0,140}approv|approv.{0,140}(?:human|person|user|jin)",
-                     prompt, re.I | re.S), "The architect proposes tidy orders for human approval"
+    assert re.search(r"propos.{0,180}fa orch request|fa orch request.{0,180}propos",
+                     prompt, re.I | re.S), "Deliver proposals to the orchestrator's durable inbox"
+    assert re.search(r"orchestrat.{0,140}(?:decid|judg|choos).{0,140}order"
+                     r"|(?:decid|judg|choos).{0,140}order.{0,140}orchestrat",
+                     prompt, re.I | re.S), "The orchestrator decides routine proposals and handles person decisions below"
+    assert re.search(r"(?:only|just).{0,40}propos|propos.{0,40}(?:only|just)",
+                     prompt, re.I | re.S), "The architect's role is to propose"
+    assert re.search(r"(?:nothing to change|no changes? (?:are )?needed).{0,120}(?:valid|acceptable|good|best)"
+                     r"|(?:valid|acceptable|good|best).{0,120}(?:nothing to change|no changes? (?:are )?needed)",
+                     prompt, re.I | re.S), "Explain that nothing to change is a valid outcome"
+    proposal = r"(?:each|every|all).{0,40}propos\w*"
+    assert re.search(rf"{proposal}.{{0,160}}(?:mark|label|tag|classif)"
+                     rf"|(?:mark|label|tag|classif).{{0,160}}{proposal}",
+                     prompt, re.I | re.S), "Mark each proposal delivered through fa orch request with its decision owner"
+    for owner in (r"orchestrat\w*", r"(?:person|human|user)"):
+        assert re.search(rf"{owner}.{{0,40}}decision|decision.{{0,40}}{owner}",
+                         prompt, re.I | re.S), "Distinguish orchestrator decisions from person decisions"
+    for category in (r"lane.{0,40}boundar|boundar.{0,40}lane", r"irreversible|hard.to.undo|difficult to undo",
+                     r"\bscope\b", r"taste|preference"):
+        assert re.search(category, prompt, re.I | re.S), f"Name this person-decision category: {category}"
+    assert re.search(r"orchestrat.{0,140}(?:forward|refer|escalat|bring|ask|present).{0,180}(?:person|human|user)",
+                     prompt, re.I | re.S), "The orchestrator forwards person decisions to the person"
+    assert re.search(r"(?:forward|refer|escalat|bring|ask|present).{0,180}(?:multiple[ -]choice|choices|options)"
+                     r"|(?:multiple[ -]choice|choices|options).{0,180}(?:forward|refer|escalat|bring|ask|present)",
+                     prompt, re.I | re.S), "The orchestrator presents person decisions as multiple choice"
+    evidence = r"(?:cit|refer|ground|support|back)\w*.{0,100}(?:facts?|numbers?|incidents?)"
+    effect = r"expect\w*.{0,80}(?:measur|quantif)\w*.{0,80}(?:effect|impact|improv\w*|outcome|result)"
+    assert re.search(rf"{proposal}.{{0,200}}{evidence}|{evidence}.{{0,200}}{proposal}",
+                     prompt, re.I | re.S), "Each proposal cites facts numbers or a real incident"
+    assert re.search(rf"{proposal}.{{0,240}}{effect}|{effect}.{{0,240}}{proposal}",
+                     prompt, re.I | re.S), "Each proposal states its expected measurable effect"
     assert len(architect_events(case.store)) == 1, "Executing the child must not count as a second call"
     assert case.gh_calls == [] and case.pushes == []
 
 
-def test_orch_architect_proposal_lands_in_existing_questions_without_publishing_orders(
+def test_orch_architect_proposal_lands_in_orchestrator_inbox_without_publishing_orders(
     tmp_path, monkeypatch, capsys,
 ):
+    from foragent.orch_inbox import questions, requests
     from foragent.state import StateStore
 
     case = architect_case(tmp_path, monkeypatch)
     case.propose = True
+    assert inbox_command(case, "request", "--from", "planning", "--text", "Keep this planning request") == 0
+    planning, = inbox_rows(case, capsys)
     assert inbox_rows(case, capsys, "questions") == []
     child = call_architect(case, capsys)
     finish_session(case, child)
-    question, = inbox_rows(case, capsys, "questions")
-    assert question["question"] == PROPOSAL and question["status"] == "open" and question["answer"] is None
-    assert question["options"] == ["Approve a tidy order (recommended)", "Defer"] and question["recommend"] == 1
+    assert inbox_rows(case, capsys, "questions") == [], (
+        "The architect call leaves forwarding person decisions to the orchestrator's later act")
+    rows = inbox_rows(case, capsys)
+    assert len(rows) == 2 and rows[0] == planning, "Use the same inbox as planning requests"
+    proposal = rows[1]
+    assert proposal["text"] == PROPOSAL and proposal["from"] == "architect" and proposal["status"] == "new"
+    assert "Decision: person" in proposal["text"], "Preserve the architect's decision-owner mark in the durable request"
     # Read through the existing API on a fresh store, not a new private proposal queue.
-    from foragent.orch_inbox import questions
-
-    assert questions(StateStore(case.store.root)) == [question]
+    assert requests(StateStore(case.store.root)) == [planning, proposal]
+    assert questions(StateStore(case.store.root), include_closed=True) == []
     assert not list((case.store.root / "approvals").glob("*.json")), "A proposal is not an approved order"
     assert not list((case.store.root / "runs").glob("*.json")), "Do not turn a proposal into lane work"
     assert case.store.local_issues() == [] and case.gh_calls == [] and case.pushes == []
     assert len(case.launches) == 1
+
+
+def test_orch_architect_is_not_launched_by_ticks_merges_or_gate_paths(
+    git_history, tmp_path, monkeypatch,
+):
+    from foragent import cli, executors
+    from foragent.runner import run_issue
+    from test_orch_review_handoff import bind_cli, make_case
+    from test_tidy_cycle import record_finish
+
+    case = make_case(git_history, tmp_path, monkeypatch, language="en", notify="none",
+                     skill_libraries=[], test_command="true")
+    case.main = bind_cli(case, monkeypatch)
+    monkeypatch.setattr(cli, "spawn_notify", lambda *a, **kw: None)
+    case.gh_calls = record_gh(monkeypatch)
+    popen = subprocess.Popen
+
+    def local_checks_only(argv, *args, **kwargs):
+        # Git stays inside git_history; the existing offline runner uses only
+        # these inert Done-when checks. An independent agent launch must fail.
+        assert isinstance(argv, (list, tuple)) and argv
+        assert argv[0] == "git" or (list(argv[:2]) == ["/bin/sh", "-c"] and argv[2] in {
+            "true", "test -f feature.txt", "test -f tests/acceptance/test_feature.py",
+        }), f"Only fa orch architect --why may launch the architect, not a gate path: {argv}"
+        return popen(argv, *args, **kwargs)
+
+    def no_model_turn(*args, **kwargs):
+        pytest.fail("Gate paths must leave the architect call to the orchestrator's judgment")
+
+    monkeypatch.setattr(subprocess, "Popen", local_checks_only)
+    for executor in (executors.ClaudeExecutor, executors.CodexExecutor):
+        monkeypatch.setattr(executor, "run", no_model_turn)
+    monkeypatch.setattr(executors, "executor_for", no_model_turn)
+
+    # Exercise a real offline runner merge and its completion hooks, then cross
+    # the old 30-merge tidy boundary. That signal must remain a request to judge.
+    assert run_issue(1, case.ctx) == "merged"
+    assert architect_events(case.store) == []
+    for number in range(2, 32):
+        record_finish(case, number)
+        if number in (29, 30, 31):
+            for flags in ((), ("--no-start",)):
+                assert cli_exit(case.main, ["gate", "tick", *flags,
+                                           "--repo-root", str(case.root)]) == 0
+                assert architect_events(case.store) == [], "Neither ticks nor merge counts call the architect"
+    assert cli_exit(case.main, ["gate", "status", "--json", "--repo-root", str(case.root)]) == 0
+    assert architect_events(case.store) == []
+    assert len(case.implementer.calls) == len(case.reviewer.calls) == 1, "Only the ordinary lane agents ran"
+    assert case.gh_calls == []
 
 
 @pytest.mark.parametrize("arguments", [(), ("--why", ""), ("--why", "   ")],

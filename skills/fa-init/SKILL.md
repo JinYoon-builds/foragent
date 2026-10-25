@@ -48,11 +48,10 @@ description: Set up a project folder for Foragent.
    option without asking for a runner label. Use self-hosted runners only for
    private repositories; GitHub advises against using them on public ones.
    Selecting `ci` generates `.github/workflows/foragent-acceptance.yml` and
-   `.github/workflows/foragent-acceptance-publish.yml`, and includes both with
-   `.foragent.yml` in the init commit. Measurement uses the base configuration
-   with read-only permissions. Publication runs trusted code on a fresh hosted
-   runner through `workflow_run`, which can consume hosted minutes on private
-   repositories. `ci_shards` defaults to
+   includes it with `.foragent.yml` in the init commit. Measurement uses the base
+   configuration with read-only permissions. The runner reads the exact head's
+   measurement artifacts directly and verifies every configured shard.
+   `ci_shards` defaults to
    4 and `ci_runs_on` to `ubuntu-latest`. After changing these settings, run
    `fa ci workflow --repo-root .` to rewrite the generated workflow and include
    it in a separate configuration commit. `checks_fallback: local`
@@ -109,8 +108,9 @@ description: Set up a project folder for Foragent.
    Each lane agent chooses tool, review, and domain skills per issue as needed;
    examples include `design-system`, `design-critique`, `accessibility-review`,
    `ux-copy`, and `webapp-testing`. These are examples, not a fixed design lane
-   skill list. Design interviews and foundation issues belong to `/fa-order` (D33).
+   skill list. Design interviews and foundation issues belong to the planning interview (`/fa-order`, which people
+   open from `/fa`) (D33).
 
-10. Tell the user the next step is `/fa-order`: for an existing project, normalize
+10. Tell the user the next step is `/fa` (it opens the planning interview): for an existing project, normalize
    existing open issues into the Foragent format with the user's approval; for
    a new project, order the first work.

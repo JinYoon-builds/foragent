@@ -129,8 +129,8 @@ attempts and draft references across turns; re-read current facts when handling 
 
 ## Design handoff from planning
 
-When visual direction is unresolved, suggest `/fa-design-session` as design mode in the planning
-session; keep the conversation there while references and running drafts are compared. Read design
+When visual direction is unresolved, suggest the design interview (디자인 인터뷰 in `/fa`, the
+`fa-design-session` skill) as design mode in the planning session; keep the conversation there while references and running drafts are compared. Read design
 requests recorded by `fa orch request` and the referenced `docs/design/<topic>/HANDOFF.md` before
 preparing the order. Turn its selected draft, principles and run instructions into lane issues, with
 visual Done when evidence of the same screen as the draft (recorded viewport/terminal size and

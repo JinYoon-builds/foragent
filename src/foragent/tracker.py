@@ -3,12 +3,15 @@
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from io import BytesIO
 import json
 import re
 import subprocess
 import time
+import zlib
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
+from zipfile import BadZipFile, ZipFile
 
 
 IssueState = Literal["open", "closed"]
@@ -102,9 +105,12 @@ class Tracker(Protocol):
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
     def pr_acceptance_checks(self, pr: int) -> list[dict]: ...
+    def pr_acceptance_reports(self, head: str) -> list[dict]: ...
+    def pr_default_branch(self) -> str: ...
     def pr_failed_logs(self, pr: int) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
-    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None: ...
+    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
+                 subject: str | None = None) -> None: ...
 
 
 class TrackerError(RuntimeError):
@@ -458,8 +464,11 @@ class RecordingTracker:
         self._tracker.close_pr(pr, comment)
         self._record_pr_state(pr, pr_number=None, merged=False)
 
-    def merge_pr(self, pr, *, expected_head_sha, method="squash"):
-        self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
+    def merge_pr(self, pr, *, expected_head_sha, method="squash", subject=None):
+        if subject is None:
+            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
+        else:
+            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method, subject=subject)
         self._record_pr_state(pr, merged=True)
 
 
@@ -669,6 +678,12 @@ class FakeTracker:
     def pr_acceptance_checks(self, pr: int) -> list[dict]:
         return []
 
+    def pr_acceptance_reports(self, head: str) -> list[dict]:
+        return []
+
+    def pr_default_branch(self) -> str:
+        return "main"
+
     def set_pr_failed_logs(self, pr: int, text: str) -> None:
         self._pr_failed_logs[pr] = text
 
@@ -681,7 +696,8 @@ class FakeTracker:
     def pr_head_sha(self, pr: int) -> str:
         return self._pr_heads.get(pr, "0" * 40)
 
-    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None:
+    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
+                 subject: str | None = None) -> None:
         _merge_flag(method)
         if self.pr_head_sha(pr) != expected_head_sha:
             raise TrackerError("PR head changed after verification")
@@ -693,9 +709,10 @@ class FakeTracker:
         ]
 
 
-def _run_gh(args: list[str], input: str | None = None) -> str:
+def _run_gh(args: list[str], input: str | None = None) -> bytes:
     return subprocess.run(
-        ["gh", *args], input=input, check=True, capture_output=True, text=True, timeout=120,
+        ["gh", *args], input=input.encode() if input is not None else None,
+        check=True, capture_output=True, timeout=120,
     ).stdout
 
 
@@ -740,18 +757,21 @@ _EMPTY_RETRY_DELAY = 0.5
 
 
 class GhTracker:
-    def __init__(self, repo: str, run: Callable[..., str] | None = None):
+    def __init__(self, repo: str, run: Callable[..., str | bytes] | None = None):
         self.repo = repo
         self._run = run or _run_gh
         self._path = f"repos/{repo}"
         self._seen_states: set[str] = set()
 
-    def _call(self, args: list[str], input: str | None = None) -> str:
+    def _call(self, args: list[str], input: str | None = None, *, binary: bool = False) -> str | bytes:
         try:
-            return self._run(args, input=input)
+            output = self._run(args, input=input)
+            return output.decode() if isinstance(output, bytes) and not binary else output
         except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
+            stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
             raise TrackerError(
-                exc.stderr or str(exc), stdout=exc.stdout or "", returncode=exc.returncode,
+                stderr or str(exc), stdout=stdout or "", returncode=exc.returncode,
             ) from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise TrackerError(str(exc)) from exc
@@ -1008,7 +1028,7 @@ class GhTracker:
 
     def pr_checks(self, pr: int) -> CheckStatus:
         try:
-            output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket"])
+            output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket,name,workflow,link"])
         except TrackerError as exc:
             if "no checks reported" in (str(exc) + "\n" + exc.stdout).lower():
                 return "none"
@@ -1016,7 +1036,13 @@ class GhTracker:
             if exc.returncode not in {1, 8} or not exc.stdout.strip():
                 raise
             output = exc.stdout
-        buckets = {item["bucket"] for item in _items(output)}
+        checks = _items(output)
+        # gh supplies workflow only for CheckRun entries, never StatusContext.
+        # Commit-status target URLs are caller-controlled and confer no identity.
+        candidates = [item for item in checks if item.get("workflow") and "/job/" in (item.get("link") or "")]
+        excluded = self._acceptance_check_keys(pr) if candidates else set()
+        buckets = {item["bucket"] for item in checks
+                   if not (item.get("workflow") and (item.get("name"), item.get("link")) in excluded)}
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
@@ -1027,44 +1053,143 @@ class GhTracker:
             return "pass"
         raise TrackerError(f"unknown check buckets: {sorted(buckets)}")
 
+    def _acceptance_check_keys(self, pr: int) -> set[tuple[str, str]]:
+        """Exclude only Actions checks with API-verified workflow provenance."""
+        from foragent.ci_workflow import WORKFLOW
+
+        try:
+            if any(path.startswith(".github/workflows/") for path in self.pr_changed_files(pr)):
+                return set()
+            checks = self.pr_acceptance_checks(pr)
+            suites = {}
+            excluded = set()
+            counted = set()
+            for check in checks:
+                key = (check.get("name"), check.get("details_url"))
+                suite = (check.get("check_suite") or {}).get("id")
+                if ((check.get("app") or {}).get("slug") != "github-actions"
+                        or type(suite) is not int or suite <= 0):
+                    counted.add(key)
+                    continue
+                if suite not in suites:
+                    runs = _items(self._call([
+                        "api", "--paginate", "--jq", ".workflow_runs",
+                        f"{self._path}/actions/runs?check_suite_id={suite}&per_page=100",
+                    ]))
+                    suites[suite] = bool(runs) and all(
+                        run.get("check_suite_id") == suite and run.get("path") == WORKFLOW
+                        and (run.get("repository") or {}).get("full_name") == self.repo
+                        for run in runs
+                    )
+                if suites[suite] and all(key):
+                    excluded.add(key)
+                else:
+                    counted.add(key)
+            # gh exposes display keys, so an ambiguous match must count too.
+            return excluded - counted
+        except (TrackerError, AttributeError, TypeError, KeyError) as exc:
+            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+                raise
+            return set()  # Unverifiable checks remain ordinary CI.
+
+    def _pr_workflow_runs(self, pr: int) -> list[dict]:
+        head = self.pr_head_sha(pr)
+        return _items(self._call([
+            "api", "--paginate", "--jq", ".workflow_runs",
+            f"{self._path}/actions/runs?head_sha={head}&per_page=100",
+        ]))
+
+    def _acceptance_run_ids(self, pr: int, runs: list[dict]) -> set[int]:
+        """Only unchanged measurement workflows may be separated from ordinary CI."""
+        from foragent.ci_workflow import WORKFLOW
+
+        candidates = {run["id"] for run in runs if run.get("path") == WORKFLOW}
+        if candidates and any(path.startswith(".github/workflows/") for path in self.pr_changed_files(pr)):
+            return set()
+        return candidates
+
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
 
     def pr_acceptance_checks(self, pr: int) -> list[dict]:
-        from foragent.ci_workflow import producer_run_id
-
-        data = json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]
-        if (data.get("repo") or {}).get("full_name", self.repo) != self.repo:
-            return []
-        head = data["sha"]
-        checks = _items(self._call([
+        """Display data only; check runs cannot establish measurement provenance."""
+        head = self.pr_head_sha(pr)
+        return _items(self._call([
             "api", "--paginate", "--jq", ".check_runs",
             f"{self._path}/commits/{head}/check-runs?per_page=100&filter=latest",
         ]))
-        runs = {}
-        for check in checks:
-            # All fields here come from GitHub's check API. Discard any nested
-            # producer metadata before establishing the relationship ourselves.
-            check.pop("workflow_run", None)
-            suite_id = (check.get("check_suite") or {}).get("id")
-            if (not check.get("name", "").startswith("foragent-acceptance/")
-                    or (check.get("app") or {}).get("slug") != "github-actions"
-                    or type(suite_id) is not int or suite_id <= 0):
-                continue
-            if suite_id not in runs:
-                candidates = _items(self._call([
-                    "api", "--paginate", "--jq", ".workflow_runs",
-                    f"{self._path}/actions/runs?check_suite_id={suite_id}&per_page=100",
-                ]))
-                runs[suite_id] = None
-                if len(candidates) == 1 and type(candidates[0].get("id")) is int:
-                    run_id = candidates[0]["id"]
-                    run = json.loads(self._call(["api", f"{self._path}/actions/runs/{run_id}"]))
-                    candidate = {**check, "workflow_run": run}
-                    if run.get("id") == run_id and producer_run_id(candidate, self.repo) == run_id:
-                        runs[suite_id] = run
-            check["workflow_run"] = runs[suite_id]
-        return checks
+
+    def pr_default_branch(self) -> str:
+        """The repository's default branch supplies trusted PR workflow code."""
+        try:
+            data = json.loads(self._call(["api", self._path]))
+            branch = data["default_branch"]
+            if data["full_name"] != self.repo or not isinstance(branch, str) or not branch:
+                raise ValueError("invalid repository identity or default branch")
+            return branch
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TrackerError(f"Default branch unavailable: {exc}") from exc
+
+    def pr_acceptance_reports(self, head: str) -> list[dict]:
+        """Read artifacts of the newest measurement run for this exact head."""
+        from foragent.ci_transport import decode_report
+        from foragent.ci_workflow import WORKFLOW
+
+        runs = _items(self._call([
+            "api", "--paginate", "--jq", ".workflow_runs",
+            f"{self._path}/actions/runs?head_sha={quote(head, safe='')}&per_page=100",
+        ]))
+        try:
+            candidates = [run for run in runs if run.get("head_sha") == head
+                          and run.get("path", "").split("@", 1)[0] == WORKFLOW
+                          and run.get("event") == "pull_request"]
+            if not candidates:
+                return []
+            if any(type(run.get("id")) is not int or run["id"] <= 0 for run in candidates):
+                raise ValueError("invalid measurement run id")
+            run = max(candidates, key=lambda value: value["id"])
+            if run.get("status") in {"queued", "in_progress"}:
+                return []  # No evidence yet; ci_mode retains its existing polling budget.
+            if (run.get("status") != "completed" or run.get("conclusion") != "success"
+                    or run["repository"]["full_name"] != self.repo
+                    or run["head_repository"]["full_name"] != self.repo):
+                raise ValueError("measurement run is foreign or unsuccessful")
+            artifacts = _items(self._call([
+                "api", "--paginate", "--jq", ".artifacts",
+                f"{self._path}/actions/runs/{run['id']}/artifacts?per_page=100",
+            ]))
+            reports, names, ids = [], set(), set()
+            for artifact in artifacts:
+                name = artifact["name"]
+                if not isinstance(name, str):
+                    raise ValueError("invalid artifact name")
+                if not name.startswith("acceptance-"):
+                    continue
+                index = int(name.removeprefix("acceptance-"))
+                artifact_id = artifact["id"]
+                if (name != f"acceptance-{index}" or index < 0 or name in names
+                        or type(artifact_id) is not int or artifact_id <= 0 or artifact_id in ids
+                        or artifact.get("expired") is not False
+                        or type(artifact["workflow_run"]["id"]) is not int
+                        or artifact["workflow_run"]["id"] != run["id"]
+                        or artifact["workflow_run"]["head_sha"] != head):
+                    raise ValueError("artifact identity, expiry or measurement run does not match")
+                names.add(name)
+                ids.add(artifact_id)
+                data = self._call(["api", f"{self._path}/actions/artifacts/{artifact_id}/zip"], binary=True)
+                with ZipFile(BytesIO(data)) as archive:
+                    filename = f"shard-{index}.json"
+                    if archive.namelist() != [filename]:
+                        raise ValueError("artifact must contain exactly one matching shard report")
+                    payload = decode_report(archive.read(filename).decode("utf-8"))
+                reports.append({"run": run, "artifact": artifact, "report": payload})
+            return reports
+        except (KeyError, TypeError, ValueError, AttributeError, BadZipFile, OSError,
+                EOFError, RuntimeError, zlib.error) as exc:
+            # API/rate-limit errors retain their TrackerError classification.
+            if isinstance(exc, TrackerError):
+                raise
+            raise TrackerError(f"Unusable acceptance artifacts: {exc}") from exc
 
     def pr_failed_logs(self, pr: int) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.
@@ -1072,16 +1197,13 @@ class GhTracker:
         ``not_started`` is true only when every failed job never ran (no steps or a
         "job was not started" annotation); such jobs have no code failure to repair.
         """
-        head = self.pr_head_sha(pr)
-        runs = _items(self._call([
-            "api", "--paginate", "--jq", ".workflow_runs",
-            f"{self._path}/actions/runs?head_sha={head}&per_page=100",
-        ]))
+        runs = self._pr_workflow_runs(pr)
+        excluded_runs = self._acceptance_run_ids(pr, runs)
         parts = []
         failed_runs = 0
         code_failure = False
         for run in runs:
-            if run["conclusion"] not in _FAILED_CONCLUSIONS:
+            if run["id"] in excluded_runs or run["conclusion"] not in _FAILED_CONCLUSIONS:
                 continue
             failed_runs += 1
             jobs = _items(self._call([
@@ -1124,8 +1246,14 @@ class GhTracker:
         annotations = _items(self._call(["api", "--paginate", f"{check_run}/annotations"]))
         return [item["message"] for item in annotations if isinstance(item.get("message"), str)]
 
-    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None:
+    def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
+                 subject: str | None = None) -> None:
+        # An explicit subject stops GitHub from using a branch commit's message
+        # (single-commit PRs and repository defaults); the PR title is the subject.
+        if subject is None and method == "squash":
+            subject = json.loads(self._call(["pr", "view", str(pr), "-R", self.repo, "--json", "title"]))["title"]
         self._call([
             "pr", "merge", str(pr), "-R", self.repo, _merge_flag(method), "--delete-branch",
             "--match-head-commit", expected_head_sha,
+            *(["--subject", subject] if subject is not None else []),
         ])

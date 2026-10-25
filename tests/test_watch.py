@@ -153,7 +153,7 @@ def test_live_liveness_crosses_ten_minutes_between_refreshes(tmp_path):
     assert "○ 멈춘 듯 10분" in after
 
 
-@pytest.mark.parametrize("language,gone", [("en", "○ runner gone"), ("ko", "○ 실행기가 끝났어요")])
+@pytest.mark.parametrize("language,gone", [("en", "○ ⚠ no worker"), ("ko", "○ ⚠ 작업자가 없어요")])
 def test_live_runner_death_is_visible_without_refresh_and_permission_is_alive(tmp_path, monkeypatch, language, gone):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
