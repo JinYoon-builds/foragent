@@ -26,11 +26,13 @@ def review_scope_rules(acceptance_dir: str) -> str:
 
 def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
+    risk_notes: str = "",
 ) -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
         f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
-        f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
+        + (f"\n\n{risk_notes}" if risk_notes else "")
+        + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         f"\n\nDone when commands:\n{commands}\n\nDiff:\n{diff[:60000]}"
         + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
     )
