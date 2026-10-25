@@ -109,8 +109,9 @@ description: Set up a project folder for Foragent.
    Each lane agent chooses tool, review, and domain skills per issue as needed;
    examples include `design-system`, `design-critique`, `accessibility-review`,
    `ux-copy`, and `webapp-testing`. These are examples, not a fixed design lane
-   skill list. Design interviews and foundation issues belong to `/fa-order` (D33).
+   skill list. Design interviews and foundation issues belong to the planning interview (`/fa-order`, which people
+   open from `/fa`) (D33).
 
-10. Tell the user the next step is `/fa-order`: for an existing project, normalize
+10. Tell the user the next step is `/fa` (it opens the planning interview): for an existing project, normalize
    existing open issues into the Foragent format with the user's approval; for
    a new project, order the first work.

@@ -50,7 +50,17 @@ def collect(store: StateStore, config: Config | None = None, now: datetime | Non
         "usage": store.usage(),
         "as_of": status["as_of"],
         "stale": status["stale"],
+        "next": next_step(config.language),
     }
+
+
+# The /fa choices at the end of the briefing (D59 addendum 2); ids name the flow, labels are what people see.
+CHOICES = ("order", "design", "inspect")
+
+
+def next_step(language: str = "en") -> dict[str, Any]:
+    return {"question": text("brief_next_question", language),
+            "choices": [{"id": choice, "label": text(f"brief_choice_{choice}", language)} for choice in CHOICES]}
 
 
 def _minutes(started: str | None, now: datetime) -> int | None:
@@ -160,4 +170,6 @@ def render(brief: dict[str, Any], language: str = "en") -> str:
                                  percent=f"{window['used_percent']:g}")
                             for window in record.get("windows") or [])
         lines.append(text("brief_usage_item", language, executor=executor, windows=windows or none))
+    step = next_step(language)
+    lines.append(" ".join([step["question"], *(f"[{choice['label']}]" for choice in step["choices"])]))
     return "\n".join(lines)
