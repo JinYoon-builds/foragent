@@ -34,6 +34,8 @@ def run(args) -> int:
         return 0
     config, _repo, store = repo_store(root)
     facts = cli.brief.collect(store, config, cli.datetime.now(cli.UTC))
+    if offer := cli.update_check.check(config):
+        facts["update"] = offer
     if args.json:
         print(cli.json.dumps(facts, ensure_ascii=False))
         return 0
