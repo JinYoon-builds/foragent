@@ -65,35 +65,45 @@ def _finished(run: Any, finished_at: str | None) -> datetime | None:
 
 
 def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
-    """Every merge of one store: (number, size, started, merged), one entry per merge.
+    """Each merged issue of one store once, at its latest merge: (number, size, started, merged).
 
-    Each sample uses the facts recorded when its merge was first seen, so a later
-    reopening, re-approval or relabelling never adds, removes or changes one.
-    A gate merge is a run that finished as merged; a reopened issue merged three
-    times contributes three runs. A merge outside the gate is a merged PR that,
-    when first seen, closed an approved issue with a recorded run that did not
-    itself merge through the gate."""
+    The merge starts at the issue's latest recorded run that began before it, for
+    gate and outside merges alike. Each merge uses the facts recorded when it was
+    first seen, so a later reopening, re-approval or relabelling never adds, removes
+    or changes one. A gate merge is a run that finished as merged. A merged PR
+    counts when, first seen, it closed an approved issue with a recorded run. The
+    gate run's own PR is the same merge seen from GitHub (same run, merged seconds
+    from the run's finish), and the issue counts once, so it adds no second sample;
+    any later merge, gate or outside, with or without a new run, is the latest."""
     rows = {row["number"]: row for row in store.local_issues()}
-    found: list[tuple[int, str, datetime, datetime]] = []
-    gate: set[tuple[int, str]] = set()
+    history = store.read_history()
+    starts: dict[int, list[datetime]] = {}
+    for run in [*history, *store.active_runs()]:
+        if (at := _time(run.started_at)) is not None:
+            starts.setdefault(run.number, []).append(at)
+    latest: dict[int, tuple[datetime, str, datetime | None]] = {}  # number -> (merged, size, started)
+
+    def merged(number: int, end: datetime, size: str, start: datetime | None) -> None:
+        if number not in latest or end > latest[number][0]:
+            latest[number] = (end, size, start)
+
     finish_times = store.finish_times()
-    for run in store.read_history():
+    for run in history:
         if run.outcome != "merged":
             continue
-        gate.add((run.number, run.started_at))
-        if (start := _time(run.started_at)) and (end := _finished(run, finish_times.get((run.number, run.started_at)))):
+        if (end := _finished(run, finish_times.get((run.number, run.started_at)))) is not None:
             row = rows.get(run.number, {})
             # Before any refresh has seen the merge, the issue's current size stands in.
             size = (row.get("run_sizes") or {}).get(run.started_at) or size_of(row.get("labels", ()))
-            found.append((run.number, size, start, end))
+            merged(run.number, end, size, max((at for at in starts.get(run.number, []) if at <= end), default=None))
     for number, row in rows.items():
         for merge in (row.get("merges") or {}).values():
-            if not (merge.get("approved") and merge.get("closed")) or (number, merge.get("started_at")) in gate:
+            if not (merge.get("approved") and merge.get("closed")) or (end := _time(merge.get("merged_at"))) is None:
                 continue
-            start, end = _time(merge.get("started_at")), _time(merge.get("merged_at"))
-            if start is not None and end is not None and merge.get("size") in SIZES:
-                found.append((number, merge["size"], start, end))
-    return found
+            if merge.get("size") in SIZES:
+                merged(number, end, merge["size"], _time(merge.get("started_at")))
+    return [(number, size, start, end) for number, (end, size, start) in sorted(latest.items())
+            if start is not None]
 
 
 def machine_stores(store: Any) -> list[Any]:
@@ -312,8 +322,8 @@ def render(snapshot: Any, config: Config, repo_root: Path, **context: Any) -> li
             # Without remaining approved work there is no estimate line.
             if snapshot.eta is not None:
                 low, high = snapshot.eta_range or (snapshot.eta, snapshot.eta)
-                lines.append([(text("progress_finish", language, when=_moment(snapshot.eta, now, language),
-                                    low=_moment(low, now, language), high=_moment(high, now, language)), "bold")])
+                lines.append([(text("progress_finish", language, low=_moment(low, now, language),
+                                    high=_moment(high, now, language)), "bold")])
                 items = [text("progress_basis_runs", language, size=size, count=count) if count is not None
                          else text("progress_basis_default", language, size=size)
                          for size, count in snapshot.eta_basis.items()]
@@ -321,8 +331,9 @@ def render(snapshot: Any, config: Config, repo_root: Path, **context: Any) -> li
             if snapshot.recent:
                 lines.append([(text("progress_evidence", language, count=snapshot.recent, remaining=remaining), "")])
             else:
-                note = text("progress_no_evidence", language, count=0, remaining=remaining)
-                lines.append([(note + text("progress_today", language, count=snapshot.today), "")])
+                lines.append([(text("progress_no_evidence", language, count=0, remaining=remaining), "")])
+                if snapshot.today:
+                    lines.append([(text("progress_today", language, count=snapshot.today), "")])
                 running = [f"#{run['number']}" + (f" {text(run['phase'], language)}" if run.get("phase") else "")
                            for run in snapshot.status.get("active_runs", [])]
                 if running:
