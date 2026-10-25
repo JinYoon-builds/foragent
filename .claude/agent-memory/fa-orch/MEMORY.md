@@ -130,3 +130,4 @@
 - [#104 skill catalog](project_104_skill_catalog.md) — Available skills prompt section, Skills used in Run/PR, claude plain VERDICT fallback
 - [#497 memory critical line](project_497_memory_critical.md) — raw kernel level, critical holds starts only, floors in IGNORED_KEYS
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
+- [#514 neutral config/locked moves](project_514_neutral_more.md) — config key rules; Done when included #483 test → applied #483 WIP diff

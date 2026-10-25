@@ -1,0 +1,13 @@
+---
+name: project-514-neutral-more
+description: #514 base-move neutral rules for .foragent.yml keys and other orders' new locked files; Done-when dependency on #483
+metadata:
+  type: project
+---
+
+- `run_base_move.base_move_is_neutral()`: own changed paths → reverify; docs/ neutral; `.foragent.yml` neutral only if `config_move_is_neutral()` (raw keys head vs target; check keys = test_command, acceptance_dir, checks*, runner_unit_tests, lanes, review, `ci_*`/`executor*`/`reviewer*`; absent/unparsable/invalid over DEFAULTS only → reverify).
+- Locked files are neutral only if the baseline did not run them: in `baseline.excluded` OR missing at `baseline.base_sha` (new `AcceptanceBaseline.base_sha`, set on every `_capture_baseline`/`capture_local_only` return; fallback `move.head_sha` without a baseline). Review: checking HEAD wrongly re-verified a 2nd move after an earlier neutral move brought the file into HEAD (keeps #376's "approved later does not hide a ran test"). Owners: open-in-tracker approval snapshots + open issues with approved/ready/running whose Files or `acceptance_paths(done_when)` name the path; this issue among owners → reverify.
+- `tests/test_run_base_move.py` fake ctx needs `tracker.list_issues` and `config.acceptance_dir`.
+- **Why it matters:** #514's Done when includes `test_baseline_follows_base.py`, which is #483's test and fails on base (4 tests) until #483 lands. QUESTION.md was rejected by the goal Stop hook (Done when must exit 0), so the #483 WIP src diff (`git diff HEAD...origin/foragent/issue-483 -- src/ | git apply`) was applied here: re-capture baseline in `refresh_base` on non-neutral moves + FakeTracker `_MergedPRs`.
+- **How to apply:** before implementing, run the Done when files on base; if a file owned by another open issue fails, reuse that issue's WIP branch diff rather than re-implementing; a QUESTION does not satisfy the hook.
+- Review: normalize `acceptance_dir` and owner paths (`./x/`) like `issue.acceptance_paths()` before comparing with Git paths (`_repo_path`).

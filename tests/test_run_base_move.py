@@ -9,7 +9,7 @@ import pytest
 
 from foragent.git import GitRepo
 from foragent.run_baseline import AcceptanceBaseline
-from foragent.run_base_move import BaseMove, base_move_is_neutral, capture_move, moved_paths
+from foragent.run_base_move import BaseMove, base_move_is_neutral, capture_move, config_move_is_neutral, moved_paths
 
 
 def git(root: Path, *args: str, env: dict | None = None) -> str:
@@ -82,7 +82,10 @@ def attempt(root: Path, owners: dict[int, list[str]], *, merged=(), n: int = 1, 
     )
     baseline = AcceptanceBaseline("pytest", (), excluded=tuple(skipped))
     approval = SimpleNamespace(acceptance_blobs={name: "sha" for name in own_locked})
-    return SimpleNamespace(n=n, ctx=SimpleNamespace(store=store), git=GitRepo(root), baseline=baseline,
+    tracker = SimpleNamespace(list_issues=lambda state: [
+        SimpleNamespace(number=number, labels=frozenset(), body="", state="open") for number in approvals])
+    ctx = SimpleNamespace(store=store, tracker=tracker, config=SimpleNamespace(acceptance_dir="tests/acceptance"))
+    return SimpleNamespace(n=n, ctx=ctx, git=GitRepo(root), baseline=baseline,
                            approval=approval)
 
 
@@ -207,3 +210,61 @@ def test_own_locked_files_reverify_even_when_the_baseline_skipped_them(repo):
     target = move(repo, {OTHER: "y\n"})
     assert neutral(attempt(repo, {2: [OTHER]}), target)
     assert not neutral(attempt(repo, {2: [OTHER]}, own_locked=(OTHER,)), target)
+
+
+BASE_CONFIG = "repo: owner/repo\nstall_minutes: 30\n"
+
+
+@pytest.mark.parametrize(("before", "after", "expected"), [
+    pytest.param(BASE_CONFIG, "repo: owner/repo\nstall_minutes: 60\n", True, id="neutral-key"),
+    pytest.param(BASE_CONFIG, BASE_CONFIG + "run_hours: always\n", True, id="neutral-key-added"),
+    pytest.param(BASE_CONFIG, BASE_CONFIG + "test_command: pytest\n", False, id="test-command-added"),
+    pytest.param(BASE_CONFIG, BASE_CONFIG + "ci_required: true\n", False, id="ci-prefix"),
+    pytest.param(BASE_CONFIG, BASE_CONFIG + "review: careful\n", False, id="review"),
+    pytest.param(BASE_CONFIG, BASE_CONFIG + "executor: codex\n", False, id="executor-prefix"),
+    pytest.param(BASE_CONFIG, BASE_CONFIG + "stall_minutes: [\n", False, id="unparsable"),
+    pytest.param(BASE_CONFIG, "repo: owner/repo\nstall_minutes: -1\n", False, id="invalid-config"),
+    pytest.param(BASE_CONFIG, BASE_CONFIG + "no_such_key: 1\n", False, id="unknown-key"),
+    pytest.param(BASE_CONFIG, None, False, id="removed"),
+    pytest.param(None, BASE_CONFIG, False, id="absent-at-head"),
+])
+def test_config_move_compares_head_and_target_keys(repo, before, after, expected):
+    if before is not None:
+        commit(repo, "main", {".foragent.yml": before})
+        git(repo, "update-ref", "refs/heads/feature", git(repo, "rev-parse", "main"))
+        on_feature(repo)
+    target = move(repo, {".foragent.yml": after})
+    work = attempt(repo, {})
+    assert config_move_is_neutral(work.git, capture_move(work.git, target)) is expected
+    assert neutral(work, target) is expected
+
+
+NEW_LOCKED = "tests/acceptance/test_new_order.py"
+
+
+def test_locked_file_absent_from_the_baseline_commit_stays_neutral_on_a_second_move(repo):
+    """A first neutral move brings it into HEAD; the baseline still never ran it (#514)."""
+    baseline_sha = git(repo, "rev-parse", "feature")
+    first = move(repo, {NEW_LOCKED: "x\n"})
+    work = attempt(repo, {2: [NEW_LOCKED]}, skipped=())
+    work.baseline = AcceptanceBaseline("pytest", (), excluded=(), base_sha=baseline_sha)
+    assert neutral(work, first)
+    # The neutral move is merged into the verified branch; the baseline is unchanged.
+    git(repo, "update-ref", "refs/heads/feature",
+        git(repo, "commit-tree", f"{first}^{{tree}}", "-p", baseline_sha, "-p", first, "-m", "merge"))
+    on_feature(repo)
+    second = move(repo, {NEW_LOCKED: "y\n"})
+    assert git(repo, "cat-file", "-t", f"feature:{NEW_LOCKED}") == "blob"
+    assert neutral(work, second)
+    ran = attempt(repo, {2: [NEW_LOCKED]}, skipped=())
+    ran.baseline = AcceptanceBaseline("pytest", (), excluded=(), base_sha=first)
+    assert not neutral(ran, second), "A file present where the baseline ran stays result-affecting"
+
+
+@pytest.mark.parametrize("directory", ["tests/acceptance", "./tests/acceptance", "./tests/acceptance/"])
+@pytest.mark.parametrize("named", [NEW_LOCKED, "./" + NEW_LOCKED])
+def test_dot_slash_acceptance_dir_and_owner_paths_match_git_paths(repo, directory, named):
+    target = move(repo, {NEW_LOCKED: "x\n"})
+    work = attempt(repo, {2: [named]}, skipped=())
+    work.ctx.config.acceptance_dir = directory
+    assert neutral(work, target)
