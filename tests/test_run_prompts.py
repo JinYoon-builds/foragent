@@ -4,6 +4,7 @@ import pytest
 
 from foragent.issue import parse_body
 from foragent.runner import build_prompt, build_review_prompt, goal_condition, parse_review, run_issue
+from foragent.run_skill_catalog import catalog_section
 from runner_support import BODY, COMMAND, run_case
 
 
@@ -91,7 +92,8 @@ def test_codex_goal_opt_in_preserves_other_options_and_acceptance_rule(run_case,
     c.ctx.config = replace(c.ctx.config, codex_goal=enabled)
     assert run_issue(1, c.ctx) == "merged"
     call = c.executor.calls[0]
-    original = build_prompt(1, parse_body(BODY), c.ctx.config.acceptance_dir)
+    # No skill library is present here, so the implementer gets the empty catalog section.
+    original = build_prompt(1, parse_body(BODY), c.ctx.config.acceptance_dir, skill_catalog=catalog_section([]))
     assert call["prompt"] == (f"/goal {goal_condition(c.ctx.config.acceptance_dir)}\n\n" if enabled else "") + original
     assert set(call) == {"worktree", "prompt", "model", "timeout_s", "log_path", "effort"}
     assert call["effort"] == "high"

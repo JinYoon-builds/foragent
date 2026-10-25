@@ -485,6 +485,10 @@ def _print_status(status: dict[str, Any], language: str = "en") -> None:
     if status.get("as_of"):
         print(text("status_as_of", language, time=status["as_of"]))
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
+    if outcome := status.get("tick_outcome"):
+        duration = outcome.get("duration_seconds")
+        print(text("tick_outcome", language, result=outcome["status"],
+                   duration=f"{duration:g}s" if duration is not None else "—"))
     _print_machine_budget(status, language)
     for lane in status["lanes"].values():
         details = [text(lane["state"], language)]

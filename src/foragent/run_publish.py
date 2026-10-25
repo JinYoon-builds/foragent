@@ -4,24 +4,25 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
+from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
 from foragent import board
-from foragent.actions import FlagContext, flag
+from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.git import GitError, GitRepo, PublicationError
-from foragent.issue import ParsedIssue
-from foragent.labels import BLOCKED, READY, RUNNING
-from foragent.policy import merge_decision, review_mode_for, touched
+from foragent.issue import ParsedIssue, body_hash
+from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
+from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped
-from foragent.run_base_move import REUSED, REVERIFY, base_move_is_neutral, capture_move
+from foragent.run_base_move import BaseMove, REUSED, REVERIFY, base_move_is_neutral, capture_move, fetch_move
 from foragent.run_checks import _acceptance_matches, _append
-from foragent.run_lane_skills import _inject_lane_skills
 from foragent.run_prompts import review_scope_rules
+from foragent.run_skill_catalog import report_line
 from foragent.run_waits import _credited_wait, _phase, _progress, _timeout
-from foragent.state import Approval
+from foragent.state import Approval, Run
 from foragent.tracker import TrackerError
 
 if TYPE_CHECKING:
@@ -37,6 +38,7 @@ def _pr_body(
     *, outside_lane: list[str] | None = None, fallback_model: str | None = None,
     attempt_tiers: dict[str, str] | None = None,
     missing_skills: list[str] | None = None,
+    skills_line: str | None = None,
     rebuttals: str = "",
     review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
 ) -> str:
@@ -68,6 +70,8 @@ def _pr_body(
         lines.extend(["", "## Outside lane", "", *(f"- `{path}`" for path in outside_lane)])
     if missing_skills:
         lines.extend(["", "## Lane skills", "", *(f"- missing skill: {name}" for name in missing_skills)])
+    if skills_line is not None:
+        lines.extend(["", skills_line])
     if fallback_model is not None:
         lines.extend(["", f"Executor fallback model: {fallback_model}"])
     if attempt_tiers:
@@ -114,9 +118,141 @@ def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str)
 @contextmanager
 def _merge_lock(n: int, ctx: RunContext):
     # Keep tick informed during an unbounded blocking flock acquisition.
-    with ExitStack() as stack:
-        _credited_wait(n, ctx, lambda: stack.enter_context(ctx.store.merge_lock()))
-        yield
+    started = None
+    try:
+        with ExitStack() as stack:
+            def acquire():
+                nonlocal started
+                stack.enter_context(ctx.store.merge_lock())
+                started = ctx.now()
+
+            _credited_wait(n, ctx, acquire)
+            yield
+    finally:
+        if started is not None:
+            ctx.store.record_merge_lock(n, (ctx.now() - started).total_seconds())
+
+
+def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float) -> str:
+    status = ctx.tracker.pr_checks(pr)
+    has_workflows = any(path.is_file() for pattern in ("*.yml", "*.yaml")
+                        for path in (worktree / ".github/workflows").glob(pattern))
+    if status == "none" and has_workflows and ctx.now().timestamp() - ready_at < 180:
+        return "pending"
+    return status
+
+
+@dataclass
+class _CIWait:
+    started: float
+    polls: int = 0
+
+
+def _wait_for_ci(
+    n: int, ctx: RunContext, git: GitRepo, pr: int, head: str, ready_at: float,
+    wait: _CIWait, failed: Callable[[], None], status: str | None = None,
+) -> str | None:
+    """Consume even a status observed under the lock, but only wait unlocked."""
+    from foragent import runner
+
+    link = f"https://github.com/{ctx.repo}/pull/{pr}"
+    while True:
+        if runner._remaining(n, ctx) <= 0:
+            return _timeout(n, ctx)
+        if status is None:
+            status = _ci_status(ctx, pr, git.root, ready_at)
+        _progress(n, ctx)
+        if ctx.tracker.pr_head_sha(pr) != head:
+            return _hold_changed_head(n, ctx, link)
+        if status in {"pass", "none"}:
+            return None
+        if status == "fail":
+            failed()
+        remaining = wait.started + 1200 - ctx.now().timestamp()
+        if remaining <= 0 or wait.polls >= 40:
+            flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
+            return "timeout"
+        ctx.sleep(min(30, remaining, runner._remaining(n, ctx)))
+        wait.polls += 1
+        status = None
+
+
+def _policy_allows(decision: Decision, base: str, batch_branch: str | None) -> bool:
+    return decision.kind == "merge" or (
+        decision.kind == "hold_mode" and decision.mode != "careful" and base == batch_branch
+    )
+
+
+@dataclass
+class _MergeInputs:
+    # A stop is deferred so flagging/invalidation happens after releasing the lock.
+    stop: Callable[[], str] | None = None
+    base_sha: str = ""
+    paths: list[str] = field(default_factory=list)
+    decision: Decision = Decision("merge")
+    status: str = "pending"
+    batch_branch: str | None = None
+
+
+def _final_merge_inputs(
+    n: int, ctx: RunContext, git: GitRepo, pr: int, branch: str, base: str,
+    head: str, approval: Approval, ready_at: float, *, base_sha: str | None = None,
+    approved_body_sha: str | None = None,
+) -> _MergeInputs:
+    """Read every mutable prerequisite after acquiring the final merge lock.
+
+    Re-read approval/labels (and live body for review-only), PR state/branches, local and remote head,
+    fetched target SHA, approved acceptance blobs on head and configured base,
+    local and tracker paths, current policy config and batch parent, CI (including workflow
+    registration grace), and the remaining run budget. Verification/review
+    evidence stays pinned to the supplied head and approval snapshot.
+    """
+    link = f"https://github.com/{ctx.repo}/pull/{pr}"
+
+    def invalid_approval() -> str:
+        invalidate_approval(ctx, n, "Approval invalidated: issue, approval or acceptance files changed. Re-approve to run it.")
+        return "hash-mismatch"
+
+    def changed_base() -> str:
+        flag(ctx, n, Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
+        return "base-changed"
+
+    status = _ci_status(ctx, pr, git.root, ready_at)
+    issue = ctx.tracker.get_issue(n)
+    saved = ctx.store.load_approval(n)
+    if (APPROVED not in issue.labels
+            or (approved_body_sha is not None and body_hash(issue.body) != approved_body_sha)
+            or saved is None or saved.body_sha != approval.body_sha
+            or saved.acceptance_blobs != approval.acceptance_blobs):
+        return _MergeInputs(stop=invalid_approval)
+    current = next((item for item in ctx.tracker.list_prs("open", branch) if item.number == pr), None)
+    if current is None or current.head != branch or current.base != base:
+        return _MergeInputs(stop=changed_base)
+    parent = ctx.tracker.parent_of(n)
+    batch_branch = f"foragent/batch-{parent}" if parent is not None else None
+    if base not in {ctx.config.base_branch, batch_branch}:
+        return _MergeInputs(stop=changed_base)
+    ctx.git.fetch("origin", base)
+    target_sha = git.ref_sha(f"origin/{base}")
+    if base_sha is not None and target_sha != base_sha:
+        return _MergeInputs(stop=changed_base)
+    configured_base_sha = target_sha
+    if base != ctx.config.base_branch:
+        ctx.git.fetch("origin", ctx.config.base_branch)
+        configured_base_sha = git.ref_sha(f"origin/{ctx.config.base_branch}")
+    for ref in (head, configured_base_sha):
+        blobs = git.blob_shas(ref, approval.acceptance_blobs)
+        if any(blobs.get(path) != sha for path, sha in approval.acceptance_blobs.items()):
+            return _MergeInputs(stop=invalid_approval)
+    paths = sorted(set(git.changed_paths(target_sha)) | set(ctx.tracker.pr_changed_files(pr)))
+    decision = merge_decision(changed_paths=paths, issue_labels=issue.labels, config=ctx.config)
+    # Bind this status and all verification evidence to the exact head we merge.
+    if git.head_sha() != head or ctx.tracker.pr_head_sha(pr) != head:
+        return _MergeInputs(stop=lambda: _hold_changed_head(n, ctx, link))
+    from foragent import runner
+    if runner._remaining(n, ctx) <= 0:
+        return _MergeInputs(stop=lambda: _timeout(n, ctx))
+    return _MergeInputs(base_sha=target_sha, paths=paths, decision=decision, status=status, batch_branch=batch_branch)
 
 
 def _batch_pr(parent: int, ctx: RunContext) -> None:
@@ -153,9 +289,11 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
 
 
-def _check_publication(git: GitRepo, target_branch: str) -> None:
+def _check_publication(git: GitRepo, target_branch: str, base_sha: str | None = None) -> None:
+    if base_sha is None:
+        base_sha = git.ref_sha(f"origin/{target_branch}")
     try:
-        git.check_publication(f"origin/{target_branch}")
+        git.check_publication(base_sha)
     except PublicationError as exc:
         raise AttemptFailure(str(exc), target_branch) from exc
 
@@ -204,6 +342,11 @@ def _push_branch(attempt: Implementation) -> None:
     attempt.pushed_head = attempt.git.head_sha()
 
 
+def _skills_line(run: Run) -> str:
+    """The implementer's own `Skills used:` report; every implementer is asked for one."""
+    return report_line(run.skills_used, run.skills_reported)
+
+
 def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str:
     n, ctx = attempt.n, attempt.ctx
     lane = ctx.store.get_run(n).lane
@@ -215,13 +358,14 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
         fallback_model=ctx.store.get_run(n).fallback_model,
         attempt_tiers=ctx.store.get_run(n).attempt_tiers,
         missing_skills=attempt.missing_skills,
+        skills_line=_skills_line(ctx.store.get_run(n)),
         rebuttals="\n\n".join(attempt.rebuttals),
         review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
     )
 
 
-def _open_or_update_pr(attempt: Implementation, title: str, body: str) -> int:
-    _check_publication(attempt.git, attempt.target_branch)
+def _open_or_update_pr(attempt: Implementation, title: str, body: str, base_sha: str | None = None) -> int:
+    _check_publication(attempt.git, attempt.target_branch, base_sha)
     pr = attempt.ctx.tracker.find_pr(attempt.branch)
     if pr is None:
         pr = attempt.ctx.tracker.create_pr(head=attempt.branch, base=attempt.target_branch, title=title, body=body)
@@ -232,13 +376,12 @@ def _open_or_update_pr(attempt: Implementation, title: str, body: str) -> int:
 
 
 def _publish(attempt: Implementation) -> str:
-    with _merge_lock(attempt.n, attempt.ctx):
-        return _publish_locked(attempt)
+    return _publish_locked(attempt)
 
 
 def _publish_locked(attempt: Implementation) -> str:
     from foragent.run_checks import _verify_implementation
-    from foragent.run_conflicts import _block_rebuild, _resolve_conflicts
+    from foragent.run_conflicts import _block_rebuild, _merge_moved_base, _resolve_conflicts
     from foragent import runner
 
     # Only metadata is read live; instructions and checks always use the snapshot.
@@ -252,51 +395,52 @@ def _publish_locked(attempt: Implementation) -> str:
     verified_head_sha = git.head_sha()
     base_merges = 0
 
-    def refresh_base() -> str | None:
-        nonlocal verified_head_sha, base_merges
-        ctx.git.fetch("origin", attempt.target_branch)
-        target_ref = f"origin/{attempt.target_branch}"
-        target_sha = git.ref_sha(target_ref)
-        if git.is_ancestor(target_sha, verified_head_sha):
-            return None
-        # Docs and other issues' pending locked tests cannot change this
-        # branch's verified result, so they neither re-verify nor use the budget.
-        # The shared remote-tracking ref can move again (another fetch) before
-        # the merge, so pin the range once, classify it, and merge exactly it.
-        move = capture_move(git, target_sha)
-        target_sha = move.target_sha
-        neutral = base_move_is_neutral(attempt, move)
-        if not neutral and base_merges == 3:
-            flag(ctx, n, Reason.TIMEOUT, "base kept moving")
-            raise ExecutorStopped("timeout")
-        _append(log, f"{REUSED if neutral else REVERIFY}: {target_sha}")
-        _inject_lane_skills(ctx, n, git, target_sha)
-        try:
-            git.merge_base(target_sha)
-        except GitError:
-            conflicts = git.conflict_paths()
-            if not conflicts:
-                raise
-            _resolve_conflicts(attempt, conflicts)
-            neutral = False
-        else:
-            if not neutral:
-                check_failure = _verify_implementation(attempt)
-                if check_failure:
-                    raise AttemptFailure(check_failure)
-        if not neutral:
-            base_merges += 1
+    def finish_base() -> None:
+        nonlocal verified_head_sha
         if runner._remaining(n, ctx) <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
         if git.has_staged_changes():
             git.commit(title)
         verified_head_sha = git.head_sha()
-        return target_sha
 
-    target_sha = refresh_base() if not attempt.review_hold else None
+    def refresh_base(move: BaseMove, conflicts: list[str] | None = None) -> str:
+        nonlocal base_merges
+        neutral = conflicts is None and base_move_is_neutral(attempt, move)
+        if not neutral and base_merges == 3:
+            flag(ctx, n, Reason.TIMEOUT, "base kept moving")
+            raise ExecutorStopped("timeout")
+        _append(log, f"{REUSED if neutral else REVERIFY}: {move.target_sha}")
+        # Exclude the merged base's paths from policy and patch replay. The
+        # separate verified_base_sha advances only after verification/push.
+        attempt.start_ref = move.target_sha
+        if conflicts is None:
+            conflicts = _merge_moved_base(attempt, move.target_sha)
+        if conflicts:
+            if base_merges == 3:
+                flag(ctx, n, Reason.TIMEOUT, "base kept moving")
+                raise ExecutorStopped("timeout")
+            _resolve_conflicts(attempt, conflicts)
+            neutral = False
+        elif not neutral:
+            check_failure = _verify_implementation(attempt)
+            if check_failure:
+                raise AttemptFailure(check_failure)
+        if not neutral:
+            base_merges += 1
+        finish_base()
+        return move.target_sha
+
+    target_sha = None
+    if not attempt.review_hold:
+        move = fetch_move(attempt, verified_head_sha)
+        # Publication can fetch a newer ref in another lane. Evidence belongs
+        # to this captured base, including when it was already in the head.
+        verified_base_sha = move.target_sha
+        if not git.is_ancestor(move.target_sha, move.head_sha):
+            target_sha = refresh_base(move)
     if not attempt.review_hold and runner._remaining(n, ctx) <= 0:
         return _timeout(n, ctx)
-    _check_publication(git, attempt.target_branch)
+    _check_publication(git, attempt.target_branch, None if attempt.review_hold else verified_base_sha)
     _push_branch(attempt)
     _progress(n, ctx)
     _append(log, f"Pushed verified HEAD: {verified_head_sha}")
@@ -311,7 +455,7 @@ def _publish_locked(attempt: Implementation) -> str:
     def pr_body() -> str:
         return _render_pr_body(attempt, try_text)
 
-    pr = _open_or_update_pr(attempt, title, pr_body())
+    pr = _open_or_update_pr(attempt, title, pr_body(), None if attempt.review_hold else verified_base_sha)
     if target_sha is not None:
         ctx.tracker.comment(pr, f"base merged before merge: {target_sha}")
     _progress(n, ctx)
@@ -328,110 +472,134 @@ def _publish_locked(attempt: Implementation) -> str:
         details = f"{attempt.failure}\n\n{link}"
         flag(ctx, n, attempt.review_hold_reason, summary, details)
         return "held"
-    decision = merge_decision(
+
+    def policy_hold(decision: Decision, batch_branch: str | None = attempt.batch_branch) -> str | None:
+        if decision.kind == "hold":
+            flag(ctx, n, decision.reason, decision.summary, link)
+            return "held"
+        if not _policy_allows(decision, attempt.target_branch, batch_branch):
+            ctx.store.update_run(n, detail=f"PR #{pr} is waiting for your review.")
+            ctx.tracker.comment(n, f"PR #{pr} is waiting for your review\n\n{link}")
+            ctx.tracker.remove_labels(n, [RUNNING])
+            return "pr-open"
+
+    if stopped := policy_hold(merge_decision(
         changed_paths=ctx.tracker.pr_changed_files(pr),
         issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
-    )
-    if decision.kind == "hold":
-        flag(ctx, n, decision.reason, decision.summary, link)
-        return "held"
-    if decision.kind == "hold_mode" and (decision.mode == "careful" or not attempt.batch_branch):
-        ctx.store.update_run(n, detail=f"PR #{pr} is waiting for your review.")
-        ctx.tracker.comment(n, f"PR #{pr} is waiting for your review\n\n{link}")
-        ctx.tracker.remove_labels(n, [RUNNING])
-        return "pr-open"
+    )):
+        return stopped
 
+    def publish_refresh(target_sha: str) -> str | None:
+        nonlocal pr_ready_at, ci_wait, verified_base_sha
+        _check_publication(git, attempt.target_branch, target_sha)
+        _push_branch(attempt)
+        _progress(n, ctx)
+        _append(log, f"Pushed verified HEAD: {verified_head_sha}")
+        ctx.tracker.update_pr(pr, base=attempt.target_branch, title=title, body=pr_body())
+        ctx.tracker.comment(pr, f"base merged before merge: {target_sha}")
+        pr_ready_at = ctx.now().timestamp()
+        ci_wait = _CIWait(pr_ready_at)
+        verified_base_sha = target_sha
+        if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
+            return _hold_changed_head(n, ctx, link)
+        decision = merge_decision(
+            changed_paths=git.changed_paths(target_sha),
+            issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
+        )
+        return policy_hold(decision)
+
+    def ci_failed() -> None:
+        if attempt.rebuilt:
+            logs = ctx.tracker.pr_failed_logs(pr)
+            _hold_if_not_started(n, ctx, pr, logs)
+            raise ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
+        _ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)
+
+    ci_wait = _CIWait(pr_ready_at)
+    queued_status = None
     # Result-affecting base merges are bounded by refresh_base's budget and
     # result-neutral ones by the run's time budget, which refresh_base checks.
     while True:
         _phase(n, ctx, "ci")
-        has_workflows = any(
-            path.is_file()
-            for pattern in ("*.yml", "*.yaml")
-            for path in (worktree / ".github/workflows").glob(pattern)
-        )
-        deadline = ctx.now().timestamp() + 20 * 60
-        for poll in range(41):
-            status = ctx.tracker.pr_checks(pr)
-            _progress(n, ctx)
-            if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
-                return _hold_changed_head(n, ctx, link)
-            # Actions checks can register after each push, including base merges.
-            if status == "none" and has_workflows and ctx.now().timestamp() - pr_ready_at < 180:
-                status = "pending"
-            if status in {"pass", "none"}:
-                break
-            if status == "fail":
-                if attempt.rebuilt:
-                    logs = ctx.tracker.pr_failed_logs(pr)
-                    _hold_if_not_started(n, ctx, pr, logs)
-                    raise ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
-                _ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)
-            remaining = deadline - ctx.now().timestamp()
-            if remaining <= 0 or poll == 40:
-                flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
-                return "timeout"
-            ctx.sleep(min(30, remaining))
+        if stopped := _wait_for_ci(n, ctx, git, pr, verified_head_sha, pr_ready_at,
+                                  ci_wait, ci_failed, queued_status):
+            return stopped
+        queued_status = None
 
-        target_sha = refresh_base()
-        target_ref = f"origin/{attempt.target_branch}"
-        if target_sha is not None:
-            _check_publication(git, attempt.target_branch)
-            _push_branch(attempt)
-            _progress(n, ctx)
-            _append(log, f"Pushed verified HEAD: {verified_head_sha}")
-            ctx.tracker.update_pr(pr, base=attempt.target_branch, title=title, body=pr_body())
-            ctx.tracker.comment(pr, f"base merged before merge: {target_sha}")
-            pr_ready_at = ctx.now().timestamp()
-            if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
-                return _hold_changed_head(n, ctx, link)
-            decision = merge_decision(
-                changed_paths=git.changed_paths(target_ref),
-                issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
-            )
-            if decision.kind == "hold":
-                flag(ctx, n, decision.reason, decision.summary, link)
-                return "held"
-            if decision.kind == "hold_mode" and (decision.mode == "careful" or not attempt.batch_branch):
-                ctx.store.update_run(n, detail=f"PR #{pr} is waiting for your review.")
-                ctx.tracker.comment(n, f"PR #{pr} is waiting for your review\n\n{link}")
-                ctx.tracker.remove_labels(n, [RUNNING])
-                return "pr-open"
+        # Refresh a base that already moved before joining the merge queue.
+        # The final snapshot still detects changes during lock acquisition.
+        ctx.git.fetch("origin", attempt.target_branch)
+        target_sha = git.ref_sha(f"origin/{attempt.target_branch}")
+        if target_sha != verified_base_sha:
+            target_sha = refresh_base(capture_move(git, target_sha))
+            if stopped := publish_refresh(target_sha):
+                return stopped
             continue
-        _check_publication(git, attempt.target_branch)
-        _phase(n, ctx, "merging")
-        try:
-            ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha)
-        except TrackerError as exc:
-            if exc.is_rate_limit:
-                raise
-            if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
-                return _hold_changed_head(n, ctx, link)
-            raise
-        if decision.kind == "merge":
-            runner.after_merge(ctx, pr, attempt.target_branch)
-        _progress(n, ctx)
-        try:
-            if attempt.target_branch == attempt.batch_branch:
-                ctx.tracker.close_issue(n, f"Merged into {attempt.batch_branch} (PR #{pr})")
-            else:
-                ctx.tracker.close_issue(n)
-        except TrackerError as exc:
-            if exc.is_rate_limit:
-                raise
-            if ctx.tracker.current_issue(n).state != "closed":
-                raise
-        ctx.tracker.remove_labels(n, [READY, RUNNING])
-        board.sync_status(ctx, n, "Done")
-        if attempt.target_branch == attempt.batch_branch and attempt.parent is not None:
-            try:
-                _batch_pr(attempt.parent, ctx)
-            except (GitError, TrackerError) as exc:
-                if isinstance(exc, TrackerError) and exc.is_rate_limit:
-                    raise
-                _append(log, f"Batch PR finalization deferred to tick: {exc}")
-        _progress(n, ctx)
-        return "merged"
+
+        with _merge_lock(n, ctx):
+            inputs = _final_merge_inputs(
+                n, ctx, git, pr, attempt.branch, attempt.target_branch,
+                verified_head_sha, attempt.approval, pr_ready_at,
+            )
+            move = None
+            continue_merge = (
+                inputs.stop is None
+                and _policy_allows(inputs.decision, attempt.target_branch, inputs.batch_branch)
+                and inputs.status in {"pass", "none"}
+            )
+            if continue_merge and inputs.base_sha != verified_base_sha:
+                move = capture_move(git, inputs.base_sha)
+            if continue_merge and move is None:
+                _check_publication(git, attempt.target_branch, inputs.base_sha)
+                _phase(n, ctx, "merging")
+                try:
+                    ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha)
+                except TrackerError as exc:
+                    if exc.is_rate_limit:
+                        raise
+                    if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
+                        inputs.stop = lambda: _hold_changed_head(n, ctx, link)
+                    else:
+                        raise
+                else:
+                    ctx.store.record_merge(n, ctx.now())
+                    if inputs.decision.kind == "merge":
+                        runner.after_merge(ctx, pr, attempt.target_branch)
+                    _progress(n, ctx)
+                    try:
+                        if attempt.target_branch == attempt.batch_branch:
+                            ctx.tracker.close_issue(n, f"Merged into {attempt.batch_branch} (PR #{pr})")
+                        else:
+                            ctx.tracker.close_issue(n)
+                    except TrackerError as exc:
+                        if exc.is_rate_limit:
+                            raise
+                        if ctx.tracker.current_issue(n).state != "closed":
+                            raise
+                    ctx.tracker.remove_labels(n, [READY, RUNNING])
+                    board.sync_status(ctx, n, "Done")
+                    if attempt.target_branch == attempt.batch_branch and attempt.parent is not None:
+                        try:
+                            _batch_pr(attempt.parent, ctx)
+                        except (GitError, TrackerError) as exc:
+                            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+                                raise
+                            _append(log, f"Batch PR finalization deferred to tick: {exc}")
+                    _progress(n, ctx)
+                    return "merged"
+        if inputs.stop is not None:
+            return inputs.stop()
+        if stopped := policy_hold(inputs.decision, inputs.batch_branch):
+            return stopped
+        if not continue_merge:
+            queued_status = inputs.status
+            continue
+        if move is not None:
+            # Pin the observed base; all merging/rechecks/pushes run unlocked.
+            target_sha = refresh_base(move)
+            if stopped := publish_refresh(target_sha):
+                return stopped
+            continue
 
 
 def _publish_reviewed_head(
@@ -443,93 +611,92 @@ def _publish_reviewed_head(
     worktree = git.root
     log = ctx.store.log_path(n)
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
-    with _merge_lock(n, ctx):
-        # A pass applies only to this head and these instructions. Neither the
-        # reviewer nor an orchestrator verdict can waive the remaining checks.
-        def unchanged() -> str | None:
-            if not approved():
-                return "hash-mismatch"
-            if ctx.tracker.pr_head_sha(pr.number) != head:
-                return _hold_changed_head(n, ctx, link)
-            current = next((item for item in ctx.tracker.list_prs("open", pr.head)
-                            if item.number == pr.number), None)
-            ctx.git.fetch("origin", pr.base)
-            if current is None or current.base != pr.base or ctx.git.ref_sha(base_ref) != base_sha:
-                flag(ctx, n, Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
-                return "base-changed"
-            if not _acceptance_matches(n, ctx, git, approval):
-                return "hash-mismatch"
-            return None
+    # A pass applies only to this head and these instructions. Neither the
+    # reviewer nor an orchestrator verdict can waive the remaining checks.
+    def unchanged() -> str | None:
+        if not approved():
+            return "hash-mismatch"
+        if ctx.tracker.pr_head_sha(pr.number) != head:
+            return _hold_changed_head(n, ctx, link)
+        current = next((item for item in ctx.tracker.list_prs("open", pr.head)
+                        if item.number == pr.number), None)
+        ctx.git.fetch("origin", pr.base)
+        if current is None or current.base != pr.base or ctx.git.ref_sha(base_ref) != base_sha:
+            flag(ctx, n, Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
+            return "base-changed"
+        if not _acceptance_matches(n, ctx, git, approval):
+            return "hash-mismatch"
+        return None
 
-        if stopped := unchanged():
-            return stopped
-        paths = sorted(set(git.changed_paths(base_ref)) | set(ctx.tracker.pr_changed_files(pr.number)))
+    if stopped := unchanged():
+        return stopped
 
-        def policy_hold() -> str | None:
-            decision = merge_decision(changed_paths=paths, issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config)
-            if decision.kind == "hold":
-                flag(ctx, n, decision.reason, decision.summary, link)
-                return "held"
-            if decision.kind == "hold_mode" and (decision.mode == "careful" or pr.base != batch_branch):
-                flag(ctx, n, Reason.RISK_HIGH, "PR is waiting for your review.", link)
-                return "pr-open"
-            return None
+    def policy_hold(decision: Decision, current_batch: str | None = batch_branch) -> str | None:
+        if decision.kind == "hold":
+            flag(ctx, n, decision.reason, decision.summary, link)
+            return "held"
+        if not _policy_allows(decision, pr.base, current_batch):
+            flag(ctx, n, Reason.RISK_HIGH, "PR is waiting for your review.", link)
+            return "pr-open"
+        return None
 
-        if stopped := policy_hold():
+    if stopped := policy_hold(merge_decision(
+        changed_paths=sorted(set(git.changed_paths(base_sha)) | set(ctx.tracker.pr_changed_files(pr.number))),
+        issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
+    )):
+        return stopped
+    started = ctx.now().timestamp()
+    ci_wait = _CIWait(started)
+    queued_status = None
+    while True:
+        if stopped := _wait_for_ci(
+            n, ctx, git, pr.number, head, started, ci_wait,
+            lambda: _ci_failure(n, ctx, pr.number, head, pr.base), queued_status,
+        ):
             return stopped
-        has_workflows = any(path.is_file() for pattern in ("*.yml", "*.yaml")
-                            for path in (worktree / ".github/workflows").glob(pattern))
-        started = ctx.now().timestamp()
-        for poll in range(41):
-            if runner._remaining(n, ctx) <= 0:
-                return _timeout(n, ctx)
-            status = ctx.tracker.pr_checks(pr.number)
-            _progress(n, ctx)
-            if ctx.tracker.pr_head_sha(pr.number) != head:
-                return _hold_changed_head(n, ctx, link)
-            if status == "none" and has_workflows and ctx.now().timestamp() - started < 180:
-                status = "pending"
-            if status in {"pass", "none"}:
-                break
-            if status == "fail":
-                _ci_failure(n, ctx, pr.number, head, pr.base)
-            if ctx.now().timestamp() - started >= 1200 or poll == 40:
-                flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
-                return "timeout"
-            ctx.sleep(min(30, runner._remaining(n, ctx)))
-        if stopped := unchanged():
+        with _merge_lock(n, ctx):
+            inputs = _final_merge_inputs(
+                n, ctx, git, pr.number, pr.head, pr.base, head, approval, started, base_sha=base_sha,
+                approved_body_sha=approval.body_sha,
+            )
+            continue_merge = (inputs.stop is None and _policy_allows(inputs.decision, pr.base, inputs.batch_branch)
+                              and inputs.status in {"pass", "none"})
+            if continue_merge:
+                _check_publication(git, pr.base, inputs.base_sha)
+                try:
+                    ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head)
+                except TrackerError as exc:
+                    if exc.is_rate_limit:
+                        raise
+                    if ctx.tracker.pr_head_sha(pr.number) != head:
+                        inputs.stop = lambda: _hold_changed_head(n, ctx, link)
+                    else:
+                        raise
+                else:
+                    ctx.store.record_merge(n, ctx.now())
+                    if review_mode_for(inputs.paths, ctx.config) == "fast":
+                        runner.after_merge(ctx, pr.number, pr.base)
+                    try:
+                        if pr.base == batch_branch:
+                            ctx.tracker.close_issue(n, f"Merged into {batch_branch} (PR #{pr.number})")
+                        else:
+                            ctx.tracker.close_issue(n)
+                    except TrackerError as exc:
+                        if exc.is_rate_limit:
+                            raise
+                        if ctx.tracker.current_issue(n).state != "closed":
+                            raise
+                    ctx.tracker.remove_labels(n, [READY, RUNNING, BLOCKED])
+                    if pr.base == batch_branch and parent is not None:
+                        try:
+                            _batch_pr(parent, ctx)
+                        except (GitError, TrackerError) as exc:
+                            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+                                raise
+                            _append(log, f"Batch PR finalization deferred to tick: {exc}")
+                    return "merged"
+        if inputs.stop is not None:
+            return inputs.stop()
+        if stopped := policy_hold(inputs.decision, inputs.batch_branch):
             return stopped
-        if stopped := policy_hold():
-            return stopped
-        if runner._remaining(n, ctx) <= 0:
-            return _timeout(n, ctx)
-        _check_publication(git, pr.base)
-        try:
-            ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head)
-        except TrackerError as exc:
-            if exc.is_rate_limit:
-                raise
-            if ctx.tracker.pr_head_sha(pr.number) != head:
-                return _hold_changed_head(n, ctx, link)
-            raise
-        if review_mode_for(paths, ctx.config) == "fast":
-            runner.after_merge(ctx, pr.number, pr.base)
-        try:
-            if pr.base == batch_branch:
-                ctx.tracker.close_issue(n, f"Merged into {batch_branch} (PR #{pr.number})")
-            else:
-                ctx.tracker.close_issue(n)
-        except TrackerError as exc:
-            if exc.is_rate_limit:
-                raise
-            if ctx.tracker.current_issue(n).state != "closed":
-                raise
-        ctx.tracker.remove_labels(n, [READY, RUNNING, BLOCKED])
-        if pr.base == batch_branch and parent is not None:
-            try:
-                _batch_pr(parent, ctx)
-            except (GitError, TrackerError) as exc:
-                if isinstance(exc, TrackerError) and exc.is_rate_limit:
-                    raise
-                _append(log, f"Batch PR finalization deferred to tick: {exc}")
-        return "merged"
+        queued_status = inputs.status

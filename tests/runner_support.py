@@ -287,7 +287,6 @@ def conflicting_lanes(run_case, monkeypatch):
     set_done_when(c, [f"{shlex.quote(sys.executable)} -B -c {shlex.quote(script)}"])
     c.ci_heads = []
     c.target_heads = []
-    statuses = iter(["pass", "pending", "pass"])
 
     def move_target():
         c.history.update({"cli.py": "commands = ['help', 'base']\n", "base-feature.txt": "new base feature\n"})
@@ -297,7 +296,8 @@ def conflicting_lanes(run_case, monkeypatch):
         c.ci_heads.append(c.tracker.pr_head_sha(pr))
         if not c.target_heads:
             move_target()
-        return next(statuses)
+        head = c.ci_heads[-1]
+        return "pending" if head != c.ci_heads[0] and c.ci_heads.count(head) == 1 else "pass"
 
     c.move_target = move_target
     monkeypatch.setattr(c.tracker, "pr_checks", ci)

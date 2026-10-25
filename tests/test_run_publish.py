@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import timedelta
 import threading
+from pathlib import Path
+import shutil
 
 import pytest
 
@@ -16,6 +18,160 @@ from foragent.tracker import TrackerError
 
 from conftest import ACCEPTANCE, BASE_TIME, git_command
 from runner_support import BODY, COMMAND, batch_setup, enable_reviewer, run_case, seed_batch, set_done_when
+
+
+def test_base_only_paths_merged_during_ci_do_not_retarget_the_pr(run_case, monkeypatch):
+    c = run_case
+    batch_setup(c)
+    c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"sibling.txt": "batch"})
+    seed_batch(c, {})
+    moved = []
+
+    def checks(pr):
+        if not moved:
+            c.history.update({"sibling.txt": "Merged by another issue during CI\n"})
+            moved.append(c.history.tip)
+        return "pass"
+
+    monkeypatch.setattr(c.tracker, "pr_checks", checks)
+    assert run_issue(1, c.ctx) == "merged"
+    child = next(pr for pr in c.tracker.created_prs if pr.head == "foragent/issue-1")
+    assert child.base == "main"
+    assert c.tracker.merged_prs == [child.number]
+    assert len(c.tracker.created_prs) == 1
+    head = c.tracker.pr_head_sha(child.number)
+    assert git_command(c.history.origin, "diff", "--name-only", moved[0], head) == "feature.txt"
+    assert git_command(c.history.origin, "show", f"{head}:sibling.txt") == "Merged by another issue during CI"
+
+
+def test_parallel_self_merges_cannot_install_an_older_tree_last(run_case, monkeypatch, tmp_path, capsys):
+    from foragent import orch_reinstall, runner
+
+    c = run_case
+    c.history.update({
+        "pyproject.toml": '[project]\nname = "foragent"\n',
+        "src/foragent/__init__.py": "VERSION = 0\n",
+    })
+    c.ctx.config = replace(c.ctx.config, test_command="true")
+    approval = c.store.load_approval(1)
+    c.tracker.add_issue(2, "Newer version", approval.body, labels=["approved", "running"])
+    c.store.save_approval(**{**approval.__dict__, "number": 2})
+    c.store.start_run(2, branch="foragent/issue-2", worktree=c.store.worktree_path(2))
+    for pr in (3, 4):
+        c.tracker.set_pr_files(pr, ["feature.txt", "src/foragent/__init__.py"])
+        c.tracker.set_pr_checks(pr, "pass")
+    package = tmp_path / "tools/foragent/lib/python3.12/site-packages/foragent"
+    first_captured, release_first = threading.Event(), threading.Event()
+    local = threading.local()
+    holder = [None]
+    installed = []
+    merge_lock, merge, after_merge = c.store.merge_lock, c.tracker.merge_pr, runner.after_merge
+
+    def implement(**kwargs):
+        local.number = int(kwargs["worktree"].name.removeprefix("issue-"))
+        c.executor.calls.append(kwargs)
+        (kwargs["worktree"] / "feature.txt").write_text("done")
+        source = kwargs["worktree"] / "src/foragent/__init__.py"
+        source.write_text(f"VERSION = {local.number}\n")
+        return ExecResult(0, False, "done", kwargs["log_path"])
+
+    @contextmanager
+    def observed_lock():
+        if local.number == 2 and holder[0] == 1:
+            # B queues behind A's installation: let A finish to unblock B.
+            release_first.set()
+        with merge_lock():
+            holder[0] = local.number
+            try:
+                yield
+            finally:
+                holder[0] = None
+
+    def merge_into_main(pr, **kwargs):
+        merge(pr, **kwargs)
+        git_command(c.history.origin, "update-ref", "refs/heads/main", kwargs["expected_head_sha"])
+        c.history.tip = kwargs["expected_head_sha"]
+
+    def uv(args, *, cwd):
+        if args[:2] == ["tool", "install"]:
+            if local.number == 1:
+                # _reinstall has already captured A's source at this point.
+                first_captured.set()
+                assert release_first.wait(10)
+            shutil.copytree(Path(args[-1]) / "src/foragent", package, dirs_exist_ok=True)
+            installed.append(local.number)
+        else:
+            assert args == ["tool", "dir"]
+        return str(tmp_path / "tools")
+
+    def install_and_verify(*args):
+        try:
+            return after_merge(*args)
+        finally:
+            if local.number == 2:
+                # With the lock released too early, B installs and verifies
+                # before A resumes, reproducing a successful rollback to A.
+                release_first.set()
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    monkeypatch.setattr(c.store, "merge_lock", observed_lock)
+    monkeypatch.setattr(c.tracker, "merge_pr", merge_into_main)
+    monkeypatch.setattr(orch_reinstall, "_uv", uv)
+    monkeypatch.setattr(runner, "after_merge", install_and_verify)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(run_issue, 1, c.ctx)
+        try:
+            assert first_captured.wait(10)
+            second = pool.submit(run_issue, 2, c.ctx)
+            assert second.result(timeout=15) == "merged"
+            assert first.result(timeout=15) == "merged"
+        finally:
+            release_first.set()
+    assert installed == [1, 2]
+    assert (package / "__init__.py").read_text() == git_command(
+        c.history.origin, "show", "main:src/foragent/__init__.py",
+    ) + "\n"
+    assert (package / "__init__.py").read_text() == "VERSION = 2\n"
+    output = capsys.readouterr().out
+    assert output.count("installed package matches merged source") == 2
+    assert "reinstall failed" not in output
+
+
+@pytest.mark.parametrize("publication", ["create_pr", "update_pr"])
+@pytest.mark.parametrize("initial_move", [None, "docs/verified.md", "verified.py"])
+def test_base_fetched_during_pr_publication_is_reverified(run_case, monkeypatch, publication, initial_move):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    set_done_when(c, [COMMAND, "test ! -f incompatible.txt"])
+    if publication == "update_pr":
+        c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing PR", body="")
+    if initial_move:
+        execute = c.executor.run
+
+        def implement(**kwargs):
+            result = execute(**kwargs)
+            c.history.update({initial_move: "Verified before publication\n"})
+            return result
+
+        monkeypatch.setattr(c.executor, "run", implement)
+    publish = getattr(c.tracker, publication)
+    moved = []
+
+    def publish_then_fetch(*args, **kwargs):
+        result = publish(*args, **kwargs)
+        if not moved:
+            c.history.update({"incompatible.txt": "The new base fails Done when\n"})
+            moved.append(c.history.tip)
+            c.ctx.git.fetch("origin", "main")
+        return result
+
+    monkeypatch.setattr(c.tracker, publication, publish_then_fetch)
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    assert len(moved) == 1
+    assert c.tracker.merged_prs == []
+    log = c.store.log_path(1).read_text()
+    assert f"base moved: result-affecting paths; re-verifying: {moved[0]}" in log
+    assert "Command: test ! -f incompatible.txt" in log
 
 
 @pytest.mark.parametrize("already_closed", [False, True])
@@ -129,7 +285,7 @@ def test_workflows_wait_three_minutes_before_trusting_no_checks(run_case, monkey
 
     monkeypatch.setattr(c.tracker, "pr_checks", checks)
     assert run_issue(1, c.ctx) == "merged"
-    assert polls == [opened_at + timedelta(seconds=30 * poll) for poll in range(7)]
+    assert polls == [opened_at + timedelta(seconds=30 * poll) for poll in range(7)] + [c.now[0]]
     assert c.now[0] == opened_at + timedelta(minutes=3)
     assert c.tracker.merged_prs == [2] and len(c.tracker.created_prs) == 1
 
@@ -148,7 +304,7 @@ def test_workflow_checks_keep_pass_failure_and_pending_behavior(run_case, monkey
     c.executor.steps[0][".github/workflows/ci.yml"] = "name: CI\n"
     started_at = c.now[0]
     results = iter(statuses)
-    monkeypatch.setattr(c.tracker, "pr_checks", lambda pr: next(results))
+    monkeypatch.setattr(c.tracker, "pr_checks", lambda pr: next(results, statuses[-1]))
     assert run_issue(1, c.ctx) == outcome
     assert c.now[0] == started_at + timedelta(seconds=elapsed)
     assert c.tracker.merged_prs == ([2] if outcome == "merged" else [])
@@ -445,7 +601,7 @@ def test_ci_retry_after_base_refresh_keeps_merged_base_and_rereviews(run_case, m
         polls.append(c.tracker.pr_head_sha(pr))
         if len(polls) == 1:
             c.history.update({"sibling.txt": "new base"})
-        return "fail" if len(polls) == 2 else "pass"
+        return "fail" if polls[-1] != polls[0] and len(set(polls)) == 2 else "pass"
 
     execute = c.executor.run
 
@@ -459,7 +615,7 @@ def test_ci_retry_after_base_refresh_keeps_merged_base_and_rereviews(run_case, m
     monkeypatch.setattr(c.tracker, "pr_checks", checks)
     assert run_issue(1, c.ctx) == "merged"
     assert len(c.executor.calls) == len(reviews) == 2
-    assert len(polls) == 3 and polls[0] != polls[1] != polls[2]
+    assert len(set(polls)) == 3
     assert "CI failed:\nfailure after refreshing base" in c.executor.calls[1]["prompt"]
     assert c.store.get_run(1).attempts == 2
     assert c.store.log_path(1).read_text().count("Done when command:") == 6
@@ -468,7 +624,7 @@ def test_ci_retry_after_base_refresh_keeps_merged_base_and_rereviews(run_case, m
 def test_ci_pending_polls_every_thirty_seconds_then_merges(run_case, monkeypatch):
     c = run_case
     statuses = iter(["pending", "pending", "pass"])
-    monkeypatch.setattr(c.tracker, "pr_checks", lambda pr: next(statuses))
+    monkeypatch.setattr(c.tracker, "pr_checks", lambda pr: next(statuses, "pass"))
     assert run_issue(1, c.ctx) == "merged"
     assert c.now[0] == BASE_TIME + timedelta(hours=1, minutes=1)
 
@@ -874,7 +1030,7 @@ def test_fresh_base_new_workflow_gets_ci_registration_grace(run_case, monkeypatc
 
     monkeypatch.setattr(c.tracker, "pr_checks", checks)
     assert run_issue(1, c.ctx) == "merged"
-    assert polls == [started, *[started + timedelta(seconds=30 * index) for index in range(7)]]
+    assert polls == [started, *[started + timedelta(seconds=30 * index) for index in range(7)], c.now[0]]
     assert c.now[0] == started + timedelta(minutes=3)
 
 
@@ -890,7 +1046,8 @@ def test_parallel_lanes_implement_while_merge_phase_serializes_and_rechecks(run_
     c.tracker.set_pr_files(3, ["a"])
     c.tracker.set_pr_files(4, ["b"])
     first_in_ci = threading.Event()
-    second_waiting = threading.Event()
+    second_in_ci = threading.Event()
+    first_merged = threading.Event()
     release_first = threading.Event()
     local = threading.local()
     entries = []
@@ -906,22 +1063,28 @@ def test_parallel_lanes_implement_while_merge_phase_serializes_and_rechecks(run_
 
     @contextmanager
     def observed_lock():
-        if local.number == 2:
-            second_waiting.set()
         with merge_lock():
             entries.append(local.number)
             yield
 
     def checks(pr):
-        assert entries == [1]
-        first_in_ci.set()
-        assert release_first.wait(10)
+        if local.number == 1:
+            if not first_in_ci.is_set():
+                assert entries == []
+                first_in_ci.set()
+                assert release_first.wait(10)
+            else:
+                assert entries == [1]
+        else:
+            second_in_ci.set()
+            assert first_merged.wait(10)
         return "pass"
 
     def merge_into_target(pr, **kwargs):
         assert entries == [1]
         merge(pr, **kwargs)
         git_command(c.history.origin, "update-ref", "refs/heads/main", kwargs["expected_head_sha"])
+        first_merged.set()
 
     monkeypatch.setattr(c.executor, "run", implement)
     monkeypatch.setattr(c.store, "merge_lock", observed_lock)
@@ -932,17 +1095,17 @@ def test_parallel_lanes_implement_while_merge_phase_serializes_and_rechecks(run_
         try:
             assert first_in_ci.wait(10)
             second = pool.submit(run_issue, 2, c.ctx)
-            assert second_waiting.wait(10)
-            assert len(c.executor.calls) == 2 and entries == [1]
+            assert second_in_ci.wait(10)
+            assert len(c.executor.calls) == 2 and entries == []
             assert not second.done()
         finally:
             release_first.set()
         assert first.result(timeout=10) == "merged"
         assert second.result(timeout=10) == "retries-exceeded"
-    assert entries == [1, 2]
+    assert entries == [1]  # The second lane refreshes its known stale base before queuing.
     assert len(c.tracker.merged_prs) == 1
     assert "Command: test ! -f a || test ! -f b" in c.tracker.list_comments(2)[-1].body
     assert git_command(c.history.origin, "ls-tree", "--name-only", "main") == "a\ntests"
-    # Only the first lane was published before CI; the second failed fresh-base verification.
+    # Both lanes published before CI; the second failed fresh-base verification.
     second_log = c.store.log_path(2).read_text()
     assert second_log.count("Done when command:") == 2

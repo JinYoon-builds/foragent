@@ -83,6 +83,11 @@ class Run:
     merge_conflicts: list[str] = field(default_factory=list)
     local_skill_paths: list[str] = field(default_factory=list)
     approval_body_sha: str | None = None
+    skills_reported: bool = False
+    skills_used: list[str] = field(default_factory=list)
+    last_review_pass_at: str | None = None
+    review_pass_to_merge_seconds: float | None = None
+    merge_lock_held_seconds: float | None = None
 
 
 REFRESH_INTERVAL = timedelta(minutes=5)
@@ -109,6 +114,7 @@ class StateStore:
     def __init__(self, root: Path, now: Callable[[], datetime] | None = None):
         self.root = Path(root)
         self._now = now or (lambda: datetime.now(UTC))
+        self._merge_lock_seconds: dict[tuple[int, str], float] = {}
 
     @classmethod
     def for_repo(cls, repo: str, *, now: Callable[[], datetime] | None = None) -> "StateStore":
@@ -626,6 +632,7 @@ class StateStore:
                       attempt_tiers=previous.attempt_tiers if resumed else {},
                       approval_body_sha=approval.body_sha if approval is not None else None,
                       last_activity_at=timestamp, process_identities=identities, **session)
+            self._merge_lock_seconds.pop((number, timestamp), None)
             self._write_run(run)
             return run
 
@@ -649,7 +656,7 @@ class StateStore:
     def clear_run_start(self, number: int) -> None:
         (self.root / "run-starts" / f"{number}.json").unlink(missing_ok=True)
 
-    def update_run(self, number: int, **fields: Any) -> Run:
+    def update_run(self, number: int, *, routine: bool = False, **fields: Any) -> Run:
         with self._state_lock():
             run = self.get_run(number)
             if run is None:
@@ -662,7 +669,7 @@ class StateStore:
                     or " ".join(run.detail.split())[:500]
                     or "Run detail unavailable."
                 )
-            from foragent.processes import observe_tree
+            from foragent.processes import observe_routine_tree, observe_tree
 
             # Numeric fields describe a run; only birth evidence supplied by a
             # launcher (or descendants of verified identities) proves ownership.
@@ -670,7 +677,12 @@ class StateStore:
             identities = {item["pid"]: item for item in (
                 *run.process_identities, *fields.get("process_identities", []),
             )}
-            fields["process_identities"] = observe_tree(list(identities.values()))
+            observer = observe_routine_tree if routine else observe_tree
+            try:
+                fields["process_identities"] = observer(list(identities.values()))
+            except OSError:
+                # Metadata updates must retain ownership even when observation fails.
+                fields["process_identities"] = list(identities.values())
             updated = replace(run, **fields)
             self._write_run(updated)
             return updated
@@ -681,6 +693,23 @@ class StateStore:
         except FileNotFoundError:
             return None
         return load_record(Run, json.loads(value))
+
+    def record_merge_lock(self, number: int, seconds: float) -> None:
+        run = self.get_run(number)
+        key = (number, run.started_at)
+        total = self._merge_lock_seconds.get(key, 0) + seconds
+        self._merge_lock_seconds[key] = total
+        if run.merge_lock_held_seconds is not None:
+            self.update_run(number, merge_lock_held_seconds=total)
+
+    def record_merge(self, number: int, merged_at: datetime) -> None:
+        run = self.get_run(number)
+        passed = run.last_review_pass_at
+        self.update_run(
+            number, review_pass_to_merge_seconds=(
+                (merged_at - datetime.fromisoformat(passed)).total_seconds() if passed else None
+            ), merge_lock_held_seconds=self._merge_lock_seconds.get((number, run.started_at), 0),
+        )
 
     def active_runs(self) -> list[Run]:
         runs = []
@@ -775,6 +804,11 @@ class StateStore:
             run = load_record(Run, json.loads(line))
             runs[run.number, run.started_at] = run
         return list(runs.values())
+
+    def prune_process_identities(self, *, inactive_only: bool = False) -> None:
+        from foragent.state_processes import prune_process_identities
+
+        prune_process_identities(self, inactive_only=inactive_only)
 
     def usage(self) -> dict[str, Any]:
         """The latest recorded plan usage per executor, as executors reported it."""
