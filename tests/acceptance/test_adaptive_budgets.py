@@ -16,6 +16,29 @@ from test_state_split import offline_acceptance
 from test_test_slots import bind_cli, machine_yml, slot_case, tick_context
 
 
+def bind_sample_clock(monkeypatch, clock):
+    """Keep completed sensor windows on the same fake clock as scheduler ticks."""
+    from foragent import capacity
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0].astimezone(tz) if tz else clock[0].replace(tzinfo=None)
+
+    def no_sleep(*args):
+        pytest.fail("memory windows must advance fake time, never wait in real time")
+
+    monkeypatch.setattr(capacity, "datetime", Clock)
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(
+        time=lambda: clock[0].timestamp(), monotonic=lambda: clock[0].timestamp(), sleep=no_sleep,
+    ))
+
+
+@pytest.fixture
+def sample_clock(monkeypatch):
+    return lambda clock: bind_sample_clock(monkeypatch, clock)
+
+
 @pytest.fixture(autouse=True)
 def adaptive_environment(monkeypatch, isolated_home, offline_acceptance):
     """Use the actual machine directory layout, entirely inside the fake HOME."""
@@ -36,10 +59,13 @@ def adaptive_environment(monkeypatch, isolated_home, offline_acceptance):
 
 
 @pytest.fixture
-def sensor(monkeypatch):
+def sensor(monkeypatch, sample_clock):
+    from conftest import BASE_TIME
     from foragent import capacity
 
-    sample = SimpleNamespace(kernel="warn", total=100, load=0.5, kernel_reads=[], swapin_reads=[])
+    sample = SimpleNamespace(kernel="normal", total=100, load=0.5, kernel_reads=[], swapin_reads=[],
+                             clock=[BASE_TIME])
+    sample_clock(sample.clock)
 
     def kernel_pressure():
         sample.kernel_reads.append(sample.kernel)
@@ -55,40 +81,41 @@ def sensor(monkeypatch):
     monkeypatch.setattr(capacity, "swapins_total", swapins_total, raising=False)
     monkeypatch.setattr(capacity, "memory_pressure", lambda: sample.kernel, raising=False)
     monkeypatch.setattr(capacity, "load_per_cpu", lambda: sample.load)
+    # Backoff tests keep admission headroom abundant, whichever unit lands first.
+    monkeypatch.setattr(capacity, "memory_bytes", lambda: (64_000_000_000, 60_000_000_000), raising=False)
     return sample
 
 
 @pytest.mark.parametrize("samples", [
     pytest.param([
-        ("warn", 100, "warn"), ("warn", 100, "normal"), ("warn", 100, "normal"),
+        *[("warn", 100, "normal")] * 10, ("warn", 100, "warn"),
     ], id="compression-without-swapins"),
     pytest.param([
-        ("normal", 100, "normal"), ("normal", 101, "warn"),
-        ("normal", 101, "normal"), ("normal", 108, "warn"),
-        ("warn", 108, "normal"),
+        ("normal", 100, "normal"), ("normal", 201, "normal"),
+        ("normal", 302, "normal"), ("normal", 403, "warn"),
+        ("normal", 403, "normal"),
     ], id="swapins-override-normal-for-one-window"),
     pytest.param([
-        ("critical", None, "critical"), ("critical", 100, "critical"),
-        ("critical", 101, "critical"), ("critical", 101, "critical"),
-        ("warn", 101, "normal"),
+        *[("critical", 100, "normal")] * 10, ("critical", 100, "critical"),
+        ("normal", 100, "normal"),
     ], id="critical-always-wins"),
     pytest.param([
-        ("warn", None, "warn"), ("warn", None, "warn"),
-        ("warn", 100, "warn"), ("warn", 100, "normal"),
-        ("warn", None, "warn"),
+        *[("warn", None, "normal")] * 10, ("warn", None, "warn"),
     ], id="unknown-is-conservative"),
     pytest.param([
-        ("warn", 100, "warn"), ("warn", 2, "normal"), ("warn", 2, "normal"),
-        ("normal", 3, "warn"), ("warn", 3, "normal"),
+        ("normal", 100, "normal"), ("normal", 201, "normal"), ("normal", 2, "normal"),
+        ("normal", 103, "normal"), ("normal", 204, "normal"), ("normal", 305, "warn"),
     ], id="counter-reset-rebases-the-window"),
 ])
 def test_adaptive_budgets_sensor_classifies_sample_windows(sensor, samples):
+    # memory-backoff: classify completed 30-second windows, not individual deltas.
     from foragent import capacity
 
     actual = []
     for kernel, total, _ in samples:
         sensor.kernel, sensor.total = kernel, total
         actual.append(capacity.machine_load())
+        sensor.clock[0] += timedelta(seconds=30)
     expected = [(pressure, sensor.load) for _, _, pressure in samples]
     assert actual == expected, f"machine_load must classify swap-in windows: {actual!r} != {expected!r}"
     assert sensor.kernel_reads and sensor.swapin_reads, "machine_load must consume both public seams"
@@ -113,9 +140,10 @@ def test_adaptive_budgets_raw_sensors_are_public_and_in_process(monkeypatch):
 
 
 def test_adaptive_budgets_sample_counter_survives_fresh_processes(sensor, isolated_home):
+    # memory-backoff: both the counter and its streak must survive a fresh process.
     from foragent import capacity
 
-    assert capacity.machine_load() == ("warn", 0.5)
+    assert capacity.machine_load() == ("normal", 0.5)
     # Copy only machine data into another isolated HOME. A module cache or a
     # counter saved elsewhere in HOME cannot satisfy persistence this way.
     fresh_home = isolated_home / "fresh-process-home"
@@ -127,20 +155,32 @@ def test_adaptive_budgets_sample_counter_survives_fresh_processes(sensor, isolat
     source = Path(__file__).resolve().parents[2] / "src"
     script = """
 import json, os, subprocess, sys
+from datetime import datetime
+from types import SimpleNamespace
 from foragent import capacity
 def forbidden(*args, **kwargs):
     raise AssertionError("sensor subprocess must not signal or spawn processes")
 os.kill = os.killpg = subprocess.Popen = subprocess.run = forbidden
-capacity.kernel_pressure = lambda: "warn"
-capacity.memory_pressure = lambda: "warn"
+now = datetime.fromisoformat(sys.argv[2])
+class Clock(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+capacity.datetime = Clock
+capacity.time = SimpleNamespace(time=lambda: now.timestamp(), monotonic=lambda: now.timestamp(),
+                                sleep=forbidden)
+capacity.kernel_pressure = lambda: "normal"
+capacity.memory_pressure = lambda: "normal"
 capacity.swapins_total = lambda: int(sys.argv[1])
 capacity.load_per_cpu = lambda: 0.5
 print(json.dumps(capacity.machine_load()))
 """
 
     def fresh_sample(total):
+        sensor.clock[0] += timedelta(seconds=30)
         result = subprocess.run(
-            [sys.executable, "-c", script, str(total)], check=True, capture_output=True, text=True,
+            [sys.executable, "-c", script, str(total), sensor.clock[0].isoformat()],
+            check=True, capture_output=True, text=True,
             env={
                 **os.environ, "HOME": str(fresh_home), "PYTHONPATH": str(source),
                 "XDG_DATA_HOME": str(fresh_home / ".local/share"),
@@ -151,15 +191,16 @@ print(json.dumps(capacity.machine_load()))
         )
         return tuple(json.loads(result.stdout))
 
-    actual = [fresh_sample(total) for total in (100, 107, 107)]
-    assert actual == [("normal", 0.5), ("warn", 0.5), ("normal", 0.5)], (
-        f"previous swap-in counter must persist in the machine data directory across processes: {actual!r}"
+    actual = [fresh_sample(total) for total in (100, 201, 302, 403, 403)]
+    assert actual == [("normal", 0.5)] * 3 + [("warn", 0.5), ("normal", 0.5)], (
+        f"machine data must preserve the counter, hot-window streak and cool-window reset: {actual!r}"
     )
 
 
 @pytest.fixture
-def adaptive_case(git_history, tmp_path, monkeypatch, adaptive_environment, sensor):
+def adaptive_case(git_history, tmp_path, monkeypatch, adaptive_environment, sensor, sample_clock):
     case = slot_case(git_history, tmp_path, monkeypatch, slots=3)
+    sample_clock(case.clock)
     machine_yml(slots=3, max_parallel=8)  # Machine-wide budgets come from machine.yml (#365).
     main = bind_cli(case, monkeypatch)
     context = tick_context(case, start_runs=False)
@@ -172,10 +213,10 @@ def adaptive_case(git_history, tmp_path, monkeypatch, adaptive_environment, sens
     return SimpleNamespace(case=case, main=main, context=context, root=root, sensor=sensor)
 
 
-def tick_slots(scenario, capsys):
+def tick_slots(scenario, capsys, *, seconds=600):
     from foragent import scheduler
 
-    scenario.case.clock[0] += timedelta(minutes=10)
+    scenario.case.clock[0] += timedelta(seconds=seconds)
     report = scheduler.tick(scenario.context)
     assert report.skipped is None, report
     assert scenario.main(["gate", "status", "--json"]) == 0
@@ -186,15 +227,17 @@ def tick_slots(scenario, capsys):
 
 
 def test_adaptive_budgets_tick_recovers_slots_then_decreases_on_swapins(adaptive_case, capsys):
+    # memory-backoff: keep recovery, replace the one-window decrease trigger.
     from foragent import capacity
 
     scenario = adaptive_case
     capacity.machine_load()  # Establish the previous counter without a budget update.
     actual = [tick_slots(scenario, capsys) for _ in range(3)]
-    scenario.sensor.total += 7
-    actual.append(tick_slots(scenario, capsys))
-    assert actual == [2, 3, 3, 2], (
-        f"kernel warn without swap-ins must recover to the ceiling, then swap-ins remove one slot: {actual!r}"
+    for _ in range(3):
+        scenario.sensor.total += 101
+        actual.append(tick_slots(scenario, capsys, seconds=30))
+    assert actual == [2, 3, 3, 3, 3, 2], (
+        f"recover to the ceiling, then remove one slot only after three hot windows: {actual!r}"
     )
     assert scenario.sensor.kernel_reads and scenario.sensor.swapin_reads, (
         "tick must consume capacity's public raw sensors through the real machine_load"
@@ -210,6 +253,8 @@ def history(root):
     text = path.read_text(encoding="utf-8")
     assert text.endswith("\n"), "each budget history record must be a complete JSON line"
     rows = [json.loads(line) for line in text.splitlines()]
+    # Headroom refusals are admission events; unchanged *budgets* still omit rows.
+    rows = [row for row in rows if row.get("rule") != "headroom"]
     for row in rows:
         assert set(HISTORY_FIELDS) <= row.keys(), row
         assert isinstance(row["at"], str), row
@@ -230,6 +275,7 @@ def assert_history(root, expected):
 
 
 def test_adaptive_budgets_slot_history_appends_changes_and_omits_noops(adaptive_case, capsys):
+    # memory-backoff: keep transition/no-op checks with a sustained swap trigger.
     from foragent import capacity
 
     scenario = adaptive_case
@@ -245,27 +291,37 @@ def test_adaptive_budgets_slot_history_appends_changes_and_omits_noops(adaptive_
     tick_slots(scenario, capsys)  # Already at the configured ceiling.
     assert path.read_bytes() == unchanged, "a tick with no budget change must append nothing"
 
-    scenario.sensor.total += 7
-    tick_slots(scenario, capsys)
-    expected.append(("test_slots", 3, 2, "warn", 0.5, 7))
+    actual = []
+    for _ in range(3):
+        scenario.sensor.total += 101
+        actual.append(tick_slots(scenario, capsys, seconds=30))
+    assert actual == [3, 3, 2], f"history must wait for the third hot window: {actual!r}"
+    expected.append(("test_slots", 3, 2, "warn", 0.5, 101))
     assert_history(scenario.root, expected)
 
 
 def test_adaptive_budgets_slot_history_records_unknown_swapins_as_null(adaptive_case, capsys):
+    # memory-backoff: an unknown counter can back off only on sustained kernel pressure.
+    from foragent import capacity
+
     scenario = adaptive_case
     (scenario.root / "test-slots.json").write_text(json.dumps({
         "slots": 3, "changed_at": scenario.case.clock[0].isoformat(),
     }), encoding="utf-8")
     scenario.sensor.total = None
-    assert tick_slots(scenario, capsys) == 2
+    scenario.sensor.kernel = "warn"
+    capacity.machine_load()
+    actual = [tick_slots(scenario, capsys, seconds=30) for _ in range(10)]
+    assert actual == [3] * 9 + [2], f"unknown swap-ins must wait five minutes: {actual!r}"
     assert_history(scenario.root, [
         ("test_slots", 3, 2, "warn", 0.5, None),
     ])
 
 
 def test_adaptive_budgets_parallel_history_uses_machine_budget_path(
-    git_history, tmp_path, monkeypatch, adaptive_environment, sensor,
+    git_history, tmp_path, monkeypatch, adaptive_environment, sensor, sample_clock,
 ):
+    # memory-backoff: preserve shared persistence, live runs and no-op history.
     from foragent import capacity, scheduler
     from foragent.state import StateStore
     from test_orch_review_handoff import make_case
@@ -278,6 +334,7 @@ def test_adaptive_budgets_parallel_history_uses_machine_budget_path(
         lanes={f"lane-{number}": {} for number in range(1, 9)},
     )
     case.store = case.ctx.store = StateStore.for_repo(case.ctx.repo, now=case.ctx.now)
+    sample_clock(case.clock)
     assert case.store.root.parent == adaptive_environment
     machine_yml(slots=1, max_parallel=8)  # Machine-wide budgets come from machine.yml (#365).
     body = case.tracker.get_issue(1).body
@@ -305,6 +362,7 @@ def test_adaptive_budgets_parallel_history_uses_machine_budget_path(
     monkeypatch.setattr(os, "kill", process_exists)
     context = tick_context(case)
     context.launcher, context.kill_runner = launch, no_kill
+    context.baseline_launcher = lambda *args, **kwargs: None
     assert context.start_runs
 
     capacity.write_state(case.store, 2, case.clock[0])
@@ -317,7 +375,7 @@ def test_adaptive_budgets_parallel_history_uses_machine_budget_path(
     assert scheduler.tick(context).skipped is None
     state = capacity.read_state(case.store)
     assert state is not None and state["parallel"] == 3, (
-        f"kernel warn with zero swap-ins must grow parallel from 2 to 3 after the interval: {state!r}"
+        f"normal kernel with zero swap-ins must grow parallel from 2 to 3 after the interval: {state!r}"
     )
     assert len(launched) == 3
     assert all(run.pid == live_pid for run in case.store.active_runs())
@@ -325,17 +383,18 @@ def test_adaptive_budgets_parallel_history_uses_machine_budget_path(
     expected = [("parallel", 2, 3, "normal", 0.5, 0)]
     assert_history(adaptive_environment, expected)
 
-    # The very next sensor sample has swap-ins: decrease immediately, even
-    # though less than an increase interval has elapsed since the growth.
-    sensor.total += 7
-    case.clock[0] += timedelta(seconds=1)
-    assert scheduler.tick(context).skipped is None
+    actual = []
+    for _ in range(3):
+        sensor.total += 101
+        case.clock[0] += timedelta(seconds=30)
+        assert scheduler.tick(context).skipped is None
+        actual.append(capacity.read_state(case.store)["parallel"])
     state = capacity.read_state(case.store)
-    assert state is not None and state["parallel"] == 1, (
-        f"the next swap-in window must halve parallel immediately from 3 to 1: {state!r}"
+    assert actual == [3, 3, 1], (
+        f"only the third hot 30-second window must halve parallel from 3 to 1: {actual!r}"
     )
     assert len(launched) == len(case.store.active_runs()) == 3
-    expected.append(("parallel", 3, 1, "warn", 0.5, 7))
+    expected.append(("parallel", 3, 1, "warn", 0.5, 101))
     assert_history(adaptive_environment, expected)
 
     path = adaptive_environment / "budget-history.jsonl"
@@ -350,10 +409,16 @@ def test_adaptive_budgets_parallel_history_uses_machine_budget_path(
     expected.append(("parallel", 1, 2, "normal", 0.5, 0))
     assert_history(adaptive_environment, expected)
 
-    case.clock[0] += timedelta(seconds=1)
+    # At the ceiling, pending critical pressure cannot be confused with growth.
+    capacity.write_state(case.store, 8, case.clock[0])
     sensor.kernel, sensor.total = "critical", None
     assert scheduler.tick(context).skipped is None
-    assert capacity.read_state(case.store)["parallel"] == 1
-    expected.append(("parallel", 2, 1, "critical", 0.5, None))
+    actual = [capacity.read_state(case.store)["parallel"]]
+    for _ in range(10):
+        case.clock[0] += timedelta(seconds=30)
+        assert scheduler.tick(context).skipped is None
+        actual.append(capacity.read_state(case.store)["parallel"])
+    assert actual == [8] * 10 + [4], f"critical history must also wait five minutes: {actual!r}"
+    expected.append(("parallel", 8, 4, "critical", 0.5, None))
     assert_history(adaptive_environment, expected)
     assert case.implementer.calls == case.reviewer.calls == []

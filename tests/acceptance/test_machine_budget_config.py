@@ -13,7 +13,7 @@ import pytest
 import yaml
 
 from conftest import git_command
-from test_adaptive_budgets import sensor
+from test_adaptive_budgets import sample_clock, sensor
 from test_orch_review_handoff import make_case
 from test_skills_autosync import isolated_home
 from test_state_split import offline_acceptance
@@ -52,13 +52,13 @@ def machine_environment(monkeypatch, isolated_home, offline_acceptance):
 
 
 def machine_config(root, **values):
-    """Public file format: a flat YAML mapping of the four machine budget keys."""
+    """Active ceilings plus optional, ignored legacy floor keys in a flat YAML mapping."""
     root.mkdir(parents=True, exist_ok=True)
     (root / "machine.yml").write_text(yaml.safe_dump(values), encoding="utf-8")
 
 
 @pytest.fixture
-def budget_repositories(git_history, tmp_path, monkeypatch, machine_environment, sensor):
+def budget_repositories(git_history, tmp_path, monkeypatch, machine_environment, sensor, sample_clock):
     """Like capacity-aimd's machine_repositories, with real per-repo YAML inputs."""
     from foragent.config import load_config
     from foragent.state import StateStore
@@ -79,7 +79,10 @@ def budget_repositories(git_history, tmp_path, monkeypatch, machine_environment,
                 "lanes": {f"lane-{number}": {} for number in range(1, 9)},
                 **values,
             }
-            case = make_case(replace(git_history, clone=clone), directory, monkeypatch, **config)
+            # Legacy keys exercise the public YAML loader, not Config's constructor.
+            active = {key: value for key, value in config.items()
+                      if key not in {"test_slots_floor", "parallel_floor"}}
+            case = make_case(replace(git_history, clone=clone), directory, monkeypatch, **active)
             (clone / ".foragent.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
             case.config = case.ctx.config = load_config(clone)
             case.ctx.repo = repo
@@ -103,6 +106,7 @@ def budget_repositories(git_history, tmp_path, monkeypatch, machine_environment,
                 baseline_launcher=lambda *args, **kwargs: None,
             )
             cases.append(case)
+        sample_clock(cases[0].clock)
         return SimpleNamespace(cases=cases, root=machine_environment, sensor=sensor)
 
     return build
@@ -119,11 +123,10 @@ def seed_budgets(scenario, *, slots, parallel):
     capacity.machine_load()  # Establish the swap-in counter using the existing sensor seams.
 
 
-def tick_budgets(scenario, index, *, swapins=7):
+def tick_budgets(scenario, index, *, swapins=0, seconds=30):
     from foragent import capacity, scheduler
 
-    # Pass both AIMD intervals; every tick observes its own genuine swap-in window.
-    now = max(case.clock[0] for case in scenario.cases) + timedelta(minutes=10)
+    now = max(case.clock[0] for case in scenario.cases) + timedelta(seconds=seconds)
     for case in scenario.cases:
         case.clock[0] = now
     scenario.sensor.total += swapins
@@ -143,34 +146,35 @@ def tick_budgets(scenario, index, *, swapins=7):
 def test_machine_budget_config_alternating_repositories_cannot_undo_machine_floors(
     budget_repositories, machine_environment,
 ):
-    machine_config(machine_environment, test_slots=4, test_slots_floor=2,
-                   parallel_floor=2, max_parallel=4)
+    # memory-backoff: legacy repo floors cannot interrupt a machine-wide streak.
+    machine_config(machine_environment, test_slots=4, max_parallel=4)
     scenario = budget_repositories(
         {"test_slots_floor": 2, "parallel_floor": 2},
         {"test_slots_floor": 1, "parallel_floor": 1},
     )
-    # Include a real transition so shared history is required without requiring
-    # any particular policy for logging attempts clamped at the floor.
     seed_budgets(scenario, slots=3, parallel=3)
-    actual = [tick_budgets(scenario, index) for index in (0, 1, 0, 1)]
-    assert actual == [(2, 2)] * 4, (
-        "kernel warn + swap-ins: alternating repo floors 2/1 must retain machine floors 2; "
+    actual = [tick_budgets(scenario, index, swapins=101) for index in (0, 1, 0)]
+    assert actual == [(3, 3), (3, 3), (2, 1)], (
+        "three hot windows across repositories must back off below ignored legacy floors; "
         f"shared (test slots, workers) were {actual!r}"
     )
     path = scenario.root / "budget-history.jsonl"
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert {row["budget"] for row in rows} == {"test_slots", "parallel"}
-    assert all(row["to"] >= 2 and row["pressure"] == "warn" and row["swapins"] == 7 for row in rows)
+    assert {(row["budget"], row["from"], row["to"]) for row in rows} == {
+        ("test_slots", 3, 2), ("parallel", 3, 1),
+    }
+    assert all(row["pressure"] == "warn" and row["swapins"] == 101 for row in rows)
     assert all(not (case.store.root / path.name).exists() for case in scenario.cases)
 
 
 def test_machine_budget_config_repository_ceilings_only_limit_own_admission(
     budget_repositories, machine_environment,
 ):
+    # memory-headroom: a repository may lower only its own admission ceiling.
     from foragent import capacity
 
-    machine_config(machine_environment, test_slots=3, test_slots_floor=1,
-                   parallel_floor=1, max_parallel=3)
+    machine_config(machine_environment, test_slots=3, max_parallel=3)
     scenario = budget_repositories(
         {"test_slots": 1, "max_parallel": 1},
         {"test_slots": 8, "max_parallel": 8},
@@ -190,6 +194,7 @@ def test_machine_budget_config_repository_ceilings_only_limit_own_admission(
 def test_machine_budget_config_repository_floors_cannot_raise_shared_budgets(
     budget_repositories, machine_environment,
 ):
+    # memory-backoff: accept legacy floors in both YAML layers and ignore them.
     machine_config(machine_environment, test_slots=4, test_slots_floor=2,
                    parallel_floor=2, max_parallel=4)
     scenario = budget_repositories(
@@ -197,26 +202,33 @@ def test_machine_budget_config_repository_floors_cannot_raise_shared_budgets(
         {"test_slots_floor": 1, "parallel_floor": 1},
     )
     seed_budgets(scenario, slots=2, parallel=2)
-    actual = [tick_budgets(scenario, index) for index in (0, 1)]
-    assert actual == [(2, 2), (2, 2)], (
-        f"a repo floor of 4 must not raise machine floors of 2 under warn pressure: {actual!r}"
+    actual = [tick_budgets(scenario, index, swapins=101) for index in (0, 1, 0)]
+    assert actual == [(2, 2), (2, 2), (1, 1)], (
+        f"legacy repo/machine floors must not raise or clamp the shared backoff: {actual!r}"
     )
 
 
 def test_machine_budget_config_critical_bypasses_floors_then_noncritical_restores_them(
     budget_repositories, machine_environment,
 ):
-    machine_config(machine_environment, test_slots=4, test_slots_floor=3,
-                   parallel_floor=3, max_parallel=6)
+    # memory-backoff: critical waits five minutes; recovery adds toward ceilings.
+    from foragent import capacity
+
+    machine_config(machine_environment, test_slots=4, max_parallel=6)
     scenario = budget_repositories({"test_slots_floor": 1, "parallel_floor": 1}, {})
-    seed_budgets(scenario, slots=2, parallel=2)
+    seed_budgets(scenario, slots=4, parallel=6)
     scenario.sensor.kernel = "critical"
-    critical = tick_budgets(scenario, 0)
-    scenario.sensor.kernel = "warn"
-    recovered = tick_budgets(scenario, 1)
-    assert (critical, recovered) == ((1, 1), (3, 3)), (
-        "critical must bypass machine floors; the next noncritical tick must restore machine "
-        f"floors despite lower repository floors: {(critical, recovered)!r}"
+    critical = [tick_budgets(scenario, 0, seconds=0)]
+    critical += [tick_budgets(scenario, index % 2) for index in range(10)]
+    assert critical == [(4, 6)] * 10 + [(3, 3)], (
+        f"critical must wait for five continuous minutes before decreasing: {critical!r}"
+    )
+    scenario.sensor.kernel = "normal"
+    recovered = [tick_budgets(scenario, index % 2,
+                             seconds=capacity.INCREASE_INTERVAL.total_seconds() + 30)
+                 for index in range(3)]
+    assert recovered == [(4, 4), (4, 5), (4, 6)], (
+        f"without floor keys both budgets must recover to machine ceilings: {recovered!r}"
     )
 
 
@@ -232,7 +244,8 @@ def test_machine_budget_config_status_reports_values_and_per_key_sources(
     from foragent import cli
     from foragent.config import load_config
 
-    defaults = {"test_slots": 2, "test_slots_floor": 1, "parallel_floor": 1, "max_parallel": None}
+    # memory-backoff: status reports active ceilings; accepted legacy floors vanish.
+    defaults = {"test_slots": 2, "max_parallel": None}
     if values is not None:
         machine_config(machine_environment, **values)
     case = slot_case(git_history, tmp_path, monkeypatch,
@@ -240,7 +253,8 @@ def test_machine_budget_config_status_reports_values_and_per_key_sources(
                      max_parallel=None if values is None else 9)
     main = bind_cli(case, monkeypatch)
     # Keep CLI isolation but let the real loader see repository and machine YAML.
-    repository = {"repo": case.ctx.repo, "test_slots": case.config.test_slots, "skill_libraries": []}
+    repository = {"repo": case.ctx.repo, "test_slots": case.config.test_slots, "skill_libraries": [],
+                  "test_slots_floor": 4, "parallel_floor": 4}
     if values is not None:
         repository["max_parallel"] = 9
     (case.root / ".foragent.yml").write_text(yaml.safe_dump(repository), encoding="utf-8")
