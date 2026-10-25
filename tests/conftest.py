@@ -141,3 +141,17 @@ def git_history(tmp_path):
     clone = shutil.copytree(template.clone, tmp_path / "clone")
     git_command(clone, "config", "remote.origin.url", str(origin))
     return GitHistory(origin, clone, template.tip)
+
+
+# Locked acceptance files cannot carry marker edits; apply the same marker here.
+LOCAL_ONLY_FILES = {
+    "tests/test_launchd.py", "tests/test_watch_open.py", "tests/test_doctor_live_unit.py",
+    "tests/acceptance/test_doctor_live.py", "tests/acceptance/test_update_check.py",
+    "tests/acceptance/test_view_open_terminals.py", "tests/acceptance/test_view_open_triggers.py",
+}
+
+
+def pytest_itemcollected(item):
+    root = Path(__file__).resolve().parent.parent
+    if item.path.relative_to(root).as_posix() in LOCAL_ONLY_FILES:
+        item.add_marker(pytest.mark.local_only)

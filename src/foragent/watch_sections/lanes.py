@@ -7,7 +7,7 @@ from foragent.config import Config
 from foragent.status import summary_values
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
-from foragent.watch_layout import _clones, _lane_issues, _split, _widths
+from foragent.watch_layout import _clones, _split, _widths, _worker_rows
 
 ORDER = 30
 # "Watching" needs an orchestrator heartbeat (written by a running fa orch watch) this fresh (D67).
@@ -97,16 +97,13 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         label_width = min(25, max(8, road_width // 3))
         agent_label = "".join(value for value, style in watch._fit(watch._line(t('watch_agent', lane=title)), label_width)).rstrip()
         label = f"▐ {badge} {agent_label} ▌"
-        workers = clones.get(slug, [])
-        if len(workers) > 1:
-            # One row per running worker, numbered by its position in start order.
-            # Each row shows its own worker's state, not the lane's representative state.
-            rows = [(position, [run["number"]], snapshot.worker_states.get(run["number"], "working"))
-                    for position, run in enumerate(workers, 1)]
-        else:
-            rows = [(None, _lane_issues(row, clones), row["state"])]
-        for position, (worker, numbers, state) in enumerate(rows):
-            name = f"{index} {row['lane_display']}" + (" ▸ " if worker is None else "")
+        several = len(clones.get(slug, [])) > 1
+        # Several workers get a road row each; the queue and done line stay on the first.
+        for position, (_, numbers) in enumerate(_worker_rows(row, clones)):
+            # Each numbered row shows its own worker's state, not the lane's representative state.
+            state = snapshot.worker_states.get(numbers[-1], "working") if several else row["state"]
+            worker = position + 1 if several else None
+            name = f"{index} {row['lane_display']}" + ("" if several else " ▸ ")
             roads.append(_road(snapshot, name, numbers, state, row["queued"] if position == 0 else [],
                                label, color, road_width, tick, worker))
             if position == 0:

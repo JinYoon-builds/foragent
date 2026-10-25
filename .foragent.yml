@@ -77,4 +77,5 @@ lanes:
     - principle-prove-it-works
 board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards
 test_slots: 3  # 2026-10-24 night: parallel_floor 5 shares slots; ceiling 3 until slot-wait numbers decide (2026-10-25)
+checks: ci  # 2026-10-26 Jin: CI mode on after #493/#506 (evidence = the measurement run's own artifacts). Revert to local in one commit if evidence is missing or rejected
 max_runtime_minutes: 360  # 2026-10-25 Jin (D89): interim until the #435 watchdog; progressing runs were cut at 90 min. stall_minutes (30, no progress) still ends silent runs

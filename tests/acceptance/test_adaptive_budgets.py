@@ -17,7 +17,7 @@ from test_test_slots import bind_cli, machine_yml, slot_case, tick_context
 
 
 def bind_sample_clock(monkeypatch, clock):
-    """Keep completed sensor windows on the same fake clock as scheduler ticks."""
+    """Keep sensor samples on the same fake clock as scheduler ticks."""
     from foragent import capacity
 
     class Clock(datetime):
@@ -26,7 +26,7 @@ def bind_sample_clock(monkeypatch, clock):
             return clock[0].astimezone(tz) if tz else clock[0].replace(tzinfo=None)
 
     def no_sleep(*args):
-        pytest.fail("memory windows must advance fake time, never wait in real time")
+        pytest.fail("sensor samples must advance fake time, never wait in real time")
 
     monkeypatch.setattr(capacity, "datetime", Clock)
     monkeypatch.setattr(capacity, "time", SimpleNamespace(
@@ -81,34 +81,34 @@ def sensor(monkeypatch, sample_clock):
     monkeypatch.setattr(capacity, "swapins_total", swapins_total, raising=False)
     monkeypatch.setattr(capacity, "memory_pressure", lambda: sample.kernel, raising=False)
     monkeypatch.setattr(capacity, "load_per_cpu", lambda: sample.load)
-    # Backoff tests keep admission headroom abundant, whichever unit lands first.
+    # Memory facts do not impose an admission reservation or free-memory threshold.
     monkeypatch.setattr(capacity, "memory_bytes", lambda: (64_000_000_000, 60_000_000_000), raising=False)
     return sample
 
 
 @pytest.mark.parametrize("samples", [
     pytest.param([
-        *[("warn", 100, "normal")] * 10, ("warn", 100, "warn"),
+        *[("warn", 100, "warn")] * 11,
     ], id="compression-without-swapins"),
     pytest.param([
         ("normal", 100, "normal"), ("normal", 201, "normal"),
-        ("normal", 302, "normal"), ("normal", 403, "warn"),
+        ("normal", 302, "normal"), ("normal", 403, "normal"),
         ("normal", 403, "normal"),
     ], id="swapins-override-normal-for-one-window"),
     pytest.param([
-        *[("critical", 100, "normal")] * 10, ("critical", 100, "critical"),
+        *[("critical", 100, "critical")] * 11,
         ("normal", 100, "normal"),
     ], id="critical-always-wins"),
     pytest.param([
-        *[("warn", None, "normal")] * 10, ("warn", None, "warn"),
+        *[("warn", None, "warn")] * 11,
     ], id="unknown-is-conservative"),
     pytest.param([
         ("normal", 100, "normal"), ("normal", 201, "normal"), ("normal", 2, "normal"),
-        ("normal", 103, "normal"), ("normal", 204, "normal"), ("normal", 305, "warn"),
+        ("normal", 103, "normal"), ("normal", 204, "normal"), ("normal", 305, "normal"),
     ], id="counter-reset-rebases-the-window"),
 ])
 def test_adaptive_budgets_sensor_classifies_sample_windows(sensor, samples):
-    # memory-backoff: classify completed 30-second windows, not individual deltas.
+    # Kernel levels remain facts; swap-in activity never reclassifies them.
     from foragent import capacity
 
     actual = []
@@ -117,7 +117,7 @@ def test_adaptive_budgets_sensor_classifies_sample_windows(sensor, samples):
         actual.append(capacity.machine_load())
         sensor.clock[0] += timedelta(seconds=30)
     expected = [(pressure, sensor.load) for _, _, pressure in samples]
-    assert actual == expected, f"machine_load must classify swap-in windows: {actual!r} != {expected!r}"
+    assert actual == expected, f"machine_load must preserve kernel levels: {actual!r} != {expected!r}"
     assert sensor.kernel_reads and sensor.swapin_reads, "machine_load must consume both public seams"
 
 
@@ -140,7 +140,7 @@ def test_adaptive_budgets_raw_sensors_are_public_and_in_process(monkeypatch):
 
 
 def test_adaptive_budgets_sample_counter_survives_fresh_processes(sensor, isolated_home):
-    # memory-backoff: both the counter and its streak must survive a fresh process.
+    # Swap-in deltas remain observable across processes without becoming pressure.
     from foragent import capacity
 
     assert capacity.machine_load() == ("normal", 0.5)
@@ -173,7 +173,8 @@ capacity.kernel_pressure = lambda: "normal"
 capacity.memory_pressure = lambda: "normal"
 capacity.swapins_total = lambda: int(sys.argv[1])
 capacity.load_per_cpu = lambda: 0.5
-print(json.dumps(capacity.machine_load()))
+sample = capacity.machine_load()
+print(json.dumps({"load": sample, "swapins": sample.swapins}))
 """
 
     def fresh_sample(total):
@@ -189,11 +190,12 @@ print(json.dumps(capacity.machine_load()))
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
         )
-        return tuple(json.loads(result.stdout))
+        sample = json.loads(result.stdout)
+        return tuple(sample["load"]), sample["swapins"]
 
-    actual = [fresh_sample(total) for total in (100, 201, 302, 403, 403)]
-    assert actual == [("normal", 0.5)] * 3 + [("warn", 0.5), ("normal", 0.5)], (
-        f"machine data must preserve the counter, hot-window streak and cool-window reset: {actual!r}"
+    actual = [fresh_sample(total) for total in (100, 201, 302, 403, 403, 2, 103)]
+    assert actual == [(("normal", 0.5), delta) for delta in (0, 101, 101, 101, 0, 0, 101)], (
+        f"machine data must preserve swap-in deltas and rebase a reset without changing pressure: {actual!r}"
     )
 
 
@@ -227,7 +229,7 @@ def tick_slots(scenario, capsys, *, seconds=600):
 
 
 def test_adaptive_budgets_tick_recovers_slots_then_decreases_on_swapins(adaptive_case, capsys):
-    # memory-backoff: keep recovery, replace the one-window decrease trigger.
+    # Retain the locked name: swap-ins no longer decrease slots; CPU overload does.
     from foragent import capacity
 
     scenario = adaptive_case
@@ -236,9 +238,11 @@ def test_adaptive_budgets_tick_recovers_slots_then_decreases_on_swapins(adaptive
     for _ in range(3):
         scenario.sensor.total += 101
         actual.append(tick_slots(scenario, capsys, seconds=30))
-    assert actual == [2, 3, 3, 3, 3, 2], (
-        f"recover to the ceiling, then remove one slot only after three hot windows: {actual!r}"
+    assert actual == [2, 3, 3, 3, 3, 3], (
+        f"recover to the ceiling and keep it despite repeated swap-ins: {actual!r}"
     )
+    scenario.sensor.load = 2.0
+    assert tick_slots(scenario, capsys, seconds=30) == 2, "CPU overload still removes one slot"
     assert scenario.sensor.kernel_reads and scenario.sensor.swapin_reads, (
         "tick must consume capacity's public raw sensors through the real machine_load"
     )
@@ -253,8 +257,8 @@ def history(root):
     text = path.read_text(encoding="utf-8")
     assert text.endswith("\n"), "each budget history record must be a complete JSON line"
     rows = [json.loads(line) for line in text.splitlines()]
-    # Headroom refusals are admission events; unchanged *budgets* still omit rows.
-    rows = [row for row in rows if row.get("rule") != "headroom"]
+    # Critical holds are admission events; unchanged budgets still omit transitions.
+    rows = [row for row in rows if row.get("rule") != "memory-critical"]
     for row in rows:
         assert set(HISTORY_FIELDS) <= row.keys(), row
         assert isinstance(row["at"], str), row
@@ -275,7 +279,7 @@ def assert_history(root, expected):
 
 
 def test_adaptive_budgets_slot_history_appends_changes_and_omits_noops(adaptive_case, capsys):
-    # memory-backoff: keep transition/no-op checks with a sustained swap trigger.
+    # Keep transition/no-op checks using the unchanged CPU overload trigger.
     from foragent import capacity
 
     scenario = adaptive_case
@@ -291,17 +295,15 @@ def test_adaptive_budgets_slot_history_appends_changes_and_omits_noops(adaptive_
     tick_slots(scenario, capsys)  # Already at the configured ceiling.
     assert path.read_bytes() == unchanged, "a tick with no budget change must append nothing"
 
-    actual = []
-    for _ in range(3):
-        scenario.sensor.total += 101
-        actual.append(tick_slots(scenario, capsys, seconds=30))
-    assert actual == [3, 3, 2], f"history must wait for the third hot window: {actual!r}"
-    expected.append(("test_slots", 3, 2, "warn", 0.5, 101))
+    scenario.sensor.load = 2.0
+    scenario.sensor.total += 101  # Still recorded as a fact, never the backoff trigger.
+    assert tick_slots(scenario, capsys, seconds=30) == 2, "CPU overload must remove one slot"
+    expected.append(("test_slots", 3, 2, "normal", 2.0, 101))
     assert_history(scenario.root, expected)
 
 
 def test_adaptive_budgets_slot_history_records_unknown_swapins_as_null(adaptive_case, capsys):
-    # memory-backoff: an unknown counter can back off only on sustained kernel pressure.
+    # CPU-driven history retains an unknown swap-in counter as JSON null.
     from foragent import capacity
 
     scenario = adaptive_case
@@ -309,19 +311,19 @@ def test_adaptive_budgets_slot_history_records_unknown_swapins_as_null(adaptive_
         "slots": 3, "changed_at": scenario.case.clock[0].isoformat(),
     }), encoding="utf-8")
     scenario.sensor.total = None
-    scenario.sensor.kernel = "warn"
+    scenario.sensor.kernel = "normal"
+    scenario.sensor.load = 2.0
     capacity.machine_load()
-    actual = [tick_slots(scenario, capsys, seconds=30) for _ in range(10)]
-    assert actual == [3] * 9 + [2], f"unknown swap-ins must wait five minutes: {actual!r}"
+    assert tick_slots(scenario, capsys, seconds=30) == 2, "CPU overload must remove one slot"
     assert_history(scenario.root, [
-        ("test_slots", 3, 2, "warn", 0.5, None),
+        ("test_slots", 3, 2, "normal", 2.0, None),
     ])
 
 
 def test_adaptive_budgets_parallel_history_uses_machine_budget_path(
     git_history, tmp_path, monkeypatch, adaptive_environment, sensor, sample_clock,
 ):
-    # memory-backoff: preserve shared persistence, live runs and no-op history.
+    # Preserve CPU-driven shared persistence, live runs and no-op history.
     from foragent import capacity, scheduler
     from foragent.state import StateStore
     from test_orch_review_handoff import make_case
@@ -383,18 +385,16 @@ def test_adaptive_budgets_parallel_history_uses_machine_budget_path(
     expected = [("parallel", 2, 3, "normal", 0.5, 0)]
     assert_history(adaptive_environment, expected)
 
-    actual = []
-    for _ in range(3):
-        sensor.total += 101
-        case.clock[0] += timedelta(seconds=30)
-        assert scheduler.tick(context).skipped is None
-        actual.append(capacity.read_state(case.store)["parallel"])
+    sensor.load = 2.0
+    sensor.total += 101
+    case.clock[0] += timedelta(seconds=30)
+    assert scheduler.tick(context).skipped is None
     state = capacity.read_state(case.store)
-    assert actual == [3, 3, 1], (
-        f"only the third hot 30-second window must halve parallel from 3 to 1: {actual!r}"
+    assert state["parallel"] == 1, (
+        f"CPU overload must halve parallel from 3 to 1: {state!r}"
     )
     assert len(launched) == len(case.store.active_runs()) == 3
-    expected.append(("parallel", 3, 1, "warn", 0.5, 101))
+    expected.append(("parallel", 3, 1, "normal", 2.0, 101))
     assert_history(adaptive_environment, expected)
 
     path = adaptive_environment / "budget-history.jsonl"
@@ -403,22 +403,25 @@ def test_adaptive_budgets_parallel_history_uses_machine_budget_path(
     assert capacity.read_state(case.store) == state
     assert path.read_bytes() == unchanged, "an unchanged parallel budget must append nothing"
 
+    sensor.load = 0.5
     case.clock[0] += capacity.INCREASE_INTERVAL + timedelta(seconds=1)
     assert scheduler.tick(context).skipped is None
     assert capacity.read_state(case.store)["parallel"] == 2
     expected.append(("parallel", 1, 2, "normal", 0.5, 0))
     assert_history(adaptive_environment, expected)
 
-    # At the ceiling, pending critical pressure cannot be confused with growth.
+    # Critical holds leave the budget and running work intact, with no transition.
     capacity.write_state(case.store, 8, case.clock[0])
     sensor.kernel, sensor.total = "critical", None
+    before = list(launched)
     assert scheduler.tick(context).skipped is None
     actual = [capacity.read_state(case.store)["parallel"]]
     for _ in range(10):
         case.clock[0] += timedelta(seconds=30)
         assert scheduler.tick(context).skipped is None
         actual.append(capacity.read_state(case.store)["parallel"])
-    assert actual == [8] * 10 + [4], f"critical history must also wait five minutes: {actual!r}"
-    expected.append(("parallel", 8, 4, "critical", 0.5, None))
+    assert actual == [8] * 11, f"critical must never change the worker budget: {actual!r}"
+    assert launched == before, "critical must start no new runs"
+    assert len(case.store.active_runs()) == 3, "critical must leave running runs untouched"
     assert_history(adaptive_environment, expected)
     assert case.implementer.calls == case.reviewer.calls == []

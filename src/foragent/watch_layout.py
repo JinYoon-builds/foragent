@@ -84,6 +84,23 @@ def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     return clones
 
 
+def _lane_name(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> str:
+    """The plain lane name; workers are told apart by their own road rows."""
+    return row["lane_display"]
+
+
+def _worker_rows(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[tuple[str, list[int]]]:
+    """One road row per running worker, named '<lane> N' in start order when there are several."""
+    workers = clones.get(row["slug"], [])
+    if len(workers) < 2:
+        return [(row["lane_display"], _lane_issues(row, clones))]
+    numbers = [run["number"] for run in workers]
+    # A blocked or waiting issue that is not a running worker keeps today's place on the first row.
+    extra = [number for number in _lane_issues(row, clones) if number not in numbers]
+    return [(f"{row['lane_display']} {position}", (extra if position == 1 else []) + [number])
+            for position, number in enumerate(numbers, 1)]
+
+
 def _lane_issues(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[int]:
     """The lane's shown issues: its current issue first, or its workers in start order when it has several."""
     current = row["issue"] if row["state"] in {"working", "blocked", "waiting-human"} else None

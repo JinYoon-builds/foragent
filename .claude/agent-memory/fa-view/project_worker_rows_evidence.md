@@ -14,3 +14,5 @@ metadata:
 리뷰 보완: 도로 이름 칸은 `min(19, road_width // 3)`칸으로 자른다. 번호 줄은 `_road(..., worker=N)`이 ` N ▸ `를 먼저 남기고 레인 이름만 `…`로 줄인다. 통째로 자르면 `orchestration` 같은 긴 이름에서 번호가 사라진다. 회귀 검증: `tests/test_watch_workers.py -k long_lane_name`.
 
 리뷰 보완 2: status JSON은 레인 대표 상태 하나뿐이다(status.py 변경 금지). 그래서 작업자별 상태는 `watch_data.collect`가 로컬 이슈 라벨로 `Snapshot.worker_states`를 만든다(needs-human → blocked → working, collect_lanes와 같은 순서). 도로 번호 줄과 활동 표의 다른 작업자 줄이 이를 쓴다. 회귀 검증: `tests/test_watch_workers.py -k own_state`. `test_view_done_state` 5개는 기준본에서도 실패한다.
+
+main 병합(2026-10-26): main에 같은 규칙의 `watch_layout._worker_rows`·`_lane_name`과 일반 시험 `tests/test_watch_worker_rows.py`가 먼저 들어왔다. 두 함수를 살리고 lanes.py가 `_worker_rows`로 줄을 만들게 했다. 작업자 상태(`worker_states`)와 번호 보존(`_road(..., worker=N)`)은 그 위에 얹었다. 실행 중이 아닌 막힌 이슈는 1번 줄 앞에 남는다(main 규칙). `_clones`는 running만 세는 HEAD 쪽을 유지했다.
