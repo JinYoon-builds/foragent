@@ -542,6 +542,12 @@ def test_enumeration_uses_fresh_kernel_start_time_and_excludes_denied_or_zombie(
         def status(self):
             return self.state
 
+        def cmdline(self):
+            return []
+
+        def uids(self):
+            return SimpleNamespace(real=501)
+
     monkeypatch.setattr(psutil, "process_iter", lambda: iter([
         Process(42000), Process(42001), Process(42002, status=psutil.STATUS_ZOMBIE),
         Process(42003, denied=True),
@@ -550,13 +556,16 @@ def test_enumeration_uses_fresh_kernel_start_time_and_excludes_denied_or_zombie(
     monkeypatch.setattr(module, "os", SimpleNamespace(getpgid=lambda pid: pid, getsid=lambda pid: pid))
     rows = module.list_processes()
     assert [(row.pid, row.start_time) for row in rows] == [(42000, 10)]
+    assert rows.unreadable == frozenset({42003})
     assert module.read_process_identity(42000) == module.ProcessIdentity(42000, 1, 42000, 42000, 10)
     changing = iter((Process(42000), Process(42000, start=20)))
     monkeypatch.setattr(psutil, "Process", lambda pid: next(changing))
     assert module.read_process_identity(42000) is None
-    for process in (Process(42000, status=psutil.STATUS_ZOMBIE), Process(42000, denied=True)):
-        monkeypatch.setattr(psutil, "Process", lambda pid: process)
-        assert module.read_process_identity(42000) is None
+    monkeypatch.setattr(psutil, "Process", lambda pid: Process(pid, status=psutil.STATUS_ZOMBIE))
+    assert module.read_process_identity(42000) is None
+    monkeypatch.setattr(psutil, "Process", lambda pid: Process(pid, denied=True))
+    with pytest.raises(PermissionError, match="cannot be read"):
+        module.read_process_identity(42000)
 
     def missing_process(pid):
         raise psutil.NoSuchProcess(pid)

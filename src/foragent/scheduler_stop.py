@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
@@ -9,6 +10,33 @@ from foragent.state import Run
 
 if TYPE_CHECKING:
     from foragent.scheduler import TickContext, TickReport
+
+
+def runner_process_exists(number: int) -> bool:
+    snapshot = scheduler.current_snapshot()
+    if snapshot is not None and snapshot.available and snapshot.runner_exists(number):
+        return True
+    try:
+        output = scheduler.subprocess.run(
+            ["ps", "-axo", "pid,command"], check=True, capture_output=True, text=True,
+        ).stdout
+    except (OSError, scheduler.subprocess.CalledProcessError):
+        return True  # An unavailable process list cannot establish runner death.
+    return scheduler.runner_commands_exist(number, (fields[1] for line in output.splitlines()
+                                                    if len(fields := line.split(maxsplit=1)) == 2 and fields[0].isdigit()))
+
+
+@contextmanager
+def tick_processes(store):
+    """Unavailable routine evidence defers pruning without failing the tick."""
+    with processes.process_snapshot() as snapshot:
+        if snapshot.available:
+            store.prune_process_identities(inactive_only=True)
+        try:
+            yield snapshot
+        finally:
+            if snapshot.available:
+                store.prune_process_identities()
 
 
 def _stop_already_refused(ctx: TickContext, run: Run) -> bool:
