@@ -23,6 +23,10 @@ MESSAGES = {
         "brief_usage_item": "Usage {executor}: {windows}",
         "brief_usage_window": "{name} {percent}%",
         "brief_usage_missing": "Usage: nothing recorded yet",
+        "brief_next_question": "What should we do?",
+        "brief_choice_order": "Planning interview",
+        "brief_choice_design": "Design interview",
+        "brief_choice_inspect": "Handle what to see",
     },
     "ko": {
         "brief_questions": "답할 질문 {count}개",
@@ -46,5 +50,9 @@ MESSAGES = {
         "brief_usage_item": "{executor} 사용량: {windows}",
         "brief_usage_window": "{name} {percent}%",
         "brief_usage_missing": "사용량: 아직 기록이 없어요",
+        "brief_next_question": "무엇을 할까요?",
+        "brief_choice_order": "기획 인터뷰",
+        "brief_choice_design": "디자인 인터뷰",
+        "brief_choice_inspect": "볼 것 처리",
     },
 }
