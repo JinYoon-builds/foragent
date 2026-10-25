@@ -127,8 +127,19 @@ def test_state_round_trip_and_unreadable_state(tmp_path):
 
 
 def budget_ctx(tmp_path, now, max_parallel=None, parallel_floor=1):
+    """max_parallel is this repository's own ceiling; the floor is the machine's (machine.yml, #365)."""
+    if parallel_floor != 1:
+        write_machine_yml(parallel_floor=parallel_floor)
     return SimpleNamespace(store=StateStore(tmp_path / "repo"), now=lambda: now,
-                           config=Config(max_parallel=max_parallel, parallel_floor=parallel_floor))
+                           config=Config(max_parallel=max_parallel))
+
+
+def write_machine_yml(**values):
+    from foragent import machine_budget
+
+    path = machine_budget.machine_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{key}: {value}\n" for key, value in values.items()), encoding="utf-8")
 
 
 def test_budget_starts_at_initial_value_and_spaces_increases(tmp_path, monkeypatch):
@@ -287,6 +298,7 @@ def test_next_test_slots_stays_between_one_and_ceiling():
 
 
 def test_effective_test_slots_reads_shared_value_capped_by_ceiling():
+    write_machine_yml(test_slots=3)  # Above the default machine ceiling of 2 (#365).
     assert capacity.effective_test_slots(3) == 3
     capacity.update_test_slots(3, NOW, pressure="warn", load_per_cpu=0.0)
     assert capacity.effective_test_slots(3) == 2
@@ -313,6 +325,7 @@ def test_test_slot_is_exclusive_up_to_the_effective_limit(monkeypatch):
 
 
 def test_test_slot_held_above_a_lowered_limit_still_counts():
+    write_machine_yml(test_slots=3)  # Above the default machine ceiling of 2 (#365).
     with capacity.hold_test_slot(3), capacity.hold_test_slot(3), capacity.hold_test_slot(3):
         # The AIMD value dropped to 2 while three commands ran; none may join.
         assert capacity._take_test_slot(2) is None
@@ -532,14 +545,17 @@ def test_test_slots_floor_allows_growth_with_headroom():
 
 
 def test_machine_max_parallel_caps_the_shared_value_during_decrease_cooldown(tmp_path):
-    from foragent import machine_budget
-
-    path = machine_budget.machine_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("max_parallel: 2\n", encoding="utf-8")
+    write_machine_yml(max_parallel=2)
     ctx = budget_ctx(tmp_path, NOW)
-    # A decrease just happened, so the cooldown would otherwise hold the value at 8.
+    # A decrease just happened; the clamp to a lower ceiling does not wait for it.
     capacity.write_state(ctx.store, 8, NOW - timedelta(hours=1), decreased_at=NOW.isoformat())
     ready = {f"lane-{n}": [n] for n in range(8)}
     assert scheduler._machine_budget(ctx, ready, capacity.LoadSample("normal", 0.5, 0)) == 2
-    assert capacity.read_state(ctx.store)["parallel"] == 2
+    state = capacity.read_state(ctx.store)
+    assert state["parallel"] == 2
+    assert state["decreased_at"] == NOW.isoformat()  # A clamp is not an AIMD decrease.
+    rows = [json.loads(line) for line in (tmp_path / capacity.HISTORY_FILE).read_text().splitlines()]
+    assert [(row["budget"], row["from"], row["to"]) for row in rows] == [("parallel", 8, 2)]
+    # The clamp happened alone; AIMD resumes on the next tick within the ceiling.
+    ctx.now = lambda: NOW + capacity.INCREASE_INTERVAL
+    assert scheduler._machine_budget(ctx, ready, capacity.LoadSample("normal", 0.5, 0)) == 2

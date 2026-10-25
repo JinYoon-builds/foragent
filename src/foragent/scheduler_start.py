@@ -39,23 +39,30 @@ def _machine_budget(
     waiting = sum(len(numbers) for lane, numbers in ready.items() if not _lane_held(ctx, lane, now))
     sample = sample if sample is not None else scheduler.machine_load()
     pressure, load = sample
-    machine = machine_budget.values(ctx.config)  # The shared value follows machine.yml only.
+    machine = machine_budget.values()  # The shared value follows machine.yml only.
+    ceiling = machine["max_parallel"]
     with scheduler.machine_lock(ctx.store):
         state = scheduler.read_state(ctx.store)
         current = int(state["parallel"]) if state else scheduler.INITIAL_PARALLEL
+        if state and ceiling is not None and current > ceiling:
+            # A lower ceiling applies at once and alone: no AIMD step, no decrease
+            # interval, no decreased_at. Running work keeps going; new starts see it.
+            scheduler.write_state(ctx.store, ceiling, now, decreased_at=state.get("decreased_at"))
+            scheduler.append_budget_history(
+                ctx.store.root.parent, now, "parallel", current, ceiling, pressure=pressure,
+                load_per_cpu=load, swapins=getattr(sample, "swapins", None), wanted=ceiling,
+            )
+            return max(1, min(ceiling, scheduler.machine_runs(ctx.store, now) + waiting))
         changed_at = scheduler.datetime.fromisoformat(state["changed_at"]) if state else now
         demand = scheduler.machine_runs(ctx.store, now) + waiting
         # Work only caps growth: the shared value never drops below itself for lack
         # of work here, so it stays the pressure- and load-driven value.
         wanted = scheduler.next_parallel(
             current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
-            ceiling=machine["max_parallel"], increase_ok=now - changed_at >= scheduler.INCREASE_INTERVAL,
+            ceiling=ceiling, increase_ok=now - changed_at >= scheduler.INCREASE_INTERVAL,
         )
         if wanted < current and not scheduler.decrease_allowed(state, now):
             wanted = current
-        if machine["max_parallel"] is not None:
-            # The machine ceiling holds even inside the decrease cooldown.
-            wanted = min(wanted, machine["max_parallel"])
         value = wanted if pressure == "critical" else max(machine["parallel_floor"], wanted)
         if state is None or value != current:
             decreased_at = (

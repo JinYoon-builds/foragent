@@ -224,7 +224,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         report.skipped = f"GitHub rate limit until {until.isoformat()}"
         return report
     # One sensor sample per tick sizes both the test slots and the run budget; machine.yml alone sizes the shared files.
-    sample, machine = machine_load(), machine_budget.values(ctx.config)
+    sample, machine = machine_load(), machine_budget.values()
     update_test_slots(
         machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
         swapins=getattr(sample, "swapins", None), floor=machine["test_slots_floor"],

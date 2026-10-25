@@ -9,6 +9,7 @@ import sys
 import time
 
 import pytest
+import yaml
 
 
 from foragent.capacity import write_state
@@ -98,6 +99,14 @@ def record_stop(ctx, callback):
     return stop
 
 
+def write_machine_yml(**values):
+    from foragent import machine_budget
+
+    path = machine_budget.machine_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(values), encoding="utf-8")
+
+
 def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
     ctx.tracker.add_issue(number, f"Issue {number}", body, labels=labels)
     ctx.tracker.record_label(number, "approved", actor)
@@ -107,7 +116,8 @@ def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
 def test_tick_applies_configured_test_slots_floor_without_starting_runs(ctx, monkeypatch, floor, pressure, expected):
     from foragent import capacity
 
-    ctx.config = replace(ctx.config, test_slots=2, test_slots_floor=floor)
+    # The shared slots follow machine.yml only (#365); repository floors no longer reach them.
+    write_machine_yml(test_slots=2, test_slots_floor=floor)
     monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(pressure, 0.5, 60))
     capacity.write_state(ctx.store, 4, NOW)
     assert tick(ctx).skipped is None
@@ -125,7 +135,8 @@ def test_tick_applies_configured_parallel_floor_when_starting_workers(ctx, monke
     from foragent import capacity
 
     lanes = {f"lane-{number}": {} for number in range(1, 5)}
-    ctx.config = replace(ctx.config, parallel_floor=floor, max_parallel=3, test_slots=1, lanes=lanes)
+    ctx.config = replace(ctx.config, max_parallel=3, test_slots=1, lanes=lanes)
+    write_machine_yml(parallel_floor=floor)  # The shared worker budget follows machine.yml only (#365).
     for number in range(1, 5):
         approve(ctx, number, labels=[f"lane:lane-{number}"])
     capacity.write_state(ctx.store, 3, NOW)

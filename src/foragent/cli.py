@@ -11,6 +11,8 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
+import yaml
+
 from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_inbox, orch_queue, orch_tick_outcome, order, tidy, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
@@ -450,6 +452,32 @@ def _refresh_status(tracker: Tracker, store: StateStore, config: Config) -> None
         pass
 
 
+def _repo_floor_keys(root: Path) -> list[str]:
+    """Floor keys this repository's .foragent.yml sets; they no longer size the machine budget."""
+    try:
+        data = yaml.safe_load((root / ".foragent.yml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return []
+    return [key for key in ("test_slots_floor", "parallel_floor") if isinstance(data, dict) and key in data]
+
+
+def _print_machine_budget(status: dict[str, Any], language: str) -> None:
+    budget = status.get("machine_budget")
+    if not budget:
+        return
+    parts = []
+    for key in machine_budget.KEYS:
+        value = budget[key]["value"]
+        parts.append(text("machine_budget_value", language, key=key,
+                          value=text("machine_budget_none", language) if value is None else value,
+                          source=text(f"machine_budget_source_{budget[key]['source']}", language)))
+    print(text("machine_budget_line", language, values=", ".join(parts)))
+    if budget.get("unknown_keys"):
+        print(text("machine_budget_unknown_keys", language, keys=", ".join(budget["unknown_keys"])))
+    if status.get("repo_floors_ignored"):
+        print(text("machine_budget_repo_floors_ignored", language, keys=", ".join(status["repo_floors_ignored"])))
+
+
 def _print_status(status: dict[str, Any], language: str = "en") -> None:
     if status_unknown(status):
         print(text("status_unknown", language) + (f": {status['error']}" if status.get("error") else ""))
@@ -457,6 +485,7 @@ def _print_status(status: dict[str, Any], language: str = "en") -> None:
     if status.get("as_of"):
         print(text("status_as_of", language, time=status["as_of"]))
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
+    _print_machine_budget(status, language)
     for lane in status["lanes"].values():
         details = [text(lane["state"], language)]
         if lane["issue"] is not None:
@@ -847,7 +876,8 @@ def main(argv: list[str] | None = None) -> int:
             status = _status(tracker, store, config)
             status["launchd"] = asdict(launchd.status(root, repo=repo))
             status["test_slots"] = capacity.effective_test_slots(config.test_slots)
-            status["machine_budget"] = machine_budget.sources(config)
+            status["machine_budget"] = machine_budget.read().report()
+            status["repo_floors_ignored"] = _repo_floor_keys(root)
             status["tick_outcome"] = orch_tick_outcome.read(store)
             if args.json:
                 print(json.dumps(status))
