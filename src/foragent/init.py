@@ -1,7 +1,7 @@
 """Idempotent repository setup; all external commands can be injected."""
 
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import logging
 from pathlib import Path
@@ -10,9 +10,11 @@ import subprocess
 import yaml
 
 from foragent import board, launchd
+from foragent.ci_workflow import PUBLISH_WORKFLOW, WORKFLOW, initial_checks, publisher_workflow_text, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.labels import LABELS
+from foragent.order import detect_test_commands
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
 
@@ -183,8 +185,11 @@ def init_repo(
         explicit = {"approvers": approvers, "review": review, "executor": executor,
                     "run_hours": run_hours, "language": language}
         added = {key: value for key, value in explicit.items() if value is not None and key not in local}
+        if "checks" not in local:
+            added["checks"] = initial_checks(repo, run, command=config.test_command or next(iter(detect_test_commands(root)), None))
         if added:
             _validate({**asdict(config), **added})
+            config = replace(config, **added)
             updated_config = _add_config(config_path, local, added)
     else:
         codex_available = _logged_in("codex")
@@ -206,11 +211,15 @@ def init_repo(
             options["language"] = language
         values = {key: DEFAULTS[key] if value is None else value for key, value in options.items()}
         values["approvers"] = approvers
+        values["checks"] = initial_checks(repo, run, command=next(iter(detect_test_commands(root)), None))
         _validate({**DEFAULTS, **values})
         config = Config(**{**DEFAULTS, **values})
         minimal = {key: value for key, value in values.items()
-                   if key in {"review", "approvers"} or options[key] is not None or value != DEFAULTS[key]}
+                   if key in {"review", "approvers", "checks"} or options[key] is not None or value != DEFAULTS[key]}
         contents = {".foragent.yml": CONFIG_COMMENT + yaml.safe_dump(minimal, sort_keys=False), **contents}
+    if config.checks == "ci":
+        contents[WORKFLOW] = workflow_text(config)
+        contents[PUBLISH_WORKFLOW] = publisher_workflow_text(config)
     if not (root / "tests/acceptance").exists():
         contents["tests/acceptance/.gitkeep"] = ""
 
@@ -221,7 +230,8 @@ def init_repo(
     if (root / "tests/acceptance").exists():
         existed.append("tests/acceptance/")
     pending = list(dict.fromkeys([
-        *created, *([".foragent.yml"] if added else []), *git.uncommitted_paths(SETUP_PATHS),
+        *created, *([".foragent.yml"] if added else []),
+        *git.uncommitted_paths([*SETUP_PATHS, *([WORKFLOW, PUBLISH_WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
     if (pending or (board_planned and not config.board)) and git.current_branch() != base_branch:
@@ -276,8 +286,11 @@ def init_repo(
     for path in created:
         destination = root / path
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("x", encoding="utf-8") as stream:
-            stream.write(contents[path])
+        if path not in {WORKFLOW, PUBLISH_WORKFLOW}:
+            with destination.open("x", encoding="utf-8") as stream:
+                stream.write(contents[path])
+    if {WORKFLOW, PUBLISH_WORKFLOW}.intersection(created):
+        write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:
         config_path.write_text(updated_config, encoding="utf-8")
     if pending:

@@ -112,12 +112,21 @@ def test_merge_lock_wait_does_not_consume_conflict_executor_backoff_budget(confl
     scripted_results(c, monkeypatch, results)
     merge_lock = c.store.merge_lock
     waits = []
+    lock_waits = []
 
     @contextmanager
     def delayed_lock():
+        lock_waits.append(c.now[0])
+        if len(lock_waits) == 1:
+            c.move_target()
         c.now[0] += timedelta(minutes=31)
         with merge_lock():
             yield
+
+    def checks(pr):
+        head = c.tracker.pr_head_sha(pr)
+        c.ci_heads.append(head)
+        return "pending" if head != c.ci_heads[0] and c.ci_heads.count(head) == 1 else "pass"
 
     def sleep(seconds):
         waits.append(seconds)
@@ -125,11 +134,13 @@ def test_merge_lock_wait_does_not_consume_conflict_executor_backoff_budget(confl
 
     c.ctx.sleep = sleep
     monkeypatch.setattr(c.store, "merge_lock", delayed_lock)
+    monkeypatch.setattr(c.tracker, "pr_checks", checks)
     assert run_issue(1, c.ctx) == "merged"
     assert waits == [120] * (2 if prior_backoff else 1) + [30]
     run = c.store.get_run(1)
     assert run.attempts == 1 and run.executor_waited_seconds == 120 * (2 if prior_backoff else 1)
-    assert run.waited_seconds == 31 * 60 + run.executor_waited_seconds
+    assert len(lock_waits) == 2  # Discover the conflict, then queue the verified resolution.
+    assert run.waited_seconds == len(lock_waits) * 31 * 60 + run.executor_waited_seconds
     assert [call["timeout_s"] for call in c.executor.calls] == [60] * (4 if prior_backoff else 3)
     assert c.store.load_flag(1) is None
 

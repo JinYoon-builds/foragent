@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from foragent.actions import flag
-from foragent.executors import classify_result
+from foragent.executors import ExecResult, classify_result
 from foragent.issue import parse_body
 from foragent.labels import attempt_tier, issue_size
 from foragent.reasons import Reason
@@ -15,7 +15,8 @@ from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Imp
 from foragent.run_baseline import _capture_acceptance_baseline
 from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
-from foragent.run_lane_skills import lane_notes, lane_skills
+from foragent.run_lane_skills import lane_notes, lane_skill_names, lane_skills
+from foragent.run_skill_catalog import available_skills, catalog_section, parse_skills_used
 from foragent.run_prompts import build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
 from foragent.run_waits import _phase, _timeout
@@ -69,6 +70,16 @@ def implementer_setup(config: Config, lane: str, tier: str, worktree: Path) -> I
     return ImplementerSetup(config.executor, model, options, notes, missing)
 
 
+def _record_skills_used(n: int, ctx: RunContext, result: ExecResult) -> None:
+    """Keep every skill the implementer reported across attempts."""
+    message = result.full_message if result.full_message is not None else result.last_message
+    used = parse_skills_used(message or "")
+    if used is None:
+        return
+    run = ctx.store.get_run(n)
+    ctx.store.update_run(n, skills_reported=True, skills_used=list(dict.fromkeys([*run.skills_used, *used])))
+
+
 def _prepare_implementation(
     n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
     capture_baseline: bool = True,
@@ -98,8 +109,19 @@ def _prepare_implementation(
     if baseline_test_command is None:
         baseline_test_command = next(iter(runner.detect_test_commands(worktree)), None)
     try:
-        baseline = (_capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
-                    if capture_baseline else None)
+        from foragent.ci_mode import enabled
+        from foragent.ci_local import capture_local_only
+        started = ctx.monotonic()
+        if capture_baseline and enabled(ctx, target_branch):
+            from foragent.run_baseline import _baseline_exclusions
+            base_sha = git.ref_sha(start_ref)
+            baseline = capture_local_only(n, ctx, git, baseline_test_command, base_sha,
+                                          _baseline_exclusions(ctx, base_sha, log))
+        else:
+            baseline = (_capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
+                        if capture_baseline else None)
+            if capture_baseline:
+                ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})
     except AttemptFailure as exc:
         _append(log, str(exc))
         reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
@@ -155,6 +177,7 @@ def _implement(
     test_command = ctx.config.test_command
     if test_command is None:
         test_command = next(iter(runner.detect_test_commands(worktree)), None)
+    fixed = lane_skill_names(ctx.config, run.lane, worktree, lane_notes(ctx.config, run.lane, worktree)[0])
     prompt = build_prompt(
         n, attempt.parsed, ctx.config.acceptance_dir, failure_context, ctx.config.language,
         native_goal=not attempt.native_claude and ctx.config.codex_goal, acceptance_locked=attempt.native_claude,
@@ -164,6 +187,7 @@ def _implement(
         test_command=test_command,
         acceptance_baseline=attempt.baseline.node_ids if attempt.baseline else (),
         failure_limit=None if isinstance(failure, CIFailure) else 4000,
+        skill_catalog=catalog_section(available_skills(ctx.config, fixed)),
     )
     result = _available_executor(
         n, ctx, attempt.executor, worktree=worktree,
@@ -180,6 +204,7 @@ def _implement(
     # only once the implementer returns an ordinary execution result.
     if hint is not None and classify_result(result) == "normal":
         hint_path.unlink()
+    _record_skills_used(n, ctx, result)
     rebuttal = _read_rebuttals(worktree)
     if rebuttal.strip() and rebuttal not in attempt.rebuttals:
         attempt.rebuttals.append(rebuttal)

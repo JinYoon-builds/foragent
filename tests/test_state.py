@@ -21,6 +21,31 @@ def store(tmp_path):
     return StateStore(tmp_path / "state", now=lambda: NOW)
 
 
+@pytest.mark.parametrize("error", [PermissionError, OSError])
+def test_update_run_keeps_recorded_ownership_when_process_table_is_unreadable(
+    store, fake_process_table, tmp_path, monkeypatch, error,
+):
+    from foragent import processes
+
+    table = fake_process_table
+    root = table.add(42000, cwd=tmp_path, start_time=10)
+    table.add(42001, ppid=root.pid, cwd=tmp_path, start_time=11)
+    run = store.start_run(1, branch="branch", worktree=tmp_path, pid=root.pid)
+    child = table.add(42002, ppid=root.pid, cwd=tmp_path, start_time=12)
+    birth = {"pid": child.pid, "start_time": child.start_time}
+
+    def unavailable():
+        raise error("fake process table unavailable")
+
+    monkeypatch.setattr(processes, "list_processes", unavailable)
+    updated = store.update_run(1, detail="Stop refused: ownership unreadable", process_identities=[birth])
+    assert updated.detail == "Stop refused: ownership unreadable"
+    assert updated.process_identities == [*run.process_identities, birth]
+    assert store.get_run(1) == updated
+    assert updated.status == "running"
+    assert not store.read_history() and not table.signals
+
+
 @pytest.mark.parametrize("invalid", [
     {"node_ids": "passing"},
     {"collected_ids": []},
@@ -749,3 +774,26 @@ def test_link_count_change_alone_voids_a_read(store, field):
     store.record_read(1, "blocked_by", [], baseline=store.read_baseline())
     store.refresh_local_issues([replace(issue, **{field: (("total", 0),)})], [], {}, NOW + timedelta(minutes=5))
     assert store.confirmed_read(1, "blocked_by") is None
+
+
+def test_merge_facts_keep_unmerged_runs_null_and_reset_on_a_new_record(store):
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.update_run(1, last_review_pass_at=NOW.isoformat())
+    store.record_merge_lock(1, 7)
+    run = store.get_run(1)
+    assert run.review_pass_to_merge_seconds is None
+    assert run.merge_lock_held_seconds is None
+    store.record_merge(1, NOW + timedelta(seconds=20))
+    store.record_merge_lock(1, 3)
+    store.finish_run(1, "merged")
+    saved = json.loads((store.root / "runs/1.json").read_text())
+    assert saved["review_pass_to_merge_seconds"] == 20
+    assert saved["merge_lock_held_seconds"] == 10
+    restarted = store.start_run(1, branch="branch", worktree="worktree")
+    assert restarted.last_review_pass_at is None
+    assert restarted.review_pass_to_merge_seconds is None
+    assert restarted.merge_lock_held_seconds is None
+    store.record_merge(1, NOW)
+    store.record_merge_lock(1, 2)
+    assert store.get_run(1).review_pass_to_merge_seconds is None
+    assert store.get_run(1).merge_lock_held_seconds == 2

@@ -3,11 +3,13 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import errno
+import logging
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -50,39 +52,163 @@ class ProcessIdentity:
     pgid: int
     sid: int
     start_time: float
+    argv: tuple[str, ...] | None = ()
+    uid: int | None = None
+
+
+class ProcessTable(tuple):
+    """A listing with explicitly unreadable PIDs, which cannot prove death."""
+
+    def __new__(cls, rows=(), unreadable=(), unreadable_uids=()):
+        table = super().__new__(cls, rows)
+        table.unreadable = frozenset(unreadable)
+        table.unreadable_uids = dict(unreadable_uids)
+        return table
+
+
+@dataclass
+class ProcessSnapshot:
+    rows: dict[int, ProcessIdentity]
+    unreadable: frozenset[int] = frozenset()
+    available: bool = True
+    captured_at: float = 0
+    unreadable_uids: dict[int, int] = field(default_factory=dict)
+
+    def runner_exists(self, number: int) -> bool:
+        return runner_commands_exist(number, (
+            " ".join(row.argv) for row in self.rows.values() if row.argv is not None
+        ))
+
+
+def runner_commands_exist(number: int, commands) -> bool:
+    pattern = re.compile(
+        rf"(?:^|\s)(?:\S*/)?(?:foragent|fa|foragent\.cli)\s+gate\s+run-issue\s+{number}(?=\s|$)"
+    )
+    return any(command is not None and pattern.search(command) is not None for command in commands)
+
+
+_snapshot: ContextVar[ProcessSnapshot | None] = ContextVar("process_snapshot", default=None)
+
+
+def current_snapshot() -> ProcessSnapshot | None:
+    return _snapshot.get()
+
+
+def _capture_process_snapshot() -> ProcessSnapshot:
+    captured_at = time.time()
+    try:
+        table = list_processes()
+        return ProcessSnapshot({row.pid: row for row in table}, getattr(table, "unreadable", frozenset()),
+                               captured_at=captured_at,
+                               unreadable_uids=getattr(table, "unreadable_uids", {}))
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Process snapshot unavailable; liveness unknown; skipping prune: %s", exc)
+        return ProcessSnapshot({}, available=False)
+
+
+@contextmanager
+def process_snapshot():
+    """Capture routine positive liveness and prune candidates for one tick."""
+    snapshot = _capture_process_snapshot()
+    token = _snapshot.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _snapshot.reset(token)
 
 
 def read_process_identity(pid: int) -> ProcessIdentity | None:
-    """Read one kernel identity immediately before signaling, without a probe."""
+    """Return a verified live kernel identity or None; read errors propagate."""
     try:
         process = psutil.Process(pid)
         start = process.create_time()
         row = ProcessIdentity(pid, process.ppid(), os.getpgid(pid), os.getsid(pid), start)
         if psutil.Process(pid).create_time() == start and process.status() != psutil.STATUS_ZOMBIE:
             return row
-    except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError, PermissionError):
+    except (psutil.NoSuchProcess, ProcessLookupError):
         pass
+    except psutil.AccessDenied as exc:
+        raise PermissionError(f"Process identity {pid} cannot be read") from exc
     return None
+
+
+@dataclass(frozen=True)
+class IdentityEvidence:
+    alive: bool | None  # None means unreadable, never permission to discard ownership.
+    row: ProcessIdentity | None = None
+
+
+def recorded_identity_evidence(
+    pid: int, start_time: float, *, rows=None, fresh: bool = False,
+) -> IdentityEvidence:
+    """Only a fresh PID read can prove a recorded lifetime dead or replaced.
+
+    A matching listing is positive evidence. Missing, unreadable and mismatched
+    cached rows all require a fresh read before pruning. Stop and cleanup paths
+    use their own fresh listings, independently of this routine evidence.
+    """
+    if not fresh:
+        if rows is None:
+            snapshot = current_snapshot()
+            rows = snapshot.rows if snapshot is not None else {}
+        row = rows.get(pid)
+        if row is not None and row.start_time == start_time:
+            return IdentityEvidence(True, row)
+    try:
+        row = read_process_identity(pid)
+    except Exception:
+        return IdentityEvidence(None)
+    if row is not None and row.pid == pid and row.start_time == start_time:
+        return IdentityEvidence(True, row)
+    return IdentityEvidence(False)
+
+
+def _caused_by_permission_error(error: BaseException) -> bool:
+    seen = set()
+    while error is not None and id(error) not in seen:
+        if isinstance(error, (psutil.AccessDenied, PermissionError)):
+            return True
+        seen.add(id(error))
+        error = error.__cause__
+    return False
 
 
 def list_processes() -> tuple[ProcessIdentity, ...]:
     """Read kernel identities without probing or signaling any process."""
-    rows = []
+    rows, unreadable, unreadable_uids = [], set(), {}
     try:
         candidates = tuple(psutil.process_iter())
     except (psutil.AccessDenied, PermissionError) as exc:
         raise PermissionError("Process table unavailable; ownership cannot be verified") from exc
     for process in candidates:
+        uid = None
         try:
+            try:
+                uid = process.uids().real
+            except (psutil.AccessDenied, PermissionError):
+                pass
             # A second creation-time read rejects a PID reused during enumeration.
             start = process.create_time()
+            try:
+                argv = tuple(process.cmdline())
+            except (psutil.AccessDenied, PermissionError):
+                argv = None  # Readable identity, but runner discovery remains unknown.
+            except SystemError as exc:
+                # macOS psutil can wrap a kernel permission error in SystemError.
+                if not _caused_by_permission_error(exc):
+                    raise
+                argv = None
             row = ProcessIdentity(process.pid, process.ppid(), os.getpgid(process.pid),
-                                  os.getsid(process.pid), start)
+                                  os.getsid(process.pid), start, argv, uid)
             if psutil.Process(process.pid).create_time() == start and process.status() != psutil.STATUS_ZOMBIE:
                 rows.append(row)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError, PermissionError):
+        except (psutil.NoSuchProcess, ProcessLookupError):
             continue
-    return tuple(rows)
+        except (psutil.Error, OSError, SystemError):
+            unreadable.add(process.pid)
+            if uid is not None:
+                unreadable_uids[process.pid] = uid
+    return ProcessTable(rows, unreadable, unreadable_uids)
 
 
 def _protected(rows) -> tuple[set[int], int, int]:
@@ -92,6 +218,48 @@ def _protected(rows) -> tuple[set[int], int, int]:
         current = rows[current].ppid
         lineage.add(current)
     return lineage, os.getpgrp(), os.getsid(0)
+
+
+def observe_routine_tree(identities=()) -> list[dict]:
+    """Retain ownership and add positively witnessed children during routine checks.
+
+    This never removes identities or supplies a stop's descendant listing.
+    """
+    snapshot = current_snapshot()
+    if snapshot is None:
+        return observe_tree(identities)
+    if not snapshot.available:
+        return list(identities)
+    rows = snapshot.rows
+    lineage, group, session = _protected(rows)
+
+    def safe(row):
+        return (row.pid > 1 and row.pid not in lineage
+                and row.pgid not in lineage and row.sid not in lineage
+                and row.pgid != group and row.sid != session)
+
+    known = {item["pid"]: item["start_time"] for item in identities}
+    live = {pid for pid, start in known.items()
+            if pid in rows and rows[pid].start_time == start and safe(rows[pid])}
+    while True:
+        children = {row.pid for row in rows.values() if row.pid not in known
+                    and row.ppid in live and row.start_time >= rows[row.ppid].start_time and safe(row)}
+        parents = {}
+        for pid in {rows[pid].ppid for pid in children}:
+            try:
+                parents[pid] = read_process_identity(pid)
+            except (OSError, psutil.Error):
+                parents[pid] = None
+        children = {pid for pid in children if parents[rows[pid].ppid] is not None
+                    and (parents[rows[pid].ppid].start_time, parents[rows[pid].ppid].ppid,
+                         parents[rows[pid].ppid].pgid, parents[rows[pid].ppid].sid)
+                    == (rows[rows[pid].ppid].start_time, rows[rows[pid].ppid].ppid,
+                        rows[rows[pid].ppid].pgid, rows[rows[pid].ppid].sid)}
+        if not children:
+            break
+        known.update({pid: rows[pid].start_time for pid in children})
+        live.update(children)
+    return [{"pid": pid, "start_time": start} for pid, start in known.items()]
 
 
 def observe_tree(identities=(), roots=()) -> list[dict]:

@@ -306,7 +306,10 @@ def read_test_slots() -> dict[str, Any] | None:
 
 
 def effective_test_slots(ceiling: int) -> int:
-    """The shared AIMD value, capped by this repository's configured ceiling."""
+    """The shared AIMD value, capped by machine.yml and this repository's lower ceiling."""
+    from foragent import machine_budget
+
+    ceiling = min(ceiling, machine_budget.values()["test_slots"])
     state = read_test_slots()
     return max(1, min(state["slots"], ceiling)) if state else max(1, ceiling)
 
@@ -338,6 +341,13 @@ def append_budget_history(
             stream.write(json.dumps(row) + "\n")
 
 
+def _write_test_slots(root: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary = tempfile.mkstemp(dir=root, prefix=f".{TEST_SLOTS_FILE}.")
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(value, stream)
+    os.replace(temporary, root / TEST_SLOTS_FILE)
+
+
 def update_test_slots(
     ceiling: int, now: datetime, *, pressure: str, load_per_cpu: float, swapins: int | None = None,
     floor: int = 1,
@@ -346,7 +356,16 @@ def update_test_slots(
     root = machine_root()
     with _flock(root / TEST_SLOTS_LOCK):
         state = read_test_slots()
-        current = min(state["slots"], ceiling) if state else ceiling
+        if state and state["slots"] > ceiling:
+            # A lower ceiling applies at once and alone: no AIMD step, no decrease
+            # interval, no decreased_at. Held slots finish; new holds see the ceiling.
+            _write_test_slots(root, {**state, "slots": ceiling, "changed_at": now.astimezone(UTC).isoformat()})
+            append_budget_history(
+                root, now, "test_slots", state["slots"], ceiling,
+                pressure=pressure, load_per_cpu=load_per_cpu, swapins=swapins, wanted=ceiling,
+            )
+            return ceiling
+        current = state["slots"] if state else ceiling
         changed_at = datetime.fromisoformat(state["changed_at"]) if state else now
         wanted = next_test_slots(
             current, pressure=pressure, load_per_cpu=load_per_cpu, ceiling=ceiling,
@@ -360,10 +379,7 @@ def update_test_slots(
             decreased_at = now.astimezone(UTC).isoformat() if value < current else (state or {}).get("decreased_at")
             if decreased_at is not None:
                 updated["decreased_at"] = decreased_at
-            descriptor, temporary = tempfile.mkstemp(dir=root, prefix=f".{TEST_SLOTS_FILE}.")
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(updated, stream)
-            os.replace(temporary, root / TEST_SLOTS_FILE)
+            _write_test_slots(root, updated)
         append_budget_history(
             root, now, "test_slots", state["slots"] if state else current, value,
             pressure=pressure, load_per_cpu=load_per_cpu, swapins=swapins, wanted=wanted,

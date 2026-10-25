@@ -11,4 +11,4 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: git config --global user.email ci@localhost && git config --global user.name ci
       - run: uv run pytest --collect-only -q
-      - run: uv run pytest -q --ignore=tests/acceptance
+      - run: uv run pytest -q --ignore=tests/acceptance -m 'not local_only'

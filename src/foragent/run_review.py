@@ -170,6 +170,8 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
         ))
     if edited:
         review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
+    if review.verdict == "PASS":
+        ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
     _append(ctx.store.log_path(n), f"Review: VERDICT: {review.verdict}\n{review.findings}")
     _progress(n, ctx)
     return replace(review, raw=raw, timed_out=result.timed_out)
@@ -254,6 +256,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return "base-changed"
     if verdict_head is not None and head != verdict_head:
         return _hold_changed_head(n, ctx, link)
+    if verdict_head is not None:
+        ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
 
     def approved() -> bool:
         issue = ctx.tracker.get_issue(n)
@@ -280,6 +284,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return _hold_changed_head(n, ctx, link)
     ctx.git.add_detached_worktree(worktree, head)
     git = ctx.git.at(worktree)
+    from foragent.ci_workflow import EXCLUSIONS
+    if (worktree / EXCLUSIONS).is_file():
+        git.publication_paths.add(EXCLUSIONS)
     if not _acceptance_matches(n, ctx, git, approval):
         return "hash-mismatch"
     if not git.is_ancestor(base_sha, head):
@@ -305,6 +312,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
             return "review-failed"
 
+    from foragent.ci_mode import enabled, review_checks
+    comparison_attempt = review_checks(n, ctx, git, pr.base) if enabled(ctx, pr.base) else None
     return _publish_reviewed_head(
         n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
+        comparison_attempt=comparison_attempt,
     )

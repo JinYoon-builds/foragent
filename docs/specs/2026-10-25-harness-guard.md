@@ -1,0 +1,3 @@
+# Test-harness guard (Jin chose to approve now as a safety fix, 2026-10-25)
+
+A #442 review reproduced that a head conftest.py (a trylast pytest_sessionfinish hook) can rewrite the JUnit report the runner trusts, so a failing head is recorded as passing. Local mode also runs PR code while measuring the acceptance baseline, the comparison and Done when. Locked acceptance tests are hash-protected; the harness around them is not. Any channel the test process can reach it can forge, so the class-level fix is detection plus a human hold: an undeclared harness change stops the run before its head evidence is trusted. The residual (product code imported by tests patching pytest) goes to the D84 reviewer risk map (#379).

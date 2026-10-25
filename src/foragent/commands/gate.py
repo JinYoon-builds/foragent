@@ -51,6 +51,35 @@ def _refresh_status(tracker, store, config) -> None:
         pass
 
 
+def _repo_floor_keys(root) -> list[str]:
+    """Floor keys this repository's .foragent.yml sets; they no longer size the machine budget."""
+    cli = facade()
+    try:
+        data = cli.yaml.safe_load((root / ".foragent.yml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, cli.yaml.YAMLError):
+        return []
+    return [key for key in ("test_slots_floor", "parallel_floor") if isinstance(data, dict) and key in data]
+
+
+def _print_machine_budget(status: dict, language: str) -> None:
+    cli = facade()
+    text = cli.text
+    budget = status.get("machine_budget")
+    if not budget:
+        return
+    parts = []
+    for key in cli.machine_budget.KEYS:
+        value = budget[key]["value"]
+        parts.append(text("machine_budget_value", language, name=key,
+                          value=text("machine_budget_none", language) if value is None else value,
+                          source=text(f"machine_budget_source_{budget[key]['source']}", language)))
+    print(text("machine_budget_line", language, values=", ".join(parts)))
+    if budget.get("unknown_keys"):
+        print(text("machine_budget_unknown_keys", language, keys=", ".join(budget["unknown_keys"])))
+    if status.get("repo_floors_ignored"):
+        print(text("machine_budget_repo_floors_ignored", language, keys=", ".join(status["repo_floors_ignored"])))
+
+
 def _print_status(status: dict, language: str = "en") -> None:
     cli = facade()
     text = cli.text
@@ -60,6 +89,11 @@ def _print_status(status: dict, language: str = "en") -> None:
     if status.get("as_of"):
         print(text("status_as_of", language, time=status["as_of"]))
     print(f"launchd: {'loaded' if status['launchd']['loaded'] else 'not loaded'}")
+    if outcome := status.get("tick_outcome"):
+        duration = outcome.get("duration_seconds")
+        print(text("tick_outcome", language, result=outcome["status"],
+                   duration=f"{duration:g}s" if duration is not None else "—"))
+    cli._print_machine_budget(status, language)
     for lane in status["lanes"].values():
         details = [text(lane["state"], language)]
         if lane["issue"] is not None:
@@ -149,6 +183,8 @@ def run(args) -> int:
         status = cli._status(tracker, store, config)
         status["launchd"] = cli.asdict(cli.launchd.status(root, repo=repo))
         status["test_slots"] = cli.capacity.effective_test_slots(config.test_slots)
+        status["machine_budget"] = cli.machine_budget.read().report()
+        status["repo_floors_ignored"] = cli._repo_floor_keys(root)
         status["tick_outcome"] = cli.orch_tick_outcome.read(store)
         if args.json:
             print(cli.json.dumps(status))

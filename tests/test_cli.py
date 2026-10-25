@@ -101,6 +101,18 @@ def test_tick_starts_by_default_and_prints_plain_report(app, capsys):
     assert calls["launches"] == [1] and store.get_run(1).pid == 1234
 
 
+@pytest.mark.parametrize("duration", [None, 2.75])
+def test_human_status_shows_latest_tick_result_and_duration(app, capsys, duration):
+    root, git, tracker, store, calls = app
+    record = {"status": "ok", "consecutive_failures": 0}
+    if duration is not None:
+        record["duration_seconds"] = duration
+    store._write_json(store.root / "tick-outcome.json", record)
+    assert cli.main(["gate", "status", "--repo-root", str(root)]) == 0
+    line = next(line for line in capsys.readouterr().out.splitlines() if "last tick:" in line)
+    assert line == f"last tick: ok · {'—' if duration is None else '2.75s'}"
+
+
 @pytest.mark.parametrize("json_output", [False, True])
 def test_skipped_tick_succeeds(app, capsys, json_output):
     root, git, tracker, store, calls = app
