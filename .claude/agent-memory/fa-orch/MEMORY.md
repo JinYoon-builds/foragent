@@ -129,6 +129,7 @@
 - #105 리뷰: 실행기 멈춤은 시작 때만이 아니라 `_available_executor()`가 매 실행 직전 `store.executor_pause_until()`로 확인하고 `_limit_wait()`로 limit-wait 처리한다. 한도 뒤 곧바로 재시작하는 시험은 시계를 `limit_wait_minutes` 뒤로 옮겨야 한다(`test_worker_sessions.py`). `test_executor_choice.py` 6개는 main에서도 실패하는 quota 범위다.
 - [#104 skill catalog](project_104_skill_catalog.md) — Available skills prompt section, Skills used in Run/PR, claude plain VERDICT fallback
 - [#370 orch stop](project_370_orch_stop.md) — record stopped+why before signal; runner honors it; unreadable PIDs refused
+- [#379 risk map](project_379_risk_map.md) — base-ref map read, review/tier/always_human hooks, commands/*.py import rule
 - [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order, conftest opt-out
 - [#497 memory critical line](project_497_memory_critical.md) — raw kernel level, critical holds starts only, floors in IGNORED_KEYS
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
