@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+import tempfile
 from typing import TYPE_CHECKING, Any
 
 from foragent.actions import flag
@@ -81,12 +82,30 @@ def _record_skills_used(n: int, ctx: RunContext, result: ExecResult) -> None:
     ctx.store.update_run(n, skills_reported=True, skills_used=list(dict.fromkeys([*run.skills_used, *used])))
 
 
+_DETECTION_FILES = ("pyproject.toml", "package.json", "pnpm-lock.yaml", "go.mod")
+
+
+def _detect_test_command_at(git: GitRepo, ref: str) -> str | None:
+    """Detect the full-suite command from a commit's files, not the checkout."""
+    from foragent import runner
+
+    sha = git.ref_sha(ref)
+    with tempfile.TemporaryDirectory(prefix="foragent-detect-") as directory:
+        root = Path(directory)
+        for name in _DETECTION_FILES:
+            if git.blob_sha(sha, name) is not None:
+                (root / name).write_text(git._call(["show", f"{sha}:{name}"]), encoding="utf-8")
+        return next(iter(runner.detect_test_commands(root)), None)
+
+
 def capture_acceptance_baseline(
-    n: int, ctx: RunContext, git: GitRepo, target_branch: str, ref: str,
+    n: int, ctx: RunContext, git: GitRepo, target_branch: str, ref: str, *, detect_at_ref: bool = False,
 ) -> AcceptanceBaseline | None:
     """Capture (or reuse the cached) protected set for ``ref``; stop the run if unusable (#327).
 
     Run at preparation and again after each result-affecting base move (#483).
+    A refresh detects the test command from ``ref`` itself: the worktree then
+    holds the PR, which must not decide how the new base is measured.
     """
     from foragent import runner
     from foragent.ci_local import capture_local_only
@@ -95,7 +114,10 @@ def capture_acceptance_baseline(
     log = ctx.store.log_path(n)
     test_command = ctx.config.test_command
     if test_command is None:
-        test_command = next(iter(runner.detect_test_commands(git.root)), None)
+        if detect_at_ref:
+            test_command = _detect_test_command_at(git, ref)
+        else:
+            test_command = next(iter(runner.detect_test_commands(git.root)), None)
     try:
         started = ctx.monotonic()
         if enabled(ctx, target_branch):
