@@ -48,11 +48,10 @@ description: Set up a project folder for Foragent.
    option without asking for a runner label. Use self-hosted runners only for
    private repositories; GitHub advises against using them on public ones.
    Selecting `ci` generates `.github/workflows/foragent-acceptance.yml` and
-   `.github/workflows/foragent-acceptance-publish.yml`, and includes both with
-   `.foragent.yml` in the init commit. Measurement uses the base configuration
-   with read-only permissions. Publication runs trusted code on a fresh hosted
-   runner through `workflow_run`, which can consume hosted minutes on private
-   repositories. `ci_shards` defaults to
+   includes it with `.foragent.yml` in the init commit. Measurement uses the base
+   configuration with read-only permissions. The runner reads the exact head's
+   measurement artifacts directly and verifies every configured shard.
+   `ci_shards` defaults to
    4 and `ci_runs_on` to `ubuntu-latest`. After changing these settings, run
    `fa ci workflow --repo-root .` to rewrite the generated workflow and include
    it in a separate configuration commit. `checks_fallback: local`
