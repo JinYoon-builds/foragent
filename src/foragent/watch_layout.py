@@ -69,17 +69,28 @@ def _split(status: dict[str, Any]) -> tuple[list[tuple[int, dict]], list[tuple[i
 
 
 def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """Active runs by lane; several runs in one lane are clones of its agent."""
+    """Active runs by lane in start order (ties by issue number); several runs are its workers."""
     clones: dict[str, list[dict[str, Any]]] = {}
-    for run in sorted(status["active_runs"], key=lambda run: run["number"]):
+    for run in sorted(status["active_runs"], key=lambda run: (run.get("started_at") or "", run["number"])):
         clones.setdefault(run["lane"], []).append(run)
     return clones
 
 
 def _lane_name(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> str:
-    """Name the lane once, with ×N when it runs several clones."""
-    count = len(clones.get(row["slug"], []))
-    return row["lane_display"] + (f" ×{count}" if count > 1 else "")
+    """The plain lane name; workers are told apart by their own road rows."""
+    return row["lane_display"]
+
+
+def _worker_rows(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[tuple[str, list[int]]]:
+    """One road row per running worker, named '<lane> N' in start order when there are several."""
+    workers = clones.get(row["slug"], [])
+    if len(workers) < 2:
+        return [(row["lane_display"], _lane_issues(row, clones))]
+    numbers = [run["number"] for run in workers]
+    # A blocked or waiting issue that is not a running worker keeps today's place on the first row.
+    extra = [number for number in _lane_issues(row, clones) if number not in numbers]
+    return [(f"{row['lane_display']} {position}", (extra if position == 1 else []) + [number])
+            for position, number in enumerate(numbers, 1)]
 
 
 def _lane_issues(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[int]:

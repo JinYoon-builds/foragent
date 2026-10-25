@@ -113,8 +113,19 @@ def _prepare_implementation(
     if baseline_test_command is None:
         baseline_test_command = next(iter(runner.detect_test_commands(worktree)), None)
     try:
-        baseline = (_capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
-                    if capture_baseline else None)
+        from foragent.ci_mode import enabled
+        from foragent.ci_local import capture_local_only
+        started = ctx.monotonic()
+        if capture_baseline and enabled(ctx, target_branch):
+            from foragent.run_baseline import _baseline_exclusions
+            base_sha = git.ref_sha(start_ref)
+            baseline = capture_local_only(n, ctx, git, baseline_test_command, base_sha,
+                                          _baseline_exclusions(ctx, base_sha, log))
+        else:
+            baseline = (_capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
+                        if capture_baseline else None)
+            if capture_baseline:
+                ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})
     except AttemptFailure as exc:
         _append(log, str(exc))
         reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
