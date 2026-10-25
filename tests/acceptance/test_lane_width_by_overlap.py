@@ -55,6 +55,7 @@ def test_lane_width_fills_machine_budget_with_disjoint_files_in_one_tick(ctx, bu
 @pytest.mark.parametrize("conflicting_run", [1, 2, 3])
 def test_lane_width_checks_every_running_issue_until_its_conflict_finishes(ctx, conflicting_run):
     starts = _wide_lane(ctx, 5)
+    object.__setattr__(ctx.config, "overlap_per_file", 1)  # Main ignores the not-yet-declared Config field.
     for number in range(1, 4):
         _lane_clone_issue(ctx, number, [f"src/foragent/file{number}.py"], running=True)
         ctx.store.update_run(number, pid=7000 + number)
