@@ -6,10 +6,12 @@ Runtime dependencies resolve through foragent.watch to preserve its patch points
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 from typing import Any
 
 from foragent import orch_inbox
 from foragent.config import Config
+from foragent.labels import BLOCKED, NEEDS_HUMAN
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
 from foragent.watch_sections import progress
@@ -31,6 +33,13 @@ class Snapshot:
     orders: int = 0
     recent: int = 0
     quota: dict[str, tuple[float, datetime]] = field(default_factory=dict)
+    # Evidence ages in seconds at captured_at (D67): heartbeat files by writer
+    # name ("orch", "gate") and runner logs by issue number. Missing evidence is absent.
+    heartbeats: dict[str, float] = field(default_factory=dict)
+    log_ages: dict[int, float] = field(default_factory=dict)
+    # Each running worker's own state from its issue labels, with the same
+    # precedence as status.collect_lanes: needs-human, then blocked, then working.
+    worker_states: dict[int, str] = field(default_factory=dict)
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -50,6 +59,26 @@ def recent_events(store: StateStore) -> list[dict[str, Any]]:
     except FileNotFoundError:
         pass
     return list(reversed(events))
+
+
+def evidence(store: StateStore, numbers: list[int], now: datetime) -> tuple[dict[str, float], dict[int, float]]:
+    """Ages of the heartbeat files and of the runner logs, read from the files themselves."""
+    heartbeats: dict[str, float] = {}
+    for name in ("orch", "gate"):
+        try:
+            at = datetime.fromisoformat(json.loads(
+                (store.root / f"{name}-heartbeat.json").read_text(encoding="utf-8"))["at"])
+            heartbeats[name] = max(0.0, (now - at).total_seconds())
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # No readable heartbeat is no evidence of life.
+    logs: dict[int, float] = {}
+    for number in numbers:
+        try:
+            modified = store.log_path(number).stat().st_mtime
+        except OSError:
+            continue
+        logs[number] = max(0.0, now.timestamp() - modified)
+    return heartbeats, logs
 
 
 def collect(
@@ -109,5 +138,12 @@ def collect(
         requests = orch_inbox.requests(store)
     except (OSError, ValueError):
         requests = []  # An unreadable box must not take the whole view down.
+    heartbeats, logs = evidence(store, [run["number"] for run in status["active_runs"]], now)
+    worker_states = {}
+    for run in status["active_runs"]:
+        labels = issues[run["number"]].labels if run["number"] in issues else frozenset()
+        worker_states[run["number"]] = ("waiting-human" if NEEDS_HUMAN in labels
+                                        else "blocked" if BLOCKED in labels else "working")
     return watch.Snapshot(status, done, order, completed, total, eta, watch.recent_events(store), now,
-                          requests, orders, recent, progress.quota(store.root / "logs", now))
+                          requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
+                          worker_states)
