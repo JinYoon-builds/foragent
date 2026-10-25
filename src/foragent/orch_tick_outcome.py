@@ -12,6 +12,7 @@ that request done; it sends no push.
 from __future__ import annotations
 
 import json
+import time
 import traceback
 from collections.abc import Callable
 from dataclasses import replace
@@ -60,22 +61,24 @@ def run_recorded(store: StateStore, config: Config, repo: str, run: Callable[[],
     with store.hold_tick_lock() as acquired:
         if not acquired:
             return None
+        started = time.monotonic()
         try:
             result = run()
         except Exception as exc:
-            record_failure(store, config, repo, exc)
+            record_failure(store, config, repo, exc, duration_seconds=time.monotonic() - started)
             raise
-        record_success(store)
+        record_success(store, duration_seconds=time.monotonic() - started)
         return result
 
 
-def record_success(store: StateStore) -> dict[str, Any]:
+def record_success(store: StateStore, *, duration_seconds: float = 0) -> dict[str, Any]:
     """Record a successful tick; close an open streak alert without a push.
 
     Callers hold the tick lock (see ``run_recorded``).
     """
     previous = read(store) or {}
-    record = {"at": store._now().isoformat(), "status": "ok", "consecutive_failures": 0}
+    record = {"at": store._now().isoformat(), "status": "ok", "consecutive_failures": 0,
+              "duration_seconds": duration_seconds}
     store._write_json(outcome_path(store), record)
     alert = previous.get("alert_request")
     if alert:
@@ -86,7 +89,8 @@ def record_success(store: StateStore) -> dict[str, Any]:
     return record
 
 
-def record_failure(store: StateStore, config: Config, repo: str, exc: BaseException) -> dict[str, Any]:
+def record_failure(store: StateStore, config: Config, repo: str, exc: BaseException, *,
+                   duration_seconds: float = 0) -> dict[str, Any]:
     """Record a failed tick with its traceback log; alert once when the streak reaches the threshold.
 
     Callers hold the tick lock (see ``run_recorded``).
@@ -98,6 +102,7 @@ def record_failure(store: StateStore, config: Config, repo: str, exc: BaseExcept
     store._atomic_write(log_path, f"gate tick failed at {at}\n" + "".join(traceback.format_exception(exc)))
     record: dict[str, Any] = {
         "at": at, "status": "failed", "consecutive_failures": streak,
+        "duration_seconds": duration_seconds,
         "error_type": type(exc).__name__, "error_message": _summary(exc), "log_path": str(log_path),
     }
     alert = previous.get("alert_request")  # Success records never carry one.

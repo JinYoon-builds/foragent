@@ -1748,6 +1748,8 @@ def test_dead_pid_finishes_run_and_restores_ready(ctx, monkeypatch):
 
 @pytest.mark.parametrize("permission_denied", [False, True])
 def test_alive_or_inaccessible_pid_keeps_project_slot(ctx, monkeypatch, permission_denied):
+    from foragent import processes
+
     approve(ctx)
     tick(ctx)
     active = mark_running(ctx)
@@ -1761,6 +1763,9 @@ def test_alive_or_inaccessible_pid_keeps_project_slot(ctx, monkeypatch, permissi
     monkeypatch.setattr("foragent.scheduler.os.kill", kill)
     ctx.now = lambda: NOW + timedelta(hours=1)
     active = ctx.store.update_run(1, last_progress_at=ctx.now().isoformat())
+    listing = ctx.process_table.list_processes
+    cached = iter((tuple(row for row in listing() if row.pid != active.pid),))
+    monkeypatch.setattr(processes, "list_processes", lambda: next(cached, None) or listing())
     ctx.start_runs = True
     tick(ctx)
     assert calls == [(123, 0)]

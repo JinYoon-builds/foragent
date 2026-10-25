@@ -651,7 +651,7 @@ class StateStore:
     def clear_run_start(self, number: int) -> None:
         (self.root / "run-starts" / f"{number}.json").unlink(missing_ok=True)
 
-    def update_run(self, number: int, **fields: Any) -> Run:
+    def update_run(self, number: int, *, routine: bool = False, **fields: Any) -> Run:
         with self._state_lock():
             run = self.get_run(number)
             if run is None:
@@ -664,7 +664,7 @@ class StateStore:
                     or " ".join(run.detail.split())[:500]
                     or "Run detail unavailable."
                 )
-            from foragent.processes import observe_tree
+            from foragent.processes import observe_routine_tree, observe_tree
 
             # Numeric fields describe a run; only birth evidence supplied by a
             # launcher (or descendants of verified identities) proves ownership.
@@ -672,7 +672,12 @@ class StateStore:
             identities = {item["pid"]: item for item in (
                 *run.process_identities, *fields.get("process_identities", []),
             )}
-            fields["process_identities"] = observe_tree(list(identities.values()))
+            observer = observe_routine_tree if routine else observe_tree
+            try:
+                fields["process_identities"] = observer(list(identities.values()))
+            except OSError:
+                # Metadata updates must retain ownership even when observation fails.
+                fields["process_identities"] = list(identities.values())
             updated = replace(run, **fields)
             self._write_run(updated)
             return updated
@@ -777,6 +782,11 @@ class StateStore:
             run = load_record(Run, json.loads(line))
             runs[run.number, run.started_at] = run
         return list(runs.values())
+
+    def prune_process_identities(self, *, inactive_only: bool = False) -> None:
+        from foragent.state_processes import prune_process_identities
+
+        prune_process_identities(self, inactive_only=inactive_only)
 
     def usage(self) -> dict[str, Any]:
         """The latest recorded plan usage per executor, as executors reported it."""
