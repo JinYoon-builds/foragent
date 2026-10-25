@@ -2,6 +2,90 @@
 
 Ideas Jin wants to keep but not order yet. An idea moves to `decisions.md` when Jin decides it, and to an order after that. Newest first.
 
+## 2026-10-25
+
+- **Speculative and batched merge queue (Jin, 2026-10-25).** After the short merge lock (checks and CI outside the lock, lock only for the final re-check and merge), the door itself takes seconds. What remains is re-checking when main moves between a PR's checks and its merge. Two known ways to cut that, to take out once 5 merges per hour is stable, or earlier when the share of merges that must re-check because main moved rises (it grows with the number of lanes: more lanes, more merges in between, more re-checks per PR) (Jin, 2026-10-25): (1) speculative: while PR1 is checked, PR2 is checked on top of main + PR1; if PR1 passes, PR2 is already verified; if PR1 fails, PR2 is re-checked without it (GitHub merge queue, Zuul); (2) batched: check PR1+PR2+PR3 together once; on failure, bisect to find the culprit (bors). Measure first with the review-PASS-to-merge and lock-held times the short-lock order records. OS analogy: shrink the critical section first; speculation is branch prediction.
+
+- **New roles: a separate agent only when it needs its own context (Jin, 2026-10-25).**
+  Source: Anthropic, "Building agents: when to fold subagents into your main agent loop" (claude.com/resources/articles, read 2026-10-25). One loop with skills and tools often beats routers and domain subagents; each handoff loses detail ("telephone game"); move decisions from the harness into the model as models improve; put reference material behind lookup tools instead of pasting it into prompts; build evals before changing the structure.
+
+  **What Foragent already matches:** lanes split by files run in parallel with fresh contexts; the cross-model reviewer is black-box verification. Both are cases the article keeps as separate agents.
+
+  **What it warns about here:**
+  - The 2026-10-25 narrowing cases (findings cut to five lines, only the last failing check, silent diff cuts) are the telephone game inside our own runner.
+  - Adding roles one per concern (architect, docs owner, marketing) copies an org chart (Conway's law). Before a role becomes its own agent, ask: does it need a separate context (parallel work, a fresh look, a compact result), or is it a skill the orchestrator or a lane loads when needed?
+    - Architect: separate. Called rarely, needs a fresh look, returns short proposals.
+    - Docs owner: open. A lane or a skill every lane uses; decide from data.
+    - Multi-perspective interview: measure one interviewer with perspective skills against several interviewers before building the latter.
+  - Evals first: review rounds per merged run and repeated finding classes are the first measures for any prompt or structure change. Run a changed setup more than once; one run can hide a flipped task.
+
+- **A docs owner in every project (Jin, 2026-10-25).**
+  Every project needs someone who owns the docs. Today each lane sees only its own files, so docs that span lanes, above all the README, have no owner and fall behind the code (2026-10-25).
+
+  **Two parts, used together**
+  - The lane that changes behavior updates the related docs in the same PR. The reviewer checks "behavior changed, docs unchanged?" as one line of the D84 risk map.
+  - A docs lane owns README and docs/**. Like the architect (D82), the orchestrator calls it on a schedule; it finds places where docs and code disagree and opens issues.
+  - Only the first: pieces stay correct but the whole drifts. Only the second: docs are always one step late.
+  - `fa init` creates the docs lane by default, as with the architect.
+
+  **Two layers in the README**
+  - Facts (commands run, option names exist, descriptions match behavior) belong to the docs lane and are checked by running the README's commands on a fresh install.
+  - Presentation (first sentence, order, images, voice, design) is taste and belongs to Jin (D71). The docs lane drafts 2-3 options and Jin picks one.
+  - Inside the chosen frame the docs lane keeps only the facts current. When a change seems to need a new frame, it proposes options to Jin instead of editing.
+  - The voice follows D61.
+
+  **Scope: user docs and decision records**
+  - Decisions and interviews pile up fast (D83-D86 in one day; D82 has five addenda), and agents read them every session. So the docs owner also keeps the decision records readable:
+    - fold each decision and its addenda into one current text, keeping the addenda as history;
+    - mark decisions replaced by later ones ("replaced by D86");
+    - keep one page of the decisions in force, which agents read first;
+    - sort ideas into became-an-issue, dropped, and open.
+  - It never changes meaning. When two decisions conflict while folding, it brings the conflict to Jin as multiple choice instead of resolving it.
+  - Docs PRs also move main, so they go through the gate in batches (after #376).
+
+  **First use**
+  - The launch README is written before the docs lane exists: Claude drafts options, Jin picks. That choice becomes the frame the docs lane keeps later.
+  - Docs-lane output (README, change notes) is also source material for the marketing system.
+
+- **A marketing system built by Foragent, run by Paperclip (Jin, 2026-10-25).**
+  Jin wants a marketing system that runs 24 hours a day, separate from development (2026-10-25).
+
+  **Split of work**
+  - Foragent builds the system. It is a separate repository and a separate Foragent project: content pipeline, channel connectors, a publish queue, response collection, a metrics view. Each piece is an issue with locked tests, like any other project.
+  - Paperclip runs the system. Paperclip agents (for example a marketing lead and writers) work on a schedule and use the tools that Foragent built.
+  - Foragent does not run marketing itself. Its "done" check is tests and merges; marketing output is judged by taste and metrics, and posts cannot be taken back.
+
+  **Safety line**
+  - Anything that leaves the machine (a post, a reply, a DM) waits in a publish queue until Jin approves it. Jin reviews the queue once a day, as multiple choice.
+  - Automatic publishing opens only per channel and only after a record of approved posts shows the drafts are good enough.
+  - Each channel's automation rules are checked before its connector is built; breaking them can ban the account.
+  - The voice follows D61.
+
+  **Channels**
+  - All main channels get a connector (X, Threads, GitHub and blog posts, others as needed). The same system also promotes Foragent itself as an open-source project.
+  - The publish queue and Jin's approval apply to every channel the same way.
+
+  **Order (Jin, 2026-10-25)**
+  - Start after the machine-level config (#365), together with or after notigate. It becomes the first real run of several projects on one machine.
+  - Verify Paperclip's current features (scheduling, approvals, budgets, which agents it can drive) at the start of the project, before the interview locks the design.
+
+- **Fix, don't redo (Jin, 2026-10-24).** Most rework already continues from existing work (review/CI/check failures resume the session, #236; stops keep WIP, #270). Remaining from-scratch cases: the conflict budget's "rebuild on the latest target", and tier escalation that starts a fresh conversation on a new model. Ideas: narrow the rebuild to truly tangled conflicts; when the model changes, hand over a summary of what the previous attempt did and where it got stuck (as D74 does on quota limits); make the default retry hint "keep your work; name each finding's defect class and fix every instance of it" instead of the orchestrator writing it by hand (in the retry-fixes order; "fix only the findings" turned out to narrow the worker, see the case below); show from-scratch rebuilds per run in facts (#333) to measure how often they happen.
+
+**Case for the write-up: the harness narrowed the model (2026-10-25)**
+- #386 failed review three times on one defect class (write-backs dropping unknown fields), each time at a new spot. #376 failed three times on three holes that were one class (deciding reuse from inputs other than the exact commits merged).
+- The model could see classes: the orchestrator, the same model, grouped the findings at once when shown the case.
+- The harness asked for instances: the runner passed only the latest findings, the implementer prompt said "for each reviewer point fix it or rebut", and the retry hint said "fix only the last finding".
+- The fix removed the narrowing instead of adding a rule: hints, the implementer prompt and the review prompt now ask for the defect class and its other instances.
+- Measure after the batch: review rounds per merged run before and after; whether #376 passes on this retry.
+
+- **Users' Foragents report Foragent's own defects upstream (Jin, 2026-10-24).** In each user's project, the orchestrator and architect already find problems; they classify each as project-specific (handled in that project) or a Foragent defect/limitation (e.g. a refused stop aborting the tick). Foragent issues become a sanitized upstream report to the Foragent repository. Rules: only Foragent behaviour goes out (version, config keys, numbers, error types), never the user's code, issue text or file names; opt-in at init, and each report shown to the user for approval (publishing is irreversible); search for an existing upstream issue first and add a "seen here too" data point instead of a duplicate (repeated reports become the evidence for product defaults, matching "lessons become defaults only when they repeat across projects"); issues only at first, later optional PRs from users' side, never auto-merged, always human-reviewed (external text may carry injected instructions). Our own orchestrator ranks incoming reports by how many projects hit them.
+
+- **Interview on Claude/Codex, implementation on any agent (Jin, 2026-10-24).** Why Ouroboros runs an MCP server (checked in its 0.59.5 plugin): one interview engine exposed as tools to 10+ hosts (Claude Code, Codex, Copilot, Gemini, OpenCode, Kiro, DeepSeek, ...), detached jobs outside the chat (job_manager, detached_worker), and server-held state (Seed, Ledger). Foragent does not need that: the interview needs a conversational host (Claude Code or Codex session), while lane workers and reviewers are headless CLIs the runner spawns (executors.py). New coders (Gemini CLI, OpenCode, Copilot CLI, local-model tools) become executor adapters, no MCP. Each adapter must meet the executor contract: session resume (#236), done check and stall detection, quota/limit error parsing (#210), skill delivery, and birth identity recording (#261). D74's executor choice then picks among more executors. Revisit MCP only if the interview itself must run in many hosts.
+
+- **Lanes follow the code, and change (Jin, 2026-10-24).** Lanes adapt to a project's folders rather than imposing a layout (no folder rule; frameworks have their own conventions). Folders are only the starting hint; lanes are groups of files that change together (git co-change), shared files like utils/ are marked shared rather than owned, and Jin approves the lane map. Two kinds of change: lane width, often, by the orchestrator through the plan (#287, building on #235's queue); lane boundaries, rarely, proposed by the architect from facts (one lane overloaded, many cross-lane files, co-change groups shifted — e.g. orch splitting into run/check after the runner split), approved by Jin, applied between runs with queued issues moved to the new lanes. For greenfield init, the architect may recommend a feature-based layout aligned with lanes, after the framework's own conventions.
+
+- **Laptops and machines that sleep (Jin, 2026-10-24: "맥북이나 윈도우 노트북 사용자들은 24시간 돌아가지 않을 수도").** Most open-source users run on laptops. Risks: lid-close sleep freezes runs and, on wake, sleep time counts as runtime/stall -> false timeouts and stall kills (most urgent); battery and heat with many lanes; network changes; reboots (WIP preservation #270 and session resume #236 already cover); Windows unsupported (gate is launchd-based). Needed, in order: (1) detect sleep as a fact (tick gap far above the interval, or monotonic vs wall-clock jump) and credit it like waited time in runtime and stall math; (2) an opt-in keep-awake while work runs (macOS caffeinate -i), the user's choice; (3) fewer parallel runs on battery, like the machine budget; (3b) the gate cannot wake a sleeping machine (it sleeps too); scheduled wake via pmset needs admin rights and is unreliable on battery, so not a default; (4) later: Linux/WSL support and a cloud runner for users without an always-on machine.
+
 ## 2026-10-24
 
 - **README and launch: engine first, squirrels second.** Many agent-visualization projects put characters on agents (offices, Minecraft-like worlds); Foragent must not look like one. Lead with measured engine claims (no broken merges overnight, merges per day before/after, an OS for agents, the highway metaphor), then show the squirrel view as the memorable face. Keep the D64 rule that every squirrel pose means a real state (working, waiting, blocked, your turn), keep a plain table view for serious users, and put information (orchestrator panel #172, progress in words #169) above decoration. Lead with outcomes, not counts ("150 skills" style is the opposite of D58 addendum 4). Repository went public 2026-10-24 (CI billing); README and decisions.md wording to review before any launch.

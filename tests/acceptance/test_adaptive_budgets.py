@@ -13,7 +13,7 @@ import pytest
 
 from test_skills_autosync import isolated_home
 from test_state_split import offline_acceptance
-from test_test_slots import bind_cli, slot_case, tick_context
+from test_test_slots import bind_cli, machine_yml, slot_case, tick_context
 
 
 @pytest.fixture(autouse=True)
@@ -160,6 +160,7 @@ print(json.dumps(capacity.machine_load()))
 @pytest.fixture
 def adaptive_case(git_history, tmp_path, monkeypatch, adaptive_environment, sensor):
     case = slot_case(git_history, tmp_path, monkeypatch, slots=3)
+    machine_yml(slots=3, max_parallel=8)  # Machine-wide budgets come from machine.yml (#365).
     main = bind_cli(case, monkeypatch)
     context = tick_context(case, start_runs=False)
     root = adaptive_environment
@@ -278,6 +279,7 @@ def test_adaptive_budgets_parallel_history_uses_machine_budget_path(
     )
     case.store = case.ctx.store = StateStore.for_repo(case.ctx.repo, now=case.ctx.now)
     assert case.store.root.parent == adaptive_environment
+    machine_yml(slots=1, max_parallel=8)  # Machine-wide budgets come from machine.yml (#365).
     body = case.tracker.get_issue(1).body
     case.tracker.remove_labels(1, ["running", "approved"])
     for number in range(1, 9):

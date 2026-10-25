@@ -16,6 +16,7 @@ from foragent.labels import BLOCKED, READY, RUNNING
 from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped
+from foragent.run_base_move import REUSED, REVERIFY, base_move_is_neutral, capture_move
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_lane_skills import _inject_lane_skills
 from foragent.run_prompts import review_scope_rules
@@ -82,12 +83,25 @@ def _hold_changed_head(n: int, ctx: RunContext, link: str) -> str:
     return "held"
 
 
+def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
+    """Jobs that never ran are infrastructure: hold with the evidence, keep the PR open."""
+    if not getattr(logs, "not_started", False):
+        return
+    link = f"https://github.com/{ctx.repo}/pull/{pr}"
+    _append(ctx.store.log_path(n), f"CI did not start:\n{logs}")
+    flag(ctx, n, Reason.CI_NOT_STARTED,
+         "CI jobs did not start; there is no code failure to repair.", f"{logs}\n\n{link}")
+    raise ExecutorStopped("held", str(logs))
+
+
 def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str) -> None:
     """Spend one implementation retry, preserving the raw logs from every run."""
-    failure = CIFailure(ctx.tracker.pr_failed_logs(pr), target_branch)
+    logs = ctx.tracker.pr_failed_logs(pr)
+    failure = CIFailure(logs, target_branch)
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     if ctx.tracker.pr_head_sha(pr) != head:
         raise ExecutorStopped(_hold_changed_head(n, ctx, link))
+    _hold_if_not_started(n, ctx, pr, logs)
     run = ctx.store.get_run(n)
     _append(ctx.store.log_path(n), f"Attempt {run.attempts} failed:\n{failure}")
     if run.attempts >= ctx.config.max_retries + 1:
@@ -245,22 +259,33 @@ def _publish_locked(attempt: Implementation) -> str:
         target_sha = git.ref_sha(target_ref)
         if git.is_ancestor(target_sha, verified_head_sha):
             return None
-        if base_merges == 3:
+        # Docs and other issues' pending locked tests cannot change this
+        # branch's verified result, so they neither re-verify nor use the budget.
+        # The shared remote-tracking ref can move again (another fetch) before
+        # the merge, so pin the range once, classify it, and merge exactly it.
+        move = capture_move(git, target_sha)
+        target_sha = move.target_sha
+        neutral = base_move_is_neutral(attempt, move)
+        if not neutral and base_merges == 3:
             flag(ctx, n, Reason.TIMEOUT, "base kept moving")
             raise ExecutorStopped("timeout")
-        _inject_lane_skills(ctx, n, git, target_ref)
+        _append(log, f"{REUSED if neutral else REVERIFY}: {target_sha}")
+        _inject_lane_skills(ctx, n, git, target_sha)
         try:
-            git.merge_base(target_ref)
+            git.merge_base(target_sha)
         except GitError:
             conflicts = git.conflict_paths()
             if not conflicts:
                 raise
             _resolve_conflicts(attempt, conflicts)
+            neutral = False
         else:
-            check_failure = _verify_implementation(attempt)
-            if check_failure:
-                raise AttemptFailure(check_failure)
-        base_merges += 1
+            if not neutral:
+                check_failure = _verify_implementation(attempt)
+                if check_failure:
+                    raise AttemptFailure(check_failure)
+        if not neutral:
+            base_merges += 1
         if runner._remaining(n, ctx) <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
         if git.has_staged_changes():
@@ -316,8 +341,9 @@ def _publish_locked(attempt: Implementation) -> str:
         ctx.tracker.remove_labels(n, [RUNNING])
         return "pr-open"
 
-    # A bounded iteration count also works with a frozen test clock.
-    for _ in range(4):
+    # Result-affecting base merges are bounded by refresh_base's budget and
+    # result-neutral ones by the run's time budget, which refresh_base checks.
+    while True:
         _phase(n, ctx, "ci")
         has_workflows = any(
             path.is_file()
@@ -337,7 +363,9 @@ def _publish_locked(attempt: Implementation) -> str:
                 break
             if status == "fail":
                 if attempt.rebuilt:
-                    raise ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{ctx.tracker.pr_failed_logs(pr)}"))
+                    logs = ctx.tracker.pr_failed_logs(pr)
+                    _hold_if_not_started(n, ctx, pr, logs)
+                    raise ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
                 _ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)
             remaining = deadline - ctx.now().timestamp()
             if remaining <= 0 or poll == 40:
@@ -404,7 +432,6 @@ def _publish_locked(attempt: Implementation) -> str:
                 _append(log, f"Batch PR finalization deferred to tick: {exc}")
         _progress(n, ctx)
         return "merged"
-    raise AssertionError("unreachable refresh state")
 
 
 def _publish_reviewed_head(

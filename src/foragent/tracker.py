@@ -137,6 +137,21 @@ class TrackerError(RuntimeError):
         return None
 
 
+_FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
+_NOT_STARTED = re.compile(r"\bjob was not started\b", re.I)
+
+
+class CIEvidence(str):
+    """Failed CI text. ``not_started`` marks evidence where no failed job ever ran."""
+
+    not_started: bool
+
+    def __new__(cls, text: str = "", *, not_started: bool = False) -> "CIEvidence":
+        evidence = super().__new__(cls, text)
+        evidence.not_started = not_started
+        return evidence
+
+
 def pr_issue_number(head: str) -> int | None:
     match = re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", head)
     return int(match[1]) if match else None
@@ -1011,18 +1026,63 @@ class GhTracker:
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
 
-    def pr_failed_logs(self, pr: int) -> str:
+    def pr_failed_logs(self, pr: int) -> CIEvidence:
+        """Failed Actions evidence for the PR head: jobs, annotations and log tails.
+
+        ``not_started`` is true only when every failed job never ran (no steps or a
+        "job was not started" annotation); such jobs have no code failure to repair.
+        """
         head = self.pr_head_sha(pr)
         runs = _items(self._call([
             "api", "--paginate", "--jq", ".workflow_runs",
             f"{self._path}/actions/runs?head_sha={head}&per_page=100",
         ]))
-        logs = []
+        parts = []
+        failed_runs = 0
+        code_failure = False
         for run in runs:
-            if run["conclusion"] in {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}:
-                output = self._call(["run", "view", str(run["id"]), "-R", self.repo, "--log-failed"])
-                logs.append(output[-4000:])
-        return "\n\n".join(logs)
+            if run["conclusion"] not in _FAILED_CONCLUSIONS:
+                continue
+            failed_runs += 1
+            jobs = _items(self._call([
+                "api", "--paginate", "--jq", ".jobs",
+                f"{self._path}/actions/runs/{run['id']}/jobs?per_page=100",
+            ]))
+            url = run.get("html_url") or run.get("url") or ""
+            lines = [f"Actions run {run['id']} ({run.get('name') or 'workflow'}) {run['conclusion']} {url}".rstrip()]
+            started_failure = False
+            failed_jobs = 0
+            for job in jobs:
+                if job.get("conclusion") not in _FAILED_CONCLUSIONS:
+                    continue
+                failed_jobs += 1
+                steps = job.get("steps") or []
+                messages = self._job_annotations(job)
+                job_url = job.get("html_url") or job.get("url") or ""
+                if not steps or any(_NOT_STARTED.search(message) for message in messages):
+                    lines.append(f"Job {job.get('name')} did not start ({len(steps)} steps) {job_url}".rstrip())
+                else:
+                    started_failure = True
+                    lines.append(f"Job {job.get('name')} failed {job_url}".rstrip())
+                lines.extend(f"  annotation: {message}" for message in messages)
+            # A failed run without failed jobs (e.g. an invalid workflow file) is
+            # still a failure the implementer may be able to repair.
+            if started_failure or not failed_jobs:
+                code_failure = True
+                try:
+                    output = self._call(["run", "view", str(run["id"]), "-R", self.repo, "--log-failed"])
+                except TrackerError as exc:
+                    if "log not found" not in f"{exc}\n{exc.stdout}".lower():
+                        raise
+                    output = f"(failed log unavailable: {str(exc).strip()})"
+                lines.append(output[-4000:])
+            parts.append("\n".join(lines))
+        return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
+
+    def _job_annotations(self, job: dict[str, Any]) -> list[str]:
+        check_run = job.get("check_run_url") or f"{self._path}/check-runs/{job['id']}"
+        annotations = _items(self._call(["api", "--paginate", f"{check_run}/annotations"]))
+        return [item["message"] for item in annotations if isinstance(item.get("message"), str)]
 
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None:
         self._call([
