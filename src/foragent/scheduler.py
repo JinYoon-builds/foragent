@@ -78,10 +78,10 @@ from foragent.scheduler_lanes import (  # noqa: E402
 
 
 def tick(ctx: TickContext) -> TickReport:
-    ctx.store.write_heartbeat("gate", ctx.now())  # Even a busy tick shows the gate is alive.
     with ctx.store.tick_lock() as acquired:
-        if not acquired:
+        if not acquired:  # The tick that holds the lock renews the gate heartbeat.
             return TickReport(skipped=BUSY_TICK)
+        ctx.store.write_heartbeat("gate", ctx.now())
         with tick_processes(ctx.store) as snapshot:
             cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
             if snapshot.available:
