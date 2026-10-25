@@ -28,7 +28,9 @@ def _has_work(row: dict[str, Any]) -> bool:
 
 def _activity(
     row: dict[str, Any], language: str, age: float, stall_minutes: float, pid: int | None,
+    log_seconds: float | None = None,
 ) -> str:
+    """The activity cell, judged by evidence: a live PID and the age of the runner log (D67)."""
     from foragent import watch
 
     if row["state"] == "blocked":
@@ -42,8 +44,13 @@ def _activity(
             return watch.text("watch_runner_gone", language)
         except PermissionError:
             pass  # A process owned by another user still exists.
+    limit = min(10, stall_minutes) * 60
+    if log_seconds is not None:
+        # The log's growth is the evidence; state metadata is not.
+        quiet = log_seconds + age
+        return watch.text("watch_quiet", language, minutes=int(quiet // 60)) if quiet >= limit else "●"
     seconds = row["last_activity_seconds"]
-    if seconds is not None and seconds + age > min(10, stall_minutes) * 60:
+    if seconds is not None and seconds + age > limit:
         return watch.text("watch_stalled", language, minutes=int((seconds + age) // 60))
     return "●"
 
@@ -69,23 +76,22 @@ def _split(status: dict[str, Any]) -> tuple[list[tuple[int, dict]], list[tuple[i
 
 
 def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """Active runs by lane; several runs in one lane are clones of its agent."""
+    """Running runs by lane in start order; ties in start time break by issue number."""
     clones: dict[str, list[dict[str, Any]]] = {}
-    for run in sorted(status["active_runs"], key=lambda run: run["number"]):
+    running = [run for run in status["active_runs"] if run.get("status", "running") == "running"]
+    for run in sorted(running, key=lambda run: (run.get("started_at") or "", run["number"])):
         clones.setdefault(run["lane"], []).append(run)
     return clones
 
 
-def _lane_name(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> str:
-    """Name the lane once, with ×N when it runs several clones."""
-    count = len(clones.get(row["slug"], []))
-    return row["lane_display"] + (f" ×{count}" if count > 1 else "")
-
-
 def _lane_issues(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[int]:
+    """The lane's shown issues: its current issue first, or its workers in start order when it has several."""
     current = row["issue"] if row["state"] in {"working", "blocked", "waiting-human"} else None
+    workers = [run["number"] for run in clones.get(row["slug"], [])]
+    if len(workers) > 1:
+        return workers + ([current] if current is not None and current not in workers else [])
     numbers = [current] if current is not None else []
-    return numbers + [run["number"] for run in clones.get(row["slug"], []) if run["number"] not in numbers]
+    return numbers + [number for number in workers if number not in numbers]
 
 
 def _sections() -> list[ModuleType]:
