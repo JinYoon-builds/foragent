@@ -284,6 +284,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return _hold_changed_head(n, ctx, link)
     ctx.git.add_detached_worktree(worktree, head)
     git = ctx.git.at(worktree)
+    from foragent.ci_workflow import EXCLUSIONS
+    if (worktree / EXCLUSIONS).is_file():
+        git.publication_paths.add(EXCLUSIONS)
     if not _acceptance_matches(n, ctx, git, approval):
         return "hash-mismatch"
     if not git.is_ancestor(base_sha, head):
@@ -309,6 +312,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
             return "review-failed"
 
+    from foragent.ci_mode import enabled, review_checks
+    comparison_attempt = review_checks(n, ctx, git, pr.base) if enabled(ctx, pr.base) else None
     return _publish_reviewed_head(
         n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
+        comparison_attempt=comparison_attempt,
     )

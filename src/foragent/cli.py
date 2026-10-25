@@ -102,6 +102,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="Executor to check (default: the configured executor)")
     doctor.add_argument("--repo-root", type=Path, default=Path.cwd())
     init = commands.add_parser("init", help="Set up this repository for Foragent")
+    ci = commands.add_parser("ci", help="Acceptance comparison workflow")
+    ci_actions = ci.add_subparsers(dest="action", required=True)
+    workflow = ci_actions.add_parser("workflow", help="Write or replace the generated workflow")
+    workflow.add_argument("--repo-root", type=Path, default=Path.cwd())
     init.add_argument("--repo-root", type=Path, default=Path.cwd())
     init.add_argument("--approver", nargs="+", action="extend", dest="approvers")
     init.add_argument("--review", choices=("fast", "batch", "careful"))
@@ -646,6 +650,10 @@ def main(argv: list[str] | None = None) -> int:
         from foragent import statusline
         return statusline.run()
     try:
+        if args.command == "ci":
+            from foragent.ci_workflow import write_workflow
+            print(f"Wrote {write_workflow(args.repo_root.resolve())}")
+            return 0
         if args.command == "design":
             if args.action == "lint":
                 return design.run(args)
@@ -721,6 +729,10 @@ def main(argv: list[str] | None = None) -> int:
             store = StateStore.for_repo(config.repo or GitRepo(root).remote_slug())
             _tidy(args, store, config.language)
             return 0
+        if args.command == "brief" and not brief.configured(root):
+            facts = brief.unconfigured()
+            print(json.dumps(facts) if args.json else brief.render(facts, os.environ.get("LANG", "en")[:2]))
+            return 0
         if args.command in {"plan", "brief"}:
             config = load_config(root)
             store = StateStore.for_repo(config.repo or GitRepo(root).remote_slug())
@@ -728,7 +740,7 @@ def main(argv: list[str] | None = None) -> int:
                 record = orch_inbox.write_plan_heartbeat(store)
                 print(f"Planning session alive at {record['at']}.")
             else:
-                facts = brief.collect(store)
+                facts = brief.collect(store, config, datetime.now(UTC))
                 print(json.dumps(facts, ensure_ascii=False) if args.json
                       else brief.render(facts, config.language))
             return 0

@@ -101,6 +101,7 @@ class Tracker(Protocol):
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
+    def pr_acceptance_checks(self, pr: int) -> list[dict]: ...
     def pr_failed_logs(self, pr: int) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
@@ -669,6 +670,9 @@ class FakeTracker:
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
 
+    def pr_acceptance_checks(self, pr: int) -> list[dict]:
+        return []
+
     def set_pr_failed_logs(self, pr: int, text: str) -> None:
         self._pr_failed_logs[pr] = text
 
@@ -1030,6 +1034,42 @@ class GhTracker:
 
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
+
+    def pr_acceptance_checks(self, pr: int) -> list[dict]:
+        from foragent.ci_workflow import producer_run_id
+
+        data = json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]
+        if (data.get("repo") or {}).get("full_name", self.repo) != self.repo:
+            return []
+        head = data["sha"]
+        checks = _items(self._call([
+            "api", "--paginate", "--jq", ".check_runs",
+            f"{self._path}/commits/{head}/check-runs?per_page=100&filter=latest",
+        ]))
+        runs = {}
+        for check in checks:
+            # All fields here come from GitHub's check API. Discard any nested
+            # producer metadata before establishing the relationship ourselves.
+            check.pop("workflow_run", None)
+            suite_id = (check.get("check_suite") or {}).get("id")
+            if (not check.get("name", "").startswith("foragent-acceptance/")
+                    or (check.get("app") or {}).get("slug") != "github-actions"
+                    or type(suite_id) is not int or suite_id <= 0):
+                continue
+            if suite_id not in runs:
+                candidates = _items(self._call([
+                    "api", "--paginate", "--jq", ".workflow_runs",
+                    f"{self._path}/actions/runs?check_suite_id={suite_id}&per_page=100",
+                ]))
+                runs[suite_id] = None
+                if len(candidates) == 1 and type(candidates[0].get("id")) is int:
+                    run_id = candidates[0]["id"]
+                    run = json.loads(self._call(["api", f"{self._path}/actions/runs/{run_id}"]))
+                    candidate = {**check, "workflow_run": run}
+                    if run.get("id") == run_id and producer_run_id(candidate, self.repo) == run_id:
+                        runs[suite_id] = run
+            check["workflow_run"] = runs[suite_id]
+        return checks
 
     def pr_failed_logs(self, pr: int) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.

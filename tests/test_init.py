@@ -21,7 +21,7 @@ from conftest import GitHistory, git_command
 PATHS = [".foragent.yml", ".github/ISSUE_TEMPLATE/foragent-task.md", "tests/acceptance/.gitkeep"]
 EXPECTED_CONFIG = (
     "# Configuration: Foragent docs/gate.md (section 9), docs/contract.md (section 4).\n"
-    "review: batch\napprovers:\n- human\n"
+    "review: batch\napprovers:\n- human\nchecks: local\n"
 )
 EXPECTED_TEMPLATE = """---
 name: Foragent task
@@ -50,6 +50,7 @@ class Setup:
     identity: dict = field(default_factory=lambda: {"user.name": "Test Human", "user.email": "human@example.com"})
     commit_fails: bool = False
     push_fails: bool = False
+    private: bool | None = True
 
     def run_git(self, args):
         self.git_calls.append(args)
@@ -102,6 +103,8 @@ class Setup:
         self.gh_calls.append((args, input))
         if args == ["auth", "status"]:
             return ""
+        if args[:2] == ["repo", "view"] and args[-2:] == ["--json", "isPrivate"]:
+            return json.dumps({"isPrivate": self.private})
         if args == ["api", "user", "--jq", ".login"]:
             return "human\n"
         if args[:3] == ["api", "-X", "POST"]:
@@ -212,7 +215,7 @@ def test_existing_config_does_not_probe_tools_or_change_worker_and_reviewer(setu
 
     monkeypatch.setattr(subprocess, "run", no_probes)
     setup.init()
-    assert (setup.root / PATHS[0]).read_text() == original
+    assert (setup.root / PATHS[0]).read_text() == original + "checks: local\n"
 
 
 def test_board_default_is_persisted_and_idempotent(setup):
@@ -236,7 +239,7 @@ def test_init_adds_board_to_existing_config_and_commits_it(setup, existing):
     assert path.read_text().count("board:") == 1
     if existing.startswith("#"):
         assert path.read_text().startswith(existing)
-    assert report.added_keys == ["board"] and report.committed and report.pushed
+    assert report.added_keys == ["checks", "board"] and report.committed and report.pushed
 
 
 def test_board_opt_out_and_dry_run_do_not_call_graphql(setup):
@@ -322,7 +325,7 @@ def test_existing_partial_config_and_template_remain_byte_for_byte(setup):
     template.parent.mkdir(parents=True)
     template.write_text("Existing template\n")
     report = setup.init(review="fast", approvers=["new"])
-    assert (setup.root / PATHS[0]).read_text() == config
+    assert (setup.root / PATHS[0]).read_text() == config + "checks: local\n"
     assert template.read_text() == "Existing template\n"
     assert report.created == [PATHS[2]]
     assert ["add", "-f", "--", PATHS[2], *PATHS[:2]] in setup.git_calls
@@ -338,9 +341,9 @@ def test_only_nondefault_keys_and_explicit_approvers_are_written(setup):
     setup.init(review="fast", executor="claude", run_hours="22-08", approvers=["alice", "bob"])
     assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {
         "review": "fast", "executor": "claude", "approvers": ["alice", "bob"], "run_hours": "22-08",
-        "reviewer": "claude",
+        "reviewer": "claude", "checks": "local",
     }
-    assert setup.gh_calls == [(["auth", "status"], None)]
+    assert setup.gh_calls == [(["auth", "status"], None), (["repo", "view", "owner/repo", "--json", "isPrivate"], None)]
 
 
 @pytest.mark.parametrize("language", ["ko", "en", "ja"])
@@ -359,8 +362,8 @@ def test_existing_config_adds_only_missing_explicit_keys(setup, key, value):
     (setup.root / PATHS[0]).write_text(config)
     report = setup.init(**{key: value})
     assert (setup.root / PATHS[0]).read_text().startswith(config)
-    assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {"base_branch": "main", key: value}
-    assert report.added_keys == [key]
+    assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {"base_branch": "main", key: value, "checks": "local"}
+    assert report.added_keys == [key, "checks"]
     assert f"Added config key: {key}" in report.summary()
     setup.git_calls.clear()
     report = setup.init(**{key: value})
@@ -384,10 +387,10 @@ def test_init_null_configuration_dry_run_and_multiple_missing_keys(setup):
     path = setup.root / PATHS[0]
     path.write_text("~\n")
     report = setup.init(language="ko", executor="claude", dry_run=True)
-    assert report.added_keys == ["executor", "language"]
+    assert report.added_keys == ["executor", "language", "checks"]
     assert path.read_text() == "~\n"
     setup.init(language="ko", executor="claude")
-    assert yaml.safe_load(path.read_text()) == {"executor": "claude", "language": "ko"}
+    assert yaml.safe_load(path.read_text()) == {"executor": "claude", "language": "ko", "checks": "local"}
     assert not setup.init(language="ko", executor="claude").added_keys
 
 
@@ -404,14 +407,14 @@ def test_existing_language_is_never_overwritten_and_missing_values_override_glob
     report = setup.init(language="en", executor="codex")
     assert load_config(setup.root).language == "ko"
     assert load_config(setup.root).executor == "codex"
-    assert report.added_keys == ["executor"]
+    assert report.added_keys == ["executor", "checks"]
 
 
 def test_init_dry_run_reports_missing_keys_without_writing(setup):
     (setup.root / PATHS[0]).write_text("review: fast\n")
     report = setup.init(language="ko", dry_run=True)
     assert (setup.root / PATHS[0]).read_text() == "review: fast\n"
-    assert report.added_keys == ["language"]
+    assert report.added_keys == ["language", "checks"]
     assert "Would add config key: language" in report.summary()
     assert not report.committed and report.commit_planned
 
@@ -665,6 +668,7 @@ def test_explicit_default_options_override_global_config(setup):
     setup.init(executor="codex", run_hours="always", review="batch", approvers=["human"])
     assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {
         "executor": "codex", "run_hours": "always", "review": "batch", "approvers": ["human"],
+        "checks": "local",
     }
     config = load_config(setup.root)
     assert (config.executor, config.run_hours, config.review, config.approvers) == (
@@ -696,3 +700,111 @@ def test_recovery_still_requires_base_branch_for_pending_paths(setup):
     with pytest.raises(GitError, match="base branch 'main'"):
         setup.init()
     assert not any("commit" in args or args[0] == "push" for args in setup.git_calls)
+
+
+def test_init_ci_commits_workflow_together_with_checks_choice(setup, monkeypatch):
+    from foragent.ci_workflow import WORKFLOW
+
+    setup.private = False
+    (setup.root / '.foragent.yml').write_text('test_command: python -m pytest\n')
+    monkeypatch.setattr('builtins.input', lambda prompt: pytest.fail('checks must not prompt'))
+    report = setup.init()
+    assert WORKFLOW in report.created
+    assert yaml.safe_load((setup.root / '.foragent.yml').read_text())['checks'] == 'ci'
+    commit = next(args for args in setup.git_calls if 'commit' in args)
+    assert '.foragent.yml' in commit and WORKFLOW in commit
+    assert git_command(setup.root, 'show', f'HEAD:{WORKFLOW}') == (setup.root / WORKFLOW).read_text().strip()
+
+
+@pytest.mark.parametrize('existing', [
+    '.github/workflows/foragent-acceptance.yml',
+    '.github/workflows/foragent-acceptance-publish.yml',
+])
+def test_ci_init_creates_missing_workflow_without_rewriting_existing(setup, existing):
+    from foragent.ci_workflow import PUBLISH_WORKFLOW, WORKFLOW
+
+    history = GitHistory(setup.root.parent / 'origin.git', setup.root,
+                         git_command(setup.root, 'rev-parse', 'HEAD'))
+    original = 'name: Customized workflow\non: [workflow_dispatch]\n'
+    history.update({'.foragent.yml': 'checks: ci\ntest_command: python -m pytest\n', existing: original})
+    git_command(setup.root, 'fetch', 'origin')
+    git_command(setup.root, 'merge', '--ff-only', 'origin/main')
+    missing = PUBLISH_WORKFLOW if existing == WORKFLOW else WORKFLOW
+
+    report = setup.init()
+
+    assert missing in report.created and existing in report.existed
+    assert (setup.root / existing).read_text() == original
+    commit = next(args for args in setup.git_calls if 'commit' in args)
+    assert missing in commit and existing not in commit
+    assert git_command(setup.root, 'status', '--porcelain') == ''
+    assert not setup.init().committed
+
+
+def test_public_init_without_a_detected_test_command_chooses_local(setup):
+    from foragent.ci_workflow import WORKFLOW
+
+    setup.private = False
+    setup.init()
+    assert yaml.safe_load((setup.root / '.foragent.yml').read_text())['checks'] == 'local'
+    assert not (setup.root / WORKFLOW).exists()
+
+
+def test_local_init_leaves_existing_acceptance_workflow_uncommitted(setup):
+    from foragent.ci_workflow import WORKFLOW
+
+    setup.init()
+    path = setup.root / WORKFLOW
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('name: user workflow\n')
+    report = setup.init()
+    assert not report.committed
+    assert path.read_text() == 'name: user workflow\n'
+    assert git_command(setup.root, 'ls-files', '--', WORKFLOW) == ''
+
+
+@pytest.mark.parametrize('existing', [False, True])
+def test_public_non_pytest_project_selects_local_with_one_line_note(setup, capsys, existing):
+    from foragent.ci_workflow import WORKFLOW
+
+    setup.private = False
+    (setup.root / 'package.json').write_text('{"scripts":{"test":"node test.js"}}')
+    if existing:
+        (setup.root / '.foragent.yml').write_text('test_command: npm test\n')
+    setup.init()
+    assert load_config(setup.root).checks == 'local'
+    assert not (setup.root / WORKFLOW).exists()
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1 and 'pytest' in lines[0] and 'checks: local' in lines[0]
+
+
+@pytest.mark.parametrize('private,mode,reason', [(False, 'ci', 'free'), (True, 'local', 'minutes'),
+                                               (None, 'local', 'visibility')])
+def test_missing_checks_in_existing_config_is_selected_without_input_and_kept(
+    setup, monkeypatch, capsys, private, mode, reason,
+):
+    from foragent.ci_workflow import WORKFLOW
+
+    setup.private = private
+    path = setup.root / '.foragent.yml'
+    original = '# Preserve project settings\nreview: fast\ntest_command: python -m pytest\n'
+    path.write_text(original)
+    monkeypatch.setattr('builtins.input', lambda prompt: pytest.fail('checks must not prompt'))
+    report = setup.init()
+    assert path.read_text().startswith(original)
+    assert yaml.safe_load(path.read_text())['checks'] == mode
+    assert report.added_keys == ['checks']
+    assert (setup.root / WORKFLOW).exists() is (mode == 'ci')
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1 and f'checks: {mode}' in lines[0]
+    assert reason in lines[0] and '.foragent.yml' in lines[0]
+    if private is True:
+        assert 'self-hosted' in lines[0] and 'ci_runs_on' in lines[0]
+    if private is None:
+        assert 'Note:' in lines[0]
+    before = path.read_bytes()
+    setup.private = not private
+    setup.gh_calls.clear()
+    assert not setup.init().committed
+    assert path.read_bytes() == before
+    assert setup.gh_calls == [(['auth', 'status'], None)]
