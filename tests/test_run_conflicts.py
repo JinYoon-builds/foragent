@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from foragent.git import GitRepo
+from foragent.git import GitError, GitRepo
 from foragent.issue import body_hash, parse_body
 from foragent.reasons import Reason
 from foragent.runner import run_issue
@@ -159,11 +159,14 @@ def test_batch_patch_uses_three_way_merge_and_retries_real_conflicts(run_case, c
     assert run_issue(1, c.ctx) == "merged"
     shared = git_command(c.history.origin, "show", "foragent/issue-1:shared.txt").splitlines()
     assert shared[2] == "child change" and shared[4] == "sibling change"
-    assert c.store.get_run(1).attempts == (2 if conflicting else 1)
+    # A replay conflict is resolved in place (#416); it does not spend an implementation attempt.
+    assert c.store.get_run(1).attempts == 1
+    assert c.store.get_run(1).rebuild_count == 0
     assert c.store.load_flag(1) is None
     assert any(args[:2] == ["apply", "--3way"] for _, args in c.operations)
     if conflicting:
         assert "Could not apply child changes" in c.executor.calls[1]["prompt"]
+        assert "shared.txt" in c.executor.calls[1]["prompt"]
 
 
 @pytest.mark.parametrize("before_push", [False, True])
@@ -184,10 +187,10 @@ def test_fresh_base_generated_batch_path_replay_conflict_uses_remaining_attempts
 
     def implement(**kwargs):
         if c.executor.calls:
+            # The replay conflict is resolved in place on the destination (#416): the child's work stays.
             root = kwargs["worktree"]
-            assert GitRepo(root).conflict_paths() == []
-            assert (root / "switch.txt").read_text() == "sibling\n"
-            assert not (root / "feature.txt").exists()
+            assert "<<<<<<<" in (root / "switch.txt").read_text()
+            assert (root / "feature.txt").exists()
         result = execute(**kwargs)
         if before_push and len(c.executor.calls) == 1:
             move_base()
@@ -200,18 +203,15 @@ def test_fresh_base_generated_batch_path_replay_conflict_uses_remaining_attempts
 
     monkeypatch.setattr(c.executor, "run", implement)
     monkeypatch.setattr(c.tracker, "pr_checks", ci)
-    assert run_issue(1, c.ctx) == ("merged" if retries else "retries-exceeded")
-    assert len(c.executor.calls) == c.store.get_run(1).attempts == retries + 1
+    # In-place resolution uses the conflict budget, not implementation attempts, so both budgets merge.
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 2 and c.store.get_run(1).attempts == 1
     assert "Could not apply child changes to foragent/batch-99" in c.store.log_path(1).read_text()
-    if retries:
-        assert "Could not apply child changes to foragent/batch-99" in c.executor.calls[1]["prompt"]
-        assert c.tracker.created_prs[0].base == "foragent/batch-99"
-        assert git_command(c.history.origin, "show", "foragent/issue-1:switch.txt") == "resolved"
-        assert git_command(c.history.origin, "show", "foragent/issue-1:sibling.txt") == "keep"
-        assert c.store.load_flag(1) is None
-    else:
-        assert c.tracker.merged_prs == []
-        assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+    assert "Could not apply child changes to foragent/batch-99" in c.executor.calls[1]["prompt"]
+    assert c.tracker.created_prs[0].base == "foragent/batch-99"
+    assert git_command(c.history.origin, "show", "foragent/issue-1:switch.txt") == "resolved"
+    assert git_command(c.history.origin, "show", "foragent/issue-1:sibling.txt") == "keep"
+    assert c.store.load_flag(1) is None
 
 
 def test_unchanged_base_does_not_merge_or_repeat_checks(run_case):
@@ -498,8 +498,17 @@ def test_interrupted_conflict_keeps_single_parent_wip_and_rechecks_on_restart(co
         return execute(**kwargs)
 
     monkeypatch.setattr(c.executor, "run", resume)
+    if restart == "noop":
+        # One of the PR's three own files conflicts: keep the work and stop for the orchestrator (#416).
+        assert run_issue(1, c.ctx) == "retries-exceeded"
+        assert len(seen) == c.ctx.config.conflict_retries
+        assert c.store.get_run(1).merge_conflicts == ["cli.py"]
+        assert c.store.get_run(1).rebuild_count == 0
+        assert "blocked" in c.tracker.get_issue(1).labels
+        assert "cli.py" in c.tracker.list_comments(1)[-1].body
+        return
     assert run_issue(1, c.ctx) == "merged"
-    assert len(seen) == (1 if restart == "resolve" else 3)
+    assert len(seen) == 1
     assert c.store.get_run(1).merge_conflicts == []
     assert "<<<<<<<" not in git_command(c.history.origin, "show", f"{branch}:cli.py")
 
@@ -704,13 +713,15 @@ def test_conflict_budget_survives_ci_repair_and_republishing(conflicting_lanes, 
     monkeypatch.setattr(c.executor, "run", implement)
     monkeypatch.setattr(c.tracker, "pr_checks", ci)
     c.tracker.set_pr_failed_logs(2, "Repair the CI failure")
-    assert run_issue(1, c.ctx) == "merged"
-    assert len(c.executor.calls) == 4
+    # The used in-place budget survives CI repair; a minority conflict then stops instead of rebuilding (#416).
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    assert len(c.executor.calls) == 3
     assert "CI failed:\nRepair the CI failure" in c.executor.calls[2]["prompt"]
-    assert "earlier attempt could not be merged onto the moved base" in c.executor.calls[3]["prompt"]
     log = c.store.log_path(1).read_text()
     assert log.count("Conflict attempt 1/1:") == 1
-    assert log.count("Rebuilding issue branch once") == 1
+    assert log.count("Rebuilding issue branch once") == 0
+    assert c.store.get_run(1).merge_conflicts == ["cli.py"]
+    assert "blocked" in c.tracker.get_issue(1).labels
 
 
 def test_fresh_base_done_when_failure_returns_to_implementer(run_case, monkeypatch):
@@ -749,3 +760,46 @@ def test_moving_base_times_out_after_three_merges(run_case, monkeypatch):
     assert c.store.load_flag(1).reason == Reason.TIMEOUT
     assert "base kept moving" in c.tracker.list_comments(1)[-1].body
     assert c.tracker.merged_prs == []
+
+
+def test_replay_failure_without_conflicts_keeps_work_and_never_rebuilds(run_case, monkeypatch):
+    """Zero conflicting own files never qualify for a from-scratch rebuild (#416)."""
+    c = run_case
+    c.history.update({"shared.txt": "base\n"})
+    batch_setup(c)
+    c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"shared.txt": "batch"})
+    seed_batch(c, {"sibling.txt": "sibling\n"})
+    c.executor.steps[0].update({"shared.txt": "child\n"})
+
+    def refuse(self, patch):
+        raise GitError("error: corrupt patch at line 3")
+
+    monkeypatch.setattr(GitRepo, "apply_staged_patch", refuse)
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    assert len(c.executor.calls) == 1
+    run = c.store.get_run(1)
+    assert run.rebuild_count == 0 and run.rebuild_reason is None
+    assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+    assert "corrupt patch" in c.tracker.list_comments(1)[-1].body
+    # The PR's own work survives on its branch instead of the destination's clean tree.
+    branch = "foragent/issue-1"
+    assert git_command(c.history.origin, "show", f"{branch}:shared.txt") == "child"
+    assert git_command(c.history.origin, "show", f"{branch}:feature.txt")
+
+
+def test_replay_own_files_come_from_branch_head_not_uncommitted_staged_work(run_case):
+    """Every staged file conflicts, but none is committed on the branch head: no rebuild (#416)."""
+    c = run_case
+    c.history.update({"shared.txt": "base\n"})
+    batch_setup(c)
+    c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"shared.txt": "batch"})
+    seed_batch(c, {"shared.txt": "sibling\n", "feature.txt": "sibling feature\n"})
+    c.executor.steps[0].update({"shared.txt": "child\n"})
+    c.executor.steps += [{}] * c.ctx.config.conflict_retries
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    assert len(c.executor.calls) == 1 + c.ctx.config.conflict_retries, "In-place resolution comes first"
+    run = c.store.get_run(1)
+    assert run.rebuild_count == 0 and run.rebuild_reason is None
+    assert "shared.txt" in c.tracker.list_comments(1)[-1].body
+    # The stop keeps the PR's own work rather than the destination tree holding replay markers.
+    assert git_command(c.history.origin, "show", "foragent/issue-1:shared.txt") == "child"

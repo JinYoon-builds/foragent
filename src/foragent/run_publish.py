@@ -41,7 +41,7 @@ def _pr_body(
     missing_skills: list[str] | None = None,
     skills_line: str | None = None,
     rebuttals: str = "",
-    review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
+    review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/", language: str = "en",
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -52,7 +52,7 @@ def _pr_body(
     lines.extend(["", "## Review", ""])
     if review_scope == "pr-body":
         lines.append(f"VERDICT: {reviews[-1].verdict}" if reviews else "Pending review.")
-        lines.extend(["", "## Review scope", "", review_scope_rules(acceptance_dir),
+        lines.extend(["", "## Review scope", "", review_scope_rules(acceptance_dir, language),
                       "The acceptance tests are locked."])
     elif not reviews:
         lines.append("Disabled (reviewer: none).")
@@ -409,6 +409,7 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
         skills_line=_skills_line(ctx.store.get_run(n)),
         rebuttals="\n\n".join(attempt.rebuttals),
         review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
+        language=ctx.config.language,
     )
 
 

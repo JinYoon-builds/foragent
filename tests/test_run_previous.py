@@ -1,0 +1,82 @@
+"""Retry default, stop point and the conflict rebuild rule (#416)."""
+
+from runner_support import run_case  # noqa: F401
+
+from pathlib import Path
+from types import SimpleNamespace
+
+from foragent.executors import ExecResult
+from foragent.run_attempt import ConflictBudgetExhausted
+from foragent.run_conflicts import _rebuild_reason
+from foragent.run_previous import consume_hint, pending_hint, record_stop_point, retry_marker, stop_path
+from foragent.run_prompts import DEFAULT_RETRY_HINT, build_resume_prompt
+
+
+def test_retry_marker_adds_default_before_hint_and_is_consumed_with_it(tmp_path):
+    assert pending_hint(tmp_path, 1) == (False, None)
+    marker = retry_marker(tmp_path, 1)
+    marker.parent.mkdir()
+    marker.write_text("retry\n")
+    (tmp_path / "hints/1.txt").write_text("Keep the locale")
+    assert pending_hint(tmp_path, 1) == (True, "Keep the locale")
+    prompt = build_resume_prompt(1, None, "body", retry_default=True, orchestrator_hint="Keep the locale")
+    assert prompt.index(DEFAULT_RETRY_HINT) < prompt.index("Keep the locale")
+    consume_hint(tmp_path, 1)
+    assert pending_hint(tmp_path, 1) == (False, None)
+
+
+def test_stop_point_prefers_final_message_then_this_turns_log_tail(tmp_path):
+    log = tmp_path / "issue-1.log"
+    log.write_text("earlier runner output\n")
+    offset = log.stat().st_size
+    log.write_text(log.read_text() + "worked on parser\nstopped before tests\n")
+    record_stop_point(tmp_path, 1, ExecResult(0, False, "", log), log, offset)
+    assert stop_path(tmp_path, 1).read_text() == "worked on parser\nstopped before tests\n"
+    record_stop_point(tmp_path, 1, ExecResult(0, False, "Final summary", log), log, offset)
+    assert stop_path(tmp_path, 1).read_text() == "Final summary\n"
+
+
+def _attempt():
+    ctx = SimpleNamespace(config=SimpleNamespace(conflict_retries=2))
+    return SimpleNamespace(ctx=ctx, target_branch="main")
+
+
+def test_rebuild_reason_needs_more_than_half_of_own_files():
+    own = ["a", "b", "c", "d"]
+    assert _rebuild_reason(_attempt(), ConflictBudgetExhausted("x", ["a", "b"], own)) is None
+    assert _rebuild_reason(_attempt(), ConflictBudgetExhausted("x", ["a"], [])) is None
+    reason = _rebuild_reason(_attempt(), ConflictBudgetExhausted("x", ["a", "b", "c"], own))
+    assert reason == "3/4 of the PR's own files conflict with main after 2 in-place resolution attempts"
+
+
+def test_path_helper_keeps_runs_issue_directory_for_reviews(tmp_path):
+    assert stop_path(tmp_path, 7) == Path(tmp_path, "runs", "issue-7-stop.txt")
+
+
+def test_review_class_question_follows_repository_language_in_pr_body_rules():
+    from foragent.run_prompts import review_scope_rules
+
+    assert review_scope_rules("tests/acceptance/").endswith(
+        "For each finding, say whether it is one instance of a broader defect class "
+        "and where else to look in the change.")
+    korean = review_scope_rules("tests/acceptance/", "ko")
+    assert "결함 종류" in korean and "broader defect class" not in korean
+
+
+def test_stop_point_is_recorded_when_a_usage_limit_ends_the_turn(run_case, monkeypatch):
+    from foragent.runner import run_issue
+
+    c = run_case
+    stale = stop_path(c.store.root, 1)
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("an earlier attempt's stop\n")
+
+    def limited(**kwargs):
+        with kwargs["log_path"].open("a", encoding="utf-8") as log:
+            log.write("Half-way through the parser when the limit hit.\n")
+        return ExecResult(1, False, "", kwargs["log_path"], error_kind="limit")
+
+    monkeypatch.setattr(c.executor, "run", limited)
+    assert run_issue(1, c.ctx) == "limit-wait"
+    text = stale.read_text()
+    assert "Half-way through the parser" in text and "earlier attempt" not in text
