@@ -11,7 +11,7 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board, usage_events
+from foragent import board, usage_events, usage_recheck
 from foragent.actions import flag
 from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
@@ -188,9 +188,9 @@ def _available_executor(
             return replace(result, timed_out=True)
         if kind == "limit":
             now = ctx.now()
-            until = usage_events.limit_reset(
-                (result.usage or {}).get(name), now, now + timedelta(minutes=ctx.config.limit_wait_minutes),
-            )
+            windows = (result.usage or {}).get(name)
+            until = usage_events.limit_reset(windows, now, now + timedelta(minutes=ctx.config.limit_wait_minutes))
+            usage_recheck.note_limit(ctx.store, name, until, windows, now)  # The gate may end it early.
             _limit_wait(n, ctx, name, run.lane, until,
                         result.last_message or result.log_tail or "Executor usage limit reached.")
         if kind == "transient" and not reviewer:

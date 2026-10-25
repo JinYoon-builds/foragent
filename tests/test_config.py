@@ -36,7 +36,7 @@ def test_exact_defaults(repo):
         "skill_roles": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2,
         "executor_fallback_model": None,
-        "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
+        "transient_max_wait_minutes": 30, "limit_wait_minutes": 60, "usage_recheck_minutes": 10,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
                   "m": {"codex_effort": "high", "claude_model": None},
                   "l": {"codex_effort": "xhigh", "claude_model": None}},
@@ -325,7 +325,9 @@ def test_lane_validation(repo, settings):
         load_config(repo)
 
 
-@pytest.mark.parametrize("key", ["max_parallel", "transient_max_wait_minutes", "limit_wait_minutes"])
+@pytest.mark.parametrize("key", [
+    "max_parallel", "transient_max_wait_minutes", "limit_wait_minutes", "usage_recheck_minutes",
+])
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_parallel_and_wait_settings_are_positive(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})

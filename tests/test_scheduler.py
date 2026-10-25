@@ -2928,6 +2928,21 @@ def test_tick_during_github_wait_still_applies_machine_ceilings_once(ctx, monkey
     assert samples == [1], "one sensor sample and one budget update per tick"
 
 
+def test_tick_during_github_wait_still_rechecks_free_usage(ctx, monkeypatch):
+    from foragent import usage_recheck
+
+    until = NOW + timedelta(hours=2)
+    usage_recheck.note_limit(ctx.store, "codex", until, [{"name": "5h", "used_percent": 100, "exhausted": True}], NOW)
+    ctx.store.pause_executor("codex", until)
+    ctx.store.pause_github(NOW + timedelta(minutes=30))
+    monkeypatch.setattr(usage_recheck, "read_codex", lambda now: [{"name": "5h", "used_percent": 4}])
+    report = tick(ctx)
+    assert report.skipped and "GitHub rate limit" in report.skipped
+    assert not ctx.store.executor_paused("codex", NOW)
+    events = [json.loads(line) for line in (ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [event["kind"] for event in events] == ["quota-recovered"]
+
+
 def test_rate_limit_error_after_budgets_does_not_apply_them_twice(ctx, monkeypatch):
     from foragent import capacity, scheduler
     from foragent.scheduler_start import _apply_budgets
