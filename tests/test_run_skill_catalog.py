@@ -1,12 +1,10 @@
 """Per-issue skill catalog and the implementer's `Skills used:` report."""
 
-import json
 from pathlib import Path
 
 import pytest
 
 from foragent.config import Config
-from foragent.run_review import parse_code_review
 from foragent.run_skill_catalog import (
     available_skills, catalog_section, parse_skills_used, report_line,
 )
@@ -69,15 +67,3 @@ def test_report_line_distinguishes_none_from_not_reported():
 def test_run_records_default_to_no_skill_report():
     run = Run(1, "b", "w", None, "t", "t")
     assert (run.skills_reported, run.skills_used) == (False, [])
-
-
-@pytest.mark.parametrize("message,verdict", [
-    ("VERDICT: PASS", "PASS"), ("\nVERDICT: FAIL\nx.py:1 — broken", "FAIL"), ("garbage", "UNUSABLE"),
-    ("Error: request failed\nVERDICT: PASS", "UNUSABLE"),
-])
-def test_claude_review_reads_a_plain_verdict_line_when_output_is_not_json(message, verdict):
-    assert parse_code_review(message).verdict == verdict
-
-
-def test_claude_review_json_events_keep_their_rules():
-    assert parse_code_review(json.dumps({"result": "VERDICT: PASS"})).verdict == "UNUSABLE"

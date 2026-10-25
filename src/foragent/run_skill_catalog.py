@@ -2,7 +2,7 @@
 
 Code gathers the facts (which approved skills exist, their descriptions and
 paths); the lane agent chooses which ones fit the issue and reports them.
-Wording lives in foragent.messages.skills_per_issue.
+Wording lives in foragent.messages.skills_used.
 """
 
 from __future__ import annotations
@@ -53,7 +53,9 @@ def catalog_section(skills: list[tuple[str, str, str]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-_REPORT = re.compile(r"[\s>*_`-]*Skills used:\s*(.*?)[\s`*_.]*", re.IGNORECASE)
+# The report prefix comes from the same template the PR line uses.
+_PREFIX = text("skills_used_line", names="").strip()
+_REPORT = re.compile(r"[\s>*_`-]*" + re.escape(_PREFIX) + r"\s*(.*?)[\s`*_.]*", re.IGNORECASE)
 
 
 def parse_skills_used(message: str) -> list[str] | None:
