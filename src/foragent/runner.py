@@ -398,6 +398,12 @@ def run_issue(n: int, ctx: RunContext) -> str:
     return outcome
 
 
+from foragent import runner_doctor
 from foragent.runner_doctor import (
-    SMOKE_FILE, SMOKE_CHECK, LiveCheck, _one_line, DOCTOR_ISSUE, DOCTOR_BODY, _RecordedExecutor, live_check,
+    SMOKE_FILE, SMOKE_CHECK, LiveCheck, _one_line, DOCTOR_ISSUE, DOCTOR_BODY, _RecordedExecutor,
 )
+
+
+def live_check(repo_root: Path, config: Config, executor_name: str, *, timeout_s: int = 900) -> LiveCheck:
+    """`fa doctor --live` enters through the issue runner; the throwaway task lives in runner_doctor."""
+    return runner_doctor.live_check(repo_root, config, executor_name, timeout_s=timeout_s)
