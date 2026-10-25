@@ -48,6 +48,11 @@ def parse_code_review(message: str) -> ReviewResult:
     try:
         event = json.loads(message)
     except ValueError:
+        # Not a /code-review event. Accept only the plain review format itself: the
+        # answer opens with the verdict line. Any JSON event keeps the checks below.
+        first = next((line for line in message.splitlines() if line.strip()), "")
+        if re.fullmatch(r"VERDICT: (PASS|FAIL)\s*", first):
+            return parse_review(message)
         event = None
     if not isinstance(event, dict) or event.get("is_error") or not isinstance(event.get("result"), str):
         return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
