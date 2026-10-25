@@ -62,6 +62,10 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
     unknown_path = ctx.store.root / "orch-watch-unknown.json"
     last_error = None
     while True:
+        try:  # Every read, changed or not, shows the orchestrator is alive.
+            ctx.store.write_heartbeat("orchestrator", ctx.now())
+        except Exception:
+            pass  # a heartbeat is best effort; the read below reports state errors
         try:
             snapshot = _watch_snapshot(ctx)
             with ctx.store._state_lock():

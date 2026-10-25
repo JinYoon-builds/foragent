@@ -129,3 +129,4 @@
 - #105 리뷰: 실행기 멈춤은 시작 때만이 아니라 `_available_executor()`가 매 실행 직전 `store.executor_pause_until()`로 확인하고 `_limit_wait()`로 limit-wait 처리한다. 한도 뒤 곧바로 재시작하는 시험은 시계를 `limit_wait_minutes` 뒤로 옮겨야 한다(`test_worker_sessions.py`). `test_executor_choice.py` 6개는 main에서도 실패하는 quota 범위다.
 - [#104 skill catalog](project_104_skill_catalog.md) — Available skills prompt section, Skills used in Run/PR, claude plain VERDICT fallback
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
+- #127: `StateStore.write_heartbeat(side, at)`/`heartbeats()`(state.py)가 `<state>/orch-heartbeat.json`·`gate-heartbeat.json`을 덮어쓴다. watch는 매 읽기 전, gate는 `tick()` 첫 줄(busy tick 포함)에 쓴다. `fa orch alive`는 `INBOX_ACTIONS`에 넣어 GitHub 없이 처리, 30초 이하면 alive. 인수 `tests/acceptance/test_heartbeats.py` 4개.
