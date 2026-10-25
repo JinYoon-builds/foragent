@@ -16,3 +16,7 @@ metadata:
 리뷰 보완 2: status JSON은 레인 대표 상태 하나뿐이다(status.py 변경 금지). 그래서 작업자별 상태는 `watch_data.collect`가 로컬 이슈 라벨로 `Snapshot.worker_states`를 만든다(needs-human → blocked → working, collect_lanes와 같은 순서). 도로 번호 줄과 활동 표의 다른 작업자 줄이 이를 쓴다. 회귀 검증: `tests/test_watch_workers.py -k own_state`. `test_view_done_state` 5개는 기준본에서도 실패한다.
 
 main 병합(2026-10-26): main에 같은 규칙의 `watch_layout._worker_rows`·`_lane_name`과 일반 시험 `tests/test_watch_worker_rows.py`가 먼저 들어왔다. 두 함수를 살리고 lanes.py가 `_worker_rows`로 줄을 만들게 했다. 작업자 상태(`worker_states`)와 번호 보존(`_road(..., worker=N)`)은 그 위에 얹었다. 실행 중이 아닌 막힌 이슈는 1번 줄 앞에 남는다(main 규칙). `_clones`는 running만 세는 HEAD 쪽을 유지했다.
+
+`.foragent/acceptance-exclusions.json`은 발행 때 실행기가 `ci_mode.stage_exclusions`로 쓴다(머지 안 된 승인 이슈의 잠긴 시험, 자기 이슈 포함). 손으로 고치면 `ci_mode.comparison`의 `payload["excluded"]` 일치 검사가 깨진다. 리뷰가 "자기 시험을 뺐다"고 지적하면 고치지 말고 REBUTTAL로 답한다.
+
+리뷰 보완 3: 1번 줄에는 실행 중이 아닌 대표 이슈(예: needs-human)가 함께 올 수 있다. 그 줄의 상태는 줄에 있는 이슈들의 상태(작업자는 `worker_states`, 나머지는 레인 `row["state"]`) 가운데 `lanes.STATE_ORDER`(collect_lanes 순서)로 가장 급한 것이다. 회귀: `tests/test_watch_workers.py -k non_running_issue`.

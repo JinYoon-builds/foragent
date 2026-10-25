@@ -12,6 +12,8 @@ from foragent.watch_layout import _clones, _split, _widths, _worker_rows
 ORDER = 30
 # "Watching" needs an orchestrator heartbeat (written by a running fa orch watch) this fresh (D67).
 ORCH_FRESH_SECONDS = 30
+# The most urgent state first, as status.collect_lanes chooses a lane's issue.
+STATE_ORDER = ("working", "waiting-human", "blocked", "queued", "idle")
 
 
 def _overview(snapshot: Snapshot, language: str, age: float = 0.0) -> list[Line]:
@@ -101,7 +103,10 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         # Several workers get a road row each; the queue and done line stay on the first.
         for position, (_, numbers) in enumerate(_worker_rows(row, clones)):
             # Each numbered row shows its own worker's state, not the lane's representative state.
-            state = snapshot.worker_states.get(numbers[-1], "working") if several else row["state"]
+            # A non-running issue kept on the first row adds its own state (the lane's), and
+            # the most urgent one wins, in status.collect_lanes order.
+            states = [snapshot.worker_states.get(number, row["state"]) for number in numbers]
+            state = min(states, key=STATE_ORDER.index) if several else row["state"]
             worker = position + 1 if several else None
             name = f"{index} {row['lane_display']}" + ("" if several else " ▸ ")
             roads.append(_road(snapshot, name, numbers, state, row["queued"] if position == 0 else [],

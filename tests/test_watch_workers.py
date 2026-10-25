@@ -147,3 +147,14 @@ def test_each_worker_row_shows_its_own_state(tmp_path):
     text = frame(tracker, store, config, clock)
     assert "⛏" in rows_with(text, "orch 1")[0] and "✋" not in rows_with(text, "orch 1")[0], text
     assert "✋" in rows_with(text, "orch 2")[0] and "⛏" not in rows_with(text, "orch 2")[0], text
+
+
+def test_first_row_keeps_waiting_state_of_a_non_running_issue(tmp_path):
+    tracker, store, config, clock = workers_case(tmp_path, {1: 0, 2: 1})
+    tracker.add_labels(1, ["blocked"])
+    tracker.add_labels(2, ["blocked"])
+    tracker.add_issue(5, "Needs a person", labels=["approved", "needs-human", "lane:orch"])
+    text = frame(tracker, store, config, clock)
+    first, second = rows_with(text, "orch 1")[0], rows_with(text, "orch 2")[0]
+    assert "#5" in first and "#1" in first and "✋" in first and "●" not in first, text
+    assert "#2" in second and "●" in second and "✋" not in second, text
