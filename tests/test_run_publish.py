@@ -1140,3 +1140,57 @@ def test_retitle_for_merge_falls_back_to_an_explicit_subject(failure):
     assert retitle("WIP: old (#1) [timeout]") == expected
     assert edits == [(2, {"base": "main", "title": "Feature (#1)", "body": "Closes #1"})]
     assert bool(notes) == bool(failure)
+
+
+def test_gate_merges_an_existing_wip_pr_with_an_explicit_subject_when_retitle_fails(run_case, monkeypatch):
+    c = run_case
+    wip = "WIP: Implement feature (#1) [timeout]"
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title=wip, body="Closes #1")
+    c.tracker.set_pr_checks(pr, "pass")
+    update, merge = c.tracker.update_pr, c.tracker.merge_pr
+    edits, merges = [], []
+
+    def update_pr(number, **fields):
+        edits.append(fields["title"])
+        if fields["title"] != wip:
+            raise TrackerError("HTTP 422: title rejected")
+        update(number, **fields)
+
+    def merge_pr(number, **kwargs):
+        merges.append(kwargs.get("subject"))
+        merge(number, **{key: value for key, value in kwargs.items() if key != "subject"})
+
+    monkeypatch.setattr(c.tracker, "update_pr", update_pr)
+    monkeypatch.setattr(c.tracker, "merge_pr", merge_pr)
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.tracker.merged_prs == [pr] and len(c.tracker.created_prs) == 1
+    assert merges == ["Implement feature (#1)"]
+    # The first refresh still retargets and updates the body under the old title.
+    assert edits[:2] == ["Implement feature (#1)", wip] and edits[-1] == "Implement feature (#1)"
+    assert "retitle failed" in c.store.log_path(1).read_text()
+
+
+def test_gate_merges_with_an_explicit_subject_when_every_pr_edit_fails(run_case, monkeypatch):
+    c = run_case
+    wip = "WIP: Implement feature (#1) [timeout]"
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title=wip, body="Closes #1")
+    c.tracker.set_pr_checks(pr, "pass")
+    merge = c.tracker.merge_pr
+    edits, merges = [], []
+
+    def update_pr(number, **fields):
+        edits.append(fields["title"])
+        raise TrackerError("HTTP 500: server error")
+
+    def merge_pr(number, **kwargs):
+        merges.append(kwargs.get("subject"))
+        merge(number, **{key: value for key, value in kwargs.items() if key != "subject"})
+
+    monkeypatch.setattr(c.tracker, "update_pr", update_pr)
+    monkeypatch.setattr(c.tracker, "merge_pr", merge_pr)
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.tracker.merged_prs == [pr] and len(c.tracker.created_prs) == 1
+    assert merges == ["Implement feature (#1)"]
+    assert edits[:2] == ["Implement feature (#1)", wip] and edits[-1] == "Implement feature (#1)"
+    log = c.store.log_path(1).read_text()
+    assert "retitle failed" in log and "HTTP 500" in log
