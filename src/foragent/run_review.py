@@ -197,6 +197,7 @@ def _normalized_findings(review: ReviewResult) -> set[str]:
 
 
 def _review_implementation(attempt: Implementation) -> None:
+    from foragent.ci_mode import commit_exclusions
     from foragent.run_publish import _open_or_update_pr, _push_branch, _render_pr_body
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
@@ -204,8 +205,7 @@ def _review_implementation(attempt: Implementation) -> None:
     pr = None
     if ctx.config.review_scope == "pr-body":
         title = f"{ctx.tracker.get_issue(n).title} (#{n})"
-        if git.has_staged_changes():
-            git.commit(title)
+        commit_exclusions(attempt, title)
         _push_branch(attempt)
         pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))
         _progress(n, ctx)
@@ -285,7 +285,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     ctx.git.add_detached_worktree(worktree, head)
     git = ctx.git.at(worktree)
     from foragent.ci_workflow import EXCLUSIONS
-    if (worktree / EXCLUSIONS).is_file():
+    if git.blob_sha("HEAD", EXCLUSIONS) is not None:
         git.publication_paths.add(EXCLUSIONS)
     if not _acceptance_matches(n, ctx, git, approval):
         return "hash-mismatch"

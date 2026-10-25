@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from foragent import board
 from foragent.actions import FlagContext, flag, invalidate_approval
-from foragent.ci_mode import ComparisonEvidence, enabled, require_comparison, stage_exclusions
+from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
 from foragent.issue import ParsedIssue, body_hash
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
@@ -468,9 +468,7 @@ def _publish_locked(attempt: Implementation) -> str:
     worktree, log = attempt.worktree, attempt.log
     issue = ctx.tracker.get_issue(n)
     title = f"{issue.title} (#{n})"
-    stage_exclusions(attempt)
-    if git.has_staged_changes():
-        git.commit(title)
+    commit_exclusions(attempt, title)
     _progress(n, ctx)
     verified_head_sha = git.head_sha()
     base_merges = 0
@@ -479,9 +477,7 @@ def _publish_locked(attempt: Implementation) -> str:
         nonlocal verified_head_sha
         if runner._remaining(n, ctx) <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
-        stage_exclusions(attempt)
-        if git.has_staged_changes():
-            git.commit(title)
+        commit_exclusions(attempt, title)
         verified_head_sha = git.head_sha()
 
     def refresh_base(move: BaseMove, conflicts: list[str] | None = None) -> str:

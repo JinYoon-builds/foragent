@@ -7,6 +7,7 @@ from datetime import timedelta
 from io import BytesIO
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 from zipfile import ZipFile
@@ -15,7 +16,7 @@ import pytest
 import yaml
 
 from foragent.ci_mode import UnusableComparison, comparison
-from foragent.ci_workflow import WORKFLOW, measurement_scope, workflow_text, write_workflow
+from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
 from foragent.config import Config, ConfigError, load_config
 from runner_support import run_case
 
@@ -150,7 +151,7 @@ def test_compare_records_parallel_wall_duration_and_detects_deselection():
     assert duration == 3
 
 
-@pytest.mark.parametrize("damage", ["check-sha", "nan", "overlap", "duplicate", "malformed", "cancelled"])
+@pytest.mark.parametrize("damage", ["check-sha", "nan", "overlap", "duplicate", "malformed", "cancelled", "exclusions"])
 def test_rejects_unusable_shards(damage):
     checks = [report(), report(1)]
     payload = checks[1]['report']
@@ -165,6 +166,8 @@ def test_rejects_unusable_shards(damage):
         payload = checks[1]['report']
     elif damage == "cancelled":
         checks[1]['run']["conclusion"] = "cancelled"
+    elif damage == "exclusions":
+        payload['excluded'] = ['tests/acceptance/test_unapproved.py']
     checks[1]['report'] = '{' if damage == 'malformed' else payload
     with pytest.raises(UnusableComparison):
         compare(checks)
@@ -252,18 +255,143 @@ def test_measurement_partitions_all_portable_nodes_and_excludes_marked_and_locke
 def test_force_added_exclusions_survive_generic_artifact_cleanup(git_history):
     from conftest import git_command
     from foragent.git import GitRepo
+    from runner_support import import_index
 
     root = git_history.clone
     git = GitRepo(root)
     metadata = root / '.foragent'
     metadata.mkdir()
-    (metadata / 'acceptance-exclusions.json').write_text('[]\n')
     (metadata / 'TRY.md').write_text('scratch')
-    git.publication_paths.add('.foragent/acceptance-exclusions.json')
+    import_index(root, f'Issue title\n\n{EXCLUSIONS_TRAILER}: []')
     git.stage_changes()
-    assert git_command(root, 'ls-files', '--', '.foragent') == '.foragent/acceptance-exclusions.json'
+    assert read_exclusions(git, git_history.tip) == []
+    assert not git_command(root, 'ls-files', '--', '.foragent')
     git._exclude_artifacts()
-    assert git_command(root, 'ls-files', '--', '.foragent') == '.foragent/acceptance-exclusions.json'
+    assert read_exclusions(git, git_history.tip) == []
+    assert not git_command(root, 'ls-files', '--', '.foragent')
+
+
+def exclusion_attempt(git_history, tmp_path, monkeypatch, excluded):
+    from foragent import ci_mode
+    from foragent.git import GitRepo
+    from runner_support import import_index
+
+    root = git_history.clone
+    commands = []
+    real_git = GitRepo(root)
+
+    def run(args):
+        commands.append(args)
+        if 'commit' in args:
+            import_index(root, args[-1])
+            return ''
+        return real_git._call(args)
+
+    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: excluded)
+    attempt = SimpleNamespace(git=GitRepo(root, run), worktree=root, start_ref=git_history.tip,
+                              ctx=SimpleNamespace(config=Config(checks='ci', test_command='pytest'), repo_root=root),
+                              target_branch='main', log=tmp_path / 'log')
+    return attempt, commands
+
+
+@pytest.mark.parametrize('untrailed_tip', [False, True])
+def test_runner_adds_no_empty_commit_when_exclusions_match(git_history, tmp_path, monkeypatch, untrailed_tip):
+    from foragent.ci_mode import commit_exclusions
+    from runner_support import import_index
+
+    attempt, commands = exclusion_attempt(git_history, tmp_path, monkeypatch, [])
+    import_index(attempt.worktree, f'Existing selection\n\n{EXCLUSIONS_TRAILER}: []')
+    if untrailed_tip:
+        import_index(attempt.worktree, 'External checkpoint without a trailer')
+    head = attempt.git.head_sha()
+    commit_exclusions(attempt, 'Issue title (#1)')
+    assert attempt.git.head_sha() == head
+    assert not any('commit' in args for args in commands)
+
+
+@pytest.mark.parametrize('previous', ['[]', None, 'invalid'])
+def test_runner_adds_exactly_one_empty_commit_when_exclusions_change(git_history, tmp_path, monkeypatch, previous):
+    from foragent.ci_mode import commit_exclusions
+    from runner_support import import_index
+
+    excluded = ['tests/acceptance/test_z.py', 'tests/acceptance/test_a.py', 'tests/acceptance/test_z.py']
+    attempt, commands = exclusion_attempt(git_history, tmp_path, monkeypatch, excluded)
+    message = 'Old selection' + (f'\n\n{EXCLUSIONS_TRAILER}: {previous}' if previous is not None else '')
+    import_index(attempt.worktree, message)
+    tree = attempt.git.staged_tree_sha()
+    commit_exclusions(attempt, 'Issue title (#1)')
+    head = attempt.git.head_sha()
+    commit_exclusions(attempt, 'Issue title (#1)')
+    commits = [args for args in commands if 'commit' in args]
+    assert len(commits) == 1 and '--allow-empty' in commits[0]
+    assert commits[0][-1] == (f'Issue title (#1)\n\n{EXCLUSIONS_TRAILER}: '
+                             '["tests/acceptance/test_a.py","tests/acceptance/test_z.py"]')
+    assert read_exclusions(attempt.git, attempt.start_ref) == sorted(set(excluded))
+    assert attempt.git.head_sha() == head and attempt.git.staged_tree_sha() == tree
+    assert not (attempt.worktree / '.foragent/acceptance-exclusions.json').exists()
+
+
+def test_runner_carries_exclusions_on_the_content_commit(git_history, tmp_path, monkeypatch):
+    from foragent.ci_mode import commit_exclusions
+
+    attempt, commands = exclusion_attempt(git_history, tmp_path, monkeypatch, [])
+    (attempt.worktree / 'feature.py').write_text('VALUE = 1\n')
+    attempt.git.stage_changes()
+    commit_exclusions(attempt, 'Issue title (#1)')
+    commit_exclusions(attempt, 'Issue title (#1)')
+    commits = [args for args in commands if 'commit' in args]
+    assert len(commits) == 1 and '--allow-empty' not in commits[0]
+    assert read_exclusions(attempt.git, attempt.start_ref) == []
+
+
+def test_runner_carries_current_exclusions_on_its_base_merge(git_history, tmp_path, monkeypatch):
+    from conftest import git_command
+    from foragent import run_conflicts
+    from foragent.ci_mode import commit_exclusions
+
+    excluded = []
+    attempt, commands = exclusion_attempt(git_history, tmp_path, monkeypatch, excluded)
+    attempt.n, attempt.issue = 1, SimpleNamespace(title='Issue title')
+    (attempt.worktree / 'feature.py').write_text('VALUE = 1\n')
+    attempt.git.stage_changes()
+    commit_exclusions(attempt, 'Issue title (#1)')
+    previous_head = attempt.git.head_sha()
+    git_history.update({'docs/new.md': 'Another issue merged\n'})
+    git_command(attempt.worktree, 'fetch', '-q', 'origin')
+    attempt.start_ref = git_history.tip
+    excluded.append('tests/acceptance/test_new.py')
+    monkeypatch.setattr(run_conflicts, '_inject_lane_skills', lambda *args: None)
+    commands.clear()
+    assert run_conflicts._merge_moved_base(attempt, attempt.start_ref) == []
+    commit_exclusions(attempt, 'Issue title (#1)')
+    commits = [args for args in commands if 'commit' in args]
+    assert len(commits) == 1 and '--allow-empty' not in commits[0]
+    parents = git_command(attempt.worktree, 'rev-list', '--parents', '-1', 'HEAD').split()[1:]
+    assert parents == [previous_head, git_history.tip]
+    assert read_exclusions(attempt.git, attempt.start_ref) == excluded
+
+
+@pytest.mark.parametrize('value', ['null', '{}', '[1]', '["z","a"]', '["a","a"]', '', '[]\n'
+                                f'{EXCLUSIONS_TRAILER}: []'])
+@pytest.mark.parametrize('protocol', ['trailer', 'legacy-file'])
+def test_shard_rejects_invalid_or_duplicate_exclusion_trailers(git_history, monkeypatch, value, protocol):
+    from conftest import git_command
+    from foragent import ci_shard
+    from runner_support import import_index
+
+    root = git_history.clone
+    legacy_file = root / '.foragent/acceptance-exclusions.json'
+    legacy_file.parent.mkdir()
+    legacy_file.write_text(value if protocol == 'legacy-file' else '[]')
+    git_command(root, 'add', '-f', '.foragent/acceptance-exclusions.json')
+    message = 'Bad legacy selection' if protocol == 'legacy-file' else f'Bad selection\n\n{EXCLUSIONS_TRAILER}: {value}'
+    import_index(root, message)
+    legacy_file.write_text('[]')
+    for key, data in {'FA_CHECKOUT': str(root), 'FA_BASE_SHA': git_history.tip,
+                      'FA_HEAD_SHA': git_command(root, 'rev-parse', 'HEAD')}.items():
+        monkeypatch.setenv(key, data)
+    with pytest.raises(ValueError):
+        ci_shard.main()
 
 
 def test_fork_check_results_are_unusable_without_fetching_checks():
@@ -383,7 +511,6 @@ def test_local_mode_generated_workflow_does_not_require_ci_inputs(monkeypatch, t
 
 def test_shard_without_head_exclusions_succeeds_without_a_report(tmp_path, monkeypatch):
     from foragent import ci_shard
-    from foragent.ci_workflow import EXCLUSIONS
 
     artifact = tmp_path / 'shard-0.json'
     output = tmp_path / 'github-output'
@@ -391,29 +518,56 @@ def test_shard_without_head_exclusions_succeeds_without_a_report(tmp_path, monke
     for key, value in {'FA_CHECKOUT': str(tmp_path), 'FA_BASE_SHA': 'base', 'FA_HEAD_SHA': 'head',
                        'FA_REPORT_FILE': str(artifact), 'GITHUB_OUTPUT': str(output)}.items():
         monkeypatch.setenv(key, value)
-    assert not (tmp_path / EXCLUSIONS).exists()
     calls = []
 
     def git(args, **kwargs):
         calls.append(args)
         assert kwargs['cwd'] == tmp_path
-        assert args == ['git', 'rev-parse', 'HEAD'] or args[1:3] in (['worktree', 'add'], ['worktree', 'remove'])
-        return SimpleNamespace(stdout='head\n')
+        if args == ['git', 'rev-parse', 'HEAD']:
+            return SimpleNamespace(stdout='head\n')
+        if args == ['git', 'rev-parse', 'HEAD:.foragent/acceptance-exclusions.json']:
+            raise subprocess.CalledProcessError(128, args, stderr='path does not exist in HEAD')
+        assert args[1:3] == ['log', '--first-parent'] and args[-1] == 'base..HEAD'
+        return SimpleNamespace(stdout='\0\0\n')
 
     monkeypatch.setattr(ci_shard.subprocess, 'run', git)
     monkeypatch.setattr(ci_shard, 'load_config', lambda *args, **kwargs: Config(checks='ci', test_command='pytest'))
     monkeypatch.setattr(ci_shard, 'measure', lambda *args: pytest.fail('non-CI-mode head was measured'))
     assert ci_shard.main() is None
-    assert calls == [['git', 'rev-parse', 'HEAD']]
+    assert len(calls) == 3
     assert not artifact.exists()
     assert output.read_text() == 'existing=value\n'
+
+
+@pytest.mark.parametrize('staged', [False, True], ids=['worktree', 'index'])
+def test_shard_does_not_inherit_a_trailer_from_the_base_or_read_a_stale_file(git_history, tmp_path, monkeypatch, capsys, staged):
+    from conftest import git_command
+    from foragent import ci_shard
+
+    git_history.update({}, message=f'Base selection\n\n{EXCLUSIONS_TRAILER}: []')
+    base = git_history.tip
+    git_history.update({})
+    git_command(git_history.clone, 'fetch', '-q', 'origin')
+    git_command(git_history.clone, 'merge', '-q', '--ff-only', 'origin/main')
+    legacy_file = git_history.clone / '.foragent/acceptance-exclusions.json'
+    legacy_file.parent.mkdir()
+    legacy_file.write_text('[]')
+    if staged:
+        git_command(git_history.clone, 'add', '-f', '.foragent/acceptance-exclusions.json')
+    artifact = tmp_path / 'unexpected.json'
+    for key, value in {'FA_CHECKOUT': str(git_history.clone), 'FA_BASE_SHA': base,
+                       'FA_HEAD_SHA': git_history.tip, 'FA_REPORT_FILE': str(artifact)}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(ci_shard, 'measure', lambda *args: pytest.fail('No branch trailer was present'))
+    ci_shard.main()
+    assert not artifact.exists()
+    assert 'PR head has no CI-mode exclusions trailer' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('fallback', [None, 'local'])
 def test_ci_head_without_exclusions_and_reports_holds_or_falls_back(tmp_path, monkeypatch, fallback):
     from conftest import BASE_TIME
     from foragent import ci_mode, ci_local
-    from foragent.ci_workflow import EXCLUSIONS
     from foragent.reasons import Reason
     from foragent.run_attempt import ExecutorStopped
 
@@ -432,7 +586,6 @@ def test_ci_head_without_exclusions_and_reports_holds_or_falls_back(tmp_path, mo
         n=1, ctx=ctx, worktree=tmp_path, target_branch='main', log=tmp_path / 'log',
         git=SimpleNamespace(ref_sha=lambda ref: 'trusted', _call=lambda args: ''),
     )
-    assert not (tmp_path / EXCLUSIONS).exists()
     monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
     monkeypatch.setattr(ci_mode, 'flag', lambda *args: flags.append(args))
     monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base: local.append(base))
@@ -481,7 +634,8 @@ def test_damaged_compressed_report_is_unusable():
         GhTracker('owner/repo', damaged).pr_acceptance_reports('head')
 
 
-def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, monkeypatch):
+@pytest.mark.parametrize('protocol', ['trailer', 'legacy-file'])
+def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, monkeypatch, protocol):
     from conftest import git_command
     from foragent import ci_shard
     from foragent.ci_transport import decode_report
@@ -489,10 +643,14 @@ def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, 
 
     config = yaml.safe_dump({'checks': 'ci', 'ci_shards': 1, 'test_command': f'{sys.executable} -m pytest'})
     keep = 'tests/acceptance/test_keep.py'
-    git_history.update({'.foragent.yml': config, '.foragent/acceptance-exclusions.json': '[]\n',
-                        keep: 'def test_keep(): assert True\n'})
+    git_history.update({'.foragent.yml': config, keep: 'def test_keep(): assert True\n'})
     base = git_history.tip
-    git_history.update({keep: 'def test_keep(): assert False\n'})
+    files = {keep: 'def test_keep(): assert False\n'}
+    message = f'Change\n\n{EXCLUSIONS_TRAILER}: []'
+    if protocol == 'legacy-file':
+        files['.foragent/acceptance-exclusions.json'] = '[]'
+        message = 'Change from an in-flight legacy runner'
+    git_history.update(files, message=message)
     head = git_history.tip
     git_command(git_history.clone, 'fetch', '-q', 'origin')
     git_command(git_history.clone, 'merge', '-q', '--ff-only', 'origin/main')
@@ -513,6 +671,47 @@ def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, 
     assert output.read_text() == 'comparison=true\n'
 
 
+@pytest.mark.parametrize('legacy_value', ['["stale-tree"]', 'invalid JSON'])
+def test_shard_reads_newest_trailer_below_untrailed_merge_and_ignores_stale_tree(git_history, tmp_path, monkeypatch, legacy_value):
+    from conftest import git_command
+    from foragent import ci_shard
+
+    root = git_history.clone
+    git_history.update({'.foragent.yml': 'checks: ci\ntest_command: pytest\nci_shards: 1\n',
+                        '.foragent/acceptance-exclusions.json': legacy_value})
+    base = git_history.tip
+    git_history.update({}, message=f'Old selection\n\n{EXCLUSIONS_TRAILER}: ["old"]')
+    excluded = ['tests/acceptance/test_frozen.py']
+    git_history.update({}, message=f'Current selection\n\n{EXCLUSIONS_TRAILER}: {json.dumps(excluded)}')
+    carrying = git_history.tip
+
+    def commit(parent, message, *extra):
+        return git_command(git_history.origin, '-c', 'user.name=Tests', '-c', 'user.email=tests@example.com',
+                           'commit-tree', f'{parent}^{{tree}}', '-p', parent, *extra, '-m', message)
+
+    side = commit(base, f'Side branch\n\n{EXCLUSIONS_TRAILER}: ["side-branch"]')
+    head = commit(carrying, 'External merge without a trailer', '-p', side)
+    git_command(git_history.origin, 'update-ref', 'refs/heads/main', head)
+    git_command(root, 'fetch', '-q', 'origin')
+    git_command(root, 'merge', '-q', '--ff-only', 'origin/main')
+    artifact = tmp_path / 'shard-0.json'
+    for key, value in {'FA_CHECKOUT': str(root), 'FA_BASE_SHA': base, 'FA_HEAD_SHA': head,
+                       'FA_REPOSITORY': 'owner/repo', 'FA_SHARD': '0', 'FA_SHARDS': '1',
+                       'FA_REPORT_FILE': str(artifact), 'GITHUB_OUTPUT': str(tmp_path / 'outputs')}.items():
+        monkeypatch.setenv(key, value)
+    selections = []
+
+    def measure(checkout, command, acceptance, frozen, directory, side):
+        selections.append(frozen)
+        return {'complete': True, 'collected_ids': [], 'passing_ids': []}
+
+    monkeypatch.setattr(ci_shard, 'measure', measure)
+    ci_shard.main()
+    payload = json.loads(artifact.read_text())
+    assert selections == [excluded, excluded] and payload['excluded'] == excluded
+    assert payload['head_sha'] == head and payload['base_sha'] == base
+
+
 @pytest.mark.parametrize('side', ['base', 'head'])
 @pytest.mark.parametrize('staged', [False, True], ids=['worktree', 'index'])
 def test_shard_rejects_measurement_that_rewrites_tracked_source(git_history, tmp_path, monkeypatch, side, staged):
@@ -530,10 +729,11 @@ def test_shard_rejects_measurement_that_rewrites_tracked_source(git_history, tmp
         test += '    subprocess.run(["git", "add", "src/demo.py"], check=True)\n'
     test += '    assert source.read_text() == "VALUE = 1\\n"\n'
     git_history.update({'.foragent.yml': yaml.safe_dump({'checks': 'ci', 'ci_shards': 1,
-                        'test_command': config.test_command}), '.foragent/acceptance-exclusions.json': '[]\n',
+                        'test_command': config.test_command}),
                         'src/demo.py': f'VALUE = {2 if side == "base" else 1}\n', keep.split('::')[0]: test})
     base = git_history.tip
-    git_history.update({'src/demo.py': f'VALUE = {2 if side == "head" else 1}\n'})
+    git_history.update({'src/demo.py': f'VALUE = {2 if side == "head" else 1}\n'},
+                       message=f'Change\n\n{EXCLUSIONS_TRAILER}: []')
     head = git_history.tip
     git_command(git_history.clone, 'fetch', '-q', 'origin')
     git_command(git_history.clone, 'merge', '-q', '--ff-only', 'origin/main')
@@ -749,11 +949,12 @@ def test_head_configuration_cannot_erase_baseline_scope(git_history, tmp_path, m
     config = Config(checks='ci', ci_shards=1, test_command=f'{sys.executable} -m pytest')
     keep = 'tests/acceptance/test_keep.py::test_keep'
     git_history.update({'.foragent.yml': yaml.safe_dump({'checks': 'ci', 'ci_shards': 1,
-                       'test_command': config.test_command}), '.foragent/acceptance-exclusions.json': '[]',
+                       'test_command': config.test_command}),
                        keep.split('::')[0]: 'def test_keep(): assert True\n'})
     base = git_history.tip
     git_history.update({'.foragent.yml': 'checks: local\nacceptance_dir: nonexistent\ntest_command: npm test\nci_shards: 1\n',
-                       keep.split('::')[0]: 'def test_keep(): assert False\n'})
+                       keep.split('::')[0]: 'def test_keep(): assert False\n'},
+                       message=f'Change\n\n{EXCLUSIONS_TRAILER}: []')
     head = git_history.tip
     git_command(git_history.clone, 'fetch', '-q', 'origin')
     git_command(git_history.clone, 'merge', '-q', '--ff-only', 'origin/main')
@@ -840,7 +1041,8 @@ def test_base_local_or_non_pytest_configuration_skips_ci_measurement(git_history
 
     git_history.update({'.foragent.yml': yaml.safe_dump(settings)})
     base = git_history.tip
-    git_history.update({'.foragent.yml': 'checks: ci\ntest_command: uv run pytest\n'})
+    git_history.update({'.foragent.yml': 'checks: ci\ntest_command: uv run pytest\n'},
+                       message=f'Change\n\n{EXCLUSIONS_TRAILER}: []')
     git_command(git_history.clone, 'fetch', '-q', 'origin')
     git_command(git_history.clone, 'merge', '-q', '--ff-only', 'origin/main')
     monkeypatch.setenv('FA_CHECKOUT', str(git_history.clone))
@@ -878,10 +1080,10 @@ def test_changed_acceptance_workflow_requires_local_comparison_even_with_fabrica
     reads = []
 
     def forged_checks(head):
-        from foragent.ci_workflow import EXCLUSIONS
+        from foragent.git import GitRepo
 
         reads.append(head)
-        excluded = json.loads((case.store.worktree_path(1) / EXCLUSIONS).read_text())
+        excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), case.history.tip)
         for check in forged:
             check['run']['head_sha'] = check['artifact']['workflow_run']['head_sha'] = head
             payload = check['report']
@@ -984,7 +1186,7 @@ def test_undetected_test_command_uses_local_path_and_invokes_worker(run_case):
 @pytest.mark.parametrize('change', ['producer', 'regression', 'missing', 'base', 'head', 'scope', 'infrastructure'])
 def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_case, monkeypatch, reviewed, change):
     from foragent import runner
-    from foragent.ci_workflow import EXCLUSIONS
+    from foragent.git import GitRepo
     from conftest import git_command
 
     case = run_case
@@ -1015,7 +1217,7 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
         heads.add(head)
         if changed[0] and change == 'missing':
             return []
-        excluded = json.loads((case.store.worktree_path(1) / EXCLUSIONS).read_text())
+        excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), case.history.tip)
         values = [report(), report(1)]
         for value in values:
             value['run']['head_sha'] = value['artifact']['workflow_run']['head_sha'] = head
