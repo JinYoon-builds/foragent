@@ -2828,3 +2828,41 @@ def test_tick_without_ready_work_still_applies_machine_parallel_ceiling(ctx):
     assert not ctx.start_runs
     tick(ctx)
     assert capacity.read_state(ctx.store)["parallel"] == 2
+
+
+def test_tick_during_github_wait_still_applies_machine_ceilings_once(ctx, monkeypatch):
+    from foragent import capacity
+
+    write_machine_yml(max_parallel=2, test_slots=1)
+    capacity.write_state(ctx.store, 5, NOW - timedelta(hours=1))
+    root = capacity.machine_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / capacity.TEST_SLOTS_FILE).write_text(json.dumps({"slots": 3, "changed_at": NOW.isoformat()}))
+    ctx.store.pause_github(NOW + timedelta(minutes=30))
+    samples = []
+    monkeypatch.setattr("foragent.scheduler.machine_load",
+                        lambda: samples.append(1) or capacity.LoadSample("normal", 0.0, 0))
+    report = tick(ctx)
+    assert report.skipped and "GitHub rate limit" in report.skipped
+    assert capacity.read_state(ctx.store)["parallel"] == 2
+    assert capacity.read_test_slots()["slots"] == 1
+    assert samples == [1], "one sensor sample and one budget update per tick"
+
+
+def test_rate_limit_error_after_budgets_does_not_apply_them_twice(ctx, monkeypatch):
+    from foragent import capacity, scheduler
+    from foragent.scheduler_start import _apply_budgets
+
+    calls = []
+    monkeypatch.setattr("foragent.scheduler.machine_load",
+                        lambda: calls.append(1) or capacity.LoadSample("normal", 0.0, 0))
+
+    def locked(context):
+        context._budget_sample = None
+        _apply_budgets(context, {})
+        raise TrackerError("API rate limit exceeded")
+
+    monkeypatch.setattr(scheduler, "_tick_locked", locked)
+    monkeypatch.setattr(scheduler.orch_github, "pause", lambda context, exc: NOW + timedelta(minutes=5))
+    assert "GitHub rate limit" in tick(ctx).skipped
+    assert calls == [1]

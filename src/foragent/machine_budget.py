@@ -62,8 +62,7 @@ def read() -> MachineBudget:
         return MachineBudget(values, sources)
     except (OSError, UnicodeDecodeError, yaml.YAMLError):
         data = False  # Unreadable: every key is invalid.
-    if data is None:
-        data = {}  # An empty file sets nothing.
+    # Not a mapping (a top-level null or an empty file included): every key is invalid.
     if not isinstance(data, dict):
         return MachineBudget(values, dict.fromkeys(KEYS, "invalid"))
     for key in KEYS:

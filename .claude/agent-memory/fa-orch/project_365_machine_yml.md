@@ -14,3 +14,5 @@ metadata:
 - A tick that starts nothing still calls `_machine_budget` so capacity.json follows machine.yml and pressure.
 - Repo `test_slots`/`max_parallel` only limit own admission (`effective_test_slots`, `_has_slot`). Repo floors are ignored; `gate status` prints a line when `.foragent.yml` contains a floor key (`status["repo_floors_ignored"]`). Human lines live in `messages/machine_budget.py`.
 - Unit tests that set floors write machine.yml (`write_machine_yml` helpers in test_capacity/test_scheduler).
+- Every tick applies the budgets exactly once via `scheduler_start._apply_budgets(ctx, ready)`, GitHub waits and rate-limit errors included; `ctx._budget_sample` (reset at the start of `tick()` and `_tick_locked()`) prevents a second AIMD step when a rate-limit error follows the update.
+- A top-level YAML null or an empty machine.yml is "not a mapping": every key is invalid (reviewer point).

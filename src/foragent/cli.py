@@ -468,7 +468,7 @@ def _print_machine_budget(status: dict[str, Any], language: str) -> None:
     parts = []
     for key in machine_budget.KEYS:
         value = budget[key]["value"]
-        parts.append(text("machine_budget_value", language, key=key,
+        parts.append(text("machine_budget_value", language, name=key,
                           value=text("machine_budget_none", language) if value is None else value,
                           source=text(f"machine_budget_source_{budget[key]['source']}", language)))
     print(text("machine_budget_line", language, values=", ".join(parts)))

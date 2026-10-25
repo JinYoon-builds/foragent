@@ -30,6 +30,27 @@ def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
     return any(ctx.store.executor_paused(name, now) for name in {config.executor, resolved_reviewer(config)})
 
 
+def _apply_budgets(
+    ctx: TickContext, ready: dict[str, list[int]], *, workers: bool = True,
+) -> tuple[str, float]:
+    """Apply machine.yml and pressure to the shared budgets once per tick; return its sensor sample.
+
+    Every tick runs this, a GitHub wait included. ``workers=False`` leaves the
+    worker budget to the caller, which sizes it with this sample right away.
+    """
+    if (sample := getattr(ctx, "_budget_sample", None)) is not None:
+        return sample  # Already applied in this tick.
+    sample, machine = scheduler.machine_load(), machine_budget.values()
+    ctx._budget_sample = sample
+    scheduler.update_test_slots(
+        machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
+        swapins=getattr(sample, "swapins", None), floor=machine["test_slots_floor"],
+    )
+    if workers:
+        scheduler._machine_budget(ctx, ready, sample)
+    return sample
+
+
 def _machine_budget(
     ctx: TickContext, ready: dict[str, list[int]], sample: tuple[str, float] | None = None,
 ) -> int:

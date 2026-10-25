@@ -3,7 +3,7 @@
 MESSAGES = {
     "en": {
         "machine_budget_line": "Machine budget (machine.yml): {values}",
-        "machine_budget_value": "{key} {value} ({source})",
+        "machine_budget_value": "{name} {value} ({source})",
         "machine_budget_none": "none",
         "machine_budget_source_machine": "machine",
         "machine_budget_source_default": "default",
@@ -15,7 +15,7 @@ MESSAGES = {
     },
     "ko": {
         "machine_budget_line": "기계 예산(machine.yml): {values}",
-        "machine_budget_value": "{key} {value} ({source})",
+        "machine_budget_value": "{name} {value} ({source})",
         "machine_budget_none": "없음",
         "machine_budget_source_machine": "machine",
         "machine_budget_source_default": "기본값",

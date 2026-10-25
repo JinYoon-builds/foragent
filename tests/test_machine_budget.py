@@ -44,11 +44,6 @@ def test_file_values_win_and_missing_keys_use_defaults():
     assert report()["test_slots_floor"]["source"] == "default"
 
 
-def test_empty_file_sets_nothing():
-    write("")
-    assert {item["source"] for key, item in report().items()} == {"default"}
-
-
 @pytest.mark.parametrize("value", ["0", "-1", "null", "two", "1.5", "true", "false", "[1]"])
 def test_invalid_value_marks_only_its_key_invalid(value):
     write(f"test_slots: {value}\nmax_parallel: 3\n")
@@ -57,7 +52,8 @@ def test_invalid_value_marks_only_its_key_invalid(value):
     assert result["max_parallel"] == {"value": 3, "source": "machine"}
 
 
-@pytest.mark.parametrize("text", ["a: [\n", "- 1\n", "just text\n"])
+# A top-level null (also an empty file) is not a mapping either.
+@pytest.mark.parametrize("text", ["a: [\n", "- 1\n", "just text\n", "null\n", "~\n", ""])
 def test_unreadable_file_marks_every_key_invalid(text):
     write(text)
     result = report()
@@ -113,3 +109,30 @@ def test_lower_ceiling_clamps_stored_test_slots_at_once_without_decreased_at():
     assert capacity.update_test_slots(3, NOW + timedelta(seconds=1), pressure="warn",
                                       load_per_cpu=0.1, swapins=4) == 2
 
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_status_prints_machine_values_unknown_keys_and_ignored_repo_floors(tmp_path, capsys, language):
+    from foragent import cli
+
+    write("test_slots: 3\nparallel_floor: 0\nturbo: 1\n")
+    (tmp_path / ".foragent.yml").write_text("test_slots_floor: 2\n", encoding="utf-8")
+    status = {"machine_budget": report(), "repo_floors_ignored": cli._repo_floor_keys(tmp_path)}
+    cli._print_machine_budget(status, language)
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 3
+    assert "test_slots 3" in lines[0] and "max_parallel" in lines[0]
+    assert "turbo" in lines[1]
+    assert "test_slots_floor" in lines[2]
+
+
+def test_status_omits_floor_line_when_repository_sets_no_floor(tmp_path, capsys):
+    from foragent import cli
+
+    (tmp_path / ".foragent.yml").write_text("test_slots: 4\n", encoding="utf-8")
+    assert cli._repo_floor_keys(tmp_path) == []
+    cli._print_machine_budget({"machine_budget": report(), "repo_floors_ignored": []}, "en")
+    assert capsys.readouterr().out.splitlines() == [
+        "Machine budget (machine.yml): test_slots 2 (default), test_slots_floor 1 (default), "
+        "parallel_floor 1 (default), max_parallel none (default)",
+    ]
