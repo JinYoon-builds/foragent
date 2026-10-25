@@ -53,14 +53,14 @@ def checked_tick(case, table):
 
 
 def assert_one_listing(table, stops=False):
-    # Routine liveness shares one snapshot. A tick that stops anything may take one
-    # more fresh listing, shared by every stop in that tick, because the snapshot can
-    # be minutes old and miss a child forked after it (that child would otherwise be
-    # orphaned to pid 1). A tick therefore lists at most twice, however many trees stop.
-    limit = 2 if stops else 1
-    assert table.list_calls <= limit, (
-        f"One tick must share one process-table snapshot, plus one fresh listing shared by all stops "
-        f"(stops={bool(stops)}); got {table.list_calls} listings"
+    # Routine positive liveness checks and prune candidates share one tick snapshot.
+    # Destructive or negative decisions (stop, kill, gone/finish, cleanup, runner death)
+    # keep listing fresh, because a cached listing can be minutes old; they have no
+    # fixed count. A tick that stops, finishes or cleans up nothing lists exactly once.
+    if stops:
+        return
+    assert table.list_calls <= 1, (
+        f"A tick that stops nothing must share one process-table snapshot; got {table.list_calls} listings"
     )
 
 
