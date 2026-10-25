@@ -802,3 +802,26 @@ def test_facade_globals_patched_on_foragent_state_reach_the_split_implementation
                                 "updated_at": None, "is_pull_request": False})()
     store.refresh_local_issues([issue], [], {}, NOW)
     assert facts == [issue]
+
+
+def test_merge_facts_keep_unmerged_runs_null_and_reset_on_a_new_record(store):
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.update_run(1, last_review_pass_at=NOW.isoformat())
+    store.record_merge_lock(1, 7)
+    run = store.get_run(1)
+    assert run.review_pass_to_merge_seconds is None
+    assert run.merge_lock_held_seconds is None
+    store.record_merge(1, NOW + timedelta(seconds=20))
+    store.record_merge_lock(1, 3)
+    store.finish_run(1, "merged")
+    saved = json.loads((store.root / "runs/1.json").read_text())
+    assert saved["review_pass_to_merge_seconds"] == 20
+    assert saved["merge_lock_held_seconds"] == 10
+    restarted = store.start_run(1, branch="branch", worktree="worktree")
+    assert restarted.last_review_pass_at is None
+    assert restarted.review_pass_to_merge_seconds is None
+    assert restarted.merge_lock_held_seconds is None
+    store.record_merge(1, NOW)
+    store.record_merge_lock(1, 2)
+    assert store.get_run(1).review_pass_to_merge_seconds is None
+    assert store.get_run(1).merge_lock_held_seconds == 2

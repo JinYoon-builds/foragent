@@ -228,7 +228,6 @@ def test_clean_fresh_base_rechecks_ci_and_merges_new_sha_without_review(run_case
     if batch:
         batch_setup(c)
     heads = []
-    statuses = iter(["pass", "pending", "pass"])
 
     def checks(pr):
         heads.append(c.tracker.pr_head_sha(pr))
@@ -237,12 +236,13 @@ def test_clean_fresh_base_rechecks_ci_and_merges_new_sha_without_review(run_case
                 seed_batch(c, {"parallel.txt": "fresh"})
             else:
                 c.history.update({"parallel.txt": "fresh"})
-        return next(statuses)
+        head = heads[-1]
+        return "pending" if head != heads[0] and heads.count(head) == 1 else "pass"
 
     monkeypatch.setattr(c.tracker, "pr_checks", checks)
     assert run_issue(1, c.ctx) == "merged"
     assert len(calls) == 1 and len(c.executor.calls) == 1
-    assert len(heads) == 3 and heads[0] != heads[1] == heads[2]
+    assert len(heads) == 4 and heads[0] != heads[1] == heads[2] == heads[3]
     assert c.tracker.pr_head_sha(c.tracker.merged_prs[0]) == heads[-1]
     assert c.store.log_path(1).read_text().count("Done when command:") == 4
     assert git_command(c.history.origin, "show", "foragent/issue-1:parallel.txt") == "fresh"
@@ -274,10 +274,10 @@ def test_fresh_base_same_line_conflict_is_resolved_in_place_and_merge_commit_is_
             assert GitRepo(root).conflict_paths() == ["cli.py"]
             assert c.store.get_run(1).attempts == 1
             implementation_heads.append(git_command(root, "rev-parse", "HEAD"))
-            # The project merge lock remains held while the implementer resolves conflicts.
+            # Conflict resolution releases the final lock before calling the implementer.
             with (c.store.root / "merge.lock").open("a") as lock:
-                with pytest.raises(BlockingIOError):
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         result = implement(**kwargs)
         if initial and before_push:
             c.move_target()
@@ -301,9 +301,9 @@ def test_fresh_base_same_line_conflict_is_resolved_in_place_and_merge_commit_is_
     assert "Preserve both the features newly added on the base branch and the features for this issue." in prompt
     assert "Do not commit. The runner will stage the resolution and create the merge commit." in prompt
     if before_push:
-        assert c.ci_heads == [c.tracker.pr_head_sha(2)]
+        assert c.ci_heads == [c.tracker.pr_head_sha(2)] * 2
     else:
-        assert len(c.ci_heads) == 3 and c.ci_heads[0] != c.ci_heads[1] == c.ci_heads[2]
+        assert c.ci_heads == [c.ci_heads[0]] + [c.tracker.pr_head_sha(2)] * 3
     assert "attempt 1" in c.tracker.created_prs[0].body
     assert c.store.log_path(1).read_text().count("Done when command:") == 2
     assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == "commands = ['help', 'base', 'issue']"
@@ -394,7 +394,7 @@ def test_conflict_resolution_done_when_failure_uses_remaining_attempt_on_merged_
     assert "Command:" in c.executor.calls[2]["prompt"] and "Resolve the conflict markers" in c.executor.calls[2]["prompt"]
     assert "attempt 1" in c.tracker.created_prs[0].body
     assert c.store.log_path(1).read_text().count("Done when command:") == 3
-    assert c.ci_heads[0] != c.ci_heads[1] == c.ci_heads[2]
+    assert c.ci_heads == [c.ci_heads[0]] + [c.tracker.pr_head_sha(2)] * 3
 
 
 @pytest.mark.parametrize("source", ["implementation", "resolution", "checks"])
@@ -653,15 +653,13 @@ def test_failed_rebuild_blocks_without_more_implementation_or_resolution(conflic
     if failure == "review":
         enable_reviewer(c, ["VERDICT: PASS", "VERDICT: FAIL\ncli.py:1 still broken"])
     if failure in {"ci", "conflict"}:
-        statuses = ["pass", "fail" if failure == "ci" else "pass"]
-
         def ci(pr):
             c.ci_heads.append(c.tracker.pr_head_sha(pr))
             if len(c.ci_heads) == 1:
                 c.move_target()
-            elif failure == "conflict":
+            elif failure == "conflict" and len(set(c.ci_heads)) > 1 and c.ci_heads.count(c.ci_heads[-1]) == 1:
                 c.history.update({"cli.py": "commands = ['help', 'base', 'parallel']\n"})
-            return statuses.pop(0)
+            return "fail" if failure == "ci" and len(set(c.ci_heads)) > 1 else "pass"
 
         monkeypatch.setattr(c.tracker, "pr_checks", ci)
         c.tracker.set_pr_failed_logs(2, "The rebuilt CI failed")
@@ -701,7 +699,7 @@ def test_conflict_budget_survives_ci_repair_and_republishing(conflicting_lanes, 
         c.ci_heads.append(c.tracker.pr_head_sha(pr))
         if len(c.ci_heads) == 1:
             c.move_target()
-        return "fail" if len(c.ci_heads) == 2 else "pass"
+        return "fail" if len(set(c.ci_heads)) == 2 else "pass"
 
     monkeypatch.setattr(c.executor, "run", implement)
     monkeypatch.setattr(c.tracker, "pr_checks", ci)

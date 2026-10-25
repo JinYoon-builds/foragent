@@ -13,6 +13,7 @@ class StateBase:
     def __init__(self, root: Path, now: Callable[[], datetime] | None = None):
         self.root = _state.Path(root)
         self._now = now or (lambda: _state.datetime.now(_state.UTC))
+        self._merge_lock_seconds: dict[tuple[int, str], float] = {}
 
     def _timestamp(self) -> str:
         now = self._now()

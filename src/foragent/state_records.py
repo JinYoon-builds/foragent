@@ -65,3 +65,6 @@ class Run:
     approval_body_sha: str | None = None
     skills_reported: bool = False
     skills_used: list[str] = field(default_factory=list)
+    last_review_pass_at: str | None = None
+    review_pass_to_merge_seconds: float | None = None
+    merge_lock_held_seconds: float | None = None

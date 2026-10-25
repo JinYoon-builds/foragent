@@ -18,15 +18,29 @@ if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
 
 
+def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
+    """Merge a pinned base; let the caller release its lock before resolving conflicts."""
+    _inject_lane_skills(attempt.ctx, attempt.n, attempt.git, target_sha)
+    try:
+        attempt.git.merge_base(target_sha)
+    except GitError:
+        conflicts = attempt.git.conflict_paths()
+        if not conflicts:
+            raise
+        return conflicts
+    return []
+
+
 def _recreate_worktree(attempt: Implementation) -> None:
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree = attempt.worktree
     artifacts = {name: path.read_bytes() for name in ("TRY.md", "REBUTTAL.md")
                  if (path := worktree / ".foragent" / name).is_file()}
+    attempt.start_ref = git.ref_sha(attempt.start_ref)
     ctx.git.remove_worktree(worktree)
     ctx.git.add_worktree(worktree, attempt.branch, attempt.start_ref)
     ctx.store.update_run(n, merge_conflicts=[])
-    _inject_lane_skills(ctx, n, git, f"origin/{attempt.target_branch}")
+    _inject_lane_skills(ctx, n, git, attempt.start_ref)
     for name, content in artifacts.items():
         path = worktree / ".foragent" / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,7 +62,7 @@ def _prepare_target(attempt: Implementation) -> bool:
         ctx.git.ensure_batch_branch(attempt.batch_branch, attempt.base_ref)
     with tempfile.NamedTemporaryFile() as patch:
         git.write_staged_patch(attempt.start_ref, Path(patch.name))
-        attempt.start_ref = f"origin/{destination}"
+        attempt.start_ref = git.ref_sha(f"origin/{destination}")
         attempt.target_branch = destination
         _recreate_worktree(attempt)
         if not _acceptance_matches(n, ctx, git, attempt.approval):
@@ -74,13 +88,13 @@ def _rebuild(attempt: Implementation, exc: ConflictBudgetExhausted) -> str:
     attempt.rebuilt = True
     _append(log, f"Rebuilding issue branch once from latest {attempt.target_branch}.\n{exc}")
     ctx.git.fetch("origin", attempt.target_branch)
-    attempt.start_ref = f"origin/{attempt.target_branch}"
+    attempt.start_ref = git.ref_sha(f"origin/{attempt.target_branch}")
     if not _acceptance_matches(n, ctx, ctx.git, attempt.approval, attempt.start_ref):
         raise ExecutorStopped("hash-mismatch")
     # Bind every rewritten push to the remote head observed before rebuilding.
     # An empty lease means the branch must still be absent.
     attempt.rebuild_lease = git.remote_branch_sha(attempt.branch) or ""
-    _append(log, f"Rebuild target: {attempt.start_ref} ({git.ref_sha(attempt.start_ref)})")
+    _append(log, f"Rebuild target: {attempt.target_branch} ({attempt.start_ref})")
     _recreate_worktree(attempt)
     attempt.paths = []
     run = ctx.store.get_run(n)
@@ -142,12 +156,15 @@ def _resume_implementation(attempt: Implementation) -> bool:
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     conflicts = ctx.store.get_run(n).merge_conflicts
-    if conflicts or not git.is_ancestor(git.ref_sha(attempt.start_ref), git.head_sha()):
+    # Own-path detection and replay follow the current target; publication
+    # keeps the base associated with verification in its own SHA snapshot.
+    attempt.start_ref = git.ref_sha(f"origin/{attempt.target_branch}")
+    if conflicts or not git.is_ancestor(attempt.start_ref, git.head_sha()):
         # A saved implementation must see the same target as its acceptance
         # baseline before the worker starts. Keep its history and reuse the
         # publish path's conflict resolution and rebuild budget.
         with _merge_lock(n, ctx):
-            if not git.is_ancestor(git.ref_sha(attempt.start_ref), git.head_sha()):
+            if not git.is_ancestor(attempt.start_ref, git.head_sha()):
                 try:
                     # A saved partial resolution still needs its marker checks,
                     # even when Git can merge the target without index conflicts.

@@ -9,6 +9,7 @@ import sys
 import time
 
 import pytest
+import yaml
 
 
 from foragent.capacity import write_state
@@ -98,6 +99,14 @@ def record_stop(ctx, callback):
     return stop
 
 
+def write_machine_yml(**values):
+    from foragent import machine_budget
+
+    path = machine_budget.machine_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(values), encoding="utf-8")
+
+
 def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
     ctx.tracker.add_issue(number, f"Issue {number}", body, labels=labels)
     ctx.tracker.record_label(number, "approved", actor)
@@ -107,7 +116,8 @@ def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
 def test_tick_applies_configured_test_slots_floor_without_starting_runs(ctx, monkeypatch, floor, pressure, expected):
     from foragent import capacity
 
-    ctx.config = replace(ctx.config, test_slots=2, test_slots_floor=floor)
+    # The shared slots follow machine.yml only (#365); repository floors no longer reach them.
+    write_machine_yml(test_slots=2, test_slots_floor=floor)
     monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(pressure, 0.5, 60))
     capacity.write_state(ctx.store, 4, NOW)
     assert tick(ctx).skipped is None
@@ -116,7 +126,8 @@ def test_tick_applies_configured_test_slots_floor_without_starting_runs(ctx, mon
     assert len(rows) == 1
     assert rows[0]["wanted"] == 1 and rows[0]["to"] == expected
     assert rows[0]["swapins"] == 60
-    assert capacity.read_state(ctx.store) == {"parallel": 4, "changed_at": NOW.isoformat()}
+    # A tick that starts nothing still applies pressure to the shared worker budget (#365).
+    assert capacity.read_state(ctx.store)["parallel"] == 2
 
 
 @pytest.mark.parametrize("floor,pressure,expected", [(3, "warn", 3), (3, "critical", 1), (1, "warn", 1)])
@@ -124,7 +135,8 @@ def test_tick_applies_configured_parallel_floor_when_starting_workers(ctx, monke
     from foragent import capacity
 
     lanes = {f"lane-{number}": {} for number in range(1, 5)}
-    ctx.config = replace(ctx.config, parallel_floor=floor, max_parallel=3, test_slots=1, lanes=lanes)
+    ctx.config = replace(ctx.config, max_parallel=3, test_slots=1, lanes=lanes)
+    write_machine_yml(parallel_floor=floor)  # The shared worker budget follows machine.yml only (#365).
     for number in range(1, 5):
         approve(ctx, number, labels=[f"lane:lane-{number}"])
     capacity.write_state(ctx.store, 3, NOW)
@@ -2809,3 +2821,53 @@ def test_periodic_tick_300_seconds_later_is_a_refresh_tick_despite_fetch_delay(c
         assert ctx.store.issues_observation()["as_of"] == started.isoformat(), \
             "Each periodic tick refreshes, stamped with its start"
     assert reads == [], "The periodic refresh confirms the earlier reads"
+
+
+def test_tick_without_ready_work_still_applies_machine_parallel_ceiling(ctx):
+    from foragent import capacity, machine_budget
+
+    path = machine_budget.machine_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("max_parallel: 2\n", encoding="utf-8")
+    capacity.write_state(ctx.store, 5, NOW - timedelta(hours=1))
+    assert not ctx.start_runs
+    tick(ctx)
+    assert capacity.read_state(ctx.store)["parallel"] == 2
+
+
+def test_tick_during_github_wait_still_applies_machine_ceilings_once(ctx, monkeypatch):
+    from foragent import capacity
+
+    write_machine_yml(max_parallel=2, test_slots=1)
+    capacity.write_state(ctx.store, 5, NOW - timedelta(hours=1))
+    root = capacity.machine_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / capacity.TEST_SLOTS_FILE).write_text(json.dumps({"slots": 3, "changed_at": NOW.isoformat()}))
+    ctx.store.pause_github(NOW + timedelta(minutes=30))
+    samples = []
+    monkeypatch.setattr("foragent.scheduler.machine_load",
+                        lambda: samples.append(1) or capacity.LoadSample("normal", 0.0, 0))
+    report = tick(ctx)
+    assert report.skipped and "GitHub rate limit" in report.skipped
+    assert capacity.read_state(ctx.store)["parallel"] == 2
+    assert capacity.read_test_slots()["slots"] == 1
+    assert samples == [1], "one sensor sample and one budget update per tick"
+
+
+def test_rate_limit_error_after_budgets_does_not_apply_them_twice(ctx, monkeypatch):
+    from foragent import capacity, scheduler
+    from foragent.scheduler_start import _apply_budgets
+
+    calls = []
+    monkeypatch.setattr("foragent.scheduler.machine_load",
+                        lambda: calls.append(1) or capacity.LoadSample("normal", 0.0, 0))
+
+    def locked(context):
+        context._budget_sample = None
+        _apply_budgets(context, {})
+        raise TrackerError("API rate limit exceeded")
+
+    monkeypatch.setattr(scheduler, "_tick_locked", locked)
+    monkeypatch.setattr(scheduler.orch_github, "pause", lambda context, exc: NOW + timedelta(minutes=5))
+    assert "GitHub rate limit" in tick(ctx).skipped
+    assert calls == [1]
