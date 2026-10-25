@@ -1143,11 +1143,46 @@ def test_view_opens_once_after_all_available_lanes_launch(ctx, monkeypatch):
         assert {run.number: run.pid for run in store.active_runs()} == {1: 7001, 2: 7002}
         opened.append((root, store, language))
 
+    monkeypatch.delenv("FORAGENT_VIEW")
     monkeypatch.setattr("foragent.scheduler.watch_open.open_view", open_view)
     tick(ctx)
     assert opened == [(ctx.repo_root, ctx.store, "ko")]
+    # One attempt per five minutes; a later tick reopens a missing view without a new run.
+    ctx.now = lambda: NOW + timedelta(minutes=4, seconds=59)
     tick(ctx)
     assert len(opened) == 1
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    tick(ctx)
+    assert len(opened) == 2
+    monkeypatch.setattr("foragent.watch_open._running", lambda store: True)
+    ctx.now = lambda: NOW + timedelta(minutes=15)
+    tick(ctx)
+    assert len(opened) == 2
+
+
+def test_view_reopen_skips_idle_repository_off_hours_and_no_start(ctx, monkeypatch):
+    opened = []
+    monkeypatch.delenv("FORAGENT_VIEW")
+    monkeypatch.setattr("foragent.scheduler.watch_open.open_view", lambda *args: opened.append(args))
+    ctx.start_runs = True
+    tick(ctx)
+    assert opened == [], "No active run means no view to reopen"
+    approve(ctx)
+    ctx.start_runs = False
+    tick(ctx)
+    assert opened == [] and ctx.store.active_runs() == []
+    ctx.start_runs = True
+    tick(ctx)
+    assert len(opened) == 1
+    ctx.now = lambda: NOW + timedelta(minutes=10)
+    ctx.start_runs = False
+    tick(ctx)
+    assert len(opened) == 1, "--no-start never opens a view"
+    local_hour = ctx.now().astimezone().hour
+    ctx.config = replace(ctx.config, run_hours=f"{(local_hour + 1) % 24:02d}-{(local_hour + 2) % 24:02d}")
+    ctx.start_runs = True
+    tick(ctx)
+    assert len(opened) == 1, "Outside run_hours never opens a view"
 
 
 @pytest.mark.parametrize("failure", [
@@ -1180,6 +1215,10 @@ def test_view_opener_failure_keeps_all_runs_and_reports_success(ctx, monkeypatch
     assert "레인 화면을 열지 못했어요" in captured.err
     tick(ctx)
     assert capsys.readouterr() == ("", "")
+    # Every failure kind is retried once the spacing has passed.
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    tick(ctx)
+    assert "레인 화면을 열지 못했어요" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("failure", [
@@ -1196,6 +1235,7 @@ def test_view_opener_exception_preserves_tick_report_and_next_tick(ctx, monkeypa
         opened.append((root, store, language))
         raise failure
 
+    monkeypatch.delenv("FORAGENT_VIEW")
     monkeypatch.setattr("foragent.scheduler.watch_open.open_view", fail)
     report = tick(ctx)
     assert report.skipped is None
