@@ -11,7 +11,7 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board, usage_events
+from foragent import board, cuts, usage_events
 from foragent.actions import flag
 from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
@@ -78,9 +78,7 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         result = ctx.poll_hook(execute, poll)
         result.usage = usage  # filled in ``finally`` once the log is complete
         if log.exists():
-            with log.open("rb") as stream:
-                stream.seek(max(offset, log.stat().st_size - 16000))
-                result.log_tail = stream.read().decode("utf-8", errors="replace")[-4000:]
+            result.log_tail = cuts.read_tail(log, offset, 4000, f"executor-log-{offset}.log")
         return result
     finally:
         poll()

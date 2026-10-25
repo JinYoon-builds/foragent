@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from difflib import SequenceMatcher
+from pathlib import Path
 
+from foragent import cuts
 from foragent.issue import ParsedIssue
 
 
@@ -12,7 +14,7 @@ REVIEW_PROMPT = (
     "or would make the Done when commands pass without the goal being met "
     "(weakened checks, special-casing test inputs). Ignore style and nice-to-haves. "
     "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
-    "followed by at most 5 findings, each one line with file:line and the concrete failure."
+    "followed by every finding, each one line with file:line and the concrete failure."
 )
 
 
@@ -26,14 +28,21 @@ def review_scope_rules(acceptance_dir: str) -> str:
 
 def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
+    full_text_dir: Path | None = None,
 ) -> str:
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
         f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
         f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
-        f"\n\nDone when commands:\n{commands}\n\nDiff:\n{diff[:60000]}"
+        f"\n\nDone when commands:\n{commands}\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
         + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
     )
+
+
+def moved_files_section(moved_files: list[str]) -> str:
+    return ("The base branch moved or split files this branch edits (old -> new). "
+            "Carry your edits to the new locations so none are orphaned:\n"
+            + "\n".join(f"- {line}" for line in moved_files))
 
 
 def goal_condition(acceptance_dir: str) -> str:
@@ -52,6 +61,9 @@ def build_prompt(
     acceptance_baseline: tuple[str, ...] = (),
     failure_limit: int | None = 4000,
     skill_catalog: str = "",
+    parent_context: str = "",
+    full_text_dir: Path | None = None,
+    moved_files: list[str] | None = None,
 ) -> str:
     from foragent import runner
 
@@ -69,7 +81,9 @@ def build_prompt(
     prompt = (
         f"You are implementing GitHub issue #{n} in this repository.\n"
         f"{parsed.goal}\n"
-        f"Out of scope (do not do these): {parsed.out_of_scope}\n"
+        + (f"This issue is part of a larger order. Its shared outcome and constraints:\n{parent_context}\n"
+           if parent_context else "")
+        + f"Out of scope (do not do these): {parsed.out_of_scope}\n"
         "The work is accepted only when these commands succeed (they will be run for you afterwards):\n"
         f"{commands}\n"
         "Rules:\n"
@@ -105,7 +119,7 @@ def build_prompt(
         prompt += "\nA reviewer said (verbatim):\n" + reviewer_text
     elif failure:
         prompt += "\nA previous attempt failed. Output of the failing check:\n" + (
-            failure if failure_limit is None else failure[-failure_limit:]
+            failure if failure_limit is None else cuts.tail(failure, failure_limit, full_text_dir, "failure.txt")
         )
     if acceptance_baseline:
         prompt += (
@@ -119,6 +133,8 @@ def build_prompt(
             + "\nPreserve both the features newly added on the base branch and the features for this issue. "
             "Do not commit. The runner will stage the resolution and create the merge commit."
         )
+    if moved_files:
+        prompt += "\n\n" + moved_files_section(moved_files)
     prompt += skill_catalog
     if orchestrator_hint is not None:
         prompt = "Orchestrator hint:\n" + orchestrator_hint + "\n\n" + prompt
@@ -128,7 +144,7 @@ def build_prompt(
 def build_resume_prompt(
     n: int, previous_body: str | None, body: str, failure: str = "", *,
     reviewer_text: str | None = None, orchestrator_hint: str | None = None,
-    merge_conflicts: list[str] | None = None,
+    merge_conflicts: list[str] | None = None, moved_files: list[str] | None = None,
 ) -> str:
     """Deliver exact specification edits and feedback to an existing session."""
     parts = [f"Continue implementing GitHub issue #{n} in this repository."]
@@ -150,4 +166,6 @@ def build_resume_prompt(
         parts.append("Orchestrator hint:\n" + orchestrator_hint)
     if merge_conflicts is not None:
         parts.append("Resolve the conflict markers in these files:\n" + "\n".join(merge_conflicts))
+    if moved_files:
+        parts.append(moved_files_section(moved_files))
     return "\n\n".join(parts)

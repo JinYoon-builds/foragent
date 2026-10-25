@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from foragent import board
+from foragent import board, cuts
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.git import GitError, GitRepo, PublicationError
 from foragent.issue import ParsedIssue, body_hash
@@ -100,7 +100,7 @@ def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
 
 def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str) -> None:
     """Spend one implementation retry, preserving the raw logs from every run."""
-    logs = ctx.tracker.pr_failed_logs(pr)
+    logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=cuts.issue_dir(ctx.store.root, n))
     failure = CIFailure(logs, target_branch)
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     if ctx.tracker.pr_head_sha(pr) != head:
@@ -510,7 +510,7 @@ def _publish_locked(attempt: Implementation) -> str:
 
     def ci_failed() -> None:
         if attempt.rebuilt:
-            logs = ctx.tracker.pr_failed_logs(pr)
+            logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=cuts.issue_dir(ctx.store.root, n))
             _hold_if_not_started(n, ctx, pr, logs)
             raise ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
         _ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)

@@ -304,7 +304,7 @@ def test_approval_exact_body_and_metadata_round_trip(store):
     }
     assert store.load_approval(42) is None
     store.save_approval(42, **values)
-    assert asdict(store.load_approval(42)) == {"number": 42, **values}
+    assert asdict(store.load_approval(42)) == {"number": 42, **values, "parent_context": None}
     snapshot = json.loads((store.root / "approvals/42.json").read_text(encoding="utf-8"))
     assert snapshot == {"number": 42, **values}
     assert [path.name for path in (store.root / "approvals").iterdir()] == ["42.json"]

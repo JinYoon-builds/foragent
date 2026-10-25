@@ -6,17 +6,19 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from foragent import cuts
 from foragent.actions import flag
 from foragent.executors import ExecResult, classify_result
 from foragent.issue import parse_body
 from foragent.labels import attempt_tier, issue_size
 from foragent.reasons import Reason
-from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation
+from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation, WholeFailure
 from foragent.run_baseline import _capture_acceptance_baseline
 from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
 from foragent.run_lane_skills import lane_notes, lane_skill_names, lane_skills
 from foragent.run_skill_catalog import available_skills, catalog_section, parse_skills_used
+from foragent.run_parent import parent_context
 from foragent.run_prompts import build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
 from foragent.run_waits import _phase, _timeout
@@ -47,7 +49,9 @@ class ImplementerSetup:
     missing_skills: list[str] = field(default_factory=list)
 
 
-def implementer_setup(config: Config, lane: str, tier: str, worktree: Path) -> ImplementerSetup:
+def implementer_setup(
+    config: Config, lane: str, tier: str, worktree: Path, full_text_dir: Path | None = None,
+) -> ImplementerSetup:
     """Choose executor, model, lane agent, lane instructions and skills from a lane-adjusted config."""
     native_claude = config.executor == "claude"
     settings = config.tiers[tier]
@@ -57,7 +61,7 @@ def implementer_setup(config: Config, lane: str, tier: str, worktree: Path) -> I
         model = (config.lanes.get(lane, {}) if lane != "main" else {}).get("model") or settings["claude_model"] or model
     else:
         options["effort"] = settings["codex_effort"]
-    agent, notes = lane_notes(config, lane, worktree)
+    agent, notes = lane_notes(config, lane, worktree, full_text_dir)
     missing: list[str] = []
     if native_claude:
         # Claude reads the lane agent itself; its notes are not prepended.
@@ -87,7 +91,7 @@ def _prepare_implementation(
     """Set up an implementer; a throwaway doctor task has no acceptance baseline to keep."""
     from foragent import runner
 
-    approval = ctx.store.load_approval(n)
+    approval = parent_context(ctx, n, ctx.store.load_approval(n))
     parsed = parse_body(approval.body)
     worktree = git.root
     branch = f"foragent/issue-{n}"
@@ -156,7 +160,8 @@ def _implement(
     run = ctx.store.get_run(n)
     tier = attempt_tier(attempt.size, run.attempts)
     ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, str(run.attempts): tier})
-    setup = implementer_setup(ctx.config, run.lane, tier, worktree)
+    full_text_dir = cuts.issue_dir(ctx.store.root, n)
+    setup = implementer_setup(ctx.config, run.lane, tier, worktree, full_text_dir)
     model, notes = setup.model, setup.notes
     attempt.options.update(setup.options)
     attempt.missing_skills.extend(name for name in setup.missing_skills if name not in attempt.missing_skills)
@@ -175,7 +180,10 @@ def _implement(
         orchestrator_hint=hint,
         test_command=test_command,
         acceptance_baseline=attempt.baseline.node_ids if attempt.baseline else (),
-        failure_limit=None if isinstance(failure, CIFailure) else 4000,
+        failure_limit=None if isinstance(failure, (CIFailure, WholeFailure)) else 4000,
+        parent_context=attempt.approval.parent_context or "",
+        full_text_dir=full_text_dir,
+        moved_files=attempt.moved_files,
         skill_catalog=catalog_section(available_skills(ctx.config, fixed)),
     )
     result = _available_executor(
@@ -185,6 +193,7 @@ def _implement(
         resume_prompt=build_resume_prompt(
             n, run.session_body, attempt.approval.body, failure_context,
             reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
+            moved_files=attempt.moved_files,
         ),
         model=model, timeout_s=remaining, log_path=log, **attempt.options,
     )
@@ -193,6 +202,8 @@ def _implement(
     # only once the implementer returns an ordinary execution result.
     if hint is not None and classify_result(result) == "normal":
         hint_path.unlink()
+    if classify_result(result) == "normal":
+        attempt.moved_files.clear()  # named once
     _record_skills_used(n, ctx, result)
     rebuttal = _read_rebuttals(worktree)
     if rebuttal.strip() and rebuttal not in attempt.rebuttals:

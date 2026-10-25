@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from foragent.actions import flag
 from foragent.git import GitError
+from foragent.i18n import text
 from foragent.policy import review_mode_for
 from foragent.reasons import Reason
 from foragent.run_attempt import ConflictBudgetExhausted, ExecutorStopped, PatchReplayError
@@ -18,16 +19,27 @@ if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
 
 
+def _note_moved(attempt: Implementation, moved: list[tuple[str, str]]) -> None:
+    lines = [f"{old} -> {new}" for old, new in moved]
+    lines = [line for line in lines if line not in attempt.moved_files]
+    if lines:
+        attempt.moved_files.extend(lines)
+        _append(attempt.log, text("moved_files_log", attempt.ctx.config.language, files="\n".join(lines)))
+
+
 def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
     """Merge a pinned base; let the caller release its lock before resolving conflicts."""
     _inject_lane_skills(attempt.ctx, attempt.n, attempt.git, target_sha)
+    moved = attempt.git.moved_by(target_sha)
     try:
         attempt.git.merge_base(target_sha)
     except GitError:
+        _note_moved(attempt, moved)
         conflicts = attempt.git.conflict_paths()
         if not conflicts:
             raise
         return conflicts
+    _note_moved(attempt, moved)
     return []
 
 
@@ -165,11 +177,14 @@ def _resume_implementation(attempt: Implementation) -> bool:
         # publish path's conflict resolution and rebuild budget.
         with _merge_lock(n, ctx):
             if not git.is_ancestor(attempt.start_ref, git.head_sha()):
+                moved = git.moved_by(attempt.start_ref)
                 try:
                     # A saved partial resolution still needs its marker checks,
                     # even when Git can merge the target without index conflicts.
                     git.merge_base(attempt.start_ref, commit=not conflicts)
+                    _note_moved(attempt, moved)
                 except GitError:
+                    _note_moved(attempt, moved)
                     unmerged = git.conflict_paths()
                     if not unmerged:
                         raise

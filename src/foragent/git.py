@@ -302,6 +302,30 @@ class GitRepo:
         self._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
                     "merge", "--no-edit", *([] if commit else ["--no-commit"]), target])
 
+    def moved_by(self, target: str) -> list[tuple[str, str]]:
+        """Files this branch changed that ``target`` renamed or copied (split) since the merge base.
+
+        Git rename and copy detection pairs each such file with where its content went.
+        """
+        try:
+            base = self._call(["merge-base", "HEAD", target]).strip()
+        except GitError:
+            return []
+        mine = {path for path in self._call(["diff", "--name-only", "--no-renames", "-z", base, "HEAD"]).split("\0")
+                if path}
+        if not mine:
+            return []
+        fields = iter(self._call(["diff", "--name-status", "-M", "-C", "-z", base, target]).split("\0"))
+        moved = []
+        for status in fields:
+            if status[:1] in ("R", "C"):
+                old, new = next(fields, ""), next(fields, "")
+                if old in mine:
+                    moved.append((old, new))
+            elif status:
+                next(fields, None)
+        return moved
+
     def merge_in_progress(self) -> bool:
         path = Path(self._call(["rev-parse", "--git-path", "MERGE_HEAD"]).strip())
         return (path if path.is_absolute() else self.root / path).is_file()

@@ -31,6 +31,9 @@ class Approval:
     acceptance_blobs: dict[str, str]
     approved_by: str
     approved_at: str
+    # A Foragent order parent's shared outcome and constraints, frozen once
+    # per approval; None means not read yet, "" means there is none.
+    parent_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -526,11 +529,14 @@ class StateStore:
     def save_approval(
         self, number: int, *, body: str, body_sha: str,
         acceptance_blobs: dict[str, str], approved_by: str, approved_at: str,
+        parent_context: str | None = None,
     ) -> None:
         snapshot = {
             "number": number, "body": body, "body_sha": body_sha, "acceptance_blobs": acceptance_blobs,
             "approved_by": approved_by, "approved_at": approved_at,
         }
+        if parent_context is not None:
+            snapshot["parent_context"] = parent_context
         self._write_mapping(self.root / "approvals" / f"{number}.json", Approval, snapshot)
 
     def load_approval(self, number: int) -> Approval | None:

@@ -4,11 +4,14 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import json
+from pathlib import Path
 import re
 import subprocess
 import time
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
+
+from foragent import cuts
 
 
 IssueState = Literal["open", "closed"]
@@ -101,7 +104,7 @@ class Tracker(Protocol):
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
-    def pr_failed_logs(self, pr: int) -> str: ...
+    def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash") -> None: ...
 
@@ -668,7 +671,7 @@ class FakeTracker:
     def set_pr_failed_logs(self, pr: int, text: str) -> None:
         self._pr_failed_logs[pr] = text
 
-    def pr_failed_logs(self, pr: int) -> str:
+    def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str:
         return self._pr_failed_logs.get(pr, "")
 
     def set_pr_head_sha(self, pr: int, sha: str) -> None:
@@ -1026,7 +1029,7 @@ class GhTracker:
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
 
-    def pr_failed_logs(self, pr: int) -> CIEvidence:
+    def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.
 
         ``not_started`` is true only when every failed job never ran (no steps or a
@@ -1075,7 +1078,7 @@ class GhTracker:
                     if "log not found" not in f"{exc}\n{exc.stdout}".lower():
                         raise
                     output = f"(failed log unavailable: {str(exc).strip()})"
-                lines.append(output[-4000:])
+                lines.append(cuts.tail(output, 4000, full_text_dir, f"ci-run-{run['id']}.log"))
             parts.append("\n".join(lines))
         return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
 

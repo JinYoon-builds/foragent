@@ -10,12 +10,14 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
+from foragent import cuts
 from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
 from foragent.reasons import Reason
+from foragent.run_attempt import WholeFailure
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
 from foragent.run_execution import _available_executor
 from foragent.run_prompts import build_review_prompt, review_scope_rules
@@ -39,7 +41,7 @@ def parse_review(message: str) -> ReviewResult:
     lines = message.splitlines()
     for index, line in enumerate(lines):
         if match := re.fullmatch(r"VERDICT: (PASS|FAIL)\s*", line):
-            findings = [line for line in lines[index + 1:] if line.strip()][:5]
+            findings = [line for line in lines[index + 1:] if line.strip()]
             return ReviewResult(match[1], "\n".join(findings))
     return ReviewResult("UNUSABLE", "", ("reviewer gave no verdict",))
 
@@ -136,6 +138,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
                 reviewer=True,
                 prompt="" if reviewer == "claude" else build_review_prompt(
                     parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
+                    full_text_dir=cuts.issue_dir(ctx.store.root, n),
                 ),
                 model=ctx.config.reviewer_model, timeout_s=runner._remaining(n, ctx),
                 log_path=ctx.store.log_path(n), **options,
@@ -223,7 +226,7 @@ def _review_implementation(attempt: Implementation) -> None:
             attempt.reviewer_text = review.raw
             attempt.failure = "A reviewer said (verbatim):\n" + review.raw
         else:
-            attempt.failure = review.findings or "Reviewer found defects (no findings provided)."
+            attempt.failure = WholeFailure(review.findings or "Reviewer found defects (no findings provided).")
         findings = _normalized_findings(review) if _read_rebuttals(worktree).strip() else set()
         if findings & attempt.previous_rebutted_findings:
             attempt.review_hold = True

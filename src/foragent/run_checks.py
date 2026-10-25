@@ -18,14 +18,14 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import capacity
+from foragent import capacity, cuts
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config
 from foragent.git import GitRepo
 from foragent.issue import ParsedIssue, has_machine_check, parse_body
 from foragent.reasons import Reason
 from foragent.records import load_record
-from foragent.run_attempt import AttemptFailure, ExecutorStopped
+from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
 from foragent.run_execution import _claude_run_dir
 from foragent.run_waits import _phase, _progress, _test_slot, _timeout
 from foragent.state import Approval
@@ -75,9 +75,7 @@ def _check(
 
     # A quiet check is still running; keep the scheduler informed while it waits.
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
-    with log.open("rb") as stream:
-        stream.seek(max(offset, log.stat().st_size - 16000))
-        tail = stream.read().decode("utf-8", errors="replace")[-4000:]
+    tail = cuts.read_tail(log, offset, 4000, f"check-output-{offset}.log")
     _append(log, f"\nCheck exit_code={code}, timed_out={timed_out}\nOutput tail:\n{tail}")
     return CheckResult(command, code, timed_out, tail)
 
@@ -383,8 +381,11 @@ def _verify_implementation(attempt: Implementation) -> str:
             continue
         failures = [check for check in attempt.checks if check.exit_code != 0 or check.timed_out]
         if failures:
-            check = failures[-1]
-            return f"Command: {check.command}\n{check.output}" + ("\nCheck timed out." if check.timed_out else "")
+            # Every failing command reaches the implementer, each with its own tail.
+            return WholeFailure("\n\n".join(
+                f"Command: {check.command}\n{check.output}" + ("\nCheck timed out." if check.timed_out else "")
+                for check in failures
+            ))
         try:
             _check_publication(git, attempt.target_branch)
         except AttemptFailure as exc:

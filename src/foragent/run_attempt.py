@@ -43,6 +43,10 @@ class CIFailure(AttemptFailure):
         self.target_branch = target_branch
 
 
+class WholeFailure(str):
+    """Failure text whose parts are already limited (each check tail, every review finding); kept whole."""
+
+
 class ExecutorStopped(Exception):
     def __init__(self, outcome: str, detail: str = ""):
         super().__init__(detail)
@@ -89,3 +93,5 @@ class Implementation:
     rebuild_lease: str | None = None
     pushed_head: str | None = None
     tracker_available: bool = True
+    # Files this branch edits that the last merged base moved or split, told once.
+    moved_files: list[str] = field(default_factory=list)

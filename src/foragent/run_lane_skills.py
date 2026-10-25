@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from itertools import islice
 from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from foragent import cuts
 from foragent.git import GitRepo
 from foragent.skills import SkillManager, copy_lane_skills
 
@@ -25,8 +25,14 @@ def _lane_notes(ctx: RunContext, n: int, worktree: Path) -> tuple[str | None, st
     return lane_notes(ctx.config, ctx.store.get_run(n).lane, worktree)
 
 
-def lane_notes(config: Config, lane: str, worktree: Path) -> tuple[str | None, str]:
-    """The lane agent and its instructions and memory, as read from the worktree."""
+def lane_notes(
+    config: Config, lane: str, worktree: Path, full_text_dir: Path | None = None,
+) -> tuple[str | None, str]:
+    """The lane agent and its instructions and memory, as read from the worktree.
+
+    Memory keeps its 200-line limit; a longer memory ends with the cut notice,
+    linking a full copy under ``full_text_dir`` (or the memory file itself).
+    """
     settings = _lane_settings(config, lane)
     agent = settings.get("agent")
     if not isinstance(agent, str) or not re.fullmatch(r"fa-[a-z0-9-]+", agent):
@@ -38,8 +44,8 @@ def lane_notes(config: Config, lane: str, worktree: Path) -> tuple[str | None, s
     body = re.sub(r"\A---\s*\n.*?\n---[^\S\n]*(?:\n|$)", "", body, count=1, flags=re.DOTALL)
     memory = worktree / ".claude/agent-memory" / agent / "MEMORY.md"
     if memory.is_file():
-        with memory.open(encoding="utf-8", errors="replace") as stream:
-            body += "\n\nMemory:\n" + "".join(islice(stream, 200))
+        text = memory.read_text(encoding="utf-8", errors="replace")
+        body += "\n\nMemory:\n" + cuts.head_lines(text, 200, full_text_dir, "lane-memory.md", full=memory.absolute())
     return agent, "Lane notes:\n" + body.strip() + "\n\n"
 
 
