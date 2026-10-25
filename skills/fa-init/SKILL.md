@@ -35,6 +35,28 @@ description: Set up a project folder for Foragent.
    available question tool): Yes (recommended) or No, then rerun with
    `--statusline yes|no`. Either answer is remembered and never asked again; skip the question if the summary already reports a decision.
 
+   When `.foragent.yml` has no `checks` key, `fa init` chooses and saves `ci` for
+   public repositories (hosted Actions minutes are free), or `local` for private
+   repositories (to avoid paid Actions minutes). Unreadable visibility selects
+   `local` with a note. Init prints one line naming the mode, why it chose it,
+   and how to change `checks` in `.foragent.yml`. An existing key is preserved.
+   CI acceptance measurement requires pytest; other detected or configured test
+   commands select `local` with a note. An existing `checks: ci` configuration
+   with an unsupported command uses the local comparison path at runtime.
+   A private repository can avoid measurement minutes with its own runner:
+   set `ci_runs_on: [self-hosted, linux]` in `.foragent.yml`. Init mentions this
+   option without asking for a runner label. Use self-hosted runners only for
+   private repositories; GitHub advises against using them on public ones.
+   Selecting `ci` generates `.github/workflows/foragent-acceptance.yml` and
+   includes it with `.foragent.yml` in the init commit. Measurement uses the base
+   configuration with read-only permissions. The runner reads the exact head's
+   measurement artifacts directly and verifies every configured shard.
+   `ci_shards` defaults to
+   4 and `ci_runs_on` to `ubuntu-latest`. After changing these settings, run
+   `fa ci workflow --repo-root .` to rewrite the generated workflow and include
+   it in a separate configuration commit. `checks_fallback: local`
+   optionally runs a local acceptance comparison when CI evidence is unusable.
+
 4. Run `fa adopt survey --json` after setup. When `kind` is `existing`,
    complete steps 5–8 in order. When it is `empty`, go to step 9.
 
@@ -86,8 +108,9 @@ description: Set up a project folder for Foragent.
    Each lane agent chooses tool, review, and domain skills per issue as needed;
    examples include `design-system`, `design-critique`, `accessibility-review`,
    `ux-copy`, and `webapp-testing`. These are examples, not a fixed design lane
-   skill list. Design interviews and foundation issues belong to `/fa-order` (D33).
+   skill list. Design interviews and foundation issues belong to the planning interview (`/fa-order`, which people
+   open from `/fa`) (D33).
 
-10. Tell the user the next step is `/fa-order`: for an existing project, normalize
+10. Tell the user the next step is `/fa` (it opens the planning interview): for an existing project, normalize
    existing open issues into the Foragent format with the user's approval; for
    a new project, order the first work.

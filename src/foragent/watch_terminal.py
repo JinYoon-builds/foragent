@@ -4,6 +4,7 @@ Runtime dependencies resolve through foragent.watch to preserve its patch points
 """
 
 from collections.abc import Callable
+from contextlib import ExitStack
 from pathlib import Path
 
 from foragent.config import Config
@@ -22,6 +23,12 @@ def color_pairs(colors: int) -> list[tuple[int, int]]:
             (curses.COLOR_GREEN, -1), (-1, -1),
             (curses.COLOR_MAGENTA, -1), (curses.COLOR_GREEN, -1),
             (curses.COLOR_BLUE, -1)]
+
+
+def _restart(cleanup: ExitStack) -> bool:
+    """Ask for a re-exec without joining the worker: a stuck refresh must not block it."""
+    cleanup.pop_all()  # execv replaces the process, so the worker thread needs no shutdown.
+    return True
 
 
 def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, config: Config, repo_root: Path, now,
@@ -62,7 +69,8 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     next_refresh = animation_started + 5
     pending = None
     started_build = watch._installed_build()
-    with watch.ThreadPoolExecutor(max_workers=1) as worker:
+    with ExitStack() as cleanup:
+        worker = cleanup.enter_context(watch.ThreadPoolExecutor(max_workers=1))
         while True:
             if pending is not None and pending.done():
                 try:
@@ -73,14 +81,24 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 pending = None
                 next_refresh = watch.time.monotonic() + 5
                 if watch.should_reload(started_build, watch._installed_build()):
-                    return True
-            if pending is None and watch.time.monotonic() >= next_refresh:
-                pending = worker.submit(refresh)
+                    return _restart(cleanup)
+            if watch.time.monotonic() >= next_refresh:
+                if pending is None:
+                    pending = worker.submit(refresh)
+                else:
+                    # A slow snapshot must not hide a reinstall: check once per due refresh.
+                    next_refresh = watch.time.monotonic() + 5
+                    if watch.should_reload(started_build, watch._installed_build()):
+                        return _restart(cleanup)
             tick = int((watch.time.monotonic() - animation_started) / 0.3)
             height, width = screen.getmaxyx()
             layout: dict = {}
-            frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(40, width - 1), selected=selected,
-                                 now=now(), **({} if store is None else {"layout": layout}))
+            try:
+                frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(40, width - 1), selected=selected,
+                                     now=now(), **({} if store is None else {"layout": layout}))
+            except ImportError:
+                # A reinstall can briefly leave modules missing; restart on the installed code.
+                return _restart(cleanup)
             # Keep keyboard help on screen even when there are more lanes than rows.
             body, footer = frame[:-1], frame[-1]
             if error:

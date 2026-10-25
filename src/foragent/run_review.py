@@ -284,6 +284,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return _hold_changed_head(n, ctx, link)
     ctx.git.add_detached_worktree(worktree, head)
     git = ctx.git.at(worktree)
+    from foragent.ci_workflow import EXCLUSIONS
+    if (worktree / EXCLUSIONS).is_file():
+        git.publication_paths.add(EXCLUSIONS)
     if not _acceptance_matches(n, ctx, git, approval):
         return "hash-mismatch"
     if not git.is_ancestor(base_sha, head):
@@ -298,8 +301,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         if runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
         if ctx.config.review_scope == "pr-body" and "## Review scope" not in pr.body:
-            ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title,
-                                  body=pr.body + "\n\n## Review scope\n\n" + review_scope_rules(ctx.config.acceptance_dir))
+            pr = replace(pr, body=pr.body + "\n\n## Review scope\n\n" + review_scope_rules(ctx.config.acceptance_dir))
+            ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
         review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx),
                          pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
@@ -309,6 +312,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
             return "review-failed"
 
+    from foragent.ci_mode import enabled, review_checks
+    comparison_attempt = review_checks(n, ctx, git, pr.base) if enabled(ctx, pr.base) else None
     return _publish_reviewed_head(
         n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
+        comparison_attempt=comparison_attempt,
     )

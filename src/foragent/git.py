@@ -59,6 +59,7 @@ class GitRepo:
         self.root = Path(root)
         self._run = run or self._run_git
         self.local_skill_paths: set[str] = set()
+        self.publication_paths: set[str] = set()
 
     def _run_git(self, args: list[str]) -> str:
         command = args
@@ -151,6 +152,9 @@ class GitRepo:
     def _exclude_artifacts(self) -> None:
         # Also remove entries staged by an executor, retaining their local files.
         self._call(["rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"])
+        # Runner-owned protocol inputs can be published explicitly; worker
+        # scratch files continue to be removed from the index.
+        self.ensure_tracked(sorted(self.publication_paths))
         if self.local_skill_paths:
             self._call(["--literal-pathspecs", "rm", "--cached", "-r", "-f", "--ignore-unmatch",
                         "--", *sorted(self.local_skill_paths)])
@@ -465,7 +469,13 @@ class GitRepo:
                     raise
                 value = ""
             identity.extend(["-c", f"{key}={value or fallback}"])
-        self._call(["add", "-f", "--", *paths])
+        # Already-staged deletions belong in the commit, but git add cannot
+        # match them once they are absent from both the worktree and index.
+        indexed = set(self._call(["ls-files", "--cached", "-z", "--", *paths]).split("\0"))
+        stage = [path for path in paths if path in indexed or (self.root / path).exists()
+                 or (self.root / path).is_symlink()]
+        if stage:
+            self._call(["add", "-f", "--", *stage])
         self._exclude_artifacts()
         self._call([*identity, "commit", "--only", "-m", title, "--", *paths, f":!{REVIEW_SCOPE_FILE}"])
 

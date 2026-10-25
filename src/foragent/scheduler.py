@@ -26,7 +26,7 @@ from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
 from foragent.scheduler_start import (
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _apply_budgets, _has_slot, _machine_budget, _reserve_slot,
     _start_ready,
-    append_budget_history, decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel,
+    append_budget_history, append_memory_hold, decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel,
     prebuild_acceptance_baseline, read_state, start_baseline_thread, update_test_slots, write_state,
 )
 from foragent.state import Approval, StateStore
@@ -219,9 +219,14 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         _apply_budgets(ctx, ready)
         return report
     sample = _apply_budgets(ctx, ready, workers=False)  # The worker budget is sized below with this sample.
-    prebuild_acceptance_baseline(ctx, base_ref, ctx.baseline_launcher)
-    if not ctx.start_runs or not ready or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+    if sample[0] != "critical":  # Critical memory also holds the baseline prebuild (#497).
+        prebuild_acceptance_baseline(ctx, base_ref, ctx.baseline_launcher)
+    if not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         _machine_budget(ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
+        return report
+    if not ready:
+        _machine_budget(ctx, ready, sample)
+        _reopen_view(ctx, report)
         return report
 
     # A lane's local queue picks the order; startability was already checked above.
@@ -229,11 +234,14 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     started = _start_ready(ctx, ready, lane_for, base_ref, report, sample)
     if started is None:
         return report
-    if started:
-        try:
-            watch_open.open_view(ctx.repo_root, ctx.store, ctx.config.language)
-        except Exception as exc:
-            # Optional progress display must never hide successfully started runs.
-            error = " ".join(str(exc).split())[:200]
-            report.actions.append(text("watch_open_failed", ctx.config.language, error=error))
+    _reopen_view(ctx, report)
     return report
+
+
+def _reopen_view(ctx: TickContext, report: TickReport) -> None:
+    try:
+        watch_open.reopen(ctx.repo_root, ctx.store, ctx.config.language, ctx.now())
+    except Exception as exc:
+        # Optional progress display must never hide successfully started runs.
+        error = " ".join(str(exc).split())[:200]
+        report.actions.append(text("watch_open_failed", ctx.config.language, error=error))

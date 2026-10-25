@@ -42,9 +42,7 @@ class Config:
     }])
     skill_roles: dict[str, str] = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
-    parallel_floor: int = 1
     test_slots: int = 2  # Machine-wide test command ceiling; AIMD lowers it under load (#243).
-    test_slots_floor: int = 1
     transient_max_wait_minutes: int = 30
     limit_wait_minutes: int = 60
     codex_goal: bool = False
@@ -56,6 +54,10 @@ class Config:
     test_command: str | None = None
     # Runner and premerge: auto trusts pull_request CI; ci always trusts it; all runs units locally.
     runner_unit_tests: str = "auto"
+    checks: str = "local"
+    checks_fallback: str | None = None
+    ci_shards: int = 4
+    ci_runs_on: str | list[str] = "ubuntu-latest"
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
@@ -74,10 +76,13 @@ class Config:
     language: str = "en"
     interview: str = "native"
     ouroboros_version: str | None = None
+    update_check: bool = True  # The daily release check (#417); FORAGENT_UPDATE_CHECK=off also opts out.
     profile: dict[str, Any] | None = None
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
+# Retired floors (#497): still accepted in YAML, dropped before Config is built.
+IGNORED_KEYS = frozenset({"test_slots_floor", "parallel_floor"})
 _REVIEW_LEVELS = {"fast", "batch", "careful"}
 _EXECUTORS = {"codex", "claude"}
 
@@ -331,7 +336,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"configuration must be a mapping: {path}")
     for key in value:
-        if key not in DEFAULTS:
+        if key not in DEFAULTS and key not in IGNORED_KEYS:
             raise ConfigError(f"unknown configuration key: {key}")
     if "max_parallel" in value and value["max_parallel"] is None:
         raise ConfigError("max_parallel must be a positive integer; omit it to have no ceiling")
@@ -366,6 +371,17 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("test_command must be a nonempty string or null")
     if not isinstance(values["runner_unit_tests"], str) or values["runner_unit_tests"] not in {"auto", "ci", "all"}:
         raise ConfigError("runner_unit_tests must be auto, ci, or all")
+    if not isinstance(values["checks"], str) or values["checks"] not in {"local", "ci"}:
+        raise ConfigError("checks must be local or ci")
+    if values["checks_fallback"] is not None and values["checks_fallback"] != "local":
+        raise ConfigError("checks_fallback must be local or null")
+    if type(values["ci_shards"]) is not int or not 1 <= values["ci_shards"] <= 256:
+        raise ConfigError("ci_shards must be an integer from 1 to 256")
+    labels = values["ci_runs_on"]
+    if isinstance(labels, str):
+        labels = [labels]
+    if not isinstance(labels, list) or not labels or any(not isinstance(label, str) or not label.strip() for label in labels):
+        raise ConfigError("ci_runs_on must be a nonempty string or nonempty list of strings")
     if not isinstance(values["review_scope"], str) or values["review_scope"] not in {"claude-local", "pr-body"}:
         raise ConfigError("review_scope must be claude-local or pr-body")
     if not isinstance(values["interview"], str) or values["interview"] not in {"ouroboros", "native"}:
@@ -398,16 +414,13 @@ def _validate(values: dict[str, Any]) -> None:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
                 "max_parallel", "transient_max_wait_minutes", "limit_wait_minutes",
-                "orchestrator_timeout_minutes", "tick_failure_alert", "test_slots", "test_slots_floor",
-                "parallel_floor"):
+                "orchestrator_timeout_minutes", "tick_failure_alert", "test_slots"):
         if key == "max_parallel" and values[key] is None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
-    if values["test_slots_floor"] > values["test_slots"]:
-        raise ConfigError("test_slots_floor must be <= test_slots")
-    if values["max_parallel"] is not None and values["parallel_floor"] > values["max_parallel"]:
-        raise ConfigError("parallel_floor must be <= max_parallel")
+    if type(values["update_check"]) is not bool:
+        raise ConfigError("update_check must be true or false")
     for key in ("always_human", "approvers"):
         if not isinstance(values[key], list) or any(not isinstance(item, str) for item in values[key]):
             raise ConfigError(f"{key} must be a list of strings")
@@ -494,6 +507,7 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
 
 
 def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
+    overrides = {key: value for key, value in overrides.items() if key not in IGNORED_KEYS}
     tiers = overrides.get("tiers")
     if isinstance(tiers, dict):
         previous = values["tiers"]

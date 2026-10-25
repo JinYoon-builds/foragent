@@ -10,3 +10,4 @@ metadata:
 - `--keep-work` and `--why` are argparse-required, so a missing `--why` fails before any context is built.
 - **Why:** acceptance `test_orch_stop.py` snapshots state, refs, files, events and outbox around each refusal.
 - **How to apply:** for later orch verbs that kill runs, reuse this precheck + `_kill_run` and do not write a parallel kill path.
+- 2026-10-26 merge: main split `cli.py` into `src/foragent/commands/<group>.py` modules discovered by `commands.discover()`. New `fa orch` verbs go in `commands/orch.py` (`add()` parser + `run()` dispatch, `cli.RunContext`/`cli.orch` through `facade()`). If `cli.py` conflicts, take main's version and move the verb there.

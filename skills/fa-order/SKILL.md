@@ -1,6 +1,6 @@
 ---
 name: fa-order
-description: Interview the user about what to build, split it into lane-assigned issues with executable acceptance tests (plan + goal per issue), get one approval, and publish them for the Foragent gate. Also turns pending decisions and feedback into updated issues. Use for a new project after /fa-init, and whenever the user wants to order new work.
+description: Interview the user about what to build, split it into lane-assigned issues with executable acceptance tests (plan + goal per issue), get one approval, and publish them for the Foragent gate. Also turns pending decisions and feedback into updated issues. Use for a new project after setup, and whenever the user wants to order new work.
 ---
 
 # fa-order
@@ -150,7 +150,8 @@ no-match or deferred choice with the person; do not invent candidates or hand th
 
 ## Design first (D33)
 Use `ui.frameworks` and `ui.has_design_foundation` from the context alongside the request.
-For UI work without a foundation, first suggest a design session (`/fa-design-session`)
+For UI work without a foundation, first suggest the design interview (디자인 인터뷰); if the
+person agrees, follow `skills/fa-design-session/SKILL.md` (the `fa-design-session` skill)
 as design mode in this same planning session to settle the visual direction (D72).
 Compare references on the local board, then running drafts in their actual medium.
 Read its `docs/design/<topic>/HANDOFF.md` as settled context, then
@@ -193,7 +194,8 @@ rest still completes. For each issue you must be able to write one sentence:
   or decisions that depend on seeing intermediate results. Publication adds the
   `interactive` label. Use `false` or omit it for work an agent can finish unattended;
   complexity alone is not a reason to mark an issue interactive. For visual design,
-  suggest a design session (`/fa-design-session`) to settle the direction together.
+  suggest the design interview (디자인 인터뷰, the `fa-design-session` skill in `/fa`) to
+  settle the direction together.
   This order records the choice and suggestion; session startup is a separate workflow.
 - **blocked_by** only for real order dependencies (B cannot be built or verified without A).
 - Fill each issue's **`files`** with the repository-relative paths or globs it is expected
@@ -259,7 +261,7 @@ and pushes. Other sessions' edits stay out of the commit, so no manual rebase is
 it cannot fast-forward, report the error instead of rebasing or committing by hand. Decisions and feedback that change
 existing issues go into `edits`. Record `progress publish --issue <number>` for each
 published or updated issue in the result. Show the printed summary and one line on what
-happens next ("the gate starts within 5 minutes; /fa-inspect shows results"), then run
+happens next ("the gate starts within 5 minutes; /fa shows results"), then run
 `fa order progress end`.
 
 Never add `approved` yourself outside `fa order publish`, never edit acceptance tests of
