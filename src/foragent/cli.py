@@ -39,7 +39,7 @@ from foragent.status import collect as collect_status, summary_values, unknown a
 from foragent.tracker import GhTracker, RecordingTracker, Tracker, TrackerError
 from foragent import commands
 from foragent.commands import _open_lane_view
-from foragent.commands.gate import _print_machine_budget, _print_status, _refresh_status, _repo_floor_keys, _status
+from foragent.commands.gate import _print_machine_budget, _print_status, _refresh_status, _status
 from foragent.commands.init import _offer_statusline
 from foragent.commands.inspect import _inspect
 from foragent.commands.order import _comma_keys, _comma_numbers

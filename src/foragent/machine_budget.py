@@ -1,7 +1,7 @@
 """Machine-wide budget settings: one machine.yml for every repository's gate (#365).
 
 The shared budget files (capacity.json, test-slots.json) belong to the machine, so
-their ceilings and floors come only from ``<data root>/machine.yml``; the Config
+their ceilings come only from ``<data root>/machine.yml``; the Config
 class defaults fill every key the file does not set validly. A repository's
 ``.foragent.yml`` never sizes the shared files; it may only lower its own admission.
 
@@ -17,13 +17,11 @@ from typing import Any
 
 import yaml
 
-from foragent.config import Config
+from foragent.config import IGNORED_KEYS, Config
 
 MACHINE_FILE = "machine.yml"
-KEYS = ("test_slots", "test_slots_floor", "parallel_floor", "max_parallel")
+KEYS = ("test_slots", "max_parallel")
 DEFAULTS: dict[str, int | None] = {item.name: item.default for item in fields(Config) if item.name in KEYS}
-# Each floor is checked against its own ceiling; a floor above it is the invalid key.
-_FLOOR_CEILING = {"test_slots_floor": "test_slots", "parallel_floor": "max_parallel"}
 
 
 @dataclass(frozen=True)
@@ -71,11 +69,8 @@ def read() -> MachineBudget:
                 values[key], sources[key] = data[key], "machine"
             else:
                 sources[key] = "invalid"
-    for floor, ceiling in _FLOOR_CEILING.items():
-        limit = values[ceiling]
-        if limit is not None and values[floor] > limit:
-            values[floor], sources[floor] = DEFAULTS[floor], "invalid"
-    unknown = sorted(str(key) for key in data if key not in KEYS)
+    # Retired floor keys (#497) are accepted and ignored, never reported as unknown.
+    unknown = sorted(str(key) for key in data if key not in KEYS and key not in IGNORED_KEYS)
     return MachineBudget(values, sources, unknown)
 
 

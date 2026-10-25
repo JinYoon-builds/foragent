@@ -51,16 +51,6 @@ def _refresh_status(tracker, store, config) -> None:
         pass
 
 
-def _repo_floor_keys(root) -> list[str]:
-    """Floor keys this repository's .foragent.yml sets; they no longer size the machine budget."""
-    cli = facade()
-    try:
-        data = cli.yaml.safe_load((root / ".foragent.yml").read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, cli.yaml.YAMLError):
-        return []
-    return [key for key in ("test_slots_floor", "parallel_floor") if isinstance(data, dict) and key in data]
-
-
 def _print_machine_budget(status: dict, language: str) -> None:
     cli = facade()
     text = cli.text
@@ -76,8 +66,6 @@ def _print_machine_budget(status: dict, language: str) -> None:
     print(text("machine_budget_line", language, values=", ".join(parts)))
     if budget.get("unknown_keys"):
         print(text("machine_budget_unknown_keys", language, keys=", ".join(budget["unknown_keys"])))
-    if status.get("repo_floors_ignored"):
-        print(text("machine_budget_repo_floors_ignored", language, keys=", ".join(status["repo_floors_ignored"])))
 
 
 def _print_status(status: dict, language: str = "en") -> None:
@@ -184,7 +172,6 @@ def run(args) -> int:
         status["launchd"] = cli.asdict(cli.launchd.status(root, repo=repo))
         status["test_slots"] = cli.capacity.effective_test_slots(config.test_slots)
         status["machine_budget"] = cli.machine_budget.read().report()
-        status["repo_floors_ignored"] = cli._repo_floor_keys(root)
         status["tick_outcome"] = cli.orch_tick_outcome.read(store)
         if args.json:
             print(cli.json.dumps(status))

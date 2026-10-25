@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from foragent import machine_budget, scheduler
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
-    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, decrease_allowed, machine_load,
+    INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
     machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
 )
 from foragent.config import resolved_reviewer
@@ -33,7 +33,7 @@ def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
 def _apply_budgets(
     ctx: TickContext, ready: dict[str, list[int]], *, workers: bool = True,
 ) -> tuple[str, float]:
-    """Apply machine.yml and pressure to the shared budgets once per tick; return its sensor sample.
+    """Apply machine.yml and CPU load to the shared budgets once per tick; return its sensor sample.
 
     Every tick runs this, a GitHub wait included. ``workers=False`` leaves the
     worker budget to the caller, which sizes it with this sample right away.
@@ -44,7 +44,7 @@ def _apply_budgets(
     ctx._budget_sample = sample
     scheduler.update_test_slots(
         machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
-        swapins=getattr(sample, "swapins", None), floor=machine["test_slots_floor"],
+        swapins=getattr(sample, "swapins", None),
     )
     if workers:
         scheduler._machine_budget(ctx, ready, sample)
@@ -77,14 +77,14 @@ def _machine_budget(
         changed_at = scheduler.datetime.fromisoformat(state["changed_at"]) if state else now
         demand = scheduler.machine_runs(ctx.store, now) + waiting
         # Work only caps growth: the shared value never drops below itself for lack
-        # of work here, so it stays the pressure- and load-driven value.
+        # of work here, so it stays the load-driven value. Memory never moves it (#497).
         wanted = scheduler.next_parallel(
-            current, pressure=pressure, load_per_cpu=load, lanes_with_work=max(demand, current),
+            current, pressure="normal", load_per_cpu=load, lanes_with_work=max(demand, current),
             ceiling=ceiling, increase_ok=now - changed_at >= scheduler.INCREASE_INTERVAL,
         )
         if wanted < current and not scheduler.decrease_allowed(state, now):
             wanted = current
-        value = wanted if pressure == "critical" else max(machine["parallel_floor"], wanted)
+        value = wanted
         if state is None or value != current:
             decreased_at = (
                 now.astimezone(scheduler.UTC).isoformat() if value < current else (state or {}).get("decreased_at")
@@ -125,6 +125,7 @@ def _start_ready(
             and not issue.labels & {scheduler.BLOCKED, scheduler.NEEDS_HUMAN, scheduler.RUNNING} and lane_for(issue) == lane
         )
 
+    sample = sample if sample is not None else scheduler.machine_load()
     budget = scheduler._machine_budget(ctx, ready, sample)
     started = False
     for lane in sorted(ready, key=scheduler.lane_order):
@@ -152,6 +153,14 @@ def _start_ready(
 
             if not eligible(scheduler._local_issue(ctx, number) or issue, lane):
                 continue
+            if sample[0] == "critical":
+                # This issue passed every start check; only critical memory holds it (#497).
+                # Running work is left alone, and one row records the held tick.
+                scheduler.append_memory_hold(
+                    ctx.store.root.parent, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
+                    swapins=getattr(sample, "swapins", None),
+                )
+                return False
             if not scheduler._reserve_slot(ctx, number, budget):
                 return started
             try:
