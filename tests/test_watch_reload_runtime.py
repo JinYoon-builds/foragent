@@ -75,3 +75,49 @@ def test_once_does_not_probe_or_replace_build(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(watch, "render_frame", lambda *args: "one frame")
     watch.run(lambda: {}, FakeTracker(), StateStore(tmp_path), Config(), tmp_path, once=True)
     assert capsys.readouterr().out == "one frame\n"
+
+
+def test_changed_build_restarts_without_waiting_for_a_stuck_refresh(tmp_path, monkeypatch):
+    """The real executor must not join a refresh that never finishes before re-exec."""
+    import curses
+    import threading
+    from types import SimpleNamespace
+
+    from foragent import watch_terminal
+
+    release = threading.Event()
+    started = threading.Event()
+    clock = SimpleNamespace(seconds=0.0)
+    builds = iter(["aaaaaaa"])
+
+    def stuck_refresh():
+        started.set()
+        release.wait(30)
+
+    class Screen:
+        def getch(self):
+            clock.seconds += 1.0
+            return -1
+
+        def getmaxyx(self):
+            return 10, 80
+
+        def __getattr__(self, name):
+            return lambda *args: None
+
+    monkeypatch.setattr(curses, "has_colors", lambda: False)
+    monkeypatch.setattr(curses, "curs_set", lambda value: None)
+    monkeypatch.setattr(watch.time, "monotonic", lambda: clock.seconds)
+    monkeypatch.setattr(watch, "_installed_build", lambda: next(builds, "bbbbbbb"))
+    monkeypatch.setattr(watch, "_frame", lambda *args, **kwargs: [watch._line("lane"), watch._line("help")])
+    result = []
+    view = threading.Thread(target=lambda: result.append(watch_terminal._terminal(
+        Screen(), stuck_refresh, SimpleNamespace(status={"lanes": {}}), Config(), tmp_path, lambda: None)), daemon=True)
+    try:
+        view.start()
+        view.join(5)
+        assert started.is_set(), "Exercise a refresh that is still running"
+        assert not view.is_alive(), "A stuck refresh blocked the restart"
+        assert result == [True]
+    finally:
+        release.set()
