@@ -67,34 +67,32 @@ def _finished(run: Any) -> datetime | None:
 def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
     """Every merge of one store: (number, size, started, merged), one entry per merge.
 
+    Each sample uses the facts recorded when its merge was first seen, so a later
+    reopening, re-approval or relabelling never adds, removes or changes one.
     A gate merge is a run that finished as merged; a reopened issue merged three
-    times contributes three runs. A merge outside the gate is a recorded merged PR
-    that closed an approved issue; it starts at the issue's latest run recorded
-    before the merge and counts only when that run did not merge through the gate."""
+    times contributes three runs. A merge outside the gate is a merged PR that,
+    when first seen, closed an approved issue with a recorded run that did not
+    itself merge through the gate."""
     rows = {row["number"]: row for row in store.local_issues()}
-    history = store.read_history()
-    runs: dict[tuple[int, str], Any] = {}
-    for path in (store.root / "runs").glob("*.json"):
-        try:
-            if (run := store.get_run(int(path.stem))) is not None:
-                runs[run.number, run.started_at] = run
-        except (OSError, ValueError):
+    found: list[tuple[int, str, datetime, datetime]] = []
+    gate: set[tuple[int, str]] = set()
+    for run in store.read_history():
+        if run.outcome != "merged":
             continue
-    runs.update({(run.number, run.started_at): run for run in history})  # finished entries win
-    found: list[tuple[int, datetime, datetime]] = []
-    for run in history:
-        if run.outcome == "merged" and (start := _time(run.started_at)) and (end := _finished(run)):
-            found.append((run.number, start, end))
+        gate.add((run.number, run.started_at))
+        if (start := _time(run.started_at)) and (end := _finished(run)):
+            row = rows.get(run.number, {})
+            # Before any refresh has seen the merge, the issue's current size stands in.
+            size = (row.get("run_sizes") or {}).get(run.started_at) or size_of(row.get("labels", ()))
+            found.append((run.number, size, start, end))
     for number, row in rows.items():
         for merge in (row.get("merges") or {}).values():
-            if not (merge.get("approved") and merge.get("closed")) or (end := _time(merge.get("merged_at"))) is None:
+            if not (merge.get("approved") and merge.get("closed")) or (number, merge.get("started_at")) in gate:
                 continue
-            before = [(start, run) for (issue, _), run in runs.items()
-                      if issue == number and (start := _time(run.started_at)) is not None and start <= end]
-            if before and (latest := max(before, key=lambda item: item[0]))[1].outcome != "merged":
-                found.append((number, latest[0], end))
-    return [(number, size_of(rows.get(number, {}).get("labels", ())), start, end)
-            for number, start, end in found]
+            start, end = _time(merge.get("started_at")), _time(merge.get("merged_at"))
+            if start is not None and end is not None and merge.get("size") in SIZES:
+                found.append((number, merge["size"], start, end))
+    return found
 
 
 def machine_stores(store: Any) -> list[Any]:

@@ -288,3 +288,61 @@ def test_outside_merges_survive_newest_first_listings_and_reopening(tmp_path):
     tracker.issues[7] = replace(tracker.issues[7], state="open")
     _refresh(store, tracker, [second])
     assert len(progress.merged_work(store)) == 2
+
+
+def test_merge_samples_keep_the_facts_seen_at_the_merge(tmp_path):
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker, PullRequest
+
+    clock = [NOW - timedelta(hours=20)]
+    store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    tracker = FakeTracker()
+    # An unapproved issue merged by hand, then reopened, approved and closed again.
+    tracker.add_issue(7, "Unapproved work", labels=["size:l"])
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    merged = PullRequest(20, "foragent/issue-7", "main", "By hand", "", (NOW - timedelta(hours=16)).isoformat())
+    tracker.close_issue(7)
+    # An approved issue merged by hand, then relabelled to another size.
+    tracker.add_issue(8, "Approved work", labels=["approved", "size:l"])
+    store.start_run(8, branch="foragent/issue-8", worktree="unused")
+    relabelled = PullRequest(21, "foragent/issue-8", "main", "By hand", "", (NOW - timedelta(hours=12)).isoformat())
+    tracker.close_issue(8)
+    # A gate merge whose issue is relabelled afterwards.
+    tracker.add_issue(9, "Gate work", labels=["approved", "size:s"])
+    store.start_run(9, branch="foragent/issue-9", worktree="unused")
+    clock[0] = NOW - timedelta(hours=18)
+    store.finish_run(9, "merged")
+    _refresh(store, tracker, [merged, relabelled])
+    before = sorted(progress.merged_work(store))
+    assert [(number, size) for number, size, *_ in before] == [(8, "l"), (9, "s")]
+    for number, labels in ((7, ["approved", "size:l"]), (8, ["approved", "size:s"]), (9, ["approved", "size:l"])):
+        tracker.issues[number] = replace(tracker.issues[number], state="open", labels=frozenset(labels))
+        _refresh(store, tracker, [merged, relabelled])
+        tracker.close_issue(number)
+    _refresh(store, tracker, [merged, relabelled])
+    assert sorted(progress.merged_work(store)) == before
+
+
+def test_issue_listed_before_the_merge_does_not_record_it_as_unclosed(tmp_path):
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker, PullRequest
+
+    clock = [NOW - timedelta(hours=6)]
+    store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    tracker = FakeTracker()
+    tracker.add_issue(7, "Raced work", labels=["approved", "size:l"])
+    tracker.issues[7] = replace(tracker.issues[7], updated_at=clock[0].isoformat())
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    stale = tracker.list_issues("all")  # listed while the PR is still open
+    clock[0] = NOW - timedelta(hours=2)
+    merged = PullRequest(20, "foragent/issue-7", "main", "By hand", "", clock[0].isoformat())
+    tracker.issues[7] = replace(tracker.issues[7], state="closed", updated_at=clock[0].isoformat())
+    store.refresh_local_issues(stale, [merged], {}, NOW, complete_prs=True)
+    assert progress.merged_work(store) == []  # undecided, not recorded as open
+    _refresh(store, tracker, [merged])
+    assert [(number, (end - start) / timedelta(hours=1)) for number, _, start, end in progress.merged_work(store)] == [
+        (7, 4)]
+    # Once decided, a reopening does not undo it.
+    tracker.issues[7] = replace(tracker.issues[7], state="open", updated_at=NOW.isoformat())
+    _refresh(store, tracker, [merged])
+    assert len(progress.merged_work(store)) == 1

@@ -70,15 +70,28 @@ class IssueRefreshMixin:
                     row["blocked_by"] = blocked_by.get(int(number), [])
                 if children is not None:
                     row["children"] = children.get(int(number), [])
+            # Run starts per issue, so a merge seen for the first time can record
+            # which recorded run it ended.
+            history = self.read_history()
+            starts: dict[int, set[str]] = {}
+            for run in [*history, *self.active_runs()]:
+                starts.setdefault(run.number, set()).add(run.started_at)
             pr_facts: dict[str, dict[str, Any]] = {}
             for pr in prs:
                 if (row := rows.get(str(pr_issue_number(pr.head)))) is not None:
                     row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
                                merged=pr.merged_at is not None)
                     if pr.merged_at is not None:
-                        _record_merge(row, pr)
+                        _record_merge(row, pr, starts.get(row["number"], set()),
+                                      facts[str(row["number"])].get("updated_at"))
                     pr_facts[str(pr_issue_number(pr.head))] = {
                         "pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
+            for run in history:
+                if run.outcome == "merged" and (row := rows.get(str(run.number))) is not None:
+                    # A gate merge's size is the issue's size when the merge is first seen.
+                    sizes = dict(row.get("run_sizes") or {})
+                    sizes.setdefault(run.started_at, _size_of(row.get("labels", ())))
+                    row["run_sizes"] = sizes
             for number, row in rows.items():
                 # What this listing showed, kept apart from later local intent.
                 listed = (pr_facts.get(number, {"pr_number": None, "pr_head": None, "merged": False})
@@ -153,22 +166,45 @@ def _merge_time(value: Any) -> datetime | None:
         return None
 
 
-def _record_merge(row: dict[str, Any], pr: Any) -> None:
+def _size_of(labels: Any) -> str:
+    from foragent.watch_sections.progress import size_of
+
+    return size_of(labels)
+
+
+def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: str | None) -> None:
     """Keep every merged PR of the issue, in any listing order and across reopening.
 
-    merged_at is the newest merge. Each merge remembers whether its issue was ever
-    seen approved and closed with it, so a later reopening keeps the merge."""
+    merged_at is the newest merge. Each merge is recorded once and never changed
+    afterwards: whether its issue was approved, the issue's size, and the latest
+    recorded run that started before it are taken when the merge is first seen.
+    Whether that merge closed the issue is taken from the first listing of the issue
+    updated at or after the merge (closing advances updated_at): an issue listed
+    before the PR merged stays undecided (None) instead of recording a stale "open".
+    A later reopening, re-approval, relabelling or re-closing changes none of it."""
     at = _merge_time(pr.merged_at)
     latest = _merge_time(row.get("merged_at"))
     if at is not None and (latest is None or at > latest):
         row["merged_at"] = pr.merged_at
     merges = dict(row.get("merges") or {})
-    seen = merges.get(str(pr.number), {})
-    merges[str(pr.number)] = {
-        "merged_at": pr.merged_at,
-        "approved": bool(seen.get("approved")) or "approved" in row.get("labels", ()),
-        "closed": bool(seen.get("closed")) or row.get("state") == "closed",
-    }
+    entry = merges.get(str(pr.number))
+    if entry is None:
+        before = [(when, start) for start in starts
+                  if (when := _merge_time(start)) is not None and at is not None and when <= at]
+        labels = row.get("labels", ())
+        entry = {
+            "merged_at": pr.merged_at,
+            "approved": "approved" in labels,
+            "closed": None,
+            "size": _size_of(labels),
+            "started_at": max(before)[1] if before else None,
+        }
+    if entry.get("closed") is None:
+        seen = _merge_time(updated_at)
+        # Without an update time the listing cannot be placed before the merge.
+        if seen is None or at is None or seen >= at:
+            entry = {**entry, "closed": row.get("state") == "closed"}
+    merges[str(pr.number)] = entry
     row["merges"] = merges
 
 
