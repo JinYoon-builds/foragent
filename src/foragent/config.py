@@ -11,6 +11,8 @@ from typing import Any
 
 import yaml
 
+from foragent import review_perspectives
+
 
 class ConfigError(ValueError):
     """Configuration could not be loaded or validated."""
@@ -51,6 +53,8 @@ class Config:
     review_max: int = 2
     review_level: str = "low"
     review_scope: str = "claude-local"
+    review_perspectives: list[dict[str, str]] = field(default_factory=list)  # Added after the defaults (#532).
+    review_reviewers: int = 1
     test_command: str | None = None
     # Runner and premerge: auto trusts pull_request CI; ci always trusts it; all runs units locally.
     runner_unit_tests: str = "auto"
@@ -419,6 +423,7 @@ def _validate(values: dict[str, Any]) -> None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
+    review_perspectives.validate(values, ConfigError)
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     for key in ("always_human", "approvers"):
