@@ -324,7 +324,7 @@ def _acceptance_matches(
 def _verify_implementation(attempt: Implementation) -> str:
     from foragent import runner
     from foragent.run_conflicts import _prepare_target
-    from foragent.run_publish import _check_publication
+    from foragent.run_publish import _check_publication, _guard_harness
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree, log = attempt.worktree, attempt.log
@@ -335,6 +335,7 @@ def _verify_implementation(attempt: Implementation) -> str:
     attempt.paths = git.changed_paths(attempt.start_ref)
     _progress(n, ctx)
     attempt.checks = []
+    _guard_harness(attempt)
     if not attempt.paths:
         return "The session made no changes."
     staged_tree = git.staged_tree_sha()

@@ -12,8 +12,9 @@ from typing import TYPE_CHECKING
 from foragent import board
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.git import GitError, GitRepo, PublicationError
+from foragent.harness_guard import changed_harness_paths, hold_details
 from foragent.issue import ParsedIssue, body_hash
-from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
+from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped
@@ -85,6 +86,30 @@ def _pr_body(
 def _hold_changed_head(n: int, ctx: RunContext, link: str) -> str:
     flag(ctx, n, Reason.RISK_HIGH, "PR head changed after verification", link)
     return "held"
+
+
+def _hold_harness_change(n: int, ctx: RunContext, paths: list[str], link: str) -> str:
+    """Hold a PR whose test harness changed outside ## Files; no head evidence is trusted."""
+    flag(ctx, n, Reason.TEST_HARNESS_CHANGED, "PR changes the test harness outside ## Files",
+         f"{hold_details(paths)}\n\n{link}")
+    ctx.tracker.add_labels(n, [NEEDS_HUMAN])
+    return "held"
+
+
+def _guard_harness(attempt: Implementation) -> None:
+    """Publish an unlisted harness change for a human before any head measurement."""
+    n, ctx, git = attempt.n, attempt.ctx, attempt.git
+    paths = changed_harness_paths(git, attempt.start_ref, attempt.parsed.files)
+    if not paths:
+        return
+    _append(attempt.log, hold_details(paths))
+    title = f"{ctx.tracker.get_issue(n).title} (#{n})"
+    if git.has_staged_changes():
+        git.commit(title)
+    _push_branch(attempt)
+    pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))
+    raise ExecutorStopped(_hold_harness_change(n, ctx, paths, f"https://github.com/{ctx.repo}/pull/{pr}"),
+                          hold_details(paths))
 
 
 def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:

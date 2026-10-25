@@ -14,6 +14,7 @@ from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
+from foragent.harness_guard import changed_harness_paths
 from foragent.labels import APPROVED
 from foragent.reasons import Reason
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
@@ -236,7 +237,9 @@ def _review_implementation(attempt: Implementation) -> None:
 def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | None) -> str:
     """Verify one immutable PR head, then apply the ordinary merge policy."""
     from foragent import runner
-    from foragent.run_publish import _check_publication, _hold_changed_head, _publish_reviewed_head
+    from foragent.run_publish import (
+        _check_publication, _hold_changed_head, _hold_harness_change, _publish_reviewed_head,
+    )
 
     approval = ctx.store.load_approval(n)
     if approval is None:
@@ -290,6 +293,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         flag(ctx, n, Reason.RISK_HIGH, "PR base changed; retry implementation on the current base.", link)
         return "base-changed"
 
+    if harness := changed_harness_paths(git, base_ref, parsed.files):
+        return _hold_harness_change(n, ctx, harness, link)
     if stopped := _verify_review_head(n, ctx, git, parsed, head, link):
         return stopped
     _check_publication(git, pr.base)

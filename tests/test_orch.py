@@ -574,3 +574,28 @@ def test_cli_routes_all_verbs_to_injected_context(review_case, monkeypatch, caps
     assert c.tracker.get_issue(1).labels & {"blocked", "ready"} == {"ready"}
     assert cli.main(["orch", "log"]) == 0
     assert "resolved review fail" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("entry", ["review-only", "resolve"])
+def test_review_entries_hold_unlisted_harness_change_before_measuring_head(review_case, monkeypatch, entry):
+    c = review_case
+    base = git_command(c.history.origin, "rev-parse", "refs/heads/main")
+    c.history.update({"tests/sub/conftest.py": "# changed harness\n"})
+    c.head = c.history.tip
+    c.tracker.set_pr_head_sha(c.pr, c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    c.ctx.git.fetch()
+    measured = []
+    monkeypatch.setattr(runner, "_check", lambda *args, **kwargs: measured.append(args))
+    if entry == "resolve":
+        orch.resolve(c.ctx, 1, "pass", "Reviewed the current head")
+    else:
+        assert runner.review_only(1, c.ctx) == "held"
+    assert measured == [] and c.review_calls == []
+    assert c.tracker.merged_prs == []
+    assert c.tracker.get_issue(c.pr).state == "open"
+    assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert any("tests/sub/conftest.py" in comment.body for comment in c.tracker.list_comments(1)
+               if "reason=test-harness-changed" in comment.body)
