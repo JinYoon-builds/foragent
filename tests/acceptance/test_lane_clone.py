@@ -39,6 +39,7 @@ def test_lane_clone_starts_disjoint_issue_and_keeps_overlapping_issue_waiting(ct
     from foragent.scheduler import tick
 
     starts = _lane_clone_case(ctx)
+    object.__setattr__(ctx.config, "overlap_per_file", 1)  # Main ignores the not-yet-declared Config field.
     _lane_clone_issue(ctx, 1, ["src/foragent/runner.py"], running=True)
     _lane_clone_issue(ctx, 2, ["src/foragent/state.py"])
     _lane_clone_issue(ctx, 3, ["src/foragent/runner.py"])
@@ -71,6 +72,7 @@ def test_lane_clone_requires_unblocked_known_files_and_two_waiting_issues(ctx, r
     from foragent.scheduler import tick
 
     starts = _lane_clone_case(ctx)
+    object.__setattr__(ctx.config, "overlap_per_file", 1)
     _lane_clone_issue(ctx, 1, ["src/foragent/runner.py"], running=True)
     files = [] if reason == "empty-files" else None if reason == "unknown-files" else ["src/foragent/state.py"]
     _lane_clone_issue(ctx, 2, files)
@@ -95,6 +97,7 @@ def test_lane_clone_glob_overlap_is_symmetric_and_skips_to_disjoint_work(ctx, ru
     from foragent.scheduler import tick
 
     starts = _lane_clone_case(ctx)
+    object.__setattr__(ctx.config, "overlap_per_file", 1)
     _lane_clone_issue(ctx, 1, running_files, running=True)
     _lane_clone_issue(ctx, 2, candidate_files)
     _lane_clone_issue(ctx, 3, ["src/foragent/state.py"])
