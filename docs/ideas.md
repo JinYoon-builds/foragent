@@ -2,6 +2,10 @@
 
 Ideas Jin wants to keep but not order yet. An idea moves to `decisions.md` when Jin decides it, and to an order after that. Newest first.
 
+## 2026-10-26
+
+- **A one-line resource summary in the lane view (Jin, 2026-10-26).** For example "CPU 62% · mem free 46% · disk busy · Claude ok", built from the same facts the orchestrator reads (D93): CPU busy fraction, kernel memory pressure, disk I/O, usage-limit state per executor, GitHub API remaining. A person sees at a glance why the gate holds back, without opening btop. It is a feature, so it waits until 5 merges per hour is stable (D88).
+
 ## 2026-10-25
 
 - **The gate and the orchestrator rest when nothing is left, and any human action wakes them (Jin, 2026-10-25).** Today the gate ticks every 5 minutes forever and the orchestrator session stays up; idle ticks are cheap but not free (GitHub reads, process scans, laptop battery), and an idle orchestrator's context keeps growing. Rule: rest only when there is no approved work, no open PR, no CI or quota wait and no human-pending item; if anything waits for a person, keep running and keep reminding (digest, phone) and show "waiting for Jin: n" instead of "all done". Any human action (new order, approval, answer) wakes the gate immediately (the existing kick on approval), so the person never has to remember to turn it back on; the orchestrator writes a note and ends its session when idle, and the gate revives it on the next event (#128). The lane view says which state it is in. After the D88 condition (5/h stable).
