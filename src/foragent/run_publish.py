@@ -150,6 +150,10 @@ class _CIWait:
     status: str = "pending"
     infrastructure: str = ""
 
+    @property
+    def deadline(self) -> float:
+        return self.started + 1200
+
 
 def _wait_for_ci(
     n: int, ctx: RunContext, git: GitRepo, pr: int, head: str, ready_at: float,
@@ -179,7 +183,7 @@ def _wait_for_ci(
                     wait.infrastructure = str(evidence)
                     return None
             failed()
-        remaining = wait.started + 1200 - ctx.now().timestamp()
+        remaining = wait.deadline - ctx.now().timestamp()
         if remaining <= 0 or wait.polls >= 40:
             if comparison_mode and ctx.config.checks_fallback == "local":
                 wait.infrastructure = "CI did not finish before the poll deadline."
@@ -617,7 +621,8 @@ def _publish_locked(attempt: Implementation) -> str:
         comparison = None
         if enabled(ctx, attempt.target_branch):
             comparison = require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
-                                            base_sha=verified_base_sha, status=ci_wait.status)
+                                            base_sha=verified_base_sha, status=ci_wait.status,
+                                            deadline=ci_wait.deadline)
             if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
                 return _hold_changed_head(n, ctx, link)
 
@@ -751,7 +756,8 @@ def _publish_reviewed_head(
         comparison = None
         if comparison_attempt is not None:
             comparison = require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
-                                            base_sha=base_sha, status=ci_wait.status)
+                                            base_sha=base_sha, status=ci_wait.status,
+                                            deadline=ci_wait.deadline)
             if stopped := unchanged():
                 return stopped
         with _merge_lock(n, ctx):

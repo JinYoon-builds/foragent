@@ -469,7 +469,13 @@ class GitRepo:
                     raise
                 value = ""
             identity.extend(["-c", f"{key}={value or fallback}"])
-        self._call(["add", "-f", "--", *paths])
+        # Already-staged deletions belong in the commit, but git add cannot
+        # match them once they are absent from both the worktree and index.
+        indexed = set(self._call(["ls-files", "--cached", "-z", "--", *paths]).split("\0"))
+        stage = [path for path in paths if path in indexed or (self.root / path).exists()
+                 or (self.root / path).is_symlink()]
+        if stage:
+            self._call(["add", "-f", "--", *stage])
         self._exclude_artifacts()
         self._call([*identity, "commit", "--only", "-m", title, "--", *paths, f":!{REVIEW_SCOPE_FILE}"])
 
