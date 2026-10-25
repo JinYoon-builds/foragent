@@ -204,7 +204,7 @@ def _implement(
         resume_prompt=build_resume_prompt(
             n, run.session_body, attempt.approval.body, failure_context,
             reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
-            moved_files=attempt.moved_files,
+            moved_files=attempt.moved_files, parent_context=attempt.approval.parent_context or "",
         ),
         model=model, timeout_s=remaining, log_path=log, **attempt.options,
     )

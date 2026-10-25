@@ -27,8 +27,8 @@ def parent_context(ctx: RunContext, n: int, approval: Approval) -> Approval:
     """Freeze the parent text into the approval snapshot the first time a run reads it."""
     if approval.parent_context is not None:
         return approval
-    parent = ctx.tracker.parent_of(n)
-    text = parent_summary(ctx.tracker.get_issue(parent).body) if parent is not None else ""
+    parent = ctx.tracker.parent_issue(n)  # one GitHub call per run, then frozen
+    text = parent_summary(parent.body) if parent is not None else ""
     ctx.store.save_approval(
         n, body=approval.body, body_sha=approval.body_sha, acceptance_blobs=approval.acceptance_blobs,
         approved_by=approval.approved_by, approved_at=approval.approved_at, parent_context=text,

@@ -317,7 +317,16 @@ class GitRepo:
             return []
         mine = {path for path in self._call(["diff", "--name-only", "--no-renames", "-z", base, "HEAD"]).split("\0")
                 if path}
+        return self.moved_between(base, target, mine)
+
+    def moved_between(self, base: str, target: str, paths: Iterable[str]) -> list[tuple[str, str]]:
+        """Which of ``paths`` ``target`` renamed or copied since its merge base with ``base``: (old, new)."""
+        mine = set(paths)
         if not mine:
+            return []
+        try:
+            base = self._call(["merge-base", base, target]).strip()
+        except GitError:
             return []
         fields = iter(self._call(["diff", "--name-status", "-M", "-C", "-z", base, target]).split("\0"))
         moved = []

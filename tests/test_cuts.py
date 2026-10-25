@@ -59,3 +59,58 @@ def test_moved_by_names_branch_files_the_target_renamed_or_split(tmp_path):
     git("update-ref", "refs/heads/main", main)
     git("update-ref", "--no-deref", "HEAD", mine)
     assert GitRepo(tmp_path).moved_by("main") == [("big.py", "moved.py")]
+
+
+def test_resume_prompt_restates_parent_context():
+    prompt = build_resume_prompt(1, "body", "body", parent_context="Use receipt_schema_v3.")
+    assert "shared outcome and constraints:\nUse receipt_schema_v3." in prompt
+
+
+def test_attempt_failure_keeps_every_check_whole():
+    from foragent.run_attempt import AttemptFailure, WholeFailure
+
+    whole = WholeFailure("Command: a\n" + "x" * 4000 + "\n\nCommand: b\nlast")
+    assert isinstance(AttemptFailure(whole).failure, WholeFailure)
+    assert type(AttemptFailure("plain").failure) is str
+
+
+def test_fake_parent_issue_reads_the_parent_in_one_call():
+    from foragent.tracker import FakeTracker
+
+    tracker = FakeTracker()
+    tracker.add_issue(1, "Parent", "Outcome.\n<!-- foragent:plan id=x map={} acceptance={} -->", [])
+    tracker.add_issue(2, "Child", "body", [])
+    tracker.set_parent(2, 1)
+    assert tracker.parent_issue(2).body.startswith("Outcome.") and tracker.parent_issue(1) is None
+
+
+def test_target_switch_names_files_the_new_target_moved(tmp_path):
+    from types import SimpleNamespace
+    from foragent.run_conflicts import _note_moved
+
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"}
+
+    def git(*args, stdin=None):
+        return subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True,
+                              text=True, input=stdin, env=env).stdout.strip()
+
+    def commit(files, parent):
+        entries = "".join(f"100644 blob {git('hash-object', '-w', '--stdin', stdin=body)}\t{name}\n"
+                          for name, body in files.items())
+        return git("commit-tree", git("mktree", stdin=entries), "-m", "c", *(["-p", parent] if parent else []))
+
+    git("init", "-q")
+    content = "".join(f"def f{n}():\n    return {n}\n\n" for n in range(40))
+    base = commit({"big.py": content}, None)
+    # The batch branch renamed something else; main split big.py into a new module.
+    batch = commit({"big.py": content, "batch_only.py": "y = 2\n"}, base)
+    main = commit({"big.py": content[:200], "parts.py": content}, base)
+    moved = GitRepo(tmp_path).moved_between(batch, main, ["big.py"])
+    assert moved == [("big.py", "parts.py")]
+    attempt = SimpleNamespace(moved_files=[], log=tmp_path / "logs" / "issue-1.log",
+                              ctx=SimpleNamespace(config=SimpleNamespace(language="en")))
+    _note_moved(attempt, moved)
+    _note_moved(attempt, moved)
+    assert attempt.moved_files == ["big.py -> parts.py"]
+    assert attempt.log.read_text().count("big.py -> parts.py") == 1

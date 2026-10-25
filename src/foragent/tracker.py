@@ -89,6 +89,7 @@ class Tracker(Protocol):
     def label_events(self, n: int) -> list[LabelEvent]: ...
     def blocked_by(self, n: int) -> list[Dependency]: ...
     def parent_of(self, n: int) -> int | None: ...
+    def parent_issue(self, n: int) -> Issue | None: ...
     def sub_issues(self, n: int) -> list[Issue]: ...
     def add_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
     def remove_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
@@ -579,6 +580,10 @@ class FakeTracker:
     def parent_of(self, n: int) -> int | None:
         return self._parents.get(n)
 
+    def parent_issue(self, n: int) -> Issue | None:
+        parent = self._parents.get(n)
+        return self.get_issue(parent) if parent is not None else None
+
     def sub_issues(self, n: int) -> list[Issue]:
         return [self.get_issue(child) for child, parent in self._parents.items() if parent == n]
 
@@ -902,6 +907,15 @@ class GhTracker:
     def parent_of(self, n: int) -> int | None:
         try:
             return json.loads(self._call(["api", f"{self._path}/issues/{n}/parent"]))["number"]
+        except TrackerError as exc:
+            if re.search(r"\bHTTP\s+404\b", str(exc)):
+                return None
+            raise
+
+    def parent_issue(self, n: int) -> Issue | None:
+        """The parent issue with its body, read in one GitHub call."""
+        try:
+            return _issue(json.loads(self._call(["api", f"{self._path}/issues/{n}/parent"])))
         except TrackerError as exc:
             if re.search(r"\bHTTP\s+404\b", str(exc)):
                 return None

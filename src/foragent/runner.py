@@ -229,7 +229,7 @@ def _implement_and_publish(
                     attempt.failure = exc
                     continue
                 except (AttemptFailure, PatchReplayError) as exc:
-                    attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else str(exc)
+                    attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else exc.failure
                     run = ctx.store.get_run(n)
             if attempt.rebuilt:
                 outcome = _block_rebuild(attempt, str(attempt.failure))

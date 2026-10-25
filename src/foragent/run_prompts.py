@@ -39,6 +39,10 @@ def build_review_prompt(
     )
 
 
+def parent_section(parent_context: str) -> str:
+    return f"This issue is part of a larger order. Its shared outcome and constraints:\n{parent_context}"
+
+
 def moved_files_section(moved_files: list[str]) -> str:
     return ("The base branch moved or split files this branch edits (old -> new). "
             "Carry your edits to the new locations so none are orphaned:\n"
@@ -81,8 +85,7 @@ def build_prompt(
     prompt = (
         f"You are implementing GitHub issue #{n} in this repository.\n"
         f"{parsed.goal}\n"
-        + (f"This issue is part of a larger order. Its shared outcome and constraints:\n{parent_context}\n"
-           if parent_context else "")
+        + (parent_section(parent_context) + "\n" if parent_context else "")
         + f"Out of scope (do not do these): {parsed.out_of_scope}\n"
         "The work is accepted only when these commands succeed (they will be run for you afterwards):\n"
         f"{commands}\n"
@@ -145,9 +148,13 @@ def build_resume_prompt(
     n: int, previous_body: str | None, body: str, failure: str = "", *,
     reviewer_text: str | None = None, orchestrator_hint: str | None = None,
     merge_conflicts: list[str] | None = None, moved_files: list[str] | None = None,
+    parent_context: str = "",
 ) -> str:
     """Deliver exact specification edits and feedback to an existing session."""
     parts = [f"Continue implementing GitHub issue #{n} in this repository."]
+    if parent_context:
+        # Always restated: the session may predate a newly read or re-approved parent text.
+        parts.append(parent_section(parent_context))
     if previous_body is not None and previous_body != body:
         old, new = previous_body.splitlines(), body.splitlines()
         for tag, start, end, new_start, new_end in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():

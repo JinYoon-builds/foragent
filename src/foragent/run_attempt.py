@@ -32,6 +32,12 @@ class AttemptFailure(Exception):
         super().__init__(message)
         self.target_branch = target_branch
 
+    @property
+    def failure(self) -> str:
+        """The failure text for the next attempt, keeping a WholeFailure whole."""
+        message = self.args[0] if self.args else ""
+        return message if isinstance(message, WholeFailure) else str(self)
+
 
 class ConflictBudgetExhausted(Exception):
     """Conflict resolution needs one fresh implementation on the latest target."""

@@ -74,7 +74,9 @@ def _prepare_target(attempt: Implementation) -> bool:
         ctx.git.ensure_batch_branch(attempt.batch_branch, attempt.base_ref)
     with tempfile.NamedTemporaryFile() as patch:
         git.write_staged_patch(attempt.start_ref, Path(patch.name))
+        previous = attempt.start_ref
         attempt.start_ref = git.ref_sha(f"origin/{destination}")
+        _note_moved(attempt, git.moved_between(previous, attempt.start_ref, paths))
         attempt.target_branch = destination
         _recreate_worktree(attempt)
         if not _acceptance_matches(n, ctx, git, attempt.approval):
