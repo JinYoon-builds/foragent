@@ -376,12 +376,20 @@ def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp
 
 
 class _MovedGit:
-    def __init__(self, changed="tests/acceptance/test_b.py"):
-        self.changed, self.calls = changed, []
+    """History where the merged target is (or is not) newer than the measured base."""
+
+    def __init__(self, moved=True):
+        self.moved, self.calls = moved, []
+
+    def merge_in_progress(self):
+        return False
 
     def _call(self, args):
         self.calls.append(args)
-        return self.changed
+        return "common\n"
+
+    def is_ancestor(self, ancestor, head):
+        return not self.moved
 
 
 def _collector(log, exit_code, lines, timed_out=False):
@@ -406,7 +414,7 @@ def test_surviving_baseline_drops_and_logs_only_missing_ids(tmp_path):
                                              "tests/acceptance/test_b.py::test_b"),
                                   excluded=("tests/acceptance/test_c.py",), base_sha="base")
     check, calls = _collector(log, 0, ["tests/acceptance/test_a.py::test_a", "1 test collected"])
-    kept = surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log)
+    kept = surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log, "origin/main")
     assert kept.node_ids == ("tests/acceptance/test_a.py::test_a",)
     assert "--collect-only" in calls[0] and "--ignore=tests/acceptance/test_c.py" in calls[0]
     assert "dropped missing node id: tests/acceptance/test_b.py::test_b" in log.read_text()
@@ -419,7 +427,7 @@ def test_surviving_baseline_keeps_every_id_when_collection_fails(tmp_path):
     log = tmp_path / "run.log"
     baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
     check, _ = _collector(log, 2, ["ERROR collecting tests/acceptance/test_a.py"])
-    assert surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log) is baseline
+    assert surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log, "origin/main") is baseline
 
 
 def test_surviving_baseline_without_acceptance_dir_drops_all_without_pytest(tmp_path):
@@ -428,16 +436,60 @@ def test_surviving_baseline_without_acceptance_dir_drops_all_without_pytest(tmp_
     log = tmp_path / "run.log"
     baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
     check, calls = _collector(log, 0, [])
-    assert surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log).node_ids == ()
+    assert surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log, "origin/main").node_ids == ()
     assert calls == []
 
 
-def test_surviving_baseline_skips_collection_when_acceptance_files_match_the_base(tmp_path):
+def test_surviving_baseline_skips_collection_when_the_base_has_not_moved(tmp_path):
     from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
 
     log = tmp_path / "run.log"
     baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
     check, calls = _collector(log, 0, [])
-    git = _MovedGit(changed="")
-    assert surviving_baseline(baseline, git, tmp_path, "tests/acceptance", check, log) is baseline
-    assert calls == [] and git.calls == [["diff", "--cached", "--name-only", "base", "--", "tests/acceptance"]]
+    git = _MovedGit(moved=False)
+    assert surviving_baseline(baseline, git, tmp_path, "tests/acceptance", check, log, "origin/main") is baseline
+    assert calls == [] and git.calls == [["merge-base", "HEAD", "origin/main"]]
+
+
+def test_base_moved_counts_a_merged_root_conftest_change(tmp_path):
+    """A newer main can rename parametrized ids from outside the acceptance directory."""
+    import os
+    import subprocess
+
+    from foragent.git import GitRepo
+    from foragent.run_baseline import _base_moved
+
+    environment = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                   "GIT_INDEX_FILE": str(tmp_path / "scratch-index")}
+
+    def git(*args, input=None):
+        return subprocess.run(["git", "-C", str(tmp_path), *args], input=input, env=environment,
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def snapshot(files, *parents):
+        # Plumbing only: the test fixtures forbid porcelain commits.
+        (tmp_path / "scratch-index").unlink(missing_ok=True)
+        for path, content in files.items():
+            blob = git("hash-object", "-w", "--stdin", input=content)
+            git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+        tree = git("write-tree")
+        return git("commit-tree", tree, *[arg for parent in parents for arg in ("-p", parent)], "-m", "c")
+
+    git("init", "-q", "-b", "main")
+    conftest = "import pytest\n@pytest.fixture(params=['old'])\ndef name(request):\n    return request.param\n"
+    files = {"tests/acceptance/test_a.py": "def test_a(name):\n    pass\n", "conftest.py": conftest}
+    base = snapshot(files)
+    work = snapshot({**files, "feature.txt": "work\n"}, base)
+    git("update-ref", "refs/heads/main", base)
+    git("update-ref", "refs/heads/issue", work)
+    git("symbolic-ref", "HEAD", "refs/heads/issue")
+    repo = GitRepo(tmp_path)
+    assert not _base_moved(repo, base, "main")
+    newer = snapshot({**files, "conftest.py": conftest.replace("'old'", "'new'")}, base)
+    git("update-ref", "refs/heads/main", newer)
+    assert not _base_moved(repo, base, "main")  # main moved, but this tree has not merged it
+    merged = snapshot({**files, "conftest.py": conftest.replace("'old'", "'new'"), "feature.txt": "work\n"},
+                      work, newer)
+    git("update-ref", "refs/heads/issue", merged)
+    assert _base_moved(repo, base, "main")

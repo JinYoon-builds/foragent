@@ -438,20 +438,41 @@ def _capture_baseline(
                 ctx.git.remove_worktree(worktree)
 
 
+def _base_moved(git, base_sha: str, target_ref: str) -> bool:
+    """Whether this tree merged target commits newer than the measured base.
+
+    Any merged file can change collection (a root conftest.py, plugins or
+    configuration), so the decision follows history, not the changed paths.
+    Unknown history counts as moved: collection is then only extra work.
+    """
+    from foragent.git import GitError
+
+    heads = ["HEAD", *(["MERGE_HEAD"] if git.merge_in_progress() else [])]
+    try:
+        for head in heads:
+            common = git._call(["merge-base", head, target_ref]).strip()
+            if not git.is_ancestor(common, base_sha):
+                return True
+    except GitError:
+        return True
+    return False
+
+
 def surviving_baseline(baseline: AcceptanceBaseline, git, worktree: Path, acceptance_dir: str,
-                       check: Callable[[str, Path], CheckResult], log: Path) -> AcceptanceBaseline:
+                       check: Callable[[str, Path], CheckResult], log: Path,
+                       target_ref: str) -> AcceptanceBaseline:
     """Drop baseline node ids that the current tree no longer collects (#123).
 
     A base sync can rename or delete a locked test. Selecting its old id makes
     pytest stop with "not found" and hides the tests that still exist. Collect
-    the same selection the capture ran, but only when the staged acceptance
-    files differ from the measured base. When collection itself fails, keep
+    the same selection the capture ran, but only when the tree merged target
+    commits newer than the measured base. When collection itself fails, keep
     every id so the verification still reports that failure.
     """
     if not baseline.node_ids or baseline.base_sha is None:
         return baseline
-    # Only a tree whose acceptance files differ from the measured base can lose ids.
-    if not git._call(["diff", "--cached", "--name-only", baseline.base_sha, "--", acceptance_dir]):
+    # Ids measured on this tree's own base still exist unless the work removed them.
+    if not _base_moved(git, baseline.base_sha, target_ref):
         return baseline
     if not (worktree / acceptance_dir).is_dir():
         collected: set[str] | None = set()

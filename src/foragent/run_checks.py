@@ -356,7 +356,8 @@ def _verify_implementation(attempt: Implementation) -> str:
             attempt.baseline = surviving_baseline(
                 attempt.baseline, git, worktree, ctx.config.acceptance_dir,
                 lambda command, root: runner._check(command, root, log, 900, progress=lambda: _progress(n, ctx),
-                                                    slot=_test_slot(n, ctx)), log)
+                                                    slot=_test_slot(n, ctx)), log,
+                f"origin/{attempt.target_branch}")
             if not attempt.baseline.node_ids:
                 _append(log, "Acceptance baseline verification skipped (count=0): no baseline node ids remain")
         if attempt.baseline and attempt.baseline.node_ids:
