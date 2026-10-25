@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from foragent import board
+from foragent import board, risks
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, enabled, require_comparison, stage_exclusions
 from foragent.git import GitError, GitRepo, PublicationError
@@ -42,6 +42,7 @@ def _pr_body(
     skills_line: str | None = None,
     rebuttals: str = "",
     review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
+    risk_notes: str = "",
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -54,6 +55,8 @@ def _pr_body(
         lines.append(f"VERDICT: {reviews[-1].verdict}" if reviews else "Pending review.")
         lines.extend(["", "## Review scope", "", review_scope_rules(acceptance_dir),
                       "The acceptance tests are locked."])
+        if risk_notes:
+            lines.extend(["", risks.notes_block(risk_notes)])
     elif not reviews:
         lines.append("Disabled (reviewer: none).")
     for round_number, review in enumerate(reviews if review_scope == "claude-local" else [], 1):
@@ -265,7 +268,8 @@ def _final_merge_inputs(
         if any(blobs.get(path) != sha for path, sha in approval.acceptance_blobs.items()):
             return _MergeInputs(stop=invalid_approval)
     paths = sorted(set(git.changed_paths(target_sha)) | set(ctx.tracker.pr_changed_files(pr)))
-    decision = merge_decision(changed_paths=paths, issue_labels=issue.labels, config=ctx.config)
+    decision = merge_decision(changed_paths=paths, issue_labels=issue.labels, config=ctx.config,
+                              risk_always_human=_risk_always_human(ctx))
     # Bind this status and all verification evidence to the exact head we merge.
     if git.head_sha() != head or ctx.tracker.pr_head_sha(pr) != head:
         return _MergeInputs(stop=lambda: _hold_changed_head(n, ctx, link))
@@ -409,7 +413,18 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
         skills_line=_skills_line(ctx.store.get_run(n)),
         rebuttals="\n\n".join(attempt.rebuttals),
         review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
+        risk_notes=_risk_notes(attempt) if ctx.config.review_scope == "pr-body" else "",
     )
+
+
+def _risk_notes(attempt: Implementation) -> str:
+    paths = sorted(set(attempt.paths) | set(attempt.git.changed_paths(attempt.base_ref)))
+    return risks.review_notes(risks.matching(risks.load_at(attempt.git, attempt.base_ref), paths), paths)
+
+
+def _risk_always_human(ctx: RunContext) -> list[str]:
+    """Always-human globs from the risk map on the configured base, not the branch under review."""
+    return risks.always_human_globs(ctx.git, f"origin/{ctx.config.base_branch}")
 
 
 def _open_or_update_pr(attempt: Implementation, title: str, body: str, base_sha: str | None = None) -> int:
@@ -567,6 +582,7 @@ def _publish_locked(attempt: Implementation) -> str:
     if stopped := policy_hold(merge_decision(
         changed_paths=ctx.tracker.pr_changed_files(pr),
         issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
+        risk_always_human=_risk_always_human(ctx),
     )):
         return stopped
 
@@ -586,6 +602,7 @@ def _publish_locked(attempt: Implementation) -> str:
         decision = merge_decision(
             changed_paths=git.changed_paths(target_sha),
             issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
+            risk_always_human=_risk_always_human(ctx),
         )
         return policy_hold(decision)
 
@@ -741,6 +758,7 @@ def _publish_reviewed_head(
     if stopped := policy_hold(merge_decision(
         changed_paths=sorted(set(git.changed_paths(base_sha)) | set(ctx.tracker.pr_changed_files(pr.number))),
         issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
+        risk_always_human=_risk_always_human(ctx),
     )):
         return stopped
     started = ctx.now().timestamp()
