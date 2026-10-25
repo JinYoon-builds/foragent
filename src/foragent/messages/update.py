@@ -12,6 +12,7 @@ MESSAGES = {
         "update_gate_busy": "Skipped {repo} ({root}): a tick is running. Run fa update again after it ends.",
         "update_gate_not_loaded": "Skipped {root}: its gate isn't loaded.",
         "update_gate_failed": "Skipped {root}: {reason}",
+        "update_record_failed": "Couldn't record the update result: {reason}",
     },
     "ko": {
         "update_offer": "Foragent {latest}이 나왔어요(지금 {current}). 실행: {command}",
@@ -24,5 +25,6 @@ MESSAGES = {
         "update_gate_busy": "{repo}({root})는 건너뛰었어요: tick이 실행 중이에요. 끝난 뒤 fa update를 다시 실행하세요.",
         "update_gate_not_loaded": "{root}는 건너뛰었어요: 게이트가 로드되어 있지 않아요.",
         "update_gate_failed": "{root}는 건너뛰었어요: {reason}",
+        "update_record_failed": "업데이트 결과를 기록하지 못했어요: {reason}",
     },
 }

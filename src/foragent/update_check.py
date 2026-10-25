@@ -25,6 +25,7 @@ from typing import Any
 
 from foragent import capacity, launchd, orch_reinstall
 from foragent.config import Config, ConfigError, load_config
+from foragent.git import GitRepo
 from foragent.i18n import text
 from foragent.state import StateStore
 
@@ -108,21 +109,26 @@ def check(config: Config | None) -> dict[str, str] | None:
         return None
     # One machine-wide lock around read, lookup and write: concurrent brief/status
     # processes wait for the first lookup (at most LOOKUP_SECONDS) and reuse it.
-    with _machine_lock("update-check.lock"):
-        now = datetime.now(UTC)
-        cache = _read_cache()
-        try:
-            checked = datetime.fromisoformat(str(cache["checked_at"]).replace("Z", "+00:00"))
-            fresh = timedelta(0) <= now - checked < CHECK_EVERY
-        except (KeyError, ValueError, TypeError):
-            fresh = False
-        if not fresh:
-            # A failure is recorded too, so an offline machine retries the next day.
-            cache = {**cache, "checked_at": now.isoformat(), "latest": lookup()}
+    # Without the lock the once-a-day limit cannot hold, so a lock that cannot be
+    # created or taken skips the check silently, like any other failed check.
+    try:
+        with _machine_lock("update-check.lock"):
+            now = datetime.now(UTC)
+            cache = _read_cache()
             try:
-                _write_cache(cache)
-            except OSError:
-                pass
+                checked = datetime.fromisoformat(str(cache["checked_at"]).replace("Z", "+00:00"))
+                fresh = timedelta(0) <= now - checked < CHECK_EVERY
+            except (KeyError, ValueError, TypeError):
+                fresh = False
+            if not fresh:
+                # A failure is recorded too, so an offline machine retries the next day.
+                cache = {**cache, "checked_at": now.isoformat(), "latest": lookup()}
+                try:
+                    _write_cache(cache)
+                except OSError:
+                    pass
+    except OSError:
+        return None
     return _offer(cache.get("latest"), cache.get("installed"))
 
 
@@ -144,18 +150,19 @@ def _machine_lock(name: str) -> Iterator[None]:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def installed_gates() -> list[Path]:
-    """Repository roots from this machine's dev.foragent.*.plist files, without duplicates."""
-    roots: list[Path] = []
-    for plist in sorted((Path.home() / "Library/LaunchAgents").glob("dev.foragent.*.plist")):
-        try:
-            arguments = plistlib.loads(plist.read_bytes()).get("ProgramArguments") or []
-            root = Path(arguments[arguments.index("--repo-root") + 1]).resolve()
-        except (OSError, ValueError, IndexError, TypeError, plistlib.InvalidFileException):
-            continue
-        if root not in roots:
-            roots.append(root)
-    return roots
+def installed_gates() -> dict[Path, list[launchd.InstalledJob]]:
+    """Each repository root with its dev.foragent.*.plist jobs, hashed or legacy label."""
+    gates: dict[Path, list[launchd.InstalledJob]] = {}
+    for job in launchd.installed_jobs():
+        gates.setdefault(job.repo_root, []).append(job)
+    return gates
+
+
+def gate_store(root: Path) -> tuple[str, StateStore]:
+    """The repository and state store `fa gate tick --repo-root root` uses, so its tick lock."""
+    config = load_config(root)
+    repo = config.repo or GitRepo(root).remote_slug()
+    return repo, StateStore.for_repo(repo)
 
 
 def _language(root: Path | None) -> str:
@@ -165,31 +172,38 @@ def _language(root: Path | None) -> str:
         return "en"
 
 
-def _restart(root: Path, language: str) -> str:
+def _restart(root: Path, jobs: list[launchd.InstalledJob], language: str) -> str:
     """Restart one gate between ticks; return restarted, busy, failed or skipped."""
     try:
-        job = launchd.Launchd(root)
-        if not job.plist_path.is_file() or not job.status().loaded:
+        loaded = [job for job in jobs if job.loaded()]
+        if not loaded:
             print(text("update_gate_not_loaded", language, root=root))
             return "skipped"
-        with StateStore(job.state_root).tick_lock() as acquired:
+        repo, store = gate_store(root)
+        with store.tick_lock() as acquired:
             if not acquired:
-                print(text("update_gate_busy", language, repo=job.repo, root=root))
+                print(text("update_gate_busy", language, repo=repo, root=root))
                 return "busy"
-            job.install()
+            for job in loaded:
+                job.restart()
     except Exception as exc:  # One broken gate must not stop the others from restarting.
         print(text("update_gate_failed", language, root=root, reason=" ".join(str(exc).split())))
         return "failed"
-    print(text("update_gate_restarted", language, repo=job.repo))
+    print(text("update_gate_restarted", language, repo=repo))
     return "restarted"
 
 
-def _restart_gates(roots: list[Path], language: str, cache: dict[str, Any]) -> int:
-    """Restart ``roots``; remember busy or failed ones so the next fa update retries them."""
-    results = {root: _restart(root, language) for root in roots}
+def _restart_gates(gates: dict[Path, list[launchd.InstalledJob]], language: str,
+                   cache: dict[str, Any]) -> int:
+    """Restart ``gates``; remember busy or failed ones so the next fa update retries them."""
+    results = {root: _restart(root, jobs, language) for root, jobs in gates.items()}
     pending = [str(root) for root, result in results.items() if result in {"busy", "failed"}]
-    with _machine_lock("update-check.lock"):
-        _write_cache({**_read_cache(), **cache, "pending_restart": pending})
+    try:
+        with _machine_lock("update-check.lock"):
+            _write_cache({**_read_cache(), **cache, "pending_restart": pending})
+    except OSError as exc:
+        # The restarts already happened; a lost record only means a retry repeats them.
+        print(text("update_record_failed", language, reason=" ".join(str(exc).split())), file=sys.stderr)
     busy = bool(results) and all(result == "busy" for result in results.values())
     return BUSY_EXIT if busy else 0
 
