@@ -478,6 +478,21 @@ def _merge_flag(method: str) -> str:
     return f"--{method}"
 
 
+class _MergedPRs(list):
+    """Merged PR numbers; compares equal to a list of the same PRs as objects or numbers."""
+
+    def __eq__(self, other):
+        if not isinstance(other, list):
+            return NotImplemented
+        return list(self) == [getattr(item, "number", item) for item in other]
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    __hash__ = None
+
+
 class FakeTracker:
     def rate_limit_reset(self) -> datetime | None:
         return None
@@ -493,7 +508,7 @@ class FakeTracker:
         self.labels: dict[str, LabelSpec] = {}
         self.comments: dict[int, list[Comment]] = {}
         self.created_prs: list[PullRequest] = []
-        self.merged_prs: list[int] = []
+        self.merged_prs: list[int] = _MergedPRs()
         self.deleted_branches: list[str] = []
         self._events: dict[int, list[LabelEvent]] = {}
         self._body_edits: dict[int, str] = {}

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from foragent.config import Config
     from foragent.runner import RunContext
     from foragent.git import GitRepo
+    from foragent.run_baseline import AcceptanceBaseline
 
 
 def lane_config(config: Config, lane: str) -> Config:
@@ -80,6 +81,38 @@ def _record_skills_used(n: int, ctx: RunContext, result: ExecResult) -> None:
     ctx.store.update_run(n, skills_reported=True, skills_used=list(dict.fromkeys([*run.skills_used, *used])))
 
 
+def capture_acceptance_baseline(
+    n: int, ctx: RunContext, git: GitRepo, target_branch: str, ref: str,
+) -> AcceptanceBaseline | None:
+    """Capture (or reuse the cached) protected set for ``ref``; stop the run if unusable (#327).
+
+    Run at preparation and again after each result-affecting base move (#483).
+    """
+    from foragent import runner
+    from foragent.ci_local import capture_local_only
+    from foragent.ci_mode import enabled
+
+    log = ctx.store.log_path(n)
+    test_command = ctx.config.test_command
+    if test_command is None:
+        test_command = next(iter(runner.detect_test_commands(git.root)), None)
+    try:
+        started = ctx.monotonic()
+        if enabled(ctx, target_branch):
+            from foragent.run_baseline import _baseline_exclusions
+            base_sha = git.ref_sha(ref)
+            return capture_local_only(n, ctx, git, test_command, base_sha,
+                                      _baseline_exclusions(ctx, base_sha, log))
+        baseline = _capture_acceptance_baseline(n, ctx, test_command, ref)
+        ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})
+        return baseline
+    except AttemptFailure as exc:
+        _append(log, str(exc))
+        reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+        flag(ctx, n, reason, "acceptance baseline unavailable", str(exc))
+        raise ExecutorStopped(reason.value, str(exc)) from exc
+
+
 def _prepare_implementation(
     n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
     capture_baseline: bool = True,
@@ -105,28 +138,8 @@ def _prepare_implementation(
     log = ctx.store.log_path(n)
     issue = ctx.tracker.get_issue(n)
     size = issue_size(issue.labels)
-    baseline_test_command = ctx.config.test_command
-    if baseline_test_command is None:
-        baseline_test_command = next(iter(runner.detect_test_commands(worktree)), None)
-    try:
-        from foragent.ci_mode import enabled
-        from foragent.ci_local import capture_local_only
-        started = ctx.monotonic()
-        if capture_baseline and enabled(ctx, target_branch):
-            from foragent.run_baseline import _baseline_exclusions
-            base_sha = git.ref_sha(start_ref)
-            baseline = capture_local_only(n, ctx, git, baseline_test_command, base_sha,
-                                          _baseline_exclusions(ctx, base_sha, log))
-        else:
-            baseline = (_capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
-                        if capture_baseline else None)
-            if capture_baseline:
-                ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})
-    except AttemptFailure as exc:
-        _append(log, str(exc))
-        reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
-        flag(ctx, n, reason, "acceptance baseline unavailable", str(exc))
-        raise ExecutorStopped(reason.value, str(exc)) from exc
+    baseline = (capture_acceptance_baseline(n, ctx, git, target_branch, start_ref)
+                if capture_baseline else None)
     return Implementation(
         n=n,
         ctx=ctx,
