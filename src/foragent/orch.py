@@ -178,6 +178,35 @@ def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = No
     return summary
 
 
+def stop(ctx: RunContext, n: int, why: str) -> str:
+    """Stop a running issue through the gate's kill path, keeping its work as WIP."""
+    from foragent import scheduler
+    from foragent.scheduler_stop import stop_target_refusal
+
+    why = _text(why, "--why")
+    run = ctx.store.get_run(n)
+    if run is None or run.status != "running":
+        raise OrchError(f"issue #{n} is not running; nothing to stop")
+    if (refusal := stop_target_refusal(run)) is not None:
+        raise OrchError(f"#{n}: stop refused: {refusal}")
+    tick_ctx = scheduler.TickContext(
+        repo=ctx.repo, repo_root=ctx.repo_root, tracker=ctx.tracker, store=ctx.store,
+        config=ctx.config, git=ctx.git, now=ctx.now, launcher=lambda number: None,
+    )
+    report = scheduler.TickReport()
+    if not scheduler._kill_run(tick_ctx, n, report, outcome="stopped",
+                               detail=f"Stopped by the orchestrator: {why}", wip_reason=f"stopped: {why}"):
+        raise OrchError(f"#{n}: stop did not complete: {'; '.join(report.actions) or 'run already ended'}")
+    # Ready is the destination; the next run resumes from the WIP on the issue branch.
+    tick_ctx.tracker.add_labels(n, [READY])
+    tick_ctx.tracker.remove_labels(n, [RUNNING])
+    scheduler.board.sync_status(tick_ctx, n, "Ready")
+    summary = f"#{n}: stopped and kept unfinished work on foragent/issue-{n}; why: {why}"
+    _event(ctx, n, "stop", summary)
+    kick_tick(ctx.repo_root)
+    return summary
+
+
 def rerun_review(ctx: RunContext, n: int, say: str | None = None) -> str:
     _issue(ctx, n)
     outcome = "interrupted"

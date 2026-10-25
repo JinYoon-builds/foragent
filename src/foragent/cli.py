@@ -265,6 +265,12 @@ files lists repository-relative paths or globs expected to change; absolute path
             command.add_argument("--tried", required=True)
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
+    stop = orch_actions.add_parser("stop", help="Stop a running issue, keep its work and return it to ready")
+    stop.add_argument("--repo-root", type=Path, default=Path.cwd())
+    stop.add_argument("number", type=int)
+    stop.add_argument("--keep-work", action="store_true", required=True,
+                      help="Save unfinished changes as a WIP commit on the issue branch")
+    stop.add_argument("--why", required=True, help="Reason for stopping, kept in the WIP commit and event log")
     request = orch_actions.add_parser("request", help="Put a planning request in the durable box")
     request.add_argument("--from", dest="source", required=True, help="Sending session, e.g. planning")
     request.add_argument("--text", required=True)
@@ -848,6 +854,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 0 if report["ready"] else 1
             elif args.action == "merge":
                 print(orch.merge(ctx, args.number, approved_by=args.approved_by, at=args.at))
+            elif args.action == "stop":
+                print(orch.stop(ctx, args.number, args.why))
             return 0
         inspect_ctx = inspect_data.InspectContext(
             tracker, store, repo, config, lambda: datetime.now(UTC), repo_root=root, git=git,

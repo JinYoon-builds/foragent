@@ -27,12 +27,14 @@ def _kill_executor(ctx: TickContext, number: int) -> None:
 
 def _remove_run_worktree(
     ctx: TickContext, number: int, worktree: Path, report: TickReport, *, outcome: str,
+    wip_reason: str = "",
 ) -> None:
     try:
         if worktree.exists() and outcome != "merged":
             try:
                 scheduler._preserve_failed_implementation(
-                    number, ctx, ctx.git.at(worktree), outcome, approval=ctx.store.load_approval(number),
+                    number, ctx, ctx.git.at(worktree), wip_reason or outcome,
+                    approval=ctx.store.load_approval(number),
                     tracker_available=ctx.store.github_wait_until(ctx.now()) is None,
                 )
             except Exception as exc:
@@ -46,7 +48,7 @@ def _remove_run_worktree(
 
 def _kill_run(
     ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
-    count_stall: bool = False, detail: str = "",
+    count_stall: bool = False, detail: str = "", wip_reason: str = "",
 ) -> bool:
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
@@ -65,7 +67,9 @@ def _kill_run(
         if stopped == "gone":
             _finish_dead_run(ctx, run, report)
         return False
-    scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome)
+    # Only a caller-supplied reason is passed on, keeping the established call shape.
+    scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome,
+                                   **({"wip_reason": wip_reason} if wip_reason else {}))
     ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
     report.actions.append(f"#{number} runner killed")
     return True
