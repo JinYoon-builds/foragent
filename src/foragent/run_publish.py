@@ -20,8 +20,9 @@ from foragent.run_base_move import REUSED, REVERIFY, base_move_is_neutral, captu
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_lane_skills import _inject_lane_skills
 from foragent.run_prompts import review_scope_rules
+from foragent.run_skill_catalog import report_line
 from foragent.run_waits import _credited_wait, _phase, _progress, _timeout
-from foragent.state import Approval
+from foragent.state import Approval, Run
 from foragent.tracker import TrackerError
 
 if TYPE_CHECKING:
@@ -37,6 +38,7 @@ def _pr_body(
     *, outside_lane: list[str] | None = None, fallback_model: str | None = None,
     attempt_tiers: dict[str, str] | None = None,
     missing_skills: list[str] | None = None,
+    skills_line: str | None = None,
     rebuttals: str = "",
     review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
 ) -> str:
@@ -68,6 +70,8 @@ def _pr_body(
         lines.extend(["", "## Outside lane", "", *(f"- `{path}`" for path in outside_lane)])
     if missing_skills:
         lines.extend(["", "## Lane skills", "", *(f"- missing skill: {name}" for name in missing_skills)])
+    if skills_line is not None:
+        lines.extend(["", skills_line])
     if fallback_model is not None:
         lines.extend(["", f"Executor fallback model: {fallback_model}"])
     if attempt_tiers:
@@ -204,6 +208,11 @@ def _push_branch(attempt: Implementation) -> None:
     attempt.pushed_head = attempt.git.head_sha()
 
 
+def _skills_line(run: Run) -> str:
+    """The implementer's own `Skills used:` report; every implementer is asked for one."""
+    return report_line(run.skills_used, run.skills_reported)
+
+
 def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str:
     n, ctx = attempt.n, attempt.ctx
     lane = ctx.store.get_run(n).lane
@@ -215,6 +224,7 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
         fallback_model=ctx.store.get_run(n).fallback_model,
         attempt_tiers=ctx.store.get_run(n).attempt_tiers,
         missing_skills=attempt.missing_skills,
+        skills_line=_skills_line(ctx.store.get_run(n)),
         rebuttals="\n\n".join(attempt.rebuttals),
         review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
     )
