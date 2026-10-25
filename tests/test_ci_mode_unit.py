@@ -196,7 +196,7 @@ def test_local_only_base_failures_are_ignored_but_head_unit_failures_are_not(git
 @pytest.mark.parametrize('marking', ['absent', 'unmarked', 'decorator', 'module', 'hook', 'collection-error'])
 def test_local_only_unit_check_requires_selected_tests(tmp_path, monkeypatch, checks, marking):
     from datetime import UTC, datetime
-    from foragent.ci_local import verify_local_only_units
+    from foragent.ci_local import check as real_check, verify_local_only_units
     from foragent.git import GitRepo
     from foragent.run_checks import CheckResult, _pytest_command
     from foragent.runner import RunContext
@@ -229,6 +229,8 @@ def test_local_only_unit_check_requires_selected_tests(tmp_path, monkeypatch, ch
     calls = []
 
     def check(n, ctx, command, worktree):
+        if '--collect-only' in command:
+            return real_check(n, ctx, command, worktree)
         calls.append(command)
         return CheckResult(command, 1, False, 'local unit failed')
 
@@ -236,10 +238,10 @@ def test_local_only_unit_check_requires_selected_tests(tmp_path, monkeypatch, ch
     result = verify_local_only_units(SimpleNamespace(n=1, ctx=ctx, worktree=root),
                                      _pytest_command(config.test_command))
     assert len(calls) == int(marking in {'decorator', 'module', 'hook'})
-    if marking in {'absent', 'unmarked'}:
+    if marking in {'absent', 'unmarked', 'collection-error'}:
         assert result is None
     else:
-        assert result.exit_code == (2 if marking == 'collection-error' else 1)
+        assert result.exit_code == 1
 
 
 def test_tracker_reads_every_page_of_head_check_runs():

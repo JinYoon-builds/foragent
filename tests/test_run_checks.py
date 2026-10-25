@@ -284,13 +284,14 @@ def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkey
 
     monkeypatch.setattr("foragent.runner._check", check)
     assert run_issue(1, c.ctx) == ("timeout" if timed_out else "merged")
-    assert [limit for _, limit in calls] == [900, 900, 2160, 2040]
+    assert [limit for _, limit in calls] == [900, 900, 2160, 2040, 1920]
+    assert '--collect-only' in calls[-3][0]
     assert '-m local_only' in calls[-2][0]
     assert "tests/test_new.py" in shlex.split(calls[-1][0])
     assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
     if timed_out:
         assert c.store.load_flag(1).reason == Reason.TIMEOUT
-        assert c.store.get_run(1).detail == "Related unit tests timed out after 2040 s (1 selected tests)."
+        assert c.store.get_run(1).detail == "Related unit tests timed out after 1920 s (1 selected tests)."
         assert c.tracker.created_prs == []
 
 
