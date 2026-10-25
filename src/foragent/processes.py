@@ -163,6 +163,16 @@ def recorded_identity_evidence(
     return IdentityEvidence(False)
 
 
+def _caused_by_permission_error(error: BaseException) -> bool:
+    seen = set()
+    while error is not None and id(error) not in seen:
+        if isinstance(error, (psutil.AccessDenied, PermissionError)):
+            return True
+        seen.add(id(error))
+        error = error.__cause__
+    return False
+
+
 def list_processes() -> tuple[ProcessIdentity, ...]:
     """Read kernel identities without probing or signaling any process."""
     rows, unreadable, unreadable_uids = [], set(), {}
@@ -183,16 +193,21 @@ def list_processes() -> tuple[ProcessIdentity, ...]:
                 argv = tuple(process.cmdline())
             except (psutil.AccessDenied, PermissionError):
                 argv = None  # Readable identity, but runner discovery remains unknown.
+            except SystemError as exc:
+                # macOS psutil can wrap a kernel permission error in SystemError.
+                if not _caused_by_permission_error(exc):
+                    raise
+                argv = None
             row = ProcessIdentity(process.pid, process.ppid(), os.getpgid(process.pid),
                                   os.getsid(process.pid), start, argv, uid)
             if psutil.Process(process.pid).create_time() == start and process.status() != psutil.STATUS_ZOMBIE:
                 rows.append(row)
-        except (psutil.AccessDenied, PermissionError):
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            continue
+        except (psutil.Error, OSError, SystemError):
             unreadable.add(process.pid)
             if uid is not None:
                 unreadable_uids[process.pid] = uid
-        except (psutil.NoSuchProcess, ProcessLookupError):
-            continue
     return ProcessTable(rows, unreadable, unreadable_uids)
 
 
