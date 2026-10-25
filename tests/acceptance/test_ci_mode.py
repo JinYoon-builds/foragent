@@ -702,4 +702,23 @@ def test_local_mode_keeps_capture_cache_regression_repair_and_records_local_comp
     assert list((case.store.root.parent / "baselines").glob("*.json")), "Local baseline caching must remain enabled"
     comparison_record(case, "local")
 
-
+@pytest.mark.parametrize("runs_on", [None, ["self-hosted", "linux"]], ids=["default-hosted", "self-hosted-label"])
+def test_generated_workflow_runs_on_the_configured_runner(git_history, tmp_path, monkeypatch, capsys, runs_on):
+    case = init_case(git_history, tmp_path, monkeypatch, private=runs_on is not None, answer="ci")
+    assert case.main(case.argv) == 0
+    output = capsys.readouterr()
+    if runs_on is not None:
+        # A private repository is told that a self-hosted runner avoids paid Actions minutes.
+        assert "self-hosted" in (output.out + output.err + "".join(case.prompts)).lower()
+        config = yaml.safe_load((case.root / ".foragent.yml").read_text())
+        config["ci_runs_on"] = runs_on
+        (case.root / ".foragent.yml").write_text(yaml.safe_dump(config))
+        assert case.main(["ci", "workflow", "--repo-root", str(case.root)]) == 0
+    document = yaml.safe_load((case.root / WORKFLOW).read_text())
+    sharded = [job for job in document["jobs"].values()
+               if "shard" in job.get("strategy", {}).get("matrix", {})]
+    assert sharded
+    expected = runs_on if runs_on is not None else "ubuntu-latest"
+    assert all(job.get("runs-on") == expected for job in sharded), (
+        f"Shard jobs must run on ci_runs_on ({expected!r}); got {[job.get('runs-on') for job in sharded]}"
+    )
