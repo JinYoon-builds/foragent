@@ -179,3 +179,124 @@ def offer_install(ask: Callable[[str], str] = input) -> str:
             record_path().unlink(missing_ok=True)
             raise
     return "installed"
+
+
+_JSON_SPACE = " \t\r\n"
+
+
+def _skip_space(text: str, at: int) -> int:
+    while at < len(text) and text[at] in _JSON_SPACE:
+        at += 1
+    return at
+
+
+def _member_span(text: str, name: str) -> tuple[int, int, int, int] | None:
+    """Find the last top-level member `name` in a JSON object text.
+
+    Returns (removal start, value start, value end, removal end): replacing
+    [value start, value end) changes only the value; deleting [removal start,
+    removal end) removes the member and exactly one separating comma.
+    """
+    decoder = json.JSONDecoder()
+    at = _skip_space(text, 0)
+    if text[at:at + 1] != "{":
+        raise ValueError("settings is not a JSON object")
+    members: list[tuple[int, int, int, int, str]] = []  # token start, value start, value end, separator end
+    previous_end = at + 1
+    at = _skip_space(text, at + 1)
+    while text[at:at + 1] != "}":
+        key, key_end = decoder.raw_decode(text, at)
+        colon = _skip_space(text, key_end)
+        if text[colon:colon + 1] != ":":
+            raise ValueError("expected ':' in settings")
+        value_start = _skip_space(text, colon + 1)
+        _value, value_end = decoder.raw_decode(text, value_start)
+        after = _skip_space(text, value_end)
+        members.append((previous_end, value_start, value_end, after, key))
+        if text[after:after + 1] == ",":
+            previous_end = after + 1
+            at = _skip_space(text, after + 1)
+        elif text[after:after + 1] != "}":
+            raise ValueError("expected ',' or '}' in settings")
+        else:
+            at = after
+    for index in range(len(members) - 1, -1, -1):
+        start, value_start, value_end, after, key = members[index]
+        if key != name:
+            continue
+        if index + 1 < len(members):
+            return start, value_start, value_end, after + 1  # also the following comma
+        if index > 0:
+            # Last member: drop the comma before it instead, keeping the closing layout.
+            return members[index - 1][2], value_start, value_end, value_end
+        return start, value_start, value_end, value_end
+    return None
+
+
+def _write_bytes(path: Path, data: bytes) -> None:
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def uninstall(language: str = "en") -> tuple[int, str]:
+    """Undo the wrapper: put back the recorded command, or remove our statusLine.
+
+    Only the statusLine value (or member) changes; every other byte of
+    settings.json stays. Returns (exit code, message for the user).
+    """
+    from foragent.i18n import text
+
+    settings_file = claude_settings_path()
+    with _install_lock():
+        record = load_record()
+        if not record or not record.get("enabled"):
+            return 0, text("statusline_not_installed", language)
+        try:
+            raw = settings_file.read_bytes()
+        except FileNotFoundError:
+            return 1, text("statusline_settings_missing", language, path=settings_file)
+        except OSError as exc:
+            return 1, text("statusline_settings_unreadable", language, path=settings_file,
+                           error=exc.strerror or exc)
+        try:
+            content = raw.decode("utf-8")
+            settings = json.loads(content)
+            if not isinstance(settings, dict):
+                raise ValueError("settings is not a JSON object")
+            span = _member_span(content, "statusLine")
+        except ValueError as exc:
+            return 1, text("statusline_settings_unreadable", language, path=settings_file, error=exc)
+        current = settings.get("statusLine")
+        command = current.get("command") if isinstance(current, dict) else None
+        if (span is None or not isinstance(command, str) or current.get("type") != "command"
+                or not is_wrapper(command)):
+            return 0, text("statusline_user_changed", language, path=settings_file)
+        removal_start, value_start, value_end, removal_end = span
+        previous = record.get("previous_command")
+        intended = dict(settings)
+        if isinstance(previous, str) and previous.strip():
+            intended["statusLine"] = {**current, "command": previous}
+            value = json.dumps(intended["statusLine"], ensure_ascii=False)
+            # The last duplicate is the one every JSON reader uses; earlier ones stay inactive.
+            updated = content[:value_start] + value + content[value_end:]
+            message = text("statusline_restored", language, command=previous.strip())
+        else:
+            del intended["statusLine"]
+            updated = content[:removal_start] + content[removal_end:]
+            # Duplicate members: removing the last would expose an earlier one, so remove them all.
+            while (span := _member_span(updated, "statusLine")) is not None:
+                updated = updated[:span[0]] + updated[span[3]:]
+            message = text("statusline_removed", language)
+        if json.loads(updated) != intended:
+            # Never write a file whose effective settings differ from what we report.
+            return 1, text("statusline_settings_unreadable", language, path=settings_file,
+                           error="could not edit statusLine without changing other settings")
+        _write_bytes(settings_file.resolve(), updated.encode("utf-8"))
+        _write_json(record_path(), {**record, "enabled": False})
+    return 0, message

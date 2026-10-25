@@ -115,8 +115,9 @@ def _text(value: str, name: str) -> str:
     return value.strip()
 
 
-def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = ()) -> dict:
-    event = append_event(ctx.store, ctx.now(), n, kind, summary)
+def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
+           say: str | None = None) -> dict:
+    event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
     if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
         return event
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
@@ -168,27 +169,27 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
 
 
-def retry(ctx: RunContext, n: int, hint: str | None = None) -> str:
+def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
     _issue(ctx, n)
     _retry(ctx, n, hint)
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
-    _event(ctx, n, "retry", summary)
+    _event(ctx, n, "retry", summary, say=say)
     kick_tick(ctx.repo_root)
     return summary
 
 
-def rerun_review(ctx: RunContext, n: int) -> str:
+def rerun_review(ctx: RunContext, n: int, say: str | None = None) -> str:
     _issue(ctx, n)
     outcome = "interrupted"
     try:
         outcome = review_only(n, ctx)
     finally:
         summary = f"#{n}: reran review on the existing PR; {outcome}"
-        _event(ctx, n, "rerun-review", summary)
+        _event(ctx, n, "rerun-review", summary, say=say)
     return summary
 
 
-def resolve(ctx: RunContext, n: int, verdict: str, note: str) -> str:
+def resolve(ctx: RunContext, n: int, verdict: str, note: str, say: str | None = None) -> str:
     _issue(ctx, n)
     if verdict not in {"pass", "fail"}:
         raise OrchError("verdict must be pass or fail")
@@ -213,13 +214,13 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str) -> str:
                 outcome += "; queued implementation retry"
     finally:
         summary = f"#{n}: resolved review {verdict} for {head}; {outcome}; {note}"
-        _event(ctx, n, "resolve", summary)
+        _event(ctx, n, "resolve", summary, say=say)
         kick_tick(ctx.repo_root)
     return summary
 
 
 def escalate(ctx: RunContext, n: int, summary: str, tried: str,
-             options: list[str] | None = None, recommend: int | None = None) -> str:
+             options: list[str] | None = None, recommend: int | None = None, say: str | None = None) -> str:
     _issue(ctx, n)
     summary, tried = _text(summary, "summary"), _text(tried, "tried")
     options = [_text(option, "option") for option in (options or [])]
@@ -234,7 +235,7 @@ def escalate(ctx: RunContext, n: int, summary: str, tried: str,
     tracker.add_labels(n, [NEEDS_HUMAN])
     tracker.remove_labels(n, [READY])
     event_summary = f"#{n}: escalated to human; {summary}; tried: {tried}"
-    _event(ctx, n, "escalate", event_summary)
+    _event(ctx, n, "escalate", event_summary, say=say)
     return event_summary
 
 
