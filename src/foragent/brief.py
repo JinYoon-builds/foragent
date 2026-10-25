@@ -19,6 +19,8 @@ from foragent.state import StateStore
 from foragent.status import collect as collect_status
 
 CONFIG_FILE = ".foragent.yml"
+# Distinct gate merges on this machine before `fa brief` asks once for a GitHub star.
+STAR_PROMPT_MERGE_THRESHOLD = 10
 
 
 def configured(root: Path) -> bool:
