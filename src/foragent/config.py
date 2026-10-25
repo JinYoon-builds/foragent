@@ -56,6 +56,10 @@ class Config:
     test_command: str | None = None
     # Runner and premerge: auto trusts pull_request CI; ci always trusts it; all runs units locally.
     runner_unit_tests: str = "auto"
+    checks: str = "local"
+    checks_fallback: str | None = None
+    ci_shards: int = 4
+    ci_runs_on: str | list[str] = "ubuntu-latest"
     approvers: list[str] = field(default_factory=list)
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
@@ -366,6 +370,17 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("test_command must be a nonempty string or null")
     if not isinstance(values["runner_unit_tests"], str) or values["runner_unit_tests"] not in {"auto", "ci", "all"}:
         raise ConfigError("runner_unit_tests must be auto, ci, or all")
+    if not isinstance(values["checks"], str) or values["checks"] not in {"local", "ci"}:
+        raise ConfigError("checks must be local or ci")
+    if values["checks_fallback"] is not None and values["checks_fallback"] != "local":
+        raise ConfigError("checks_fallback must be local or null")
+    if type(values["ci_shards"]) is not int or not 1 <= values["ci_shards"] <= 256:
+        raise ConfigError("ci_shards must be an integer from 1 to 256")
+    labels = values["ci_runs_on"]
+    if isinstance(labels, str):
+        labels = [labels]
+    if not isinstance(labels, list) or not labels or any(not isinstance(label, str) or not label.strip() for label in labels):
+        raise ConfigError("ci_runs_on must be a nonempty string or nonempty list of strings")
     if not isinstance(values["review_scope"], str) or values["review_scope"] not in {"claude-local", "pr-body"}:
         raise ConfigError("review_scope must be claude-local or pr-body")
     if not isinstance(values["interview"], str) or values["interview"] not in {"ouroboros", "native"}:
