@@ -55,7 +55,7 @@ a signal to inspect, not a report.
 
 Run `fa orch list --json`. Read each item's full blocked details, raw reviewer text and original
 logs (`log_path`; read beyond the tail when necessary). Diagnose the cause from evidence and use the
-appropriate existing verb:
+appropriate existing verb, always with `--say "<one line for a person>"` in the docs/voice.md voice:
 
 - `fa orch rerun-review N`: review the existing PR again for a transient review failure.
 - `fa orch retry N --hint "<diagnosis and useful correction>"`: retry implementation;
