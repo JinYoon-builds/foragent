@@ -1,0 +1,3 @@
+# Baseline follows the base (diagnosed on #196, 2026-10-25)
+
+run_publish.refresh_base merges a result-affecting base move and then _verify_implementation runs attempt.baseline.node_ids, the protected set captured on the old base; it is never refreshed for the new target SHA, and base_move_is_neutral only knows the old baseline's excluded list. So a locked acceptance test changed on main after a run's baseline (for example for an open issue, failing on main by design) stays protected for that run and burns its attempts. It hits every running issue once per locked-test change. Fix the class: re-derive the protected set for the new base.
