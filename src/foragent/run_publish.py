@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
@@ -278,7 +278,7 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
     for child in sorted(children, key=lambda child: child.number):
         pr = prs.get(f"foragent/issue-{child.number}")
         lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
-    title = f"Batch: {ctx.tracker.get_issue(parent).title}"
+    title = f"Batch: {ctx.tracker.get_issue(parent).title} (#{parent})"
     body = "\n".join(lines)
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
@@ -287,6 +287,27 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
     pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
     board.sync_status(ctx, parent, "PR open")
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
+
+
+def retitle_for_merge(
+    ctx: RunContext, pr: int, *, title: str, current_title: str, base: str,
+    body: Callable[[], str], note: Callable[[str], None],
+) -> dict[str, str]:
+    """Give the PR its issue-derived title before merging; return extra merge_pr arguments.
+
+    Branch commit messages (WIP checkpoints) never decide the title. The squash
+    subject is the PR title, so it is passed only when retitling failed (other
+    than a rate limit): the merge then still uses the issue-derived subject.
+    """
+    if title != current_title:
+        try:
+            ctx.tracker.update_pr(pr, base=base, title=title, body=body())
+        except TrackerError as exc:
+            if exc.is_rate_limit:
+                raise
+            note(f"PR #{pr} retitle failed; merging with subject {title!r}: {exc}")
+            return {"subject": title}
+    return {}
 
 
 def _check_publication(git: GitRepo, target_branch: str, base_sha: str | None = None) -> None:
@@ -552,8 +573,13 @@ def _publish_locked(attempt: Implementation) -> str:
             if continue_merge and move is None:
                 _check_publication(git, attempt.target_branch, inputs.base_sha)
                 _phase(n, ctx, "merging")
+                applied, title = title, f"{ctx.tracker.get_issue(n).title} (#{n})"
+                subject = retitle_for_merge(
+                    ctx, pr, title=title, current_title=applied, base=attempt.target_branch,
+                    body=pr_body, note=lambda line: _append(log, line),
+                )
                 try:
-                    ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha)
+                    ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
                 except TrackerError as exc:
                     if exc.is_rate_limit:
                         raise
@@ -663,8 +689,14 @@ def _publish_reviewed_head(
                               and inputs.status in {"pass", "none"})
             if continue_merge:
                 _check_publication(git, pr.base, inputs.base_sha)
+                title = f"{ctx.tracker.get_issue(n).title} (#{n})"
+                subject = retitle_for_merge(
+                    ctx, pr.number, title=title, current_title=pr.title, base=pr.base,
+                    body=lambda: pr.body, note=lambda line: _append(log, line),
+                )
+                pr = replace(pr, title=title)
                 try:
-                    ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head)
+                    ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
                 except TrackerError as exc:
                     if exc.is_rate_limit:
                         raise

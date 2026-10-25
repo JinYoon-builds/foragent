@@ -706,7 +706,7 @@ def test_batch_child_targets_shared_branch_closes_and_opens_parent_pr_once(run_c
     assert c.tracker.get_issue(1).state == "closed"
     assert c.tracker.list_comments(1)[-1].body == "Merged into foragent/batch-99 (PR #100)"
     assert batch.head == "foragent/batch-99" and batch.base == "main"
-    assert batch.title == "Batch: The whole feature"
+    assert batch.title == "Batch: The whole feature (#99)"
     assert "Closes #99" in batch.body and "#1: Implement feature (PR #100)" in batch.body
     _batch_pr(99, c.ctx)
     assert len(c.tracker.created_prs) == 2
@@ -1109,3 +1109,34 @@ def test_parallel_lanes_implement_while_merge_phase_serializes_and_rechecks(run_
     # Both lanes published before CI; the second failed fresh-base verification.
     second_log = c.store.log_path(2).read_text()
     assert second_log.count("Done when command:") == 2
+
+
+@pytest.mark.parametrize("failure", [None, "HTTP 422", "API rate limit exceeded"])
+def test_retitle_for_merge_falls_back_to_an_explicit_subject(failure):
+    from types import SimpleNamespace
+
+    from foragent.run_publish import retitle_for_merge
+
+    edits, notes = [], []
+
+    def update_pr(pr, **fields):
+        edits.append((pr, fields))
+        if failure:
+            raise TrackerError(failure)
+
+    ctx = SimpleNamespace(tracker=SimpleNamespace(update_pr=update_pr))
+
+    def retitle(current):
+        return retitle_for_merge(ctx, 2, title="Feature (#1)", current_title=current, base="main",
+                                 body=lambda: "Closes #1", note=notes.append)
+
+    assert retitle("Feature (#1)") == {} and not edits
+    if failure and "rate limit" in failure:
+        with pytest.raises(TrackerError):
+            retitle("WIP: old (#1) [timeout]")
+        assert not notes
+        return
+    expected = {"subject": "Feature (#1)"} if failure else {}
+    assert retitle("WIP: old (#1) [timeout]") == expected
+    assert edits == [(2, {"base": "main", "title": "Feature (#1)", "body": "Closes #1"})]
+    assert bool(notes) == bool(failure)
