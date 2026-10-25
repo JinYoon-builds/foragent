@@ -1,0 +1,3 @@
+# CI evidence from measurement artifacts (diagnosed on #196 / PR #489, 2026-10-25)
+
+The runner trusted check runs named foragent-acceptance/{i} and derived their producer via check_suite -> workflow run. On GitHub the published check runs sit in the measurement run's suite (event pull_request) and that run's repository object has no default_branch, so every comparison was rejected as missing acceptance shards. #442's tests used fake data shaped like the code. The locked tests now use fakes built from real responses captured from PR #489 (tests/fixtures/github_ci/). Built outside the gate under D83 by the planning session, together with the local-mode PR fix (shards on a head without the exclusions file).
