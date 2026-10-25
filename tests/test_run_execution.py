@@ -13,6 +13,43 @@ from foragent.runner import run_issue
 from runner_support import COMMAND, enable_reviewer, run_case, scripted_results
 
 
+@pytest.mark.parametrize("failure", ["exit-error", "launch-error"])
+def test_failed_resume_is_counted_once_even_when_fresh_launch_also_fails(run_case, failure):
+    from foragent.run_execution import _available_executor
+    from foragent.state import StateStore
+
+    c = run_case
+    c.store.update_run(1, session_id="saved", session_executor=c.ctx.config.executor)
+    calls = []
+
+    class Executor:
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            if "resume_session_id" in kwargs:
+                if failure == "launch-error":
+                    raise OSError("resume executable unavailable")
+                kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+                kwargs["log_path"].write_text("CLI stderr: saved transcript unavailable\n")
+                return ExecResult(1, False, "resume refused", kwargs["log_path"])
+            raise OSError("fresh executable unavailable")
+
+    with pytest.raises(OSError, match="fresh executable unavailable"):
+        _available_executor(
+            1, c.ctx, Executor(), session_body="body", resume_prompt="continue",
+            worktree=c.ctx.repo_root, prompt="full task", model=None, log_path=c.store.log_path(1),
+        )
+    assert len(calls) == 2
+    assert calls[0]["prompt"] == "continue" and calls[1]["prompt"] == "full task"
+    assert StateStore(c.store.root).get_run(1).resume_failures == 1
+    log = c.store.log_path(1).read_text()
+    if failure == "launch-error":
+        assert "resume executable unavailable" in log
+    else:
+        assert "resume refused" in log and "CLI stderr: saved transcript unavailable" in log
+    c.store.finish_run(1, "executor-error")
+    c.tracker.remove_labels(1, ["running"])
+
+
 def test_executor_nonzero_exit_still_relies_on_independent_checks(run_case):
     c = run_case
     c.executor.exit_code = 1
@@ -206,11 +243,10 @@ def test_implementer_limit_pauses_lane_and_returns_ready_without_attempt(run_cas
     assert c.store.load_flag(1) is None and c.tracker.created_prs == []
 
 
-@pytest.mark.parametrize("message", ["overloaded", "429 quota"])
-def test_reviewer_availability_waits_then_uses_recovered_verdict(run_case, message):
+def test_reviewer_availability_waits_then_uses_recovered_verdict(run_case):
     c = run_case
-    calls = enable_reviewer(c, [ExecResult(1, False, message, Path("unused"),
-                                        error_kind="limit" if "429" in message else "transient"), "VERDICT: PASS"])
+    calls = enable_reviewer(c, [ExecResult(1, False, "overloaded", Path("unused"), error_kind="transient"),
+                                "VERDICT: PASS"])
     assert run_issue(1, c.ctx) == "merged"
     assert len(calls) == 2 and c.store.get_run(1).attempts == 1
     assert c.store.get_run(1).waited_seconds == 120
@@ -219,17 +255,17 @@ def test_reviewer_availability_waits_then_uses_recovered_verdict(run_case, messa
     assert "Round 2" not in c.tracker.created_prs[0].body
 
 
-def test_reviewer_limit_only_becomes_unusable_after_wait_budget(run_case):
+def test_reviewer_unreadable_limit_pauses_its_executor_for_configured_wait(run_case):
     c = run_case
-    c.executor.steps.append({})
-    c.ctx.config = replace(c.ctx.config, transient_max_wait_minutes=2)
+    c.ctx.config = replace(c.ctx.config, limit_wait_minutes=15)
     limit = ExecResult(1, False, "usage limit", Path("unused"), error_kind="limit")
-    calls = enable_reviewer(c, [limit, limit, limit])
-    assert run_issue(1, c.ctx) == "retries-exceeded"
-    assert len(calls) == 3 and c.store.get_run(1).waited_seconds == 120
-    assert c.store.get_run(1).attempts == 2
-    assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
-    assert not c.store.lane_paused("main", c.now[0])
+    calls = enable_reviewer(c, [limit, limit])
+    assert run_issue(1, c.ctx) == "limit-wait"
+    assert len(calls) == 1 and c.store.get_run(1).waited_seconds == 0
+    assert c.store.executor_paused("codex", c.now[0] + timedelta(minutes=14))
+    assert not c.store.executor_paused("codex", c.now[0] + timedelta(minutes=15))
+    assert not c.store.executor_paused("claude", c.now[0])
+    assert c.store.load_flag(1) is None
 
 
 def test_reviewer_transient_exhaustion_uses_executor_unavailable_flag(run_case):
@@ -275,3 +311,71 @@ def test_implementation_text_does_not_pause_or_backoff(run_case, monkeypatch, me
     run = c.store.get_run(1)
     assert run.waited_seconds == 0 and run.attempts == (1 if success else 2)
     assert not c.store.lane_paused("main", c.now[0])
+
+
+def _codex_usage(reset, percent=100):
+    return json.dumps({"type": "event_msg", "payload": {"type": "token_count", "rate_limits": {
+        "primary": {"used_percent": percent, "window_minutes": 300, "resets_at": int(reset.timestamp())}}}})
+
+
+def _claude_usage(reset):
+    return json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+        "status": "rejected", "resetsAt": int(reset.timestamp()), "rateLimitType": "five_hour"}})
+
+
+def test_implementer_limit_pauses_its_executor_until_reported_reset(run_case, monkeypatch):
+    c = run_case
+    reset = (c.now[0] + timedelta(hours=2)).replace(microsecond=0)
+    event = _claude_usage(reset) if c.ctx.config.executor == "claude" else _codex_usage(reset)
+    scripted_results(c, monkeypatch, [(event, "limit")], log_only=True)
+    assert run_issue(1, c.ctx) == "limit-wait"
+    assert c.store.executor_paused(c.ctx.config.executor, reset - timedelta(seconds=1))
+    assert not c.store.executor_paused(c.ctx.config.executor, reset)
+    assert c.store.lane_paused("main", reset - timedelta(seconds=1))
+
+
+def test_reviewer_limit_with_exhausted_usage_waits_for_reset_without_retrying(run_case):
+    c = run_case
+    reset = (c.now[0] + timedelta(hours=3)).replace(microsecond=0)
+    calls = []
+
+    def review(**kwargs):
+        calls.append(kwargs)
+        kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        with kwargs["log_path"].open("a") as stream:
+            stream.write(_codex_usage(reset) + "\n")
+        return ExecResult(1, False, "usage limit", kwargs["log_path"], error_kind="limit")
+
+    enable_reviewer(c, [])
+    reviewer = c.ctx.executor_factory("codex")
+    reviewer.run = review
+    assert run_issue(1, c.ctx) == "limit-wait"
+    assert len(calls) == 1 and c.store.get_run(1).waited_seconds == 0
+    assert c.store.executor_paused("codex", reset - timedelta(seconds=1))
+    assert not c.store.executor_paused("codex", reset)
+    assert not c.store.executor_paused("claude", c.now[0])
+    assert c.store.load_flag(1) is None
+    assert "ready" in c.tracker.get_issue(1).labels and "running" not in c.tracker.get_issue(1).labels
+
+
+def test_running_issue_does_not_launch_an_executor_paused_by_another_run(run_case):
+    c = run_case
+    reset = c.now[0] + timedelta(hours=1)
+    calls = enable_reviewer(c, ["VERDICT: PASS"])
+    c.store.pause_executor("codex", reset)  # e.g. another lane's reviewer hit the codex limit
+    assert run_issue(1, c.ctx) == "limit-wait"
+    assert calls == [] and c.store.get_run(1).waited_seconds == 0
+    assert c.store.lane_paused("main", reset - timedelta(seconds=1))
+    assert not c.store.lane_paused("main", reset)
+    assert "ready" in c.tracker.get_issue(1).labels and c.store.load_flag(1) is None
+    assert c.tracker.created_prs == []
+
+
+def test_paused_implementer_is_not_launched_until_its_reset(run_case):
+    c = run_case
+    reset = c.now[0] + timedelta(minutes=30)
+    c.store.pause_executor(c.ctx.config.executor, reset)
+    before = list(c.executor.steps)
+    assert run_issue(1, c.ctx) == "limit-wait"
+    assert c.executor.steps == before
+    assert c.store.executor_pause_until(c.ctx.config.executor, c.now[0]) == reset

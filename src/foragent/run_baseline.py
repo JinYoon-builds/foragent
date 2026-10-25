@@ -4,17 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from hashlib import sha256
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+from time import monotonic
 from typing import IO, TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
@@ -34,6 +38,8 @@ class AcceptanceBaseline:
     node_ids: tuple[str, ...]
     collected_ids: tuple[str, ...] | None = None
     failing_ids: tuple[str, ...] | None = None
+    # Locked files this baseline did not run because open issues own them (#376).
+    excluded: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -66,7 +72,8 @@ def _build_baseline(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> Non
                 ctx, build.test_command, build.base_sha, log=log,
                 report=cache.root / f"{build.key}.xml",
                 check=lambda command, root: runner._check(
-                    command, root, log, 900, slot=capacity.hold_test_slot(ctx.config.test_slots)),
+                    command, root, log, _baseline_capture_limit(ctx, log),
+                    slot=capacity.hold_test_slot(ctx.config.test_slots)),
                 prepare=lambda: None, wait=lambda acquire: acquire(), build=build, lock=lock,
             )
         except Exception as exc:
@@ -142,8 +149,8 @@ def _baseline_environment(root: Path) -> dict:
     }
 
 
-def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]:
-    """Locked files owned by approved issues that have not merged (#327)."""
+def unmerged_acceptance_owners(ctx: RunContext) -> dict[str, set[int]]:
+    """Locked file -> approved issues that own it and have not merged (#327)."""
     merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
     owners: dict[str, set[int]] = {}
     for path in (ctx.store.root / "approvals").glob("*.json"):
@@ -152,6 +159,12 @@ def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]
             continue
         for name in approval.acceptance_blobs:
             owners.setdefault(name, set()).add(approval.number)
+    return owners
+
+
+def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]:
+    """Locked files owned by approved issues that have not merged (#327)."""
+    owners = unmerged_acceptance_owners(ctx)
     excluded = sorted(name for name in owners if ctx.git.blob_sha(base_sha, name) is not None)
     open_issues = sorted({number for name in excluded for number in owners[name]})
     _append(log, f"Acceptance baseline skipped {len(excluded)} files owned by open issues: "
@@ -195,7 +208,49 @@ def _premerge_baseline(ctx: RunContext, test_command: str, base_sha: str,
 def _saved_baseline(command: str, saved: dict) -> AcceptanceBaseline:
     return AcceptanceBaseline(command, tuple(saved["node_ids"]),
                               tuple(saved["collected_ids"]) if "collected_ids" in saved else None,
-                              tuple(saved["failing_ids"]) if "failing_ids" in saved else None)
+                              tuple(saved["failing_ids"]) if "failing_ids" in saved else None,
+                              tuple(saved.get("excluded", ())))
+
+
+def _baseline_capture_limit(ctx: RunContext, log: Path, remaining: int | None = None) -> int:
+    """Use this repository's latest successful capture, even after its cache expires."""
+    latest = None
+    for path in (ctx.store.root.parent / "baselines").glob("*.json"):
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(saved, dict):
+                continue
+            report = path.with_suffix(".xml")
+            if "repository" in saved:
+                if saved["repository"] != str(ctx.repo_root.resolve()):
+                    continue
+            elif not report.is_file():
+                # Legacy entries lack repository tags; accept companion reports in this shared cache.
+                continue
+            if "duration_seconds" in saved:
+                duration = saved["duration_seconds"]
+            else:
+                junit = ET.parse(report).getroot()
+                suites = [junit] if junit.tag == "testsuite" else junit.findall("testsuite")
+                if junit.tag not in {"testsuite", "testsuites"} or not suites:
+                    continue
+                duration = sum(float(suite.attrib["time"]) for suite in suites)
+            created_at = datetime.fromisoformat(saved["created_at"])
+            if (isinstance(duration, bool) or not isinstance(duration, (int, float))
+                    or not isfinite(duration) or duration < 0 or created_at.tzinfo is None
+                    or created_at > ctx.now()):
+                continue
+            if latest is None or created_at > latest[0]:
+                latest = created_at, duration
+        except (OSError, ValueError, TypeError, KeyError, ET.ParseError):
+            continue
+    limit = 900 if latest is None else int(min(3600, max(900, 2 * latest[1])))
+    reason = "default: no successful capture history" if latest is None else f"last successful capture={latest[1]:g}s"
+    if remaining is not None:
+        limit = min(limit, remaining)
+        reason += f", run remaining={remaining}s"
+    _append(log, f"Acceptance baseline capture starting: limit={limit}s ({reason})")
+    return limit
 
 
 def _capture_acceptance_baseline(
@@ -204,9 +259,11 @@ def _capture_acceptance_baseline(
     from foragent import runner
 
     def check(command: str, worktree: Path) -> CheckResult:
-        if runner._remaining(n, ctx) <= 0:
+        remaining = runner._remaining(n, ctx)
+        if remaining <= 0:
             raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before capture")
-        result = runner._check(command, worktree, ctx.store.log_path(n), min(900, runner._remaining(n, ctx)),
+        result = runner._check(command, worktree, ctx.store.log_path(n),
+                               _baseline_capture_limit(ctx, ctx.store.log_path(n), remaining),
                                progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
         _progress(n, ctx)
         return result
@@ -237,13 +294,16 @@ def _capture_baseline(
     cached_ids = cache.root / f"{key}.json"
 
     def save_baseline(node_ids: tuple[str, ...], collected_ids: tuple[str, ...],
-                      failing_ids: tuple[str, ...]) -> None:
-        cache._atomic_write(cached_ids, json.dumps({
+                      failing_ids: tuple[str, ...], duration_seconds: float | None = None) -> None:
+        saved = {
             "node_ids": node_ids, "collected_ids": collected_ids, "failing_ids": failing_ids,
             "excluded": excluded,
             "scope": build.scope,
             "created_at": ctx.now().isoformat(),
-        }) + "\n")
+        }
+        if duration_seconds is not None:
+            saved.update(repository=str(ctx.repo_root.resolve()), duration_seconds=duration_seconds)
+        cache._atomic_write(cached_ids, json.dumps(saved) + "\n")
 
     prepare()
     if lock is None:
@@ -262,12 +322,12 @@ def _capture_baseline(
         if saved is not None and (required_ids is None or
                                   {"collected_ids", "failing_ids", "excluded"} <= saved.keys()):
             _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-            return _saved_baseline(command, saved)
+            return replace(_saved_baseline(command, saved), excluded=tuple(excluded))
         report.parent.mkdir(parents=True, exist_ok=True)
-        report.unlink(missing_ok=True)
         # Use a fresh base checkout; tests can write files without touching the implementation.
         with tempfile.TemporaryDirectory(prefix="foragent-baseline-") as directory:
             worktree = Path(directory) / "worktree"
+            capture_report = Path(directory) / "capture.xml"
             ctx.git.add_detached_worktree(worktree, base_sha)
             try:
                 if not (worktree / ctx.config.acceptance_dir).is_dir():
@@ -280,22 +340,24 @@ def _capture_baseline(
                            for path in (worktree / ctx.config.acceptance_dir).rglob("*")):
                     save_baseline((), (), ())
                     _append(log, "Acceptance baseline count=0: no acceptance test files remain after exclusions")
-                    return AcceptanceBaseline(command, (), (), ())
+                    return AcceptanceBaseline(command, (), (), (), tuple(excluded))
                 # A compatible cache can cover a broader selection. Establish
                 # the current selection before reusing its recorded outcomes.
                 if required_ids is not None:
                     saved = _premerge_baseline(ctx, test_command, base_sha, excluded, required_ids)
                     if saved is not None:
                         _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-                        return _saved_baseline(command, saved)
+                        return replace(_saved_baseline(command, saved), excluded=tuple(excluded))
                 selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)}"
                 selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
                 baseline_command = (
                     f"{selection} "
-                    f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(report.resolve()))}"
+                    f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(capture_report))}"
                 )
                 offset = log.stat().st_size if log.exists() else 0
+                started = monotonic()
                 result = check(baseline_command, worktree)
+                duration_seconds = monotonic() - started
                 # Read this execution's collection count from the full log: a long
                 # traceback can push it out of CheckResult's bounded output tail.
                 collected = None
@@ -310,8 +372,8 @@ def _capture_baseline(
                 except OSError:
                     pass
                 try:
-                    node_ids = _passing_acceptance_ids(report)
-                    junit = ET.parse(report)
+                    node_ids = _passing_acceptance_ids(capture_report)
+                    junit = ET.parse(capture_report)
                     # A failed call and failed teardown produce two records for
                     # one node. Count each executed node once, across all outcomes.
                     recorded = len({(case.get("file"), case.get("classname"), case.get("name"))
@@ -342,17 +404,24 @@ def _capture_baseline(
                     cacheable = (usable_report and not result.timed_out
                             and result.exit_code == expected_exit and not collection_errors
                             and (collected is None or collected == recorded))
-                    if cacheable:
-                        save_baseline(node_ids, collected_ids, failing_ids)
-                    else:
+                    if not cacheable:
                         _append(log, f"Acceptance baseline not cached: collected={collected}, recorded={recorded}")
+                # A failed refresh must not replace the last successful legacy XML history.
+                # Validate only the fresh report so a missing result cannot reuse that history as evidence.
+                if cacheable or not cached_ids.is_file():
+                    if capture_report.is_file():
+                        shutil.copyfile(capture_report, report)
+                    else:
+                        report.unlink(missing_ok=True)
+                if cacheable:
+                    save_baseline(node_ids, collected_ids, failing_ids, duration_seconds)
                 _append(log, f"Acceptance baseline count={len(node_ids)}, exit_code={result.exit_code}, timed_out={result.timed_out}")
                 if not cacheable:
                     raise AttemptFailure(
                         f"acceptance baseline unavailable: exit_code={result.exit_code}, timed_out={result.timed_out}; "
                         "capture did not produce a complete, usable JUnit report"
                     )
-                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids)
+                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded))
             finally:
                 ctx.git.remove_worktree(worktree)
 

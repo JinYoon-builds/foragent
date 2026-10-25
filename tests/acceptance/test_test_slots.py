@@ -29,6 +29,17 @@ class SlotConfig(Config):
     test_slots: int = 2
 
 
+def machine_yml(*, slots, max_parallel=None):
+    """Write the machine budget file (#365) under the isolated machine data root."""
+    import yaml
+    from foragent import capacity
+
+    root = capacity.machine_root()
+    root.mkdir(parents=True, exist_ok=True)
+    values = {"test_slots": slots, **({"max_parallel": max_parallel} if max_parallel is not None else {})}
+    (root / "machine.yml").write_text(yaml.safe_dump(values), encoding="utf-8")
+
+
 def slot_case(history, directory, monkeypatch, *, slots=1, repo="owner/repo", **settings):
     from foragent import runner
 
@@ -303,6 +314,7 @@ def test_test_slots_tick_decreases_one_then_recovers_to_ceiling_in_gate_status(
     from foragent import scheduler
 
     case = slot_case(git_history, tmp_path, monkeypatch, slots=3)
+    machine_yml(slots=3, max_parallel=8)  # Machine-wide budgets come from machine.yml (#365).
     main = bind_cli(case, monkeypatch)
     signal = [pressure, load]
     samples = []

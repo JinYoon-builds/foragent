@@ -30,13 +30,13 @@ def test_session_identity_comes_from_lifecycle_events_only(tmp_path, monkeypatch
 
 
 def test_resume_commands_keep_headless_io_and_supported_options():
-    codex = codex_command(Path("/work"), Path("/message"), "model", "high", resume_session_id="thread")
+    codex = codex_command(Path("/work"), Path("/message"), "model", "high", resume_session_id="thread", prompt="continue")
     assert codex[:5] == ["codex", "exec", "resume", "thread", "-"]
     assert "-C" not in codex and "-s" not in codex
     assert 'sandbox_mode="workspace-write"' in codex
     assert "--json" in codex and codex[codex.index("-o") + 1] == "/message"
     assert codex[-4:] == ["-m", "model", "-c", "model_reasoning_effort=high"]
-    claude = claude_command("model", Path("/settings"), "fa-api", resume_session_id="session")
+    claude = claude_command("model", Path("/settings"), "fa-api", resume_session_id="session", prompt="continue")
     assert claude[:2] == ["claude", "-p"]
     assert claude[claude.index("--resume") + 1] == "session"
     assert claude[claude.index("--agent") + 1] == "fa-api"
@@ -219,7 +219,8 @@ def test_undelivered_spec_survives_limit_wait_and_restart(run_case, executor):
             )
         assert stopped.value.outcome == "limit-wait"
         c.store.finish_run(1, "limit-wait")
-        c.now[0] += timedelta(seconds=1)
+        # The executor stays paused until the wait ends; the scheduler restarts only after it.
+        c.now[0] += timedelta(minutes=c.ctx.config.limit_wait_minutes, seconds=1)
         reloaded = StateStore(c.store.root, now=c.ctx.now)
         run = reloaded.start_run(1, branch="branch", worktree=c.store.worktree_path(1))
         assert run.session_id == "worker" and run.session_body == BODY

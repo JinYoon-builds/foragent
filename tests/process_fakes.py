@@ -1,6 +1,7 @@
 """Deterministic process I/O shared by unit tests; never signals real PIDs."""
 
 from dataclasses import dataclass, replace
+import io
 import os
 from pathlib import Path
 import signal
@@ -161,6 +162,7 @@ def install_popen(monkeypatch, table, *, matches, exit_code=0, timeout=False, ch
         def __init__(self, argv, **kwargs):
             self.kwargs = kwargs
             self.calls = 0
+            self.stdin = io.BytesIO() if kwargs.get("stdin") == subprocess.PIPE else None
             table.add(self.pid, cwd=kwargs["cwd"], start_time=10)
             for pid in children:
                 table.add(pid, ppid=self.pid, cwd=kwargs["cwd"], start_time=11)
@@ -172,7 +174,9 @@ def install_popen(monkeypatch, table, *, matches, exit_code=0, timeout=False, ch
                 self.returncode = -next(sig for kind, target, sig in reversed(table.signals) if target == self.pid)
             return self.returncode
 
-        def communicate(self, **kwargs):
+        def wait(self, **kwargs):
+            if self.poll() is not None:
+                return self.returncode
             self.calls += 1
             if communicate is not None:
                 communicate(self)
@@ -181,11 +185,15 @@ def install_popen(monkeypatch, table, *, matches, exit_code=0, timeout=False, ch
             if self.poll() is None:
                 table.exit(self.pid)
                 self.returncode = exit_code
-            return None, None
-
-        def wait(self, **kwargs):
-            assert self.poll() is not None, "Fake process survived cleanup"
             return self.returncode
+
+        def communicate(self, input=None, **kwargs):
+            if self.stdin is not None and not self.stdin.closed:
+                if input is not None:
+                    self.stdin.write(input)
+                self.stdin.close()
+            self.wait(**kwargs)
+            return None, None
 
     def launch(argv, *args, **kwargs):
         if matches(argv):

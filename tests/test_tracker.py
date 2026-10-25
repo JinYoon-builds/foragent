@@ -568,6 +568,14 @@ def test_fake_failed_logs_default_and_pr_isolation():
     assert tracker.pr_failed_logs(43) == ""
 
 
+STARTED_STEPS = json.dumps([{"name": "Run tests", "status": "completed", "conclusion": "failure"}])
+
+
+def failed_job(number, name="test", steps=STARTED_STEPS):
+    return json.dumps([{"id": number, "name": name, "conclusion": "failure",
+                        "steps": json.loads(steps), "html_url": f"https://job/{number}"}])
+
+
 def test_gh_failed_logs_use_head_sha_all_pages_and_per_run_tails():
     head = "a" * 40
     runs = [
@@ -579,32 +587,84 @@ def test_gh_failed_logs_use_head_sha_all_pages_and_per_run_tails():
     run = ScriptedRun(
         json.dumps({"head": {"sha": head}}),
         json.dumps(runs) + "\n" + json.dumps(second_page),
-        "discard me" + "A" * 4000,
-        "discard me too" + "B" * 4000,
+        failed_job(11), "[]", "discard me" + "A" * 4000,
+        failed_job(14), "[]", "discard me too" + "B" * 4000,
     )
-    assert GhTracker(REPO, run).pr_failed_logs(42) == "A" * 4000 + "\n\n" + "B" * 4000
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "A" * 4000 in logs and "B" * 4000 in logs
+    assert "discard me" not in logs
+    assert logs.index("Actions run 1") < logs.index("A" * 4000) < logs.index("Actions run 4")
+    assert not logs.not_started
     assert run.calls == [
         (["api", "repos/owner/repo/pulls/42"], None),
         (["api", "--paginate", "--jq", ".workflow_runs",
           f"repos/owner/repo/actions/runs?head_sha={head}&per_page=100"], None),
+        (["api", "--paginate", "--jq", ".jobs", "repos/owner/repo/actions/runs/1/jobs?per_page=100"], None),
+        (["api", "--paginate", "repos/owner/repo/check-runs/11/annotations"], None),
         (["run", "view", "1", "-R", REPO, "--log-failed"], None),
+        (["api", "--paginate", "--jq", ".jobs", "repos/owner/repo/actions/runs/4/jobs?per_page=100"], None),
+        (["api", "--paginate", "repos/owner/repo/check-runs/14/annotations"], None),
         (["run", "view", "4", "-R", REPO, "--log-failed"], None),
     ]
 
 
 def test_gh_failed_logs_empty_when_head_has_no_failed_actions():
     run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"success"}]')
-    assert GhTracker(REPO, run).pr_failed_logs(42) == ""
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs == "" and not logs.not_started
     assert len(run.calls) == 2
 
 
 def test_gh_failed_log_errors_propagate():
     run = ScriptedRun(
-        '{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]',
+        '{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]', failed_job(11), "[]",
         subprocess.CalledProcessError(1, ["gh"], stderr="logs unavailable"),
     )
     with pytest.raises(TrackerError, match="logs unavailable"):
         GhTracker(REPO, run).pr_failed_logs(42)
+
+
+@pytest.mark.parametrize("steps,annotation", [
+    ("[]", "A runner could not be provisioned."),
+    (json.dumps([{"name": "Run tests", "status": "queued", "conclusion": None}]),
+     "The job was not started because the spending limit needs to be increased."),
+])
+def test_gh_failed_logs_mark_jobs_that_never_started_without_reading_logs(steps, annotation):
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', '[{"id":7,"name":"ci","conclusion":"failure","html_url":"https://run/7"}]',
+        failed_job(70, steps=steps), json.dumps([{"message": annotation}]),
+    )
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs.not_started
+    assert annotation in logs and "Actions run 7" in logs and "Job test did not start" in logs
+    assert not any("--log-failed" in call[0] for call in run.calls)
+
+
+def test_gh_failed_logs_mixed_jobs_are_a_code_failure_and_keep_both():
+    jobs = json.loads(failed_job(70, "build", steps="[]")) + json.loads(failed_job(71, "unit"))
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"failure"}]', json.dumps(jobs),
+        json.dumps([{"message": "The job was not started."}]), "[]", "assert 1 == 2",
+    )
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert not logs.not_started
+    assert "The job was not started." in logs and "Job unit failed" in logs and "assert 1 == 2" in logs
+
+
+def test_gh_failed_logs_missing_log_of_started_job_is_kept_as_evidence():
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"failure"}]', failed_job(70), "[]",
+        subprocess.CalledProcessError(1, ["gh"], stderr="log not found: 70"),
+    )
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert not logs.not_started and "log not found: 70" in logs
+
+
+def test_gh_failed_run_without_failed_jobs_is_a_code_failure():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"startup_failure"}]', "[]",
+                      "invalid workflow file")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert not logs.not_started and "invalid workflow file" in logs
 
 
 def gh_error(stderr, stdout="", code=1):

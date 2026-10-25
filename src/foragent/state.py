@@ -79,6 +79,7 @@ class Run:
     session_ids: list[str] = field(default_factory=list)
     session_body: str | None = None
     resume_reason: str = ""
+    resume_failures: int = 0
     merge_conflicts: list[str] = field(default_factory=list)
     local_skill_paths: list[str] = field(default_factory=list)
     approval_body_sha: str | None = None
@@ -703,6 +704,29 @@ class StateStore:
         except FileNotFoundError:
             return False
         return lane in pauses and now < datetime.fromisoformat(pauses[lane])
+
+    def pause_executor(self, executor: str, until: datetime) -> None:
+        """Hold every lane that needs ``executor`` until its usage window resets."""
+        with self._state_lock():
+            path = self.root / "executor-pauses.json"
+            pauses = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            timestamp = until.astimezone(UTC).isoformat()
+            current = pauses.get(executor)
+            if current is None or datetime.fromisoformat(current) < until:
+                pauses[executor] = timestamp
+            self._write_json(path, pauses)
+
+    def executor_pause_until(self, executor: str, now: datetime) -> datetime | None:
+        """When a usage-limit pause of ``executor`` ends, or None when it is not paused."""
+        try:
+            pauses = json.loads((self.root / "executor-pauses.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        until = datetime.fromisoformat(pauses[executor]) if executor in pauses else None
+        return until if until is not None and now < until else None
+
+    def executor_paused(self, executor: str, now: datetime) -> bool:
+        return self.executor_pause_until(executor, now) is not None
 
     def pause_github(self, until: datetime) -> datetime:
         """Share a reset deadline across runners and ticks without shortening it."""

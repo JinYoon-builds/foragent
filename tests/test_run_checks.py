@@ -446,3 +446,27 @@ def test_fa_test_inside_a_held_slot_runs_without_waiting(tmp_path, monkeypatch, 
         monkeypatch.setattr(capacity, "SLOT_POLL_SECONDS", 60)  # Any wait would hang the test.
         assert run_tests(tmp_path, Config(test_command="pytest", test_slots=1), []) == 0
     assert "child=held" in capfd.readouterr().out
+
+
+@pytest.mark.parametrize("with_slot", [False, True], ids=["no-slot", "slot"])
+def test_checks_do_not_write_bytecode_into_the_worktree(tmp_path, with_slot):
+    """Generated __pycache__ must not be staged and published with the change (#376)."""
+    from foragent import capacity
+    from foragent.run_checks import _check
+
+    worktree = tmp_path / "worktree"
+    (worktree / "pkg").mkdir(parents=True)
+    (worktree / "pkg/__init__.py").write_text("")
+    (worktree / "pkg/mod.py").write_text("VALUE = 1\n")
+    log = tmp_path / "log.txt"
+    log.write_text("")
+
+    @contextmanager
+    def slot():
+        yield
+
+    command = f"{shlex.quote(sys.executable)} -c 'import os, pkg.mod; print(os.environ.get(\"{capacity.TEST_SLOT_ENV}\"))'"
+    result = _check(command, worktree, log, 60, slot=slot() if with_slot else None)
+    assert result.exit_code == 0, result.output
+    assert not list(worktree.rglob("__pycache__"))
+    assert ("None" in result.output) is not with_slot
