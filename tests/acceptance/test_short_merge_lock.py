@@ -147,12 +147,37 @@ def assert_merged(case, number=1):
     assert len([row for row in case.merges if row.issue == number]) == 1
 
 
+def slow_under_lock(case):
+    """Work that must never happen while merge.lock is held.
+
+    Verification and sleeping are always slow. Inside one hold, the final
+    decision may re-read CI status of the exact head once (a non-waiting
+    read, so a rerun that failed during the lock wait is seen); a second CI
+    read in the same hold is polling.
+    """
+    slow, reads, hold = [], 0, None
+    for row in case.events:
+        if row.kind == "lock-acquired":
+            reads, hold = 0, row
+        elif row.kind == "lock-released":
+            hold = None
+        elif row.holder is None:
+            continue
+        elif row.kind in {"verify", "sleep"}:
+            slow.append(row)
+        elif row.kind == "ci":
+            reads += 1
+            if reads > 1:
+                slow.append(row)
+    return slow
+
+
 def assert_short_holds(case):
     assert case.holder is None
-    slow = [row for row in case.events
-            if row.kind in {"verify", "ci", "sleep"} and row.holder is not None]
+    slow = slow_under_lock(case)
     assert not slow, (
-        "Premerge verification and CI polling/waiting must run outside merge.lock; "
+        "Premerge verification and CI polling/waiting must run outside merge.lock "
+        "(one non-waiting CI status read per hold is allowed); "
         f"observed {[(row.kind, row.issue, row.holder) for row in slow]}"
     )
     if case.merges:
@@ -384,8 +409,7 @@ def test_changed_pr_head_is_held_without_waiting_under_lock(short_case):
     assert case.merges == case.tracker.merged_prs == []
     assert case.tracker.get_issue(1).state == "open"
     # A short-lock implementation need not acquire at all for a rejected head.
-    assert not [row for row in case.events
-                if row.kind in {"verify", "ci", "sleep"} and row.holder is not None], (
+    assert not slow_under_lock(case), (
         "Rejecting a changed head must not monopolize merge.lock during CI"
     )
 
@@ -402,4 +426,33 @@ def test_merge_records_review_latency_and_lock_hold_from_fake_clock(short_case, 
     assert_merge_facts(case)
     merged, = case.merges
     assert (merged.at - case.review_passes[1]).total_seconds() == pending_polls * 30 + queue_seconds + 2
+    assert_short_holds(case)
+
+
+def test_ci_rerun_failing_during_lock_wait_prevents_the_merge(short_case):
+    case = short_case
+
+    def rerun_fails():
+        # CI passed on this head, then a rerun of the same head failed while
+        # the run queued for merge.lock; the final decision must see it.
+        case.ci_status = lambda pr, head, poll: "fail"
+
+    case.before_lock = rerun_fails
+    assert run(case) != "merged"
+    assert case.merges == case.tracker.merged_prs == []
+    assert case.tracker.get_issue(1).state == "open"
+    assert_short_holds(case)
+
+
+def test_risk_high_added_during_lock_wait_holds_the_merge(short_case):
+    case = short_case
+
+    def mark_risky():
+        if "risk:high" not in case.tracker.get_issue(1).labels:
+            case.tracker.add_labels(1, ["risk:high"])
+
+    case.before_lock = mark_risky
+    assert run(case) == "held"
+    assert case.merges == case.tracker.merged_prs == []
+    assert case.tracker.get_issue(1).state == "open"
     assert_short_holds(case)
