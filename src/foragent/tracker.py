@@ -31,6 +31,8 @@ class Issue:
     # Link counts GitHub lists with each issue; they change when a link changes.
     sub_issues_summary: tuple[tuple[str, int], ...] | None = None
     dependencies_summary: tuple[tuple[str, int], ...] | None = None
+    # Why GitHub closed the issue ("completed", "not_planned", ...); None while open or unknown.
+    state_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -750,6 +752,7 @@ def _issue(data: dict[str, Any]) -> Issue:
         frozenset(label["name"] for label in data.get("labels", [])),
         data["state"], "pull_request" in data, data.get("updated_at"),
         _summary(data.get("sub_issues_summary")), _summary(data.get("issue_dependencies_summary")),
+        data.get("state_reason"),
     )
 
 

@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -145,13 +145,17 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                     unknown.add(label)
         return issue_lane(issue.labels, ctx.config.lanes)
 
+    # An order parent's column follows its children; see board_parents.
+    parents = board_parents.order_parents(ctx.store.local_issues())
     for issue in local_issue_models(ctx.store):
         if issue.state != "open":
             # A manually closed card leaves its column; known cards only.
             board.sync_status(ctx, issue, "closed", existing_only=True)
             continue
-        if processes_available:
+        if processes_available:  # Cleans a left-over worktree; board writes skip parents.
             issue = _recover_orphan(ctx, issue, report)
+        if issue.number in parents:
+            continue  # Its column follows its children, whatever its own labels say.
         issue = _escalate_overdue_blocker(ctx, issue, report)
         if issue.state != "open":
             board.sync_status(ctx, issue, "closed", existing_only=True)
@@ -217,6 +221,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         report.actions.append(f"#{issue.number} promoted to ready")
         ready.setdefault(lane, []).append(issue.number)
 
+    if listing_current:  # Children change only through observed facts and this tick's writes.
+        board_parents.follow_children(ctx, report)
     if until := ctx.store.github_wait_until(ctx.now()):
         report.skipped = f"GitHub rate limit until {until.isoformat()}"
         _apply_budgets(ctx, ready)
