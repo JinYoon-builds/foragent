@@ -21,6 +21,20 @@ class MissingComparison(UnusableComparison):
     pass
 
 
+def _excluded_subset(value, required):
+    """CI's exclusions still protect every file the gate requires now."""
+    return (isinstance(value, list) and all(isinstance(path, str) for path in value)
+            and set(value) <= set(required))
+
+
+def scope_covers(recorded, required):
+    """Equal scopes except that recorded exclusions may be a subset of required ones."""
+    if not isinstance(recorded, dict) or not isinstance(required, dict) or recorded.keys() != required.keys():
+        return False
+    return (all(recorded[key] == required[key] for key in required if key != "excluded")
+            and _excluded_subset(recorded.get("excluded"), required.get("excluded", [])))
+
+
 def _trusted_sha(git, tracker):
     try:
         return git.ref_sha(f"origin/{tracker.pr_default_branch()}")
@@ -48,7 +62,7 @@ class ComparisonEvidence:
                 or self.trusted_sha != _trusted_sha(git, ctx.tracker)):
             return False
         excluded = _baseline_exclusions(ctx, base_sha, ctx.store.log_path(n))
-        if self.scope != measurement_scope(ctx.config, ctx.repo_root, excluded):
+        if not scope_covers(self.scope, measurement_scope(ctx.config, ctx.repo_root, excluded)):
             return False
         try:
             if self.infrastructure and status == "fail":
@@ -114,6 +128,7 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
     if not isinstance(artifacts, list):
         raise UnusableComparison("invalid artifact listing")
     artifact_ids = set()
+    excluded = set(excluded)
     for evidence in artifacts:
         try:
             run, artifact, payload = evidence["run"], evidence["artifact"], evidence["report"]
@@ -132,8 +147,9 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
                     or artifact["workflow_run"]["head_sha"] != head_sha
                     or type(payload["schema_version"]) is not int or payload["schema_version"] != 1
                     or payload["repository"] != repo or payload["base_sha"] != base_sha
-                    or payload["head_sha"] != head_sha or payload["excluded"] != list(excluded)
-                    or payload["scope"] != expected_scope
+                    or payload["head_sha"] != head_sha or not _excluded_subset(payload["excluded"], excluded)
+                    or not scope_covers(payload["scope"], expected_scope)
+                    or payload["scope"]["excluded"] != payload["excluded"]
                     or type(index) is not int or type(shards) is not int or not 1 <= shards <= 256
                     or shards != len(expected_shards) or index not in expected_shards
                     or not 0 <= index < shards or artifact["name"] != f"acceptance-{index}"
@@ -145,11 +161,13 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
                 raise UnusableComparison("invalid duration")
             producer = run_id
             base, head = suite(payload["base"]), suite(payload["head"])
+            ci_excluded = set(payload["excluded"])
             for side, ids in (("base", base[0]), ("head", head[0])):
-                if seen[side] & ids or any(node.split("::", 1)[0] in excluded for node in ids):
+                if seen[side] & ids or any(node.split("::", 1)[0] in ci_excluded for node in ids):
                     raise UnusableComparison("overlapping or excluded tests")
                 seen[side].update(ids)
-            lost.update(base[1] - head[1])
+            # Files excluded since CI started are no longer protected.
+            lost.update(node for node in base[1] - head[1] if node.split("::", 1)[0] not in excluded)
             reports[index] = payload
             duration = max(duration, seconds)
         except (KeyError, TypeError, ValueError, AttributeError) as exc:

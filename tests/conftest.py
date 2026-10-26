@@ -53,6 +53,29 @@ from process_fakes import fake_process_table  # noqa: E402, F401
 def no_view_windows(monkeypatch):
     """Never open real terminal windows during the test suite."""
     monkeypatch.setenv("FORAGENT_VIEW", "off")
+    monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")  # Nor real orchestrator sessions (D76).
+
+
+@pytest.fixture(autouse=True)
+def no_real_ancestors(monkeypatch):
+    """Hide the real processes above pytest (#590).
+
+    `fa orch watch` records the nearest Claude ancestor. Under a gate check or a
+    person's Claude, that ancestor is the real session running pytest; tests
+    must not see it. Tests that need ancestors replace psutil.Process themselves.
+    """
+    import psutil
+
+    own = os.getpid()
+
+    class Isolated(psutil.Process):
+        def parent(self):
+            return None if self.pid == own else super().parent()
+
+        def parents(self):
+            return [] if self.pid == own else super().parents()
+
+    monkeypatch.setattr(psutil, "Process", Isolated)
 
 
 @pytest.fixture(autouse=True)

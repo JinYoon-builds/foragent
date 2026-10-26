@@ -22,6 +22,7 @@ def environment(tmp_path, monkeypatch):
         remote_slug=lambda: remotes.append(root) or "owner/repo",
     ))
     monkeypatch.setattr(kick.StateStore, "for_repo", lambda repo: repos.append(repo) or store)
+    monkeypatch.setattr(kick, "_launchd_kickstart", lambda repo: False)
     return root, store, repos, remotes
 
 
@@ -42,7 +43,8 @@ def test_kick_detaches_same_python_and_appends_both_streams(environment, monkeyp
     assert kick.kick_tick(Path(root.name)) is None
     assert kick.kick_tick(root) is None
     assert calls[0][0] == [sys.executable, "-m", "foragent.cli", "gate", "tick", "--repo-root", str(root)]
-    assert set(calls[0][1]) == {"cwd", "stdin", "start_new_session", "stdout", "stderr"}
+    assert set(calls[0][1]) == {"cwd", "stdin", "start_new_session", "stdout", "stderr", "env"}
+    assert calls[0][1]["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert calls[0][1]["cwd"] == root
     assert calls[0][1]["stdin"] == subprocess.DEVNULL
     assert calls[0][1]["start_new_session"] is True
@@ -107,3 +109,33 @@ def test_kick_while_tick_lock_is_held_safely_skips(environment, monkeypatch):
     assert (store.root / "kick.log").read_text() == "another tick is running\n"
     with store.tick_lock() as acquired:
         assert acquired
+
+
+def test_installed_job_is_started_through_launchd(environment, monkeypatch):
+    root, store, _, _ = environment
+    started, spawned = [], []
+    monkeypatch.setattr(kick, "_launchd_kickstart", lambda repo: started.append(repo) or True)
+    monkeypatch.setattr(kick.subprocess, "Popen", lambda *args, **kwargs: spawned.append(args))
+    assert kick.kick_tick(root) is None
+    assert started == ["custom/project"] and spawned == []
+
+
+def test_launchd_kickstart_needs_an_installed_job(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(kick.sys, "platform", "darwin")
+    monkeypatch.setattr(kick.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(kick.subprocess, "run", lambda args, **kwargs: calls.append(args)
+                        or SimpleNamespace(returncode=0))
+    assert kick._launchd_kickstart("owner/repo") is False and calls == []
+    from foragent import launchd
+    plist = tmp_path / "Library/LaunchAgents" / f"{launchd.label_for('owner/repo')}.plist"
+    plist.parent.mkdir(parents=True)
+    import plistlib
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"HOME": str(tmp_path)}}))
+    # An older job would start a tick without the gate environment: start directly instead.
+    assert kick._launchd_kickstart("owner/repo") is False and calls == []
+    plist.write_text("not a plist")  # Unknown environment: never trusted for a kickstart.
+    assert kick._launchd_kickstart("owner/repo") is False and calls == []
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": dict(launchd.GATE_ENVIRONMENT)}))
+    assert kick._launchd_kickstart("owner/repo") is True
+    assert calls[0][:2] == ["launchctl", "kickstart"] and calls[0][2].endswith(launchd.label_for("owner/repo"))

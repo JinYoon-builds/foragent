@@ -23,12 +23,13 @@ import time
 import psutil
 
 
-# Child discovery delay is bounded by poll interval + max cache age <= 1.0 s.
-OBSERVER_POLL_INTERVAL = 0.5
-ROUTINE_SCAN_MAX_AGE = 0.5
-# Contention falls back to a direct scan at once: waiting would hold up the
-# observer's join before SIGTERM relay and stretch the discovery bound.
-ROUTINE_SCAN_LOCK_TIMEOUT = 0.0
+# Each observer accepts scans started at or after its previous poll's start.
+# A child alive then and still alive at the scan is witnessed; discovery takes
+# at most two poll intervals (in addition to time spent waiting/scanning).
+OBSERVER_POLL_INTERVAL = 1.0
+# SIGTERM relay joins the observer: its scan work can block for at most this
+# lock bound plus one scan pair, including when contention requires fallback.
+ROUTINE_SCAN_LOCK_TIMEOUT = 2.0
 ROUTINE_SCAN_LOCK_RETRY_INTERVAL = 0.01
 
 
@@ -142,6 +143,72 @@ def read_process_identity(pid: int) -> ProcessIdentity | None:
     except psutil.AccessDenied as exc:
         raise PermissionError(f"Process identity {pid} cannot be read") from exc
     return None
+
+
+def _same_dir(cwd: str | None, root: Path) -> bool:
+    """``cwd`` is ``root``. A missing, empty or relative path matches nothing:
+    resolving it would silently use this process's own directory instead."""
+    if not cwd or not Path(cwd).is_absolute():
+        return False
+    try:
+        return Path(cwd).resolve() == root.resolve()
+    except OSError:
+        return False
+
+
+def _cwd(process) -> str | None:
+    """Absolute working directory, or None when it is unreadable, empty or gone."""
+    try:
+        cwd = process.cwd()
+    except (psutil.Error, OSError, SystemError):
+        return None
+    return cwd if isinstance(cwd, str) and cwd and Path(cwd).is_absolute() else None
+
+
+def claude_session() -> dict | None:
+    """``{pid, start_time}`` of the nearest Claude ancestor of this process, or None.
+
+    A Claude Code session shows argv[0] ``claude`` and psutil name ``claude`` or
+    ``claude.exe``. The nearest such ancestor is the session, wherever it runs
+    and whatever lies between.
+    """
+    try:
+        current = psutil.Process(os.getpid()).parent()
+        while current is not None:
+            try:
+                argv = current.cmdline()
+            except (psutil.AccessDenied, PermissionError, SystemError):
+                argv = []
+            try:
+                name = current.name()
+            except (psutil.AccessDenied, PermissionError, SystemError):
+                name = ""
+            if (argv and Path(argv[0]).name == "claude") or name in {"claude", "claude.exe"}:
+                return {"pid": current.pid, "start_time": current.create_time()}
+            current = current.parent()
+    except (psutil.Error, OSError, SystemError):
+        return None
+    return None
+
+
+def orchestrator_process_alive(repo_root: Path, skill: str = "/fa-orchestrator") -> bool:
+    """True when a live process has ``skill`` in its argv and runs at ``repo_root``.
+
+    The working directory is read only for those candidates; an unreadable or
+    missing one does not match.
+    """
+    try:
+        candidates = tuple(psutil.process_iter())
+    except (psutil.Error, OSError):
+        return False
+    for process in candidates:
+        try:
+            argv = process.cmdline()
+        except (psutil.Error, OSError, SystemError):
+            continue
+        if skill in (argv or ()) and _same_dir(_cwd(process), repo_root):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -284,7 +351,7 @@ def _scan_tree_rows() -> tuple[dict[int, ProcessIdentity], dict[int, ProcessIden
     return rows, confirmed
 
 
-def _read_routine_rows(path: Path, max_age: float):
+def _read_routine_rows(path: Path, not_before: float):
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -292,7 +359,7 @@ def _read_routine_rows(path: Path, max_age: float):
     if (type(value["version"]) is not int or value["version"] != 1
             or type(value["captured_at"]) not in (int, float)
             # Monotonic time is system-wide and immune to wall-clock steps.
-            or not 0 <= time.monotonic() - value["captured_at"] <= max_age):
+            or not not_before <= value["captured_at"] <= time.monotonic()):
         return None
 
     def decode(records):
@@ -334,8 +401,8 @@ def _routine_scan_lock(path: Path) -> Iterator[None]:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def shared_routine_rows(max_age: float = ROUTINE_SCAN_MAX_AGE) -> tuple[dict[int, ProcessIdentity], dict[int, ProcessIdentity]]:
-    """Share one reconciled scan pair per interval, without caller-specific protection.
+def shared_routine_rows(*, not_before: float) -> tuple[dict[int, ProcessIdentity], dict[int, ProcessIdentity]]:
+    """Reuse a scan started since the caller's previous poll, never a future scan.
 
     Return reconciled rows and the complete confirmed rows for lineage checks.
     Cache failures use direct scans; stop and birth evidence never use this cache.
@@ -347,11 +414,11 @@ def shared_routine_rows(max_age: float = ROUTINE_SCAN_MAX_AGE) -> tuple[dict[int
     try:
         try:
             path = capacity.machine_root() / "process-scan.json"
-            cached = _read_routine_rows(path, max_age)
+            cached = _read_routine_rows(path, not_before)
             if cached is not None:
                 return cached
             lock.enter_context(_routine_scan_lock(path.with_suffix(".lock")))
-            cached = _read_routine_rows(path, max_age)
+            cached = _read_routine_rows(path, not_before)
         except cache_errors:
             path, cached = None, None
         if cached is not None:
@@ -392,16 +459,22 @@ def shared_routine_rows(max_age: float = ROUTINE_SCAN_MAX_AGE) -> tuple[dict[int
             pass
 
 
-def observe_tree(identities=(), roots=(), *, shared: bool = False) -> list[dict]:
+def observe_tree(
+    identities=(), roots=(), *, shared: bool = False, not_before: float | None = None,
+) -> list[dict]:
     """Keep observed identities across reparenting; only verified parents add children.
 
     roots are supplied only when Foragent records a newly launched process. A
     missing or reused recorded identity is never re-anchored by its PID alone.
-    Only the periodic child observer opts into shared routine rows.
+    Only the periodic child observer opts into shared routine rows, supplying
+    its previous poll's start as not_before. Other shared callers default to
+    requiring a scan started since this observation.
     """
     if not identities and not roots:
         return []
-    rows, confirmed = shared_routine_rows() if shared else _scan_tree_rows()
+    rows, confirmed = shared_routine_rows(
+        not_before=time.monotonic() if not_before is None else not_before,
+    ) if shared else _scan_tree_rows()
     lineage, group, session = _protected(confirmed)
 
     def safe(row):
@@ -602,6 +675,7 @@ def run_logged(
             # the main thread so the launch snapshot can still record ownership.
             writer = threading.Thread(target=write_prompt, daemon=True)
             writer.start()
+        launch_observed_at = time.monotonic()
         try:
             identities = observe_tree(roots=(process.pid,))
         except PermissionError:
@@ -612,11 +686,14 @@ def run_logged(
 
         def observe_children():
             nonlocal identities
+            previous_poll = launch_observed_at
             try:
                 # The launch snapshot already anchors ownership. Keep witnessed
                 # children across reparenting with shared machine-wide scan pairs.
                 while not stop_tracking.wait(OBSERVER_POLL_INTERVAL):
-                    observed = observe_tree(identities, shared=True)
+                    poll_started_at = time.monotonic()
+                    observed = observe_tree(identities, shared=True, not_before=previous_poll)
+                    previous_poll = poll_started_at
                     if observed != identities:
                         identities = observed
                         if on_process_tree is not None:
@@ -689,6 +766,8 @@ def run_logged(
                 raise observation_errors[0]
         finally:
             stop_tracking.set()
+            # An in-flight observer waits at most the lock bound plus one scan
+            # pair before this join lets cleanup relay SIGTERM to the executor.
             observer.join()
             try:
                 identities = observe_tree(identities)

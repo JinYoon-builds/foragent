@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field, replace
+from glob import escape
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
@@ -13,8 +14,11 @@ from foragent import board, review_perspectives, risks
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
+from foragent.i18n import text
 from foragent.issue import ParsedIssue, body_hash
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
+from foragent.orch_events import append_event
+from foragent.overlap_files import any_overlap
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped
@@ -254,18 +258,24 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
         finally:
             ctx.git.remove_worktree(worktree)
     prs = {pr.head: pr for pr in ctx.tracker.list_prs("merged", "foragent/issue-") if pr.base == branch}
-    lines = [f"Closes #{parent}", "", "## Children", ""]
+    # No closing keyword: the parent's completion belongs to the gate's order
+    # aggregation (board_parents), which comments first and keeps a parent with
+    # a not-planned child open. A merge here must not close it behind that.
+    lines = [text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", ""]
     for child in sorted(children, key=lambda child: child.number):
         pr = prs.get(f"foragent/issue-{child.number}")
         lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
-    title = f"Batch: {ctx.tracker.get_issue(parent).title} (#{parent})"
+    issue = ctx.tracker.get_issue(parent)
+    title = f"Batch: {issue.title} (#{parent})"
     body = "\n".join(lines)
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
-        board.sync_status(ctx, parent, "PR open")
+        if issue.state == "open":  # A completed order (#411) stays in Done.
+            board.sync_status(ctx, parent, "PR open")
         return
     pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
-    board.sync_status(ctx, parent, "PR open")
+    if issue.state == "open":
+        board.sync_status(ctx, parent, "PR open")
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
 
 
@@ -305,6 +315,48 @@ def _preserve_failed_implementation(
     tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
 ) -> None:
     """Save stopped work before cleanup, including after the runner has died."""
+    with ctx.store.worktree_lock(n):
+        # Recheck only after acquiring the lock: a competing cleanup may have
+        # removed the worktree while we waited. A parent repository is no save.
+        if not (git.root / ".git").is_file():
+            return
+        try:
+            git.check_worktree()
+        except GitError:
+            return
+        _preserve_locked_implementation(
+            n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
+            pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
+        )
+
+
+def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> list[str]:
+    """Leave unowned deletions out of the index without discarding other work."""
+    deletions = git.staged_deletions()
+    if not deletions:
+        return []
+    patterns = []
+    if run is not None:
+        patterns.extend(run.declared_files or [])
+        patterns.extend([escape(path) for path in run.effective_files or []]
+                        if run.files_committed else run.effective_files or [])
+        patterns.extend(escape(path) for path in [*(run.changed_files or []), *run.late_files])
+    base = (run.files_base_branch if run is not None else None) or ctx.config.base_branch
+    committed = git.committed_paths(f"origin/{base}")
+    artifacts = git.artifact_paths()
+    refused = sorted(path for path in deletions
+                     if path not in committed
+                     and not any(path == root or path.startswith(root + "/") for root in artifacts)
+                     and not any_overlap(ctx, [escape(path)], patterns))
+    git.restore_staged_paths("HEAD", refused)
+    return refused
+
+
+def _preserve_locked_implementation(
+    n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
+    approved_ref: str, title: str | None, pushed_head: str | None,
+    tracker_available: bool, push_branch: Callable[[], None] | None,
+) -> None:
     branch = f"foragent/issue-{n}"
     run = ctx.store.get_run(n)
     git.local_skill_paths.update(run.local_skill_paths if run is not None else ())
@@ -317,8 +369,13 @@ def _preserve_failed_implementation(
     git.stage_changes()
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
+    refused = _check_wip_deletions(ctx, git, run)
     if git.has_staged_changes():
         git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
+    if refused:
+        detail = "WIP preservation refused: deletions outside allowed paths: " + ", ".join(map(repr, refused[:10]))
+        _append(ctx.store.log_path(n), detail)
+        append_event(ctx.store, ctx.now(), n, "wip-preservation-refused", detail)
     if git.head_sha() == pushed_head or not tracker_available:
         return
     try:

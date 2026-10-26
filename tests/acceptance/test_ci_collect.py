@@ -15,7 +15,10 @@ def test_project_ci_collects_every_test_including_acceptance():
     collect = [run for run in runs if "--collect-only" in run]
     assert collect, runs
     assert all("--ignore" not in run for run in collect)
-    assert any("--ignore=tests/acceptance" in run and "--collect-only" not in run for run in runs)
+    # The unit run excludes acceptance tests, either with --ignore or through the
+    # shard entry point that discovers unit files only (#561).
+    assert any(("--ignore=tests/acceptance" in run or "foragent.ci_unit_shard" in run)
+               and "--collect-only" not in run for run in runs)
 
 
 def test_adopt_ci_reports_a_missing_collect_step(tmp_path):

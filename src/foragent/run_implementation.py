@@ -88,7 +88,7 @@ _DETECTION_FILES = ("pyproject.toml", "package.json", "pnpm-lock.yaml", "go.mod"
 
 
 def _detect_test_command_at(git: GitRepo, ref: str) -> str | None:
-    """Detect the full-suite command from a commit's files, not the checkout."""
+    """Detect the full-suite command from a base commit's files, not a PR checkout."""
     from foragent import runner
 
     sha = git.ref_sha(ref)
@@ -101,46 +101,43 @@ def _detect_test_command_at(git: GitRepo, ref: str) -> str | None:
 
 
 def capture_acceptance_baseline(
-    n: int, ctx: RunContext, git: GitRepo, target_branch: str, ref: str, *, detect_at_ref: bool = False,
-    required: bool = False,
+    n: int, ctx: RunContext, git: GitRepo, target_branch: str, ref: str,
+    test_command: str | None = None,
 ) -> AcceptanceBaseline | None:
     """Capture (or reuse the cached) protected set for ``ref``; stop the run if unusable (#327).
 
-    Run at preparation and again after each result-affecting base move (#483).
-    A refresh detects the test command from ``ref`` itself: the worktree then
-    holds the PR, which must not decide how the new base is measured.
-    ``required`` (a refresh of a run that already had a protected set) turns
-    "no baseline" into the #327 stop instead of silently dropping protection.
+    Run at preparation and again whenever the run adopts a newer base (#483).
     """
     from foragent import runner
     from foragent.ci_local import capture_local_only
     from foragent.ci_mode import enabled
 
     log = ctx.store.log_path(n)
-    test_command = ctx.config.test_command
     if test_command is None:
-        if detect_at_ref:
-            test_command = _detect_test_command_at(git, ref)
-        else:
-            test_command = next(iter(runner.detect_test_commands(git.root)), None)
+        test_command = ctx.config.test_command
+    if test_command is None:
+        test_command = next(iter(runner.detect_test_commands(git.root)), None)
     try:
         started = ctx.monotonic()
         if enabled(ctx, target_branch):
             from foragent.run_baseline import _baseline_exclusions
             base_sha = git.ref_sha(ref)
-            return capture_local_only(n, ctx, git, test_command, base_sha,
-                                      _baseline_exclusions(ctx, base_sha, log))
+            baseline = capture_local_only(n, ctx, git, test_command, base_sha,
+                                          _baseline_exclusions(ctx, base_sha, log))
+            return replace(baseline, test_command=test_command) if baseline else None
         baseline = _capture_acceptance_baseline(n, ctx, test_command, ref)
-        if baseline is None and required:
-            raise AttemptFailure(
-                f"acceptance baseline unavailable: no baseline could be captured for the new base {ref}")
         ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})
-        return baseline
+        return replace(baseline, test_command=test_command) if baseline else None
     except AttemptFailure as exc:
-        _append(log, str(exc))
-        reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
-        flag(ctx, n, reason, "acceptance baseline unavailable", str(exc))
-        raise ExecutorStopped(reason.value, str(exc)) from exc
+        _baseline_unavailable(n, ctx, str(exc), exc)
+
+
+def _baseline_unavailable(n: int, ctx: RunContext, detail: str, cause: Exception | None = None) -> None:
+    """The #327 stop: no merge without a usable protected set."""
+    _append(ctx.store.log_path(n), detail)
+    reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+    flag(ctx, n, reason, "acceptance baseline unavailable", detail)
+    raise ExecutorStopped(reason.value, detail) from cause
 
 
 def follow_base(attempt: Implementation) -> None:
@@ -149,17 +146,25 @@ def follow_base(attempt: Implementation) -> None:
     Every step that adopts a newer base (a result-affecting move, a rebuild,
     a switch between batch and base targets) changes ``start_ref``. Checks
     call this before verifying, so none of them can verify against the
-    protected set and exclusions of an older base.
+    protected set and exclusions of an older base. The command is the one the
+    protected set was captured with: the branch may have changed the files
+    test-command detection reads.
     """
     if attempt.baseline_sha is None:
         return
     sha = attempt.git.ref_sha(attempt.start_ref)
     if sha == attempt.baseline_sha:
         return
-    attempt.baseline = capture_acceptance_baseline(
-        attempt.n, attempt.ctx, attempt.git, attempt.target_branch, sha,
-        detect_at_ref=True, required=attempt.baseline is not None)
-    attempt.baseline_sha = sha
+    previous = attempt.baseline
+    # Without an earlier protected set, the worktree holds the PR: read the base.
+    command = previous.test_command if previous else (
+        attempt.ctx.config.test_command or _detect_test_command_at(attempt.git, sha))
+    baseline = capture_acceptance_baseline(attempt.n, attempt.ctx, attempt.git, attempt.target_branch, sha, command)
+    if baseline is None and previous is not None:
+        # A run that had protection must not continue with none (#327).
+        _baseline_unavailable(attempt.n, attempt.ctx,
+                              f"acceptance baseline unavailable: no baseline could be captured for the new base {sha}")
+    attempt.baseline, attempt.baseline_sha = baseline, sha
 
 
 def _prepare_implementation(
@@ -188,7 +193,11 @@ def _prepare_implementation(
     issue = ctx.tracker.get_issue(n)
     size = issue_size(issue.labels)
     baseline_sha = git.ref_sha(start_ref) if capture_baseline else None
-    baseline = (capture_acceptance_baseline(n, ctx, git, target_branch, baseline_sha)
+    baseline_command = ctx.config.test_command
+    if baseline_command is None and capture_baseline and git.head_sha() != baseline_sha:
+        # A resumed run's worktree holds its saved branch; measure the base by the base's files.
+        baseline_command = _detect_test_command_at(git, baseline_sha)
+    baseline = (capture_acceptance_baseline(n, ctx, git, target_branch, baseline_sha, baseline_command)
                 if capture_baseline else None)
     return Implementation(
         n=n,
