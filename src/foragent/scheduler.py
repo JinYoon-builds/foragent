@@ -103,8 +103,7 @@ def tick(ctx: TickContext) -> TickReport:
                 until = orch_github.pause(ctx, exc)
                 _apply_budgets(ctx, {})
                 return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
-            # After this tick's starts, so idle lanes are really idle. A due tidy is a
-            # request for the orchestrator's judgment, never a launch or an order.
+            # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
             if request := tidy.post_if_due(ctx.store):
                 report.actions.append(f"Tidy due; inbox request {request['id']}")
             return report
