@@ -40,13 +40,14 @@ def _offer_statusline(answer: str | None) -> None:
 
 def _offer_upstream_reports(root) -> None:
     """Ask once, default no, whether upstream error reports may be proposed; remember either answer."""
-    from foragent.config import set_upstream_reports
+    from foragent.config import load_config, set_upstream_reports
     from foragent.upstream_report import UPSTREAM
 
     cli = facade()
     try:
         # Asked only after setup wrote a usable config; the answer itself is global.
-        language = cli.load_config(root).language
+        # Read the file directly so the facade's config hook sees only the view's read.
+        language = load_config(root).language
         if cli.load_global_config().upstream_reports is not None:
             return
     except cli.ConfigError:
