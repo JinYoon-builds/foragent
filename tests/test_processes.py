@@ -510,7 +510,7 @@ def test_observed_detached_child_survives_reload_as_owned(fake_process_table, tm
     store = StateStore(tmp_path / "state")
     store.start_run(1, branch="branch", worktree=tmp_path, pid=root.pid)
     child = table.add(42001, ppid=root.pid, cwd=tmp_path.parent, start_time=11)
-    store.update_run(1, phase="implement")
+    store.update_run(1, phase="implement", observe=True)
     table.exit(root.pid)
     table.rows[child.pid] = replace(child, ppid=1)
     reloaded = StateStore(store.root).get_run(1)
