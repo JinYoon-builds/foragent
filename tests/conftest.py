@@ -62,6 +62,17 @@ def no_release_lookup(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_real_usage_source(request, monkeypatch):
+    """A paused executor's recheck must not start the real `codex app-server` or read the real
+    Claude snapshot. Tests that supply their own fake server (`codex_server`) keep the real readers."""
+    from foragent import usage_recheck
+
+    if "codex_server" not in request.fixturenames and request.module.__name__ != "test_usage_recheck_unit":
+        monkeypatch.setattr(usage_recheck, "read_codex", lambda now: None)
+        monkeypatch.setattr(usage_recheck, "read_claude", lambda now, interval, since: None)
+
+
+@pytest.fixture(autouse=True)
 def no_live_cpu_times(monkeypatch):
     """Tests opt into fake CPU counters instead of depending on the shared machine."""
     import psutil

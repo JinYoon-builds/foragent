@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, orch_queue, tidy, watch_open
+from foragent import board, orch_github, orch_queue, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -50,6 +50,7 @@ class TickContext:
     runner_process_exists: Callable[[int], bool] = runner_process_exists
     kill_runner: Callable[[int], None] = kill_process_group
     baseline_launcher: Callable = start_baseline_thread
+    committed_config: bool = False  # fa gate tick: settings from origin/<base> after the fetch.
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self, queue_writes=True)
@@ -72,6 +73,7 @@ from foragent.scheduler_checks import (  # noqa: E402
     _blockers, _check_prerequisites, _confirmed_read, _escalate_overdue_blocker, _label_events, _open_pr,
     _reconcile_batches,
 )
+from foragent.scheduler_config import fetch_base  # noqa: E402
 from foragent.scheduler_lanes import (  # noqa: E402
     _can_start_in_lane, _file_patterns_overlap, _filesystem_case_sensitive,
 )
@@ -85,6 +87,7 @@ def tick(ctx: TickContext) -> TickReport:
             cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
             if snapshot.available:
                 _reap_inactive_runs(ctx, cleanup)
+            usage_recheck.recheck(ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
             if until := ctx.store.github_wait_until(ctx.now()):
                 _apply_budgets(ctx, {})
                 return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
@@ -109,7 +112,7 @@ def tick(ctx: TickContext) -> TickReport:
 def _tick_locked(ctx: TickContext) -> TickReport:
     report, ctx._budget_sample = TickReport(), None
     started = ctx.now()  # The tick's own time; the fetch below can take seconds.
-    ctx.git.fetch("origin", ctx.config.base_branch)
+    fetch_base(ctx)  # Also applies origin's committed .foragent.yml for fa gate tick.
     base_ref = f"origin/{ctx.config.base_branch}"
     # A listing taken this tick can confirm remembered per-issue reads.
     # A periodic tick starts within process start-up jitter of its nominal 300 s

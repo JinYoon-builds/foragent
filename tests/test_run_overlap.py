@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from foragent.issue import parse_body
-from foragent.run_overlap import wait_for_overlap
+from foragent.run_overlap import OVERLAP_POLL_SECONDS, wait_for_overlap
 from foragent.run_waits import _remaining
 from test_overlap_files import context, edit, reserve  # noqa: F401
 
@@ -48,7 +48,7 @@ def test_late_cap_wait_credits_time_and_advertises_liveness(context, limit):
     context.sleep = sleep
     wait_for_overlap(attempt(context, 1))
     run = context.store.get_run(1)
-    assert waits == [1]
+    assert waits == [OVERLAP_POLL_SECONDS]
     assert run.waiting_until is None and run.waited_seconds == 7
     assert _remaining(1, context) == before
 
@@ -72,7 +72,7 @@ def test_two_late_additions_give_the_earlier_starter_the_place(context):
 
     context.sleep = sleep
     wait_for_overlap(attempt(context, 2))
-    assert waits == [1]
+    assert waits == [OVERLAP_POLL_SECONDS]
 
 
 @pytest.mark.parametrize('limit', [2, 1], ids=['default-cap', 'cap-one'])
@@ -107,7 +107,7 @@ def test_crossed_late_claims_let_the_earlier_run_proceed(context, limit, exclusi
 
     context.sleep = sleep
     wait_for_overlap(attempt(context, later))
-    assert waits == [1]
+    assert waits == [OVERLAP_POLL_SECONDS]
     assert context.store.get_run(later).waiting_until is None
 
 
@@ -136,7 +136,7 @@ def test_declared_path_readded_after_narrowing_is_checked(context, declared, exc
 
     context.sleep = sleep
     wait_for_overlap(attempt(context, 1))
-    assert waits == [1]
+    assert waits == [OVERLAP_POLL_SECONDS]
     assert context.store.get_run(1).effective_files == ['own.py', 'shared.py']
 
 
@@ -247,7 +247,7 @@ def test_batch_late_union_uses_configured_base_and_preserves_exclusive(context, 
     owner = attempt(context, 1)
     owner.target_branch = 'batch'
     wait_for_overlap(owner)
-    assert waits == ([1] if exclusive else [])
+    assert waits == ([OVERLAP_POLL_SECONDS] if exclusive else [])
     assert len(calls) == (3 if exclusive else 1), 'Read one attribute batch per wait check'
     assert all('--source=origin/trunk' in args for args in calls)
     assert context.store.get_run(1).overlap_records == []

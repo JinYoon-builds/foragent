@@ -2661,7 +2661,7 @@ def test_crash_group_termination_failure_preserves_worktree_and_active_run(ctx, 
     tick(ctx)
     mark_running(ctx)
     ctx.process_table.add(124, ppid=123, cwd=ctx.repo_root, start_time=NOW.timestamp() + 1)
-    ctx.store.update_run(1)
+    ctx.store.update_run(1, observe=True)
     ctx.process_table.exit(ctx.store.get_run(1).pid)
     monkeypatch.setattr(ctx.git, "remove_worktree", lambda path: pytest.fail("group is not stopped"))
 
@@ -2926,6 +2926,21 @@ def test_tick_during_github_wait_still_applies_machine_ceilings_once(ctx, monkey
     assert capacity.read_state(ctx.store)["parallel"] == 2
     assert capacity.read_test_slots()["slots"] == 1
     assert samples == [1], "one sensor sample and one budget update per tick"
+
+
+def test_tick_during_github_wait_still_rechecks_free_usage(ctx, monkeypatch):
+    from foragent import usage_recheck
+
+    until = NOW + timedelta(hours=2)
+    usage_recheck.note_limit(ctx.store, "codex", until, [{"name": "5h", "used_percent": 100, "exhausted": True}], NOW)
+    ctx.store.pause_executor("codex", until)
+    ctx.store.pause_github(NOW + timedelta(minutes=30))
+    monkeypatch.setattr(usage_recheck, "read_codex", lambda now: [{"name": "5h", "used_percent": 4}])
+    report = tick(ctx)
+    assert report.skipped and "GitHub rate limit" in report.skipped
+    assert not ctx.store.executor_paused("codex", NOW)
+    events = [json.loads(line) for line in (ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [event["kind"] for event in events] == ["quota-recovered"]
 
 
 def test_rate_limit_error_after_budgets_does_not_apply_them_twice(ctx, monkeypatch):
