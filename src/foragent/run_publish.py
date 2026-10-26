@@ -14,6 +14,7 @@ from foragent import board, review_perspectives, risks
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
+from foragent.i18n import text
 from foragent.issue import ParsedIssue, body_hash
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
 from foragent.orch_events import append_event
@@ -257,7 +258,10 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
         finally:
             ctx.git.remove_worktree(worktree)
     prs = {pr.head: pr for pr in ctx.tracker.list_prs("merged", "foragent/issue-") if pr.base == branch}
-    lines = [f"Closes #{parent}", "", "## Children", ""]
+    # No closing keyword: the parent's completion belongs to the gate's order
+    # aggregation (board_parents), which comments first and keeps a parent with
+    # a not-planned child open. A merge here must not close it behind that.
+    lines = [text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", ""]
     for child in sorted(children, key=lambda child: child.number):
         pr = prs.get(f"foragent/issue-{child.number}")
         lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))

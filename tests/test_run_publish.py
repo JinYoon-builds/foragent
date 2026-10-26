@@ -1,3 +1,4 @@
+import re
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -18,6 +19,9 @@ from foragent.tracker import TrackerError
 
 from conftest import ACCEPTANCE, BASE_TIME, git_command
 from runner_support import BODY, COMMAND, batch_setup, enable_reviewer, run_case, seed_batch, set_done_when
+
+# GitHub closes an issue named after one of these words when the PR merges.
+CLOSING_KEYWORD = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+#\d+", re.I)
 
 
 def test_base_only_paths_merged_during_ci_do_not_retarget_the_pr(run_case, monkeypatch):
@@ -707,7 +711,10 @@ def test_batch_child_targets_shared_branch_closes_and_opens_parent_pr_once(run_c
     assert c.tracker.list_comments(1)[-1].body == "Merged into foragent/batch-99 (PR #100)"
     assert batch.head == "foragent/batch-99" and batch.base == "main"
     assert batch.title == "Batch: The whole feature (#99)"
-    assert "Closes #99" in batch.body and "#1: Implement feature (PR #100)" in batch.body
+    from foragent.i18n import text
+
+    assert text("batch_pr_parent", c.ctx.config.language, parent=99) in batch.body and "#1: Implement feature (PR #100)" in batch.body
+    assert not CLOSING_KEYWORD.search(batch.body), "Only the gate's order aggregation closes the parent"
     _batch_pr(99, c.ctx)
     assert len(c.tracker.created_prs) == 2
     if existing_batch:
@@ -1194,3 +1201,57 @@ def test_gate_merges_with_an_explicit_subject_when_every_pr_edit_fails(run_case,
     assert edits[:2] == ["Implement feature (#1)", wip] and edits[-1] == "Implement feature (#1)"
     log = c.store.log_path(1).read_text()
     assert "retitle failed" in log and "HTTP 500" in log
+
+
+def _merge_batch_then_tick(c):
+    """Merge the batch PR right after runner finalization, before any gate tick."""
+    from foragent.scheduler import TickContext, tick
+
+    assert run_issue(1, c.ctx) == "merged"
+    batch = c.tracker.created_prs[-1]
+    assert batch.head == "foragent/batch-99"
+    assert not CLOSING_KEYWORD.search(batch.body), "A batch PR merge must not close the order parent"
+    c.tracker.merge_pr(batch.number, expected_head_sha=c.tracker.pr_head_sha(batch.number))
+    assert c.tracker.get_issue(99).state == "open"
+    context = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now,
+        launcher=lambda number: pytest.fail("parent completion must not launch"), start_runs=False,
+    )
+    tick(context)
+    return context
+
+
+def test_batch_pr_merged_before_any_tick_leaves_parent_completion_to_the_gate(run_case):
+    from foragent.i18n import text
+    from foragent.scheduler import tick
+
+    c = run_case
+    batch_setup(c)
+    before = c.tracker.list_comments(99)
+    context = _merge_batch_then_tick(c)
+    parent = c.tracker.get_issue(99)
+    assert parent.state == "closed", "The gate closes the order once every child is done"
+    completion = text("parent_children_done", c.ctx.config.language, count=1)
+    added = c.tracker.list_comments(99)[len(before):]
+    assert [comment.body for comment in added].count(completion) == 1
+    tick(context)
+    assert [comment.body for comment in c.tracker.list_comments(99)[len(before):]] == [
+        comment.body for comment in added
+    ]
+
+
+def test_batch_pr_merge_keeps_a_parent_with_a_not_planned_child_open_and_flagged(run_case):
+    from dataclasses import replace as replace_issue
+
+    from foragent.board_parents import NOT_PLANNED_FLAG
+
+    c = run_case
+    batch_setup(c)
+    dropped = c.tracker.add_issue(3, "Dropped part", state="closed")
+    c.tracker.issues[3] = replace_issue(dropped, state_reason="not_planned")
+    c.tracker.set_parent(3, 99)
+    _merge_batch_then_tick(c)
+    assert c.tracker.get_issue(99).state == "open", "A not-planned child keeps the order open"
+    flag = c.store.load_flag(99)
+    assert flag is not None and flag.reason == NOT_PLANNED_FLAG

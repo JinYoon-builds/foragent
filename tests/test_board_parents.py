@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -45,6 +46,10 @@ def test_messages_have_both_languages():
     assert "3" in text("parent_children_done", "en", count=3)
     assert "3" in text("parent_children_done", "ko", count=3)
     assert "#9" in text("parent_child_not_planned", "ko", number=1, children="#9")
+    closing = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+#\d+", re.I)
+    lines = {language: text("batch_pr_parent", language, parent=99) for language in ("en", "ko")}
+    assert lines["en"] != lines["ko"] and all("#99" in line for line in lines.values())
+    assert not any(closing.search(line) for line in lines.values()), "Only the gate closes an order parent"
 
 
 @pytest.mark.parametrize("language", ["en", "ko"])
