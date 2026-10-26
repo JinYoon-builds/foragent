@@ -1,5 +1,6 @@
 """`fa gate`: schedule and inspect approved issues."""
 
+from foragent import gh
 from foragent.commands import facade
 
 ORDER = 110
@@ -36,9 +37,12 @@ def add(commands) -> None:
 
 
 def _status(tracker, store, config=None) -> dict:
-    """Local status; the tracker is accepted for compatibility and never read."""
+    """Local status and every gate on this machine; the tracker is accepted for compatibility and never read."""
     cli = facade()
-    return cli.collect_status(store, config or cli.Config(), cli.datetime.now(cli.UTC))
+    now = cli.datetime.now(cli.UTC)
+    status = cli.collect_status(store, config or cli.Config(), now)
+    status["installed_gates"] = cli.gates.collect(now, current=store.root)
+    return status
 
 
 def _refresh_status(tracker, store, config) -> None:
@@ -114,6 +118,14 @@ def _print_status(status: dict, language: str = "en") -> None:
     print("History (last 10):")
     for run in status["history"]:
         print(f"  #{run['number']} {run['outcome']} started={run['started_at']}")
+    if "installed_gates" in status:
+        _print_gates(status["installed_gates"], language)
+
+
+def _print_gates(rows: list, language: str) -> None:
+    cli = facade()
+    for line in cli.gates.human_lines(rows, cli.datetime.now(cli.UTC), language):
+        print(line)
 
 
 def _launchd(args, root) -> int:
@@ -165,6 +177,8 @@ def run(args) -> int:
     repo = config.repo or git.remote_slug()
     tracker = cli.GhTracker(repo)
     store = cli.StateStore.for_repo(repo)
+    # Status, watch and run gh calls count too, not only those inside a tick context.
+    gh.set_recorder(store, lambda: cli.datetime.now(cli.UTC))
     if args.action == "tick":
         _tick(args, root, git, config, repo, tracker, store)
     elif args.action == "status":

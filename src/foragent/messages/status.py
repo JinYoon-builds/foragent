@@ -40,7 +40,7 @@ MESSAGES = {
         "ci": "CI 기다려요",
         "merging": "합치는 중",
         "overlap-wait": "공유 파일 기다려요",
-        "test-slot-wait": "시험 자리 기다려요",
+        "test-slot-wait": "시험 자리 기다리는 중",
         "overlap_wait_started": "다른 이슈가 쓰는 공유 파일을 기다려요: {blockers}",
         "resolving-conflict": "충돌 풀어요",
         "elapsed": "{seconds}초 경과",

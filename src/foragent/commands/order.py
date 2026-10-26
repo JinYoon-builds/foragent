@@ -42,6 +42,18 @@ def _comma_numbers(value: str) -> list[int]:
         raise cli.argparse.ArgumentTypeError("expected comma-separated positive issue numbers") from exc
 
 
+def _help_language() -> str:
+    """The current repository's configured language for help text, else English."""
+    from foragent.config import _read_yaml
+
+    # Only the repository file's language: building the parser must not load the full config.
+    try:
+        language = _read_yaml(facade().Path.cwd() / ".foragent.yml").get("language")
+    except Exception:  # Help must render even where no valid configuration exists.
+        return "en"
+    return language if isinstance(language, str) else "en"
+
+
 def add(commands) -> None:
     cli = facade()
     order_command = commands.add_parser("order", help="Deterministic tools for fa-order")
@@ -74,6 +86,14 @@ def add(commands) -> None:
     preread.add_argument("plan", type=cli.Path)
     preread.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     preread.add_argument("--json", action="store_true")
+    say = lambda key: cli.text(key, _help_language())  # noqa: E731
+    perspectives = order_actions.add_parser("perspectives", help=say("perspectives_help"),
+                                            description=say("perspectives_help"))
+    perspectives.add_argument("target", help=say("perspectives_help_target"))
+    perspectives.add_argument("question", nargs="?", help=say("perspectives_help_question"))
+    perspectives.add_argument("--changed", choices=("yes", "no"), help=say("perspectives_help_changed"))
+    perspectives.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    perspectives.add_argument("--json", action="store_true")
     publish = order_actions.add_parser(
         "publish", formatter_class=cli.argparse.RawDescriptionHelpFormatter, epilog=PUBLISH_EPILOG)
     publish.add_argument("plan", type=cli.Path)
@@ -100,6 +120,48 @@ def _preread(args, root) -> int:
     return 0
 
 
+def _perspectives(args, root) -> int:
+    from foragent import order_perspectives
+    from foragent.i18n import text
+
+    cli = facade()
+    config, _repo, store = repo_store(root)
+    say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
+    seat = lambda name: say(f"perspectives_seat_{name}")  # noqa: E731
+    if args.target == "mark":
+        if not args.question or args.changed is None:
+            raise cli.order.PlanError(say("perspectives_mark_usage"))
+        question = order_perspectives.mark(store, args.question, args.changed == "yes", config.language)
+        print(cli.json.dumps(question, ensure_ascii=False) if args.json else
+              say(f"perspectives_marked_{args.changed}", id=args.question))
+        return 0
+    if args.question is not None or args.changed is not None:
+        raise cli.order.PlanError(say("perspectives_mark_only"))
+    if args.target == "stats":
+        result = order_perspectives.stats(store)
+        if args.json:
+            print(cli.json.dumps(result, ensure_ascii=False))
+        else:
+            for name, row in result["perspectives"].items():
+                print(say("perspectives_stats_row", seat=seat(name), **row))
+        return 0
+    result = order_perspectives.run(cli.order.read_plan(cli.Path(args.target)), root, config, store)
+    if args.json:
+        print(cli.json.dumps(result, ensure_ascii=False))
+    else:
+        for question in result["questions"]:
+            print(say("perspectives_question", seat=seat(question["perspective"]), **{
+                key: question[key] for key in ("executor", "id", "text")}))
+        for failure in result["failures"]:
+            print(say("perspectives_failed", seat=seat(failure["perspective"]),
+                      executor=failure["executor"] or "-", error=failure["error"]))
+        print(say("perspectives_summary", count=len(result["questions"]), plan_hash=result["plan_hash"][:12]))
+    if len(result["failures"]) == len(order_perspectives.SEATS):
+        print(say("perspectives_none_ran"), file=cli.sys.stderr)
+        return 1
+    return 0
+
+
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
@@ -112,6 +174,8 @@ def run(args) -> int:
         return 0
     if args.action == "preread":
         return _preread(args, root)
+    if args.action == "perspectives":
+        return _perspectives(args, root)
     git = cli.GitRepo(root)
     config = cli.load_config(root)
     repo = config.repo or git.remote_slug()

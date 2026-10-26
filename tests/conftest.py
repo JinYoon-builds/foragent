@@ -78,6 +78,27 @@ def no_real_ancestors(monkeypatch):
     monkeypatch.setattr(psutil, "Process", Isolated)
 
 
+REAL_HOME = Path.home()
+
+
+@pytest.fixture(autouse=True)
+def no_real_installed_gates(monkeypatch):
+    """Status lists every gate on the machine (#366); never this machine's real gates.
+
+    Under the real HOME the list is empty; a test that isolates HOME discovers its own gates.
+    """
+    from foragent import gates
+
+    collect = gates.collect
+
+    def isolated(*args, **kwargs):
+        if Path.home() == REAL_HOME and kwargs.get("home") is None:
+            return []
+        return collect(*args, **kwargs)
+
+    monkeypatch.setattr(gates, "collect", isolated)
+
+
 @pytest.fixture(autouse=True)
 def no_release_lookup(monkeypatch):
     """Never ask GitHub for the latest release during the test suite (#417)."""
