@@ -29,3 +29,4 @@
 - 닫힌 이슈와 미승인 이슈의 보드 동기화는 `board.sync_status(..., existing_only=True)`로 한다(#184 리뷰). 보드에 이미 있는 카드만 옮기고, 카드를 새로 추가하지 않는다. 카드 상태는 이슈 목록을 새로 읽는 tick(5분 주기)에서 `board.refresh_cards`가 보드 전체를 한 번 읽어 맞춘다. 카드가 없으면 `board.NO_CARD`를 기록한다. 그래서 사람이 추가하거나 옮긴 카드도 다음 새로 읽기 때 반영된다. 이슈마다 따로 캐시해서 영원히 건너뛰게 하면 리뷰에서 막힌다. 잠긴 인수 테스트가 `board.set_status(issue, status)`를 인자 두 개짜리로 바꿔치기하므로 공개 `set_status`의 모양은 바꾸지 않는다. 실제 kill 테스트는 `-k 'not real_runner_is_terminated'`로 뺀다.
 - 메시지 레지스트리: 새 문구는 `src/foragent/messages/<기능>.py`의 `MESSAGES`에 두고 `from foragent.i18n import text`로 부른다(`foragent.messages`에는 `text`가 없다). 저장소 밖 명령의 언어는 `load_config(Path.cwd()).language`를 시도하고 실패하면 "en". settings.json 바이트 보존 편집은 `statusline._member_span`(#412).
 - JSON 바이트 편집 리뷰 함정: 중복 키는 마지막 값이 유효하다. 키를 지울 때는 같은 이름을 모두 지우고, 쓰기 전에 `json.loads(편집본) == 의도한 dict`를 확인해 다르면 쓰지 않는다(#412).
+- [issues.json 캐시 (#588)](issue_record_cache.md) — 읽기만 캐시, 잠금 쓰기는 새로 해석; fstat으로 버전 고정; deepcopy 금지
