@@ -131,9 +131,11 @@ def _ranked(ctx: TickContext, ready: dict[str, list[int]]) -> list[tuple[str, in
 
     Fewer declared files overlapping running runs first, then the cross-lane
     priority list, then the position in the lane's (already queue-ordered) list,
-    then the issue number.
+    then the issue number. A project without named lanes has only the main
+    lane, so there is nothing to balance across lanes: its start order stays
+    the lane queue and issue number, and only the priority list applies.
     """
-    claims = overlap_files.claims(ctx)[0] if ctx.store.active_runs() else []
+    claims = overlap_files.claims(ctx)[0] if ctx.config.lanes and ctx.store.active_runs() else []
     priority = {number: index for index, number in enumerate(orch_queue.get_global(ctx.store))}
     unlisted = len(priority)
     keyed = [
