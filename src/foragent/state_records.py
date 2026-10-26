@@ -61,6 +61,9 @@ class Run:
     resume_reason: str = ""
     resume_failures: int = 0
     merge_conflicts: list[str] = field(default_factory=list)
+    # From-scratch rebuilds in this run and the fixed English machine reason for the latest one.
+    rebuild_count: int = 0
+    rebuild_reason: str | None = None
     local_skill_paths: list[str] = field(default_factory=list)
     approval_body_sha: str | None = None
     skills_reported: bool = False

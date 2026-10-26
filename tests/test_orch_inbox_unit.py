@@ -95,3 +95,29 @@ def test_brief_counts_open_questions_and_hides_zero_line(store):
     assert brief.render(brief.collect(store), "en") == "Questions to answer: 1"
     orch_inbox.answer(store, record["id"], "ok")
     assert brief.collect(store) == {"questions_open": 0}
+
+
+def test_orch_alive_compares_exact_age_not_whole_seconds(tmp_path, monkeypatch, capsys):
+    """A heartbeat 30.9 s old is past the 30 s limit even though it displays as 30."""
+    import json
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    from foragent.commands.orch import _alive
+    from foragent.state import StateStore
+
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    store = StateStore(tmp_path / "state", now=lambda: now)
+    args, config = SimpleNamespace(json=True), SimpleNamespace(language="en")
+    for age, alive in ((timedelta(seconds=30), True), (timedelta(seconds=30.9), False)):
+        store.write_heartbeat("orchestrator", now - age)
+        _alive(args, store, config)
+        assert json.loads(capsys.readouterr().out) == {
+            "alive": alive, "last_seen": (now - age).isoformat(), "age_seconds": 30}
+
+
+def test_orch_alive_help_comes_from_the_messages_registry():
+    from foragent.i18n import text
+
+    assert text("heartbeats_help")
+    assert text("heartbeats_help", "ko") != text("heartbeats_help")

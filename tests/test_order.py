@@ -1071,7 +1071,7 @@ def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
     attempt = SimpleNamespace(n=1, ctx=ctx, worktree=tmp_path / "repo", log=tmp_path / "log",
                               size=size, options={}, missing_skills=[], native_claude=ctx.config.executor == "claude",
                               parsed=parse_body(body), baseline=None, executor=None,
-                              approval=store.load_approval(1))
+                              approval=store.load_approval(1), review_feedback=False)
     monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
     monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
     with pytest.raises(Stop):
