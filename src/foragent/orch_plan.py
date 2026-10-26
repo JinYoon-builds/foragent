@@ -106,27 +106,30 @@ def _drop_lapsed(plan: dict, now: datetime) -> bool:
     return bool(lapsed)
 
 
-def _bring_up_to_date(store: StateStore, now: datetime) -> tuple[dict, list]:
+def _bring_up_to_date(store: StateStore, now: datetime) -> dict:
     """Migrate, expire and drop lapsed pauses; the caller holds the state lock.
 
-    Returns the live plan and the events to append once the lock is released
-    (the journal takes the same, non-reentrant lock).
+    This upkeep is the plan's own change over time, not part of any edit, so it is
+    kept even when the edit that triggered it is refused. Each write and its event
+    happen under the same lock: an expiry is never stored without its event.
     """
     plan = _read(store)
     _migrate(store, plan)
     if _expired(plan, now):
         expired_at = plan["expires_at"]
         _write(store, _empty())
-        return _empty(), [("plan-expired", None, f"plan expired at {expired_at}; defaults apply",
-                           {"expires_at": expired_at, "by": None})]
+        _journal(store, now, [("plan-expired", None, f"plan expired at {expired_at}; defaults apply",
+                               {"expires_at": expired_at, "by": None})])
+        return _empty()
     if _drop_lapsed(plan, now):
         _write(store, plan)
-    return plan, []
+    return plan
 
 
 def _journal(store: StateStore, now: datetime, events: list) -> None:
+    """Append events; the caller holds the state lock."""
     for kind, lane, summary, details in events:
-        orch_events.append_event(store, now, None, kind, summary, details={"lane": lane, **details})
+        orch_events.append_event(store, now, None, kind, summary, details={"lane": lane, **details}, locked=True)
 
 
 def load(store: StateStore, now: datetime | None = None) -> dict:
@@ -145,9 +148,7 @@ def load(store: StateStore, now: datetime | None = None) -> dict:
 def refresh(store: StateStore, now: datetime) -> dict:
     """Once per tick: drop lapsed pauses silently and expire the plan with one event."""
     with store._state_lock():
-        plan, events = _bring_up_to_date(store, now)
-    _journal(store, now, events)
-    return plan
+        return _bring_up_to_date(store, now)
 
 
 def view(plan: dict) -> dict:
@@ -178,12 +179,11 @@ def _edit(store: StateStore, by: str, change) -> dict:
         raise PlanRefused(f"--by must be one of: {', '.join(AUTHORS)}")
     now = store._now()
     with store._state_lock():
-        plan, events = _bring_up_to_date(store, now)
-        edited = deepcopy(plan)
-        changes = change(edited, now)  # Raises before anything below is written.
+        edited = deepcopy(_bring_up_to_date(store, now))
+        changes = change(edited, now)  # A refusal raises before the edit is written.
         _write(store, edited)
-    _journal(store, now, events + [(kind, lane, summary, {"by": by, **details})
-                                   for kind, lane, summary, details in changes])
+        _journal(store, now, [(kind, lane, summary, {"by": by, **details})
+                              for kind, lane, summary, details in changes])
     return edited
 
 

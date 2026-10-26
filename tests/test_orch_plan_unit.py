@@ -109,3 +109,16 @@ def test_plan_cli_validates_lanes_widths_and_times(tmp_path, monkeypatch, capsys
     assert out.index("lane:orch") < out.index("lane:main")
     assert run("plan", "--width", "orch=off", "--json") == 0
     assert json.loads(capsys.readouterr().out)["width"] == {"main": 2}
+
+
+def test_refused_edit_after_expiry_keeps_the_expired_event(tmp_path):
+    clock = [NOW]
+    store = store_at(tmp_path, clock)
+    orch_plan.set_plan(store, {"orch": 2}, NOW + timedelta(hours=1), "human")
+    clock[0] += timedelta(hours=1, seconds=1)
+    with pytest.raises(orch_plan.PlanRefused, match="past"):
+        orch_plan.pause(store, "orch", NOW, "late", "human")
+    assert len(events(tmp_path, "plan-expired")) == 1
+    assert json.loads((tmp_path / "plan.json").read_text())["width"] == {}
+    orch_plan.refresh(store, clock[0])
+    assert len(events(tmp_path, "plan-expired")) == 1

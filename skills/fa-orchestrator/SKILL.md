@@ -90,13 +90,7 @@ Explain what was tried and why this decision is needed. Record the chosen answer
 issue with `fa inspect answer N --text "<chosen option and note>"`; keep deferred items pending.
 Carry requirement changes into an order edit; an answer alone is not re-approval.
 
-For newly pending `needs-human` items, send a push through the configured notifier:
-`fa notify --title "Decision needed" --line "<question and recommendation>" --link "<issue URL>"`.
-When the queue becomes empty, send
-`fa notify --title "Queue empty" --line "<done count; items left to inspect>" --link "<project URL>"`.
-On the initial snapshot, notify if either condition already holds. Avoid duplicate pushes for
-unchanged pending decisions; batch ordinary merge/lane completion updates until the queue empties or
-the next useful recap. The notifier owns delivery.
+Send push notifications as `notify.md` says.
 
 For a PR awaiting a human merge, run `fa orch premerge PR --json`, show the changes, checks and try
 card, then AskUserQuestion: Merge (recommended when ready) / Later / Details. Record the answer,

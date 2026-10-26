@@ -3074,3 +3074,28 @@ def test_tick_budget_ceiling_history_records_cpu_measurements(ctx, monkeypatch, 
         assert len(rows) == 1
         assert rows[0]["load_per_cpu"] == busy / 0.6
         assert rows[0]["load_average_per_cpu"] == 1.82 and rows[0]["cpu_busy"] == busy
+
+
+def test_tick_during_github_wait_still_expires_the_plan_and_drops_lapsed_pauses(ctx):
+    from foragent import orch_plan
+
+    ctx.store.root.mkdir(parents=True, exist_ok=True)
+    (ctx.store.root / "plan.json").write_text(json.dumps({
+        "queues": {"main": [3]}, "paused": {}, "width": {}, "expires_at": (NOW - timedelta(seconds=1)).isoformat(),
+        "authors": {"queues": {"main": "human"}, "width": {}, "expires_at": "human"},
+    }))
+    ctx.store.pause_github(NOW + timedelta(minutes=30))
+    report = tick(ctx)
+    assert report.skipped and "GitHub rate limit" in report.skipped
+    assert json.loads((ctx.store.root / "plan.json").read_text())["queues"] == {}
+    kinds = [json.loads(line)["kind"] for line in (ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert kinds.count("plan-expired") == 1
+
+    (ctx.store.root / "plan.json").write_text(json.dumps({
+        "queues": {}, "paused": {"main": {"until": NOW.isoformat(), "why": "short", "by": "human"}},
+        "width": {"main": 2}, "expires_at": None, "authors": {"queues": {}, "width": {"main": "human"}},
+    }))
+    tick(ctx)
+    stored = json.loads((ctx.store.root / "plan.json").read_text())
+    assert stored["paused"] == {} and stored["width"] == {"main": 2}
+    assert orch_plan.load(ctx.store, NOW)["width"] == {"main": 2}
