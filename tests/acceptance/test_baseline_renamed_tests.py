@@ -77,10 +77,12 @@ def test_baseline_renamed_tests_surviving_failure_still_returns_to_implementer(
 
     def implement_and_move_main(kwargs):
         case.implement(kwargs)
-        # Both changes arrive through the ordinary base merge. The missing
-        # selector must not hide the failure of the still-collected test_keep.
-        git_history.update({obsolete: None, renamed: source, "keep.txt": None})
-        return "Implemented while main relocated a test and removed keep.txt"
+        # The branch breaks test_keep while main relocates a test through the
+        # ordinary base merge. test_keep still passes on the new base, so it
+        # stays protected; the missing selector must not hide its failure.
+        (kwargs["worktree"] / "keep.txt").unlink()
+        git_history.update({obsolete: None, renamed: source})
+        return "Implemented and removed keep.txt while main relocated a test"
 
     def restore_keep(kwargs):
         (kwargs["worktree"] / "keep.txt").write_text("keep\n")

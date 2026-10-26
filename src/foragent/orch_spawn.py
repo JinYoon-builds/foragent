@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from types import SimpleNamespace
 
-from foragent import notify, processes, watch_open
+from foragent import notify, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
@@ -170,7 +170,7 @@ def on_tick(ctx, report):
 
 @contextmanager
 def deciding(ctx, acquired: bool = True):
-    """Wrap a whole gate tick (inside its lock) so the spawn decision runs on every exit.
+    """Wrap a whole gate tick (inside its lock) so the stale-files scan and spawn decision run on every exit.
 
     The decision reads only local facts (heartbeats, active runs, approvals), so
     it does not depend on any tick step: a GitHub wait or a failed heartbeat,
@@ -191,8 +191,16 @@ def deciding(ctx, acquired: bool = True):
     try:
         yield keep
     except Exception:
+        try:  # Local facts only; a failed scan must not replace the tick's own error.
+            with step("stale_files"):
+                orch_stale_files.report(ctx)
+        except Exception:
+            pass
         with step("orchestrator_spawn"):
             on_tick(ctx, SimpleNamespace(actions=[]))  # The tick's report is lost with the error.
         raise
+    # Stale Files are facts for the orchestrator, so they are read before its spawn decision.
+    with step("stale_files"):
+        orch_stale_files.report(ctx)
     with step("orchestrator_spawn"):
         on_tick(ctx, kept[-1] if kept else SimpleNamespace(actions=[]))
