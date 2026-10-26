@@ -335,8 +335,16 @@ def _flow(value: Any) -> str:
 
 def _read_yaml(path: Path) -> dict[str, Any]:
     try:
-        value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc}") from exc
+    return _parse_yaml(content, path)
+
+
+def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
+    try:
+        value = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
     if value is None:
         return {}
@@ -373,6 +381,38 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
     _overlay(values, _read_yaml(local_path))
     _validate(values)
     return Config(**values)
+
+
+# Built from the local checkout once per command; origin's copy cannot move them.
+LOCAL_ONLY_KEYS = ("repo", "base_branch", "language")
+
+
+def load_committed_config(local: Config, content: str | None, source: str,
+                          global_path: Path | None = None) -> tuple[Config | None, list[str]]:
+    """Merge a committed .foragent.yml (``content``) with the global config like load_config.
+
+    ``local`` is the config already loaded from the checkout. Returns ``(None, [])``
+    when ``content`` is missing, unparsable or invalid, so the caller keeps ``local``.
+    Otherwise the second item names the local-only keys origin tried to change;
+    those keys keep their local values and the rest of origin's settings apply.
+    """
+    if content is None:
+        return None, []
+    if global_path is None:
+        global_path = Path.home() / ".config/foragent/config.yml"
+    try:
+        committed = _parse_yaml(content, source)
+        values = deepcopy(DEFAULTS)
+        if global_path.exists():
+            _overlay(values, _read_yaml(global_path))
+        _overlay(values, committed)
+        # A language change is not a conflict worth a warning; repo and base_branch are.
+        ignored = [key for key in ("repo", "base_branch") if key in committed and values[key] != getattr(local, key)]
+        values.update({key: getattr(local, key) for key in LOCAL_ONLY_KEYS})
+        _validate(values)
+        return Config(**values), ignored
+    except (ConfigError, TypeError, ValueError):
+        return None, []
 
 
 def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
