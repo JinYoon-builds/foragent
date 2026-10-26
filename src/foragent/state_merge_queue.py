@@ -65,7 +65,8 @@ class MergeQueueMixin:
             own = next((entry for entry in entries if entry["number"] == number), None)
             peers = [entry for entry in entries if entry["number"] != number and entry.get("base") == base
                      and entry.get("claimed_by") is None][:max(0, maximum - 1)]
-            if own is None or not peers:
+            # A run claimed by another leader belongs to that group until it finishes.
+            if own is None or own.get("claimed_by") not in (None, number) or not peers:
                 self._save_queue(before, entries)
                 return []
             chosen = {number, *(entry["number"] for entry in peers)}
@@ -84,6 +85,9 @@ class MergeQueueMixin:
     def has_unclaimed_merge_peers(self, number: int, base: str) -> bool:
         with self._state_lock():
             entries = self._live_entries(self.merge_queue())
+        own = next((entry for entry in entries if entry["number"] == number), None)
+        if own is not None and own.get("claimed_by") not in (None, number):
+            return False
         return any(entry["number"] != number and entry.get("base") == base and entry.get("claimed_by") is None
                    for entry in entries)
 

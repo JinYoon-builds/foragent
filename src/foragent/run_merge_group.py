@@ -14,7 +14,6 @@ import tempfile
 from typing import TYPE_CHECKING, Any
 
 from foragent import board
-from foragent.ci_mode import enabled
 from foragent.git import GitError, PublicationError
 from foragent.issue import parse_body
 from foragent.labels import READY, RUNNING
@@ -47,7 +46,8 @@ def grouping_enabled(attempt: Implementation, automatic: bool) -> bool:
     return (automatic and getattr(ctx.config, "merge_group_max", 1) > 1
             and attempt.target_branch == ctx.config.base_branch
             and attempt.target_branch != attempt.batch_branch
-            and not enabled(ctx, attempt.target_branch))
+            # The configured mode decides, not whether a CI comparison is possible.
+            and getattr(ctx.config, "checks", "local") == "local")
 
 
 def enqueue(attempt: Implementation, pr: int, head: str, base_sha: str, ready_at: float) -> None:
@@ -99,6 +99,10 @@ def joint_check(attempt: Implementation, entries: list[dict[str, Any]], base_sha
                 except GitError as exc:
                     _append(log, f"Merge group: #{entry['number']} does not merge cleanly: {exc}")
                     return False
+            # The checks must verify exactly the contents that will be merged.
+            combined_head = git.head_sha()
+            git.stage_changes()
+            combined_tree = git.staged_tree_sha()
 
             def check(command: str, timeout_s: int = 900):
                 result = runner._check(command, worktree, log, timeout_s, progress=lambda: _progress(n, ctx),
@@ -125,6 +129,10 @@ def joint_check(attempt: Implementation, entries: list[dict[str, Any]], base_sha
                 own_only=ctx.config.runner_unit_tests != "all" and trusts_ci(worktree, ctx.config))
             if units and unit_command:
                 checks.append(check(f"{unit_command} {shlex.join(units)}", max(900, runner._remaining(n, ctx))))
+            git.stage_changes()
+            if git.head_sha() != combined_head or git.staged_tree_sha() != combined_tree:
+                _append(log, "Merge group: joint check commands modified tracked files")
+                return False
             return all(result.exit_code == 0 and not result.timed_out for result in checks)
         finally:
             ctx.git.remove_worktree(worktree)
@@ -139,7 +147,11 @@ def merged_by_group(attempt: Implementation, pr: int, head: str) -> bool:
 
 
 def member_inputs(attempt: Implementation, group: Group, base_sha: str) -> list[Member]:
-    """Re-read every borrowed member's merge inputs; invalid members are left out."""
+    """Re-read every borrowed member's merge inputs; invalid members are left out.
+
+    The caller merges borrowed members only when every member is still valid:
+    the joint PASS covers the whole combination, not any subset of it.
+    """
     from foragent.run_publish import _final_merge_inputs, _policy_allows
 
     ctx = attempt.ctx
@@ -159,6 +171,11 @@ def member_inputs(attempt: Implementation, group: Group, base_sha: str) -> list[
         if (inputs.stop is None and inputs.status in {"pass", "none"}
                 and _policy_allows(inputs.decision, entry["base"], inputs.batch_branch)
                 and inputs.decision.kind == "merge"):
+            try:
+                git.check_publication(base_sha)
+            except PublicationError as exc:
+                _append(attempt.log, f"Merge group: #{number} left out: {exc}")
+                continue
             members.append(Member(entry, git, inputs))
     return members
 
@@ -169,11 +186,6 @@ def merge_member(attempt: Implementation, member: Member) -> bool:
 
     ctx, entry = attempt.ctx, member.entry
     number, pr = entry["number"], entry["pr"]
-    try:
-        member.git.check_publication(member.inputs.base_sha)
-    except PublicationError as exc:
-        _append(attempt.log, f"Merge group: #{number} left out: {exc}")
-        return False
     current = next((item for item in ctx.tracker.list_prs("open", entry["branch"]) if item.number == pr), None)
     title = f"{ctx.tracker.get_issue(number).title} (#{number})"
     subject = retitle_for_merge(
@@ -185,9 +197,11 @@ def merge_member(attempt: Implementation, member: Member) -> bool:
     except TrackerError as exc:
         if exc.is_rate_limit:
             raise
-        _append(attempt.log, f"Merge group: #{number} left out: {exc}")
+        _append(attempt.log, f"Merge group: #{number} merge failed: {exc}")
         return False
+    # Durable at once: the member's own run finishes merged even if the leader stops here.
     ctx.store.record_merge(number, ctx.now())
+    ctx.store.record_group_merge(number, entry["head_sha"])
     return True
 
 
@@ -198,7 +212,6 @@ def finish_members(attempt: Implementation, merged: list[dict[str, Any]], size: 
     for entry in merged:
         number = entry["number"]
         ctx.store.update_run(number, merge_group_size=size, merge_group_bisect_checks=0)
-        ctx.store.record_group_merge(number, entry["head_sha"])
         others = ", ".join(f"#{other}" for other in [attempt.n, *numbers] if other != number)
         try:
             ctx.tracker.close_issue(number, f"Merged in a merge group with {others}.")
@@ -210,3 +223,12 @@ def finish_members(attempt: Implementation, merged: list[dict[str, Any]], size: 
         ctx.tracker.remove_labels(number, [READY, RUNNING])
         board.sync_status(ctx, number, "Done")
     ctx.store.dequeue_merge(*numbers)
+
+
+def finish_merged_self(attempt: Implementation) -> None:
+    """A member merged by another group closes its own issue if the leader could not."""
+    ctx, n = attempt.ctx, attempt.n
+    if ctx.tracker.current_issue(n).state != "closed":
+        ctx.tracker.close_issue(n, "Merged in another run's merge group.")
+    ctx.tracker.remove_labels(n, [READY, RUNNING])
+    board.sync_status(ctx, n, "Done")

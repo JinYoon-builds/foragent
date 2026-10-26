@@ -76,11 +76,15 @@ class _Hold:
     members: list[int] = field(default_factory=list)
 
 
+# The caller's hold for its next _merge_lock, so wrappers of the lock keep it.
+_HOLDS: dict[int, _Hold] = {}
+
+
 @contextmanager
 def _merge_lock(n: int, ctx: RunContext):
     # Keep tick informed during an unbounded blocking flock acquisition.
     started = None
-    hold = _Hold()
+    hold = _HOLDS.pop(n, None) or _Hold()
     try:
         with ExitStack() as stack:
             def acquire():
@@ -620,11 +624,13 @@ def _publish_locked(attempt: Implementation) -> str:
             if not group_failed:
                 group, group_failed = run_merge_group.form(attempt)
         wait_for_overlap(attempt)
-        with _merge_lock(n, ctx) as hold:
+        hold = _HOLDS[n] = _Hold()
+        with _merge_lock(n, ctx):
             if grouping and run_merge_group.merged_by_group(attempt, pr, verified_head_sha):
                 # Another run's group merged this head and recorded its facts.
                 hold.record = False
                 _append(log, f"Merged by another run's merge group: {verified_head_sha}")
+                run_merge_group.finish_merged_self(attempt)
                 _progress(n, ctx)
                 return "merged"
             inputs = _final_merge_inputs(
@@ -633,7 +639,16 @@ def _publish_locked(attempt: Implementation) -> str:
             )
             if group is not None and group.base_sha != inputs.base_sha:
                 group = None  # Members merged elsewhere or main moved since the joint check.
-            if (grouping and group is None and not group_failed and inputs.stop is None
+            members: dict[int, run_merge_group.Member] = {}
+            invalidated = False
+            if group is not None and inputs.stop is None:
+                members = {member.entry["number"]: member
+                           for member in run_merge_group.member_inputs(attempt, group, inputs.base_sha)}
+                if len(members) != len(group.entries) - 1:
+                    # The joint PASS covered every member together, not this subset.
+                    _append(log, "Merge group: a member is no longer valid; merging alone on own checks")
+                    group, members, invalidated = None, {}, True
+            if (grouping and group is None and not group_failed and not invalidated and inputs.stop is None
                     and ctx.store.has_unclaimed_merge_peers(n, attempt.target_branch)):
                 # Lead the unclaimed peers: their joint check runs outside the lock.
                 queued_status = inputs.status
@@ -658,44 +673,41 @@ def _publish_locked(attempt: Implementation) -> str:
                 )
                 if not subject:
                     attempt.pr_title = title
-                borrowed = []
-                if group is not None:
-                    members = {member.entry["number"]: member
-                               for member in run_merge_group.member_inputs(attempt, group, inputs.base_sha)}
-                    # Queue order, including the leader's own position.
-                    for entry in group.entries:
-                        if entry["number"] == n:
-                            break
-                        if entry["number"] in members and run_merge_group.merge_member(attempt, members.pop(entry["number"])):
-                            borrowed.append(entry)
-                else:
-                    members = {}
+                # Merging now under the lock: no longer a peer for other leaders.
+                ctx.store.dequeue_merge(n)
+                borrowed: list[dict] = []
+                leader_merged = False
+                order = group.entries if group is not None else [{"number": n}]
                 try:
-                    ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
-                except TrackerError as exc:
-                    if exc.is_rate_limit:
-                        raise
+                    # Queue order, including the leader's own position.
+                    for entry in order:
+                        if entry["number"] != n:
+                            if not run_merge_group.merge_member(attempt, members[entry["number"]]):
+                                break  # The rest were checked only together with it.
+                            borrowed.append(entry)
+                            continue
+                        try:
+                            ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
+                        except TrackerError as exc:
+                            if exc.is_rate_limit:
+                                raise
+                            if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
+                                inputs.stop = lambda: _hold_changed_head(n, ctx, link)
+                                break
+                            raise
+                        leader_merged = True
+                        ctx.store.record_merge(n, ctx.now())
+                finally:
+                    # Finish every successful merge, even when a later one raised.
+                    size = len(borrowed) + leader_merged
                     if borrowed:
-                        # Members merged before the leader still finish merged.
-                        run_merge_group.finish_members(attempt, borrowed, len(borrowed))
                         hold.members.extend(entry["number"] for entry in borrowed)
-                        runner.after_merge(ctx, pr, attempt.target_branch)
-                    if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
-                        inputs.stop = lambda: _hold_changed_head(n, ctx, link)
-                    else:
-                        raise
-                else:
-                    ctx.store.record_merge(n, ctx.now())
-                    for member in members.values():
-                        if run_merge_group.merge_member(attempt, member):
-                            borrowed.append(member.entry)
-                    size = 1 + len(borrowed)
-                    ctx.store.update_run(n, merge_group_size=size, merge_group_bisect_checks=0)
-                    run_merge_group.finish_members(attempt, borrowed, size)
-                    hold.members.extend(entry["number"] for entry in borrowed)
+                        run_merge_group.finish_members(attempt, borrowed, size)
                     # Reinstall once per group, after its last merge.
-                    if inputs.decision.kind == "merge":
+                    if size and inputs.decision.kind == "merge":
                         runner.after_merge(ctx, pr, attempt.target_branch)
+                if leader_merged:
+                    ctx.store.update_run(n, merge_group_size=size, merge_group_bisect_checks=0)
                     _progress(n, ctx)
                     others = ", ".join(f"#{entry['number']}" for entry in borrowed)
                     try:

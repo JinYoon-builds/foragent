@@ -26,7 +26,7 @@ def test_exact_defaults(repo):
         "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "run_hours": "always",
-        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "base_branch": "main",
+        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_group_max": 4, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "tick_failure_alert": 3,
         "repo": None, "board": None, "board_map": None, "language": "en", "codex_goal": False, "review_level": "low",

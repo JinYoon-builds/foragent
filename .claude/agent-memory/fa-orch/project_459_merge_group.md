@@ -1,12 +1,21 @@
 ---
 name: project-459-merge-group
-description: #459 merge-group acceptance tests contradict short_case's observed_lock green check; QUESTION.md filed 2026-10-26
+description: #459 merge groups — queue/claim design that the acceptance tests require, and pitfalls hit while implementing (2026-10-26)
 metadata:
   type: project
 ---
 
-#459 (merge-group-join): short_case's `observed_lock` starts other runs only inside a lock request (`before_lock`), so a borrowed member always has a pending merge.lock request that is acquired after the innermost leader merged its PR. At acquisition `find_pr` (FakeTracker: open PRs only) returns None → `hold.green=False` → `assert_short_holds` fails. Default/max-2/exclusion tests and the bisect file are unpassable as written; max-1, borrowed-CI-reread and culprit cases are passable.
+#459 is implemented in `run_merge_group.py` (form/joint check/member re-read/merge), `state_merge_queue.py` (merge-queue.json, claims) and the lock loop in `run_publish._publish_locked`. The first QUESTION (borrowed members' late empty hold was not green) was right; the order fixed the harness in 7ed16d1.
 
-**Why:** filed `.foragent/QUESTION.md` (ko) recommending a fixture fix (accept a hold whose PR was already merged by another group) instead of implementing against an impossible test.
+**Why:** the tests fix behaviour that is not obvious from the issue text.
 
-**How to apply:** if #459 returns with a fixed fixture, design notes: claims must end after the joint check (default test needs 5 to regroup {1,4,5}); after acquiring as non-merged, drop merged members and fall back to today's base-move path, then regroup with unclaimed entries (max-2 test expects [1,6,4,5]); after a failed joint check the leader stays solo for the rest of the run; enqueue only after CI green so held/red runs never appear in queue writes; Config needs `merge_group_max` default 4 (prepare() injects it with object.__setattr__).
+**How to apply:**
+- Claims end right after the joint check; otherwise a newer leader cannot regroup the full set (the default test expects one group of 1, 4, 5).
+- When the group's base moved at the final lock and unclaimed peers exist, regroup on the moved main without refreshing the own head. The max-2 test compares queue heads with the *final* PR heads. The pre-lock base refresh is also skipped while unclaimed peers exist, and a passed group's pinned base counts as the checked base.
+- After a failed joint check, the leader stays solo for the rest of the run.
+- Dequeue the leader's own entry under the lock just *before* merge_pr. A thread waiting on the merge signal otherwise sees it as a peer (test_run_publish parallel-lanes test).
+- Unit fixtures wrap `_merge_lock` and yield None. Pass the hold through the `_HOLDS[n]` registry, not through `as hold`.
+- `needs-human` must be a merge-decision hold (`policy.merge_decision`); the exclusion test expects that run to be "held".
+- The runner can be killed (SIGTERM) and recreate the worktree. Only its WIP commit keeps the work, so do not rely on uncommitted files between attempts.
+- Review round 1 (2026-10-26) fixed five defect classes: (1) stale evidence — merge borrowed members only when *all* re-read valid; otherwise the leader merges alone only on its own verified base and does not regroup that turn (test 5 would loop otherwise); (2) joint checks must leave HEAD and the staged tree unchanged; (3) a run claimed by another leader cannot claim or report peers; (4) gate grouping on `config.checks == "local"`, not `ci_mode.enabled()` (that one is capability detection); (5) make each member merge durable at once (`group_merged_head`) and finish members in `finally`; a member that sees the marker closes its own issue if still open.
+- Keep test output in harness background tasks only; Stop hooks count shell redirection to /private/tmp as changing files outside the repo.
