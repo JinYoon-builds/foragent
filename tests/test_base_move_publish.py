@@ -73,3 +73,44 @@ def test_merge_uses_the_classified_commit_when_the_shared_ref_moves_again(publis
     assert case.verifications.count(late[0]) == 1, "The racing src commit must be verified before publication"
     assert_verifications(case, [case.base_sha, late[0]])
     assert log.count(REUSED) == log.count(REVERIFY) == 1
+
+
+def test_reverify_recaptures_with_the_baselines_command_when_detection_would_fail(publish_case, monkeypatch):
+    """With test_command unset, the branch deleting pyproject.toml must not drop protection."""
+    from dataclasses import replace
+
+    from foragent import run_implementation, runner
+
+    case = publish_case
+    move_during_publish(case, monkeypatch, [[{"src/widget.py": "VALUE = 2\n"}]])
+    review = case.reviewer.steps[0]
+
+    def review_then_unset_command(kwargs):
+        verdict = review(kwargs)
+        # As when the branch deleted the files detection reads (pyproject.toml).
+        detected.clear()
+        return verdict
+
+    case.reviewer.steps = [review_then_unset_command]
+    # test_command unset: the initial command comes from detection.
+    initial = [case.config.test_command]
+    detected = list(initial)
+    case.ctx.config = replace(case.ctx.config, test_command=None)
+    monkeypatch.setattr(runner, "detect_test_commands", lambda root: list(detected))
+    capture = run_implementation.capture_acceptance_baseline
+    captured = []
+
+    def spy(n, ctx, git, target_branch, ref, test_command=None):
+        baseline = capture(n, ctx, git, target_branch, ref, test_command)
+        captured.append((test_command, baseline))
+        return baseline
+
+    monkeypatch.setattr(run_implementation, "capture_acceptance_baseline", spy)
+    log = run_to_merge(case, moves=1)
+    assert log.count(REVERIFY) == 1
+    assert len(captured) == 2, "Initial preparation, then exactly one refresh"
+    command, baseline = captured[-1]
+    assert command == initial[0] and baseline is not None and baseline.node_ids, (
+        "The refreshed baseline must keep the command the protected set was captured with"
+    )
+

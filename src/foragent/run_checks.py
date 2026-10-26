@@ -361,19 +361,14 @@ def _verify_implementation(attempt: Implementation) -> str:
             if not baseline.node_ids and not baseline.unverifiable:
                 _append(log, "Acceptance baseline verification skipped (count=0): no baseline node ids remain")
         if baseline and (baseline.node_ids or baseline.unverifiable):
-            from foragent.run_baseline import baseline_verification_command, exact_baseline_result
+            from foragent.run_baseline import baseline_verification_command, protected_result
 
             started = ctx.monotonic()
-            report = ctx.store.root / "runs" / f"issue-{n}-baseline-verification.xml"
             result = None
             if baseline.node_ids:
-                result = runner._check(baseline_verification_command(baseline, report), worktree, log, 900,
+                result = runner._check(baseline_verification_command(baseline), worktree, log, 900,
                                        progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
-            if baseline.exact_check:
-                result = exact_baseline_result(
-                    baseline, report, result, log,
-                    lambda command, root: runner._check(command, root, log, 900, progress=lambda: _progress(n, ctx),
-                                                        slot=_test_slot(n, ctx)), worktree)
+            result = protected_result(baseline, result)
             attempt.checks.append(result)
             _append(log, f"Acceptance baseline verification count={len(baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")

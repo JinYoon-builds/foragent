@@ -12,11 +12,12 @@ exit 4 are halved to single ids. Every project setting (conftest imports, --noco
 options) applies as in verification. Rejected designs, each broken by a review: terminal parsing, directory collection, PYTHONPATH
 plugin injection, `shlex.join` of `NAME=value`, plugin as a helper-dir conftest.py (overwrote the project's `conftest` module;
 `--noconftest` disabled it). `--collect-only` JUnit has no testcases; `--setup-plan` crashes without the terminal plugin (checked).
-Verification after a sync (`exact_check=True`) runs exact ids only: each non-parametrized id gets `--deselect=<id>[` and
-`--deselect=<id>::` (`_expansion_deselects`; skipped if another baseline id shares the prefix; a param id `f[a]` selects exactly,
-so it gets none — a deselect built from `a` would drop `a][b`). Expanded variants therefore never execute (a variant calling
-`pytest.exit` cannot block). pytest's nonzero exit always stands — never rewrite 1/2 to success from test records (session hooks can
-set exitstatus). ONE deletion rule, `_proven_absent()`: `<cmd> --collect-only <id> <its deselects>` with a `--collect-only` JUnit report must exit
+The verification command stays `<command> <ids>`: locked `test_baseline_prebuild.py` treats any `--junitxml=` command as a
+baseline build (forbidden in the issue worktree) and checks that its `::` words equal the protected ids, so no JUnit and no
+`--deselect` there. Expansion (`f` → `f[...]` or a class) is settled before the run by `_replaced_ids()`: bare selector exit 0
+and, with `--deselect=<id>[`/`--deselect=<id>::`, exit 5 → dropped; only for ids whose test file, a conftest.py on its path or
+pytest config changed (`_changed_paths`; unknown → all). An exact `f` cannot coexist with `f[...]`, so kept ids select exactly.
+pytest's exit always stands; `protected_result()` fails unverifiable ids. ONE deletion rule, `_proven_absent()`: `<cmd> --collect-only <id> <its deselects>` with a `--collect-only` JUnit report must exit
 4 (not found) or 5 (only expansions) and the report must hold zero records (collect-only JUnit records collection skips/errors —
 importorskip, `pytest_generate_tests` skip, import errors — never items). Hooks can fake both codes: a hook raising
 `pytest.UsageError` exits 4, a hook deselecting the test exits 5. So exit 4 also needs the id's nearest existing directory to
@@ -34,5 +35,11 @@ The acceptance test allows `--collect-only` commands but no pytest execution whe
 After 10+ review rounds each found a new hook that forges a pytest signal (UsageError, deselect, sessionstart files, UsageError only
 for node selectors). Hooks can forge any signal, so on 2026-10-26 this went to `.foragent/QUESTION.md` (trust hooks like the
 verification run does, recommended). Don't keep adding controls for adversarial hooks without that decision.
+Trust decided 2026-10-26 (spec update): pytest's own 'not found' (exit 4 + no record + directory control) is trusted like the
+verification run; deliberate forgery hooks → REBUTTAL. Then main's #483 (`run_publish.refresh_base` recaptures on a non-neutral base move) clashed with #123's locked tests 2/3.
+Resolved without editing locked tests by `run_baseline.follow_moved_base()`: first check the old ids on a detached checkout of the
+new base with collection only (same deletion rule, logs drops); none left → empty baseline, no capture (spec: "skips when none
+remain"; test 3 forbids any non-collect pytest after the sync); else capture (#483) and keep protecting old ids the capture lacks
+while their test file blob is unchanged (test 2), dropping changed ones (#483 `fails-on-new-base`).
 **Why:** a stale id makes pytest exit 4 "not found" and hides real failures.
 **How to apply:** keep baseline filtering per verification; renamed tests are not re-protected (out of scope).

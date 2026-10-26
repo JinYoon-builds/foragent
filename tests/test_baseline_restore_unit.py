@@ -12,6 +12,8 @@ def test_restored_baseline_test_is_verified_again_after_a_later_sync(git_history
     monkeypatch.syspath_prepend(str(Path(__file__).parent / "acceptance"))
     from test_acceptance_baseline import KEEP, baseline_case
 
+    KEEP_SOURCE = "from pathlib import Path\n\ndef test_keep():\n    assert Path('keep.txt').is_file()\n"
+
     git_history.update({
         "other.txt": "other\n",
         OTHER: "from pathlib import Path\n\ndef test_other():\n    assert Path('other.txt').is_file()\n",
@@ -27,8 +29,11 @@ def test_restored_baseline_test_is_verified_again_after_a_later_sync(git_history
 
     def repair_while_main_restores(kwargs):
         (kwargs["worktree"] / "other.txt").write_text("other\n")
-        git_history.update({KEEP: "def test_keep():\n    assert False, 'restored and broken'\n"})
-        return "Restored other.txt while main restored test_keep"
+        # main restores test_keep as it was (it passes on the new base); this
+        # branch removes the file it needs, so only renewed protection catches it.
+        git_history.update({KEEP: KEEP_SOURCE})
+        (kwargs["worktree"] / "keep.txt").unlink()
+        return "Restored other.txt and removed keep.txt while main restored test_keep"
 
     case.implementer.steps = [implement_while_main_deletes, repair_while_main_restores]
     case.reviewer.steps = ["VERDICT: PASS", "VERDICT: PASS"]
