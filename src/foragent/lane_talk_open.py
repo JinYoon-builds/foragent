@@ -56,7 +56,8 @@ def _session(run: Run, config: Config) -> tuple[str, str | None]:
         executor = run.session_executor or _lane_executor(run, config)
         return executor, run.session_id
     executor = _lane_executor(run, config)
-    usable = run.session_id if run.session_executor in (None, executor) else None
+    # A stale session (a fresh thread is starting, or inherited and not resumed) is not the worker's.
+    usable = run.session_id if run.session_executor in (None, executor) and not run.session_stale else None
     return executor, usable
 
 
@@ -196,6 +197,8 @@ def _current_session(store: StateStore, run: Run, number: int, language: str) ->
     current = store.get_run(number)
     if current is None or current.started_at != run.started_at or current.status != "running":
         raise TalkError(text("talk_run_changed", language, n=number))
+    if current.session_stale:  # The worker switched to a thread whose ID is not recorded yet.
+        raise TalkError(text("talk_session_starting", language, n=number))
     session = current.session_id if current.session_executor in (None, "codex") else None
     if not session:
         raise TalkError(text("talk_no_session", language, n=number))

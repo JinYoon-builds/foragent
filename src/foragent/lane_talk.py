@@ -79,19 +79,24 @@ def _tmux_server_up(socket_path: str) -> bool | None:
 def _orca_listed(executable: str, handle: str, cwd: Path) -> bool | None:
     """After a ``terminal show`` failure without an envelope: is the handle among Orca's terminals?
 
-    None when Orca cannot list either (it is down or crashing), so nothing is concluded.
-    When the list answers in Orca's envelope, membership decides. A successful list in
-    another shape shows Orca is working, so the failed show is its answer for this handle.
+    Only positive evidence closes a talk. None when Orca cannot list (it is down or
+    crashing), answers nothing (``{}``), or answers an envelope without a terminal
+    list. In Orca's envelope, whether the handle is listed decides. The one remaining
+    case is a non-empty answer in another shape: Orca served this request, so the
+    failed ``show`` stands as its answer for the handle. (Older Orca, and the locked
+    acceptance fake, answer every call that way.)
     """
     try:
         data = _orca_envelope(_call([executable, "terminal", "list", "--json"], cwd).stdout)
     except (OSError, subprocess.SubprocessError):
         return None
-    if data is None or data.get("ok") is False:
+    if not data or data.get("ok") is False:
         return None
-    result = data.get("result")
-    terminals = result.get("terminals") if isinstance(result, dict) else None
-    if isinstance(terminals, list):
+    if "result" in data or "ok" in data:
+        result = data.get("result")
+        terminals = result.get("terminals") if isinstance(result, dict) else None
+        if not isinstance(terminals, list):
+            return None  # An envelope we do not recognise tells nothing.
         return any(isinstance(item, dict) and item.get("handle") == handle for item in terminals)
     return False
 
@@ -104,7 +109,7 @@ def _alive(record: dict, cwd: Path, *, show: bool) -> bool | None:
     """
     executable, handle = record.get("executable"), record.get("handle")
     if not isinstance(executable, str) or not isinstance(handle, str):
-        return False
+        return None  # A record that names no terminal cannot be probed: no evidence either way.
     if record.get("kind") == "orca":
         try:
             answer = _call([executable, "terminal", "show", "--terminal", handle, "--json"], cwd).stdout

@@ -13,6 +13,7 @@ MESSAGES = {
         "talk_manual": "No terminal opener found; run: {command}",
         "talk_ended": "#{n} talk terminal closed; stall clock restarted",
         "talk_run_changed": "#{n} started a new run while the terminal opened; run fa lanes talk {n} again.",
+        "talk_session_starting": "#{n} is starting a new worker session; send the message again in a minute.",
         "talk_record_unreadable": "Cannot read the talk record of #{n} ({path}); close its terminal, delete the file, then retry.",
     },
     "ko": {
@@ -27,6 +28,7 @@ MESSAGES = {
         "talk_manual": "터미널을 열 수 없어요. 직접 실행하세요: {command}",
         "talk_ended": "#{n} 대화 터미널이 닫혀 정지 시계를 다시 시작했어요",
         "talk_run_changed": "터미널을 여는 동안 #{n}이 새 실행을 시작했어요. fa lanes talk {n}을 다시 실행하세요.",
+        "talk_session_starting": "#{n}이 새 작업자 세션을 시작하는 중이에요. 1분 뒤에 메시지를 다시 보내세요.",
         "talk_record_unreadable": "#{n}의 대화 기록을 읽을 수 없어요({path}). 그 터미널을 닫고 파일을 지운 뒤 다시 실행하세요.",
     },
 }

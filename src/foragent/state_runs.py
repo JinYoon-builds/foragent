@@ -34,6 +34,8 @@ class RunRecordsMixin:
                 session = {
                     "session_id": previous.session_id, "session_executor": previous.session_executor,
                     "session_ids": previous.session_ids, "session_body": previous.session_body,
+                    # Inherited, not running: only a launch that resumes it makes it the worker's again.
+                    "session_stale": previous.session_id is not None,
                     "merge_conflicts": previous.merge_conflicts,
                     "local_skill_paths": previous.local_skill_paths,
                     "resume_reason": reason + (

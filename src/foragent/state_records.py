@@ -77,10 +77,14 @@ class Run:
     # A person's talk terminal is open (fa lanes talk); stall and runtime checks pause meanwhile.
     talking: bool = False
     talking_since: str | None = None
-    # A runner wait (test slot, executor backoff, lock) open since this time, and the seconds it
-    # overlapped the open talk: overlapping pauses count once (their union), not twice.
-    wait_open_since: str | None = None
-    talk_overlap_seconds: float = 0
+    # Open pauses (the talk and each runner wait: test slot, executor backoff, lock), by key,
+    # with their start times; ``pause_mark`` is when their overlap was last counted.
+    # ``waited_seconds`` always holds the union of closed pause time, never a sum (D55 addendum).
+    pauses_open: dict[str, str] = field(default_factory=dict)
+    pause_mark: str | None = None
+    # The recorded session is not the running worker's (a fresh thread is starting, or it was
+    # inherited from an earlier run and not resumed yet); nothing may be sent to it.
+    session_stale: bool = False
     files_base_branch: str | None = None
     declared_files: list[str] | None = None
     changed_files: list[str] | None = None
@@ -89,22 +93,22 @@ class Run:
     overlap_records: list[dict] = field(default_factory=list)
 
     def talk_pause_seconds(self, now: datetime) -> float:
-        """Seconds the open talk paused the run beyond what runner waits already credit.
+        """Paused seconds not yet in ``waited_seconds``: the open talk, less pending overlap.
 
-        ``waited_seconds`` receives this when the talk ends; time when a runner wait
-        was open too is credited by that wait, so it is left out here.
+        Runner waits credit their own time as it passes; the talk credits its whole
+        length when it ends. Time when several pauses are open at once counts once.
         """
-        talking = _at(self.talking_since) if self.talking else None
-        if talking is None:
-            return 0.0
-        return max(0.0, (now - talking).total_seconds() - self.talk_overlap_seconds - self.open_overlap(now))
+        talking = _at(self.pauses_open.get("talk") or self.talking_since) if self.talking else None
+        talk = max(0.0, (now - talking).total_seconds()) if talking is not None else 0.0
+        # May be negative: overlapping runner waits have already credited the shared time twice.
+        return talk - self.pending_overlap(now)
 
-    def open_overlap(self, now: datetime) -> float:
-        """Seconds the open talk and the open runner wait have both been open, up to ``now``."""
-        talking, waiting = _at(self.talking_since) if self.talking else None, _at(self.wait_open_since)
-        if talking is None or waiting is None:
+    def pending_overlap(self, now: datetime) -> float:
+        """Seconds counted more than once since ``pause_mark`` while several pauses are open."""
+        mark = _at(self.pause_mark)
+        if mark is None or len(self.pauses_open) < 2:
             return 0.0
-        return max(0.0, (now - max(talking, waiting)).total_seconds())
+        return (len(self.pauses_open) - 1) * max(0.0, (now - mark).total_seconds())
 
 
 def _at(value: str | None) -> datetime | None:

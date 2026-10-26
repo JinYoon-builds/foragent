@@ -31,12 +31,13 @@ class TalkRecordsMixin:
                 _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
 
     def add_waited(self, number: int, seconds: float, *, wait: str | None = None,
-                   now: datetime | None = None, **fields: Any) -> Run:
-        """Add ``seconds`` (negative corrects an advance credit) to ``waited_seconds`` under the state lock.
+                   key: str | None = None, now: datetime | None = None, **fields: Any) -> Run:
+        """The one helper every pause credit goes through: ``waited_seconds`` stays the union.
 
-        Increments keep every concurrent credit. ``wait="open"`` / ``"close"`` marks a
-        runner wait's span at ``now``; while a talk is open too, closing it records
-        the overlap so the talk's own credit leaves that time out (union, not sum).
+        ``seconds`` (negative corrects an advance credit) is the caller's own measure
+        of its pause. ``wait="open"`` / ``"close"`` with a ``key`` marks that pause's span
+        at ``now``. Time when several pauses were open is counted once, so concurrent
+        backoffs, a test-slot queue and a talk add only the length of their union.
         """
         with self._state_lock():
             run = self.get_run(number)
@@ -44,12 +45,7 @@ class TalkRecordsMixin:
                 raise KeyError(number)
             if run.status == "finished":
                 return run
-            if wait == "open" and run.wait_open_since is None:
-                fields["wait_open_since"] = now.isoformat()
-            elif wait == "close":
-                fields.update(wait_open_since=None,
-                              talk_overlap_seconds=run.talk_overlap_seconds + run.open_overlap(now))
-            updated = _state.replace(run, waited_seconds=run.waited_seconds + seconds, **fields)
+            updated = _state.replace(run, **_pause_event(run, now, seconds, wait, key), **fields)
             self._write_run(updated)
             return updated
 
@@ -61,7 +57,8 @@ class TalkRecordsMixin:
                 return None
             if run.talking:
                 return run
-            updated = _state.replace(run, talking=True, talking_since=now.isoformat(), talk_overlap_seconds=0)
+            updated = _state.replace(run, talking=True, talking_since=now.isoformat(),
+                                     **_pause_event(run, now, 0.0, "open", "talk"))
             self._write_run(updated)
             return updated
 
@@ -93,9 +90,30 @@ def _talk_ended(run: Run, now: datetime, *, restart_stall: bool) -> Run:
     if not run.talking:
         return run
     fields = {"last_progress_at": now.isoformat()} if restart_stall else {}
-    # Only the talk time no runner wait already credited: the union of both pauses.
-    return _state.replace(run, talking=False, talking_since=None, talk_overlap_seconds=0,
-                          waited_seconds=run.waited_seconds + run.talk_pause_seconds(now), **fields)
+    since = _state.datetime.fromisoformat(run.pauses_open.get("talk") or run.talking_since or now.isoformat())
+    length = max(0.0, (now - since).total_seconds())
+    # The talk's whole length, through the shared union accounting.
+    return _state.replace(run, talking=False, talking_since=None,
+                          **_pause_event(run, now, length, "close", "talk"), **fields)
+
+
+def _pause_event(run: Run, now: datetime | None, seconds: float, wait: str | None, key: str | None) -> dict:
+    """Fields after crediting ``seconds`` and opening or closing pause ``key`` at ``now``.
+
+    Before the change, the time since ``pause_mark`` with k pauses open was counted
+    k times by their own credits; (k - 1) times that is taken back, so the total is
+    the union of the pause intervals.
+    """
+    opened = dict(run.pauses_open)
+    waited = run.waited_seconds + seconds
+    if now is None:
+        return {"waited_seconds": waited}
+    waited -= run.pending_overlap(now)
+    if wait == "open" and key is not None:
+        opened.setdefault(key, now.isoformat())
+    elif wait == "close" and key is not None:
+        opened.pop(key, None)
+    return {"waited_seconds": waited, "pauses_open": opened, "pause_mark": now.isoformat() if opened else None}
 
 
 import foragent.state as _state

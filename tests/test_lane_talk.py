@@ -11,6 +11,7 @@ import pytest
 from foragent import lane_talk, lane_talk_open, lanes
 from foragent.config import Config
 from foragent.state import StateStore
+from runner_support import run_case  # noqa: F401 - the shared runner fixture
 
 NOW = datetime(2026, 10, 27, 12, tzinfo=UTC)
 
@@ -576,7 +577,7 @@ def test_open_talk_and_open_wait_pause_the_live_budget_once(tmp_path):
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
     run = store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
     ctx = SimpleNamespace(store=store, now=lambda: clock[0], config=config(max_runtime_minutes=60))
-    store.add_waited(1, 600, wait="open", now=clock[0])  # An executor backoff credited up front.
+    store.add_waited(1, 600, wait="open", key="backoff", now=clock[0])  # Credited up front.
     store.begin_talk(1, run.started_at, clock[0])
     clock[0] += timedelta(minutes=10)
     assert run_waits._remaining(1, ctx) == 60 * 60  # Both open for 10 minutes: paused 10, not 20.
@@ -627,3 +628,87 @@ def test_unreadable_talk_record_keeps_the_talk_and_opens_no_duplicate(store, tmp
     with pytest.raises(lane_talk_open.TalkError):
         lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
     assert len(terminals.opened()) == 1 and store.get_run(1).talking is True
+
+
+def test_a_resume_that_switches_threads_never_lets_talk_send_to_the_old_one(run_case):
+    from dataclasses import replace
+
+    from foragent.executors import ExecResult
+    from foragent.run_execution import _available_executor
+
+    c = run_case
+    ctx = replace(c.ctx, config=replace(c.ctx.config, executor="codex"))
+    c.store.update_run(1, session_id="old-thread", session_executor="codex")
+    seen = []
+
+    class Executor:
+        def run(self, **kwargs):
+            if "resume_session_id" in kwargs:  # The resume is refused, so a fresh thread starts.
+                return ExecResult(1, False, "resume refused", kwargs["log_path"])
+            run = c.store.get_run(1)
+            seen.append(run.session_stale)
+            with pytest.raises(lane_talk_open.TalkError, match="new worker session"):
+                lane_talk_open._current_session(c.store, run, 1, "en")  # A talk sending right now.
+            return ExecResult(0, False, "done", kwargs["log_path"], session_id="new-thread", num_turns=1)
+
+    _available_executor(1, ctx, Executor(), session_body="body", resume_prompt="continue",
+                        worktree=ctx.repo_root, prompt="full task", model=None, log_path=c.store.log_path(1))
+    run = c.store.get_run(1)
+    assert seen == [True] and run.session_id == "new-thread" and run.session_stale is False
+    assert lane_talk_open._current_session(c.store, run, 1, "en") == "new-thread"
+    c.store.finish_run(1, "merged")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_an_inherited_session_is_not_the_new_runs_worker_until_resumed(store):
+    store.update_run(1, session_id="earlier-thread", session_executor="codex")
+    store.finish_run(1, "crashed")
+    run = store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    assert run.session_id == "earlier-thread" and run.session_stale is True
+    assert lane_talk_open._session(run, config())[1] is None
+
+
+def test_two_overlapping_120s_backoffs_inside_a_600s_talk_credit_600s(tmp_path):
+    from types import SimpleNamespace
+
+    from foragent.run_waits import _executor_wait
+
+    clock, mono = [NOW], [0.0]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    run = store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    store.begin_talk(1, run.started_at, clock[0])
+    clock[0] += timedelta(seconds=100)
+    mono[0] += 100
+    depth = []
+
+    def sleep(seconds):
+        if not depth:  # A second panel reviewer backs off while the first one waits.
+            depth.append(1)
+            _executor_wait(1, ctx, 120)
+            return
+        clock[0] += timedelta(seconds=seconds)
+        mono[0] += seconds
+
+    ctx = SimpleNamespace(store=store, now=lambda: clock[0], monotonic=lambda: mono[0], sleep=sleep)
+    _executor_wait(1, ctx, 120)
+    assert store.get_run(1).pauses_open == {"talk": NOW.isoformat()}
+    clock[0] = NOW + timedelta(seconds=600)
+    ended = store.end_talk(1, clock[0])
+    assert ended.waited_seconds == 600 and ended.pauses_open == {} and ended.pause_mark is None
+
+
+@pytest.mark.parametrize("listing", ["{}", json.dumps({"id": "req-4", "ok": True, "result": {}})])
+def test_an_empty_or_unrecognised_orca_listing_keeps_the_talk_open(store, tmp_path, monkeypatch, listing):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+
+    def run(argv, **kwargs):
+        terminals.calls.append(list(argv))
+        if argv[1:3] == ["terminal", "show"]:
+            raise subprocess.CalledProcessError(1, argv, output="", stderr="crashed")
+        return subprocess.CompletedProcess(argv, 0, stdout=listing, stderr="")
+
+    monkeypatch.setattr(lane_talk.subprocess, "run", run)
+    run_record, still_open = lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW)
+    assert still_open and store.get_run(1).talking is True and lane_talk.talk_path(store, 1).exists()
