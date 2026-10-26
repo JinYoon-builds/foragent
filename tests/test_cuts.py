@@ -135,3 +135,15 @@ def test_moved_between_names_a_copy_whose_original_main_left_unchanged(tmp_path)
     # main copies big.py into a new module and leaves the original untouched.
     main = commit({"big.py": content, "copy.py": content}, base)
     assert GitRepo(tmp_path).moved_between(base, main, ["big.py"]) == [("big.py", "copy.py")]
+
+
+def test_previous_attempt_records_name_what_their_limits_leave_out(tmp_path):
+    from types import SimpleNamespace
+    from foragent.run_previous import STOP_LIMIT, record_stop_point, stop_path
+
+    text = "start\n" + "y" * (STOP_LIMIT + 10)
+    record_stop_point(tmp_path, 3, SimpleNamespace(full_message=text, last_message=""), tmp_path / "log", 0)
+    saved = cuts.issue_dir(tmp_path, 3) / "stop-full.txt"
+    kept = stop_path(tmp_path, 3).read_text()
+    assert kept.startswith(f"[cut: {len(text) - STOP_LIMIT} more chars; full text: {saved}]")
+    assert saved.read_text() == text

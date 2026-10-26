@@ -22,7 +22,7 @@ def _pr_body(
     skills_line: str | None = None,
     rebuttals: str = "",
     review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
-    risk_notes: str = "",
+    risk_notes: str = "", language: str = "en",
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -33,7 +33,7 @@ def _pr_body(
     lines.extend(["", "## Review", ""])
     if review_scope == "pr-body":
         lines.append(f"VERDICT: {reviews[-1].verdict}" if reviews else "Pending review.")
-        lines.extend(["", "## Review scope", "", review_scope_rules(acceptance_dir),
+        lines.extend(["", "## Review scope", "", review_scope_rules(acceptance_dir, language),
                       "The acceptance tests are locked."])
         if risk_notes:
             lines.extend(["", risks.notes_block(risk_notes)])

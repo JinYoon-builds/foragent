@@ -16,13 +16,27 @@ REVIEW_PROMPT = (
     "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
     "followed by every finding, each one line with file:line and the concrete failure."
 )
+REVIEW_FEEDBACK_INSTRUCTIONS = (
+    "For each review finding, name the defect class it belongs to, "
+    "find every other instance of that class in the change, fix or rebut each instance, "
+    "and state the class and the instances found."
+)
+DEFAULT_RETRY_HINT = (
+    "Keep the branch's work; for each recorded finding, name the defect class it belongs to, "
+    "find every other instance of that class in the change, fix them all, "
+    "and state the class and the instances found."
+)
 
 
-def review_scope_rules(acceptance_dir: str) -> str:
+def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
+    """Scope rules for reviewers; PR bodies pass the repository language for the human-read question."""
+    from foragent.i18n import text
+
     return (
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
-        "Improvements beyond this issue's Goal are not defects."
+        "Improvements beyond this issue's Goal are not defects.\n"
+        + text("review_class_question", language)
     )
 
 
@@ -67,6 +81,9 @@ def build_prompt(
     acceptance_baseline: tuple[str, ...] = (),
     failure_limit: int | None = 4000,
     skill_catalog: str = "",
+    previous_attempt: str = "",
+    review_feedback: bool = False,
+    retry_default: bool = False,
     parent_context: str = "",
     full_text_dir: Path | None = None,
     moved_files: list[str] | None = None,
@@ -120,12 +137,16 @@ def build_prompt(
         "  steps:\n"
         "  - <what to click or type>\n"
     )
+    if previous_attempt:
+        prompt += "\nPrevious attempt (from local records):\n" + previous_attempt + "\n"
     if reviewer_text is not None:
         prompt += "\nA reviewer said (verbatim):\n" + reviewer_text
     elif failure:
         prompt += "\nA previous attempt failed. Output of the failing check:\n" + (
             failure if failure_limit is None else cuts.tail(failure, failure_limit, full_text_dir, "failure.txt")
         )
+    if review_feedback:
+        prompt += "\n" + REVIEW_FEEDBACK_INSTRUCTIONS + "\n"
     if acceptance_baseline:
         prompt += (
             f"\nThese acceptance tests already pass on the base and must keep passing ({len(acceptance_baseline)}):\n"
@@ -143,14 +164,17 @@ def build_prompt(
     prompt += skill_catalog
     if orchestrator_hint is not None:
         prompt = "Orchestrator hint:\n" + orchestrator_hint + "\n\n" + prompt
+    if retry_default:
+        # A queued retry's default always comes before any orchestrator hint.
+        prompt = "Retry instructions:\n" + DEFAULT_RETRY_HINT + "\n\n" + prompt
     return f"/goal {runner.goal_condition(acceptance_dir)}\n\n{prompt}" if native_goal else prompt
 
 
 def build_resume_prompt(
     n: int, previous_body: str | None, body: str, failure: str = "", *,
     reviewer_text: str | None = None, orchestrator_hint: str | None = None,
-    merge_conflicts: list[str] | None = None, moved_files: list[str] | None = None,
-    parent_context: str = "",
+    merge_conflicts: list[str] | None = None, review_feedback: bool = False, retry_default: bool = False,
+    moved_files: list[str] | None = None, parent_context: str = "",
 ) -> str:
     """Deliver exact specification edits and feedback to an existing session."""
     parts = [f"Continue implementing GitHub issue #{n} in this repository."]
@@ -171,6 +195,10 @@ def build_resume_prompt(
         parts.append("A reviewer said (verbatim):\n" + reviewer_text)
     elif failure:
         parts.append("A previous attempt failed. Output or stop reason:\n" + failure)
+    if review_feedback:
+        parts.append(REVIEW_FEEDBACK_INSTRUCTIONS)
+    if retry_default:
+        parts.append("Retry instructions:\n" + DEFAULT_RETRY_HINT)
     if orchestrator_hint is not None:
         parts.append("Orchestrator hint:\n" + orchestrator_hint)
     if merge_conflicts is not None:

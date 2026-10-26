@@ -24,6 +24,15 @@ if TYPE_CHECKING:
 class PatchReplayError(GitError):
     """A child patch could not be replayed onto its selected destination."""
 
+    def __init__(self, message: str, own_paths: list[str] | tuple[str, ...] = (), *,
+                 source_head: str | None = None, source_tree: str | None = None, source_target: str = ""):
+        super().__init__(message)
+        self.own_paths = list(own_paths)
+        # The branch head and staged tree before replay, so a stop can restore the PR's work.
+        self.source_head = source_head
+        self.source_tree = source_tree
+        self.source_target = source_target
+
 
 class AttemptFailure(Exception):
     """Checks failed and need another implementation attempt."""
@@ -40,7 +49,13 @@ class AttemptFailure(Exception):
 
 
 class ConflictBudgetExhausted(Exception):
-    """Conflict resolution needs one fresh implementation on the latest target."""
+    """In-place conflict resolution used its budget; the PR's own files decide on a rebuild."""
+
+    def __init__(self, message: str, conflicts: list[str] | tuple[str, ...] = (),
+                 own_paths: list[str] | tuple[str, ...] = ()):
+        super().__init__(message)
+        self.conflicts = list(conflicts)
+        self.own_paths = list(own_paths)
 
 
 class CIFailure(AttemptFailure):
@@ -89,6 +104,8 @@ class Implementation:
     review_hold: bool = False
     review_hold_reason: Reason = Reason.RISK_HIGH
     reviewer_text: str | None = None
+    # The pending failure came from a review round; the next prompt asks for a defect-class sweep.
+    review_feedback: bool = False
     rebuttals: list[str] = field(default_factory=list)
     previous_rebutted_findings: set[str] = field(default_factory=set)
     checks: list[CheckResult] = field(default_factory=list)
