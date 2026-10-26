@@ -7,16 +7,28 @@ ORDER = 157
 
 def add(commands) -> None:
     cli = facade()
-    report = commands.add_parser("report", help="Prepare and send an upstream Foragent error report")
+    # The parser is built per command run, so help follows the current repository's language.
+    # Read the file directly: every `fa` command builds this parser and must not fail or be
+    # observed through the facade's config hook because of it.
+    from foragent.config import load_config
+    try:
+        language = load_config(cli.Path.cwd()).language
+    except (ValueError, TypeError, OSError):
+        language = "en"
+
+    def say(key: str) -> str:
+        return cli.text(key, language)
+
+    report = commands.add_parser("report", help=say("report_help"))
     actions = report.add_subparsers(dest="action", required=True)
-    propose = actions.add_parser("propose", help="Prepare a report from a local record and show all of it")
+    propose = actions.add_parser("propose", help=say("report_help_propose"))
     propose.add_argument("--from", dest="source", required=True, metavar="flag:N|event:N",
-                         help="flag:N is issue N's flag; event:N is line N of the orchestrator journal")
-    propose.add_argument("--json", action="store_true")
+                         help=say("report_help_from"))
+    propose.add_argument("--json", action="store_true", help=say("report_help_json"))
     propose.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-    send = actions.add_parser("send", help="Send one prepared report after your approval")
-    send.add_argument("report_id")
-    send.add_argument("--yes", action="store_true", help="Approve sending this report without a prompt")
+    send = actions.add_parser("send", help=say("report_help_send"))
+    send.add_argument("report_id", help=say("report_help_id"))
+    send.add_argument("--yes", action="store_true", help=say("report_help_yes"))
     send.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
 
@@ -49,7 +61,7 @@ def run(args) -> int:
             raise upstream_report.ReportError("report_not_allowed")
         _config, _repo, store = repo_store(root)
         if args.action == "propose":
-            report = upstream_report.propose(store, args.source, config_key_names(root))
+            report = upstream_report.propose(store, args.source, config_key_names(root), language)
             if args.json:
                 print(cli.json.dumps(report, ensure_ascii=False))
             else:
