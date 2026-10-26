@@ -1012,8 +1012,15 @@ class GhTracker:
         self._call(args)
 
     def search_issues(self, query: str) -> list[dict[str, Any]]:
-        """One page of GitHub issue search results for ``query`` (raw REST items)."""
-        data = json.loads(self._call(["api", "-X", "GET", "search/issues", "-f", f"q={query}"]))
+        """Up to 100 GitHub issue search results for ``query`` (raw REST items).
+
+        GitHub matches titles, bodies and comments; text-match metadata (``text_matches``)
+        shows the matching fragments, including comment fragments a body check cannot see.
+        """
+        data = json.loads(self._call([
+            "api", "-X", "GET", "search/issues", "-H", "Accept: application/vnd.github.text-match+json",
+            "-f", f"q={query}", "-f", "per_page=100",
+        ]))
         return list(data.get("items") or [])
 
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int:

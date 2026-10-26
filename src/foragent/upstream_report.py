@@ -17,6 +17,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 
 import foragent
+from foragent.orch_tick_outcome import LOG_FILE as TICK_FAILURE_LOG
 from foragent.state import StateStore
 
 UPSTREAM = "JinYoon-builds/foragent"
@@ -28,6 +29,7 @@ _TYPE_INLINE = re.compile(rf"(?<![\w.])({_TYPE})(?::(?=\s|$)|$)")
 _FRAME_LINE = re.compile(r'^\s+File "([^"]+)", line (\d+), in (\S+)\s*$')
 _TYPE_LINE = re.compile(rf"^({_TYPE})(?::(?=\s|$)|$)")
 _HEADER = "Traceback (most recent call last):"
+_LOG_TAIL = 2_000_000  # Bytes read from the end of a log; tracebacks are appended last.
 _SYNTHETIC_FUNCTIONS = {"<module>", "<lambda>", "<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>"}
 # Run fields that are counts or durations; everything else in a run can hold private text.
 _RUN_NUMBERS = ("attempts", "restarts", "transient_errors", "resume_failures", "rebuild_count",
@@ -116,6 +118,22 @@ def parse_traceback(text: str) -> tuple[str | None, list[tuple[str, int, str]]]:
     return name, [frame for frame in (_verified_frame(*item) for item in raw) if frame]
 
 
+def _log_traceback(text: str) -> tuple[str | None, list[tuple[str, int, str]]]:
+    """The last traceback in a log that has verified Foragent frames.
+
+    Issue logs also hold executor output, such as a user project's failing tests; those
+    tracebacks have no Foragent frames, so they are skipped rather than reported.
+    """
+    lines = text.splitlines()
+    starts = [index for index, line in enumerate(lines) if line.rstrip().endswith(_HEADER)]
+    for position in reversed(range(len(starts))):
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        name, frames = parse_traceback("\n".join(lines[starts[position]:end]))
+        if name and frames:
+            return name, frames
+    return None, []
+
+
 def _joined_traceback(text: str) -> tuple[str | None, list[tuple[str, int, str]]]:
     """A journal line with its line breaks removed: frames stay readable, the type only if unambiguous."""
     last = None
@@ -134,8 +152,30 @@ def signature(kind: str, frame: tuple[str, int, str] | None) -> str:
     return "fa-sig-" + hashlib.sha256(f"{kind}|{where}".encode()).hexdigest()[:12]
 
 
-def _source(store: StateStore, source: str) -> tuple[str, int | None, str]:
-    """The local text for flag:N or event:N, the issue it belongs to, and its kind label."""
+def _read_log(path: Path) -> str:
+    """The tail of a local log (tracebacks are appended at the end); empty if it is missing."""
+    try:
+        with path.open("rb") as stream:
+            stream.seek(max(0, path.stat().st_size - _LOG_TAIL))
+            return stream.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _issue_records(store: StateStore, issue: int) -> list[tuple[str, str]]:
+    """Where an issue's failure is recorded, as (kind, text): the runner flags `retries-exceeded`
+    and appends the traceback to the issue log, so the flag reason alone rarely holds it."""
+    flag = store.load_flag(issue)
+    run = store.get_run(issue)
+    return [("text", flag.reason if flag else ""), ("text", run.detail if run else ""),
+            ("log", _read_log(store.log_path(issue)))]
+
+
+def _source(store: StateStore, source: str) -> tuple[list[tuple[str, str]], int | None, str]:
+    """The local records for flag:N or event:N in the order they are read, the issue, and the kind.
+
+    Each record is ("text", text), ("joined", one-line journal text) or ("log", log tail).
+    """
     kind, _, number = source.partition(":")
     if kind not in {"flag", "event"} or not number.isdigit() or int(number) < 1:
         raise ReportError("report_bad_source")
@@ -143,7 +183,7 @@ def _source(store: StateStore, source: str) -> tuple[str, int | None, str]:
         flag = store.load_flag(int(number))
         if flag is None:
             raise ReportError("report_source_missing")
-        return flag.reason, flag.number, "flag"
+        return _issue_records(store, flag.number), flag.number, "flag"
     try:
         lines = (store.root / "orch-events.jsonl").read_text(encoding="utf-8").splitlines()
         event = json.loads(lines[int(number) - 1])
@@ -152,17 +192,22 @@ def _source(store: StateStore, source: str) -> tuple[str, int | None, str]:
     issue = event.get("issue")
     issue = issue if type(issue) is int else None
     summary = str(event.get("summary", ""))
-    # The journal joins lines; the issue's own flag or run detail may keep the same traceback whole.
-    originals = []
-    if issue is not None:
-        flag = store.load_flag(issue)
-        run = store.get_run(issue)
-        originals = [flag.reason if flag else "", run.detail if run else ""]
-    for original in originals:
-        joined = " ".join(original.split())
-        if "\n" in original and joined and (joined in summary or summary in joined):
-            return original, issue, "event"
-    return summary, issue, "event"
+    records = _issue_records(store, issue) if issue is not None else []
+    # The journal joins lines; the issue's flag or run detail may keep this same traceback whole.
+    same = [record for record in records[:2] if "\n" in record[1] and " ".join(record[1].split())
+            and (" ".join(record[1].split()) in summary or summary in " ".join(record[1].split()))]
+    tick_log = store.root / TICK_FAILURE_LOG
+    # A failed gate tick writes its traceback to this log and names the log in its request event.
+    tick = [("log", _read_log(tick_log))] if issue is None and str(tick_log) in summary else []
+    return [*same, ("joined", summary), *records, *tick], issue, "event"
+
+
+def _read_record(kind: str, text: str) -> tuple[str | None, list[tuple[str, int, str]]]:
+    if kind == "log":
+        return _log_traceback(text)
+    if kind == "joined" or "\n" not in text:
+        return _joined_traceback(text)
+    return parse_traceback(text)
 
 
 def _number(value: float) -> str:
@@ -176,8 +221,11 @@ def propose(store: StateStore, source: str, config_keys: list[str], language: st
     """
     from foragent.i18n import text as say
 
-    record, issue, kind = _source(store, source)
-    name, frames = parse_traceback(record) if "\n" in record else _joined_traceback(record)
+    records, issue, kind = _source(store, source)
+    # A record with Foragent frames wins: a flag reason such as "Runner failed: KeyError: 'pid'"
+    # names the error but not where it happened, which the issue log's traceback shows.
+    found = [result for result in map(lambda record: _read_record(*record), records) if result[0]]
+    name, frames = next((result for result in found if result[1]), found[0] if found else (None, []))
     if name is None:
         raise ReportError("report_no_error")
     innermost = frames[-1] if frames else None
@@ -235,6 +283,16 @@ def load(store: StateStore, report_id: str) -> dict[str, Any]:
         raise ReportError("report_unknown") from None
 
 
+def _searchable_text(row: dict[str, Any]) -> str:
+    """Title, body and every text-match fragment GitHub returned, which includes comment matches.
+
+    A search hit alone is not trusted (search is fuzzy); the signature must appear in this text.
+    """
+    fragments = [str(match.get("fragment") or "") for match in row.get("text_matches") or []
+                 if isinstance(match, dict)]
+    return "\n".join([str(row.get("title") or ""), str(row.get("body") or ""), *fragments])
+
+
 def send(store: StateStore, report: dict[str, Any], tracker) -> tuple[str, str]:
     """Search upstream by signature, then append to the matching open issue or open one.
 
@@ -242,7 +300,7 @@ def send(store: StateStore, report: dict[str, Any], tracker) -> tuple[str, str]:
     """
     rows = tracker.search_issues(f'repo:{UPSTREAM} is:issue is:open "{report["signature"]}"')
     match = next((row for row in rows if str(row.get("state", "")).lower() == "open"
-                  and report["signature"] in f"{row.get('title') or ''}\n{row.get('body') or ''}"), None)
+                  and report["signature"] in _searchable_text(row)), None)
     if match is not None:
         number = int(match["number"])
         tracker.comment(number, report["body"])

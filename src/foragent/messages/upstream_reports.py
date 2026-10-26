@@ -8,6 +8,7 @@ MESSAGES = {
         "upstream_reports_on": "Upstream reports: on. Foragent may propose a report; you approve each one.",
         "upstream_reports_off": "Upstream reports: off. Foragent won't ask again.",
         "upstream_reports_unanswered": "Upstream reports: not asked (no terminal); fa init will ask next time.",
+        "config_upstream_reports_invalid": "upstream_reports must be true or false.",
         "report_not_allowed": (
             "Upstream reports are off. To allow them, set upstream_reports: true in {path}."),
         "report_bad_source": "Use --from flag:N or event:N (N is an issue number or a journal line).",
@@ -50,6 +51,7 @@ MESSAGES = {
         "upstream_reports_on": "Upstream report: 켬. Foragent가 보고서를 제안하고, 보낼 때마다 승인을 받아요.",
         "upstream_reports_off": "Upstream report: 끔. 다시 묻지 않을게요.",
         "upstream_reports_unanswered": "Upstream report: 묻지 못했어요(터미널 없음). 다음 fa init 때 다시 물어요.",
+        "config_upstream_reports_invalid": "upstream_reports는 true 또는 false여야 해요.",
         "report_not_allowed": (
             "Upstream report가 꺼져 있어요. 켜려면 {path}에 upstream_reports: true를 넣어 주세요."),
         "report_bad_source": "--from flag:N 또는 event:N을 쓰세요(N은 이슈 번호 또는 기록 줄 번호).",

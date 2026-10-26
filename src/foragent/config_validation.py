@@ -84,7 +84,9 @@ def _validate(values: dict[str, Any]) -> None:
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     if values["upstream_reports"] is not None and type(values["upstream_reports"]) is not bool:
-        raise ConfigError("upstream_reports must be true or false")
+        from foragent.i18n import text
+        language = values["language"] if isinstance(values["language"], str) else "en"
+        raise ConfigError(text("config_upstream_reports_invalid", language))
     for key in ("always_human", "approvers"):
         if not isinstance(values[key], list) or any(not isinstance(item, str) for item in values[key]):
             raise ConfigError(f"{key} must be a list of strings")
