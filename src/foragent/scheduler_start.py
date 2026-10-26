@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -13,7 +12,7 @@ from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
     machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
 )
-from foragent.config import resolved_reviewer
+from foragent.config import lane_executors
 from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
 from foragent.tracker import Issue
 
@@ -25,9 +24,7 @@ def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
     """A lane waits while it, its implementer or its reviewer is paused for a usage limit."""
     if ctx.store.lane_paused(lane, now):
         return True
-    settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
-    config = replace(ctx.config, executor=settings.get("executor") or ctx.config.executor)
-    return any(ctx.store.executor_paused(name, now) for name in {config.executor, resolved_reviewer(config)})
+    return any(ctx.store.executor_paused(name, now) for name in lane_executors(ctx.config, lane))
 
 
 def _apply_budgets(

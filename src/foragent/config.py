@@ -2,7 +2,7 @@
 
 from collections import Counter
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 import re
@@ -50,6 +50,7 @@ class Config:
     test_slots: int = 2  # Machine-wide test command ceiling; AIMD lowers it under load (#243).
     transient_max_wait_minutes: int = 30
     limit_wait_minutes: int = 60
+    usage_recheck_minutes: int = 10  # How often an exhausted executor's free usage source is re-read.
     codex_goal: bool = False
     reviewer: str | None = None
     reviewer_model: str | None = None
@@ -477,6 +478,13 @@ def set_profile(repo_root: Path, *, kind: str, stage: str, priority: str) -> dic
 
 def resolved_reviewer(config: Config) -> str:
     return config.reviewer or ("claude" if config.executor == "codex" else "codex")
+
+
+def lane_executors(config: Config, lane: str) -> set[str]:
+    """The implementer and reviewer a lane uses; an unset reviewer follows the lane's implementer."""
+    settings = config.lanes.get(lane, {}) if lane != "main" else {}
+    lane_config = replace(config, executor=settings.get("executor") or config.executor)
+    return {lane_config.executor, resolved_reviewer(lane_config)}
 
 
 def in_run_hours(now: datetime, run_hours: str) -> bool:

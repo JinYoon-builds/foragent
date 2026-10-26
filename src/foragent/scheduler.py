@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, orch_queue, tidy, watch_open
+from foragent import board, orch_github, orch_queue, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -87,6 +87,7 @@ def tick(ctx: TickContext) -> TickReport:
             cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
             if snapshot.available:
                 _reap_inactive_runs(ctx, cleanup)
+            usage_recheck.recheck(ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
             if until := ctx.store.github_wait_until(ctx.now()):
                 _apply_budgets(ctx, {})
                 return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
