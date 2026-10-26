@@ -16,3 +16,5 @@ metadata:
 **How to apply:** any locked test that advances a fake clock past 30 min with active runs needs stall handled by the test or by #435 first; check this before blaming new code.
 
 Resolved 2026-10-27: the orchestrator answered the question by adding `stall_minutes=120` to the locked test (option 1). For the SKILL.md 150-line limit, move a whole paragraph verbatim into a file beside it with a one-line pointer (`notify.md` held the push-notification paragraph), then compare the PASSED/FAILED set of every acceptance file that greps `fa-orchestrator` before and after.
+
+Merge with #333 (2026-10-27): `fa orch facts` must never open `plan.json` (locked acceptance guard on `open`), so the facts start-order replay (`orch_facts_resources`) now uses issue-number order instead of lane queues. When merging, keep both `facts` and `pause/resume/plan` in `INBOX_ACTIONS` and parser registration. Check regressions by loading main's `src` via `git archive <sha> src` into `.foragent/base` and `PYTHONPATH=...`, then diff the FAILED sets.

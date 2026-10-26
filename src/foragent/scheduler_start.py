@@ -132,14 +132,15 @@ def _overlap_count(ctx: TickContext, number: int, claims: list) -> int:
                for path in parse_body(approval.body).files)
 
 
-def _ranked(ctx: TickContext, ready: dict[str, list[int]]) -> list[tuple[str, int]]:
+def _ranked(ctx: TickContext, ready: dict[str, list[int]], claims: list | None = None) -> list[tuple[str, int]]:
     """Every lane's candidates in one start order; each still meets every start rule.
 
     Fewer declared files overlapping running runs first, then the cross-lane
     priority list, then the position in the lane's (already queue-ordered) list,
-    then the issue number.
+    then the issue number. ``claims`` lets a read-only view pass its recorded claims.
     """
-    claims = overlap_files.claims(ctx)[0] if ctx.store.active_runs() else []
+    if claims is None:
+        claims = overlap_files.claims(ctx)[0] if ctx.store.active_runs() else []
     priority = {number: index for index, number in enumerate(orch_queue.get_global(ctx.store))}
     unlisted = len(priority)
     keyed = [
