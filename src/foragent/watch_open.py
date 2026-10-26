@@ -120,7 +120,17 @@ def _call(argv: list[str], root: Path) -> None:
     )
 
 
-def _recorded_terminal(store: StateStore, root: Path) -> tuple[str, str] | None:
+class _ViewLive(Exception):
+    """A view became live while an opener was working: stop without a command."""
+
+
+def _guard(store: StateStore) -> None:
+    # A view can take its lock at any moment, so check right before each command.
+    if _live(store):
+        raise _ViewLive
+
+
+def _recorded_terminal(store: StateStore, root: Path, *, guarded: bool = False) -> tuple[str, str] | None:
     try:
         record = json.loads((store.root / "watch-terminal.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
@@ -130,6 +140,8 @@ def _recorded_terminal(store: StateStore, root: Path) -> tuple[str, str] | None:
     executable, handle = record.get("executable"), record.get("handle")
     if not isinstance(executable, str) or not isinstance(handle, str) or not executable or not handle:
         return None
+    if guarded:
+        _guard(store)
     try:
         _call([executable, "terminal", "show", "--terminal", handle], root)
     except (OSError, subprocess.SubprocessError):
@@ -234,6 +246,7 @@ def _launch(repo_root: Path, store: StateStore, language: str, record_at: dateti
 
     def final(argv: list[str], root: Path) -> None:
         # Only the final split or window command counts as an attempt.
+        _guard(store)
         try:
             _call(argv, root)
         except (OSError, subprocess.SubprocessError):
@@ -261,7 +274,7 @@ def _launch(repo_root: Path, store: StateStore, language: str, record_at: dateti
             })
             terminal = executable, handle
         elif not handle:
-            terminal = _recorded_terminal(store, root)
+            terminal = _recorded_terminal(store, root, guarded=True)
         if terminal:
             executable, handle = terminal
             final([executable, "terminal", "split", "--terminal", handle,
@@ -296,6 +309,8 @@ def _launch(repo_root: Path, store: StateStore, language: str, record_at: dateti
             else:
                 script = 'tell application "Terminal" to do script ' + quoted
             final([osascript, "-e", script], root)
+    except _ViewLive:
+        return
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         # Subprocess output is suppressed; every failure stays on one short line.
         if isinstance(exc, subprocess.CalledProcessError):

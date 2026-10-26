@@ -230,3 +230,46 @@ def test_concurrent_opener_waits_and_honours_the_others_timeout_record(opening, 
     second.join(5)
     assert calls == ["first"], "The first opener's timeout record must stop the waiting opener"
     assert (store.root / "watch-open.json").exists()
+
+
+def test_view_locking_during_the_show_probe_stops_the_split(opening, tmp_path, monkeypatch):
+    from contextlib import ExitStack
+
+    store, _ = opening
+    store._write_json(store.root / "watch-terminal.json", {"executable": "/fake/orca", "handle": "term_1"})
+    calls = []
+    with ExitStack() as held:
+        def call(argv, root):
+            calls.append(argv[:3])
+            if argv[2] == "show":
+                # A view starts and takes its lock while the probe runs.
+                assert held.enter_context(watch_open.exclusive(store)) is not None
+
+        monkeypatch.setattr(watch_open, "_call", call)
+        watch_open.open_view(tmp_path, store)
+    assert calls == [["/fake/orca", "terminal", "show"]], "No split may run once the view holds its lock"
+    assert not (store.root / "watch-open.json").exists(), "Stopping for a live view is not a failed attempt"
+
+
+@pytest.mark.parametrize("backend, env", [
+    ("tmux", {"TMUX": "/tmp/tmux,1,0"}), ("wezterm", {"WEZTERM_PANE": "1"}),
+    ("kitty", {"KITTY_WINDOW_ID": "1"}), ("osascript", {}),
+])
+def test_view_locking_before_any_backend_command_stops_it(opening, tmp_path, monkeypatch, capsys, backend, env):
+    from contextlib import ExitStack
+
+    store, calls = opening
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    with ExitStack() as held:
+        def which(name):
+            if name != backend:
+                return None
+            # The view takes its lock after the opener's first check, before the command.
+            held.enter_context(watch_open.exclusive(store))
+            return "/fake/" + name
+
+        monkeypatch.setattr(watch_open.shutil, "which", which)
+        watch_open.open_view(tmp_path, store)
+    assert calls == []
+    assert capsys.readouterr().err == ""
