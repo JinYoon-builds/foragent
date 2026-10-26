@@ -245,3 +245,16 @@ def human(facts: dict[str, Any]) -> str:
     reason_lines += [f"  {count}x {text[:100]}" for text, count in reasons[:HUMAN_ITEMS]]
     blocks = [runs, capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}"]]
     return "\n\n".join("\n".join(block) for block in blocks)
+
+
+def add_parser(orch_actions) -> None:
+    """`fa orch facts [--json]` under `fa orch`."""
+    facts = orch_actions.add_parser("facts", help="Show measured run, slot, file and resource facts")
+    facts.add_argument("--repo-root", type=Path, default=Path.cwd())
+    facts.add_argument("--json", action="store_true")
+
+
+def command(args, store: StateStore, config: Config) -> None:
+    # The checkout config; collect applies the tick's recorded committed config from its frozen read.
+    facts = collect(store, config, args.repo_root.resolve(), checkout=True)
+    print(json.dumps(facts, ensure_ascii=False) if args.json else human(facts))

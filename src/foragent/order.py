@@ -658,7 +658,7 @@ def preread_target(plan: dict, item: dict, config: Config, root: Path):
     from foragent.run_implementation import implementer_setup, lane_config
 
     setup = implementer_setup(lane_config(config, item["lane"]), item["lane"], item["size"], root)
-    prompt = setup.notes + preread_prompt(plan, item)
+    prompt = setup.notes + preread_prompt(plan, item) + setup.memory_notice
     # The whole plan is part of the key: any change to any issue needs a new preread.
     digest = hashlib.sha256(json.dumps(
         [setup.executor, setup.model, setup.options, prompt, plan], ensure_ascii=False, sort_keys=True,

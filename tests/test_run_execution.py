@@ -379,3 +379,25 @@ def test_paused_implementer_is_not_launched_until_its_reset(run_case):
     assert run_issue(1, c.ctx) == "limit-wait"
     assert c.executor.steps == before
     assert c.store.executor_pause_until(c.ctx.config.executor, c.now[0]) == reset
+
+
+def test_undelivered_feedback_survives_an_executor_error(run_case):
+    """#420: an executor error before the turn ran keeps the pending check failures and their whole flag."""
+    from foragent.run_execution import _available_executor
+
+    c = run_case
+    pending = "Command: a\nfirst failure\n\nCommand: b\nsecond failure"
+    c.store.update_run(1, resume_reason=pending, resume_whole=True)
+
+    class Executor:
+        def run(self, **kwargs):
+            kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+            kwargs["log_path"].write_text("executor crashed\n")
+            return ExecResult(1, False, "executor crashed", kwargs["log_path"])
+
+    _available_executor(1, c.ctx, Executor(), session_body="body", resume_prompt=None,
+                        worktree=c.ctx.repo_root, prompt="full task", model=None, log_path=c.store.log_path(1))
+    run = c.store.get_run(1)
+    assert run.resume_reason.startswith(pending + "\n\nExecutor exit_code=1") and run.resume_whole
+    c.store.finish_run(1, "executor-error")
+    c.tracker.remove_labels(1, ["running"])

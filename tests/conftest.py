@@ -4,15 +4,75 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 import os
+import pwd
 import signal
 import shutil
 import subprocess
+import tempfile
 
 import pytest
 
 
 ACCEPTANCE = "tests/acceptance/test_feature.py"
 BASE_TIME = datetime(2026, 10, 20, 8, tzinfo=UTC)
+
+
+# Captured at import, before any test isolates HOME: the HOME pytest started with.
+REAL_HOME = Path.home()
+ACCOUNT_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+_HOME = pytest.StashKey[Path]()
+_HOME_PATCH = pytest.StashKey[pytest.MonkeyPatch]()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """Give every test its own HOME, XDG and Git config directories (#655).
+
+    A hook, not an autouse fixture: pytest does not order same-scope autouse
+    fixtures by declaration, so a fixture could still see the starting HOME.
+    This runs before any fixture of this test, of any scope, is set up.
+    `isolated_home` still works: it points HOME at its own directory on top.
+    """
+    home = Path(tempfile.mkdtemp(prefix="fa-test-home-")).resolve()
+    patch = pytest.MonkeyPatch()
+    item.stash[_HOME], item.stash[_HOME_PATCH] = home, patch
+    patch.setenv("HOME", str(home))
+    for key, directory in (("XDG_CONFIG_HOME", ".config"), ("XDG_DATA_HOME", ".local/share"),
+                           ("XDG_STATE_HOME", ".local/state"), ("XDG_CACHE_HOME", ".cache")):
+        patch.setenv(key, str(home / directory))
+    patch.setenv("GIT_CONFIG_GLOBAL", str(home / ".gitconfig"))
+    patch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    patch.setenv("GIT_TERMINAL_PROMPT", "0")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item):
+    """Restore the starting environment only after every fixture has torn down."""
+    yield
+    patch = item.stash.get(_HOME_PATCH, None)
+    if patch is not None:
+        patch.undo()
+        shutil.rmtree(item.stash[_HOME], ignore_errors=True)
+
+
+@pytest.fixture
+def temporary_home(request):
+    """The HOME this test started with (see pytest_runtest_setup)."""
+    return request.node.stash[_HOME]
+
+
+def _real_homes():
+    return {path.resolve() for path in (REAL_HOME, ACCOUNT_HOME)}
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_call(item):
+    """Fail closed: no test body may run with the real or starting HOME."""
+    home = Path.home().resolve()
+    if home in _real_homes():
+        raise RuntimeError(f"Test would run with the real HOME {home}; HOME isolation failed")
 
 
 # Block delivering signals, including subprocess timeout cleanup; allow probes.
@@ -76,6 +136,25 @@ def no_real_ancestors(monkeypatch):
             return [] if self.pid == own else super().parents()
 
     monkeypatch.setattr(psutil, "Process", Isolated)
+
+
+@pytest.fixture(autouse=True)
+def no_real_installed_gates(monkeypatch, temporary_home):
+    """Status lists every gate on the machine (#366); never this machine's real gates.
+
+    Under the default temporary HOME (which stands in for the starting HOME) the
+    list is empty; a test that sets its own HOME discovers its own gates.
+    """
+    from foragent import gates
+
+    collect = gates.collect
+
+    def isolated(*args, **kwargs):
+        if Path.home() in (REAL_HOME, temporary_home) and kwargs.get("home") is None:
+            return []
+        return collect(*args, **kwargs)
+
+    monkeypatch.setattr(gates, "collect", isolated)
 
 
 @pytest.fixture(autouse=True)

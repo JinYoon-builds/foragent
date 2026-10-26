@@ -39,6 +39,7 @@ class RunRecordsMixin:
                     "session_id": previous.session_id, "session_executor": previous.session_executor,
                     "session_ids": previous.session_ids, "session_body": previous.session_body,
                     "merge_conflicts": previous.merge_conflicts,
+                    "resume_whole": previous.resume_whole, "moved_files": previous.moved_files,
                     "local_skill_paths": previous.local_skill_paths,
                     "work_events": previous.work_events,
                     "resume_reason": reason + (

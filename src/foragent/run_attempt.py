@@ -41,6 +41,12 @@ class AttemptFailure(Exception):
         super().__init__(message)
         self.target_branch = target_branch
 
+    @property
+    def failure(self) -> str:
+        """The failure text for the next attempt, keeping a WholeFailure whole."""
+        message = self.args[0] if self.args else ""
+        return message if isinstance(message, WholeFailure) else str(self)
+
 
 class ConflictBudgetExhausted(Exception):
     """In-place conflict resolution used its budget; the PR's own files decide on a rebuild."""
@@ -56,6 +62,10 @@ class CIFailure(AttemptFailure):
     def __init__(self, logs: str, target_branch: str):
         super().__init__(f"CI failed:\n{logs}")
         self.target_branch = target_branch
+
+
+class WholeFailure(str):
+    """Failure text whose parts are already limited (each check tail, every review finding); kept whole."""
 
 
 class ExecutorStopped(Exception):

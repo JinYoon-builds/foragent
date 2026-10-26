@@ -11,6 +11,9 @@ class Approval:
     acceptance_blobs: dict[str, str]
     approved_by: str
     approved_at: str
+    # A Foragent order parent's shared outcome and constraints, frozen once
+    # per approval; None means not read yet, "" means there is none.
+    parent_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,10 @@ class Run:
     session_ids: list[str] = field(default_factory=list)
     session_body: str | None = None
     resume_reason: str = ""
+    # The saved failure is already limited part by part (every check, every finding): keep it whole.
+    resume_whole: bool = False
+    # Files this branch edits that a merged base moved or split, until the next prompt names them.
+    moved_files: list[str] = field(default_factory=list)
     resume_failures: int = 0
     merge_conflicts: list[str] = field(default_factory=list)
     # From-scratch rebuilds in this run and the fixed English machine reason for the latest one.
