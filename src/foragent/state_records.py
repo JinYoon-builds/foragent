@@ -71,6 +71,9 @@ class Run:
     last_review_pass_at: str | None = None
     review_pass_to_merge_seconds: float | None = None
     merge_lock_held_seconds: float | None = None
+    # Size of the merge group merged together (1 alone) and its bisect checks (#459).
+    merge_group_size: int | None = None
+    merge_group_bisect_checks: int | None = None
     comparison: dict | None = None
     files_committed: bool = False
     files_base_branch: str | None = None

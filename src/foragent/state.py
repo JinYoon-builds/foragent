@@ -26,6 +26,7 @@ from foragent.state_issues import (  # noqa: F401
     observed_issue_facts,
 )
 from foragent.state_local import LocalRecordsMixin
+from foragent.state_merge_queue import MergeQueueMixin
 from foragent.state_locks import _TICK_LOCKS_HELD, StateLocksMixin, _held_tick_locks  # noqa: F401
 from foragent.state_records import Approval, Flag, InspectState, Run  # noqa: F401
 from foragent.state_refresh import IssueRefreshMixin
@@ -33,7 +34,8 @@ from foragent.state_runs import RunRecordsMixin
 
 
 class StateStore(
-    IssueSnapshotMixin, IssueRefreshMixin, RunRecordsMixin, LocalRecordsMixin, StateLocksMixin, StateBase,
+    IssueSnapshotMixin, IssueRefreshMixin, RunRecordsMixin, LocalRecordsMixin, MergeQueueMixin, StateLocksMixin,
+    StateBase,
 ):
     @classmethod
     def for_repo(cls, repo: str, *, now: Callable[[], datetime] | None = None) -> "StateStore":

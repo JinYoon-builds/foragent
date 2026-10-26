@@ -77,6 +77,8 @@ class Config:
     max_runtime_minutes: int = 90
     max_retries: int = 2
     conflict_retries: int = 2
+    # Ready runs merge together after one joint check (#459); 1 keeps one PR at a time.
+    merge_group_max: int = 4
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None
