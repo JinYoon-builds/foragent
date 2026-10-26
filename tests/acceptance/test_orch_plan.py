@@ -237,6 +237,9 @@ def test_plan_width_never_starts_overlapping_files(queue_case, capsys, monkeypat
     # 7 shares a file with 5, not with the first run 3: every running issue counts.
     wide_lane(case, monkeypatch, {3: ["src/foragent/state.py"], 5: ["src/foragent/order.py"],
                                   7: ["src/foragent/order.py"], 9: ["src/foragent/watch.py"]})
+    # Pin the overlap cap to one run per file, so the cap (not the width) holds 7 back.
+    from dataclasses import replace
+    case.tick_ctx.config = replace(case.tick_ctx.config, overlap_per_file=1)
     fa_ok(case, capsys, "plan", "--width", "orch=3")
     running, actions = tick_lane(case, ticks=5)
     assert running == [3, 5, 9], actions
