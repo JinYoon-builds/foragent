@@ -112,6 +112,8 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 
 ## 9. 설정: `.foragent.yml`
 
+`.foragent.yml` 수정은 커밋해서 기본 브랜치에 푸시해야 반영된다. gate tick은 fetch 뒤 `origin/<base>`의 파일을 읽는다(공유 checkout은 당기지 않는다). 그 파일이 없거나 잘못되면 로컬 파일을 쓰고 stderr에 한 줄 알린다.
+
 ```yaml
 review: batch            # fast | batch | careful
 review_paths:            # 경로별 덮어쓰기 (선택)

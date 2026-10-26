@@ -340,3 +340,27 @@ def test_lane_overrides_and_nulls_load(repo):
     config = load_config(repo)
     assert config.lanes == lanes and config.max_parallel == 1
     assert config.executor_fallback_model == "fallback"
+
+
+def test_committed_config_applies_origin_settings_over_global(tmp_path):
+    from foragent.config import Config, load_committed_config
+    global_path = tmp_path / "global.yml"
+    global_path.write_text("overlap_per_file: 1\nmax_parallel: 3\n", encoding="utf-8")
+    local = Config(repo="owner/repo", overlap_per_file=2)
+    config, ignored = load_committed_config(local, "overlap_per_file: 3\n", "origin/main:.foragent.yml", global_path)
+    assert (config.overlap_per_file, config.max_parallel, config.repo, ignored) == (3, 3, "owner/repo", [])
+
+
+def test_committed_config_keeps_local_repo_and_base_and_names_them(tmp_path):
+    from foragent.config import Config, load_committed_config
+    local = Config(repo="owner/repo", base_branch="main", language="ko")
+    content = "repo: other/repo\nbase_branch: dev\nlanguage: en\noverlap_per_file: 4\n"
+    config, ignored = load_committed_config(local, content, "origin/main:.foragent.yml", tmp_path / "none.yml")
+    assert (config.repo, config.base_branch, config.language, config.overlap_per_file) == ("owner/repo", "main", "ko", 4)
+    assert ignored == ["repo", "base_branch"]
+
+
+@pytest.mark.parametrize("content", [None, "overlap_per_file: [\n", "- a list\n", "nonsense_key: 1\n", "max_parallel: 0\n"])
+def test_committed_config_missing_or_invalid_falls_back(tmp_path, content):
+    from foragent.config import Config, load_committed_config
+    assert load_committed_config(Config(), content, "origin/main:.foragent.yml", tmp_path / "none.yml") == (None, [])

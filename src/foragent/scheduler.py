@@ -10,10 +10,11 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import sys
 
 from foragent import board, orch_github, orch_queue, tidy, watch_open
 from foragent.actions import flag, invalidate_approval
-from foragent.config import Config, in_run_hours
+from foragent.config import Config, in_run_hours, load_committed_config
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
@@ -50,6 +51,8 @@ class TickContext:
     runner_process_exists: Callable[[int], bool] = runner_process_exists
     kill_runner: Callable[[int], None] = kill_process_group
     baseline_launcher: Callable = start_baseline_thread
+    # fa gate tick reads .foragent.yml from origin/<base> after its fetch.
+    committed_config: bool = False
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self, queue_writes=True)
@@ -106,11 +109,30 @@ def tick(ctx: TickContext) -> TickReport:
             return report
 
 
+def _use_committed_config(ctx: TickContext, base_ref: str) -> None:
+    """Apply origin's committed config without touching the shared checkout."""
+    try:
+        sha = ctx.git.blob_sha(base_ref, ".foragent.yml")
+        content = None if sha is None else ctx.git._call(["cat-file", "blob", sha])
+    except GitError:
+        content = None
+    config, ignored = load_committed_config(ctx.config, content, f"{base_ref}:.foragent.yml")
+    language = ctx.config.language
+    if config is None:
+        print(text("tick_config_fallback", language, ref=base_ref), file=sys.stderr)
+        return
+    for key in ignored:
+        print(text("tick_config_key_ignored", language, ref=base_ref, key=key), file=sys.stderr)
+    ctx.config = config
+
+
 def _tick_locked(ctx: TickContext) -> TickReport:
     report, ctx._budget_sample = TickReport(), None
     started = ctx.now()  # The tick's own time; the fetch below can take seconds.
     ctx.git.fetch("origin", ctx.config.base_branch)
     base_ref = f"origin/{ctx.config.base_branch}"
+    if ctx.committed_config:
+        _use_committed_config(ctx, base_ref)
     # A listing taken this tick can confirm remembered per-issue reads.
     # A periodic tick starts within process start-up jitter of its nominal 300 s
     # cadence, and its refresh is stamped with its start; it is the next refresh tick.
