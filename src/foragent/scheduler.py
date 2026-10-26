@@ -80,9 +80,9 @@ from foragent.scheduler_lanes import (  # noqa: E402
 
 
 def tick(ctx: TickContext) -> TickReport:
-    with orch_spawn.deciding(ctx) as keep, ctx.store.tick_lock() as acquired:
-        if not acquired:  # The tick that holds the lock renews the gate heartbeat.
-            return keep(TickReport(skipped=BUSY_TICK))
+    with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep:
+        if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
+            return TickReport(skipped=BUSY_TICK)
         ctx.store.write_heartbeat("gate", ctx.now())
         with tick_processes(ctx.store) as snapshot:
             cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.

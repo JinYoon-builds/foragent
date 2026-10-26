@@ -300,7 +300,7 @@ def test_tick_opens_orchestrator_when_an_earlier_step_raises(ctx, monkeypatch, s
     assert len(spawned) == 1
 
 
-def test_busy_tick_still_decides_the_orchestrator(ctx, monkeypatch):
+def test_busy_tick_leaves_the_orchestrator_decision_to_the_lock_holder(ctx, monkeypatch):
     from contextlib import contextmanager
 
     from foragent import orch_spawn
@@ -315,7 +315,7 @@ def test_busy_tick_still_decides_the_orchestrator(ctx, monkeypatch):
 
     monkeypatch.setattr(ctx.store, "tick_lock", held)
     report = tick(ctx)
-    assert report.skipped and spawned and "Opened an orchestrator (orca)" in report.actions
+    assert report.skipped and spawned == [] and report.actions == []
 
 
 def test_tick_opens_orchestrator_on_both_github_wait_returns(ctx, monkeypatch):

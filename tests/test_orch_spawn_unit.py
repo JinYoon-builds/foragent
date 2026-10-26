@@ -72,3 +72,11 @@ def test_tick_hook_reports_through_the_messages_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(orch_spawn, "ensure_orchestrator", lambda *args, **kwargs: "orca")
     orch_spawn.on_tick(ctx, report)
     assert report.actions == ["오케스트레이터를 열지 못했어요: disk full", "오케스트레이터를 열었어요 (orca)"]
+
+
+def test_tick_hook_never_raises_on_an_incomplete_context():
+    from types import SimpleNamespace
+
+    report = SimpleNamespace(actions=[])
+    assert orch_spawn.on_tick(SimpleNamespace(), report) is report
+    assert len(report.actions) == 1 and report.actions[0].startswith("Could not open an orchestrator:")

@@ -104,8 +104,9 @@ def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, n
 
 def on_tick(ctx, report):
     """Open an orchestrator when needed and note it in ``report``; never raise. Returns ``report``."""
-    language = ctx.config.language
+    language = "en"
     try:
+        language = ctx.config.language
         screen = ensure_orchestrator(ctx.repo_root, ctx.store, ctx.config, now=ctx.now())
     except Exception as exc:  # noqa: BLE001 - the optional spawn must not stop the tick
         report.actions.append(text("orch_spawn_failed", language, error=" ".join(str(exc).split())[:200]))
@@ -116,14 +117,15 @@ def on_tick(ctx, report):
 
 
 @contextmanager
-def deciding(ctx):
-    """Wrap a whole gate tick so the spawn decision runs on every exit.
+def deciding(ctx, acquired: bool = True):
+    """Wrap a whole gate tick (inside its lock) so the spawn decision runs on every exit.
 
     The decision reads only local facts (heartbeats, active runs, approvals), so
-    it does not depend on any tick step: a busy tick, a GitHub wait, a failed
+    it does not depend on any tick step: a GitHub wait or a failed heartbeat,
     fetch, refresh, recovery or budget step all still open a missing
     orchestrator. Yields ``keep(report) -> report`` for the tick's result; on an
-    error the spawn runs and the original error propagates unchanged.
+    error the spawn runs and the original error propagates unchanged. A tick
+    that did not get the lock touches nothing; the tick holding it decides.
     """
     kept = []
 
@@ -131,6 +133,9 @@ def deciding(ctx):
         kept.append(report)
         return report
 
+    if not acquired:
+        yield keep
+        return
     try:
         yield keep
     except Exception:
