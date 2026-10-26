@@ -42,6 +42,8 @@ class AcceptanceBaseline:
     excluded: tuple[str, ...] = ()
     # The base commit this set was measured on; None when unknown.
     base_sha: str | None = None
+    # Set after a base sync: run only exact ids and confirm them from JUnit (#123).
+    exact_check: bool = False
 
 
 @dataclass(frozen=True)
@@ -458,48 +460,43 @@ def _base_moved(git, base_sha: str, target_ref: str) -> bool:
     return False
 
 
-def _collected_ids(baseline: AcceptanceBaseline, worktree: Path,
-                   check: Callable[[str, Path], CheckResult]) -> set[str] | None:
-    """Node ids the current tree collects, or None when collection is not proven.
+def _missing_ids(baseline: AcceptanceBaseline, worktree: Path,
+                 check: Callable[[str, Path], CheckResult]) -> set[str]:
+    """Baseline ids the current tree no longer has, judged by pytest's exit status.
 
-    The measurement plugin records pytest's own item ids in a file, so terminal
-    settings (verbosity_test_cases, -p no:terminal, addopts) cannot change them.
-    It is loaded as the conftest of a directory named on the command line:
-    pytest imports that file itself, so `python -I` and an inline PYTHONPATH
-    cannot hide it. Baseline files are named explicitly, as the verification
-    names their ids: pytest collects an explicit file even when `python_files`
-    no longer matches.
+    Collection runs the verification's own command and selectors, so every
+    project setting (conftest imports, --noconftest, -p, -I, PYTHONPATH,
+    python_files, terminal options) applies exactly as it does there; nothing
+    is added to the project's environment. pytest exits 4 when a selector is
+    not found. Groups that exit 4 are halved until single ids remain, and an
+    id counts as missing only if its file still collects on its own: a file
+    that fails to import, or any other failure, keeps its ids for verification.
     """
     # The pytest command pins --rootdir=., so ids are paths in this worktree.
-    files = sorted({node.split("::", 1)[0] for node in baseline.node_ids})
-    existing = [name for name in files if (worktree / name).is_file()]
-    if not existing:
-        return set()
-    # Runner-owned and never published; removed before the run stages again.
-    (worktree / ".foragent").mkdir(exist_ok=True)
-    directory = Path(tempfile.mkdtemp(prefix="collect-", dir=worktree / ".foragent"))
-    try:
-        shutil.copyfile(Path(__file__).with_name("ci_pytest.py"), directory / "conftest.py")
-        evidence = directory / "results.json"
-        arguments = " ".join(shlex.quote(word) for word in [
-            *existing, directory.relative_to(worktree).as_posix(), "--collect-only"])
-        environment = f"FA_REPORT={shlex.quote(str(evidence))} FA_SHARD=0 FA_SHARDS=1"
-        result = check(f"{environment} {baseline.command} {arguments}", worktree)
-        if result.timed_out or result.exit_code not in (0, 5):
-            return None
-        try:
-            measurement = json.loads(evidence.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
-    finally:
-        shutil.rmtree(directory, ignore_errors=True)
-    # A module that fails to import collects nothing; its ids have not vanished.
-    if not isinstance(measurement, dict) or measurement.get("exit_code") != result.exit_code:
-        return None
-    ids = measurement.get("collected_ids")
-    if not isinstance(ids, list) or not all(isinstance(node, str) for node in ids):
-        return None
-    return set(ids)
+    missing = {node for node in baseline.node_ids if not (worktree / node.split("::", 1)[0]).is_file()}
+    statuses: dict[tuple[str, ...], int | None] = {}
+
+    def status(selectors: tuple[str, ...]) -> int | None:
+        if selectors not in statuses:
+            result = check(f"{baseline.command} --collect-only {shlex.join(selectors)}", worktree)
+            statuses[selectors] = None if result.timed_out else result.exit_code
+        return statuses[selectors]
+
+    def candidates(group: tuple[str, ...]) -> list[str]:
+        code = status(group)
+        if code != 4:
+            return []  # 0/5: all exist; anything else proves nothing about absence.
+        if len(group) == 1:
+            return list(group)
+        middle = len(group) // 2
+        return candidates(group[:middle]) + candidates(group[middle:])
+
+    present = tuple(node for node in baseline.node_ids if node not in missing)
+    if present:
+        for node in candidates(present):
+            if status((node.split("::", 1)[0],)) in (0, 5):
+                missing.add(node)
+    return missing
 
 
 def surviving_baseline(baseline: AcceptanceBaseline, git, worktree: Path,
@@ -508,28 +505,64 @@ def surviving_baseline(baseline: AcceptanceBaseline, git, worktree: Path,
     """Drop baseline node ids that the current tree no longer collects (#123).
 
     A base sync can rename or delete a locked test. Selecting its old id makes
-    pytest stop with "not found" and hides the tests that still exist. Collect
-    the baseline's files, but only when the tree merged target
-    commits newer than the measured base. When collection itself fails, keep
-    every id so the verification still reports that failure.
+    pytest stop with "not found" and hides the tests that still exist. Check
+    the ids only when the tree merged target commits newer than the measured
+    base. An id whose absence is not proven stays, so the verification still
+    reports a failing collection.
     """
     if not baseline.node_ids or baseline.base_sha is None:
         return baseline
     # Ids measured on this tree's own base still exist unless the work removed them.
     if not _base_moved(git, baseline.base_sha, target_ref):
         return baseline
-    collected = _collected_ids(baseline, worktree, check)
-    if collected is None:
-        _append(log, "Acceptance baseline collection failed; keeping every baseline node id")
-        return baseline
-    missing = [node for node in baseline.node_ids if node not in collected]
+    # A valid selector is not an existing id: `::test_keep` still selects
+    # `test_keep[1]` once main parametrizes it. Verification confirms exactness.
+    baseline = replace(baseline, exact_check=True)
+    missing_ids = _missing_ids(baseline, worktree, check)
+    missing = [node for node in baseline.node_ids if node in missing_ids]
     for node in missing:
         _append(log, f"Acceptance baseline dropped missing node id: {node}")
     if not missing:
         return baseline
-    kept = tuple(node for node in baseline.node_ids if node in collected)
+    kept = tuple(node for node in baseline.node_ids if node not in missing_ids)
     _append(log, f"Acceptance baseline dropped {len(missing)} missing node ids; {len(kept)} remain")
     return replace(baseline, node_ids=kept)
+
+
+def baseline_verification_command(baseline: AcceptanceBaseline, report: Path) -> str:
+    """The verification command; after a base sync it runs exact ids only.
+
+    pytest deselects by node-id prefix, so `--deselect=<id>[` and `--deselect=<id>::`
+    remove what a selector expanded into (new parametrizations, a class of the
+    same name) and leave the exact id. Its own JUnit report then names what ran.
+    """
+    command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
+    if not baseline.exact_check:
+        return command
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.unlink(missing_ok=True)
+    deselect = [f"--deselect={node}{suffix}" for node in baseline.node_ids for suffix in ("[", "::")]
+    return (f"{command} {shlex.join(deselect)} -o junit_family=legacy --junit-prefix= "
+            f"--junitxml={shlex.quote(str(report))}")
+
+
+def exact_baseline_result(baseline: AcceptanceBaseline, report: Path, result: CheckResult,
+                          log: Path) -> CheckResult:
+    """Log baseline ids that no longer ran as themselves; an empty run is a skip."""
+    if not baseline.exact_check or result.timed_out or result.exit_code not in (0, 1, 5):
+        return result  # A crashed or interrupted run's report proves nothing.
+    try:
+        reported = {junit_node_id(case) for case in ET.parse(report).iter("testcase")}
+    except (OSError, ET.ParseError):
+        _append(log, "Acceptance baseline exact ids not confirmed: no JUnit report")
+        return result
+    missing = [node for node in baseline.node_ids if node not in reported]
+    for node in missing:
+        _append(log, f"Acceptance baseline dropped missing node id: {node} (no exact match)")
+    if result.exit_code == 5 and len(missing) == len(baseline.node_ids):
+        _append(log, "Acceptance baseline verification skipped (count=0): no exact baseline node ids remain")
+        return replace(result, exit_code=0)
+    return result
 
 
 if __name__ == "__main__":

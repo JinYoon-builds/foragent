@@ -361,10 +361,14 @@ def _verify_implementation(attempt: Implementation) -> str:
             if not baseline.node_ids:
                 _append(log, "Acceptance baseline verification skipped (count=0): no baseline node ids remain")
         if baseline and baseline.node_ids:
+            from foragent.run_baseline import baseline_verification_command, exact_baseline_result
+
             started = ctx.monotonic()
-            command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
+            report = ctx.store.root / "runs" / f"issue-{n}-baseline-verification.xml"
+            command = baseline_verification_command(baseline, report)
             result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                             slot=_test_slot(n, ctx))
+            result = exact_baseline_result(baseline, report, result, log)
             attempt.checks.append(result)
             _append(log, f"Acceptance baseline verification count={len(baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")

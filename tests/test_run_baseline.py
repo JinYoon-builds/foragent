@@ -393,8 +393,12 @@ class _MovedGit:
 
 
 def _collector(log, exit_code, ids, timed_out=False):
-    """Stand in for pytest plus the measurement plugin: write its results file."""
-    import json
+    """Stand in for pytest --collect-only over the collected item ids `ids`.
+
+    Like pytest, a selector also matches what it expands into (`sel[...]`,
+    `sel::...`); exit 4 when a node id selector matches nothing. `exit_code`
+    is returned for every other selection (0 for a working project).
+    """
     import shlex
 
     from foragent.run_checks import CheckResult
@@ -403,11 +407,13 @@ def _collector(log, exit_code, ids, timed_out=False):
 
     def check(command, root):
         calls.append(command)
-        report = next(word.split("=", 1)[1] for word in shlex.split(command) if word.startswith("FA_REPORT="))
-        if ids is not None:
-            with open(report, "w") as stream:
-                json.dump({"exit_code": exit_code, "collected_ids": ids}, stream)
-        return CheckResult(command, exit_code, timed_out, "")
+        words = shlex.split(command)
+        selectors = words[words.index("--collect-only") + 1:]
+        def found(selector):
+            return any(item == selector or item.startswith((selector + "[", selector + "::")) for item in ids)
+
+        code = 4 if exit_code == 0 and any("::" in word and not found(word) for word in selectors) else exit_code
+        return CheckResult(command, code, timed_out, "")
     return check, calls
 
 
@@ -424,10 +430,13 @@ def test_surviving_baseline_drops_and_logs_only_missing_ids(tmp_path):
     check, calls = _collector(log, 0, ["tests/acceptance/test_a.py::test_a"])
     kept = surviving_baseline(baseline, _MovedGit(), tmp_path, check, log, "origin/main")
     assert kept.node_ids == ("tests/acceptance/test_a.py::test_a",)
-    # Existing baseline files are named explicitly; a deleted file is not passed to pytest.
+    # The verification's own selectors are tried; a deleted file never reaches pytest.
     words = shlex.split(calls[0])
-    assert "--collect-only" in words and "tests/acceptance/test_a.py" in words
-    assert "tests/acceptance/test_c.py" in words and "tests/acceptance/test_b.py" not in words
+    assert words[words.index("--collect-only") + 1:] == ["tests/acceptance/test_a.py::test_a",
+                                                        "tests/acceptance/test_c.py::test_renamed"]
+    assert not any("test_b.py" in call for call in calls)
+    # Absence is confirmed only after the id's file still collects on its own.
+    assert shlex.split(calls[-1])[-1] == "tests/acceptance/test_c.py"
     assert "dropped missing node id: tests/acceptance/test_c.py::test_renamed" in log.read_text()
     assert "dropped missing node id: tests/acceptance/test_b.py::test_b" in log.read_text()
 
@@ -440,7 +449,8 @@ def test_surviving_baseline_keeps_every_id_when_collection_fails(tmp_path):
     log = tmp_path / "run.log"
     baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
     check, _ = _collector(log, 2, [])
-    assert surviving_baseline(baseline, _MovedGit(), tmp_path, check, log, "origin/main") is baseline
+    kept = surviving_baseline(baseline, _MovedGit(), tmp_path, check, log, "origin/main")
+    assert kept.node_ids == baseline.node_ids
 
 
 def test_surviving_baseline_without_acceptance_dir_drops_all_without_pytest(tmp_path):
@@ -534,8 +544,8 @@ def _real_pytest(tmp_path, ini, command, *, files=None, project_name="project"):
                                                              "tests/acceptance/test_a.py::test_gone"),
                                   base_sha="base")
     kept = surviving_baseline(baseline, _MovedGit(), project, check, log, "origin/main")
-    # The collection helper is removed again; nothing is left to publish.
-    assert not list((project / ".foragent").glob("*"))
+    # Nothing is added to the project: the tree is exactly what verification runs on.
+    assert not (project / ".foragent").exists()
     return kept.node_ids, log.read_text()
 
 
@@ -595,3 +605,88 @@ def test_surviving_baseline_collects_when_paths_and_pythonpath_contain_spaces(tm
                              project_name="my project")
     assert kept == ("tests/acceptance/test_a.py::test_kept[1]",), log
     assert "dropped missing node id: tests/acceptance/test_a.py::test_gone" in log
+
+
+def test_surviving_baseline_keeps_project_conftest_imports_and_noconftest(tmp_path):
+    # Tests that import the project's conftest, with and without --noconftest.
+    files = {"tests/acceptance/conftest.py": "VALUE = 1\n",
+             "tests/acceptance/test_a.py": "from conftest import VALUE\n\n"
+                                           "import pytest\n\n@pytest.mark.parametrize('x', [VALUE])\n"
+                                           "def test_kept(x):\n    assert False\n"}
+    for suffix, name in (("", "imports conftest"), (" --noconftest", "no conftest")):
+        kept, log = _real_pytest(tmp_path / name, "[pytest]\n", f"{_python_pytest()}{suffix}", files=files)
+        assert kept == ("tests/acceptance/test_a.py::test_kept[1]",), log
+        assert "dropped missing node id: tests/acceptance/test_a.py::test_gone" in log
+
+
+def test_surviving_baseline_keeps_ids_of_a_file_that_no_longer_imports(tmp_path):
+    # pytest reports "not found" for every id of a file that fails to import;
+    # that is a failure to verify, not a renamed test.
+    files = {"tests/acceptance/test_a.py": "import missing_module\n\ndef test_kept():\n    pass\n"}
+    kept, log = _real_pytest(tmp_path, "[pytest]\n", _python_pytest(), files=files)
+    assert kept == ("tests/acceptance/test_a.py::test_kept[1]", "tests/acceptance/test_a.py::test_gone"), log
+    assert "dropped missing node id" not in log
+
+
+def test_surviving_baseline_keeps_an_expanded_selector_for_the_exact_check(tmp_path):
+    # `::test_keep` stays a valid selector once main parametrizes it; collection
+    # alone cannot tell, so verification must confirm the exact id.
+    from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
+
+    (tmp_path / "tests/acceptance").mkdir(parents=True)
+    (tmp_path / "tests/acceptance/test_a.py").write_text("")
+    log = tmp_path / "run.log"
+    baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_keep",), base_sha="base")
+    check, _ = _collector(log, 0, ["tests/acceptance/test_a.py::test_keep[1]", "tests/acceptance/test_a.py::test_keep[2]"])
+    kept = surviving_baseline(baseline, _MovedGit(), tmp_path, check, log, "origin/main")
+    assert kept.node_ids == baseline.node_ids and kept.exact_check
+
+
+def _verify_exact(tmp_path, source, node_ids):
+    """Run the real verification command; return (result, log text, command)."""
+    import subprocess
+
+    from foragent.run_baseline import (AcceptanceBaseline, baseline_verification_command,
+                                       exact_baseline_result)
+    from foragent.run_checks import CheckResult, _pytest_command
+
+    project = tmp_path / "my project"
+    (project / "tests/acceptance").mkdir(parents=True)
+    (project / "pytest.ini").write_text("[pytest]\n")
+    (project / "tests/acceptance/test_a.py").write_text(source)
+    log = tmp_path / "run.log"
+    log.write_text("")
+    baseline = AcceptanceBaseline(_pytest_command(_python_pytest()), node_ids, base_sha="base", exact_check=True)
+    report = tmp_path / "state dir/runs/verification.xml"
+    command = baseline_verification_command(baseline, report)
+    done = subprocess.run(["/bin/sh", "-c", command], cwd=project, capture_output=True, text=True)
+    result = exact_baseline_result(baseline, report, CheckResult(command, done.returncode, False, done.stdout), log)
+    return result, log.read_text(), command
+
+
+PARAMETRIZED = ("import pytest\n\n@pytest.mark.parametrize('x', [1, 2])\n"
+                "def test_keep(x):\n    assert False, 'new variant'\n\ndef test_other():\n    pass\n")
+
+
+def test_exact_check_drops_a_parametrized_id_and_still_verifies_the_rest(tmp_path):
+    result, log, _ = _verify_exact(tmp_path, PARAMETRIZED, ("tests/acceptance/test_a.py::test_keep",
+                                                           "tests/acceptance/test_a.py::test_other"))
+    # The new variants did not run in place of the old id; test_other still did.
+    assert result.exit_code == 0, result.output
+    assert "dropped missing node id: tests/acceptance/test_a.py::test_keep (no exact match)" in log
+    assert "test_other" not in log
+
+
+def test_exact_check_skips_when_only_expanded_variants_remain(tmp_path):
+    result, log, command = _verify_exact(tmp_path, PARAMETRIZED, ("tests/acceptance/test_a.py::test_keep",))
+    assert result.exit_code == 0, result.output
+    assert "verification skipped (count=0)" in log
+    # Each deselection is one shell word; the report path with spaces stays one word.
+    assert "--deselect=tests/acceptance/test_a.py::test_keep[" in shlex.split(command)
+
+
+def test_exact_check_still_fails_an_exact_baseline_test(tmp_path):
+    source = "def test_keep():\n    assert False, 'regressed'\n"
+    result, log, _ = _verify_exact(tmp_path, source, ("tests/acceptance/test_a.py::test_keep",))
+    assert result.exit_code == 1
+    assert "dropped" not in log
