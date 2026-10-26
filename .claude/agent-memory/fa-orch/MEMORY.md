@@ -148,3 +148,6 @@
 - `test_scheduler_split.py`가 facade `scheduler.py`를 250줄로 제한한다. scheduler에 줄을 더하면 같은 수만큼 줄이거나 분할 모듈로 옮긴다. 바꾼 파일마다 `tests/acceptance/test_*split*.py` 전부를 돌려 확인한다.
 - [#128 orch spawn](project_128_orch_spawn.md) — gate opens orchestrator; conftest opt-out; scheduler.py 250-line cap
 - [#333 orch facts](project_333_facts.md) — read-only facts view, capacity.observing(), related-check junit flag form
+- [#590 orch liveness](project_590_orch_liveness.md) — heartbeat session, /fa-orchestrator scan, nearest Claude literally; conftest hides real ancestors
+- #591: `orch_reinstall._uv()`가 uv 설치의 디렉터리 경쟁 오류만 3회까지 재시도(`sleep` 모듈 속성)하며 update_check도 이 함수를 공유한다. 게이트 자식 환경은 `launcher.gate_environment()`; launcher·kick·launchd 단위 시험은 Popen 인자 집합을 정확히 비교한다.
+- #591 리뷰: 패키지 안 `sys.dont_write_bytecode`는 `__init__.pyc`가 먼저 써져 늦다. 틱이 `launchd.refresh_from_tick()`로 예전 plist를 따로 떨어진 갱신 프로세스(틱 잠금 대기→`update_check._restart`)로 다시 올린다. scheduler 파사드는 250줄 제한. 게이트 작업은 파일 이름이 아니라 `installed_jobs()`의 `--repo-root`로 찾고(옛 이름·개명 plist 포함), 읽지 못한 plist는 최신으로 보지 않는다. plist는 bootout→수정→bootstrap 안에서만 바꾸고, `launchctl print` 실패는 없음(113)과 모름을 나눈다.

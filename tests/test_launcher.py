@@ -28,7 +28,8 @@ def test_launcher_detaches_appends_both_streams_and_returns_pid(tmp_path, monkey
     assert calls[0][0] == [
         sys.executable, "-m", "foragent.cli", "gate", "run-issue", "7", "--repo-root", str(root),
     ]
-    assert set(calls[0][1]) == {"start_new_session", "stdout", "stderr"}
+    assert set(calls[0][1]) == {"start_new_session", "stdout", "stderr", "env"}
+    assert calls[0][1]["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert calls[0][1]["stdout"].closed
     assert store.log_path(7).read_text() == "runner output\nrunner output\n"
 
@@ -51,7 +52,8 @@ def test_notification_detaches_without_waiting_and_appends_both_streams(tmp_path
     assert calls[0][0] == [
         sys.executable, "-m", "foragent.cli", "inspect", "notify", "--repo-root", str(root),
     ]
-    assert set(calls[0][1]) == {"stdin", "start_new_session", "stdout", "stderr"}
+    assert set(calls[0][1]) == {"stdin", "start_new_session", "stdout", "stderr", "env"}
+    assert calls[0][1]["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert calls[0][1]["stdin"] == subprocess.DEVNULL
     assert calls[0][1]["start_new_session"] is True
     assert calls[0][1]["stdout"].closed

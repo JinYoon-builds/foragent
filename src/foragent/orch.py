@@ -21,7 +21,7 @@ from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issu
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
-from foragent.processes import run_logged
+from foragent.processes import claude_session, run_logged
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
@@ -62,9 +62,10 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
     path = ctx.store.root / "orch-watch.json"
     unknown_path = ctx.store.root / "orch-watch-unknown.json"
     last_error = None
+    session = claude_session()  # The gate's spawn check trusts it past a stale heartbeat.
     while True:
         try:  # Every read, changed or not, shows the orchestrator is alive.
-            ctx.store.write_heartbeat("orchestrator", ctx.now())
+            ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session)
         except Exception:
             pass  # a heartbeat is best effort; the read below reports state errors
         try:

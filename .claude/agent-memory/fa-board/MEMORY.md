@@ -30,3 +30,4 @@
 - 메시지 레지스트리: 새 문구는 `src/foragent/messages/<기능>.py`의 `MESSAGES`에 두고 `from foragent.i18n import text`로 부른다(`foragent.messages`에는 `text`가 없다). 저장소 밖 명령의 언어는 `load_config(Path.cwd()).language`를 시도하고 실패하면 "en". settings.json 바이트 보존 편집은 `statusline._member_span`(#412).
 - JSON 바이트 편집 리뷰 함정: 중복 키는 마지막 값이 유효하다. 키를 지울 때는 같은 이름을 모두 지우고, 쓰기 전에 `json.loads(편집본) == 의도한 dict`를 확인해 다르면 쓰지 않는다(#412).
 - [issues.json 캐시 (#588)](issue_record_cache.md) — 읽기만 캐시, 잠금 쓰기는 새로 해석; fstat으로 버전 고정; deepcopy 금지
+- [닫힌 PR watermark (#589)](closed_pr_watermark.md) — merged_prs.json 목록+watermark, GhTracker만 증분, 성공 뒤에만 기록

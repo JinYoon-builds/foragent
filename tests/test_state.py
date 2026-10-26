@@ -917,3 +917,22 @@ def test_one_state_directory_shares_one_parse_across_path_spellings(store, tmp_p
 
     assert {StateStore(root, now=lambda: NOW).local_issues()[0]["title"] for root in spellings} == {"shared"}
     assert len(parses) == 1
+
+
+@pytest.mark.parametrize("content", [
+    "not json", "[]", '{"prs": []}', '{"watermark": "later", "prs": []}',
+    '{"watermark": "2026-10-20T09:00:00+00:00", "prs": {}}',
+    '{"watermark": "2026-10-20T09:00:00+00:00", "prs": [{"number": 1}]}',
+])
+def test_unreadable_merged_pr_listing_means_a_full_listing(store, content):
+    store.root.mkdir(parents=True, exist_ok=True)
+    (store.root / "merged_prs.json").write_text(content, encoding="utf-8")
+    assert store.merged_pr_listing() is None
+
+
+def test_merged_pr_listing_round_trips(store):
+    listing = {"watermark": NOW.isoformat(), "prs": [{
+        "number": 1, "head": "foragent/issue-1", "base": "main", "merged_at": NOW.isoformat(),
+        "url": "u", "updated_at": None}]}
+    store.record_merged_pr_listing(listing)
+    assert store.merged_pr_listing() == listing
