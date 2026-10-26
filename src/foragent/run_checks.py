@@ -53,7 +53,9 @@ def _check(
     command: str, worktree: Path, log: Path, timeout_s: int,
     *, progress: Callable[[], None] | None = None,
     slot: AbstractContextManager | None = None,
+    full_text_dir: Path | None = None,
 ) -> CheckResult:
+    """Run one check; a cut output tail links its full copy under ``full_text_dir`` (the issue's folder)."""
     from foragent import runner
 
     _append(log, f"\nDone when command:\n{command}")
@@ -75,7 +77,7 @@ def _check(
 
     # A quiet check is still running; keep the scheduler informed while it waits.
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
-    tail = cuts.read_tail(log, offset, 4000, f"check-output-{offset}.log")
+    tail = cuts.read_tail(log, offset, 4000, "check", full_text_dir)
     _append(log, f"\nCheck exit_code={code}, timed_out={timed_out}\nOutput tail:\n{tail}")
     return CheckResult(command, code, timed_out, tail)
 
@@ -415,13 +417,13 @@ def _verify_contents(attempt: Implementation) -> str:
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
-                                 slot=_test_slot(n, ctx)))
+                                 slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n)))
             _progress(n, ctx)
         if attempt.baseline and attempt.baseline.node_ids:
             started = ctx.monotonic()
             command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
             result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
-                            slot=_test_slot(n, ctx))
+                            slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n))
             attempt.checks.append(result)
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
@@ -444,7 +446,8 @@ def _verify_contents(attempt: Implementation) -> str:
         if unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
             result = runner._check(f"{unit_command} {shlex.join(unit_tests)}", worktree, log, limit,
-                            progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+                            progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                            full_text_dir=cuts.issue_dir(ctx.store.root, n))
             attempt.checks.append(result)
             _progress(n, ctx)
             if result.timed_out:
@@ -507,7 +510,7 @@ def _check_review_head(
             save_failures(ctx.store.root, n, checks, complete=False)
             return _timeout(n, ctx)
         check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)), progress=lambda: _progress(n, ctx),
-                       slot=_test_slot(n, ctx))
+                       slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n))
         checks.append(check)
         _progress(n, ctx)
         if check.timed_out or runner._remaining(n, ctx) <= 0:

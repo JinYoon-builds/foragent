@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 def _note_moved(attempt: Implementation, moved: list[tuple[str, str]]) -> None:
     """Queue moved or split files for the next prompt; saved in the run so restarts keep them."""
+    if not moved:
+        return  # nothing to tell; the run record is left untouched
     n, store = attempt.n, attempt.ctx.store
     pending = store.get_run(n).moved_files
     lines = [line for line in dict.fromkeys(f"{old} -> {new}" for old, new in moved) if line not in pending]

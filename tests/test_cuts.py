@@ -1,5 +1,6 @@
 """Shared cut notice, parent summary and moved-file detection."""
 
+from pathlib import Path
 import subprocess
 
 from foragent import cuts
@@ -22,7 +23,18 @@ def test_head_tail_and_lines_keep_limits_and_link_the_full_text(tmp_path):
 
 
 def test_log_dir_maps_to_the_issue_state_folder(tmp_path):
-    assert cuts.dir_for_log(tmp_path / "logs" / "issue-7.log") == tmp_path / "runs" / "issue-7"
+    # The owning folder is given, never inferred from a log name: a review-panel log of
+    # issue 7 still saves under runs/issue-7, and concurrent panel logs never share a copy.
+    issue = cuts.issue_dir(tmp_path, 7)
+    copies = []
+    for k in (1, 2):
+        log = tmp_path / "logs" / f"issue-7-review-1-{k}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(f"reviewer {k} " + "z" * 5000)
+        copies.append(cuts.read_tail(log, 0, 100, "executor", issue))
+    paths = [line.split("full text: ", 1)[1].split("]", 1)[0] for line in copies]
+    assert all(path.startswith(str(issue) + "/") for path in paths) and paths[0] != paths[1]
+    assert [Path(path).read_text()[:10] for path in paths] == ["reviewer 1", "reviewer 2"]
     assert cuts.issue_dir(tmp_path, 7) == tmp_path / "runs" / "issue-7"
 
 

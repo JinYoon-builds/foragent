@@ -21,14 +21,6 @@ def issue_dir(state_root: Path, n: int) -> Path:
     return Path(state_root) / "runs" / f"issue-{n}"
 
 
-def dir_for_log(log: Path) -> Path:
-    """The full-text folder for a log: ``<state>/logs/issue-N.log`` maps to ``<state>/runs/issue-N``."""
-    log = Path(log)
-    if log.parent.name == "logs":
-        return log.parent.parent / "runs" / log.stem
-    return log.parent / f"{log.stem}-full"
-
-
 def notice(count: int, unit: str, path: Path) -> str:
     return f"[cut: {count} more {unit}; full text: {Path(path).absolute()}]"
 
@@ -86,13 +78,19 @@ def tail(text: str, limit: int, directory: Path | None, name: str) -> str:
     return notice(len(text) - limit, "chars", path) + "\n" + text[-limit:]
 
 
-def read_tail(log: Path, offset: int, limit: int, name: str) -> str:
-    """The tail of what ``log`` gained after ``offset``, with a notice when it is longer."""
+def read_tail(log: Path, offset: int, limit: int, kind: str, directory: Path | None = None) -> str:
+    """The tail of what ``log`` gained after ``offset``, with a notice when it is longer.
+
+    The caller names the owning folder (an issue's ``runs/issue-N``); nothing is inferred
+    from the log's file name. Without one, the full copy stays beside the log. The copy
+    is named after the log and offset, so concurrent logs (review panels) never share one.
+    """
     log = Path(log)
     with log.open("rb") as stream:
         stream.seek(offset)
         output = stream.read().decode("utf-8", errors="replace")
-    return tail(output, limit, dir_for_log(log), name)
+    return tail(output, limit, directory if directory is not None else log.parent,
+                f"{log.stem}-{kind}-{offset}.log")
 
 
 FAILURES_FILE = "check-failures.txt"

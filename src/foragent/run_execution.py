@@ -78,7 +78,7 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         result = ctx.poll_hook(execute, poll)
         result.usage = usage  # filled in ``finally`` once the log is complete
         if log.exists():
-            result.log_tail = cuts.read_tail(log, offset, 4000, f"executor-log-{offset}.log")
+            result.log_tail = cuts.read_tail(log, offset, 4000, "executor", cuts.issue_dir(ctx.store.root, n))
         return result
     finally:
         poll()
