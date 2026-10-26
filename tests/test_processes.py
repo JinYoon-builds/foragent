@@ -24,7 +24,7 @@ def test_large_prompt_reaches_slow_reader_without_blocking_identity_recording(tm
     assert len(prompt.encode("utf-8")) > 65536
     observations = []
 
-    def observe_tree(identities=(), roots=()):
+    def observe_tree(identities=(), roots=(), *, shared=False, not_before=None):
         if roots:
             # The child pauses after its first chunk until both callbacks run.
             # A synchronous writer would fill the pipe and never reach here.
