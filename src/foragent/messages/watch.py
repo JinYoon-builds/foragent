@@ -45,6 +45,7 @@ MESSAGES = {
         "watch_terminal": "You can watch live in a terminal. Use --once for plain text.",
         'watch_open_failed': "Couldn't open the lane view ({error}). Try again.",
         "watch_open_manual": "To open the lane view, run: {command}",
+        "watch_already_open": "A lane view is already open for this repository.",
         'watch_refresh_failed': "Couldn't refresh ({error}). I'll try again.",
     },
     "ko": {
@@ -91,6 +92,7 @@ MESSAGES = {
         "watch_terminal": "실시간 화면은 터미널에서 볼 수 있어요. 일반 텍스트는 --once로 확인해요",
         "watch_open_failed": "레인 화면을 열지 못했어요({error}). 다시 시도해요",
         "watch_open_manual": "이 명령으로 레인 화면을 열어요: {command}",
+        "watch_already_open": "이 저장소의 레인 화면이 이미 열려 있어요",
         "watch_refresh_failed": "새로고침을 못했어요({error}). 다시 시도할게요",
     },
 }
