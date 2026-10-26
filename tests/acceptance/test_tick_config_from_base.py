@@ -51,10 +51,10 @@ def configured_history(git_history, tmp_path):
 @pytest.fixture
 def tick_case(ctx, git_history, monkeypatch, isolated_home):
     # These settings exist only in HOME. Admission requires the inherited
-    # approver, while the inherited ceiling leaves exactly one new run slot.
+    # approver, while the inherited ceiling leaves two new run slots.
     # The repository's overlap value must also override the global value.
     write_global_config({
-        "approvers": ["human"], "max_parallel": 3, "overlap_per_file": 1,
+        "approvers": ["human"], "max_parallel": 4, "overlap_per_file": 1,
         "skill_libraries": [], "notify": "none", "test_command": "true",
         "language": "en",
     })
@@ -109,13 +109,18 @@ def _tick(case, capsys, *, no_start=False):
 
 
 def _assert_admission(case, started, waiting, report):
-    assert case.starts == [started], report
-    assert {run.number for run in case.store.active_runs()} == {1, 2, started}
-    assert "running" in case.tracker.get_issue(started).labels
-    assert "ready" not in case.tracker.get_issue(started).labels
-    assert "ready" in case.tracker.get_issue(waiting).labels
-    assert "running" not in case.tracker.get_issue(waiting).labels
-    assert case.store.get_run(waiting) is None
+    # Which config applies decides whether #3 (sharing src/shared.py with the
+    # two running runs) may start; start order between #3 and #4 is not checked.
+    started, waiting = set(started), set(waiting)
+    assert set(case.starts) == started, report
+    assert {run.number for run in case.store.active_runs()} == {1, 2} | started
+    for number in started:
+        assert "running" in case.tracker.get_issue(number).labels
+        assert "ready" not in case.tracker.get_issue(number).labels
+    for number in waiting:
+        assert "ready" in case.tracker.get_issue(number).labels
+        assert "running" not in case.tracker.get_issue(number).labels
+        assert case.store.get_run(number) is None
 
 
 def _assert_fallback(output):
@@ -139,7 +144,7 @@ def test_tick_config_from_base_origin_update_applies_on_next_tick_without_pull(t
 
     output, report = _tick(case, capsys)
 
-    _assert_admission(case, started=3, waiting=4, report=report)
+    _assert_admission(case, started={3, 4}, waiting=set(), report=report)
     assert output.err == ""
     assert git_command(case.root, "status", "--porcelain") == ""
 
@@ -152,7 +157,7 @@ def test_tick_config_from_base_ignores_uncommitted_local_config(tick_case, capsy
 
     output, report = _tick(case, capsys)
 
-    _assert_admission(case, started=4, waiting=3, report=report)
+    _assert_admission(case, started={4}, waiting={3}, report=report)
     assert output.err == ""
     assert git_command(case.root, "diff", "--name-only") == ".foragent.yml"
 
@@ -164,7 +169,7 @@ def test_tick_config_from_base_invalid_origin_yaml_uses_local_and_warns(tick_cas
 
     output, report = _tick(case, capsys)
 
-    _assert_admission(case, started=3, waiting=4, report=report)
+    _assert_admission(case, started={3, 4}, waiting=set(), report=report)
     _assert_fallback(output)
 
 
@@ -175,5 +180,5 @@ def test_tick_config_from_base_missing_origin_config_uses_local_and_warns(tick_c
 
     output, report = _tick(case, capsys)
 
-    _assert_admission(case, started=3, waiting=4, report=report)
+    _assert_admission(case, started={3, 4}, waiting=set(), report=report)
     _assert_fallback(output)
