@@ -323,7 +323,7 @@ class RecordingTracker:
             since = (watermark if watermark.tzinfo else watermark.replace(tzinfo=UTC)) - _WATERMARK_MARGIN
         records = {record["number"]: record for record in (known or {}).get("prs", [])}
         records.update((record["number"], record) for record in read(since, "foragent/"))
-        ordered = sorted(records.values(), key=lambda record: _parse_time(record["updated_at"])
+        ordered = sorted(records.values(), key=lambda record: _parse_time(record.get("updated_at"))
                          or datetime.min.replace(tzinfo=UTC), reverse=True)
         prs = [PullRequest(record["number"], record["head"], record["base"], "", "",
                            record["merged_at"], record["url"]) for record in ordered]
@@ -1033,7 +1033,8 @@ class GhTracker:
 
         Pages are read one at a time and reading stops after the first page whose
         oldest update is before ``since``; with no ``since`` every page is read.
-        Each record is a PullRequest's fields plus GitHub's ``updated_at``.
+        Each record is a PullRequest's fields plus GitHub's ``updated_at``, which
+        may be missing; a page without known times never proves the rest is old.
         """
         records, page = [], 1
         while True:
@@ -1043,7 +1044,7 @@ class GhTracker:
             ]))
             records.extend({
                 "number": item["number"], "head": item["head"]["ref"], "base": item["base"]["ref"],
-                "merged_at": item["merged_at"], "url": item["html_url"], "updated_at": item["updated_at"],
+                "merged_at": item["merged_at"], "url": item["html_url"], "updated_at": item.get("updated_at"),
             } for item in data if item["head"]["ref"].startswith(head_prefix) and item.get("merged_at"))
             # The cutoff uses the raw page, before filtering by head or merge.
             times = [_parse_time(item.get("updated_at")) for item in data]

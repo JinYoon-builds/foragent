@@ -205,7 +205,12 @@ class IssueSnapshotMixin:
         except (FileNotFoundError, ValueError, TypeError, KeyError):
             # Without a readable listing the next refresh lists every closed PR.
             return None
-        return listing if isinstance(listing.get("prs"), list) else None
+        prs = listing.get("prs")
+        fields = ("number", "head", "base", "merged_at", "url")
+        if not isinstance(prs, list) or not all(
+                isinstance(record, dict) and all(key in record for key in fields) for record in prs):
+            return None
+        return listing
 
     def record_merged_pr_listing(self, listing: dict[str, Any]) -> None:
         with self._state_lock():

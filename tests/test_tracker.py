@@ -1595,3 +1595,12 @@ def test_merged_prs_updated_since_stops_at_the_first_page_older_than_the_cutoff(
     run = ScriptedRun(json.dumps(second), json.dumps([]))
     assert len(GhTracker(REPO, run).merged_prs_updated_since(None)) == 99
     assert len(run.calls) == 2
+
+
+def test_merged_prs_updated_since_accepts_pulls_without_updated_at():
+    item = {"number": 5, "head": {"ref": "foragent/issue-5"}, "base": {"ref": "main"},
+            "html_url": "https://github.com/owner/repo/pull/5", "merged_at": NOW.isoformat()}
+    run = ScriptedRun(json.dumps([item]))
+    assert GhTracker(REPO, run).merged_prs_updated_since(NOW, "foragent/") == [{
+        "number": 5, "head": "foragent/issue-5", "base": "main", "merged_at": NOW.isoformat(),
+        "url": item["html_url"], "updated_at": None}]
