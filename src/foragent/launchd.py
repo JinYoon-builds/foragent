@@ -37,15 +37,22 @@ def _legacy_label_for(repo: str) -> str:
     return re.sub(r"[^a-z0-9.-]", "-", "dev.foragent." + repo.replace("/", ".").lower())
 
 
+def _fa_shim() -> Path | None:
+    """Keep the PATH entry stable when a versioned install switches its target."""
+    if found := shutil.which("fa"):
+        return Path(found).absolute()
+    return None
+
+
 def fa_executable() -> Path:
+    if shim := _fa_shim():
+        return shim
     current = Path(sys.argv[0]).expanduser()
     if current.name in {"fa", "foragent"}:
         if current.is_file():
-            return current.resolve()
+            return current.absolute()
         if found := shutil.which(str(current)):
-            return Path(found).resolve()
-    if found := shutil.which("fa"):
-        return Path(found).resolve()
+            return Path(found).absolute()
     raise LaunchdError("cannot locate the fa executable; install Foragent or run its fa entry point")
 
 
@@ -64,21 +71,26 @@ def _bootout(call: Callable[[list[str]], subprocess.CompletedProcess[str]], targ
         raise LaunchdError(f"launchctl bootout: {message or result.returncode}")
 
 
-# Gate processes must not write __pycache__ into the tool directory that a
-# reinstall empties. Python writes bytecode while importing, so only the
-# environment a process starts with can stop it.
+# Keep gate imports from writing bytecode into installed package trees.
+# Python needs this environment when the process starts, before any imports.
 GATE_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
 REFRESH_WAIT_SECONDS = 1800
 REFRESH_POLL_SECONDS = 5
 
 
-def _environment(path: Path) -> dict | None:
-    """The plist's EnvironmentVariables, or None when the file cannot be read as a plist."""
+def _plist(path: Path) -> dict | None:
     try:
         data = plistlib.loads(Path(path).read_bytes())
-        environment = data.get("EnvironmentVariables") or {}
     except (OSError, ValueError, TypeError, AttributeError, plistlib.InvalidFileException):
         return None
+    return data if isinstance(data, dict) else None
+
+
+def _environment(path: Path) -> dict | None:
+    """The plist's EnvironmentVariables, or None when the file cannot be read as a plist."""
+    if (data := _plist(path)) is None:
+        return None
+    environment = data.get("EnvironmentVariables") or {}
     # A malformed value sets nothing in launchd; migrating replaces it.
     return environment if isinstance(environment, dict) else {}
 
@@ -94,17 +106,34 @@ def has_gate_environment(path: Path) -> bool:
 
 
 def needs_environment_refresh(path: Path) -> bool:
-    """True when a readable plist predates the gate environment and can be migrated."""
-    return _environment(path) is not None and not has_gate_environment(path)
+    """True when a readable plist needs the gate environment or stable executable."""
+    return _refreshed_plist(path) is not None
+
+
+def _refreshed_plist(path: Path) -> dict | None:
+    """Build independent environment and executable migrations without writing."""
+    if (data := _plist(path)) is None:
+        return None
+    shim = _fa_shim()
+    if shim is None:
+        print(f"foragent: cannot locate fa on PATH; keeping executable in {path}", file=sys.stderr)
+    environment = data.get("EnvironmentVariables")
+    environment = environment if isinstance(environment, dict) else {}
+    arguments = data.get("ProgramArguments")
+    current_executable = (shim is None or not isinstance(arguments, list) or not arguments
+                          or arguments[0] == str(shim))
+    if current_executable and all(environment.get(name) == value for name, value in GATE_ENVIRONMENT.items()):
+        return None
+    data["EnvironmentVariables"] = {**environment, **GATE_ENVIRONMENT}
+    if shim is not None and isinstance(arguments, list) and arguments:
+        data["ProgramArguments"] = [str(shim), *arguments[1:]]
+    return data
 
 
 def _migrate_environment(path: Path) -> None:
-    """Add the gate environment to an older plist, keeping every other key."""
-    if not needs_environment_refresh(path):
-        return
-    data = plistlib.loads(path.read_bytes())
-    data["EnvironmentVariables"] = {**_environment(path), **GATE_ENVIRONMENT}
-    path.write_bytes(plistlib.dumps(data))
+    """Refresh the gate environment and executable, keeping every other key."""
+    if (data := _refreshed_plist(path)) is not None:
+        path.write_bytes(plistlib.dumps(data))
 
 
 def installed_plist(repo: str, home: Path | None = None) -> Path:
@@ -112,14 +141,14 @@ def installed_plist(repo: str, home: Path | None = None) -> Path:
 
 
 def stale_jobs(repo_root: Path, home: Path | None = None) -> list["InstalledJob"]:
-    """Every installed job that ticks ``repo_root`` without the gate environment.
+    """Every installed job ticking ``repo_root`` with stale environment or executable.
 
     Found by the plist's --repo-root, as fa update finds gates, so legacy labels
     and plists written under an earlier repository name are included.
     """
     root = Path(repo_root).resolve()
     return [job for job in installed_jobs(home) if job.repo_root == root
-            and not has_gate_environment(job.plist_path)]
+            and needs_environment_refresh(job.plist_path)]
 
 
 def _unreadable_plist(repo: str) -> Path | None:
@@ -128,7 +157,7 @@ def _unreadable_plist(repo: str) -> Path | None:
 
 
 def refresh_if_stale(repo: str, repo_root: Path, log_dir: Path) -> bool:
-    """From a tick: start a detached reload when a job for this repo predates the gate environment.
+    """From a tick: start a detached reload for a stale environment or executable.
 
     The reload waits for the tick lock, so it never stops a running tick.
     """
@@ -140,16 +169,21 @@ def refresh_if_stale(repo: str, repo_root: Path, log_dir: Path) -> bool:
         print(f"foragent: cannot read {unreadable}; run fa gate install to rewrite it", file=sys.stderr)
     if not _jobs_to_refresh(Path(repo_root).resolve()):
         return False
+    spawn_refresh(repo_root, log_dir, python=sys.executable)
+    return True
+
+
+def spawn_refresh(repo_root: Path, log_dir: Path, *, python: str | Path) -> None:
+    """Enqueue the between-ticks refresher using the requested installation."""
     from foragent.launcher import gate_environment
 
     log_dir.mkdir(parents=True, exist_ok=True)
     with (log_dir / "launchd-refresh.log").open("ab") as stream:
         subprocess.Popen(
-            [sys.executable, "-m", "foragent.launchd", "refresh", str(Path(repo_root).resolve())],
+            [str(python), "-m", "foragent.launchd", "refresh", str(Path(repo_root).resolve())],
             stdin=subprocess.DEVNULL, stdout=stream, stderr=stream, start_new_session=True,
             env=gate_environment(),
         )
-    return True
 
 
 def refresh_from_tick(repo: str, repo_root: Path, log_dir: Path) -> None:
@@ -176,7 +210,7 @@ def refresh_jobs(repo_root: Path, *, sleep: Callable[[float], None] = time.sleep
         except BlockingIOError:
             return "already"  # Another refresher is waiting for the same gate.
         # A plist changes only inside restart (bootout, migrate, bootstrap), never
-        # on disk alone: a file with the variable always means a reloaded job.
+        # on disk alone: a current file always means a reloaded job.
         while jobs := _jobs_to_refresh(root):
             if any(state == "unknown" for _, state in jobs):
                 return "unknown"  # Cannot tell whether launchd holds it; the next tick retries.
@@ -231,7 +265,7 @@ class InstalledJob:
     def restart(self) -> None:
         """Reload the plist as installed: bootout, then bootstrap the same file.
 
-        An older plist gains the gate environment while the job is out, so a
+        An older plist gains the gate environment and stable shim while out, so a
         kickstart never sees the new file with the old definition loaded.
         """
         _bootout(self._call, self.target)
@@ -286,7 +320,7 @@ class Launchd:
 
     def plist(self) -> bytes:
         executable = (
-            Path(self.executable).expanduser().resolve()
+            Path(self.executable).expanduser().absolute()
             if self.executable is not None else fa_executable()
         )
         return plistlib.dumps({

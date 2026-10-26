@@ -49,7 +49,8 @@ def _fake_update(monkeypatch, gates, busy):
     installs, restarts = [], []
     monkeypatch.setattr(update_check, "lookup", lambda: "v0.1.10")
     monkeypatch.setattr(update_check, "installed_gates", lambda: {gate: [] for gate in gates})
-    monkeypatch.setattr(update_check.orch_reinstall, "_uv", lambda args, cwd: installs.append(args) or "")
+    monkeypatch.setattr(update_check.tool_install, "install",
+                        lambda source, **kw: installs.append(source))
 
     def restart(root: Path, jobs, language: str) -> str:
         if root in busy:
@@ -105,6 +106,7 @@ def _gate(tmp_path, monkeypatch, *, repo, origin, label):
 
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(launchd.shutil, "which", lambda name: str(home / ".local/bin/fa") if name == "fa" else None)
     root = tmp_path / "project"
     root.mkdir()
     (root / ".foragent.yml").write_text(f"repo: {repo}\n" if repo else "")
