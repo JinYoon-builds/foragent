@@ -8,6 +8,6 @@ metadata:
 
 **Why:** a first attempt added `lane_order(lane)[0]` (main last) before the number to keep two old unit tests green; review rejected it — the issue fixes the key list and the number tie-break wins over lanes. The old tests (`test_lane_single_run_cap_order_and_lowest_issue`, `test_project_ceiling_counts_only_this_repositorys_runs`) keep their names with updated expectations.
 
-Overlap ranking applies only when `ctx.config.lanes` is non-empty: locked `test_tick_config_from_base.py` (main-only project, two runs on src/shared.py) needs overlapping #3 before free #4 by number, which contradicts within-lane overlap ranking that `test_cross_lane_start.py` test 1 needs. Gate baseline reports such conflicts only after the attempt, so run older acceptance files that use `test_scheduler.ctx` with several ready issues.
+Overlap ranking applies whenever runs are running, one lane (`config.lanes={}`) included; a config-dependent bypass to keep the older locked `test_tick_config_from_base.py` green was rejected in review. A real conflict with a locked test is a spec question (.foragent/QUESTION.md), not a bypass.
 
 **How to apply:** do not add lane-based keys to start ranking. Global list lives in `<state>/global-queue.json` (`orch_queue.get_global/set_global`); CLI `fa orch queue --global N...` gets the first number in the optional `lane` positional. CLI text is in `messages/orch_queue.py`.
