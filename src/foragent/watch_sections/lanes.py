@@ -4,10 +4,10 @@ from pathlib import Path
 from typing import Any
 
 from foragent.config import Config
-from foragent.status import summary_values
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 from foragent.watch_layout import _clones, _split, _widths, _worker_rows
+from foragent.watch_sections import orch_panel
 
 ORDER = 30
 # "Watching" needs an orchestrator heartbeat (written by a running fa orch watch) this fresh (D67).
@@ -16,26 +16,31 @@ ORCH_FRESH_SECONDS = 30
 STATE_ORDER = ("working", "waiting-human", "blocked", "queued", "idle")
 
 
-def _overview(snapshot: Snapshot, language: str, age: float = 0.0) -> list[Line]:
+def _overview(snapshot: Snapshot, language: str, age: float = 0.0, width: int = 26) -> list[Line]:
     from foragent import watch
 
     status = snapshot.status
     t = lambda key, **values: watch.text(key, language, **values)
     overview: list[Line] = []
     heartbeat = snapshot.heartbeats.get("orch")
-    if heartbeat is not None and heartbeat + age <= ORCH_FRESH_SECONDS:
-        state = "watch_handling" if status["summary"]["blocked"] else "watch_monitoring"
-        overview.append(watch._line(t(state), "yellow" if status["summary"]["blocked"] else "green"))
+    fresh = heartbeat is not None and heartbeat + age <= ORCH_FRESH_SECONDS
+    if fresh:
+        # A live watcher is always named (D67 evidence); blocked work keeps its own
+        # unchanged "handling" line after it.
+        overview.append(watch._line(t("watch_monitoring"), "green"))
+        if status["summary"]["blocked"]:
+            overview.append(watch._line(t("watch_handling"), "yellow"))
     elif heartbeat is not None or status["active_runs"] or any(watch._has_work(row) for row in status["lanes"].values()):
         # A stale or missing heartbeat while work exists means nobody is watching.
         overview.append(watch._line(t("watch_orch_off"), "yellow"))
+    # The note and the count for people follow the state line (orch_panel).
+    overview += orch_panel.lines(snapshot.panel, status["summary"]["waiting_human"], language, width, age, fresh)
     if snapshot.order:
         # The combined bar and finish time live in the progress section.
         overview += [watch._line(t("watch_order") + f" #{snapshot.order.number}"),
                      watch._line(snapshot.order.title)]
     else:
         overview.append(watch._line(t("watch_no_order")))
-    overview.append(watch._line(t("watch_waiting", **summary_values({"count": status["summary"]["waiting_human"]})), "bold"))
     if snapshot.requests:
         count = lambda name: sum(row.get("status") == name for row in snapshot.requests)
         overview.append(watch._line(t("watch_requests", processing=count("processing"), done=count("done"))))
@@ -78,6 +83,32 @@ def _road(
     return watch._fit([*prefix, (" " * max(0, space - road_cells), "road"), *road, *tail], road_width)
 
 
+def _flow(head: str, items: list[str], width: int) -> list[str]:
+    """Lines of ``head`` and the items joined by " · ", wrapping instead of cutting.
+
+    A new line starts between items. An item (or the heading) too wide for a
+    whole line wraps between its own words, so no lane name or done count is cut.
+    """
+    from foragent import watch
+
+    indent = "  "
+    wrap = lambda value, room: ["".join(part for part, _ in line) for line in watch._wrap(value, max(1, room))]
+    lines = wrap(head, width)
+    current = lines.pop()
+    first = True
+    for item in items:
+        joined = current + (" " if first else " · ") + item
+        first = False
+        if watch._cells(joined) <= width:
+            current = joined
+            continue
+        lines.append(current)
+        pieces = [indent + piece for piece in wrap(item, width - len(indent))]
+        lines += pieces[:-1]
+        current = pieces[-1]
+    return lines + [current]
+
+
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
     from foragent import watch
 
@@ -87,7 +118,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     busy, idle = _split(snapshot.status)
     clones = _clones(snapshot.status)
     age = max(0.0, (context["now"] - snapshot.captured_at).total_seconds())
-    left = watch._panel(_overview(snapshot, language, age), orchestrator_width, "🧭 " + t("watch_orchestrator"))
+    left = watch._panel(_overview(snapshot, language, age, orchestrator_width - 2), orchestrator_width, "🧭 " + t("watch_orchestrator"))
     roads: list[Line] = [[("━" * road_width, "edge")]]
     for index, row in busy:
         slug = row["slug"]
@@ -122,8 +153,11 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         items = []
         for index, row in idle:
             count = len(snapshot.done.get(row["slug"], []))
-            items.append(f"{index} {row['lane_display']}" + (f" ✓{count}" if count else ""))
-        roads.append(watch._fit(watch._line(t("watch_idle_lanes") + ": " + " · ".join(items)), road_width))
+            items.append(f"{index} {row['lane_display']}" + (" " + t("done_state_lane_done", count=count) if count else ""))
+        # Clean the parts first: cleaning a finished line would collapse the continuation indent.
+        flowed = _flow(watch._clean(t("watch_idle_lanes") + ":"), [watch._clean(item) for item in items], road_width)
+        roads += [[(line, "")] for line in flowed]
         roads.append([("━" * road_width, "edge")])
     context.get("hits", []).append((0, top, orchestrator_width, top + len(left), ("orchestrator", None)))
-    return watch._beside(left, roads, orchestrator_width, links=True) if side_by_side else left + roads
+    # The arrows point from the orchestrator to working lanes; with every lane idle they go.
+    return watch._beside(left, roads, orchestrator_width, links=bool(busy)) if side_by_side else left + roads

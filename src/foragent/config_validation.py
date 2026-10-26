@@ -74,6 +74,13 @@ def _validate(values: dict[str, Any]) -> None:
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
     review_perspectives.validate(values, ConfigError)
+    from foragent.order_perspectives import SEATS
+    seats = values["perspectives"]
+    if not isinstance(seats, dict) or any(seat not in SEATS or not isinstance(executor, str) or executor not in _EXECUTORS
+                                          for seat, executor in seats.items()):
+        from foragent.i18n import text
+        language = values.get("language") if isinstance(values.get("language"), str) else "en"
+        raise ConfigError(text("perspectives_config_shape", language, seats=", ".join(SEATS)))
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     for key in ("always_human", "approvers"):
