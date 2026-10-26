@@ -883,3 +883,16 @@ def test_fa_test_accepts_its_own_repo_root_first(tmp_path, monkeypatch):
     assert cli.main(["test", "--repo-root", str(tmp_path), "-q", "--repo-root=x"]) == 0
     assert cli.main(["test", f"--repo-root={tmp_path}", "-x"]) == 0
     assert calls == [(tmp_path.resolve(), ["-q", "--repo-root=x"]), (tmp_path.resolve(), ["-x"])]
+
+
+def test_gate_commands_leave_macos_background_state(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    monkeypatch.setattr(cli.os, "setpriority", lambda *args: calls.append(args))
+    monkeypatch.setattr(cli.commands, "module", lambda name: SimpleNamespace(run=lambda args: 0))
+    assert cli.main(["gate", "status"]) == 0
+    assert calls == [(cli.PRIO_DARWIN_PROCESS, 0, 0)]
+    calls.clear()
+    assert cli.main(["update"]) == 0
+    assert calls == []

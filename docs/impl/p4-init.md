@@ -22,7 +22,7 @@ Steps (each idempotent; re-running init on an initialized repo only fills what i
 - Label: `dev.foragent.<sanitized owner>.<sanitized repo>.<hash>` (owner and repo lowercase, characters outside `[a-z0-9.-]` replaced by `-`; hash is the first 8 hexadecimal characters of SHA-1 of the original `owner/repo` string). Install and uninstall also boot out and remove an existing plist with the legacy label without the hash.
 - Plist path: `~/Library/LaunchAgents/<label>.plist` (injectable base dir for tests).
 - ProgramArguments: absolute path of the `fa` executable that is currently running (resolve `sys.argv[0]` / `shutil.which("fa")`; if it lives in a project `.venv`, use that absolute path), then `gate tick --repo-root <abs repo root>`.
-- `StartInterval` 300, `RunAtLoad` true, `ProcessType` Background.
+- `StartInterval` 300, `RunAtLoad` true, `ProcessType` Standard (Background confined runs to throttled efficiency cores).
 - EnvironmentVariables: `PATH` = `~/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin` (expanded), `HOME`, `LANG=en_US.UTF-8`.
 - StandardOutPath/StandardErrorPath: `<state root>/launchd.out.log` / `launchd.err.log`.
 - Generate with `plistlib` (not string templates).
