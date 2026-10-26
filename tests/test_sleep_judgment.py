@@ -29,5 +29,6 @@ def test_a_suspend_after_ledger_observation_is_not_charged(git_history, tmp_path
     case.facts.advance(30 * 60 if limit == "runtime" else 60)
     case.store.update_run(1, last_progress_at=case.clock[0].isoformat())
     suspend_after_observing(case, monkeypatch)
-    tick_case(case)
+    report = tick_case(case)
+    assert sum("slept" in action for action in report.actions) == 1, "The judgment observes the suspend once"
     assert_running(case, f"30 min work plus a suspend after observation must not trip the {limit} limit")

@@ -41,6 +41,8 @@ def _remaining(n: int, ctx: RunContext) -> int:
     started = datetime.fromisoformat(run.started_at)
     # Machine sleep is not run time. Waits are timed without sleep, so it is credited once.
     slept, now = capacity.slept_until(started, ctx.now)
+    # A run from before #415 may hold sleep in waited_seconds already; it keeps today's budget.
+    slept = slept if run.sleep_free_waits else 0.0
     elapsed = (now - started).total_seconds() - run.waited_seconds - slept
     return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
 
@@ -54,7 +56,8 @@ def _timeout(n: int, ctx: RunContext) -> str:
 def _test_slot(n: int, ctx: RunContext):
     """Hold a machine-wide test slot; credit the queue time as waited, not run time."""
     run = ctx.store.get_run(n)
-    started = ctx.now()
+    # The wait's sleep window starts at a sensor sample, never at one taken earlier.
+    started = capacity.sleep_mark(ctx.now)
     waited = False
 
     def credit() -> datetime:

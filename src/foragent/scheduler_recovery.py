@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import processes, scheduler, sleep_ledger
+from foragent import capacity, processes, scheduler, sleep_ledger
 from foragent.scheduler_stop import (
     _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes,
 )
@@ -223,18 +223,21 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         if not dead:
             if _stop_already_refused(ctx, run):
                 continue
-            # Judge at the ledger's moment: a suspend after it would be sleep with no credit yet.
-            now, progress = slept.at or ctx.now(), run.last_progress_at or run.started_at
+            started, progress = (scheduler.datetime.fromisoformat(value) for value in (
+                run.started_at, run.last_progress_at or run.started_at))
+            # Both windows' sleep and their shared end are one sensor snapshot; the grace
+            # is checked after it, so any sleep the snapshot credits has opened the grace.
+            (run_sleep, quiet_sleep), now = capacity.slept_until_many([started, progress], ctx.now)
+            slept = sleep_ledger.current(ctx, report, slept)
             waiting = run.waiting_until is not None and now < scheduler.datetime.fromisoformat(run.waiting_until)
-            runtime = (now - scheduler.datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
-            runtime -= slept.credit(run.started_at, now)
+            # A run from before #415 may hold sleep in waited_seconds; it gets no second credit.
+            runtime = (now - started).total_seconds() - run.waited_seconds - run_sleep * run.sleep_free_waits
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
                 if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit."):
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
             elif run.pid is not None and not waiting and not slept.defers_stall(run, now) and (
-                now - scheduler.datetime.fromisoformat(progress)
-                - scheduler.timedelta(seconds=slept.credit(progress, now))
+                now - progress - scheduler.timedelta(seconds=quiet_sleep)
             ) > scheduler.timedelta(minutes=ctx.config.stall_minutes):
                 restarts = run.restarts + 1
                 outcome = "stalled-restart" if restarts <= 1 else "stalled"

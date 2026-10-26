@@ -133,6 +133,7 @@ def no_real_machine_sleep(request, monkeypatch):
 
     if request.module.__name__ not in {"test_machine_sleep", "test_sleep_ledger"}:
         monkeypatch.setattr(capacity, "slept_seconds", lambda since: 0.0)
+        monkeypatch.setattr(capacity, "sleep_sample", lambda awake_at: None)
 
 
 @pytest.fixture(autouse=True)

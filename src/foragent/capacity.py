@@ -517,8 +517,6 @@ def hold_test_slot(ceiling: int, *, waiting: Callable[[], None] | None = None) -
 
 
 SLEEP_HISTORY_FILE = "sleep-history.json"
-# Sleep intervals are kept this long, and longer while a run that started earlier is running.
-SLEEP_RETENTION = timedelta(days=30)
 # A clock offset change below this is drift or rounding, not sleep.
 SLEEP_MIN_SECONDS = 1.0
 # Reads of the kernel pair and the clock offset repeat until both hold still.
@@ -582,19 +580,43 @@ def _when(value: Any) -> datetime | None:
         return None
 
 
-def sleep_within(intervals: list[dict[str, Any]], since: datetime, until: datetime) -> float:
-    """The least sleep that must lie inside [since, until].
+def _span(item: dict[str, Any]) -> float:
+    return (item["end"] - item["start"]).total_seconds()
 
-    An interval says ``seconds`` of sleep happened somewhere in [start, end]. Only
-    the part that cannot fit outside [since, until] is counted, so awake time
-    near a coarse interval's edge is never counted as sleep.
+
+def _overlap(start: datetime, end: datetime, since: datetime, until: datetime) -> float:
+    return max(0.0, (min(end, until) - max(start, since)).total_seconds())
+
+
+def sleep_within(intervals: list[dict[str, Any]], since: datetime, until: datetime) -> float:
+    """Sleep inside [since, until].
+
+    A kernel pair is wholly asleep and is intersected exactly. An interval found
+    from a clock offset says only that ``seconds`` of sleep lie somewhere in it,
+    outside the kernel pairs; it is credited up to the part of the query inside
+    it. Every point a query starts from (a run's start, its progress, a wait's
+    start, a tick) is followed by a sensor sample, so such an interval never
+    reaches far past a query start and awake time is not credited.
     """
-    total = 0.0
+    exact = [item for item in intervals if item["seconds"] >= _span(item) - 1e-6]
+    total = sum(_overlap(item["start"], item["end"], since, until) for item in exact)
     for item in intervals:
-        outside = (max(0.0, (min(since, item["end"]) - item["start"]).total_seconds())
-                   + max(0.0, (item["end"] - max(until, item["start"])).total_seconds()))
-        total += max(0.0, item["seconds"] - outside)
+        if item in exact:
+            continue
+        room = _overlap(item["start"], item["end"], since, until) - sum(
+            _overlap(max(pair["start"], item["start"]), min(pair["end"], item["end"]), since, until)
+            for pair in exact if pair["start"] < item["end"] and pair["end"] > item["start"])
+        total += min(item["seconds"], max(0.0, room))
     return total
+
+
+def sleep_sample(awake_at: datetime) -> None:
+    """Sample the sensor right after an event stamped at ``awake_at``.
+
+    The event proves the machine was awake then, so sleep found by this sample
+    is placed before or after that event time, not at the observation time.
+    """
+    _observe_sleep(None, awake_at)
 
 
 def _explained(intervals: list[dict[str, Any]], start: datetime, end: datetime) -> float:
@@ -653,8 +675,9 @@ def _read_history(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
 def latest_wake(after: datetime) -> datetime | None:
     """The latest recorded moment by which the machine was awake again, if after ``after``.
 
-    A kernel pair gives the measured wake; an interval found from a clock offset
-    gives the read that found it, which is never before the wake.
+    A kernel pair gives the measured wake. An interval found from a clock offset
+    ends at the first awake event stamped after it (see ``sleep_sample``), else at
+    the read that found it; neither is before the wake.
     """
     root = machine_root()
     with _flock(root / f"{SLEEP_HISTORY_FILE}.lock"):
@@ -662,14 +685,30 @@ def latest_wake(after: datetime) -> datetime | None:
     return max((item["end"] for item in intervals if item["end"] > after), default=None)
 
 
-def _observe_sleep() -> tuple[list[dict[str, Any]], datetime]:
+def _split_at_event(start: datetime, end: datetime, seconds: float, awake_at: datetime | None) -> list[dict[str, Any]]:
+    """Clock-offset sleep in [start, end]; an awake event inside splits it at the event time.
+
+    A process cannot stamp an event while the machine sleeps, so no sleep spans
+    the event. At most ``end - awake_at`` of it can follow the event.
+    """
+    if awake_at is None or not start < awake_at < end:
+        return [{"start": start, "end": end, "seconds": seconds}]
+    after = min(seconds, (end - awake_at).total_seconds())
+    parts = [(start, awake_at, seconds - after), (awake_at, end, after)]
+    return [{"start": a, "end": b, "seconds": value} for a, b, value in parts if value >= SLEEP_MIN_SECONDS]
+
+
+def _observe_sleep(since: datetime | None, awake_at: datetime | None = None) -> tuple[list[dict[str, Any]], datetime]:
     """Add every sleep seen since the last read to the machine-wide history.
 
     The time and clocks are read inside the lock, so a reader that waited for
-    another never writes an older sample over a newer one.
+    another never writes an older sample over a newer one. Sleep that ended
+    before the oldest running run's start, and before this read's ``since``,
+    is pruned.
     """
     root = machine_root()
     path = root / SLEEP_HISTORY_FILE
+    oldest = oldest_running_start(set())  # Outside the lock: it reads run records.
     with _flock(root / f"{SLEEP_HISTORY_FILE}.lock"):
         raw, intervals = _read_history(path)
         snapshot = _clock_snapshot()
@@ -685,10 +724,9 @@ def _observe_sleep() -> tuple[list[dict[str, Any]], datetime]:
             # Sleep the kernel's last pair missed, such as an earlier sleep between reads.
             missed = offset - sample["offset"] - _explained(intervals, previous, now)
             if missed >= SLEEP_MIN_SECONDS:
-                intervals.append({"start": previous, "end": now, "seconds": missed})
-        oldest = oldest_running_start(set())
-        cutoff = min(now - SLEEP_RETENTION, oldest) if oldest else now - SLEEP_RETENTION
-        intervals = [item for item in intervals if item["end"] >= cutoff]
+                intervals += _split_at_event(previous, now, missed, awake_at)
+        cutoff = min((moment for moment in (oldest, since) if moment is not None), default=now)
+        intervals = [item for item in intervals if item["end"] > cutoff]
         value = {
             "sample": {"at": now.isoformat(), "kind": kind, "offset": offset},
             "intervals": [{**item, "start": item["start"].isoformat(), "end": item["end"].isoformat()}
@@ -709,22 +747,40 @@ def slept_seconds(since: datetime) -> float:
     sleep-counting clock offset that those times do not explain. A machine that
     was never read before ``since`` has no sleep recorded before its first read.
     """
-    intervals, now = _observe_sleep()
+    intervals, now = _observe_sleep(since)
     return sleep_within(intervals, since, now)
 
 
-def slept_until(since: datetime, now: Callable[[], datetime]) -> tuple[float, datetime]:
-    """Sleep in [since, now()] from one consistent reading, and that moment.
+def slept_until_many(
+    sinces: list[datetime], now: Callable[[], datetime],
+) -> tuple[list[float], datetime]:
+    """Sleep in each [since, now()] from one consistent reading, and that moment.
 
     ``now()`` is read between two equal sensor readings, so no sleep began
     between the reading and the moment; a suspend in between repeats the
     reading. If the machine keeps suspending, the later reading is used,
-    capped at the window: never negative, never more than the window.
+    capped at each window: never negative, never more than the window.
     """
     for _ in range(SLEEP_SNAPSHOT_TRIES):
-        first = slept_seconds(since)
+        first = [slept_seconds(since) for since in sinces]
         moment = now()
-        second = slept_seconds(since)
-        if second - first < SLEEP_MIN_SECONDS:
+        second = [slept_seconds(since) for since in sinces]
+        if all(b - a < SLEEP_MIN_SECONDS for a, b in zip(first, second)):
             return first, moment
-    return max(0.0, min(second, (moment - since).total_seconds())), moment
+    return [max(0.0, min(b, (moment - since).total_seconds())) for b, since in zip(second, sinces)], moment
+
+
+def slept_until(since: datetime, now: Callable[[], datetime]) -> tuple[float, datetime]:
+    """Sleep in [since, now()] from one consistent reading, and that moment."""
+    values, moment = slept_until_many([since], now)
+    return values[0], moment
+
+
+def sleep_mark(now: Callable[[], datetime]) -> datetime:
+    """A moment that starts a sleep window: the sensor is sampled around it with no sleep between.
+
+    A later sleep is then recorded in an interval that starts at or after this
+    moment, never in one that began earlier, so a window starting here is never
+    credited less sleep than a longer window around it.
+    """
+    return slept_until(datetime.fromtimestamp(0, UTC), now)[1]
