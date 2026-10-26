@@ -129,7 +129,7 @@ reviewer: claude         # codex | claude | none (기본 = executor와 다른 �
 reviewer_model: null
 review_level: low       # Claude /code-review: low | medium | high | xhigh | max
 review_scope: claude-local  # claude-local | pr-body
-review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 5개와 이름이 같으면 그 focus를 바꿈
+review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 6개(security·concurrency·failure·compatibility·realism·docs)와 이름이 같으면 그 focus를 바꿈
 review_reviewers: 1      # 1 이상 정수; 1이면 리뷰어 하나가 모든 관점을 체크리스트로 받음
 review_max: 2            # 리뷰 FAIL 허용 수; 초과하면 PR을 열고 risk-high로 보류
 approvers: [JinYoon-builds]   # v1 승인 라벨을 붙일 수 있는 사람 (D14)
