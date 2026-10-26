@@ -43,6 +43,99 @@ def test_failed_spawn_reserves_spacing_without_a_push(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_explicit_call_skips_only_the_spacing(tmp_path, monkeypatch):
+    store, repo, calls, _pushes = _setup(tmp_path, monkeypatch, fail=True)
+    config = Config(repo="owner/repo", language="en")
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW) is None
+    later = NOW + timedelta(seconds=60)
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=later, spacing=False) is None
+    assert len(calls) == 2
+    monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=later, spacing=False) is None
+    assert len(calls) == 2
+
+
+def _explicit_lock_doing(monkeypatch, before, *, busy=False):
+    """Run ``before()`` while the explicit call waits for the lock, then report ``busy``."""
+    from contextlib import contextmanager
+
+    real = orch_spawn._explicit_lock
+
+    @contextmanager
+    def lock(store):
+        before()
+        with real(store):
+            yield busy
+
+    monkeypatch.setattr(orch_spawn, "_explicit_lock", lock)
+
+
+def _write_spawn(store, at):
+    import json
+
+    (store.root / "orch-spawn.json").write_text(json.dumps({"spawned_at": at.isoformat(), "screen": "tmux"}))
+
+
+def test_explicit_call_never_opens_a_second_after_a_spawn_made_while_it_waited(tmp_path, monkeypatch):
+    store, repo, calls, pushes = _setup(tmp_path, monkeypatch)
+    _explicit_lock_doing(monkeypatch, lambda: _write_spawn(store, NOW))
+    why = []
+    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW,
+                                          spacing=False, why=why) is None
+    assert calls == pushes == [] and why == ["raced"]
+
+
+def test_explicit_call_waits_out_an_opener_that_was_mid_spawn_when_it_began(tmp_path, monkeypatch):
+    store, repo, calls, _pushes = _setup(tmp_path, monkeypatch)
+    _write_spawn(store, NOW - timedelta(seconds=5))  # Written before this call read the record.
+    _explicit_lock_doing(monkeypatch, lambda: None, busy=True)
+    why = []
+    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW,
+                                          spacing=False, why=why) is None
+    assert calls == [] and why == ["raced"]
+
+
+def test_explicit_call_skips_spacing_when_the_busy_lock_held_no_recent_spawn(tmp_path, monkeypatch):
+    store, repo, calls, _pushes = _setup(tmp_path, monkeypatch)
+    _write_spawn(store, NOW - timedelta(minutes=5))
+    _explicit_lock_doing(monkeypatch, lambda: None, busy=True)
+    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW,
+                                          spacing=False) == "background"
+    assert len(calls) == 1
+
+
+def test_explicit_call_checks_its_guards_again_inside_the_lock(tmp_path, monkeypatch):
+    store, repo, calls, _pushes = _setup(tmp_path, monkeypatch)
+    _explicit_lock_doing(monkeypatch, lambda: store.write_heartbeat("orchestrator", NOW))
+    why = []
+    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW,
+                                          spacing=False, why=why) is None
+    assert calls == [] and why == ["alive"]
+
+
+def test_gate_path_is_unchanged_by_the_explicit_call(tmp_path, monkeypatch):
+    """The gate checks liveness before the lock only and keeps its record shape."""
+    from contextlib import contextmanager
+    import json
+
+    from foragent import watch_open
+
+    store, repo, calls, _pushes = _setup(tmp_path, monkeypatch)
+    real = watch_open._opening
+
+    @contextmanager
+    def opening(target):
+        store.write_heartbeat("orchestrator", NOW)
+        with real(target):
+            yield
+
+    monkeypatch.setattr(watch_open, "_opening", opening)
+    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW) == "background"
+    assert len(calls) == 1
+    assert json.loads((store.root / "orch-spawn.json").read_text()) == {
+        "spawned_at": NOW.isoformat(), "screen": "background"}
+
+
 def test_missing_claude_opens_nothing_and_keeps_no_record(tmp_path, monkeypatch):
     store, repo, calls, pushes = _setup(tmp_path, monkeypatch, claude=False)
     assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW) is None
@@ -187,3 +280,27 @@ def test_suite_hides_the_real_claude_session_running_pytest():
     from foragent import processes
 
     assert processes.claude_session() is None
+
+
+def test_explicit_lock_reports_busy_while_another_opener_holds_it(tmp_path, monkeypatch):
+    import threading
+
+    from foragent import watch_open
+
+    store, _repo, _calls, _pushes = _setup(tmp_path, monkeypatch)
+    held, release = threading.Event(), threading.Event()
+
+    def other_opener():
+        with watch_open._opening(store):
+            held.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=other_opener)
+    thread.start()
+    held.wait(5)
+    threading.Timer(0.2, release.set).start()
+    with orch_spawn._explicit_lock(store) as busy:
+        assert busy is True
+    thread.join(5)
+    with orch_spawn._explicit_lock(store) as busy:
+        assert busy is False

@@ -51,6 +51,10 @@ read: treat it as unknown, not empty. One-shot watch then exits non-zero; `--fol
 the next good read always prints the real snapshot. Read fresh status after a wake-up; a snapshot is
 a signal to inspect, not a report.
 
+Say you are watching only while `fa orch watch --follow` is running in this session and renewing
+the heartbeat. If the watcher is not running, say it is stopped and restart it; never claim to be
+watching without it.
+
 ## Handle blocked items first
 
 Change `overlap_per_file` only from conflict facts reported by `fa orch facts`.
