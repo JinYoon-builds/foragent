@@ -99,7 +99,7 @@ def assert_refreshed_merge(case, outcome):
     assert refreshed == [({STILL_PASS}, 0)], (
         "Re-verification must protect exactly the passing IDs from the new base"
     )
-    assert case.tracker.created_prs == case.tracker.merged_prs
+    assert [pr.number for pr in case.tracker.created_prs] == case.tracker.merged_prs
     assert len(case.tracker.merged_prs) == 1
     assert case.tracker.get_issue(1).state == "closed"
     assert case.store.load_flag(1) is None
