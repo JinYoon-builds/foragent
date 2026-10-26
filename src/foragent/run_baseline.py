@@ -115,7 +115,8 @@ def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str])
             [sys.executable, "-m", "foragent.run_baseline", json.dumps(request), str(lock.fileno())],
             pass_fds=(lock.fileno(),), stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
             start_new_session=True,
-            env={name: value for name, value in os.environ.items() if name != capacity.TEST_SLOT_ENV},
+            env={**{name: value for name, value in os.environ.items() if name != capacity.TEST_SLOT_ENV},
+                 "PYTHONDONTWRITEBYTECODE": "1"},
         )
     lock.close()
 

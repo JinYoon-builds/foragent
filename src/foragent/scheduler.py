@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -84,6 +84,7 @@ def tick(ctx: TickContext) -> TickReport:
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
         timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
+        timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
         with tick_processes(ctx.store) as snapshot:
             cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
             if snapshot.available:

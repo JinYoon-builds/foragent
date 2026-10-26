@@ -109,6 +109,25 @@ class IssueRefreshMixin:
             })
             return sorted(dropped)
 
+    def merged_pr_listing(self) -> dict[str, Any] | None:
+        """The stored merged-PR listing and the refresh start it covers, if any."""
+        try:
+            listing = _state.json.loads((self.root / "merged_prs.json").read_text(encoding="utf-8"))
+            datetime.fromisoformat(listing["watermark"])
+        except (FileNotFoundError, ValueError, TypeError, KeyError):
+            # Without a readable listing the next refresh lists every closed PR.
+            return None
+        prs = listing.get("prs")
+        fields = ("number", "head", "base", "merged_at", "url")
+        if not isinstance(prs, list) or not all(
+                isinstance(record, dict) and all(key in record for key in fields) for record in prs):
+            return None
+        return listing
+
+    def record_merged_pr_listing(self, listing: dict[str, Any]) -> None:
+        with self._state_lock():
+            self._write_json(self.root / "merged_prs.json", listing)
+
     def read_baseline(self) -> dict[str, Any]:
         """Facts a per-issue read will depend on, taken before the read starts."""
         snapshot = self._issue_view()
