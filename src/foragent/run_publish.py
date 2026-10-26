@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field, replace
+import fcntl
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
@@ -29,8 +30,24 @@ from foragent.run_waits import _credited_wait, _phase, _progress, _timeout
 from foragent.state import Approval, Run
 from foragent.tracker import TrackerError
 
-# A run outcome `fa orch stop` records before signaling; its detail is the why.
+# A run outcome `fa orch stop` records before signaling; Run.stop_why holds the why.
 STOPPED = "stopped"
+
+
+@contextmanager
+def stop_intent_lock(store, n: int) -> Iterator[None]:
+    """Order `fa orch stop` recording its intent against a WIP commit choosing its reason.
+
+    Separate from the state lock, which is not reentrant and is taken by update_run.
+    """
+    path = store.root / "runs" / f"{n}.stop.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 # A run outcome: unfinished work could not be saved, so its worktree was kept.
 WIP_NOT_SAVED = "wip-not-saved"
 
@@ -317,17 +334,45 @@ def keep_unsaved_work(n: int, ctx: FlagContext, worktree: Path, error: BaseExcep
     """
     reason = " ".join(str(error).split()) or type(error).__name__
     detail = f"WIP preservation failed; worktree kept at {worktree}: {reason}"
-    _append(ctx.store.log_path(n), detail)
-    append_event(ctx.store, ctx.now(), n, "wip-preservation-failed", detail)
-    run = ctx.store.get_run(n)
-    if run is not None and run.status == "running":
-        ctx.store.update_run(n, outcome=WIP_NOT_SAVED)
-    try:
-        flag(ctx, n, Reason.RETRIES_EXCEEDED,
-             "Unfinished work could not be saved; its worktree is kept for recovery.", detail)
-    except Exception as exc:  # The kept worktree and run outcome still hold the issue.
-        _append(ctx.store.log_path(n), f"Flagging the unsaved work failed: {exc}")
+
+    def outcome() -> None:
+        run = ctx.store.get_run(n)
+        if run is not None and run.status == "running":
+            ctx.store.update_run(n, outcome=WIP_NOT_SAVED)
+
+    # Each report is best effort and never raises: the caller keeps the worktree
+    # and ends the run as WIP_NOT_SAVED from its own state, whichever step fails.
+    for step in (
+        lambda: _append(ctx.store.log_path(n), detail),
+        lambda: append_event(ctx.store, ctx.now(), n, "wip-preservation-failed", detail),
+        outcome,
+        lambda: flag(ctx, n, Reason.RETRIES_EXCEEDED,
+                     "Unfinished work could not be saved; its worktree is kept for recovery.", detail),
+    ):
+        try:
+            step()
+        except Exception:
+            pass
     return detail
+
+
+def stop_kept_work(run: Run) -> bool:
+    """A stop owns this run's end only if any WIP it made names the stop's why."""
+    return bool(run.stop_why) and run.wip_reason in {None, f"{STOPPED}: {run.stop_why}"}
+
+
+def final_outcome(run: Run | None, outcome: str, *, recorded_first: bool = False) -> str:
+    """A runner's last outcome: lost work and merges win, then a stop that kept the work.
+
+    A run that saved WIP for its own reason before the stop's intent keeps that outcome.
+    """
+    if outcome in {"merged", WIP_NOT_SAVED} or run is None:
+        return outcome
+    if run.outcome == WIP_NOT_SAVED:
+        return WIP_NOT_SAVED
+    if run.stop_why:
+        return STOPPED if stop_kept_work(run) else outcome
+    return (run.outcome or outcome) if recorded_first else outcome
 
 
 def _preserve_failed_implementation(
@@ -348,10 +393,16 @@ def _preserve_failed_implementation(
     git.stage_changes()
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
-    if reason == STOPPED and run is not None and run.detail:
-        reason = run.detail  # `fa orch stop --why` records its reason before any signal.
-    if git.has_staged_changes():
-        git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
+    with stop_intent_lock(ctx.store, n):
+        # Read the intent now, not at entry: a stop recorded during staging still names its why,
+        # and one recorded after the commit sees which reason this WIP carries.
+        current = ctx.store.get_run(n)
+        if current is not None and current.stop_why:
+            reason = f"{STOPPED}: {current.stop_why}"
+        if git.has_staged_changes():
+            git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
+            if current is not None and current.status == "running":
+                ctx.store.update_run(n, wip_reason=reason)
     if git.head_sha() == pushed_head or not tracker_available:
         return
     try:

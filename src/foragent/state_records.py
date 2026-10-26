@@ -41,6 +41,10 @@ class Run:
     status: str = "running"
     outcome: str | None = None
     detail: str = ""
+    # Written only by `fa orch stop`: its --why while it ends this run (detail is overwritten by others).
+    stop_why: str = ""
+    # The reason named by this run's WIP commit, recorded with the commit under the stop-intent lock.
+    wip_reason: str | None = None
     lane: str = "main"
     waited_seconds: float = 0
     waiting_until: str | None = None

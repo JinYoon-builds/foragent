@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
 from foragent.scheduler_stop import (
-    _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes,
+    _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes, clear_stale_stop,
+    complete_stop,
 )
-from foragent.run_publish import WIP_NOT_SAVED, keep_unsaved_work
+from foragent.run_publish import STOPPED, WIP_NOT_SAVED, keep_unsaved_work, stop_kept_work
 from foragent.state import Run
 from foragent.tracker import Issue
 
@@ -144,6 +145,9 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         report, outcome=(run.outcome or "crashed") if run is not None else "crashed",
     ):
         return ctx.tracker.get_issue(issue.number)  # Flagged; the kept worktree is not a crash to restart.
+    if run is not None and run.outcome == STOPPED and stop_kept_work(run):  # Ended by `fa orch stop`.
+        report.actions.append(f"#{issue.number} completed an interrupted stop{complete_stop(ctx, run)}")
+        return ctx.tracker.get_issue(issue.number)
     if run is not None and run.outcome == "merged":
         ctx.tracker.remove_labels(issue.number, [scheduler.READY, scheduler.RUNNING])
         return ctx.tracker.get_issue(issue.number)
@@ -222,6 +226,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         if run is None or run.status != "running":
             continue
         if not dead:
+            run = clear_stale_stop(ctx, run)  # No stop runs while a tick holds the lock.
             if _stop_already_refused(ctx, run):
                 continue
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)

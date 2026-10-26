@@ -203,11 +203,19 @@ def _tick_lock_for_stop(ctx: RunContext) -> Iterator[None]:
         time.sleep(1)
 
 
+class StopPending(OrchError):
+    """The run stopped and its work was kept, but its labels still wait for the next tick."""
+
+
 def stop(ctx: RunContext, n: int, why: str) -> str:
     """Stop a running issue through the gate's kill path, keeping its work as WIP."""
     why = _text(why, "--why")
-    with _tick_lock_for_stop(ctx):
-        summary = _stop_locked(ctx, n, why)
+    try:
+        with _tick_lock_for_stop(ctx):
+            summary = _stop_locked(ctx, n, why)
+    except StopPending:
+        kick_tick(ctx.repo_root)  # The tick completes the labels of the finished stop.
+        raise
     # The terminated runner's own kick found the lock held; wake the gate now.
     kick_tick(ctx.repo_root)
     return summary
@@ -215,8 +223,8 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
 
 def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
     from foragent import scheduler
-    from foragent.run_publish import STOPPED
-    from foragent.scheduler_stop import stop_target_refusal
+    from foragent.run_publish import STOPPED, stop_intent_lock, stop_kept_work
+    from foragent.scheduler_stop import complete_stop, stop_summary, stop_target_refusal
 
     run = ctx.store.get_run(n)
     if run is None or run.status != "running":
@@ -229,41 +237,36 @@ def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
     )
     report = scheduler.TickReport()
     detail = f"{STOPPED}: {why}"
-    # Record the stop before any signal: a runner saving its own WIP on SIGTERM
-    # names this reason and leaves the labels to this verb, as for a first stall.
-    ctx.store.update_run(n, outcome=STOPPED, detail=detail)
+    # Record the intent before any signal, ordered against any WIP commit by the
+    # intent lock: a WIP made afterwards names this why, one made before is seen.
+    with stop_intent_lock(ctx.store, n):
+        ctx.store.update_run(n, outcome=STOPPED, detail=detail, stop_why=why)
     try:
         scheduler._kill_run(tick_ctx, n, report, outcome=STOPPED, detail=detail)
     finally:
-        current = ctx.store.get_run(n)
-        if current is not None and current.status == "running" and current.outcome == STOPPED:
-            # Undo only this verb's own mark; a runner's wip-not-saved stays.
-            ctx.store.update_run(n, outcome=run.outcome, detail=run.detail)
-    # Success is the finished record, whichever process wrote it, never the kill's return.
-    if current is None or current.status != "finished" or current.outcome != STOPPED:
+        with stop_intent_lock(ctx.store, n):
+            current = ctx.store.get_run(n)
+            if current is not None and current.status == "running":
+                # The run did not end: undo only this verb's marks; a runner's wip-not-saved stays.
+                undo = {"outcome": run.outcome, "detail": run.detail} if current.outcome == STOPPED else {}
+                current = ctx.store.update_run(n, stop_why="", **undo)
+    # Success is the finished record, whichever process wrote it, and a WIP naming the why.
+    if current is None or current.status != "finished" or current.outcome != STOPPED or not stop_kept_work(current):
         state = "still running" if current is not None and current.status == "running" else (
             f"finished as {current.outcome}" if current is not None else "no run record")
+        if current is not None and current.wip_reason and current.wip_reason != detail:
+            state += f"; its work was already saved as WIP for {current.wip_reason}"
         raise OrchError(f"#{n}: stop did not complete ({state}): {'; '.join(report.actions) or 'no action'}")
-    summary = f"#{n}: stopped and kept unfinished work on foragent/issue-{n}; why: {why}"
-    issue = tick_ctx.tracker.get_issue(n)
-    if issue.state != "open" or issue.labels & {BLOCKED, NEEDS_HUMAN}:
-        # ready would contradict a closed issue or a hold the scheduler never
-        # starts, as in crash recovery: only the running label is cleared.
-        tick_ctx.tracker.remove_labels(n, [RUNNING])
-        held = "closed" if issue.state != "open" else ", ".join(sorted(issue.labels & {BLOCKED, NEEDS_HUMAN}))
-        summary += f"; not returned to ready because the issue is {held}"
-    elif (pr := tick_ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
-        # A tick clears ready while the PR is open, so ready would never restart.
-        # As for a crash or stall with an open PR, the orchestrator chooses the next step.
-        scheduler.flag(tick_ctx, n, scheduler.Reason.RETRIES_EXCEEDED,
-                       f"Stopped with open PR #{pr}; rerun review or retry implementation.", f"Stop reason: {why}")
-        summary += f"; blocked because PR #{pr} is open: run `fa orch rerun-review {n}` or `fa orch retry {n}`"
-    else:
-        # Ready is the destination; the next run resumes from the WIP on the issue branch.
-        tick_ctx.tracker.add_labels(n, [READY])
-        tick_ctx.tracker.remove_labels(n, [RUNNING])
-        scheduler.board.sync_status(tick_ctx, n, "Ready")
-    _event(ctx, n, "stop", summary)
+    try:
+        summary = stop_summary(n, why) + complete_stop(tick_ctx, current)
+    except Exception as exc:
+        # The run is finished as stopped; the next tick's orphan recovery repeats each step.
+        raise StopPending(f"{stop_summary(n, why)}; not completed ({' '.join(str(exc).split()) or type(exc).__name__}); "
+                          "the next gate tick completes the stop") from exc
+    try:  # The required local event is already journaled; the GitHub audit comment is extra.
+        RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(n, "<!-- foragent:orch -->\n" + summary)
+    except Exception as exc:
+        summary += f"; audit comment not posted: {exc}"
     return summary
 
 

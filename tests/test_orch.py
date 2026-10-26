@@ -582,7 +582,7 @@ def test_review_only_stopped_by_orchestrator_keeps_reason_and_leaves_labels(revi
 
     def review(n, ctx, worktree, verdict_head):
         # `fa orch stop` records its why before signaling the review runner.
-        ctx.store.update_run(n, outcome="stopped", detail="stopped: reprioritize")
+        ctx.store.update_run(n, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
         raise SystemExit(143)
 
     monkeypatch.setattr(runner, "_review_only", review)

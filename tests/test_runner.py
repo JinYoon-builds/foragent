@@ -320,7 +320,7 @@ def test_runner_stop_leaves_orchestrator_stop_labels_and_reason_to_the_verb(run_
 
     def execute(number, ctx, worktree):
         # `fa orch stop` records its outcome and why before signaling the runner.
-        ctx.store.update_run(number, outcome="stopped", detail="stopped: reprioritize")
+        ctx.store.update_run(number, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
         raise SystemExit(143)
 
     monkeypatch.setattr("foragent.runner._execute", execute)
@@ -395,3 +395,81 @@ def test_tracker_exception_after_push_still_cleans_up_and_finishes(run_case, mon
     assert run_issue(1, c.ctx) == "error"
     assert "PR creation unavailable" in c.store.log_path(1).read_text()
     assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+
+
+def test_runner_flags_and_detail_during_a_stop_cannot_erase_its_intent(run_case, monkeypatch):
+    """Finding class 1: the stop intent races with ordinary runner updates."""
+    from foragent.actions import flag
+
+    c = run_case
+
+    def execute(number, ctx, worktree):
+        # `fa orch stop` records its intent, then kills the executor first (children first).
+        ctx.store.update_run(number, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
+        ctx.store.update_run(number, detail="Executor progress overwrote the detail.")
+        flag(ctx, number, Reason.RETRIES_EXCEEDED, "Checks failed after the executor died.")
+        raise RuntimeError("executor killed")
+
+    monkeypatch.setattr("foragent.runner._execute", execute)
+    run_issue(1, c.ctx)
+    run = c.store.get_run(1)
+    # The runner's flags still land; `fa orch stop` sets the destination after every process is gone.
+    assert (run.status, run.outcome, run.detail) == ("finished", "stopped", "stopped: reprioritize")
+
+
+def test_failed_reporting_of_unsaved_work_still_keeps_the_worktree(run_case, monkeypatch):
+    """Finding class 2: failure reporting must never bypass work preservation."""
+    from foragent import run_publish
+
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    c.executor.steps = [{"feature.txt": "unfinished"}]
+    original_git_run, update_run = c.ctx.git._run, c.store.update_run
+
+    def unavailable_push(args):
+        command = args
+        while command[:1] == ["-C"]:
+            command = command[2:]
+        if command[:1] == ["push"]:
+            raise subprocess.CalledProcessError(1, ["git", *args], stderr="Origin unavailable")
+        return original_git_run(args)
+
+    def broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    def no_outcome_write(number, **fields):
+        if fields.get("outcome") == "wip-not-saved":
+            raise OSError("state unavailable")
+        return update_run(number, **fields)
+
+    monkeypatch.setattr(c.ctx.git, "_run", unavailable_push)
+    for name in ("_append", "append_event", "flag"):
+        monkeypatch.setattr(run_publish, name, broken)
+    monkeypatch.setattr(c.store, "update_run", no_outcome_write)
+    assert run_issue(1, c.ctx) == "wip-not-saved"
+    worktree = c.store.worktree_path(1)
+    assert (worktree / "feature.txt").read_text() == "unfinished", "Reporting failures removed the only copy"
+    assert c.store.get_run(1).outcome == "wip-not-saved"
+    monkeypatch.setattr(c.ctx.git, "_run", original_git_run)
+    c.ctx.git.remove_worktree(worktree)  # A person recovers the kept work.
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_tick_completes_a_stop_whose_label_update_failed(run_case):
+    """Finding class 3: a partially completed stop is finished by the next tick, not crashed."""
+    c = run_case
+    c.store.update_run(1, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
+    c.store.finish_run(1, outcome="stopped")
+    c.now[0] += timedelta(seconds=1)
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+    )
+    report = TickReport()
+    _recover_orphan(ctx, c.tracker.get_issue(1), report)
+    labels = c.tracker.get_issue(1).labels
+    assert "ready" in labels and not labels & {"running", "blocked"}, report.actions
+    assert c.store.get_run(1).outcome == "stopped", "Orphan recovery replaced the stop with a crash"
+    events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [event["kind"] for event in events if event["issue"] == 1] == ["stop"]
+    assert "reprioritize" in events[-1]["summary"]

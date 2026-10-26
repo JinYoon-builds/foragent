@@ -127,7 +127,9 @@ from foragent.run_conflicts import (
     _block_rebuild, _rebuild, _rebuild_after_conflicts, _recover_replay, _resume_implementation,
 )
 from foragent.run_implementation import _implement, _prepare_implementation
-from foragent.run_publish import STOPPED, WIP_NOT_SAVED, WipNotSaved, _publish, _push_branch, keep_unsaved_work
+from foragent.run_publish import (
+    STOPPED, WIP_NOT_SAVED, WipNotSaved, _publish, _push_branch, final_outcome, keep_unsaved_work,
+)
 from foragent.run_review import _review_implementation
 
 
@@ -260,10 +262,10 @@ def _implement_and_publish(
         raise
     finally:
         if outcome != "merged":
-            run = ctx.store.get_run(n)
             try:
+                run = ctx.store.get_run(n)
                 _preserve_failed_implementation(
-                    n, ctx, git, run.outcome or outcome, approval=attempt.approval,
+                    n, ctx, git, (run.outcome if run is not None else None) or outcome, approval=attempt.approval,
                     approved_ref=attempt.approved_ref, title=attempt.issue.title, pushed_head=attempt.pushed_head,
                     tracker_available=attempt.tracker_available, push_branch=lambda: _push_branch(attempt),
                 )
@@ -332,9 +334,9 @@ def review_only(
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Review runner exited: {exc}"
-        if started and (stopped := ctx.store.get_run(n)) is not None and stopped.outcome == STOPPED:
+        if started and (stopped := ctx.store.get_run(n)) is not None and stopped.stop_why:
             # `fa orch stop` recorded its why before the signal and owns the labels.
-            outcome, detail = STOPPED, ""
+            outcome = STOPPED
         raise
     finally:
         if started:
@@ -343,8 +345,10 @@ def review_only(
                     ctx.git.remove_worktree(worktree)
             finally:
                 try:
+                    stopping = bool(getattr(ctx.store.get_run(n), "stop_why", ""))
                     # A rate-limit wait is discoverable locally; defer label repair.
-                    if outcome not in {"limit-wait", STOPPED}:
+                    # A run `fa orch stop` is ending leaves its labels to the stop.
+                    if outcome not in {"limit-wait", STOPPED, WIP_NOT_SAVED} and not stopping:
                         current = ctx.tracker.current_issue(n)
                         if current.state == "open" and not current.labels & {BLOCKED, READY}:
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
@@ -356,7 +360,10 @@ def review_only(
                     outcome = "limit-wait"
                 finally:
                     try:
-                        ctx.store.finish_run(n, outcome=outcome, detail=detail)
+                        run = ctx.store.get_run(n)
+                        final = final_outcome(run, outcome)
+                        ctx.store.finish_run(n, outcome=final, detail=(
+                            f"{STOPPED}: {run.stop_why}" if final == STOPPED and run is not None else detail))
                     finally:
                         kick_tick(ctx.repo_root)
     return outcome
@@ -403,7 +410,7 @@ def run_issue(n: int, ctx: RunContext) -> str:
         outcome = "killed"
         detail = f"Runner exited: {exc}"
         stopped = ctx.store.get_run(n)
-        if stopped is None or stopped.outcome not in {"stalled-restart", STOPPED}:
+        if stopped is None or (stopped.outcome != "stalled-restart" and not stopped.stop_why):
             # A handled stop must not look like an orphan to the next tick.
             ctx.tracker.add_labels(n, [BLOCKED])
             ctx.tracker.remove_labels(n, [READY, RUNNING])
@@ -415,8 +422,10 @@ def run_issue(n: int, ctx: RunContext) -> str:
         try:
             run = ctx.store.get_run(n)
             if run is not None and run.status != "finished":
-                ctx.store.finish_run(n, outcome=run.outcome or outcome,
-                                     detail="" if run.outcome == STOPPED else detail)
+                # Lost work wins over every recorded outcome, then a stop's own record.
+                final = final_outcome(run, outcome, recorded_first=True)
+                ctx.store.finish_run(n, outcome=final,
+                                     detail=f"{STOPPED}: {run.stop_why}" if final == STOPPED else detail)
         finally:
             kick_tick(ctx.repo_root)
     return outcome

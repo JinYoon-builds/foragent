@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
@@ -129,3 +130,57 @@ def stop_target_refusal(run: Run) -> str | None:
     if run.pid not in identities:
         return f"recorded runner PID {run.pid} has no recorded process identity; ownership cannot be verified"
     return None
+
+
+def stop_summary(number: int, why: str) -> str:
+    return f"#{number}: stopped and kept unfinished work on foragent/issue-{number}; why: {why}"
+
+
+def complete_stop(ctx: TickContext, run: Run) -> str:
+    """Finish an issue whose run `fa orch stop` ended; returns a summary note.
+
+    The stop event is required, so it is journaled first and once per run; the
+    labels follow. Every step is idempotent, so a tick's orphan recovery repeats
+    whatever a failed stop left. As `fa orch retry`, the issue returns to ready:
+    a hold or this issue's own open PR (which a tick would otherwise read as
+    review) is cleared, and the next run resumes from the issue branch.
+    """
+    number = run.number
+    journal = ctx.store.root / "orch-events.jsonl"
+    started = scheduler.datetime.fromisoformat(run.started_at)
+    recorded = journal.exists() and any(
+        event.get("issue") == number and event.get("kind") == "stop"
+        and scheduler.datetime.fromisoformat(event["at"]) >= started
+        for event in map(json.loads, journal.read_text(encoding="utf-8").splitlines())
+    )
+    if not recorded:
+        scheduler.append_event(ctx.store, ctx.now(), number, "stop", stop_summary(number, run.stop_why))
+    issue = ctx.tracker.get_issue(number)
+    if issue.state != "open":
+        ctx.tracker.remove_labels(number, [scheduler.RUNNING])
+        return "; the issue is closed, so it was not returned to ready"
+    note = ""
+    if (pr := ctx.tracker.find_pr(f"foragent/issue-{number}")) is not None:
+        ctx.tracker.close_pr(pr, f"Closed by Foragent orchestrator stop; the next run resumes from the issue branch. "
+                                 f"Why: {run.stop_why}")
+        note = f"; closed PR #{pr} so the next run resumes from the branch"
+    ctx.tracker.add_labels(number, [scheduler.READY])
+    ctx.tracker.remove_labels(number, [scheduler.RUNNING, scheduler.BLOCKED, scheduler.NEEDS_HUMAN])
+    scheduler.board.sync_status(ctx, number, "Ready")
+    return note
+
+
+def clear_stale_stop(ctx: TickContext, run: Run) -> Run:
+    """Drop a stop intent left on a live run by a `fa orch stop` that died before signaling.
+
+    The stop holds the tick lock from its intent to its labels, so a tick that
+    sees an intent on a live runner knows no stop is in progress. Left in place,
+    the intent would silence the runner's own flags and end it as stopped.
+    """
+    if not run.stop_why:
+        return run
+    from foragent.run_publish import STOPPED
+
+    scheduler.append_event(ctx.store, ctx.now(), run.number, "stop-abandoned",
+                           f"#{run.number}: a stop ended before signaling the runner; why: {run.stop_why}")
+    return ctx.store.update_run(run.number, stop_why="", **({"outcome": None} if run.outcome == STOPPED else {}))
