@@ -4,11 +4,23 @@ on:
   push:
     branches: [main]
 jobs:
-  test:
+  collect:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - run: git config --global user.email ci@localhost && git config --global user.name ci
       - run: uv run pytest --collect-only -q
-      - run: uv run pytest -q --ignore=tests/acceptance -m 'not local_only'
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: git config --global user.email ci@localhost && git config --global user.name ci
+      - run: uv run python -m foragent.ci_unit_shard
+        env:
+          FA_SHARD: ${{ matrix.shard }}
+          FA_SHARDS: 4
