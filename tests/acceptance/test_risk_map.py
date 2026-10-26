@@ -47,7 +47,7 @@ FULL_REVIEW_INSTRUCTIONS = (
     "or would make the Done when commands pass without the goal being met "
     "(weakened checks, special-casing test inputs). Ignore style and nice-to-haves. "
     "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
-    "followed by at most 5 findings, each one line with file:line and the concrete failure."
+    "followed by every finding, each one line with file:line and the concrete failure."
 )
 FULL_SCOPE_RULES = (
     "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
