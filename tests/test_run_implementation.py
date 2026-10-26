@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -30,7 +31,13 @@ def test_question_stops_before_checks_and_is_truncated(run_case):
     comment = c.tracker.list_comments(1)[-1].body
     assert parse_reason(comment) == Reason.SPEC_QUESTION
     assert "Choose A or B; recommend A." in comment
-    assert comment.endswith("q" * 100) and len(comment.split("\n\n", 1)[1]) == 6000
+    # The 6000-character limit stays and names what it left out (#420).
+    details = comment.split("\n\n", 1)[1]
+    kept, notice = details.split("[cut: ", 1)
+    assert len(kept) == 6000 and kept.endswith("q" * 100)
+    assert notice.startswith(f"{len('Choose A or B; recommend A.') + 1 + 7000 - 6000} more chars; full text: ")
+    saved = Path(notice.split("full text: ", 1)[1].rstrip("]"))
+    assert saved.read_text().endswith("q" * 7000)
     assert not any(args[:1] == ["add"] for _, args in c.operations)
     assert c.tracker.created_prs == []
 
@@ -100,3 +107,98 @@ def test_claude_tier_model_and_lane_precedence(run_case, lane_model, expected):
     assert kinds == ["claude"]
     assert [call["model"] for call in c.executor.calls] == expected
     assert all("effort" not in call for call in c.executor.calls)
+
+
+def test_new_attempt_reads_the_saved_failure_bundle_not_the_short_detail(run_case):
+    """#420: a retry after rerun-review gets every saved failing command, whatever the run detail says."""
+    from foragent import cuts
+
+    c = run_case
+    bundle = "Command: first\nfirst output\n\nCommand: second\nsecond output"
+    cuts.save_full(cuts.failures_path(c.store.root, 1).parent, cuts.FAILURES_FILE, bundle)
+    c.store.update_run(1, detail="Done when failed on the PR head.", resume_reason="checks-failed")
+    assert run_issue(1, c.ctx) == "merged"
+    prompt = c.executor.calls[0]["prompt"]
+    assert "first output" in prompt and "second output" in prompt
+    assert prompt.count("second output") == 1
+
+
+@pytest.mark.parametrize("resumed", [False, True], ids=["fresh", "resumed"])
+def test_saved_review_reaches_the_next_attempt_whole(run_case, resumed):
+    """#420: after rerun-review FAIL then retry, every saved finding reaches the implementer, fresh or resumed."""
+    from foragent import cuts
+
+    c = run_case
+    findings = [f"src/feature_{n}.py:{n} — retry drops required field_{n}. " + "x" * 400 for n in range(1, 10)]
+    review = cuts.issue_dir(c.store.root, 1) / "review-1.txt"
+    review.parent.mkdir(parents=True, exist_ok=True)
+    review.write_text("VERDICT: FAIL\n" + "\n".join(findings), encoding="utf-8")
+    c.store.update_run(1, detail="Re-run review FAIL.", resume_reason="retries-exceeded\nRe-run review FAIL.")
+    if resumed:
+        c.store.update_run(1, session_id="saved", session_executor=c.ctx.config.executor,
+                           session_body=c.store.load_approval(1).body)
+    assert run_issue(1, c.ctx) == "merged"
+    call = c.executor.calls[0]
+    assert (call.get("resume_session_id") == "saved") is resumed
+    missing = [finding for finding in findings if finding not in call["prompt"]]
+    assert not missing, f"{len(missing)} of 9 saved findings lost"
+
+
+def test_exception_during_checks_keeps_the_failures_gathered_before_it(run_case, monkeypatch):
+    """#420: command A fails, launching command B raises; A's failure still reaches the next attempt."""
+    from foragent import cuts, runner
+    from foragent.run_checks import CheckResult
+    from runner_support import set_done_when
+
+    c = run_case
+    set_done_when(c, ["check-a", "check-b"])
+
+    def check(command, *args, **kwargs):
+        if command == "check-b":
+            raise OSError("cannot launch check-b")
+        return CheckResult(command, 1, False, "A failed output")
+
+    monkeypatch.setattr(runner, "_check", check)
+    run_issue(1, c.ctx)
+    assert "A failed output" in cuts.failures_path(c.store.root, 1).read_text()
+
+
+def test_duplicate_done_when_command_failure_is_not_hidden_by_a_later_pass(run_case, monkeypatch):
+    """#420: the same command listed twice, failing once, still fails verification."""
+    from foragent import runner
+    from foragent.run_checks import CheckResult
+    from runner_support import set_done_when
+
+    c = run_case
+    set_done_when(c, ["check-same", "check-same"])
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    runs = []
+
+    def check(command, *args, **kwargs):
+        runs.append(command)
+        return CheckResult(command, 1 if len(runs) == 1 else 0, False, "first invocation broke")
+
+    monkeypatch.setattr(runner, "_check", check)
+    assert run_issue(1, c.ctx) != "merged"
+
+
+def test_reverification_interruption_keeps_first_pass_failures(run_case, monkeypatch):
+    """#420: checks change tracked files, the second pass cannot launch; first-pass failures survive."""
+    from foragent import cuts, runner
+    from foragent.run_checks import CheckResult
+    from runner_support import set_done_when
+
+    c = run_case
+    set_done_when(c, ["check-a"])
+    passes = []
+
+    def check(command, worktree, *args, **kwargs):
+        passes.append(command)
+        if len(passes) == 1:
+            (Path(worktree) / f"generated-{len(passes)}.txt").write_text("changed by the check")
+            return CheckResult(command, 1, False, "first pass broke")
+        raise OSError("second pass cannot launch")
+
+    monkeypatch.setattr(runner, "_check", check)
+    run_issue(1, c.ctx)
+    assert "first pass broke" in cuts.failures_path(c.store.root, 1).read_text()

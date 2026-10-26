@@ -40,12 +40,31 @@ class LocalRecordsMixin:
     def save_approval(
         self, number: int, *, body: str, body_sha: str,
         acceptance_blobs: dict[str, str], approved_by: str, approved_at: str,
+        parent_context: str | None = None,
     ) -> None:
         snapshot = {
             "number": number, "body": body, "body_sha": body_sha, "acceptance_blobs": acceptance_blobs,
             "approved_by": approved_by, "approved_at": approved_at,
         }
-        self._write_mapping(self.root / "approvals" / f"{number}.json", _state.Approval, snapshot)
+        if parent_context is not None:
+            snapshot["parent_context"] = parent_context
+        with self._state_lock():
+            self._write_mapping(self.root / "approvals" / f"{number}.json", _state.Approval, snapshot)
+
+    def freeze_parent_context(self, number: int, read_for: Approval, parent_context: str) -> Approval | None:
+        """Store parent text only on the approval it was read for; a newer approval wins.
+
+        Returns the current approval, which is a different one if it changed meanwhile.
+        """
+        with self._state_lock():
+            current = self.load_approval(number)
+            if current is None or _approval_identity(current) != _approval_identity(read_for):
+                return current
+            if current.parent_context is None:
+                current = _state.replace(current, parent_context=parent_context)
+                self._write_mapping(self.root / "approvals" / f"{number}.json", _state.Approval,
+                                    _state.asdict(current))
+            return current
 
     def load_approval(self, number: int) -> Approval | None:
         path = self.root / "approvals" / f"{number}.json"
@@ -56,7 +75,8 @@ class LocalRecordsMixin:
         return _state.load_record(_state.Approval, snapshot)
 
     def clear_approval(self, number: int) -> None:
-        (self.root / "approvals" / f"{number}.json").unlink(missing_ok=True)
+        with self._state_lock():
+            (self.root / "approvals" / f"{number}.json").unlink(missing_ok=True)
 
     def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None) -> None:
         self._write_mapping(self.root / "flags" / f"{number}.json", _state.Flag, {
@@ -115,3 +135,7 @@ class LocalRecordsMixin:
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
+
+
+def _approval_identity(approval: Approval) -> tuple:
+    return approval.body_sha, approval.approved_by, approval.approved_at, approval.acceptance_blobs
