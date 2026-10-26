@@ -81,8 +81,9 @@ from foragent.scheduler_lanes import (  # noqa: E402
 
 def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired:
-        if not acquired:
+        if not acquired:  # The tick that holds the lock renews the gate heartbeat.
             return TickReport(skipped=BUSY_TICK)
+        ctx.store.write_heartbeat("gate", ctx.now())
         with tick_processes(ctx.store) as snapshot:
             cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
             if snapshot.available:
@@ -102,8 +103,7 @@ def tick(ctx: TickContext) -> TickReport:
                 until = orch_github.pause(ctx, exc)
                 _apply_budgets(ctx, {})
                 return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
-            # After this tick's starts, so idle lanes are really idle. A due tidy is a
-            # request for the orchestrator's judgment, never a launch or an order.
+            # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
             if request := tidy.post_if_due(ctx.store):
                 report.actions.append(f"Tidy due; inbox request {request['id']}")
             return report
