@@ -271,6 +271,27 @@ def test_refresh_preserves_local_writes_during_remote_reads(ctx, monkeypatch, du
     )
 
 
+def test_tick_opens_orchestrator_on_both_github_wait_returns(ctx, monkeypatch):
+    from foragent import orch_spawn
+
+    spawned = []
+    monkeypatch.setattr(orch_spawn, "ensure_orchestrator",
+                        lambda root, store, config, *, now: spawned.append(now) or "tmux")
+    until = NOW + timedelta(minutes=10)
+
+    def unavailable():
+        raise TrackerError("API rate limit exceeded (HTTP 403)",
+                           stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    monkeypatch.setattr(ctx.tracker, "list_issues", unavailable)
+    first = tick(ctx)  # The wait starts inside the tick.
+    assert "GitHub rate limit" in first.skipped and len(spawned) == 1
+    assert "Opened an orchestrator (tmux)" in first.actions
+    second = tick(ctx)  # The recorded wait returns before any GitHub call.
+    assert "GitHub rate limit" in second.skipped and len(spawned) == 2
+    assert "Opened an orchestrator (tmux)" in second.actions
+
+
 @pytest.mark.parametrize("message,limited", [
     ("API rate limit exceeded (HTTP 403)", True),
     ("HTTP 422 Validation Failed", False),

@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, orch_queue, tidy, usage_recheck, watch_open
+from foragent import board, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -91,7 +91,7 @@ def tick(ctx: TickContext) -> TickReport:
             usage_recheck.recheck(ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
             if until := ctx.store.github_wait_until(ctx.now()):
                 _apply_budgets(ctx, {})
-                return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
+                return orch_spawn.on_tick(ctx, TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions))
             if not isinstance(ctx.tracker, RecordingTracker):
                 ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
             try:
@@ -102,8 +102,8 @@ def tick(ctx: TickContext) -> TickReport:
                     raise
                 until = orch_github.pause(ctx, exc)
                 _apply_budgets(ctx, {})
-                return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
-            # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
+                return orch_spawn.on_tick(ctx, TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions))
+            orch_spawn.on_tick(ctx, report)  # After this tick's starts (idle lanes really idle): D76, then a due tidy.
             if request := tidy.post_if_due(ctx.store):
                 report.actions.append(f"Tidy due; inbox request {request['id']}")
             return report
