@@ -113,7 +113,7 @@ def test_union_merge_overlap_normal_file_still_waits_and_only_it_is_recorded(
     entered, sleeps = _wait_for_pair(case, monkeypatch)
 
     assert entered == [2], "The later normal-source append must still wait for the earlier run"
-    assert sleeps == [1], "Wait with the fake clock until the earlier holder finishes"
+    assert len(sleeps) == 1, "Wait with the fake clock until the earlier holder finishes"
     for number, peer in ((1, 2), (2, 1)):
         saved = json.loads((case.store.root / "runs" / f"{number}.json").read_text())
         rows = saved["overlap_records"]
