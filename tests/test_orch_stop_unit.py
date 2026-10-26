@@ -101,7 +101,10 @@ def test_refused_kill_restores_the_recorded_outcome(tmp_path, monkeypatch):
 
 class _Labels:
     def __init__(self):
-        self.calls = []
+        self.calls, self.pr = [], None
+
+    def find_pr(self, head):
+        return self.pr
 
     def add_labels(self, n, labels):
         self.calls.append(("add", n, tuple(labels)))
@@ -162,15 +165,49 @@ def test_busy_tick_lock_refuses_without_changes(tmp_path, monkeypatch):
     assert store.get_run(1) == before and labels.calls == [] and events == []
 
 
-def test_kill_success_with_another_finished_outcome_is_not_a_stop(tmp_path, monkeypatch):
+@pytest.mark.parametrize("outcome", ["killed", "wip-not-saved"])
+def test_kill_success_with_another_finished_outcome_is_not_a_stop(tmp_path, monkeypatch, outcome):
     store, ctx, labels, events = _running_store(tmp_path, monkeypatch)
 
     def kill(tick_ctx, number, report, **kwargs):
-        # A runner whose handler ignored the stop finishes the record first.
-        store.finish_run(number, outcome="killed")
+        # A runner that ignored the stop, or could not save its work, finished the record.
+        store.finish_run(number, outcome=outcome)
         return True
 
     monkeypatch.setattr(scheduler, "_kill_run", kill)
-    with pytest.raises(orch.OrchError, match="finished as killed"):
+    with pytest.raises(orch.OrchError, match=f"finished as {outcome}"):
         orch.stop(ctx, 1, "reprioritize")
     assert labels.calls == [] and events == []
+
+
+def test_runner_mark_of_unsaved_work_survives_a_refused_stop(tmp_path, monkeypatch):
+    store, ctx, labels, events = _running_store(tmp_path, monkeypatch)
+
+    def kill(tick_ctx, number, report, **kwargs):
+        store.update_run(number, outcome="wip-not-saved")  # The runner's failed save, mid-stop.
+        return False
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    with pytest.raises(orch.OrchError, match="still running"):
+        orch.stop(ctx, 1, "reprioritize")
+    assert store.get_run(1).outcome == "wip-not-saved" and labels.calls == []
+
+
+def test_stop_with_an_open_pr_blocks_instead_of_a_ready_that_a_tick_would_clear(tmp_path, monkeypatch, kicks):
+    store, ctx, labels, events = _running_store(tmp_path, monkeypatch)
+    labels.pr = 7
+    flags = []
+    monkeypatch.setattr(scheduler, "flag", lambda tick_ctx, n, reason, summary, details=None:
+                        flags.append((n, reason, summary, details)))
+
+    def kill(tick_ctx, number, report, **kwargs):
+        store.finish_run(number, outcome="stopped")
+        return True
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    summary = orch.stop(ctx, 1, "reprioritize")
+    assert flags == [(1, scheduler.Reason.RETRIES_EXCEEDED,
+                      "Stopped with open PR #7; rerun review or retry implementation.", "Stop reason: reprioritize")]
+    assert ("add", 1, ("ready",)) not in labels.calls
+    assert "PR #7 is open" in summary and "fa orch retry 1" in summary
+    assert [kind for _, kind, _ in events] == ["stop"]

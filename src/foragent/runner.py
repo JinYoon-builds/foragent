@@ -125,7 +125,7 @@ from foragent.run_attempt import (
 from foragent.run_checks import _verify_implementation
 from foragent.run_conflicts import _block_rebuild, _rebuild, _recover_replay, _resume_implementation
 from foragent.run_implementation import _implement, _prepare_implementation
-from foragent.run_publish import STOPPED, _publish, _push_branch
+from foragent.run_publish import STOPPED, WIP_NOT_SAVED, WipNotSaved, _publish, _push_branch, keep_unsaved_work
 from foragent.run_review import _review_implementation
 
 
@@ -255,11 +255,14 @@ def _implement_and_publish(
     finally:
         if outcome != "merged":
             run = ctx.store.get_run(n)
-            _preserve_failed_implementation(
-                n, ctx, git, run.outcome or outcome, approval=attempt.approval, approved_ref=attempt.approved_ref,
-                title=attempt.issue.title, pushed_head=attempt.pushed_head, tracker_available=attempt.tracker_available,
-                push_branch=lambda: _push_branch(attempt),
-            )
+            try:
+                _preserve_failed_implementation(
+                    n, ctx, git, run.outcome or outcome, approval=attempt.approval,
+                    approved_ref=attempt.approved_ref, title=attempt.issue.title, pushed_head=attempt.pushed_head,
+                    tracker_available=attempt.tracker_available, push_branch=lambda: _push_branch(attempt),
+                )
+            except Exception as exc:
+                raise WipNotSaved(keep_unsaved_work(n, ctx, git.root, exc)) from exc
 
 
 def review_only(
@@ -270,7 +273,7 @@ def review_only(
     outcome = "error"
     detail = ""
     previous = ctx.store.get_run(n)
-    started = False
+    started = kept = False
     try:
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
@@ -304,6 +307,9 @@ def review_only(
     except ExecutorStopped as exc:
         outcome = exc.outcome
         detail = str(exc)
+    except WipNotSaved as exc:
+        # CI repair could not save its work; the worktree is the only copy (already flagged).
+        outcome, detail, kept = WIP_NOT_SAVED, str(exc), True
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         if not started:
@@ -327,7 +333,8 @@ def review_only(
     finally:
         if started:
             try:
-                ctx.git.remove_worktree(worktree)
+                if not kept:
+                    ctx.git.remove_worktree(worktree)
             finally:
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
@@ -364,13 +371,20 @@ def run_issue(n: int, ctx: RunContext) -> str:
         from foragent.run_implementation import lane_config
 
         ctx = replace(ctx, config=lane_config(ctx.config, run.lane))
+        kept = False
         try:
             outcome = _execute(n, ctx, worktree)
+        except WipNotSaved:
+            kept = True  # The only copy of the unfinished work is this worktree.
+            raise
         finally:
-            ctx.git.remove_worktree(worktree)
+            if not kept:
+                ctx.git.remove_worktree(worktree)
     except ExecutorStopped as exc:
         outcome = exc.outcome
         detail = str(exc)
+    except WipNotSaved as exc:
+        outcome, detail = WIP_NOT_SAVED, str(exc)  # Already flagged by keep_unsaved_work.
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())

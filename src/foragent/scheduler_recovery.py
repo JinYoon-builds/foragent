@@ -9,6 +9,7 @@ from foragent import processes, scheduler
 from foragent.scheduler_stop import (
     _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes,
 )
+from foragent.run_publish import WIP_NOT_SAVED, keep_unsaved_work
 from foragent.state import Run
 from foragent.tracker import Issue
 
@@ -27,21 +28,19 @@ def _kill_executor(ctx: TickContext, number: int) -> None:
 
 def _remove_run_worktree(
     ctx: TickContext, number: int, worktree: Path, report: TickReport, *, outcome: str,
-) -> None:
-    try:
-        if worktree.exists() and outcome != "merged":
-            try:
-                scheduler._preserve_failed_implementation(
-                    number, ctx, ctx.git.at(worktree), outcome, approval=ctx.store.load_approval(number),
-                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None,
-                )
-            except Exception as exc:
-                detail = f"WIP preservation failed before worktree cleanup: {exc}"
-                scheduler._append(ctx.store.log_path(number), detail)
-                scheduler.append_event(ctx.store, ctx.now(), number, "wip-preservation-failed", detail)
-                report.actions.append(f"#{number} {detail}")
-    finally:
-        ctx.git.remove_worktree(worktree)
+) -> bool:
+    """Save unfinished work, then remove the worktree; False keeps it after a failed save."""
+    if worktree.exists() and outcome != "merged":
+        try:
+            scheduler._preserve_failed_implementation(
+                number, ctx, ctx.git.at(worktree), outcome, approval=ctx.store.load_approval(number),
+                tracker_available=ctx.store.github_wait_until(ctx.now()) is None,
+            )
+        except Exception as exc:
+            report.actions.append(f"#{number} {keep_unsaved_work(number, ctx, worktree, exc)}")
+            return False
+    ctx.git.remove_worktree(worktree)
+    return True
 
 
 def _kill_run(
@@ -65,7 +64,9 @@ def _kill_run(
         if stopped == "gone":
             _finish_dead_run(ctx, run, report)
         return False
-    scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome)
+    if not scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome):
+        ctx.store.finish_run(number, outcome=WIP_NOT_SAVED)
+        return False  # Flagged with the worktree kept; no caller may restart or report a clean stop.
     ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
     report.actions.append(f"#{number} runner killed")
     return True
@@ -138,10 +139,11 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         ctx.store.clear_run_start(issue.number)
     if scheduler.RUNNING not in issue.labels or (run is not None and run.status == "running"):
         return issue
-    scheduler._remove_run_worktree(
+    if not scheduler._remove_run_worktree(
         ctx, issue.number, scheduler.Path(run.worktree) if run is not None else ctx.store.worktree_path(issue.number),
         report, outcome=(run.outcome or "crashed") if run is not None else "crashed",
-    )
+    ):
+        return ctx.tracker.get_issue(issue.number)  # Flagged; the kept worktree is not a crash to restart.
     if run is not None and run.outcome == "merged":
         ctx.tracker.remove_labels(issue.number, [scheduler.READY, scheduler.RUNNING])
         return ctx.tracker.get_issue(issue.number)
@@ -250,7 +252,9 @@ def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
     outcome = run.outcome or "crashed"
     if run.executor_pgid is not None:
         ctx.store.update_run(run.number, executor_pgid=None)
-    scheduler._remove_run_worktree(ctx, run.number, scheduler.Path(run.worktree), report, outcome=outcome)
+    if not scheduler._remove_run_worktree(ctx, run.number, scheduler.Path(run.worktree), report, outcome=outcome):
+        ctx.store.finish_run(run.number, outcome=WIP_NOT_SAVED)
+        return  # Flagged with the worktree kept; neither stall nor crash recovery applies.
     detail = scheduler._crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
     finished = ctx.store.finish_run(run.number, outcome=outcome, detail=detail)
     if finished.outcome in {"stalled-restart", "stalled"}:

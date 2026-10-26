@@ -229,18 +229,26 @@ def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
         scheduler._kill_run(tick_ctx, n, report, outcome=STOPPED, detail=detail)
     finally:
         current = ctx.store.get_run(n)
-        if current is not None and current.status == "running":
+        if current is not None and current.status == "running" and current.outcome == STOPPED:
+            # Undo only this verb's own mark; a runner's wip-not-saved stays.
             ctx.store.update_run(n, outcome=run.outcome, detail=run.detail)
     # Success is the finished record, whichever process wrote it, never the kill's return.
     if current is None or current.status != "finished" or current.outcome != STOPPED:
         state = "still running" if current is not None and current.status == "running" else (
             f"finished as {current.outcome}" if current is not None else "no run record")
         raise OrchError(f"#{n}: stop did not complete ({state}): {'; '.join(report.actions) or 'no action'}")
-    # Ready is the destination; the next run resumes from the WIP on the issue branch.
-    tick_ctx.tracker.add_labels(n, [READY])
-    tick_ctx.tracker.remove_labels(n, [RUNNING])
-    scheduler.board.sync_status(tick_ctx, n, "Ready")
     summary = f"#{n}: stopped and kept unfinished work on foragent/issue-{n}; why: {why}"
+    if (pr := tick_ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
+        # A tick clears ready while the PR is open, so ready would never restart.
+        # As for a crash or stall with an open PR, the orchestrator chooses the next step.
+        scheduler.flag(tick_ctx, n, scheduler.Reason.RETRIES_EXCEEDED,
+                       f"Stopped with open PR #{pr}; rerun review or retry implementation.", f"Stop reason: {why}")
+        summary += f"; blocked because PR #{pr} is open: run `fa orch rerun-review {n}` or `fa orch retry {n}`"
+    else:
+        # Ready is the destination; the next run resumes from the WIP on the issue branch.
+        tick_ctx.tracker.add_labels(n, [READY])
+        tick_ctx.tracker.remove_labels(n, [RUNNING])
+        scheduler.board.sync_status(tick_ctx, n, "Ready")
     _event(ctx, n, "stop", summary)
     return summary
 

@@ -594,3 +594,27 @@ def test_review_only_stopped_by_orchestrator_keeps_reason_and_leaves_labels(revi
     assert c.store.load_flag(1) == flag_before, "A stopped review must not be flagged blocked"
     c.tracker.add_labels(1, ["ready"])  # `fa orch stop` then returns it to ready
     c.tracker.remove_labels(1, ["running"])
+
+
+def test_review_ci_repair_keeps_worktree_when_its_work_cannot_be_saved(review_case, monkeypatch):
+    from foragent.run_attempt import AttemptFailure
+    from foragent.run_publish import WipNotSaved, keep_unsaved_work
+
+    c = review_case
+    worktree = c.store.worktree_path(1)
+
+    def failing_ci(n, ctx, path, verdict_head):
+        ctx.git.add_detached_worktree(path, c.head)
+        raise AttemptFailure("CI failed", "main")
+
+    def unsaved_repair(n, ctx, git, **kwargs):
+        (git.root / "repair.txt").write_text("unfinished repair\n")
+        raise WipNotSaved(keep_unsaved_work(n, ctx, git.root, RuntimeError("push unavailable")))
+
+    monkeypatch.setattr(runner, "_review_only", failing_ci)
+    monkeypatch.setattr(runner, "_implement_and_publish", unsaved_repair)
+    assert runner.review_only(1, c.ctx) == "wip-not-saved"
+    assert (worktree / "repair.txt").read_text() == "unfinished repair\n", "The only copy was deleted"
+    assert c.store.get_run(1).outcome == "wip-not-saved"
+    assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"blocked"}
+    c.ctx.git.remove_worktree(worktree)  # A person recovers the kept work.

@@ -14,6 +14,7 @@ from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, enabled, require_comparison, stage_exclusions
 from foragent.git import GitError, GitRepo, PublicationError
 from foragent.issue import ParsedIssue, body_hash
+from foragent.orch_events import append_event
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
@@ -28,6 +29,8 @@ from foragent.tracker import TrackerError
 
 # A run outcome `fa orch stop` records before signaling; its detail is the why.
 STOPPED = "stopped"
+# A run outcome: unfinished work could not be saved, so its worktree was kept.
+WIP_NOT_SAVED = "wip-not-saved"
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
@@ -351,6 +354,31 @@ def _check_publication(git: GitRepo, target_branch: str, base_sha: str | None = 
         git.check_publication(base_sha)
     except PublicationError as exc:
         raise AttemptFailure(str(exc), target_branch) from exc
+
+
+class WipNotSaved(Exception):
+    """Unfinished work could not be saved; its worktree must be kept."""
+
+
+def keep_unsaved_work(n: int, ctx: FlagContext, worktree: Path, error: BaseException) -> str:
+    """Record a failed WIP save without removing its worktree; block the issue for recovery.
+
+    No caller may then report a stop as done or return the issue to ready:
+    the run outcome becomes WIP_NOT_SAVED and the issue is flagged.
+    """
+    reason = " ".join(str(error).split()) or type(error).__name__
+    detail = f"WIP preservation failed; worktree kept at {worktree}: {reason}"
+    _append(ctx.store.log_path(n), detail)
+    append_event(ctx.store, ctx.now(), n, "wip-preservation-failed", detail)
+    run = ctx.store.get_run(n)
+    if run is not None and run.status == "running":
+        ctx.store.update_run(n, outcome=WIP_NOT_SAVED)
+    try:
+        flag(ctx, n, Reason.RETRIES_EXCEEDED,
+             "Unfinished work could not be saved; its worktree is kept for recovery.", detail)
+    except Exception as exc:  # The kept worktree and run outcome still hold the issue.
+        _append(ctx.store.log_path(n), f"Flagging the unsaved work failed: {exc}")
+    return detail
 
 
 def _preserve_failed_implementation(

@@ -111,7 +111,10 @@ def test_retry_reads_saved_branch_before_worker_even_without_both_copies(run_cas
     with monkeypatch.context() as patch:
         if saved_at == "local":
             patch.setattr(c.ctx.git, "_run", unavailable_push)
-        assert run_issue(1, c.ctx) == ("error" if saved_at == "local" else "retries-exceeded")
+        assert run_issue(1, c.ctx) == ("wip-not-saved" if saved_at == "local" else "retries-exceeded")
+    # A failed push is a failed save: the runner keeps its worktree and blocks the issue.
+    assert c.store.worktree_path(1).exists() == (saved_at == "local")
+    assert ("blocked" in c.tracker.get_issue(1).labels) and "running" not in c.tracker.get_issue(1).labels
     if saved_at == "origin":
         # Model a new clone that has the remote WIP but no local issue branch.
         git_command(c.history.clone, "update-ref", "-d", f"refs/heads/{branch}")
@@ -175,7 +178,7 @@ def test_scheduler_preserves_wip_after_real_process_death(run_case, fake_process
 
 @pytest.mark.parametrize("cleanup", ["kill", "crash", "orphan"])
 @pytest.mark.parametrize("failure", ["stage", "push"])
-def test_scheduler_records_preservation_failure_and_still_removes_worktree(run_case, monkeypatch, cleanup, failure):
+def test_scheduler_preservation_failure_keeps_worktree_and_blocks_issue(run_case, monkeypatch, cleanup, failure):
     c = run_case
     path = c.store.worktree_path(1)
     c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
@@ -208,15 +211,24 @@ def test_scheduler_records_preservation_failure_and_still_removes_worktree(run_c
         c.store.finish_run(1, "error")
         c.now[0] += timedelta(seconds=1)
         _recover_orphan(ctx, c.tracker.get_issue(1), report)
-    assert not path.exists() and c.store.get_run(1).status == "finished"
+    # A failed save never removes the only copy, nor restarts the issue as a crash.
+    assert (path / "unfinished.txt").read_text() == "partial implementation\n"
+    run = c.store.get_run(1)
+    assert run.status == "finished"
+    assert run.outcome == ("error" if cleanup == "orphan" else "wip-not-saved")
+    assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"blocked"}
+    assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
     events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
     failures = [event for event in events if event["kind"] == "wip-preservation-failed"]
     assert len(failures) == 1 and f"{failure} unavailable" in failures[0]["summary"]
+    assert "worktree kept" in failures[0]["summary"]
+    assert not any(event["kind"] == "crash-restart" for event in events)
     assert "WIP preservation failed" in c.store.log_path(1).read_text()
     assert any("WIP preservation failed" in action for action in report.actions)
     if failure == "push":
         assert git_command(c.history.clone, "show", "foragent/issue-1:unfinished.txt") == "partial implementation"
-    c.tracker.remove_labels(1, ["running"])
+    monkeypatch.setattr(c.ctx.git, "_run", git_run)
+    c.ctx.git.remove_worktree(path)  # A person recovers the kept work.
 
 
 def test_scheduler_keeps_unverified_wip_local_with_open_pr(run_case):
