@@ -84,8 +84,7 @@ def _add_inbox(orch_actions) -> None:
     queue.add_argument("--clear", action="store_true")
     queue.add_argument("--json", action="store_true")
     queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-    facts = orch_actions.add_parser(
-        "facts", help="Show measured run, test-slot, file, failure and resource facts from local records")
+    facts = orch_actions.add_parser("facts", help="Show measured run, slot, file and resource facts")
     facts.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     facts.add_argument("--json", action="store_true")
     reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")

@@ -291,12 +291,7 @@ def _capture_acceptance_baseline(
 
     def wait(acquire) -> None:
         # Waiting for another run's build of the same baseline is its own phase.
-        inside = phase_identity(ctx.store.get_run(n))
-        _phase(n, ctx, "baseline-wait")
-        try:
-            _credited_wait(n, ctx, acquire)
-        finally:
-            restore_phase(n, ctx, inside)
+        _credited_wait(n, ctx, acquire, "baseline-wait")
 
     previous = phase_identity(ctx.store.get_run(n))
     try:

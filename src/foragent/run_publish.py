@@ -83,7 +83,7 @@ def _merge_lock(n: int, ctx: RunContext):
                 stack.enter_context(ctx.store.merge_lock())
                 started = ctx.now()
 
-            _credited_wait(n, ctx, acquire)
+            _credited_wait(n, ctx, acquire, "merge-lock-wait", eager=False)  # Phase only if it waits.
             yield
     finally:
         if started is not None:

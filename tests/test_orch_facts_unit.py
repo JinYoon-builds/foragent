@@ -560,17 +560,29 @@ def test_tidy_done_writes_one_boundary_moment(env):
     assert event["at"] == store.tidy_state()["last_tidy_at"] == NOW.isoformat()
 
 
-def test_observed_load_respects_cpu_busy_off(tmp_path, monkeypatch):
+@pytest.mark.parametrize("seconds,expected_busy", [(100.0, 0.75), (1.0, 0.06)], ids=["fresh", "short-interval"])
+def test_observed_load_uses_the_gates_busy_rule(tmp_path, monkeypatch, seconds, expected_busy):
     import os
+    from collections import namedtuple
 
+    import psutil
+
+    CPU = namedtuple("CPU", "user system idle")
     (tmp_path / "machine-data").mkdir(exist_ok=True)
-    (tmp_path / "machine-data" / capacity.SENSOR_FILE).write_text(json.dumps({"cpu_busy": 0.06}))
+    saved = {"cpu_total": 1000.0, "cpu_idle": 900.0, "cpu_busy": 0.06}
+    (tmp_path / "machine-data" / capacity.SENSOR_FILE).write_text(json.dumps(saved))
+    # Since the saved counters: `seconds` of CPU time, three quarters of it busy.
+    monkeypatch.setattr(psutil, "cpu_times", lambda: CPU(100.0 + 0.75 * seconds, 0.0, 900.0 + 0.25 * seconds))
     monkeypatch.setattr(os, "getloadavg", lambda: (8.0, 8.0, 8.0))
     monkeypatch.setattr(os, "cpu_count", lambda: 4)
     monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
     monkeypatch.delenv("FORAGENT_CPU_BUSY", raising=False)
+    before = (tmp_path / "machine-data" / capacity.SENSOR_FILE).read_bytes()
     with capacity.observing():
-        assert capacity.machine_load()[1] == pytest.approx(0.1), "A saved busy fraction lowers the load"
+        sample = capacity.machine_load()
+    assert sample.cpu_busy == pytest.approx(expected_busy)
+    assert sample[1] == pytest.approx(min(2.0, expected_busy / 0.6))
+    assert (tmp_path / "machine-data" / capacity.SENSOR_FILE).read_bytes() == before, "Observing writes nothing"
     monkeypatch.setenv("FORAGENT_CPU_BUSY", "off")
     with capacity.observing():
         sample = capacity.machine_load()
@@ -700,3 +712,146 @@ def test_checkout_config_is_read_with_the_records(env):
     (root / ".foragent.yml").write_text("repo: owner/repo\nmax_parallel: 1\n")
     stale = Config(repo="owner/repo", max_parallel=4)
     assert orch_facts.collect(store, stale, root, checkout=True)["binding"]["kind"] == "cap"
+
+
+def wait_ctx(store, clock):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(store=store, config=Config(repo="owner/repo"), now=lambda: clock[0],
+                           monotonic=lambda: clock[0].timestamp(),
+                           sleep=lambda seconds: clock.__setitem__(0, clock[0] + timedelta(seconds=seconds)))
+
+
+def test_executor_backoff_is_a_wait_phase_not_implementing(env):
+    from foragent import run_waits
+
+    store, root = env
+    clock = [NOW - timedelta(seconds=250)]
+    store._now = lambda: clock[0]
+    store.start_run(7, branch="b", worktree=store.worktree_path(7))
+    store.update_run(7, phase="implementing", phase_started_at=clock[0].isoformat())
+    clock[0] += timedelta(seconds=10)
+    run_waits._executor_wait(7, wait_ctx(store, clock), 240)
+    assert store.get_run(7).phase == "implementing"
+    store.finish_run(7, outcome="timeout")
+    store._now = lambda: NOW
+    row, = collect(store, root)["runs"]
+    assert (row["implementing_seconds"], row["waste_seconds"], row["runtime_seconds"]) == (10, 240, 250)
+    assert row["waste_share"] == pytest.approx(0.96)
+
+
+@pytest.mark.parametrize("held_for", [240, 0])
+def test_merge_lock_wait_is_a_wait_phase_only_when_it_waits(env, held_for):
+    from foragent import run_waits
+
+    store, root = env
+    clock = [NOW - timedelta(seconds=10 + held_for)]
+    store._now = lambda: clock[0]
+    store.start_run(7, branch="b", worktree=store.worktree_path(7))
+    store.update_run(7, phase="merging", phase_started_at=clock[0].isoformat())
+    clock[0] += timedelta(seconds=10)
+
+    def acquire():
+        clock[0] += timedelta(seconds=held_for)  # Another merge holds the lock this long.
+
+    run_waits._credited_wait(7, wait_ctx(store, clock), acquire, "merge-lock-wait", eager=False)
+    assert store.get_run(7).phase == "merging"
+    store.finish_run(7, outcome="merged")
+    store._now = lambda: NOW
+    phases = [json.loads(line)["phase"] for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert phases == (["merging", "merge-lock-wait", "merging"] if held_for else ["merging"])
+    row, = collect(store, root)["runs"]
+    assert row["waste_seconds"] == held_for and row["runtime_seconds"] == 10 + held_for
+    assert row["waste_share"] == pytest.approx(held_for / (10 + held_for))
+
+
+def test_replay_uses_the_gates_overlap_ranking(env):
+    store, root = env
+    capacity.write_state(store, 3, NOW)
+    approve(store, 1, ["src/shared.py"], labels=("approved", "running"), active=True)
+    approve(store, 2, ["src/shared.py"])
+    approve(store, 3, ["src/shared.py"])
+    approve(store, 4, ["src/other.py"])
+    # The gate starts #4 (no overlap) and then #2; the cap, not the files, holds #3.
+    facts = collect(store, root)
+    assert facts["resources"]["parallelizable_work"]["held"] == {"3": "cap"}
+    assert facts["binding"]["kind"] == "cap"
+
+
+def test_replay_uses_the_global_priority_list(env):
+    from foragent import orch_queue
+
+    store, root = env
+    capacity.write_state(store, 1, NOW)
+    approve(store, 2, ["src/a.py"])
+    approve(store, 3, ["src/b.py"], lane="other")
+    orch_queue.set_global(store, [3, 2])
+    assert collect(store, root)["resources"]["parallelizable_work"]["held"] == {"2": "cap"}
+
+
+def test_review_only_ci_checks_record_related_tests_as_checking(git_history, tmp_path):
+    import sys
+
+    from conftest import BASE_TIME, git_command
+    from foragent.ci_mode import review_checks
+    from foragent.git import GitRepo
+    from foragent.runner import RunContext
+    from foragent.tracker import FakeTracker
+
+    git_history.update({
+        'src/demo.py': 'VALUE = 1\n',
+        'tests/conftest.py': 'import sys\nfrom pathlib import Path\n'
+            'sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))\n',
+        'tests/test_demo.py': 'from demo import VALUE\ndef test_demo(): assert VALUE > 0\n',
+        'tests/test_importer.py': 'from demo import VALUE\ndef test_importer(): assert VALUE > 0\n',
+    })
+    root = git_history.clone
+    git_command(root, 'fetch', '-q', 'origin')
+    git_command(root, 'merge', '-q', '--ff-only', 'origin/main')
+    (root / 'src/demo.py').write_text('VALUE = 2\n')
+    git = GitRepo(root)
+    git.stage_changes()
+    store = StateStore(tmp_path / 'state' / 'owner__repo', now=lambda: BASE_TIME)
+    store.start_run(1, branch='test', worktree=root)
+    store.update_run(1, phase='reviewing', phase_started_at=BASE_TIME.isoformat())
+    config = Config(checks='ci', runner_unit_tests='all', test_command=f'{sys.executable} -m pytest')
+    ctx = RunContext('owner/repo', root, FakeTracker(), store, config, git, lambda: BASE_TIME)
+    review_checks(1, ctx, git, 'main')
+    check, = store.get_run(1).related_tests
+    assert check["selected_files"] == ["tests/test_demo.py", "tests/test_importer.py"]
+    assert check["changed_file_count"] == 1 and check["timed_out"] is False
+    assert set(check["file_seconds"]) == set(check["selected_files"])
+    assert store.get_run(1).phase == "reviewing"
+    phases = [json.loads(line)["phase"] for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert "checking" in phases
+
+
+def test_review_head_done_when_is_checking_time(env, monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent.issue import ParsedIssue
+    from foragent.run_checks import _verify_review_head
+
+    store, root = env
+    clock = [NOW - timedelta(seconds=100)]
+    store._now = lambda: clock[0]
+    store.start_run(8, branch="b", worktree=store.worktree_path(8))
+    store.update_run(8, phase="reviewing", phase_started_at=clock[0].isoformat())
+    clock[0] += timedelta(seconds=40)
+    git = SimpleNamespace(root=root, stage_changes=lambda: None, head_sha=lambda: "head",
+                          has_staged_changes=lambda: False)
+    ctx = SimpleNamespace(store=store, config=Config(repo="owner/repo"), now=lambda: clock[0],
+                          monotonic=lambda: clock[0].timestamp())
+    from foragent import runner
+    real = runner._check
+
+    def timed(*args, **kwargs):
+        clock[0] += timedelta(seconds=60)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_check", timed)
+    assert _verify_review_head(8, ctx, git, ParsedIssue(None, "", "", ["true"], []), "head", "") is None
+    store.finish_run(8, outcome="merged")
+    store._now = lambda: NOW
+    row, = collect(store, root)["runs"]
+    assert row["checking_seconds"] == 60 and row["test_phase_share"] == pytest.approx(0.6)

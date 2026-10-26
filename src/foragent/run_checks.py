@@ -27,7 +27,7 @@ from foragent.reasons import Reason
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout
+from foragent.run_waits import _phase, _progress, _test_slot, _timeout, in_phase
 from foragent.state import Approval
 
 if TYPE_CHECKING:
@@ -237,6 +237,28 @@ def _record_related_check(
         ctx.store.update_run(n, related_tests=[*run.related_tests, check])
 
 
+def run_related_check(
+    n: int, ctx: RunContext, worktree: Path, unit_command: str, unit_tests: list[str], changed: int, limit: int,
+) -> CheckResult:
+    """Run the selected related unit tests with their own JUnit report and record the check.
+
+    Every verification path that runs related tests (implementation, review-only CI
+    checks) goes through here, so each check lands in Run.related_tests.
+    """
+    from foragent import runner
+
+    report = ctx.store.root / "runs" / f"issue-{n}-related.xml"
+    # A stale report from an earlier check must never supply this check's timings.
+    report.unlink(missing_ok=True)
+    # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
+    junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
+    result = runner._check(f"{unit_command} {junit} {shlex.join(unit_tests)}", worktree, ctx.store.log_path(n), limit,
+                           progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic)
+    _record_related_check(n, ctx, changed, unit_tests, report, result)
+    _progress(n, ctx)
+    return result
+
+
 def has_pull_request_ci(root: Path) -> bool:
     """Whether a GitHub Actions workflow in this checkout runs on pull_request (read from files)."""
     workflows = root / ".github" / "workflows"
@@ -419,16 +441,8 @@ def _verify_implementation(attempt: Implementation) -> str:
                 attempt.checks.append(local_units)
         if unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
-            report = ctx.store.root / "runs" / f"issue-{n}-related.xml"
-            # A stale report from an earlier check must never supply this check's timings.
-            report.unlink(missing_ok=True)
-            # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
-            junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
-            result = runner._check(f"{unit_command} {junit} {shlex.join(unit_tests)}", worktree, log, limit,
-                            progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic)
+            result = run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths), limit)
             attempt.checks.append(result)
-            _record_related_check(n, ctx, len(attempt.paths), unit_tests, report, result)
-            _progress(n, ctx)
             if result.timed_out:
                 detail = f"Related unit tests timed out after {limit} s ({len(unit_tests)} selected tests)."
                 flag(ctx, n, Reason.TIMEOUT, detail)
@@ -465,18 +479,20 @@ def _verify_review_head(
 
     worktree = git.root
     log = ctx.store.log_path(n)
-    for command in parsed.done_when_commands:
-        if runner._remaining(n, ctx) <= 0:
-            return _timeout(n, ctx)
-        check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)), progress=lambda: _progress(n, ctx),
-                       slot=_test_slot(n, ctx))
-        _progress(n, ctx)
-        if check.timed_out or runner._remaining(n, ctx) <= 0:
-            return _timeout(n, ctx)
-        if check.exit_code != 0:
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.",
-                 f"Command: {command}\n{check.output}\n{link}")
-            return "checks-failed"
+    # Done when on the PR head is checking time, as in an implementation's verification.
+    with in_phase(n, ctx, "checking"):
+        for command in parsed.done_when_commands:
+            if runner._remaining(n, ctx) <= 0:
+                return _timeout(n, ctx)
+            check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)),
+                                  progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+            _progress(n, ctx)
+            if check.timed_out or runner._remaining(n, ctx) <= 0:
+                return _timeout(n, ctx)
+            if check.exit_code != 0:
+                flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.",
+                     f"Command: {command}\n{check.output}\n{link}")
+                return "checks-failed"
     git.stage_changes()
     if git.head_sha() != head or git.has_staged_changes():
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when changed the verified PR contents.", link)

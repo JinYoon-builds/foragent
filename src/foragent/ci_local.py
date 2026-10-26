@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import _passing_acceptance_ids, _pytest_command, junit_node_id
-from foragent.run_waits import _phase, _progress, _test_slot, phase_identity, restore_phase
+from foragent.run_waits import _phase, _progress, _test_slot, in_phase, phase_identity, restore_phase
 
 
 def report_ids(report, result, measurement):
@@ -160,7 +160,9 @@ def fallback_comparison(attempt, base_sha):
         raise LocalComparisonUnavailable("fallback acceptance baseline unavailable")
     result = None
     if baseline.node_ids:
-        result = check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", attempt.worktree)
+        # Running the acceptance comparison on the head is checking time, not CI waiting.
+        with in_phase(n, ctx, "checking"):
+            result = check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", attempt.worktree)
     if (attempt.git.head_sha() != head
             or attempt.git._call(["status", "--porcelain=v1", "--untracked-files=no"])):
         # The normal implementation retry stages and rechecks rewrites. Retain

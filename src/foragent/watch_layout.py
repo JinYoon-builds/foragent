@@ -29,7 +29,8 @@ def _has_work(row: dict[str, Any]) -> bool:
 # Run phases in which the runner waits on checks, CI, a merge or a review.
 # Waits inside them (merge.lock, a test slot) need no phase of their own.
 WAITING_PHASES = frozenset({"checking", "ci", "merging", "reviewing", "overlap-wait",
-                            "test-slot-wait", "baseline", "baseline-wait"})
+                            "test-slot-wait", "baseline", "baseline-wait", "executor-wait",
+                            "merge-lock-wait"})
 
 
 def _activity(
