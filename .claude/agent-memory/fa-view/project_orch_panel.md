@@ -16,3 +16,4 @@ metadata:
 - 2026-10-27 오케스트레이터 결정: Q1·Q2 모두 A(140칸↑ 36칸 고정, `지켜보는 중` 줄 추가). 고정 시험이 이슈 문장과 충돌하는 곳의 계약이다. 리뷰가 다시 지적하면 이 결정을 REBUTTAL에 인용한다. 재시도 때 작업 트리가 다시 만들어지면 코드는 WIP 커밋에 남고 `.foragent/` 파일만 사라진다.
 - 결정이 이슈 본문에 반영되지 않으면 리뷰는 "결정이 Goal과 모순"이라며 계속 지적한다. REBUTTAL에 힌트 원문 인용, 셀 수 근거, 본문이 결정보다 오래됐다는 사실(updatedAt)을 함께 적는다. 이슈 본문은 직접 고치지 않는다(실행 중 해시 불일치).
 - 결정을 인용한 REBUTTAL도 리뷰가 "Goal과 모순"으로 세 번째 거절했다. 결정이 이슈 본문에 없으면 반박으로는 끝나지 않으므로, QUESTION.md로 본문 갱신(A)을 요청한다.
+- main 병합(2026-10-27): main이 Snapshot에 `merged_at`을 더해 watch_data.py가 충돌했다. `merged_at` 뒤에 `panel`을 두고 생성자 끝에 `merged_at, orch_panel.collect(store, now)` 순으로 넘긴다. 결정이 Goal에 반영된 뒤에는 남은 QUESTION.md를 지워야 spec-question으로 다시 멈추지 않는다. `test_view_usage_line` 5개 실패는 미구현 #115 범위다.
