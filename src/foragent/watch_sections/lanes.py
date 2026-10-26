@@ -7,6 +7,7 @@ from foragent.config import Config
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 from foragent.watch_layout import _clones, _split, _widths, _worker_rows
+from foragent.watch_sections import orch_panel
 
 ORDER = 30
 # "Watching" needs an orchestrator heartbeat (written by a running fa orch watch) this fresh (D67).
@@ -15,19 +16,25 @@ ORCH_FRESH_SECONDS = 30
 STATE_ORDER = ("working", "waiting-human", "blocked", "queued", "idle")
 
 
-def _overview(snapshot: Snapshot, language: str, age: float = 0.0) -> list[Line]:
+def _overview(snapshot: Snapshot, language: str, age: float = 0.0, width: int = 26) -> list[Line]:
     from foragent import watch
 
     status = snapshot.status
     t = lambda key, **values: watch.text(key, language, **values)
     overview: list[Line] = []
     heartbeat = snapshot.heartbeats.get("orch")
-    if heartbeat is not None and heartbeat + age <= ORCH_FRESH_SECONDS:
-        state = "watch_handling" if status["summary"]["blocked"] else "watch_monitoring"
-        overview.append(watch._line(t(state), "yellow" if status["summary"]["blocked"] else "green"))
+    fresh = heartbeat is not None and heartbeat + age <= ORCH_FRESH_SECONDS
+    if fresh:
+        # A live watcher is always named (D67 evidence); blocked work keeps its own
+        # unchanged "handling" line after it.
+        overview.append(watch._line(t("watch_monitoring"), "green"))
+        if status["summary"]["blocked"]:
+            overview.append(watch._line(t("watch_handling"), "yellow"))
     elif heartbeat is not None or status["active_runs"] or any(watch._has_work(row) for row in status["lanes"].values()):
         # A stale or missing heartbeat while work exists means nobody is watching.
         overview.append(watch._line(t("watch_orch_off"), "yellow"))
+    # The note and the count for people follow the state line (orch_panel).
+    overview += orch_panel.lines(snapshot.panel, status["summary"]["waiting_human"], language, width, age, fresh)
     if snapshot.order:
         # The combined bar and finish time live in the progress section.
         overview += [watch._line(t("watch_order") + f" #{snapshot.order.number}"),
@@ -111,7 +118,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     busy, idle = _split(snapshot.status)
     clones = _clones(snapshot.status)
     age = max(0.0, (context["now"] - snapshot.captured_at).total_seconds())
-    left = watch._panel(_overview(snapshot, language, age), orchestrator_width, "🧭 " + t("watch_orchestrator"))
+    left = watch._panel(_overview(snapshot, language, age, orchestrator_width - 2), orchestrator_width, "🧭 " + t("watch_orchestrator"))
     roads: list[Line] = [[("━" * road_width, "edge")]]
     for index, row in busy:
         slug = row["slug"]

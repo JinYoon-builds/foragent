@@ -14,7 +14,7 @@ from foragent.config import Config
 from foragent.labels import BLOCKED, NEEDS_HUMAN
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
-from foragent.watch_sections import progress
+from foragent.watch_sections import orch_panel, progress
 
 
 @dataclass
@@ -47,6 +47,8 @@ class Snapshot:
     today: int = 0
     # When each issue in ``done`` merged, from the local issue records; unknown times are absent.
     merged_at: dict[int, datetime] = field(default_factory=dict)
+    # The orchestrator note, its age in seconds and the fresh `fa inspect` count (orch_panel.collect).
+    panel: dict[str, Any] = field(default_factory=dict)
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -166,4 +168,4 @@ def collect(
                                         else "blocked" if BLOCKED in labels else "working")
     return watch.Snapshot(status, done, order, completed, total, eta, watch.recent_events(store), now,
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
-                          worker_states, eta_range, basis, today, merged_at)
+                          worker_states, eta_range, basis, today, merged_at, orch_panel.collect(store, now))

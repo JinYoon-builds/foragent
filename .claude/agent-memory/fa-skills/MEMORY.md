@@ -26,3 +26,4 @@
 - `SkillManager._scan()`은 (유효 스킬, 건너뜀 `{path, error}`)를 돌려준다. 깨진 SKILL.md는 catalog·install에서 조용히 빠지고, `add`는 `skipped`로 알린다. 유효 스킬 0개+건너뜀 있음일 때만 모든 경로를 담아 실패한다. #232 검증: `fa test tests/acceptance/test_skills_add_partial_pack.py`. `fa test`는 슬롯 대기로 10분을 넘길 수 있으니 백그라운드로 돌린다.
 - [.foragent.yml 줄 단위 편집](settings_roundtrip.md) — lanes add/skills는 compose 위치로 줄만 고치고 다시 읽어 확인; ruamel 왕복은 거절됨 (#233)
 - [게이트 슬롯 환경 변수](gate_slot_env.md) — FORAGENT_TEST_SLOT=held가 시험에 새면 capacity 슬롯 시험이 게이트에서만 실패
+- 오케스트레이터 시간 초과(`scheduler_checks._escalate_overdue_blocker`) 시계는 최신 blocked 댓글과 그 이슈의 최신 `store.finish_times()`(키 `(번호, started_at)`) 중 늦은 쪽부터 센다(#642). 시험에서 종료 시각을 바꾸려면 같은 state 경로로 `now`가 다른 `StateStore`를 새로 만들어 `finish_run`한다.
