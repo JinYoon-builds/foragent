@@ -145,6 +145,77 @@ def read_process_identity(pid: int) -> ProcessIdentity | None:
     return None
 
 
+def _same_dir(cwd: str | None, root: Path) -> bool:
+    try:
+        return cwd is not None and Path(cwd).resolve() == root.resolve()
+    except OSError:
+        return False
+
+
+def _cwd(process) -> str | None:
+    """Working directory, or None when it is unreadable or gone."""
+    try:
+        return process.cwd()
+    except (psutil.Error, OSError, SystemError):
+        return None
+
+
+def _foragent_gate(argv) -> bool:
+    """argv of a Foragent gate command: ``fa gate ...`` or ``python -m foragent.cli gate ...``."""
+    return any((Path(part).name in {"fa", "foragent"} or part == "foragent.cli") and argv[index + 1] == "gate"
+               for index, part in enumerate(argv[:-1]))
+
+
+def claude_session() -> dict | None:
+    """``{pid, start_time}`` of the nearest Claude ancestor of this process, or None.
+
+    A Claude Code session shows argv[0] ``claude`` and psutil name ``claude`` or
+    ``claude.exe``. The nearest such ancestor is the session, wherever it runs.
+    A Foragent gate command between them means the gate (its runner or its
+    checks) started this process, not that session: the Claude above it is the
+    gate's lane executor or the person's own session, so there is no session.
+    """
+    try:
+        current = psutil.Process(os.getpid()).parent()
+        while current is not None:
+            try:
+                argv = current.cmdline()
+            except (psutil.AccessDenied, PermissionError, SystemError):
+                argv = []
+            try:
+                name = current.name()
+            except (psutil.AccessDenied, PermissionError, SystemError):
+                name = ""
+            if (argv and Path(argv[0]).name == "claude") or name in {"claude", "claude.exe"}:
+                return {"pid": current.pid, "start_time": current.create_time()}
+            if _foragent_gate(argv):
+                return None
+            current = current.parent()
+    except (psutil.Error, OSError, SystemError):
+        return None
+    return None
+
+
+def orchestrator_process_alive(repo_root: Path, skill: str = "/fa-orchestrator") -> bool:
+    """True when a live process has ``skill`` in its argv and runs at ``repo_root``.
+
+    The working directory is read only for those candidates; an unreadable or
+    missing one does not match.
+    """
+    try:
+        candidates = tuple(psutil.process_iter())
+    except (psutil.Error, OSError):
+        return False
+    for process in candidates:
+        try:
+            argv = process.cmdline()
+        except (psutil.Error, OSError, SystemError):
+            continue
+        if skill in (argv or ()) and _same_dir(_cwd(process), repo_root):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class IdentityEvidence:
     alive: bool | None  # None means unreadable, never permission to discard ownership.

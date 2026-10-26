@@ -147,3 +147,4 @@
 - [#567 CI exclusions drift](project_567_ci_exclusions_drift.md) — subset rule, keep payload/scope excluded equal, slow test_ci_mode under load
 - `test_scheduler_split.py`가 facade `scheduler.py`를 250줄로 제한한다. scheduler에 줄을 더하면 같은 수만큼 줄이거나 분할 모듈로 옮긴다. 바꾼 파일마다 `tests/acceptance/test_*split*.py` 전부를 돌려 확인한다.
 - [#128 orch spawn](project_128_orch_spawn.md) — gate opens orchestrator; conftest opt-out; scheduler.py 250-line cap
+- [#590 orch liveness](project_590_orch_liveness.md) — heartbeat session, /fa-orchestrator scan, walk stops at a gate process; verify via gate check-done
