@@ -23,6 +23,11 @@ import pytest
 from test_init import setup
 from test_skills_autosync import cli_exit, isolated_home
 
+def _skip_upstream(answer):
+    """#419 asks once about upstream reports; these tests count only statusline questions."""
+    return lambda prompt="": "n" if "upstream report" in prompt.lower() else answer(prompt)
+
+
 
 RATE_LIMITS = {
     "five_hour": {"used_percentage": 23.5, "resets_at": 1793082762},
@@ -182,7 +187,7 @@ def test_statusline_wrapper_init_installs_once_and_preserves_previous_command(
     save_json(settings_path(), original)
     main, argv = init_cli(setup, monkeypatch)
     prompts = []
-    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "y")
+    monkeypatch.setattr("builtins.input", _skip_upstream(lambda prompt="": prompts.append(prompt) or "y"))
     assert cli_exit(main, argv) == 0
     assert len(prompts) == 1, "fa init must ask once before installing the Claude statusline wrapper"
     expected = {**original, "statusLine": {**original.get("statusLine", {}),
@@ -195,7 +200,7 @@ def test_statusline_wrapper_init_installs_once_and_preserves_previous_command(
     def no_second_question(prompt=""):
         pytest.fail("Re-running init must not ask again or double wrap the user's command")
 
-    monkeypatch.setattr("builtins.input", no_second_question)
+    monkeypatch.setattr("builtins.input", _skip_upstream(no_second_question))
     assert cli_exit(main, argv) == 0
     assert (settings_path().read_bytes(), record.read_bytes()) == unchanged
 
@@ -209,7 +214,7 @@ def test_statusline_wrapper_init_refusal_is_remembered_without_changing_claude_s
     unchanged = settings_path().read_bytes()
     main, argv = init_cli(setup, monkeypatch)
     prompts = []
-    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "n")
+    monkeypatch.setattr("builtins.input", _skip_upstream(lambda prompt="": prompts.append(prompt) or "n"))
     assert cli_exit(main, argv) == 0
     assert len(prompts) == 1, "fa init must offer the optional wrapper before remembering a refusal"
     assert settings_path().read_bytes() == unchanged
@@ -221,7 +226,7 @@ def test_statusline_wrapper_init_refusal_is_remembered_without_changing_claude_s
     def no_second_question(prompt=""):
         pytest.fail("A declined wrapper must not be offered on the next init")
 
-    monkeypatch.setattr("builtins.input", no_second_question)
+    monkeypatch.setattr("builtins.input", _skip_upstream(no_second_question))
     assert cli_exit(main, argv) == 0
     assert settings_path().read_bytes() == unchanged and record.read_bytes() == record_bytes
 
@@ -238,7 +243,7 @@ def test_statusline_wrapper_init_keeps_existing_install_and_does_not_double_wrap
     def no_question(prompt=""):
         pytest.fail("An already installed wrapper needs no question")
 
-    monkeypatch.setattr("builtins.input", no_question)
+    monkeypatch.setattr("builtins.input", _skip_upstream(no_question))
     assert cli_exit(main, argv) == 0
     assert (settings_path().read_bytes(), record.read_bytes()) == unchanged
     raw = statusline_input()
