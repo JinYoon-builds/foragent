@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from foragent import capacity, run_waits, sleep_ledger
 from foragent.state import StateStore
 
@@ -195,7 +197,8 @@ def test_a_tick_reads_its_time_inside_the_ledger_lock(tmp_path, monkeypatch):
     def waited(path):
         with lock(path):
             held.append(path.name)
-            facts.awake(5)  # Another repository's tick held the lock meanwhile.
+            if path.name == f"{sleep_ledger.LEDGER_FILE}.lock":
+                facts.awake(5)  # Another repository's tick held the lock meanwhile.
             yield
             held.pop()
 
@@ -233,7 +236,7 @@ def test_awake_time_after_wake_is_not_credited_as_sleep(tmp_path, monkeypatch):
     progress = facts.clock[0].isoformat()
     facts.awake(4 * 60)  # The first tick after wake comes four minutes later.
     ledger, _ = tick(ctx)
-    assert ledger.credit(progress, facts.clock[0]) == 0
+    assert ledger.credit(progress, facts.clock[0]) == pytest.approx(0, abs=sleep_ledger.PLACEMENT_SECONDS)
     store.update_run(1, last_progress_at=progress)
     assert not ledger.defers_stall(store.get_run(1), facts.clock[0]), "Progress after wake ends grace"
 
@@ -261,3 +264,142 @@ def test_two_sleeps_seen_together_place_each_sleep_conservatively(tmp_path, monk
     awake(60)
     assert capacity.slept_seconds(BASE) == 2 * NIGHT
     assert capacity.slept_seconds(second) <= NIGHT
+
+
+def test_wake_grace_is_not_ended_by_activity_before_a_short_sleep(tmp_path, monkeypatch):
+    # Baseline 08:00, progress 08:01:02, sleep 08:04-08:05:01; baseline + slept would be 08:01:01.
+    facts, store, ctx = setup(tmp_path, monkeypatch)
+    store.start_run(1, branch="b", worktree=tmp_path / "w")
+    tick(ctx)
+    facts.awake(62)
+    store.update_run(1, last_progress_at=facts.clock[0].isoformat())
+    facts.awake(178)
+    facts.sleep(61)
+    facts.awake(60)
+    ledger, actions = tick(ctx)
+    woke = BASE + timedelta(seconds=301)
+    assert actions and woke <= ledger.wake_at <= woke + timedelta(seconds=sleep_ledger.PLACEMENT_SECONDS)
+    assert ledger.defers_stall(store.get_run(1), facts.clock[0])
+
+
+def test_offset_found_sleep_wakes_no_earlier_than_the_read_that_found_it(tmp_path, monkeypatch):
+    sleep, awake = fake_clocks(monkeypatch, "other", offset_counts_sleep=True)
+    now = lambda: datetime.fromtimestamp(capacity.time.time(), UTC)  # noqa: E731
+    store = StateStore(tmp_path / "data" / "repo", now=now)
+    ctx = SimpleNamespace(now=now, store=store, config=SimpleNamespace(language="en"))
+    store.start_run(1, branch="b", worktree=tmp_path / "w")
+    tick(ctx)
+    awake(62)
+    store.update_run(1, last_progress_at=now().isoformat())
+    awake(178)
+    sleep(61)
+    awake(60)
+    ledger, actions = tick(ctx)
+    assert actions and ledger.wake_at == now(), "Only the read time is measured for clock-offset sleep"
+    assert ledger.defers_stall(store.get_run(1), now())
+
+
+def test_a_run_started_inside_a_tick_interval_gets_its_whole_sleep(tmp_path, monkeypatch):
+    facts, store, ctx = setup(tmp_path, monkeypatch)
+    tick(ctx)
+    facts.awake(4 * 60)
+    run = store.start_run(1, branch="b", worktree=tmp_path / "w")
+    facts.awake(60)
+    facts.sleep(NIGHT)
+    facts.awake(60)
+    ledger, _ = tick(ctx)
+    assert ledger.credit(run.started_at, facts.clock[0]) == pytest.approx(NIGHT, abs=sleep_ledger.PLACEMENT_SECONDS)
+    progress = (BASE + timedelta(minutes=5, seconds=1)).isoformat()  # One second into the sleep.
+    assert ledger.credit(progress, facts.clock[0]) == pytest.approx(NIGHT - 1, abs=sleep_ledger.PLACEMENT_SECONDS)
+
+
+def test_a_suspend_between_the_kernel_pair_and_the_offset_reads_counts_once(tmp_path, monkeypatch):
+    sleep, awake = fake_clocks(monkeypatch, "darwin", offset_counts_sleep=True)
+    pair = capacity._darwin_sleep_interval
+    armed = []
+
+    def suspending():
+        seen = pair()
+        if armed:
+            armed.clear()
+            sleep(NIGHT)  # The machine sleeps right after the kernel pair was read.
+            awake(1)
+        return seen
+
+    monkeypatch.setattr(capacity, "_darwin_sleep_interval", suspending)
+    assert capacity.slept_seconds(BASE) == 0
+    armed.append(True)
+    assert capacity.slept_seconds(BASE) == NIGHT
+    awake(60)
+    assert capacity.slept_seconds(BASE) == NIGHT
+
+
+def suspend_after_first_read(facts, monkeypatch):
+    """The machine sleeps right after the next sensor reading returns."""
+    armed = [True]
+
+    def reading(since):
+        value = facts.slept_seconds(since)
+        if armed:
+            armed.clear()
+            facts.sleep(NIGHT)
+        return value
+
+    monkeypatch.setattr(capacity, "slept_seconds", reading)
+
+
+def test_remaining_runtime_survives_a_suspend_between_sensor_reads(tmp_path, monkeypatch):
+    facts, store, _ = setup(tmp_path, monkeypatch)
+    store.start_run(1, branch="b", worktree=tmp_path / "w")
+    ctx = SimpleNamespace(now=lambda: facts.clock[0], store=store,
+                          config=SimpleNamespace(max_runtime_minutes=90))
+    facts.awake(30 * 60)
+    suspend_after_first_read(facts, monkeypatch)
+    assert run_waits._remaining(1, ctx) == 60 * 60, "An 8 h sleep mid-read must not use the budget"
+
+
+def test_test_slot_credit_survives_a_suspend_between_sensor_reads(tmp_path, monkeypatch):
+    facts, store, _ = setup(tmp_path, monkeypatch)
+    store.start_run(1, branch="b", worktree=tmp_path / "w")
+    ctx = SimpleNamespace(now=lambda: facts.clock[0], store=store,
+                          config=SimpleNamespace(test_slots=1, max_runtime_minutes=90))
+    facts.awake(30 * 60)
+
+    @contextmanager
+    def slot(ceiling, waiting):
+        facts.awake(60)
+        suspend_after_first_read(facts, monkeypatch)
+        waiting()
+        yield
+
+    monkeypatch.setattr(capacity, "hold_test_slot", slot)
+    with run_waits._test_slot(1, ctx):
+        pass
+    assert store.get_run(1).waited_seconds == 60, "Sleep during the credit is not waited time"
+    monkeypatch.setattr(capacity, "slept_seconds", facts.slept_seconds)
+    assert run_waits._remaining(1, ctx) == 60 * 60, "The sleep is credited once"
+
+
+def test_slept_until_never_exceeds_its_window_when_suspends_repeat(tmp_path, monkeypatch):
+    facts = Facts()
+
+    def reading(since):
+        facts.sleep(NIGHT)  # Every reading is followed by another suspend.
+        return facts.slept_seconds(since)
+
+    monkeypatch.setattr(capacity, "slept_seconds", reading)
+    slept, moment = capacity.slept_until(BASE, lambda: facts.clock[0])
+    assert 0 <= slept <= (moment - BASE).total_seconds()
+
+
+def test_a_short_exact_sleep_keeps_every_second_for_grace_and_credit(tmp_path, monkeypatch):
+    facts, store, ctx = setup(tmp_path, monkeypatch)
+    run = store.start_run(1, branch="b", worktree=tmp_path / "w")
+    tick(ctx)
+    facts.awake(240)
+    facts.sleep(60.1)  # Just over the wake threshold; the tick comes right at wake.
+    ledger, actions = tick(ctx)
+    assert len(actions) == 1 and ledger.grace_until is not None, "60.1 s of sleep starts the wake grace"
+    assert sum(item["seconds"] for item in ledger.entries) == pytest.approx(60.1, abs=1e-4)
+    assert ledger.credit(run.started_at, facts.clock[0]) == pytest.approx(60.1, abs=1e-4)
+    assert ledger.defers_stall(store.get_run(1), facts.clock[0])

@@ -521,6 +521,8 @@ SLEEP_HISTORY_FILE = "sleep-history.json"
 SLEEP_RETENTION = timedelta(days=30)
 # A clock offset change below this is drift or rounding, not sleep.
 SLEEP_MIN_SECONDS = 1.0
+# Reads of the kernel pair and the clock offset repeat until both hold still.
+SLEEP_SNAPSHOT_TRIES = 5
 
 
 class _Timeval(ctypes.Structure):
@@ -554,6 +556,23 @@ def _sleep_offset() -> tuple[str, float]:
         return "boottime", time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
     except (AttributeError, OSError):
         return "wall", time.time() - time.monotonic()
+
+
+def _clock_snapshot() -> tuple[tuple[datetime, datetime] | None, str, float, datetime] | None:
+    """The kernel pair, clock offset and wall time as one consistent reading.
+
+    A suspend between two of the reads would let one source see a sleep the
+    other misses. Each reading is taken twice; it is used only when nothing moved.
+    """
+    for _ in range(SLEEP_SNAPSHOT_TRIES):
+        pair = _darwin_sleep_interval() if sys.platform == "darwin" else None
+        kind, offset = _sleep_offset()
+        now = datetime.now(UTC)
+        again = _darwin_sleep_interval() if sys.platform == "darwin" else None
+        kind_again, offset_again = _sleep_offset()
+        if pair == again and kind == kind_again and abs(offset_again - offset) < SLEEP_MIN_SECONDS:
+            return pair, kind, offset, now
+    return None
 
 
 def _when(value: Any) -> datetime | None:
@@ -617,6 +636,32 @@ def oldest_running_start(roots: set[Path]) -> datetime | None:
     return min(starts, default=None)
 
 
+def _read_history(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError):
+        raw = {}
+    intervals = []
+    for item in raw.get("intervals", []):
+        start, end = _when(item.get("start")), _when(item.get("end"))
+        if start and end and isinstance(item.get("seconds"), (int, float)):
+            intervals.append({"start": start, "end": end, "seconds": float(item["seconds"])})
+    return raw, intervals
+
+
+def latest_wake(after: datetime) -> datetime | None:
+    """The latest recorded moment by which the machine was awake again, if after ``after``.
+
+    A kernel pair gives the measured wake; an interval found from a clock offset
+    gives the read that found it, which is never before the wake.
+    """
+    root = machine_root()
+    with _flock(root / f"{SLEEP_HISTORY_FILE}.lock"):
+        _, intervals = _read_history(root / SLEEP_HISTORY_FILE)
+    return max((item["end"] for item in intervals if item["end"] > after), default=None)
+
+
 def _observe_sleep() -> tuple[list[dict[str, Any]], datetime]:
     """Add every sleep seen since the last read to the machine-wide history.
 
@@ -626,20 +671,13 @@ def _observe_sleep() -> tuple[list[dict[str, Any]], datetime]:
     root = machine_root()
     path = root / SLEEP_HISTORY_FILE
     with _flock(root / f"{SLEEP_HISTORY_FILE}.lock"):
-        now = datetime.now(UTC)
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            raw = raw if isinstance(raw, dict) else {}
-        except (OSError, ValueError):
-            raw = {}
-        intervals = []
-        for item in raw.get("intervals", []):
-            start, end = _when(item.get("start")), _when(item.get("end"))
-            if start and end and isinstance(item.get("seconds"), (int, float)):
-                intervals.append({"start": start, "end": end, "seconds": float(item["seconds"])})
-        if sys.platform == "darwin" and (pair := _darwin_sleep_interval()) and pair[0] < pair[1] <= now:
+        raw, intervals = _read_history(path)
+        snapshot = _clock_snapshot()
+        if snapshot is None:  # The machine kept sleeping and waking; the next read records it.
+            return intervals, datetime.now(UTC)
+        pair, kind, offset, now = snapshot
+        if pair is not None and pair[0] < pair[1] <= now:
             _add_kernel_pair(intervals, *pair)
-        kind, offset = _sleep_offset()
         sample = raw.get("sample") if isinstance(raw.get("sample"), dict) else {}
         previous = _when(sample.get("at"))
         if (previous is not None and previous <= now and sample.get("kind") == kind
@@ -673,3 +711,20 @@ def slept_seconds(since: datetime) -> float:
     """
     intervals, now = _observe_sleep()
     return sleep_within(intervals, since, now)
+
+
+def slept_until(since: datetime, now: Callable[[], datetime]) -> tuple[float, datetime]:
+    """Sleep in [since, now()] from one consistent reading, and that moment.
+
+    ``now()`` is read between two equal sensor readings, so no sleep began
+    between the reading and the moment; a suspend in between repeats the
+    reading. If the machine keeps suspending, the later reading is used,
+    capped at the window: never negative, never more than the window.
+    """
+    for _ in range(SLEEP_SNAPSHOT_TRIES):
+        first = slept_seconds(since)
+        moment = now()
+        second = slept_seconds(since)
+        if second - first < SLEEP_MIN_SECONDS:
+            return first, moment
+    return max(0.0, min(second, (moment - since).total_seconds())), moment

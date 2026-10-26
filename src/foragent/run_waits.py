@@ -40,7 +40,8 @@ def _remaining(n: int, ctx: RunContext) -> int:
         raise KeyError(n)
     started = datetime.fromisoformat(run.started_at)
     # Machine sleep is not run time. Waits are timed without sleep, so it is credited once.
-    elapsed = (ctx.now() - started).total_seconds() - run.waited_seconds - capacity.slept_seconds(started)
+    slept, now = capacity.slept_until(started, ctx.now)
+    elapsed = (now - started).total_seconds() - run.waited_seconds - slept
     return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
 
 
@@ -57,9 +58,9 @@ def _test_slot(n: int, ctx: RunContext):
     waited = False
 
     def credit() -> datetime:
-        now = ctx.now()
         # A wall-clock wait would include sleep, which the runtime limit credits separately.
-        queued = (now - started).total_seconds() - capacity.slept_seconds(started)
+        slept, now = capacity.slept_until(started, ctx.now)
+        queued = (now - started).total_seconds() - slept
         ctx.store.update_run(
             n, waited_seconds=run.waited_seconds + max(0.0, queued),
             last_progress_at=now.astimezone(UTC).isoformat(),
