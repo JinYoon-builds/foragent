@@ -43,7 +43,8 @@ def test_kick_detaches_same_python_and_appends_both_streams(environment, monkeyp
     assert kick.kick_tick(Path(root.name)) is None
     assert kick.kick_tick(root) is None
     assert calls[0][0] == [sys.executable, "-m", "foragent.cli", "gate", "tick", "--repo-root", str(root)]
-    assert set(calls[0][1]) == {"cwd", "stdin", "start_new_session", "stdout", "stderr"}
+    assert set(calls[0][1]) == {"cwd", "stdin", "start_new_session", "stdout", "stderr", "env"}
+    assert calls[0][1]["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert calls[0][1]["cwd"] == root
     assert calls[0][1]["stdin"] == subprocess.DEVNULL
     assert calls[0][1]["start_new_session"] is True
@@ -129,6 +130,12 @@ def test_launchd_kickstart_needs_an_installed_job(monkeypatch, tmp_path):
     from foragent import launchd
     plist = tmp_path / "Library/LaunchAgents" / f"{launchd.label_for('owner/repo')}.plist"
     plist.parent.mkdir(parents=True)
-    plist.write_text("")
+    import plistlib
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"HOME": str(tmp_path)}}))
+    # An older job would start a tick without the gate environment: start directly instead.
+    assert kick._launchd_kickstart("owner/repo") is False and calls == []
+    plist.write_text("not a plist")  # Unknown environment: never trusted for a kickstart.
+    assert kick._launchd_kickstart("owner/repo") is False and calls == []
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": dict(launchd.GATE_ENVIRONMENT)}))
     assert kick._launchd_kickstart("owner/repo") is True
     assert calls[0][:2] == ["launchctl", "kickstart"] and calls[0][2].endswith(launchd.label_for("owner/repo"))
