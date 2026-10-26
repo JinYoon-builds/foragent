@@ -22,6 +22,7 @@ def environment(tmp_path, monkeypatch):
         remote_slug=lambda: remotes.append(root) or "owner/repo",
     ))
     monkeypatch.setattr(kick.StateStore, "for_repo", lambda repo: repos.append(repo) or store)
+    monkeypatch.setattr(kick, "_launchd_kickstart", lambda repo: False)
     return root, store, repos, remotes
 
 
@@ -107,3 +108,27 @@ def test_kick_while_tick_lock_is_held_safely_skips(environment, monkeypatch):
     assert (store.root / "kick.log").read_text() == "another tick is running\n"
     with store.tick_lock() as acquired:
         assert acquired
+
+
+def test_installed_job_is_started_through_launchd(environment, monkeypatch):
+    root, store, _, _ = environment
+    started, spawned = [], []
+    monkeypatch.setattr(kick, "_launchd_kickstart", lambda repo: started.append(repo) or True)
+    monkeypatch.setattr(kick.subprocess, "Popen", lambda *args, **kwargs: spawned.append(args))
+    assert kick.kick_tick(root) is None
+    assert started == ["custom/project"] and spawned == []
+
+
+def test_launchd_kickstart_needs_an_installed_job(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(kick.sys, "platform", "darwin")
+    monkeypatch.setattr(kick.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(kick.subprocess, "run", lambda args, **kwargs: calls.append(args)
+                        or SimpleNamespace(returncode=0))
+    assert kick._launchd_kickstart("owner/repo") is False and calls == []
+    from foragent import launchd
+    plist = tmp_path / "Library/LaunchAgents" / f"{launchd.label_for('owner/repo')}.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_text("")
+    assert kick._launchd_kickstart("owner/repo") is True
+    assert calls[0][:2] == ["launchctl", "kickstart"] and calls[0][2].endswith(launchd.label_for("owner/repo"))

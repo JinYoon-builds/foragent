@@ -63,6 +63,24 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+# setpriority(2) "which" for a process's macOS darwin-background state.
+PRIO_DARWIN_PROCESS = 4
+
+
+def _leave_background() -> None:
+    """Gate work never inherits background QoS from whoever started it.
+
+    A background process (launchd ProcessType Background, or a tick kicked by one)
+    runs on throttled efficiency cores, and its children inherit that state.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        os.setpriority(PRIO_DARWIN_PROCESS, 0, 0)
+    except OSError:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["test"]:
@@ -71,6 +89,8 @@ def main(argv: list[str] | None = None) -> int:
         # Claude Code runs this on every refresh; keep it repository-free and byte-exact.
         return commands.module("statusline").run(None)
     args = _parser().parse_args(argv)
+    if args.command == "gate":
+        _leave_background()
     group = commands.module(args.command)
     if args.command == "statusline":
         return group.run(args)
