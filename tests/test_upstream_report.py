@@ -134,7 +134,7 @@ def test_report_prose_follows_the_repository_language(tmp_path, language, expect
     assert "secret" not in report["title"] + report["body"]
 
 
-@pytest.mark.parametrize("language,expected", [("en", "Approve sending this report"), ("ko", "보내도록 승인합니다")])
+@pytest.mark.parametrize("language,expected", [("en", "Approve sending this report"), ("ko", "보내도록 승인해요")])
 def test_report_help_follows_the_repository_language(tmp_path, monkeypatch, capsys, language, expected):
     from foragent import cli
 

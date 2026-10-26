@@ -46,6 +46,12 @@ class FakeGit:
         pass
 
 
+@pytest.fixture(autouse=True)
+def isolated_global_config(tmp_path, monkeypatch):
+    """`fa init` remembers the upstream-report answer in the global config; keep it off the real home."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     git = FakeGit()
