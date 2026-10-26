@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 
+from foragent import cuts
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import _passing_acceptance_ids, _pytest_command, junit_node_id
 from foragent.run_waits import _progress, _test_slot
@@ -36,7 +37,8 @@ def report_ids(report, result, measurement):
 def check(n, ctx, command, root):
     from foragent import runner
     return runner._check(command, root, ctx.store.log_path(n), max(1, runner._remaining(n, ctx)),
-                         progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+                         progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                         full_text_dir=cuts.issue_dir(ctx.store.root, n))
 
 
 @contextmanager

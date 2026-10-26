@@ -803,6 +803,14 @@ def test_parent_and_paginated_sub_issues_gh():
     ]
 
 
+def test_parent_issue_gh_reads_parent_body_in_one_call():
+    run = ScriptedRun(json.dumps(issue_json(99, body="Shared outcome.")))
+    parent = GhTracker(REPO, run).parent_issue(1)
+    assert (parent.number, parent.body) == (99, "Shared outcome.")
+    assert run.calls == [(["api", "repos/owner/repo/issues/1/parent"], None)]
+    assert GhTracker(REPO, ScriptedRun(gh_error("gh: error (HTTP 404)"))).parent_issue(1) is None
+
+
 @pytest.mark.parametrize("code", [404, 403, 500])
 def test_only_missing_parent_is_none(code):
     tracker = GhTracker(REPO, ScriptedRun(gh_error(f"gh: error (HTTP {code})")))
