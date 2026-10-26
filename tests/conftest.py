@@ -56,6 +56,32 @@ def no_view_windows(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_release_lookup(monkeypatch):
+    """Never ask GitHub for the latest release during the test suite (#417)."""
+    monkeypatch.setenv("FORAGENT_UPDATE_CHECK", "off")
+
+
+@pytest.fixture(autouse=True)
+def no_live_cpu_times(monkeypatch):
+    """Tests opt into fake CPU counters instead of depending on the shared machine."""
+    import psutil
+
+    popen = subprocess.Popen
+
+    def isolated_cpu(*args, **kwargs):
+        # Child interpreters cannot inherit the parent's monkeypatched counters.
+        env = kwargs.get("env")
+        kwargs["env"] = {**(os.environ if env is None else env), "FORAGENT_CPU_BUSY": "off"}
+        return popen(*args, **kwargs)
+
+    def unavailable(*args, **kwargs):
+        raise OSError("CPU counters are unavailable unless the test supplies them")
+
+    monkeypatch.setattr(subprocess, "Popen", isolated_cpu)
+    monkeypatch.setattr(psutil, "cpu_times", unavailable)
+
+
+@pytest.fixture(autouse=True)
 def isolated_test_slots(tmp_path, monkeypatch):
     """Keep machine-wide test slots away from the real data root and live runs."""
     from foragent import capacity
@@ -102,12 +128,12 @@ class GitHistory:
     clone: Path
     tip: str | None = None
 
-    def update(self, files: dict[str, str | None], *, at: datetime = BASE_TIME) -> None:
+    def update(self, files: dict[str, str | None], *, at: datetime = BASE_TIME, message: str = "Update") -> None:
         """Import a new main commit directly into the local bare origin."""
         stream = [
             "commit refs/heads/main\n",
             f"committer Offline Tests <tests@example.com> {int(at.timestamp())} +0000\n",
-            "data 6\nUpdate\n",
+            f"data {len(message.encode('utf-8'))}\n{message}\n",
         ]
         if self.tip is not None:
             stream.append(f"from {self.tip}\n")
@@ -155,64 +181,3 @@ def pytest_itemcollected(item):
     root = Path(__file__).resolve().parent.parent
     if item.path.relative_to(root).as_posix() in LOCAL_ONLY_FILES:
         item.add_marker(pytest.mark.local_only)
-
-
-@pytest.fixture(autouse=True)
-def ci_evidence_recording(request, monkeypatch):
-    """Supply new GitHub wire fields missing from the locked CI recording.
-
-    The recorded suite has two shards. Declare that layout in its runner config,
-    and supply the app/run metadata and frozen scope a real publisher now emits.
-    All recorded damage, selection, fallback and merge assertions remain active.
-    """
-    module = request.module
-    if module.__name__ != 'test_ci_mode':
-        return
-    import json
-    from foragent.ci_workflow import PUBLISH_WORKFLOW, measurement_scope
-
-    select = module.select_mode
-    payload = module.ComparisonCI.payload
-    check_runs = module.ComparisonCI.check_runs
-    command = module.ComparisonCI.command
-    init_case = module.init_case
-
-    def pytest_init_case(*args, **kwargs):
-        case = init_case(*args, **kwargs)
-        # Visibility selection assumes a known test runner. The separate unit
-        # fixture without a manifest covers init's unsupported-command path.
-        (case.root / '.foragent.yml').write_text('test_command: python -m pytest\n')
-        return case
-
-    def select_mode(case, mode, fallback):
-        select(case, mode, fallback)
-        object.__setattr__(case.config, 'ci_shards', 2)
-
-    def scoped_payload(self, index):
-        value = payload(self, index)
-        value['scope'] = measurement_scope(self.case.config, self.case.root, module.EXCLUDED)
-        return value
-
-    def produced_checks(self):
-        values = check_runs(self)
-        for value in values:
-            value['app'] = {'slug': 'github-actions'}
-            value['check_suite'] = {'id': 420}
-        return values
-
-    def github(self, args, input=None):
-        if args[:1] == ['api'] and 'check_suite_id=420' in args[-1]:
-            return json.dumps([{'id': module.RUN}])
-        output = command(self, args, input)
-        if args[:1] == ['api'] and args[-1] == f'repos/{module.REPO}/actions/runs/{module.RUN}':
-            value = json.loads(output)
-            value.update(path=PUBLISH_WORKFLOW, event='workflow_run', check_suite_id=420, head_branch='main',
-                         repository={'full_name': module.REPO, 'default_branch': 'main'})
-            return json.dumps(value)
-        return output
-
-    monkeypatch.setattr(module, 'select_mode', select_mode)
-    monkeypatch.setattr(module.ComparisonCI, 'payload', scoped_payload)
-    monkeypatch.setattr(module.ComparisonCI, 'check_runs', produced_checks)
-    monkeypatch.setattr(module.ComparisonCI, 'command', github)
-    monkeypatch.setattr(module, 'init_case', pytest_init_case)

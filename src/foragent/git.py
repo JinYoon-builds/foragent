@@ -105,6 +105,30 @@ class GitRepo:
     def ref_sha(self, ref: str) -> str:
         return self._call(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
 
+    def union_merge_paths(self, base_ref: str, paths: Iterable[str]) -> set[str]:
+        """Read merge attributes in one batch; unreadable attributes retain overlap limits."""
+        paths = sorted(set(paths))
+        if not paths:
+            return set()
+        try:
+            fields = self._call(["check-attr", f"--source={base_ref}", "-z", "merge", "--", *paths]).split("\0")
+        except GitError:
+            return set()
+        return {path for path, attribute, value in zip(fields[::3], fields[1::3], fields[2::3])
+                if attribute == "merge" and value == "union" and path in paths}
+
+    def latest_trailer(self, key: str, base_ref: str) -> str | None:
+        """Read the newest carrying commit on this branch's first-parent chain."""
+        fields = self._call([
+            "log", "--first-parent",
+            f"--format=%(trailers:key={key},keyonly)%x00%(trailers:key={key},valueonly)%x00",
+            f"{base_ref}..HEAD",
+        ]).split("\0")
+        for index in range(0, len(fields) - 1, 2):
+            if fields[index].strip():
+                return fields[index + 1].strip()
+        return None
+
     def local_branch_sha(self, branch: str) -> str | None:
         try:
             return self._call(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"]).strip()
@@ -152,8 +176,7 @@ class GitRepo:
     def _exclude_artifacts(self) -> None:
         # Also remove entries staged by an executor, retaining their local files.
         self._call(["rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"])
-        # Runner-owned protocol inputs can be published explicitly; worker
-        # scratch files continue to be removed from the index.
+        # Retain runner-owned protocol inputs explicitly preserved by the caller.
         self.ensure_tracked(sorted(self.publication_paths))
         if self.local_skill_paths:
             self._call(["--literal-pathspecs", "rm", "--cached", "-r", "-f", "--ignore-unmatch",
@@ -320,7 +343,10 @@ class GitRepo:
         return self.moved_between(base, target, mine)
 
     def moved_between(self, base: str, target: str, paths: Iterable[str]) -> list[tuple[str, str]]:
-        """Which of ``paths`` ``target`` renamed or copied since its merge base with ``base``: (old, new)."""
+        """Which of ``paths`` ``target`` renamed or copied since its merge base with ``base``: (old, new).
+
+        Copies from unchanged files count too, so a module split out while the original stays is named.
+        """
         mine = set(paths)
         if not mine:
             return []
@@ -328,7 +354,8 @@ class GitRepo:
             base = self._call(["merge-base", base, target]).strip()
         except GitError:
             return []
-        fields = iter(self._call(["diff", "--name-status", "-M", "-C", "-z", base, target]).split("\0"))
+        fields = iter(self._call(["diff", "--name-status", "-M", "-C", "--find-copies-harder", "-z",
+                                  base, target]).split("\0"))
         moved = []
         for status in fields:
             if status[:1] in ("R", "C"):
@@ -406,11 +433,11 @@ class GitRepo:
     def has_staged_changes(self) -> bool:
         return self.staged_tree_sha() != self._call(["rev-parse", "HEAD^{tree}"]).strip()
 
-    def commit(self, title: str) -> None:
+    def commit(self, title: str, *, allow_empty: bool = False) -> None:
         self._exclude_artifacts()
         self._call([
             "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
-            "commit", "-m", title,
+            "commit", *(["--allow-empty"] if allow_empty else []), "-m", title,
         ])
 
     def continue_merge(self) -> None:
@@ -502,7 +529,13 @@ class GitRepo:
                     raise
                 value = ""
             identity.extend(["-c", f"{key}={value or fallback}"])
-        self._call(["add", "-f", "--", *paths])
+        # Already-staged deletions belong in the commit, but git add cannot
+        # match them once they are absent from both the worktree and index.
+        indexed = set(self._call(["ls-files", "--cached", "-z", "--", *paths]).split("\0"))
+        stage = [path for path in paths if path in indexed or (self.root / path).exists()
+                 or (self.root / path).is_symlink()]
+        if stage:
+            self._call(["add", "-f", "--", *stage])
         self._exclude_artifacts()
         self._call([*identity, "commit", "--only", "-m", title, "--", *paths, f":!{REVIEW_SCOPE_FILE}"])
 

@@ -3,11 +3,9 @@
 from dataclasses import dataclass
 import json
 from math import isfinite
-import zlib
 
 from foragent.actions import flag
-from foragent.ci_workflow import EXCLUSIONS, PUBLISH_WORKFLOW, acceptance_command, measurement_scope, producer_run_id
-from foragent.ci_transport import decode_report
+from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, acceptance_command, measurement_scope, read_exclusions
 from foragent.git import GitError
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
@@ -23,10 +21,12 @@ class MissingComparison(UnusableComparison):
     pass
 
 
-def _trusted_sha(git):
+def _trusted_sha(git, tracker):
     try:
-        return git.ref_sha("origin/HEAD")
-    except GitError:
+        return git.ref_sha(f"origin/{tracker.pr_default_branch()}")
+    except (GitError, AttributeError, TrackerError) as exc:
+        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            raise
         return None
 
 
@@ -40,12 +40,12 @@ class ComparisonEvidence:
     trusted_sha: str | None
     status: str
     infrastructure: str
-    checks: str | None = None
+    reports: str | None = None
 
     def current(self, n, ctx, git, pr, head, base_sha, status):
         """One non-waiting read; changed evidence must be checked again unlocked."""
         if (self.base_sha != base_sha or self.head_sha != head or self.status != status
-                or self.trusted_sha != _trusted_sha(git)):
+                or self.trusted_sha != _trusted_sha(git, ctx.tracker)):
             return False
         excluded = _baseline_exclusions(ctx, base_sha, ctx.store.log_path(n))
         if self.scope != measurement_scope(ctx.config, ctx.repo_root, excluded):
@@ -55,9 +55,9 @@ class ComparisonEvidence:
                 logs = ctx.tracker.pr_failed_logs(pr)
                 if not getattr(logs, "not_started", False) or str(logs) != self.infrastructure:
                     return False
-            if self.checks is None:
+            if self.reports is None:
                 return True  # Local evidence is pinned to the same base/head and scope.
-            return self.checks == json.dumps(ctx.tracker.pr_acceptance_checks(pr), sort_keys=True)
+            return self.reports == json.dumps(ctx.tracker.pr_acceptance_reports(head), sort_keys=True)
         except (AttributeError, TrackerError) as exc:
             if isinstance(exc, TrackerError) and exc.is_rate_limit:
                 raise
@@ -69,16 +69,23 @@ def enabled(ctx, target_branch):
             and acceptance_command(ctx.config, ctx.repo_root) is not None)
 
 
-def stage_exclusions(attempt):
-    """Publish the runner's frozen selection, including when .foragent is ignored."""
-    if not enabled(attempt.ctx, attempt.target_branch):
+def commit_exclusions(attempt, title):
+    """Carry the current selection on a content/merge commit, or one empty commit."""
+    git = attempt.git
+    committing = git.has_staged_changes() or git.merge_in_progress()
+    if enabled(attempt.ctx, attempt.target_branch):
+        excluded = _baseline_exclusions(attempt.ctx, git.ref_sha(attempt.start_ref), attempt.log)
+        excluded = sorted(set(excluded))
+        if not committing:
+            try:
+                if read_exclusions(git, attempt.start_ref) == excluded:
+                    return
+            except ValueError:
+                pass  # Replace an invalid selection before publishing this head.
+        title += f"\n\n{EXCLUSIONS_TRAILER}: {json.dumps(excluded, separators=(',', ':'))}"
+    elif not committing:
         return
-    path = attempt.worktree / EXCLUSIONS
-    path.parent.mkdir(parents=True, exist_ok=True)
-    excluded = _baseline_exclusions(attempt.ctx, attempt.git.ref_sha(attempt.start_ref), attempt.log)
-    path.write_text(json.dumps(excluded) + "\n", encoding="utf-8")
-    attempt.git.publication_paths.add(EXCLUSIONS)
-    attempt.git._call(["add", "--force", "--", EXCLUSIONS])
+    git.commit(title, allow_empty=not committing)
 
 
 def suite(value):
@@ -97,44 +104,42 @@ def suite(value):
     return sets
 
 
-def comparison(checks, repo, base_sha, head_sha, excluded, *, expected_scope, expected_shards):
+def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope, expected_shards):
     reports = {}
     expected_shards = set(expected_shards)
     producer = None
     duration = 0
     lost = set()
     seen = {"base": set(), "head": set()}
-    if not isinstance(checks, list):
-        raise UnusableComparison("invalid check-run listing")
-    for check in checks:
-        if not isinstance(check, dict) or not isinstance(check.get("name"), str):
-            raise UnusableComparison("invalid check run")
-        name = check.get("name", "")
-        if not name.startswith("foragent-acceptance/"):
-            continue
-        run_id = producer_run_id(check, repo)
-        run = check.get("workflow_run")
-        if not isinstance(run, dict):
-            continue
-        if (run_id is None or run.get("id") != run_id
-                or (run.get("repository") or {}).get("full_name") != repo
-                or run.get("path", "").split("@", 1)[0] != PUBLISH_WORKFLOW
-                or run.get("event") != "workflow_run"):
-            continue
+    if not isinstance(artifacts, list):
+        raise UnusableComparison("invalid artifact listing")
+    artifact_ids = set()
+    for evidence in artifacts:
         try:
-            payload = decode_report(check["output"]["text"])
+            run, artifact, payload = evidence["run"], evidence["artifact"], evidence["report"]
+            run_id, artifact_id = run["id"], artifact["id"]
             index, shards = payload["shard_index"], payload["shard_count"]
-            if (check.get("head_sha") != head_sha or check.get("status") != "completed"
-                    or check.get("conclusion") != "success" or type(payload["schema_version"]) is not int
-                    or payload["schema_version"] != 1
+            if (type(run_id) is not int or run_id <= 0
+                    or run["head_sha"] != head_sha or run["status"] != "completed"
+                    or run["conclusion"] != "success" or run["event"] != "pull_request"
+                    or run["path"].split("@", 1)[0] != WORKFLOW
+                    or run["repository"]["full_name"] != repo
+                    or run["head_repository"]["full_name"] != repo
+                    or type(artifact_id) is not int or artifact_id <= 0 or artifact_id in artifact_ids
+                    or artifact["expired"] is not False
+                    or type(artifact["workflow_run"]["id"]) is not int
+                    or artifact["workflow_run"]["id"] != run_id
+                    or artifact["workflow_run"]["head_sha"] != head_sha
+                    or type(payload["schema_version"]) is not int or payload["schema_version"] != 1
                     or payload["repository"] != repo or payload["base_sha"] != base_sha
                     or payload["head_sha"] != head_sha or payload["excluded"] != list(excluded)
                     or payload["scope"] != expected_scope
                     or type(index) is not int or type(shards) is not int or not 1 <= shards <= 256
                     or shards != len(expected_shards) or index not in expected_shards
-                    or not 0 <= index < shards or name != f"foragent-acceptance/{index}"
+                    or not 0 <= index < shards or artifact["name"] != f"acceptance-{index}"
                     or index in reports or (producer is not None and producer != run_id)):
                 raise UnusableComparison("shard identity, status or exclusions do not match")
+            artifact_ids.add(artifact_id)
             seconds = payload["duration_seconds"]
             if type(seconds) not in (int, float) or not isfinite(seconds) or seconds < 0:
                 raise UnusableComparison("invalid duration")
@@ -147,26 +152,28 @@ def comparison(checks, repo, base_sha, head_sha, excluded, *, expected_scope, ex
             lost.update(base[1] - head[1])
             reports[index] = payload
             duration = max(duration, seconds)
-        except (KeyError, TypeError, ValueError, zlib.error) as exc:
-            raise UnusableComparison(f"Unusable acceptance shard {name}: {exc}") from exc
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise UnusableComparison(f"Unusable acceptance shard: {exc}") from exc
     if not expected_shards or set(reports) != expected_shards:
         raise MissingComparison("missing acceptance shards")
     return sorted(lost), duration
 
 
-def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass"):
+def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None):
     from foragent.ci_local import LocalComparisonUnavailable, fallback_comparison
 
     n, ctx = attempt.n, attempt.ctx
+    if deadline is None:
+        deadline = ctx.now().timestamp() + 1200
     if base_sha is None:
         base_sha = attempt.git.ref_sha(f"origin/{attempt.target_branch}")
     excluded = _baseline_exclusions(ctx, base_sha, attempt.log)
     scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
-    trusted_sha = _trusted_sha(attempt.git)
+    trusted_sha = _trusted_sha(attempt.git, ctx.tracker)
     evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure)
     # pull_request executes the head's workflow. Its artifacts are usable only
-    # when all acceptance workflows match the default branch exactly. A missing
-    # remote default-branch reference also requires a local comparison.
+    # when all acceptance workflows match the default branch exactly.
+    workflow_error = None
     try:
         if trusted_sha is None:
             raise GitError("Default branch reference unavailable")
@@ -175,8 +182,9 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             ".github/workflows/foragent-acceptance*.yml",
             ".github/workflows/foragent-acceptance*.yaml",
         ])
-    except GitError:
-        changed_workflows = True
+    except GitError as exc:
+        changed_workflows = False
+        workflow_error = str(exc)
     if changed_workflows:
         try:
             fallback_comparison(attempt, base_sha)
@@ -185,22 +193,26 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Local acceptance comparison unavailable", str(exc))
             raise ExecutorStopped("held", str(exc)) from exc
     try:
-        # workflow_run publication follows the measurement run asynchronously.
-        # Give its checks the same registration grace as ordinary Actions jobs.
-        for poll in range(7):
-            checks = ctx.tracker.pr_acceptance_checks(pr)
+        if workflow_error:
+            raise UnusableComparison(workflow_error)
+        # Measurement and artifact registration share ordinary CI's deadline.
+        while True:
+            reports = ctx.tracker.pr_acceptance_reports(head)
             try:
-                lost, duration = comparison(checks, ctx.repo, base_sha, head, excluded,
+                lost, duration = comparison(reports, ctx.repo, base_sha, head, excluded,
                                            expected_scope=scope,
                                            expected_shards=range(ctx.config.ci_shards))
                 break
             except MissingComparison:
-                if infrastructure or poll == 6:
+                from foragent import runner
+
+                remaining = min(deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
+                if infrastructure or remaining <= 0:
                     raise
                 from foragent.run_waits import _progress
 
                 _progress(n, ctx)
-                ctx.sleep(30)
+                ctx.sleep(min(30, remaining))
     except (UnusableComparison, AttributeError, TrackerError) as exc:
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
             raise
@@ -227,7 +239,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         flag(ctx, n, Reason.CI_NOT_STARTED, "CI jobs did not start", infrastructure)
         raise ExecutorStopped("held", infrastructure)
     return ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
-                              json.dumps(checks, sort_keys=True))
+                              json.dumps(reports, sort_keys=True))
 
 
 def review_checks(n, ctx, git, target_branch):

@@ -32,3 +32,6 @@
 - #237 4차: preread는 `run_implementation.lane_config` + `implementer_setup(config, lane, tier, worktree)`를 구현과 함께 쓴다(첫 시도 tier = 이슈 크기). 필드를 따로 흉내 내면 리뷰마다 어긋남이 새로 나온다. 비교 시험은 `tests/test_order.py::test_preread_setup_matches_the_implementation_setup`.
 - 병합 중(MERGE_HEAD 있음)에 main이 또 움직였으면 `git diff --name-only MERGE_HEAD origin/main`만 가져온다. `git checkout --theirs`는 권한이 막히므로 `git restore --source=origin/main --worktree`를 쓴다.
 - #237 5차: 이번 주문이 만드는 레인(`new_lanes` 중 설정에 아직 없는 것)의 이슈는 preread와 승인 모두 거절한다. 레인 에이전트·스킬은 `add_lane`이 설치하므로 미리 흉내 내지 않는다. 순서: `--approve` 없이 발행 → preread → `--approve`로 재발행.
+- #119: 사람은 `/fa`만 친다(`skills/fa/SKILL.md`가 `fa brief --json` → 라우팅). 다른 스킬의 다음 단계 안내는 `/fa`로 쓴다(인수 정규식이 run/type/use/tell the user the next step 줄의 `/fa-init|order|inspect`를 막음). `test_fa_init_skill` 등 스킬 문서 시험 12개는 원래 실패한다. 기준선 비교 임시 파일도 저장소 밖(/tmp)에 쓰지 않는다.
+- #119 2차: `.foragent/acceptance-exclusions.json`은 러너(`ci_mode.stage_exclusions`)가 기준 커밋 실패 시험으로 만들어 강제 추가한다. 리뷰가 "내 시험 제외"로 지적하면 REBUTTAL로 답한다. 사람이 보는 새 문구는 스킬에 박지 말고 `src/foragent/messages/*.py`에 두고 CLI JSON으로 넘긴다(예: `brief.next_step`).
+- #119 3차: 리뷰는 정규식에 안 걸리는 `/fa-design-session` 제안도 "사람에게 /fa만" 위반으로 본다. 사람에게는 "디자인 인터뷰"라고 말하고 스킬 파일 경로를 따라가게 쓴다. 단 `test_fa_init_skill.py::test_brownfield_steps_are_present_in_order`는 fa-init에서 `fa adopt ci` 뒤에 `/fa-order` 문자열이 있어야 한다.

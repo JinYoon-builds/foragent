@@ -1,4 +1,4 @@
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta, timezone
 import errno
 import fcntl
@@ -384,7 +384,10 @@ def test_runs_round_trip_update_active_and_history(store):
     store.finish_run(2, "failed")
     assert [run.number for run in store.active_runs()] == [10]
     history = [json.loads(line) for line in (store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert history == [asdict(finished), asdict(store.get_run(2))]
+    # Each history entry also saves when the run finished, beside the Run fields.
+    ended = store._timestamp()
+    assert history == [{**asdict(finished), "finished_at": ended}, {**asdict(store.get_run(2)), "finished_at": ended}]
+    assert store.finish_times() == {(1, finished.started_at): ended, (2, store.get_run(2).started_at): ended}
     assert store.read_history() == [finished, store.get_run(2)]
     assert store.finish_run(1, "success") == finished
     assert len((store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 2
@@ -774,6 +777,34 @@ def test_link_count_change_alone_voids_a_read(store, field):
     store.record_read(1, "blocked_by", [], baseline=store.read_baseline())
     store.refresh_local_issues([replace(issue, **{field: (("total", 0),)})], [], {}, NOW + timedelta(minutes=5))
     assert store.confirmed_read(1, "blocked_by") is None
+
+
+def test_facade_globals_patched_on_foragent_state_reach_the_split_implementation(store, monkeypatch):
+    store.refresh_local_issues([], [], {}, NOW)
+    assert not store.issues_refresh_due(NOW)
+    monkeypatch.setattr(state_module, "REFRESH_INTERVAL", timedelta(0))
+    assert store.issues_refresh_due(NOW)
+
+    built = []
+    original_run = state_module.Run
+
+    @dataclass(frozen=True)
+    class RecordingRun(original_run):
+        def __post_init__(self):
+            built.append(self.number)
+
+    monkeypatch.setattr(state_module, "Run", RecordingRun)
+    store.start_run(3, branch="foragent/issue-3", worktree=store.worktree_path(3))
+    assert built == [3]
+    assert store.get_run(3).branch == "foragent/issue-3"
+    assert built == [3, 3]
+
+    facts = []
+    monkeypatch.setattr(state_module, "observed_issue_facts", lambda issue: facts.append(issue) or {})
+    issue = type("Issue", (), {"number": 5, "title": "t", "body": "b", "labels": [], "state": "open",
+                                "updated_at": None, "is_pull_request": False})()
+    store.refresh_local_issues([issue], [], {}, NOW)
+    assert facts == [issue]
 
 
 def test_merge_facts_keep_unmerged_runs_null_and_reset_on_a_new_record(store):

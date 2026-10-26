@@ -26,6 +26,7 @@ from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_checks import CheckResult, trusts_ci
+from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
 from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
@@ -456,6 +457,14 @@ def _base_note(report: dict) -> str:
     return f" ({count} failing on the base too)" if count else ""
 
 
+def _merge_title(ctx: RunContext, pr: PullRequest) -> str:
+    """The issue's current title decides the squash subject; unlinked PRs keep theirs."""
+    if (number := pr_issue_number(pr.head)) is None:
+        return pr.title
+    title = f"{ctx.tracker.get_issue(number).title} (#{number})"
+    return f"Batch: {title}" if pr.head.startswith("foragent/batch-") else title
+
+
 def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -> str:
     """Record the human's decision and merge only the freshly checked PR head."""
     approved_by = _text(approved_by, "approved-by")
@@ -482,7 +491,11 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
         n, f"Approved by {approved_by} in the orchestrator ({at}). "
            f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
-    ctx.tracker.merge_pr(n, expected_head_sha=checked.head)
+    subject = retitle_for_merge(
+        ctx, n, title=_merge_title(ctx, current), current_title=current.title, base=current.base,
+        body=lambda: current.body, note=print,
+    )
+    ctx.tracker.merge_pr(n, expected_head_sha=checked.head, **subject)
     summary = (f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; "
                f"tests pass{_base_note(report)}, no conflicts, CI {ci}")
     _event(ctx, None, "merge", summary)

@@ -14,6 +14,7 @@ from foragent.reasons import Reason
 from foragent.run_attempt import ConflictBudgetExhausted, ExecutorStopped, PatchReplayError
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_lane_skills import _inject_lane_skills
+from foragent.run_overlap import conflict_resolution, record_redo
 
 if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
@@ -29,10 +30,13 @@ def _note_moved(attempt: Implementation, moved: list[tuple[str, str]]) -> None:
 
 def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
     """Merge a pinned base; let the caller release its lock before resolving conflicts."""
+    from foragent.ci_mode import commit_exclusions, enabled
+
+    ci = enabled(attempt.ctx, attempt.target_branch)
     _inject_lane_skills(attempt.ctx, attempt.n, attempt.git, target_sha)
     moved = attempt.git.moved_by(target_sha)
     try:
-        attempt.git.merge_base(target_sha)
+        attempt.git.merge_base(target_sha, commit=not ci)
     except GitError:
         _note_moved(attempt, moved)
         conflicts = attempt.git.conflict_paths()
@@ -40,6 +44,8 @@ def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
             raise
         return conflicts
     _note_moved(attempt, moved)
+    if ci and attempt.git.merge_in_progress():
+        commit_exclusions(attempt, f"{attempt.issue.title} (#{attempt.n})")
     return []
 
 
@@ -99,6 +105,7 @@ def _recover_replay(attempt: Implementation, exc: PatchReplayError) -> str:
 def _rebuild(attempt: Implementation, exc: ConflictBudgetExhausted) -> str:
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     log = attempt.log
+    record_redo(attempt)
     attempt.rebuilt = True
     _append(log, f"Rebuilding issue branch once from latest {attempt.target_branch}.\n{exc}")
     ctx.git.fetch("origin", attempt.target_branch)
@@ -127,12 +134,18 @@ def _block_rebuild(attempt: Implementation, details: str) -> str:
 
 
 def _resolve_conflicts(attempt: Implementation, conflicts: list[str]) -> None:
+    conflicts = sorted(set(conflicts) | set(attempt.ctx.store.get_run(attempt.n).merge_conflicts))
+    with conflict_resolution(attempt, conflicts):
+        _resolve_conflicts_inner(attempt, conflicts)
+
+
+def _resolve_conflicts_inner(attempt: Implementation, conflicts: list[str]) -> None:
+    from foragent.ci_mode import commit_exclusions, enabled
     from foragent.run_checks import _verify_implementation
     from foragent.run_implementation import _implement
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     log = attempt.log
-    conflicts = sorted(set(conflicts) | set(ctx.store.get_run(n).merge_conflicts))
     ctx.store.update_run(n, merge_conflicts=conflicts)
     title = f"{attempt.issue.title} (#{n})"
     pending_merge = git.merge_in_progress()
@@ -151,7 +164,10 @@ def _resolve_conflicts(attempt: Implementation, conflicts: list[str]) -> None:
             check_failure = f"Conflict markers remain in: {', '.join(markers)}"
             continue
         git.stage_changes()
-        if pending_merge:
+        if enabled(ctx, attempt.target_branch):
+            commit_exclusions(attempt, title)
+            pending_merge = False
+        elif pending_merge:
             git.continue_merge()
             pending_merge = False
         elif git.has_staged_changes():
@@ -166,7 +182,7 @@ def _resolve_conflicts(attempt: Implementation, conflicts: list[str]) -> None:
 
 
 def _resume_implementation(attempt: Implementation) -> bool:
-    from foragent.run_publish import _merge_lock
+    from foragent.ci_mode import commit_exclusions, enabled
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     conflicts = ctx.store.get_run(n).merge_conflicts
@@ -177,25 +193,29 @@ def _resume_implementation(attempt: Implementation) -> bool:
         # A saved implementation must see the same target as its acceptance
         # baseline before the worker starts. Keep its history and reuse the
         # publish path's conflict resolution and rebuild budget.
-        with _merge_lock(n, ctx):
-            if not git.is_ancestor(attempt.start_ref, git.head_sha()):
-                moved = git.moved_by(attempt.start_ref)
-                try:
-                    # A saved partial resolution still needs its marker checks,
-                    # even when Git can merge the target without index conflicts.
-                    git.merge_base(attempt.start_ref, commit=not conflicts)
-                    _note_moved(attempt, moved)
-                except GitError:
-                    _note_moved(attempt, moved)
-                    unmerged = git.conflict_paths()
-                    if not unmerged:
-                        raise
-                    conflicts = sorted(set(conflicts) | set(unmerged))
-            if conflicts:
-                try:
-                    _resolve_conflicts(attempt, conflicts)
-                except ConflictBudgetExhausted as exc:
-                    attempt.failure = _rebuild(attempt, exc)
-                else:
-                    return True
+        # Preparation stays unlocked; publication rechecks the verified base
+        # and all merge inputs under its final short merge lock.
+        if not git.is_ancestor(attempt.start_ref, git.head_sha()):
+            moved = git.moved_by(attempt.start_ref)
+            try:
+                # A saved partial resolution still needs its marker checks,
+                # even when Git can merge the target without index conflicts.
+                ci = enabled(ctx, attempt.target_branch)
+                git.merge_base(attempt.start_ref, commit=not conflicts and not ci)
+                if ci and not conflicts and git.merge_in_progress():
+                    commit_exclusions(attempt, f"{attempt.issue.title} (#{n})")
+                _note_moved(attempt, moved)
+            except GitError:
+                _note_moved(attempt, moved)
+                unmerged = git.conflict_paths()
+                if not unmerged:
+                    raise
+                conflicts = sorted(set(conflicts) | set(unmerged))
+        if conflicts:
+            try:
+                _resolve_conflicts(attempt, conflicts)
+            except ConflictBudgetExhausted as exc:
+                attempt.failure = _rebuild(attempt, exc)
+            else:
+                return True
     return False

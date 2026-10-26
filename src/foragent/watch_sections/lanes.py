@@ -10,15 +10,25 @@ from foragent.watch_data import Snapshot
 from foragent.watch_layout import _clones, _split, _widths, _worker_rows
 
 ORDER = 30
+# "Watching" needs an orchestrator heartbeat (written by a running fa orch watch) this fresh (D67).
+ORCH_FRESH_SECONDS = 30
+# The most urgent state first, as status.collect_lanes chooses a lane's issue.
+STATE_ORDER = ("working", "waiting-human", "blocked", "queued", "idle")
 
 
-def _overview(snapshot: Snapshot, language: str) -> list[Line]:
+def _overview(snapshot: Snapshot, language: str, age: float = 0.0) -> list[Line]:
     from foragent import watch
 
     status = snapshot.status
     t = lambda key, **values: watch.text(key, language, **values)
-    state = "watch_handling" if status["summary"]["blocked"] else "watch_monitoring"
-    overview = [watch._line(t(state), "yellow" if status["summary"]["blocked"] else "green")]
+    overview: list[Line] = []
+    heartbeat = snapshot.heartbeats.get("orch")
+    if heartbeat is not None and heartbeat + age <= ORCH_FRESH_SECONDS:
+        state = "watch_handling" if status["summary"]["blocked"] else "watch_monitoring"
+        overview.append(watch._line(t(state), "yellow" if status["summary"]["blocked"] else "green"))
+    elif heartbeat is not None or status["active_runs"] or any(watch._has_work(row) for row in status["lanes"].values()):
+        # A stale or missing heartbeat while work exists means nobody is watching.
+        overview.append(watch._line(t("watch_orch_off"), "yellow"))
     if snapshot.order:
         # The combined bar and finish time live in the progress section.
         overview += [watch._line(t("watch_order") + f" #{snapshot.order.number}"),
@@ -32,6 +42,42 @@ def _overview(snapshot: Snapshot, language: str) -> list[Line]:
     return overview
 
 
+def _road(
+    snapshot: Snapshot, name: str, numbers: list[int], state: str, queue: list[dict[str, Any]],
+    label: str, color: str, road_width: int, tick: int, worker: int | None = None,
+) -> Line:
+    """One road: the lane name, as much of its queue as fits, then the worker's issues and badge."""
+    from foragent import watch
+
+    width = min(19, road_width // 3)
+    if worker is not None:
+        # Keep the worker number and arrow whole; only the lane name gives way.
+        lead, tail_text = name, f" {worker} ▸ "
+        room = width - sum(watch._cells(char) for char in tail_text)
+        if sum(watch._cells(char) for char in lead) > room:
+            fitted = "".join(value for value, style in watch._fit(watch._line(lead), max(0, room - 1)))
+            lead = fitted.rstrip() + "…"
+        name = lead + tail_text
+    prefix = watch._fit(watch._line(name, "bold"), width)
+    tool = watch.PICK[tick % 4] if state == "working" else " ✋ " if state == "waiting-human" else " ●  " if state == "blocked" else " zZ "
+    hit = "hit" if state == "working" and tick % 4 == 2 else color
+    tail: Line = [(f" #{number} ", hit) for number in numbers]
+    tail += [(tool, "yellow"), (label, color)]
+    space = max(0, road_width - sum(watch._cells(value) for value, style in prefix + tail))
+    shown = len(queue)
+    while True:
+        road: Line = []
+        if shown < len(queue):
+            road.append((f"+{len(queue) - shown} ", ""))
+        for item in reversed(queue[:shown]):
+            road += [(f" #{item['number']} ", "queue"), (" ", "road")]
+        road_cells = sum(watch._cells(value) for value, style in road)
+        if road_cells <= space or shown == 0:
+            break
+        shown -= 1
+    return watch._fit([*prefix, (" " * max(0, space - road_cells), "road"), *road, *tail], road_width)
+
+
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
     from foragent import watch
 
@@ -40,10 +86,11 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     side_by_side, orchestrator_width, road_width, _, _ = _widths(context["width"])
     busy, idle = _split(snapshot.status)
     clones = _clones(snapshot.status)
-    left = watch._panel(_overview(snapshot, language), orchestrator_width, "🧭 " + t("watch_orchestrator"))
+    age = max(0.0, (context["now"] - snapshot.captured_at).total_seconds())
+    left = watch._panel(_overview(snapshot, language, age), orchestrator_width, "🧭 " + t("watch_orchestrator"))
     roads: list[Line] = [[("━" * road_width, "edge")]]
     for index, row in busy:
-        slug, state = row["slug"], row["state"]
+        slug = row["slug"]
         lane = config.lanes.get(slug, {})
         executor = lane.get("executor") or config.executor
         color, badge = ("claude", "✳") if executor == "claude" else ("codex", "✺")
@@ -52,28 +99,20 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         label_width = min(25, max(8, road_width // 3))
         agent_label = "".join(value for value, style in watch._fit(watch._line(t('watch_agent', lane=title)), label_width)).rstrip()
         label = f"▐ {badge} {agent_label} ▌"
-        tool = watch.PICK[tick % 4] if state == "working" else " ✋ " if state == "waiting-human" else " ●  " if state == "blocked" else " zZ "
-        hit = "hit" if state == "working" and tick % 4 == 2 else color
+        several = len(clones.get(slug, [])) > 1
         # Several workers get a road row each; the queue and done line stay on the first.
-        for position, (display, numbers) in enumerate(_worker_rows(row, clones)):
-            prefix = watch._fit(watch._line(f"{index} {display} ▸ ", "bold"), min(19, road_width // 3))
-            queue = row["queued"] if position == 0 else []
-            tail: Line = [(f" #{number} ", hit) for number in numbers]
-            tail += [(tool, "yellow"), (label, color)]
-            space = max(0, road_width - sum(watch._cells(value) for value, style in prefix + tail))
-            shown = len(queue)
-            while True:
-                road: Line = []
-                if shown < len(queue):
-                    road.append((f"+{len(queue) - shown} ", ""))
-                for item in reversed(queue[:shown]):
-                    road += [(f" #{item['number']} ", "queue"), (" ", "road")]
-                road_cells = sum(watch._cells(value) for value, style in road)
-                if road_cells <= space or shown == 0:
-                    break
-                shown -= 1
-            roads.append(watch._fit([*prefix, (" " * max(0, space - road_cells), "road"), *road, *tail], road_width))
+        for position, (_, numbers) in enumerate(_worker_rows(row, clones)):
+            # Each numbered row shows its own worker's state, not the lane's representative state.
+            # A non-running issue kept on the first row adds its own state (the lane's), and
+            # the most urgent one wins, in status.collect_lanes order.
+            states = [snapshot.worker_states.get(number, row["state"]) for number in numbers]
+            state = min(states, key=STATE_ORDER.index) if several else row["state"]
+            worker = position + 1 if several else None
+            name = f"{index} {row['lane_display']}" + ("" if several else " ▸ ")
+            roads.append(_road(snapshot, name, numbers, state, row["queued"] if position == 0 else [],
+                               label, color, road_width, tick, worker))
             if position == 0:
+                # The lane's done line stays with its first worker.
                 done = snapshot.done.get(slug, [])
                 roads.append(watch._fit(watch._line("  " + t("watch_done", count=len(done), title=done[-1].title if done else "—"), "green"), road_width))
         last = index == busy[-1][0] and not idle

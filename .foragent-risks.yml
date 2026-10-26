@@ -1,0 +1,42 @@
+# Foragent risk map: the reviewer reads the entries whose paths a PR touches.
+# Add entries with `fa risk add`; it appends and keeps everything above as is.
+# Unmapped code keeps the same full review; these notes only add context.
+- paths:
+  - src/foragent/processes.py
+  - src/foragent/scheduler_recovery.py
+  - src/foragent/inspect_runtime.py
+  why: Code here sends signals to process groups. A wrong process identity kills
+    processes Foragent does not own.
+  incident:
+    date: '2026-10-24'
+    summary: A review reproduced a kill path on the real machine. A process record
+      with the fake identity of 1 reached the signal sender, and the signal killed
+      the user's apps.
+  guidance: Read only; never execute signal-sending code, including tests that send
+    real signals. Check ownership with fake process tables only. Treat any weakened
+    kill-safety check (ownership, PID reuse, group membership) as a defect.
+  fixed_by: '#261'
+  guard_tests:
+  - tests/acceptance/test_stop_whole_tree.py
+  added:
+    by: orchestrator
+    at: '2026-10-25T00:00:00+00:00'
+    event: incident:kill-2026-10-24
+- paths:
+  - src/foragent/run_baseline.py
+  - src/foragent/policy.py
+  why: The acceptance baseline and the merge policy decide which tests must keep
+    passing before a PR merges automatically.
+  incident:
+    date: '2026-10-24'
+    summary: An empty acceptance baseline was treated as a valid result, so previously
+      passing acceptance tests were left unprotected and a regression could merge.
+  guidance: Treat a missing or empty baseline as unknown, never as a pass. Check that
+    every previously passing acceptance test still has to keep passing, and that no
+    merge-policy hold was weakened.
+  guard_tests:
+  - tests/acceptance/test_acceptance_baseline.py
+  added:
+    by: orchestrator
+    at: '2026-10-25T00:00:00+00:00'
+    event: incident:empty-baseline-2026-10-24

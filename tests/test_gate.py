@@ -57,11 +57,17 @@ def test_check_done_runs_all_commands_from_root_with_scrubbed_environment(hook, 
 def test_check_done_blocks_and_reports_only_last_2000_output_characters(hook, capsys):
     setup, worktree, counter = hook
     command = shlex.join([sys.executable, "-c", "print('lost prefix' + 'x' * 2100 + 'tail'); raise SystemExit(4)"])
-    assert main(setup([command, "touch should-not-run"])) == 2
+    second = "echo second-failure; exit 3"
+    assert main(setup([command, "touch still-runs", second])) == 2
     output = capsys.readouterr()
     assert output.out == ""
-    assert output.err == f"Done when failed: {command}\n" + ("x" * 2100 + "tail\n")[-2000:] + "\n"
-    assert counter.read_text() == "1" and not (worktree / "should-not-run").exists()
+    # Every failing command is reported; the 2000-character limit names what it left out (#420).
+    full = "lost prefix" + "x" * 2100 + "tail\n"
+    saved = counter.parent / "stop-check-0.log"
+    assert output.err.startswith(f"Done when failed: {command}\n[cut: {len(full) - 2000} more chars; full text: {saved}]\n"
+                                 + full[-2000:] + "\n\nDone when failed: " + second + "\nsecond-failure\n")
+    assert saved.read_text() == full
+    assert counter.read_text() == "1" and (worktree / "still-runs").exists()
 
 
 def test_check_done_blocks_eight_times_then_skips_checks(hook, capsys):

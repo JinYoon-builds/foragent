@@ -4,16 +4,19 @@ from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
+from io import BytesIO
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
+from zipfile import ZipFile
 
 import pytest
 import yaml
 
 from foragent.ci_mode import UnusableComparison, comparison
-from foragent.ci_workflow import PUBLISH_WORKFLOW, WORKFLOW, measurement_scope, workflow_text, write_workflow
+from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
 from foragent.config import Config, ConfigError, load_config
 from runner_support import run_case
 
@@ -25,13 +28,111 @@ def report(index=0, count=2):
                "scope": measurement_scope(Config(ci_shards=count), Path('.'), []),
                "base": {"complete": True, "collected_ids": [node], "passing_ids": [node]},
                "head": {"complete": True, "collected_ids": [node], "passing_ids": [node]}}
-    return {"name": f"foragent-acceptance/{index}", "head_sha": "head", "status": "completed", "conclusion": "success",
-            "app": {"slug": "github-actions"}, "details_url": "https://github.com/owner/repo/actions/runs/42",
-            "check_suite": {"id": 420},
-            "workflow_run": {"id": 42, "check_suite_id": 420, "head_branch": "main",
-                             "repository": {"full_name": "owner/repo", "default_branch": "main"},
-                             "path": PUBLISH_WORKFLOW, "event": "workflow_run"},
-            "output": {"text": json.dumps(payload)}}
+    run = {"id": 42, "head_sha": "head", "status": "completed", "conclusion": "success",
+           "repository": {"full_name": "owner/repo"}, "head_repository": {"full_name": "owner/repo"},
+           "path": WORKFLOW, "event": "pull_request"}
+    artifact = {"id": 100 + index, "name": f"acceptance-{index}", "expired": False,
+                "workflow_run": {"id": 42, "head_sha": "head"}}
+    return {"run": run, "artifact": artifact, "report": payload}
+
+
+def recorded_github(values, *, runs=None):
+    """Serve the REST run/artifact shapes and actual binary ZIP responses."""
+    calls = []
+
+    def github(args, input=None):
+        calls.append(args)
+        endpoint = args[-1]
+        if endpoint == 'repos/owner/repo':
+            return json.dumps({'full_name': 'owner/repo', 'default_branch': 'trunk'})
+        if '/actions/runs?head_sha=head&' in endpoint:
+            return json.dumps(runs if runs is not None else [values[0]['run'] if values else report()['run']])
+        if '/actions/runs/42/artifacts?' in endpoint:
+            artifacts = [value['artifact'] for value in values]
+            return '\n'.join(json.dumps([artifact]) for artifact in artifacts) or '[]'
+        for value in values:
+            if endpoint.endswith(f"/actions/artifacts/{value['artifact']['id']}/zip"):
+                output = BytesIO()
+                with ZipFile(output, 'w') as archive:
+                    archive.writestr(f"shard-{value['report']['shard_index']}.json", json.dumps(value['report']))
+                return output.getvalue()
+        raise AssertionError(f'Unexpected GitHub command: {args}')
+
+    return github, calls
+
+
+@pytest.mark.parametrize('status', ['queued', 'in_progress'])
+@pytest.mark.parametrize('finishes', [True, False])
+def test_unfinished_measurement_polls_within_existing_ci_budget(tmp_path, monkeypatch, status, finishes):
+    from conftest import BASE_TIME
+    from foragent import ci_mode
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.tracker import GhTracker
+
+    fixtures = Path(__file__).parent / 'fixtures/github_ci'
+    run = json.loads((fixtures / 'measurement_run.json').read_text())
+    repo, head = run['repository']['full_name'], run['head_sha']
+    listing = json.loads((fixtures / 'runs_by_head.json').read_text())
+    listing['workflow_runs'] = [run]
+    artifacts = json.loads((fixtures / 'artifacts.json').read_text())
+    artifacts['artifacts'] = artifacts['artifacts'][:1]
+    payload = json.loads((fixtures / 'shard-0.json').read_text())
+    config = Config(checks='ci', test_command='pytest', ci_shards=1)
+    payload.update(base_sha='base', head_sha=head, excluded=[], shard_count=1,
+                   scope=measurement_scope(config, tmp_path, []))
+    archive = BytesIO()
+    with ZipFile(archive, 'w') as output:
+        output.writestr('shard-0.json', json.dumps(payload))
+    reads, sleeps, updates = [], [], []
+    clock = [BASE_TIME + timedelta(seconds=480)]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += timedelta(seconds=seconds)
+
+    def github(args, input=None):
+        endpoint = args[-1]
+        if endpoint == f'repos/{repo}':
+            return json.dumps({'full_name': repo, 'default_branch': 'main'})
+        if '/actions/runs?' in endpoint:
+            reads.append(endpoint)
+            pending = not finishes or len(reads) <= 8
+            run.update(status=status if pending else 'completed', conclusion=None if pending else 'success')
+            return json.dumps(listing['workflow_runs'])
+        assert finishes and len(reads) == 9, 'Pending runs must not supply artifacts'
+        if '/artifacts?' in endpoint:
+            return json.dumps(artifacts['artifacts'])
+        if endpoint.endswith('/zip'):
+            return archive.getvalue()
+        raise AssertionError(args)
+
+    ctx = SimpleNamespace(
+        repo=repo, repo_root=tmp_path, config=config, now=lambda: clock[0], sleep=sleep,
+        tracker=GhTracker(repo, github),
+        store=SimpleNamespace(update_run=lambda n, **kwargs: updates.append(kwargs)),
+    )
+    attempt = SimpleNamespace(
+        n=1, ctx=ctx, target_branch='main', log=tmp_path / 'log',
+        git=SimpleNamespace(ref_sha=lambda ref: 'trusted', _call=lambda args: ''),
+    )
+    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'flag', lambda *args: None)
+    monkeypatch.setattr('foragent.run_waits._progress', lambda *args: None)
+    monkeypatch.setattr('foragent.runner._remaining', lambda *args: 3600)
+    from foragent.run_publish import _CIWait
+
+    deadline = _CIWait(BASE_TIME.timestamp()).deadline
+    if finishes:
+        evidence = ci_mode.require_comparison(attempt, 2, head, base_sha='base', deadline=deadline)
+        assert evidence.reports is not None
+        assert any(update.get('comparison', {}).get('source') == 'ci' for update in updates)
+        assert len(reads) == 9 and sleeps == [30] * 8
+    else:
+        with pytest.raises(ExecutorStopped, match='missing acceptance shards'):
+            ci_mode.require_comparison(attempt, 2, head, base_sha='base', deadline=deadline)
+        assert len(reads) == 25 and sleeps == [30] * 24
+        assert clock[0].timestamp() == deadline
+        assert not updates
 
 
 def compare(checks, count=2):
@@ -42,30 +143,32 @@ def compare(checks, count=2):
 
 def test_compare_records_parallel_wall_duration_and_detects_deselection():
     checks = [report(), report(1)]
-    payload = json.loads(checks[1]["output"]["text"])
+    payload = checks[1]['report']
     payload["head"] = {"complete": True, "collected_ids": [], "passing_ids": []}
-    checks[1]["output"]["text"] = json.dumps(payload)
+    checks[1]['report'] = payload
     lost, duration = compare(checks)
     assert lost == ["tests/acceptance/test_keep_1.py::test_keep"]
     assert duration == 3
 
 
-@pytest.mark.parametrize("damage", ["check-sha", "nan", "overlap", "duplicate", "malformed", "cancelled"])
+@pytest.mark.parametrize("damage", ["check-sha", "nan", "overlap", "duplicate", "malformed", "cancelled", "exclusions"])
 def test_rejects_unusable_shards(damage):
     checks = [report(), report(1)]
-    payload = json.loads(checks[1]["output"]["text"])
+    payload = checks[1]['report']
     if damage == "check-sha":
-        checks[1]["head_sha"] = "old"
+        checks[1]['run']["head_sha"] = "old"
     elif damage == "nan":
         payload["duration_seconds"] = float('nan')
     elif damage == "overlap":
-        payload["base"] = json.loads(checks[0]["output"]["text"])["base"]
+        payload["base"] = checks[0]['report']["base"]
     elif damage == "duplicate":
         checks[1] = deepcopy(checks[0])
-        payload = json.loads(checks[1]["output"]["text"])
+        payload = checks[1]['report']
     elif damage == "cancelled":
-        checks[1]["conclusion"] = "cancelled"
-    checks[1]["output"]["text"] = "{" if damage == "malformed" else json.dumps(payload)
+        checks[1]['run']["conclusion"] = "cancelled"
+    elif damage == "exclusions":
+        payload['excluded'] = ['tests/acceptance/test_unapproved.py']
+    checks[1]['report'] = '{' if damage == 'malformed' else payload
     with pytest.raises(UnusableComparison):
         compare(checks)
 
@@ -97,11 +200,29 @@ def test_workflow_runner_visibility_warning_and_rewrite(tmp_path, capsys, privat
     assert job['runs-on'] == ['self-hosted', 'linux']
     assert job['strategy'] == {'fail-fast': False, 'matrix': {'shard': [0, 1, 2]}}
     assert [step.get('uses') for step in job['steps'][:2]] == ['actions/checkout@v4', 'astral-sh/setup-uv@v6']
-    assert document['permissions']['checks'] == 'write'
+    assert document['permissions'] == {'contents': 'read'}
+    assert not (tmp_path / '.github/workflows/foragent-acceptance-publish.yml').exists()
     path.write_text('obsolete workflow')
     write_workflow(tmp_path, config, warn=False)
     assert path.read_text() == workflow_text(config)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('generated', [True, False])
+def test_workflow_removes_only_generated_legacy_publisher(tmp_path, capsys, generated):
+    legacy = tmp_path / '.github/workflows/foragent-acceptance-publish.yml'
+    legacy.parent.mkdir(parents=True)
+    original = ('# Generated by fa ci workflow.\n' if generated else '# Maintained by the team\n') + (
+        'name: foragent-acceptance-publish\njobs:\n  publish:\n'
+        '    steps:\n      - run: python -m foragent.ci_publish\n')
+    legacy.write_text(original)
+    write_workflow(tmp_path, Config(), warn=False)
+    assert legacy.exists() is not generated
+    if generated:
+        assert f'Removed: {legacy.relative_to(tmp_path)}' in capsys.readouterr().out
+    else:
+        assert legacy.read_text() == original
+        assert 'Removed:' not in capsys.readouterr().out
 
 
 def test_measurement_partitions_all_portable_nodes_and_excludes_marked_and_locked_tests(tmp_path, monkeypatch):
@@ -134,30 +255,153 @@ def test_measurement_partitions_all_portable_nodes_and_excludes_marked_and_locke
 def test_force_added_exclusions_survive_generic_artifact_cleanup(git_history):
     from conftest import git_command
     from foragent.git import GitRepo
+    from runner_support import import_index
 
     root = git_history.clone
     git = GitRepo(root)
     metadata = root / '.foragent'
     metadata.mkdir()
-    (metadata / 'acceptance-exclusions.json').write_text('[]\n')
     (metadata / 'TRY.md').write_text('scratch')
-    git.publication_paths.add('.foragent/acceptance-exclusions.json')
+    import_index(root, f'Issue title\n\n{EXCLUSIONS_TRAILER}: []')
     git.stage_changes()
-    assert git_command(root, 'ls-files', '--', '.foragent') == '.foragent/acceptance-exclusions.json'
+    assert read_exclusions(git, git_history.tip) == []
+    assert not git_command(root, 'ls-files', '--', '.foragent')
     git._exclude_artifacts()
-    assert git_command(root, 'ls-files', '--', '.foragent') == '.foragent/acceptance-exclusions.json'
+    assert read_exclusions(git, git_history.tip) == []
+    assert not git_command(root, 'ls-files', '--', '.foragent')
+
+
+def exclusion_attempt(git_history, tmp_path, monkeypatch, excluded):
+    from foragent import ci_mode
+    from foragent.git import GitRepo
+    from runner_support import import_index
+
+    root = git_history.clone
+    commands = []
+    real_git = GitRepo(root)
+
+    def run(args):
+        commands.append(args)
+        if 'commit' in args:
+            import_index(root, args[-1])
+            return ''
+        return real_git._call(args)
+
+    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: excluded)
+    attempt = SimpleNamespace(git=GitRepo(root, run), worktree=root, start_ref=git_history.tip,
+                              ctx=SimpleNamespace(config=Config(checks='ci', test_command='pytest'), repo_root=root),
+                              target_branch='main', log=tmp_path / 'log')
+    return attempt, commands
+
+
+@pytest.mark.parametrize('untrailed_tip', [False, True])
+def test_runner_adds_no_empty_commit_when_exclusions_match(git_history, tmp_path, monkeypatch, untrailed_tip):
+    from foragent.ci_mode import commit_exclusions
+    from runner_support import import_index
+
+    attempt, commands = exclusion_attempt(git_history, tmp_path, monkeypatch, [])
+    import_index(attempt.worktree, f'Existing selection\n\n{EXCLUSIONS_TRAILER}: []')
+    if untrailed_tip:
+        import_index(attempt.worktree, 'External checkpoint without a trailer')
+    head = attempt.git.head_sha()
+    commit_exclusions(attempt, 'Issue title (#1)')
+    assert attempt.git.head_sha() == head
+    assert not any('commit' in args for args in commands)
+
+
+@pytest.mark.parametrize('previous', ['[]', None, 'invalid'])
+def test_runner_adds_exactly_one_empty_commit_when_exclusions_change(git_history, tmp_path, monkeypatch, previous):
+    from foragent.ci_mode import commit_exclusions
+    from runner_support import import_index
+
+    excluded = ['tests/acceptance/test_z.py', 'tests/acceptance/test_a.py', 'tests/acceptance/test_z.py']
+    attempt, commands = exclusion_attempt(git_history, tmp_path, monkeypatch, excluded)
+    message = 'Old selection' + (f'\n\n{EXCLUSIONS_TRAILER}: {previous}' if previous is not None else '')
+    import_index(attempt.worktree, message)
+    tree = attempt.git.staged_tree_sha()
+    commit_exclusions(attempt, 'Issue title (#1)')
+    head = attempt.git.head_sha()
+    commit_exclusions(attempt, 'Issue title (#1)')
+    commits = [args for args in commands if 'commit' in args]
+    assert len(commits) == 1 and '--allow-empty' in commits[0]
+    assert commits[0][-1] == (f'Issue title (#1)\n\n{EXCLUSIONS_TRAILER}: '
+                             '["tests/acceptance/test_a.py","tests/acceptance/test_z.py"]')
+    assert read_exclusions(attempt.git, attempt.start_ref) == sorted(set(excluded))
+    assert attempt.git.head_sha() == head and attempt.git.staged_tree_sha() == tree
+    assert not (attempt.worktree / '.foragent/acceptance-exclusions.json').exists()
+
+
+def test_runner_carries_exclusions_on_the_content_commit(git_history, tmp_path, monkeypatch):
+    from foragent.ci_mode import commit_exclusions
+
+    attempt, commands = exclusion_attempt(git_history, tmp_path, monkeypatch, [])
+    (attempt.worktree / 'feature.py').write_text('VALUE = 1\n')
+    attempt.git.stage_changes()
+    commit_exclusions(attempt, 'Issue title (#1)')
+    commit_exclusions(attempt, 'Issue title (#1)')
+    commits = [args for args in commands if 'commit' in args]
+    assert len(commits) == 1 and '--allow-empty' not in commits[0]
+    assert read_exclusions(attempt.git, attempt.start_ref) == []
+
+
+def test_runner_carries_current_exclusions_on_its_base_merge(git_history, tmp_path, monkeypatch):
+    from conftest import git_command
+    from foragent import run_conflicts
+    from foragent.ci_mode import commit_exclusions
+
+    excluded = []
+    attempt, commands = exclusion_attempt(git_history, tmp_path, monkeypatch, excluded)
+    attempt.n, attempt.issue = 1, SimpleNamespace(title='Issue title')
+    (attempt.worktree / 'feature.py').write_text('VALUE = 1\n')
+    attempt.git.stage_changes()
+    commit_exclusions(attempt, 'Issue title (#1)')
+    previous_head = attempt.git.head_sha()
+    git_history.update({'docs/new.md': 'Another issue merged\n'})
+    git_command(attempt.worktree, 'fetch', '-q', 'origin')
+    attempt.start_ref = git_history.tip
+    excluded.append('tests/acceptance/test_new.py')
+    monkeypatch.setattr(run_conflicts, '_inject_lane_skills', lambda *args: None)
+    commands.clear()
+    assert run_conflicts._merge_moved_base(attempt, attempt.start_ref) == []
+    commit_exclusions(attempt, 'Issue title (#1)')
+    commits = [args for args in commands if 'commit' in args]
+    assert len(commits) == 1 and '--allow-empty' not in commits[0]
+    parents = git_command(attempt.worktree, 'rev-list', '--parents', '-1', 'HEAD').split()[1:]
+    assert parents == [previous_head, git_history.tip]
+    assert read_exclusions(attempt.git, attempt.start_ref) == excluded
+
+
+@pytest.mark.parametrize('value', ['null', '{}', '[1]', '["z","a"]', '["a","a"]', '', '[]\n'
+                                f'{EXCLUSIONS_TRAILER}: []'])
+@pytest.mark.parametrize('protocol', ['trailer', 'legacy-file'])
+def test_shard_rejects_invalid_or_duplicate_exclusion_trailers(git_history, monkeypatch, value, protocol):
+    from conftest import git_command
+    from foragent import ci_shard
+    from runner_support import import_index
+
+    root = git_history.clone
+    legacy_file = root / '.foragent/acceptance-exclusions.json'
+    legacy_file.parent.mkdir()
+    legacy_file.write_text(value if protocol == 'legacy-file' else '[]')
+    git_command(root, 'add', '-f', '.foragent/acceptance-exclusions.json')
+    message = 'Bad legacy selection' if protocol == 'legacy-file' else f'Bad selection\n\n{EXCLUSIONS_TRAILER}: {value}'
+    import_index(root, message)
+    legacy_file.write_text('[]')
+    for key, data in {'FA_CHECKOUT': str(root), 'FA_BASE_SHA': git_history.tip,
+                      'FA_HEAD_SHA': git_command(root, 'rev-parse', 'HEAD')}.items():
+        monkeypatch.setenv(key, data)
+    with pytest.raises(ValueError):
+        ci_shard.main()
 
 
 def test_fork_check_results_are_unusable_without_fetching_checks():
-    from foragent.tracker import GhTracker
+    from foragent.tracker import GhTracker, TrackerError
 
-    calls = []
-
-    def github(args, input=None):
-        calls.append(args)
-        return json.dumps({'head': {'sha': 'head', 'repo': {'full_name': 'fork/repo'}}})
-
-    assert GhTracker('owner/repo', github).pr_acceptance_checks(1) == []
+    value = report(count=1)
+    value['run']['head_repository']['full_name'] = 'fork/repo'
+    github, calls = recorded_github([value])
+    with pytest.raises(TrackerError, match='foreign'):
+        GhTracker('owner/repo', github).pr_acceptance_reports('head')
     assert len(calls) == 1
 
 
@@ -247,22 +491,13 @@ def test_local_only_unit_check_requires_selected_tests(tmp_path, monkeypatch, ch
 def test_tracker_reads_every_page_of_head_check_runs():
     from foragent.tracker import GhTracker
 
-    calls = []
-
-    def github(args, input=None):
-        calls.append(args)
-        if args[-1].endswith('/pulls/2'):
-            return json.dumps({'head': {'sha': 'head', 'repo': {'full_name': 'owner/repo'}}})
-        if args[-1].endswith('/actions/runs/42'):
-            return json.dumps(report()['workflow_run'])
-        if 'check_suite_id=420' in args[-1]:
-            return json.dumps([report()['workflow_run']])
-        assert '--paginate' in args and args[args.index('--jq') + 1] == '.check_runs'
-        assert '/commits/head/check-runs?' in args[-1]
-        return json.dumps([report()]) + '\n' + json.dumps([report(1)])
-
-    assert len(GhTracker('owner/repo', github).pr_acceptance_checks(2)) == 2
-    assert len(calls) == 4
+    github, calls = recorded_github([report(), report(1)])
+    tracker = GhTracker('owner/repo', github)
+    assert tracker.pr_default_branch() == 'trunk'
+    assert compare(tracker.pr_acceptance_reports('head')) == ([], 3)
+    assert len(calls) == 5
+    assert all('--paginate' in args for args in calls if '--jq' in args)
+    assert all('/check-runs' not in args[-1] for args in calls)
 
 
 def test_local_mode_generated_workflow_does_not_require_ci_inputs(monkeypatch, tmp_path, capsys):
@@ -274,41 +509,148 @@ def test_local_mode_generated_workflow_does_not_require_ci_inputs(monkeypatch, t
     assert 'locally' in capsys.readouterr().out
 
 
-def test_large_comparisons_fit_github_output_without_losing_any_ids():
-    from foragent.ci_transport import LIMIT, encode_report
+def test_shard_without_head_exclusions_succeeds_without_a_report(tmp_path, monkeypatch):
+    from foragent import ci_shard
 
-    check = report(count=1)
-    payload = json.loads(check['output']['text'])
+    artifact = tmp_path / 'shard-0.json'
+    output = tmp_path / 'github-output'
+    output.write_text('existing=value\n')
+    for key, value in {'FA_CHECKOUT': str(tmp_path), 'FA_BASE_SHA': 'base', 'FA_HEAD_SHA': 'head',
+                       'FA_REPORT_FILE': str(artifact), 'GITHUB_OUTPUT': str(output)}.items():
+        monkeypatch.setenv(key, value)
+    calls = []
+
+    def git(args, **kwargs):
+        calls.append(args)
+        assert kwargs['cwd'] == tmp_path
+        if args == ['git', 'rev-parse', 'HEAD']:
+            return SimpleNamespace(stdout='head\n')
+        if args == ['git', 'rev-parse', 'HEAD:.foragent/acceptance-exclusions.json']:
+            raise subprocess.CalledProcessError(128, args, stderr='path does not exist in HEAD')
+        assert args[1:3] == ['log', '--first-parent'] and args[-1] == 'base..HEAD'
+        return SimpleNamespace(stdout='\0\0\n')
+
+    monkeypatch.setattr(ci_shard.subprocess, 'run', git)
+    monkeypatch.setattr(ci_shard, 'load_config', lambda *args, **kwargs: Config(checks='ci', test_command='pytest'))
+    monkeypatch.setattr(ci_shard, 'measure', lambda *args: pytest.fail('non-CI-mode head was measured'))
+    assert ci_shard.main() is None
+    assert len(calls) == 3
+    assert not artifact.exists()
+    assert output.read_text() == 'existing=value\n'
+
+
+@pytest.mark.parametrize('staged', [False, True], ids=['worktree', 'index'])
+def test_shard_does_not_inherit_a_trailer_from_the_base_or_read_a_stale_file(git_history, tmp_path, monkeypatch, capsys, staged):
+    from conftest import git_command
+    from foragent import ci_shard
+
+    git_history.update({}, message=f'Base selection\n\n{EXCLUSIONS_TRAILER}: []')
+    base = git_history.tip
+    git_history.update({})
+    git_command(git_history.clone, 'fetch', '-q', 'origin')
+    git_command(git_history.clone, 'merge', '-q', '--ff-only', 'origin/main')
+    legacy_file = git_history.clone / '.foragent/acceptance-exclusions.json'
+    legacy_file.parent.mkdir()
+    legacy_file.write_text('[]')
+    if staged:
+        git_command(git_history.clone, 'add', '-f', '.foragent/acceptance-exclusions.json')
+    artifact = tmp_path / 'unexpected.json'
+    for key, value in {'FA_CHECKOUT': str(git_history.clone), 'FA_BASE_SHA': base,
+                       'FA_HEAD_SHA': git_history.tip, 'FA_REPORT_FILE': str(artifact)}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(ci_shard, 'measure', lambda *args: pytest.fail('No branch trailer was present'))
+    ci_shard.main()
+    assert not artifact.exists()
+    assert 'PR head has no CI-mode exclusions trailer' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('fallback', [None, 'local'])
+def test_ci_head_without_exclusions_and_reports_holds_or_falls_back(tmp_path, monkeypatch, fallback):
+    from conftest import BASE_TIME
+    from foragent import ci_mode, ci_local
+    from foragent.reasons import Reason
+    from foragent.run_attempt import ExecutorStopped
+
+    config = Config(checks='ci', checks_fallback=fallback, test_command='pytest')
+    updates, flags, reads, local = [], [], [], []
+    clock = [BASE_TIME]
+
+    def sleep(seconds):
+        clock[0] += timedelta(seconds=seconds)
+    ctx = SimpleNamespace(
+        repo='owner/repo', repo_root=tmp_path, config=config, now=lambda: clock[0], sleep=sleep,
+        tracker=SimpleNamespace(pr_default_branch=lambda: 'main', pr_acceptance_reports=lambda pr: reads.append(pr) or []),
+        store=SimpleNamespace(update_run=lambda n, **kwargs: updates.append(kwargs)),
+    )
+    attempt = SimpleNamespace(
+        n=1, ctx=ctx, worktree=tmp_path, target_branch='main', log=tmp_path / 'log',
+        git=SimpleNamespace(ref_sha=lambda ref: 'trusted', _call=lambda args: ''),
+    )
+    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'flag', lambda *args: flags.append(args))
+    monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base: local.append(base))
+    monkeypatch.setattr('foragent.runner._remaining', lambda *args: 3600)
+    if fallback is None:
+        with pytest.raises(ExecutorStopped, match='missing acceptance shards') as stopped:
+            ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
+        assert stopped.value.outcome == 'held'
+        assert flags[0][2] == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+        assert not local
+    else:
+        evidence = ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
+        assert evidence.reports is None and local == ['base']
+        assert not flags
+    assert reads
+    assert not any(update.get('comparison', {}).get('source') == 'ci' for update in updates)
+
+
+def test_large_comparisons_fit_github_output_without_losing_any_ids():
+    from foragent.tracker import GhTracker
+
+    value = report(count=1)
+    payload = value['report']
     ids = [f'tests/acceptance/test_large.py::TestRegression::test_case[parameter-{index}]' for index in range(1500)]
     for side in ('base', 'head'):
         payload[side] = {'complete': True, 'collected_ids': ids, 'passing_ids': ids}
     payload['head']['passing_ids'] = ids[:-1]
-    check['output']['text'] = encode_report(payload)
-    assert len(check['output']['text'].encode()) <= LIMIT
-    assert json.loads(check['output']['text'])['encoding'] == 'zlib+base64'
-    lost, _ = compare([check], count=1)
-    assert lost == [ids[-1]]
+    assert len(json.dumps(payload).encode()) > 65535
+    github, _ = recorded_github([value])
+    assert compare(GhTracker('owner/repo', github).pr_acceptance_reports('head'), count=1)[0] == [ids[-1]]
 
 
 def test_damaged_compressed_report_is_unusable():
-    check = report(count=1)
-    check['output']['text'] = json.dumps({'encoding': 'zlib+base64', 'excluded': [], 'data': 'eA=='})
-    with pytest.raises(UnusableComparison):
-        compare([check], count=1)
+    from foragent.tracker import GhTracker, TrackerError
+
+    value = report(count=1)
+    github, _ = recorded_github([value])
+    output = BytesIO()
+    with ZipFile(output, 'w') as archive:
+        archive.writestr('shard-0.json', json.dumps({'encoding': 'zlib+base64', 'excluded': [], 'data': 'eA=='}))
+
+    def damaged(args, input=None):
+        return output.getvalue() if args[-1].endswith('/zip') else github(args, input)
+
+    with pytest.raises(TrackerError, match='Unusable acceptance artifacts'):
+        GhTracker('owner/repo', damaged).pr_acceptance_reports('head')
 
 
-def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, monkeypatch):
+@pytest.mark.parametrize('protocol', ['trailer', 'legacy-file'])
+def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, monkeypatch, protocol):
     from conftest import git_command
-    from foragent import ci_publish, ci_shard
+    from foragent import ci_shard
     from foragent.ci_transport import decode_report
     import tempfile
 
     config = yaml.safe_dump({'checks': 'ci', 'ci_shards': 1, 'test_command': f'{sys.executable} -m pytest'})
     keep = 'tests/acceptance/test_keep.py'
-    git_history.update({'.foragent.yml': config, '.foragent/acceptance-exclusions.json': '[]\n',
-                        keep: 'def test_keep(): assert True\n'})
+    git_history.update({'.foragent.yml': config, keep: 'def test_keep(): assert True\n'})
     base = git_history.tip
-    git_history.update({keep: 'def test_keep(): assert False\n'})
+    files = {keep: 'def test_keep(): assert False\n'}
+    message = f'Change\n\n{EXCLUSIONS_TRAILER}: []'
+    if protocol == 'legacy-file':
+        files['.foragent/acceptance-exclusions.json'] = '[]'
+        message = 'Change from an in-flight legacy runner'
+    git_history.update(files, message=message)
     head = git_history.tip
     git_command(git_history.clone, 'fetch', '-q', 'origin')
     git_command(git_history.clone, 'merge', '-q', '--ff-only', 'origin/main')
@@ -320,34 +662,54 @@ def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, 
                        'FA_REPORT_FILE': str(tmp_path / 'shard-0.json'),
                        'GITHUB_OUTPUT': str(output), 'PYTEST_DISABLE_PLUGIN_AUTOLOAD': '1'}.items():
         monkeypatch.setenv(key, value)
-    posted = []
-
-    class Response:
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
-        def read(self):
-            return b'{}'
-
-    def publish(request):
-        assert request.full_url == 'https://api.github.com/repos/owner/repo/check-runs'
-        assert request.get_method() == 'POST'
-        posted.append(json.loads(request.data))
-        return Response()
-
-    monkeypatch.setattr(ci_publish, 'urlopen', publish)
     ci_shard.main()
-    assert posted == []
-    ci_publish.publish(decode_report((tmp_path / 'shard-0.json').read_text()), 'owner/repo', head,
-                       'https://github.com/owner/repo/actions/runs/42')
-    assert len(posted) == 1 and posted[0]['head_sha'] == head
-    payload = decode_report(posted[0]['output']['text'])
+    payload = json.loads((tmp_path / 'shard-0.json').read_text())
     assert payload['base_sha'] == base and payload['head_sha'] == head
     assert payload['base']['complete'] and payload['head']['complete']
     assert f'{keep}::test_keep' in payload['base']['passing_ids']
     assert f'{keep}::test_keep' not in payload['head']['passing_ids']
-    assert decode_report(output.read_text().removeprefix('comparison=')) == payload
+    assert output.read_text() == 'comparison=true\n'
+
+
+@pytest.mark.parametrize('legacy_value', ['["stale-tree"]', 'invalid JSON'])
+def test_shard_reads_newest_trailer_below_untrailed_merge_and_ignores_stale_tree(git_history, tmp_path, monkeypatch, legacy_value):
+    from conftest import git_command
+    from foragent import ci_shard
+
+    root = git_history.clone
+    git_history.update({'.foragent.yml': 'checks: ci\ntest_command: pytest\nci_shards: 1\n',
+                        '.foragent/acceptance-exclusions.json': legacy_value})
+    base = git_history.tip
+    git_history.update({}, message=f'Old selection\n\n{EXCLUSIONS_TRAILER}: ["old"]')
+    excluded = ['tests/acceptance/test_frozen.py']
+    git_history.update({}, message=f'Current selection\n\n{EXCLUSIONS_TRAILER}: {json.dumps(excluded)}')
+    carrying = git_history.tip
+
+    def commit(parent, message, *extra):
+        return git_command(git_history.origin, '-c', 'user.name=Tests', '-c', 'user.email=tests@example.com',
+                           'commit-tree', f'{parent}^{{tree}}', '-p', parent, *extra, '-m', message)
+
+    side = commit(base, f'Side branch\n\n{EXCLUSIONS_TRAILER}: ["side-branch"]')
+    head = commit(carrying, 'External merge without a trailer', '-p', side)
+    git_command(git_history.origin, 'update-ref', 'refs/heads/main', head)
+    git_command(root, 'fetch', '-q', 'origin')
+    git_command(root, 'merge', '-q', '--ff-only', 'origin/main')
+    artifact = tmp_path / 'shard-0.json'
+    for key, value in {'FA_CHECKOUT': str(root), 'FA_BASE_SHA': base, 'FA_HEAD_SHA': head,
+                       'FA_REPOSITORY': 'owner/repo', 'FA_SHARD': '0', 'FA_SHARDS': '1',
+                       'FA_REPORT_FILE': str(artifact), 'GITHUB_OUTPUT': str(tmp_path / 'outputs')}.items():
+        monkeypatch.setenv(key, value)
+    selections = []
+
+    def measure(checkout, command, acceptance, frozen, directory, side):
+        selections.append(frozen)
+        return {'complete': True, 'collected_ids': [], 'passing_ids': []}
+
+    monkeypatch.setattr(ci_shard, 'measure', measure)
+    ci_shard.main()
+    payload = json.loads(artifact.read_text())
+    assert selections == [excluded, excluded] and payload['excluded'] == excluded
+    assert payload['head_sha'] == head and payload['base_sha'] == base
 
 
 @pytest.mark.parametrize('side', ['base', 'head'])
@@ -367,10 +729,11 @@ def test_shard_rejects_measurement_that_rewrites_tracked_source(git_history, tmp
         test += '    subprocess.run(["git", "add", "src/demo.py"], check=True)\n'
     test += '    assert source.read_text() == "VALUE = 1\\n"\n'
     git_history.update({'.foragent.yml': yaml.safe_dump({'checks': 'ci', 'ci_shards': 1,
-                        'test_command': config.test_command}), '.foragent/acceptance-exclusions.json': '[]\n',
+                        'test_command': config.test_command}),
                         'src/demo.py': f'VALUE = {2 if side == "base" else 1}\n', keep.split('::')[0]: test})
     base = git_history.tip
-    git_history.update({'src/demo.py': f'VALUE = {2 if side == "head" else 1}\n'})
+    git_history.update({'src/demo.py': f'VALUE = {2 if side == "head" else 1}\n'},
+                       message=f'Change\n\n{EXCLUSIONS_TRAILER}: []')
     head = git_history.tip
     git_command(git_history.clone, 'fetch', '-q', 'origin')
     git_command(git_history.clone, 'merge', '-q', '--ff-only', 'origin/main')
@@ -387,7 +750,8 @@ def test_shard_rejects_measurement_that_rewrites_tracked_source(git_history, tmp
     assert payload[side]['complete'] is False
     assert payload['head' if side == 'base' else 'base']['complete'] is True
     check = report(count=1)
-    check.update(head_sha=head, output={'text': artifact.read_text()})
+    check['report'] = json.loads(artifact.read_text())
+    check['run']['head_sha'] = check['artifact']['workflow_run']['head_sha'] = head
     with pytest.raises(UnusableComparison, match='incomplete suite'):
         comparison([check], 'owner/repo', base, head, [],
                    expected_scope=measurement_scope(config, git_history.clone, []), expected_shards=[0])
@@ -409,7 +773,7 @@ def test_local_fallback_cannot_merge_the_head_before_a_tracked_rewrite(run_case,
             '    assert source.read_text() == "VALUE = 1\\n"\n',
     })
     case.executor.steps = [{'feature.txt': 'done', 'src/demo.py': 'VALUE = 2\n'}, {'feature.txt': 'done'}]
-    monkeypatch.setattr(case.tracker, 'pr_acceptance_checks', lambda pr: [])
+    monkeypatch.setattr(case.tracker, 'pr_acceptance_reports', lambda pr: [])
 
     outcome = run_issue(1, case.ctx)
     if max_retries:
@@ -517,37 +881,37 @@ def test_workflow_only_measures_issue_prs_to_the_configured_primary_base():
     assert "github.event.pull_request.base.ref == 'release'" in condition
 
 
-@pytest.mark.parametrize('damage', ['unrelated-app', 'foreign-suite', 'missing-app', 'wrong-workflow',
-                                         'wrong-repository', 'wrong-event', 'wrong-run', 'wrong-sha', 'wrong-name'])
+@pytest.mark.parametrize('damage', ['foreign-run', 'missing-run', 'wrong-workflow', 'wrong-repository',
+                                  'wrong-event', 'mixed-runs', 'wrong-sha', 'wrong-name', 'expired', 'duplicate-id'])
 def test_unrelated_producers_cannot_supply_acceptance_evidence(damage):
     checks = [report(), report(1)]
     for check in checks:
-        if damage == 'unrelated-app':
-            check['app'] = {'slug': 'unrelated-publisher'}
-        elif damage == 'foreign-suite':
-            check['check_suite']['id'] = 999
-        elif damage == 'missing-app':
-            check.pop('app')
+        if damage == 'foreign-run':
+            check['artifact']['workflow_run']['id'] = 999
+        elif damage == 'missing-run':
+            check.pop('run')
         elif damage == 'wrong-workflow':
-            check['workflow_run']['path'] = '.github/workflows/unrelated.yml'
+            check['run']['path'] = '.github/workflows/unrelated.yml'
         elif damage == 'wrong-repository':
-            check['workflow_run']['repository']['full_name'] = 'owner/other'
+            check['run']['repository']['full_name'] = 'owner/other'
         elif damage == 'wrong-event':
-            check['workflow_run']['event'] = 'pull_request'
-        elif damage == 'wrong-run':
-            check['workflow_run']['id'] = 43
-            check['workflow_run']['check_suite_id'] = 430
+            check['run']['event'] = 'workflow_run'
+        elif damage == 'mixed-runs' and check['report']['shard_index'] == 1:
+            check['run']['id'] = check['artifact']['workflow_run']['id'] = 43
         elif damage == 'wrong-sha':
-            check['head_sha'] = 'old'
-        else:
-            check['name'] += '-edited'
+            check['run']['head_sha'] = 'old'
+        elif damage == 'wrong-name':
+            check['artifact']['name'] += '-edited'
+        elif damage == 'expired':
+            check['artifact']['expired'] = True
+        elif damage == 'duplicate-id':
+            check['artifact']['id'] = 100
     with pytest.raises(UnusableComparison):
         compare(checks)
 
 
 def test_measurement_cannot_read_publication_credentials(tmp_path, monkeypatch):
     from foragent.ci_shard import measure
-    from foragent.ci_workflow import publisher_workflow_text
 
     root = tmp_path / 'repo'
     acceptance = root / 'tests/acceptance'
@@ -574,10 +938,7 @@ def test_measurement_cannot_read_publication_credentials(tmp_path, monkeypatch):
     assert step['working-directory'] == '${{ runner.temp }}'
     assert not set(secret_names) & step['env'].keys()
     assert 'PYTHONPATH' not in step['env']
-    publisher = yaml.safe_load(publisher_workflow_text(Config()))
-    assert 'workflow_run' in publisher['on']
-    assert publisher['permissions']['checks'] == 'write'
-    assert all(step.get('uses') != 'actions/checkout@v4' for step in publisher['jobs']['publish']['steps'])
+    assert workflow['permissions'] == {'contents': 'read'}
 
 
 def test_head_configuration_cannot_erase_baseline_scope(git_history, tmp_path, monkeypatch):
@@ -588,11 +949,12 @@ def test_head_configuration_cannot_erase_baseline_scope(git_history, tmp_path, m
     config = Config(checks='ci', ci_shards=1, test_command=f'{sys.executable} -m pytest')
     keep = 'tests/acceptance/test_keep.py::test_keep'
     git_history.update({'.foragent.yml': yaml.safe_dump({'checks': 'ci', 'ci_shards': 1,
-                       'test_command': config.test_command}), '.foragent/acceptance-exclusions.json': '[]',
+                       'test_command': config.test_command}),
                        keep.split('::')[0]: 'def test_keep(): assert True\n'})
     base = git_history.tip
     git_history.update({'.foragent.yml': 'checks: local\nacceptance_dir: nonexistent\ntest_command: npm test\nci_shards: 1\n',
-                       keep.split('::')[0]: 'def test_keep(): assert False\n'})
+                       keep.split('::')[0]: 'def test_keep(): assert False\n'},
+                       message=f'Change\n\n{EXCLUSIONS_TRAILER}: []')
     head = git_history.tip
     git_command(git_history.clone, 'fetch', '-q', 'origin')
     git_command(git_history.clone, 'merge', '-q', '--ff-only', 'origin/main')
@@ -608,21 +970,22 @@ def test_head_configuration_cannot_erase_baseline_scope(git_history, tmp_path, m
     assert payload['scope'] == scope
     assert keep in payload['base']['passing_ids'] and keep not in payload['head']['passing_ids']
     check = report(count=1)
-    check.update(head_sha=head, output={'text': artifact.read_text()})
+    check['report'] = json.loads(artifact.read_text())
+    check['run']['head_sha'] = check['artifact']['workflow_run']['head_sha'] = head
     assert comparison([check], 'owner/repo', base, head, [], expected_scope=scope, expected_shards=[0])[0] == [keep]
     payload['scope']['acceptance_dir'] = 'nonexistent'
     for side in ('base', 'head'):
         payload[side] = {'complete': True, 'collected_ids': [], 'passing_ids': []}
-    check['output']['text'] = json.dumps(payload)
+    check['report'] = payload
     with pytest.raises(UnusableComparison):
         comparison([check], 'owner/repo', base, head, [], expected_scope=scope, expected_shards=[0])
 
 
 def test_report_cannot_shrink_the_expected_four_shard_layout():
     check = report(count=1)
-    payload = json.loads(check['output']['text'])
+    payload = check['report']
     payload['scope'] = measurement_scope(Config(ci_shards=4), Path('.'), [])
-    check['output']['text'] = json.dumps(payload)
+    check['report'] = payload
     with pytest.raises(UnusableComparison):
         compare([check], count=4)
 
@@ -639,45 +1002,35 @@ def test_non_pytest_ci_uses_local_comparison_and_invokes_worker(run_case, comman
 
 
 @pytest.mark.parametrize('damage', [None, 'no-shards', 'foreign-repository', 'wrong-workflow', 'wrong-event',
-                                         'foreign-head', 'missing-shard', 'wrong-shard'])
+                                  'foreign-head', 'missing-shard', 'wrong-shard'])
 def test_publisher_accepts_only_complete_artifacts_from_the_triggering_run(tmp_path, monkeypatch, damage):
-    from foragent import ci_publish
+    """The runner now validates measurement artifacts directly (legacy test name)."""
+    from foragent.tracker import GhTracker, TrackerError
 
-    run = {'path': WORKFLOW, 'event': 'pull_request', 'repository': {'full_name': 'owner/repo'},
-           'head_repository': {'full_name': 'owner/repo'}, 'head_sha': 'head', 'conclusion': 'success'}
+    values = [report(), report(1)]
+    runs = [deepcopy(values[0]['run'])]
     if damage == 'foreign-repository':
-        run['head_repository']['full_name'] = 'fork/repo'
+        runs[0]['head_repository']['full_name'] = 'fork/repo'
     elif damage == 'wrong-workflow':
-        run['path'] = '.github/workflows/other.yml'
+        runs[0]['path'] = '.github/workflows/other.yml'
     elif damage == 'wrong-event':
-        run['event'] = 'push'
+        runs[0]['event'] = 'push'
     elif damage == 'foreign-head':
-        run['head_sha'] = 'other-head'
-    event = tmp_path / 'event.json'
-    event.write_text(json.dumps({'workflow_run': run}))
-    for index in range(2):
-        payload = json.loads(report(index)['output']['text'])
-        if damage == 'no-shards' or (damage == 'missing-shard' and index == 1):
-            continue
-        if damage == 'wrong-shard' and index == 1:
-            payload['shard_index'] = 0
-        (tmp_path / f'shard-{index}.json').write_text(json.dumps(payload))
-    for name, value in {'FA_REPOSITORY': 'owner/repo', 'FA_SHARDS': '2', 'FA_REPORT_DIR': str(tmp_path),
-                        'GITHUB_EVENT_PATH': str(event), 'GITHUB_RUN_ID': '42'}.items():
-        monkeypatch.setenv(name, value)
-    posted = []
-    monkeypatch.setattr(ci_publish, 'publish', lambda *args: posted.append(args))
-    if damage == 'no-shards':
-        ci_publish.main()
-        assert not posted
-    elif damage:
-        with pytest.raises(ValueError):
-            ci_publish.main()
-        assert not posted
+        runs[0]['head_sha'] = 'other-head'
+    elif damage == 'no-shards':
+        values = []
+    elif damage == 'missing-shard':
+        values.pop()
+    elif damage == 'wrong-shard':
+        values[1]['report']['shard_index'] = 0
+    github, calls = recorded_github(values, runs=runs)
+    tracker = GhTracker('owner/repo', github)
+    if damage:
+        with pytest.raises((TrackerError, UnusableComparison)):
+            compare(tracker.pr_acceptance_reports('head'))
     else:
-        ci_publish.main()
-        assert [args[0]['shard_index'] for args in posted] == [0, 1]
-        assert all(args[1:] == ('owner/repo', 'head', 'https://github.com/owner/repo/actions/runs/42') for args in posted)
+        assert compare(tracker.pr_acceptance_reports('head')) == ([], 3)
+    assert all('/check-runs' not in args[-1] for args in calls)
 
 
 @pytest.mark.parametrize('settings', [{'checks': 'local', 'test_command': 'uv run pytest'},
@@ -688,7 +1041,8 @@ def test_base_local_or_non_pytest_configuration_skips_ci_measurement(git_history
 
     git_history.update({'.foragent.yml': yaml.safe_dump(settings)})
     base = git_history.tip
-    git_history.update({'.foragent.yml': 'checks: ci\ntest_command: uv run pytest\n'})
+    git_history.update({'.foragent.yml': 'checks: ci\ntest_command: uv run pytest\n'},
+                       message=f'Change\n\n{EXCLUSIONS_TRAILER}: []')
     git_command(git_history.clone, 'fetch', '-q', 'origin')
     git_command(git_history.clone, 'merge', '-q', '--ff-only', 'origin/main')
     monkeypatch.setenv('FA_CHECKOUT', str(git_history.clone))
@@ -701,7 +1055,7 @@ def test_base_local_or_non_pytest_configuration_skips_ci_measurement(git_history
     assert not artifact.exists()
 
 
-@pytest.mark.parametrize('workflow', [WORKFLOW, PUBLISH_WORKFLOW, '.github/workflows/foragent-acceptance-extra.yml'])
+@pytest.mark.parametrize('workflow', [WORKFLOW, '.github/workflows/foragent-acceptance-extra.yml'])
 @pytest.mark.parametrize('regressed', [False, True])
 def test_changed_acceptance_workflow_requires_local_comparison_even_with_fabricated_shards(
     run_case, monkeypatch, workflow, regressed,
@@ -712,7 +1066,6 @@ def test_changed_acceptance_workflow_requires_local_comparison_even_with_fabrica
     case.ctx.config = replace(case.ctx.config, checks='ci', checks_fallback=None, max_retries=0, ci_shards=2,
                               test_command=f'{sys.executable} -m pytest')
     case.history.update({WORKFLOW: 'name: measurement\non: [pull_request]\n',
-                         PUBLISH_WORKFLOW: 'name: publish\non: [workflow_run]\n',
                          'src/__init__.py': '', 'src/demo.py': 'VALUE = 1\n',
                          'tests/acceptance/test_keep.py':
                              'from src.demo import VALUE\ndef test_keep(): assert VALUE == 1\n'})
@@ -720,27 +1073,26 @@ def test_changed_acceptance_workflow_requires_local_comparison_even_with_fabrica
                             'src/demo.py': f'VALUE = {2 if regressed else 1}\n'}]
     forged = [report(), report(1)]
     for check in forged:
-        payload = json.loads(check['output']['text'])
+        payload = check['report']
         for side in ('base', 'head'):
             payload[side] = {'complete': True, 'collected_ids': [], 'passing_ids': []}
-        check['output']['text'] = json.dumps(payload)
+        check['report'] = payload
     reads = []
 
-    def forged_checks(pr):
-        from foragent.ci_workflow import EXCLUSIONS
+    def forged_checks(head):
+        from foragent.git import GitRepo
 
-        reads.append(pr)
-        head = case.tracker.pr_head_sha(pr)
-        excluded = json.loads((case.store.worktree_path(1) / EXCLUSIONS).read_text())
+        reads.append(head)
+        excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), case.history.tip)
         for check in forged:
-            check['head_sha'] = head
-            payload = json.loads(check['output']['text'])
+            check['run']['head_sha'] = check['artifact']['workflow_run']['head_sha'] = head
+            payload = check['report']
             payload.update(base_sha=case.history.tip, head_sha=head, excluded=excluded,
                            scope=measurement_scope(case.ctx.config, case.ctx.repo_root, excluded))
-            check['output']['text'] = json.dumps(payload)
+            check['report'] = payload
         return forged
 
-    monkeypatch.setattr(case.tracker, 'pr_acceptance_checks', forged_checks)
+    monkeypatch.setattr(case.tracker, 'pr_acceptance_reports', forged_checks)
 
     outcome = run_issue(1, case.ctx)
     assert (outcome == 'merged') is not regressed
@@ -752,40 +1104,28 @@ def test_changed_acceptance_workflow_requires_local_comparison_even_with_fabrica
         assert 'test_keep' in case.store.log_path(1).read_text()
 
 
-@pytest.mark.parametrize('damage', ['unrelated-workflow', 'different-suite', 'non-default-branch', None])
+@pytest.mark.parametrize('damage', ['unrelated-workflow', 'foreign-run', 'failed-newer-run', None])
 def test_tracker_binds_borrowed_publisher_url_to_github_suite_and_run_ids(damage):
-    from foragent.tracker import GhTracker
+    """URLs/check suites cannot substitute for the run/artifact relationship."""
+    from foragent.tracker import GhTracker, TrackerError
 
-    check = report(count=1)
-    check['check_suite'] = {'id': 990}
-    run = {**check['workflow_run'], 'id': 99, 'check_suite_id': 990}
+    value = report(count=1)
+    run = deepcopy(value['run'])
+    runs = [run]
     if damage == 'unrelated-workflow':
         run['path'] = '.github/workflows/unrelated.yml'
-    elif damage == 'different-suite':
-        run['check_suite_id'] = 420
-    elif damage == 'non-default-branch':
-        run['head_branch'] = 'foragent/issue-1'
-    calls = []
-
-    def github(args, input=None):
-        endpoint = args[-1]
-        calls.append(endpoint)
-        if endpoint.endswith('/pulls/2'):
-            return json.dumps({'head': {'sha': 'head', 'repo': {'full_name': 'owner/repo'}}})
-        if '/commits/head/check-runs?' in endpoint:
-            return json.dumps([check])
-        if 'check_suite_id=990' in endpoint:
-            return json.dumps([{'id': 99}])
-        assert endpoint.endswith('/actions/runs/99'), endpoint
-        return json.dumps(run)
-
-    checks = GhTracker('owner/repo', github).pr_acceptance_checks(2)
-    assert all(not endpoint.endswith('/actions/runs/42') for endpoint in calls)
+    elif damage == 'foreign-run':
+        value['artifact']['workflow_run']['id'] = 99
+    elif damage == 'failed-newer-run':
+        runs.append({**run, 'id': 99, 'conclusion': 'failure'})
+    github, calls = recorded_github([value], runs=runs)
+    tracker = GhTracker('owner/repo', github)
     if damage:
-        with pytest.raises(UnusableComparison):
-            compare(checks, count=1)
+        with pytest.raises((UnusableComparison, TrackerError)):
+            compare(tracker.pr_acceptance_reports('head'), count=1)
     else:
-        assert compare(checks, count=1)[0] == []
+        assert compare(tracker.pr_acceptance_reports('head'), count=1)[0] == []
+    assert all('/check-runs' not in args[-1] for args in calls)
 
 
 def test_local_only_baseline_rejects_exit_after_preexisting_failure_before_remaining_test(run_case):
@@ -846,7 +1186,7 @@ def test_undetected_test_command_uses_local_path_and_invokes_worker(run_case):
 @pytest.mark.parametrize('change', ['producer', 'regression', 'missing', 'base', 'head', 'scope', 'infrastructure'])
 def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_case, monkeypatch, reviewed, change):
     from foragent import runner
-    from foragent.ci_workflow import EXCLUSIONS
+    from foragent.git import GitRepo
     from conftest import git_command
 
     case = run_case
@@ -872,24 +1212,23 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
     merge_lock = case.store.merge_lock
     sleep = case.ctx.sleep
 
-    def checks(pr):
+    def checks(head):
         reads.append(holder[0])
-        head = case.tracker.pr_head_sha(pr)
         heads.add(head)
         if changed[0] and change == 'missing':
             return []
-        excluded = json.loads((case.store.worktree_path(1) / EXCLUSIONS).read_text())
+        excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), case.history.tip)
         values = [report(), report(1)]
         for value in values:
-            value['head_sha'] = head
+            value['run']['head_sha'] = value['artifact']['workflow_run']['head_sha'] = head
             if changed[0] and change == 'producer':
-                value['workflow_run']['id'] = 43
-            payload = json.loads(value['output']['text'])
+                value['run']['id'] = value['artifact']['workflow_run']['id'] = 43
+            payload = value['report']
             payload.update(base_sha=case.history.tip, head_sha=head, excluded=excluded,
                            scope=measurement_scope(case.ctx.config, case.ctx.repo_root, excluded))
             if changed[0] and change == 'regression':
                 payload['head']['passing_ids'] = []
-            value['output']['text'] = json.dumps(payload)
+            value['report'] = payload
         return values
 
     @contextmanager
@@ -916,7 +1255,7 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
         assert not holder[0], 'Comparison polling must release the final merge lock'
         sleep(seconds)
 
-    monkeypatch.setattr(case.tracker, 'pr_acceptance_checks', checks)
+    monkeypatch.setattr(case.tracker, 'pr_acceptance_reports', checks)
     monkeypatch.setattr(case.store, 'merge_lock', observed_lock)
     case.ctx.sleep = unlocked_sleep
     outcome = runner.review_only(1, case.ctx, repair_ci=False) if reviewed else runner.run_issue(1, case.ctx)
@@ -934,3 +1273,100 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
     if change == 'head':
         assert outcome == 'held'
     assert git_command(case.history.origin, 'rev-parse', 'main') == case.history.tip
+
+
+@pytest.mark.parametrize('damage', ['not-zip', 'wrong-member', 'duplicate-member', 'truncated-json',
+                                  'expired', 'foreign-run', 'duplicate-name', 'duplicate-id'])
+def test_tracker_rejects_damaged_or_ambiguous_artifacts(damage):
+    from foragent.tracker import GhTracker, TrackerError
+
+    values = [report(), report(1)]
+    if damage == 'expired':
+        values[1]['artifact']['expired'] = True
+    elif damage == 'foreign-run':
+        values[1]['artifact']['workflow_run']['id'] = 99
+    elif damage == 'duplicate-name':
+        values[1]['artifact']['name'] = 'acceptance-0'
+    elif damage == 'duplicate-id':
+        values[1]['artifact']['id'] = values[0]['artifact']['id']
+    github, _ = recorded_github(values)
+
+    def damaged(args, input=None):
+        if args[-1].endswith('/zip') and damage in {'not-zip', 'wrong-member', 'duplicate-member', 'truncated-json'}:
+            if damage == 'not-zip':
+                return b'not a ZIP archive'
+            output = BytesIO()
+            with ZipFile(output, 'w') as archive:
+                filename = 'shard-9.json' if damage == 'wrong-member' else 'shard-0.json'
+                archive.writestr(filename, '{' if damage == 'truncated-json' else json.dumps(values[0]['report']))
+                if damage == 'duplicate-member':
+                    with pytest.warns(UserWarning, match='Duplicate name'):
+                        archive.writestr(filename, json.dumps(values[0]['report']))
+            return output.getvalue()
+        return github(args, input)
+
+    with pytest.raises(TrackerError, match='Unusable acceptance artifacts'):
+        GhTracker('owner/repo', damaged).pr_acceptance_reports('head')
+
+
+def test_trusted_workflow_revision_uses_repository_default_branch():
+    from foragent.ci_mode import _trusted_sha
+    from foragent.tracker import GhTracker
+
+    github, calls = recorded_github([])
+    refs = []
+    git = SimpleNamespace(ref_sha=lambda ref: refs.append(ref) or 'trusted')
+    assert _trusted_sha(git, GhTracker('owner/repo', github)) == 'trusted'
+    assert refs == ['origin/trunk']
+    assert calls == [['api', 'repos/owner/repo']]
+
+
+@pytest.mark.parametrize('fallback', [None, 'local'])
+def test_missing_trusted_default_branch_obeys_fallback_configuration(tmp_path, monkeypatch, fallback):
+    from conftest import BASE_TIME
+    from foragent import ci_mode, ci_local
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.tracker import TrackerError
+
+    def unavailable():
+        raise TrackerError('HTTP 403')
+
+    local = []
+    ctx = SimpleNamespace(repo='owner/repo', repo_root=tmp_path, now=lambda: BASE_TIME,
+                          config=Config(checks='ci', checks_fallback=fallback, test_command='pytest'),
+                          tracker=SimpleNamespace(pr_default_branch=unavailable))
+    attempt = SimpleNamespace(n=1, ctx=ctx, log=tmp_path / 'log', git=SimpleNamespace())
+    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'flag', lambda *args: None)
+    monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base: local.append(base))
+    if fallback:
+        assert ci_mode.require_comparison(attempt, 2, 'head', base_sha='base').reports is None
+        assert local == ['base']
+    else:
+        with pytest.raises(ExecutorStopped, match='Default branch reference unavailable') as exc:
+            ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
+        assert exc.value.outcome == 'held' and not local
+
+
+def test_github_binary_download_preserves_bytes_and_text_errors(monkeypatch):
+    import subprocess
+    from foragent.tracker import GhTracker, TrackerError
+
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        if args[-1].endswith('/zip'):
+            return SimpleNamespace(stdout=b'PK\x03\x04\xff\x00')
+        if args[-1] == 'repos/owner/repo':
+            return SimpleNamespace(stdout=b'{"full_name":"owner/repo","default_branch":"main"}')
+        raise subprocess.CalledProcessError(1, args, output=b'body', stderr=b'HTTP 403')
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    tracker = GhTracker('owner/repo')
+    assert tracker.pr_default_branch() == 'main'
+    assert tracker._call(['api', 'repos/owner/repo/actions/artifacts/100/zip'], binary=True) == b'PK\x03\x04\xff\x00'
+    with pytest.raises(TrackerError, match='HTTP 403') as exc:
+        tracker._call(['api', 'missing'])
+    assert exc.value.stdout == 'body'
+    assert all(not kwargs.get('text') for _, kwargs in calls)

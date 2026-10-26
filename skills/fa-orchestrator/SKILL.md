@@ -53,9 +53,9 @@ a signal to inspect, not a report.
 
 ## Handle blocked items first
 
+Change `overlap_per_file` only from conflict facts reported by `fa orch facts`.
 Run `fa orch list --json`. Read each item's full blocked details, raw reviewer text and original
-logs (`log_path`; read beyond the tail when necessary). Diagnose the cause from evidence and use the
-appropriate existing verb, always with `--say "<one line for a person>"` in the docs/voice.md voice:
+logs (`log_path`; read beyond the tail when necessary). Diagnose the cause from evidence and use the appropriate existing verb, always with `--say "<one line for a person>"` in the docs/voice.md voice:
 
 - `fa orch rerun-review N`: review the existing PR again for a transient review failure.
 - `fa orch retry N --hint "<diagnosis and useful correction>"`: retry implementation;
@@ -129,8 +129,8 @@ attempts and draft references across turns; re-read current facts when handling 
 
 ## Design handoff from planning
 
-When visual direction is unresolved, suggest `/fa-design-session` as design mode in the planning
-session; keep the conversation there while references and running drafts are compared. Read design
+When visual direction is unresolved, suggest the design interview (디자인 인터뷰 in `/fa`, the
+`fa-design-session` skill) as design mode in the planning session; keep the conversation there while references and running drafts are compared. Read design
 requests recorded by `fa orch request` and the referenced `docs/design/<topic>/HANDOFF.md` before
 preparing the order. Turn its selected draft, principles and run instructions into lane issues, with
 visual Done when evidence of the same screen as the draft (recorded viewport/terminal size and

@@ -114,3 +114,24 @@ def test_target_switch_names_files_the_new_target_moved(tmp_path):
     _note_moved(attempt, moved)
     assert attempt.moved_files == ["big.py -> parts.py"]
     assert attempt.log.read_text().count("big.py -> parts.py") == 1
+
+
+def test_moved_between_names_a_copy_whose_original_main_left_unchanged(tmp_path):
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"}
+
+    def git(*args, stdin=None):
+        return subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True,
+                              text=True, input=stdin, env=env).stdout.strip()
+
+    def commit(files, parent):
+        entries = "".join(f"100644 blob {git('hash-object', '-w', '--stdin', stdin=body)}\t{name}\n"
+                          for name, body in files.items())
+        return git("commit-tree", git("mktree", stdin=entries), "-m", "c", *(["-p", parent] if parent else []))
+
+    git("init", "-q")
+    content = "".join(f"def f{n}():\n    return {n}\n\n" for n in range(40))
+    base = commit({"big.py": content}, None)
+    # main copies big.py into a new module and leaves the original untouched.
+    main = commit({"big.py": content, "copy.py": content}, base)
+    assert GitRepo(tmp_path).moved_between(base, main, ["big.py"]) == [("big.py", "copy.py")]
