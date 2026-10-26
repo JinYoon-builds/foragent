@@ -92,3 +92,67 @@ def test_grouping_follows_the_configured_checks_mode(checks, expected):
     attempt = SimpleNamespace(ctx=SimpleNamespace(config=config), target_branch="main", batch_branch=None)
     assert grouping_enabled(attempt, True) is expected
     assert grouping_enabled(attempt, False) is False
+
+
+def test_a_restarted_execution_never_inherits_its_old_entry_claim_or_marker(tmp_path):
+    clock = [datetime(2026, 10, 26, tzinfo=UTC)]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    for number in (1, 2):
+        store.start_run(number, branch=f"foragent/issue-{number}", worktree=tmp_path / str(number))
+        store.enqueue_merge(entry(number))
+    store.claim_merge_group(2, "main", 2)
+    store.record_group_merge(1, "a" * 40, store.get_run(1).started_at)
+    assert store.group_merged_head(1) == "a" * 40
+    # Both issues restart as new executions before either is ready again.
+    from datetime import timedelta
+    clock[0] += timedelta(minutes=5)
+    store.start_run(1, branch="foragent/issue-1", worktree=tmp_path / "1")
+    store.start_run(2, branch="foragent/issue-2", worktree=tmp_path / "2")
+    assert store.group_merged_head(1) is None
+    assert not store.has_unclaimed_merge_peers(2, "main")
+    # The reader's cleanup is saved, not only computed.
+    assert store.merge_queue() == []
+
+
+def test_group_finish_keeps_local_facts_reinstall_and_journal_when_github_fails(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from foragent import runner
+    from foragent.run_merge_group import finish_group
+    from foragent.tracker import TrackerError
+
+    store = store_with_runs(tmp_path, 1, 4, 5)
+    reinstalls = []
+    monkeypatch.setattr(runner, "after_merge", lambda ctx, pr, base: reinstalls.append(pr))
+
+    class Tracker:
+        def __init__(self):
+            self.closed = []
+
+        def current_issue(self, number):
+            return SimpleNamespace(state="open")
+
+        def close_issue(self, number, comment=None):
+            if number == 1:
+                raise TrackerError("HTTP 429: API rate limit exceeded")
+            self.closed.append((number, comment))
+
+        def remove_labels(self, number, labels):
+            pass
+
+    tracker = Tracker()
+    monkeypatch.setattr("foragent.board.sync_status", lambda ctx, number, status: None)
+    ctx = SimpleNamespace(store=store, tracker=tracker, now=store._now)
+    attempt = SimpleNamespace(ctx=ctx, n=5, log=tmp_path / "5.log", target_branch="main")
+    borrowed = [{"number": 1, "pr": 11, "head_sha": "1" * 40}, {"number": 4, "pr": 14, "head_sha": "4" * 40}]
+    finish_group(attempt, borrowed, (15, "5" * 40), reinstall=True)
+    for number in (1, 4, 5):
+        assert store.get_run(number).merge_group_size == 3
+        assert store.get_run(number).merge_group_bisect_checks == 0
+    assert reinstalls == [15]
+    assert tracker.closed == [(4, "Merged in a merge group with #1, #5.")]
+    events = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [(row["issue"], row["kind"]) for row in events] == [(1, "merge"), (4, "merge"), (5, "merge")]
+    assert "with #4, #5" in events[0]["summary"] and "PR #11" in events[0]["summary"]
+    assert "finishing #1 failed" in (tmp_path / "5.log").read_text()

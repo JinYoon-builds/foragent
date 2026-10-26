@@ -162,7 +162,9 @@ def member_inputs(attempt: Implementation, group: Group, base_sha: str) -> list[
             continue
         saved = ctx.store.load_approval(number)
         run = ctx.store.get_run(number)
-        if saved is None or run is None or run.status != "running" or not Path(entry["worktree"]).is_dir():
+        # Only the execution that queued this entry may be merged by it.
+        if (saved is None or run is None or run.status != "running" or run.started_at != entry.get("started_at")
+                or not Path(entry["worktree"]).is_dir()):
             continue
         approval = replace(saved, body_sha=entry["body_sha"], acceptance_blobs=entry["acceptance_blobs"])
         git = ctx.git.at(Path(entry["worktree"]))
@@ -201,34 +203,77 @@ def merge_member(attempt: Implementation, member: Member) -> bool:
         return False
     # Durable at once: the member's own run finishes merged even if the leader stops here.
     ctx.store.record_merge(number, ctx.now())
-    ctx.store.record_group_merge(number, entry["head_sha"])
+    ctx.store.record_group_merge(number, entry["head_sha"], entry.get("started_at"))
     return True
 
 
-def finish_members(attempt: Implementation, merged: list[dict[str, Any]], size: int) -> None:
-    """Close borrowed members and record their group fields; the leader's lock hold follows."""
-    ctx = attempt.ctx
-    numbers = [entry["number"] for entry in merged]
-    for entry in merged:
-        number = entry["number"]
+def finish_group(attempt: Implementation, borrowed: list[dict[str, Any]], leader: tuple[int, str] | None,
+                 *, reinstall: bool, raise_errors: bool = False) -> None:
+    """Finish every merge of a group, local facts first and fallible GitHub work last.
+
+    Durable local state (group fields, queue, reinstall, journal) never waits for
+    GitHub; each member's GitHub finalization is attempted even after another one
+    failed, and the first error is raised at the end. A borrowed member's own run
+    closes its issue when this could not (finish_merged_self).
+    """
+    from foragent import runner
+    from foragent.orch_events import append_event
+
+    ctx, n = attempt.ctx, attempt.n
+    merged = [(entry["number"], entry["pr"], entry["head_sha"]) for entry in borrowed]
+    if leader is not None:
+        merged.append((n, *leader))
+    size = len(merged)
+    if not size:
+        return
+    numbers = [number for number, _, _ in merged]
+    for number in numbers:
         ctx.store.update_run(number, merge_group_size=size, merge_group_bisect_checks=0)
-        others = ", ".join(f"#{other}" for other in [attempt.n, *numbers] if other != number)
-        try:
-            ctx.tracker.close_issue(number, f"Merged in a merge group with {others}.")
-        except TrackerError as exc:
-            if exc.is_rate_limit:
-                raise
-            if ctx.tracker.current_issue(number).state != "closed":
-                raise
-        ctx.tracker.remove_labels(number, [READY, RUNNING])
-        board.sync_status(ctx, number, "Done")
     ctx.store.dequeue_merge(*numbers)
+    if reinstall:  # Once per group, after its last merge.
+        runner.after_merge(ctx, merged[-1][1], attempt.target_branch)
+    if size > 1:
+        for number, pr, head in merged:
+            others = ", ".join(f"#{other}" for other in numbers if other != number)
+            append_event(ctx.store, ctx.now(), number, "merge",
+                         f"PR #{pr}: merged {head} in a merge group with {others}")
+    errors: list[BaseException] = []
+    for number in numbers:
+        if number == n:
+            continue  # The leader closes its own issue after this.
+        others = ", ".join(f"#{other}" for other in numbers if other != number)
+        try:
+            _close_merged(ctx, number, f"Merged in a merge group with {others}.")
+        except Exception as exc:  # noqa: BLE001 - every member is attempted; the first error is raised
+            _append(attempt.log, f"Merge group: finishing #{number} failed: {exc}")
+            errors.append(exc)
+    if errors and raise_errors:
+        raise errors[0]
+
+
+def _close_merged(ctx, number: int, comment: str) -> None:
+    """Close a merged issue and clear its labels; each step runs even if an earlier one failed."""
+    errors: list[BaseException] = []
+
+    def close() -> None:
+        if ctx.tracker.current_issue(number).state == "closed":
+            return
+        try:
+            ctx.tracker.close_issue(number, comment)
+        except TrackerError as exc:
+            if exc.is_rate_limit or ctx.tracker.current_issue(number).state != "closed":
+                raise
+
+    for step in (close, lambda: ctx.tracker.remove_labels(number, [READY, RUNNING]),
+                 lambda: board.sync_status(ctx, number, "Done")):
+        try:
+            step()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+    if errors:
+        raise errors[0]
 
 
 def finish_merged_self(attempt: Implementation) -> None:
     """A member merged by another group closes its own issue if the leader could not."""
-    ctx, n = attempt.ctx, attempt.n
-    if ctx.tracker.current_issue(n).state != "closed":
-        ctx.tracker.close_issue(n, "Merged in another run's merge group.")
-    ctx.tracker.remove_labels(n, [READY, RUNNING])
-    board.sync_status(ctx, n, "Done")
+    _close_merged(attempt.ctx, attempt.n, "Merged in another run's merge group.")

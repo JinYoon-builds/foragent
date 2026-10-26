@@ -688,7 +688,10 @@ def _publish_locked(attempt: Implementation) -> str:
                 # Another run's group merged this head and recorded its facts.
                 hold.record = False
                 _append(log, f"Merged by another run's merge group: {verified_head_sha}")
-                run_merge_group.finish_merged_self(attempt)
+                try:
+                    run_merge_group.finish_merged_self(attempt)
+                except Exception as exc:  # noqa: BLE001 - the merge happened; never redo the work
+                    _append(log, f"Closing the issue after the group merge failed: {exc}")
                 _progress(n, ctx)
                 return "merged"
             inputs = _final_merge_inputs(
@@ -756,16 +759,15 @@ def _publish_locked(attempt: Implementation) -> str:
                         leader_merged = True
                         ctx.store.record_merge(n, ctx.now())
                 finally:
-                    # Finish every successful merge, even when a later one raised.
+                    # Finish every successful merge, even when a later one raised. Local
+                    # facts, reinstall and journal come first; a member whose GitHub
+                    # finalization fails closes its own issue when its run sees the marker.
                     size = len(borrowed) + leader_merged
-                    if borrowed:
-                        hold.members.extend(entry["number"] for entry in borrowed)
-                        run_merge_group.finish_members(attempt, borrowed, size)
-                    # Reinstall once per group, after its last merge.
-                    if size and inputs.decision.kind == "merge":
-                        runner.after_merge(ctx, pr, attempt.target_branch)
+                    hold.members.extend(entry["number"] for entry in borrowed)
+                    run_merge_group.finish_group(
+                        attempt, borrowed, (pr, verified_head_sha) if leader_merged else None,
+                        reinstall=inputs.decision.kind == "merge", raise_errors=False)
                 if leader_merged:
-                    ctx.store.update_run(n, merge_group_size=size, merge_group_bisect_checks=0)
                     _progress(n, ctx)
                     others = ", ".join(f"#{entry['number']}" for entry in borrowed)
                     try:
