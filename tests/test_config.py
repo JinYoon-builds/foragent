@@ -35,7 +35,7 @@ def test_exact_defaults(repo):
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
         "interview": "native", "ouroboros_version": None, "profile": None, "update_check": True,
         "skill_roles": {},
-        "lanes": {}, "max_parallel": None, "test_slots": 2,
+        "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
@@ -326,7 +326,7 @@ def test_lane_validation(repo, settings):
         load_config(repo)
 
 
-@pytest.mark.parametrize("key", ["max_parallel", "transient_max_wait_minutes", "limit_wait_minutes"])
+@pytest.mark.parametrize("key", ["max_parallel", "overlap_per_file", "transient_max_wait_minutes", "limit_wait_minutes"])
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_parallel_and_wait_settings_are_positive(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})

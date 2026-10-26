@@ -19,6 +19,7 @@ from foragent.run_lane_skills import lane_notes, lane_skill_names, lane_skills
 from foragent.run_skill_catalog import available_skills, catalog_section, parse_skills_used
 from foragent.run_prompts import build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
+from foragent.run_overlap import wait_for_overlap
 from foragent.run_waits import _phase, _timeout
 
 if TYPE_CHECKING:
@@ -159,6 +160,7 @@ def _implement(
     from foragent import runner
 
     n, ctx = attempt.n, attempt.ctx
+    wait_for_overlap(attempt)
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")
     remaining = runner._remaining(n, ctx)
@@ -216,3 +218,4 @@ def _implement(
             details = stream.read(6000)
         flag(ctx, n, Reason.SPEC_QUESTION, "The executor needs a product decision.", details)
         raise ExecutorStopped("spec-question")
+    wait_for_overlap(attempt)

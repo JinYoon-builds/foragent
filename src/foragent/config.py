@@ -11,7 +11,11 @@ from typing import Any
 
 import yaml
 
+<<<<<<< HEAD
 from foragent import review_perspectives
+=======
+from foragent.config_validation import _validate
+>>>>>>> 82b093d75b3bcdb5ffdf8c6451e7882880c41c31
 
 
 class ConfigError(ValueError):
@@ -44,6 +48,9 @@ class Config:
     }])
     skill_roles: dict[str, str] = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
+    # Cautious start: one conflict (#196) in 231 runs; the orchestrator
+    # changes this only from conflict facts (fa orch facts).
+    overlap_per_file: int = 2
     test_slots: int = 2  # Machine-wide test command ceiling; AIMD lowers it under load (#243).
     transient_max_wait_minutes: int = 30
     limit_wait_minutes: int = 60
@@ -358,6 +365,7 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
     return int(start), int(end)
 
 
+<<<<<<< HEAD
 def _validate(values: dict[str, Any]) -> None:
     if type(values["notify_summary_hour"]) is not int or not 0 <= values["notify_summary_hour"] <= 23:
         raise ConfigError("notify_summary_hour must be an integer from 0 to 23")
@@ -497,6 +505,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError(str(exc)) from exc
 
 
+=======
+>>>>>>> 82b093d75b3bcdb5ffdf8c6451e7882880c41c31
 def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
     local_path = repo_root / ".foragent.yml"
     if not local_path.is_file():
