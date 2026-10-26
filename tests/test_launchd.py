@@ -48,7 +48,7 @@ def test_plist_round_trip_has_exact_job_and_environment(job):
         "ProgramArguments": [str(job.repo_root / ".venv/bin/fa"), "gate", "tick", "--repo-root", str(job.repo_root)],
         "StartInterval": 300,
         "RunAtLoad": True,
-        "ProcessType": "Background",
+        "ProcessType": "Standard",
         "EnvironmentVariables": {
             "PATH": f"{job.home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
             "HOME": str(job.home), "LANG": "en_US.UTF-8",

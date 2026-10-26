@@ -147,7 +147,9 @@ class Launchd:
             "ProgramArguments": [str(executable), "gate", "tick", "--repo-root", str(self.repo_root)],
             "StartInterval": 300,
             "RunAtLoad": True,
-            "ProcessType": "Background",
+            # Background confines the tick and every run it starts (tests, agents) to
+            # throttled efficiency cores; measured 6x slower CPU work on Apple Silicon.
+            "ProcessType": "Standard",
             "EnvironmentVariables": {
                 "PATH": f"{self.home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
                 "HOME": str(self.home), "LANG": "en_US.UTF-8",

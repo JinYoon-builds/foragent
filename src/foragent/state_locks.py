@@ -1,7 +1,7 @@
 """File locks for the local state store and the acceptance baseline cache."""
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 import threading
 from typing import IO, Any
@@ -12,6 +12,17 @@ _TICK_LOCKS_HELD = threading.local()
 
 def _held_tick_locks() -> set[str]:
     return _state._TICK_LOCKS_HELD.__dict__.setdefault("paths", set())
+
+
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
 
 
 class StateLocksMixin:
@@ -54,15 +65,19 @@ class StateLocksMixin:
             raise
         return lock
 
-    @contextmanager
-    def _state_lock(self) -> Iterator[None]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / "state.lock").open("a", encoding="utf-8") as stream:
-            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
+    def _state_lock(self) -> AbstractContextManager[None]:
+        return _file_lock(self.root / "state.lock")
+
+    def worktree_lock(self, number: int) -> AbstractContextManager[None]:
+        """Serialize an issue's WIP preservation and worktree removal.
+
+        Lock order: tick (if held) -> worktree -> state. Never wait for a
+        worktree lock under the state lock, or take the tick lock under a
+        worktree lock. These locks are not reentrant; cleanup acquires it
+        separately from preservation. Keep lock files after removal so all
+        contenders continue to lock the same inode.
+        """
+        return _file_lock(self.root / "runs" / f"issue-{number}.worktree.lock")
 
     @contextmanager
     def merge_lock(self) -> Iterator[None]:
