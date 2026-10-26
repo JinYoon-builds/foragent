@@ -497,21 +497,54 @@ def _junit_records(report: Path) -> list[ET.Element] | None:
         return None
 
 
-def _collects_nothing_else(baseline: AcceptanceBaseline, worktree: Path, check: Callable[[str, Path], CheckResult],
-                           report: Path, selectors: list[str], extra: tuple[str, ...] | list[str] = ()) -> bool:
-    """Proof that a clean collection of `selectors` holds no skip or error.
-
-    `--collect-only` JUnit records collection skips and errors (also from
-    pytest_generate_tests), never collected items. Only exit 0/5 with zero
-    records is clean; a partial collection or a missing report proves nothing.
-    For a file this proves its ids are gone once their selectors are not found;
-    for one id with its expansions deselected it proves only expansions remain.
-    """
+def _collect(baseline: AcceptanceBaseline, worktree: Path, check: Callable[[str, Path], CheckResult],
+             report: Path, selectors: list[str]) -> tuple[int | None, list[ET.Element] | None]:
+    """(exit, JUnit records) of `<command> --collect-only <selectors>`; exit None on timeout."""
     report.parent.mkdir(parents=True, exist_ok=True)
     report.unlink(missing_ok=True)
     result = check(f"{baseline.command} --collect-only -o junit_family=legacy --junit-prefix= "
-                   f"--junitxml={shlex.quote(str(report))} {shlex.join([*selectors, *extra])}", worktree)
-    return not result.timed_out and result.exit_code in (0, 5) and _junit_records(report) == []
+                   f"--junitxml={shlex.quote(str(report))} {shlex.join(selectors)}", worktree)
+    return (None if result.timed_out else result.exit_code), _junit_records(report)
+
+
+def _proven_absent(baseline: AcceptanceBaseline, worktree: Path, check: Callable[[str, Path], CheckResult],
+                   report: Path, node: str, controls: dict[str, bool] | None = None) -> bool:
+    """The one deletion rule: pytest's own selection shows this id is not collected.
+
+    `<command> --collect-only <id>` (its expansions deselected) must hold no
+    JUnit record — `--collect-only` JUnit records collection skips and errors
+    (importorskip, pytest_generate_tests, import failures), never items — and:
+
+    - exit 4 (not found) counts only when the same command collects the id's
+      directory without a usage error: a hook raising UsageError also exits 4;
+    - exit 5 (nothing selected) counts only when the id has expansions to
+      deselect and, without those deselects, the selector does select items
+      (exit 0): only expansions remain, and an exact `f` cannot coexist with
+      `f[...]`. A hook that deselects the test itself also exits 5 without them.
+
+    A missing file on disk, a skip, an error, a timeout, a missing report or
+    any other exit proves nothing, so the id stays protected. Files created
+    by session hooks exist when pytest collects, so they are found here.
+    """
+    deselect = _expansion_deselects(node, baseline.node_ids)
+    code, records = _collect(baseline, worktree, check, report, [node, *deselect])
+    if records != []:
+        return False
+    if code == 4:
+        controls = {} if controls is None else controls
+        # The directory itself proves nothing about the id; it only shows the
+        # command and its hooks collect without a usage error.
+        directory = Path(_node_parts(node)[0]).parent
+        while directory != directory.parent and not (worktree / directory).is_dir():
+            directory = directory.parent
+        key = directory.as_posix()
+        if key not in controls:
+            control, _ = _collect(baseline, worktree, check, report, [key])
+            controls[key] = control in (0, 2, 5)
+        return controls[key]
+    if code == 5 and deselect:
+        return _collect(baseline, worktree, check, report, [node])[0] == 0
+    return False
 
 
 def _missing_ids(baseline: AcceptanceBaseline, worktree: Path,
@@ -519,16 +552,12 @@ def _missing_ids(baseline: AcceptanceBaseline, worktree: Path,
     """(deleted, unverifiable) baseline ids whose selectors pytest no longer finds.
 
     Collection runs the verification's own command and selectors, so every
-    project setting (conftest imports, --noconftest, -p, -I, PYTHONPATH,
-    python_files, terminal options) applies exactly as it does there; nothing
-    is added to the project's environment. pytest exits 4 when a selector is
-    not found. Groups that exit 4 are halved until single ids remain. Only
-    proof counts as deletion: the file is gone, or the whole file collects
-    with no skip or error record. Anything else leaves the id unverifiable.
+    project setting (conftest imports, hooks, --noconftest, -p, -I,
+    PYTHONPATH, python_files, terminal options) applies exactly as it does
+    there; nothing is added to the project's environment. pytest exits 4 when
+    a selector is not found. Groups that exit 4 are halved until single ids
+    remain; each is deleted only by `_proven_absent`, otherwise unverifiable.
     """
-    # The pytest command pins --rootdir=., so ids are paths in this worktree.
-    deleted = {node for node in baseline.node_ids if not (worktree / _node_parts(node)[0]).is_file()}
-    unverifiable: set[str] = set()
     statuses: dict[tuple[str, ...], int | None] = {}
 
     def status(selectors: tuple[str, ...]) -> int | None:
@@ -546,14 +575,11 @@ def _missing_ids(baseline: AcceptanceBaseline, worktree: Path,
         middle = len(group) // 2
         return candidates(group[:middle]) + candidates(group[middle:])
 
-    files: dict[str, bool] = {}
-    present = tuple(node for node in baseline.node_ids if node not in deleted)
-    if present:
-        for node in candidates(present):
-            file = _node_parts(node)[0]
-            if file not in files:
-                files[file] = _collects_nothing_else(baseline, worktree, check, report, [file])
-            (deleted if files[file] else unverifiable).add(node)
+    deleted: set[str] = set()
+    unverifiable: set[str] = set()
+    controls: dict[str, bool] = {}
+    for node in candidates(baseline.node_ids):
+        (deleted if _proven_absent(baseline, worktree, check, report, node, controls) else unverifiable).add(node)
     return deleted, unverifiable
 
 
@@ -607,45 +633,50 @@ def exact_baseline_result(baseline: AcceptanceBaseline, report: Path, result: Ch
                           check: Callable[[str, Path], CheckResult], worktree: Path) -> CheckResult:
     """Judge the baseline after a base sync; pytest's failure always stands.
 
-    Only exact ids ran, so every nonzero exit belongs to the baseline run and
-    is returned as is. An id missing from a successful run's report is dropped
-    only when a separate collection proves that nothing but its expansions
-    remain (exit 5 with no skip or error record); otherwise it, like every
-    unverifiable id, fails verification. An empty run (exit 5) passes only
-    when every id was proven deleted. `result` is None when no id was runnable.
+    Only exact ids ran, so a nonzero exit belongs to the baseline run and is
+    returned as a failure. Every id the report does not show as run, whatever
+    the exit, goes through `_proven_absent` and is logged as dropped or as not
+    confirmed; an unconfirmed id, like every unverifiable id, fails the
+    verification. An empty run (exit 5) passes only when every id was proven
+    deleted. `result` is None when no id was runnable.
     """
-    if result is not None and (not baseline.exact_check or result.timed_out or result.exit_code not in (0, 5)):
-        return result  # A test, session or process failure is never rewritten.
+    if result is not None and not baseline.exact_check:
+        return result
     unknown = list(baseline.unverifiable)
+    dropped: list[str] = []
     if result is not None:
-        records = _junit_records(report)
+        records = None if result.timed_out else _junit_records(report)
+        recorded = {junit_node_id(case) for case in records or ()}
         if records is None:
-            if result.exit_code == 0 and not unknown:
-                return result  # Without a report, pytest's own success is the evidence.
-            _append(log, "Acceptance baseline exact ids not confirmed: no JUnit report")
-            records = []
-        recorded = {junit_node_id(case) for case in records}
+            _append(log, "Acceptance baseline exact ids not confirmed by the run: no JUnit report")
         probe = log.with_name(log.name + ".collect.xml")
-        dropped = []
+        controls: dict[str, bool] = {}
         for node in baseline.node_ids:
             if node in recorded:
                 continue
-            deselect = _expansion_deselects(node, baseline.node_ids)
-            if deselect and _collects_nothing_else(baseline, worktree, check, probe, [node], deselect):
+            if _proven_absent(baseline, worktree, check, probe, node, controls):
                 dropped.append(node)
-                _append(log, f"Acceptance baseline dropped missing node id: {node} (replaced by new node ids)")
+                _append(log, f"Acceptance baseline dropped missing node id: {node} (not collected after the sync)")
             else:
                 unknown.append(node)
-        if not unknown and len(dropped) == len(baseline.node_ids):
-            _append(log, "Acceptance baseline verification skipped (count=0): no exact baseline node ids remain")
-            return CheckResult(result.command, 0, False, result.output)
-        if not unknown and result.exit_code == 0:
-            return result
-    command = result.command if result else "acceptance baseline"
-    note = ("Acceptance baseline tests could not be verified (not run, and no proof they were deleted): "
-            + " ".join(unknown)) if unknown else f"Acceptance baseline verification failed: pytest exited {result.exit_code}"
-    return CheckResult(command, result.exit_code if result and result.exit_code else 1, False,
-                       (result.output if result else "") + "\n" + note)
+                _append(log, f"Acceptance baseline node id did not run and is not proven deleted: {node}")
+        if not result.timed_out and result.exit_code in (0, 5) and not unknown:
+            if len(dropped) == len(baseline.node_ids):
+                _append(log, "Acceptance baseline verification skipped (count=0): no exact baseline node ids remain")
+                return CheckResult(result.command, 0, False, result.output)
+            if result.exit_code == 0:
+                return result
+    notes = []
+    if unknown:
+        notes.append("Acceptance baseline tests could not be verified (not run, and no proof they were deleted): "
+                     + " ".join(unknown))
+    if result is not None and (result.timed_out or result.exit_code != 0):
+        notes.append(f"Acceptance baseline verification failed: pytest exited {result.exit_code}"
+                     + (" after timing out" if result.timed_out else ""))
+    if result is None:
+        return CheckResult("acceptance baseline", 1, False, "\n".join(notes))
+    exit_code = result.exit_code if result.exit_code else 1
+    return replace(result, exit_code=exit_code, output=result.output + "\n" + "\n".join(notes))
 
 
 if __name__ == "__main__":

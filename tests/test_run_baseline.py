@@ -414,7 +414,7 @@ def _collector(log, exit_code, ids, timed_out=False):
 
         code = 4 if exit_code == 0 and any("::" in word and not found(word) for word in selectors) else exit_code
         junit = next((word.split("=", 1)[1] for word in words if word.startswith("--junitxml=")), None)
-        if junit is not None and code in (0, 5):
+        if junit is not None and exit_code == 0:
             Path(junit).write_text("<testsuites><testsuite/></testsuites>")  # A clean collection.
         return CheckResult(command, code, timed_out, "")
     return check, calls
@@ -433,13 +433,14 @@ def test_surviving_baseline_drops_and_logs_only_missing_ids(tmp_path):
     check, calls = _collector(log, 0, ["tests/acceptance/test_a.py::test_a"])
     kept = surviving_baseline(baseline, _MovedGit(), tmp_path, check, log, "origin/main")
     assert kept.node_ids == ("tests/acceptance/test_a.py::test_a",)
-    # The verification's own selectors are tried; a deleted file never reaches pytest.
+    # The verification's own selectors are tried, even for a file missing on disk.
     words = shlex.split(calls[0])
-    assert words[words.index("--collect-only") + 1:] == ["tests/acceptance/test_a.py::test_a",
-                                                        "tests/acceptance/test_c.py::test_renamed"]
-    assert not any("test_b.py" in call for call in calls)
-    # Absence is confirmed only after the id's file still collects on its own.
-    assert shlex.split(calls[-1])[-1] == "tests/acceptance/test_c.py"
+    assert words[words.index("--collect-only") + 1:] == list(baseline.node_ids)
+    # Each absence is confirmed by collecting that one id with a JUnit report.
+    probes = [shlex.split(call) for call in calls if "--junitxml=" in call]
+    # The directory is collected once as a control that the command has no usage error.
+    assert {words[words.index("--collect-only") + 5] for words in probes} == {
+        "tests/acceptance/test_c.py::test_renamed", "tests/acceptance/test_b.py::test_b", "tests/acceptance"}
     assert "dropped missing node id: tests/acceptance/test_c.py::test_renamed" in log.read_text()
     assert "dropped missing node id: tests/acceptance/test_b.py::test_b" in log.read_text()
 
@@ -456,14 +457,15 @@ def test_surviving_baseline_keeps_every_id_when_collection_fails(tmp_path):
     assert kept.node_ids == baseline.node_ids
 
 
-def test_surviving_baseline_without_acceptance_dir_drops_all_without_pytest(tmp_path):
+def test_surviving_baseline_without_acceptance_dir_drops_all_by_collection_only(tmp_path):
+    # A missing directory is not evidence on its own; pytest collection reports it.
     from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
 
     log = tmp_path / "run.log"
     baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
     check, calls = _collector(log, 0, [])
     assert surviving_baseline(baseline, _MovedGit(), tmp_path, check, log, "origin/main").node_ids == ()
-    assert calls == []
+    assert calls and all("--collect-only" in shlex.split(call) for call in calls)
 
 
 def test_surviving_baseline_skips_collection_when_the_base_has_not_moved(tmp_path):
@@ -521,7 +523,7 @@ def test_base_moved_counts_a_merged_root_conftest_change(tmp_path):
     assert _base_moved(repo, base, "main")
 
 
-def _real_pytest(tmp_path, ini, command, *, files=None, project_name="project", full=False):
+def _real_pytest(tmp_path, ini, command, *, files=None, project_name="project", full=False, node_ids=None):
     """Run the real collection step on a tiny project; return (kept ids, log text)."""
     import subprocess
 
@@ -543,8 +545,8 @@ def _real_pytest(tmp_path, ini, command, *, files=None, project_name="project", 
         log.write_text((log.read_text() if log.exists() else "") + done.stdout + done.stderr)
         return CheckResult(command, done.returncode, False, done.stdout[-4000:])
 
-    baseline = AcceptanceBaseline(_pytest_command(command), ("tests/acceptance/test_a.py::test_kept[1]",
-                                                             "tests/acceptance/test_a.py::test_gone"),
+    baseline = AcceptanceBaseline(_pytest_command(command), node_ids or ("tests/acceptance/test_a.py::test_kept[1]",
+                                                                         "tests/acceptance/test_a.py::test_gone"),
                                   base_sha="base")
     kept = surviving_baseline(baseline, _MovedGit(), project, check, log, "origin/main")
     # Nothing is added to the project: the tree is exactly what verification runs on.
@@ -683,7 +685,7 @@ def test_exact_check_drops_a_parametrized_id_and_still_verifies_the_rest(tmp_pat
                                                            "tests/acceptance/test_a.py::test_other"))
     # The new variants did not run in place of the old id; test_other still did.
     assert result.exit_code == 0, result.output
-    assert "dropped missing node id: tests/acceptance/test_a.py::test_keep (replaced by new node ids)" in log
+    assert "dropped missing node id: tests/acceptance/test_a.py::test_keep (not collected after the sync)" in log
     assert "test_other" not in log
 
 
@@ -762,6 +764,7 @@ def test_exact_check_keeps_an_id_whose_module_skips_while_others_run(tmp_path):
 
 
 def test_missing_ids_needs_a_clean_file_collection_to_prove_deletion(tmp_path):
+    # The one rule: collecting the id ran and did not collect it (exit 4/5, no record).
     from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
     from foragent.run_checks import CheckResult
 
@@ -773,20 +776,34 @@ def test_missing_ids_needs_a_clean_file_collection_to_prove_deletion(tmp_path):
     skipped = ('<testsuites><testsuite><testcase classname="" name="tests.acceptance.test_a" '
                'file="tests/acceptance/test_a.py"><skipped message="collection skipped"/></testcase>'
                '</testsuite></testsuites>')
-    # (file exit, file JUnit report, deleted): only a clean collection proves deletion.
-    for file_exit, report, deleted in ((0, empty, True), (0, skipped, False), (0, None, False),
-                                       (5, empty, True), (5, skipped, False), (5, None, False),
-                                       (2, empty, False)):
-        def check(command, root, file_exit=file_exit, report=report):
+    errored = skipped.replace('<skipped message="collection skipped"/>', '<error message="collection failure"/>')
+    # (probe exit, probe timed out, probe JUnit report, exit without our deselects, directory exit, deleted)
+    cases = ((4, False, empty, 0, 0, True), (5, False, empty, 0, 0, True),
+             (4, False, empty, 0, 4, False),   # A hook raising UsageError: the directory exits 4 too.
+             (5, False, empty, 5, 0, False),   # A hook deselecting the test: 5 without our deselects too.
+             (4, False, skipped, 0, 0, False), (4, False, errored, 0, 0, False), (4, False, None, 0, 0, False),
+             (4, True, empty, 0, 0, False), (0, False, empty, 0, 0, False), (2, False, empty, 0, 0, False),
+             (3, False, empty, 0, 0, False))
+    for probe_exit, timed_out, report, bare_exit, directory_exit, deleted in cases:
+        def check(command, root, probe_exit=probe_exit, timed_out=timed_out, report=report,
+                  bare_exit=bare_exit, directory_exit=directory_exit):
             words = shlex.split(command)
-            if "::" in words[-1]:
-                return CheckResult(command, 4, False, "")
-            junit = next(word.split("=", 1)[1] for word in words if word.startswith("--junitxml="))
+            junit = next((word.split("=", 1)[1] for word in words if word.startswith("--junitxml=")), None)
+            if junit is None:
+                return CheckResult(command, 4, False, "")  # The group selector is not found.
+            selectors = [word for word in words[words.index("--collect-only") + 1:] if not word.startswith("-")]
+            if not any("::" in word for word in selectors):
+                Path(junit).write_text(empty)
+                return CheckResult(command, directory_exit, False, "")  # The directory control.
+            if not any(word.startswith("--deselect") for word in words):
+                Path(junit).write_text(empty)
+                return CheckResult(command, bare_exit, False, "")  # The id without our deselects.
             if report is not None:
                 Path(junit).write_text(report)
-            return CheckResult(command, file_exit, False, "")
+            return CheckResult(command, probe_exit, timed_out, "")
         kept = surviving_baseline(baseline, _MovedGit(), tmp_path, check, log, "origin/main")
-        assert kept.node_ids == () and kept.unverifiable == (() if deleted else baseline.node_ids), file_exit
+        expected = () if deleted else baseline.node_ids
+        assert kept.node_ids == () and kept.unverifiable == expected, (probe_exit, timed_out, report)
 
 
 def test_deleting_the_last_test_of_a_kept_file_drops_its_id(tmp_path):
@@ -813,7 +830,7 @@ def test_exact_check_reads_a_parameter_id_containing_the_separator(tmp_path):
     result, log, _ = _verify_exact(tmp_path, source, ("tests/acceptance/test_a.py::test_keep",
                                                      "tests/acceptance/test_a.py::test_other"))
     assert result.exit_code == 0, result.output
-    assert "dropped missing node id: tests/acceptance/test_a.py::test_keep (replaced by new node ids)" in log
+    assert "dropped missing node id: tests/acceptance/test_a.py::test_keep (not collected after the sync)" in log
 
 
 def test_node_parts_keep_parameters_whole():
@@ -829,8 +846,10 @@ def test_partial_collection_of_a_file_is_not_deletion(tmp_path):
               "def test_other():\n    pass\n\n"
               "def pytest_generate_tests(metafunc):\n    if metafunc.cls is TestC:\n        pytest.skip('gen')\n")
     files = {"tests/acceptance/test_a.py": source}
-    kept, log = _real_pytest(tmp_path, "[pytest]\n", _python_pytest(), files=files, full=True)
-    assert "tests/acceptance/test_a.py::test_kept[1]" in kept.unverifiable, log
+    ids = ("tests/acceptance/test_a.py::TestC::test_m", "tests/acceptance/test_a.py::test_other")
+    kept, log = _real_pytest(tmp_path, "[pytest]\n", _python_pytest(), files=files, full=True, node_ids=ids)
+    assert kept.unverifiable == ("tests/acceptance/test_a.py::TestC::test_m",), log
+    assert kept.node_ids == ("tests/acceptance/test_a.py::test_other",)
     assert "dropped" not in log
 
 
@@ -841,7 +860,7 @@ def test_expanded_variants_never_run_after_their_id_is_gone(tmp_path):
     result, log, _ = _verify_exact(tmp_path, source, ("tests/acceptance/test_a.py::test_keep",))
     assert result.exit_code == 0, result.output
     assert "variant ran" not in result.output
-    assert "dropped missing node id: tests/acceptance/test_a.py::test_keep (replaced by new node ids)" in log
+    assert "dropped missing node id: tests/acceptance/test_a.py::test_keep (not collected after the sync)" in log
     assert "verification skipped (count=0)" in log
 
 
@@ -855,3 +874,85 @@ def test_a_failing_replacement_does_not_excuse_a_session_failure(tmp_path):
                                  files={"tests/acceptance/conftest.py": conftest})
     assert result.exit_code == 1
     assert "new variant" not in result.output
+
+
+def test_files_created_by_session_hooks_are_not_deleted(tmp_path):
+    # The file exists only while pytest runs; disk absence before pytest is no evidence.
+    import subprocess
+
+    from foragent.run_baseline import (AcceptanceBaseline, baseline_verification_command,
+                                       exact_baseline_result, surviving_baseline)
+    from foragent.run_checks import CheckResult, _pytest_command
+
+    project = tmp_path / "my project"
+    (project / "tests/acceptance").mkdir(parents=True)
+    (project / "pytest.ini").write_text("[pytest]\n")
+    (project / "conftest.py").write_text(
+        "from pathlib import Path\n\nGENERATED = Path('tests/acceptance/test_gen.py')\n\n"
+        "def pytest_sessionstart(session):\n    GENERATED.write_text(\"def test_g():\\n    assert False, 'broken'\\n\")\n\n"
+        "def pytest_sessionfinish(session):\n    GENERATED.unlink()\n")
+    log = tmp_path / "run.log"
+    log.write_text("")
+
+    def check(command, root):
+        done = subprocess.run(["/bin/sh", "-c", command], cwd=root, capture_output=True, text=True)
+        return CheckResult(command, done.returncode, False, done.stdout + done.stderr)
+
+    baseline = AcceptanceBaseline(_pytest_command(_python_pytest()), ("tests/acceptance/test_gen.py::test_g",),
+                                  base_sha="base")
+    kept = surviving_baseline(baseline, _MovedGit(), project, check, log, "origin/main")
+    assert kept.node_ids == baseline.node_ids and kept.unverifiable == (), log.read_text()
+    report = tmp_path / "verification.xml"
+    result = exact_baseline_result(kept, report, check(baseline_verification_command(kept, report), project),
+                                   log, check, project)
+    assert result.exit_code == 1 and "broken" in result.output
+    assert "dropped" not in log.read_text()
+
+
+def test_disappearance_is_detected_and_logged_while_another_test_fails(tmp_path):
+    # test_keep was parametrized away; test_other still exists and now fails.
+    source = ("import pytest\n\n@pytest.mark.parametrize('v', [1])\n"
+              "def test_keep(v):\n    pass\n\ndef test_other():\n    assert False, 'regressed'\n")
+    result, log, _ = _verify_exact(tmp_path, source, ("tests/acceptance/test_a.py::test_keep",
+                                                     "tests/acceptance/test_a.py::test_other"))
+    assert result.exit_code == 1 and "regressed" in result.output
+    assert "dropped missing node id: tests/acceptance/test_a.py::test_keep" in log
+
+
+def test_an_id_that_does_not_run_in_a_crashed_run_is_not_confirmed(tmp_path):
+    # A non-collection exit (pytest.exit -> 2) keeps an unproven id protected and logged.
+    source = ("import pytest\n\ndef test_first():\n    pytest.exit('stop')\n\ndef test_second():\n    pass\n")
+    result, log, _ = _verify_exact(tmp_path, source, ("tests/acceptance/test_a.py::test_first",
+                                                     "tests/acceptance/test_a.py::test_second"))
+    assert result.exit_code == 2
+    assert "did not run and is not proven deleted: tests/acceptance/test_a.py::test_second" in log
+    assert "dropped" not in log
+
+
+USAGE_HOOK = "import pytest\n\ndef pytest_collection_finish(session):\n    raise pytest.UsageError('hook')\n"
+DESELECT_HOOK = ("def pytest_collection_modifyitems(config, items):\n"
+                 "    gone = [item for item in items if item.name == 'test_keep']\n"
+                 "    items[:] = [item for item in items if item not in gone]\n"
+                 "    config.hook.pytest_deselected(items=gone)\n")
+FAILING_KEEP = "def test_keep():\n    assert False, 'broken'\n\ndef test_other():\n    pass\n"
+
+
+def test_a_hook_usage_error_is_not_absence(tmp_path):
+    # The hook makes every collection exit 4 with no record; the test still exists.
+    files = {"tests/acceptance/test_a.py": FAILING_KEEP, "conftest.py": USAGE_HOOK}
+    ids = ("tests/acceptance/test_a.py::test_keep",)
+    kept, log = _real_pytest(tmp_path / "phase", "[pytest]\n", _python_pytest(), files=files, full=True, node_ids=ids)
+    assert kept.unverifiable == ids and "dropped" not in log
+    result, log, _ = _verify_exact(tmp_path / "verify", FAILING_KEEP, ids, files={"conftest.py": USAGE_HOOK})
+    assert result.exit_code != 0 and "dropped" not in log
+
+
+def test_a_hook_deselecting_an_existing_failing_test_is_not_absence(tmp_path):
+    files = {"tests/acceptance/test_a.py": FAILING_KEEP, "conftest.py": DESELECT_HOOK}
+    ids = ("tests/acceptance/test_a.py::test_keep",)
+    kept, log = _real_pytest(tmp_path / "phase", "[pytest]\n", _python_pytest(), files=files, full=True, node_ids=ids)
+    # The selector is found, so collection keeps it for verification.
+    assert kept.node_ids == ids and "dropped" not in log
+    result, log, _ = _verify_exact(tmp_path / "verify", FAILING_KEEP, ids, files={"conftest.py": DESELECT_HOOK})
+    assert result.exit_code != 0
+    assert "not proven deleted: tests/acceptance/test_a.py::test_keep" in log and "dropped" not in log
