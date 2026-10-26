@@ -11,6 +11,9 @@ class Approval:
     acceptance_blobs: dict[str, str]
     approved_by: str
     approved_at: str
+    # A Foragent order parent's shared outcome and constraints, frozen once
+    # per approval; None means not read yet, "" means there is none.
+    parent_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,10 @@ class Run:
     session_ids: list[str] = field(default_factory=list)
     session_body: str | None = None
     resume_reason: str = ""
+    # The saved failure is already limited part by part (every check, every finding): keep it whole.
+    resume_whole: bool = False
+    # Files this branch edits that a merged base moved or split, until the next prompt names them.
+    moved_files: list[str] = field(default_factory=list)
     resume_failures: int = 0
     merge_conflicts: list[str] = field(default_factory=list)
     # From-scratch rebuilds in this run and the fixed English machine reason for the latest one.
@@ -79,3 +86,12 @@ class Run:
     effective_files: list[str] | None = None
     late_files: list[str] = field(default_factory=list)
     overlap_records: list[dict] = field(default_factory=list)
+    # One entry per related-unit-test check: changed_file_count, selected_files,
+    # file_seconds (JUnit testcase seconds per file), total_seconds and timed_out.
+    related_tests: list[dict] = field(default_factory=list)
+    # Identity of the work the current phase does (e.g. "baseline:<sha>"), journaled when it ends;
+    # work_events maps each finished work identity to its first phase event, across executions.
+    phase_work_id: str | None = None
+    # When this instance of the work began; segments split by nested waits share it.
+    phase_work_started_at: str | None = None
+    work_events: dict[str, str] = field(default_factory=dict)

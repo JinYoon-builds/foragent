@@ -244,5 +244,6 @@ def test_test_slot_wait_is_a_phase_only_when_the_run_queues(tmp_path, monkeypatc
         assert store.get_run(1).phase == "checking"
     journal = store.root / "orch-events.jsonl"
     events = [json.loads(line) for line in journal.read_text().splitlines()] if journal.exists() else []
-    expected = [("checking -> test-slot-wait", 5), ("test-slot-wait -> checking", 40)] if queued else []
+    # The queue segment starts when the run asks for a slot, so checking closes at 0 seconds.
+    expected = [("checking -> test-slot-wait", 0), ("test-slot-wait -> checking", 45)] if queued else []
     assert [(event["summary"], event["seconds"]) for event in events] == expected
