@@ -332,6 +332,10 @@ def _check_publication(git: GitRepo, target_branch: str, base_sha: str | None = 
         raise AttemptFailure(str(exc), target_branch) from exc
 
 
+class SaveDeferredToStop(Exception):
+    """`fa orch stop` saves this worktree after the run's whole tree exits; keep it in place."""
+
+
 class WipNotSaved(Exception):
     """Unfinished work could not be saved; its worktree must be kept."""
 
@@ -366,23 +370,46 @@ def keep_unsaved_work(n: int, ctx: FlagContext, worktree: Path, error: BaseExcep
     return detail
 
 
-def stop_kept_work(run: Run) -> bool:
-    """A stop owns this run's end only if any WIP it made names the stop's why."""
-    return bool(run.stop_why) and run.wip_reason in {None, f"{STOPPED}: {run.stop_why}"}
+def stop_head(git: GitRepo, n: int) -> str | None:
+    try:
+        return git.ref_sha(f"refs/heads/foragent/issue-{n}")
+    except GitError:
+        return None
+
+
+def stop_kept_work(git: GitRepo, run: Run) -> bool:
+    """Positive evidence from Git that the stop kept its work under its why.
+
+    Either the issue branch did not move since the intent (nothing was saved,
+    because nothing was unsaved), or its newest commit names `stopped: <why>`.
+    A recorded field alone is not evidence: a runner from before an upgrade
+    saves WIP without ever recording one.
+    """
+    if not run.stop_why:
+        return False
+    head = stop_head(git, run.number)
+    if head == run.stop_head:
+        # Nothing new was saved; a WIP this run already made must still name the why.
+        return run.wip_reason in {None, f"{STOPPED}: {run.stop_why}"}
+    try:
+        message = git._call(["log", "-1", "--format=%B", head]) if head else ""
+    except GitError:
+        return False
+    return f"[{STOPPED}: {run.stop_why}]" in message
 
 
 def final_outcome(run: Run | None, outcome: str, *, recorded_first: bool = False) -> str:
-    """A runner's last outcome: lost work and merges win, then a stop that kept the work.
+    """A runner's last outcome: lost work and merges win; then a recorded stop request wins.
 
-    A run that saved WIP for its own reason before the stop's intent keeps that outcome.
+    Children are signaled first, so a runner may finish on an ordinary path
+    (an executor error) before its own SIGTERM; the stop still owns that end.
     """
     if outcome in {"merged", WIP_NOT_SAVED} or run is None:
         return outcome
     if run.outcome == WIP_NOT_SAVED:
         return WIP_NOT_SAVED
     if run.stop_why:
-        # Only a runner the stop terminated ends as stopped; an intent alone is no termination.
-        return STOPPED if outcome in {"killed", STOPPED} and stop_kept_work(run) else outcome
+        return STOPPED
     return (run.outcome or outcome) if recorded_first else outcome
 
 
@@ -390,21 +417,66 @@ def _preserve_failed_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
     approved_ref: str = "HEAD", title: str | None = None, pushed_head: str | None = None,
     tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
-) -> None:
-    """Save stopped work before cleanup, including after the runner has died."""
+    defer_to_stop: bool = False, tree_exited: bool = False,
+) -> bool:
+    """Save stopped work before cleanup, including after the runner has died.
+
+    Returns True when a runner (`defer_to_stop`) left the save to `fa orch stop`:
+    the stop saves only after the run's whole tree exited, so nothing a still
+    running executor deletes afterwards is missing from the WIP. `tree_exited`
+    marks such a save: the worktree is final, so its deletions are the run's own.
+    """
     with ctx.store.worktree_lock(n):
         # Recheck only after acquiring the lock: a competing cleanup may have
         # removed the worktree while we waited. A parent repository is no save.
         if not (git.root / ".git").is_file():
-            return
+            return False
         try:
             git.check_worktree()
         except GitError:
-            return
-        _preserve_locked_implementation(
+            return False
+        return _preserve_locked_implementation(
             n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
             pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
+            defer_to_stop=defer_to_stop, tree_exited=tree_exited,
         )
+
+
+# Every field a stop request grants; cancelling a request clears all of them together,
+# so no authority (such as owning an exited tree's deletions) outlives the request.
+STOP_REQUEST_CLEARED = {"stop_why": "", "stop_head": None, "stop_in_turn": False}
+
+
+# Phases in which a live executor is the implementer; a reviewer runs (and its review
+# state is restored) under "reviewing". No phase yet means the implementer's first turn.
+IMPLEMENTER_PHASES = {None, "implementing", "resolving-conflict"}
+
+
+def implementer_turn_open(run: Run) -> bool:
+    """Edit provenance, not mere liveness: an open turn or a live executor in an implementer phase."""
+    return run.phase in IMPLEMENTER_PHASES and (run.in_turn or run.executor_pgid is not None)
+
+
+def begin_turn(ctx, n: int) -> None:
+    """Open an implementer turn, unless a stop already asked the run to end."""
+    with stop_intent_lock(ctx.store, n):
+        run = ctx.store.get_run(n)
+        if run is not None and run.stop_why:
+            raise SaveDeferredToStop()  # No new executor after a stop request.
+        ctx.store.update_run(n, in_turn=True)
+
+
+def end_turn(ctx, n: int, worktree: Path) -> None:
+    """Close a turn with its provenance; under a stop request, leave it open and stop here.
+
+    The request arrived while the turn ran, so the stopper owns what the exited
+    tree leaves; going on (checks, cleanup) could change the worktree it saves.
+    """
+    with stop_intent_lock(ctx.store, n):  # One step: a stop sees either an open turn or its provenance.
+        run = ctx.store.get_run(n)
+        if run is not None and run.stop_why:
+            raise SaveDeferredToStop()
+        _observe_locked(ctx, n, worktree, in_turn=False)
 
 
 class ProvenanceUnavailable(Exception):
@@ -414,28 +486,36 @@ class ProvenanceUnavailable(Exception):
 def observe_live_changes(ctx, n: int, worktree: Path) -> bool:
     """Record what the live run changed, as provenance for its later WIP; False if it could not.
 
-    Taken when an implementer turn ends and before a stop or gate kill signals,
-    never during cleanup: deletions a racing removal causes later stay unowned
-    (#572). Observers merge into the latest record under the run's intent lock,
-    so an older observation can never replace a newer one. A failure is
-    recorded, so missing evidence is never read as "nothing was changed".
+    Taken when an implementer turn ends, never during cleanup: deletions a racing
+    removal causes later stay unowned (#572). Observers merge into the latest
+    record under the run's intent lock, so an older observation can never
+    replace a newer one. A failure is recorded, so missing evidence is never
+    read as "nothing was changed".
     """
     with stop_intent_lock(ctx.store, n):
-        run = ctx.store.get_run(n)
-        if run is None or run.status != "running" or not (worktree / ".git").exists():
-            return True  # No live worktree: no work in it to own.
-        try:
-            git = ctx.git.at(worktree)
-            base = git._own_base(f"origin/{run.files_base_branch or ctx.config.base_branch}")
-            output = git._call(["diff", "--cached", "--name-only", "--no-renames", "-z", base])
-            output += git._call(["diff", "--name-only", "--no-renames", "-z", base])
-        except (GitError, ValueError):
-            ctx.store.update_run(n, live_changes_failed=True)
-            return False
-        paths = sorted(set(filter(None, output.split("\0"))) | set(run.live_changes))
-        if paths != run.live_changes:
-            ctx.store.update_run(n, live_changes=paths)
+        return _observe_locked(ctx, n, worktree)
+
+
+def _observe_locked(ctx, n: int, worktree: Path, **fields) -> bool:
+    run = ctx.store.get_run(n)
+    if run is None or run.status != "running":
         return True
+    if not (worktree / ".git").exists():
+        if fields:
+            ctx.store.update_run(n, **fields)
+        return True  # No live worktree: no work in it to own.
+    try:
+        git = ctx.git.at(worktree)
+        base = git._own_base(f"origin/{run.files_base_branch or ctx.config.base_branch}")
+        output = git._call(["diff", "--cached", "--name-only", "--no-renames", "-z", base])
+        output += git._call(["diff", "--name-only", "--no-renames", "-z", base])
+    except (GitError, ValueError):
+        ctx.store.update_run(n, live_changes_failed=True, **fields)
+        return False
+    paths = sorted(set(filter(None, output.split("\0"))) | set(run.live_changes))
+    if paths != run.live_changes or fields:
+        ctx.store.update_run(n, live_changes=paths, **fields)
+    return True
 
 
 def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> list[str]:
@@ -465,8 +545,9 @@ def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> lis
 def _preserve_locked_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
     approved_ref: str, title: str | None, pushed_head: str | None,
-    tracker_available: bool, push_branch: Callable[[], None] | None,
-) -> None:
+    tracker_available: bool, push_branch: Callable[[], None] | None, defer_to_stop: bool = False,
+    tree_exited: bool = False,
+) -> bool:
     branch = f"foragent/issue-{n}"
     run = ctx.store.get_run(n)
     git.local_skill_paths.update(run.local_skill_paths if run is not None else ())
@@ -483,7 +564,12 @@ def _preserve_locked_implementation(
         # Read the intent and the provenance now, not at entry: a stop or an observation
         # recorded during staging still counts, and one recorded after the commit sees this WIP.
         current = ctx.store.get_run(n)
-        refused = _check_wip_deletions(ctx, git, current)
+        if defer_to_stop and current is not None and current.stop_why:
+            return True  # The stopper saves after the whole tree exits; staged changes stay in place.
+        # Only a stop that interrupted an implementer turn owns everything the exited tree left:
+        # outside a turn the runner itself may have begun cleanup, so provenance is still checked.
+        owned = tree_exited and current is not None and bool(current.stop_why) and current.stop_in_turn
+        refused = [] if owned else _check_wip_deletions(ctx, git, current)
         if refused and current is not None and current.live_changes_failed:
             # The evidence that could own these deletions is missing: keep the worktree instead.
             raise ProvenanceUnavailable(
@@ -499,18 +585,19 @@ def _preserve_locked_implementation(
         _append(ctx.store.log_path(n), detail)
         append_event(ctx.store, ctx.now(), n, "wip-preservation-refused", detail)
     if git.head_sha() == pushed_head or not tracker_available:
-        return
+        return False
     try:
         pr = ctx.tracker.find_pr(branch)
     except TrackerError as exc:
         _append(ctx.store.log_path(n), f"WIP kept on local branch {branch}; open PR lookup failed: {exc}")
-        return
+        return False
     # An unverified WIP must not replace the head seen by an open PR's CI/review.
     if pr is None:
         if push_branch is not None:
             push_branch()
         else:
             git.push(branch)
+    return False
 
 
 def _push_branch(attempt: Implementation) -> None:

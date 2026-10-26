@@ -214,6 +214,9 @@ def _implement(
         retry_default=retry_default,
     )
     offset = log.stat().st_size if log.exists() else 0
+    from foragent.run_publish import SaveDeferredToStop, begin_turn, end_turn
+
+    begin_turn(ctx, n)  # Marks the turn open; refuses to start one after a stop request.
     result = None
     try:
         result = _available_executor(
@@ -234,9 +237,9 @@ def _implement(
         except OSError:
             pass
         try:  # Provenance for the WIP: what this turn changed, before any cleanup.
-            from foragent.run_publish import observe_live_changes
-
-            observe_live_changes(ctx, n, worktree)
+            end_turn(ctx, n, worktree)
+        except SaveDeferredToStop:
+            raise  # A stop arrived during the turn: go no further, it saves the worktree.
         except Exception:
             pass
     # A prepared prompt has not been delivered yet. Keep its hint through

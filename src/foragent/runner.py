@@ -128,7 +128,8 @@ from foragent.run_conflicts import (
 )
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import (
-    STOPPED, WIP_NOT_SAVED, WipNotSaved, _publish, _push_branch, final_outcome, keep_unsaved_work,
+    STOPPED, WIP_NOT_SAVED, SaveDeferredToStop, WipNotSaved, _publish, _push_branch, final_outcome,
+    keep_unsaved_work, stop_intent_lock,
 )
 from foragent.run_review import _review_implementation
 
@@ -264,13 +265,16 @@ def _implement_and_publish(
         if outcome != "merged":
             try:
                 run = ctx.store.get_run(n)
-                _preserve_failed_implementation(
+                deferred = _preserve_failed_implementation(
                     n, ctx, git, (run.outcome if run is not None else None) or outcome, approval=attempt.approval,
                     approved_ref=attempt.approved_ref, title=attempt.issue.title, pushed_head=attempt.pushed_head,
                     tracker_available=attempt.tracker_available, push_branch=lambda: _push_branch(attempt),
+                    defer_to_stop=True,
                 )
             except Exception as exc:
                 raise WipNotSaved(keep_unsaved_work(n, ctx, git.root, exc)) from exc
+            if deferred:
+                raise SaveDeferredToStop()
 
 
 def review_only(
@@ -318,6 +322,8 @@ def review_only(
     except WipNotSaved as exc:
         # CI repair could not save its work; the worktree is the only copy (already flagged).
         outcome, detail, kept = WIP_NOT_SAVED, str(exc), True
+    except SaveDeferredToStop:
+        outcome, kept = STOPPED, True  # The stop saves this worktree once the tree has exited.
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         if not started:
@@ -360,10 +366,13 @@ def review_only(
                     outcome = "limit-wait"
                 finally:
                     try:
-                        run = ctx.store.get_run(n)
-                        final = final_outcome(run, outcome)
-                        ctx.store.finish_run(n, outcome=final, detail=(
-                            f"{STOPPED}: {run.stop_why}" if final == STOPPED and run is not None else detail))
+                        # Read and finish under the stop's intent lock: a request either sees this
+                        # run finished (and refuses), or this finish sees the request (and is stopped).
+                        with stop_intent_lock(ctx.store, n):
+                            run = ctx.store.get_run(n)
+                            final = final_outcome(run, outcome)
+                            ctx.store.finish_run(n, outcome=final, detail=(
+                                f"{STOPPED}: {run.stop_why}" if final == STOPPED and run is not None else detail))
                     finally:
                         kick_tick(ctx.repo_root)
     return outcome
@@ -387,7 +396,7 @@ def run_issue(n: int, ctx: RunContext) -> str:
         kept = False
         try:
             outcome = _execute(n, ctx, worktree)
-        except WipNotSaved:
+        except (WipNotSaved, SaveDeferredToStop):
             kept = True  # The only copy of the unfinished work is this worktree.
             raise
         finally:
@@ -398,6 +407,8 @@ def run_issue(n: int, ctx: RunContext) -> str:
         detail = str(exc)
     except WipNotSaved as exc:
         outcome, detail = WIP_NOT_SAVED, str(exc)  # Already flagged by keep_unsaved_work.
+    except SaveDeferredToStop:
+        outcome = STOPPED  # `fa orch stop` saves the kept worktree after the whole tree exits.
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())
@@ -420,12 +431,15 @@ def run_issue(n: int, ctx: RunContext) -> str:
     finally:
         # A tick may already have finished the record while terminating this runner.
         try:
-            run = ctx.store.get_run(n)
-            if run is not None and run.status != "finished":
-                # Lost work wins over every recorded outcome, then a stop's own record.
-                final = final_outcome(run, outcome, recorded_first=True)
-                ctx.store.finish_run(n, outcome=final,
-                                     detail=f"{STOPPED}: {run.stop_why}" if final == STOPPED else detail)
+            # Under the stop's intent lock: a request either sees this run finished (and
+            # refuses), or this finish sees the request (and records the stop).
+            with stop_intent_lock(ctx.store, n):
+                run = ctx.store.get_run(n)
+                if run is not None and run.status != "finished":
+                    # Lost work wins over every recorded outcome, then a stop's own record.
+                    final = final_outcome(run, outcome, recorded_first=True)
+                    ctx.store.finish_run(n, outcome=final,
+                                         detail=f"{STOPPED}: {run.stop_why}" if final == STOPPED else detail)
         finally:
             kick_tick(ctx.repo_root)
     return outcome

@@ -6,11 +6,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
-from foragent.scheduler_stop import (
-    _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes, clear_stale_stop,
-    complete_stop, recover_pending_stops,
-)
-from foragent.run_publish import STOPPED, WIP_NOT_SAVED, keep_unsaved_work, observe_live_changes, stop_kept_work
+from foragent.orch_stop import clear_stale_stop, recover_pending_stops, tree_proven_gone
+from foragent.scheduler_stop import _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes
+from foragent.run_publish import WIP_NOT_SAVED, keep_unsaved_work
 from foragent.state import Run
 from foragent.tracker import Issue
 
@@ -28,14 +26,15 @@ def _kill_executor(ctx: TickContext, number: int) -> None:
 
 
 def _remove_run_worktree(
-    ctx: TickContext, number: int, worktree: Path, report: TickReport, *, outcome: str,
+    ctx: TickContext, number: int, worktree: Path, report: TickReport, *, outcome: str, tree_exited: bool = False,
 ) -> bool:
-    """Save unfinished work, then remove the worktree; False keeps it after a failed save."""
+    """Save, then remove the worktree (False keeps it); tree_exited or a stop: the worktree is final."""
     if worktree.exists() and outcome != "merged":
         try:
+            tree_exited = tree_exited or bool(getattr(ctx.store.get_run(number), "stop_why", ""))
             scheduler._preserve_failed_implementation(
                 number, ctx, ctx.git.at(worktree), outcome, approval=ctx.store.load_approval(number),
-                tracker_available=ctx.store.github_wait_until(ctx.now()) is None,
+                tracker_available=ctx.store.github_wait_until(ctx.now()) is None, tree_exited=tree_exited,
             )
         except Exception as exc:
             report.actions.append(f"#{number} {keep_unsaved_work(number, ctx, worktree, exc)}")
@@ -53,7 +52,6 @@ def _kill_run(
         return False
     if count_stall:
         ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
-    observe_live_changes(ctx, number, scheduler.Path(run.worktree))  # Provenance before any signal.
     try:
         stopped = _stop_run_processes(ctx, run, report)
     except Exception:
@@ -66,7 +64,9 @@ def _kill_run(
         if stopped == "gone":
             _finish_dead_run(ctx, run, report)
         return False
-    if not scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome):
+    if not tree_proven_gone(ctx.store.get_run(number)):  # The killer may skip an unreadable PID.
+        return False
+    if not scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome, tree_exited=True):
         ctx.store.finish_run(number, outcome=WIP_NOT_SAVED)
         return False  # Flagged with the worktree kept; no caller may restart or report a clean stop.
     ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
@@ -141,14 +141,13 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         ctx.store.clear_run_start(issue.number)
     if scheduler.RUNNING not in issue.labels or (run is not None and run.status == "running"):
         return issue
+    if run is not None and run.stop_why and run.outcome != "merged":
+        return issue  # A stop's pending record drives its save and labels, not this label.
     if not scheduler._remove_run_worktree(
         ctx, issue.number, scheduler.Path(run.worktree) if run is not None else ctx.store.worktree_path(issue.number),
         report, outcome=(run.outcome or "crashed") if run is not None else "crashed",
     ):
         return ctx.tracker.get_issue(issue.number)  # Flagged; the kept worktree is not a crash to restart.
-    if run is not None and run.outcome == STOPPED and stop_kept_work(run):  # Ended by `fa orch stop`.
-        report.actions.append(f"#{issue.number} completed an interrupted stop{complete_stop(ctx, run)}")
-        return ctx.tracker.get_issue(issue.number)
     if run is not None and run.outcome == "merged":
         ctx.tracker.remove_labels(issue.number, [scheduler.READY, scheduler.RUNNING])
         return ctx.tracker.get_issue(issue.number)
@@ -249,7 +248,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         # Clean up a crashed group or finish an interrupted stall termination.
         # A recorded completion does not need another signal.
         stopped = _stop_run_processes(
-            ctx, run, report, stop_runner=run.outcome in {None, "crashed", "stalled-restart", "stalled", STOPPED},
+            ctx, run, report, stop_runner=bool(run.stop_why) or run.outcome in {None, "crashed", "stalled-restart", "stalled"},
         )
         if stopped != "refused":
             _finish_dead_run(ctx, run, report)
@@ -257,6 +256,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
 
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
     outcome = run.outcome or "crashed"
+    if not tree_proven_gone(run):
+        return  # Unknown liveness is never termination; the next tick tries again.
     if run.executor_pgid is not None:
         ctx.store.update_run(run.number, executor_pgid=None)
     if not scheduler._remove_run_worktree(ctx, run.number, scheduler.Path(run.worktree), report, outcome=outcome):

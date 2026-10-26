@@ -458,7 +458,10 @@ def test_failed_reporting_of_unsaved_work_still_keeps_the_worktree(run_case, mon
 
 def test_tick_completes_a_stop_whose_label_update_failed(run_case):
     """Finding class 3: a partially completed stop is finished by the next tick, not crashed."""
+    from foragent.orch_stop import mark_stop_pending
+
     c = run_case
+    mark_stop_pending(c.store, c.store.get_run(1), "reprioritize")
     c.store.update_run(1, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
     c.store.finish_run(1, outcome="stopped")
     c.now[0] += timedelta(seconds=1)
@@ -467,7 +470,8 @@ def test_tick_completes_a_stop_whose_label_update_failed(run_case):
         config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
     )
     report = TickReport()
-    _recover_orphan(ctx, c.tracker.get_issue(1), report)
+    assert _recover_orphan(ctx, c.tracker.get_issue(1), report).labels & {"running"}, "labels never drive it"
+    _recover_runs(ctx, report)  # The pending record does.
     labels = c.tracker.get_issue(1).labels
     assert "ready" in labels and not labels & {"running", "blocked"}, report.actions
     assert c.store.get_run(1).outcome == "stopped", "Orphan recovery replaced the stop with a crash"
@@ -479,7 +483,7 @@ def test_tick_completes_a_stop_whose_label_update_failed(run_case):
 def test_tick_completes_a_pending_stop_after_a_runner_flag_erased_running(run_case):
     """The class 'recovery depends on an erased label': the local stop record drives the tick."""
     from foragent.actions import flag
-    from foragent.scheduler_stop import mark_stop_pending
+    from foragent.orch_stop import mark_stop_pending
 
     c = run_case
     mark_stop_pending(c.store, c.store.get_run(1), "reprioritize")
@@ -504,7 +508,7 @@ def test_abandoned_stop_on_a_dead_runner_still_stops_its_recorded_descendants(ru
     """Class 'intent mistaken for termination': a stop that died after its intent left the
     runner gone but a recorded descendant alive, with no executor group recorded."""
     from foragent import processes
-    from foragent.scheduler_stop import mark_stop_pending
+    from foragent.orch_stop import mark_stop_pending
 
     c, table = run_case, fake_process_table
     path = c.store.worktree_path(1)
@@ -605,6 +609,126 @@ def test_a_failed_observation_keeps_unowned_deletions_in_the_worktree(run_case, 
         _preserve_failed_implementation(1, c.ctx, git, "killed", approval=c.store.load_approval(1),
                                         tracker_available=False)
     assert not (path / "src/own.txt").exists() and path.exists(), "the only copy of the work stays"
+    c.ctx.git.remove_worktree(path)
+    c.store.finish_run(1, "killed")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_a_deletion_a_live_executor_makes_during_termination_is_kept_in_the_wip(run_case, fake_process_table):
+    """Class 'stale preservation evidence': stop the whole tree, then read the worktree, then save."""
+    from foragent import processes
+
+    c, table = run_case, fake_process_table
+    c.history.update({"src/early.txt": "deleted before the stop\n", "src/late.txt": "deleted while stopping\n"})
+    c.ctx.git.fetch("origin", "main")
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    root = table.add(42000, cwd=path, start_time=10)
+    executor = table.add(42001, ppid=root.pid, cwd=path, start_time=11)
+    c.store.update_run(1, pid=root.pid, process_identities=[{"pid": root.pid, "start_time": 10}])
+    # As orch.stop records it: the request arrived during the executor's turn.
+    c.store.update_run(1, outcome="stopped", stop_why="reprioritize", stop_in_turn=True)
+    (path / "src/early.txt").unlink()
+
+    def executor_finishes_its_edit(call):
+        if call[1] == executor.pid and (path / "src/late.txt").exists():
+            (path / "src/late.txt").unlink()  # The live executor's last deletion, after any earlier read.
+
+    table.after_signal = executor_finishes_its_edit
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+        kill_runner=processes.kill_process_group,
+    )
+    assert _kill_run(ctx, 1, TickReport(), outcome="stopped", detail="stopped: reprioritize")
+    tracked = git_command(c.history.clone, "ls-tree", "-r", "--name-only", "foragent/issue-1").splitlines()
+    assert "src/early.txt" not in tracked and "src/late.txt" not in tracked, "the WIP missed a deletion"
+    assert "[stopped: reprioritize]" in git_command(c.history.clone, "log", "-1", "--format=%B", "foragent/issue-1")
+    c.tracker.remove_labels(1, ["running"])
+
+
+@pytest.mark.parametrize("ending", ["executor-error", "deferred"])
+def test_a_runner_that_finishes_before_its_sigterm_still_ends_as_the_stop(run_case, monkeypatch, ending):
+    """Class 'competing completion races': children die first; the recorded request wins."""
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.run_publish import SaveDeferredToStop
+
+    c = run_case
+    worktree = c.store.worktree_path(1)
+
+    def execute(number, ctx, path):
+        ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+        ctx.store.update_run(number, outcome="stopped", stop_why="reprioritize")
+        if ending == "deferred":
+            raise SaveDeferredToStop()  # Its save was left to the stop, after the tree exits.
+        raise ExecutorStopped("executor-error", "the executor was killed first")
+
+    monkeypatch.setattr("foragent.runner._execute", execute)
+    monkeypatch.setattr("foragent.runner.kick_tick", lambda root: None)
+    run_issue(1, c.ctx)
+    run = c.store.get_run(1)
+    assert (run.status, run.outcome, run.detail) == ("finished", "stopped", "stopped: reprioritize")
+    assert worktree.exists() is (ending == "deferred"), "a deferred save keeps the worktree for the stop"
+    c.ctx.git.remove_worktree(worktree)
+    c.tracker.remove_labels(1, ["running"])
+
+
+@pytest.mark.parametrize("in_turn", [True, False])
+def test_an_exited_tree_owns_deletions_only_when_the_stop_interrupted_a_turn(run_case, in_turn):
+    """Class 'provenance-check bypass': outside a turn the runner itself may have begun cleanup."""
+    from foragent.run_publish import _preserve_failed_implementation
+
+    c = run_case
+    c.history.update({"src/partial.txt": "removed by an interrupted cleanup or by the implementer\n"})
+    c.ctx.git.fetch("origin", "main")
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    c.store.update_run(1, outcome="stopped", stop_why="reprioritize", stop_in_turn=in_turn)
+    (path / "src/partial.txt").unlink()
+    (path / "unfinished.txt").write_text("partial implementation\n")
+    _preserve_failed_implementation(1, c.ctx, c.ctx.git.at(path), "stopped", approval=c.store.load_approval(1),
+                                    tracker_available=False, tree_exited=True)
+    tracked = git_command(path, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+    assert "unfinished.txt" in tracked
+    assert ("src/partial.txt" in tracked) is not in_turn, "an unowned deletion was committed as work"
+    c.ctx.git.remove_worktree(path)
+    c.store.finish_run(1, "stopped")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_a_turn_refuses_to_start_and_ends_early_once_a_stop_is_recorded(run_case):
+    """Turn boundaries are atomic with the stop request, so 'in a turn' is never stale."""
+    from foragent.run_publish import SaveDeferredToStop, begin_turn, end_turn
+
+    c = run_case
+    begin_turn(c.ctx, 1)
+    assert c.store.get_run(1).in_turn
+    c.store.update_run(1, outcome="stopped", stop_why="reprioritize")
+    with pytest.raises(SaveDeferredToStop):
+        end_turn(c.ctx, 1, c.store.worktree_path(1))
+    assert c.store.get_run(1).in_turn, "the stopper owns the open turn"
+    with pytest.raises(SaveDeferredToStop):
+        begin_turn(c.ctx, 1)
+    c.store.finish_run(1, "stopped")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_a_turn_mark_without_an_active_stop_owns_nothing(run_case):
+    """Class 'stale authority surviving cancellation': a later ordinary gate kill keeps #572's check."""
+    from foragent.run_publish import _preserve_failed_implementation
+
+    c = run_case
+    c.history.update({"src/unowned.txt": "deleted by an interrupted cleanup\n"})
+    c.ctx.git.fetch("origin", "main")
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    c.store.update_run(1, stop_in_turn=True)  # Left behind by a cancelled stop, with no active request.
+    (path / "src/unowned.txt").unlink()
+    (path / "unfinished.txt").write_text("partial implementation\n")
+    _preserve_failed_implementation(1, c.ctx, c.ctx.git.at(path), "killed", approval=c.store.load_approval(1),
+                                    tracker_available=False, tree_exited=True)
+    tracked = git_command(path, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+    assert "src/unowned.txt" in tracked and "unfinished.txt" in tracked
     c.ctx.git.remove_worktree(path)
     c.store.finish_run(1, "killed")
     c.tracker.remove_labels(1, ["running"])

@@ -100,6 +100,13 @@ def test_wip_names_the_recorded_stop_reason_whoever_saves_it(tmp_path, outcome, 
     assert git.commits == [f"WIP: Locale (#1) [{reason}]"]
 
 
+class _StillBranch:
+    """The issue branch did not move: no WIP was needed, which is evidence enough."""
+
+    def ref_sha(self, ref):
+        return "base"
+
+
 def test_refused_kill_restores_the_recorded_outcome(tmp_path, monkeypatch):
     store = StateStore(tmp_path / "state", lambda: datetime(2026, 10, 26, tzinfo=UTC))
     monkeypatch.setattr(processes, "observe_tree", lambda identities=(), roots=(): list(identities))
@@ -115,7 +122,7 @@ def test_refused_kill_restores_the_recorded_outcome(tmp_path, monkeypatch):
 
     monkeypatch.setattr(scheduler, "_kill_run", refused)
     ctx = SimpleNamespace(repo="o/r", repo_root=tmp_path, tracker=None, store=store, config=None,
-                          git=None, now=lambda: datetime(2026, 10, 26, tzinfo=UTC))
+                          git=_StillBranch(), now=lambda: datetime(2026, 10, 26, tzinfo=UTC))
     monkeypatch.setattr(scheduler, "TickContext", lambda **kw: SimpleNamespace(**kw))
     with pytest.raises(orch.OrchError, match="stop did not complete"):
         orch.stop(ctx, 1, "reprioritize")
@@ -173,7 +180,7 @@ def _running_store(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler.board, "sync_status", lambda *args: None)
     monkeypatch.setattr(orch, "RecordingTracker", lambda tracker, context, **kwargs: tracker)
     ctx = SimpleNamespace(repo="o/r", repo_root=tmp_path, tracker=labels, store=store, config=None,
-                          git=None, now=lambda: datetime(2026, 10, 26, tzinfo=UTC))
+                          git=_StillBranch(), now=lambda: datetime(2026, 10, 26, tzinfo=UTC))
     return store, ctx, labels
 
 
@@ -228,19 +235,46 @@ def test_busy_tick_lock_refuses_without_changes(tmp_path, monkeypatch):
     assert store.get_run(1) == before and labels.calls == [] and _journal(store) == []
 
 
-@pytest.mark.parametrize(("outcome", "fields", "message"), [
-    ("killed", {}, "finished as killed"),
-    ("wip-not-saved", {}, "finished as wip-not-saved"),
-    # The runner saved WIP for its own failure before the stop recorded its intent.
-    ("stopped", {"wip_reason": "retries-exceeded"}, "already saved as WIP for retries-exceeded"),
-])
-def test_a_run_that_did_not_end_with_its_work_kept_for_the_why_is_not_a_stop(tmp_path, monkeypatch, outcome,
-                                                                             fields, message):
+@pytest.mark.parametrize("outcome", ["killed", "executor-error", "retries-exceeded"])
+def test_a_stop_request_wins_over_however_the_runner_finished(tmp_path, monkeypatch, kicks, outcome):
+    """Class 'competing completion races': children die first, so a runner may finish
+    on an ordinary path before its own SIGTERM; the recorded stop still owns the end."""
+    from foragent.run_publish import final_outcome, stop_intent_lock
+
     store, ctx, labels = _running_store(tmp_path, monkeypatch)
+
+    def runner_finishes_first(tick_ctx, number, report, **kwargs):
+        # The runner's own finish, as runner.run_issue does it: under the intent lock.
+        with stop_intent_lock(store, number):
+            store.finish_run(number, outcome=final_outcome(store.get_run(number), outcome, recorded_first=True))
+        return True
+
+    monkeypatch.setattr(scheduler, "_kill_run", runner_finishes_first)
+    summary = orch.stop(ctx, 1, "reprioritize")
+    assert store.get_run(1).outcome == "stopped"
+    assert labels.calls == [*READY, ("comment", 1)] and "why: reprioritize" in summary
+    assert [event["kind"] for event in _journal(store)] == ["stop"]
+    assert not (store.root / "stops" / "1.json").exists()
+
+
+@pytest.mark.parametrize(("outcome", "fields", "message"), [
+    ("wip-not-saved", {}, "finished as wip-not-saved"),
+    ("merged", {}, "finished as merged"),
+    # A WIP this run made does not name the why (saved before the request, or by an old runner).
+    ("stopped", {"wip_reason": "retries-exceeded"}, "no WIP commit names the stop reason"),
+])
+def test_a_stop_without_its_kept_work_is_not_reported_as_success(tmp_path, monkeypatch, outcome, fields, message):
+    """Class 'missing evidence accepted as success'."""
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    flags = []
+    monkeypatch.setattr(scheduler, "flag", lambda tick_ctx, n, reason, summary, details=None: flags.append(summary))
     monkeypatch.setattr(scheduler, "_kill_run", _finish(store, outcome, **fields))
     with pytest.raises(orch.OrchError, match=message):
         orch.stop(ctx, 1, "reprioritize")
-    assert labels.calls == [] and _journal(store) == []
+    assert ("add", 1, ("ready",)) not in labels.calls and _journal(store) == []
+    assert flags == (["Stopped, but the unfinished work was not saved under the stop reason."]
+                     if outcome == "stopped" else [])
+    assert not (store.root / "stops" / "1.json").exists()
 
 
 def test_runner_mark_of_unsaved_work_survives_a_refused_stop(tmp_path, monkeypatch):
@@ -290,7 +324,7 @@ def test_a_closed_issue_is_stopped_without_ready(tmp_path, monkeypatch, kicks):
 
 def test_tracker_failure_after_termination_is_pending_and_the_retry_records_one_event(tmp_path, monkeypatch, kicks):
     """Finding class: a partially completed stop stays recoverable without duplicate events."""
-    from foragent.scheduler_stop import complete_stop
+    from foragent.orch_stop import complete_stop
 
     store, ctx, labels = _running_store(tmp_path, monkeypatch)
     issue = labels.issue
@@ -305,7 +339,7 @@ def test_tracker_failure_after_termination_is_pending_and_the_retry_records_one_
     assert [(event["kind"], "reprioritize" in event["summary"]) for event in _journal(store)] == [("stop", True)]
     assert labels.calls == [] and store.get_run(1).outcome == "stopped" and kicks == [tmp_path]
     labels.get_issue = lambda n: issue  # The tick's orphan recovery repeats the completion.
-    complete_stop(SimpleNamespace(store=store, tracker=labels, now=ctx.now), store.get_run(1))
+    complete_stop(SimpleNamespace(store=store, tracker=labels, now=ctx.now, git=_StillBranch()), store.get_run(1))
     assert [event["kind"] for event in _journal(store)] == ["stop"] and labels.calls == READY
 
 
@@ -334,27 +368,26 @@ class _StagingGit(_Git):
 
 @pytest.mark.parametrize("stop_during_staging", [True, False])
 def test_wip_reason_reads_the_stop_intent_at_commit_time(tmp_path, monkeypatch, stop_during_staging):
-    """Finding class: stale stop-intent reads; the WIP and the final outcome agree."""
+    """Stale intent reads: a WIP after the request names it; one before it does not count."""
     from foragent.run_publish import final_outcome, stop_kept_work
 
     store, ctx, labels = _running_store(tmp_path, monkeypatch)
-    record = lambda: store.update_run(1, outcome="stopped", stop_why="reprioritize")  # noqa: E731
+    record = lambda: store.update_run(1, outcome="stopped", stop_why="reprioritize", stop_head="base")  # noqa: E731
     git = _StagingGit(record if stop_during_staging else lambda: None)
     _preserve(ctx, git, "retries-exceeded")
     if not stop_during_staging:
-        record()  # The stop recorded its intent only after this WIP was committed.
+        record()  # The stop recorded its request only after this WIP was committed.
     run = store.get_run(1)
     reason = "stopped: reprioritize" if stop_during_staging else "retries-exceeded"
     assert git.commits == [f"WIP: Locale (#1) [{reason}]"] and run.wip_reason == reason
-    assert stop_kept_work(run) is stop_during_staging
-    # Only a runner the stop terminated ends as stopped; one that ended on its own keeps its outcome.
-    assert final_outcome(run, "killed") == ("stopped" if stop_during_staging else "killed")
-    assert final_outcome(run, "retries-exceeded") == "retries-exceeded"
+    assert final_outcome(run, "executor-error") == "stopped"  # The request wins the race to finish.
+    moved = SimpleNamespace(ref_sha=lambda ref: "wip", _call=lambda args: f"WIP: Locale (#1) [{reason}]\n")
+    assert stop_kept_work(moved if stop_during_staging else _StillBranch(), run) is stop_during_staging
 
 
 def test_tick_drops_a_stop_intent_abandoned_before_any_signal(tmp_path, monkeypatch):
     """A stop process that died after recording its intent."""
-    from foragent.scheduler_stop import clear_stale_stop
+    from foragent.orch_stop import clear_stale_stop
 
     store, ctx, labels = _running_store(tmp_path, monkeypatch)
     run = store.update_run(1, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
@@ -372,7 +405,7 @@ def test_every_completion_step_failing_once_is_finished_by_the_next_tick(tmp_pat
 
     The pending record, written before the intent, drives the tick; labels never do.
     """
-    from foragent.scheduler_stop import recover_pending_stops
+    from foragent.orch_stop import recover_pending_stops
 
     store, ctx, labels = _running_store(tmp_path, monkeypatch)
     labels.pr = 7
@@ -384,7 +417,7 @@ def test_every_completion_step_failing_once_is_finished_by_the_next_tick(tmp_pat
         orch.stop(ctx, 1, "reprioritize")
     assert (store.root / "stops" / "1.json").exists(), "the stop must stay recorded until every step is done"
     report = scheduler.TickReport()
-    recover_pending_stops(SimpleNamespace(store=store, tracker=labels, now=ctx.now), report)
+    recover_pending_stops(SimpleNamespace(store=store, tracker=labels, now=ctx.now, git=_StillBranch()), report)
     assert not (store.root / "stops" / "1.json").exists(), report.actions
     done = labels.calls
     assert ("close", 7) in done and ("add", 1, ("ready",)) in done
@@ -392,8 +425,8 @@ def test_every_completion_step_failing_once_is_finished_by_the_next_tick(tmp_pat
     assert [event["kind"] for event in _journal(store)] == ["stop"]
 
 
-def test_pending_record_is_dropped_when_the_stop_is_undone_or_the_run_ended_its_own_way(tmp_path, monkeypatch):
-    from foragent.scheduler_stop import mark_stop_pending, recover_pending_stops
+def test_pending_record_is_dropped_when_the_stop_is_undone_or_the_run_merged(tmp_path, monkeypatch):
+    from foragent.orch_stop import mark_stop_pending, recover_pending_stops
 
     store, ctx, labels = _running_store(tmp_path, monkeypatch)
 
@@ -405,38 +438,26 @@ def test_pending_record_is_dropped_when_the_stop_is_undone_or_the_run_ended_its_
     with pytest.raises(orch.OrchError, match="still running"):
         orch.stop(ctx, 1, "reprioritize")
     assert not (store.root / "stops" / "1.json").exists()
-    # A record left by a dead stop process whose run then ended for its own reason.
+    # A record left by a dead stop process whose run then merged: the merge owns the issue.
     mark_stop_pending(store, store.get_run(1), "reprioritize")
-    store.finish_run(1, outcome="retries-exceeded")
-    recover_pending_stops(SimpleNamespace(store=store, tracker=labels, now=ctx.now), scheduler.TickReport())
+    store.finish_run(1, outcome="merged")
+    recover_pending_stops(SimpleNamespace(store=store, tracker=labels, now=ctx.now, git=_StillBranch()),
+                          scheduler.TickReport())
     assert not (store.root / "stops" / "1.json").exists() and labels.calls == []
 
 
 def test_completion_waits_until_recorded_descendants_are_gone(tmp_path, monkeypatch, kicks):
     """Class 'intent mistaken for termination': a finished stopped record is not proof."""
-    from foragent import scheduler_stop
+    from foragent import orch_stop
 
     store, ctx, labels = _running_store(tmp_path, monkeypatch)
-    monkeypatch.setattr(scheduler_stop, "recorded_tree_alive", lambda run: True)
-    monkeypatch.setattr(scheduler_stop, "_stop_run_processes", lambda *args, **kwargs: "refused")
+    monkeypatch.setattr(orch_stop, "recorded_tree_alive", lambda run: True)
+    monkeypatch.setattr(orch_stop, "_stop_run_processes", lambda *args, **kwargs: "refused")
     monkeypatch.setattr(scheduler, "_kill_run", _finish(store))
     with pytest.raises(orch.StopPending, match="still alive"):
         orch.stop(ctx, 1, "reprioritize")
     assert labels.calls == [] and _journal(store) == []
     assert (store.root / "stops" / "1.json").exists(), "the stop stays pending until the tree is gone"
-
-
-def test_stop_is_refused_before_any_signal_when_the_worktree_cannot_be_observed(tmp_path, monkeypatch):
-    """Class 'missing preservation evidence treated as success'."""
-    store, ctx, labels = _running_store(tmp_path, monkeypatch)
-    before = store.get_run(1)
-    monkeypatch.setattr("foragent.run_publish.observe_live_changes", lambda *args: False)
-    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **kw: pytest.fail("signaled without provenance"))
-    with pytest.raises(orch.OrchError, match="could not be read; nothing was stopped"):
-        orch.stop(ctx, 1, "reprioritize")
-    run = store.get_run(1)
-    assert (run.status, run.outcome, run.stop_why, run.detail) == ("running", before.outcome, "", before.detail)
-    assert not (store.root / "stops" / "1.json").exists() and labels.calls == []
 
 
 @pytest.mark.parametrize(("rows", "unreadable", "owners", "alive"), [
@@ -450,7 +471,7 @@ def test_stop_is_refused_before_any_signal_when_the_worktree_cannot_be_observed(
 ])
 def test_tree_liveness_uses_recorded_identities_and_never_reads_unknown_as_dead(monkeypatch, rows, unreadable,
                                                                                  owners, alive):
-    from foragent.scheduler_stop import recorded_tree_alive
+    from foragent.orch_stop import recorded_tree_alive
 
     monkeypatch.setattr(processes, "list_processes", lambda: ProcessTable(rows, unreadable, owners))
     run = _run(status="finished", process_identities=[{"pid": 42000, "start_time": 5.0},
@@ -464,3 +485,73 @@ def test_an_unreadable_recorded_descendant_refuses_the_stop(monkeypatch):
     run = _run(process_identities=[{"pid": 42000, "start_time": 5.0}, {"pid": 42001, "start_time": 6.0}])
     refusal = stop_target_refusal(run)
     assert refusal is not None and "42001 cannot be read" in refusal
+
+
+def test_a_finished_record_that_is_not_stopped_is_never_reported_as_the_stop(tmp_path, monkeypatch):
+    """Class 'unsynchronized completion': a runner that finished without the lock (one from
+    before an upgrade) keeps its own outcome, which finish_run cannot revise."""
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    flags = []
+    monkeypatch.setattr(scheduler, "flag", lambda tick_ctx, n, reason, summary, details=None: flags.append(summary))
+    monkeypatch.setattr(scheduler, "_kill_run", _finish(store, "executor-error"))
+    with pytest.raises(orch.OrchError, match="finished as executor-error, not as stopped"):
+        orch.stop(ctx, 1, "reprioritize")
+    assert ("add", 1, ("ready",)) not in labels.calls and _journal(store) == []
+    assert flags == ["Stop requested, but the run finished as executor-error."]
+    assert not (store.root / "stops" / "1.json").exists()
+
+
+def test_a_stop_that_cannot_prove_the_tree_gone_changes_no_worktree(tmp_path, monkeypatch):
+    """Class 'assuming termination without proving it': the killer may skip an unreadable PID."""
+    from foragent import scheduler_recovery
+
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(scheduler_recovery, "_stop_run_processes", lambda *args, **kwargs: "stopped")
+    monkeypatch.setattr(scheduler_recovery, "tree_proven_gone", lambda run: False)
+    monkeypatch.setattr(scheduler, "_remove_run_worktree", lambda *a, **kw: pytest.fail("cleaned up unproven"))
+    real = SimpleNamespace(**{**vars(ctx), "kill_runner": lambda pid: None})
+    report = scheduler.TickReport()
+    assert scheduler_recovery._kill_run(real, 1, report, outcome="stopped") is False
+    assert store.get_run(1).status == "running"
+
+
+@pytest.mark.parametrize(("phase", "executor", "in_turn", "owned"), [
+    (None, 4242, False, True),                 # a live executor before any phase: the implementer
+    ("implementing", None, True, True),        # an open implementer turn
+    ("reviewing", 4242, False, False),         # a live reviewer is liveness, not edit provenance
+    ("reviewing", None, True, False),          # a stale turn mark during review grants nothing
+    ("checking", None, False, False),
+])
+def test_only_an_implementer_turn_grants_the_stop_its_deletions(tmp_path, monkeypatch, kicks, phase, executor,
+                                                                   in_turn, owned):
+    """Class 'process liveness mistaken for edit provenance'."""
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    store.update_run(1, phase=phase, executor_pgid=executor, in_turn=in_turn)
+    granted = []
+
+    def kill(tick_ctx, number, report, **kwargs):
+        granted.append(store.get_run(number).stop_in_turn)
+        store.finish_run(number, outcome="stopped")
+        return True
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    orch.stop(ctx, 1, "reprioritize")
+    assert granted == [owned]
+
+
+def test_cancelling_a_stop_clears_every_authority_it_granted(tmp_path, monkeypatch):
+    """Class 'stale authority surviving cancellation': abandoned and refused stops alike."""
+    from foragent.orch_stop import clear_stale_stop
+    from foragent.run_publish import STOP_REQUEST_CLEARED
+
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    run = store.update_run(1, outcome="stopped", stop_why="reprioritize", stop_head="base", stop_in_turn=True)
+    cleared = clear_stale_stop(ctx, run)
+    assert {name: getattr(cleared, name) for name in STOP_REQUEST_CLEARED} == STOP_REQUEST_CLEARED
+
+    store.update_run(1, phase="implementing", in_turn=True)
+    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **kw: False)  # A refused stop is undone.
+    with pytest.raises(orch.OrchError, match="still running"):
+        orch.stop(ctx, 1, "reprioritize")
+    undone = store.get_run(1)
+    assert {name: getattr(undone, name) for name in STOP_REQUEST_CLEARED} == STOP_REQUEST_CLEARED

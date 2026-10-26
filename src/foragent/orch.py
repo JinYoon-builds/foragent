@@ -224,10 +224,11 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
 
 def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
     from foragent import scheduler
-    from foragent.run_publish import STOPPED, observe_live_changes, stop_intent_lock, stop_kept_work
-    from foragent.scheduler_stop import (
-        complete_stop, drop_stop_pending, mark_stop_pending, stop_summary, stop_target_refusal,
+    from foragent.run_publish import (
+        STOP_REQUEST_CLEARED, STOPPED, WIP_NOT_SAVED, implementer_turn_open, stop_head, stop_intent_lock,
     )
+    from foragent.orch_stop import StopFailed, complete_stop, drop_stop_pending, mark_stop_pending, stop_summary
+    from foragent.scheduler_stop import stop_target_refusal
 
     run = ctx.store.get_run(n)
     if run is None or run.status != "running":
@@ -240,18 +241,20 @@ def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
     )
     report = scheduler.TickReport()
     detail = f"{STOPPED}: {why}"
-    # Record the intent before any signal, ordered against any WIP commit by the
-    # intent lock: a WIP made afterwards names this why, one made before is seen.
+    # Record the request before any signal, ordered against any WIP commit by the
+    # intent lock. From here the request wins: a runner defers its save to this stop,
+    # and however it finishes (children die first), it ends as stopped.
     with stop_intent_lock(ctx.store, n):
-        # The durable record comes first: every later step, including labels a dying
-        # runner's flag may already have removed, is recovered from it by the next tick.
-        mark_stop_pending(ctx.store, run, why)
-        ctx.store.update_run(n, outcome=STOPPED, stop_why=why)  # detail stays the run's own until it ends
+        run = ctx.store.get_run(n)
+        if run is None or run.status != "running":
+            raise OrchError(f"issue #{n} is not running; nothing to stop")
+        mark_stop_pending(ctx.store, run, why)  # Durable first: every later step is recovered from it.
+        # Whether an implementer turn is open now decides who owns what the tree leaves.
+        ctx.store.update_run(n, outcome=STOPPED, stop_why=why, stop_head=stop_head(ctx.git, n),
+                             stop_in_turn=implementer_turn_open(run))
     try:
-        # What the live run changed, seen before any signal or cleanup, is the WIP's provenance;
-        # without it the work could not be kept exactly, so nothing is signaled.
-        if not observe_live_changes(ctx, n, Path(run.worktree)):
-            raise OrchError(f"#{n}: stop refused: the worktree's changes could not be read; nothing was stopped")
+        # The tree is stopped before the worktree is observed and saved (in _kill_run), so
+        # nothing a still-running executor deletes can be missing from the WIP.
         scheduler._kill_run(tick_ctx, n, report, outcome=STOPPED, detail=detail)
     finally:
         with stop_intent_lock(ctx.store, n):
@@ -259,20 +262,19 @@ def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
             if current is not None and current.status == "running":
                 # The run did not end: undo only this verb's marks; a runner's wip-not-saved stays.
                 undo = {"outcome": run.outcome} if current.outcome == STOPPED else {}
-                current = ctx.store.update_run(n, stop_why="", **undo)
+                current = ctx.store.update_run(n, **STOP_REQUEST_CLEARED, **undo)
                 drop_stop_pending(ctx.store, n)
-    # Success is the finished record, whichever process wrote it, and a WIP naming the why.
-    if current is None or current.status != "finished" or current.outcome != STOPPED or not stop_kept_work(current):
+    if current is None or current.status != "finished" or current.outcome in {"merged", WIP_NOT_SAVED}:
         state = "still running" if current is not None and current.status == "running" else (
             f"finished as {current.outcome}" if current is not None else "no run record")
-        if current is not None and current.wip_reason and current.wip_reason != detail:
-            state += f"; its work was already saved as WIP for {current.wip_reason}"
-        drop_stop_pending(ctx.store, n)  # The run's own outcome owns its labels.
+        drop_stop_pending(ctx.store, n)  # A merge, a lost-work flag or the live run owns the issue.
         raise OrchError(f"#{n}: stop did not complete ({state}): {'; '.join(report.actions) or 'no action'}")
     try:
         summary = stop_summary(n, why) + complete_stop(tick_ctx, current)
+    except StopFailed as exc:
+        raise OrchError(f"#{n}: stop did not complete: {exc}") from exc
     except Exception as exc:
-        # The run is finished as stopped; the pending stop record makes the next tick repeat each step.
+        # The run is finished; the pending stop record makes the next tick repeat each step.
         raise StopPending(f"{stop_summary(n, why)}; not completed ({' '.join(str(exc).split()) or type(exc).__name__}); "
                           "the next gate tick completes the stop") from exc
     try:  # The required local event is already journaled; the GitHub audit comment is extra.

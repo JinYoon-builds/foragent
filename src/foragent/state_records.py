@@ -43,12 +43,18 @@ class Run:
     detail: str = ""
     # Written only by `fa orch stop`: its --why while it ends this run (detail is overwritten by others).
     stop_why: str = ""
+    # The issue branch head when `fa orch stop` recorded its intent; None if there was no branch.
+    stop_head: str | None = None
     # The reason named by this run's WIP commit, recorded with the commit under the stop-intent lock.
     wip_reason: str | None = None
     # Paths the live run changed, seen by Foragent before any cleanup touched its worktree.
     live_changes: list[str] = field(default_factory=list)
     # An observation failed: deletions it could have owned have no provenance (never "none changed").
     live_changes_failed: bool = False
+    # An implementer turn is open: set before the executor starts, cleared when the turn ends.
+    in_turn: bool = False
+    # The stop request arrived during an implementer turn: what the tree leaves is the turn's work.
+    stop_in_turn: bool = False
     lane: str = "main"
     waited_seconds: float = 0
     waiting_until: str | None = None
