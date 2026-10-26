@@ -230,8 +230,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     with step("apply_budgets"):
         sample = _apply_budgets(ctx, ready, workers=False)  # The worker budget is sized below with this sample.
     if sample[0] != "critical":  # Critical memory also holds the baseline prebuild (#497).
-        with step("baseline_prebuild"):
-            prebuild_acceptance_baseline(ctx, base_ref, ctx.baseline_launcher)
+        timed("baseline_prebuild", prebuild_acceptance_baseline, ctx, base_ref, ctx.baseline_launcher)
     if not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         timed("machine_budget", _machine_budget, ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
