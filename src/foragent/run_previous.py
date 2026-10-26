@@ -33,9 +33,31 @@ def pending_hint(root: Path, n: int) -> tuple[bool, str | None]:
     return retry_marker(root, n).is_file(), hint
 
 
-def consume_hint(root: Path, n: int) -> None:
-    hint_path(root, n).unlink(missing_ok=True)
-    retry_marker(root, n).unlink(missing_ok=True)
+def consume_hint(root: Path, n: int, used: str | None) -> None:
+    """Acknowledge the delivered hint ``used``; text added after it was read stays for the next attempt.
+
+    `fa lanes talk` appends a message to an unused hint (one blank line apart)
+    while an attempt runs, so the file may now hold more than the prompt did.
+    """
+    from foragent.state_locks import _file_lock
+
+    path = hint_path(root, n)
+    with _file_lock(root / "state.lock"):  # The lock fa lanes talk appends under.
+        current = path.read_text(encoding="utf-8") if path.is_file() else None
+        if current is not None and used is not None:
+            delivered = used.rstrip()
+            if current.rstrip() == delivered:
+                path.unlink(missing_ok=True)
+            elif current.startswith(delivered):
+                remainder = current[len(delivered):].lstrip("\n")
+                if remainder.strip():
+                    temporary = path.with_name(path.name + ".tmp")
+                    temporary.write_text(remainder, encoding="utf-8")
+                    temporary.replace(path)
+                else:
+                    path.unlink(missing_ok=True)
+            # Otherwise someone replaced the hint (orch retry); it was not delivered.
+        retry_marker(root, n).unlink(missing_ok=True)
 
 
 def stop_path(root: Path, n: int) -> Path:

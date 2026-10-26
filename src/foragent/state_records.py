@@ -1,6 +1,7 @@
 """Frozen records persisted by the local state store."""
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -73,9 +74,21 @@ class Run:
     merge_lock_held_seconds: float | None = None
     comparison: dict | None = None
     files_committed: bool = False
+    # A person's talk terminal is open (fa lanes talk); stall and runtime checks pause meanwhile.
+    talking: bool = False
+    talking_since: str | None = None
     files_base_branch: str | None = None
     declared_files: list[str] | None = None
     changed_files: list[str] | None = None
     effective_files: list[str] | None = None
     late_files: list[str] = field(default_factory=list)
     overlap_records: list[dict] = field(default_factory=list)
+
+    def talk_pause_seconds(self, now: datetime) -> float:
+        """Seconds of the open talk so far; ``waited_seconds`` receives them when the talk ends."""
+        if not self.talking or not self.talking_since:
+            return 0.0
+        try:
+            return max(0.0, (now - datetime.fromisoformat(self.talking_since)).total_seconds())
+        except (TypeError, ValueError):
+            return 0.0

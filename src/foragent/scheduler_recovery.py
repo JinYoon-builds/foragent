@@ -222,6 +222,11 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         if not dead:
             if _stop_already_refused(ctx, run):
                 continue
+            if run.talking:  # A person is watching or talking; the first closed-terminal tick ends it.
+                run, still_open = scheduler.lane_talk.check_talking(ctx.store, run, ctx.repo_root, ctx.now())
+                if still_open:
+                    continue
+                report.actions.append(scheduler.text("talk_ended", ctx.config.language, n=run.number))
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
             runtime = (ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
@@ -248,6 +253,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
 
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
     outcome = run.outcome or "crashed"
+    if run.talking:
+        run = scheduler.lane_talk.end_talk(ctx.store, run, ctx.now())
     if run.executor_pgid is not None:
         ctx.store.update_run(run.number, executor_pgid=None)
     scheduler._remove_run_worktree(ctx, run.number, scheduler.Path(run.worktree), report, outcome=outcome)

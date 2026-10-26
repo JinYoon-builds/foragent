@@ -22,11 +22,22 @@ def add(commands) -> None:
     fixed_skills.add_argument("name")
     fixed_skills.add_argument("ids", nargs="*", help="Skill IDs; omit to clear the lane's fixed skills")
     fixed_skills.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    talk = lane_actions.add_parser("talk", help="Open an issue's live log or session; optionally send a message")
+    talk.add_argument("number", type=int)
+    talk.add_argument("--message", help="Message for the worker (running) or first prompt (finished or blocked)")
+    talk.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
 
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
+    if args.action == "talk":
+        from foragent import lanes
+        from foragent.commands import repo_store
+
+        config, _, store = repo_store(root)
+        print(lanes.talk(args.number, message=args.message, store=store, config=config, repo_root=root))
+        return 0
     if args.action == "skills":
         lane = cli.set_lane_skills(root, args.name, args.ids)
         print(f"Updated lane:{args.name} skills: {', '.join(lane['skills']) or '(none)'}")

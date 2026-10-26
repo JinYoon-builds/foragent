@@ -38,8 +38,17 @@ def _remaining(n: int, ctx: RunContext) -> int:
     run = ctx.store.get_run(n)
     if run is None:
         raise KeyError(n)
-    elapsed = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
+    now = ctx.now()
+    # An open talk terminal pauses the runtime limit as it happens (D55 addendum).
+    elapsed = (now - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds - run.talk_pause_seconds(now)
     return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
+
+
+def paused_seconds(n: int, ctx: RunContext) -> float:
+    """All paused time of the run so far, including an open talk (for ``processes.extend_deadline``)."""
+    run = ctx.store.get_run(n)
+    now = ctx.now()
+    return run.waited_seconds + run.talk_pause_seconds(now)
 
 
 def _timeout(n: int, ctx: RunContext) -> str:
@@ -50,16 +59,17 @@ def _timeout(n: int, ctx: RunContext) -> str:
 @contextmanager
 def _test_slot(n: int, ctx: RunContext):
     """Hold a machine-wide test slot; credit the queue time as waited, not run time."""
-    run = ctx.store.get_run(n)
     started = ctx.now()
     waited = False
+    credited = 0.0
 
     def credit() -> datetime:
+        nonlocal credited
         now = ctx.now()
-        ctx.store.update_run(
-            n, waited_seconds=run.waited_seconds + max(0.0, (now - started).total_seconds()),
-            last_progress_at=now.astimezone(UTC).isoformat(),
-        )
+        total = max(0.0, (now - started).total_seconds())
+        # Increments, so a talk credit written meanwhile by the tick is kept.
+        ctx.store.add_waited(n, total - credited, last_progress_at=now.astimezone(UTC).isoformat())
+        credited = total
         return now
 
     def waiting() -> None:
@@ -101,8 +111,8 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
     run = ctx.store.get_run(n)
     started = ctx.now()
     started_mono = ctx.monotonic()
-    ctx.store.update_run(
-        n, waited_seconds=run.waited_seconds + seconds,
+    ctx.store.add_waited(
+        n, seconds,
         executor_waited_seconds=run.executor_waited_seconds + seconds,
         waiting_until=(started + timedelta(seconds=seconds)).astimezone(UTC).isoformat(),
         last_progress_at=started.astimezone(UTC).isoformat(),
@@ -111,8 +121,8 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
         ctx.sleep(seconds)
     finally:
         elapsed = max(0, ctx.monotonic() - started_mono)
-        ctx.store.update_run(
-            n, waited_seconds=run.waited_seconds + elapsed,
+        ctx.store.add_waited(
+            n, elapsed - seconds,
             executor_waited_seconds=run.executor_waited_seconds + elapsed,
             waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
         )
@@ -122,21 +132,21 @@ def _credited_wait(n: int, ctx: RunContext, acquire: Callable[[], object]) -> No
     """Block in acquire; credit the time as waited and keep tick informed meanwhile."""
     from foragent import runner
 
-    run = ctx.store.get_run(n)
     started = ctx.monotonic()
+    credited = 0.0
+
+    def credit(**fields):
+        nonlocal credited
+        total = max(0, ctx.monotonic() - started)
+        ctx.store.add_waited(n, total - credited, **fields)
+        credited = total
 
     def progress():
         now = ctx.now().astimezone(UTC)
-        ctx.store.update_run(
-            n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
-            waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat(),
-        )
+        credit(waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat())
 
     progress()
     try:
         runner.poll_executor(acquire, progress)
     finally:
-        ctx.store.update_run(
-            n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
-            waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
-        )
+        credit(waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat())

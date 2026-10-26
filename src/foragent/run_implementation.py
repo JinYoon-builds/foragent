@@ -292,7 +292,7 @@ def _implement(
     # availability waits, launch failures and interruptions; acknowledge it
     # only once the implementer returns an ordinary execution result.
     if (retry_default or hint is not None) and classify_result(result) == "normal":
-        consume_hint(ctx.store.root, n)
+        consume_hint(ctx.store.root, n, hint)
     _record_skills_used(n, ctx, result)
     rebuttal = _read_rebuttals(worktree)
     if rebuttal.strip() and rebuttal not in attempt.rebuttals:

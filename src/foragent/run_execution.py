@@ -22,6 +22,8 @@ from foragent.run_attempt import ExecutorStopped
 from foragent.run_waits import _executor_wait, _progress
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from foragent.runner import RunContext
 
 
@@ -53,17 +55,26 @@ def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
     return path
 
 
-def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> ExecResult:
+def _run_executor(n: int, ctx: RunContext, executor: Executor, *,
+                  on_session: Callable[[str], None] | None = None, **kwargs) -> ExecResult:
+    """Run one executor call; ``on_session`` receives its session ID as soon as the log shows it."""
     log = kwargs["log_path"]
     size = log.stat().st_size if log.exists() else 0
     offset = size
+    announced = on_session is None
 
     def poll():
-        nonlocal size
+        nonlocal size, announced
         current = log.stat().st_size if log.exists() else 0
         if current > size:
             timestamp = ctx.now().astimezone(UTC).isoformat()
             ctx.store.update_run(n, last_progress_at=timestamp, last_activity_at=timestamp)
+            if not announced:
+                # The worker is live before it returns; fa lanes talk needs its session now.
+                identity = stream_session_id(log, ctx.config.executor, offset=offset)
+                if identity is not None:
+                    announced = True
+                    on_session(identity)
         size = current
 
     def execute():
@@ -110,22 +121,30 @@ def _available_executor(
     errors = 0
     full_prompt = kwargs["prompt"]
 
+    def record_session(identity: str) -> None:
+        current = ctx.store.get_run(n)
+        if current.session_id == identity and current.session_executor == ctx.config.executor:
+            return
+        ctx.store.update_run(
+            n, session_id=identity, session_executor=ctx.config.executor,
+            session_ids=[*current.session_ids, *([identity] if identity not in current.session_ids else [])],
+            session_body=session_body,
+        )
+
+    live = record_session if session_body is not None and not reviewer else None
+
     def execute() -> ExecResult:
         log = kwargs["log_path"]
         offset = log.stat().st_size if log.exists() else 0
         try:
-            return _run_executor(n, ctx, executor, **kwargs)
+            return _run_executor(n, ctx, executor, on_session=live, **kwargs)
         except BaseException:
             # run_logged flushes stdout into the log during interruption cleanup.
             # Recover this call's lifecycle before run_issue finishes its history.
-            if session_body is not None and not reviewer and log.exists():
+            if live is not None and log.exists():
                 identity = stream_session_id(log, ctx.config.executor, offset=offset)
                 if identity is not None:
-                    current = ctx.store.get_run(n)
-                    ctx.store.update_run(
-                        n, session_id=identity, session_executor=ctx.config.executor,
-                        session_ids=[*current.session_ids, identity], session_body=session_body,
-                    )
+                    live(identity)
             raise
 
     name = resolved_reviewer(ctx.config) if reviewer else ctx.config.executor
