@@ -206,6 +206,16 @@ def isolated_test_slots(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_github_call_counter():
+    """A context's gh counter must not leak into later tests' gh calls."""
+    from foragent import gh
+
+    gh.clear_recorder()
+    yield
+    gh.clear_recorder()
+
+
+@pytest.fixture(autouse=True)
 def kicks(monkeypatch):
     """Record event hooks without starting background ticks in any test."""
     from foragent import cli, orch, order, runner

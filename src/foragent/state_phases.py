@@ -9,11 +9,11 @@ from typing import Any
 from foragent.state_records import Run
 
 
-def _load() -> float:
+def _load() -> float | None:
     try:
         return float(os.getloadavg()[0])
     except OSError:
-        return 0.0
+        return None  # Unknown, not idle.
 
 
 def work_event(run: Run) -> tuple[str, str | None] | None:
@@ -30,8 +30,10 @@ def work_event(run: Run) -> tuple[str, str | None] | None:
     return event_id, (first if first is not None and first != event_id else None)
 
 
-def close_phase(root: Path, run: Run, closed_at: datetime) -> dict[str, Any]:
-    """Journal the ended phase: its own seconds and the 1-minute load.
+def close_phase(root: Path, run: Run, closed_at: datetime, next_step: str) -> dict[str, Any]:
+    """Journal the ended phase: its own whole seconds and the 1-minute load (null if unknown).
+
+    The summary names the transition: ``<phase> -> <next phase or run outcome>``.
 
     Callers hold the state lock and call this as each transition happens, so readers see
     it at once. Work with an identity also gets event_id/work_id, and repeat_of when the
@@ -41,7 +43,8 @@ def close_phase(root: Path, run: Run, closed_at: datetime) -> dict[str, Any]:
         return {}
     opened = datetime.fromisoformat(run.phase_started_at)
     event = {"at": closed_at.astimezone(UTC).isoformat(), "issue": run.number, "kind": "phase",
-             "phase": run.phase, "seconds": max(0.0, (closed_at - opened).total_seconds()),
+             "summary": f"{run.phase} -> {next_step}",
+             "phase": run.phase, "seconds": max(0, round((closed_at - opened).total_seconds())),
              "load": _load(),
              # Identifies the interval, so a close journaled again (the run record failed
              # to persist and the phase closes once more) replaces rather than adds time.

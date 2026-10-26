@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 from typing import Any, Iterator
 
-from foragent import capacity
+from foragent import capacity, gh
 from foragent.brief import STAR_PROMPT_MERGE_THRESHOLD
 from foragent.i18n import text
 
@@ -92,7 +92,7 @@ def local_merges(root: Path | None = None) -> int:
 
 def _gh_ready() -> bool:
     try:
-        result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, check=False)
+        result = gh.run(["auth", "status"], capture_output=True, text=True, check=False)
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0
@@ -132,8 +132,8 @@ def _answer(choice: str, language: str, now: datetime | None) -> str:
         # Not eligible while gh cannot star: ignore the answer and keep the record as it is.
         return text("star_not_asked", language)
     try:
-        subprocess.run(["gh", "api", "-X", "PUT", f"user/starred/{FORAGENT_REPO}"],
-                       capture_output=True, text=True, check=True)
+        gh.run(["api", "-X", "PUT", f"user/starred/{FORAGENT_REPO}"],
+               capture_output=True, text=True, check=True)
     except (OSError, subprocess.SubprocessError):
         # Not recorded: the question may be shown again. Answers hold the lock,
         # so only the still-open shown record seen above is removed here.

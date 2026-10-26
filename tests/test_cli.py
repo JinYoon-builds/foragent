@@ -896,3 +896,13 @@ def test_gate_commands_leave_macos_background_state(monkeypatch):
     calls.clear()
     assert cli.main(["update"]) == 0
     assert calls == []
+
+
+def test_gate_commands_count_gh_calls_outside_a_tick_in_the_repo_store(app, capsys):
+    from foragent import gh
+
+    root, git, tracker, store, calls = app
+    assert cli.main(["gate", "status", "--repo-root", str(root)]) == 0
+    capsys.readouterr()
+    gh.count_call()  # e.g. a live status refresh or update check after the command starts
+    assert [row["calls"] for row in store.github_calls()] == [1]
