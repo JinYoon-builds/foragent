@@ -14,7 +14,7 @@ from foragent.config import Config
 from foragent.labels import BLOCKED, NEEDS_HUMAN
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
-from foragent.watch_sections import progress
+from foragent.watch_sections import orch_panel, progress
 
 
 @dataclass
@@ -45,6 +45,8 @@ class Snapshot:
     eta_range: tuple[datetime, datetime] | None = None
     eta_basis: dict[str, int | None] = field(default_factory=dict)
     today: int = 0
+    # The orchestrator note, its age in seconds and the fresh `fa inspect` count (orch_panel.collect).
+    panel: dict[str, Any] = field(default_factory=dict)
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -158,4 +160,4 @@ def collect(
                                         else "blocked" if BLOCKED in labels else "working")
     return watch.Snapshot(status, done, order, completed, total, eta, watch.recent_events(store), now,
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
-                          worker_states, eta_range, basis, today)
+                          worker_states, eta_range, basis, today, orch_panel.collect(store, now))

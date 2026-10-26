@@ -250,6 +250,13 @@ def collect(ctx: InspectContext) -> Inbox:
         item.lane_display = lane_display(ctx.config, item.lane, ctx.config.language)
     items.sort(key=lambda item: (GROUPS.index(item.group), item.number, item.pr or 0))
     counts = Counter(item.group for item in items)
+    # The lane view's '사람이 볼 것 N' reads this count (watch_sections.orch_panel).
+    from foragent.watch_sections import orch_panel
+
+    try:
+        orch_panel.write_count(ctx.store, len(items), ctx.now())
+    except OSError:
+        pass  # The view then falls back to the status summary.
     return Inbox(items, {group: counts[group] for group in GROUPS}, since, ctx.config.language)
 
 

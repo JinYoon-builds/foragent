@@ -122,3 +122,4 @@
 - `.foragent/acceptance-exclusions.json`은 러너가 브랜치 커밋에 섞어 넣는다. PR이 이 파일을 건드리면 리뷰가 CI 약화로 지적하므로 `git show origin/main:<path> >` 로 main과 같게 둔다.
 - #503 gate 병합의 끝은 `finish_run` 시각이 아니다(병합 뒤 설치·정리가 끝난 시각). `record_merge`가 실행 기록 옆 키 `merged_at`을 저장하고, finish_run이 history로 옮기며, `StateStore.merge_times()`로 읽는다. 같은 이슈의 다음 실행 파일은 이전 키를 물려받으므로 실행 시작보다 이른 merged_at은 무시한다. 회귀: `tests/test_watch_progress.py -k recorded_merge`.
 - [#543 레인 화면 하나만](project_single_lane_view.md) — watch.lock flock, 모든 열기의 공유 시도 기록, execv 잠금 인계
+- [#172 오케스트레이터 메모 줄](project_orch_panel.md) — 140칸↑ 상자 36칸, 문제 푸는 중 줄 유지+지켜보는 중 추가, inspect 개수 파일은 폴더 있을 때만
