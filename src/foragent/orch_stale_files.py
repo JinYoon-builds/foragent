@@ -95,6 +95,13 @@ def report(ctx) -> None:
     """Scan every open issue that has an approval snapshot; never raises GitError."""
     base_ref = f"origin/{ctx.config.base_branch}"
     path = ctx.store.root / STATE_FILE
+    candidates = []  # Issues with approved Files; Git is read only when there are some.
+    for issue in local_issue_models(ctx.store):
+        approval = ctx.store.load_approval(issue.number) if issue.state == "open" else None
+        if approval is not None and (entries := parse_body(approval.body).files):
+            candidates.append((issue.number, approval.approved_at, entries))
+    if not candidates:
+        return
     try:
         head = ctx.git._call(["rev-parse", base_ref]).strip()
     except GitError:
@@ -108,17 +115,11 @@ def report(ctx) -> None:
 
     with ctx.store._state_lock():
         seen = _read(path)
-    for issue in local_issue_models(ctx.store):
-        if issue.state != "open" or head in seen.get(str(issue.number), []):
-            continue
-        approval = ctx.store.load_approval(issue.number)
-        if approval is None:
-            continue
-        entries = parse_body(approval.body).files
-        if not entries:
+    for number, approved_at, entries in candidates:
+        if head in seen.get(str(number), []):
             continue
         try:
-            then_sha = approval_base(ctx, base_ref, approval.approved_at)
+            then_sha = approval_base(ctx, base_ref, approved_at)
             if then_sha is None:
                 continue
             stale = stale_entries(entries, tree(then_sha), tree(head))
@@ -126,8 +127,8 @@ def report(ctx) -> None:
             continue
         if not stale:
             continue
-        values = {"number": issue.number, "base": base_ref, "sha": head[:12], "entries": ", ".join(stale)}
+        values = {"number": number, "base": base_ref, "sha": head[:12], "entries": ", ".join(stale)}
         say = text("stale_files", ctx.config.language, **values)
-        append_event(ctx.store, ctx.now(), issue.number, KIND, text("stale_files", "en", **values),
+        append_event(ctx.store, ctx.now(), number, KIND, text("stale_files", "en", **values),
                      say=say if ctx.config.language != "en" else None)
-        _record(ctx, path, issue.number, head)
+        _record(ctx, path, number, head)
