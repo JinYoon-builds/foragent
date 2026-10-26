@@ -190,6 +190,22 @@ def _risk_notes(git: GitRepo, base_ref: str) -> str:
     return risks.review_notes(risks.matching(risks.load_at(git, base_ref), changed), changed)
 
 
+def with_review_scope(body: str, acceptance_dir: str, language: str) -> str:
+    """Add the review scope, or the defect-class question to an older PR's existing scope section."""
+    from foragent.i18n import text
+
+    rules = review_scope_rules(acceptance_dir, language)
+    if "## Review scope" not in body:
+        return body + "\n\n## Review scope\n\n" + rules
+    question = text("review_class_question", language)
+    if question in body:
+        return body
+    earlier = rules.removesuffix("\n" + question)
+    if earlier in body:
+        return body.replace(earlier, rules, 1)
+    return body.replace("## Review scope\n\n", f"## Review scope\n\n{question}\n", 1)
+
+
 def _read_rebuttals(worktree: Path) -> str:
     path = worktree / ".foragent/REBUTTAL.md"
     return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
@@ -316,9 +332,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             return _timeout(n, ctx)
         if ctx.config.review_scope == "pr-body":
             # Native PR review reads only the PR body: refresh the risk notes for this head and base.
-            body = pr.body if "## Review scope" in pr.body else (
-                pr.body + "\n\n## Review scope\n\n"
-                + review_scope_rules(ctx.config.acceptance_dir, ctx.config.language))
+            body = with_review_scope(pr.body, ctx.config.acceptance_dir, ctx.config.language)
             body = risks.refresh_notes(body, _risk_notes(git, base_ref))
             if body != pr.body:
                 pr = replace(pr, body=body)

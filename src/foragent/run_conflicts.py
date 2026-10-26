@@ -97,6 +97,14 @@ def _own_paths(attempt: Implementation, target: str | None = None) -> list[str]:
     return [path for path in output.split("\0") if path]
 
 
+def _unresolved_conflicts(git, conflicts: list[str]) -> list[str]:
+    """Conflict paths still unresolved: marker files, plus unmerged paths markers cannot show."""
+    unmerged = set(git.conflict_paths()) & set(conflicts)
+    unreadable = {name for name in unmerged
+                  if (git.root / name).is_symlink() or not (git.root / name).is_file()}
+    return sorted(set(git.conflict_marker_paths(conflicts)) | unreadable)
+
+
 def _rebuild_reason(attempt: Implementation, exc: ConflictBudgetExhausted) -> str | None:
     """A fixed English reason when more than half of the PR's own files conflict, else None."""
     own = set(exc.own_paths)
@@ -119,9 +127,14 @@ def _stop_conflicts(attempt: Implementation, exc: ConflictBudgetExhausted) -> Ex
 
     language = attempt.ctx.config.language
     own = set(exc.own_paths)
-    summary = text("conflict_stop", language, budget=attempt.ctx.config.conflict_retries,
-                   count=len(own & set(exc.conflicts)), total=len(own))
-    details = text("conflict_stop_files", language, paths=", ".join(exc.conflicts)) + f"\n\n{exc}"
+    budget = attempt.ctx.config.conflict_retries
+    if exc.conflicts:
+        summary = text("conflict_stop", language, budget=budget,
+                       count=len(own & set(exc.conflicts)), total=len(own))
+        details = text("conflict_stop_files", language, paths=", ".join(exc.conflicts)) + f"\n\n{exc}"
+    else:
+        summary = text("conflict_stop_checks", language, budget=budget)
+        details = str(exc)
     _append(attempt.log, f"{summary}\n{details}")
     flag(attempt.ctx, attempt.n, Reason.RETRIES_EXCEEDED, summary, details)
     return ExecutorStopped("retries-exceeded", details)
@@ -251,7 +264,8 @@ def _resolve_conflicts_inner(
         if attempt.rebuilt:
             raise ExecutorStopped(_block_rebuild(attempt, check_failure))
         if attempt.conflict_attempts >= ctx.config.conflict_retries:
-            raise ConflictBudgetExhausted(check_failure, conflicts, own)
+            # Judge the rebuild on what is still unresolved now, not on the initial conflict list.
+            raise ConflictBudgetExhausted(check_failure, _unresolved_conflicts(git, conflicts), own)
         attempt.conflict_attempts += 1
         _append(log, f"Conflict attempt {attempt.conflict_attempts}/{ctx.config.conflict_retries}:\n{check_failure}")
         _implement(attempt, check_failure, merge_conflicts=conflicts)

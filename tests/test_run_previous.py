@@ -80,3 +80,68 @@ def test_stop_point_is_recorded_when_a_usage_limit_ends_the_turn(run_case, monke
     assert run_issue(1, c.ctx) == "limit-wait"
     text = stale.read_text()
     assert "Half-way through the parser" in text and "earlier attempt" not in text
+
+
+def _git(root, *args, stdin=None):
+    import subprocess
+    return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True,
+                          input=stdin).stdout
+
+
+def _commit(ref, message, files, parent=None):
+    stream = [f"commit {ref}\n", "committer Tests <t@example.com> 1792483200 +0000\n",
+              f"data {len(message)}\n{message}\n"]
+    if parent is not None:
+        stream.append(f"from {parent}\n")
+    stream += [f"M 100644 inline {name}\ndata {len(text)}\n{text}\n" for name, text in files.items()]
+    return "".join(stream)
+
+
+def test_rebuild_judges_conflicts_still_unresolved_after_partial_resolution(tmp_path):
+    from foragent.git import GitRepo
+    from foragent.run_conflicts import _unresolved_conflicts
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "issue")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "Tests")
+    names = ["a.txt", "b.txt", "c.txt", "d.txt"]
+    _git(root, "fast-import", "--quiet", stdin="".join([
+        _commit("refs/heads/base", "base", {name: "base\n" for name in names}),
+        _commit("refs/heads/issue", "issue", {name: "issue\n" for name in names}, "refs/heads/base"),
+        _commit("refs/heads/main", "target", {name: "target\n" for name in names[:3]}, "refs/heads/base"),
+    ]) + "done\n")
+    _git(root, "read-tree", "-u", "--reset", "issue")
+    git = GitRepo(root)
+    try:
+        _git(root, "merge", "main")
+    except Exception:
+        pass
+    conflicts = git.conflict_paths()
+    assert conflicts == names[:3]
+    # The implementer resolved two of the three conflicts in place but did not stage them.
+    (root / "a.txt").write_text("target\nissue\n")
+    (root / "b.txt").write_text("target\nissue\n")
+    remaining = _unresolved_conflicts(git, conflicts)
+    assert remaining == ["c.txt"]
+    assert _rebuild_reason(_attempt(), ConflictBudgetExhausted("x", remaining, names)) is None
+    assert _rebuild_reason(_attempt(), ConflictBudgetExhausted("x", conflicts, names)) is not None
+
+
+def test_rerun_review_adds_the_class_question_to_an_older_pr_scope():
+    from foragent.i18n import text
+    from foragent.run_prompts import review_scope_rules
+    from foragent.run_review import with_review_scope
+
+    question = text("review_class_question", "en")
+    rules = review_scope_rules("tests/acceptance/")
+    older = "Closes #1\n\n## Review scope\n\n" + rules.removesuffix("\n" + question) + "\nThe acceptance tests are locked."
+    refreshed = with_review_scope(older, "tests/acceptance/", "en")
+    assert rules in refreshed and refreshed.count(question) == 1
+    assert with_review_scope(refreshed, "tests/acceptance/", "en") == refreshed
+    assert with_review_scope("Closes #1", "tests/acceptance/", "en") == "Closes #1\n\n## Review scope\n\n" + rules
+    custom = "Closes #1\n\n## Review scope\n\nOnly the API.\n"
+    assert question in with_review_scope(custom, "tests/acceptance/", "en")
+    korean = with_review_scope(older, "tests/acceptance/", "ko")
+    assert text("review_class_question", "ko") in korean

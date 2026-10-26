@@ -421,7 +421,14 @@ def test_conflict_resolution_exhaustion_never_publishes_failed_resolution(confli
     content = "commands = ['help', 'issue']\n" + ("<<<<<<< HEAD\n=======\n>>>>>>> target\n" if failure == "markers" else "")
     c.executor.steps += [{"cli.py": content}] * 3
     assert run_issue(1, c.ctx) == "retries-exceeded"
-    assert len(c.executor.calls) == 4 and c.store.get_run(1).attempts == 2
+    if failure == "markers":
+        # The one own file still conflicts after the in-place budget: one rebuild, which also fails.
+        assert len(c.executor.calls) == 4 and c.store.get_run(1).attempts == 2
+        assert c.store.get_run(1).rebuild_count == 1
+    else:
+        # Markers are gone but checks fail: no file still conflicts, so no rebuild (#416).
+        assert len(c.executor.calls) == 1 + c.ctx.config.conflict_retries
+        assert c.store.get_run(1).attempts == 1 and c.store.get_run(1).rebuild_count == 0
     assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
     assert len(c.ci_heads) == 1 and c.tracker.merged_prs == []
     assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == c.ci_heads[0]
@@ -436,8 +443,13 @@ def test_failed_conflict_resolution_resumes_local_wip_while_preserving_open_pr(c
     c.executor.steps += [{"cli.py": content}] * 3
     assert run_issue(1, c.ctx) == "retries-exceeded"
     assert git_command(c.history.clone, "show", f"{branch}:cli.py") == content.strip()
-    assert "[retries-exceeded]" in git_command(c.history.clone, "log", "-1", "--format=%B", branch)
-    assert git_command(c.history.clone, "rev-parse", f"{branch}^") == c.target_heads[0]
+    if failure == "markers":
+        assert "[retries-exceeded]" in git_command(c.history.clone, "log", "-1", "--format=%B", branch)
+        assert git_command(c.history.clone, "rev-parse", f"{branch}^") == c.target_heads[0]
+    else:
+        # No rebuild (#416): the in-place resolution's merge commit is kept on the local branch.
+        parents = git_command(c.history.clone, "show", "-s", "--format=%P", branch).split()
+        assert len(parents) == 2 and c.target_heads[-1] in parents
     assert git_command(c.history.origin, "rev-parse", branch) == c.ci_heads[0]
     assert git_command(c.history.origin, "rev-parse", "main") == c.history.tip
 
