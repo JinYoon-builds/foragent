@@ -4,6 +4,16 @@ Ideas Jin wants to keep but not order yet. An idea moves to `decisions.md` when 
 
 ## 2026-10-26
 
+- **출시 이야기의 중심은 "레인" (2026-10-26, Jin).**
+  - 비교 조사(Gas Town, Symphony, Orchestrator.inc, Paperclip, 가재코드, OmO, 우로보로스) 뒤 Jin이 정했다. 간판은 레인 세계관이다.
+    1. 레인은 프로젝트 영역을 맡은 다람쥐다. fa init이 레인과 스킬을 만든다.
+    2. 레인은 이슈를 스스로 찾아 처리한다(forage).
+    3. 레인은 자기 기억으로 영역을 배운다. 쓸수록 코드베이스를 아는 팀이 된다.
+    4. 동시에 도는 실행 수는 CPU 부하를 따라 늘고 준다(메모리는 위험할 때만 새 시작을 멈춘다).
+  - 잠긴 인수 시험과 최신 main 재검증은 간판이 아니라 믿음의 근거다. "사람 없이 머지"가 아니라 "코드 대신 의도를 리뷰한다"로 말한다.
+  - 워크트리 격리는 기본기다(차별점 아님). 하드웨어 조정은 "맥 한 대로 돈다" 한 줄이면 된다.
+  - 증명할 숫자: 레인별 재시도 비율과 리뷰 한 번 통과율의 추세(#333 facts). 머지 뒤 되돌린 비율.
+
 - **A one-line resource summary in the lane view (Jin, 2026-10-26).** For example "CPU 62% · mem free 46% · disk busy · Claude ok", built from the same facts the orchestrator reads (D93): CPU busy fraction, kernel memory pressure, disk I/O, usage-limit state per executor, GitHub API remaining. A person sees at a glance why the gate holds back, without opening btop. It is a feature, so it waits until 5 merges per hour is stable (D88).
 
 ## 2026-10-25
