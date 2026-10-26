@@ -3,6 +3,8 @@
 import re
 from typing import Any
 
+from foragent import review_perspectives
+
 
 def _validate(values: dict[str, Any]) -> None:
     from foragent.config import ConfigError, SKILL_ROLES, _EXECUTORS, _REVIEW_LEVELS, _hours
@@ -66,11 +68,12 @@ def _validate(values: dict[str, Any]) -> None:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
                 "max_parallel", "overlap_per_file", "transient_max_wait_minutes", "limit_wait_minutes",
-                "orchestrator_timeout_minutes", "tick_failure_alert", "test_slots"):
+                "usage_recheck_minutes", "orchestrator_timeout_minutes", "tick_failure_alert", "test_slots"):
         if key == "max_parallel" and values[key] is None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
+    review_perspectives.validate(values, ConfigError)
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     for key in ("always_human", "approvers"):

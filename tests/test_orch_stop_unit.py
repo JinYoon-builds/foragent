@@ -30,6 +30,18 @@ def test_unreadable_recorded_pid_is_refused(monkeypatch, field):
     assert refusal is not None and "cannot be read" in refusal
 
 
+@pytest.mark.parametrize(("pid", "identities"), [
+    (None, []),  # launched but never recorded: nothing proves which process to stop
+    (42000, []),  # a numeric PID without its recorded birth is not ownership
+    (42000, [{"pid": 41999, "start_time": 5.0}]),
+])
+def test_runner_without_a_recorded_identity_is_refused(monkeypatch, pid, identities):
+    # The PID is not even listed: absence of a live row must not count as safe.
+    monkeypatch.setattr(processes, "list_processes", lambda: ProcessTable(()))
+    refusal = stop_target_refusal(_run(pid=pid, process_identities=identities))
+    assert refusal is not None and "ownership cannot be verified" in refusal
+
+
 def test_recorded_live_owned_pid_passes(monkeypatch):
     row = ProcessIdentity(42000, 1, 42000, 42000, 5.0)
     monkeypatch.setattr(processes, "list_processes", lambda: ProcessTable((row,)))
@@ -102,9 +114,13 @@ def test_refused_kill_restores_the_recorded_outcome(tmp_path, monkeypatch):
 class _Labels:
     def __init__(self):
         self.calls, self.pr = [], None
+        self.issue = SimpleNamespace(state="open", labels={"approved", "running"})
 
     def find_pr(self, head):
         return self.pr
+
+    def get_issue(self, n):
+        return self.issue
 
     def add_labels(self, n, labels):
         self.calls.append(("add", n, tuple(labels)))
@@ -210,4 +226,28 @@ def test_stop_with_an_open_pr_blocks_instead_of_a_ready_that_a_tick_would_clear(
                       "Stopped with open PR #7; rerun review or retry implementation.", "Stop reason: reprioritize")]
     assert ("add", 1, ("ready",)) not in labels.calls
     assert "PR #7 is open" in summary and "fa orch retry 1" in summary
+    assert [kind for _, kind, _ in events] == ["stop"]
+
+
+@pytest.mark.parametrize(("state", "labels", "held"), [
+    ("open", {"approved", "running", "blocked"}, "blocked"),
+    ("open", {"approved", "running", "needs-human"}, "needs-human"),
+    ("closed", {"running"}, "closed"),
+])
+def test_stop_never_adds_ready_that_contradicts_a_hold_or_closed_issue(
+    tmp_path, monkeypatch, kicks, state, labels, held,
+):
+    store, ctx, tracker, events = _running_store(tmp_path, monkeypatch)
+    tracker.issue = SimpleNamespace(state=state, labels=labels)
+    tracker.pr = 7  # The hold wins over the open-PR rule too: no second flag.
+    monkeypatch.setattr(scheduler, "flag", lambda *args, **kwargs: pytest.fail("Stop re-flagged a held issue"))
+
+    def kill(tick_ctx, number, report, **kwargs):
+        store.finish_run(number, outcome="stopped")
+        return True
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    summary = orch.stop(ctx, 1, "reprioritize")
+    assert tracker.calls == [("remove", 1, ("running",))]
+    assert f"not returned to ready because the issue is {held}" in summary
     assert [kind for _, kind, _ in events] == ["stop"]

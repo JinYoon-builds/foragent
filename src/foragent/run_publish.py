@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from foragent import board, risks
+from foragent import board, review_perspectives, risks
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
@@ -395,7 +395,8 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
         skills_line=_skills_line(ctx.store.get_run(n)),
         rebuttals="\n\n".join(attempt.rebuttals),
         review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
-        risk_notes=_risk_notes(attempt) if ctx.config.review_scope == "pr-body" else "",
+        language=ctx.config.language,
+        risk_notes=review_perspectives.with_checklist(_risk_notes(attempt), ctx.config) if ctx.config.review_scope == "pr-body" else "",
     )
 
 

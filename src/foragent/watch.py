@@ -35,7 +35,7 @@ from foragent.watch_layout import PICK, _activity, _frame, _has_work, render_fra
 from foragent.watch_sections.detail import render_detail
 from foragent.watch_sections.stage import _stage
 from foragent.watch_mouse import handle_mouse, hit_test, switch_to_orchestrator
-from foragent.watch_open import registered
+from foragent.watch_open import LOCK_FD_ENV, exclusive, registered
 from foragent.watch_terminal import _terminal, color_pairs
 
 
@@ -67,21 +67,28 @@ def run(
     argv = sys.argv.copy()
     reload_requested = False
     refresh = lambda: collect(status(), tracker, store, config, now())
-    with nullcontext() if once else registered(store):
-        snapshot = refresh()
-        if once:
-            print(render_frame(snapshot, config, repo_root))
+    if once:
+        print(render_frame(refresh(), config, repo_root))
+        return
+    with exclusive(store) as lock:
+        if lock is None:
+            # Another live view holds the kernel lock: leave without registering a PID.
+            print(text("watch_already_open", config.language))
             return
-        import curses
+        with registered(store):
+            snapshot = refresh()
+            import curses
 
-        try:
-            reload_requested = curses.wrapper(_terminal, refresh, snapshot, config, repo_root, now, store)
-        except KeyboardInterrupt:
-            pass
-        except curses.error as exc:
-            raise ConfigError(str(exc)) from exc
-    if reload_requested:
-        # Both curses and PID registration must unwind before exec replaces us.
+            try:
+                reload_requested = curses.wrapper(_terminal, refresh, snapshot, config, repo_root, now, store)
+            except KeyboardInterrupt:
+                pass
+            except curses.error as exc:
+                raise ConfigError(str(exc)) from exc
+        if not reload_requested:
+            return
+        # Curses and PID registration unwind before exec; the inherited lock leaves no gap.
+        os.environ[LOCK_FD_ENV] = str(lock)
         if Path(argv[0]).resolve() == Path(__file__).with_name("cli.py").resolve():
             os.execv(sys.executable, [sys.executable, "-m", "foragent.cli", *argv[1:]])
         else:

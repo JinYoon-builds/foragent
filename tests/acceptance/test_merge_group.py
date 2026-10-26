@@ -260,6 +260,13 @@ def assert_group_short_holds(case):
                 continue
             seen.add(row.pr)
         view.events.append(row)
+    # A member whose PR a group leader already merged still acquires its own
+    # merge.lock request, then finishes merged (#459). Its PR is closed by then,
+    # so that hold cannot see a green open PR; it must stay empty (no merge in it).
+    merged_at = {owner(case, row.pr): row.at for row in case.merges}
+    view.holds = [SimpleNamespace(**{**vars(hold), "green": True})
+                  if not hold.green and hold.issue in merged_at and merged_at[hold.issue] <= hold.start
+                  else hold for hold in case.holds]
     assert not slow_under_lock(view)
     assert_short_holds(view)
 

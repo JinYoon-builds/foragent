@@ -176,3 +176,100 @@ def test_once_leaves_an_interactive_views_pid_untouched(tmp_path, monkeypatch, c
     watch.run(lambda: {}, FakeTracker(), store, Config(), tmp_path, once=True)
     assert capsys.readouterr().out == "one frame\n"
     assert pid_file.read_text() == "123\n"
+
+
+def test_reopen_without_an_opener_does_not_reserve_the_spacing(opening, tmp_path, monkeypatch, capsys):
+    from datetime import UTC, datetime, timedelta
+
+    store, calls = opening
+    monkeypatch.setattr(store, "active_runs", lambda: [object()])
+    path = store.root / "watch-open.json"
+    now = datetime(2026, 10, 26, 12, tzinfo=UTC)
+    watch_open.reopen(tmp_path, store, "en", now)
+    assert not path.exists(), "Printing the manual command is not an attempt"
+
+    old = now - watch_open.REOPEN_SPACING - timedelta(minutes=1)
+    store._write_json(path, {"attempted_at": old.isoformat()})
+    watch_open.reopen(tmp_path, store, "en", now + timedelta(seconds=1))
+    assert json.loads(path.read_text())["attempted_at"] == old.isoformat()
+    assert calls == []
+    assert capsys.readouterr().err.count("fa gate watch") == 2
+
+    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/osascript" if name == "osascript" else None)
+    watch_open.reopen(tmp_path, store, "en", now + timedelta(seconds=2))
+    assert len(calls) == 1
+    assert json.loads(path.read_text())["attempted_at"] == (now + timedelta(seconds=2)).isoformat()
+
+
+def test_concurrent_opener_waits_and_honours_the_others_timeout_record(opening, tmp_path, monkeypatch):
+    import threading
+    import time
+
+    store, _ = opening
+    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/osascript" if name == "osascript" else None)
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def call(argv, root):
+        calls.append(threading.current_thread().name)
+        if threading.current_thread().name == "first":
+            started.set()
+            assert release.wait(5)
+            raise subprocess.TimeoutExpired(argv, 5)
+
+    monkeypatch.setattr(watch_open, "_call", call)
+    first = threading.Thread(target=watch_open.open_view, args=(tmp_path, store), name="first")
+    second = threading.Thread(target=watch_open.open_view, args=(tmp_path, store), name="second")
+    first.start()
+    assert started.wait(5)
+    second.start()
+    time.sleep(0.2)
+    assert calls == ["first"], "The second opener must wait while the first runs its command"
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert calls == ["first"], "The first opener's timeout record must stop the waiting opener"
+    assert (store.root / "watch-open.json").exists()
+
+
+def test_view_locking_during_the_show_probe_stops_the_split(opening, tmp_path, monkeypatch):
+    from contextlib import ExitStack
+
+    store, _ = opening
+    store._write_json(store.root / "watch-terminal.json", {"executable": "/fake/orca", "handle": "term_1"})
+    calls = []
+    with ExitStack() as held:
+        def call(argv, root):
+            calls.append(argv[:3])
+            if argv[2] == "show":
+                # A view starts and takes its lock while the probe runs.
+                assert held.enter_context(watch_open.exclusive(store)) is not None
+
+        monkeypatch.setattr(watch_open, "_call", call)
+        watch_open.open_view(tmp_path, store)
+    assert calls == [["/fake/orca", "terminal", "show"]], "No split may run once the view holds its lock"
+    assert not (store.root / "watch-open.json").exists(), "Stopping for a live view is not a failed attempt"
+
+
+@pytest.mark.parametrize("backend, env", [
+    ("tmux", {"TMUX": "/tmp/tmux,1,0"}), ("wezterm", {"WEZTERM_PANE": "1"}),
+    ("kitty", {"KITTY_WINDOW_ID": "1"}), ("osascript", {}),
+])
+def test_view_locking_before_any_backend_command_stops_it(opening, tmp_path, monkeypatch, capsys, backend, env):
+    from contextlib import ExitStack
+
+    store, calls = opening
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    with ExitStack() as held:
+        def which(name):
+            if name != backend:
+                return None
+            # The view takes its lock after the opener's first check, before the command.
+            held.enter_context(watch_open.exclusive(store))
+            return "/fake/" + name
+
+        monkeypatch.setattr(watch_open.shutil, "which", which)
+        watch_open.open_view(tmp_path, store)
+    assert calls == []
+    assert capsys.readouterr().err == ""

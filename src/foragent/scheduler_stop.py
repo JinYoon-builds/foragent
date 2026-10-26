@@ -99,8 +99,9 @@ def stop_target_refusal(run: Run) -> str | None:
     """Why a recorded runner or executor PID fails #261's rules, read without signaling.
 
     A live recorded PID must be a recorded identity outside PID 1 and this
-    process's own lineage, group and session. An unreadable one cannot be
-    verified and is refused; a dead one is left to the stop path.
+    process's own lineage, group and session. An unreadable one, or a runner
+    PID that is missing or was never recorded as an identity, cannot be
+    verified and is refused; a dead recorded one is left to the stop path.
     """
     try:
         table = processes.list_processes()
@@ -121,4 +122,10 @@ def stop_target_refusal(run: Run) -> str | None:
             or row.pgid == group or row.sid == session
         )):
             return f"recorded {name} PID {pid} is not a process Foragent started for this run"
+    # Missing evidence is never proof of safety: without a recorded runner
+    # identity the stop could neither verify nor signal the process it ends.
+    if run.pid is None:
+        return "no runner PID is recorded for this run; ownership cannot be verified"
+    if run.pid not in identities:
+        return f"recorded runner PID {run.pid} has no recorded process identity; ownership cannot be verified"
     return None

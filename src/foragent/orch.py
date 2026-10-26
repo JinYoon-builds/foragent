@@ -26,6 +26,7 @@ from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_checks import CheckResult, trusts_ci
+from foragent.run_previous import retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
 from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
@@ -62,6 +63,10 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
     unknown_path = ctx.store.root / "orch-watch-unknown.json"
     last_error = None
     while True:
+        try:  # Every read, changed or not, shows the orchestrator is alive.
+            ctx.store.write_heartbeat("orchestrator", ctx.now())
+        except Exception:
+            pass  # a heartbeat is best effort; the read below reports state errors
         try:
             snapshot = _watch_snapshot(ctx)
             with ctx.store._state_lock():
@@ -163,6 +168,8 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
         ctx.store._atomic_write(path, hint)
     else:
         path.unlink(missing_ok=True)
+    # The next implementer receives the keep-work/defect-class default before any hint.
+    ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         ctx.tracker.close_pr(pr, "Closed by Foragent orchestrator retry")
     # Establish the destination before clearing the old state, including on errors.
@@ -238,7 +245,14 @@ def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
             f"finished as {current.outcome}" if current is not None else "no run record")
         raise OrchError(f"#{n}: stop did not complete ({state}): {'; '.join(report.actions) or 'no action'}")
     summary = f"#{n}: stopped and kept unfinished work on foragent/issue-{n}; why: {why}"
-    if (pr := tick_ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
+    issue = tick_ctx.tracker.get_issue(n)
+    if issue.state != "open" or issue.labels & {BLOCKED, NEEDS_HUMAN}:
+        # ready would contradict a closed issue or a hold the scheduler never
+        # starts, as in crash recovery: only the running label is cleared.
+        tick_ctx.tracker.remove_labels(n, [RUNNING])
+        held = "closed" if issue.state != "open" else ", ".join(sorted(issue.labels & {BLOCKED, NEEDS_HUMAN}))
+        summary += f"; not returned to ready because the issue is {held}"
+    elif (pr := tick_ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         # A tick clears ready while the PR is open, so ready would never restart.
         # As for a crash or stall with an open PR, the orchestrator chooses the next step.
         scheduler.flag(tick_ctx, n, scheduler.Reason.RETRIES_EXCEEDED,
