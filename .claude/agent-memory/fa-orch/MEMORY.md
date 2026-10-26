@@ -131,4 +131,4 @@
 - [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order, conftest opt-out
 - [#497 memory critical line](project_497_memory_critical.md) — raw kernel level, critical holds starts only, floors in IGNORED_KEYS
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
-- [#483 baseline follows base](project_483_baseline_follows_base.md) — re-capture baseline on result-affecting base move; FakeTracker merged_prs equality
+- [#483 baseline follows base](project_483_baseline_follows_base.md) — re-capture baseline on result-affecting base move; detect test command at new base

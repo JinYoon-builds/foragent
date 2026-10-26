@@ -100,12 +100,15 @@ def _detect_test_command_at(git: GitRepo, ref: str) -> str | None:
 
 def capture_acceptance_baseline(
     n: int, ctx: RunContext, git: GitRepo, target_branch: str, ref: str, *, detect_at_ref: bool = False,
+    required: bool = False,
 ) -> AcceptanceBaseline | None:
     """Capture (or reuse the cached) protected set for ``ref``; stop the run if unusable (#327).
 
     Run at preparation and again after each result-affecting base move (#483).
     A refresh detects the test command from ``ref`` itself: the worktree then
     holds the PR, which must not decide how the new base is measured.
+    ``required`` (a refresh of a run that already had a protected set) turns
+    "no baseline" into the #327 stop instead of silently dropping protection.
     """
     from foragent import runner
     from foragent.ci_local import capture_local_only
@@ -126,6 +129,9 @@ def capture_acceptance_baseline(
             return capture_local_only(n, ctx, git, test_command, base_sha,
                                       _baseline_exclusions(ctx, base_sha, log))
         baseline = _capture_acceptance_baseline(n, ctx, test_command, ref)
+        if baseline is None and required:
+            raise AttemptFailure(
+                f"acceptance baseline unavailable: no baseline could be captured for the new base {ref}")
         ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})
         return baseline
     except AttemptFailure as exc:
@@ -133,6 +139,25 @@ def capture_acceptance_baseline(
         reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
         flag(ctx, n, reason, "acceptance baseline unavailable", str(exc))
         raise ExecutorStopped(reason.value, str(exc)) from exc
+
+
+def follow_base(attempt: Implementation) -> None:
+    """Keep the protected set on the base the branch is built on (#483).
+
+    Every step that adopts a newer base (a result-affecting move, a rebuild,
+    a switch between batch and base targets) changes ``start_ref``. Checks
+    call this before verifying, so none of them can verify against the
+    protected set and exclusions of an older base.
+    """
+    if attempt.baseline_sha is None:
+        return
+    sha = attempt.git.ref_sha(attempt.start_ref)
+    if sha == attempt.baseline_sha:
+        return
+    attempt.baseline = capture_acceptance_baseline(
+        attempt.n, attempt.ctx, attempt.git, attempt.target_branch, sha,
+        detect_at_ref=True, required=attempt.baseline is not None)
+    attempt.baseline_sha = sha
 
 
 def _prepare_implementation(
@@ -160,7 +185,8 @@ def _prepare_implementation(
     log = ctx.store.log_path(n)
     issue = ctx.tracker.get_issue(n)
     size = issue_size(issue.labels)
-    baseline = (capture_acceptance_baseline(n, ctx, git, target_branch, start_ref)
+    baseline_sha = git.ref_sha(start_ref) if capture_baseline else None
+    baseline = (capture_acceptance_baseline(n, ctx, git, target_branch, baseline_sha)
                 if capture_baseline else None)
     return Implementation(
         n=n,
@@ -183,6 +209,7 @@ def _prepare_implementation(
         issue=issue,
         size=size,
         baseline=baseline,
+        baseline_sha=baseline_sha,
         failure=failure,
     )
 

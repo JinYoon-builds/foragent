@@ -73,6 +73,8 @@ class Implementation:
     issue: Issue
     size: str
     baseline: AcceptanceBaseline | None
+    # The base commit `baseline` was taken at; None when this run keeps no baseline (#483).
+    baseline_sha: str | None = None
     failure: str | CIFailure = ""
     reviews: list[ReviewResult] = field(default_factory=list)
     review_failures: int = 0

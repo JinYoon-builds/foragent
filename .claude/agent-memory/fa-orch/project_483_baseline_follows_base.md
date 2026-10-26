@@ -1,11 +1,14 @@
 ---
 name: 483-baseline-follows-base
-description: #483 result-affecting base move re-captures the acceptance baseline for the new base SHA; shared helper and FakeTracker merged_prs equality
+description: #483 result-affecting base move re-captures the acceptance baseline for the new base SHA; shared helper, refresh detects the test command at the new base
 metadata:
   type: project
 ---
 - `run_implementation.capture_acceptance_baseline(n, ctx, git, target_branch, ref)` is the single capture path (ci-mode local_only or #325 cached capture); it flags `acceptance-baseline-unavailable` and raises ExecutorStopped on AttemptFailure (#327).
 - `run_publish.refresh_base()` calls it with `move.target_sha` only when the move is not neutral, after the REVERIFY log line and before merging the moved base, so conflict resolution and verification both use the new protected set. Neutral classification (#376) still reads the old `attempt.baseline.excluded`.
-- The acceptance test asserts `tracker.created_prs == tracker.merged_prs` (PullRequest objects vs ints). FakeTracker.merged_prs is a `_MergedPRs(list)` subclass whose `__eq__` maps objects to `.number`; a list subclass on the right side gets its reflected `__eq__` tried first.
+- The first acceptance test compared PR objects with PR numbers; the order was corrected to compare numbers and FakeTracker stays unchanged (spec decision). Fix test-side mismatches through the order, not by changing shared fakes.
 - Tests: `tests/acceptance/test_baseline_follows_base.py` (5), with base_move_reuse and short_merge_lock: 41 pass in ~2 min.
 - Review: with `test_command` unset, the refresh must detect the command from the new base commit (`_detect_test_command_at` writes pyproject/package.json/pnpm-lock/go.mod from `git show` into a temp dir), not from the PR worktree; a PR that deletes pyproject.toml would otherwise make capture return None and drop protection. Preparation still detects from the worktree (`tests/test_run_baseline.py` asserts the worktree root). Unit test: `tests/test_baseline_refresh_unit.py`.
+- Review 2: a refresh of a run that already had a protected set passes `required=attempt.baseline is not None`; any `None` from the new-base capture (no command, non-pytest command, missing acceptance dir) then raises AttemptFailure → #327 stop. Runs that never had a baseline keep today's skip. `ExecutorStopped` keeps the outcome in `.outcome`, not `args[0]` (that is the detail).
+- Review 3 (defect class "adopts a newer base without refreshing the baseline"): `_rebuild()` and `_prepare_target()` also change `attempt.start_ref`. Fix is structural: `Implementation.baseline_sha` records the capture commit; `run_implementation.follow_base(attempt)` recaptures when `ref_sha(start_ref)` differs and is called at the top of each `_verify_implementation()` pass and in `refresh_base()` for result-affecting moves. Preparation now captures at the resolved SHA. When adding any new step that moves `start_ref`, verification already follows it.
+- Flaky, unrelated: `tests/test_run_publish.py::test_parallel_self_merges_cannot_install_an_older_tree_last` (10 s real-time wait; fails on base source too). Done-when gate checks can time out when other test runs load the machine; do not run own tests while ending a turn.

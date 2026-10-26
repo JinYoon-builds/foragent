@@ -345,6 +345,8 @@ def _verify_implementation(attempt: Implementation) -> str:
         return "The session made no changes."
     staged_tree = git.staged_tree_sha()
     for verification in range(2):
+        from foragent.run_implementation import follow_base
+        follow_base(attempt)
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
