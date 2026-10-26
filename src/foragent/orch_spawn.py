@@ -8,6 +8,7 @@ tmux window, or ``claude --bg`` without a screen. The lane view stays beside the
 planning session, so nothing here splits a pane or switches focus.
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 import json
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 from foragent import notify, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
@@ -101,10 +103,7 @@ def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, n
 
 
 def on_tick(ctx, report):
-    """Gate tick hook: open an orchestrator when needed; never fail the tick. Returns ``report``.
-
-    It needs no GitHub call, so the gate also runs it during a GitHub rate-limit wait.
-    """
+    """Open an orchestrator when needed and note it in ``report``; never raise. Returns ``report``."""
     language = ctx.config.language
     try:
         screen = ensure_orchestrator(ctx.repo_root, ctx.store, ctx.config, now=ctx.now())
@@ -114,3 +113,27 @@ def on_tick(ctx, report):
     if screen:
         report.actions.append(text("orch_spawn_tick", language, screen=screen))
     return report
+
+
+@contextmanager
+def deciding(ctx):
+    """Wrap a whole gate tick so the spawn decision runs on every exit.
+
+    The decision reads only local facts (heartbeats, active runs, approvals), so
+    it does not depend on any tick step: a busy tick, a GitHub wait, a failed
+    fetch, refresh, recovery or budget step all still open a missing
+    orchestrator. Yields ``keep(report) -> report`` for the tick's result; on an
+    error the spawn runs and the original error propagates unchanged.
+    """
+    kept = []
+
+    def keep(report):
+        kept.append(report)
+        return report
+
+    try:
+        yield keep
+    except Exception:
+        on_tick(ctx, SimpleNamespace(actions=[]))  # The tick's report is lost with the error.
+        raise
+    on_tick(ctx, kept[-1] if kept else SimpleNamespace(actions=[]))

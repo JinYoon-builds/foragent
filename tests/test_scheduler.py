@@ -271,6 +271,53 @@ def test_refresh_preserves_local_writes_during_remote_reads(ctx, monkeypatch, du
     )
 
 
+@pytest.mark.parametrize("step", [
+    "heartbeat", "reap", "usage", "fetch", "refresh", "recovery", "budgets",
+])
+def test_tick_opens_orchestrator_when_an_earlier_step_raises(ctx, monkeypatch, step):
+    from foragent import orch_spawn, scheduler, usage_recheck
+    from foragent.git import GitError
+
+    spawned = []
+    monkeypatch.setattr(orch_spawn, "ensure_orchestrator",
+                        lambda root, store, config, *, now: spawned.append(now) or "tmux")
+    error = {"fetch": GitError("fetch failed"), "refresh": TrackerError("HTTP 500 Server Error")}.get(
+        step, OSError(f"{step} failed"))
+
+    def boom(*args, **kwargs):
+        raise error
+
+    target = {
+        "heartbeat": (ctx.store, "write_heartbeat"), "reap": (scheduler, "_reap_inactive_runs"),
+        "usage": (usage_recheck, "recheck"), "fetch": (scheduler, "fetch_base"),
+        "refresh": (ctx.tracker, "list_issues"), "recovery": (scheduler, "_recover_runs"),
+        "budgets": (scheduler, "_apply_budgets"),
+    }[step]
+    monkeypatch.setattr(*target, boom)
+    with pytest.raises(type(error)) as raised:
+        tick(ctx)
+    assert raised.value is error  # The original error propagates unchanged.
+    assert len(spawned) == 1
+
+
+def test_busy_tick_still_decides_the_orchestrator(ctx, monkeypatch):
+    from contextlib import contextmanager
+
+    from foragent import orch_spawn
+
+    spawned = []
+    monkeypatch.setattr(orch_spawn, "ensure_orchestrator",
+                        lambda root, store, config, *, now: spawned.append(now) or "orca")
+
+    @contextmanager
+    def held():
+        yield False
+
+    monkeypatch.setattr(ctx.store, "tick_lock", held)
+    report = tick(ctx)
+    assert report.skipped and spawned and "Opened an orchestrator (orca)" in report.actions
+
+
 def test_tick_opens_orchestrator_on_both_github_wait_returns(ctx, monkeypatch):
     from foragent import orch_spawn
 
