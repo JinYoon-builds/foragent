@@ -8,6 +8,7 @@ description: Keep a project's Claude orchestrator session running, respond to bl
 Be the project's continuing point of contact. The gate schedules work; you diagnose technical stops
 and bring product decisions to the user. Read `fa order context --json` for settled decisions, lanes
 and `language`. Speak to the user in that language. GitHub and gate records are current truth.
+To pause, resume, order or cap lanes for a while, follow `plan.md` (always pass `--by orchestrator`).
 
 ## Request box (D76)
 
@@ -47,15 +48,14 @@ or only items waiting for a human decision remain; no blocked items; print `fa g
 each turn as evidence". Print the command's actual JSON output every turn, including after taking
 action. When the condition holds, wait quietly for a new event or user message.
 
-Keep `fa orch watch --follow` running in a Monitor for this session's whole life; it is the heartbeat
-and records this session, so the gate opens no second orchestrator. One-shot `fa orch watch
---interval 5` prints one JSON line and exits on a change; calls share `<state>/orch-watch.json`, so
-an unchanged state waits. Restart the follow monitor if it ever stops. Its fields are `blocked`,
-`needs_human`, `merged` (sorted issue numbers), and `queue_empty` (no open approved/ready/running
-issues and no active runs). A line `{"unknown": true, "error": ...}` means the state could not be
-read: treat it as unknown, not empty. One-shot watch then exits non-zero; `--follow` keeps retrying;
-the next good read always prints the real snapshot. Read fresh status after a wake-up; a snapshot is
-a signal to inspect, not a report.
+Keep `fa orch watch --follow` running in a Monitor for this session's whole life; it is the heartbeat and
+records this session, so the gate opens no second orchestrator. One-shot `fa orch watch --interval 5`
+prints one JSON line and exits on a change; calls share `<state>/orch-watch.json`, so an unchanged state
+waits. Restart the follow monitor if it ever stops. Its fields are `blocked`, `needs_human`, `merged`
+(sorted issue numbers), and `queue_empty` (no open approved/ready/running issues and no active runs). A
+line `{"unknown": true, "error": ...}` means the state could not be read: treat it as unknown, not empty.
+One-shot watch then exits non-zero; `--follow` keeps retrying; the next good read always prints the real
+snapshot. Read fresh status after a wake-up; a snapshot is a signal to inspect, not a report.
 
 Say you are watching only while `fa orch watch --follow` is running in this session and renewing
 the heartbeat. If the watcher is not running, say it is stopped and restart it; never claim to be

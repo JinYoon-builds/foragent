@@ -155,3 +155,4 @@
 - #604: `orch_stale_files.report()`가 board_sync 뒤 tick마다 승인 스냅샷의 Files를 `rev-list -1 --first-parent --until=<unix ts>`(포함; first-parent 없으면 나중에 병합된 토픽 커밋이 기준이 됨)로 찾은 승인 시점 base 트리와 현재 트리로 비교, `stale-files.json`(이슈→보고한 SHA 목록, 닫힌 이슈도 지우지 않음)으로 SHA당 한 번만 기록. 시험의 conftest 가드가 git commit/checkout을 막으니 commit-tree 등 plumbing으로 이력을 만든다. scheduler.py facade는 `test_scheduler_split`이 250줄 상한을 강제하므로 줄을 더하면 기존 `with step` 블록을 `timed(...)` 한 줄로 접는다.
 - #604 리뷰: 잠금을 잡은 tick의 모든 종료(GitHub 대기·한도 예외 포함)에서 돌아야 하는 로컬 사실 검사는 `orch_spawn.deciding()` 래퍼에 넣는다(scheduler 본문의 중간 호출은 이른 반환에 건너뛰어짐). `ls-tree -z` 출력은 split 뒤 빈 이름을 빼야 `**`가 빈 트리에 일치하지 않는다. scheduler에 git 호출을 더하면 test_cli의 엄격한 가짜 git이 깨지므로 대상이 있을 때만 git을 읽는다.
 - [#366 installed gates](project_366_installed_gates.md) — gates.py discovery, remote fallback for state root, conftest real-HOME isolation
+- [#287 lane plan](project_287_plan.md) — plan.json, non-reentrant state lock, CLI stderr exits, stall vs 1h clock in locked test

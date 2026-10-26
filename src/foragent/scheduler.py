@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, launchd, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_github, orch_plan, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -227,6 +227,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report
+    timed("plan_refresh", orch_plan.refresh, ctx.store, ctx.now())  # Lapse pauses; expire the plan once.
     with step("apply_budgets"):
         sample = _apply_budgets(ctx, ready, workers=False)  # The worker budget is sized below with this sample.
     if sample[0] != "critical":  # Critical memory also holds the baseline prebuild (#497).
