@@ -3,7 +3,9 @@
 from foragent.commands import facade, repo_store
 
 ORDER = 120
-INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue"}
+# An orchestrator whose heartbeat is at most this old counts as alive.
+ALIVE_SECONDS = 30
+INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive"}
 
 
 def add(commands) -> None:
@@ -70,6 +72,9 @@ def _add_inbox(orch_actions) -> None:
         command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         if command in (inbox, questions):
             command.add_argument("--json", action="store_true")
+    alive = orch_actions.add_parser("alive", help=cli.text("heartbeats_help"))
+    alive.add_argument("--json", action="store_true")
+    alive.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     queue = orch_actions.add_parser("queue", help="Set, show or clear a lane's preferred start order")
     queue.add_argument("lane")
     queue.add_argument("numbers", type=int, nargs="*", help="Issue numbers in start order; none shows the queue")
@@ -82,6 +87,9 @@ def _orch_inbox(args, store, config, repo: str) -> None:
     """Local request/question box; never reads GitHub or starts an executor."""
     cli = facade()
     box = cli.orch_inbox
+    if args.action == "alive":
+        _alive(args, store, config)
+        return
     if args.action == "queue":
         if args.clear and args.numbers:
             raise SystemExit("fa orch queue: give issue numbers or --clear, not both")
@@ -137,6 +145,22 @@ def _orch_inbox(args, store, config, repo: str) -> None:
                 print(f"  {index}. {option}{mark}")
             if row.get("answer"):
                 print(f"  answer: {row['answer']}")
+
+
+def _alive(args, store, config) -> None:
+    cli = facade()
+    last = store.heartbeats()["orchestrator"]
+    elapsed = None if last is None else (store._now() - last).total_seconds()
+    # Compare the exact elapsed time; the whole seconds below are only for display.
+    alive = elapsed is not None and elapsed <= ALIVE_SECONDS
+    age = None if elapsed is None else int(elapsed)
+    if args.json:
+        print(cli.json.dumps({"alive": alive, "last_seen": last and last.isoformat(), "age_seconds": age}))
+    elif last is None:
+        print(cli.text("heartbeats_never", config.language))
+    else:
+        key = "heartbeats_alive" if alive else "heartbeats_gone"
+        print(cli.text(key, config.language, age=age, at=last.isoformat()))
 
 
 def _list(ctx, args) -> None:
