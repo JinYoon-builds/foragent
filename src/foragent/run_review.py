@@ -15,6 +15,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
+from foragent import risks
 from foragent.reasons import Reason
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
 from foragent.run_execution import _available_executor
@@ -83,7 +84,7 @@ def parse_code_review(message: str) -> ReviewResult:
 
 
 @contextmanager
-def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = ""):
+def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = "", risk_notes: str = ""):
     git.ignore_review_scope()
     path = git.root / REVIEW_SCOPE_FILE
     link = os.readlink(path) if path.is_symlink() else None
@@ -92,6 +93,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
     section = (
         "# Review scope (written by Foragent for this review only)\n\n"
         f"{body}\n\n{review_scope_rules(acceptance_dir)}\n\n"
+        + (f"{risk_notes}\n\n" if risk_notes else "")
         + (f"Implementer rebuttals (judge them):\n{rebuttals}\n\n" if rebuttals else "")
     ).encode("utf-8")
     try:
@@ -122,13 +124,17 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     if reviewer == "claude" and pr is not None:
         options["review_pr"] = pr
     rebuttals = _read_rebuttals(git.root)
+    risk_notes = _risk_notes(git, base_ref)
+    settings = risks.review_options(ctx.config, reviewer, ctx.config.reviewer_model) if risk_notes else {
+        "model": ctx.config.reviewer_model}
     edited = False
     with ExitStack() as scope:
         if reviewer == "claude" and ctx.config.review_scope == "claude-local":
             approval = ctx.store.load_approval(n)
             if approval is None:
                 raise ValueError("Claude review requires an approved snapshot")
-            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir, rebuttals))
+            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir, rebuttals,
+                                                      risk_notes))
         before = git.review_state()
         try:
             result = _available_executor(
@@ -136,8 +142,9 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
                 reviewer=True,
                 prompt="" if reviewer == "claude" else build_review_prompt(
                     parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
+                    risk_notes=risk_notes,
                 ),
-                model=ctx.config.reviewer_model, timeout_s=runner._remaining(n, ctx),
+                **settings, timeout_s=runner._remaining(n, ctx),
                 log_path=ctx.store.log_path(n), **options,
             )
             message = result.full_message if result.full_message is not None else result.last_message
@@ -177,6 +184,12 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     return replace(review, raw=raw, timed_out=result.timed_out)
 
 
+def _risk_notes(git: GitRepo, base_ref: str) -> str:
+    """Risk notes for the paths this head changes; empty when no mapped path changed."""
+    changed = git.changed_paths(base_ref)
+    return risks.review_notes(risks.matching(risks.load_at(git, base_ref), changed), changed)
+
+
 def _read_rebuttals(worktree: Path) -> str:
     path = worktree / ".foragent/REBUTTAL.md"
     return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
@@ -197,6 +210,7 @@ def _normalized_findings(review: ReviewResult) -> set[str]:
 
 
 def _review_implementation(attempt: Implementation) -> None:
+    from foragent.ci_mode import commit_exclusions
     from foragent.run_publish import _open_or_update_pr, _push_branch, _render_pr_body
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
@@ -204,8 +218,7 @@ def _review_implementation(attempt: Implementation) -> None:
     pr = None
     if ctx.config.review_scope == "pr-body":
         title = f"{ctx.tracker.get_issue(n).title} (#{n})"
-        if git.has_staged_changes():
-            git.commit(title)
+        commit_exclusions(attempt, title)
         _push_branch(attempt)
         pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))
         _progress(n, ctx)
@@ -286,7 +299,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     ctx.git.add_detached_worktree(worktree, head)
     git = ctx.git.at(worktree)
     from foragent.ci_workflow import EXCLUSIONS
-    if (worktree / EXCLUSIONS).is_file():
+    if git.blob_sha("HEAD", EXCLUSIONS) is not None:
         git.publication_paths.add(EXCLUSIONS)
     if not _acceptance_matches(n, ctx, git, approval):
         return "hash-mismatch"
@@ -301,9 +314,15 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if verdict_head is None and ctx.config.reviewer != "none":
         if runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
-        if ctx.config.review_scope == "pr-body" and "## Review scope" not in pr.body:
-            pr = replace(pr, body=pr.body + "\n\n## Review scope\n\n" + review_scope_rules(ctx.config.acceptance_dir, ctx.config.language))
-            ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
+        if ctx.config.review_scope == "pr-body":
+            # Native PR review reads only the PR body: refresh the risk notes for this head and base.
+            body = pr.body if "## Review scope" in pr.body else (
+                pr.body + "\n\n## Review scope\n\n"
+                + review_scope_rules(ctx.config.acceptance_dir, ctx.config.language))
+            body = risks.refresh_notes(body, _risk_notes(git, base_ref))
+            if body != pr.body:
+                pr = replace(pr, body=body)
+                ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
         review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx),
                          pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")

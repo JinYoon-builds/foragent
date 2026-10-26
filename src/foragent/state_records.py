@@ -72,3 +72,10 @@ class Run:
     review_pass_to_merge_seconds: float | None = None
     merge_lock_held_seconds: float | None = None
     comparison: dict | None = None
+    files_committed: bool = False
+    files_base_branch: str | None = None
+    declared_files: list[str] | None = None
+    changed_files: list[str] | None = None
+    effective_files: list[str] | None = None
+    late_files: list[str] = field(default_factory=list)
+    overlap_records: list[dict] = field(default_factory=list)

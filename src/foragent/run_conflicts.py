@@ -13,6 +13,7 @@ from foragent.reasons import Reason
 from foragent.run_attempt import ConflictBudgetExhausted, ExecutorStopped, PatchReplayError
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_lane_skills import _inject_lane_skills
+from foragent.run_overlap import conflict_resolution, record_redo
 
 if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
@@ -20,14 +21,19 @@ if TYPE_CHECKING:
 
 def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
     """Merge a pinned base; let the caller release its lock before resolving conflicts."""
+    from foragent.ci_mode import commit_exclusions, enabled
+
+    ci = enabled(attempt.ctx, attempt.target_branch)
     _inject_lane_skills(attempt.ctx, attempt.n, attempt.git, target_sha)
     try:
-        attempt.git.merge_base(target_sha)
+        attempt.git.merge_base(target_sha, commit=not ci)
     except GitError:
         conflicts = attempt.git.conflict_paths()
         if not conflicts:
             raise
         return conflicts
+    if ci and attempt.git.merge_in_progress():
+        commit_exclusions(attempt, f"{attempt.issue.title} (#{attempt.n})")
     return []
 
 
@@ -188,6 +194,7 @@ def _recover_replay(attempt: Implementation, exc: PatchReplayError) -> str:
 def _rebuild(attempt: Implementation, exc: ConflictBudgetExhausted) -> str:
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     log = attempt.log
+    record_redo(attempt)
     attempt.rebuilt = True
     _append(log, f"Rebuilding issue branch once from latest {attempt.target_branch}.\n{exc}")
     ctx.git.fetch("origin", attempt.target_branch)
@@ -219,12 +226,21 @@ def _resolve_conflicts(
     attempt: Implementation, conflicts: list[str], *,
     own_paths: list[str] | None = None, failure: str | None = None,
 ) -> None:
+    conflicts = sorted(set(conflicts) | set(attempt.ctx.store.get_run(attempt.n).merge_conflicts))
+    with conflict_resolution(attempt, conflicts):
+        _resolve_conflicts_inner(attempt, conflicts, own_paths=own_paths, failure=failure)
+
+
+def _resolve_conflicts_inner(
+    attempt: Implementation, conflicts: list[str], *,
+    own_paths: list[str] | None = None, failure: str | None = None,
+) -> None:
+    from foragent.ci_mode import commit_exclusions, enabled
     from foragent.run_checks import _verify_implementation
     from foragent.run_implementation import _implement
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     log = attempt.log
-    conflicts = sorted(set(conflicts) | set(ctx.store.get_run(n).merge_conflicts))
     ctx.store.update_run(n, merge_conflicts=conflicts)
     title = f"{attempt.issue.title} (#{n})"
     pending_merge = git.merge_in_progress()
@@ -245,7 +261,10 @@ def _resolve_conflicts(
             check_failure = f"Conflict markers remain in: {', '.join(markers)}"
             continue
         git.stage_changes()
-        if pending_merge:
+        if enabled(ctx, attempt.target_branch):
+            commit_exclusions(attempt, title)
+            pending_merge = False
+        elif pending_merge:
             git.continue_merge()
             pending_merge = False
         elif git.has_staged_changes():
@@ -260,6 +279,8 @@ def _resolve_conflicts(
 
 
 def _resume_implementation(attempt: Implementation) -> bool:
+    from foragent.ci_mode import commit_exclusions, enabled
+
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     conflicts = ctx.store.get_run(n).merge_conflicts
     # Own-path detection and replay follow the current target; publication
@@ -275,7 +296,10 @@ def _resume_implementation(attempt: Implementation) -> bool:
             try:
                 # A saved partial resolution still needs its marker checks,
                 # even when Git can merge the target without index conflicts.
-                git.merge_base(attempt.start_ref, commit=not conflicts)
+                ci = enabled(ctx, attempt.target_branch)
+                git.merge_base(attempt.start_ref, commit=not conflicts and not ci)
+                if ci and not conflicts and git.merge_in_progress():
+                    commit_exclusions(attempt, f"{attempt.issue.title} (#{n})")
             except GitError:
                 unmerged = git.conflict_paths()
                 if not unmerged:

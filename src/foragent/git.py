@@ -105,6 +105,18 @@ class GitRepo:
     def ref_sha(self, ref: str) -> str:
         return self._call(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
 
+    def latest_trailer(self, key: str, base_ref: str) -> str | None:
+        """Read the newest carrying commit on this branch's first-parent chain."""
+        fields = self._call([
+            "log", "--first-parent",
+            f"--format=%(trailers:key={key},keyonly)%x00%(trailers:key={key},valueonly)%x00",
+            f"{base_ref}..HEAD",
+        ]).split("\0")
+        for index in range(0, len(fields) - 1, 2):
+            if fields[index].strip():
+                return fields[index + 1].strip()
+        return None
+
     def local_branch_sha(self, branch: str) -> str | None:
         try:
             return self._call(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"]).strip()
@@ -152,8 +164,7 @@ class GitRepo:
     def _exclude_artifacts(self) -> None:
         # Also remove entries staged by an executor, retaining their local files.
         self._call(["rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"])
-        # Runner-owned protocol inputs can be published explicitly; worker
-        # scratch files continue to be removed from the index.
+        # Retain runner-owned protocol inputs explicitly preserved by the caller.
         self.ensure_tracked(sorted(self.publication_paths))
         if self.local_skill_paths:
             self._call(["--literal-pathspecs", "rm", "--cached", "-r", "-f", "--ignore-unmatch",
@@ -373,11 +384,11 @@ class GitRepo:
     def has_staged_changes(self) -> bool:
         return self.staged_tree_sha() != self._call(["rev-parse", "HEAD^{tree}"]).strip()
 
-    def commit(self, title: str) -> None:
+    def commit(self, title: str, *, allow_empty: bool = False) -> None:
         self._exclude_artifacts()
         self._call([
             "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
-            "commit", "-m", title,
+            "commit", *(["--allow-empty"] if allow_empty else []), "-m", title,
         ])
 
     def continue_merge(self) -> None:
