@@ -1,5 +1,6 @@
 """Tick snapshot regressions use only fake identities and fake signals."""
 
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
 import json
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from foragent import orch_tick_outcome, processes, scheduler
+from foragent import capacity, orch_tick_outcome, processes, scheduler
 from foragent.config import Config
 from foragent.processes import list_processes as kernel_listing, read_process_identity as kernel_identity
 from foragent.scheduler_stop import _run_processes_exist, _stop_run_processes, tick_processes
@@ -25,6 +26,476 @@ def snapshot_identity_io(fake_process_table, monkeypatch):
             return None
 
     monkeypatch.setattr(processes, "read_process_identity", read_identity)
+
+
+@pytest.fixture
+def routine_scan(fake_process_table, tmp_path, monkeypatch):
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(processes.time, "monotonic", lambda: clock.now)
+    root = fake_process_table.add(42000, cwd=tmp_path, start_time=10)
+    child = fake_process_table.add(42001, ppid=root.pid, cwd=tmp_path, start_time=11)
+    return SimpleNamespace(
+        clock=clock, table=fake_process_table, root=root, child=child,
+        identities=[{"pid": root.pid, "start_time": root.start_time}],
+        path=capacity.machine_root() / "process-scan.json",
+    )
+
+
+def test_many_routine_observers_share_one_scan_pair_across_repositories(routine_scan, tmp_path, monkeypatch):
+    scan = routine_scan
+    reads, locks = [], []
+    read_text = type(scan.path).read_text
+    flock = processes._routine_scan_lock
+
+    def read(path, *args, **kwargs):
+        if path == scan.path:
+            reads.append(path)
+        return read_text(path, *args, **kwargs)
+
+    @contextmanager
+    def lock(path):
+        locks.append(path)
+        with flock(path):
+            yield
+
+    monkeypatch.setattr(type(scan.path), "read_text", read)
+    monkeypatch.setattr(processes, "_routine_scan_lock", lock)
+    for observer in range(10):
+        repo = tmp_path / f"repo-{observer}"
+        repo.mkdir()
+        monkeypatch.chdir(repo)
+        assert processes.observe_tree(scan.identities, shared=True) == [
+            *scan.identities, {"pid": scan.child.pid, "start_time": scan.child.start_time},
+        ]
+        scan.clock.now += 0.05
+    assert scan.table.list_calls == 2
+    assert len(reads) == 11  # First observer re-reads under the lock; all others read the file.
+    assert locks == [scan.path.with_suffix(".lock")]
+
+
+def test_child_born_just_after_shared_capture_is_witnessed_within_one_second(routine_scan, tmp_path):
+    scan = routine_scan
+    processes.shared_routine_rows()
+    captured_at = scan.clock.now
+    born_at = captured_at + 0.001
+    scan.clock.now = born_at
+    child = scan.table.add(42002, ppid=scan.root.pid, cwd=tmp_path, start_time=born_at)
+
+    scan.clock.now = captured_at + processes.OBSERVER_POLL_INTERVAL
+    assert child.pid not in {item["pid"] for item in processes.observe_tree(scan.identities, shared=True)}
+    assert scan.table.list_calls == 2  # The last pre-birth cache is still valid at its age boundary.
+
+    scan.clock.now += processes.OBSERVER_POLL_INTERVAL
+    assert child.pid in {item["pid"] for item in processes.observe_tree(scan.identities, shared=True)}
+    assert scan.clock.now - born_at <= 1.0
+    assert processes.OBSERVER_POLL_INTERVAL + processes.ROUTINE_SCAN_MAX_AGE <= 1.0
+    assert scan.table.list_calls == 4
+
+
+def test_contended_routine_scan_lock_has_immediate_direct_fallback(routine_scan, monkeypatch):
+    from process_fakes import _ModuleView
+
+    scan = routine_scan
+    processes.shared_routine_rows()
+    previous = scan.path.read_text()
+    scan.clock.now += 1
+    started_at = scan.clock.now
+    attempts, sleeps, scans, publications, streams = [], [], [], [], []
+    direct_scan = processes._scan_tree_rows
+    open_path = type(scan.path).open
+    replace_file = processes.os.replace
+
+    def flock(descriptor, operation):
+        attempts.append(operation)
+        assert operation == processes.fcntl.LOCK_EX | processes.fcntl.LOCK_NB
+        raise BlockingIOError("fake lock held by another runner")
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        scan.clock.now += seconds
+
+    def scan_directly():
+        scans.append(scan.clock.now - started_at)
+        return direct_scan()
+
+    def open_lock(path, *args, **kwargs):
+        stream = open_path(path, *args, **kwargs)
+        if path == scan.path.with_suffix(".lock"):
+            streams.append(stream)
+        return stream
+
+    def publish(source, target):
+        publications.append(target)
+        replace_file(source, target)
+
+    monkeypatch.setattr(processes, "fcntl", _ModuleView(processes.fcntl, flock=flock))
+    monkeypatch.setattr(processes.time, "sleep", sleep)
+    monkeypatch.setattr(processes, "_scan_tree_rows", scan_directly)
+    monkeypatch.setattr(type(scan.path), "open", open_lock)
+    monkeypatch.setattr(processes.os, "replace", publish)
+
+    assert processes.observe_tree(scan.identities, shared=True) == [
+        *scan.identities, {"pid": scan.child.pid, "start_time": scan.child.start_time},
+    ]
+    assert attempts == [processes.fcntl.LOCK_EX | processes.fcntl.LOCK_NB]
+    assert sleeps == []
+    assert scans == [0.0]
+    assert scan.table.list_calls == 4
+    assert len(streams) == 1 and streams[0].closed
+    assert scan.path.read_text() == previous
+    assert publications == []
+    assert not list(scan.path.parent.glob(".process-scan.json.*.tmp"))
+
+
+@pytest.mark.parametrize("elapsed", [0.51, -0.01])
+def test_stale_or_future_routine_scan_is_replaced_atomically(routine_scan, tmp_path, monkeypatch, elapsed):
+    scan = routine_scan
+    processes.shared_routine_rows()
+    previous = scan.path.read_text()
+    scan.clock.now += elapsed
+    added = scan.table.add(42002, ppid=scan.child.pid, cwd=tmp_path, start_time=12)
+    replace_file = processes.os.replace
+    replacements = []
+
+    def atomic_replace(source, target):
+        assert source != target and source.parent == target.parent
+        assert target.read_text() == previous
+        value = json.loads(source.read_text())
+        assert value["captured_at"] == scan.clock.now
+        assert added.pid in {row["pid"] for row in value["rows"]}
+        replacements.append(source)
+        replace_file(source, target)
+
+    monkeypatch.setattr(processes.os, "replace", atomic_replace)
+    assert added.pid in {item["pid"] for item in processes.observe_tree(scan.identities, shared=True)}
+    assert scan.table.list_calls == 4
+    assert len(replacements) == 1 and not replacements[0].exists()
+
+
+def test_routine_scan_accepts_max_age_boundary_and_rereads_after_lock(routine_scan, monkeypatch):
+    scan = routine_scan
+    processes.shared_routine_rows()
+    payload = scan.path.read_text()
+    scan.clock.now += processes.ROUTINE_SCAN_MAX_AGE
+    processes.shared_routine_rows()
+    assert scan.table.list_calls == 2
+    scan.path.unlink()
+    locks = []
+
+    @contextmanager
+    def another_observer_published(path):
+        locks.append(path)
+        scan.path.write_text(payload)
+        yield
+
+    monkeypatch.setattr(processes, "_routine_scan_lock", another_observer_published)
+    processes.shared_routine_rows()
+    assert scan.table.list_calls == 2
+    assert locks == [scan.path.with_suffix(".lock")]
+
+
+def test_backward_wall_clock_step_does_not_extend_routine_scan_reuse(routine_scan, tmp_path, monkeypatch):
+    scan = routine_scan
+    wall_clock = SimpleNamespace(now=1_700_000_000.0)
+    monkeypatch.setattr(processes.time, "time", lambda: wall_clock.now)
+    processes.shared_routine_rows()
+    assert json.loads(scan.path.read_text())["captured_at"] == scan.clock.now
+
+    scan.clock.now += processes.ROUTINE_SCAN_MAX_AGE
+    wall_clock.now += processes.ROUTINE_SCAN_MAX_AGE
+    processes.shared_routine_rows()
+    assert scan.table.list_calls == 2
+
+    wall_clock.now -= processes.ROUTINE_SCAN_MAX_AGE / 2
+    scan.clock.now += 0.01
+    added = scan.table.add(42002, ppid=scan.child.pid, cwd=tmp_path, start_time=12)
+    assert added.pid in {item["pid"] for item in processes.observe_tree(scan.identities, shared=True)}
+    assert scan.table.list_calls == 4
+    assert json.loads(scan.path.read_text())["captured_at"] == scan.clock.now
+
+
+@pytest.mark.parametrize("damage", ["json", "depth", "encoding", "version", "version_type", "time_type", "shape", "identity"])
+def test_invalid_shared_routine_scan_uses_correct_direct_rows(routine_scan, damage):
+    scan = routine_scan
+    processes.shared_routine_rows()
+    value = json.loads(scan.path.read_text())
+    if damage == "json":
+        scan.path.write_text("{")
+    elif damage == "depth":
+        scan.path.write_text("[" * 2000 + "]" * 2000)
+    elif damage == "encoding":
+        scan.path.write_bytes(b"\xff")
+    else:
+        if damage == "version":
+            value["version"] += 1
+        elif damage == "version_type":
+            value["version"] = True
+        elif damage == "time_type":
+            value["captured_at"] = True
+            scan.clock.now = 1.0
+        elif damage == "shape":
+            value = []
+        else:
+            value["rows"][0]["pid"] = "invalid"
+        scan.path.write_text(json.dumps(value))
+    assert processes.observe_tree(scan.identities, shared=True) == [
+        *scan.identities, {"pid": scan.child.pid, "start_time": scan.child.start_time},
+    ]
+    assert scan.table.list_calls == 4
+
+
+@pytest.mark.parametrize("operation", ["read", "reread", "lock", "unlock", "temporary", "replace"])
+def test_shared_routine_cache_io_failure_keeps_direct_behavior(routine_scan, monkeypatch, operation):
+    scan = routine_scan
+
+    def unavailable(*args, **kwargs):
+        raise PermissionError("fake cache unavailable")
+
+    if operation == "read":
+        monkeypatch.setattr(processes, "_read_routine_rows", unavailable)
+    elif operation == "reread":
+        reads = []
+
+        def unavailable_after_lock(*args):
+            reads.append(None)
+            return None if len(reads) == 1 else unavailable()
+
+        monkeypatch.setattr(processes, "_read_routine_rows", unavailable_after_lock)
+    elif operation == "lock":
+        monkeypatch.setattr(processes, "_routine_scan_lock", unavailable)
+    elif operation == "unlock":
+        flock = processes._routine_scan_lock
+
+        @contextmanager
+        def unavailable_on_release(path):
+            with flock(path):
+                yield
+            unavailable()
+
+        monkeypatch.setattr(processes, "_routine_scan_lock", unavailable_on_release)
+    elif operation == "temporary":
+        monkeypatch.setattr(processes.tempfile, "NamedTemporaryFile", unavailable)
+    else:
+        monkeypatch.setattr(processes.os, "replace", unavailable)
+    assert processes.observe_tree(scan.identities, shared=True) == [
+        *scan.identities, {"pid": scan.child.pid, "start_time": scan.child.start_time},
+    ]
+    assert scan.table.list_calls == 2
+    assert not list(scan.path.parent.glob(".process-scan.json.*.tmp"))
+
+
+@pytest.mark.parametrize("source,fail_at", [("list_processes", 1), ("list_processes", 2), ("_scan_tree_rows", 1)])
+@pytest.mark.parametrize("error", [OSError, PermissionError, ValueError, TypeError, KeyError, OverflowError, RecursionError])
+def test_shared_routine_unavailable_table_preserves_direct_error(routine_scan, monkeypatch, source, fail_at, error):
+    original = getattr(processes, source)
+    failure = error("fake table unavailable")
+    calls = []
+
+    def unavailable_once():
+        calls.append(None)
+        if len(calls) == fail_at:
+            raise failure
+        return original()
+
+    monkeypatch.setattr(processes, source, unavailable_once)
+    with pytest.raises(error) as caught:
+        processes.observe_tree(routine_scan.identities, shared=True)
+    assert caught.value is failure
+    assert len(calls) == fail_at
+    assert not routine_scan.path.exists()
+
+
+def test_shared_routine_cache_unlock_error_does_not_mask_enumeration_error(routine_scan, monkeypatch):
+    failure = PermissionError("fake table unavailable")
+    flock = processes._routine_scan_lock
+
+    @contextmanager
+    def failed_unlock(path):
+        with flock(path):
+            yield
+        raise OSError("fake unlock failed")
+
+    def unavailable():
+        raise failure
+
+    monkeypatch.setattr(processes, "_routine_scan_lock", failed_unlock)
+    monkeypatch.setattr(processes, "list_processes", unavailable)
+    with pytest.raises(PermissionError) as caught:
+        processes.observe_tree(routine_scan.identities, shared=True)
+    assert caught.value is failure
+
+
+def test_shared_routine_rejects_cached_lifetime_and_adopts_reused_pid_next_scan(routine_scan, tmp_path):
+    scan = routine_scan
+    processes.shared_routine_rows()
+    scan.table.exit(scan.child.pid)
+    current = scan.table.add(scan.child.pid, ppid=scan.root.pid, cwd=tmp_path, start_time=12)
+
+    identities = processes.observe_tree(scan.identities, shared=True)
+    assert identities == scan.identities
+    assert scan.table.list_calls == 2  # The stale row is still within the shared interval.
+
+    scan.clock.now += 0.51
+    assert processes.observe_tree(identities, shared=True) == [
+        *scan.identities, {"pid": current.pid, "start_time": current.start_time},
+    ]
+    assert scan.table.list_calls == 4
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("adoption", ["root", "child", "grandchild"])
+@pytest.mark.parametrize("evidence", [
+    "pid", "start_time", "ppid", "missing", "permission", "psutil", "oserror", "psutil_error",
+    "no_such_process", "process_lookup", "system_permission", "system_access_denied", "system_nested_permission",
+])
+def test_shared_routine_validates_every_adoption_before_traversing_descendants(
+    routine_scan, tmp_path, monkeypatch, adoption, evidence, cached,
+):
+    scan = routine_scan
+    candidate = scan.child
+    if adoption == "root":
+        candidate = scan.table.add(43000, cwd=tmp_path, start_time=11)
+    elif adoption == "grandchild":
+        candidate = scan.table.add(43000, ppid=scan.child.pid, cwd=tmp_path, start_time=12)
+    descendant = scan.table.add(44000, ppid=candidate.pid, cwd=tmp_path, start_time=13)
+    sibling = scan.table.add(45000, ppid=scan.root.pid, cwd=tmp_path, start_time=14)
+    if cached:
+        processes.shared_routine_rows()
+    read_identity = processes.read_process_identity
+    reads = []
+
+    def fresh_identity(pid):
+        reads.append(pid)
+        if pid != candidate.pid or reads.count(pid) > 1:
+            return read_identity(pid)
+        if evidence == "missing":
+            return None
+        if evidence == "permission":
+            raise PermissionError("fake unreadable identity")
+        if evidence == "psutil":
+            raise processes.psutil.AccessDenied(pid)
+        if evidence == "oserror":
+            raise OSError("fake identity read failed")
+        if evidence == "psutil_error":
+            raise processes.psutil.Error("fake identity read failed")
+        if evidence == "no_such_process":
+            raise processes.psutil.NoSuchProcess(pid)
+        if evidence == "process_lookup":
+            raise ProcessLookupError(pid)
+        if evidence.startswith("system_"):
+            cause = processes.psutil.AccessDenied(pid) if evidence == "system_access_denied" else PermissionError(pid)
+            if evidence == "system_nested_permission":
+                wrapped = RuntimeError("fake wrapped permission failure")
+                wrapped.__cause__ = cause
+                cause = wrapped
+            raise SystemError("fake identity read failed") from cause
+        return replace(candidate, **{evidence: getattr(candidate, evidence) + 1})
+
+    monkeypatch.setattr(processes, "read_process_identity", fresh_identity)
+    result = processes.observe_tree(
+        scan.identities, roots=(candidate.pid,) if adoption == "root" else (), shared=True,
+    )
+    expected = scan.identities if adoption == "child" else [
+        *scan.identities, {"pid": scan.child.pid, "start_time": scan.child.start_time},
+    ]
+    assert {item["pid"]: item["start_time"] for item in result} == {
+        item["pid"]: item["start_time"] for item in [
+            *expected, {"pid": sibling.pid, "start_time": sibling.start_time},
+        ]
+    }
+    assert reads.count(candidate.pid) == 1
+    assert descendant.pid not in reads  # Its only adoption path was dropped first.
+    assert scan.table.list_calls == 2
+
+    # A failed check excludes this branch for one observation, then can recover.
+    recovered = processes.observe_tree(
+        result, roots=(candidate.pid,) if adoption == "root" else (), shared=True,
+    )
+    assert {item["pid"]: item["start_time"] for item in recovered} == {
+        row.pid: row.start_time for row in (scan.root, scan.child, candidate, descendant, sibling)
+    }
+    assert scan.table.list_calls == 2
+
+
+@pytest.mark.parametrize("failure", [SystemError("unrelated failure"), ValueError("bad identity"), RuntimeError("bug")])
+def test_shared_routine_unexpected_fresh_read_errors_propagate(routine_scan, monkeypatch, failure):
+    def failed_read(pid):
+        raise failure
+
+    monkeypatch.setattr(processes, "read_process_identity", failed_read)
+    with pytest.raises(type(failure)) as caught:
+        processes.observe_tree(routine_scan.identities, shared=True)
+    assert caught.value is failure
+
+
+def test_shared_routine_lineage_is_computed_for_each_reader(routine_scan, tmp_path, monkeypatch):
+    scan = routine_scan
+    first_parent = scan.table.add(43000, ppid=scan.table.self_pid, cwd=tmp_path, start_time=5)
+    first_child = scan.table.add(43001, ppid=first_parent.pid, cwd=tmp_path, start_time=6)
+    second_parent = scan.table.add(44000, cwd=tmp_path, start_time=5)
+    second_child = scan.table.add(44001, ppid=second_parent.pid, cwd=tmp_path, start_time=6)
+    identities = [{"pid": row.pid, "start_time": row.start_time}
+                  for row in (scan.table.rows[scan.table.self_pid], second_parent)]
+    first = processes.observe_tree(identities, shared=True)
+    assert first_child.pid not in {item["pid"] for item in first}
+    assert second_child.pid in {item["pid"] for item in first}
+    # The second caller is a child of the other recorded root. Its ancestry
+    # must be protected even though the first caller could safely traverse it.
+    monkeypatch.setattr(processes.os, "getpid", lambda: 92003)
+    monkeypatch.setattr(processes.os, "getppid", lambda: second_parent.pid)
+    monkeypatch.setattr(processes.os, "getpgrp", lambda: 92000)
+    monkeypatch.setattr(processes.os, "getsid", lambda pid: 91999)
+    second = processes.observe_tree(identities, shared=True)
+    assert first_child.pid in {item["pid"] for item in second}
+    assert second_child.pid not in {item["pid"] for item in second}
+    assert scan.table.list_calls == 2
+
+
+def test_shared_routine_lineage_uses_even_unreconciled_confirmed_ancestors(routine_scan, monkeypatch):
+    scan = routine_scan
+    observed = scan.table.list_processes()
+    parent = scan.table.rows[scan.table.parent_pid]
+    scan.table.rows[parent.pid] = replace(parent, ppid=scan.root.pid)
+    confirmed = scan.table.list_processes()
+    listings = iter((observed, confirmed))
+    monkeypatch.setattr(processes, "list_processes", lambda: next(listings))
+    for _ in range(2):
+        # The parent changed between scans and is absent from reconciled rows.
+        # Its confirmed ancestry still protects the recorded root and child.
+        assert processes.observe_tree(scan.identities, shared=True) == scan.identities
+
+
+def test_shared_routine_rows_reject_pid_reuse_parent_changes_and_older_children(routine_scan, tmp_path, monkeypatch):
+    scan = routine_scan
+    old = scan.table.add(42002, ppid=scan.root.pid, cwd=tmp_path, start_time=9)
+    reused = scan.table.add(43000, cwd=tmp_path, start_time=20)
+    reused_child = scan.table.add(43001, ppid=reused.pid, cwd=tmp_path, start_time=21)
+    moved = scan.table.add(44000, ppid=scan.root.pid, cwd=tmp_path, start_time=20)
+    moved_child = scan.table.add(44001, ppid=moved.pid, cwd=tmp_path, start_time=21)
+    identities = [*scan.identities, {"pid": reused.pid, "start_time": reused.start_time}]
+    observed = scan.table.list_processes()
+    scan.table.rows[reused.pid] = replace(reused, start_time=22)
+    scan.table.rows[moved.pid] = replace(moved, ppid=1)
+    confirmed = scan.table.list_processes()
+    listings = iter((observed, confirmed))
+    monkeypatch.setattr(processes, "list_processes", lambda: next(listings))
+    for _ in range(2):  # Both the writer and a file reader use the same traversal rules.
+        result = processes.observe_tree(identities, shared=True)
+        assert result == [*identities, {"pid": scan.child.pid, "start_time": scan.child.start_time}]
+        assert not {old.pid, reused_child.pid, moved.pid, moved_child.pid} & {item["pid"] for item in result}
+
+
+def test_stop_and_launch_observation_never_read_shared_routine_rows(routine_scan, tmp_path, monkeypatch):
+    from process_fakes import install_popen
+
+    monkeypatch.setattr(processes, "shared_routine_rows", lambda *args, **kwargs: pytest.fail("Fresh path used shared rows"))
+    scan = routine_scan
+    identities = processes.observe_tree(roots=(scan.root.pid,))
+    with processes.recorded_tree(identities):
+        assert processes.kill_process_group(scan.root.pid) == 2
+    install_popen(monkeypatch, scan.table, matches=lambda argv: argv == ["offline-executor"])
+    assert processes.run_logged(["offline-executor"], cwd=tmp_path, timeout_s=1,
+                                log_path=tmp_path / "run.log")[:2] == (0, False)
 
 
 @pytest.mark.parametrize("finished", [False, True])
@@ -196,7 +667,7 @@ def test_launch_inside_tick_keeps_its_separate_birth_evidence(fake_process_table
     with tick_processes(store):
         root = table.add(42000, cwd=tmp_path, start_time=10)
         store.start_run(1, branch="branch", worktree=tmp_path, pid=root.pid)
-        store.update_run(1, phase="implement")
+        store.update_run(1, phase="implement", observe=True)
     assert store.get_run(1).process_identities == [{"pid": root.pid, "start_time": root.start_time}]
     assert table.list_calls == 5, "Launch and state updates retain their original two fresh listings"
     assert not table.signals

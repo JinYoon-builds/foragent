@@ -7,6 +7,11 @@ from typing import Any
 from foragent.state_records import Run
 
 
+# Updates passing any of these change or attest process ownership, so they
+# observe the process tree; every other update is metadata only.
+PROCESS_FIELDS = frozenset({"process_identities", "pid", "executor_pgid"})
+
+
 class RunRecordsMixin:
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
@@ -67,7 +72,15 @@ class RunRecordsMixin:
     def clear_run_start(self, number: int) -> None:
         (self.root / "run-starts" / f"{number}.json").unlink(missing_ok=True)
 
-    def update_run(self, number: int, *, routine: bool = False, **fields: Any) -> Run:
+    def update_run(
+        self, number: int, *, routine: bool = False, observe: bool = False, **fields: Any,
+    ) -> Run:
+        """Save ``fields``; observe the process tree only when asked or ownership changes.
+
+        Metadata-only updates keep the saved identities as they are; the tick's
+        process pass observes and prunes them once per tick.
+        """
+        observe = observe or not PROCESS_FIELDS.isdisjoint(fields)
         with self._state_lock():
             run = self.get_run(number)
             if run is None:
@@ -80,6 +93,10 @@ class RunRecordsMixin:
                     or " ".join(run.detail.split())[:500]
                     or "Run detail unavailable."
                 )
+            if not observe:
+                updated = _state.replace(run, **fields)
+                self._write_run(updated)
+                return updated
             from foragent.processes import observe_routine_tree, observe_tree
 
             # Numeric fields describe a run; only birth evidence supplied by a
