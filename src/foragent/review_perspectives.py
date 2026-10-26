@@ -41,17 +41,27 @@ def perspectives(config: Config) -> list[dict[str, str]]:
     return effective
 
 
-def checklist(config: Config) -> str:
-    """Reviewer checklist text for one reviewer that covers every perspective."""
+def checklist(config: Config, items: list[dict[str, str]] | None = None) -> str:
+    """Reviewer checklist text; covers every perspective unless `items` gives this reviewer's share."""
     lines = ["Review perspectives checklist: check the change from each perspective below "
              "and report findings under any of them."]
-    lines += [f"- [ ] {item['name']}: {item['focus']}" for item in perspectives(config)]
+    lines += [f"- [ ] {item['name']}: {item['focus']}" for item in (perspectives(config) if items is None else items)]
     return "\n".join(lines)
 
 
-def with_checklist(notes: str, config: Config) -> str:
+def with_checklist(notes: str, config: Config, items: list[dict[str, str]] | None = None) -> str:
     """Risk notes followed by the checklist; empty notes (no risk-map path) stay empty."""
-    return f"{notes}\n\n{checklist(config)}" if notes else ""
+    return f"{notes}\n\n{checklist(config, items)}" if notes else ""
+
+
+def shares(config: Config, count: int) -> list[list[dict[str, str]]]:
+    """Split the effective perspectives round-robin in list order: reviewer k gets k, k+N, ...
+
+    N above the number of perspectives is capped at that number.
+    """
+    items = perspectives(config)
+    count = max(1, min(count, len(items)))
+    return [items[k::count] for k in range(count)]
 
 
 def validate(values: dict[str, Any], error: type[Exception]) -> None:

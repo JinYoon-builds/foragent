@@ -5,7 +5,8 @@ from foragent.commands import facade, repo_store
 ORDER = 120
 # An orchestrator whose heartbeat is at most this old counts as alive.
 ALIVE_SECONDS = 30
-INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive"}
+INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive",
+                 "reviewers"}
 
 
 def add(commands) -> None:
@@ -81,12 +82,40 @@ def _add_inbox(orch_actions) -> None:
     queue.add_argument("--clear", action="store_true")
     queue.add_argument("--json", action="store_true")
     queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")
+    reviewers.add_argument("issue", type=int)
+    reviewers.add_argument("count", type=int, nargs="?", help="Reviewer count (1 or more); wins over review_reviewers")
+    reviewers.add_argument("--clear", action="store_true")
+    reviewers.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+
+
+def _reviewers(args, store, config) -> None:
+    """Per-issue reviewer count in the state directory; .foragent.yml is never written."""
+    from foragent import orch_reviewers
+    from foragent.i18n import text
+
+    language = config.language
+    if args.clear == (args.count is not None):
+        raise SystemExit(text("orch_reviewers_usage", language))
+    if args.clear:
+        orch_reviewers.clear(store, args.issue)
+        print(text("orch_reviewers_cleared", language, issue=args.issue,
+                   count=orch_reviewers.effective(store, config, args.issue)))
+        return
+    if args.count < 1:
+        raise SystemExit(text("orch_reviewers_invalid", language, count=args.count,
+                              current=orch_reviewers.effective(store, config, args.issue)))
+    orch_reviewers.set_count(store, args.issue, args.count)
+    print(text("orch_reviewers_set", language, issue=args.issue, count=args.count))
 
 
 def _orch_inbox(args, store, config, repo: str) -> None:
     """Local request/question box; never reads GitHub or starts an executor."""
     cli = facade()
     box = cli.orch_inbox
+    if args.action == "reviewers":
+        _reviewers(args, store, config)
+        return
     if args.action == "alive":
         _alive(args, store, config)
         return
