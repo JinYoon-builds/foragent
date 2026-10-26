@@ -392,15 +392,21 @@ class _MovedGit:
         return not self.moved
 
 
-def _collector(log, exit_code, lines, timed_out=False):
+def _collector(log, exit_code, ids, timed_out=False):
+    """Stand in for pytest plus the measurement plugin: write its results file."""
+    import json
+    import shlex
+
     from foragent.run_checks import CheckResult
 
     calls = []
 
     def check(command, root):
         calls.append(command)
-        with log.open("a") as stream:
-            stream.write("\n".join(lines) + "\n")
+        report = next(word.split("=", 1)[1] for word in shlex.split(command) if word.startswith("FA_REPORT="))
+        if ids is not None:
+            with open(report, "w") as stream:
+                json.dump({"exit_code": exit_code, "collected_ids": ids}, stream)
         return CheckResult(command, exit_code, timed_out, "")
     return check, calls
 
@@ -409,14 +415,20 @@ def test_surviving_baseline_drops_and_logs_only_missing_ids(tmp_path):
     from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
 
     (tmp_path / "tests/acceptance").mkdir(parents=True)
+    (tmp_path / "tests/acceptance/test_a.py").write_text("")
+    (tmp_path / "tests/acceptance/test_c.py").write_text("")
     log = tmp_path / "run.log"
     baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",
-                                             "tests/acceptance/test_b.py::test_b"),
-                                  excluded=("tests/acceptance/test_c.py",), base_sha="base")
-    check, calls = _collector(log, 0, ["tests/acceptance/test_a.py::test_a", "1 test collected"])
-    kept = surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log, "origin/main")
+                                             "tests/acceptance/test_c.py::test_renamed",
+                                             "tests/acceptance/test_b.py::test_b"), base_sha="base")
+    check, calls = _collector(log, 0, ["tests/acceptance/test_a.py::test_a"])
+    kept = surviving_baseline(baseline, _MovedGit(), tmp_path, check, log, "origin/main")
     assert kept.node_ids == ("tests/acceptance/test_a.py::test_a",)
-    assert "--collect-only" in calls[0] and "--ignore=tests/acceptance/test_c.py" in calls[0]
+    # Existing baseline files are named explicitly; a deleted file is not passed to pytest.
+    words = shlex.split(calls[0])
+    assert "--collect-only" in words and "tests/acceptance/test_a.py" in words
+    assert "tests/acceptance/test_c.py" in words and "tests/acceptance/test_b.py" not in words
+    assert "dropped missing node id: tests/acceptance/test_c.py::test_renamed" in log.read_text()
     assert "dropped missing node id: tests/acceptance/test_b.py::test_b" in log.read_text()
 
 
@@ -424,10 +436,11 @@ def test_surviving_baseline_keeps_every_id_when_collection_fails(tmp_path):
     from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
 
     (tmp_path / "tests/acceptance").mkdir(parents=True)
+    (tmp_path / "tests/acceptance/test_a.py").write_text("")
     log = tmp_path / "run.log"
     baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
-    check, _ = _collector(log, 2, ["ERROR collecting tests/acceptance/test_a.py"])
-    assert surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log, "origin/main") is baseline
+    check, _ = _collector(log, 2, [])
+    assert surviving_baseline(baseline, _MovedGit(), tmp_path, check, log, "origin/main") is baseline
 
 
 def test_surviving_baseline_without_acceptance_dir_drops_all_without_pytest(tmp_path):
@@ -436,7 +449,7 @@ def test_surviving_baseline_without_acceptance_dir_drops_all_without_pytest(tmp_
     log = tmp_path / "run.log"
     baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
     check, calls = _collector(log, 0, [])
-    assert surviving_baseline(baseline, _MovedGit(), tmp_path, "tests/acceptance", check, log, "origin/main").node_ids == ()
+    assert surviving_baseline(baseline, _MovedGit(), tmp_path, check, log, "origin/main").node_ids == ()
     assert calls == []
 
 
@@ -447,7 +460,7 @@ def test_surviving_baseline_skips_collection_when_the_base_has_not_moved(tmp_pat
     baseline = AcceptanceBaseline("pytest", ("tests/acceptance/test_a.py::test_a",), base_sha="base")
     check, calls = _collector(log, 0, [])
     git = _MovedGit(moved=False)
-    assert surviving_baseline(baseline, git, tmp_path, "tests/acceptance", check, log, "origin/main") is baseline
+    assert surviving_baseline(baseline, git, tmp_path, check, log, "origin/main") is baseline
     assert calls == [] and git.calls == [["merge-base", "HEAD", "origin/main"]]
 
 
@@ -493,3 +506,71 @@ def test_base_moved_counts_a_merged_root_conftest_change(tmp_path):
                       work, newer)
     git("update-ref", "refs/heads/issue", merged)
     assert _base_moved(repo, base, "main")
+
+
+def _real_pytest(tmp_path, ini, command, *, files=None):
+    """Run the real collection step on a tiny project; return (kept ids, log text)."""
+    import subprocess
+
+    from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
+    from foragent.run_checks import CheckResult, _pytest_command
+
+    project = tmp_path / "project"
+    (project / "tests/acceptance").mkdir(parents=True)
+    (project / "pytest.ini").write_text(ini)
+    (project / "tests/acceptance/test_a.py").write_text(
+        "import pytest\n\n@pytest.mark.parametrize('x', [1])\ndef test_kept(x):\n    assert False\n")
+    for path, content in (files or {}).items():
+        (project / path).parent.mkdir(parents=True, exist_ok=True)
+        (project / path).write_text(content)
+    log = tmp_path / "run.log"
+
+    def check(command, root):
+        done = subprocess.run(["/bin/sh", "-c", command], cwd=root, capture_output=True, text=True)
+        log.write_text((log.read_text() if log.exists() else "") + done.stdout + done.stderr)
+        return CheckResult(command, done.returncode, False, done.stdout[-4000:])
+
+    baseline = AcceptanceBaseline(_pytest_command(command), ("tests/acceptance/test_a.py::test_kept[1]",
+                                                             "tests/acceptance/test_a.py::test_gone"),
+                                  base_sha="base")
+    kept = surviving_baseline(baseline, _MovedGit(), project, check, log, "origin/main",
+                              scratch=tmp_path / "scratch")
+    return kept.node_ids, log.read_text()
+
+
+def _python_pytest():
+    import shlex
+    import sys
+
+    return f"{shlex.quote(sys.executable)} -m pytest"
+
+
+def test_surviving_baseline_collection_ignores_verbosity_test_cases(tmp_path):
+    # A collection tree instead of id lines must not read as "nothing collected".
+    kept, log = _real_pytest(tmp_path, "[pytest]\nverbosity_test_cases = 0\naddopts = -q\n", _python_pytest())
+    assert kept == ("tests/acceptance/test_a.py::test_kept[1]",), log
+    assert "dropped missing node id: tests/acceptance/test_a.py::test_gone" in log
+
+
+def test_surviving_baseline_collection_works_without_the_terminal_plugin(tmp_path):
+    # `-p no:terminal` rejects terminal options such as --verbosity.
+    kept, log = _real_pytest(tmp_path, "[pytest]\n", f"{_python_pytest()} -p no:terminal")
+    assert kept == ("tests/acceptance/test_a.py::test_kept[1]",), log
+    assert "dropped missing node id: tests/acceptance/test_a.py::test_gone" in log
+
+
+def test_surviving_baseline_keeps_a_file_that_python_files_no_longer_matches(tmp_path):
+    # Verification names the file explicitly, so pytest still runs it there.
+    kept, log = _real_pytest(tmp_path, "[pytest]\npython_files = check_*.py\n", _python_pytest())
+    assert kept == ("tests/acceptance/test_a.py::test_kept[1]",), log
+
+
+def test_surviving_baseline_keeps_the_commands_own_pythonpath(tmp_path):
+    # An inline PYTHONPATH must not hide the plugin, nor lose the project's path.
+    files = {"src/helper.py": "VALUE = 1\n",
+             "tests/acceptance/test_a.py": "from helper import VALUE\n\n"
+                                           "import pytest\n\n@pytest.mark.parametrize('x', [VALUE])\n"
+                                           "def test_kept(x):\n    assert False\n"}
+    kept, log = _real_pytest(tmp_path, "[pytest]\n", f"PYTHONPATH=src {_python_pytest()}", files=files)
+    assert kept == ("tests/acceptance/test_a.py::test_kept[1]",), log
+    assert "dropped missing node id: tests/acceptance/test_a.py::test_gone" in log

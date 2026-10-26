@@ -351,10 +351,10 @@ def _verify_implementation(attempt: Implementation) -> str:
             from foragent.run_baseline import surviving_baseline
 
             attempt.baseline = surviving_baseline(
-                attempt.baseline, git, worktree, ctx.config.acceptance_dir,
+                attempt.baseline, git, worktree,
                 lambda command, root: runner._check(command, root, log, 900, progress=lambda: _progress(n, ctx),
                                                     slot=_test_slot(n, ctx)), log,
-                f"origin/{attempt.target_branch}")
+                f"origin/{attempt.target_branch}", scratch=ctx.store.root / "runs")
             if not attempt.baseline.node_ids:
                 _append(log, "Acceptance baseline verification skipped (count=0): no baseline node ids remain")
         if attempt.baseline and attempt.baseline.node_ids:
