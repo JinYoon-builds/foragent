@@ -48,10 +48,10 @@ def test_plist_round_trip_has_exact_job_and_environment(job):
         "ProgramArguments": [str(job.repo_root / ".venv/bin/fa"), "gate", "tick", "--repo-root", str(job.repo_root)],
         "StartInterval": 300,
         "RunAtLoad": True,
-        "ProcessType": "Background",
+        "ProcessType": "Standard",
         "EnvironmentVariables": {
             "PATH": f"{job.home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-            "HOME": str(job.home), "LANG": "en_US.UTF-8",
+            "HOME": str(job.home), "LANG": "en_US.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
         },
         "StandardOutPath": str(job.state_root / "launchd.out.log"),
         "StandardErrorPath": str(job.state_root / "launchd.err.log"),
@@ -281,3 +281,199 @@ def test_module_entry_points_forward_dependencies(job, operation):
     )
     assert result == (launchd.LaunchdStatus(job.label, False, True) if operation == "status" else job.label)
     assert calls[0][1] == job.target
+
+
+
+def _old_plist(path, root, label=None):
+    """A plist as an older Foragent wrote it: no gate environment."""
+    old = {"Label": label or path.stem, "ProgramArguments": ["fa", "gate", "tick", "--repo-root", str(root)],
+           "EnvironmentVariables": {"HOME": str(root), "LANG": "en_US.UTF-8"}}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(plistlib.dumps(old))
+    return old
+
+
+def test_refresh_decision_reads_an_existing_plist(tmp_path, job):
+    job, _ = job
+    path = tmp_path / "LaunchAgents/dev.foragent.old.plist"
+    assert not launchd.needs_environment_refresh(path) and not launchd.has_gate_environment(path)
+    _old_plist(path, tmp_path)
+    assert launchd.needs_environment_refresh(path) and not launchd.has_gate_environment(path)
+    path.write_bytes(job.plist())
+    assert not launchd.needs_environment_refresh(path) and launchd.has_gate_environment(path)
+    # Unreadable proves nothing about the loaded job: never current, and not migratable.
+    path.write_text("not a plist")
+    assert not launchd.has_gate_environment(path) and not launchd.needs_environment_refresh(path)
+    path.write_bytes(plistlib.dumps({"EnvironmentVariables": "PYTHONDONTWRITEBYTECODE=1"}))
+    assert not launchd.has_gate_environment(path) and launchd.needs_environment_refresh(path)
+    launchd._migrate_environment(path)
+    assert launchd.has_gate_environment(path)
+
+
+def test_restart_adds_gate_environment_while_the_job_is_out(tmp_path, monkeypatch):
+    path = tmp_path / "dev.foragent.old.plist"
+    old = _old_plist(path, tmp_path)
+    calls = []
+
+    def run(args):
+        environment = plistlib.loads(path.read_bytes())["EnvironmentVariables"]
+        calls.append((args[0], environment.get("PYTHONDONTWRITEBYTECODE")))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(launchd, "_run_launchctl", run)
+    launchd.InstalledJob(path, "dev.foragent.old", tmp_path, "gui/501").restart()
+    assert calls == [("bootout", None), ("bootstrap", "1")]
+    data = plistlib.loads(path.read_bytes())
+    assert data["EnvironmentVariables"] == {**old["EnvironmentVariables"], "PYTHONDONTWRITEBYTECODE": "1"}
+    assert {k: v for k, v in data.items() if k != "EnvironmentVariables"} == {
+        k: v for k, v in old.items() if k != "EnvironmentVariables"}
+    current = path.read_bytes()
+    launchd.InstalledJob(path, "dev.foragent.old", tmp_path, "gui/501").restart()
+    assert path.read_bytes() == current
+
+
+def test_install_writes_the_plist_only_after_bootout(job):
+    job, _ = job
+    seen = []
+    job._run = lambda args: seen.append((args[0], job.plist_path.exists())) or subprocess.CompletedProcess(
+        args, 0, stdout="", stderr="")
+    job.install()
+    assert seen[0] == ("bootout", False) and seen[-1] == ("bootstrap", True)
+
+
+def _jobs_for_one_gate(home, root):
+    """Hashed, legacy and renamed-repository plists that all tick ``root``, plus a current and another gate."""
+    agents = home / "Library/LaunchAgents"
+    hashed = agents / f"{launchd.label_for('o/r')}.plist"
+    legacy = agents / f"{launchd._legacy_label_for('o/r')}.plist"
+    renamed = agents / f"{launchd.label_for('o/old-name')}.plist"
+    for path in (hashed, legacy, renamed):
+        _old_plist(path, root)
+    current = agents / f"{launchd.label_for('o/current')}.plist"
+    current.write_bytes(launchd.Launchd(root, repo="o/current", home=home, state_root=home / "s",
+                                        executable=home / "fa").plist())
+    other = agents / f"{launchd.label_for('o/other')}.plist"
+    _old_plist(other, home / "other-root")
+    return hashed, legacy, renamed, other
+
+
+def test_stale_jobs_finds_every_plist_that_ticks_the_repo(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    hashed, legacy, renamed, other = _jobs_for_one_gate(tmp_path, root)
+    found = {job.plist_path for job in launchd.stale_jobs(root, home=tmp_path)}
+    assert found == {path.resolve() for path in (hashed, legacy, renamed)}
+
+
+def test_tick_starts_a_detached_refresh_for_any_stale_job_of_the_repo(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(launchd.sys, "platform", "darwin")
+    monkeypatch.setattr(launchd.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "0")
+    root = tmp_path / "repo"
+    root.mkdir()
+    spawned, states = [], {"value": "loaded"}
+    monkeypatch.setattr(launchd.InstalledJob, "state", lambda job: states["value"])
+    monkeypatch.setattr(launchd.subprocess, "Popen", lambda argv, **kwargs: spawned.append((argv, kwargs)))
+    assert launchd.refresh_if_stale("o/r", root, tmp_path / "state") is False  # nothing installed
+    legacy = tmp_path / "Library/LaunchAgents" / f"{launchd._legacy_label_for('o/r')}.plist"
+    _old_plist(legacy, root)  # only a legacy-label job: still found
+    states["value"] = "absent"  # launchd confirms no such job: it starts no tick
+    assert launchd.refresh_if_stale("o/r", root, tmp_path / "state") is False and spawned == []
+    for state in ("unknown", "loaded"):  # unknown is not absence
+        states["value"] = state
+        assert launchd.refresh_if_stale("o/r", root, tmp_path / "state") is True
+    del spawned[1:]
+    argv, kwargs = spawned[0]
+    assert argv[1:] == ["-m", "foragent.launchd", "refresh", str(root.resolve())]
+    assert kwargs["start_new_session"] is True and kwargs["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    launchd._migrate_environment(legacy)
+    assert launchd.refresh_if_stale("o/r", root, tmp_path / "state") is False and len(spawned) == 1
+    launchd.installed_plist("o/r").write_text("not a plist")
+    assert launchd.refresh_if_stale("o/r", root, tmp_path / "state") is False
+    err = capsys.readouterr().err
+    assert "cannot read" in err and "fa gate install" in err
+    monkeypatch.setattr(launchd.sys, "platform", "linux")
+    _old_plist(legacy, root)
+    assert launchd.refresh_if_stale("o/r", root, tmp_path / "state") is False
+
+
+def test_job_state_separates_absent_from_unknown(tmp_path, monkeypatch):
+    job = launchd.InstalledJob(tmp_path / "x.plist", "dev.foragent.x", tmp_path, "gui/501")
+    for returncode, stderr, expected in [
+        (0, "", "loaded"),
+        (113, "Could not find service \"dev.foragent.x\" in domain for user gui: 501", "absent"),
+        (1, "Could not find service", "absent"),
+        (5, "Input/output error", "unknown"),
+        (1, "Operation not permitted", "unknown"),
+    ]:
+        monkeypatch.setattr(launchd, "_run_launchctl", lambda args: subprocess.CompletedProcess(
+            args, returncode, stdout="", stderr=stderr))
+        assert job.state() == expected, (returncode, stderr)
+
+    def missing(args):
+        raise FileNotFoundError("launchctl")
+
+    monkeypatch.setattr(launchd, "_run_launchctl", missing)
+    assert job.state() == "unknown"
+
+
+def test_refresh_waits_for_the_tick_then_restarts_every_stale_job_launchd_may_hold(tmp_path, monkeypatch):
+    from foragent import update_check
+    monkeypatch.setattr(launchd.Path, "home", lambda: tmp_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+    hashed, legacy, renamed, other = _jobs_for_one_gate(tmp_path, root)
+    renamed_before = renamed.read_bytes()
+    states = {hashed.resolve(): "loaded", legacy.resolve(): "loaded", renamed.resolve(): "absent"}
+    monkeypatch.setattr(launchd.InstalledJob, "state", lambda job: states[job.plist_path])
+    results, restarts, sleeps = ["busy", "busy", "restarted"], [], []
+
+    def restart(gate, jobs, language):
+        restarts.append((gate, sorted(job.plist_path for job in jobs)))
+        result = results.pop(0)
+        if result == "restarted":
+            for job in jobs:
+                launchd._migrate_environment(job.plist_path)
+        return result
+
+    monkeypatch.setattr(update_check, "_restart", restart)
+    monkeypatch.setattr(update_check, "_language", lambda root: "en")
+    assert launchd.refresh_jobs(root, sleep=sleeps.append, monotonic=lambda: 0) == "restarted"
+    assert sleeps == [launchd.REFRESH_POLL_SECONDS] * 2
+    assert restarts == [(root.resolve(), sorted([hashed.resolve(), legacy.resolve()]))] * 3
+    # A confirmed absent plist is never rewritten without a reload; another gate is untouched.
+    assert renamed.read_bytes() == renamed_before and not launchd.has_gate_environment(other)
+    assert launchd.refresh_jobs(root, sleep=sleeps.append) == "current" and len(restarts) == 3
+
+
+def test_refresh_never_rewrites_a_plist_whose_job_state_is_unknown(tmp_path, monkeypatch):
+    from foragent import update_check
+    monkeypatch.setattr(launchd.Path, "home", lambda: tmp_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+    hashed, legacy, renamed, _ = _jobs_for_one_gate(tmp_path, root)
+    before = {path: path.read_bytes() for path in (hashed, legacy, renamed)}
+    monkeypatch.setattr(launchd.InstalledJob, "state",
+                        lambda job: "unknown" if job.plist_path == legacy.resolve() else "loaded")
+    monkeypatch.setattr(update_check, "_restart", lambda *args: pytest.fail("no restart while unknown"))
+    monkeypatch.setattr(update_check, "_language", lambda root: "en")
+    assert launchd.refresh_jobs(root) == "unknown"
+    assert {path: path.read_bytes() for path in before} == before
+    # The plists stay stale, so the next tick starts another refresh.
+    assert len(launchd.stale_jobs(root)) == 3
+
+
+def test_failed_print_during_restart_leaves_the_plist_stale_for_the_next_tick(tmp_path, monkeypatch):
+    """update's restart skips a job whose print fails; the file must then stay unmigrated."""
+    from foragent import update_check
+    monkeypatch.setattr(launchd.Path, "home", lambda: tmp_path)
+    root = tmp_path / "repo"
+    root.mkdir()
+    hashed, *_ = _jobs_for_one_gate(tmp_path, root)
+    monkeypatch.setattr(launchd.InstalledJob, "state", lambda job: "loaded")
+    monkeypatch.setattr(launchd, "_run_launchctl", lambda args: subprocess.CompletedProcess(
+        args, 5, stdout="", stderr="Input/output error"))
+    monkeypatch.setattr(update_check, "_language", lambda root: "en")
+    before = hashed.read_bytes()
+    assert launchd.refresh_jobs(root) == "skipped"
+    assert hashed.read_bytes() == before and launchd.needs_environment_refresh(hashed)

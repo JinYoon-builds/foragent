@@ -4,23 +4,30 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from glob import escape
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from foragent import board
+from foragent import board, review_perspectives, risks
 from foragent.actions import FlagContext, flag, invalidate_approval
+from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
 from foragent.harness_guard import changed_harness_paths, hold_details
+from foragent.i18n import text
 from foragent.issue import ParsedIssue, body_hash
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
+from foragent.orch_events import append_event
+from foragent.overlap_files import any_overlap
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped
 from foragent.run_base_move import BaseMove, REUSED, REVERIFY, base_move_is_neutral, capture_move, fetch_move
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_prompts import review_scope_rules
+from foragent.run_pr_body import _pr_body
+from foragent.run_overlap import wait_for_overlap
 from foragent.run_skill_catalog import report_line
 from foragent.run_waits import _credited_wait, _phase, _progress, _timeout
 from foragent.state import Approval, Run
@@ -31,56 +38,6 @@ if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
     from foragent.run_checks import CheckResult
     from foragent.run_review import ReviewResult
-
-
-def _pr_body(
-    n: int, parsed: ParsedIssue, checks: list[CheckResult], attempt: int,
-    reviews: list[ReviewResult], try_text: str | None = None,
-    *, outside_lane: list[str] | None = None, fallback_model: str | None = None,
-    attempt_tiers: dict[str, str] | None = None,
-    missing_skills: list[str] | None = None,
-    skills_line: str | None = None,
-    rebuttals: str = "",
-    review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
-) -> str:
-    lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
-    for check in checks:
-        command = check.command.replace("&", "&amp;").replace("<", "&lt;").replace("|", "&#124;")
-        command = command.replace("`", "&#96;").replace("\n", "<br>")
-        passed = check.exit_code == 0 and not check.timed_out
-        lines.append(f"| <code>{command}</code> | {'pass' if passed else 'fail'} |")
-    lines.extend(["", "## Review", ""])
-    if review_scope == "pr-body":
-        lines.append(f"VERDICT: {reviews[-1].verdict}" if reviews else "Pending review.")
-        lines.extend(["", "## Review scope", "", review_scope_rules(acceptance_dir),
-                      "The acceptance tests are locked."])
-    elif not reviews:
-        lines.append("Disabled (reviewer: none).")
-    for round_number, review in enumerate(reviews if review_scope == "claude-local" else [], 1):
-        lines.append(f"Round {round_number}: VERDICT: {review.verdict}")
-        if review.findings:
-            lines.append(review.findings)
-        lines.extend(review.notes)
-        lines.append("")
-    if rebuttals:
-        lines.extend(["", "## Rebuttals", "", rebuttals])
-    if parsed.done_when_checklist:
-        lines.extend(["", "## Needs a human check", ""])
-        lines.extend(f"- [ ] {item.text}" for item in parsed.done_when_checklist)
-    if outside_lane:
-        lines.extend(["", "## Outside lane", "", *(f"- `{path}`" for path in outside_lane)])
-    if missing_skills:
-        lines.extend(["", "## Lane skills", "", *(f"- missing skill: {name}" for name in missing_skills)])
-    if skills_line is not None:
-        lines.extend(["", skills_line])
-    if fallback_model is not None:
-        lines.extend(["", f"Executor fallback model: {fallback_model}"])
-    if attempt_tiers:
-        lines.extend(["", *(f"Attempt {number} at tier {tier}" for number, tier in attempt_tiers.items())])
-    lines.extend(["", f"Opened by Foragent gate (attempt {attempt})"])
-    return "\n".join(lines) + "\n\n## Try it\n\n" + (
-        try_text if try_text is not None else "_not provided by the implementer_"
-    )
 
 
 def _hold_changed_head(n: int, ctx: RunContext, link: str) -> str:
@@ -171,30 +128,47 @@ def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float) -> str
 class _CIWait:
     started: float
     polls: int = 0
+    status: str = "pending"
+    infrastructure: str = ""
+
+    @property
+    def deadline(self) -> float:
+        return self.started + 1200
 
 
 def _wait_for_ci(
     n: int, ctx: RunContext, git: GitRepo, pr: int, head: str, ready_at: float,
     wait: _CIWait, failed: Callable[[], None], status: str | None = None,
+    *, comparison_mode: bool = False,
 ) -> str | None:
     """Consume even a status observed under the lock, but only wait unlocked."""
     from foragent import runner
 
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
+    wait.infrastructure = ""
     while True:
         if runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
         if status is None:
             status = _ci_status(ctx, pr, git.root, ready_at)
+        wait.status = status
         _progress(n, ctx)
         if ctx.tracker.pr_head_sha(pr) != head:
             return _hold_changed_head(n, ctx, link)
         if status in {"pass", "none"}:
             return None
         if status == "fail":
+            if comparison_mode:
+                evidence = ctx.tracker.pr_failed_logs(pr)
+                if getattr(evidence, "not_started", False):
+                    wait.infrastructure = str(evidence)
+                    return None
             failed()
-        remaining = wait.started + 1200 - ctx.now().timestamp()
+        remaining = wait.deadline - ctx.now().timestamp()
         if remaining <= 0 or wait.polls >= 40:
+            if comparison_mode and ctx.config.checks_fallback == "local":
+                wait.infrastructure = "CI did not finish before the poll deadline."
+                return None
             flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
             return "timeout"
         ctx.sleep(min(30, remaining, runner._remaining(n, ctx)))
@@ -217,19 +191,21 @@ class _MergeInputs:
     decision: Decision = Decision("merge")
     status: str = "pending"
     batch_branch: str | None = None
+    comparison_current: bool = True
 
 
 def _final_merge_inputs(
     n: int, ctx: RunContext, git: GitRepo, pr: int, branch: str, base: str,
     head: str, approval: Approval, ready_at: float, *, base_sha: str | None = None,
     approved_body_sha: str | None = None,
+    comparison: ComparisonEvidence | None = None,
 ) -> _MergeInputs:
     """Read every mutable prerequisite after acquiring the final merge lock.
 
     Re-read approval/labels (and live body for review-only), PR state/branches, local and remote head,
     fetched target SHA, approved acceptance blobs on head and configured base,
-    local and tracker paths, current policy config and batch parent, CI (including workflow
-    registration grace), and the remaining run budget. Verification/review
+    local and tracker paths, current policy config and batch parent, comparison evidence,
+    CI (including workflow registration grace), and the remaining run budget. Verification/review
     evidence stays pinned to the supplied head and approval snapshot.
     """
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
@@ -270,14 +246,22 @@ def _final_merge_inputs(
         if any(blobs.get(path) != sha for path, sha in approval.acceptance_blobs.items()):
             return _MergeInputs(stop=invalid_approval)
     paths = sorted(set(git.changed_paths(target_sha)) | set(ctx.tracker.pr_changed_files(pr)))
-    decision = merge_decision(changed_paths=paths, issue_labels=issue.labels, config=ctx.config)
+    decision = merge_decision(changed_paths=paths, issue_labels=issue.labels, config=ctx.config,
+                              risk_always_human=_risk_always_human(ctx))
     # Bind this status and all verification evidence to the exact head we merge.
     if git.head_sha() != head or ctx.tracker.pr_head_sha(pr) != head:
         return _MergeInputs(stop=lambda: _hold_changed_head(n, ctx, link))
     from foragent import runner
     if runner._remaining(n, ctx) <= 0:
         return _MergeInputs(stop=lambda: _timeout(n, ctx))
-    return _MergeInputs(base_sha=target_sha, paths=paths, decision=decision, status=status, batch_branch=batch_branch)
+    comparison_current = True
+    if enabled(ctx, base):
+        comparison_current = comparison is not None and comparison.current(n, ctx, git, pr, head, target_sha, status)
+        if comparison_current and comparison.infrastructure:
+            # The unlocked comparison already handled this infrastructure state.
+            status = "pass"
+    return _MergeInputs(base_sha=target_sha, paths=paths, decision=decision, status=status,
+                        batch_branch=batch_branch, comparison_current=comparison_current)
 
 
 def _batch_pr(parent: int, ctx: RunContext) -> None:
@@ -299,19 +283,46 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
         finally:
             ctx.git.remove_worktree(worktree)
     prs = {pr.head: pr for pr in ctx.tracker.list_prs("merged", "foragent/issue-") if pr.base == branch}
-    lines = [f"Closes #{parent}", "", "## Children", ""]
+    # No closing keyword: the parent's completion belongs to the gate's order
+    # aggregation (board_parents), which comments first and keeps a parent with
+    # a not-planned child open. A merge here must not close it behind that.
+    lines = [text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", ""]
     for child in sorted(children, key=lambda child: child.number):
         pr = prs.get(f"foragent/issue-{child.number}")
         lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
-    title = f"Batch: {ctx.tracker.get_issue(parent).title}"
+    issue = ctx.tracker.get_issue(parent)
+    title = f"Batch: {issue.title} (#{parent})"
     body = "\n".join(lines)
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
-        board.sync_status(ctx, parent, "PR open")
+        if issue.state == "open":  # A completed order (#411) stays in Done.
+            board.sync_status(ctx, parent, "PR open")
         return
     pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
-    board.sync_status(ctx, parent, "PR open")
+    if issue.state == "open":
+        board.sync_status(ctx, parent, "PR open")
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
+
+
+def retitle_for_merge(
+    ctx: RunContext, pr: int, *, title: str, current_title: str | None, base: str,
+    body: Callable[[], str], note: Callable[[str], None],
+) -> dict[str, str]:
+    """Give the PR its issue-derived title before merging; return extra merge_pr arguments.
+
+    Branch commit messages (WIP checkpoints) never decide the title. The squash
+    subject is the PR title, so it is passed only when retitling failed (other
+    than a rate limit): the merge then still uses the issue-derived subject.
+    """
+    if title != current_title:
+        try:
+            ctx.tracker.update_pr(pr, base=base, title=title, body=body())
+        except TrackerError as exc:
+            if exc.is_rate_limit:
+                raise
+            note(f"PR #{pr} retitle failed; merging with subject {title!r}: {exc}")
+            return {"subject": title}
+    return {}
 
 
 def _check_publication(git: GitRepo, target_branch: str, base_sha: str | None = None) -> None:
@@ -329,6 +340,48 @@ def _preserve_failed_implementation(
     tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
 ) -> None:
     """Save stopped work before cleanup, including after the runner has died."""
+    with ctx.store.worktree_lock(n):
+        # Recheck only after acquiring the lock: a competing cleanup may have
+        # removed the worktree while we waited. A parent repository is no save.
+        if not (git.root / ".git").is_file():
+            return
+        try:
+            git.check_worktree()
+        except GitError:
+            return
+        _preserve_locked_implementation(
+            n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
+            pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
+        )
+
+
+def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> list[str]:
+    """Leave unowned deletions out of the index without discarding other work."""
+    deletions = git.staged_deletions()
+    if not deletions:
+        return []
+    patterns = []
+    if run is not None:
+        patterns.extend(run.declared_files or [])
+        patterns.extend([escape(path) for path in run.effective_files or []]
+                        if run.files_committed else run.effective_files or [])
+        patterns.extend(escape(path) for path in [*(run.changed_files or []), *run.late_files])
+    base = (run.files_base_branch if run is not None else None) or ctx.config.base_branch
+    committed = git.committed_paths(f"origin/{base}")
+    artifacts = git.artifact_paths()
+    refused = sorted(path for path in deletions
+                     if path not in committed
+                     and not any(path == root or path.startswith(root + "/") for root in artifacts)
+                     and not any_overlap(ctx, [escape(path)], patterns))
+    git.restore_staged_paths("HEAD", refused)
+    return refused
+
+
+def _preserve_locked_implementation(
+    n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
+    approved_ref: str, title: str | None, pushed_head: str | None,
+    tracker_available: bool, push_branch: Callable[[], None] | None,
+) -> None:
     branch = f"foragent/issue-{n}"
     run = ctx.store.get_run(n)
     git.local_skill_paths.update(run.local_skill_paths if run is not None else ())
@@ -341,8 +394,13 @@ def _preserve_failed_implementation(
     git.stage_changes()
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
+    refused = _check_wip_deletions(ctx, git, run)
     if git.has_staged_changes():
         git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
+    if refused:
+        detail = "WIP preservation refused: deletions outside allowed paths: " + ", ".join(map(repr, refused[:10]))
+        _append(ctx.store.log_path(n), detail)
+        append_event(ctx.store, ctx.now(), n, "wip-preservation-refused", detail)
     if git.head_sha() == pushed_head or not tracker_available:
         return
     try:
@@ -386,7 +444,19 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
         skills_line=_skills_line(ctx.store.get_run(n)),
         rebuttals="\n\n".join(attempt.rebuttals),
         review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
+        language=ctx.config.language,
+        risk_notes=review_perspectives.with_checklist(_risk_notes(attempt), ctx.config) if ctx.config.review_scope == "pr-body" else "",
     )
+
+
+def _risk_notes(attempt: Implementation) -> str:
+    paths = sorted(set(attempt.paths) | set(attempt.git.changed_paths(attempt.base_ref)))
+    return risks.review_notes(risks.matching(risks.load_at(attempt.git, attempt.base_ref), paths), paths)
+
+
+def _risk_always_human(ctx: RunContext) -> list[str]:
+    """Always-human globs from the risk map on the configured base, not the branch under review."""
+    return risks.always_human_globs(ctx.git, f"origin/{ctx.config.base_branch}")
 
 
 def _open_or_update_pr(attempt: Implementation, title: str, body: str, base_sha: str | None = None) -> int:
@@ -394,13 +464,45 @@ def _open_or_update_pr(attempt: Implementation, title: str, body: str, base_sha:
     pr = attempt.ctx.tracker.find_pr(attempt.branch)
     if pr is None:
         pr = attempt.ctx.tracker.create_pr(head=attempt.branch, base=attempt.target_branch, title=title, body=body)
+        attempt.pr_title = title
     else:
-        attempt.ctx.tracker.update_pr(pr, base=attempt.target_branch, title=title, body=body)
+        _update_open_pr(attempt, pr, title, body)
     board.sync_status(attempt.ctx, attempt.n, "PR open")
     return pr
 
 
+def _update_open_pr(attempt: Implementation, pr: int, title: str, body: str) -> None:
+    """Retarget and refresh an open PR; a failed retitle alone never stops the run.
+
+    The merge retitles again and, if that still fails, squashes with the
+    issue-derived subject (retitle_for_merge). A base that was not retargeted
+    is caught by the final merge inputs, which compare the live PR base.
+    """
+    ctx = attempt.ctx
+    try:
+        ctx.tracker.update_pr(pr, base=attempt.target_branch, title=title, body=body)
+    except TrackerError as exc:
+        if exc.is_rate_limit:
+            raise
+        attempt.pr_title = None  # unknown: the merge retitles before squashing
+        _append(attempt.log, f"PR #{pr} retitle failed; retitling again at merge: {exc}")
+        try:
+            # Keep the current title so a rejected title alone does not block the retarget.
+            current = next((item for item in ctx.tracker.list_prs("open", attempt.branch)
+                            if item.number == pr), None)
+            if current is not None and current.title != title:
+                ctx.tracker.update_pr(pr, base=attempt.target_branch, title=current.title, body=body)
+                attempt.pr_title = current.title
+        except TrackerError as retry:
+            if retry.is_rate_limit:
+                raise
+            _append(attempt.log, f"PR #{pr} refresh under its current title failed: {retry}")
+    else:
+        attempt.pr_title = title
+
+
 def _publish(attempt: Implementation) -> str:
+    wait_for_overlap(attempt)
     return _publish_locked(attempt)
 
 
@@ -414,8 +516,7 @@ def _publish_locked(attempt: Implementation) -> str:
     worktree, log = attempt.worktree, attempt.log
     issue = ctx.tracker.get_issue(n)
     title = f"{issue.title} (#{n})"
-    if git.has_staged_changes():
-        git.commit(title)
+    commit_exclusions(attempt, title)
     _progress(n, ctx)
     verified_head_sha = git.head_sha()
     base_merges = 0
@@ -424,8 +525,7 @@ def _publish_locked(attempt: Implementation) -> str:
         nonlocal verified_head_sha
         if runner._remaining(n, ctx) <= 0:
             raise ExecutorStopped(_timeout(n, ctx))
-        if git.has_staged_changes():
-            git.commit(title)
+        commit_exclusions(attempt, title)
         verified_head_sha = git.head_sha()
 
     def refresh_base(move: BaseMove, conflicts: list[str] | None = None) -> str:
@@ -438,6 +538,10 @@ def _publish_locked(attempt: Implementation) -> str:
         # Exclude the merged base's paths from policy and patch replay. The
         # separate verified_base_sha advances only after verification/push.
         attempt.start_ref = move.target_sha
+        if not neutral:
+            # Protect what passes on the new base before merging it (#483).
+            from foragent.run_implementation import follow_base
+            follow_base(attempt)
         if conflicts is None:
             conflicts = _merge_moved_base(attempt, move.target_sha)
         if conflicts:
@@ -511,6 +615,7 @@ def _publish_locked(attempt: Implementation) -> str:
     if stopped := policy_hold(merge_decision(
         changed_paths=ctx.tracker.pr_changed_files(pr),
         issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
+        risk_always_human=_risk_always_human(ctx),
     )):
         return stopped
 
@@ -520,7 +625,7 @@ def _publish_locked(attempt: Implementation) -> str:
         _push_branch(attempt)
         _progress(n, ctx)
         _append(log, f"Pushed verified HEAD: {verified_head_sha}")
-        ctx.tracker.update_pr(pr, base=attempt.target_branch, title=title, body=pr_body())
+        _update_open_pr(attempt, pr, title, pr_body())
         ctx.tracker.comment(pr, f"base merged before merge: {target_sha}")
         pr_ready_at = ctx.now().timestamp()
         ci_wait = _CIWait(pr_ready_at)
@@ -530,6 +635,7 @@ def _publish_locked(attempt: Implementation) -> str:
         decision = merge_decision(
             changed_paths=git.changed_paths(target_sha),
             issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
+            risk_always_human=_risk_always_human(ctx),
         )
         return policy_hold(decision)
 
@@ -547,7 +653,8 @@ def _publish_locked(attempt: Implementation) -> str:
     while True:
         _phase(n, ctx, "ci")
         if stopped := _wait_for_ci(n, ctx, git, pr, verified_head_sha, pr_ready_at,
-                                  ci_wait, ci_failed, queued_status):
+                                  ci_wait, ci_failed, queued_status,
+                                  comparison_mode=enabled(ctx, attempt.target_branch)):
             return stopped
         queued_status = None
 
@@ -561,10 +668,19 @@ def _publish_locked(attempt: Implementation) -> str:
                 return stopped
             continue
 
+        comparison = None
+        if enabled(ctx, attempt.target_branch):
+            comparison = require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
+                                            base_sha=verified_base_sha, status=ci_wait.status,
+                                            deadline=ci_wait.deadline)
+            if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
+                return _hold_changed_head(n, ctx, link)
+
+        wait_for_overlap(attempt)
         with _merge_lock(n, ctx):
             inputs = _final_merge_inputs(
                 n, ctx, git, pr, attempt.branch, attempt.target_branch,
-                verified_head_sha, attempt.approval, pr_ready_at,
+                verified_head_sha, attempt.approval, pr_ready_at, comparison=comparison,
             )
             move = None
             continue_merge = (
@@ -574,11 +690,18 @@ def _publish_locked(attempt: Implementation) -> str:
             )
             if continue_merge and inputs.base_sha != verified_base_sha:
                 move = capture_move(git, inputs.base_sha)
-            if continue_merge and move is None:
+            if continue_merge and move is None and inputs.comparison_current:
                 _check_publication(git, attempt.target_branch, inputs.base_sha)
                 _phase(n, ctx, "merging")
+                title = f"{ctx.tracker.get_issue(n).title} (#{n})"
+                subject = retitle_for_merge(
+                    ctx, pr, title=title, current_title=attempt.pr_title,
+                    base=attempt.target_branch, body=pr_body, note=lambda line: _append(log, line),
+                )
+                if not subject:
+                    attempt.pr_title = title
                 try:
-                    ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha)
+                    ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
                 except TrackerError as exc:
                     if exc.is_rate_limit:
                         raise
@@ -616,7 +739,7 @@ def _publish_locked(attempt: Implementation) -> str:
             return inputs.stop()
         if stopped := policy_hold(inputs.decision, inputs.batch_branch):
             return stopped
-        if not continue_merge:
+        if not continue_merge or (move is None and not inputs.comparison_current):
             queued_status = inputs.status
             continue
         if move is not None:
@@ -630,6 +753,7 @@ def _publish_locked(attempt: Implementation) -> str:
 def _publish_reviewed_head(
     n: int, ctx: RunContext, git: GitRepo, pr, head: str, base_ref: str, base_sha: str,
     approval: Approval, approved: Callable[[], bool], batch_branch: str | None, parent: int | None,
+    *, comparison_attempt=None,
 ) -> str:
     from foragent import runner
 
@@ -668,6 +792,7 @@ def _publish_reviewed_head(
     if stopped := policy_hold(merge_decision(
         changed_paths=sorted(set(git.changed_paths(base_sha)) | set(ctx.tracker.pr_changed_files(pr.number))),
         issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
+        risk_always_human=_risk_always_human(ctx),
     )):
         return stopped
     started = ctx.now().timestamp()
@@ -677,19 +802,34 @@ def _publish_reviewed_head(
         if stopped := _wait_for_ci(
             n, ctx, git, pr.number, head, started, ci_wait,
             lambda: _ci_failure(n, ctx, pr.number, head, pr.base), queued_status,
+            comparison_mode=comparison_attempt is not None,
         ):
             return stopped
+        comparison = None
+        if comparison_attempt is not None:
+            comparison = require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
+                                            base_sha=base_sha, status=ci_wait.status,
+                                            deadline=ci_wait.deadline)
+            if stopped := unchanged():
+                return stopped
         with _merge_lock(n, ctx):
             inputs = _final_merge_inputs(
                 n, ctx, git, pr.number, pr.head, pr.base, head, approval, started, base_sha=base_sha,
                 approved_body_sha=approval.body_sha,
+                comparison=comparison,
             )
             continue_merge = (inputs.stop is None and _policy_allows(inputs.decision, pr.base, inputs.batch_branch)
-                              and inputs.status in {"pass", "none"})
+                              and inputs.status in {"pass", "none"} and inputs.comparison_current)
             if continue_merge:
                 _check_publication(git, pr.base, inputs.base_sha)
+                title = f"{ctx.tracker.get_issue(n).title} (#{n})"
+                subject = retitle_for_merge(
+                    ctx, pr.number, title=title, current_title=pr.title, base=pr.base,
+                    body=lambda: pr.body, note=lambda line: _append(log, line),
+                )
+                pr = replace(pr, title=title)
                 try:
-                    ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head)
+                    ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
                 except TrackerError as exc:
                     if exc.is_rate_limit:
                         raise

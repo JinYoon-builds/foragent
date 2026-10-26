@@ -1,7 +1,7 @@
 """Small, injectable Git adapter for approval integrity checks."""
 
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 import fcntl
 import os
@@ -12,8 +12,11 @@ import stat
 import subprocess
 import time
 
+from foragent.state import StateStore
+
 
 REVIEW_SCOPE_FILE = "CLAUDE.local.md"
+ARTIFACT_PATHS = (".foragent",)
 
 
 def _conflict_marker_numbers(content: str, widths: set[int]) -> list[int]:
@@ -59,6 +62,7 @@ class GitRepo:
         self.root = Path(root)
         self._run = run or self._run_git
         self.local_skill_paths: set[str] = set()
+        self.publication_paths: set[str] = set()
 
     def _run_git(self, args: list[str]) -> str:
         command = args
@@ -93,9 +97,15 @@ class GitRepo:
         return GitRepo(root, lambda args: self._call(["-C", str(root), *args]))
 
     def remove_worktree(self, path: Path) -> None:
-        if path.exists():
-            self._call(["worktree", "remove", "--force", str(path)])
-        self._call(["worktree", "prune"])
+        with ExitStack() as stack:
+            # Every issue-worktree cleanup path goes through this adapter,
+            # including runner exit, rebuild, tick recovery and explicit kills.
+            if path.parent.name == "worktrees" and path.name.startswith("issue-") and path.name[6:].isdigit():
+                store = StateStore(path.parent.parent)
+                stack.enter_context(store.worktree_lock(int(path.name[6:])))
+            if path.exists():
+                self._call(["worktree", "remove", "--force", str(path)])
+            self._call(["worktree", "prune"])
 
     def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +113,30 @@ class GitRepo:
 
     def ref_sha(self, ref: str) -> str:
         return self._call(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
+
+    def union_merge_paths(self, base_ref: str, paths: Iterable[str]) -> set[str]:
+        """Read merge attributes in one batch; unreadable attributes retain overlap limits."""
+        paths = sorted(set(paths))
+        if not paths:
+            return set()
+        try:
+            fields = self._call(["check-attr", f"--source={base_ref}", "-z", "merge", "--", *paths]).split("\0")
+        except GitError:
+            return set()
+        return {path for path, attribute, value in zip(fields[::3], fields[1::3], fields[2::3])
+                if attribute == "merge" and value == "union" and path in paths}
+
+    def latest_trailer(self, key: str, base_ref: str) -> str | None:
+        """Read the newest carrying commit on this branch's first-parent chain."""
+        fields = self._call([
+            "log", "--first-parent",
+            f"--format=%(trailers:key={key},keyonly)%x00%(trailers:key={key},valueonly)%x00",
+            f"{base_ref}..HEAD",
+        ]).split("\0")
+        for index in range(0, len(fields) - 1, 2):
+            if fields[index].strip():
+                return fields[index + 1].strip()
+        return None
 
     def local_branch_sha(self, branch: str) -> str | None:
         try:
@@ -124,7 +158,7 @@ class GitRepo:
     def stage_changes(self) -> None:
         output = self._call([
             "ls-files", "--modified", "--deleted", "--others", "--exclude-standard", "-z",
-            "--", ".", ":!.foragent", f":!{REVIEW_SCOPE_FILE}",
+            "--", ".", *(f":!{path}" for path in ARTIFACT_PATHS), f":!{REVIEW_SCOPE_FILE}",
             *(f":(exclude,literal){path}" for path in sorted(self.local_skill_paths)),
         ])
         paths = sorted(set(filter(None, output.split("\0"))))
@@ -148,9 +182,15 @@ class GitRepo:
                 self._call(["--literal-pathspecs", "rm", "--cached", "-r", "-f", "--ignore-unmatch", "--", name])
         self.local_skill_paths.difference_update(owned)
 
+    def artifact_paths(self) -> set[str]:
+        """Runner-owned roots intentionally removed from the index."""
+        return {*ARTIFACT_PATHS, *self.local_skill_paths}
+
     def _exclude_artifacts(self) -> None:
         # Also remove entries staged by an executor, retaining their local files.
-        self._call(["rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"])
+        self._call(["rm", "--cached", "-r", "-f", "--ignore-unmatch", *ARTIFACT_PATHS])
+        # Retain runner-owned protocol inputs explicitly preserved by the caller.
+        self.ensure_tracked(sorted(self.publication_paths))
         if self.local_skill_paths:
             self._call(["--literal-pathspecs", "rm", "--cached", "-r", "-f", "--ignore-unmatch",
                         "--", *sorted(self.local_skill_paths)])
@@ -369,11 +409,23 @@ class GitRepo:
     def has_staged_changes(self) -> bool:
         return self.staged_tree_sha() != self._call(["rev-parse", "HEAD^{tree}"]).strip()
 
-    def commit(self, title: str) -> None:
+    def staged_deletions(self) -> list[str]:
+        output = self._call(["diff", "--cached", "--name-only", "--no-renames", "--diff-filter=D", "-z"])
+        return list(filter(None, output.split("\0")))
+
+    def committed_paths(self, base_ref: str) -> set[str]:
+        """Branch changes since the shared base, including earlier deletions."""
+        output = self._call(["diff", "--name-only", "--no-renames", "-z", self._own_base(base_ref), "HEAD"])
+        # Exclude the target's history, including commits already merged from it.
+        output += self._call(["log", "--format=", "--name-only", "--no-renames", "--diff-filter=D",
+                              "-z", f"{base_ref}..HEAD"])
+        return set(filter(None, output.split("\0")))
+
+    def commit(self, title: str, *, allow_empty: bool = False) -> None:
         self._exclude_artifacts()
         self._call([
             "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
-            "commit", "-m", title,
+            "commit", *(["--allow-empty"] if allow_empty else []), "-m", title,
         ])
 
     def continue_merge(self) -> None:
@@ -465,7 +517,13 @@ class GitRepo:
                     raise
                 value = ""
             identity.extend(["-c", f"{key}={value or fallback}"])
-        self._call(["add", "-f", "--", *paths])
+        # Already-staged deletions belong in the commit, but git add cannot
+        # match them once they are absent from both the worktree and index.
+        indexed = set(self._call(["ls-files", "--cached", "-z", "--", *paths]).split("\0"))
+        stage = [path for path in paths if path in indexed or (self.root / path).exists()
+                 or (self.root / path).is_symlink()]
+        if stage:
+            self._call(["add", "-f", "--", *stage])
         self._exclude_artifacts()
         self._call([*identity, "commit", "--only", "-m", title, "--", *paths, f":!{REVIEW_SCOPE_FILE}"])
 

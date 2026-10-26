@@ -325,6 +325,8 @@ def _verify_implementation(attempt: Implementation) -> str:
     from foragent import runner
     from foragent.run_conflicts import _prepare_target
     from foragent.run_publish import _check_publication, _guard_harness
+    from foragent.ci_mode import enabled
+    from foragent.ci_local import verify_local_only_units
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree, log = attempt.worktree, attempt.log
@@ -336,16 +338,20 @@ def _verify_implementation(attempt: Implementation) -> str:
     _progress(n, ctx)
     attempt.checks = []
     _guard_harness(attempt)
-    if not attempt.paths:
+    # Cleaning tracked runner scratch files is not an implementation change.
+    if not any(not path.startswith(".foragent/") for path in attempt.paths):
         return "The session made no changes."
     staged_tree = git.staged_tree_sha()
     for verification in range(2):
+        from foragent.run_implementation import follow_base
+        follow_base(attempt)
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                                  slot=_test_slot(n, ctx)))
             _progress(n, ctx)
         if attempt.baseline and attempt.baseline.node_ids:
+            started = ctx.monotonic()
             command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
             result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                             slot=_test_slot(n, ctx))
@@ -353,12 +359,21 @@ def _verify_implementation(attempt: Implementation) -> str:
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
             _progress(n, ctx)
+            if not enabled(ctx, attempt.target_branch):
+                previous = ctx.store.get_run(n).comparison or {}
+                ctx.store.update_run(n, comparison={"source": "local", "duration_seconds":
+                    previous.get("duration_seconds", 0) + max(0, ctx.monotonic() - started)})
         test_command = ctx.config.test_command
         if test_command is None:
             test_command = next(iter(runner.detect_test_commands(worktree)), None)
         unit_command = _pytest_command(test_command) if test_command else None
         unit_tests = _related_unit_tests(worktree, attempt.paths, ctx.config.acceptance_dir,
-                                         own_only=trusts_ci(worktree, ctx.config))
+                                         own_only=ctx.config.runner_unit_tests != "all"
+                                         and (enabled(ctx, attempt.target_branch) or trusts_ci(worktree, ctx.config)))
+        if unit_command:
+            local_units = verify_local_only_units(attempt, unit_command)
+            if local_units is not None:
+                attempt.checks.append(local_units)
         if unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
             result = runner._check(f"{unit_command} {shlex.join(unit_tests)}", worktree, log, limit,
@@ -390,7 +405,7 @@ def _verify_implementation(attempt: Implementation) -> str:
             _check_publication(git, attempt.target_branch)
         except AttemptFailure as exc:
             return str(exc)
-        return "" if attempt.paths else "The session made no changes."
+        return "" if any(not path.startswith(".foragent/") for path in attempt.paths) else "The session made no changes."
     raise AssertionError("unreachable verification state")
 
 

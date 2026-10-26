@@ -1,4 +1,8 @@
-"""Machine-wide run budget and test slots: AIMD on memory pressure and load (D60, #243)."""
+"""Machine-wide run budget and test slots: AIMD on CPU load (D60, #243).
+
+Memory is a fact, not a budget input (#497): only the kernel's critical level
+matters, and it holds new starts and new test slots without changing a budget.
+"""
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -6,12 +10,15 @@ import ctypes
 from datetime import UTC, datetime, timedelta
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import sys
 import tempfile
 import time
 from typing import IO, Any
+
+import psutil
 
 from foragent.state import Run, StateStore
 
@@ -34,6 +41,8 @@ TEST_SLOTS_LOCK = "test-slots.lock"
 TEST_SLOTS_DIR = "test-slots"
 SENSOR_FILE = "memory-sample.json"
 SENSOR_LOCK = "memory-sample.lock"
+# Accumulate five wall-seconds × CPU count of CPU time before advancing the baseline.
+CPU_BUSY_MIN_SECONDS = 5.0
 HISTORY_FILE = "budget-history.jsonl"
 # Set for a command that runs inside a held slot, so a nested `fa test` reuses it.
 TEST_SLOT_ENV = "FORAGENT_TEST_SLOT"
@@ -103,7 +112,7 @@ def memory_pressure() -> str:
 
 
 def kernel_pressure() -> str:
-    """The raw kernel pressure level, before swap-in window classification."""
+    """The raw kernel pressure level: normal, warn or critical."""
     return memory_pressure()
 
 
@@ -156,13 +165,20 @@ def swapins_total() -> int | None:
 
 
 class LoadSample(tuple[str, float]):
-    """Keep the public (pressure, load) pair and its exact swap-in window together."""
+    """Keep the public (pressure, load) pair and its sensor measurements together."""
 
     swapins: int | None
+    load_average_per_cpu: float | None
+    cpu_busy: float | None
 
-    def __new__(cls, pressure: str, load: float, swapins: int | None):
+    def __new__(
+        cls, pressure: str, load: float, swapins: int | None, *,
+        load_average_per_cpu: float | None = None, cpu_busy: float | None = None,
+    ):
         sample = super().__new__(cls, (pressure, load))
         sample.swapins = swapins
+        sample.load_average_per_cpu = load_average_per_cpu
+        sample.cpu_busy = cpu_busy
         return sample
 
 
@@ -175,23 +191,61 @@ def load_per_cpu() -> float:
     return max(0.0, load) / (os.cpu_count() or 1)
 
 
+def _read_sensor(root: Path) -> dict[str, Any]:
+    try:
+        value = json.loads((root / SENSOR_FILE).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def cpu_busy() -> float | None:
+    """Busy fraction since the last persisted CPU sample; iowait is idle, steal is busy."""
+    if os.environ.get("FORAGENT_CPU_BUSY") == "off":
+        return None
+    try:
+        root = machine_root()
+        with _flock(root / SENSOR_LOCK):
+            times = psutil.cpu_times()
+            # Linux guest time is already included in user/nice counters.
+            total = sum(times) - getattr(times, "guest", 0) - getattr(times, "guest_nice", 0)
+            idle = times.idle + getattr(times, "iowait", 0)
+            sensor = _read_sensor(root)
+            previous_total, previous_idle = sensor.get("cpu_total"), sensor.get("cpu_idle")
+            busy = None
+            if (type(previous_total) in (int, float) and type(previous_idle) in (int, float)
+                    and 0 <= previous_idle <= previous_total):
+                elapsed, idle_elapsed = total - previous_total, idle - previous_idle
+                # Subtracting float counters can put an all-idle delta just above total.
+                if elapsed >= 0 and 0 <= idle_elapsed <= elapsed + 2 * math.ulp(total):
+                    if elapsed < CPU_BUSY_MIN_SECONDS * (os.cpu_count() or 1):
+                        busy = sensor.get("cpu_busy")
+                        return busy if type(busy) in (int, float) and 0 <= busy <= 1 else None
+                    busy = max(0.0, min(1.0, 1 - idle_elapsed / elapsed))
+            # First samples and counter resets discard the old fraction and rebase.
+            sensor.update(cpu_total=total, cpu_idle=idle, cpu_busy=busy)
+            (root / SENSOR_FILE).write_text(json.dumps(sensor), encoding="utf-8")
+        return busy
+    except (OSError, ValueError, TypeError, AttributeError, NotImplementedError, psutil.Error):
+        return None
+
+
 def machine_load() -> LoadSample:
     root = machine_root()
     with _flock(root / SENSOR_LOCK):
         pressure, total = kernel_pressure(), swapins_total()
-        try:
-            previous = json.loads((root / SENSOR_FILE).read_text(encoding="utf-8"))["swapins_total"]
-            if type(previous) is not int or previous < 0:
-                previous = None
-        except (OSError, ValueError, TypeError, KeyError):
+        sensor = _read_sensor(root)
+        previous = sensor.get("swapins_total")
+        if type(previous) is not int or previous < 0:
             previous = None
         # A reset (e.g. reboot) establishes a new baseline without negative activity.
         swapins = max(0, total - previous) if total is not None and previous is not None else None
-        (root / SENSOR_FILE).write_text(json.dumps({"swapins_total": total}), encoding="utf-8")
-    if pressure != "critical":
-        if swapins is not None:
-            pressure = "warn" if swapins else "normal"
-    return LoadSample(pressure, load_per_cpu(), swapins)
+        sensor["swapins_total"] = total
+        (root / SENSOR_FILE).write_text(json.dumps(sensor), encoding="utf-8")
+    # Swap-ins are recorded as a fact; they never reclassify the kernel level.
+    raw_load, busy = load_per_cpu(), cpu_busy()
+    load = min(raw_load, busy / 0.6) if busy is not None else raw_load
+    return LoadSample(pressure, load, swapins, load_average_per_cpu=raw_load, cpu_busy=busy)
 
 
 def _within_grace(timestamp: str | None, now: datetime) -> bool:
@@ -322,9 +376,26 @@ def decrease_allowed(state: dict[str, Any] | None, now: datetime) -> bool:
         return True
 
 
+def append_memory_hold(
+    root: Path, now: datetime, *, pressure: str, load_per_cpu: float, swapins: int | None,
+    load_average_per_cpu: float | None = None, cpu_busy: float | None = None,
+) -> None:
+    """Record a tick whose new starts the critical kernel level held back."""
+    row = {
+        "at": now.astimezone(UTC).isoformat(), "rule": "memory-critical", "pressure": pressure,
+        "load_per_cpu": load_per_cpu, "swapins": swapins,
+    }
+    if cpu_busy is not None:
+        row.update(load_average_per_cpu=load_average_per_cpu, cpu_busy=cpu_busy)
+    with _flock(root / "budget-history.lock"):
+        with (root / HISTORY_FILE).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
+
+
 def append_budget_history(
     root: Path, now: datetime, budget: str, current: int, value: int, *,
     pressure: str, load_per_cpu: float, swapins: int | None, wanted: int | None = None,
+    load_average_per_cpu: float | None = None, cpu_busy: float | None = None,
 ) -> None:
     if current == value and (wanted is None or wanted == value):
         return
@@ -333,6 +404,8 @@ def append_budget_history(
         "from": current, "to": value, "pressure": pressure,
         "load_per_cpu": load_per_cpu, "swapins": swapins,
     }
+    if cpu_busy is not None:
+        row.update(load_average_per_cpu=load_average_per_cpu, cpu_busy=cpu_busy)
     if wanted is not None:
         row["wanted"] = wanted
     # Both budgets and all repository gates share one append lock.
@@ -350,9 +423,9 @@ def _write_test_slots(root: Path, value: dict[str, Any]) -> None:
 
 def update_test_slots(
     ceiling: int, now: datetime, *, pressure: str, load_per_cpu: float, swapins: int | None = None,
-    floor: int = 1,
+    load_average_per_cpu: float | None = None, cpu_busy: float | None = None,
 ) -> int:
-    """Apply the guard and configured floor; critical pressure bypasses the floor."""
+    """Apply the guard and the CPU-load step; ``pressure`` is only recorded in history."""
     root = machine_root()
     with _flock(root / TEST_SLOTS_LOCK):
         state = read_test_slots()
@@ -363,17 +436,18 @@ def update_test_slots(
             append_budget_history(
                 root, now, "test_slots", state["slots"], ceiling,
                 pressure=pressure, load_per_cpu=load_per_cpu, swapins=swapins, wanted=ceiling,
+                load_average_per_cpu=load_average_per_cpu, cpu_busy=cpu_busy,
             )
             return ceiling
         current = state["slots"] if state else ceiling
         changed_at = datetime.fromisoformat(state["changed_at"]) if state else now
         wanted = next_test_slots(
-            current, pressure=pressure, load_per_cpu=load_per_cpu, ceiling=ceiling,
+            current, pressure="normal", load_per_cpu=load_per_cpu, ceiling=ceiling,
             increase_ok=now - changed_at >= INCREASE_INTERVAL,
         )
         if wanted < current and not decrease_allowed(state, now):
             wanted = current
-        value = wanted if pressure == "critical" else max(floor, wanted)
+        value = wanted
         if state is None or value != state["slots"]:
             updated = {"slots": value, "changed_at": now.astimezone(UTC).isoformat()}
             decreased_at = now.astimezone(UTC).isoformat() if value < current else (state or {}).get("decreased_at")
@@ -383,6 +457,7 @@ def update_test_slots(
         append_budget_history(
             root, now, "test_slots", state["slots"] if state else current, value,
             pressure=pressure, load_per_cpu=load_per_cpu, swapins=swapins, wanted=wanted,
+            load_average_per_cpu=load_average_per_cpu, cpu_busy=cpu_busy,
         )
     return value
 
@@ -428,7 +503,8 @@ def hold_test_slot(ceiling: int, *, waiting: Callable[[], None] | None = None) -
         yield
         return
     heartbeat = None
-    while (stream := _take_test_slot(effective_test_slots(ceiling))) is None:
+    # While the kernel reports critical memory pressure, a free slot stays unclaimed.
+    while kernel_pressure() == "critical" or (stream := _take_test_slot(effective_test_slots(ceiling))) is None:
         if waiting is not None and (heartbeat is None or time.monotonic() - heartbeat >= SLOT_HEARTBEAT_SECONDS):
             heartbeat = time.monotonic()
             waiting()

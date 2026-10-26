@@ -30,12 +30,14 @@ def test_exact_defaults(repo):
         "orchestrator_timeout_minutes": 30,
         "tick_failure_alert": 3,
         "repo": None, "board": None, "board_map": None, "language": "en", "codex_goal": False, "review_level": "low",
-        "review_scope": "claude-local", "test_command": None, "runner_unit_tests": "auto",
-        "interview": "native", "ouroboros_version": None, "profile": None,
+        "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
+        "test_command": None, "runner_unit_tests": "auto",
+        "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
+        "interview": "native", "ouroboros_version": None, "profile": None, "update_check": True,
         "skill_roles": {},
-        "lanes": {}, "max_parallel": None, "parallel_floor": 1, "test_slots": 2, "test_slots_floor": 1,
+        "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,
-        "transient_max_wait_minutes": 30, "limit_wait_minutes": 60,
+        "transient_max_wait_minutes": 30, "limit_wait_minutes": 60, "usage_recheck_minutes": 10,
         "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
                   "m": {"codex_effort": "high", "claude_model": None},
                   "l": {"codex_effort": "xhigh", "claude_model": None}},
@@ -205,7 +207,7 @@ def test_acceptance_directory_allows_literal_paths(repo, directory):
 
 
 @pytest.mark.parametrize("key", ["stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries",
-                                 "review_max", "test_slots_floor", "parallel_floor"])
+                                 "review_max"])
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_integer_fields_are_positive_integers(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
@@ -214,54 +216,15 @@ def test_integer_fields_are_positive_integers(repo, key, value):
 
 
 @pytest.mark.parametrize("source", ["local", "global"])
-def test_test_slots_floor_cannot_exceed_ceiling(repo, tmp_path, source):
+@pytest.mark.parametrize("value", [0, 3, 99, "2", None, True])
+def test_retired_floor_keys_are_accepted_and_ignored(repo, tmp_path, source, value):
+    # #497: floors no longer apply; any value loads and Config has no floor fields.
     global_path = tmp_path / "global.yml"
     path = repo / ".foragent.yml" if source == "local" else global_path
-    write_settings(path, {"test_slots": 2, "test_slots_floor": 3})
-    with pytest.raises(ConfigError, match="test_slots_floor.*test_slots"):
-        load_config(repo, global_path)
-
-
-def test_test_slots_floor_uses_merged_settings(repo, tmp_path):
-    global_path = tmp_path / "global.yml"
-    write_settings(global_path, {"test_slots": 3, "test_slots_floor": 2})
-    assert load_config(repo, global_path).test_slots_floor == 2
-    write_settings(repo / ".foragent.yml", {"test_slots_floor": 1})
-    assert load_config(repo, global_path).test_slots_floor == 1
-    write_settings(repo / ".foragent.yml", {"test_slots": 1})
-    with pytest.raises(ConfigError, match="test_slots_floor.*test_slots"):
-        load_config(repo, global_path)
-
-
-@pytest.mark.parametrize("source", ["local", "global"])
-def test_parallel_floor_cannot_exceed_project_ceiling(repo, tmp_path, source):
-    global_path = tmp_path / "global.yml"
-    path = repo / ".foragent.yml" if source == "local" else global_path
-    write_settings(path, {"max_parallel": 2, "parallel_floor": 3})
-    with pytest.raises(ConfigError, match="parallel_floor.*max_parallel"):
-        load_config(repo, global_path)
-
-
-@pytest.mark.parametrize("settings", [
-    {"parallel_floor": 3}, {"parallel_floor": 3, "max_parallel": 3},
-    {"parallel_floor": 1, "max_parallel": 1},
-])
-def test_parallel_floor_accepts_no_ceiling_or_a_floor_equal_to_ceiling(repo, settings):
-    write_settings(repo / ".foragent.yml", settings)
-    config = load_config(repo)
-    assert config.parallel_floor == settings["parallel_floor"]
-    assert config.max_parallel == settings.get("max_parallel")
-
-
-def test_parallel_floor_uses_merged_settings(repo, tmp_path):
-    global_path = tmp_path / "global.yml"
-    write_settings(global_path, {"parallel_floor": 3})
-    assert load_config(repo, global_path).parallel_floor == 3
-    write_settings(repo / ".foragent.yml", {"max_parallel": 2})
-    with pytest.raises(ConfigError, match="parallel_floor.*max_parallel"):
-        load_config(repo, global_path)
-    write_settings(repo / ".foragent.yml", {"parallel_floor": 1, "max_parallel": 2})
-    assert load_config(repo, global_path).parallel_floor == 1
+    write_settings(path, {"test_slots": 2, "max_parallel": 2, "test_slots_floor": value, "parallel_floor": value})
+    config = load_config(repo, global_path)
+    assert (config.test_slots, config.max_parallel) == (2, 2)
+    assert not hasattr(config, "test_slots_floor") and not hasattr(config, "parallel_floor")
 
 
 def test_all_valid_overrides(repo):
@@ -363,7 +326,9 @@ def test_lane_validation(repo, settings):
         load_config(repo)
 
 
-@pytest.mark.parametrize("key", ["max_parallel", "transient_max_wait_minutes", "limit_wait_minutes"])
+@pytest.mark.parametrize("key", [
+    "max_parallel", "overlap_per_file", "transient_max_wait_minutes", "limit_wait_minutes", "usage_recheck_minutes",
+])
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_parallel_and_wait_settings_are_positive(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
@@ -378,3 +343,27 @@ def test_lane_overrides_and_nulls_load(repo):
     config = load_config(repo)
     assert config.lanes == lanes and config.max_parallel == 1
     assert config.executor_fallback_model == "fallback"
+
+
+def test_committed_config_applies_origin_settings_over_global(tmp_path):
+    from foragent.config import Config, load_committed_config
+    global_path = tmp_path / "global.yml"
+    global_path.write_text("overlap_per_file: 1\nmax_parallel: 3\n", encoding="utf-8")
+    local = Config(repo="owner/repo", overlap_per_file=2)
+    config, ignored = load_committed_config(local, "overlap_per_file: 3\n", "origin/main:.foragent.yml", global_path)
+    assert (config.overlap_per_file, config.max_parallel, config.repo, ignored) == (3, 3, "owner/repo", [])
+
+
+def test_committed_config_keeps_local_repo_and_base_and_names_them(tmp_path):
+    from foragent.config import Config, load_committed_config
+    local = Config(repo="owner/repo", base_branch="main", language="ko")
+    content = "repo: other/repo\nbase_branch: dev\nlanguage: en\noverlap_per_file: 4\n"
+    config, ignored = load_committed_config(local, content, "origin/main:.foragent.yml", tmp_path / "none.yml")
+    assert (config.repo, config.base_branch, config.language, config.overlap_per_file) == ("owner/repo", "main", "ko", 4)
+    assert ignored == ["repo", "base_branch"]
+
+
+@pytest.mark.parametrize("content", [None, "overlap_per_file: [\n", "- a list\n", "nonsense_key: 1\n", "max_parallel: 0\n"])
+def test_committed_config_missing_or_invalid_falls_back(tmp_path, content):
+    from foragent.config import Config, load_committed_config
+    assert load_committed_config(Config(), content, "origin/main:.foragent.yml", tmp_path / "none.yml") == (None, [])

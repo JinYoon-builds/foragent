@@ -40,6 +40,11 @@ class AcceptanceBaseline:
     failing_ids: tuple[str, ...] | None = None
     # Locked files this baseline did not run because open issues own them (#376).
     excluded: tuple[str, ...] = ()
+    # The base commit this baseline ran on; files absent there were never run (#514).
+    base_sha: str | None = None
+    # The configured or detected test command this baseline came from (#483);
+    # a refresh reuses it so later edits to detected files cannot drop protection.
+    test_command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,13 @@ class BaselineBuild:
     excluded: list[str]
     key: str
     scope: str
+
+
+def _validate_baseline_checkout(git, base_sha: str) -> None:
+    """A measurement must describe the requested base, including its index."""
+    if (git.head_sha() != base_sha
+            or git._call(["status", "--porcelain=v1", "--untracked-files=no"])):
+        raise AttemptFailure("acceptance baseline unavailable: capture modified tracked files")
 
 
 def _baseline_build(ctx: RunContext, test_command: str, target_ref: str, log: Path) -> BaselineBuild:
@@ -103,7 +115,8 @@ def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str])
             [sys.executable, "-m", "foragent.run_baseline", json.dumps(request), str(lock.fileno())],
             pass_fds=(lock.fileno(),), stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
             start_new_session=True,
-            env={name: value for name, value in os.environ.items() if name != capacity.TEST_SLOT_ENV},
+            env={**{name: value for name, value in os.environ.items() if name != capacity.TEST_SLOT_ENV},
+                 "PYTHONDONTWRITEBYTECODE": "1"},
         )
     lock.close()
 
@@ -113,6 +126,8 @@ def prebuild_acceptance_baseline(ctx: RunContext, target_ref: str, launch: Calla
     from foragent import runner
     from foragent.orch_events import append_event
 
+    if ctx.config.checks == "ci":
+        return
     test_command = ctx.config.test_command or next(iter(runner.detect_test_commands(ctx.repo_root)), None)
     if test_command is None or _pytest_command(test_command) is None:
         return
@@ -322,7 +337,7 @@ def _capture_baseline(
         if saved is not None and (required_ids is None or
                                   {"collected_ids", "failing_ids", "excluded"} <= saved.keys()):
             _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-            return replace(_saved_baseline(command, saved), excluded=tuple(excluded))
+            return replace(_saved_baseline(command, saved), excluded=tuple(excluded), base_sha=base_sha)
         report.parent.mkdir(parents=True, exist_ok=True)
         # Use a fresh base checkout; tests can write files without touching the implementation.
         with tempfile.TemporaryDirectory(prefix="foragent-baseline-") as directory:
@@ -340,14 +355,14 @@ def _capture_baseline(
                            for path in (worktree / ctx.config.acceptance_dir).rglob("*")):
                     save_baseline((), (), ())
                     _append(log, "Acceptance baseline count=0: no acceptance test files remain after exclusions")
-                    return AcceptanceBaseline(command, (), (), (), tuple(excluded))
+                    return AcceptanceBaseline(command, (), (), (), tuple(excluded), base_sha)
                 # A compatible cache can cover a broader selection. Establish
                 # the current selection before reusing its recorded outcomes.
                 if required_ids is not None:
                     saved = _premerge_baseline(ctx, test_command, base_sha, excluded, required_ids)
                     if saved is not None:
                         _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-                        return replace(_saved_baseline(command, saved), excluded=tuple(excluded))
+                        return replace(_saved_baseline(command, saved), excluded=tuple(excluded), base_sha=base_sha)
                 selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)}"
                 selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
                 baseline_command = (
@@ -358,6 +373,7 @@ def _capture_baseline(
                 started = monotonic()
                 result = check(baseline_command, worktree)
                 duration_seconds = monotonic() - started
+                _validate_baseline_checkout(ctx.git.at(worktree), base_sha)
                 # Read this execution's collection count from the full log: a long
                 # traceback can push it out of CheckResult's bounded output tail.
                 collected = None
@@ -421,7 +437,7 @@ def _capture_baseline(
                         f"acceptance baseline unavailable: exit_code={result.exit_code}, timed_out={result.timed_out}; "
                         "capture did not produce a complete, usable JUnit report"
                     )
-                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded))
+                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded), base_sha)
             finally:
                 ctx.git.remove_worktree(worktree)
 

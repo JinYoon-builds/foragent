@@ -8,7 +8,7 @@ from foragent.i18n import text
 from foragent.status import _age
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
-from foragent.watch_layout import _clones, _lane_issues, _lane_name, _split, _widths
+from foragent.watch_layout import _clones, _lane_issues, _split, _widths
 
 ORDER = 40
 # The orchestrator verbs that take --say; they write their summary as "#N: ...".
@@ -31,6 +31,17 @@ def person_line(event: dict[str, Any], language: str) -> str:
     if kind in SAY_KINDS and issue is not None and event["summary"].startswith(f"#{issue}: "):
         return text(f"orch_say_{kind}", language, issue=issue)
     return event["summary"]
+
+
+def _runner_progress(run: dict[str, Any] | None, captured_at: Any) -> float | None:
+    """Seconds since the runner's own last progress, or None before it made any.
+
+    start_run sets last_progress_at to the start time; that value is the default,
+    not evidence that the runner moved.
+    """
+    if not run or run.get("last_progress_at") in (None, run.get("started_at")):
+        return None
+    return _age(run["last_progress_at"], captured_at)
 
 
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
@@ -57,8 +68,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             if number == row["issue"]:
                 shown = row
             else:
-                # A clone run: its own phase and title, judged as a working run.
-                shown = {**row, "state": "working", "issue": number, "title": titles.get(number) or "",
+                # Another worker of the lane: its own state, phase and title.
+                shown = {**row, "state": snapshot.worker_states.get(number, "working"), "issue": number, "title": titles.get(number) or "",
                          "phase": run.get("phase") if run else None,
                          "last_activity_seconds": _age(run.get("last_activity_at") or run.get("started_at"),
                                                        snapshot.captured_at) if run else None}
@@ -66,9 +77,14 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             task = f"#{number} {shown['title'] or ''}".rstrip() if number is not None else "—"
             if run and run["attempts"] > 1:
                 task += " · " + t("watch_retry", count=run["attempts"])
-            activity = watch._activity(shown, language, age, config.stall_minutes, run.get("pid") if run else None)
-            table += watch._columns([_lane_name(row, clones), task, phase, activity], widths,
-                                    "yellow" if activity.startswith("○") or shown["state"] == "blocked" else "")
+            activity = watch._activity(
+                shown, language, age, config.stall_minutes, run.get("pid") if run else None,
+                snapshot.log_ages.get(number) if run else None,
+                _runner_progress(run, snapshot.captured_at),
+                _age(run.get("phase_started_at"), snapshot.captured_at) if run else None)
+            # Each worker's issue shows with the plain lane name; the road numbers the workers.
+            table += watch._columns([row["lane_display"], task, phase, activity], widths,
+                                    "yellow" if activity.startswith(("○", "?", "⚠")) or shown["state"] == "blocked" else "")
     if not busy:
         table.append(watch._line(t("watch_all_idle")))
     events: list[Line] = []

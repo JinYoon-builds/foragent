@@ -71,6 +71,71 @@ def test_no_changes_are_a_failed_attempt_with_retry_output(run_case):
     assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == c.history.tip
 
 
+def test_ci_protocol_alone_is_not_an_implementation_change(run_case):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, checks='ci', checks_fallback='local',
+                           test_command=f'{sys.executable} -m pytest')
+    c.executor.steps = [{}, {}]
+    set_done_when(c, ['true'])
+
+    assert run_issue(1, c.ctx) == 'retries-exceeded'
+    assert len(c.executor.calls) == 2
+    assert 'The session made no changes.' in c.executor.calls[1]['prompt']
+    assert c.tracker.created_prs == c.tracker.merged_prs == []
+
+
+@pytest.mark.parametrize('checks,test_command', [
+    ('local', f'{sys.executable} -m pytest'),
+    ('ci', 'true'),
+    ('ci', f'{sys.executable} -m pytest'),
+], ids=['local', 'unsupported-command', 'ci'])
+@pytest.mark.parametrize('implementation', [False, True], ids=['protocol-only', 'implementation'])
+def test_tracked_protocol_cleanup_is_not_an_implementation_change(run_case, checks, test_command, implementation):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, checks=checks, test_command=test_command, checks_fallback='local',
+                           max_retries=0)
+    c.history.update({'.foragent/acceptance-exclusions.json': '[]\n'})
+    c.executor.steps = [{'feature.txt': 'done'} if implementation else {}]
+    set_done_when(c, ['true'])
+
+    assert run_issue(1, c.ctx) == ('merged' if implementation else 'retries-exceeded')
+    assert len(c.executor.calls) == 1
+    if implementation:
+        assert len(c.tracker.created_prs) == len(c.tracker.merged_prs) == 1
+        from foragent.ci_workflow import EXCLUSIONS_TRAILER
+
+        value = git_command(c.history.origin, 'log', '-1', f'--format=%(trailers:key={EXCLUSIONS_TRAILER},valueonly)',
+                            'foragent/issue-1')
+        if checks == 'ci' and test_command != 'true':
+            assert value == f'["{ACCEPTANCE}"]'
+        else:
+            assert value == ''
+        assert not git_command(c.history.origin, 'ls-tree', '-r', '--name-only', 'foragent/issue-1', '--', '.foragent')
+    else:
+        assert 'The session made no changes.' in c.store.log_path(1).read_text()
+        assert c.tracker.created_prs == c.tracker.merged_prs == []
+
+
+@pytest.mark.parametrize('checks', ['local', 'ci'])
+def test_runner_unit_tests_all_checks_importers_in_either_mode(run_case, checks):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, checks=checks, max_retries=0, checks_fallback='local',
+                           runner_unit_tests='all', test_command=f'{sys.executable} -m pytest')
+    c.history.update({
+        'src/demo.py': 'VALUE = 1\n',
+        'tests/conftest.py': 'import sys\nfrom pathlib import Path\n'
+            'sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))\n',
+        'tests/test_demo.py': 'from demo import VALUE\ndef test_demo(): assert VALUE > 0\n',
+        'tests/test_importer.py': 'from demo import VALUE\ndef test_importer(): assert VALUE == 1\n',
+    })
+    c.executor.steps = [{'feature.txt': 'done', 'src/demo.py': 'VALUE = 2\n'}]
+
+    assert run_issue(1, c.ctx) == 'retries-exceeded'
+    assert len(c.executor.calls) == 1
+    assert 'test_importer' in c.store.log_path(1).read_text()
+    assert c.tracker.created_prs == c.tracker.merged_prs == []
+
+
 @pytest.mark.parametrize("source", ["src/demo/service.py", "demo/service.py"])
 def test_related_units_include_importers_of_deleted_modules_and_existing_changed_tests(tmp_path, source):
     from foragent.runner import _related_unit_tests
@@ -208,7 +273,9 @@ def test_related_unit_failure_uses_implementation_budget_and_reaches_next_prompt
 def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkeypatch, timed_out):
     c = run_case
     c.ctx.config = replace(c.ctx.config, test_command="pytest -q")
-    c.executor.steps = [{"feature.txt": "done", "tests/test_new.py": "def test_new():\n    assert True\n"}]
+    c.executor.steps = [{"feature.txt": "done", "tests/test_new.py": (
+        "import pytest\n@pytest.mark.local_only\ndef test_new():\n    assert True\n"
+    )}]
     c.now[0] += timedelta(minutes=60)
     c.store.update_run(1, waited_seconds=600)
     calls = []
@@ -226,12 +293,14 @@ def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkey
 
     monkeypatch.setattr("foragent.runner._check", check)
     assert run_issue(1, c.ctx) == ("timeout" if timed_out else "merged")
-    assert [limit for _, limit in calls] == [900, 900, 2160]
+    assert [limit for _, limit in calls] == [900, 900, 2160, 2040, 1920]
+    assert '--collect-only' in calls[-3][0]
+    assert '-m local_only' in calls[-2][0]
     assert "tests/test_new.py" in shlex.split(calls[-1][0])
     assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
     if timed_out:
         assert c.store.load_flag(1).reason == Reason.TIMEOUT
-        assert c.store.get_run(1).detail == "Related unit tests timed out after 2160 s (1 selected tests)."
+        assert c.store.get_run(1).detail == "Related unit tests timed out after 1920 s (1 selected tests)."
         assert c.tracker.created_prs == []
 
 

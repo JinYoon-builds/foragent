@@ -2,7 +2,25 @@
 
 Ideas Jin wants to keep but not order yet. An idea moves to `decisions.md` when Jin decides it, and to an order after that. Newest first.
 
+## 2026-10-26
+
+- **출시 이야기의 중심은 "레인" (2026-10-26, Jin).**
+  - 비교 조사(Gas Town, Symphony, Orchestrator.inc, Paperclip, 가재코드, OmO, 우로보로스) 뒤 Jin이 정했다. 간판은 레인 세계관이다.
+    1. 레인은 프로젝트 영역을 맡은 다람쥐다. fa init이 레인과 스킬을 만든다.
+    2. 레인은 이슈를 스스로 찾아 처리한다(forage).
+    3. 레인은 자기 기억으로 영역을 배운다. 쓸수록 코드베이스를 아는 팀이 된다.
+    4. 동시에 도는 실행 수는 CPU 부하를 따라 늘고 준다(메모리는 위험할 때만 새 시작을 멈춘다).
+  - 잠긴 인수 시험과 최신 main 재검증은 간판이 아니라 믿음의 근거다. "사람 없이 머지"가 아니라 "코드 대신 의도를 리뷰한다"로 말한다.
+  - 워크트리 격리는 기본기다(차별점 아님). 하드웨어 조정은 "맥 한 대로 돈다" 한 줄이면 된다.
+  - 증명할 숫자: 레인별 재시도 비율과 리뷰 한 번 통과율의 추세(#333 facts). 머지 뒤 되돌린 비율.
+
+- **A one-line resource summary in the lane view (Jin, 2026-10-26).** For example "CPU 62% · mem free 46% · disk busy · Claude ok", built from the same facts the orchestrator reads (D93): CPU busy fraction, kernel memory pressure, disk I/O, usage-limit state per executor, GitHub API remaining. A person sees at a glance why the gate holds back, without opening btop. It is a feature, so it waits until 5 merges per hour is stable (D88).
+
 ## 2026-10-25
+
+- **The gate and the orchestrator rest when nothing is left, and any human action wakes them (Jin, 2026-10-25).** Today the gate ticks every 5 minutes forever and the orchestrator session stays up; idle ticks are cheap but not free (GitHub reads, process scans, laptop battery), and an idle orchestrator's context keeps growing. Rule: rest only when there is no approved work, no open PR, no CI or quota wait and no human-pending item; if anything waits for a person, keep running and keep reminding (digest, phone) and show "waiting for Jin: n" instead of "all done". Any human action (new order, approval, answer) wakes the gate immediately (the existing kick on approval), so the person never has to remember to turn it back on; the orchestrator writes a note and ends its session when idle, and the gate revives it on the next event (#128). The lane view says which state it is in. After the D88 condition (5/h stable).
+
+- **Orchestrators talk to each other across a team (Jin, 2026-10-25).** On 10-25 the planning session and the orchestrator on one machine already split work over session messages (diagnosis, locked-test amendments, outside builds). With several Foragent users in one team (D78, one factory per person), their orchestrators could: hand issues over by quota ("I'm out, take #100"), warn before collisions ("I'm rewriting auth.py; hold issues touching it"), share incidents and risk-map entries, route issues by expertise (design issues to the designer's factory), and ask the right person through the right orchestrator. Default channel: GitHub (a pinned discussion or issue comments as the mailbox), so it stays auditable and matches "GitHub is the truth"; a direct link only as a speed-up on one network. Lines: decisions still belong to the person who ordered the issue (D71, D78-3); every exchange is recorded. After team mode (D78) lands.
 
 - **Positioning against "multi-agent + /goal" (Jin, 2026-10-25).** One line: /goal finishes the task it was given; Foragent runs a project over time and reshapes the codebase so the next tasks go faster. Layers: (1) finish a task (both); (2) prove it is done: the agent's own judgment vs locked tests written before the work plus a cross-model adversarial review (on 10-25 the reviews found 20+ defects in code that passed every test); (3) many tasks at once without breaking main: lanes, baseline comparison, short merge lock; (4) days without a person: recovery, stall detection, keep-work resume, quota waits, multiple-choice questions only; (5) compounding: the architect measures hot and co-changing files and proposes splits, and orders are split so issues touch different files (10-25: cli.py and state.py splits, optimistic overlap after measuring 1 real conflict in 231 runs). With /goal, each task adds a reasonable 50 lines to the same hot file and the codebase gets slower to change; with Foragent it gets faster. Honest line: for a small one-shot task /goal is enough; Foragent pays off for large, many-threaded, multi-day work.
 

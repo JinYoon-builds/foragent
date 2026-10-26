@@ -112,44 +112,78 @@ def approve(ctx, number=1, *, body=BODY, actor="human", labels=()):
     ctx.tracker.record_label(number, "approved", actor)
 
 
-@pytest.mark.parametrize("floor,pressure,expected", [(2, "warn", 2), (2, "critical", 1), (1, "warn", 1)])
-def test_tick_applies_configured_test_slots_floor_without_starting_runs(ctx, monkeypatch, floor, pressure, expected):
+@pytest.mark.parametrize("pressure", ["warn", "critical"])
+def test_tick_memory_pressure_leaves_shared_budgets_alone(ctx, monkeypatch, pressure):
     from foragent import capacity
 
-    # The shared slots follow machine.yml only (#365); repository floors no longer reach them.
-    write_machine_yml(test_slots=2, test_slots_floor=floor)
+    # #497: memory never moves a budget; floors in machine.yml are ignored.
+    write_machine_yml(test_slots=2, test_slots_floor=2, parallel_floor=3)
     monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(pressure, 0.5, 60))
     capacity.write_state(ctx.store, 4, NOW)
     assert tick(ctx).skipped is None
-    assert capacity.effective_test_slots(2) == expected
-    rows = [json.loads(line) for line in (capacity.machine_root() / capacity.HISTORY_FILE).read_text().splitlines()]
-    assert len(rows) == 1
-    assert rows[0]["wanted"] == 1 and rows[0]["to"] == expected
-    assert rows[0]["swapins"] == 60
-    # A tick that starts nothing still applies pressure to the shared worker budget (#365).
-    assert capacity.read_state(ctx.store)["parallel"] == 2
+    assert capacity.effective_test_slots(2) == 2
+    assert capacity.read_state(ctx.store)["parallel"] == 4
+    assert not (capacity.machine_root() / capacity.HISTORY_FILE).exists()
+    assert not (ctx.store.root.parent / capacity.HISTORY_FILE).exists()
 
 
-@pytest.mark.parametrize("floor,pressure,expected", [(3, "warn", 3), (3, "critical", 1), (1, "warn", 1)])
-def test_tick_applies_configured_parallel_floor_when_starting_workers(ctx, monkeypatch, floor, pressure, expected):
+@pytest.mark.parametrize("pressure,started", [("warn", 3), ("critical", 0)])
+def test_tick_critical_memory_holds_new_starts_and_records_one_row(ctx, monkeypatch, pressure, started):
     from foragent import capacity
 
     lanes = {f"lane-{number}": {} for number in range(1, 5)}
     ctx.config = replace(ctx.config, max_parallel=3, test_slots=1, lanes=lanes)
-    write_machine_yml(parallel_floor=floor)  # The shared worker budget follows machine.yml only (#365).
     for number in range(1, 5):
         approve(ctx, number, labels=[f"lane:lane-{number}"])
     capacity.write_state(ctx.store, 3, NOW)
     monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(pressure, 0.5, 60))
+    prebuilds = []
+    ctx.baseline_launcher = lambda *args, **kwargs: prebuilds.append(args)
     ctx.start_runs = True
     assert tick(ctx).skipped is None
-    assert len(ctx.store.active_runs()) == expected
-    assert capacity.read_state(ctx.store)["parallel"] == expected
-    rows = [json.loads(line) for line in (ctx.store.root.parent / capacity.HISTORY_FILE).read_text().splitlines()]
-    assert len(rows) == 1
-    assert rows[0]["budget"] == "parallel"
-    assert rows[0]["wanted"] == 1 and rows[0]["to"] == expected
-    assert rows[0]["swapins"] == 60
+    assert len(ctx.store.active_runs()) == started
+    assert capacity.read_state(ctx.store)["parallel"] == 3
+    path = ctx.store.root.parent / capacity.HISTORY_FILE
+    rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    if pressure == "critical":
+        assert rows == [{"at": NOW.isoformat(), "rule": "memory-critical", "pressure": "critical",
+                         "load_per_cpu": 0.5, "swapins": 60}]
+        assert prebuilds == []
+    else:
+        assert rows == []
+
+
+def test_tick_critical_memory_records_nothing_when_files_overlap_already_hold_the_work(ctx, monkeypatch):
+    from foragent import capacity, scheduler
+
+    # Work that a running issue's files already hold back was not stopped by memory.
+    lanes = {f"lane-{number}": {} for number in range(1, 3)}
+    ctx.config = replace(ctx.config, max_parallel=3, test_slots=1, lanes=lanes)
+    for number in range(1, 3):
+        approve(ctx, number, labels=[f"lane:lane-{number}"])
+    capacity.write_state(ctx.store, 3, NOW)
+    lanes_checked = []
+
+    def overlapping(context, lane, issue):
+        lanes_checked.append(lane)
+        return False
+
+    monkeypatch.setattr(scheduler, "_can_start_in_lane", overlapping)
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample("critical", 0.5, 0))
+    ctx.start_runs = True
+    assert tick(ctx).skipped is None
+    assert sorted(lanes_checked) == ["lane-1", "lane-2"]
+    assert ctx.store.active_runs() == []
+    assert not (ctx.store.root.parent / capacity.HISTORY_FILE).exists()
+
+
+def test_tick_critical_memory_without_startable_work_records_nothing(ctx, monkeypatch):
+    from foragent import capacity
+
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample("critical", 0.5, 0))
+    ctx.start_runs = True
+    assert tick(ctx).skipped is None
+    assert not (ctx.store.root.parent / capacity.HISTORY_FILE).exists()
 
 
 @pytest.mark.parametrize("needs_human", [False, True])
@@ -235,6 +269,74 @@ def test_refresh_preserves_local_writes_during_remote_reads(ctx, monkeypatch, du
     assert (row["title"], row["body"], row["labels"]) == (
         "Human revision after refresh", "Latest human body", ["needs-human"],
     )
+
+
+@pytest.mark.parametrize("step", [
+    "heartbeat", "reap", "usage", "fetch", "refresh", "recovery", "budgets",
+])
+def test_tick_opens_orchestrator_when_an_earlier_step_raises(ctx, monkeypatch, step):
+    from foragent import orch_spawn, scheduler, usage_recheck
+    from foragent.git import GitError
+
+    spawned = []
+    monkeypatch.setattr(orch_spawn, "ensure_orchestrator",
+                        lambda root, store, config, *, now: spawned.append(now) or "tmux")
+    error = {"fetch": GitError("fetch failed"), "refresh": TrackerError("HTTP 500 Server Error")}.get(
+        step, OSError(f"{step} failed"))
+
+    def boom(*args, **kwargs):
+        raise error
+
+    target = {
+        "heartbeat": (ctx.store, "write_heartbeat"), "reap": (scheduler, "_reap_inactive_runs"),
+        "usage": (usage_recheck, "recheck"), "fetch": (scheduler, "fetch_base"),
+        "refresh": (ctx.tracker, "list_issues"), "recovery": (scheduler, "_recover_runs"),
+        "budgets": (scheduler, "_apply_budgets"),
+    }[step]
+    monkeypatch.setattr(*target, boom)
+    with pytest.raises(type(error)) as raised:
+        tick(ctx)
+    assert raised.value is error  # The original error propagates unchanged.
+    assert len(spawned) == 1
+
+
+def test_busy_tick_leaves_the_orchestrator_decision_to_the_lock_holder(ctx, monkeypatch):
+    from contextlib import contextmanager
+
+    from foragent import orch_spawn
+
+    spawned = []
+    monkeypatch.setattr(orch_spawn, "ensure_orchestrator",
+                        lambda root, store, config, *, now: spawned.append(now) or "orca")
+
+    @contextmanager
+    def held():
+        yield False
+
+    monkeypatch.setattr(ctx.store, "tick_lock", held)
+    report = tick(ctx)
+    assert report.skipped and spawned == [] and report.actions == []
+
+
+def test_tick_opens_orchestrator_on_both_github_wait_returns(ctx, monkeypatch):
+    from foragent import orch_spawn
+
+    spawned = []
+    monkeypatch.setattr(orch_spawn, "ensure_orchestrator",
+                        lambda root, store, config, *, now: spawned.append(now) or "tmux")
+    until = NOW + timedelta(minutes=10)
+
+    def unavailable():
+        raise TrackerError("API rate limit exceeded (HTTP 403)",
+                           stdout=f"X-RateLimit-Reset: {int(until.timestamp())}\r\n")
+
+    monkeypatch.setattr(ctx.tracker, "list_issues", unavailable)
+    first = tick(ctx)  # The wait starts inside the tick.
+    assert "GitHub rate limit" in first.skipped and len(spawned) == 1
+    assert "Opened an orchestrator (tmux)" in first.actions
+    second = tick(ctx)  # The recorded wait returns before any GitHub call.
+    assert "GitHub rate limit" in second.skipped and len(spawned) == 2
+    assert "Opened an orchestrator (tmux)" in second.actions
 
 
 @pytest.mark.parametrize("message,limited", [
@@ -1143,11 +1245,46 @@ def test_view_opens_once_after_all_available_lanes_launch(ctx, monkeypatch):
         assert {run.number: run.pid for run in store.active_runs()} == {1: 7001, 2: 7002}
         opened.append((root, store, language))
 
+    monkeypatch.delenv("FORAGENT_VIEW")
     monkeypatch.setattr("foragent.scheduler.watch_open.open_view", open_view)
     tick(ctx)
     assert opened == [(ctx.repo_root, ctx.store, "ko")]
+    # One attempt per five minutes; a later tick reopens a missing view without a new run.
+    ctx.now = lambda: NOW + timedelta(minutes=4, seconds=59)
     tick(ctx)
     assert len(opened) == 1
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    tick(ctx)
+    assert len(opened) == 2
+    monkeypatch.setattr("foragent.watch_open._running", lambda store: True)
+    ctx.now = lambda: NOW + timedelta(minutes=15)
+    tick(ctx)
+    assert len(opened) == 2
+
+
+def test_view_reopen_skips_idle_repository_off_hours_and_no_start(ctx, monkeypatch):
+    opened = []
+    monkeypatch.delenv("FORAGENT_VIEW")
+    monkeypatch.setattr("foragent.scheduler.watch_open.open_view", lambda *args: opened.append(args))
+    ctx.start_runs = True
+    tick(ctx)
+    assert opened == [], "No active run means no view to reopen"
+    approve(ctx)
+    ctx.start_runs = False
+    tick(ctx)
+    assert opened == [] and ctx.store.active_runs() == []
+    ctx.start_runs = True
+    tick(ctx)
+    assert len(opened) == 1
+    ctx.now = lambda: NOW + timedelta(minutes=10)
+    ctx.start_runs = False
+    tick(ctx)
+    assert len(opened) == 1, "--no-start never opens a view"
+    local_hour = ctx.now().astimezone().hour
+    ctx.config = replace(ctx.config, run_hours=f"{(local_hour + 1) % 24:02d}-{(local_hour + 2) % 24:02d}")
+    ctx.start_runs = True
+    tick(ctx)
+    assert len(opened) == 1, "Outside run_hours never opens a view"
 
 
 @pytest.mark.parametrize("failure", [
@@ -1180,6 +1317,10 @@ def test_view_opener_failure_keeps_all_runs_and_reports_success(ctx, monkeypatch
     assert "레인 화면을 열지 못했어요" in captured.err
     tick(ctx)
     assert capsys.readouterr() == ("", "")
+    # Every failure kind is retried once the spacing has passed.
+    ctx.now = lambda: NOW + timedelta(minutes=5)
+    tick(ctx)
+    assert "레인 화면을 열지 못했어요" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("failure", [
@@ -1196,6 +1337,7 @@ def test_view_opener_exception_preserves_tick_report_and_next_tick(ctx, monkeypa
         opened.append((root, store, language))
         raise failure
 
+    monkeypatch.delenv("FORAGENT_VIEW")
     monkeypatch.setattr("foragent.scheduler.watch_open.open_view", fail)
     report = tick(ctx)
     assert report.skipped is None
@@ -2587,7 +2729,7 @@ def test_crash_group_termination_failure_preserves_worktree_and_active_run(ctx, 
     tick(ctx)
     mark_running(ctx)
     ctx.process_table.add(124, ppid=123, cwd=ctx.repo_root, start_time=NOW.timestamp() + 1)
-    ctx.store.update_run(1)
+    ctx.store.update_run(1, observe=True)
     ctx.process_table.exit(ctx.store.get_run(1).pid)
     monkeypatch.setattr(ctx.git, "remove_worktree", lambda path: pytest.fail("group is not stopped"))
 
@@ -2854,6 +2996,21 @@ def test_tick_during_github_wait_still_applies_machine_ceilings_once(ctx, monkey
     assert samples == [1], "one sensor sample and one budget update per tick"
 
 
+def test_tick_during_github_wait_still_rechecks_free_usage(ctx, monkeypatch):
+    from foragent import usage_recheck
+
+    until = NOW + timedelta(hours=2)
+    usage_recheck.note_limit(ctx.store, "codex", until, [{"name": "5h", "used_percent": 100, "exhausted": True}], NOW)
+    ctx.store.pause_executor("codex", until)
+    ctx.store.pause_github(NOW + timedelta(minutes=30))
+    monkeypatch.setattr(usage_recheck, "read_codex", lambda now: [{"name": "5h", "used_percent": 4}])
+    report = tick(ctx)
+    assert report.skipped and "GitHub rate limit" in report.skipped
+    assert not ctx.store.executor_paused("codex", NOW)
+    events = [json.loads(line) for line in (ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [event["kind"] for event in events] == ["quota-recovered"]
+
+
 def test_rate_limit_error_after_budgets_does_not_apply_them_twice(ctx, monkeypatch):
     from foragent import capacity, scheduler
     from foragent.scheduler_start import _apply_budgets
@@ -2871,3 +3028,45 @@ def test_rate_limit_error_after_budgets_does_not_apply_them_twice(ctx, monkeypat
     monkeypatch.setattr(scheduler.orch_github, "pause", lambda context, exc: NOW + timedelta(minutes=5))
     assert "GitHub rate limit" in tick(ctx).skipped
     assert calls == [1]
+
+
+@pytest.mark.parametrize("busy", [0.0, 0.5])
+def test_tick_memory_hold_history_records_cpu_measurements(ctx, monkeypatch, busy):
+    from foragent import capacity
+
+    ctx.config = replace(ctx.config, max_parallel=3, test_slots=1)
+    approve(ctx)
+    capacity.write_state(ctx.store, 3, NOW)
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(
+        "critical", busy / 0.6, 60, load_average_per_cpu=1.82, cpu_busy=busy,
+    ))
+    ctx.baseline_launcher = lambda *args, **kwargs: None
+    ctx.start_runs = True
+    assert tick(ctx).skipped is None
+    assert ctx.store.active_runs() == []
+    rows = [json.loads(line) for line in (ctx.store.root.parent / capacity.HISTORY_FILE).read_text().splitlines()]
+    assert rows == [{
+        "at": NOW.isoformat(), "rule": "memory-critical", "pressure": "critical",
+        "load_per_cpu": busy / 0.6, "swapins": 60, "load_average_per_cpu": 1.82, "cpu_busy": busy,
+    }]
+
+
+@pytest.mark.parametrize("busy", [0.0, 0.5])
+def test_tick_budget_ceiling_history_records_cpu_measurements(ctx, monkeypatch, busy):
+    from foragent import capacity
+
+    write_machine_yml(max_parallel=2, test_slots=1)
+    capacity.write_state(ctx.store, 5, NOW - timedelta(hours=1))
+    root = capacity.machine_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / capacity.TEST_SLOTS_FILE).write_text(json.dumps({"slots": 3, "changed_at": NOW.isoformat()}))
+    ctx.store.pause_github(NOW + timedelta(minutes=30))
+    monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(
+        "normal", busy / 0.6, 0, load_average_per_cpu=1.82, cpu_busy=busy,
+    ))
+    assert "GitHub rate limit" in tick(ctx).skipped
+    for history_root in (root, ctx.store.root.parent):
+        rows = [json.loads(line) for line in (history_root / capacity.HISTORY_FILE).read_text().splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["load_per_cpu"] == busy / 0.6
+        assert rows[0]["load_average_per_cpu"] == 1.82 and rows[0]["cpu_busy"] == busy

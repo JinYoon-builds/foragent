@@ -21,11 +21,13 @@ from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issu
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
-from foragent.processes import run_logged
+from foragent.processes import claude_session, run_logged
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_checks import CheckResult, trusts_ci
+from foragent.run_previous import retry_marker
+from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
 from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
@@ -60,7 +62,12 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
     path = ctx.store.root / "orch-watch.json"
     unknown_path = ctx.store.root / "orch-watch-unknown.json"
     last_error = None
+    session = claude_session()  # The gate's spawn check trusts it past a stale heartbeat.
     while True:
+        try:  # Every read, changed or not, shows the orchestrator is alive.
+            ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session)
+        except Exception:
+            pass  # a heartbeat is best effort; the read below reports state errors
         try:
             snapshot = _watch_snapshot(ctx)
             with ctx.store._state_lock():
@@ -162,6 +169,8 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
         ctx.store._atomic_write(path, hint)
     else:
         path.unlink(missing_ok=True)
+    # The next implementer receives the keep-work/defect-class default before any hint.
+    ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         ctx.tracker.close_pr(pr, "Closed by Foragent orchestrator retry")
     # Establish the destination before clearing the old state, including on errors.
@@ -456,6 +465,14 @@ def _base_note(report: dict) -> str:
     return f" ({count} failing on the base too)" if count else ""
 
 
+def _merge_title(ctx: RunContext, pr: PullRequest) -> str:
+    """The issue's current title decides the squash subject; unlinked PRs keep theirs."""
+    if (number := pr_issue_number(pr.head)) is None:
+        return pr.title
+    title = f"{ctx.tracker.get_issue(number).title} (#{number})"
+    return f"Batch: {title}" if pr.head.startswith("foragent/batch-") else title
+
+
 def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -> str:
     """Record the human's decision and merge only the freshly checked PR head."""
     approved_by = _text(approved_by, "approved-by")
@@ -482,7 +499,11 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
         n, f"Approved by {approved_by} in the orchestrator ({at}). "
            f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
-    ctx.tracker.merge_pr(n, expected_head_sha=checked.head)
+    subject = retitle_for_merge(
+        ctx, n, title=_merge_title(ctx, current), current_title=current.title, base=current.base,
+        body=lambda: current.body, note=print,
+    )
+    ctx.tracker.merge_pr(n, expected_head_sha=checked.head, **subject)
     summary = (f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; "
                f"tests pass{_base_note(report)}, no conflicts, CI {ci}")
     _event(ctx, None, "merge", summary)

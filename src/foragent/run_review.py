@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, replace
 import json
@@ -16,8 +17,11 @@ from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.harness_guard import changed_harness_paths
 from foragent.labels import APPROVED
+from foragent import orch_reviewers, review_perspectives, risks
+from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
+from foragent.run_attempt import ExecutorStopped
 from foragent.run_execution import _available_executor
 from foragent.run_prompts import build_review_prompt, review_scope_rules
 from foragent.run_waits import _phase, _progress, _timeout
@@ -84,7 +88,7 @@ def parse_code_review(message: str) -> ReviewResult:
 
 
 @contextmanager
-def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = ""):
+def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = "", risk_notes: str = ""):
     git.ignore_review_scope()
     path = git.root / REVIEW_SCOPE_FILE
     link = os.readlink(path) if path.is_symlink() else None
@@ -93,6 +97,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
     section = (
         "# Review scope (written by Foragent for this review only)\n\n"
         f"{body}\n\n{review_scope_rules(acceptance_dir)}\n\n"
+        + (f"{risk_notes}\n\n" if risk_notes else "")
         + (f"Implementer rebuttals (judge them):\n{rebuttals}\n\n" if rebuttals else "")
     ).encode("utf-8")
     try:
@@ -123,13 +128,21 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     if reviewer == "claude" and pr is not None:
         options["review_pr"] = pr
     rebuttals = _read_rebuttals(git.root)
+    notes = _risk_notes(git, base_ref)
+    if notes and len(shares := review_perspectives.shares(
+            ctx.config, orch_reviewers.effective(ctx.store, ctx.config, n))) > 1:
+        return _panel_review(n, ctx, git, parsed, base_ref, reviewer, rebuttals, notes, shares, round_number)
+    risk_notes = review_perspectives.with_checklist(notes, ctx.config)
+    settings = risks.review_options(ctx.config, reviewer, ctx.config.reviewer_model) if risk_notes else {
+        "model": ctx.config.reviewer_model}
     edited = False
     with ExitStack() as scope:
         if reviewer == "claude" and ctx.config.review_scope == "claude-local":
             approval = ctx.store.load_approval(n)
             if approval is None:
                 raise ValueError("Claude review requires an approved snapshot")
-            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir, rebuttals))
+            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir, rebuttals,
+                                                      risk_notes))
         before = git.review_state()
         try:
             result = _available_executor(
@@ -137,22 +150,14 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
                 reviewer=True,
                 prompt="" if reviewer == "claude" else build_review_prompt(
                     parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
+                    risk_notes=risk_notes,
                 ),
-                model=ctx.config.reviewer_model, timeout_s=runner._remaining(n, ctx),
+                **settings, timeout_s=runner._remaining(n, ctx),
                 log_path=ctx.store.log_path(n), **options,
             )
             message = result.full_message if result.full_message is not None else result.last_message
-            raw = message
-            if reviewer == "claude":
-                try:
-                    event = json.loads(message)
-                except ValueError:
-                    event = None
-                if isinstance(event, dict) and isinstance(event.get("result"), str):
-                    raw = event["result"]
-            path = ctx.store.root / "runs" / f"issue-{n}" / f"review-{round_number}.txt"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(raw, encoding="utf-8")
+            raw = _raw_text(reviewer, message)
+            _save_review(n, ctx, f"review-{round_number}.txt", raw)
         finally:
             if git.review_state() != before:
                 git.restore_review_state(before)
@@ -178,6 +183,162 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     return replace(review, raw=raw, timed_out=result.timed_out)
 
 
+def _raw_text(reviewer: str, message: str) -> str:
+    """The reviewer's text: Claude's JSON result field when present, else the message itself."""
+    if reviewer == "claude":
+        try:
+            event = json.loads(message)
+        except ValueError:
+            event = None
+        if isinstance(event, dict) and isinstance(event.get("result"), str):
+            return event["result"]
+    return message
+
+
+def _save_review(n: int, ctx: RunContext, name: str, raw: str) -> None:
+    path = ctx.store.root / "runs" / f"issue-{n}" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(raw, encoding="utf-8")
+
+
+def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str, reviewer: str,
+                  rebuttals: str, notes: str, shares: list[list[dict[str, str]]],
+                  round_number: int) -> ReviewResult:
+    """N independent reviewers run at once on disjoint perspective shares; one merge call decides.
+
+    Every call uses the prompt path at the risk-map tier, whatever reviewer or review_scope is
+    set. A usage limit in any reviewer stops the whole round (limit-wait) and it runs again in
+    full; any other failure or timeout makes the round UNUSABLE, as a failed single review is.
+    """
+    from foragent import runner
+
+    settings = risks.review_options(ctx.config, reviewer, ctx.config.reviewer_model)
+    executor = ctx.executor_factory(reviewer)
+    diff = git.staged_diff(base_ref)
+    acceptance = ctx.config.acceptance_dir
+    log = ctx.store.log_path(n)
+
+    def call(prompt: str, log_path: Path = log) -> ExecResult:
+        # The panel decides the round's outcome from every call, so no call blocks the issue itself.
+        return _available_executor(n, ctx, executor, worktree=git.root, reviewer=True, prompt=prompt,
+                                   **settings, timeout_s=runner._remaining(n, ctx), log_path=log_path,
+                                   flag_exhaustion=False)
+
+    def unusable_error(label: str, error: BaseException) -> str:
+        """Re-raise a usage limit or an interrupt; any other error becomes an UNUSABLE note."""
+        if _is_limit(error) or not isinstance(error, Exception):
+            raise error
+        return f"{label} failed: {getattr(error, 'outcome', type(error).__name__)} {error}".rstrip()
+
+    # Each concurrent reviewer logs to its own file: executors derive per-call output files
+    # (Claude's `<log>.stdout`) from the log path, so a shared log would mix their outputs.
+    logs = [log.with_name(f"{log.stem}-review-{round_number}-{k}.log") for k in range(1, len(shares) + 1)]
+
+    def restore(before) -> bool:
+        if git.review_state() == before:
+            return False
+        git.restore_review_state(before)
+        _append(log, "Reviewer changed repository state; restored HEAD, index and working tree.")
+        return True
+
+    prompts = [build_review_prompt(parsed, diff, acceptance, rebuttals=rebuttals,
+                                   risk_notes=review_perspectives.with_checklist(notes, ctx.config, share))
+               for share in shares]
+    before = git.review_state()
+    try:
+        with ThreadPoolExecutor(max_workers=len(prompts), thread_name_prefix=f"review-{n}") as pool:
+            futures = [pool.submit(call, prompt, path) for prompt, path in zip(prompts, logs)]
+        errors = [future.exception() for future in futures]
+    finally:
+        edited = restore(before)
+    count = len(futures)
+    # Outcome order: an interrupt propagates first; then any usage limit wins over every other
+    # reviewer outcome (the round is discarded and runs again in full); other errors are UNUSABLE.
+    raised = [error for error in errors if error is not None]
+    for error in ([error for error in raised if not isinstance(error, Exception)]
+                  + [error for error in raised if _is_limit(error)]):
+        raise error
+    problems: list[str] = []
+    raws = []
+    timed_out = False
+    for k, (future, error) in enumerate(zip(futures, errors), start=1):
+        if error is not None:
+            problems.append(unusable_error(f"Reviewer {k} of {count}", error))
+            raws.append(problems[-1])
+        else:
+            result = future.result()
+            message = result.full_message if result.full_message is not None else result.last_message
+            raws.append(_raw_text(reviewer, message))
+            timed_out |= result.timed_out
+            if result.timed_out or result.exit_code != 0:
+                problems.append(f"Reviewer {k} of {count} exit_code={result.exit_code}, timed_out={result.timed_out}")
+            elif parse_review(raws[-1]).verdict == "UNUSABLE":
+                # A reviewer without a VERDICT line gave no usable review; never let the merge cover for it.
+                problems.append(f"Reviewer {k} of {count} gave no verdict")
+        _save_review(n, ctx, f"review-{round_number}-{k}.txt", raws[-1])
+    _append(log, "Parallel reviewer logs:\n" + "\n".join(str(path) for path in logs))
+    findings = "\n\n".join(f"Reviewer {k}:\n{raw}" for k, raw in enumerate(raws, start=1))
+    if problems:
+        raw = findings
+        review = ReviewResult("UNUSABLE", "", tuple(problems))
+    else:
+        try:
+            result = call(build_review_prompt(parsed, diff, acceptance, rebuttals=rebuttals,
+                                              risk_notes=review_perspectives.with_checklist(notes, ctx.config),
+                                              panel_findings=findings))
+        except BaseException as error:
+            result = None
+            raw = unusable_error("Findings merge", error)
+        finally:
+            edited = restore(before) or edited
+        if result is None:
+            review = ReviewResult("UNUSABLE", "", (raw,))
+        else:
+            message = result.full_message if result.full_message is not None else result.last_message
+            raw = _raw_text(reviewer, message)
+            timed_out = result.timed_out
+            review = (ReviewResult("UNUSABLE", "", (
+                f"Findings merge exit_code={result.exit_code}, timed_out={result.timed_out}",
+            )) if result.timed_out or result.exit_code != 0 else parse_review(raw))
+    _save_review(n, ctx, f"review-{round_number}.txt", raw)
+    review = ReviewResult(review.verdict, review.findings, (
+        f"reviewers: {count} in parallel, one findings merge", *review.notes,
+    ))
+    if edited:
+        review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
+    if review.verdict == "PASS":
+        ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
+    _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}")
+    _progress(n, ctx)
+    return replace(review, raw=raw, timed_out=timed_out)
+
+
+def _is_limit(error: BaseException) -> bool:
+    return isinstance(error, ExecutorStopped) and error.outcome == "limit-wait"
+
+
+def _risk_notes(git: GitRepo, base_ref: str) -> str:
+    """Risk notes for the paths this head changes; empty when no mapped path changed."""
+    changed = git.changed_paths(base_ref)
+    return risks.review_notes(risks.matching(risks.load_at(git, base_ref), changed), changed)
+
+
+def with_review_scope(body: str, acceptance_dir: str, language: str) -> str:
+    """Add the review scope, or the defect-class question to an older PR's existing scope section."""
+    from foragent.i18n import text
+
+    rules = review_scope_rules(acceptance_dir, language)
+    if "## Review scope" not in body:
+        return body + "\n\n## Review scope\n\n" + rules
+    question = text("review_class_question", language)
+    if question in body:
+        return body
+    earlier = rules.removesuffix("\n" + question)
+    if earlier in body:
+        return body.replace(earlier, rules, 1)
+    return body.replace("## Review scope\n\n", f"## Review scope\n\n{question}\n", 1)
+
+
 def _read_rebuttals(worktree: Path) -> str:
     path = worktree / ".foragent/REBUTTAL.md"
     return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
@@ -198,6 +359,7 @@ def _normalized_findings(review: ReviewResult) -> set[str]:
 
 
 def _review_implementation(attempt: Implementation) -> None:
+    from foragent.ci_mode import commit_exclusions
     from foragent.run_publish import _open_or_update_pr, _push_branch, _render_pr_body
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
@@ -205,8 +367,7 @@ def _review_implementation(attempt: Implementation) -> None:
     pr = None
     if ctx.config.review_scope == "pr-body":
         title = f"{ctx.tracker.get_issue(n).title} (#{n})"
-        if git.has_staged_changes():
-            git.commit(title)
+        commit_exclusions(attempt, title)
         _push_branch(attempt)
         pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))
         _progress(n, ctx)
@@ -220,6 +381,7 @@ def _review_implementation(attempt: Implementation) -> None:
         ]))
     if review.verdict != "PASS":
         attempt.review_failures += 1
+        attempt.review_feedback = True
         if review.verdict == "UNUSABLE":
             attempt.reviewer_text = review.raw
             attempt.failure = "A reviewer said (verbatim):\n" + review.raw
@@ -287,6 +449,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return _hold_changed_head(n, ctx, link)
     ctx.git.add_detached_worktree(worktree, head)
     git = ctx.git.at(worktree)
+    from foragent.ci_workflow import EXCLUSIONS
+    if git.blob_sha("HEAD", EXCLUSIONS) is not None:
+        git.publication_paths.add(EXCLUSIONS)
     if not _acceptance_matches(n, ctx, git, approval):
         return "hash-mismatch"
     if not git.is_ancestor(base_sha, head):
@@ -302,9 +467,13 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if verdict_head is None and ctx.config.reviewer != "none":
         if runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
-        if ctx.config.review_scope == "pr-body" and "## Review scope" not in pr.body:
-            ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title,
-                                  body=pr.body + "\n\n## Review scope\n\n" + review_scope_rules(ctx.config.acceptance_dir))
+        if ctx.config.review_scope == "pr-body":
+            # Native PR review reads only the PR body: refresh the risk notes for this head and base.
+            body = with_review_scope(pr.body, ctx.config.acceptance_dir, ctx.config.language)
+            body = risks.refresh_notes(body, review_perspectives.with_checklist(_risk_notes(git, base_ref), ctx.config))
+            if body != pr.body:
+                pr = replace(pr, body=body)
+                ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
         review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx),
                          pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
@@ -314,6 +483,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
             return "review-failed"
 
+    from foragent.ci_mode import enabled, review_checks
+    comparison_attempt = review_checks(n, ctx, git, pr.base) if enabled(ctx, pr.base) else None
     return _publish_reviewed_head(
         n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
+        comparison_attempt=comparison_attempt,
     )
