@@ -41,6 +41,8 @@ class CheckResult:
     exit_code: int | None
     timed_out: bool
     output: str
+    # Elapsed command time (excluding any test-slot queue) when a clock was supplied.
+    seconds: float | None = None
 
 
 def _append(log: Path, text: str) -> None:
@@ -53,6 +55,7 @@ def _check(
     command: str, worktree: Path, log: Path, timeout_s: int,
     *, progress: Callable[[], None] | None = None,
     slot: AbstractContextManager | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> CheckResult:
     from foragent import runner
 
@@ -63,15 +66,24 @@ def _check(
     # published afterwards. Bytecode written by the checks must not join them.
     environment = {"PYTHONDONTWRITEBYTECODE": "1"}
 
+    elapsed: list[float] = []
+
+    def timed(env):
+        started = clock() if clock is not None else None
+        try:
+            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
+                                     env=env)
+        finally:
+            if started is not None:
+                elapsed.append(max(0.0, clock() - started))
+
     def execute():
         # The slot covers only the command; timeout_s counts execution, not the queue.
         if slot is None:
-            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
-                                     env=environment)
+            return timed(environment)
         with slot:
             # A nested `fa test` in the command shares this slot instead of waiting for another.
-            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
-                                     env={**environment, **capacity.HELD_ENV})
+            return timed({**environment, **capacity.HELD_ENV})
 
     # A quiet check is still running; keep the scheduler informed while it waits.
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
@@ -79,7 +91,7 @@ def _check(
         stream.seek(max(offset, log.stat().st_size - 16000))
         tail = stream.read().decode("utf-8", errors="replace")[-4000:]
     _append(log, f"\nCheck exit_code={code}, timed_out={timed_out}\nOutput tail:\n{tail}")
-    return CheckResult(command, code, timed_out, tail)
+    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None)
 
 
 def _pytest_command(command: str) -> str | None:
@@ -191,6 +203,38 @@ def _passing_acceptance_ids(report: Path) -> tuple[str, ...]:
             continue
         (failed if any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) else passed).add(node_id)
     return tuple(sorted(passed - failed))
+
+
+def _junit_file_seconds(report: Path) -> dict[str, float]:
+    """Sum legacy JUnit testcase times per file; a missing or unreadable report has none."""
+    seconds: dict[str, float] = {}
+    try:
+        cases = list(ET.parse(report).iter("testcase"))
+    except (OSError, ET.ParseError):
+        return seconds
+    for case in cases:
+        file = case.get("file")
+        try:
+            value = float(case.get("time", ""))
+        except ValueError:
+            continue
+        if file:
+            seconds[file] = seconds.get(file, 0) + value
+    return seconds
+
+
+def _record_related_check(
+    n: int, ctx: RunContext, changed: int, selected: list[str], report: Path, result: CheckResult,
+) -> None:
+    """Append this related-unit-test check to the run, before a timeout ends it."""
+    check = {"changed_file_count": changed, "selected_files": sorted(selected),
+             "file_seconds": _junit_file_seconds(report),
+             "total_seconds": result.seconds if result.seconds is not None else 0,
+             "timed_out": bool(result.timed_out)}
+    report.unlink(missing_ok=True)
+    run = ctx.store.get_run(n)
+    if run is not None:
+        ctx.store.update_run(n, related_tests=[*run.related_tests, check])
 
 
 def has_pull_request_ci(root: Path) -> bool:
@@ -373,9 +417,15 @@ def _verify_implementation(attempt: Implementation) -> str:
                 attempt.checks.append(local_units)
         if unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
-            result = runner._check(f"{unit_command} {shlex.join(unit_tests)}", worktree, log, limit,
-                            progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+            report = ctx.store.root / "runs" / f"issue-{n}-related.xml"
+            # A stale report from an earlier check must never supply this check's timings.
+            report.unlink(missing_ok=True)
+            # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
+            junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
+            result = runner._check(f"{unit_command} {junit} {shlex.join(unit_tests)}", worktree, log, limit,
+                            progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic)
             attempt.checks.append(result)
+            _record_related_check(n, ctx, len(attempt.paths), unit_tests, report, result)
             _progress(n, ctx)
             if result.timed_out:
                 detail = f"Related unit tests timed out after {limit} s ({len(unit_tests)} selected tests)."

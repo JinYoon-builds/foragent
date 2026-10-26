@@ -253,7 +253,10 @@ def log(ctx: RunContext) -> list[dict]:
     with ctx.store._state_lock():
         if path.exists():
             with path.open(encoding="utf-8") as stream:
-                events = [json.loads(line) for line in deque(stream, maxlen=20)]
+                # Phase timings (kind=phase) are measurements for `fa orch facts`, not actions.
+                events = deque((event for line in stream
+                                if (event := json.loads(line)).get("kind") != "phase"), maxlen=20)
+                events = list(events)
         else:
             events = []
     _event(ctx, None, "log", f"Read {len(events)} recent orchestrator events")

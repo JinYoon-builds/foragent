@@ -53,6 +53,7 @@ def _test_slot(n: int, ctx: RunContext):
     run = ctx.store.get_run(n)
     started = ctx.now()
     waited = False
+    previous_phase = run.phase
 
     def credit() -> datetime:
         now = ctx.now()
@@ -64,6 +65,9 @@ def _test_slot(n: int, ctx: RunContext):
 
     def waiting() -> None:
         nonlocal waited
+        if not waited:
+            # Queued time is its own phase, so facts can see the slot queue and its wait.
+            ctx.store.update_run(n, phase="test-slot-wait", phase_started_at=started.astimezone(UTC).isoformat())
         waited = True
         now = credit()
         # Tick reads a future waiting_until as alive; refresh it while queued.
@@ -74,8 +78,9 @@ def _test_slot(n: int, ctx: RunContext):
             stack.enter_context(capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting))
         finally:
             if waited:
-                credit()
-                ctx.store.update_run(n, waiting_until=None)
+                now = credit()
+                ctx.store.update_run(n, waiting_until=None, phase=previous_phase,
+                                     phase_started_at=now.astimezone(UTC).isoformat())
         yield
 
 

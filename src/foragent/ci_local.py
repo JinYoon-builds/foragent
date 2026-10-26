@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import _passing_acceptance_ids, _pytest_command, junit_node_id
-from foragent.run_waits import _progress, _test_slot
+from foragent.run_waits import _phase, _progress, _test_slot
 
 
 def report_ids(report, result, measurement):
@@ -56,11 +56,23 @@ def base_checkout(ctx, git, base_sha):
 
 
 def capture_local_only(n, ctx, git, test_command, base_sha, excluded):
-    from foragent.run_baseline import AcceptanceBaseline, _validate_baseline_checkout
-
     command = _pytest_command(test_command) if test_command else None
     if command is None:
         raise AttemptFailure("local_only checks require a supported pytest command")
+    # Measuring the base is the baseline phase; a second measurement of this base repeats it.
+    previous = ctx.store.get_run(n).phase
+    _phase(n, ctx, "baseline")
+    ctx.store.update_run(n, phase_work_id=f"baseline-local:{base_sha}")
+    try:
+        return _capture_local_only(n, ctx, git, command, base_sha, excluded)
+    finally:
+        if previous is not None:
+            _phase(n, ctx, previous)
+
+
+def _capture_local_only(n, ctx, git, command, base_sha, excluded):
+    from foragent.run_baseline import AcceptanceBaseline, _validate_baseline_checkout
+
     report = ctx.store.root / "runs" / f"issue-{n}-local-only.xml"
     report.parent.mkdir(parents=True, exist_ok=True)
     with base_checkout(ctx, git, base_sha) as root:

@@ -6,6 +6,7 @@ matters, and it holds new starts and new test slots without changing a budget.
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 import ctypes
 from datetime import UTC, datetime, timedelta
 import fcntl
@@ -51,6 +52,9 @@ HELD_ENV = {TEST_SLOT_ENV: "held"}
 SLOT_POLL_SECONDS = 0.1
 # How often a waiting test command reports that it is still waiting.
 SLOT_HEARTBEAT_SECONDS = 10.0
+
+# Inside observing(), machine_load() reads the sensors without writing their baselines.
+_OBSERVING: ContextVar[bool] = ContextVar("foragent_capacity_observing", default=False)
 
 _DARWIN_PRESSURE = {1: "normal", 2: "warn", 4: "critical"}
 
@@ -230,7 +234,29 @@ def cpu_busy() -> float | None:
         return None
 
 
+@contextmanager
+def observing() -> Iterator[None]:
+    """Read machine_load() for display only: no lock, no sensor baseline written."""
+    token = _OBSERVING.set(True)
+    try:
+        yield
+    finally:
+        _OBSERVING.reset(token)
+
+
+def _observed_load() -> LoadSample:
+    """The current sample from read-only sources; CPU busy comes from the last saved sample."""
+    sensor = _read_sensor(machine_root())
+    busy = sensor.get("cpu_busy")
+    busy = busy if type(busy) in (int, float) and 0 <= busy <= 1 else None
+    raw_load = load_per_cpu()
+    load = min(raw_load, busy / 0.6) if busy is not None else raw_load
+    return LoadSample(kernel_pressure(), load, None, load_average_per_cpu=raw_load, cpu_busy=busy)
+
+
 def machine_load() -> LoadSample:
+    if _OBSERVING.get():
+        return _observed_load()
     root = machine_root()
     with _flock(root / SENSOR_LOCK):
         pressure, total = kernel_pressure(), swapins_total()

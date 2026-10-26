@@ -79,3 +79,10 @@ class Run:
     effective_files: list[str] | None = None
     late_files: list[str] = field(default_factory=list)
     overlap_records: list[dict] = field(default_factory=list)
+    # One entry per related-unit-test check: changed_file_count, selected_files,
+    # file_seconds (JUnit testcase seconds per file), total_seconds and timed_out.
+    related_tests: list[dict] = field(default_factory=list)
+    # Identity of the work the current phase does (e.g. "baseline:<sha>"), journaled when it ends;
+    # work_events maps each finished work identity to its first phase event, across executions.
+    phase_work_id: str | None = None
+    work_events: dict[str, str] = field(default_factory=dict)

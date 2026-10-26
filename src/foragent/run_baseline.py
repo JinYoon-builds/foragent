@@ -22,6 +22,7 @@ from time import monotonic
 from typing import IO, TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
+from foragent.git import GitError
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
@@ -276,18 +277,35 @@ def _capture_acceptance_baseline(
         remaining = runner._remaining(n, ctx)
         if remaining <= 0:
             raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before capture")
+        # A capture (not a cache hit) is work on this base; a second capture of it repeats it.
+        try:
+            ctx.store.update_run(n, phase_work_id=f"baseline:{ctx.git.at(worktree).head_sha()}")
+        except GitError:
+            pass  # Without the base identity the capture is still measured, only not linked.
         result = runner._check(command, worktree, ctx.store.log_path(n),
                                _baseline_capture_limit(ctx, ctx.store.log_path(n), remaining),
                                progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
         _progress(n, ctx)
         return result
 
-    return _capture_baseline(
-        ctx, test_command, target_ref, log=ctx.store.log_path(n),
-        report=ctx.store.root / "runs" / f"issue-{n}-acceptance-baseline.xml", check=check,
-        prepare=lambda: _phase(n, ctx, "checking"),
-        wait=lambda acquire: _credited_wait(n, ctx, acquire),
-    )
+    def wait(acquire) -> None:
+        # Waiting for another run's build of the same baseline is its own phase.
+        _phase(n, ctx, "baseline-wait")
+        try:
+            _credited_wait(n, ctx, acquire)
+        finally:
+            _phase(n, ctx, "baseline")
+
+    previous = ctx.store.get_run(n).phase
+    try:
+        return _capture_baseline(
+            ctx, test_command, target_ref, log=ctx.store.log_path(n),
+            report=ctx.store.root / "runs" / f"issue-{n}-acceptance-baseline.xml", check=check,
+            prepare=lambda: _phase(n, ctx, "baseline"), wait=wait,
+        )
+    finally:
+        if previous is not None:
+            _phase(n, ctx, previous)
 
 
 def _capture_baseline(

@@ -6,7 +6,7 @@ ORDER = 120
 # An orchestrator whose heartbeat is at most this old counts as alive.
 ALIVE_SECONDS = 30
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive",
-                 "reviewers"}
+                 "reviewers", "facts"}
 
 
 def add(commands) -> None:
@@ -82,6 +82,10 @@ def _add_inbox(orch_actions) -> None:
     queue.add_argument("--clear", action="store_true")
     queue.add_argument("--json", action="store_true")
     queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    facts = orch_actions.add_parser(
+        "facts", help="Show measured run, test-slot, file, failure and resource facts from local records")
+    facts.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    facts.add_argument("--json", action="store_true")
     reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")
     reviewers.add_argument("issue", type=int)
     reviewers.add_argument("count", type=int, nargs="?", help="Reviewer count (1 or more); wins over review_reviewers")
@@ -118,6 +122,10 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         return
     if args.action == "alive":
         _alive(args, store, config)
+        return
+    if args.action == "facts":
+        facts = cli.orch_facts.collect(store, config, args.repo_root.resolve())
+        print(cli.json.dumps(facts, ensure_ascii=False) if args.json else cli.orch_facts.human(facts))
         return
     if args.action == "queue":
         if args.clear and args.numbers:

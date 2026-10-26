@@ -12,7 +12,40 @@ from foragent.state_records import Run
 PROCESS_FIELDS = frozenset({"process_identities", "pid", "executor_pgid"})
 
 
+def _load() -> float:
+    try:
+        return float(_state.os.getloadavg()[0])
+    except OSError:
+        return 0.0
+
+
 class RunRecordsMixin:
+    def _close_phase(self, run: Run, closed_at: datetime) -> dict[str, Any]:
+        """Journal the ended phase (#224 schema): its own seconds and the 1-minute load.
+
+        Called under the state lock, as each transition happens, so readers see it at once.
+        Work with an identity also gets event_id/work_id, and repeat_of when the same work
+        already ended once. Returns the run fields this closing changes.
+        """
+        if not run.phase or not run.phase_started_at:
+            return {}
+        opened = _state.datetime.fromisoformat(run.phase_started_at)
+        event = {"at": closed_at.astimezone(_state.UTC).isoformat(), "issue": run.number, "kind": "phase",
+                 "phase": run.phase, "seconds": max(0.0, (closed_at - opened).total_seconds()),
+                 "load": _load()}
+        changes: dict[str, Any] = {}
+        if run.phase_work_id:
+            event_id = f"{run.number}:{run.phase}:{run.phase_started_at}"
+            event.update(event_id=event_id, work_id=run.phase_work_id)
+            if (first := run.work_events.get(run.phase_work_id)) is not None:
+                event["repeat_of"] = first
+            else:
+                changes["work_events"] = {**run.work_events, run.phase_work_id: event_id}
+            changes["phase_work_id"] = None
+        with (self.root / "orch-events.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(_state.json.dumps(event, ensure_ascii=False) + "\n")
+        return changes
+
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
         lane: str = "main", tier: str = "m",
@@ -35,6 +68,7 @@ class RunRecordsMixin:
                     "session_ids": previous.session_ids, "session_body": previous.session_body,
                     "merge_conflicts": previous.merge_conflicts,
                     "local_skill_paths": previous.local_skill_paths,
+                    "work_events": previous.work_events,
                     "resume_reason": reason + (
                         "\nThe runner recreated the worktree from its target branch; "
                         "earlier uncommitted changes are no longer present."
@@ -93,6 +127,10 @@ class RunRecordsMixin:
                     or " ".join(run.detail.split())[:500]
                     or "Run detail unavailable."
                 )
+            if "phase" in fields and fields["phase"] != run.phase:
+                closed = fields.get("phase_started_at")
+                changes = self._close_phase(run, _state.datetime.fromisoformat(closed) if closed else self._now())
+                fields = {**changes, **fields}
             if not observe:
                 updated = _state.replace(run, **fields)
                 self._write_run(updated)
@@ -219,7 +257,8 @@ class RunRecordsMixin:
                 detail = " ".join(run.detail.split())[:500] or f"Run finished with outcome {outcome}."
             from foragent.processes import observe_tree
 
-            finished = _state.replace(run, status="finished", outcome=outcome, detail=detail,
+            finished = _state.replace(run, **self._close_phase(run, self._now()))
+            finished = _state.replace(finished, status="finished", outcome=outcome, detail=detail,
                                       process_identities=observe_tree(run.process_identities))
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
