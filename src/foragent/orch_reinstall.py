@@ -3,6 +3,7 @@
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
+from time import sleep
 import tomllib
 from typing import TYPE_CHECKING
 
@@ -12,15 +13,27 @@ if TYPE_CHECKING:
     from foragent.runner import RunContext
 
 
+# Running processes can write __pycache__ into the tool directory while uv
+# empties it; a moment later the same install succeeds.
+RACE_ERRORS = ("Directory not empty", "failed to remove directory")
+INSTALL_ATTEMPTS = 3
+BACKOFF_SECONDS = 2.0
+
+
 def _uv(args: list[str], *, cwd: Path) -> str:
-    result = subprocess.run(
-        ["uv", *args], cwd=cwd, capture_output=True, text=True,
-        errors="replace", timeout=300,
-    )
-    if result.returncode:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip()
-                           or f"uv {' '.join(args)} exited {result.returncode}")
-    return result.stdout.strip()
+    for attempt in range(1, INSTALL_ATTEMPTS + 1):
+        result = subprocess.run(
+            ["uv", *args], cwd=cwd, capture_output=True, text=True,
+            errors="replace", timeout=300,
+        )
+        if not result.returncode:
+            return result.stdout.strip()
+        output = f"{result.stderr}\n{result.stdout}"
+        if attempt == INSTALL_ATTEMPTS or not any(error in output for error in RACE_ERRORS):
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip()
+                               or f"uv {' '.join(args)} exited {result.returncode}")
+        sleep(BACKOFF_SECONDS * attempt)
+    raise AssertionError("unreachable")
 
 
 def _package_files(root: Path) -> dict[Path, bytes]:
