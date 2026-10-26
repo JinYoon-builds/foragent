@@ -15,7 +15,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import risks
+from foragent import review_perspectives, risks
 from foragent.reasons import Reason
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
 from foragent.run_execution import _available_executor
@@ -124,7 +124,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     if reviewer == "claude" and pr is not None:
         options["review_pr"] = pr
     rebuttals = _read_rebuttals(git.root)
-    risk_notes = _risk_notes(git, base_ref)
+    risk_notes = review_perspectives.with_checklist(_risk_notes(git, base_ref), ctx.config)
     settings = risks.review_options(ctx.config, reviewer, ctx.config.reviewer_model) if risk_notes else {
         "model": ctx.config.reviewer_model}
     edited = False
@@ -317,7 +317,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             # Native PR review reads only the PR body: refresh the risk notes for this head and base.
             body = pr.body if "## Review scope" in pr.body else (
                 pr.body + "\n\n## Review scope\n\n" + review_scope_rules(ctx.config.acceptance_dir))
-            body = risks.refresh_notes(body, _risk_notes(git, base_ref))
+            body = risks.refresh_notes(body, review_perspectives.with_checklist(_risk_notes(git, base_ref), ctx.config))
             if body != pr.body:
                 pr = replace(pr, body=body)
                 ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
