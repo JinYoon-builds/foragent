@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Any
 
 from foragent.config import Config
-from foragent.status import summary_values
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 from foragent.watch_layout import _clones, _split, _widths, _worker_rows
@@ -35,7 +34,6 @@ def _overview(snapshot: Snapshot, language: str, age: float = 0.0) -> list[Line]
                      watch._line(snapshot.order.title)]
     else:
         overview.append(watch._line(t("watch_no_order")))
-    overview.append(watch._line(t("watch_waiting", **summary_values({"count": status["summary"]["waiting_human"]})), "bold"))
     if snapshot.requests:
         count = lambda name: sum(row.get("status") == name for row in snapshot.requests)
         overview.append(watch._line(t("watch_requests", processing=count("processing"), done=count("done"))))
@@ -76,6 +74,32 @@ def _road(
             break
         shown -= 1
     return watch._fit([*prefix, (" " * max(0, space - road_cells), "road"), *road, *tail], road_width)
+
+
+def _flow(head: str, items: list[str], width: int) -> list[str]:
+    """Lines of ``head`` and the items joined by " · ", wrapping instead of cutting.
+
+    A new line starts between items. An item (or the heading) too wide for a
+    whole line wraps between its own words, so no lane name or done count is cut.
+    """
+    from foragent import watch
+
+    indent = "  "
+    wrap = lambda value, room: ["".join(part for part, _ in line) for line in watch._wrap(value, max(1, room))]
+    lines = wrap(head, width)
+    current = lines.pop()
+    first = True
+    for item in items:
+        joined = current + (" " if first else " · ") + item
+        first = False
+        if watch._cells(joined) <= width:
+            current = joined
+            continue
+        lines.append(current)
+        pieces = [indent + piece for piece in wrap(item, width - len(indent))]
+        lines += pieces[:-1]
+        current = pieces[-1]
+    return lines + [current]
 
 
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
@@ -122,8 +146,11 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         items = []
         for index, row in idle:
             count = len(snapshot.done.get(row["slug"], []))
-            items.append(f"{index} {row['lane_display']}" + (f" ✓{count}" if count else ""))
-        roads.append(watch._fit(watch._line(t("watch_idle_lanes") + ": " + " · ".join(items)), road_width))
+            items.append(f"{index} {row['lane_display']}" + (" " + t("done_state_lane_done", count=count) if count else ""))
+        # Clean the parts first: cleaning a finished line would collapse the continuation indent.
+        flowed = _flow(watch._clean(t("watch_idle_lanes") + ":"), [watch._clean(item) for item in items], road_width)
+        roads += [[(line, "")] for line in flowed]
         roads.append([("━" * road_width, "edge")])
     context.get("hits", []).append((0, top, orchestrator_width, top + len(left), ("orchestrator", None)))
-    return watch._beside(left, roads, orchestrator_width, links=True) if side_by_side else left + roads
+    # The arrows point from the orchestrator to working lanes; with every lane idle they go.
+    return watch._beside(left, roads, orchestrator_width, links=bool(busy)) if side_by_side else left + roads
