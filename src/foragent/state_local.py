@@ -1,4 +1,4 @@
-"""Order progress, approvals, flags, inspect state, plan usage and tidy state."""
+"""Order progress, approvals, flags, inspect state, plan usage, tidy state and the orchestrator note."""
 
 from collections.abc import Callable
 from typing import Any
@@ -7,6 +7,16 @@ from foragent.state_records import Approval, Flag, InspectState
 
 
 class LocalRecordsMixin:
+    ORCH_NOTE_FILE = "orch-note.json"
+
+    def orch_note(self) -> dict[str, Any] | None:
+        """The orchestrator's latest note (``fa orch note``); None when missing or unreadable."""
+        try:
+            record = _state.json.loads((self.root / self.ORCH_NOTE_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return record if isinstance(record, dict) else None
+
     def order_progress(self) -> dict[str, Any] | None:
         """Read order preparation facts shared by the CLI and lane view."""
         try:

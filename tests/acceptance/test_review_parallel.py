@@ -162,7 +162,7 @@ def test_review_parallel_non_risk_stays_single_and_risk_count_is_capped(
     git_history, tmp_path, monkeypatch,
 ):
     results = []
-    for risk_paths, count, name in ((["docs/**"], 1, "ordinary"), (["feature*.txt"], 5, "risk")):
+    for risk_paths, count, name in ((["docs/**"], 1, "ordinary"), (["feature*.txt"], len(CHECKLIST), "risk")):
         root = tmp_path / name
         history = copy_history(git_history, root)
         case = perspective_case(history, root, monkeypatch, count=9, risk_paths=risk_paths,

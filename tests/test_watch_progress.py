@@ -80,7 +80,8 @@ def test_render_words_in_both_languages():
     none_today = plain(progress.render(snapshot(total=10, completed=4, orders=1), Config(), None, now=NOW))
     assert none_today[1:] == ["nothing finished in the last 3 hours · 6 left"]
     done = plain(progress.render(snapshot(total=3, completed=3, orders=1), Config(), None, now=NOW))
-    assert done[1:] == ["all done"]
+    # A finished order has only its bar here; the done section announces it.
+    assert done[1:] == []
     assert progress.render(snapshot(), Config(), None, now=NOW) == []
 
 
