@@ -226,6 +226,19 @@ When a behaviour cannot be checked by a machine (visual taste, real device), add
 checklist item and keep at least one executable command anyway (e.g. the build or a smoke
 check). Done when commands must run with the repo's normal tooling from the repo root.
 
+## 5b. Challenge the spec from other seats
+Once the spec is roughly formed, before you lock it for approval, write the plan JSON
+(schema in `fa order publish --help`) to a temp file and run
+`fa order perspectives PLAN.json --json`. Read-only agents question it in parallel from
+fixed seats: skeptic, first-time user, attacker, operator, maintainer in six months, and
+incidents (risk map and decisions). A failed seat is listed under `failures`; the others
+still count. Merge duplicate questions across seats into one. Answer what the code, the
+docs or a settled decision already answers, and fold it into the spec yourself. Ask the
+person only the questions D71 leaves to them: behaviour, scope or approval. Then record
+each question once with `fa order perspectives mark ID --changed yes|no` (yes when it
+changed the spec; mark every id of a merged duplicate). `fa order perspectives stats --json`
+shows which seats changed specs.
+
 ## 6. One approval
 Write the plan JSON (schema in `fa order publish --help`) to a temp file. Run
 `fa order publish PLAN.json --dry-run`, fix validation errors, then record `progress check`.
