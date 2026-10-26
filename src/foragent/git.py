@@ -105,6 +105,18 @@ class GitRepo:
     def ref_sha(self, ref: str) -> str:
         return self._call(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
 
+    def union_merge_paths(self, base_ref: str, paths: Iterable[str]) -> set[str]:
+        """Read merge attributes in one batch; unreadable attributes retain overlap limits."""
+        paths = sorted(set(paths))
+        if not paths:
+            return set()
+        try:
+            fields = self._call(["check-attr", f"--source={base_ref}", "-z", "merge", "--", *paths]).split("\0")
+        except GitError:
+            return set()
+        return {path for path, attribute, value in zip(fields[::3], fields[1::3], fields[2::3])
+                if attribute == "merge" and value == "union" and path in paths}
+
     def latest_trailer(self, key: str, base_ref: str) -> str | None:
         """Read the newest carrying commit on this branch's first-parent chain."""
         fields = self._call([

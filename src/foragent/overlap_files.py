@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from glob import escape
+from glob import escape, has_magic
 from itertools import combinations, product
 from pathlib import Path
 
@@ -94,8 +94,24 @@ def any_overlap(ctx, left: list[str], right: list[str]) -> bool:
     return any(intersects(ctx, a, b) for a in left for b in right)
 
 
-def at_capacity(ctx, files: list[str], peers: list[Claim]) -> bool:
+def union_patterns(ctx, files: list[str], peers: list[Claim]) -> set[str]:
+    """Only exempt concrete paths; a glob alone cannot prove every match is union."""
+    paths = {path for path in [*files, *(path for peer in peers for path in peer.files)]
+             if not has_magic(path)}
+    for peer in peers:
+        paths.update(peer.run.changed_files or [])
+        if peer.run.files_committed:
+            paths.update(peer.run.effective_files or [])
+    return {escape(path) for path in ctx.git.union_merge_paths(f"origin/{ctx.config.base_branch}", paths)}
+
+
+def at_capacity(ctx, files: list[str], peers: list[Claim], *, union: set[str] | None = None) -> bool:
     """Count distinct runs sharing the same possible path, not matching patterns."""
+    if union is None:
+        union = union_patterns(ctx, files, peers)
+    files = [path for path in files if path not in union]
+    peers = [Claim(peer.run, peer.parsed, [path for path in peer.files if path not in union])
+             for peer in peers]
     limit = ctx.config.overlap_per_file
     for path in files:
         matching = [peer for peer in peers if any_overlap(ctx, [path], peer.files)]
