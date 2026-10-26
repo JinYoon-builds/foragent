@@ -121,9 +121,15 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
         )
     ]
     latest = max(comments, key=lambda c: (scheduler.datetime.fromisoformat(c.created_at), c.id), default=None)
-    if latest is None or ctx.now() - scheduler.datetime.fromisoformat(latest.created_at) <= scheduler.timedelta(
-        minutes=ctx.config.orchestrator_timeout_minutes,
-    ):
+    if latest is None:
+        return issue
+    # The runner's blocker comment can reach the local record after its run ends,
+    # so the clock starts at the later of the newest blocker and the newest run end.
+    since = max([scheduler.datetime.fromisoformat(latest.created_at)] + [
+        scheduler.datetime.fromisoformat(ended)
+        for (number, _), ended in ctx.store.finish_times().items() if number == issue.number
+    ])
+    if ctx.now() - since <= scheduler.timedelta(minutes=ctx.config.orchestrator_timeout_minutes):
         return issue
     ctx.tracker.add_labels(issue.number, [scheduler.NEEDS_HUMAN])
     scheduler.board.sync_status(ctx, issue, "Needs human")

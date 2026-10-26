@@ -156,3 +156,4 @@
 - #604 리뷰: 잠금을 잡은 tick의 모든 종료(GitHub 대기·한도 예외 포함)에서 돌아야 하는 로컬 사실 검사는 `orch_spawn.deciding()` 래퍼에 넣는다(scheduler 본문의 중간 호출은 이른 반환에 건너뛰어짐). `ls-tree -z` 출력은 split 뒤 빈 이름을 빼야 `**`가 빈 트리에 일치하지 않는다. scheduler에 git 호출을 더하면 test_cli의 엄격한 가짜 git이 깨지므로 대상이 있을 때만 git을 읽는다.
 - #154: `lane_talk.py`(`fa lanes talk`)는 `<state>/talk/<n>.json`에 터미널 핸들을 두고 Run의 `talking`·`talking_since`로 tick의 stall·runtime 검사를 건너뛴다. 닫힘은 `scheduler_recovery`가 감지해 waited_seconds 가산·last_progress_at=now. 인수 시험이 `"-f" in command`를 요구해 `tail -f -F`를 쓴다. Orca는 issue worktree를 모르므로 `--worktree path:<repo root>`+subprocess cwd, codex resume엔 `-C dir`.
 - #154 리뷰: waited_seconds는 runner·tick이 함께 쓰므로 `StateStore.add_waited` 증분으로만 더한다(스냅샷+절대값은 손실). 힌트 소비는 전달한 문자열만 지운다(`consume_hint(root,n,used)`). 실행기 시간 제한은 `processes.extend_deadline`이 `_remaining()`을 다시 묻는다.
+- [#366 installed gates](project_366_installed_gates.md) — gates.py discovery, remote fallback for state root, conftest real-HOME isolation

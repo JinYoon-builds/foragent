@@ -220,6 +220,9 @@ def test_lane_width_is_only_a_cap_set_by_a_live_plan(queue_case, capsys, monkeyp
     wide_lane(case, monkeypatch, {3: ["src/foragent/state.py"], 5: ["src/foragent/order.py"],
                                   7: ["src/foragent/watch.py"]})
     assert plan(case, capsys).get("width", {}) == {}
+    # The clock jumps an hour below; keep the stall rule out of this width check.
+    from dataclasses import replace
+    case.tick_ctx.config = replace(case.tick_ctx.config, stall_minutes=120)
     fa_ok(case, capsys, "plan", "--width", "orch=2", "--expires", at(case, hours=1))
     assert plan(case, capsys)["width"]["orch"] == 2
     running, actions = tick_lane(case)

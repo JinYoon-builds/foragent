@@ -11,6 +11,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
 from foragent import capacity, kick, launchd, launcher, orch_reinstall, run_baseline, update_check
@@ -43,6 +44,7 @@ def race_sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(update_check, "current_version", lambda: "0.1.9")
     monkeypatch.setattr(update_check, "_language", lambda root: "en")
     monkeypatch.setattr(update_check, "installed_gates", lambda: {})
+    monkeypatch.setattr(psutil, "process_iter", lambda *args, **kwargs: iter(()))
     return tmp_path
 
 
@@ -89,23 +91,34 @@ def exercise_install(root, entry, error, failures, monkeypatch, capsys):
     )
 
     def fake_uv(argv, **kwargs):
+        nonlocal package
         assert argv[0] == "uv", f"Only the fake uv boundary is allowed: {argv!r}"
-        if argv[1:] == ["tool", "dir"]:
-            return subprocess.CompletedProcess(argv, 0, stdout=str(tools), stderr="")
+        if argv[1:] in (["tool", "dir"], ["tool", "dir", "--bin"]):
+            directory = root / "fake-bin" if "--bin" in argv else tools
+            return subprocess.CompletedProcess(argv, 0, stdout=str(directory), stderr="")
         assert argv[1:3] == ["tool", "install"], argv
         calls.append(list(argv))
         trace.append(("install", len(calls)))
         assert len(calls) <= 3, "Never exceed three uv install attempts"
         if entry == "after-merge":
-            assert argv[3:5] == ["--force", "--reinstall"]
+            assert argv[3:-1] in (["--force"], ["--force", "--reinstall"])
             source = Path(argv[-1])
             assert source in worktrees and Path(kwargs["cwd"]) == source
         else:
-            assert argv[3:] == [update_check.INSTALL_SOURCE + "v0.1.10"]
+            assert argv[3:-1] in ([], ["--force"], ["--force", "--reinstall"])
+            assert argv[-1] == update_check.INSTALL_SOURCE + "v0.1.10"
             assert Path(kwargs["cwd"]) == Path.home()
         failed = failures is None or len(calls) <= failures
-        if not failed and entry == "after-merge":
-            shutil.copytree(source / "src/foragent", package, dirs_exist_ok=True)
+        if not failed:
+            environment = kwargs.get("env") or {}
+            installed_bin = Path(environment.get("UV_TOOL_BIN_DIR", str(root / "fake-bin")))
+            installed_bin.mkdir(parents=True, exist_ok=True)
+            for name in ("fa", "foragent"):
+                (installed_bin / name).write_text("installed")
+            if entry == "after-merge":
+                package = Path(environment.get("UV_TOOL_DIR", str(tools))) / (
+                    "foragent/lib/python3.12/site-packages/foragent")
+                shutil.copytree(source / "src/foragent", package, dirs_exist_ok=True)
         result = subprocess.CompletedProcess(argv, 1 if failed else 0,
                                              stdout="" if failed else "installed",
                                              stderr=error if failed else "")
