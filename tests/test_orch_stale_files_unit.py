@@ -120,3 +120,67 @@ def test_dedup_survives_close_reopen_and_a_base_returning_to_a_reported_sha(tmp_
     assert tick(first) == 1  # Reopened at the same SHA.
     assert tick(second) == 2
     assert tick(first) == 2  # The base moved back to an already reported SHA.
+
+
+@pytest.mark.parametrize("entry", ["**", "**/**", "a.py", "*.py"])
+def test_empty_listing_elements_are_not_file_names(entry):
+    # A raw split of an empty tree listing is [""]; it must not match "**".
+    assert stale_entries([entry], ["a.py"], [""]) == [entry]
+    assert stale_entries([entry], ["a.py"], []) == [entry]
+
+
+def test_deleting_every_file_reports_recursive_globs_on_an_empty_tree(tmp_path, repo, monkeypatch):
+    root = _commit(repo, T0, ["a.py"])
+    empty = _commit(repo, APPROVED_AT + timedelta(minutes=1), [], root)
+    context = _context(tmp_path, repo, [])
+    body = "## Files\n- **\n- **/**\n"
+    context.store.save_approval(8, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                                approved_by="human", approved_at=APPROVED_AT.isoformat())
+    monkeypatch.setattr(orch_stale_files, "local_issue_models",
+                        lambda store: [SimpleNamespace(number=8, state="open")])
+    _point_base(repo, empty)
+    orch_stale_files.report(context)
+    events = [json.loads(line) for line in (context.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [event["issue"] for event in events] == [8]
+    assert "**, **/**" in events[0]["summary"]
+
+
+# Every tick exit that holds the lock scans: GitHub waits and rate limits read only local state.
+from dataclasses import replace  # noqa: E402
+
+from conftest import BASE_TIME, git_command  # noqa: E402
+from foragent import scheduler  # noqa: E402
+from foragent.tracker import TrackerError  # noqa: E402
+from test_scheduler import BODY, approve, ctx  # noqa: E402,F401
+
+
+@pytest.mark.parametrize("exit_path", ["wait-before-fetch", "wait-after-refresh", "rate-limit-error"])
+def test_github_wait_and_rate_limit_ticks_still_report(ctx, git_history, monkeypatch, exit_path):  # noqa: F811
+    ctx.config = replace(ctx.config, skill_libraries=[], test_command="true")
+    gone = "src/foragent/gone.py"
+    git_history.update({gone: "# old\n"}, at=BASE_TIME + timedelta(minutes=1))
+    approve(ctx, 5, body=BODY + f"\n## Files\n- {gone}\n")
+    assert scheduler.tick(ctx).skipped is None
+    assert ctx.store.load_approval(5) is not None
+    git_history.update({gone: None}, at=ctx.now() + timedelta(minutes=1))
+    later = ctx.now() + timedelta(minutes=5)
+    ctx.now = lambda: later
+    if exit_path == "wait-before-fetch":
+        git_command(ctx.repo_root, "fetch", "origin")  # An earlier fetch; this tick does not fetch.
+        ctx.store.pause_github(later + timedelta(hours=1))
+    elif exit_path == "wait-after-refresh":
+        flush = ctx.tracker.flush_outbox
+
+        def pause_during_refresh():
+            flush()
+            ctx.store.pause_github(later + timedelta(hours=1))
+        monkeypatch.setattr(ctx.tracker, "flush_outbox", pause_during_refresh)
+    else:
+        def limited(context, report):
+            raise TrackerError("API rate limit exceeded")
+        monkeypatch.setattr(scheduler, "_recover_runs", limited)
+    report = scheduler.tick(ctx)
+    assert report.skipped is not None and "rate limit" in report.skipped
+    path = ctx.store.root / "orch-events.jsonl"
+    events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    assert [event["issue"] for event in events if event["kind"] == "stale-files"] == [5]

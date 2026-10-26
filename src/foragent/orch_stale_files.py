@@ -21,6 +21,7 @@ STATE_FILE = "stale-files.json"
 
 
 def _matching(entry: str, files: list[str]) -> bool:
+    files = [path for path in files if path]  # Callers may pass raw listings.
     if has_magic(entry):
         return any(_matches(path, entry) for path in files)
     entry = entry.rstrip("/")
@@ -110,7 +111,9 @@ def report(ctx) -> None:
 
     def tree(sha: str) -> list[str]:
         if sha not in trees:
-            trees[sha] = ctx.git._call(["ls-tree", "-r", "--name-only", "-z", sha]).split("\0")
+            # An empty tree lists nothing; "" is not a file name (it would match "**").
+            listing = ctx.git._call(["ls-tree", "-r", "--name-only", "-z", sha])
+            trees[sha] = [name for name in listing.split("\0") if name]
         return trees[sha]
 
     with ctx.store._state_lock():

@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, launchd, orch_github, orch_queue, orch_spawn, orch_stale_files, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -224,7 +224,6 @@ def _tick_locked(ctx: TickContext) -> TickReport:
 
         if listing_current:  # Children change only through observed facts and this tick's writes.
             board_parents.follow_children(ctx, report)
-    timed("stale_files", orch_stale_files.report, ctx)  # Facts for the orchestrator; starts are unaffected.
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report
