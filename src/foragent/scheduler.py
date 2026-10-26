@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -84,6 +84,7 @@ def tick(ctx: TickContext) -> TickReport:
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
         timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
+        timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
         with tick_processes(ctx.store) as snapshot:
             cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
             if snapshot.available:
@@ -146,13 +147,16 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         return issue_lane(issue.labels, ctx.config.lanes)
 
     with step("board_sync"):
+        parents = board_parents.order_parents(ctx.store.local_issues())  # Columns follow children.
         for issue in local_issue_models(ctx.store):
             if issue.state != "open":
                 # A manually closed card leaves its column; known cards only.
                 board.sync_status(ctx, issue, "closed", existing_only=True)
                 continue
-            if processes_available:
+            if processes_available:  # Cleans a left-over worktree; board writes skip parents.
                 issue = _recover_orphan(ctx, issue, report)
+            if issue.number in parents:
+                continue  # Its column follows its children, whatever its own labels say.
             issue = _escalate_overdue_blocker(ctx, issue, report)
             if issue.state != "open":
                 board.sync_status(ctx, issue, "closed", existing_only=True)
@@ -218,6 +222,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             report.actions.append(f"#{issue.number} promoted to ready")
             ready.setdefault(lane, []).append(issue.number)
 
+        if listing_current:  # Children change only through observed facts and this tick's writes.
+            board_parents.follow_children(ctx, report)
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report
