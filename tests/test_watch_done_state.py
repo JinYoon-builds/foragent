@@ -1,0 +1,165 @@
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+from foragent import cli, watch
+from foragent.config import Config
+from foragent.state import StateStore
+from foragent.tracker import FakeTracker, Issue, RecordingTracker
+from foragent.watch_sections import activity, done, summary
+
+NOW = datetime(2026, 10, 21, 9, tzinfo=UTC)
+
+
+def collected(tracker, store, config):
+    context = SimpleNamespace(store=store, config=config, now=lambda: NOW)
+    RecordingTracker(tracker, context).refresh_issues()
+    return watch.collect(cli._status(tracker, store, config), tracker, store, config, NOW)
+
+
+def finish(tracker, store, number, parent, lane="api", title=None):
+    tracker.add_issue(number, title or f"Finished task {number}", labels=[f"lane:{lane}"], state="closed")
+    tracker.set_parent(number, parent)
+    store.start_run(number, branch=f"issue-{number}", worktree="unused", lane=lane)
+    store.finish_run(number, "merged")
+
+
+def plain(lines):
+    return ["".join(value for value, style in line) for line in lines]
+
+
+def test_collect_reads_each_done_issue_merge_time_from_local_records(tmp_path):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    config = Config(lanes={"api": {"title": "Server"}})
+    tracker.add_issue(90, "Order")
+    finish(tracker, store, 1, 90)
+    finish(tracker, store, 2, 90)
+    rows = store.local_issues
+    times = {1: "2026-10-21T08:00:00+00:00", 2: "not a time"}
+    store.local_issues = lambda: [dict(row, merged_at=times.get(row["number"])) for row in rows()]
+    result = collected(tracker, store, config)
+    assert result.merged_at == {1: datetime(2026, 10, 21, 8, tzinfo=UTC)}
+
+
+def test_done_list_is_newest_first_then_unknown_by_number_and_counts_the_rest():
+    issues = {number: Issue(number, f"Task {number}", "", frozenset(), "closed") for number in range(1, 12)}
+    snapshot = watch.Snapshot(
+        {"lanes": {}, "summary": {}, "active_runs": []},
+        {"api": [issues[n] for n in (1, 2, 3, 4, 5, 6)], "docs": [issues[n] for n in (7, 8, 9, 10, 11)]},
+        None, 11, 11, None, [], NOW,
+        merged_at={3: NOW - timedelta(hours=2), 9: NOW - timedelta(hours=1), 5: NOW - timedelta(hours=3)})
+    config = Config(lanes={"api": {"title": "Server", "emoji": "🔧"}, "docs": {"title": "Docs", "emoji": "🧩"}})
+    lines = plain(done.render(snapshot, config, None, width=80))
+    assert lines[0] == "This order is all done ✓"
+    numbers = [int(line.split()[0][1:]) for line in lines[1:9]]
+    assert numbers == [9, 3, 5, 11, 10, 8, 7, 6]
+    assert lines[1] == "#9 Task 9 — 🧩 Docs"
+    assert lines[9] == "+3 more"
+    ko = plain(done.render(snapshot, replace(config, language="ko"), None, width=80))
+    assert ko[0] == "이번 주문을 모두 끝냈어요 ✓" and ko[-1] == "+3개 더"
+
+
+def test_done_list_cuts_long_titles_but_keeps_number_and_lane():
+    issue = Issue(7, "word " * 40, "", frozenset(), "closed")
+    snapshot = watch.Snapshot({"lanes": {}, "summary": {}, "active_runs": []}, {"api": [issue]},
+                              None, 1, 1, None, [], NOW)
+    config = Config(lanes={"api": {"title": "Server", "emoji": "🔧"}})
+    line = plain(done.render(snapshot, config, None, width=40))[1]
+    assert line.startswith("#7 word") and "…" in line and line.endswith("— 🔧 Server")
+    assert watch._cells(line) <= 40
+
+
+def test_done_section_is_empty_until_every_child_is_closed():
+    base = watch.Snapshot({"lanes": {}, "summary": {}, "active_runs": []}, {}, None, 2, 3, None, [], NOW)
+    assert done.render(base, Config(), None, width=80) == []
+    assert done.render(replace(base, completed=0, total=0), Config(), None, width=80) == []
+
+
+def test_summary_hides_only_zero_counts_unless_all_zero_or_unknown():
+    counts = lambda **values: {"working": 0, "blocked": 0, "waiting_human": 0, "queued": 0, **values}
+    assert summary._counts(counts(working=2, queued=1), "en") == "working 2 · queued 1"
+    assert summary._counts(counts(waiting_human=1), "ko") == "확인할 일 1"
+    assert summary._counts(counts(), "en") == "working 0 · waiting for you 0 · queued 0"
+    assert summary._counts(counts(working=1, queued=None), "en") == "working 1 · waiting for you 0 · queued ?"
+
+
+def test_only_the_events_panel_remains_and_takes_the_full_width(tmp_path):
+    config = Config(lanes={"api": {"title": "Server"}})
+    status = {"lanes": {"api": {"slug": "api", "lane_display": "🧰 Server", "state": "idle", "issue": None,
+                                "queued": [], "running": [], "ready": []}},
+              "summary": {"working": 0, "blocked": 0, "waiting_human": 0, "queued": 0}, "active_runs": []}
+    event = {"at": NOW.isoformat(), "kind": "note", "summary": "checked the board", "issue": None}
+    snapshot = watch.Snapshot(status, {}, None, 0, 0, None, [event], NOW)
+    lines = plain(activity.render(snapshot, config, tmp_path, width=120, now=NOW))
+    assert len(lines) == 3 and all(watch._cells(line) == 120 for line in lines)
+    assert "handled by the orchestrator" in lines[0] and "now doing" not in "".join(lines)
+    assert activity.render(replace(snapshot, events=[]), config, tmp_path, width=120, now=NOW) == []
+
+
+def test_idle_lanes_wrap_between_lanes_instead_of_cutting_off(tmp_path):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    lanes = {f"lane-{i}": {"title": f"Long lane name {i}", "emoji": "🧩"} for i in range(6)}
+    config = Config(lanes=lanes)
+    tracker.add_issue(90, "Order")
+    finish(tracker, store, 1, 90, lane="lane-0")
+    frame = watch.render_frame(collected(tracker, store, config), config, tmp_path, width=80)
+    assert all(watch._cells(line) <= 80 for line in frame.splitlines())
+    for lane in lanes.values():
+        assert lane["title"] in frame
+    assert "Long lane name 0 1 done" in frame and "✓1" not in frame
+    assert "▶" not in frame
+
+
+def test_an_idle_lane_too_wide_for_one_line_wraps_and_keeps_its_done_count(tmp_path):
+    """Defect class: a single lane item wider than the line was cut, first or later."""
+    long_title = "Very long lane title " * 3 + "ending"  # 69 characters
+    for first in (True, False):
+        lanes = {"short": {"title": "Short", "emoji": "🧩"}, "wide": {"title": long_title, "emoji": "🧩"}}
+        if first:
+            lanes = dict(reversed(list(lanes.items())))
+        config = Config(lanes=lanes)
+        tracker = FakeTracker()
+        store = StateStore(tmp_path / str(first), now=lambda: NOW)
+        tracker.add_issue(90, "Order")
+        finish(tracker, store, 1, 90, lane="wide")
+        frame = watch.render_frame(collected(tracker, store, config), config, tmp_path, width=80)
+        lines = frame.splitlines()
+        assert all(watch._cells(line) <= 80 for line in lines)
+        words = " ".join(" ".join(lines).split())
+        assert long_title + " 1 done" in words and "Short" in words
+
+
+def test_flow_wraps_heading_items_and_oversized_items_without_losing_text():
+    from foragent.watch_sections import lanes
+
+    items = ["1 🧩 A", "2 🧩 " + "word " * 12 + "1 done", "3 🧩 C"]
+    lines = lanes._flow("idle lanes:", items, 30)
+    assert all(watch._cells(line) <= 30 for line in lines)
+    # A new line starts between items, so no separator is left dangling at a line end.
+    assert lines[0] == "idle lanes: 1 🧩 A" and lines[-1] == "  3 🧩 C"
+    assert " ".join(" ".join(lines).split()) == "idle lanes: 1 🧩 A " + " ".join(items[1].split()) + " 3 🧩 C"
+
+
+def test_done_item_with_a_lane_name_wider_than_the_line_wraps_instead_of_cutting():
+    issue = Issue(7, "Task", "", frozenset(), "closed")
+    lane_title = "Extremely long lane name " * 3
+    snapshot = watch.Snapshot({"lanes": {}, "summary": {}, "active_runs": []}, {"api": [issue]},
+                              None, 1, 1, None, [], NOW)
+    config = Config(lanes={"api": {"title": lane_title.strip(), "emoji": "🔧"}})
+    lines = plain(done.render(snapshot, config, None, width=40))
+    assert all(watch._cells(line) <= 40 for line in lines)
+    assert " ".join(" ".join(lines[1:]).split()).endswith(" ".join(lane_title.split()))
+
+
+def test_idle_lane_continuation_lines_keep_their_indent(tmp_path):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    lanes = {f"lane-{i}": {"title": f"Long lane name {i}", "emoji": "🧩"} for i in range(6)}
+    config = Config(lanes=lanes)
+    tracker.add_issue(90, "Order")
+    finish(tracker, store, 1, 90, lane="lane-0")
+    lines = watch.render_frame(collected(tracker, store, config), config, tmp_path, width=80).splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("idle lanes:"))
+    assert lines[start + 1].startswith("  ") and lines[start + 1][2] != " "

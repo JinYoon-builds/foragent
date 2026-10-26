@@ -54,6 +54,10 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     busy, _ = _split(status)
     clones = _clones(status)
     age = max(0, (context["now"] - snapshot.captured_at).total_seconds())
+    if not (busy and snapshot.events):
+        # An empty panel is hidden; the one that remains takes the full width.
+        table_width = events_width = context["width"]
+        side_by_side = False
     runs = {run["number"]: run for run in status["active_runs"]}
     inner = table_width - 2
     lane_width = min(13, inner // 6)
@@ -85,16 +89,17 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             # Each worker's issue shows with the plain lane name; the road numbers the workers.
             table += watch._columns([row["lane_display"], task, phase, activity], widths,
                                     "yellow" if activity.startswith(("○", "?", "⚠")) or shown["state"] == "blocked" else "")
-    if not busy:
-        table.append(watch._line(t("watch_all_idle")))
     events: list[Line] = []
     for event in snapshot.events:
         when = watch.datetime.fromisoformat(event["at"]).astimezone().strftime("%H:%M") if event.get("at") else "—"
         line = person_line(event, language)
         number = f" #{event['issue']}" if event.get("issue") is not None and line == event["summary"] else ""
         events.extend(watch._wrap(f"{when}{number} {line} ✓", events_width - 2))
-    if not events:
-        events.append(watch._line(t("watch_no_events")))
-    work = watch._panel(table, table_width, t("watch_now"))
-    handled = watch._panel(events, events_width, t("watch_events"))
-    return watch._beside(work, handled, table_width) if side_by_side else work + handled
+    panels = []
+    if busy:
+        panels.append(watch._panel(table, table_width, t("watch_now")))
+    if events:
+        panels.append(watch._panel(events, events_width, t("watch_events")))
+    if side_by_side:
+        return watch._beside(*panels, table_width)
+    return [line for panel in panels for line in panel]
