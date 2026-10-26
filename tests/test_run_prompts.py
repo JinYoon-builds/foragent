@@ -72,11 +72,13 @@ def test_prompt_try_and_evidence_in_configured_language_on_every_attempt(run_cas
         assert all(heading in prompt for heading in ("## What changed", "## Try it", "## Expect", "## Web"))
 
 
-def test_review_prompt_truncates_only_diff_and_parse_limits_findings():
-    prompt = build_review_prompt(parse_body(BODY), "x" * 60000 + "TRUNCATED")
-    assert prompt.endswith("x" * 60000) and "TRUNCATED" not in prompt
+def test_review_prompt_truncates_only_diff_and_parse_limits_findings(tmp_path):
+    # The diff keeps its limit with the shared cut notice; findings are no longer limited (#420).
+    prompt = build_review_prompt(parse_body(BODY), "x" * 60000 + "TRUNCATED", full_text_dir=tmp_path)
+    assert prompt.endswith("x" * 60000 + f"[cut: 9 more chars; full text: {tmp_path / 'review-diff.patch'}]")
+    assert (tmp_path / "review-diff.patch").read_text() == "x" * 60000 + "TRUNCATED"
     review = parse_review("VERDICT: FAIL\n" + "\n".join(f"file:{i}: defect" for i in range(8)))
-    assert review.verdict == "FAIL" and len(review.findings.splitlines()) == 5
+    assert review.verdict == "FAIL" and len(review.findings.splitlines()) == 8
 
 
 def test_native_goal_condition_length_cap_preserves_instructions():

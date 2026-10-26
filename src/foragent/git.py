@@ -1,5 +1,6 @@
 """Small, injectable Git adapter for approval integrity checks."""
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
@@ -16,6 +17,10 @@ from foragent.state import StateStore
 
 
 REVIEW_SCOPE_FILE = "CLAUDE.local.md"
+# A split part names its source when at least half of its added lines (of at
+# least this many, each this long once stripped) come from that source.
+SPLIT_MIN_LINES = 5
+SPLIT_MIN_LINE = 4
 ARTIFACT_PATHS = (".foragent",)
 
 
@@ -341,6 +346,79 @@ class GitRepo:
     def merge_base(self, target: str, *, commit: bool = True) -> None:
         self._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
                     "merge", "--no-edit", *([] if commit else ["--no-commit"]), target])
+
+    def moved_by(self, target: str) -> list[tuple[str, str]]:
+        """Files this branch changed that ``target`` renamed or copied (split) since the merge base.
+
+        Git rename and copy detection pairs each such file with where its content went.
+        """
+        try:
+            base = self._call(["merge-base", "HEAD", target]).strip()
+        except GitError:
+            return []
+        mine = {path for path in self._call(["diff", "--name-only", "--no-renames", "-z", base, "HEAD"]).split("\0")
+                if path}
+        return self.moved_between(base, target, mine)
+
+    def moved_between(self, base: str, target: str, paths: Iterable[str]) -> list[tuple[str, str]]:
+        """Which of ``paths`` ``target`` renamed or copied since its merge base with ``base``: (old, new).
+
+        Copies from unchanged files count too, so a module split out while the original stays is named.
+        """
+        mine = set(paths)
+        if not mine:
+            return []
+        try:
+            base = self._call(["merge-base", base, target]).strip()
+        except GitError:
+            return []
+        fields = iter(self._call(["diff", "--name-status", "-M", "-C", "--find-copies-harder", "-z",
+                                  base, target]).split("\0"))
+        moved = []
+        for status in fields:
+            if status[:1] in ("R", "C"):
+                old, new = next(fields, ""), next(fields, "")
+                if old in mine:
+                    moved.append((old, new))
+            elif status:
+                next(fields, None)
+        found = set(moved)
+        return moved + [pair for pair in self._split_into(base, target, mine) if pair not in found]
+
+    def _split_into(self, base: str, target: str, mine: set[str]) -> list[tuple[str, str]]:
+        """Files whose added lines mostly come from one of ``mine``: parts of a split file.
+
+        Git's copy detection needs a whole-file similarity; a module split into
+        three parts leaves each part near a third and is not reported.
+        """
+        def lines(ref: str, path: str) -> list[str]:
+            try:
+                text = self._call(["show", f"{ref}:{path}"])
+            except (GitError, UnicodeDecodeError):
+                return []
+            return [line.strip() for line in text.splitlines() if len(line.strip()) >= SPLIT_MIN_LINE]
+
+        fields = iter(self._call(["diff", "--name-status", "--no-renames", "-z", base, target]).split("\0"))
+        changed = {}
+        for status in fields:
+            if status:
+                changed[next(fields, "")] = status[:1]
+        sources = {path: set(lines(base, path)) for path in sorted(mine) if changed.get(path) != "A"}
+        sources = {path: content for path, content in sources.items() if content}
+        pairs = []
+        for dest, status in sorted(changed.items()):
+            if status not in ("A", "M") or not sources:
+                continue
+            added = Counter(lines(target, dest))
+            if status == "M":
+                added -= Counter(lines(base, dest))
+            total = sum(added.values())
+            if total < SPLIT_MIN_LINES:
+                continue
+            for source, content in sources.items():
+                if source != dest and sum(count for line, count in added.items() if line in content) * 2 >= total:
+                    pairs.append((source, dest))
+        return pairs
 
     def merge_in_progress(self) -> bool:
         path = Path(self._call(["rev-parse", "--git-path", "MERGE_HEAD"]).strip())
