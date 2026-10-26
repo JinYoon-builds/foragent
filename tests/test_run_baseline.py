@@ -944,3 +944,25 @@ def test_a_hook_deselecting_an_existing_failing_test_is_not_absence(tmp_path):
     result, log, _ = _verify_exact(tmp_path / "verify", FAILING_KEEP, ids, files={"conftest.py": DESELECT_HOOK})
     # The hook's deselection makes pytest exit 5; that failure stands and nothing is dropped.
     assert result.exit_code != 0 and "dropped" not in log
+
+
+def test_a_directory_with_a_collection_error_is_no_control(tmp_path):
+    # A sibling syntax error makes the directory exit 2: it does not collect normally.
+    files = {"tests/acceptance/test_a.py": "def test_other():\n    pass\n",
+             "tests/acceptance/test_broken.py": "def test_broken(:\n"}
+    ids = ("tests/acceptance/test_a.py::test_keep",)
+    kept, log = _real_pytest(tmp_path, "[pytest]\n", _python_pytest(), files=files, full=True, node_ids=ids)
+    assert kept.unverifiable == ids and "dropped" not in log
+
+
+def test_changed_paths_keep_spaces_and_newlines():
+    from foragent.run_baseline import _changed_paths
+
+    class Git:
+        def merge_in_progress(self):
+            return False
+
+        def _call(self, args):
+            return "common\n" if args[0] == "merge-base" else "tests/my dir/test_a.py\0odd\nname.py\0"
+
+    assert _changed_paths(Git(), "base", "origin/main") == {"tests/my dir/test_a.py", "odd\nname.py"}

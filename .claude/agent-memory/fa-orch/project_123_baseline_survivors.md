@@ -41,5 +41,9 @@ Resolved without editing locked tests by `run_baseline.follow_moved_base()`: fir
 new base with collection only (same deletion rule, logs drops); none left → empty baseline, no capture (spec: "skips when none
 remain"; test 3 forbids any non-collect pytest after the sync); else capture (#483) and keep protecting old ids the capture lacks
 while their test file blob is unchanged (test 2), dropping changed ones (#483 `fails-on-new-base`).
+Review after that (2026-10-26): recapture protects renamed tests and drops still-existing failing tests (both against #123's
+goal/out of scope) but #483's locked `fails-on-new-base` requires the drop; plus the path gate for expansion probes misses
+helpers/plugins. Sent to QUESTION.md (recommend #123 governs, re-approve #483 test; probe all non-param ids). Fixed meanwhile:
+directory control needs exit 0/5 and no error record; `_changed_paths` uses `git diff -z`.
 **Why:** a stale id makes pytest exit 4 "not found" and hides real failures.
 **How to apply:** keep baseline filtering per verification; renamed tests are not re-protected (out of scope).

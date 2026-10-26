@@ -475,7 +475,8 @@ def _changed_paths(git, base_sha: str, target_ref: str) -> set[str] | None:
         changed: set[str] = set()
         for head in heads:
             common = git._call(["merge-base", head, target_ref]).strip()
-            changed |= set(git._call(["diff", "--name-only", base_sha, common]).split())
+            # NUL-separated: paths may contain spaces or newlines.
+            changed |= set(filter(None, git._call(["diff", "--name-only", "-z", base_sha, common]).split("\0")))
         return changed
     except GitError:
         return None
@@ -555,7 +556,8 @@ def _proven_absent(baseline: AcceptanceBaseline, worktree: Path, check: Callable
     (importorskip, pytest_generate_tests, import failures), never items — and:
 
     - exit 4 (not found) counts only when the same command collects the id's
-      directory without a usage error: a hook raising UsageError also exits 4;
+      directory normally (exit 0 or 5, no collection error record): a hook
+      raising UsageError also exits 4, and a sibling collection error exits 2;
     - exit 5 (nothing selected) counts only when the id has expansions to
       deselect and, without those deselects, the selector does select items
       (exit 0): only expansions remain, and an exact `f` cannot coexist with
@@ -572,14 +574,17 @@ def _proven_absent(baseline: AcceptanceBaseline, worktree: Path, check: Callable
     if code == 4:
         controls = {} if controls is None else controls
         # The directory itself proves nothing about the id; it only shows the
-        # command and its hooks collect without a usage error.
+        # command and its hooks collect normally.
         directory = Path(_node_parts(node)[0]).parent
         while directory != directory.parent and not (worktree / directory).is_dir():
             directory = directory.parent
         key = directory.as_posix()
         if key not in controls:
-            control, _ = _collect(baseline, worktree, check, report, [key])
-            controls[key] = control in (0, 2, 5)
+            control, records = _collect(baseline, worktree, check, report, [key])
+            # "Collects normally": a clean exit and no collection error anywhere
+            # in the directory (a sibling syntax error exits 2 with an error record).
+            controls[key] = control in (0, 5) and records is not None and not any(
+                case.find("error") is not None for case in records)
         return controls[key]
     if code == 5 and deselect:
         return _collect(baseline, worktree, check, report, [node])[0] == 0
