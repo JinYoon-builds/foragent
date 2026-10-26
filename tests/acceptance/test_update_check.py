@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import fcntl
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import plistlib
 import socket
@@ -13,6 +14,7 @@ import sys
 import time
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
 from test_local_truth import record_gh
@@ -116,7 +118,8 @@ def update_case(git_history, tmp_path, monkeypatch, isolated_home):
                 stream.write(json.dumps(row) + "\n")
             handler = case.uv_reply if executable == "uv" else case.launchctl_reply
             assert handler is not None, f"Routine observations must not run {executable}: {argv}"
-            result = handler(list(argv[1:]))
+            result = (handler(list(argv[1:]), env=kwargs.get("env")) if executable == "uv"
+                      else handler(list(argv[1:])))
             if kwargs.get("check") and result.returncode:
                 raise subprocess.CalledProcessError(result.returncode, argv,
                                                     output=result.stdout, stderr=result.stderr)
@@ -135,18 +138,24 @@ def update_case(git_history, tmp_path, monkeypatch, isolated_home):
     monkeypatch.setattr(executors.ClaudeExecutor, "run", forbidden)
     monkeypatch.setattr(executors.CodexExecutor, "run", forbidden)
 
-    # All uv/gh/launchctl calls return above without spawning any executable.
-    # Only local Git fixture processes may reach Popen.
+    # uv/gh/launchctl and detached refreshes are fakes. Only local Git fixture
+    # processes may reach the original Popen.
     popen = subprocess.Popen
 
     def local_popen(argv, *args, **kwargs):
         assert isinstance(argv, (list, tuple)) and argv, f"Unexpected shell command: {argv}"
+        if list(argv[1:4]) == ["-m", "foragent.launchd", "refresh"]:
+            assert case.install_succeeded, "Refresh only after a successful install"
+            assert Path(argv[0]).is_relative_to(case.machine / "tool-versions")
+            assert Path(argv[-1]) in {job.repo_root for job in case.jobs.values()}
+            return SimpleNamespace(pid=42000)
         executable = Path(argv[0]).name
         assert executable == "git", f"Unrecorded process: {argv}"
         assert not any("://" in str(arg) or str(arg).startswith("git@") for arg in argv)
         return popen(argv, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", local_popen)
+    monkeypatch.setattr(psutil, "process_iter", lambda *args, **kwargs: iter(()))
     monkeypatch.setattr(launchd, "_run_launchctl", lambda argv: subprocess.run(
         ["launchctl", *argv], capture_output=True, text=True, check=False))
     return case
@@ -326,6 +335,7 @@ def installer(update_case, monkeypatch, tmp_path):
     case.local = local
     executable = Path.home() / ".local/bin/fa"
     monkeypatch.setattr(launchd, "fa_executable", lambda: executable)
+    monkeypatch.setattr(launchd.shutil, "which", lambda name: str(executable) if name == "fa" else None)
     monkeypatch.setattr(launchd, "GitRepo", lambda root: SimpleNamespace(
         remote_slug=lambda: load_config(Path(root)).repo))
     for repo, root in (("owner/repo", case.root),
@@ -350,11 +360,14 @@ def installer(update_case, monkeypatch, tmp_path):
     monkeypatch.setattr(orch_reinstall, "_reinstall", no_local_reinstall)
     monkeypatch.setattr(case.git, "fetch", no_local_reinstall)
 
-    def uv(argv):
-        if argv == ["tool", "dir"]:
+    def uv(argv, *, env=None):
+        if argv in (["tool", "dir"], ["tool", "dir", "--bin"]):
+            directory = executable.parent if "--bin" in argv else case.commands.tool_dir
             return subprocess.CompletedProcess(["uv", *argv], 0,
-                                               stdout=str(case.commands.tool_dir), stderr="")
-        assert argv == ["tool", "install", INSTALL_SOURCE + case.release["tag_name"]], (
+                                               stdout=str(directory), stderr="")
+        assert argv[:-1] in (["tool", "install"], ["tool", "install", "--force"],
+                             ["tool", "install", "--force", "--reinstall"])
+        assert argv[-1] == INSTALL_SOURCE + case.release["tag_name"], (
             "Install exactly the latest upstream tag regardless of receipt, cwd, or selected repository")
         assert case.gh, "The install tag must come from the recorded upstream release lookup"
         assert_lookup(case, len(case.gh))
@@ -367,6 +380,11 @@ def installer(update_case, monkeypatch, tmp_path):
         if case.install_exit == "missing-uv":
             raise FileNotFoundError("offline fake: uv is unavailable")
         case.install_succeeded = case.install_exit == 0
+        if case.install_succeeded:
+            installed_bin = Path((env or os.environ)["UV_TOOL_BIN_DIR"])
+            installed_bin.mkdir(parents=True, exist_ok=True)
+            for name in ("fa", "foragent"):
+                (installed_bin / name).write_text("installed")
         return subprocess.CompletedProcess(["uv", *argv], case.install_exit,
                                            stdout="installed" if case.install_succeeded else "",
                                            stderr="" if case.install_succeeded else "offline install failed")
@@ -400,7 +418,9 @@ def assert_installed(case, *, restarted):
     from foragent.state import StateStore
 
     calls = [row["argv"] for row in case.commands.calls("uv") if row["argv"][:2] == ["tool", "install"]]
-    assert calls == [["tool", "install", INSTALL_SOURCE + case.release["tag_name"]]], (
+    assert len(calls) == 1 and calls[0][-1] == INSTALL_SOURCE + case.release["tag_name"] and (
+        calls[0][:-1] in (["tool", "install"], ["tool", "install", "--force"],
+                          ["tool", "install", "--force", "--reinstall"])), (
         "fa update must run exactly one uv tool install for the latest upstream release tag")
     assert case.events[0] == ("install", case.release["tag_name"])
     actual = [repo for event, repo in case.events if event in {"bootstrap", "kickstart"}]
