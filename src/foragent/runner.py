@@ -123,7 +123,9 @@ from foragent.run_attempt import (
     ExecutorStopped,
 )
 from foragent.run_checks import _verify_implementation
-from foragent.run_conflicts import _block_rebuild, _rebuild, _recover_replay, _resume_implementation
+from foragent.run_conflicts import (
+    _block_rebuild, _rebuild, _rebuild_after_conflicts, _recover_replay, _resume_implementation,
+)
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import _publish, _push_branch
 from foragent.run_review import _review_implementation
@@ -220,7 +222,7 @@ def _implement_and_publish(
                     outcome = _publish(attempt)
                     return outcome
                 except ConflictBudgetExhausted as exc:
-                    attempt.failure = _rebuild(attempt, exc)
+                    attempt.failure = _rebuild_after_conflicts(attempt, exc)
                     continue
                 except CIFailure as exc:
                     if attempt.rebuilt:
@@ -230,6 +232,10 @@ def _implement_and_publish(
                     continue
                 except (AttemptFailure, PatchReplayError) as exc:
                     attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else str(exc)
+                    if not attempt.failure:
+                        # The replay was resolved and verified in place; publish it without a new turn.
+                        resume_verified = True
+                        continue
                     run = ctx.store.get_run(n)
             if attempt.rebuilt:
                 outcome = _block_rebuild(attempt, str(attempt.failure))

@@ -38,3 +38,23 @@ class StateStore(
     @classmethod
     def for_repo(cls, repo: str, *, now: Callable[[], datetime] | None = None) -> "StateStore":
         return cls(Path.home() / ".local/share/foragent" / repo.replace("/", "__"), now)
+
+    # Heartbeat file stem for each side; each write overwrites one small file.
+    HEARTBEATS = {"orchestrator": "orch", "gate": "gate"}
+
+    def write_heartbeat(self, side: str, at: datetime) -> None:
+        """Overwrite one side's heartbeat with ``at`` (no lock: one atomic replace)."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._write_json(self.root / f"{self.HEARTBEATS[side]}-heartbeat.json", {"at": at.isoformat()})
+
+    def heartbeats(self) -> dict[str, datetime | None]:
+        """Last heartbeat of each side; a missing or unreadable file is None."""
+        seen: dict[str, datetime | None] = {}
+        for side, stem in self.HEARTBEATS.items():
+            try:
+                at = datetime.fromisoformat(
+                    json.loads((self.root / f"{stem}-heartbeat.json").read_text(encoding="utf-8"))["at"])
+            except (OSError, ValueError, KeyError, TypeError):
+                at = None
+            seen[side] = at if at is None or at.tzinfo is not None else None
+        return seen

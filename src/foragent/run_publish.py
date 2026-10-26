@@ -362,6 +362,7 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
         skills_line=_skills_line(ctx.store.get_run(n)),
         rebuttals="\n\n".join(attempt.rebuttals),
         review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
+        language=ctx.config.language,
         risk_notes=review_perspectives.with_checklist(_risk_notes(attempt), ctx.config) if ctx.config.review_scope == "pr-body" else "",
     )
 
