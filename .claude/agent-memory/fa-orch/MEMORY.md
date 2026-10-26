@@ -132,8 +132,12 @@
 - [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order, conftest opt-out
 - [#497 memory critical line](project_497_memory_critical.md) — raw kernel level, critical holds starts only, floors in IGNORED_KEYS
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
+- #127: `StateStore.write_heartbeat(side, at)`/`heartbeats()`(state.py)가 `<state>/orch-heartbeat.json`·`gate-heartbeat.json`을 덮어쓴다. watch는 매 읽기 전, gate는 `tick()`에서 tick lock을 얻은 직후 쓴다(busy tick은 ctx에 store만 있는 `test_kick` 시험 때문에 쓰지 않음). `fa orch alive`는 `INBOX_ACTIONS`에 넣어 GitHub 없이 처리, 30초 이하면 alive. 인수 `tests/acceptance/test_heartbeats.py` 4개.
+- #521 이후 CI 제외 목록은 커밋 trailer로 전달되고 main은 `.foragent/acceptance-exclusions.json`을 추적하지 않는다. 병합 충돌(UD)이면 파일을 지운다.
+- [#416 retry fixes](project_416_retry_fixes.md) — retry marker, stop file path, majority-only rebuild, contradicting locked tests
 - [#318 usage recheck](project_318_usage_recheck.md) — free quota re-read in tick, note_limit baseline, conftest stubs real codex app-server
 - #532: 리뷰 관점 체크리스트는 `review_perspectives.with_checklist()`로 위험 지도 메모 뒤에 붙인다(run_review 2곳·run_publish 1곳). 새 Config 키는 `tests/test_config.py::test_exact_defaults`도 고쳐야 한다.
 - #547: `update_run`은 `observe=True` 또는 `pid`·`process_identities`·`executor_pgid`가 있을 때만 프로세스 표를 읽는다. 메타데이터만 바꾸는 갱신에 기대 후손을 관찰하던 단위 시험은 `observe=True`를 명시해 의도를 유지한다.
 - #551: tick의 origin 설정 읽기는 `TickContext.committed_config`(gate만 True)로 켠다. 기본 False라 Config를 직접 주는 단위 시험은 영향 없음. test_cli의 FakeGit은 `blob_sha`·`_call(cat-file)`로 로컬 파일을 커밋본처럼 흉내 낸다. `fa test`는 .foragent.yml 있는 곳에서만 돈다: 기준선은 worktree에서 `PYTHONPATH=<archive>/src`로.
 - [#533 review panel](project_533_review_panel.md) — _panel_review threads+merge, orch_reviewers state override, limit re-raise
+- `test_scheduler_split.py`가 facade `scheduler.py`를 250줄로 제한한다. scheduler에 줄을 더하면 같은 수만큼 줄이거나 분할 모듈로 옮긴다. 바꾼 파일마다 `tests/acceptance/test_*split*.py` 전부를 돌려 확인한다.
