@@ -1,17 +1,20 @@
 """Idempotent repository setup; all external commands can be injected."""
 
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
+import logging
 from pathlib import Path
 import subprocess
 
 import yaml
 
-from foragent import board, launchd
+from foragent import board, gh, launchd
+from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.labels import LABELS
+from foragent.order import detect_test_commands
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
 
@@ -33,6 +36,39 @@ Commands must run in a CI-free shell; acceptance tests live in tests/acceptance/
 SETUP_PATHS = [".foragent.yml", ".github/ISSUE_TEMPLATE/foragent-task.md", "tests/acceptance/.gitkeep"]
 
 
+def _parse_board_map(value: str) -> dict[str, str]:
+    mapping = {}
+    for pair in value.split(","):
+        group, separator, column = pair.partition("=")
+        group, column = group.strip(), column.strip()
+        if not separator or group not in board.DEFAULT_MAP or not column or group in mapping:
+            raise ConfigError("--board-map requires Group=Column pairs for the five board groups")
+        mapping[group] = column
+    if mapping.keys() != board.DEFAULT_MAP.keys():
+        raise ConfigError("--board-map must include Backlog, Up next, In progress, Your turn, Done")
+    return mapping
+
+
+def _choose_board_map(columns: list[str]) -> dict[str, str]:
+    print("Map Foragent groups to existing team columns (saved in .foragent.yml):")
+    for number, column in enumerate(columns, 1):
+        print(f"  {number}. {column}")
+    mapping = {}
+    for group in board.DEFAULT_MAP:
+        while True:
+            try:
+                answer = input(f"{group} — column name or number: ").strip()
+            except (EOFError, OSError) as exc:
+                raise ConfigError("Existing board needs a mapping; retry init with --board-map Group=Column,...") from exc
+            if answer.isdecimal() and 1 <= int(answer) <= len(columns):
+                answer = columns[int(answer) - 1]
+            if answer in columns:
+                mapping[group] = answer
+                break
+            print("Choose one of the listed columns.")
+    return mapping
+
+
 @dataclass(frozen=True)
 class InitReport:
     created: list[str]
@@ -48,6 +84,7 @@ class InitReport:
     added_keys: list[str] = field(default_factory=list)
     board_id: str | None = None
     board_planned: bool = False
+    removed: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = ["Foragent setup plan:" if self.dry_run else "Foragent setup:"]
@@ -55,6 +92,7 @@ class InitReport:
             lines.append(f"Using repository root: {self.normalized_root}")
         lines.append("Would ensure labels." if self.dry_run else "Labels ensured.")
         lines.extend(f"{'Would create' if self.dry_run else 'Created'}: {path}" for path in self.created)
+        lines.extend(f"{'Would remove' if self.dry_run else 'Removed'}: {path}" for path in self.removed)
         lines.extend(f"Already exists: {path}" for path in self.existed)
         lines.extend(f"{'Would add' if self.dry_run else 'Added'} config key: {key}" for key in self.added_keys)
         if self.board_planned:
@@ -73,7 +111,7 @@ class InitReport:
 
 
 def _run_gh(args: list[str], input: str | None = None) -> str:
-    return subprocess.run(["gh", *args], input=input, check=True, capture_output=True, text=True).stdout
+    return gh.run(args, input=input, check=True, capture_output=True, text=True).stdout
 
 
 def _gh_call(run: Callable[..., str], args: list[str]) -> str:
@@ -117,9 +155,11 @@ def init_repo(
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
     no_push: bool = False,
     no_launchd: bool = False, no_board: bool = False, dry_run: bool = False, git: GitRepo | None = None,
+    board_map: str | None = None,
     gh_run: Callable[..., str] | None = None, tracker: Tracker | None = None,
     install_launchd: Callable[[Path], str] | None = None,
 ) -> InitReport:
+    requested_map = _parse_board_map(board_map) if board_map is not None else None
     root = Path(repo_root).resolve()
     git = git or GitRepo(root)
     git.check_worktree()
@@ -147,8 +187,11 @@ def init_repo(
         explicit = {"approvers": approvers, "review": review, "executor": executor,
                     "run_hours": run_hours, "language": language}
         added = {key: value for key, value in explicit.items() if value is not None and key not in local}
+        if "checks" not in local:
+            added["checks"] = initial_checks(repo, run, command=config.test_command or next(iter(detect_test_commands(root)), None))
         if added:
             _validate({**asdict(config), **added})
+            config = replace(config, **added)
             updated_config = _add_config(config_path, local, added)
     else:
         codex_available = _logged_in("codex")
@@ -170,11 +213,14 @@ def init_repo(
             options["language"] = language
         values = {key: DEFAULTS[key] if value is None else value for key, value in options.items()}
         values["approvers"] = approvers
+        values["checks"] = initial_checks(repo, run, command=next(iter(detect_test_commands(root)), None))
         _validate({**DEFAULTS, **values})
         config = Config(**{**DEFAULTS, **values})
         minimal = {key: value for key, value in values.items()
-                   if key in {"review", "approvers"} or options[key] is not None or value != DEFAULTS[key]}
+                   if key in {"review", "approvers", "checks"} or options[key] is not None or value != DEFAULTS[key]}
         contents = {".foragent.yml": CONFIG_COMMENT + yaml.safe_dump(minimal, sort_keys=False), **contents}
+    if config.checks == "ci":
+        contents[WORKFLOW] = workflow_text(config)
     if not (root / "tests/acceptance").exists():
         contents["tests/acceptance/.gitkeep"] = ""
 
@@ -184,8 +230,19 @@ def init_repo(
         existed.insert(0, ".foragent.yml")
     if (root / "tests/acceptance").exists():
         existed.append("tests/acceptance/")
+    removed = obsolete_workflow_paths(root)
+    # A staged deletion is absent from the index but still belongs to HEAD.
+    tracked_removals = set()
+    if removed:
+        for command in (["ls-files", "--cached", "-z", "--", *removed],
+                        ["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", *removed]):
+            tracked_removals.update(git._call(command).split("\0"))
+    tracked_removals = [path for path in removed if path in tracked_removals]
+    # Also recover a deletion left uncommitted by an interrupted setup.
+    legacy_paths = [LEGACY_PUBLISH_WORKFLOW] if not (root / LEGACY_PUBLISH_WORKFLOW).exists() else []
     pending = list(dict.fromkeys([
-        *created, *([".foragent.yml"] if added else []), *git.uncommitted_paths(SETUP_PATHS),
+        *created, *tracked_removals, *([".foragent.yml"] if added else []),
+        *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
     if (pending or (board_planned and not config.board)) and git.current_branch() != base_branch:
@@ -196,26 +253,59 @@ def init_repo(
         board_change = board_planned and not config.board
         return InitReport(created, existed, True, push_planned=push_planned or (board_change and not no_push),
                           commit_planned=bool(pending) or board_change, launchd_planned=not no_launchd,
-                          normalized_root=normalized_root, added_keys=list(added), board_planned=board_planned)
+                          normalized_root=normalized_root, added_keys=list(added), board_planned=board_planned,
+                          removed=removed)
 
-    tracker = tracker or GhTracker(repo, run=run)
+    # GhTracker counts its own attempts; its default runner must not count them again.
+    tracker = tracker or GhTracker(repo, run=gh_run)
     tracker.ensure_labels(LABELS)
     board_id = config.board
     if not no_board:
-        board_id = board.ensure(tracker, repo, config.lanes, config.board)
+        created_boards: set[str] = set()
+        board_id = board.ensure(tracker, repo, config.lanes, config.board, created=created_boards)
+        board_changes = {}
         if board_id and board_id != config.board:
+            board_changes["board"] = board_id
+        if board_id and (requested_map is not None or config.board_map is None):
+            try:
+                status = board.Project(tracker, repo, board_id).fields().get("Status", {})
+                columns = [option["name"] for option in status.get("options", [])]
+            except Exception:
+                logging.getLogger(__name__).warning("Could not read board columns for %s", repo, exc_info=True)
+            else:
+                mapping = requested_map
+                if mapping is None and columns == list(board.COLUMNS):
+                    # Foragent's own five columns have exactly one mapping. A board
+                    # created now or already saved uses it by default; an existing
+                    # board adopted now records it without asking, once.
+                    if board_id != config.board and board_id not in created_boards:
+                        mapping = dict(board.DEFAULT_MAP)
+                elif mapping is None and columns:
+                    mapping = _choose_board_map(columns)
+                if mapping is not None:
+                    missing = set(mapping.values()) - set(columns)
+                    if missing:
+                        raise ConfigError(f"board_map refers to unavailable columns: {', '.join(sorted(missing))}")
+                    if mapping != config.board_map:
+                        board_changes["board_map"] = mapping
+        if board_changes:
             if config_path.exists():
-                added["board"] = board_id
+                added.update(board_changes)
                 updated_config = _add_config(config_path, local, added)
             else:
-                contents[".foragent.yml"] += yaml.safe_dump({"board": board_id}, sort_keys=False)
+                contents[".foragent.yml"] += yaml.safe_dump(board_changes, sort_keys=False, allow_unicode=True)
             pending = list(dict.fromkeys([*pending, ".foragent.yml"]))
             push_planned = not no_push
     for path in created:
         destination = root / path
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("x", encoding="utf-8") as stream:
-            stream.write(contents[path])
+        if path != WORKFLOW:
+            with destination.open("x", encoding="utf-8") as stream:
+                stream.write(contents[path])
+    for path in removed:
+        (root / path).unlink()
+    if WORKFLOW in created:
+        write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:
         config_path.write_text(updated_config, encoding="utf-8")
     if pending:
@@ -224,4 +314,4 @@ def init_repo(
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     return InitReport(created, existed, False, bool(pending), push_planned, label,
-                      normalized_root=normalized_root, added_keys=list(added), board_id=board_id)
+                      normalized_root=normalized_root, added_keys=list(added), board_id=board_id, removed=removed)

@@ -29,16 +29,16 @@ def finish(tracker, store, number, parent, lane="api"):
     tracker.add_issue(number, f"Finished task {number}", labels=[f"lane:{lane}"], state="closed")
     tracker.set_parent(number, parent)
     store.start_run(number, branch=f"issue-{number}", worktree="unused", lane=lane)
-    store.update_run(number, last_progress_at=(NOW + timedelta(minutes=4)).isoformat())
+    store.update_run(number, last_progress_at=(NOW - timedelta(minutes=4)).isoformat())
     store.finish_run(number, "merged")
 
 
-def test_order_progress_and_lane_totals_use_full_history_without_other_orders(tmp_path):
+def test_order_progress_and_lane_totals_use_full_history_without_closed_orders(tmp_path):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
     config = Config(lanes={"api": {"title": "Server"}}, max_parallel=2)
     tracker.add_issue(90, "Current order")
-    tracker.add_issue(91, "Other order")
+    tracker.add_issue(91, "Other order", state="closed")
     for number in range(1, 14):
         finish(tracker, store, number, 90)
     finish(tracker, store, 14, 91)
@@ -50,7 +50,11 @@ def test_order_progress_and_lane_totals_use_full_history_without_other_orders(tm
     assert result.order.number == 90
     assert (result.completed, result.total) == (13, 14)
     assert [issue.number for issue in result.done["api"]] == list(range(1, 14))
-    assert result.eta == NOW + timedelta(minutes=4)
+    # All 14 merges finished recently. The one approved issue left has no size label,
+    # so it counts as size:m, learned from the 14 merged runs (started and finished
+    # at the fixed clock, so they took no time).
+    assert result.recent == 14 and result.eta == NOW
+    assert result.eta_basis == {"m": 14}
     output = watch.render_frame(result, config, tmp_path)
     assert "13/14" in output and "✓ 13 done" in output and "Finished task 13" in output
     assert "Finished task 14" not in output
@@ -152,7 +156,7 @@ def test_live_liveness_crosses_ten_minutes_between_refreshes(tmp_path):
     assert "○ 멈춘 듯 10분" in after
 
 
-@pytest.mark.parametrize("language,gone", [("en", "○ runner gone"), ("ko", "○ 실행기가 끝났어요")])
+@pytest.mark.parametrize("language,gone", [("en", "○ ⚠ no worker"), ("ko", "○ ⚠ 작업자가 없어요")])
 def test_live_runner_death_is_visible_without_refresh_and_permission_is_alive(tmp_path, monkeypatch, language, gone):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
@@ -266,3 +270,13 @@ def test_first_line_shows_snapshot_time_and_warns_when_nothing_was_read(tmp_path
                                config, tmp_path).splitlines()[0]
     local_time = datetime.fromisoformat(observed["as_of"]).astimezone().strftime("%H:%M")
     assert first.endswith(f"queued 1 · as of {local_time}") and "⚠" not in first
+
+
+@pytest.mark.parametrize('language,label', [('en', 'waiting for shared files'), ('ko', '공유 파일 기다려요')])
+def test_overlap_wait_activity_uses_translated_waiting_phase(language, label):
+    from foragent.watch_layout import _activity
+
+    row = {'state': 'working', 'phase': 'overlap-wait', 'last_activity_seconds': 0}
+    assert _activity(row, language, 0, 10, None, phase_seconds=120) == (
+        f'● {label} ' + ('2 min' if language == 'en' else '2분')
+    )

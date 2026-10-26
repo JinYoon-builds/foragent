@@ -45,6 +45,7 @@ def test_file_patterns_overlap_is_symmetric(left, right, expected):
 
 
 def _issue(ctx, number, files, *, running=False):
+    ctx.config = replace(ctx.config, overlap_per_file=1)
     body = BODY
     if files is not None:
         body += "\n## Files\n" + "".join(f"- {path}\n" for path in files)
@@ -98,7 +99,8 @@ def test_lane_clone_starts_with_backlog_on_later_ticks_and_stops_at_two(ctx):
     for number in range(1, 5):
         _issue(ctx, number, [f"src/file{number}.py"])
     tick(ctx)
-    assert starts == [1]
+    # Disjoint files fill the initial machine budget of two in one tick; no lane cap applies.
+    assert starts == [1, 2]
     tick(ctx)
     tick(ctx)
     assert starts == [1, 2]
@@ -144,14 +146,14 @@ def test_lane_clone_candidate_files_come_from_snapshot(ctx, approved_files, live
     _clone_backlog(ctx, ["src/shared.py"], approved_files)
     body = ctx.tracker.get_issue(2).body.replace(approved_files[0], live_files[0])
     ctx.tracker.edit_body(2, body)
-    assert _can_start_in_lane(ctx, "main", ctx.tracker.get_issue(2), 2) is allowed
+    assert _can_start_in_lane(ctx, "main", ctx.tracker.get_issue(2)) is allowed
 
 
 @pytest.mark.parametrize("missing_snapshot", [1, 2])
 def test_lane_clone_requires_both_approval_snapshots(ctx, missing_snapshot):
     _clone_backlog(ctx, ["src/one.py"], ["src/two.py"])
     ctx.store.clear_approval(missing_snapshot)
-    assert not _can_start_in_lane(ctx, "main", ctx.tracker.get_issue(2), 2)
+    assert not _can_start_in_lane(ctx, "main", ctx.tracker.get_issue(2))
 
 
 @pytest.mark.parametrize("legacy_run", [False, True])

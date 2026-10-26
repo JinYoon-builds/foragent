@@ -1,0 +1,3 @@
+# Memory critical line (Jin, 2026-10-25 evening)
+
+Replaces the sustained-window back-off (#470) and the headroom admission (#471), both closed. On macOS low memory mostly means slowdown (swap, thrashing), rarely failure, so minutes of judgment latency are fine: the orchestrator sets the parallel budget and test slots from facts through the machine.yml ceilings (#365). The gate keeps one cheap insurance line against 'out of application memory': while kernel pressure is critical, start nothing new; running work is never touched. CPU-load back-off stays as today for now. A later memory-facts order (after #333) puts the kernel level, swap-out activity, compressed-memory trend and CPU load with recent history into fa orch facts.

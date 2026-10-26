@@ -163,3 +163,85 @@ def test_orchestrator_cannot_overwrite_what_a_person_wrote(queue_case, capsys):
     assert plan_events(case, "plan-resume") == []
     assert_tick_starts_nothing(case)
     assert case.gh_calls == []
+
+
+def wide_lane(case, monkeypatch, files):
+    """Give each waiting issue declared Files and free machine budget, as the lane-clone test does."""
+    from dataclasses import replace
+
+    from foragent import scheduler
+    from foragent.capacity import write_state
+
+    case.tick_ctx.config = replace(case.tick_ctx.config, max_parallel=4)
+    monkeypatch.setattr(scheduler, "machine_load", lambda: ("normal", 0.0))
+    write_state(case.store, 4, case.clock[0] - timedelta(hours=1))
+    body = case.tracker.get_issue(3).body
+    for number, paths in files.items():
+        listed = body + "\n## Files\n" + "".join(f"- {path}\n" for path in paths)
+        case.tracker.add_issue(number, f"Task {number}", listed, labels=["ready", "lane:orch"])
+    # Approve after the body edit, so each approval covers the declared Files.
+    case.clock[0] += timedelta(seconds=1)
+    for number in files:
+        case.tracker.record_label(number, "approved", "human")
+
+
+def tick_lane(case, ticks=4):
+    reports = [tick(case.tick_ctx) for _ in range(ticks)]
+    for report in reports:
+        assert report.skipped is None, report
+    actions = [action for report in reports for action in report.actions]
+    running = sorted(run.number for run in case.store.active_runs() if run.lane == "orch")
+    return running, actions
+
+
+def test_plan_width_lets_a_lane_run_three_disjoint_issues(queue_case, capsys, monkeypatch):
+    case = queue_case
+    wide_lane(case, monkeypatch, {3: ["src/foragent/state.py"], 5: ["src/foragent/order.py"],
+                                  7: ["src/foragent/watch.py"]})
+    fa_ok(case, capsys, "plan", "--width", "orch=3")
+    assert plan(case, capsys)["width"]["orch"] == 3
+    stored = json.loads((case.store.root / "plan.json").read_text(encoding="utf-8"))
+    assert stored["width"]["orch"] == 3, stored
+    [event] = plan_events(case, "plan-width")
+    text = json.dumps(event, ensure_ascii=False)
+    for fact in ("orch", "3", "human"):
+        assert fact in text, (fact, event)
+
+    running, actions = tick_lane(case)
+    assert running == [3, 5, 7], actions
+    assert sorted(case.launched) == [3, 5, 7], actions
+    assert case.gh_calls == []
+
+
+def test_lane_width_is_only_a_cap_set_by_a_live_plan(queue_case, capsys, monkeypatch):
+    """Planning addendum r10 (Jin): no fixed per-lane cap; fill free slots with any ready
+    issue whose Files do not overlap a running one. A plan width is an optional cap."""
+    case = queue_case
+    wide_lane(case, monkeypatch, {3: ["src/foragent/state.py"], 5: ["src/foragent/order.py"],
+                                  7: ["src/foragent/watch.py"]})
+    assert plan(case, capsys).get("width", {}) == {}
+    fa_ok(case, capsys, "plan", "--width", "orch=2", "--expires", at(case, hours=1))
+    assert plan(case, capsys)["width"]["orch"] == 2
+    running, actions = tick_lane(case)
+    assert len(running) == 2, actions
+    # Once the plan expires its width lapses; with no fixed cap all disjoint issues run.
+    case.clock[0] += timedelta(hours=1, seconds=1)
+    running, actions = tick_lane(case)
+    assert running == [3, 5, 7], actions
+    assert sorted(case.launched) == running, actions
+    assert case.gh_calls == []
+
+
+def test_plan_width_never_starts_overlapping_files(queue_case, capsys, monkeypatch):
+    case = queue_case
+    # 7 shares a file with 5, not with the first run 3: every running issue counts.
+    wide_lane(case, monkeypatch, {3: ["src/foragent/state.py"], 5: ["src/foragent/order.py"],
+                                  7: ["src/foragent/order.py"], 9: ["src/foragent/watch.py"]})
+    fa_ok(case, capsys, "plan", "--width", "orch=3")
+    running, actions = tick_lane(case, ticks=5)
+    assert running == [3, 5, 9], actions
+    assert 7 not in case.launched, actions
+    assert case.store.get_run(7) is None
+    assert "ready" in case.tracker.get_issue(7).labels
+    assert "running" not in case.tracker.get_issue(7).labels
+    assert case.gh_calls == []

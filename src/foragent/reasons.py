@@ -14,9 +14,12 @@ class Reason(StrEnum):
     RETRIES_EXCEEDED = "retries-exceeded"
     STALLED = "stalled"
     TIMEOUT = "timeout"
+    STOP_REFUSED = "stop-refused"
     NO_MACHINE_CHECK = "no-machine-check"
     ORCHESTRATOR_TIMEOUT = "orchestrator-timeout"
     REVIEW_DISPUTE = "review-dispute"
+    ACCEPTANCE_BASELINE_UNAVAILABLE = "acceptance-baseline-unavailable"
+    CI_NOT_STARTED = "ci-not-started"
 
 
 GROUP: dict[Reason, str] = {
@@ -28,9 +31,12 @@ GROUP: dict[Reason, str] = {
     Reason.RETRIES_EXCEEDED: "tech-failure",
     Reason.STALLED: "tech-failure",
     Reason.TIMEOUT: "tech-failure",
+    Reason.STOP_REFUSED: "tech-failure",
     Reason.NO_MACHINE_CHECK: "decision",
     Reason.ORCHESTRATOR_TIMEOUT: "tech-failure",
     Reason.REVIEW_DISPUTE: "tech-failure",
+    Reason.ACCEPTANCE_BASELINE_UNAVAILABLE: "tech-failure",
+    Reason.CI_NOT_STARTED: "tech-failure",
 }
 
 APPROVAL_MARKER = "<!-- foragent:approved"

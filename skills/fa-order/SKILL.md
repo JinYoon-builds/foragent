@@ -1,6 +1,6 @@
 ---
 name: fa-order
-description: Interview the user about what to build, split it into lane-assigned issues with executable acceptance tests (plan + goal per issue), get one approval, and publish them for the Foragent gate. Also turns pending decisions and feedback into updated issues. Use for a new project after /fa-init, and whenever the user wants to order new work.
+description: Interview the user about what to build, split it into lane-assigned issues with executable acceptance tests (plan + goal per issue), get one approval, and publish them for the Foragent gate. Also turns pending decisions and feedback into updated issues. Use for a new project after setup, and whenever the user wants to order new work.
 ---
 
 # fa-order
@@ -150,7 +150,8 @@ no-match or deferred choice with the person; do not invent candidates or hand th
 
 ## Design first (D33)
 Use `ui.frameworks` and `ui.has_design_foundation` from the context alongside the request.
-For UI work without a foundation, first suggest a design session (`/fa-design-session`)
+For UI work without a foundation, first suggest the design interview (디자인 인터뷰); if the
+person agrees, follow `skills/fa-design-session/SKILL.md` (the `fa-design-session` skill)
 as design mode in this same planning session to settle the visual direction (D72).
 Compare references on the local board, then running drafts in their actual medium.
 Read its `docs/design/<topic>/HANDOFF.md` as settled context, then
@@ -193,7 +194,8 @@ rest still completes. For each issue you must be able to write one sentence:
   or decisions that depend on seeing intermediate results. Publication adds the
   `interactive` label. Use `false` or omit it for work an agent can finish unattended;
   complexity alone is not a reason to mark an issue interactive. For visual design,
-  suggest a design session (`/fa-design-session`) to settle the direction together.
+  suggest the design interview (디자인 인터뷰, the `fa-design-session` skill in `/fa`) to
+  settle the direction together.
   This order records the choice and suggestion; session startup is a separate workflow.
 - **blocked_by** only for real order dependencies (B cannot be built or verified without A).
 - Fill each issue's **`files`** with the repository-relative paths or globs it is expected
@@ -216,6 +218,10 @@ use that checkout, and its files must stay untouched. Put the final contents int
 `acceptance_files` and `spec_markdown`, under their acceptance-dir paths. Test observable behaviour through the
 project's real entry points (CLI, HTTP, public functions), not internals. Each test must
 fail today and pass only when the goal is met. Prefer 2–4 sharp cases including one edge.
+Judge every test by the break-it rule (from pstack's
+principle-test-behavior-not-implementation, MIT): Make the code return a wrong value, skip an
+effect, or do the effect twice. If the test still passes, it proves nothing. Rewrite such a
+test so that each of those breaks makes it fail.
 When a behaviour cannot be checked by a machine (visual taste, real device), add it as a
 checklist item and keep at least one executable command anyway (e.g. the build or a smoke
 check). Done when commands must run with the repo's normal tooling from the repo root.
@@ -223,6 +229,15 @@ check). Done when commands must run with the repo's normal tooling from the repo
 ## 6. One approval
 Write the plan JSON (schema in `fa order publish --help`) to a temp file. Run
 `fa order publish PLAN.json --dry-run`, fix validation errors, then record `progress check`.
+Then run `fa order preread PLAN.json --json`. The implementer reads each issue read-only and
+lists what it would have to guess. Show every unknown to the user as it is and ask them to
+answer it; never answer an unknown yourself. Fold the user's answers into the plan, then run
+preread again until every issue has no unknowns.
+`--approve` refuses issues whose latest preread of the current content is missing or has
+unknowns; any plan edit needs a new preread. The dry-run is never blocked.
+Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
+so preread refuses them: publish once without `--approve` to create the lanes, run preread,
+then publish again with `--approve`.
 Show the order grouped by lane, work first:
 ```
 This order: 7 issues
@@ -246,7 +261,7 @@ and pushes. Other sessions' edits stay out of the commit, so no manual rebase is
 it cannot fast-forward, report the error instead of rebasing or committing by hand. Decisions and feedback that change
 existing issues go into `edits`. Record `progress publish --issue <number>` for each
 published or updated issue in the result. Show the printed summary and one line on what
-happens next ("the gate starts within 5 minutes; /fa-inspect shows results"), then run
+happens next ("the gate starts within 5 minutes; /fa shows results"), then run
 `fa order progress end`.
 
 Never add `approved` yourself outside `fa order publish`, never edit acceptance tests of

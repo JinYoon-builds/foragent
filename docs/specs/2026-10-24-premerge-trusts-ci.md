@@ -1,0 +1,3 @@
+# Premerge trusts CI (addition to #331)
+
+By D81's logic: with pull_request CI, premerge does not run the unit suite locally (CI runs it on the PR and premerge already requires green CI). Premerge = acceptance comparison only: the head side runs tests/acceptance excluding locked files of approved-but-unmerged issues (same exclusion as PR #327), the base side comes from the baseline cache (run only if missing). Without CI, or with runner_unit_tests: all, keep the full suite. Verdict unchanged: CI green + no previously passing acceptance id fails + no conflict. Expected: about 30 min down to a few minutes.

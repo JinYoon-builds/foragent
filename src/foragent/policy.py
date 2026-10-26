@@ -48,11 +48,13 @@ def hold_mode(mode: str) -> Decision:
     return Decision("hold_mode", summary="PR is waiting for your review", mode=mode)
 
 
-def merge_decision(*, changed_paths: list[str], issue_labels, config: Config) -> Decision:
+def merge_decision(*, changed_paths: list[str], issue_labels, config: Config,
+                   risk_always_human: list[str] = ()) -> Decision:
+    """`risk_always_human` holds paths that the risk map marks always_human, like config.always_human."""
     directory = PurePosixPath(config.acceptance_dir)
     if any(PurePosixPath(path).is_relative_to(directory) for path in changed_paths):
         return Decision("hold", Reason.ACCEPTANCE_TOUCHED, "Acceptance files changed; a human must review this PR.")
-    if touched(changed_paths, config.always_human):
+    if touched(changed_paths, [*config.always_human, *risk_always_human]):
         return Decision("hold", Reason.ALWAYS_HUMAN_PATH, "This PR touches a path requiring human review.")
     if RISK_HIGH in issue_labels:
         return Decision("hold", Reason.RISK_HIGH, "This issue is marked risk:high; a human must review this PR.")

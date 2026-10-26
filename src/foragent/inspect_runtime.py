@@ -1,5 +1,6 @@
 """Prepare local try results and manage disposable web previews without GitHub writes."""
 
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -10,10 +11,12 @@ import socket
 import subprocess
 import tempfile
 import time
+from typing import Any
 
 from foragent.git import GitRepo
 from foragent.inspect_data import InspectContext, Prepared, PreparedCommand, collect, load_prepared
-from foragent.processes import _child_environment, kill_process_group, run_logged
+from foragent.processes import _child_environment, kill_process_group, observe_tree, recorded_tree, run_logged
+from foragent.records import write_back
 
 
 class InspectRuntimeError(ValueError):
@@ -64,11 +67,36 @@ def prepare(ctx: InspectContext) -> list[int]:
                         results.append(run_command(command, worktree, Path(log.name)))
                 saved = ctx.store.root / "inspect/prepared" / f"{item.number}.json"
                 saved.parent.mkdir(parents=True, exist_ok=True)
-                saved.write_text(json.dumps(asdict(Prepared(base_sha, results)), ensure_ascii=False), encoding="utf-8")
+                record = _prepared_write_back(saved, Prepared(base_sha, results))
+                saved.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
                 prepared.append(item.number)
             finally:
                 git.remove_worktree(worktree)
     return prepared
+
+
+def _prepared_write_back(path: Path, prepared: Prepared) -> dict:
+    """Keep unknown fields a newer version stored.
+
+    Each command is paired with the next unused saved record of the same text,
+    so repeated commands keep their own records in order.
+    """
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    results = saved.get("results")
+    previous: dict[Any, deque] = defaultdict(deque)
+    for item in results if isinstance(results, list) else []:
+        if isinstance(item, dict):
+            previous[item.get("command")].append(item)
+    value = asdict(prepared)
+    value["results"] = [
+        write_back(PreparedCommand, previous[item["command"]].popleft() if previous[item["command"]] else None, item)
+        for item in value["results"]
+    ]
+    return write_back(Prepared, saved, value)
 
 
 def _port_open(port: int) -> bool:
@@ -114,7 +142,8 @@ def _served_lock(ctx: InspectContext) -> Iterator[None]:
 
 
 def _stop_one(ctx: InspectContext, number: str, records: dict, killer: Callable[[int], None]) -> None:
-    killer(records[number]["pid"])
+    with recorded_tree(records[number].get("process_identities", [])):
+        killer(records[number]["pid"])
     _git(ctx).remove_worktree(ctx.store.root / "inspect" / f"serve-{int(number)}")
     del records[number]
     _save_served(ctx, records)
@@ -168,7 +197,8 @@ def serve(
                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
-            records[str(number)] = {"pid": process.pid, "port": web.port}
+            records[str(number)] = {"pid": process.pid, "port": web.port,
+                                    "process_identities": observe_tree(roots=(process.pid,))}
             _save_served(ctx, records)
             if not (port_waiter or wait_for_port)(web.port, 90):
                 raise InspectRuntimeError(f"#{number} did not open port {web.port} within 90 s")

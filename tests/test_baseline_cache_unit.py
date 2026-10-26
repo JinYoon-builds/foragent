@@ -1,9 +1,13 @@
 """Exercise baseline reuse against real pytest subprocesses and local Git history."""
 
 from datetime import timedelta
+from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 import json
 import shlex
+import subprocess
 import sys
+import time
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
@@ -12,6 +16,7 @@ import pytest
 from conftest import BASE_TIME, git_command
 from foragent.config import Config
 from foragent.git import GitRepo
+from foragent.run_attempt import AttemptFailure
 from foragent.runner import RunContext, _capture_acceptance_baseline
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker
@@ -55,6 +60,75 @@ def gated_test(variable):
         f"@pytest.mark.skipif(not os.environ.get({variable!r}), reason='environment disabled')\n"
         "def test_last():\n    pass\n"
     )
+
+
+@pytest.mark.parametrize("budget_exhausted", [False, True])
+@pytest.mark.parametrize("api", ["runner", "premerge"])
+def test_baseline_caches_all_files_excluded_without_starting_pytest(baseline_case, monkeypatch, budget_exhausted, api):
+    from foragent.run_baseline import _capture_baseline
+
+    c = baseline_case
+    c.ctx.store.save_approval(
+        1, body="Approved tests", body_sha="approved",
+        acceptance_blobs=c.ctx.git.blob_shas("origin/main", [FIRST, LAST]),
+        approved_by="human", approved_at=BASE_TIME.isoformat(),
+    )
+    if budget_exhausted:
+        c.now[0] += timedelta(minutes=c.ctx.config.max_runtime_minutes)
+
+    def no_pytest(*args, **kwargs):
+        pytest.fail("pytest must not run")
+
+    monkeypatch.setattr("foragent.runner._check", no_pytest)
+
+    def capture():
+        if api == "runner":
+            return c.capture("uv run pytest -q")
+        return _capture_baseline(
+            c.ctx, "uv run pytest -q", "origin/main", log=c.log, report=c.report,
+            check=no_pytest, prepare=lambda: None, wait=lambda acquire: acquire(),
+            required_ids=frozenset(),
+        )
+
+    first = capture()
+    assert first is not None and first.node_ids == first.collected_ids == first.failing_ids == ()
+    assert capture() == first
+    entry, = c.cache.glob("*.json")
+    saved = json.loads(entry.read_text())
+    assert saved["node_ids"] == saved["collected_ids"] == saved["failing_ids"] == []
+    assert saved["excluded"] == [FIRST, LAST]
+    assert saved["created_at"] == c.now[0].isoformat()
+    assert not c.report.exists()
+    log = c.log.read_text()
+    assert log.count("no acceptance test files remain after exclusions") == 1
+    assert log.count("Acceptance baseline count=0, cache=hit") == 1
+
+
+def test_premerge_empty_selection_is_cached_before_reusing_a_broader_baseline(baseline_case):
+    from foragent.run_baseline import _capture_baseline
+
+    c = baseline_case
+    assert c.capture().node_ids == PASSING_IDS
+    c.ctx.store.save_approval(
+        1, body="Approved tests", body_sha="approved",
+        acceptance_blobs=c.ctx.git.blob_shas("origin/main", [FIRST, LAST]),
+        approved_by="human", approved_at=BASE_TIME.isoformat(),
+    )
+
+    def no_pytest(*args, **kwargs):
+        pytest.fail("Empty premerge base must not spawn pytest")
+
+    for _ in range(2):
+        baseline = _capture_baseline(
+            c.ctx, COMMAND, "origin/main", log=c.log, report=c.report,
+            check=no_pytest, prepare=lambda: None, wait=lambda acquire: acquire(),
+            required_ids=frozenset(),
+        )
+        assert baseline.node_ids == baseline.collected_ids == baseline.failing_ids == ()
+    saved = [json.loads(path.read_text()) for path in c.cache.glob("*.json")]
+    empty, = [entry for entry in saved if entry["excluded"] == [FIRST, LAST]]
+    assert empty["node_ids"] == empty["collected_ids"] == empty["failing_ids"] == []
+    assert c.log.read_text().count("no acceptance test files remain after exclusions") == 1
 
 
 def test_baseline_cache_rebuilds_when_pytest_environment_changes(baseline_case, monkeypatch):
@@ -179,8 +253,9 @@ def test_baseline_does_not_cache_early_stop_from_pytest_plugin(baseline_case, te
         "    item.session.shouldfail = 'stop with a partial JUnit report'\n"
     )})
     command = COMMAND if terminal else f"{shlex.quote(sys.executable)} -m pytest -p no:terminal"
-    assert c.capture(command).node_ids == PASSING_IDS[:1]
-    assert c.capture(command).node_ids == PASSING_IDS[:1]
+    for _ in range(2):
+        with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+            c.capture(command)
     assert len(list(ET.parse(c.report).iter("testcase"))) == 1
     assert not list(c.cache.glob("*.json"))
     assert c.log.read_text().count("Acceptance baseline count=1, exit_code=1") == 2
@@ -196,12 +271,14 @@ def test_baseline_does_not_cache_duplicate_junit_records_after_early_stop(baseli
             "    assert False, 'teardown failed'\n"
         ),
     })
-    assert c.capture().node_ids == ()
+    with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+        c.capture()
     cases = list(ET.parse(c.report).iter("testcase"))
     assert len(cases) == 2
     assert {case.get("name") for case in cases} == {"test_first"}
     assert not list(c.cache.glob("*.json"))
-    assert c.capture().node_ids == ()
+    with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+        c.capture()
     assert c.log.read_text().count("Acceptance baseline count=0, exit_code=1") == 2
     assert "cache=hit" not in c.log.read_text()
 
@@ -246,3 +323,200 @@ def test_baseline_caches_empty_passing_set_after_complete_execution(baseline_cas
     assert c.capture().node_ids == ()
     assert len(list(ET.parse(c.report).iter("testcase"))) == 2
     assert c.log.read_text().count("cache=hit") == 1
+
+
+def test_baseline_cache_preserves_failed_and_skipped_outcomes(baseline_case):
+    c = baseline_case
+    c.prepare({FIRST: "def test_first():\n    assert False\n",
+               LAST: "import pytest\n\n@pytest.mark.skip(reason='pending')\ndef test_last():\n    pass\n"})
+    for baseline in (c.capture(), c.capture()):
+        assert baseline.node_ids == ()
+        assert baseline.collected_ids == PASSING_IDS
+        assert baseline.failing_ids == PASSING_IDS[:1]
+    assert c.log.read_text().count("cache=hit") == 1
+
+
+def test_premerge_cache_reuses_only_covered_outcomes_across_approval_stores(baseline_case):
+    from foragent.run_baseline import _premerge_baseline
+
+    c = baseline_case
+    c.ctx.store.save_approval(
+        2, body="pending", body_sha="body", acceptance_blobs={FIRST: "blob"},
+        approved_by="human", approved_at=BASE_TIME.isoformat(),
+    )
+    assert c.capture().node_ids == PASSING_IDS[1:]
+    other = replace(c.ctx, store=StateStore(c.ctx.store.root.parent / "other", now=c.ctx.now))
+    base = c.ctx.git.ref_sha("origin/main")
+    saved = _premerge_baseline(other, COMMAND, base, [], frozenset(PASSING_IDS[1:]))
+    assert saved is not None and saved["excluded"] == [FIRST]
+    # The other approval store cannot use this cache to excuse a failure in FIRST.
+    assert _premerge_baseline(other, COMMAND, base, [], frozenset(PASSING_IDS[:1])) is None
+    assert _premerge_baseline(other, COMMAND + " -v", base, [], frozenset()) is None
+    other.config = replace(other.config, acceptance_dir="another/acceptance")
+    assert _premerge_baseline(other, COMMAND, base, [], frozenset()) is None
+
+
+def test_runner_reuses_legacy_cache_but_premerge_rebuilds_unknown_outcomes(baseline_case):
+    from foragent.run_baseline import _capture_baseline
+    from foragent.run_checks import _check
+
+    c = baseline_case
+    c.capture()
+    entry, = c.cache.glob("*.json")
+    entry.write_text(json.dumps({"node_ids": PASSING_IDS, "created_at": BASE_TIME.isoformat()}))
+    assert c.capture().node_ids == PASSING_IDS
+    assert c.log.read_text().count("cache=hit") == 1
+    baseline = _capture_baseline(
+        c.ctx, COMMAND, "origin/main", log=c.log, report=c.report,
+        check=lambda command, root: _check(command, root, c.log, 30),
+        prepare=lambda: None, wait=lambda acquire: acquire(), required_ids=frozenset(),
+    )
+    assert baseline.collected_ids == PASSING_IDS and baseline.failing_ids == ()
+    assert "collected_ids" in json.loads(entry.read_text())
+
+
+def test_concurrent_prebuild_scheduling_reserves_key_before_launch(baseline_case):
+    from foragent.run_baseline import prebuild_acceptance_baseline
+
+    c = baseline_case
+    c.ctx.config = replace(c.ctx.config, test_command=COMMAND)
+    launches = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: prebuild_acceptance_baseline(
+            c.ctx, "origin/main", lambda *args: launches.append(args)), range(4)))
+    try:
+        assert len(launches) == 1
+        _, build, _ = launches[0]
+        assert build.base_sha == c.ctx.git.ref_sha("origin/main")
+        events = [json.loads(line) for line in (c.ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+        assert len(events) == 1 and events[0]["kind"] == "baseline-build"
+        assert build.base_sha in events[0]["summary"]
+    finally:
+        for _, _, lock in launches:
+            lock.close()
+
+
+def test_failed_prebuild_launch_releases_key_for_later_tick(baseline_case):
+    from foragent.run_baseline import prebuild_acceptance_baseline
+
+    c = baseline_case
+    c.ctx.config = replace(c.ctx.config, test_command=COMMAND)
+    attempts = []
+
+    def unavailable(ctx, build, lock):
+        attempts.append(build.key)
+        raise OSError("worker could not start")
+
+    for _ in range(2):
+        prebuild_acceptance_baseline(c.ctx, "origin/main", unavailable)
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert not list(c.cache.glob("*.json"))
+    assert "worker could not start" in (c.ctx.store.root / "baseline-build.log").read_text()
+
+
+def test_queued_prebuild_keeps_original_exclusions_and_sha(baseline_case):
+    from foragent.run_baseline import _build_baseline, prebuild_acceptance_baseline
+
+    c = baseline_case
+    c.ctx.config = replace(c.ctx.config, test_command=COMMAND)
+    launches = []
+    prebuild_acceptance_baseline(c.ctx, "origin/main", lambda *args: launches.append(args))
+    _, build, lock = launches[0]
+    try:
+        c.ctx.store.save_approval(
+            2, body="pending", body_sha="body", acceptance_blobs={FIRST: "blob"},
+            approved_by="human", approved_at=BASE_TIME.isoformat(),
+        )
+        c.prepare({LAST: "def test_last():\n    assert False\n"})
+        assert c.ctx.git.ref_sha("origin/main") != build.base_sha
+        _build_baseline(c.ctx, build, lock)
+        saved = json.loads((c.cache / f"{build.key}.json").read_text())
+        assert saved["node_ids"] == list(PASSING_IDS)
+        assert saved["excluded"] == []
+        assert saved["scope"] == build.scope
+    finally:
+        lock.close()
+
+
+def test_prebuild_caches_all_files_excluded_without_starting_pytest(baseline_case, monkeypatch):
+    from foragent.run_baseline import _build_baseline, prebuild_acceptance_baseline
+
+    c = baseline_case
+    c.ctx.config = replace(c.ctx.config, test_command=COMMAND)
+    c.ctx.store.save_approval(
+        2, body="Approved tests", body_sha="approved",
+        acceptance_blobs=c.ctx.git.blob_shas("origin/main", [FIRST, LAST]),
+        approved_by="human", approved_at=BASE_TIME.isoformat(),
+    )
+
+    def no_pytest(*args, **kwargs):
+        pytest.fail("An empty prebuild must not start pytest")
+
+    monkeypatch.setattr("foragent.runner._check", no_pytest)
+    launches = []
+    launch = lambda *args: launches.append(args)
+    prebuild_acceptance_baseline(c.ctx, "origin/main", launch)
+    ctx, build, lock = launches[0]
+    _build_baseline(ctx, build, lock)
+    prebuild_acceptance_baseline(c.ctx, "origin/main", launch)
+    assert len(launches) == 1
+    saved = json.loads((c.cache / f"{build.key}.json").read_text())
+    assert saved["node_ids"] == saved["collected_ids"] == saved["failing_ids"] == []
+    assert saved["excluded"] == [FIRST, LAST]
+    assert saved["scope"] == build.scope
+    assert not (c.cache / f"{build.key}.xml").exists()
+
+
+def test_detached_prebuild_outlives_scheduler_and_retains_reservation(baseline_case, tmp_path):
+    c = baseline_case
+    release, entered = tmp_path / "release", tmp_path / "entered"
+    c.prepare({FIRST: (
+        "from pathlib import Path\nimport time\n"
+        "def test_first():\n"
+        f"    Path({str(entered)!r}).touch()\n"
+        f"    while not Path({str(release)!r}).exists():\n"
+        "        time.sleep(0.01)\n"
+    )})
+    # A real short-lived scheduler process: neither its Python threads nor its
+    # open descriptors can be responsible for completing the eventual cache.
+    script = "\n".join([
+        "from pathlib import Path",
+        "from types import SimpleNamespace",
+        "from datetime import UTC, datetime",
+        "from foragent import capacity",
+        "from foragent.config import Config",
+        "from foragent.git import GitRepo",
+        "from foragent.state import StateStore",
+        "from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_process",
+        f"capacity.machine_root = lambda: Path({str(tmp_path / 'slots')!r})",
+        f"root = Path({str(c.root)!r})",
+        f"ctx = SimpleNamespace(repo_root=root, store=StateStore(Path({str(c.ctx.store.root)!r})),",
+        f"    config=Config(test_command={COMMAND!r}, acceptance_dir={ACCEPTANCE_DIR!r}, test_slots=1),",
+        "    git=GitRepo(root), now=lambda: datetime.now(UTC))",
+        "prebuild_acceptance_baseline(ctx, 'origin/main', start_baseline_process)",
+    ])
+    try:
+        subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True, timeout=10)
+        deadline = time.monotonic() + 10
+        while not entered.exists():
+            assert time.monotonic() < deadline, [p.read_text() for p in c.cache.glob("*.log")]
+            time.sleep(0.01)
+        key, = [p.stem for p in c.cache.glob("*.lock")]
+        cache = StateStore(c.cache)
+        assert cache.lock_acceptance_baseline(key, blocking=False) is None
+        assert not list(c.cache.glob("*.json"))
+        # The detached worker must take its own slot rather than inherit the
+        # enclosing `fa test` command's FORAGENT_TEST_SLOT=held shortcut.
+        assert (tmp_path / "slots/test-slots").is_dir()
+    finally:
+        release.touch()
+        deadline = time.monotonic() + 10
+        while not list(c.cache.glob("*.json")):
+            assert time.monotonic() < deadline, [p.read_text() for p in c.cache.glob("*.log")]
+            time.sleep(0.01)
+    assert cache.load_acceptance_baseline(key)["node_ids"] == list(PASSING_IDS)
+    deadline = time.monotonic() + 10
+    while (lock := cache.lock_acceptance_baseline(key, blocking=False)) is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    lock.close()

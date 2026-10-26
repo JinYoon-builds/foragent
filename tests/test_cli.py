@@ -34,6 +34,14 @@ class FakeGit:
     def blob_shas(self, ref, paths):
         return {path: "missing" for path in paths}
 
+    # The tick reads origin's committed .foragent.yml; model it as the checkout's file.
+    def blob_sha(self, ref, path):
+        return path if (self.root / path).is_file() else None
+
+    def _call(self, args):
+        assert args[:2] == ["cat-file", "blob"], args
+        return (self.root / args[2]).read_text(encoding="utf-8")
+
     def remove_worktree(self, path):
         pass
 
@@ -48,6 +56,7 @@ def app(tmp_path, monkeypatch):
 
     def git_repo(root):
         calls["roots"].append(root)
+        git.root = root
         return git
 
     def gh_tracker(repo):
@@ -99,6 +108,18 @@ def test_tick_starts_by_default_and_prints_plain_report(app, capsys):
     assert cli.main(["gate", "tick", "--repo-root", str(root)]) == 0
     assert "#1 started running (pid=1234)" in capsys.readouterr().out
     assert calls["launches"] == [1] and store.get_run(1).pid == 1234
+
+
+@pytest.mark.parametrize("duration", [None, 2.75])
+def test_human_status_shows_latest_tick_result_and_duration(app, capsys, duration):
+    root, git, tracker, store, calls = app
+    record = {"status": "ok", "consecutive_failures": 0}
+    if duration is not None:
+        record["duration_seconds"] = duration
+    store._write_json(store.root / "tick-outcome.json", record)
+    assert cli.main(["gate", "status", "--repo-root", str(root)]) == 0
+    line = next(line for line in capsys.readouterr().out.splitlines() if "last tick:" in line)
+    assert line == f"last tick: ok · {'—' if duration is None else '2.75s'}"
 
 
 @pytest.mark.parametrize("json_output", [False, True])
@@ -300,7 +321,7 @@ def test_init_cli_passes_all_flags_and_prints_summary(tmp_path, monkeypatch, cap
     ]) == 0
     assert calls == [(tmp_path, {
         "approvers": ["alice", "bob", "carol"], "review": "careful", "executor": "claude",
-        "run_hours": "22-08", "language": "ko", "no_push": True, "no_launchd": True, "no_board": True, "dry_run": True,
+        "run_hours": "22-08", "language": "ko", "no_push": True, "no_launchd": True, "no_board": True, "board_map": None, "dry_run": True,
     })]
     assert capsys.readouterr().out == "Setup summary\n"
 
@@ -314,7 +335,7 @@ def test_init_cli_defaults_to_cwd_and_default_options(tmp_path, monkeypatch, cap
         assert root == tmp_path
         assert kwargs == {
             "approvers": None, "review": None, "executor": None, "run_hours": None,
-            "no_push": False, "no_launchd": False, "no_board": False, "dry_run": False, "language": None,
+            "no_push": False, "no_launchd": False, "no_board": False, "board_map": None, "dry_run": False, "language": None,
         }
         return InitReport([], [], False)
 
@@ -754,7 +775,8 @@ def test_tick_returns_while_notification_child_is_still_running(app, monkeypatch
 
     def slow_notification(args, **kwargs):
         # Replace GitHub/osascript with a real offline child that stays busy.
-        child = popen([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+        child = popen([sys.executable, "-c", "import sys; sys.stdin.readline()"],
+                      **{**kwargs, "stdin": subprocess.PIPE})
         children.append(child)
         return child
 
@@ -769,8 +791,10 @@ def test_tick_returns_while_notification_child_is_still_running(app, monkeypatch
         assert store.load_inspect().notified_signature is None
     finally:
         for child in children:
-            child.terminate()
+            child.stdin.write(b"release\n")
+            child.stdin.flush()
             child.wait(timeout=5)
+            child.stdin.close()
 
 
 def test_status_groups_running_and_ready_by_lane(app, capsys):
@@ -859,3 +883,16 @@ def test_fa_test_accepts_its_own_repo_root_first(tmp_path, monkeypatch):
     assert cli.main(["test", "--repo-root", str(tmp_path), "-q", "--repo-root=x"]) == 0
     assert cli.main(["test", f"--repo-root={tmp_path}", "-x"]) == 0
     assert calls == [(tmp_path.resolve(), ["-q", "--repo-root=x"]), (tmp_path.resolve(), ["-x"])]
+
+
+def test_gate_commands_leave_macos_background_state(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    monkeypatch.setattr(cli.os, "setpriority", lambda *args: calls.append(args))
+    monkeypatch.setattr(cli.commands, "module", lambda name: SimpleNamespace(run=lambda args: 0))
+    assert cli.main(["gate", "status"]) == 0
+    assert calls == [(cli.PRIO_DARWIN_PROCESS, 0, 0)]
+    calls.clear()
+    assert cli.main(["update"]) == 0
+    assert calls == []

@@ -677,3 +677,146 @@ def test_copy_lane_skills_prefers_local_then_cache_and_preserves_checkout(librar
     assert copy_lane_skills(tmp_path / "fresh-repo", cached, ["testing-strategy"], SkillManager(config)) == copied
     assert (cached / copied[0] / "references/example.md").read_text() == "Example\n"
     assert (cached / copied[0] / "SKILL.md").read_bytes() == (source / "engineering/skills/testing-strategy/SKILL.md").read_bytes()
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("# top\nrepo:    o/r  # keep\n",
+     "# top\nrepo:    o/r  # keep\nlanes:\n  docs:\n    paths: [docs/**]\n"),
+    ("lanes:\n    api:\n        paths:\n          - 'api/**'\n\n# tail\nmax_parallel: 1\n",
+     "lanes:\n    api:\n        paths:\n          - 'api/**'\n    docs:\n        paths: [docs/**]\n"
+     "\n# tail\nmax_parallel: 1\n"),
+    ("lanes:\n  api:\n    paths:\n    - api/**\n# tail\n",
+     "lanes:\n  api:\n    paths:\n    - api/**\n  docs:\n    paths: [docs/**]\n# tail\n"),
+    ("lanes: {}  # none yet\nrepo: o/r\n",
+     "lanes: {docs: {paths: [docs/**]}}  # none yet\nrepo: o/r\n"),
+    ("# top\n{}\n", "# top\n{lanes: {docs: {paths: [docs/**]}}}\n"),
+    ("repo: o/r\n# keep tail", "repo: o/r\nlanes:\n  docs:\n    paths: [docs/**]\n# keep tail"),
+    ("repo: o/r\n\n# keep tail\n", "repo: o/r\nlanes:\n  docs:\n    paths: [docs/**]\n\n# keep tail\n"),
+    ("# only a note", "lanes:\n  docs:\n    paths: [docs/**]\n# only a note"),
+    ("# head\nrepo: owner/repo", "# head\nlanes:\n  docs:\n    paths: [docs/**]\nrepo: owner/repo"),
+    ("lanes:\n  api:\n    paths: [api/**]", "lanes:\n  docs:\n    paths: [docs/**]\n  api:\n    paths: [api/**]"),
+    ("# only a note\n", "# only a note\nlanes:\n  docs:\n    paths: [docs/**]\n"),
+    ("lanes: {api: {paths: [api/**]},  # api\n  web: {paths: [web/**]}}  # end\n",
+     "lanes: {api: {paths: [api/**]},  # api\n  web: {paths: [web/**]}, docs: {paths: [docs/**]}}  # end\n"),
+    ("lanes:   # soon\nrepo: o/r\n", "lanes:   # soon\n  docs:\n    paths: [docs/**]\nrepo: o/r\n"),
+    ("repo:    o/r\r\nlanes:\r\n  api:  # a \r\n    paths: [api/**]\r\n# tail\r\n",
+     "repo:    o/r\r\nlanes:\r\n  api:  # a \r\n    paths: [api/**]\r\n  docs:\r\n    paths: [docs/**]\r\n# tail\r\n"),
+    ("{repo: o/r}  # flow\n", "{repo: o/r, lanes: {docs: {paths: [docs/**]}}}  # flow\n"),
+])
+def test_settings_document_adds_a_lane_without_moving_other_lines(tmp_path, text, expected):
+    from foragent.config import LaneSettings
+
+    path = tmp_path / ".foragent.yml"
+    path.write_bytes(text.encode())
+    settings = LaneSettings(path)
+    settings.add_lane("docs", {"paths": ["docs/**"]}, {})
+    settings.save()
+    assert path.read_bytes() == expected.encode()
+
+
+@pytest.mark.parametrize("text, skills, expected", [
+    ("lanes:\n  api:\n    skills:\n    - tone\n    agent: fa-api  # keep\n# tail\n", ["polish"],
+     "lanes:\n  api:\n    skills:\n    - polish\n    agent: fa-api  # keep\n# tail\n"),
+    ("repo:    o/r\nlanes:\n  api:\n    skills: [tone]  # fixed\n", ["polish", "x"],
+     "repo:    o/r\nlanes:\n  api:\n    skills: [polish, x]  # fixed\n"),
+    ("lanes:\n  api:\n    skills:\n    - tone # Keep tone note\n    - keep\n", ["keep", "polish"],
+     "lanes:\n  api:\n    skills:\n           # Keep tone note\n    - keep\n    - polish\n"),
+    ("lanes:\n  api:\n    skills:\n    - tone   #  spaced note  \n", ["polish"],
+     "lanes:\n  api:\n    skills:\n             #  spaced note  \n    - polish\n"),
+    ("lanes:\n  api: {paths: [api/**],\n    # why\n    skills: [tone]}  # c\n", ["polish"],
+     "lanes:\n  api: {paths: [api/**],\n    # why\n    skills: [polish]}  # c\n"),
+    ("lanes:\n  api: {paths: [api/**],  # why\n    agent: fa-api}\n", ["polish"],
+     "lanes:\n  api: {paths: [api/**],  # why\n    agent: fa-api, skills: [polish]}\n"),
+    ("lanes:\r\n  api:\r\n    skills: [tone]  # c \r\n    agent: fa-api\r\n", [],
+     "lanes:\r\n  api:\r\n    skills: []  # c \r\n    agent: fa-api\r\n"),
+    ("lanes:\n  api:\n    skills:\n    - tone\n# trailing\nmax_parallel: 1\n", [],
+     "lanes:\n  api:\n    skills: []\n# trailing\nmax_parallel: 1\n"),
+    ("lanes:\n  api:\n    paths: [api/**]\n\n# tail\n", ["polish"],
+     "lanes:\n  api:\n    paths: [api/**]\n    skills: [polish]\n\n# tail\n"),
+    ("lanes:\n  api:\n    paths: [api/**]", ["polish"],
+     "lanes:\n  api:\n    skills: [polish]\n    paths: [api/**]"),
+    ("lanes:\n  api:\n    skills:\n    agent: fa-api\n", ["polish"],
+     "lanes:\n  api:\n    skills: [polish]\n    agent: fa-api\n"),
+])
+def test_settings_document_replaces_a_block_list_in_place(tmp_path, text, skills, expected):
+    from foragent.config import LaneSettings
+
+    path = tmp_path / ".foragent.yml"
+    path.write_bytes(text.encode())
+    settings = LaneSettings(path)
+    settings.set_skills("api", skills, {}, {})
+    settings.save()
+    assert path.read_bytes() == expected.encode()
+
+
+def test_settings_document_refuses_an_edit_that_would_change_other_settings(tmp_path):
+    from foragent.config import ConfigError, LaneSettings
+
+    path = tmp_path / ".foragent.yml"
+    text = "base: &shared\n  skills: [tone]\nlanes:\n  api: *shared\n"
+    path.write_text(text)
+    settings = LaneSettings(path)
+    settings.set_skills("api", ["polish"], {}, {})
+    with pytest.raises(ConfigError, match="edit it by hand"):
+        settings.save()
+    assert path.read_text() == text
+
+
+@pytest.mark.parametrize("text", [
+    "lanes:\n  api:\n    skills: [tone, # preserve me\n      handmade]\n    agent: fa-api\n",
+    "lanes:\n  api:\n    skills:\n    - >- # comment\n      tone\n    agent: fa-api\n",
+    "lanes:\n  api:\n    skills:\n    - [tone]\n",
+])
+def test_settings_document_refuses_unusual_skills_layouts_by_lane(tmp_path, text):
+    from foragent.config import ConfigError, LaneSettings
+
+    path = tmp_path / ".foragent.yml"
+    path.write_bytes(text.encode())
+    with pytest.raises(ConfigError, match="lane api: .*edit .foragent.yml by hand"):
+        LaneSettings(path).set_skills("api", ["polish"], {}, {})
+    assert path.read_bytes() == text.encode()
+
+
+def test_settings_document_never_writes_a_result_that_drops_a_comment(tmp_path):
+    from foragent.config import ConfigError, LaneSettings
+
+    path = tmp_path / ".foragent.yml"
+    text = "lanes:\n  api:\n    skills: [tone]\n    # Keep this  \n    agent: fa-api\n"
+    path.write_bytes(text.encode())
+    settings = LaneSettings(path)
+    settings.set_skills("api", ["polish"], {}, {})
+    del settings.lines[3]
+    with pytest.raises(ConfigError, match="changing or losing a comment"):
+        settings.save()
+    assert path.read_bytes() == text.encode()
+
+
+def test_settings_document_refuses_to_change_a_final_comment_line_end(tmp_path):
+    from foragent.config import ConfigError, LaneSettings
+
+    path = tmp_path / ".foragent.yml"
+    text = "lanes:   # soon"
+    path.write_bytes(text.encode())
+    settings = LaneSettings(path)
+    with pytest.raises(ConfigError, match="edit it by hand"):
+        settings.add_lane("docs", {"paths": ["docs/**"]}, {})
+        settings.save()
+    assert path.read_bytes() == text.encode()
+
+
+@pytest.mark.parametrize("text, skills", [
+    ("lanes:\n  api:\n    skills:\n    - tone", ["tone", "polish"]),
+    ("repo: o/r\nlanes:", None),
+])
+def test_settings_document_refuses_to_add_a_line_end_to_the_last_setting(tmp_path, text, skills):
+    from foragent.config import ConfigError, LaneSettings
+
+    path = tmp_path / ".foragent.yml"
+    path.write_bytes(text.encode())
+    settings = LaneSettings(path)
+    with pytest.raises(ConfigError, match="no line end; edit it by hand"):
+        if skills is None:
+            settings.add_lane("docs", {"paths": ["docs/**"]}, {})
+        else:
+            settings.set_skills("api", skills, {}, {})
+    assert path.read_bytes() == text.encode()
