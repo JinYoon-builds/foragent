@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from foragent import labels
-from foragent.config import DEFAULTS, IGNORED_KEYS, Config, ConfigError, _overlay, _validate
+from foragent.config import DEFAULTS, IGNORED_KEYS, Config, _overlay, _validate
 from foragent.git import GitError
 from foragent.issue import acceptance_paths, parse_body
 
@@ -83,6 +83,12 @@ def _nul_paths(output: bytes) -> list[str]:
     return [path.decode("utf-8", "surrogateescape") for path in output.split(b"\0") if path != b""]
 
 
+def _blob_exists(git: GitRepo, sha: str, path: str) -> bool:
+    """Whether ``path`` is a file at ``sha``, comparing the exact name bytes."""
+    output = _git_bytes(git, ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", "--name-only", sha, "--", path])
+    return path in _nul_paths(output)
+
+
 def moved_paths(git: GitRepo, move: BaseMove) -> set[str]:
     """Paths touched by each commit in the fixed range, not only by the net diff."""
     commits = _git_bytes(git, ["rev-list", f"{move.head_sha}..{move.target_sha}"]).decode("ascii").split()
@@ -103,13 +109,17 @@ def _repo_config(git: GitRepo, sha: str) -> dict[str, Any] | None:
     Validation uses the repository file over DEFAULTS only, never the user's
     global config, so the decision depends only on the two commits.
     """
-    if git.blob_sha(sha, CONFIG_PATH) is None:
+    if not _blob_exists(git, sha, CONFIG_PATH):
         return None
     try:
         # Strict UTF-8: undecodable bytes are unparsable, not replacement characters.
         text = _git_bytes(git, ["cat-file", "blob", f"{sha}:{CONFIG_PATH}"]).decode("utf-8")
+    except (GitError, UnicodeDecodeError):
+        return None
+    try:
         value = yaml.safe_load(text)
-    except (GitError, UnicodeDecodeError, yaml.YAMLError):
+    except Exception:  # noqa: BLE001 - constructors raise ValueError, RecursionError, ...
+        # Any failure to load is unparsable, and unparsable is result-affecting.
         return None
     value = {} if value is None else value
     if not isinstance(value, dict) or any(key not in DEFAULTS and key not in IGNORED_KEYS for key in value):
@@ -121,9 +131,21 @@ def _repo_config(git: GitRepo, sha: str) -> dict[str, Any] | None:
         _overlay(values, value)
         _validate(values)
         Config(**values)
-    except (ConfigError, TypeError, ValueError):
+    except Exception:  # noqa: BLE001 - odd shapes or cyclic values can fail anywhere in validation
         return None
     return value
+
+
+def _canonical(value: Any) -> str | None:
+    """Comparable text for one raw YAML value; None when it cannot be rendered.
+
+    Values may contain aliases, including cycles, which == comparison would
+    recurse into forever; the dumper writes them as anchors instead.
+    """
+    try:
+        return yaml.safe_dump(value, sort_keys=True, allow_unicode=True)
+    except Exception:  # noqa: BLE001 - e.g. mixed key types cannot be sorted
+        return None
 
 
 def config_move_is_neutral(git: GitRepo, move: BaseMove) -> bool:
@@ -131,9 +153,10 @@ def config_move_is_neutral(git: GitRepo, move: BaseMove) -> bool:
     before, after = _repo_config(git, move.head_sha), _repo_config(git, move.target_sha)
     if before is None or after is None:
         return False
-    missing = object()
+    # A key added or removed is changed; so is any value that cannot be compared.
     changed = {key for key in before.keys() | after.keys()
-               if before.get(key, missing) != after.get(key, missing)}
+               if key not in before or key not in after
+               or (old := _canonical(before[key])) is None or old != _canonical(after[key])}
     return not any(key in CHECK_KEYS or key.startswith(CHECK_PREFIXES) for key in changed)
 
 
@@ -201,7 +224,7 @@ def base_move_is_neutral(attempt: Implementation, move: BaseMove) -> bool:
     skipped = set(attempt.baseline.excluded) if attempt.baseline else set()
     ran_on = (attempt.baseline.base_sha if attempt.baseline else None) or move.head_sha
     unverified = {path for path in rest
-                  if path in skipped or attempt.git.blob_sha(ran_on, path) is None}
+                  if path in skipped or not _blob_exists(attempt.git, ran_on, path)}
     # This issue's own locked files are verified by Done when.
     if not rest <= unverified - set(attempt.approval.acceptance_blobs):
         return False

@@ -318,3 +318,44 @@ def test_undecodable_docs_path_keeps_the_docs_rule_and_exact_own_paths(repo):
 def test_undecodable_path_outside_docs_reverifies(repo):
     target = commit_bytes(repo, {"src/caf\udce9.py": b"x\n"})
     assert not neutral(attempt(repo, {}), target)
+
+
+def _config_case(repo, before: str, after: str) -> bool:
+    commit(repo, "main", {".foragent.yml": before})
+    git(repo, "update-ref", "refs/heads/feature", git(repo, "rev-parse", "main"))
+    on_feature(repo)
+    target = move(repo, {".foragent.yml": after})
+    work = attempt(repo, {})
+    result = config_move_is_neutral(work.git, capture_move(work.git, target))
+    assert neutral(work, target) is result
+    return result
+
+
+BAD_DATE = "profile: {confirmed_at: 2026-02-30}\n"
+
+
+@pytest.mark.parametrize("side", ["head", "target"])
+def test_yaml_constructor_errors_are_unparsable_on_either_side(repo, side):
+    """Loading must never raise: a constructor ValueError is unparsable, so re-verify."""
+    bad = BASE_CONFIG + BAD_DATE
+    good = "repo: owner/repo\nstall_minutes: 60\n"
+    before, after = (bad, good) if side == "head" else (BASE_CONFIG, bad)
+    assert _config_case(repo, before, after) is False
+
+
+@pytest.mark.parametrize("key", ["profile", "notify", "test_slots_floor"])
+def test_cyclic_aliases_compare_without_recursion(repo, key):
+    """An unchanged self-referencing value must not abort a neutral stall-only move."""
+    cyclic = f"{key}: &p {{self: *p}}\n"
+    before = BASE_CONFIG + cyclic
+    after = "repo: owner/repo\nstall_minutes: 60\n" + cyclic
+    # Whatever validation decides about the value, comparison must not raise.
+    result = _config_case(repo, before, after)
+    if key == "profile":
+        assert result is True, "Config-valid recursive profile; only stall_minutes changed"
+
+
+def test_cyclic_value_change_in_neutral_key_stays_neutral(repo):
+    before = BASE_CONFIG + "profile: &p {self: *p, kind: a}\n"
+    after = BASE_CONFIG + "profile: &p {self: *p, kind: b}\n"
+    assert _config_case(repo, before, after) is True
