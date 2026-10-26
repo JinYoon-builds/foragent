@@ -503,6 +503,14 @@ def _publish_locked(attempt: Implementation) -> str:
             flag(ctx, n, Reason.TIMEOUT, "base kept moving")
             raise ExecutorStopped("timeout")
         _append(log, f"{REUSED if neutral else REVERIFY}: {move.target_sha}")
+        if not neutral:
+            # Protect what passes on the new base, not on the old one (#483).
+            from foragent.run_implementation import capture_acceptance_baseline
+            # Keep the command the protected set was captured with; the branch
+            # may have changed the files test-command detection reads.
+            command = attempt.baseline.test_command if attempt.baseline else None
+            attempt.baseline = capture_acceptance_baseline(
+                n, ctx, git, attempt.target_branch, move.target_sha, command)
         # Exclude the merged base's paths from policy and patch replay. The
         # separate verified_base_sha advances only after verification/push.
         attempt.start_ref = move.target_sha

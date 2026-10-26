@@ -65,7 +65,7 @@ def capture_local_only(n, ctx, git, test_command, base_sha, excluded):
     report.parent.mkdir(parents=True, exist_ok=True)
     with base_checkout(ctx, git, base_sha) as root:
         if not (root / ctx.config.acceptance_dir).is_dir():
-            return AcceptanceBaseline(command, (), excluded=tuple(excluded))
+            return AcceptanceBaseline(command, (), excluded=tuple(excluded), base_sha=base_sha)
         report.unlink(missing_ok=True)
         selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)} -m local_only"
         selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
@@ -83,7 +83,7 @@ def capture_local_only(n, ctx, git, test_command, base_sha, excluded):
                 collected, passing = report_ids(report, result, json.loads(evidence.read_text()))
             except (OSError, ValueError, ET.ParseError) as exc:
                 raise AttemptFailure(f"local_only acceptance baseline unavailable: {exc}") from exc
-        return AcceptanceBaseline(command, passing, collected, tuple(sorted(set(collected) - set(passing))), tuple(excluded))
+        return AcceptanceBaseline(command, passing, collected, tuple(sorted(set(collected) - set(passing))), tuple(excluded), base_sha)
 
 
 def _uses_local_only(root):

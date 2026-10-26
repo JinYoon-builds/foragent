@@ -40,6 +40,11 @@ class AcceptanceBaseline:
     failing_ids: tuple[str, ...] | None = None
     # Locked files this baseline did not run because open issues own them (#376).
     excluded: tuple[str, ...] = ()
+    # The base commit this baseline ran on; files absent there were never run (#514).
+    base_sha: str | None = None
+    # The configured or detected test command this baseline came from (#483);
+    # a refresh reuses it so later edits to detected files cannot drop protection.
+    test_command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -331,7 +336,7 @@ def _capture_baseline(
         if saved is not None and (required_ids is None or
                                   {"collected_ids", "failing_ids", "excluded"} <= saved.keys()):
             _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-            return replace(_saved_baseline(command, saved), excluded=tuple(excluded))
+            return replace(_saved_baseline(command, saved), excluded=tuple(excluded), base_sha=base_sha)
         report.parent.mkdir(parents=True, exist_ok=True)
         # Use a fresh base checkout; tests can write files without touching the implementation.
         with tempfile.TemporaryDirectory(prefix="foragent-baseline-") as directory:
@@ -349,14 +354,14 @@ def _capture_baseline(
                            for path in (worktree / ctx.config.acceptance_dir).rglob("*")):
                     save_baseline((), (), ())
                     _append(log, "Acceptance baseline count=0: no acceptance test files remain after exclusions")
-                    return AcceptanceBaseline(command, (), (), (), tuple(excluded))
+                    return AcceptanceBaseline(command, (), (), (), tuple(excluded), base_sha)
                 # A compatible cache can cover a broader selection. Establish
                 # the current selection before reusing its recorded outcomes.
                 if required_ids is not None:
                     saved = _premerge_baseline(ctx, test_command, base_sha, excluded, required_ids)
                     if saved is not None:
                         _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-                        return replace(_saved_baseline(command, saved), excluded=tuple(excluded))
+                        return replace(_saved_baseline(command, saved), excluded=tuple(excluded), base_sha=base_sha)
                 selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)}"
                 selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
                 baseline_command = (
@@ -431,7 +436,7 @@ def _capture_baseline(
                         f"acceptance baseline unavailable: exit_code={result.exit_code}, timed_out={result.timed_out}; "
                         "capture did not produce a complete, usable JUnit report"
                     )
-                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded))
+                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded), base_sha)
             finally:
                 ctx.git.remove_worktree(worktree)
 
