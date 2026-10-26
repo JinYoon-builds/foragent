@@ -1,0 +1,38 @@
+"""Lines for the machine gate list in fa status, fa gate status and the lane view."""
+
+MESSAGES = {
+    "en": {
+        "gates_heading": "Installed gates:",
+        "gates_none": "No Foragent gates are installed on this machine.",
+        "gates_row": "  {repo}: last tick {tick} · running={running} · {scheduler}",
+        "gates_never": "never",
+        "gates_stale": "stale",
+        "gates_scheduler_loaded": "loaded",
+        "gates_scheduler_not_loaded": "not loaded",
+        "gates_scheduler_unknown": "unknown",
+        "gates_age_seconds": "{count} s ago",
+        "gates_age_minutes": "{count} min ago",
+        "gates_age_hours": "{count} h ago",
+        "gates_age_days": "{count} d ago",
+        "gates_lane_heading": "Other gates:",
+        "gates_lane_running": "{count} running",
+        "status_help": "Show this repository's gate status and every gate installed on this machine",
+    },
+    "ko": {
+        "gates_heading": "설치된 게이트:",
+        "gates_none": "이 기계에 설치된 Foragent 게이트가 없어요",
+        "gates_row": "  {repo}: 마지막 틱 {tick} · running={running} · {scheduler}",
+        "gates_never": "never(없음)",
+        "gates_stale": "멈춤",
+        "gates_scheduler_loaded": "loaded(실행 예약됨)",
+        "gates_scheduler_not_loaded": "not loaded(예약 안 됨)",
+        "gates_scheduler_unknown": "unknown(알 수 없음)",
+        "gates_age_seconds": "{count}초 전",
+        "gates_age_minutes": "{count}분 전",
+        "gates_age_hours": "{count}시간 전",
+        "gates_age_days": "{count}일 전",
+        "gates_lane_heading": "다른 게이트:",
+        "gates_lane_running": "{count}개 실행 중",
+        "status_help": "이 저장소의 게이트 상태와 이 기계에 설치된 모든 게이트를 보여 줘요",
+    },
+}
