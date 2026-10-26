@@ -170,7 +170,7 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def note_path(store: StateStore) -> Path:
-    return store.root / "orch-note.json"
+    return store.root / store.ORCH_NOTE_FILE
 
 
 def note_location(environ: dict[str, str], title: str | None = None,
@@ -198,8 +198,4 @@ def write_note(store: StateStore, now: str, why: str | None, next_step: str | No
 
 
 def read_note(store: StateStore) -> dict[str, Any] | None:
-    try:
-        record = _read(note_path(store))
-    except (OSError, ValueError):
-        return None
-    return record if isinstance(record, dict) else None
+    return store.orch_note()
