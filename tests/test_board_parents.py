@@ -103,3 +103,41 @@ def test_work_state_writes_skip_an_open_order_parent_card(monkeypatch):
         board.sync_status(ctx, number, "Needs human")
     board.sync_status(ctx, 1, "Running", parent=True)
     assert written == [(3, "Needs human"), (5, "Needs human"), (7, "Needs human"), (1, "Running")]
+
+
+@pytest.mark.parametrize(("batch_rows", "pending"), [
+    pytest.param([{"number": 2, "pr_base": "foragent/batch-9", "pr_number": 50, "merged": True}],
+                 True, id="child-merged-no-batch-pr"),
+    pytest.param([{"number": 2, "pr_base": "foragent/batch-9", "pr_number": 50, "merged": True},
+                  {"number": 9, "pr_head": "foragent/batch-9", "pr_number": 51, "merged": False}],
+                 True, id="batch-pr-open"),
+    pytest.param([{"number": 2, "pr_base": "foragent/batch-9", "pr_number": 50, "merged": True},
+                  {"number": 9, "pr_head": "foragent/batch-9", "pr_number": 51, "merged": True}],
+                 False, id="batch-pr-merged"),
+    pytest.param([], False, id="no-batch"),
+])
+def test_batch_parent_completes_once_its_batch_pr_merged(monkeypatch, batch_rows, pending):
+    from types import SimpleNamespace
+
+    from foragent import board, board_parents
+
+    rows = [{"number": 9, "state": "open", "labels": [], "children": [2]}]
+    for row in batch_rows:
+        target = next((r for r in rows if r["number"] == row["number"]), None)
+        if target is None:
+            rows.append({"state": "closed", "labels": [], **row})
+        else:
+            target.update(row)
+    synced, closed = [], []
+    tracker = SimpleNamespace(sub_issues=lambda n: [child(2, state="closed", reason="completed")],
+                              close_issue=lambda n, comment: closed.append((n, comment)))
+    ctx = SimpleNamespace(store=SimpleNamespace(local_issues=lambda: rows), tracker=tracker,
+                          config=SimpleNamespace(language="en"))
+    monkeypatch.setattr(board, "sync_status", lambda ctx, n, state, parent=False: synced.append((n, state)))
+    report = SimpleNamespace(actions=[])
+    board_parents.follow_children(ctx, report)
+    if pending:
+        assert closed == [] and report.actions == [] and synced == [(9, "PR open")]
+    else:
+        assert closed == [(9, text("parent_children_done", "en", count=1))]
+        assert synced == [(9, "Done")]
