@@ -8,6 +8,34 @@ from foragent.git import GitError, GitRepo
 from conftest import ACCEPTANCE, BASE_TIME, GitHistory, git_command
 
 
+def test_union_merge_paths_reads_one_base_batch_with_literal_nul_delimited_names(git_history, monkeypatch):
+    git_history.update({'.gitattributes': 'docs/** merge=union\ndocs/normal.md merge=text\n'})
+    git = GitRepo(git_history.clone)
+    git.fetch('origin', 'main')
+    (git.root / '.gitattributes').write_text('docs/** merge=text\nother.md merge=union\n')
+    paths = ['docs/space name.md', 'docs/line\nbreak.md', 'docs/[1].md', 'docs/normal.md', 'other.md']
+    calls, call = [], git._call
+
+    def observe(args):
+        calls.append(args)
+        return call(args)
+
+    monkeypatch.setattr(git, '_call', observe)
+    assert git.union_merge_paths('origin/main', [*paths, paths[0]]) == set(paths[:3])
+    assert calls == [['check-attr', '--source=origin/main', '-z', 'merge', '--', *sorted(paths)]]
+
+
+def test_union_merge_paths_unreadable_base_is_not_exempt(git_history):
+    git = GitRepo(git_history.clone)
+    (git.root / '.gitattributes').write_text('*.md merge=union\n')
+    assert git.union_merge_paths('origin/missing', ['shared.md']) == set()
+
+
+def test_union_merge_paths_empty_batch_does_not_call_git(tmp_path):
+    git = GitRepo(tmp_path, lambda args: pytest.fail(f'Unexpected Git call: {args}'))
+    assert git.union_merge_paths('origin/main', []) == set()
+
+
 @pytest.mark.parametrize("url", [
     "git@github.com:owner/repo.git",
     "https://github.com/owner/repo",

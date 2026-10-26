@@ -384,7 +384,10 @@ def test_runs_round_trip_update_active_and_history(store):
     store.finish_run(2, "failed")
     assert [run.number for run in store.active_runs()] == [10]
     history = [json.loads(line) for line in (store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert history == [asdict(finished), asdict(store.get_run(2))]
+    # Each history entry also saves when the run finished, beside the Run fields.
+    ended = store._timestamp()
+    assert history == [{**asdict(finished), "finished_at": ended}, {**asdict(store.get_run(2)), "finished_at": ended}]
+    assert store.finish_times() == {(1, finished.started_at): ended, (2, store.get_run(2).started_at): ended}
     assert store.read_history() == [finished, store.get_run(2)]
     assert store.finish_run(1, "success") == finished
     assert len((store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 2

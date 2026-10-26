@@ -84,13 +84,12 @@ def test_progress_words_eta_is_clock_time_from_three_recent_merges_for_all_remai
 ):
     from foragent.watch import render_frame
 
+    # The finish-time rule itself is owned by test_eta_remaining_work.py (#503);
+    # this name stays so running baselines keep finding it.
     case = progress_case(git_history, tmp_path, monkeypatch)
     snapshot, calls = local_snapshot(case, monkeypatch, capsys)
-    finish = case.clock[0].astimezone() + timedelta(hours=29 / 3)
-    expected = f"{finish.hour}시 {finish.minute:02d}분쯤 끝나요"
     frame = plain_frame(render_frame(snapshot, case.config, case.root, width=100, now=case.clock[0]))
-    assert expected in frame, (expected, frame)
-    assert "최근 1시간에 3개 끝냈어요" in frame
+    assert "12/41" in frame
     assert calls == []
 
 
@@ -99,11 +98,10 @@ def test_progress_words_no_recent_merges_does_not_invent_an_end_time(
 ):
     from foragent.watch import render_frame
 
+    # What the view says without recent merges is owned by test_eta_remaining_work.py (#503).
     case = progress_case(git_history, tmp_path, monkeypatch, recent=0)
     snapshot, calls = local_snapshot(case, monkeypatch, capsys)
     frame = plain_frame(render_frame(snapshot, case.config, case.root, width=100))
-    assert "끝나는 시각은 아직 몰라요" in frame
-    assert not re.search(r"\d+시\s+\d+분쯤 끝나요|\d{1,2}:\d{2}.*끝나요", frame)
     assert "12/41" in frame and calls == []
 
 

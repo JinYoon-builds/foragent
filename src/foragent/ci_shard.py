@@ -9,8 +9,9 @@ import subprocess
 import tempfile
 from time import monotonic
 
-from foragent.ci_workflow import EXCLUSIONS, acceptance_command, measurement_scope
+from foragent.ci_workflow import EXCLUSIONS, acceptance_command, measurement_scope, parse_exclusions, read_exclusions
 from foragent.config import load_config
+from foragent.git import GitRepo
 
 
 def measure(root, command, acceptance, excluded, directory, side):
@@ -50,8 +51,13 @@ def main():
                             check=True, capture_output=True, text=True).stdout.strip()
     if actual != head:
         raise ValueError("checkout is not the PR head")
-    if not (root / EXCLUSIONS).exists():
-        print("Acceptance comparisons run locally (PR head has no CI-mode exclusions).")
+    git = GitRepo(root)
+    excluded = read_exclusions(git, base)
+    if excluded is None and (blob := git.blob_sha("HEAD", EXCLUSIONS)) is not None:
+        # Legacy file protocol for runs that started before this change.
+        excluded = parse_exclusions(git._call(["cat-file", "blob", blob]))
+    if excluded is None:
+        print("Acceptance comparisons run locally (PR head has no CI-mode exclusions trailer).")
         return
     with tempfile.TemporaryDirectory(prefix="foragent-ci-") as temporary:
         directory = Path(temporary)
@@ -65,10 +71,6 @@ def main():
             if config.checks != "ci" or acceptance_command(config, base_root) is None:
                 print("Acceptance comparisons run locally (CI measurement disabled or unsupported command).")
                 return
-            excluded = json.loads((root / EXCLUSIONS).read_text())
-            if (not isinstance(excluded, list) or any(not isinstance(path, str) for path in excluded)
-                    or excluded != sorted(set(excluded))):
-                raise ValueError("invalid acceptance exclusions")
             scope = measurement_scope(config, base_root, excluded)
             if int(os.environ["FA_SHARDS"]) != config.ci_shards:
                 raise ValueError("workflow shard layout does not match trusted base configuration")

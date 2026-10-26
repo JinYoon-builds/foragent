@@ -102,6 +102,15 @@ def test_tracked_protocol_cleanup_is_not_an_implementation_change(run_case, chec
     assert len(c.executor.calls) == 1
     if implementation:
         assert len(c.tracker.created_prs) == len(c.tracker.merged_prs) == 1
+        from foragent.ci_workflow import EXCLUSIONS_TRAILER
+
+        value = git_command(c.history.origin, 'log', '-1', f'--format=%(trailers:key={EXCLUSIONS_TRAILER},valueonly)',
+                            'foragent/issue-1')
+        if checks == 'ci' and test_command != 'true':
+            assert value == f'["{ACCEPTANCE}"]'
+        else:
+            assert value == ''
+        assert not git_command(c.history.origin, 'ls-tree', '-r', '--name-only', 'foragent/issue-1', '--', '.foragent')
     else:
         assert 'The session made no changes.' in c.store.log_path(1).read_text()
         assert c.tracker.created_prs == c.tracker.merged_prs == []

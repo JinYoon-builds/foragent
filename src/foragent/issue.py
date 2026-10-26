@@ -5,6 +5,8 @@ import hashlib
 import re
 import shlex
 
+from foragent.issue_metadata import exclusive_paths
+
 
 MARKER = "<!-- foragent:v1 -->"
 
@@ -23,6 +25,7 @@ class ParsedIssue:
     done_when_commands: list[str]
     done_when_checklist: list[ChecklistItem]
     files: list[str] = field(default_factory=list)
+    exclusive: list[str] = field(default_factory=list)
 
 
 def parse_body(body: str) -> ParsedIssue:
@@ -75,6 +78,7 @@ def parse_body(body: str) -> ParsedIssue:
         out_of_scope="".join(sections.get("Out of scope", [])).strip(),
         done_when_commands=commands,
         done_when_checklist=checklist,
+        exclusive=exclusive_paths(body),
         files=[match[1] for raw_line in sections.get("Files", [])
                if (match := re.fullmatch(r"[ \t]*[-*] (.+)", raw_line.removesuffix("\n")))],
     )

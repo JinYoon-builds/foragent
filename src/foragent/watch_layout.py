@@ -26,11 +26,22 @@ def _has_work(row: dict[str, Any]) -> bool:
             or row["state"] in {"working", "blocked", "waiting-human"})
 
 
+# Run phases in which the runner waits on checks, CI, a merge or a review.
+# Waits inside them (merge.lock, a test slot) need no phase of their own.
+WAITING_PHASES = frozenset({"checking", "ci", "merging", "reviewing", "overlap-wait"})
+
+
 def _activity(
     row: dict[str, Any], language: str, age: float, stall_minutes: float, pid: int | None,
-    log_seconds: float | None = None,
+    log_seconds: float | None = None, progress_seconds: float | None = None,
+    phase_seconds: float | None = None,
 ) -> str:
-    """The activity cell, judged by evidence: a live PID and the age of the runner log (D67)."""
+    """The activity cell, judged by evidence: a live PID, the worker's last activity
+    (its runner log when present) and the runner's own last progress (D67).
+
+    A run looks stalled or quiet only when both the worker and the runner have been
+    silent past the threshold. Otherwise a waiting phase shows the phase and its age.
+    """
     from foragent import watch
 
     if row["state"] == "blocked":
@@ -45,13 +56,27 @@ def _activity(
         except PermissionError:
             pass  # A process owned by another user still exists.
     limit = min(10, stall_minutes) * 60
+
+    def silent(seconds: float | None) -> float | None:
+        if seconds is None:
+            return None
+        quiet = seconds + age
+        if progress_seconds is not None:
+            quiet = min(quiet, progress_seconds + age)
+        return quiet
+
     if log_seconds is not None:
         # The log's growth is the evidence; state metadata is not.
-        quiet = log_seconds + age
-        return watch.text("watch_quiet", language, minutes=int(quiet // 60)) if quiet >= limit else "●"
-    seconds = row["last_activity_seconds"]
-    if seconds is not None and seconds + age > limit:
-        return watch.text("watch_stalled", language, minutes=int((seconds + age) // 60))
+        quiet = silent(log_seconds)
+        if quiet >= limit:
+            return watch.text("watch_quiet", language, minutes=int(quiet // 60))
+    else:
+        quiet = silent(row["last_activity_seconds"])
+        if quiet is not None and quiet > limit:
+            return watch.text("watch_stalled", language, minutes=int(quiet // 60))
+    if row.get("phase") in WAITING_PHASES and phase_seconds is not None:
+        return watch.text("watch_in_phase", language, phase=watch.text(row["phase"], language),
+                          minutes=int((phase_seconds + age) // 60))
     return "●"
 
 
