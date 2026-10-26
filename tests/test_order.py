@@ -1302,3 +1302,48 @@ def test_perspectives_help_follows_the_repository_language(tmp_path, monkeypatch
         cli.main(["order", "perspectives", "--help"])
     assert exit_info.value.code == 0
     assert expected in " ".join(capsys.readouterr().out.split())
+
+
+def test_perspectives_korean_config_yields_korean_questions_end_to_end(tmp_path, monkeypatch, capsys):
+    import shutil
+    from foragent import executors
+    from foragent.executors import ExecResult
+
+    (tmp_path / ".foragent.yml").write_text(yaml.safe_dump({"repo": "owner/repo", "language": "ko"}))
+    (tmp_path / "PLAN.json").write_text(json.dumps({"id": "p", "title": "복구"}), encoding="utf-8")
+    store = StateStore(tmp_path / "state")
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kw: store))
+    prompts = []
+
+    class Worker:
+        def run(self, **kwargs):
+            prompts.append(kwargs["prompt"])
+            korean = "Write every question in Korean" in kwargs["prompt"]
+            return ExecResult(0, False, "선택한 언어를 유지해야 하나요?" if korean else "Keep the locale?",
+                              kwargs["log_path"])
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: Worker())
+    argv = ["order", "perspectives", str(tmp_path / "PLAN.json"), "--repo-root", str(tmp_path)]
+    assert cli.main(argv) == 0
+    out = capsys.readouterr().out
+    assert len(prompts) == 6
+    assert out.count("선택한 언어를 유지해야 하나요?") == 6 and "Keep the locale?" not in out
+    labels = {line.split(" (", 1)[0] for line in out.splitlines() if " (" in line}
+    assert labels == {"회의론자", "처음 쓰는 사람", "공격자", "운영자", "6개월 뒤 유지보수자", "사고 기록"}
+    assert "질문 6개" in out
+    assert cli.main([*argv, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["language"] == "ko" and {q["language"] for q in payload["questions"]} == {"ko"}
+    ledger = json.loads((store.root / "perspectives" / f"{payload['plan_hash']}.json").read_text(encoding="utf-8"))
+    assert ledger["language"] == "ko" and all(q["language"] == "ko" for q in ledger["questions"])
+    assert cli.main(["order", "perspectives", "stats", "--repo-root", str(tmp_path)]) == 0
+    assert "회의론자: 질문 1개" in capsys.readouterr().out
+
+
+def test_perspectives_prompt_names_the_configured_language(tmp_path):
+    from foragent import order_perspectives
+
+    assert "Write every question in Korean" in order_perspectives.prompt("skeptic", {}, tmp_path, "ko-KR")
+    assert "Write every question in English" in order_perspectives.prompt("skeptic", {}, tmp_path)
+    assert "'fr'" in order_perspectives.prompt("skeptic", {}, tmp_path, "fr")

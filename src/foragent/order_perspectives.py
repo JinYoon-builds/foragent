@@ -44,6 +44,19 @@ DECISIONS_FILE = "docs/decisions.md"
 RISK_FILE = ".foragent-risks.yml"
 LATEST_DECISIONS = 20
 LEDGER_DIR = "perspectives"
+LANGUAGE_NAMES = {"en": "English", "ko": "Korean"}
+
+
+def language_code(language: Any) -> str:
+    """The configured language as i18n reads it ("ko-KR" -> "ko"), English when unset."""
+    return language.lower().split("-")[0] if isinstance(language, str) and language.strip() else "en"
+
+
+def language_instruction(language: str) -> str:
+    code = language_code(language)
+    name = LANGUAGE_NAMES.get(code, f"the language with code {code!r}")
+    return (f"The person reads {name}. Write every question in {name}, even though these "
+            "instructions are in English. Keep the word NONE in English.\n")
 
 
 def plan_hash(plan: dict) -> str:
@@ -67,12 +80,13 @@ def decisions_text(root: Path) -> str:
             f"## All decision titles\n{titles}\n\n## Latest {LATEST_DECISIONS} decisions\n{latest}")
 
 
-def prompt(seat: str, plan: dict, root: Path) -> str:
+def prompt(seat: str, plan: dict, root: Path, language: str = "en") -> str:
     body = (
         "Read the order plan below and the repository read-only. Do not change any file.\n"
         f"Seat: {seat.replace('_', ' ')}. {SEAT_FOCUS[seat]}\n\n"
         f"{QUESTION}\n"
-        "Reply with one question per line and nothing else. If you have none, reply with exactly NONE.\n\n"
+        "Reply with one question per line and nothing else. If you have none, reply with exactly NONE.\n"
+        f"{language_instruction(language)}\n"
         "## Order plan (PLAN.json)\n```json\n"
         f"{json.dumps(plan, ensure_ascii=False, indent=2)}\n```\n"
     )
@@ -138,7 +152,7 @@ def _ask(seat: str, executor: str | None, plan: dict, root: Path, logs: Path, di
     try:
         # The executor's own default model and effort; only the timeout follows preread.
         result = executors.executor_for(executor).run(
-            worktree=root, prompt=prompt(seat, plan, root), model=None,
+            worktree=root, prompt=prompt(seat, plan, root, language), model=None,
             timeout_s=PREREAD_TIMEOUT_S, log_path=log, read_only=True)
     except Exception as exc:  # One seat's failure must not lose the others.
         return seat, executor, None, text("perspectives_error_raised", language,
@@ -159,7 +173,7 @@ def run(plan: dict, root: Path, config: Any, store) -> dict:
     logs = _ledger_dir(store) / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     chosen = seat_executors(config)
-    language = getattr(config, "language", "en")
+    language = language_code(getattr(config, "language", "en"))
     with ThreadPoolExecutor(max_workers=len(SEATS)) as pool:
         answers = list(pool.map(lambda seat: _ask(seat, chosen[seat], plan, root, logs, digest, language), SEATS))
     questions, failures = [], []
@@ -168,7 +182,7 @@ def run(plan: dict, root: Path, config: Any, store) -> dict:
             failures.append({"perspective": seat, "executor": executor, "error": error})
             continue
         questions += [{"id": f"{digest[:12]}-{seat}-{number}", "perspective": seat,
-                       "executor": executor, "text": text}
+                       "executor": executor, "language": language, "text": text}
                       for number, text in enumerate(texts, start=1)]
     path = _ledger_dir(store) / f"{digest}.json"
     with _lock(store):
@@ -180,9 +194,9 @@ def run(plan: dict, root: Path, config: Any, store) -> dict:
                  if isinstance(item, dict) and isinstance(item.get("changed"), bool)}
         saved = [{**question, **({"changed": marks[question["id"]]} if question["id"] in marks else {})}
                  for question in questions]
-        _write(store, path, {"plan_hash": digest, "plan_id": plan.get("id"), "questions": saved,
+        _write(store, path, {"plan_hash": digest, "plan_id": plan.get("id"), "language": language, "questions": saved,
                              "failures": failures})
-    return {"plan_hash": digest, "questions": questions, "failures": failures}
+    return {"plan_hash": digest, "language": language, "questions": questions, "failures": failures}
 
 
 def mark(store, identity: str, changed: bool, language: str = "en") -> dict:

@@ -2,6 +2,12 @@
 
 MESSAGES = {
     "en": {
+        "perspectives_seat_skeptic": "skeptic",
+        "perspectives_seat_first_time_user": "first-time user",
+        "perspectives_seat_attacker": "attacker",
+        "perspectives_seat_operator": "operator",
+        "perspectives_seat_maintainer": "maintainer in six months",
+        "perspectives_seat_incidents": "incidents",
         "perspectives_question": "{seat} ({executor}) [{id}]: {text}",
         "perspectives_failed": "{seat} ({executor}) failed: {error}",
         "perspectives_none_ran": "No perspective agent finished, so nothing was asked.",
@@ -23,6 +29,12 @@ MESSAGES = {
         "perspectives_help_changed": "whether the question changed the spec (only with mark)",
     },
     "ko": {
+        "perspectives_seat_skeptic": "회의론자",
+        "perspectives_seat_first_time_user": "처음 쓰는 사람",
+        "perspectives_seat_attacker": "공격자",
+        "perspectives_seat_operator": "운영자",
+        "perspectives_seat_maintainer": "6개월 뒤 유지보수자",
+        "perspectives_seat_incidents": "사고 기록",
         "perspectives_question": "{seat} ({executor}) [{id}]: {text}",
         "perspectives_failed": "{seat} ({executor}) 실패: {error}",
         "perspectives_none_ran": "끝까지 실행된 관점 에이전트가 없어서 질문이 없어요.",

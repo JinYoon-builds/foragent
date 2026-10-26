@@ -38,3 +38,4 @@
 - #414: `fa order perspectives`는 `src/foragent/order_perspectives.py`(CLI는 `commands/order.py`). 원장은 작업 트리가 아니라 `store.root/perspectives/<plan_hash>.json`(시험이 작업 트리 불변 검사). 시험이 `executors.executor_for`와 `shutil.which`를 모듈 속성으로 바꾸므로 `from ... import`로 묶지 말 것. 질문 id는 `hash[:12]-seat-번호`(재실행 시 같은 id여야 stats가 맞음).
 - #414 2차: 리뷰는 사람에게 보이는 오류 문자열(실패 사유, PlanError, ConfigError 포함)도 messages 목록과 설정 언어를 요구한다. 함수에 `language`를 넘기고, 설정 검증 오류는 `values["language"]`를 쓴다. 에이전트 프롬프트는 영어로 두고 REBUTTAL에 적는다.
 - #414 3차: 새 argparse 도움말도 지역화 대상이다. 파서 생성 중 `load_config`를 부르면 `tests/test_cli.py::test_init_view_uses_normalized_root_and_skips_dry_run`의 가짜 load_config 기록이 깨진다. 도움말 언어는 `config._read_yaml(cwd/.foragent.yml)`의 language만 읽는다.
+- #414 4차: 설정 언어는 에이전트가 만드는 사람용 글(질문)에도 전달해야 한다. 프롬프트에 "Write every question in <언어>"를 넣고, 질문·원장·JSON에 `language`를 기록하고, 출력의 자리 이름도 메시지 목록에서 가져온다.

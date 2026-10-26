@@ -127,6 +127,7 @@ def _perspectives(args, root) -> int:
     cli = facade()
     config, _repo, store = repo_store(root)
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
+    seat = lambda name: say(f"perspectives_seat_{name}")  # noqa: E731
     if args.target == "mark":
         if not args.question or args.changed is None:
             raise cli.order.PlanError(say("perspectives_mark_usage"))
@@ -141,18 +142,18 @@ def _perspectives(args, root) -> int:
         if args.json:
             print(cli.json.dumps(result, ensure_ascii=False))
         else:
-            for seat, row in result["perspectives"].items():
-                print(say("perspectives_stats_row", seat=seat, **row))
+            for name, row in result["perspectives"].items():
+                print(say("perspectives_stats_row", seat=seat(name), **row))
         return 0
     result = order_perspectives.run(cli.order.read_plan(cli.Path(args.target)), root, config, store)
     if args.json:
         print(cli.json.dumps(result, ensure_ascii=False))
     else:
         for question in result["questions"]:
-            print(say("perspectives_question", seat=question["perspective"], **{
+            print(say("perspectives_question", seat=seat(question["perspective"]), **{
                 key: question[key] for key in ("executor", "id", "text")}))
         for failure in result["failures"]:
-            print(say("perspectives_failed", seat=failure["perspective"],
+            print(say("perspectives_failed", seat=seat(failure["perspective"]),
                       executor=failure["executor"] or "-", error=failure["error"]))
         print(say("perspectives_summary", count=len(result["questions"]), plan_hash=result["plan_hash"][:12]))
     if len(result["failures"]) == len(order_perspectives.SEATS):
