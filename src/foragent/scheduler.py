@@ -91,8 +91,7 @@ def tick(ctx: TickContext) -> TickReport:
                 with step("reap_inactive_runs"):
                     _reap_inactive_runs(ctx, cleanup)
             timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
-            # Local plan upkeep (lapse pauses, expire the plan once) also runs during a GitHub wait.
-            timed("plan_refresh", orch_plan.refresh, ctx.store, ctx.now())
+            timed("plan_refresh", orch_plan.refresh, ctx.store, ctx.now())  # Local plan upkeep, also during a GitHub wait.
             if skipped := _github_wait(ctx, {}, "github_wait_check"):
                 return keep(TickReport(skipped=skipped, actions=cleanup.actions))
             if not isinstance(ctx.tracker, RecordingTracker):

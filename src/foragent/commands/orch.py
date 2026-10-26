@@ -7,7 +7,6 @@ ORDER = 120
 ALIVE_SECONDS = 30
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive",
                  "reviewers", "ensure", "facts", "pause", "resume", "plan"}
-PLAN_ACTIONS = {"pause", "resume", "plan"}
 
 
 def add(commands) -> None:
@@ -87,132 +86,15 @@ def _add_inbox(orch_actions) -> None:
     queue.add_argument("--clear", action="store_true")
     queue.add_argument("--json", action="store_true")
     queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-    _add_plan(orch_actions, queue)
+    from foragent import orch_plan_cli
+
+    orch_plan_cli.add_parsers(orch_actions, queue)
     cli.orch_facts.add_parser(orch_actions)
     reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")
     reviewers.add_argument("issue", type=int)
     reviewers.add_argument("count", type=int, nargs="?", help="Reviewer count (1 or more); wins over review_reviewers")
     reviewers.add_argument("--clear", action="store_true")
     reviewers.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-
-
-def _add_plan(orch_actions, queue) -> None:
-    from foragent import orch_plan
-
-    cli = facade()
-    pause = orch_actions.add_parser("pause", help="Hold a lane in the plan until a time, with a reason")
-    pause.add_argument("lane")
-    pause.add_argument("--until", required=True, help="ISO time; without a timezone it is local time")
-    pause.add_argument("--why", required=True)
-    resume = orch_actions.add_parser("resume", help="Remove a lane's plan pause")
-    resume.add_argument("lane")
-    plan = orch_actions.add_parser("plan", help="Show the plan, or set lane widths and its expiry")
-    plan.add_argument("--width", action="append", default=[], metavar="LANE=N",
-                      help="Cap a lane's running runs (N >= 1), or LANE=off to clear; may repeat")
-    plan.add_argument("--expires", help="ISO time when the whole plan lapses")
-    plan.add_argument("--json", action="store_true")
-    for command in (pause, resume, plan, queue):
-        command.add_argument("--by", choices=orch_plan.AUTHORS, default="human",
-                             help="Who writes this (default: human); the orchestrator passes --by orchestrator")
-        if command is not queue:
-            command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-
-
-def _fail(message: str):
-    """Print the reason where a person sees it, then exit non-zero."""
-    print(message, file=facade().sys.stderr)
-    raise SystemExit(1)
-
-
-def _plan_time(action: str, value: str, language: str):
-    from foragent import orch_plan
-
-    cli = facade()
-    try:
-        return orch_plan.parse_time(value)
-    except ValueError:
-        _fail(cli.text("orch_plan_bad_time", language, action=action, value=value))
-
-
-def _check_lanes(action: str, lanes, config) -> None:
-    cli = facade()
-    known = sorted({"main", *config.lanes})
-    unknown = [lane for lane in lanes if lane not in known]
-    if unknown:
-        _fail(cli.text("orch_plan_unknown_lanes", config.language, action=action,
-                                  lanes=", ".join(unknown), known=", ".join(known)))
-
-
-def _widths(values: list[str], language: str) -> dict:
-    cli = facade()
-    widths = {}
-    for value in values:
-        lane, sep, raw = value.partition("=")
-        try:
-            width = None if raw == "off" else int(raw)
-        except ValueError:
-            width = 0
-        if not sep or not lane or (width is not None and width < 1):
-            _fail(cli.text("orch_plan_bad_width", language, value=value))
-        widths[lane] = width
-    return widths
-
-
-def _plan(args, store, config) -> None:
-    """Plan pauses, widths, expiry and their display; queues go through ``fa orch queue``."""
-    from foragent import orch_plan
-
-    cli = facade()
-    plan_module, text, language = orch_plan, cli.text, config.language
-    try:
-        if args.action == "pause":
-            _check_lanes("pause", [args.lane], config)
-            until = _plan_time("pause", args.until, language)
-            item = plan_module.pause(store, args.lane, until, args.why, args.by)["paused"][args.lane]
-            print(text("orch_plan_paused", language, lane=args.lane, **item))
-            return
-        if args.action == "resume":
-            removed = plan_module.resume(store, args.lane, args.by)
-            print(text("orch_plan_resumed" if removed else "orch_plan_not_paused", language, lane=args.lane))
-            return
-        widths = _widths(args.width, language)
-        _check_lanes("plan", list(widths), config)
-        expires = _plan_time("plan", args.expires, language) if args.expires else None
-        current = (plan_module.set_plan(store, widths, expires, args.by) if widths or expires
-                   else plan_module.load(store))
-    except plan_module.PlanRefused as exc:
-        _fail(text("orch_plan_refused", language, action=args.action, reason=exc))
-    if args.json:
-        print(cli.json.dumps(plan_module.view(current), ensure_ascii=False))
-        return
-    for line in _plan_lines(current, language):
-        print(line)
-
-
-def _plan_lines(plan: dict, language: str) -> list[str]:
-    from foragent.labels import lane_order
-
-    cli = facade()
-    text = cli.text
-    authors = plan["authors"]
-    lines = []
-    for lane in sorted({*plan["queues"], *plan["paused"], *plan["width"]}, key=lane_order):
-        parts = []
-        if lane in plan["queues"]:
-            parts.append(text("orch_plan_queue", language, by=authors["queues"][lane],
-                              order=" ".join(f"#{n}" for n in plan["queues"][lane])))
-        if lane in plan["paused"]:
-            parts.append(text("orch_plan_pause", language, **plan["paused"][lane]))
-        if lane in plan["width"]:
-            parts.append(text("orch_plan_width", language, width=plan["width"][lane], by=authors["width"][lane]))
-        lines.append(text("orch_plan_line", language, lane=lane, parts="; ".join(parts)))
-    if not lines and not plan["expires_at"]:
-        return [text("orch_plan_none", language)]
-    if plan["expires_at"]:
-        lines.append(text("orch_plan_expires", language, at=plan["expires_at"], by=authors["expires_at"]))
-    else:
-        lines.append(text("orch_plan_no_expiry", language))
-    return lines
 
 
 def _reviewers(args, store, config) -> None:
@@ -235,28 +117,6 @@ def _reviewers(args, store, config) -> None:
     print(text("orch_reviewers_set", language, issue=args.issue, count=args.count))
 
 
-def _global_queue(args, store, config) -> None:
-    """Cross-lane priority list in the state directory; argparse puts the first number in ``lane``."""
-    cli = facade()
-    text, language = cli.text, config.language
-    numbers = list(args.numbers)
-    if args.lane is not None:
-        try:
-            numbers.insert(0, int(args.lane))
-        except ValueError:
-            raise SystemExit(text("orch_queue_global_number", language, value=args.lane)) from None
-    if args.clear and numbers:
-        raise SystemExit(text("orch_queue_global_usage", language))
-    order = cli.orch_queue.set_global(store, []) if args.clear else (
-        cli.orch_queue.set_global(store, numbers) if numbers else cli.orch_queue.get_global(store))
-    if args.json:
-        print(cli.json.dumps({"lane": None, "order": order}))
-    elif order:
-        print(text("orch_queue_global_show", language, order=" ".join(f"#{n}" for n in order)))
-    else:
-        print(text("orch_queue_global_empty", language))
-
-
 def _orch_inbox(args, store, config, repo: str) -> None:
     """Local request/question box; never reads GitHub or starts an executor."""
     cli = facade()
@@ -267,8 +127,10 @@ def _orch_inbox(args, store, config, repo: str) -> None:
     if args.action == "alive":
         _alive(args, store, config)
         return
-    if args.action in PLAN_ACTIONS:
-        _plan(args, store, config)
+    from foragent import orch_plan_cli
+
+    if args.action in orch_plan_cli.ACTIONS:
+        orch_plan_cli.run(args, store, config)
         return
     if args.action == "facts":
         return cli.orch_facts.command(args, store, config)
@@ -276,25 +138,7 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         _ensure(args, store, config)
         return
     if args.action == "queue":
-        if args.global_:
-            _global_queue(args, store, config)
-            return
-        if args.lane is None:
-            raise SystemExit(cli.text("orch_queue_lane_required", config.language))
-        if args.clear and args.numbers:
-            raise SystemExit("fa orch queue: give issue numbers or --clear, not both")
-        try:
-            order = cli.orch_queue.set_order(store, args.lane, [], args.by) if args.clear else (
-                cli.orch_queue.set_order(store, args.lane, args.numbers, args.by) if args.numbers
-                else cli.orch_queue.get(store, args.lane))
-        except cli.orch_queue.orch_plan.PlanRefused as exc:
-            _fail(cli.text("orch_plan_refused", config.language, action="queue", reason=exc))
-        if args.json:
-            print(cli.json.dumps({"lane": args.lane, "order": order}))
-        elif order:
-            print(f"lane:{args.lane} queue: " + " ".join(f"#{n}" for n in order))
-        else:
-            print(f"lane:{args.lane} queue is empty; issues start by number.")
+        (orch_plan_cli.global_queue if args.global_ else orch_plan_cli.lane_queue)(args, store, config)
         return
     if args.action == "request":
         record = box.add_request(store, args.source, args.text)
