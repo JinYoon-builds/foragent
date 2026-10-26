@@ -147,8 +147,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         return issue_lane(issue.labels, ctx.config.lanes)
 
     with step("board_sync"):
-        # An order parent's column follows its children; see board_parents.
-        parents = board_parents.order_parents(ctx.store.local_issues())
+        parents = board_parents.order_parents(ctx.store.local_issues())  # Columns follow children.
         for issue in local_issue_models(ctx.store):
             if issue.state != "open":
                 # A manually closed card leaves its column; known cards only.
