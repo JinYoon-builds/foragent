@@ -137,7 +137,6 @@ def test_rebuild_verification_uses_the_rebuilt_base(git_history, monkeypatch):
     monkeypatch.setattr("foragent.run_conflicts._prepare_target", lambda attempt: True)
     monkeypatch.setattr(run_checks, "_phase", lambda *args: None)
     monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
-    monkeypatch.setattr("foragent.ci_mode.stage_exclusions", lambda attempt: None)
     monkeypatch.setattr(runner, "_check", lambda *args, **kwargs: checks.append(args))
     attempt.git.stage_changes = lambda: None
     attempt.git.changed_paths = lambda ref: ["src/feature.py"]
