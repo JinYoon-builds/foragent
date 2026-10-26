@@ -227,7 +227,7 @@ def test_queued_test_slot_is_its_own_phase(env, monkeypatch):
     assert row["test_slot_wait_seconds"] == 23 and facts["test_slots"]["total_wait_seconds"] == 23
 
 
-def test_a_transition_during_the_read_is_not_counted_as_closed_and_open(env, monkeypatch):
+def test_a_transition_during_the_computation_does_not_reach_the_facts(env, monkeypatch):
     store, root = env
     clock = [NOW - timedelta(seconds=40)]
     store._now = lambda: clock[0]
@@ -248,8 +248,11 @@ def test_a_transition_during_the_read_is_not_counted_as_closed_and_open(env, mon
 
     monkeypatch.setattr(orch_facts, "_current_runs", racing)
     row, = collect(store, root)["runs"]
-    assert len(calls) == 2, "A changed version is read again"
+    assert calls, "The transition happened while facts were computed"
+    assert row["phase"] == "checking", "Facts are computed from the frozen read only"
     assert row["checking_seconds"] == 30 and row["test_phase_share"] == pytest.approx(0.75)
+    row, = collect(store, root)["runs"]
+    assert row["phase"] == "reviewing" and row["checking_seconds"] == 30
 
 
 def test_open_phase_starts_after_an_event_that_already_closed_it(env, monkeypatch):
@@ -381,26 +384,31 @@ def test_a_restored_open_segment_of_first_work_is_not_waste(env, monkeypatch):
     assert (row["baseline_seconds"], row["waste_seconds"]) == (80, 20)
 
 
-def test_a_sibling_start_during_the_read_is_read_again(env, monkeypatch):
+def test_writers_wait_while_every_input_is_read(env, monkeypatch):
+    import fcntl
+
     store, root = env
-    capacity.write_state(store, 1, NOW)
-    approve(store, 5, ["src/a.py"])
+    store.start_run(3, branch="b", worktree=store.worktree_path(3))  # Creates this store's state.lock.
     sibling = StateStore(store.root.parent / "other__repo", now=lambda: NOW)
-    read = orch_facts._current_runs
-    calls = []
+    sibling.start_run(9, branch="b", worktree=sibling.worktree_path(9))
+    blocked = []
 
-    def racing(store_):
-        runs = read(store_)
-        if not calls:
-            sibling.prepare_run_start(9)  # Another gate reserves the only machine slot.
-        calls.append(1)
-        return runs
+    def sample():
+        # Called while the inputs are read: no writer may take either repository's state lock.
+        for path in (store.root / "state.lock", sibling.root / "state.lock"):
+            with path.open("a") as stream:
+                try:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    blocked.append(path.parent.name)
+                else:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        return ("normal", 0.1)
 
-    monkeypatch.setattr(orch_facts, "_current_runs", racing)
+    monkeypatch.setattr(capacity, "machine_load", sample)
     facts = collect(store, root)
-    assert len(calls) == 2
-    assert facts["resources"]["parallelizable_work"]["machine_runs"] == 1
-    assert facts["binding"]["kind"] == "cap"
+    assert sorted(blocked) == ["other__repo", "owner__repo"]
+    assert facts["resources"]["parallelizable_work"]["machine_runs"] == 2
 
 
 def test_warn_memory_does_not_hide_a_fixable_structure_hold(env, monkeypatch):
@@ -436,7 +444,7 @@ def test_outside_run_hours_nothing_starts(env):
 
 
 def test_facts_use_the_committed_config_the_tick_applied(env):
-    from foragent.scheduler_config import record_tick_config, tick_config
+    from foragent.scheduler_config import record_tick_config
 
     store, root = env
     capacity.write_state(store, 4, NOW)
@@ -448,7 +456,7 @@ def test_facts_use_the_committed_config_the_tick_applied(env):
     stamp = (store.root / "tick-config.json").stat().st_mtime_ns
     record_tick_config(store, "origin/main:.foragent.yml", "repo: owner/repo\nmax_parallel: 1\n")
     assert (store.root / "tick-config.json").stat().st_mtime_ns == stamp, "An unchanged config is not rewritten"
-    facts = orch_facts.collect(store, tick_config(store, local), root)
+    facts = orch_facts.collect(store, local, root)  # collect applies the recorded committed config.
     assert facts["resources"]["parallelizable_work"]["held"] == {"2": "cap"}
     assert facts["binding"]["kind"] == "cap"
 
@@ -509,3 +517,186 @@ def test_a_close_journaled_twice_counts_once(env, monkeypatch):
     row, = collect(store, root)["runs"]
     assert row["checking_seconds"] == 20 and row["runtime_seconds"] == 20
     assert row["test_phase_share"] == pytest.approx(1.0)
+
+
+def test_a_config_change_during_the_computation_does_not_mix_in(env, monkeypatch):
+    from foragent.scheduler_config import record_tick_config
+
+    store, root = env
+    capacity.write_state(store, 4, NOW)
+    approve(store, 1, ["src/a.py"], labels=("approved", "running"), active=True)
+    approve(store, 2, ["src/b.py"])
+    record_tick_config(store, "origin/main:.foragent.yml", "repo: owner/repo\nmax_parallel: 4\n")
+    read = orch_facts._current_runs
+
+    def racing(store_):
+        record_tick_config(store, "origin/main:.foragent.yml", "repo: owner/repo\nmax_parallel: 1\n")
+        return read(store_)
+
+    monkeypatch.setattr(orch_facts, "_current_runs", racing)
+    assert collect(store, root, max_parallel=4)["binding"] is None, "The frozen read had max_parallel 4"
+    monkeypatch.setattr(orch_facts, "_current_runs", read)
+    assert collect(store, root, max_parallel=4)["binding"]["kind"] == "cap"
+
+
+def test_a_sibling_half_written_finish_holds_no_machine_slot(env):
+    store, root = env
+    sibling = StateStore(store.root.parent / "other__repo", now=lambda: NOW)
+    sibling.start_run(9, branch="b", worktree=sibling.worktree_path(9))
+    before = (sibling.root / "runs" / "9.json").read_bytes()
+    sibling.finish_run(9, outcome="merged")
+    (sibling.root / "runs" / "9.json").write_bytes(before)  # History written, record not yet replaced.
+    assert collect(store, root)["resources"]["parallelizable_work"]["machine_runs"] == 0
+
+
+def test_tidy_done_writes_one_boundary_moment(env):
+    from foragent import tidy
+
+    store, _ = env
+    moments = iter([NOW, NOW + timedelta(seconds=5)])
+    store._now = lambda: next(moments)
+    tidy.done(store)
+    event, = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert event["at"] == store.tidy_state()["last_tidy_at"] == NOW.isoformat()
+
+
+def test_observed_load_respects_cpu_busy_off(tmp_path, monkeypatch):
+    import os
+
+    (tmp_path / "machine-data").mkdir(exist_ok=True)
+    (tmp_path / "machine-data" / capacity.SENSOR_FILE).write_text(json.dumps({"cpu_busy": 0.06}))
+    monkeypatch.setattr(os, "getloadavg", lambda: (8.0, 8.0, 8.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    monkeypatch.delenv("FORAGENT_CPU_BUSY", raising=False)
+    with capacity.observing():
+        assert capacity.machine_load()[1] == pytest.approx(0.1), "A saved busy fraction lowers the load"
+    monkeypatch.setenv("FORAGENT_CPU_BUSY", "off")
+    with capacity.observing():
+        sample = capacity.machine_load()
+    assert sample[1] == 2.0 and sample.cpu_busy is None
+
+
+def test_a_sibling_first_reservation_before_locking_is_seen(env, monkeypatch):
+    store, root = env
+    capacity.write_state(store, 1, NOW)
+    approve(store, 5, ["src/a.py"])
+    sibling = StateStore(store.root.parent / "new__repo", now=lambda: NOW)
+    lock = orch_facts._lock_shared
+    reserved = []
+
+    def reserving(stack, path):
+        if not reserved:  # Between store discovery and the locks: a new repository reserves a slot.
+            sibling.prepare_run_start(9)
+            reserved.append(1)
+        return lock(stack, path)
+
+    monkeypatch.setattr(orch_facts, "_lock_shared", reserving)
+    facts = collect(store, root)
+    assert facts["resources"]["parallelizable_work"]["machine_runs"] == 1
+    assert facts["binding"]["kind"] == "cap"
+
+
+def test_an_invalid_recorded_config_falls_back_to_the_checkout(env):
+    from foragent.scheduler_config import record_tick_config
+
+    store, root = env
+    capacity.write_state(store, 4, NOW)
+    approve(store, 1, ["src/a.py"], labels=("approved", "running"), active=True)
+    approve(store, 2, ["src/b.py"])
+    record_tick_config(store, "origin/main:.foragent.yml", "repo: owner/repo\nmax_parallel: 1\n")
+    assert collect(store, root, max_parallel=4)["binding"]["kind"] == "cap"
+    record_tick_config(store, "origin/main:.foragent.yml", "max_parallel: [not a number\n")
+    facts = collect(store, root, max_parallel=4)
+    assert facts["binding"] is None and facts["resources"]["parallelizable_work"]["free_run_slots"] == 3
+
+
+def test_a_github_wait_holds_before_any_file_check(env):
+    store, root = env
+    capacity.write_state(store, 4, NOW)
+    approve(store, 1, ["src/shared.py"], labels=("approved", "running"), active=True)
+    approve(store, 2, ["src/shared.py"])
+    approve(store, 3, ["src/shared.py"])
+    store.pause_github(NOW + timedelta(minutes=30))
+    facts = collect(store, root)
+    assert facts["resources"]["parallelizable_work"]["held"] == {"2": "github", "3": "github"}
+    assert facts["binding"]["kind"] == "github"
+
+
+def test_run_hours_hold_before_the_cap(env):
+    store, root = env
+    capacity.write_state(store, 1, NOW)
+    approve(store, 1, ["src/a.py"], labels=("approved", "running"), active=True)
+    approve(store, 2, ["src/b.py"])
+    hour = NOW.astimezone().hour
+    facts = collect(store, root, run_hours=f"{(hour + 1) % 24:02d}-{(hour + 2) % 24:02d}")
+    assert facts["resources"]["parallelizable_work"]["held"] == {"2": "run_hours"}
+    assert facts["binding"]["kind"] == "run_hours"
+
+
+def test_critical_memory_ends_the_start_loop_at_the_first_startable_issue(env, monkeypatch):
+    store, root = env
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("critical", 0.1))
+    capacity.write_state(store, 4, NOW)
+    approve(store, 1, ["src/shared.py"], labels=("approved", "running"), active=True)
+    approve(store, 2, ["src/a.py"])
+    approve(store, 3, ["src/shared.py"])
+    approve(store, 4, ["src/b.py"])
+    # The gate stops at #2; #3 and #4 are never checked in this tick.
+    assert collect(store, root, overlap_per_file=1)["resources"]["parallelizable_work"]["held"] == {
+        "2": "machine", "3": "machine", "4": "machine"}
+
+
+@pytest.mark.parametrize("boundary", ["tidy-json", "tidy-done-event"])
+def test_legacy_merges_without_times_count_when_started_after_the_tidy(env, boundary):
+    store, root = env
+    tidy_at = NOW - timedelta(hours=3)
+    if boundary == "tidy-json":
+        store.update_tidy_state(lambda state: state.update(last_tidy_at=tidy_at.isoformat(), merged_at_tidy=0) or True)
+    else:
+        append_event(store, tidy_at, None, "tidy-done", "Tidy completed")
+    for number, started in ((1, NOW - timedelta(hours=5)), (2, NOW - timedelta(hours=1))):
+        store._now = lambda started=started: started
+        store.start_run(number, branch="b", worktree=store.worktree_path(number))
+        store.finish_run(number, outcome="merged")
+    # Legacy history: drop the finish and merge times written by newer code.
+    lines = [json.loads(line) for line in (store.root / "runs.jsonl").read_text().splitlines()]
+    (store.root / "runs.jsonl").write_text("".join(json.dumps({key: value for key, value in line.items()
+                                                                 if key not in ("finished_at", "merged_at")}) + "\n"
+                                                   for line in lines))
+    store._now = lambda: NOW
+    assert collect(store, root)["merges_since_tidy"] == 1, "Only the merge started after the tidy counts"
+
+
+def test_global_config_is_read_with_the_records(env, monkeypatch, tmp_path):
+    from foragent.scheduler_config import record_tick_config
+
+    store, root = env
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    path = tmp_path / "home/.config/foragent/config.yml"
+    path.parent.mkdir(parents=True)
+    path.write_text("max_parallel: 4\n")
+    capacity.write_state(store, 4, NOW)
+    approve(store, 1, ["src/a.py"], labels=("approved", "running"), active=True)
+    approve(store, 2, ["src/b.py"])
+    record_tick_config(store, "origin/main:.foragent.yml", "repo: owner/repo\n")
+    read = orch_facts._current_runs
+
+    def racing(store_):
+        path.write_text("max_parallel: 1\n")  # The global cap drops after the frozen read.
+        return read(store_)
+
+    monkeypatch.setattr(orch_facts, "_current_runs", racing)
+    assert collect(store, root)["binding"] is None, "The frozen global config still had max_parallel 4"
+    monkeypatch.setattr(orch_facts, "_current_runs", read)
+    assert collect(store, root)["binding"]["kind"] == "cap"
+
+
+def test_checkout_config_is_read_with_the_records(env):
+    store, root = env
+    capacity.write_state(store, 4, NOW)
+    approve(store, 1, ["src/a.py"], labels=("approved", "running"), active=True)
+    approve(store, 2, ["src/b.py"])
+    (root / ".foragent.yml").write_text("repo: owner/repo\nmax_parallel: 1\n")
+    stale = Config(repo="owner/repo", max_parallel=4)
+    assert orch_facts.collect(store, stale, root, checkout=True)["binding"]["kind"] == "cap"

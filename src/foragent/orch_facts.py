@@ -9,15 +9,19 @@ facts name what binds now; they decide nothing and carry no throughput goal.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import fcntl
 import json
+import os
+from pathlib import Path
 from statistics import median
+import tempfile
+from types import SimpleNamespace
 from typing import Any
 
-from types import SimpleNamespace
-
-from foragent import capacity, machine_budget, orch_queue, tidy
+from foragent import capacity, machine_budget, orch_queue
 from foragent.config import Config, in_run_hours, lane_executors
 from foragent.issue import ParsedIssue, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_order
@@ -244,13 +248,14 @@ def _failure_reasons(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _merges_since_tidy(store: StateStore) -> int:
-    """Merges after the latest tidy: `fa tidy done` keeps a merge count, a tidy-done event a time."""
-    events = [moment for event in _jsonl(store.root / "orch-events.jsonl")
-              if event.get("kind") == "tidy-done" and (moment := _time(event.get("at"))) is not None]
-    latest = max(events, default=None)
-    recorded = _time(store.tidy_state().get("last_tidy_at"))
-    if latest is None or (recorded is not None and recorded >= latest):
-        return tidy.status(store)["merges_since"]  # The same count the tidy schedule uses.
+    """Merges after the one tidy boundary: the latest tidy moment, journaled or in tidy.json.
+
+    `fa tidy done` writes both with one timestamp. Without any tidy, every merge counts.
+    """
+    moments = [moment for event in _jsonl(store.root / "orch-events.jsonl")
+               if event.get("kind") == "tidy-done" and (moment := _time(event.get("at"))) is not None]
+    moments.append(_time(store.tidy_state().get("last_tidy_at")))
+    latest = max((moment for moment in moments if moment is not None), default=None)
     merged, finished = store.merge_times(), store.finish_times()
     count = 0
     for run in store.read_history():
@@ -261,14 +266,18 @@ def _merges_since_tidy(store: StateStore) -> int:
         if moment is None or (started is not None and moment < started):
             # No own merge time recorded: the merge happened at or before the finish.
             moment = _time(finished.get(key))
-        if moment is not None and moment > latest:
+        if moment is None:
+            # A legacy record with neither time: a start after the boundary still proves the
+            # merge came after it; a start before it proves nothing, so it is not counted.
+            moment = started
+        if latest is None or (moment is not None and moment > latest):
             count += 1
     return count
 
 
-def _test_slots(config: Config, running: list[Run], rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _test_slots(config: Config, running: list[Run], rows: list[dict[str, Any]], machine) -> dict[str, Any]:
     """The shared slot value (bounded by this project's test_slots), queue and waits."""
-    state = capacity.read_test_slots()
+    state = machine["test_slots"]
     return {"current": max(1, min(state["slots"], config.test_slots) if state else config.test_slots),
             "queue_length": sum(run.phase == "test-slot-wait" for run in running),
             "total_wait_seconds": sum(row["test_slot_wait_seconds"] or 0 for row in rows)}
@@ -323,17 +332,22 @@ def _quota(store: StateStore, now: datetime) -> dict[str, dict[str, Any]]:
     return result
 
 
-def _alive(run: Run, now: datetime) -> bool:
-    """A sibling run holds a machine slot while its process lives; read without any signal."""
+def _probe(pid: int) -> bool:
+    """Whether a process lives, read without any signal; unreadable is not proof it ended."""
+    try:
+        return read_process_identity(pid) is not None
+    except OSError:
+        return True
+
+
+def _alive(run: Run, now: datetime, alive: dict[int, bool]) -> bool:
+    """A sibling run holds a machine slot while its process lives (probed during the frozen read)."""
     if run.pid is None:
         return capacity._within_grace(run.started_at, now)
-    try:
-        return read_process_identity(run.pid) is not None
-    except OSError:
-        return True  # Unreadable is not proof that the slot is free.
+    return alive.get(run.pid, True)
 
 
-def _machine_runs(store: StateStore, now: datetime, running: list[Run]) -> int:
+def _machine_runs(store: StateStore, now: datetime, running: list[Run], alive: dict[int, bool]) -> int:
     """capacity.machine_runs without its signal probe: this store's runs and live sibling runs."""
     numbers = {run.number for run in running}
     count = len(running) + sum(1 for number, prepared in store.run_starts().items()
@@ -348,7 +362,7 @@ def _machine_runs(store: StateStore, now: datetime, running: list[Run]) -> int:
             sibling = StateStore(root, now=lambda: now)
             runs = _still_running(sibling, sibling.active_runs())
             running = {run.number for run in runs}
-            count += sum(_alive(run, now) for run in runs) + sum(
+            count += sum(_alive(run, now, alive) for run in runs) + sum(
                 1 for number, prepared in sibling.run_starts().items()
                 if number not in running and capacity._within_grace(prepared, now))
         except (OSError, ValueError, TypeError, KeyError):
@@ -358,7 +372,7 @@ def _machine_runs(store: StateStore, now: datetime, running: list[Run]) -> int:
 
 def _admission(
     store: StateStore, config: Config, root, now: datetime, waiting: list[_Waiting], running: list[Run],
-    hold_all: str | None = None,
+    hold_all: str | None = None, machine: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replay the gate's start loop read-only: machine budget, project ceiling, lane holds, file rule.
 
@@ -371,13 +385,17 @@ def _admission(
     ctx = SimpleNamespace(store=store, config=config, repo_root=root)
     state = capacity.read_state(store)
     machine_cap = int(state["parallel"]) if state else capacity.INITIAL_PARALLEL
-    if (ceiling := machine_budget.values()["max_parallel"]) is not None:
+    if (ceiling := machine["budget"]["max_parallel"]) is not None:
         machine_cap = min(machine_cap, ceiling)
-    machine_active, project_active = _machine_runs(store, now, running), len(running)
+    machine_active, project_active = _machine_runs(store, now, running, machine["alive"]), len(running)
     free = max(0, machine_cap - machine_active)
     if config.max_parallel is not None:
         free = min(free, max(0, config.max_parallel - project_active))
+    # The same running set as every other fact: a half-written finish claims nothing.
+    live = {(run.number, run.started_at) for run in running}
     known, unknown = claims(ctx, measured=False)
+    known = [claim for claim in known if (claim.run.number, claim.run.started_at) in live]
+    unknown = [run for run in unknown if (run.number, run.started_at) in live]
     running = [path for claim in known for path in [*claim.files, *claim.parsed.exclusive]]
     contended = [item.number for item in waiting if item.startable and any_overlap(
         ctx, [*item.parsed.files, *item.parsed.exclusive], running)]
@@ -390,20 +408,31 @@ def _admission(
     for item in items.values():
         lanes.setdefault(item.lane, []).append(item.number)
     # Same order as the tick: lanes by lane_order, each lane's local queue first.
-    for lane in sorted(lanes, key=lane_order):
-        order = orch_queue.ordered(store, lane, lanes[lane])
+    ordered = [(lane, orch_queue.ordered(store, lane, lanes[lane])) for lane in sorted(lanes, key=lane_order)]
+    if hold_all in ("github", "run_hours"):
+        # The tick skips the whole start loop before any cap, quota or file check.
+        held.update({number: hold_all for _, order in ordered for number in order})
+        ordered = []
+    stopped = False
+    for lane, order in ordered:
+        if stopped:
+            held.update(dict.fromkeys(order, "machine"))
+            continue
         if remaining > 0 and _lane_held(ctx, lane, now):
             held.update(dict.fromkeys(order, "quota"))
             continue
         for number in order:
             item = items[number]
-            if remaining <= 0:
+            if stopped:
+                held[number] = "machine"
+            elif remaining <= 0:
                 held[number] = "cap"
             elif not admits(ctx, lane, item.parsed, known, unknown, union=union):
                 held[number] = "structure"
-            elif hold_all is not None:
-                # Passed every start check; the tick still starts nothing (critical memory, run hours).
-                held[number] = hold_all
+            elif hold_all == "machine":
+                # Passed every start check; critical memory ends the tick here, so nothing after it starts.
+                held[number] = "machine"
+                stopped = True
             else:
                 remaining -= 1
                 run = Run(number, "", "", None, now.isoformat(), now.isoformat(), lane=lane)
@@ -417,9 +446,9 @@ def _admission(
             "overlap_blocked": contended, "held": {str(number): reason for number, reason in sorted(held.items())}}
 
 
-def _resources(store: StateStore, config: Config, root, now: datetime, waiting, slots, running) -> dict[str, Any]:
-    with capacity.observing():
-        sample = capacity.machine_load()
+def _resources(store: StateStore, config: Config, root, now: datetime, waiting, slots, running,
+               machine: dict[str, Any]) -> dict[str, Any]:
+    sample = machine["sample"]
     pressure, load = sample[0], float(sample[1])
     # The gate's rules: only critical memory holds starts and test slots (#497); load at or over
     # OVERLOAD_LOAD shrinks the run and slot budgets; below HEADROOM_LOAD they may grow.
@@ -432,7 +461,7 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
     hold_all = ("github" if github_until is not None
                 else "run_hours" if not in_run_hours(now.astimezone(), config.run_hours)
                 else "machine" if not memory_headroom else None)
-    work = _admission(store, config, root, now, waiting, running, hold_all)
+    work = _admission(store, config, root, now, waiting, running, hold_all, machine)
     work["github_wait_until"] = github_until.isoformat() if github_until is not None else None
     # Running work held in flight: a run waiting for files other runs hold.
     work["in_flight"] = {str(run.number): "structure" for run in sorted(running, key=lambda run: run.number)
@@ -454,7 +483,8 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
                     "idle_while_waiting": headroom and waiting_now},
         "quota": quota,
         # `admitted` is what `hold_test_slot` grants now, including machine.yml's default ceiling.
-        "test_slots": {**slots, "admitted": capacity.effective_test_slots(config.test_slots),
+        "test_slots": {**slots, "admitted": capacity.effective_test_slots(
+                           config.test_slots, state=machine["test_slots"], machine=machine["budget"]),
                        "queue_with_machine_headroom": slots["queue_length"] > 0 and headroom},
         "parallelizable_work": work,
     }
@@ -497,45 +527,130 @@ def _binding(resources: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-SNAPSHOT_ATTEMPTS = 5
+# Never copied or opened: plan.json may carry a throughput goal, which facts must not show.
+NOT_READ = {"plan.json"}
+FREEZE_ATTEMPTS = 3
 
 
-def _version(store: StateStore) -> dict[str, tuple[int, int, int]]:
-    """A version stamp of every record facts reads; atomic writes and appends both change it."""
-    root = store.root
-    paths = [*root.glob("*.json"), *root.glob("*.jsonl"), *(root / "approvals").glob("*.json"),
-             root.parent / capacity.STATE_FILE, machine_budget.machine_file(),
-             capacity.machine_root() / capacity.TEST_SLOTS_FILE, capacity.machine_root() / capacity.SENSOR_FILE]
-    # Run records and start reservations of this store and of every sibling (machine-wide run count).
+def _lock_shared(stack: ExitStack, path: Path) -> bool:
+    """Hold a shared flock on an existing lock file without creating or changing it."""
     try:
-        stores = [path for path in root.parent.iterdir() if path.is_dir()]
-    except OSError:
-        stores = [root]
-    for directory in stores:
-        paths += [*(directory / "runs").glob("*.json"), *(directory / "run-starts").glob("*.json")]
-    stamp = {}
-    for path in paths:
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        stamp[str(path)] = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
-    return stamp
+        descriptor = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    stack.callback(os.close, descriptor)
+    fcntl.flock(descriptor, fcntl.LOCK_SH)
+    stack.callback(fcntl.flock, descriptor, fcntl.LOCK_UN)
+    return True
 
 
-def collect(store: StateStore, config: Config, root) -> dict[str, Any]:
-    """All facts as one JSON-ready mapping, computed from one unchanged version of the records.
+def _copy(source: Path, target: Path) -> None:
+    try:
+        data = source.read_bytes()
+    except FileNotFoundError:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
 
-    Writers change several files per transition (journal, then run record), so a
-    read that overlaps a write is computed again until the version is stable.
+
+GLOBAL_CONFIG = "global-config.yml"
+
+
+def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tuple[StateStore, dict[str, Any]] | None:
+    """Read every input once under the writers' locks; None when a lock appeared meanwhile.
+
+    Lock order: every repository's state lock (sorted), the machine run-budget lock,
+    then the sensor lock. Writers hold at most one of them at a time, so a shared
+    hold of all cannot deadlock. A lock file that does not exist yet has never been
+    written under; if one appears during the read, the caller reads again.
     """
-    for _ in range(SNAPSHOT_ATTEMPTS):
-        version = _version(store)
-        facts = _collect(store, config, root)
-        if _version(store) == version:
-            return facts
-    facts["consistent"] = False  # The records kept changing; this read may mix two versions.
-    return facts
+    parent = store.root.parent
+
+    def discover() -> list[Path]:
+        try:
+            found = {path for path in parent.iterdir() if path.is_dir() and (
+                (path / "runs").is_dir() or (path / "run-starts").is_dir())}
+        except OSError:
+            found = set()
+        return sorted(found | {store.root})
+
+    def lock_set(stores: list[Path]) -> list[Path]:
+        return [*(path / "state.lock" for path in stores), parent / capacity.LOCK_FILE,
+                capacity.machine_root() / capacity.SENSOR_LOCK]
+
+    stores = discover()
+    locks = lock_set(stores)
+    with ExitStack() as stack:
+        held = [_lock_shared(stack, path) for path in locks]
+        # Start reservations (and a sibling's first one, which creates its store) happen under
+        # the machine lock held now: discover again, so none made before it is missed.
+        if discover() != stores:
+            return None
+        for source in stores:
+            target = into / "data" / source.name
+            names = [*source.glob("*.json"), *source.glob("*.jsonl")] if source == store.root else [
+                source / "runs.jsonl"]
+            for path in names:
+                if path.name not in NOT_READ:
+                    _copy(path, target / path.name)
+            for directory in ("runs", "run-starts", *(("approvals",) if source == store.root else ())):
+                for path in (source / directory).glob("*.json"):
+                    _copy(path, target / directory / path.name)
+        _copy(parent / capacity.STATE_FILE, into / "data" / capacity.STATE_FILE)
+        # Config files: the global config and the checkout's .foragent.yml, read once like the records.
+        _copy(Path.home() / ".config/foragent/config.yml", into / GLOBAL_CONFIG)
+        if checkout is not None:
+            _copy(checkout / ".foragent.yml", into / "checkout" / ".foragent.yml")
+        with capacity.observing():
+            sample = capacity.machine_load()
+        # Sibling processes are probed now, while their records cannot change.
+        alive = {}
+        for path in (into / "data").glob("*/runs/*.json"):
+            if path.parent.parent.name == store.root.name:
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except ValueError:
+                continue
+            if record.get("status") == "running" and type(record.get("pid")) is int:
+                alive[record["pid"]] = _probe(record["pid"])
+        machine = {"test_slots": capacity.read_test_slots(), "budget": machine_budget.values(), "sample": sample,
+                   "now": store._now(), "alive": alive}
+        # A lock file created meanwhile (a first write under it) means the read was not covered.
+        if discover() != stores or [path.exists() for path in lock_set(stores)] != held:
+            return None
+    (into / "data" / store.root.name).mkdir(parents=True, exist_ok=True)
+    observed = machine["now"]
+    return StateStore(into / "data" / store.root.name, now=lambda: observed), machine
+
+
+def collect(store: StateStore, config: Config, root, *, checkout: bool = False) -> dict[str, Any]:
+    """All facts as one JSON-ready mapping, computed from one frozen read of every input.
+
+    ``config`` is the checkout config. With ``checkout``, it is loaded again from the
+    frozen copies of ``root/.foragent.yml`` and the global config (``config`` stays the
+    fallback). The gate's committed config recorded by the last tick applies over it,
+    merged with the same frozen global config.
+    """
+    from foragent.config import ConfigError, load_config
+    from foragent.scheduler_config import tick_config
+
+    for attempt in range(FREEZE_ATTEMPTS):
+        with tempfile.TemporaryDirectory(prefix="foragent-facts-") as directory:
+            frozen = _freeze(store, Path(directory), Path(root) if checkout else None)
+            if frozen is None and attempt < FREEZE_ATTEMPTS - 1:
+                continue
+            if frozen is None:
+                raise OSError("State locks kept appearing while facts were read; try again")
+            snapshot, machine = frozen
+            global_path = Path(directory) / GLOBAL_CONFIG
+            if checkout:
+                try:
+                    config = load_config(Path(directory) / "checkout", global_path=global_path)
+                except (ConfigError, OSError, ValueError, TypeError):
+                    pass  # The checkout file vanished or broke meanwhile: keep the command's config.
+            return _collect(snapshot, tick_config(snapshot, config, global_path), root, machine)
+    raise AssertionError("unreachable")
 
 
 def _still_running(store: StateStore, runs: list[Run]) -> list[Run]:
@@ -548,8 +663,8 @@ def _still_running(store: StateStore, runs: list[Run]) -> list[Run]:
     return [run for run in runs if run.status == "running" and (run.number, run.started_at) not in finished]
 
 
-def _collect(store: StateStore, config: Config, root) -> dict[str, Any]:
-    now = store._now()
+def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -> dict[str, Any]:
+    now = machine["now"]  # The moment the inputs were read.
     current = _current_runs(store)
     running = _still_running(store, current)
     rows = [_row(execution, now) for execution in _executions(store, now, current)
@@ -558,10 +673,10 @@ def _collect(store: StateStore, config: Config, root) -> dict[str, Any]:
     for row in rows:
         row["comparisons"] = _comparisons(row, history["medians"])
     waiting = _waiting_issues(store, config, running)
-    slots = _test_slots(config, running, rows)
+    slots = _test_slots(config, running, rows, machine)
     measured = [row for row in rows if row["waste_seconds"] is not None and row["runtime_seconds"] is not None]
     wasted, runtime = sum(row["waste_seconds"] for row in measured), sum(row["runtime_seconds"] for row in measured)
-    resources = _resources(store, config, root, now, waiting, slots, running)
+    resources = _resources(store, config, root, now, waiting, slots, running, machine)
     return {
         "at": now.astimezone(UTC).isoformat(),
         "window_days": RECENT.days,

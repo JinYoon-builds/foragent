@@ -9,7 +9,7 @@ runs tidy work. ``fa tidy done`` starts the next period.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from foragent import orch_inbox
@@ -66,17 +66,20 @@ def public(facts: dict[str, Any]) -> dict[str, Any]:
 
 def done(store: StateStore) -> dict[str, Any]:
     """Record a finished tidy; the merge count and the due period start again."""
+    from foragent.orch_events import append_event
+
     merged = _merged_runs(store)
+    # One moment for both records: tidy.json's last_tidy_at and the journal's tidy-done event
+    # are the same boundary, which `fa orch facts` counts merges from.
+    at = store._now()
+    stamp = at.astimezone(UTC).isoformat()
 
     def change(state: dict[str, Any]) -> bool:
-        state.update(last_tidy_at=store._timestamp(), merged_at_tidy=merged)
+        state.update(last_tidy_at=stamp, merged_at_tidy=merged)
         return True
 
     store.update_tidy_state(change)
-    from foragent.orch_events import append_event
-
-    # The journal's tidy-done event is the boundary `fa orch facts` counts merges from.
-    append_event(store, store._now(), None, "tidy-done", f"Tidy completed after {merged} recorded merges")
+    append_event(store, at, None, "tidy-done", f"Tidy completed after {merged} recorded merges")
     return public(status(store))
 
 

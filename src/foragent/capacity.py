@@ -246,9 +246,11 @@ def observing() -> Iterator[None]:
 
 def _observed_load() -> LoadSample:
     """The current sample from read-only sources; CPU busy comes from the last saved sample."""
-    sensor = _read_sensor(machine_root())
-    busy = sensor.get("cpu_busy")
-    busy = busy if type(busy) in (int, float) and 0 <= busy <= 1 else None
+    busy = None
+    # FORAGENT_CPU_BUSY=off turns the busy fraction off, including a previously saved one.
+    if os.environ.get("FORAGENT_CPU_BUSY") != "off":
+        busy = _read_sensor(machine_root()).get("cpu_busy")
+        busy = busy if type(busy) in (int, float) and 0 <= busy <= 1 else None
     raw_load = load_per_cpu()
     load = min(raw_load, busy / 0.6) if busy is not None else raw_load
     return LoadSample(kernel_pressure(), load, None, load_average_per_cpu=raw_load, cpu_busy=busy)
@@ -385,12 +387,19 @@ def read_test_slots() -> dict[str, Any] | None:
     return value
 
 
-def effective_test_slots(ceiling: int) -> int:
-    """The shared AIMD value, capped by machine.yml and this repository's lower ceiling."""
+def effective_test_slots(
+    ceiling: int, *, state: dict[str, Any] | None | bool = False, machine: dict[str, Any] | None = None,
+) -> int:
+    """The shared AIMD value, capped by machine.yml and this repository's lower ceiling.
+
+    ``state`` and ``machine`` let a caller that already read test-slots.json and machine.yml
+    reuse those values instead of reading the files again.
+    """
     from foragent import machine_budget
 
-    ceiling = min(ceiling, machine_budget.values()["test_slots"])
-    state = read_test_slots()
+    ceiling = min(ceiling, (machine if machine is not None else machine_budget.values())["test_slots"])
+    if state is False:
+        state = read_test_slots()
     return max(1, min(state["slots"], ceiling)) if state else max(1, ceiling)
 
 

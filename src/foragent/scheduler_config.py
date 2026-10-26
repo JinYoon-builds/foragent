@@ -24,13 +24,16 @@ def record_tick_config(store, source: str, content: str | None) -> None:
     store._write_json(path, value)
 
 
-def tick_config(store, local):
-    """The config the last tick admitted work with: the recorded committed file over ``local``."""
+def tick_config(store, local, global_path=None):
+    """The config the last tick admitted work with: the recorded committed file over ``local``.
+
+    ``global_path`` is the global config to merge (a frozen copy for read-only views).
+    """
     import json
 
     try:
         value = json.loads((store.root / TICK_CONFIG_FILE).read_text(encoding="utf-8"))
-        config, _ = load_committed_config(local, value["content"], value["source"])
+        config, _ = load_committed_config(local, value["content"], value["source"], global_path)
     except (OSError, ValueError, KeyError, TypeError):
         return local
     return config or local
