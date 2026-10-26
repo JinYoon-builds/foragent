@@ -821,3 +821,99 @@ def test_merge_facts_keep_unmerged_runs_null_and_reset_on_a_new_record(store):
     store.record_merge_lock(1, 2)
     assert store.get_run(1).review_pass_to_merge_seconds is None
     assert store.get_run(1).merge_lock_held_seconds == 2
+
+
+def _counted_parses(monkeypatch):
+    parses = []
+    loads = json.loads
+
+    def counted(text, *args, **kwargs):
+        value = loads(text, *args, **kwargs)
+        if isinstance(value, dict) and "issues" in value:
+            parses.append(value)
+        return value
+
+    monkeypatch.setattr(state_module.json, "loads", counted)
+    return parses
+
+
+def test_locked_write_reads_the_current_file_not_the_read_cache(store):
+    import os
+
+    store.update_local_issue(7, title="aaaa")
+    assert store.local_issues()[0]["title"] == "aaaa"  # warms the read cache
+    path = store.root / "issues.json"
+    before = path.stat()
+    # Same size, same inode, restored mtime: invisible to the read cache's version.
+    path.write_text(path.read_text(encoding="utf-8").replace('"aaaa"', '"bbbb"'), encoding="utf-8")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    store.update_local_issue(7, lane="other")
+
+    saved = json.loads(path.read_text(encoding="utf-8"))["issues"]["7"]
+    assert (saved["title"], saved["lane"]) == ("bbbb", "other")
+
+
+def test_replace_between_stat_and_read_is_parsed_once(store, monkeypatch):
+    from foragent import state_issues
+
+    store.update_local_issue(7, title="first")
+    peer = StateStore(store.root, now=lambda: NOW)
+    parses = _counted_parses(monkeypatch)
+    read_issue_file = state_issues._read_issue_file
+
+    def replaced_first(path):
+        # A peer's atomic replace lands after the reader's stat and before its read.
+        monkeypatch.setattr(state_issues, "_read_issue_file", read_issue_file)
+        peer.update_local_issue(7, title="second")
+        parses.clear()
+        return read_issue_file(path)
+
+    monkeypatch.setattr(state_issues, "_read_issue_file", replaced_first)
+    assert store.local_issues()[0]["title"] == "second"
+    assert store.github_outbox() == []
+    assert store.local_board_value(7, "p", "f") is None
+    assert len(parses) == 1
+
+
+def test_concurrent_cache_misses_parse_one_version_once(store, monkeypatch):
+    import threading
+
+    store.update_local_issue(7, title="shared")
+    store.update_local_issue(8, board_values={"p": {"f": "Todo"}})
+    parses = _counted_parses(monkeypatch)
+    start = threading.Barrier(6)
+
+    def lookup(index):
+        start.wait()
+        return [store.local_issues, store.github_outbox,
+                lambda: store.local_board_value(8, "p", "f")][index % 3]()
+
+    with ThreadPoolExecutor(6) as pool:
+        results = list(pool.map(lookup, range(6)))
+
+    assert results[2] == "Todo" and results[1] == []
+    assert len(parses) == 1
+
+
+def test_values_leaving_the_read_cache_are_detached(store):
+    store.update_local_issue(7, board_values={"p": {"f": ["Todo"]}})
+    store.record_issues_refresh_failure("offline", NOW)
+
+    store.local_board_value(7, "p", "f").append("caller-only")
+    store.issues_observation()["error"] = "caller-only"
+
+    assert store.local_board_value(7, "p", "f") == ["Todo"]
+    assert store.local_issues()[0]["board_values"] == {"p": {"f": ["Todo"]}}
+    assert store.issues_observation()["error"] == "offline"
+
+
+def test_one_state_directory_shares_one_parse_across_path_spellings(store, tmp_path, monkeypatch):
+    store.update_local_issue(7, title="shared")
+    link = tmp_path / "linked-state"
+    link.symlink_to(store.root, target_is_directory=True)
+    spellings = [store.root, link, store.root / ".." / store.root.name]
+    parses = _counted_parses(monkeypatch)
+
+    assert {StateStore(root, now=lambda: NOW).local_issues()[0]["title"] for root in spellings} == {"shared"}
+    assert len(parses) == 1

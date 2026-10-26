@@ -1,5 +1,6 @@
 """Local issue snapshot, its pending GitHub writes and local label/comment facts."""
 
+import threading as _threading
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -23,20 +24,91 @@ def _forget_reads(row: dict[str, Any]) -> None:
     row.pop("reads", None)
 
 
+def _copy(value: Any) -> Any:
+    """A detached copy of parsed JSON; several times cheaper than parsing or deepcopy."""
+    if type(value) is dict:
+        return {key: _copy(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_copy(item) for item in value]
+    return value
+
+
+# Parsed issues.json per state directory, keyed by the file version one stat shows. Shared by
+# every store instance in the process; an atomic replace gives a new inode, so it is seen next read.
+# The directory's identity, not its spelling, names the entry, so symlinked or relative roots share it.
+# Only readers use it: a locked write always parses the current file (_issue_snapshot).
+# Every value leaving the cache through a public method is copied (_copy), so no caller holds it.
+_RECORDS: dict[tuple[int, int], tuple[tuple[int, int, int, int], dict[str, Any]]] = {}
+_RECORDS_LOCK = _threading.Lock()
+_EMPTY = {"refreshed_at": None, "issues": {}}
+
+
+def _version(stat: Any) -> tuple[int, int, int, int]:
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _read_issue_file(path: Any) -> tuple[tuple[int, int, int, int], dict[str, Any]] | None:
+    """Parse the file and the version of exactly the bytes parsed (fstat of the open file)."""
+    try:
+        with path.open(encoding="utf-8") as stream:
+            version = _version(_state.os.fstat(stream.fileno()))
+            return version, _state.json.loads(stream.read())
+    except FileNotFoundError:
+        return None
+
+
 class IssueSnapshotMixin:
-    def _issue_snapshot(self) -> dict[str, Any]:
+    def _issue_record(self) -> dict[str, Any]:
+        """The parsed record of the current file version; shared, so callers must not mutate it."""
+        path = self.root / "issues.json"
         try:
-            return _state.json.loads((self.root / "issues.json").read_text(encoding="utf-8"))
+            directory = _state.os.stat(self.root)
         except FileNotFoundError:
-            return {"refreshed_at": None, "issues": {}}
+            return _EMPTY
+        key = (directory.st_dev, directory.st_ino)
+
+        def current() -> dict[str, Any] | None:
+            try:
+                version = _version(_state.os.stat(path))
+            except FileNotFoundError:
+                return _EMPTY
+            cached = _RECORDS.get(key)
+            return cached[1] if cached is not None and cached[0] == version else None
+
+        if (record := current()) is not None:
+            return record
+        # One parse per version: concurrent misses wait and reuse the first parse.
+        with _RECORDS_LOCK:
+            if (record := current()) is not None:
+                return record
+            read = _read_issue_file(path)
+            if read is None:
+                return _EMPTY
+            _RECORDS[key] = read
+            return read[1]
+
+    def _issue_view(self) -> dict[str, Any]:
+        """A detached copy of the cached record for read-only lookups."""
+        return _copy(self._issue_record())
+
+    def _issue_snapshot(self) -> dict[str, Any]:
+        """The current file, parsed now: the baseline of a read-modify-write under the state lock."""
+        read = _read_issue_file(self.root / "issues.json")
+        return _copy(_EMPTY) if read is None else read[1]
 
     def local_issues(self) -> list[dict[str, Any]]:
         """Read the last observed issue facts without contacting the tracker."""
-        return sorted(self._issue_snapshot()["issues"].values(), key=lambda row: row["number"])
+        rows = self._issue_record()["issues"].values()
+        return [_copy(row) for row in sorted(rows, key=lambda row: row["number"])]
 
     def github_outbox(self) -> list[dict[str, Any]]:
         """Read pending GitHub writes in their persisted delivery order."""
-        return self._issue_snapshot().get("outbox", [])
+        return _copy(self._issue_record().get("outbox", []))
+
+    def local_board_value(self, number: int, project: str, field: str) -> Any:
+        """The board value last recorded for an issue's card, copying only that value."""
+        row = self._issue_record()["issues"].get(str(number)) or {}
+        return _copy((row.get("board_values") or {}).get(project, {}).get(field))
 
     def drop_missing_github_issue(self, number: int) -> None:
         """Remove a confirmed missing issue and all its pending writes atomically."""
@@ -120,10 +192,10 @@ class IssueSnapshotMixin:
 
     def issues_observation(self) -> dict[str, Any]:
         """When the snapshot was last read and whether a later read failed."""
-        snapshot = self._issue_snapshot()
+        snapshot = self._issue_record()
         failure = snapshot.get("refresh_failure") or {}
-        return {"as_of": snapshot["refreshed_at"], "error": failure.get("error"),
-                "failed_at": failure.get("failed_at")}
+        return _copy({"as_of": snapshot["refreshed_at"], "error": failure.get("error"),
+                      "failed_at": failure.get("failed_at")})
 
     def record_issues_refresh_failure(self, error: str, failed_at: datetime) -> None:
         """Keep the last known facts and note that a later read failed."""
@@ -133,7 +205,7 @@ class IssueSnapshotMixin:
             self._write_json(self.root / "issues.json", snapshot)
 
     def issues_revision(self) -> int:
-        return self._issue_snapshot().get("revision", 0)
+        return _copy(self._issue_record().get("revision", 0))
 
     def _save_local_issue(self, snapshot: dict[str, Any], row: dict[str, Any]) -> None:
         snapshot["revision"] = snapshot.get("revision", 0) + 1
@@ -141,7 +213,7 @@ class IssueSnapshotMixin:
         self._write_json(self.root / "issues.json", snapshot)
 
     def issues_refresh_due(self, now: datetime) -> bool:
-        refreshed = self._issue_snapshot()["refreshed_at"]
+        refreshed = self._issue_record()["refreshed_at"]
         return refreshed is None or now - _state.datetime.fromisoformat(refreshed) >= _state.REFRESH_INTERVAL
 
     def update_local_issue(self, number: int, **fields: Any) -> None:
