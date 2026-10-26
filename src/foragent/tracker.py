@@ -424,8 +424,7 @@ class RecordingTracker:
 
     def board_value(self, n, project, field):
         """The value this repository last confirmed setting on the issue's card."""
-        row = next((row for row in self._context.store.local_issues() if row["number"] == n), {})
-        return (row.get("board_values") or {}).get(project, {}).get(field)
+        return self._context.store.local_board_value(n, project, field)
 
     def _record_pr(self, pr, head, base=None, *, merged=False):
         if (number := pr_issue_number(head)) is not None:
