@@ -122,8 +122,17 @@ def _command(root: Path, store: StateStore, title: str) -> tuple[str, list[str]]
     return "background", [claude, "--bg", "-n", title, SKILL]
 
 
-def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, now: datetime) -> str | None:
-    """Open one orchestrator if needed; return the screen used, or None."""
+def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, now: datetime,
+                        spacing: bool = True, why: list | None = None) -> str | None:
+    """Open one orchestrator if needed; return the screen used, or None.
+
+    ``spacing=False`` is the explicit planning-session call (``fa orch ensure``,
+    see ``orch_ensure.ensure_explicit``, which appends why it opened nothing to ``why``);
+    the gate's default path below is unchanged.
+    """
+    if not spacing:
+        from foragent.orch_ensure import ensure_explicit  # Late: orch_ensure imports this module.
+        return ensure_explicit(repo_root, store, config, now, why)
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
         return None
     if _alive(store, now) or not _approved_work(store):

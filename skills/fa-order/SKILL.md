@@ -277,5 +277,19 @@ published or updated issue in the result. Show the printed summary and one line 
 happens next ("the gate starts within 5 minutes; /fa shows results"), then run
 `fa order progress end`.
 
+After publishing, check the orchestrator. This session is the planning session (D76). It never becomes the orchestrator and never
+takes over its work; it only makes sure one runs and talks to it:
+- Run `fa orch alive --json`. If it prints `"alive": false`, run `fa orch ensure`. It
+  opens one orchestrator in the background and prints one line; when it opened nothing,
+  tell the user that line. If the orchestrator is already alive, do not start a second one.
+- Open the lane view beside this planning session with `fa gate watch --open`.
+- Send every request to the orchestrator twice: as a cross-session message to the
+  `orch: <project>` session (SendMessage) and with
+  `fa orch request --from planning --text "<request>"`, so it survives a restart.
+- While this session is open, renew `fa plan heartbeat` about every minute, so
+  questions reach this session by message instead of a push notification.
+- Show the open questions from `fa orch questions` and record answers with
+  `fa orch answer <id> --text "<answer>"`.
+
 Never add `approved` yourself outside `fa order publish`, never edit acceptance tests of
 issues that are already running, never merge.
