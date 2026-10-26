@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
+from foragent.orch_tick_outcome import step
 from foragent.state import Run
 
 if TYPE_CHECKING:
@@ -29,14 +30,17 @@ def runner_process_exists(number: int) -> bool:
 @contextmanager
 def tick_processes(store):
     """Unavailable routine evidence defers pruning without failing the tick."""
-    with processes.process_snapshot() as snapshot:
-        if snapshot.available:
-            store.prune_process_identities(inactive_only=True)
+    with ExitStack() as stack:
+        with step("process_snapshot"):
+            snapshot = stack.enter_context(processes.process_snapshot())
+            if snapshot.available:
+                store.prune_process_identities(inactive_only=True)
         try:
             yield snapshot
         finally:
             if snapshot.available:
-                store.prune_process_identities()
+                with step("process_prune"):
+                    store.prune_process_identities()
 
 
 def _stop_already_refused(ctx: TickContext, run: Run) -> bool:
