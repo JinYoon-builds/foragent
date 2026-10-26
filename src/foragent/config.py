@@ -88,6 +88,8 @@ class Config:
     profile: dict[str, Any] | None = None
     # Whether `fa report propose` may prepare upstream error reports; None means not asked yet (#419).
     upstream_reports: bool | None = None
+    # Order perspective seat -> executor (#414); unnamed seats use the built-in split.
+    perspectives: dict[str, str] = field(default_factory=dict)
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
