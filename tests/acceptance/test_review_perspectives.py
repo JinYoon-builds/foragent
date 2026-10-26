@@ -14,13 +14,14 @@ from test_risk_map import copy_history, entry, offline, risk_case
 from test_skills_autosync import isolated_home
 
 
-NAMES = ("security", "concurrency", "failure", "compatibility", "realism")
+NAMES = ("security", "concurrency", "failure", "compatibility", "realism", "docs")
 THEMES = (
     ("spoof", "tamper", "provenance"),
     ("race", "toctou", "stale"),
     ("down", "slow", "partial", "odd"),
     ("old data", "existing install", "old config"),
     ("real environment", "api", "fake"),
+    ("behaviour", "readme", "docs/**", "skills", "same pr"),
 )
 # Project overrides give prompt assertions distinct, known focus texts without
 # importing the missing API during collection or deriving the oracle from it.
@@ -92,7 +93,7 @@ def test_review_perspectives_defaults_have_exact_order_and_required_focus():
 def test_review_perspectives_project_appends_and_overrides_in_place(tmp_path):
     override = {"name": "security", "focus": "PROJECT-SECURITY: verify signed input provenance"}
     path = tmp_path / ".foragent.yml"
-    # Put the addition first in YAML: it must still follow all five defaults.
+    # Put the addition first in YAML: it must still follow all six defaults.
     path.write_text(yaml.safe_dump({
         "review_perspectives": [PROJECT, override], "review_reviewers": 3,
     }), encoding="utf-8")
@@ -104,7 +105,7 @@ def test_review_perspectives_project_appends_and_overrides_in_place(tmp_path):
     assert isinstance(effective, list)
     assert [item["name"] for item in effective] == [*NAMES, PROJECT["name"]]
     assert effective[0] == override
-    assert effective[1:5] == before[1:]
+    assert effective[1:len(NAMES)] == before[1:]
     assert effective[-1] == PROJECT
     assert list(module.DEFAULT_PERSPECTIVES) == before, "Project overrides must not mutate defaults"
     assert module.perspectives(Config()) == before, "Project settings must not leak into another project"
