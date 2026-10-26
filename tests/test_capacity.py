@@ -1,3 +1,4 @@
+from collections import namedtuple
 from datetime import UTC, datetime, timedelta
 import ctypes
 import json
@@ -7,6 +8,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import psutil
 
 from foragent import capacity, scheduler
 from foragent.config import Config
@@ -425,6 +427,140 @@ def test_machine_load_rebases_after_unreadable_sample_and_corrupt_state(monkeypa
     assert sample == ("warn", 0.5) and sample.swapins == 0
     (capacity.machine_root() / capacity.SENSOR_FILE).write_text("{broken")
     assert capacity.machine_load() == ("warn", 0.5)
+
+
+@pytest.mark.parametrize("field,expected", [("idle", 0.0), ("iowait", 0.0), ("steal", 1.0), ("system", 1.0)])
+def test_cpu_busy_accounts_for_cpu_time_categories(monkeypatch, field, expected):
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    times = namedtuple("CPUTimes", "user nice system idle iowait steal guest guest_nice")
+    initial = times(20, 0, 10, 70, 0, 0, 0, 0)
+    samples = iter([initial, initial._replace(**{field: getattr(initial, field) + 100})])
+    monkeypatch.setattr(psutil, "cpu_times", lambda: next(samples))
+    assert capacity.cpu_busy() is None
+    assert capacity.cpu_busy() == pytest.approx(expected)
+
+
+def test_cpu_busy_does_not_count_guest_time_twice(monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    times = namedtuple("CPUTimes", "user nice system idle iowait steal guest guest_nice")
+    samples = iter([times(20, 0, 10, 70, 0, 0, 0, 0), times(60, 10, 10, 120, 0, 0, 20, 5)])
+    monkeypatch.setattr(psutil, "cpu_times", lambda: next(samples))
+    assert capacity.cpu_busy() is None
+    assert capacity.cpu_busy() == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("next_times", [(20, 10, 70), (2, 1, 7), (100, 10, 60), (0, 10, 120)])
+def test_cpu_busy_rebases_when_window_has_no_progress_or_counters_reset(monkeypatch, next_times):
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    times = namedtuple("CPUTimes", "user system idle")
+    reset = times(*next_times)
+    samples = iter([times(20, 10, 70), reset, times(reset.user + 70, reset.system, reset.idle + 30)])
+    monkeypatch.setattr(psutil, "cpu_times", lambda: next(samples))
+    assert capacity.cpu_busy() is None
+    assert capacity.cpu_busy() is None
+    assert capacity.cpu_busy() == pytest.approx(0.7)
+
+
+@pytest.mark.parametrize("busy", [0.0, 0.7, 1.0])
+def test_cpu_busy_identical_counters_reuse_persisted_fraction(monkeypatch, busy):
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    times = namedtuple("CPUTimes", "user system idle")
+    baseline = times(120, 10, 170)
+    initial = times(baseline.user - 100 * busy, baseline.system, baseline.idle - 100 * (1 - busy))
+    samples = iter([initial, baseline, baseline, baseline])
+    monkeypatch.setattr(psutil, "cpu_times", lambda: next(samples))
+    assert capacity.cpu_busy() is None
+    assert capacity.cpu_busy() == pytest.approx(busy)
+    path = capacity.machine_root() / capacity.SENSOR_FILE
+    saved = json.loads(path.read_text())
+    assert saved["cpu_busy"] == pytest.approx(busy)
+    assert capacity.cpu_busy() == pytest.approx(busy)
+    assert capacity.cpu_busy() == pytest.approx(busy)
+    assert json.loads(path.read_text()) == saved
+
+
+@pytest.mark.parametrize("field", ["user", "idle"])
+@pytest.mark.parametrize("has_fraction", [False, True])
+@pytest.mark.parametrize("offset", [0, 9_000_000])
+def test_cpu_busy_short_windows_accumulate_without_extreme_fractions(monkeypatch, field, has_fraction, offset):
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    times = namedtuple("CPUTimes", "user system idle")
+    baseline = times(offset + 90, 10, offset + 100)
+    initial = times(baseline.user - 70, baseline.system, baseline.idle - 30)
+    samples = iter([
+        *([initial] if has_fraction else []), baseline,
+        baseline._replace(**{field: getattr(baseline, field) + 0.01}),
+        times(baseline.user + 5, baseline.system, baseline.idle + 5),
+        times(baseline.user + 10, baseline.system, baseline.idle + 10),
+    ])
+    monkeypatch.setattr(psutil, "cpu_times", lambda: next(samples))
+    if has_fraction:
+        assert capacity.cpu_busy() is None
+    expected = pytest.approx(0.7) if has_fraction else None
+    assert capacity.cpu_busy() == expected
+    path = capacity.machine_root() / capacity.SENSOR_FILE
+    saved = json.loads(path.read_text())
+    # One tick and then 10 CPU-seconds are both below the 20-second minimum.
+    for _ in range(2):
+        assert capacity.cpu_busy() == expected
+        assert json.loads(path.read_text()) == saved
+    assert capacity.cpu_busy() == pytest.approx(0.5)
+    assert json.loads(path.read_text())["cpu_total"] == sum(baseline) + 20
+
+
+@pytest.mark.parametrize("explicit_env", [False, True])
+def test_cpu_busy_is_disabled_in_fresh_test_processes(explicit_env):
+    script = """
+import os
+import psutil
+from foragent import capacity
+assert os.environ["FORAGENT_CPU_BUSY"] == "off"
+def forbidden():
+    raise AssertionError("disabled sensor must not read host CPU counters")
+psutil.cpu_times = forbidden
+assert capacity.cpu_busy() is None
+"""
+    subprocess.run(
+        [sys.executable, "-c", script], check=True, capture_output=True, text=True,
+        env=dict(os.environ) if explicit_env else None,
+    )
+
+
+@pytest.mark.parametrize("error", [OSError, psutil.Error, NotImplementedError])
+def test_cpu_busy_unavailable_counter_is_unknown(monkeypatch, error):
+    def unavailable():
+        raise error("CPU counters unavailable")
+
+    monkeypatch.setattr(psutil, "cpu_times", unavailable)
+    assert capacity.cpu_busy() is None
+
+
+def test_machine_load_preserves_cpu_and_swapin_baselines_together(monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    times = namedtuple("CPUTimes", "user system idle")
+    samples, swapins = iter([times(20, 10, 70), times(60, 40, 100)]), iter([100, 125])
+    monkeypatch.setattr(psutil, "cpu_times", lambda: next(samples))
+    monkeypatch.setattr(capacity, "swapins_total", lambda: next(swapins))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    monkeypatch.setattr(capacity, "load_per_cpu", lambda: 2.0)
+    first, second = capacity.machine_load(), capacity.machine_load()
+    assert first == ("normal", 2.0) and first.swapins is None and first.cpu_busy is None
+    assert second == ("normal", pytest.approx(0.7 / 0.6))
+    assert second.swapins == 25 and second.load_average_per_cpu == 2.0
+    assert second.cpu_busy == pytest.approx(0.7)
+    saved = json.loads((capacity.machine_root() / capacity.SENSOR_FILE).read_text())
+    assert saved["swapins_total"] == 125
+
+
+@pytest.mark.parametrize("busy,expected", [(None, 0.4), (0.0, 0.0), (0.9, 0.4)])
+def test_machine_load_keeps_raw_load_as_the_upper_bound(monkeypatch, busy, expected):
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    monkeypatch.setattr(capacity, "swapins_total", lambda: 100)
+    monkeypatch.setattr(capacity, "load_per_cpu", lambda: 0.4)
+    monkeypatch.setattr(capacity, "cpu_busy", lambda: busy)
+    sample = capacity.machine_load()
+    assert sample == ("normal", expected)
+    assert sample.load_average_per_cpu == 0.4 and sample.cpu_busy == busy
 
 
 @pytest.mark.parametrize("budget", ["parallel", "test_slots"])
