@@ -1,0 +1,34 @@
+[project]
+name = "foragent"
+version = "0.1.0"
+description = "Your agent forages for the next task: an issue-queue scheduler for coding agents."
+readme = "README.md"
+authors = [
+    { name = "Jin.Yoon", email = "jin.yoon.builds@gmail.com" }
+]
+requires-python = ">=3.12"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+dependencies = [
+    "psutil>=7.1.0",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+foragent = "foragent.cli:main"
+fa = "foragent.cli:main"
+
+[build-system]
+requires = ["setuptools>=81"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "setup.py" }, { git = { commit = true } }]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+markers = ["local_only: requires machine tools or macOS integrations; run locally"]
