@@ -12,6 +12,7 @@ metadata:
 - A thread's `ExecutorStopped` (limit-wait) is re-raised after all threads join; nothing is saved so the round reruns.
 - Override: `<state>/review-reviewers.json`; CLI `fa orch reviewers <issue> <N>|--clear` is in `INBOX_ACTIONS` (no GitHub). Text in `messages/orch_reviewers.py`.
 - Unit tests in `tests/` that reuse acceptance helpers must `sys.path.insert` tests/acceptance and import the autouse fixtures by name (`offline` needs `isolated_home` from test_skills_autosync).
+- Repeated main-merge conflicts: the WIP commit snapshots the previously merged main. If `git diff <old-main> <WIP> -- file` is empty, take MERGE_HEAD's file whole (`git show MERGE_HEAD:file > file`); hand-resolve only files the branch changed (here commands/orch.py, run_prompts.py — keep both sides' additions).
 
 **Why:** design decisions from the issue text; kept for follow-ups (facts per perspective after #333).
 **How to apply:** extend the panel here, not in the single-review path.

@@ -22,6 +22,7 @@ from foragent import notify, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
+from foragent.orch_tick_outcome import step
 from foragent.state import StateStore
 
 SPAWN_SPACING = timedelta(minutes=2)
@@ -139,6 +140,8 @@ def deciding(ctx, acquired: bool = True):
     try:
         yield keep
     except Exception:
-        on_tick(ctx, SimpleNamespace(actions=[]))  # The tick's report is lost with the error.
+        with step("orchestrator_spawn"):
+            on_tick(ctx, SimpleNamespace(actions=[]))  # The tick's report is lost with the error.
         raise
-    on_tick(ctx, kept[-1] if kept else SimpleNamespace(actions=[]))
+    with step("orchestrator_spawn"):
+        on_tick(ctx, kept[-1] if kept else SimpleNamespace(actions=[]))
