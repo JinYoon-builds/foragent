@@ -146,34 +146,31 @@ def read_process_identity(pid: int) -> ProcessIdentity | None:
 
 
 def _same_dir(cwd: str | None, root: Path) -> bool:
+    """``cwd`` is ``root``. A missing, empty or relative path matches nothing:
+    resolving it would silently use this process's own directory instead."""
+    if not cwd or not Path(cwd).is_absolute():
+        return False
     try:
-        return cwd is not None and Path(cwd).resolve() == root.resolve()
+        return Path(cwd).resolve() == root.resolve()
     except OSError:
         return False
 
 
 def _cwd(process) -> str | None:
-    """Working directory, or None when it is unreadable or gone."""
+    """Absolute working directory, or None when it is unreadable, empty or gone."""
     try:
-        return process.cwd()
+        cwd = process.cwd()
     except (psutil.Error, OSError, SystemError):
         return None
-
-
-def _foragent_gate(argv) -> bool:
-    """argv of a Foragent gate command: ``fa gate ...`` or ``python -m foragent.cli gate ...``."""
-    return any((Path(part).name in {"fa", "foragent"} or part == "foragent.cli") and argv[index + 1] == "gate"
-               for index, part in enumerate(argv[:-1]))
+    return cwd if isinstance(cwd, str) and cwd and Path(cwd).is_absolute() else None
 
 
 def claude_session() -> dict | None:
     """``{pid, start_time}`` of the nearest Claude ancestor of this process, or None.
 
     A Claude Code session shows argv[0] ``claude`` and psutil name ``claude`` or
-    ``claude.exe``. The nearest such ancestor is the session, wherever it runs.
-    A Foragent gate command between them means the gate (its runner or its
-    checks) started this process, not that session: the Claude above it is the
-    gate's lane executor or the person's own session, so there is no session.
+    ``claude.exe``. The nearest such ancestor is the session, wherever it runs
+    and whatever lies between.
     """
     try:
         current = psutil.Process(os.getpid()).parent()
@@ -188,8 +185,6 @@ def claude_session() -> dict | None:
                 name = ""
             if (argv and Path(argv[0]).name == "claude") or name in {"claude", "claude.exe"}:
                 return {"pid": current.pid, "start_time": current.create_time()}
-            if _foragent_gate(argv):
-                return None
             current = current.parent()
     except (psutil.Error, OSError, SystemError):
         return None

@@ -95,7 +95,7 @@ class _Proc:
     def cwd(self):
         if isinstance(self._cwd, Exception):
             raise self._cwd
-        return str(self._cwd)
+        return "" if self._cwd is None else str(self._cwd)  # psutil reports a missing cwd as "".
 
     def name(self):
         return self._name
@@ -117,6 +117,10 @@ def test_orchestrator_process_needs_skill_argument_and_readable_repo_cwd(tmp_pat
     rows = [_Proc(10, ["claude"], repo), _Proc(11, ["claude", "/fa-orchestrator"], psutil.AccessDenied(11)),
             _Proc(12, ["claude", "/fa-orchestrator"], tmp_path)]
     monkeypatch.setattr(psutil, "process_iter", lambda *a, **k: iter(rows))
+    assert not processes.orchestrator_process_alive(repo)
+    # A missing ("") or relative cwd must not resolve to the gate's own directory.
+    monkeypatch.chdir(repo)
+    rows += [_Proc(14, ["claude", "/fa-orchestrator"], None), _Proc(15, ["claude", "/fa-orchestrator"], ".")]
     assert not processes.orchestrator_process_alive(repo)
     rows.append(_Proc(13, ["claude", "/fa-orchestrator"], repo))
     assert processes.orchestrator_process_alive(repo)
@@ -165,17 +169,21 @@ def test_live_recorded_session_suppresses_spawn_and_notes_once_per_hour(tmp_path
     assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW + timedelta(hours=2)) == "background"
 
 
-def test_claude_session_stops_at_a_foragent_gate_between_watch_and_claude(tmp_path, monkeypatch):
+def test_claude_session_is_recorded_through_a_foragent_gate_between_watch_and_claude(tmp_path, monkeypatch):
     import psutil
 
     from foragent import processes
 
-    lane = _Proc(5, ["claude", "-p", "--agent", "fa-orch"], tmp_path, start=1.0)
+    claude = _Proc(5, ["claude", "--resume", "ID"], tmp_path, start=1.0)
     for gate_argv in (["/x/bin/python", "-m", "foragent.cli", "gate", "check-done"], ["/x/bin/fa", "gate", "run-issue"]):
-        gate = _Proc(6, gate_argv, tmp_path, parent=lane)
-        pytest_proc = _Proc(7, ["python", "-m", "pytest"], tmp_path, parent=gate)
-        monkeypatch.setattr(psutil, "Process", lambda pid=None, me=pytest_proc: me)
-        assert processes.claude_session() is None
-    other = _Proc(6, ["/x/bin/fa", "orch", "watch", "--follow"], tmp_path, parent=lane)
-    monkeypatch.setattr(psutil, "Process", lambda pid=None: other)
-    assert processes.claude_session() == {"pid": 5, "start_time": 1.0}
+        gate = _Proc(6, gate_argv, tmp_path, parent=claude)
+        watch = _Proc(7, ["/x/bin/fa", "orch", "watch"], tmp_path, parent=gate)
+        monkeypatch.setattr(psutil, "Process", lambda pid=None, me=watch: me)
+        assert processes.claude_session() == {"pid": 5, "start_time": 1.0}
+
+
+def test_suite_hides_the_real_claude_session_running_pytest():
+    """conftest isolates the real ancestry, so tests never record the Claude running them."""
+    from foragent import processes
+
+    assert processes.claude_session() is None
