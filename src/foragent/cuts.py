@@ -7,8 +7,10 @@ under the issue's state folder, ``<state>/runs/issue-N/``.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
+import tempfile
 
 # How far a head cut may move back to end on a whole line.
 LINE_SLACK = 200
@@ -36,7 +38,11 @@ def save_full(directory: Path, name: str, text: str) -> Path:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     path = (directory / (re.sub(r"[^A-Za-z0-9._-]+", "-", name) or "text.txt")).absolute()
-    path.write_text(text, encoding="utf-8")
+    # Write the replacement first, then swap it in: a reader never sees a missing or half copy.
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, prefix=f".{path.name}.",
+                                     delete=False) as stream:
+        stream.write(text)
+    os.replace(stream.name, path)
     return path
 
 

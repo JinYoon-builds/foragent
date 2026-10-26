@@ -330,13 +330,24 @@ def _acceptance_matches(
     return not mismatches
 
 
+def _invocation_keys(checks: list[CheckResult]) -> list[str]:
+    """One key per invocation: the command and which run of that command it is, so duplicates stay apart."""
+    seen: dict[str, int] = {}
+    keys = []
+    for check in checks:
+        seen[check.command] = seen.get(check.command, -1) + 1
+        keys.append(f"{seen[check.command]}:{check.command}")
+    return keys
+
+
 def save_failures(state_root: Path, n: int, checks: list[CheckResult], *, complete: bool = True) -> WholeFailure:
     """Update the saved failure bundle the next attempt reads, and return what this call found failing.
 
-    A complete verification (every command ran) replaces the bundle; all passing clears it.
-    A partial one (timeout, budget, exception) updates only the commands it ran: a failure
-    replaces that command's entry, a pass removes it, and commands it never reached keep
-    their earlier failures. Nothing is deleted before its replacement is known.
+    Results are kept per invocation, not per command text: a passing duplicate never hides
+    another invocation's failure. A complete verification (every invocation ran) replaces
+    the bundle; all passing clears it. A partial one (timeout, budget, exception) updates only
+    the invocations it ran, and the others keep their earlier failures. The new bundle is
+    written before it replaces the old one.
     """
     def block(check: CheckResult) -> str:
         return f"Command: {check.command}\n{check.output}" + ("\nCheck timed out." if check.timed_out else "")
@@ -350,18 +361,19 @@ def save_failures(state_root: Path, n: int, checks: list[CheckResult], *, comple
             entries = {str(key): str(value) for key, value in saved.items()} if isinstance(saved, dict) else {}
         except (OSError, ValueError):
             entries = {}
-    found = [check for check in checks if check.exit_code != 0 or check.timed_out]
-    for check in checks:
-        entries.pop(check.command, None)
-        if check in found:
-            entries[check.command] = block(check)
-    if not entries:
+    failed = []
+    for key, check in zip(_invocation_keys(checks), checks):
+        entries.pop(key, None)
+        if check.exit_code != 0 or check.timed_out:
+            entries[key] = block(check)
+            failed.append(check)
+    if entries:
+        cuts.save_full(path.parent, index.name, json.dumps(entries))
+        cuts.save_full(path.parent, path.name, "\n\n".join(entries.values()))
+    elif complete or checks:
         path.unlink(missing_ok=True)
         index.unlink(missing_ok=True)
-        return WholeFailure("")
-    cuts.save_full(path.parent, path.name, "\n\n".join(entries.values()))
-    cuts.save_full(path.parent, index.name, json.dumps(entries))
-    return WholeFailure("\n\n".join(block(check) for check in found))
+    return WholeFailure("\n\n".join(block(check) for check in failed))
 
 
 def _keep_gathered(state_root: Path, n: int, checks: list[CheckResult]) -> None:
@@ -452,8 +464,10 @@ def _verify_contents(attempt: Implementation) -> str:
         attempt.paths = git.changed_paths(attempt.start_ref)
         checked_tree = git.staged_tree_sha()
         if checked_tree != staged_tree:
+            # Save this pass before anything replaces it: if re-verification cannot finish,
+            # these failures still reach the next attempt.
+            save_failures(ctx.store.root, n, attempt.checks)
             if verification == 1:
-                save_failures(ctx.store.root, n, attempt.checks)
                 return "Done when commands modify tracked files"
             _append(log, "Done when changed staged contents; checking the final contents again.")
             staged_tree = checked_tree

@@ -252,3 +252,35 @@ def test_partial_verification_never_deletes_failures_it_did_not_rerun(tmp_path):
     # A complete verification that passes clears everything.
     save_failures(tmp_path, 1, [CheckResult("a", 0, False, ""), CheckResult("b", 0, False, "")])
     assert not path.exists()
+
+
+def test_duplicate_command_invocations_are_kept_apart(tmp_path):
+    """#420: a passing duplicate never erases another invocation's failure."""
+    from foragent.run_checks import CheckResult, save_failures
+
+    checks = [CheckResult("make check", 1, False, "first run broke"), CheckResult("make check", 0, False, "")]
+    bundle = save_failures(tmp_path, 1, checks)
+    assert "first run broke" in bundle
+    assert "first run broke" in cuts.failures_path(tmp_path, 1).read_text()
+    # A partial update where only the first invocation runs again and passes clears it, nothing else.
+    save_failures(tmp_path, 1, [CheckResult("other", 1, False, "other broke"),
+                                CheckResult("make check", 1, False, "second run broke")])
+    save_failures(tmp_path, 1, [CheckResult("other", 0, False, "")], complete=False)
+    assert "second run broke" in cuts.failures_path(tmp_path, 1).read_text()
+
+
+def test_save_full_replaces_atomically(tmp_path, monkeypatch):
+    """#420: the old copy stays whole until the new one is fully written."""
+    import os
+
+    path = cuts.save_full(tmp_path, "bundle.txt", "old")
+
+    def broken_replace(source, target):
+        raise OSError("interrupted")
+
+    monkeypatch.setattr(os, "replace", broken_replace)
+    try:
+        cuts.save_full(tmp_path, "bundle.txt", "new")
+    except OSError:
+        pass
+    assert path.read_text() == "old"

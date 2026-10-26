@@ -161,3 +161,44 @@ def test_exception_during_checks_keeps_the_failures_gathered_before_it(run_case,
     monkeypatch.setattr(runner, "_check", check)
     run_issue(1, c.ctx)
     assert "A failed output" in cuts.failures_path(c.store.root, 1).read_text()
+
+
+def test_duplicate_done_when_command_failure_is_not_hidden_by_a_later_pass(run_case, monkeypatch):
+    """#420: the same command listed twice, failing once, still fails verification."""
+    from foragent import runner
+    from foragent.run_checks import CheckResult
+    from runner_support import set_done_when
+
+    c = run_case
+    set_done_when(c, ["check-same", "check-same"])
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    runs = []
+
+    def check(command, *args, **kwargs):
+        runs.append(command)
+        return CheckResult(command, 1 if len(runs) == 1 else 0, False, "first invocation broke")
+
+    monkeypatch.setattr(runner, "_check", check)
+    assert run_issue(1, c.ctx) != "merged"
+
+
+def test_reverification_interruption_keeps_first_pass_failures(run_case, monkeypatch):
+    """#420: checks change tracked files, the second pass cannot launch; first-pass failures survive."""
+    from foragent import cuts, runner
+    from foragent.run_checks import CheckResult
+    from runner_support import set_done_when
+
+    c = run_case
+    set_done_when(c, ["check-a"])
+    passes = []
+
+    def check(command, worktree, *args, **kwargs):
+        passes.append(command)
+        if len(passes) == 1:
+            (Path(worktree) / f"generated-{len(passes)}.txt").write_text("changed by the check")
+            return CheckResult(command, 1, False, "first pass broke")
+        raise OSError("second pass cannot launch")
+
+    monkeypatch.setattr(runner, "_check", check)
+    run_issue(1, c.ctx)
+    assert "first pass broke" in cuts.failures_path(c.store.root, 1).read_text()
