@@ -14,9 +14,13 @@ from types import ModuleType
 
 
 def discover() -> list[ModuleType]:
-    """Every group module on this package's current __path__, in help order."""
+    """Every group module on this package's current __path__, in help order.
+
+    Modules whose name starts with an underscore are helpers of a group, not groups.
+    """
     found = [importlib.import_module(info.name)
-             for info in pkgutil.iter_modules(__path__, __name__ + ".") if not info.ispkg]
+             for info in pkgutil.iter_modules(__path__, __name__ + ".")
+             if not info.ispkg and not info.name.rsplit(".", 1)[-1].startswith("_")]
     return sorted(found, key=lambda module: (module.ORDER, module.__name__))
 
 
