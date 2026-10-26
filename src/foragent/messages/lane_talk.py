@@ -12,6 +12,8 @@ MESSAGES = {
         "talk_no_handle": "Terminal gives no handle, so stall checks keep running.",
         "talk_manual": "No terminal opener found; run: {command}",
         "talk_ended": "#{n} talk terminal closed; stall clock restarted",
+        "talk_run_changed": "#{n} started a new run while the terminal opened; run fa lanes talk {n} again.",
+        "talk_record_unreadable": "Cannot read the talk record of #{n} ({path}); close its terminal, delete the file, then retry.",
     },
     "ko": {
         "talk_no_session": "#{n}에는 아직 대화할 세션 기록이 없어요.",
@@ -24,5 +26,7 @@ MESSAGES = {
         "talk_no_handle": "Terminal은 핸들을 주지 않아서 정지 검사는 계속돼요.",
         "talk_manual": "터미널을 열 수 없어요. 직접 실행하세요: {command}",
         "talk_ended": "#{n} 대화 터미널이 닫혀 정지 시계를 다시 시작했어요",
+        "talk_run_changed": "터미널을 여는 동안 #{n}이 새 실행을 시작했어요. fa lanes talk {n}을 다시 실행하세요.",
+        "talk_record_unreadable": "#{n}의 대화 기록을 읽을 수 없어요({path}). 그 터미널을 닫고 파일을 지운 뒤 다시 실행하세요.",
     },
 }

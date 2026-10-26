@@ -122,14 +122,16 @@ def _available_executor(
     full_prompt = kwargs["prompt"]
 
     def record_session(identity: str) -> None:
-        current = ctx.store.get_run(n)
-        if current.session_id == identity and current.session_executor == ctx.config.executor:
-            return
-        ctx.store.update_run(
-            n, session_id=identity, session_executor=ctx.config.executor,
-            session_ids=[*current.session_ids, *([identity] if identity not in current.session_ids else [])],
-            session_body=session_body,
-        )
+        # The talk lock: `fa lanes talk` reads the session and sends to it under the same lock.
+        with ctx.store.talk_lock(n):
+            current = ctx.store.get_run(n)
+            if current.session_id == identity and current.session_executor == ctx.config.executor:
+                return
+            ctx.store.update_run(
+                n, session_id=identity, session_executor=ctx.config.executor,
+                session_ids=[*current.session_ids, *([identity] if identity not in current.session_ids else [])],
+                session_body=session_body,
+            )
 
     live = record_session if session_body is not None and not reviewer else None
 
@@ -191,13 +193,14 @@ def _available_executor(
             identity = result.session_id or session_id
             reason = (f"Executor exit_code={result.exit_code}, timed_out={result.timed_out}\n"
                       f"{result.last_message}\n{result.log_tail}" if result.exit_code != 0 or result.timed_out else "")
-            run = ctx.store.update_run(
-                n, session_id=identity, session_executor=ctx.config.executor,
-                session_ids=[*run.session_ids, *([identity] if identity is not None else [])],
-                session_body=(session_body if result.session_id is not None or (
-                    result.exit_code == 0 and not result.timed_out
-                ) else run.session_body), resume_reason=reason,
-            )
+            with ctx.store.talk_lock(n):  # A session change never interleaves with a talk's send.
+                run = ctx.store.update_run(
+                    n, session_id=identity, session_executor=ctx.config.executor,
+                    session_ids=[*run.session_ids, *([identity] if identity is not None else [])],
+                    session_body=(session_body if result.session_id is not None or (
+                        result.exit_code == 0 and not result.timed_out
+                    ) else run.session_body), resume_reason=reason,
+                )
             if reason:
                 resume_prompt = (resume_prompt or "") + "\n\n" + reason
         if kind == "normal":

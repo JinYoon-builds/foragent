@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from foragent.state_records import Run
+from foragent.state_talk import _talk_ended
 
 
 # Updates passing any of these change or attest process ownership, so they
@@ -117,59 +118,6 @@ class RunRecordsMixin:
             self._write_run(updated)
             return updated
 
-    def add_waited(self, number: int, seconds: float, **fields: Any) -> Run:
-        """Add ``seconds`` (negative corrects an advance credit) to ``waited_seconds`` under the state lock.
-
-        Increments keep every concurrent credit: the runner's waits and the tick's talk credit.
-        """
-        with self._state_lock():
-            run = self.get_run(number)
-            if run is None:
-                raise KeyError(number)
-            if run.status == "finished":
-                return run
-            updated = _state.replace(run, waited_seconds=run.waited_seconds + seconds, **fields)
-            self._write_run(updated)
-            return updated
-
-    def begin_talk(self, number: int, started_at: str, now: datetime) -> Run | None:
-        """Mark the run ``started_at`` as talking before its terminal opens; None if it is no longer running."""
-        with self._state_lock():
-            run = self.get_run(number)
-            if run is None or run.status != "running" or run.started_at != started_at:
-                return None
-            if run.talking:
-                return run
-            updated = _state.replace(run, talking=True, talking_since=now.isoformat())
-            self._write_run(updated)
-            return updated
-
-    def publish_talk(self, number: int, started_at: str, status: str, record: dict) -> bool:
-        """Save a talk terminal record only while the run is still the same run in the same state."""
-        with self._state_lock():
-            run = self.get_run(number)
-            if run is None or run.started_at != started_at or run.status != status:
-                return False
-            if status == "running" and not run.talking:
-                return False  # The talk already ended (or never began); nothing may pause.
-            self._write_json(self.root / "talk" / f"{number}.json", record)
-            return True
-
-    def end_talk(self, number: int, now: datetime, *, restart_stall: bool = True) -> Run | None:
-        """End a talk: credit its paused time, drop its record and, if asked, restart the stall clock at ``now``."""
-        with self._state_lock():
-            run = self.get_run(number)
-            if run is None or run.status == "finished" or not run.talking:
-                return run
-            fields = {"last_progress_at": now.isoformat()} if restart_stall else {}
-            updated = _state.replace(
-                run, talking=False, talking_since=None,
-                waited_seconds=run.waited_seconds + run.talk_pause_seconds(now), **fields,
-            )
-            self._write_run(updated)
-            (self.root / "talk" / f"{number}.json").unlink(missing_ok=True)
-            return updated
-
     def get_run(self, number: int) -> Run | None:
         try:
             value = (self.root / "runs" / f"{number}.json").read_text(encoding="utf-8")
@@ -274,9 +222,10 @@ class RunRecordsMixin:
                 detail = " ".join(run.detail.split())[:500] or f"Run finished with outcome {outcome}."
             from foragent.processes import observe_tree
 
-            finished = _state.replace(run, status="finished", outcome=outcome, detail=detail,
-                                      process_identities=observe_tree(run.process_identities),
-                                      talking=False, talking_since=None)
+            # An open talk ends with the run, credited like any other ending.
+            finished = _state.replace(_talk_ended(run, self._now(), restart_stall=False),
+                                      status="finished", outcome=outcome, detail=detail,
+                                      process_identities=observe_tree(run.process_identities))
             # A live-log record belongs to the running run only; publish_talk will not recreate it.
             (self.root / "talk" / f"{number}.json").unlink(missing_ok=True)
             history_path = self.root / "runs.jsonl"

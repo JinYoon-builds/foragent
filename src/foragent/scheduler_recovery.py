@@ -46,8 +46,12 @@ def _remove_run_worktree(
 
 def _kill_run(
     ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
-    count_stall: bool = False, detail: str = "",
+    count_stall: bool = False, detail: str = "", unless_talking: bool = False,
 ) -> bool:
+    """Stop a run; ``unless_talking`` (runtime and stall stops) re-reads talk under its lock first."""
+    if unless_talking:
+        with scheduler.lane_talk.unless_talking(ctx.store, number) as may_stop:
+            return may_stop and _kill_run(ctx, number, report, outcome=outcome, count_stall=count_stall, detail=detail)
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
         return False
@@ -230,7 +234,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
             runtime = (ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
-                if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit."):
+                if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit.", unless_talking=True):
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
             elif run.pid is not None and not waiting and ctx.now() - scheduler.datetime.fromisoformat(
@@ -239,7 +243,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 restarts = run.restarts + 1
                 outcome = "stalled-restart" if restarts <= 1 else "stalled"
                 if scheduler._kill_run(ctx, run.number, report, outcome=outcome, count_stall=True,
-                          detail="Runner stopped making progress past the stall limit."):
+                          detail="Runner stopped making progress past the stall limit.", unless_talking=True):
                     scheduler._restore_stalled(ctx, run.number, restarts, report)
             continue
         # Clean up a crashed group or finish an interrupted stall termination.

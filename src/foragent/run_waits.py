@@ -63,19 +63,19 @@ def _test_slot(n: int, ctx: RunContext):
     waited = False
     credited = 0.0
 
-    def credit() -> datetime:
+    def credit(**span) -> datetime:
         nonlocal credited
         now = ctx.now()
         total = max(0.0, (now - started).total_seconds())
         # Increments, so a talk credit written meanwhile by the tick is kept.
-        ctx.store.add_waited(n, total - credited, last_progress_at=now.astimezone(UTC).isoformat())
+        ctx.store.add_waited(n, total - credited, last_progress_at=now.astimezone(UTC).isoformat(), **span)
         credited = total
         return now
 
     def waiting() -> None:
         nonlocal waited
         waited = True
-        now = credit()
+        now = credit(wait="open", now=started)  # The queue began at ``started``.
         # Tick reads a future waiting_until as alive; refresh it while queued.
         ctx.store.update_run(n, waiting_until=(now + timedelta(seconds=60)).astimezone(UTC).isoformat())
 
@@ -84,7 +84,7 @@ def _test_slot(n: int, ctx: RunContext):
             stack.enter_context(capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting))
         finally:
             if waited:
-                credit()
+                credit(wait="close", now=ctx.now())
                 ctx.store.update_run(n, waiting_until=None)
         yield
 
@@ -112,7 +112,7 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
     started = ctx.now()
     started_mono = ctx.monotonic()
     ctx.store.add_waited(
-        n, seconds,
+        n, seconds, wait="open", now=started,
         executor_waited_seconds=run.executor_waited_seconds + seconds,
         waiting_until=(started + timedelta(seconds=seconds)).astimezone(UTC).isoformat(),
         last_progress_at=started.astimezone(UTC).isoformat(),
@@ -122,7 +122,7 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
     finally:
         elapsed = max(0, ctx.monotonic() - started_mono)
         ctx.store.add_waited(
-            n, elapsed - seconds,
+            n, elapsed - seconds, wait="close", now=ctx.now(),
             executor_waited_seconds=run.executor_waited_seconds + elapsed,
             waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
         )
@@ -141,12 +141,12 @@ def _credited_wait(n: int, ctx: RunContext, acquire: Callable[[], object]) -> No
         ctx.store.add_waited(n, total - credited, **fields)
         credited = total
 
-    def progress():
+    def progress(**span):
         now = ctx.now().astimezone(UTC)
-        credit(waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat())
+        credit(waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat(), **span)
 
-    progress()
+    progress(wait="open", now=ctx.now())
     try:
         runner.poll_executor(acquire, progress)
     finally:
-        credit(waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat())
+        credit(waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(), wait="close", now=ctx.now())

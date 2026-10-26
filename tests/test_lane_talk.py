@@ -2,12 +2,13 @@
 
 from datetime import UTC, datetime, timedelta
 import json
+import os
 from pathlib import Path
 import subprocess
 
 import pytest
 
-from foragent import lane_talk, lanes
+from foragent import lane_talk, lane_talk_open, lanes
 from foragent.config import Config
 from foragent.state import StateStore
 
@@ -24,7 +25,7 @@ class Terminals:
         if opener == "tmux":
             monkeypatch.setenv("TMUX", "socket")
         available = {"codex", "claude", opener}
-        monkeypatch.setattr(lane_talk.shutil, "which", lambda name: f"/bin/{name}" if name in available else None)
+        monkeypatch.setattr(lane_talk_open.shutil, "which", lambda name: f"/bin/{name}" if name in available else None)
         monkeypatch.setattr("foragent.orch_spawn.shutil.which",
                             lambda name: f"/bin/{name}" if name in available else None)
 
@@ -35,15 +36,22 @@ class Terminals:
             name = Path(argv[0]).name
             if name == "codex" and queue_fails:
                 raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
-            if not self.alive and argv[1:3] in (["terminal", "show"], ["select-window", "-t"], ["list-windows", "-a"]):
-                raise subprocess.CalledProcessError(1, argv)
-            stdout = {"orca": json.dumps({"handle": "term_1"}), "tmux": "@7\n"}.get(name, "")
+            probe = argv[1:3] == ["terminal", "show"] or "list-windows" in argv
+            if probe and self.alive == "timeout":
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+            if probe and not self.alive:
+                # Real Orca answers a closed terminal's handle with an ok:false envelope.
+                stale = {"id": "req-9", "ok": False, "error": {"code": "terminal_handle_stale"}}
+                raise subprocess.CalledProcessError(1, argv, output=json.dumps(stale) if name == "orca" else "")
+            # Real Orca wraps answers in {"id": <request id>, "ok": true, "result": {...}}.
+            envelope = {"id": "req-1", "ok": True, "result": {"terminal": {"handle": "term_1"}}}
+            stdout = {"orca": json.dumps(envelope), "tmux": "@7\n"}.get(name, "")
             return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
         monkeypatch.setattr(lane_talk.subprocess, "run", run)
 
     def opened(self):
-        return [argv for argv in self.calls if argv[1:3] == ["terminal", "create"] or argv[1:2] == ["new-window"]]
+        return [argv for argv in self.calls if argv[1:3] == ["terminal", "create"] or "new-window" in argv]
 
 
 @pytest.fixture
@@ -69,7 +77,7 @@ def config(**values):
 def test_failed_queue_exits_nonzero_keeps_log_open_and_records_nothing(store, tmp_path, monkeypatch):
     session(store, "codex")
     terminals = Terminals(monkeypatch, queue_fails=True)
-    with pytest.raises(lane_talk.TalkError):
+    with pytest.raises(lane_talk_open.TalkError):
         lanes.talk(1, message="hi", store=store, config=config(), repo_root=tmp_path)
     assert len(terminals.opened()) == 1
     assert ["--message", "hi"] == terminals.calls[-1][-2:]
@@ -111,7 +119,7 @@ def test_tmux_records_window_id_and_reshows_instead_of_opening_again(store, tmp_
     assert json.loads(lane_talk.talk_path(store, 1).read_text())["handle"] == "@7"
     line = lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
     assert "Showed" in line and len(terminals.opened()) == 1
-    assert ["/bin/tmux", "select-window", "-t", "@7"] in terminals.calls
+    assert ["/bin/tmux", "-S", "socket", "select-window", "-t", "@7"] in terminals.calls
 
 
 def test_terminal_app_has_no_handle_so_talking_stays_unset(store, tmp_path, monkeypatch):
@@ -157,7 +165,7 @@ def test_finishing_a_talking_run_clears_talk_state(store, tmp_path, monkeypatch)
 def test_running_talk_ignores_a_session_recorded_for_another_executor(store, tmp_path, monkeypatch):
     session(store, "claude")  # An earlier run's Claude session; the lane now runs Codex.
     terminals = Terminals(monkeypatch)
-    with pytest.raises(lane_talk.TalkError):
+    with pytest.raises(lane_talk_open.TalkError):
         lanes.talk(1, message="hi", store=store, config=config(), repo_root=tmp_path)
     assert terminals.calls == []
 
@@ -265,7 +273,7 @@ def test_tick_leaves_a_talk_alone_while_another_talk_command_holds_the_issue(sto
     terminals = Terminals(monkeypatch)
     lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
     terminals.alive = False
-    with lane_talk._issue_lock(store, 1):
+    with store.talk_lock(1):
         run, still_open = lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW)
     assert still_open and store.get_run(1).talking is True
     run, still_open = lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW)
@@ -293,7 +301,7 @@ def test_failed_queue_on_an_existing_talk_ends_it_and_drops_its_record(store, tm
     assert store.get_run(1).talking and lane_talk.talk_path(store, 1).exists()
     # Reused (alive) or replaced (closed) terminal, then the send fails.
     terminals = Terminals(monkeypatch, queue_fails=True, alive=alive)
-    with pytest.raises(lane_talk.TalkError):
+    with pytest.raises(lane_talk_open.TalkError):
         lanes.talk(1, message="hi", store=store, config=config(), repo_root=tmp_path)
     assert store.get_run(1).talking is False and not lane_talk.talk_path(store, 1).exists()
     assert len(terminals.opened()) == (0 if alive else 1)
@@ -357,3 +365,265 @@ def test_runner_extends_every_command_timeout_by_the_runs_pause(store, monkeypat
     monkeypatch.setattr("foragent.run_implementation.lane_config", lambda config, lane: config)
     assert runner.run_issue(1, ctx) == "merged"
     assert seen == [42.0]
+
+
+def test_a_talk_opening_between_the_ticks_read_and_its_stop_prevents_the_stop(store, monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import scheduler_recovery
+
+    stops = []
+    monkeypatch.setattr(scheduler_recovery, "_stop_run_processes",
+                        lambda ctx, run, report, **kw: stops.append(run.number) or "refused")
+    ctx, report = SimpleNamespace(store=store), SimpleNamespace(actions=[])
+    run = store.get_run(1)  # The tick's read: not talking.
+    assert run.talking is False
+    store.begin_talk(1, run.started_at, NOW)  # fa lanes talk opens before the stop acts.
+    assert scheduler_recovery._kill_run(ctx, 1, report, count_stall=True, unless_talking=True) is False
+    assert stops == [] and store.get_run(1).restarts == 0
+    store.end_talk(1, NOW)
+    with store.talk_lock(1):  # A talk command is opening right now.
+        assert scheduler_recovery._kill_run(ctx, 1, report, unless_talking=True) is False
+    assert stops == []
+    scheduler_recovery._kill_run(ctx, 1, report, unless_talking=True)  # No talk: the stop goes ahead.
+    assert stops == [1]
+
+
+def test_panel_reviewer_threads_get_the_runs_pause(store):
+    from concurrent.futures import ThreadPoolExecutor
+    import contextvars
+    import threading
+
+    from foragent import processes
+
+    class Process:
+        args = ["reviewer"]
+
+        def __init__(self):
+            self.waits = []
+
+        def wait(self, timeout=None):
+            self.waits.append(timeout)
+            if len(self.waits) == 1:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+    paused = iter([0.0, 90.0])
+
+    def review():
+        process = Process()
+        processes._wait_with_deadline(process, 10)  # Would time out without the pause.
+        return process.waits
+
+    with processes.extend_deadline(lambda: next(paused)):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            copied = pool.submit(contextvars.copy_context().run, review).result()
+        plain = []
+        thread = threading.Thread(target=lambda: plain.append(processes.current_pause()))
+        thread.start()
+        thread.join()
+    assert copied == [10, 90.0] and plain[0] is not None
+    assert processes.current_pause() is None  # The run's pause ends with the run.
+
+
+def test_tmux_talk_targets_its_own_server_socket_from_the_tick(store, tmp_path, monkeypatch):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch, opener="tmux")
+    monkeypatch.setenv("TMUX", "/tmp/custom-tmux-socket,4242,0")
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    create = terminals.opened()[0]
+    assert create[1:4] == ["-S", "/tmp/custom-tmux-socket", "new-window"]
+    assert json.loads(lane_talk.talk_path(store, 1).read_text())["socket"] == "/tmp/custom-tmux-socket"
+    monkeypatch.delenv("TMUX")  # The gate tick runs outside tmux.
+    run, still_open = lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW)
+    assert still_open
+    assert terminals.calls[-1][1:4] == ["-S", "/tmp/custom-tmux-socket", "list-windows"]
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)  # Re-show selects on that server.
+    assert terminals.calls[-1][1:4] == ["-S", "/tmp/custom-tmux-socket", "select-window"]
+
+
+def test_finishing_after_a_ten_minute_talk_credits_600_waited_seconds(tmp_path):
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    run = store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    store.begin_talk(1, run.started_at, NOW)
+    clock[0] = NOW + timedelta(minutes=10)
+    finished = store.finish_run(1, "merged")
+    assert finished.waited_seconds == 600 and finished.talking is False and finished.talking_since is None
+
+
+def test_orca_handle_comes_from_the_result_terminal_not_the_request_id(store, tmp_path, monkeypatch):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    assert json.loads(lane_talk.talk_path(store, 1).read_text())["handle"] == "term_1"
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)  # The same terminal is re-shown.
+    assert len(terminals.opened()) == 1
+    assert ["/bin/orca", "terminal", "show", "--terminal", "term_1", "--json"] in terminals.calls
+    assert lane_talk._orca_handle(json.dumps({"id": "req-1", "ok": False, "error": {"code": "x"}})) is None
+
+
+@pytest.mark.parametrize("opener", ["orca", "tmux"])
+def test_a_probe_that_cannot_answer_keeps_the_talk(store, tmp_path, monkeypatch, opener):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch, opener=opener)
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    terminals.alive = "timeout"
+    run, still_open = lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW)
+    assert still_open and store.get_run(1).talking is True and lane_talk.talk_path(store, 1).exists()
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)  # No duplicate beside a maybe-open one.
+    assert len(terminals.opened()) == 1
+    terminals.alive = False  # Confirmed closed: Orca's stale-handle code, or no tmux server on the socket.
+    run, still_open = lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW)
+    assert not still_open and store.get_run(1).talking is False
+
+
+def test_orca_error_other_than_a_stale_handle_is_not_a_closure(tmp_path, monkeypatch):
+    def run(argv, **kwargs):
+        raise subprocess.CalledProcessError(1, argv, output=json.dumps(
+            {"id": "req-2", "ok": False, "error": {"code": "runtime_unavailable"}}))
+
+    monkeypatch.setattr(lane_talk.subprocess, "run", run)
+    record = {"kind": "orca", "executable": "/bin/orca", "handle": "term_1"}
+    assert lane_talk._alive(record, tmp_path, show=False) is None
+
+
+def test_tmux_failure_while_its_server_listens_is_not_a_closure(tmp_path, monkeypatch):
+    import socket
+
+    path = Path("/tmp") / f"fa-talk-{os.getpid()}.sock"  # AF_UNIX paths must stay short.
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen(1)
+    try:
+        monkeypatch.setattr(lane_talk.subprocess, "run", lambda argv, **kw: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(1, argv)))
+        record = {"kind": "tmux", "executable": "/bin/tmux", "socket": str(path), "handle": "@7"}
+        assert lane_talk._alive(record, tmp_path, show=False) is None
+    finally:
+        server.close()
+        path.unlink()
+    assert lane_talk._alive(record, tmp_path, show=False) is False  # Socket gone: server gone.
+
+
+def test_queue_uses_the_session_recorded_while_the_terminal_opened(store, tmp_path, monkeypatch):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+
+    def during(argv):
+        if argv[1:3] == ["terminal", "create"]:  # The runner records the worker's new session now.
+            store.update_run(1, session_id="thread-2", session_executor="codex")
+
+    terminals.on_call = during
+    lanes.talk(1, message="hi", store=store, config=config(), repo_root=tmp_path)
+    queue = next(argv for argv in terminals.calls if Path(argv[0]).name == "codex")
+    assert queue[queue.index("--thread") + 1] == "thread-2"
+
+
+def test_runner_session_record_waits_for_an_open_talk_command(store, tmp_path):
+    import threading
+
+    from foragent import run_execution
+
+    assert "talk_lock" in __import__("inspect").getsource(run_execution._available_executor)
+    done = threading.Event()
+    with store.talk_lock(1):
+        def write():
+            with store.talk_lock(1):
+                done.set()
+
+        thread = threading.Thread(target=write)
+        thread.start()
+        assert not done.wait(0.3)  # A session write waits while a talk sends.
+    assert done.wait(2)
+    thread.join()
+
+
+@pytest.mark.parametrize("talk_ends_first", [True, False])
+def test_a_talk_overlapping_a_test_slot_wait_is_credited_once(tmp_path, monkeypatch, talk_ends_first):
+    from types import SimpleNamespace
+
+    from foragent import run_waits
+
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    run = store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    ctx = SimpleNamespace(store=store, now=lambda: clock[0], config=config(max_runtime_minutes=60))
+
+    @__import__("contextlib").contextmanager
+    def slot(slots, waiting):
+        waiting()  # Queued for 40 minutes while a person talks for the same 40 minutes.
+        store.begin_talk(1, run.started_at, clock[0])
+        clock[0] += timedelta(minutes=40)
+        if talk_ends_first:
+            store.end_talk(1, clock[0])
+        yield
+
+    monkeypatch.setattr(run_waits.capacity, "hold_test_slot", slot)
+    with run_waits._test_slot(1, ctx):
+        pass
+    store.end_talk(1, clock[0])
+    clock[0] += timedelta(minutes=20)  # 60 minutes passed; 40 of them were paused once.
+    assert store.get_run(1).waited_seconds == 40 * 60
+    assert run_waits._remaining(1, ctx) == 40 * 60
+
+
+def test_open_talk_and_open_wait_pause_the_live_budget_once(tmp_path):
+    from types import SimpleNamespace
+
+    from foragent import run_waits
+
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    run = store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    ctx = SimpleNamespace(store=store, now=lambda: clock[0], config=config(max_runtime_minutes=60))
+    store.add_waited(1, 600, wait="open", now=clock[0])  # An executor backoff credited up front.
+    store.begin_talk(1, run.started_at, clock[0])
+    clock[0] += timedelta(minutes=10)
+    assert run_waits._remaining(1, ctx) == 60 * 60  # Both open for 10 minutes: paused 10, not 20.
+
+
+def test_orca_show_failure_without_an_envelope_is_unknown_when_orca_cannot_list(tmp_path, monkeypatch):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv[1:3])
+        raise subprocess.CalledProcessError(1, argv, output="", stderr="Traceback: crashed")
+
+    monkeypatch.setattr(lane_talk.subprocess, "run", run)
+    record = {"kind": "orca", "executable": "/bin/orca", "handle": "term_1"}
+    assert lane_talk._alive(record, tmp_path, show=False) is None
+    assert calls == [["terminal", "show"], ["terminal", "list"]]
+
+
+@pytest.mark.parametrize("listed,expected", [(["term_1", "term_2"], True), (["term_2"], False)])
+def test_orca_show_failure_without_an_envelope_asks_the_terminal_list(tmp_path, monkeypatch, listed, expected):
+    def run(argv, **kwargs):
+        if argv[1:3] == ["terminal", "show"]:
+            raise subprocess.CalledProcessError(1, argv, output="", stderr="")
+        terminals = [{"handle": handle} for handle in listed]
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(
+            {"id": "req-3", "ok": True, "result": {"terminals": terminals}}), stderr="")
+
+    monkeypatch.setattr(lane_talk.subprocess, "run", run)
+    record = {"kind": "orca", "executable": "/bin/orca", "handle": "term_1"}
+    assert lane_talk._alive(record, tmp_path, show=False) is expected
+
+
+def test_orca_cli_killed_by_a_signal_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(lane_talk.subprocess, "run", lambda argv, **kw: (_ for _ in ()).throw(
+        subprocess.CalledProcessError(-9, argv)))
+    record = {"kind": "orca", "executable": "/bin/orca", "handle": "term_1"}
+    assert lane_talk._alive(record, tmp_path, show=False) is None
+
+
+@pytest.mark.parametrize("content", ["{not json", json.dumps({"kind": "orca"}), json.dumps([1])])
+def test_unreadable_talk_record_keeps_the_talk_and_opens_no_duplicate(store, tmp_path, monkeypatch, content):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    lane_talk.talk_path(store, 1).write_text(content, encoding="utf-8")
+    run, still_open = lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW)
+    assert still_open and store.get_run(1).talking is True
+    with pytest.raises(lane_talk_open.TalkError):
+        lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    assert len(terminals.opened()) == 1 and store.get_run(1).talking is True
