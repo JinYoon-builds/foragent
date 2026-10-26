@@ -121,9 +121,15 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
         )
     ]
     latest = max(comments, key=lambda c: (scheduler.datetime.fromisoformat(c.created_at), c.id), default=None)
-    if latest is None or ctx.now() - scheduler.datetime.fromisoformat(latest.created_at) <= scheduler.timedelta(
-        minutes=ctx.config.orchestrator_timeout_minutes,
-    ):
+    if latest is None:
+        return issue
+    # The runner's blocker comment can reach the local record after its run ends,
+    # so the clock starts at the later of the newest blocker and the newest run end.
+    since = max([scheduler.datetime.fromisoformat(latest.created_at)] + [
+        scheduler.datetime.fromisoformat(ended)
+        for (number, _), ended in ctx.store.finish_times().items() if number == issue.number
+    ])
+    if ctx.now() - since <= scheduler.timedelta(minutes=ctx.config.orchestrator_timeout_minutes):
         return issue
     ctx.tracker.add_labels(issue.number, [scheduler.NEEDS_HUMAN])
     scheduler.board.sync_status(ctx, issue, "Needs human")
@@ -142,15 +148,21 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
 def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
     issues = {issue.number: issue for issue in scheduler.local_issue_models(ctx.store) if issue.state == "open"}
     parents: set[int] = set()
+    rows = ctx.store.local_issues()
     prs = [scheduler.PullRequest(row["pr_number"], row["pr_head"], row["pr_base"], row["title"], row["body"])
-           for row in ctx.store.local_issues() if row["merged"] and row.get("pr_head") and row.get("pr_base")]
+           for row in rows if row["merged"] and row.get("pr_head") and row.get("pr_base")]
+    # The gate closes an order parent once its children are done (#411), possibly
+    # before its batch PR exists; finalization continues until that PR merged.
+    batch_merged = {row["number"] for row in rows
+                    if row["merged"] and row.get("pr_head") == f"foragent/batch-{row['number']}"}
+    closed_parents = {row["number"] for row in rows if row["state"] == "closed"} - batch_merged
     for pr in prs:
         child_match = scheduler.re.fullmatch(r"foragent/issue-(\d+)", pr.head)
         batch_match = scheduler.re.fullmatch(r"foragent/batch-(\d+)", pr.base)
         if child_match is None or batch_match is None:
             continue
         number, parent = int(child_match[1]), int(batch_match[1])
-        if parent in issues:
+        if parent in issues or parent in closed_parents:
             parents.add(parent)
         if number not in issues or ctx.tracker.parent_of(number) != parent:
             continue

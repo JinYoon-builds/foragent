@@ -342,35 +342,22 @@ def _verify_implementation(attempt: Implementation) -> str:
         return "The session made no changes."
     staged_tree = git.staged_tree_sha()
     for verification in range(2):
+        from foragent.run_implementation import follow_base
+        follow_base(attempt)
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                                  slot=_test_slot(n, ctx)))
             _progress(n, ctx)
-        # Filter from the captured baseline on every pass: a later base sync can
-        # restore an id that an earlier one removed, and it must be checked again.
-        baseline = attempt.baseline
-        if baseline and baseline.node_ids:
-            from foragent.run_baseline import surviving_baseline
-
-            baseline = surviving_baseline(
-                baseline, git, worktree,
-                lambda command, root: runner._check(command, root, log, 900, progress=lambda: _progress(n, ctx),
-                                                    slot=_test_slot(n, ctx)), log,
-                f"origin/{attempt.target_branch}")
-            if not baseline.node_ids and not baseline.unverifiable:
-                _append(log, "Acceptance baseline verification skipped (count=0): no baseline node ids remain")
-        if baseline and (baseline.node_ids or baseline.unverifiable):
-            from foragent.run_baseline import baseline_verification_command, protected_result
-
+        if attempt.baseline_emptied:
+            _append(log, "Acceptance baseline verification skipped (count=0): no protected node ids remain")
+        if attempt.baseline and attempt.baseline.node_ids:
             started = ctx.monotonic()
-            result = None
-            if baseline.node_ids:
-                result = runner._check(baseline_verification_command(baseline), worktree, log, 900,
-                                       progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
-            result = protected_result(baseline, result)
+            command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
+            result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
+                            slot=_test_slot(n, ctx))
             attempt.checks.append(result)
-            _append(log, f"Acceptance baseline verification count={len(baseline.node_ids)}, "
+            _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
             _progress(n, ctx)
             if not enabled(ctx, attempt.target_branch):

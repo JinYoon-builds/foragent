@@ -2,7 +2,8 @@
 
 The gate calls ``ensure_orchestrator`` every tick. It opens one Claude session
 running ``/fa-orchestrator`` only when approved work exists, no orchestrator
-renewed its heartbeat lately, and no spawn happened in the last two minutes.
+renewed its heartbeat lately, no recorded or gate-spawned orchestrator session
+is still running, and no spawn happened in the last two minutes.
 The session opens in the background: a new Orca tab without focus, a detached
 tmux window, or ``claude --bg`` without a screen. The lane view stays beside the
 planning session, so nothing here splits a pane or switches focus.
@@ -18,15 +19,18 @@ import shutil
 import subprocess
 from types import SimpleNamespace
 
-from foragent import notify, watch_open
+from foragent import notify, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
+from foragent.orch_events import append_event
 from foragent.orch_tick_outcome import step
 from foragent.state import StateStore
 
 SPAWN_SPACING = timedelta(minutes=2)
 SKILL = "/fa-orchestrator"
+# A live orchestrator without a fresh heartbeat is noted at most this often.
+SILENT_NOTE_SPACING = timedelta(hours=1)
 
 
 def _record_path(store: StateStore) -> Path:
@@ -38,12 +42,55 @@ def _alive(store: StateStore, now: datetime) -> bool:
     return last is not None and (now - last).total_seconds() <= ALIVE_SECONDS
 
 
+def _session_alive(store: StateStore, root: Path) -> bool:
+    """The heartbeat's recorded session, or a gate-spawned session, is still running.
+
+    The recorded session must match its PID and start time, so a reused PID is
+    not a live orchestrator. A plain Claude at the repository root (a planning
+    or lane session) carries no ``/fa-orchestrator`` argument and does not count.
+    """
+    session = store.heartbeat_session("orchestrator")
+    if session is not None and processes.recorded_identity_evidence(
+            session["pid"], session["start_time"], fresh=True).alive:
+        return True
+    return processes.orchestrator_process_alive(root, SKILL)
+
+
+def _note_silent(store: StateStore, now: datetime) -> None:
+    """Record one orch event per hour for a live orchestrator without a heartbeat."""
+    path = store.root / "orch-silent-note.json"
+    with store._state_lock():
+        try:
+            last = datetime.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["at"])
+            if now - last < SILENT_NOTE_SPACING:
+                return
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        store._write_json(path, {"at": now.isoformat()})
+    append_event(store, now, None, "orch-silent",
+                 "orchestrator alive without heartbeat; no second orchestrator opened")
+
+
 def _spaced(store: StateStore, now: datetime) -> bool:
     try:
         last = datetime.fromisoformat(json.loads(_record_path(store).read_text(encoding="utf-8"))["spawned_at"])
         return now - last < SPAWN_SPACING
     except (OSError, ValueError, KeyError, TypeError):
         return False
+
+
+def _record_session(store: StateStore, now: datetime, screen: str, pid) -> None:
+    """Add the launcher's PID and its start time to the spawn record, when known."""
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return
+    try:
+        row = processes.read_process_identity(pid)
+    except Exception:  # noqa: BLE001 - the identity is optional evidence
+        row = None
+    if row is None:
+        return
+    store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen,
+                                            "pid": pid, "start_time": row.start_time})
 
 
 def _approved_work(store: StateStore) -> bool:
@@ -75,11 +122,23 @@ def _command(root: Path, store: StateStore, title: str) -> tuple[str, list[str]]
     return "background", [claude, "--bg", "-n", title, SKILL]
 
 
-def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, now: datetime) -> str | None:
-    """Open one orchestrator if needed; return the screen used, or None."""
+def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, now: datetime,
+                        spacing: bool = True, why: list | None = None) -> str | None:
+    """Open one orchestrator if needed; return the screen used, or None.
+
+    ``spacing=False`` is the explicit planning-session call (``fa orch ensure``,
+    see ``orch_ensure.ensure_explicit``, which appends why it opened nothing to ``why``);
+    the gate's default path below is unchanged.
+    """
+    if not spacing:
+        from foragent.orch_ensure import ensure_explicit  # Late: orch_ensure imports this module.
+        return ensure_explicit(repo_root, store, config, now, why)
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
         return None
     if _alive(store, now) or not _approved_work(store):
+        return None
+    if _session_alive(store, repo_root.resolve()):
+        _note_silent(store, now)
         return None
     with watch_open._opening(store):  # Serialize with other openers in this state root.
         if _spaced(store, now):
@@ -93,10 +152,11 @@ def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, n
         # A failed or timed-out command may still open later, so it reserves the spacing too.
         store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen})
         try:
-            subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, check=True, timeout=10)
+            result = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, check=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return None
+        _record_session(store, now, screen, getattr(result, "pid", None))
     language = config.language
     notify.send(config, text("orch_spawn_title", language),
                 text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
@@ -119,7 +179,7 @@ def on_tick(ctx, report):
 
 @contextmanager
 def deciding(ctx, acquired: bool = True):
-    """Wrap a whole gate tick (inside its lock) so the spawn decision runs on every exit.
+    """Wrap a whole gate tick (inside its lock) so the stale-files scan and spawn decision run on every exit.
 
     The decision reads only local facts (heartbeats, active runs, approvals), so
     it does not depend on any tick step: a GitHub wait or a failed heartbeat,
@@ -140,8 +200,16 @@ def deciding(ctx, acquired: bool = True):
     try:
         yield keep
     except Exception:
+        try:  # Local facts only; a failed scan must not replace the tick's own error.
+            with step("stale_files"):
+                orch_stale_files.report(ctx)
+        except Exception:
+            pass
         with step("orchestrator_spawn"):
             on_tick(ctx, SimpleNamespace(actions=[]))  # The tick's report is lost with the error.
         raise
+    # Stale Files are facts for the orchestrator, so they are read before its spawn decision.
+    with step("stale_files"):
+        orch_stale_files.report(ctx)
     with step("orchestrator_spawn"):
         on_tick(ctx, kept[-1] if kept else SimpleNamespace(actions=[]))

@@ -5,7 +5,7 @@ Runtime dependencies resolve through foragent.watch to preserve its patch points
 
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 import json
 from typing import Any
 
@@ -14,7 +14,7 @@ from foragent.config import Config
 from foragent.labels import BLOCKED, NEEDS_HUMAN
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
-from foragent.watch_sections import progress
+from foragent.watch_sections import orch_panel, progress
 
 
 @dataclass
@@ -45,6 +45,10 @@ class Snapshot:
     eta_range: tuple[datetime, datetime] | None = None
     eta_basis: dict[str, int | None] = field(default_factory=dict)
     today: int = 0
+    # When each issue in ``done`` merged, from the local issue records; unknown times are absent.
+    merged_at: dict[int, datetime] = field(default_factory=dict)
+    # The orchestrator note, its age in seconds and the fresh `fa inspect` count (orch_panel.collect).
+    panel: dict[str, Any] = field(default_factory=dict)
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -137,6 +141,12 @@ def collect(
             continue
         if (issue := issues.get(number)) is not None:
             done.setdefault(run.lane, []).append(issue)
+    merged_at = {}
+    for issues_done in done.values():
+        for issue in issues_done:
+            at = progress._time(rows[issue.number].get("merged_at"))
+            if at is not None:  # Unseen merges are listed after the known times.
+                merged_at[issue.number] = at if at.tzinfo else at.replace(tzinfo=UTC)
     finished = [end for *_, end in progress.merged_work(store) if end <= now]
     recent = sum(now - progress.RATE_WINDOW <= end for end in finished)
     midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -158,4 +168,4 @@ def collect(
                                         else "blocked" if BLOCKED in labels else "working")
     return watch.Snapshot(status, done, order, completed, total, eta, watch.recent_events(store), now,
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
-                          worker_states, eta_range, basis, today)
+                          worker_states, eta_range, basis, today, merged_at, orch_panel.collect(store, now))

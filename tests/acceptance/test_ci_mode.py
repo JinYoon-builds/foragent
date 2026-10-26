@@ -548,6 +548,9 @@ def init_case(git_history, tmp_path, monkeypatch, *, private, readable=True):
         root, git=case.git, tracker=case.tracker, **kwargs))
 
     def no_question(prompt=""):
+        # #419 asks once about upstream reports; this test only forbids a checks-mode question.
+        if "upstream report" in prompt.lower():
+            return "n"
         pytest.fail(f"fa init must choose the checks mode without asking: {prompt!r}")
 
     monkeypatch.setattr("builtins.input", no_question)

@@ -57,6 +57,49 @@ def no_view_windows(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_real_ancestors(monkeypatch):
+    """Hide the real processes above pytest (#590).
+
+    `fa orch watch` records the nearest Claude ancestor. Under a gate check or a
+    person's Claude, that ancestor is the real session running pytest; tests
+    must not see it. Tests that need ancestors replace psutil.Process themselves.
+    """
+    import psutil
+
+    own = os.getpid()
+
+    class Isolated(psutil.Process):
+        def parent(self):
+            return None if self.pid == own else super().parent()
+
+        def parents(self):
+            return [] if self.pid == own else super().parents()
+
+    monkeypatch.setattr(psutil, "Process", Isolated)
+
+
+REAL_HOME = Path.home()
+
+
+@pytest.fixture(autouse=True)
+def no_real_installed_gates(monkeypatch):
+    """Status lists every gate on the machine (#366); never this machine's real gates.
+
+    Under the real HOME the list is empty; a test that isolates HOME discovers its own gates.
+    """
+    from foragent import gates
+
+    collect = gates.collect
+
+    def isolated(*args, **kwargs):
+        if Path.home() == REAL_HOME and kwargs.get("home") is None:
+            return []
+        return collect(*args, **kwargs)
+
+    monkeypatch.setattr(gates, "collect", isolated)
+
+
+@pytest.fixture(autouse=True)
 def no_release_lookup(monkeypatch):
     """Never ask GitHub for the latest release during the test suite (#417)."""
     monkeypatch.setenv("FORAGENT_UPDATE_CHECK", "off")

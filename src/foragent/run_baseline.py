@@ -45,8 +45,6 @@ class AcceptanceBaseline:
     # The configured or detected test command this baseline came from (#483);
     # a refresh reuses it so later edits to detected files cannot drop protection.
     test_command: str | None = None
-    # Ids pytest no longer selects without proof that they were deleted (#123).
-    unverifiable: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,7 +115,8 @@ def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str])
             [sys.executable, "-m", "foragent.run_baseline", json.dumps(request), str(lock.fileno())],
             pass_fds=(lock.fileno(),), stdin=subprocess.DEVNULL, stdout=stream, stderr=stream,
             start_new_session=True,
-            env={name: value for name, value in os.environ.items() if name != capacity.TEST_SLOT_ENV},
+            env={**{name: value for name, value in os.environ.items() if name != capacity.TEST_SLOT_ENV},
+                 "PYTHONDONTWRITEBYTECODE": "1"},
         )
     lock.close()
 
@@ -443,327 +442,78 @@ def _capture_baseline(
                 ctx.git.remove_worktree(worktree)
 
 
-def _base_moved(git, base_sha: str, target_ref: str) -> bool:
-    """Whether this tree merged target commits newer than the measured base.
+def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
+                          sha: str) -> tuple[set[str], set[str]]:
+    """(owned, missing) ids of ``previous`` on base ``sha``, by collection only (#123).
 
-    Any merged file can change collection (a root conftest.py, plugins or
-    configuration), so the decision follows history, not the changed paths.
-    Unknown history counts as moved: collection is then only extra work.
-    """
-    from foragent.git import GitError
-
-    heads = ["HEAD", *(["MERGE_HEAD"] if git.merge_in_progress() else [])]
-    try:
-        for head in heads:
-            common = git._call(["merge-base", head, target_ref]).strip()
-            if not git.is_ancestor(common, base_sha):
-                return True
-    except GitError:
-        return True
-    return False
-
-
-COLLECTION_CONFIG = {"conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}
-
-
-def _changed_paths(git, base_sha: str, target_ref: str) -> set[str] | None:
-    """Paths the merged target changed since the measured base; None when unknown."""
-    from foragent.git import GitError
-
-    heads = ["HEAD", *(["MERGE_HEAD"] if git.merge_in_progress() else [])]
-    try:
-        changed: set[str] = set()
-        for head in heads:
-            common = git._call(["merge-base", head, target_ref]).strip()
-            # NUL-separated: paths may contain spaces or newlines.
-            changed |= set(filter(None, git._call(["diff", "--name-only", "-z", base_sha, common]).split("\0")))
-        return changed
-    except GitError:
-        return None
-
-
-def _may_expand(node: str, changed: set[str] | None) -> bool:
-    """Whether a merged change could have parametrized this id or made it a class.
-
-    That takes its test file, a conftest.py on its path, or pytest
-    configuration; with unknown changes every id is checked.
-    """
-    if changed is None:
-        return True
-    file = _node_parts(node)[0]
-    if file in changed:
-        return True
-    parents = {"", *(Path(file).parents[index].as_posix() for index in range(len(Path(file).parents) - 1))}
-    for path in changed:
-        location = Path(path)
-        folder = "" if location.parent == Path(".") else location.parent.as_posix()
-        if location.name in COLLECTION_CONFIG and folder in parents:
-            return True
-    return False
-
-
-def _node_parts(node: str) -> tuple[str, tuple[str, ...], str | None]:
-    """(file, names, parameters) of a node id; parameters may contain `::` or `[`.
-
-    Function and class names never contain `[`, so the first `[` after the
-    file starts the parameter id, and only the part before it is hierarchy.
-    """
-    file, _, rest = node.partition("::")
-    names, bracket, parameters = rest.partition("[")
-    return file, tuple(names.split("::")) if names else (), (bracket + parameters) or None
-
-
-def _expansion_deselects(node: str, node_ids: tuple[str, ...]) -> list[str]:
-    """Deselect what a selector expands into beyond the exact id itself.
-
-    `file::f` also selects `file::f[...]` once f is parametrized, and
-    `file::X::...` once X is a class; an id with parameters selects exactly.
-    pytest deselects by prefix, so a prefix shared with another baseline id
-    is never used (one capture cannot hold both `f` and `f[x]`; this only guards).
-    """
-    if _node_parts(node)[2] is not None:
-        return []
-    prefixes = [node + "[", node + "::"]
-    if any(other != node and other.startswith(tuple(prefixes)) for other in node_ids):
-        return []
-    return [f"--deselect={prefix}" for prefix in prefixes]
-
-
-def _junit_records(report: Path) -> list[ET.Element] | None:
-    """testcase records of a JUnit report, or None when there is no usable report."""
-    try:
-        return list(ET.parse(report).iter("testcase"))
-    except (OSError, ET.ParseError):
-        return None
-
-
-def _collect(baseline: AcceptanceBaseline, worktree: Path, check: Callable[[str, Path], CheckResult],
-             report: Path, selectors: list[str]) -> tuple[int | None, list[ET.Element] | None]:
-    """(exit, JUnit records) of `<command> --collect-only <selectors>`; exit None on timeout."""
-    report.parent.mkdir(parents=True, exist_ok=True)
-    report.unlink(missing_ok=True)
-    result = check(f"{baseline.command} --collect-only -o junit_family=legacy --junit-prefix= "
-                   f"--junitxml={shlex.quote(str(report))} {shlex.join(selectors)}", worktree)
-    return (None if result.timed_out else result.exit_code), _junit_records(report)
-
-
-def _proven_absent(baseline: AcceptanceBaseline, worktree: Path, check: Callable[[str, Path], CheckResult],
-                   report: Path, node: str, controls: dict[str, bool] | None = None) -> bool:
-    """The one deletion rule: pytest's own selection shows this id is not collected.
-
-    `<command> --collect-only <id>` (its expansions deselected) must hold no
-    JUnit record — `--collect-only` JUnit records collection skips and errors
-    (importorskip, pytest_generate_tests, import failures), never items — and:
-
-    - exit 4 (not found) counts only when the same command collects the id's
-      directory normally (exit 0 or 5, no collection error record): a hook
-      raising UsageError also exits 4, and a sibling collection error exits 2;
-    - exit 5 (nothing selected) counts only when the id has expansions to
-      deselect and, without those deselects, the selector does select items
-      (exit 0): only expansions remain, and an exact `f` cannot coexist with
-      `f[...]`. A hook that deselects the test itself also exits 5 without them.
-
-    A missing file on disk, a skip, an error, a timeout, a missing report or
-    any other exit proves nothing, so the id stays protected. Files created
-    by session hooks exist when pytest collects, so they are found here.
-    """
-    deselect = _expansion_deselects(node, baseline.node_ids)
-    code, records = _collect(baseline, worktree, check, report, [node, *deselect])
-    if records != []:
-        return False
-    if code == 4:
-        controls = {} if controls is None else controls
-        # The directory itself proves nothing about the id; it only shows the
-        # command and its hooks collect normally.
-        directory = Path(_node_parts(node)[0]).parent
-        while directory != directory.parent and not (worktree / directory).is_dir():
-            directory = directory.parent
-        key = directory.as_posix()
-        if key not in controls:
-            control, records = _collect(baseline, worktree, check, report, [key])
-            # "Collects normally": a clean exit and no collection error anywhere
-            # in the directory (a sibling syntax error exits 2 with an error record).
-            controls[key] = control in (0, 5) and records is not None and not any(
-                case.find("error") is not None for case in records)
-        return controls[key]
-    if code == 5 and deselect:
-        return _collect(baseline, worktree, check, report, [node])[0] == 0
-    return False
-
-
-def _missing_ids(baseline: AcceptanceBaseline, worktree: Path,
-                 check: Callable[[str, Path], CheckResult], report: Path) -> tuple[set[str], set[str]]:
-    """(deleted, unverifiable) baseline ids whose selectors pytest no longer finds.
-
-    Collection runs the verification's own command and selectors, so every
-    project setting (conftest imports, hooks, --noconftest, -p, -I,
-    PYTHONPATH, python_files, terminal options) applies exactly as it does
-    there; nothing is added to the project's environment. pytest exits 4 when
-    a selector is not found. Groups that exit 4 are halved until single ids
-    remain; each is deleted only by `_proven_absent`, otherwise unverifiable.
-    """
-    statuses: dict[tuple[str, ...], int | None] = {}
-
-    def status(selectors: tuple[str, ...]) -> int | None:
-        if selectors not in statuses:
-            result = check(f"{baseline.command} --collect-only {shlex.join(selectors)}", worktree)
-            statuses[selectors] = None if result.timed_out else result.exit_code
-        return statuses[selectors]
-
-    def candidates(group: tuple[str, ...]) -> list[str]:
-        code = status(group)
-        if code != 4:
-            return []  # Selectable (or failing for another reason): verification decides.
-        if len(group) == 1:
-            return list(group)
-        middle = len(group) // 2
-        return candidates(group[:middle]) + candidates(group[middle:])
-
-    deleted: set[str] = set()
-    unverifiable: set[str] = set()
-    controls: dict[str, bool] = {}
-    for node in candidates(baseline.node_ids):
-        (deleted if _proven_absent(baseline, worktree, check, report, node, controls) else unverifiable).add(node)
-    return deleted, unverifiable
-
-
-def _replaced_ids(baseline: AcceptanceBaseline, worktree: Path, check: Callable[[str, Path], CheckResult],
-                 settled: set[str], changed: set[str] | None) -> set[str]:
-    """Ids whose selector now selects only new expansions (`f` became `f[...]` or a class).
-
-    Exit codes only, before anything runs: the bare selector collects items
-    (exit 0) and, with the id's own expansions deselected, nothing (exit 5).
-    An exact `f` cannot coexist with `f[...]`, and a hook that deselects the
-    test itself already exits 5 for the bare selector. Only ids a merged
-    change could expand are checked.
-    """
-    replaced = set()
-    for node in baseline.node_ids:
-        deselect = _expansion_deselects(node, baseline.node_ids)
-        if node in settled or not deselect or not _may_expand(node, changed):
-            continue
-        bare = check(f"{baseline.command} --collect-only {shlex.quote(node)}", worktree)
-        if bare.timed_out or bare.exit_code != 0:
-            continue
-        exact = check(f"{baseline.command} --collect-only {shlex.join([node, *deselect])}", worktree)
-        if not exact.timed_out and exact.exit_code == 5:
-            replaced.add(node)
-    return replaced
-
-
-def surviving_baseline(baseline: AcceptanceBaseline, git, worktree: Path,
-                       check: Callable[[str, Path], CheckResult], log: Path,
-                       target_ref: str) -> AcceptanceBaseline:
-    """Drop baseline node ids that the current tree provably no longer has (#123).
-
-    A base sync can rename or delete a locked test. Selecting its old id makes
-    pytest stop with "not found" and hides the tests that still exist. Check
-    the ids only when the tree merged target commits newer than the measured
-    base. Ids pytest cannot select without proof of deletion leave the run
-    (so the others are verified) but fail the verification as unverifiable.
-    """
-    if not baseline.node_ids or baseline.base_sha is None:
-        return baseline
-    # Ids measured on this tree's own base still exist unless the work removed them.
-    if not _base_moved(git, baseline.base_sha, target_ref):
-        return baseline
-    deleted, unverifiable = _missing_ids(baseline, worktree, check, log.with_name(log.name + ".collect.xml"))
-    replaced = _replaced_ids(baseline, worktree, check, deleted | unverifiable,
-                             _changed_paths(git, baseline.base_sha, target_ref))
-    for node in baseline.node_ids:
-        if node in replaced:
-            _append(log, f"Acceptance baseline dropped missing node id: {node} (only new parametrizations remain)")
-        elif node in deleted:
-            _append(log, f"Acceptance baseline dropped missing node id: {node}")
-        elif node in unverifiable:
-            _append(log, f"Acceptance baseline cannot select node id without proof it was deleted: {node}")
-    deleted |= replaced
-    kept = tuple(node for node in baseline.node_ids if node not in deleted | unverifiable)
-    if deleted:
-        _append(log, f"Acceptance baseline dropped {len(deleted)} missing node ids; {len(kept)} remain")
-    return replace(baseline, node_ids=kept,
-                   unverifiable=tuple(node for node in baseline.node_ids if node in unverifiable))
-
-
-def baseline_verification_command(baseline: AcceptanceBaseline) -> str:
-    """The verification command: the captured command with the protected ids.
-
-    After a base sync only ids with an exact test remain (see
-    `surviving_baseline`), and an exact `f` cannot also expand into `f[...]`
-    or a class of the same name, so the selectors run exactly those tests.
-    pytest's own exit status is the verdict.
-    """
-    return f"{baseline.command} {shlex.join(baseline.node_ids)}"
-
-
-def protected_result(baseline: AcceptanceBaseline, result: CheckResult | None) -> CheckResult | None:
-    """Fail the verification for ids that could neither run nor be proven deleted.
-
-    pytest's own failure always stands; `result` is None when no id ran.
-    """
-    if not baseline.unverifiable:
-        return result
-    note = ("Acceptance baseline tests could not be verified (not selectable, and no proof they were deleted): "
-            + " ".join(baseline.unverifiable))
-    if result is None:
-        return CheckResult("acceptance baseline", 1, False, note)
-    return replace(result, exit_code=result.exit_code or 1, output=result.output + "\n" + note)
-
-
-def follow_moved_base(n: int, ctx: RunContext, old: AcceptanceBaseline | None, target_sha: str,
-                      capture: Callable[[], AcceptanceBaseline | None]) -> AcceptanceBaseline | None:
-    """The protected set after a result-affecting base move (#483, #123).
-
-    Before recapturing, the old ids are checked on a checkout of the new base
-    with collection only, by the one deletion rule; deleted ids are logged.
-    When none remain the baseline is empty and nothing is executed. Otherwise
-    the new base is captured (#483) and an old id it no longer protects stays
-    protected while its test file is unchanged: main broke a test it did not
-    touch, and the branch must still pass it. An id whose test file changed
-    follows the new capture and is logged as leaving the protected set.
+    Runs locally on a checkout of ``sha`` with the new base's exclusions, the
+    capture time limit, the run budget and a machine test slot. One
+    ``--collect-only`` of all ids usually settles it; pytest exits 4 for a
+    selector it does not find, and only then are the ids halved to find which.
+    Any other outcome (a collection error, a timeout) raises AttemptFailure.
     """
     from foragent import runner
 
-    if old is None or not old.node_ids:
-        return capture()
     log = ctx.store.log_path(n)
-
-    def check(command: str, root: Path) -> CheckResult:
-        return runner._check(command, root, log, 900, progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
-
-    with tempfile.TemporaryDirectory(prefix="foragent-base-ids-") as directory:
+    excluded = _baseline_exclusions(ctx, sha, log)
+    owned = {node for node in previous.node_ids if node.split("::", 1)[0] in excluded}
+    selectable = tuple(node for node in previous.node_ids if node not in owned)
+    ignores = "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
+    missing: set[str] = set()
+    if not selectable:
+        return owned, missing
+    with tempfile.TemporaryDirectory(prefix="foragent-protected-") as directory:
         worktree = Path(directory) / "worktree"
-        ctx.git.add_detached_worktree(worktree, target_sha)
+        ctx.git.add_detached_worktree(worktree, sha)
         try:
-            deleted, unverifiable = _missing_ids(old, worktree, check, log.with_name(log.name + ".collect.xml"))
+            def exit_code(group: tuple[str, ...]) -> int:
+                remaining = runner._remaining(n, ctx)
+                if remaining <= 0:
+                    raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before collection")
+                result = runner._check(
+                    f"{previous.command} --collect-only {shlex.join(group)}{ignores}", worktree, log,
+                    _baseline_capture_limit(ctx, log, remaining), progress=lambda: _progress(n, ctx),
+                    slot=_test_slot(n, ctx))
+                _progress(n, ctx)
+                if result.timed_out or result.exit_code not in (0, 4):
+                    raise AttemptFailure(
+                        f"acceptance baseline unavailable: collecting the protected ids on {sha} failed "
+                        f"(exit_code={result.exit_code}, timed_out={result.timed_out})")
+                return result.exit_code
+
+            def find(group: tuple[str, ...]) -> None:
+                if exit_code(group) == 0:
+                    return
+                if len(group) == 1:
+                    missing.add(group[0])
+                    return
+                middle = len(group) // 2
+                find(group[:middle])
+                find(group[middle:])
+
+            find(selectable)
         finally:
             ctx.git.remove_worktree(worktree)
-    for node in old.node_ids:
-        if node in deleted:
-            _append(log, f"Acceptance baseline dropped missing node id: {node} (not collected on the new base)")
-        elif node in unverifiable:
-            _append(log, f"Acceptance baseline cannot select node id without proof it was deleted: {node}")
-    remaining = tuple(node for node in old.node_ids if node not in deleted)
-    if not remaining:
-        _append(log, "Acceptance baseline verification skipped (count=0): no baseline node ids remain")
-        return replace(old, node_ids=(), base_sha=target_sha, unverifiable=())
-    new = capture()
-    if new is None:
-        return None
-    excluded = set(new.excluded)
-    carried = []
-    for node in remaining:
-        file = _node_parts(node)[0]
-        if node in new.node_ids or file in excluded:
+    return owned, missing
+
+
+def log_dropped_ids(log: Path, previous: AcceptanceBaseline, protected: tuple[str, ...], owned: set[str],
+                    missing: set[str], new: AcceptanceBaseline | None, ci: bool) -> None:
+    """One audit line per id protected before a base sync and not after it (#123)."""
+    excluded = set(new.excluded) if new else set()
+    for node in previous.node_ids:
+        if node in protected:
             continue
-        unchanged = (old.base_sha is not None
-                     and ctx.git.blob_sha(old.base_sha, file) == ctx.git.blob_sha(target_sha, file) is not None)
-        if unchanged:
-            carried.append(node)
-            _append(log, f"Acceptance baseline keeps protecting {node}: its test is unchanged but fails on the new base")
+        if node in owned or node.split("::", 1)[0] in excluded:
+            reason = "owned by an open issue"
+        elif node in missing:
+            reason = "missing on the new base"
+        elif (not ci and new is not None and new.collected_ids is not None and node in new.collected_ids
+              and (new.failing_ids is None or node in new.failing_ids)):
+            reason = "failing on the new base"
         else:
-            _append(log, f"Acceptance baseline dropped node id {node}: its test changed and does not pass on the new base")
-    return replace(new, node_ids=(*new.node_ids, *carried)) if carried else new
+            reason = "no longer protected on the new base"
+        _append(log, f"Acceptance baseline dropped protected node id {node}: {reason}")
 
 
 if __name__ == "__main__":
