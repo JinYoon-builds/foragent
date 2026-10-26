@@ -12,3 +12,4 @@ metadata:
 - conftest blocks `git commit/checkout` in tests: build history with hash-object/mktree/commit-tree/update-ref.
 - Merge lesson (2026-10-26): a stalled-restart WIP commit can flatten an earlier main merge, so `git merge-base HEAD MERGE_HEAD` points at the old main and files the issue never touched conflict. Fix: `git diff <previous main> <WIP>` is exactly the issue's change; per conflicted file run `git merge-file -p <main> <previous main> <WIP>` (files outside that diff take main's copy). This leaves the index untouched. `.foragent/` is gone after a worktree recreate, so rewrite REBUTTAL/TRY.
 - main's `run_previous.py` (previous-attempt summary) had the same silent cuts (stop text, `-n50` commits, files list, review tail); they now use `cuts.tail`/`cuts.head_lines`.
+- `cuts.head` backs off to a line end only within `LINE_SLACK` (200) chars of the limit; an unbounded backoff kept 28 of 6000 chars for a long QUESTION.md line.

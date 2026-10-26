@@ -1,12 +1,15 @@
 """Bounded subprocesses and termination of recorded process trees."""
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import errno
+import fcntl
+import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -18,6 +21,17 @@ import threading
 import time
 
 import psutil
+
+from foragent.records import load_record
+
+
+# Child discovery delay is bounded by poll interval + max cache age <= 1.0 s.
+OBSERVER_POLL_INTERVAL = 0.5
+ROUTINE_SCAN_MAX_AGE = 0.5
+# Contention falls back to a direct scan at once: waiting would hold up the
+# observer's join before SIGTERM relay and stretch the discovery bound.
+ROUTINE_SCAN_LOCK_TIMEOUT = 0.0
+ROUTINE_SCAN_LOCK_RETRY_INTERVAL = 0.01
 
 
 _process_group_callback: ContextVar[Callable[[int | None], None] | None] = ContextVar(
@@ -262,20 +276,136 @@ def observe_routine_tree(identities=()) -> list[dict]:
     return [{"pid": pid, "start_time": start} for pid, start in known.items()]
 
 
-def observe_tree(identities=(), roots=()) -> list[dict]:
-    """Keep observed identities across reparenting; only verified parents add children.
-
-    roots are supplied only when Foragent records a newly launched process. A
-    missing or reused recorded identity is never re-anchored by its PID alone.
-    """
-    if not identities and not roots:
-        return []
+def _scan_tree_rows() -> tuple[dict[int, ProcessIdentity], dict[int, ProcessIdentity]]:
     observed = {row.pid: row for row in list_processes()}
     confirmed = {row.pid: row for row in list_processes()}
     # Enumeration is not atomic: a reused parent must not authorize its new
     # children from an earlier row in the same scan.
     rows = {pid: row for pid, row in observed.items() if pid in confirmed
             and (row.start_time, row.ppid) == (confirmed[pid].start_time, confirmed[pid].ppid)}
+    return rows, confirmed
+
+
+def _read_routine_rows(path: Path, max_age: float):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if (type(value["version"]) is not int or value["version"] != 1
+            or type(value["captured_at"]) not in (int, float)
+            # Monotonic time is system-wide and immune to wall-clock steps.
+            or not 0 <= time.monotonic() - value["captured_at"] <= max_age):
+        return None
+
+    def decode(records):
+        if not isinstance(records, list):
+            raise ValueError("Invalid process scan rows")
+        rows = {}
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("Invalid process scan identity")
+            row = load_record(ProcessIdentity, record)
+            if (any(type(getattr(row, name)) is not int for name in ("pid", "ppid", "pgid", "sid"))
+                    or type(row.start_time) not in (int, float) or not math.isfinite(row.start_time)
+                    or (row.uid is not None and type(row.uid) is not int)
+                    or (row.argv is not None and (not isinstance(row.argv, list)
+                                                 or any(not isinstance(arg, str) for arg in row.argv)))):
+                raise ValueError("Invalid process scan identity")
+            rows[row.pid] = ProcessIdentity(row.pid, row.ppid, row.pgid, row.sid, row.start_time,
+                                            None if row.argv is None else tuple(row.argv), row.uid)
+        return rows
+
+    return decode(value["rows"]), decode(value["confirmed"])
+
+
+@contextmanager
+def _routine_scan_lock(path: Path) -> Iterator[None]:
+    deadline = time.monotonic() + ROUTINE_SCAN_LOCK_TIMEOUT
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        while True:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(ROUTINE_SCAN_LOCK_RETRY_INTERVAL, remaining))
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def shared_routine_rows(max_age: float = ROUTINE_SCAN_MAX_AGE) -> tuple[dict[int, ProcessIdentity], dict[int, ProcessIdentity]]:
+    """Share one reconciled scan pair per interval, without caller-specific protection.
+
+    Return reconciled rows and the complete confirmed rows for lineage checks.
+    Cache failures use direct scans; stop and birth evidence never use this cache.
+    """
+    from foragent import capacity
+
+    cache_errors = (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError)
+    lock = ExitStack()
+    try:
+        try:
+            path = capacity.machine_root() / "process-scan.json"
+            cached = _read_routine_rows(path, max_age)
+            if cached is not None:
+                return cached
+            lock.enter_context(_routine_scan_lock(path.with_suffix(".lock")))
+            cached = _read_routine_rows(path, max_age)
+        except cache_errors:
+            path, cached = None, None
+        if cached is not None:
+            return cached
+
+        # Enumeration errors belong to the observer, never to cache fallback.
+        captured_at = time.monotonic()
+        rows, confirmed = _scan_tree_rows()
+        if path is None:
+            return rows, confirmed
+        temporary = None
+        try:
+            value = {"version": 1, "captured_at": captured_at}
+            for name, table in (("rows", rows), ("confirmed", confirmed)):
+                value[name] = [asdict(ProcessIdentity(
+                    row.pid, row.ppid, row.pgid, row.sid, row.start_time, row.argv, getattr(row, "uid", None),
+                )) for row in table.values()]
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                json.dump(value, stream)
+            os.replace(temporary, path)
+        except cache_errors:
+            pass  # The fresh rows remain usable when publication fails.
+        finally:
+            try:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return rows, confirmed
+    finally:
+        try:
+            lock.close()
+        except cache_errors:
+            pass
+
+
+def observe_tree(identities=(), roots=(), *, shared: bool = False) -> list[dict]:
+    """Keep observed identities across reparenting; only verified parents add children.
+
+    roots are supplied only when Foragent records a newly launched process. A
+    missing or reused recorded identity is never re-anchored by its PID alone.
+    Only the periodic child observer opts into shared routine rows.
+    """
+    if not identities and not roots:
+        return []
+    rows, confirmed = shared_routine_rows() if shared else _scan_tree_rows()
     lineage, group, session = _protected(confirmed)
 
     def safe(row):
@@ -283,19 +413,38 @@ def observe_tree(identities=(), roots=()) -> list[dict]:
                 and row.pgid not in lineage and row.sid not in lineage
                 and row.pgid != group and row.sid != session)
 
+    fresh_rows = {}
+
+    def fresh(row):
+        if not shared:
+            return True
+        if row.pid not in fresh_rows:
+            try:
+                fresh_rows[row.pid] = read_process_identity(row.pid)
+            except SystemError as exc:
+                if not _caused_by_permission_error(exc):
+                    raise
+                fresh_rows[row.pid] = None
+            except (OSError, psutil.Error):
+                fresh_rows[row.pid] = None
+        current = fresh_rows[row.pid]
+        return (current is not None
+                and (current.pid, current.start_time, current.ppid) == (row.pid, row.start_time, row.ppid))
+
     known = {}
     for item in identities:
         known.setdefault(item["pid"], item["start_time"])
     for pid in roots:
         # A runner can attest its own birth for a later gate to verify. It is
         # still excluded from traversal/signaling in its own current lineage.
-        if pid in rows and (safe(rows[pid]) or pid == os.getpid()):
+        if pid in rows and (safe(rows[pid]) or pid == os.getpid()) and fresh(rows[pid]):
             known[pid] = rows[pid].start_time
     live = {pid for pid, start in known.items()
             if pid in rows and rows[pid].start_time == start and safe(rows[pid])}
     while True:
         children = {row.pid for row in rows.values() if row.pid not in known
-                    and row.ppid in live and row.start_time >= rows[row.ppid].start_time and safe(row)}
+                    and row.ppid in live and row.start_time >= rows[row.ppid].start_time
+                    and safe(row) and fresh(row)}
         if not children:
             break
         for pid in children:
@@ -469,9 +618,9 @@ def run_logged(
             nonlocal identities
             try:
                 # The launch snapshot already anchors ownership. Keep witnessed
-                # children across reparenting without continuously scanning the host.
-                while not stop_tracking.wait(1):
-                    observed = observe_tree(identities)
+                # children across reparenting with shared machine-wide scan pairs.
+                while not stop_tracking.wait(OBSERVER_POLL_INTERVAL):
+                    observed = observe_tree(identities, shared=True)
                     if observed != identities:
                         identities = observed
                         if on_process_tree is not None:

@@ -147,3 +147,9 @@ def test_previous_attempt_records_name_what_their_limits_leave_out(tmp_path):
     kept = stop_path(tmp_path, 3).read_text()
     assert kept.startswith(f"[cut: {len(text) - STOP_LIMIT} more chars; full text: {saved}]")
     assert saved.read_text() == text
+
+
+def test_head_keeps_the_limit_when_no_line_end_is_near(tmp_path):
+    text = "short\n" + "z" * 1000
+    kept = cuts.head(text, 500, tmp_path, "long-line.txt")
+    assert kept.startswith("short\n" + "z" * 494) and f"[cut: {len(text) - 500} more chars;" in kept

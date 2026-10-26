@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -30,7 +31,13 @@ def test_question_stops_before_checks_and_is_truncated(run_case):
     comment = c.tracker.list_comments(1)[-1].body
     assert parse_reason(comment) == Reason.SPEC_QUESTION
     assert "Choose A or B; recommend A." in comment
-    assert comment.endswith("q" * 100) and len(comment.split("\n\n", 1)[1]) == 6000
+    # The 6000-character limit stays and names what it left out (#420).
+    details = comment.split("\n\n", 1)[1]
+    kept, notice = details.split("[cut: ", 1)
+    assert len(kept) == 6000 and kept.endswith("q" * 100)
+    assert notice.startswith(f"{len('Choose A or B; recommend A.') + 1 + 7000 - 6000} more chars; full text: ")
+    saved = Path(notice.split("full text: ", 1)[1].rstrip("]"))
+    assert saved.read_text().endswith("q" * 7000)
     assert not any(args[:1] == ["add"] for _, args in c.operations)
     assert c.tracker.created_prs == []
 

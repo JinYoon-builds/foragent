@@ -10,6 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 import re
 
+# How far a head cut may move back to end on a whole line.
+LINE_SLACK = 200
+
 
 def issue_dir(state_root: Path, n: int) -> Path:
     """Where an issue's full texts are saved."""
@@ -38,10 +41,14 @@ def save_full(directory: Path, name: str, text: str) -> Path:
 
 
 def head(text: str, limit: int, directory: Path | None, name: str) -> str:
-    """The first ``limit`` characters, cut at a line end when one exists, then the notice."""
+    """The first ``limit`` characters, then the notice.
+
+    The cut moves back to a line end only when one is near, so a long line
+    never shrinks what is kept far below the limit.
+    """
     if len(text) <= limit:
         return text
-    end = text.rfind("\n", 0, limit) + 1 or limit
+    end = text.rfind("\n", max(0, limit - LINE_SLACK), limit) + 1 or limit
     if directory is None:
         return text[:end]
     path = save_full(directory, name, text)
