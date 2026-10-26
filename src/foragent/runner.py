@@ -265,15 +265,15 @@ def _implement_and_publish(
         if outcome != "merged":
             try:
                 run = ctx.store.get_run(n)
-                deferred = _preserve_failed_implementation(
+                status = _preserve_failed_implementation(
                     n, ctx, git, (run.outcome if run is not None else None) or outcome, approval=attempt.approval,
                     approved_ref=attempt.approved_ref, title=attempt.issue.title, pushed_head=attempt.pushed_head,
                     tracker_available=attempt.tracker_available, push_branch=lambda: _push_branch(attempt),
-                    defer_to_stop=True,
+                    defer_to_stop=True, strict=True,  # An unverifiable worktree is kept, never removed unsaved.
                 )
             except Exception as exc:
                 raise WipNotSaved(keep_unsaved_work(n, ctx, git.root, exc)) from exc
-            if deferred:
+            if status == "deferred":
                 raise SaveDeferredToStop()
 
 

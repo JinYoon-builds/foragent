@@ -377,20 +377,25 @@ def stop_head(git: GitRepo, n: int) -> str | None:
         return None
 
 
-def stop_kept_work(git: GitRepo, run: Run) -> bool:
+def stop_kept_work(git: GitRepo, run: Run, saved: str | None) -> bool:
     """Positive evidence from Git that the stop kept its work under its why.
 
     Either the issue branch did not move since the intent (nothing was saved,
     because nothing was unsaved), or its newest commit names `stopped: <why>`.
     A recorded field alone is not evidence: a runner from before an upgrade
-    saves WIP without ever recording one.
+    saves WIP without ever recording one. The save itself must have been proven
+    under the request (`saved`, kept in the pending stop record so it survives the
+    run's own finish and the worktree's removal), since a skipped save leaves the
+    branch still.
     """
     if not run.stop_why:
         return False
-    head = stop_head(git, run.number)
-    if head == run.stop_head:
-        # Nothing new was saved; a WIP this run already made must still name the why.
+    if saved == "clean":
+        # A save under the request found nothing to save; an earlier WIP must still name the why.
         return run.wip_reason in {None, f"{STOPPED}: {run.stop_why}"}
+    if saved != "saved":
+        return False  # No save under the request was proven: an unchanged branch proves nothing.
+    head = stop_head(git, run.number)
     try:
         message = git._call(["log", "-1", "--format=%B", head]) if head else ""
     except GitError:
@@ -417,11 +422,14 @@ def _preserve_failed_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
     approved_ref: str = "HEAD", title: str | None = None, pushed_head: str | None = None,
     tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
-    defer_to_stop: bool = False, tree_exited: bool = False,
-) -> bool:
+    defer_to_stop: bool = False, tree_exited: bool = False, strict: bool = False,
+) -> str:
     """Save stopped work before cleanup, including after the runner has died.
 
-    Returns True when a runner (`defer_to_stop`) left the save to `fa orch stop`:
+    Returns how it ended: "saved" (a WIP commit), "clean" (nothing to save),
+    "absent" (no worktree), "unproven" (a directory that cannot be verified as
+    the worktree, so nothing about its files is known) or "deferred", when a
+    runner (`defer_to_stop`) left the save to `fa orch stop`:
     the stop saves only after the run's whole tree exited, so nothing a still
     running executor deletes afterwards is missing from the WIP. `tree_exited`
     marks such a save: the worktree is final, so its deletions are the run's own.
@@ -429,12 +437,16 @@ def _preserve_failed_implementation(
     with ctx.store.worktree_lock(n):
         # Recheck only after acquiring the lock: a competing cleanup may have
         # removed the worktree while we waited. A parent repository is no save.
-        if not (git.root / ".git").is_file():
-            return False
+        if not git.root.exists():
+            return "absent"
         try:
+            if not (git.root / ".git").is_file():
+                raise GitError(f"{git.root} is not a Git worktree")
             git.check_worktree()
-        except GitError:
-            return False
+        except GitError as exc:
+            if strict:  # Callers that delete the directory next must not lose files they could not see.
+                raise WorktreeUnverified(f"the worktree could not be verified, so its files are kept: {exc}") from exc
+            return "unproven"
         return _preserve_locked_implementation(
             n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
             pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
@@ -463,7 +475,7 @@ def begin_turn(ctx, n: int) -> None:
         run = ctx.store.get_run(n)
         if run is not None and run.stop_why:
             raise SaveDeferredToStop()  # No new executor after a stop request.
-        ctx.store.update_run(n, in_turn=True)
+        ctx.store.update_run(n, in_turn=True, turns=(run.turns if run is not None else 0) + 1)
 
 
 def end_turn(ctx, n: int, worktree: Path) -> None:
@@ -477,6 +489,10 @@ def end_turn(ctx, n: int, worktree: Path) -> None:
         if run is not None and run.stop_why:
             raise SaveDeferredToStop()
         _observe_locked(ctx, n, worktree, in_turn=False)
+
+
+class WorktreeUnverified(Exception):
+    """The directory could not be verified as the run's worktree; nothing proves its files were saved."""
 
 
 class ProvenanceUnavailable(Exception):
@@ -547,7 +563,7 @@ def _preserve_locked_implementation(
     approved_ref: str, title: str | None, pushed_head: str | None,
     tracker_available: bool, push_branch: Callable[[], None] | None, defer_to_stop: bool = False,
     tree_exited: bool = False,
-) -> bool:
+) -> str:
     branch = f"foragent/issue-{n}"
     run = ctx.store.get_run(n)
     git.local_skill_paths.update(run.local_skill_paths if run is not None else ())
@@ -565,7 +581,7 @@ def _preserve_locked_implementation(
         # recorded during staging still counts, and one recorded after the commit sees this WIP.
         current = ctx.store.get_run(n)
         if defer_to_stop and current is not None and current.stop_why:
-            return True  # The stopper saves after the whole tree exits; staged changes stay in place.
+            return "deferred"  # The stopper saves after the whole tree exits; staged changes stay in place.
         # Only a stop that interrupted an implementer turn owns everything the exited tree left:
         # outside a turn the runner itself may have begun cleanup, so provenance is still checked.
         owned = tree_exited and current is not None and bool(current.stop_why) and current.stop_in_turn
@@ -576,28 +592,35 @@ def _preserve_locked_implementation(
                 "WIP deletions have no provenance after a failed observation: " + ", ".join(map(repr, refused[:10])))
         if current is not None and current.stop_why:
             reason = f"{STOPPED}: {current.stop_why}"
-        if git.has_staged_changes():
+        status = "saved" if git.has_staged_changes() else "clean"
+        if status == "saved":
             git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
-            if current is not None and current.status == "running":
-                ctx.store.update_run(n, wip_reason=reason)
+        if current is not None and current.status == "running" and status == "saved":
+            ctx.store.update_run(n, wip_reason=reason)
+        if current is not None and current.stop_why:
+            # Proof for the stop, written to its pending record: unlike the run record it can
+            # still change after the runner finished, and it outlives the worktree's removal.
+            from foragent.orch_stop import record_stop_save
+
+            record_stop_save(ctx.store, n, status)
     if refused:
         detail = "WIP preservation refused: deletions outside allowed paths: " + ", ".join(map(repr, refused[:10]))
         _append(ctx.store.log_path(n), detail)
         append_event(ctx.store, ctx.now(), n, "wip-preservation-refused", detail)
     if git.head_sha() == pushed_head or not tracker_available:
-        return False
+        return status
     try:
         pr = ctx.tracker.find_pr(branch)
     except TrackerError as exc:
         _append(ctx.store.log_path(n), f"WIP kept on local branch {branch}; open PR lookup failed: {exc}")
-        return False
+        return status
     # An unverified WIP must not replace the head seen by an open PR's CI/review.
     if pr is None:
         if push_branch is not None:
             push_branch()
         else:
             git.push(branch)
-    return False
+    return status
 
 
 def _push_branch(attempt: Implementation) -> None:

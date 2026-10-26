@@ -458,11 +458,12 @@ def test_failed_reporting_of_unsaved_work_still_keeps_the_worktree(run_case, mon
 
 def test_tick_completes_a_stop_whose_label_update_failed(run_case):
     """Finding class 3: a partially completed stop is finished by the next tick, not crashed."""
-    from foragent.orch_stop import mark_stop_pending
+    from foragent.orch_stop import mark_stop_pending, record_stop_save
 
     c = run_case
     mark_stop_pending(c.store, c.store.get_run(1), "reprioritize")
     c.store.update_run(1, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
+    record_stop_save(c.store, 1, "clean")  # The gate's save under the request found nothing to save.
     c.store.finish_run(1, outcome="stopped")
     c.now[0] += timedelta(seconds=1)
     ctx = TickContext(
@@ -483,12 +484,13 @@ def test_tick_completes_a_stop_whose_label_update_failed(run_case):
 def test_tick_completes_a_pending_stop_after_a_runner_flag_erased_running(run_case):
     """The class 'recovery depends on an erased label': the local stop record drives the tick."""
     from foragent.actions import flag
-    from foragent.orch_stop import mark_stop_pending
+    from foragent.orch_stop import mark_stop_pending, record_stop_save
 
     c = run_case
     mark_stop_pending(c.store, c.store.get_run(1), "reprioritize")
     c.store.update_run(1, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
     flag(c.ctx, 1, Reason.RETRIES_EXCEEDED, "Executor died during the stop.")  # removes running, adds blocked
+    record_stop_save(c.store, 1, "clean")  # The gate's save under the request found nothing to save.
     c.store.finish_run(1, outcome="stopped")
     assert "running" not in c.tracker.get_issue(1).labels
     c.now[0] += timedelta(seconds=1)
@@ -730,5 +732,96 @@ def test_a_turn_mark_without_an_active_stop_owns_nothing(run_case):
     tracked = git_command(path, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
     assert "src/unowned.txt" in tracked and "unfinished.txt" in tracked
     c.ctx.git.remove_worktree(path)
+    c.store.finish_run(1, "killed")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_an_unverifiable_worktree_is_kept_and_the_stop_is_not_reported_as_saved(run_case, monkeypatch):
+    """Class 'missing preservation evidence accepted as success': a Git error proves nothing."""
+    from foragent.git import GitError, GitRepo
+    from foragent.orch_stop import StopFailed, complete_stop, mark_stop_pending
+
+    c = run_case
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    (path / "unfinished.txt").write_text("partial implementation\n")
+    mark_stop_pending(c.store, c.store.get_run(1), "reprioritize")
+    c.store.update_run(1, outcome="stopped", stop_why="reprioritize", stop_in_turn=True)
+    c.store.finish_run(1, outcome="stopped")  # The runner deferred its save to the stop.
+    check = GitRepo.check_worktree
+
+    def unverifiable(self):
+        if self.root == path:
+            raise GitError("fatal: not a git repository")
+        return check(self)
+
+    monkeypatch.setattr(GitRepo, "check_worktree", unverifiable)
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+    )
+    with pytest.raises(StopFailed, match="could not be saved; its worktree is kept"):
+        complete_stop(ctx, c.store.get_run(1))
+    assert (path / "unfinished.txt").read_text() == "partial implementation\n", "the only copy was deleted"
+    assert "ready" not in c.tracker.get_issue(1).labels
+    monkeypatch.setattr(GitRepo, "check_worktree", check)
+    c.ctx.git.remove_worktree(path)
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_an_unchanged_branch_without_a_proven_save_is_no_evidence(run_case):
+    from foragent.run_publish import stop_head, stop_kept_work
+
+    c = run_case
+    head = stop_head(c.ctx.git, 1)
+    run = c.store.update_run(1, stop_why="reprioritize", stop_head=head)
+    assert stop_kept_work(c.ctx.git, run, None) is False, "a skipped save also leaves the branch still"
+    assert stop_kept_work(c.ctx.git, run, "clean") is True
+    c.store.finish_run(1, "stopped")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_save_evidence_survives_the_runners_own_finish_and_the_worktrees_removal(run_case):
+    """Class 'lost save evidence after run completion': the proof lives in the pending stop
+    record, so a finished run's save and a retry after the worktree is gone still count."""
+    from foragent.orch_stop import complete_stop, mark_stop_pending, stop_save_of
+
+    c = run_case
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    (path / "unfinished.txt").write_text("partial implementation\n")
+    mark_stop_pending(c.store, c.store.get_run(1), "reprioritize")
+    c.store.update_run(1, outcome="stopped", stop_why="reprioritize", stop_in_turn=True)
+    c.store.finish_run(1, outcome="stopped")  # The runner finished its record before exiting.
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+    )
+    failing = c.tracker.get_issue
+    calls = []
+
+    def label_read_fails_once(n):
+        calls.append(n)
+        if len(calls) == 1:
+            raise RuntimeError("GitHub unavailable")
+        return failing(n)
+
+    c.tracker.get_issue = label_read_fails_once
+    with pytest.raises(RuntimeError, match="GitHub unavailable"):
+        complete_stop(ctx, c.store.get_run(1))  # Saved and removed the worktree, then failed.
+    assert not path.exists() and stop_save_of(c.store, 1) == "saved"
+    complete_stop(ctx, c.store.get_run(1))  # The retry has no worktree, only the recorded proof.
+    labels = c.tracker.get_issue(1).labels
+    assert "ready" in labels and "running" not in labels
+    assert "[stopped: reprioritize]" in git_command(c.history.clone, "log", "-1", "--format=%B", "foragent/issue-1")
+
+
+def test_a_turn_is_counted_so_a_missing_worktree_after_it_is_never_called_clean(run_case):
+    from foragent.run_publish import begin_turn
+
+    c = run_case
+    assert c.store.get_run(1).turns == 0
+    begin_turn(c.ctx, 1)
+    assert c.store.get_run(1).turns == 1
     c.store.finish_run(1, "killed")
     c.tracker.remove_labels(1, ["running"])

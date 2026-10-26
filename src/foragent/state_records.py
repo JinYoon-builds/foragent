@@ -53,6 +53,8 @@ class Run:
     live_changes_failed: bool = False
     # An implementer turn is open: set before the executor starts, cleared when the turn ends.
     in_turn: bool = False
+    # Implementer turns this run began: none means no implementer edit can exist in its worktree.
+    turns: int = 0
     # The stop request arrived during an implementer turn: what the tree leaves is the turn's work.
     stop_in_turn: bool = False
     lane: str = "main"

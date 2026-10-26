@@ -37,6 +37,37 @@ def mark_stop_pending(store, run: Run, why: str) -> None:
     store._atomic_write(path, json.dumps({"number": run.number, "started_at": run.started_at, "why": why}))
 
 
+def ensure_stop_pending(store, run: Run, issue):
+    """Keep a finished run's stop driven by its record, recreating one a race may have lost."""
+    from foragent.run_publish import WIP_NOT_SAVED, stop_intent_lock
+
+    with stop_intent_lock(store, run.number):
+        current = store.get_run(run.number) or run
+        if current.stop_why and current.status == "finished" and current.outcome != WIP_NOT_SAVED \
+                and not _pending(store, run.number).exists():
+            mark_stop_pending(store, current, current.stop_why)
+    return issue
+
+
+def record_stop_save(store, number: int, status: str) -> None:
+    """Keep how a save under the request ended ("saved"/"clean") in the pending record.
+
+    Called under the run's intent lock. With no pending record there is no active
+    request whose evidence this could be.
+    """
+    path = _pending(store, number)
+    if path.exists():
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if record.get("saved") == "saved":
+            status = "saved"  # A later retry finding nothing left does not erase the WIP it made.
+        store._atomic_write(path, json.dumps({**record, "saved": status}))
+
+
+def stop_save_of(store, number: int) -> str | None:
+    path = _pending(store, number)
+    return json.loads(path.read_text(encoding="utf-8")).get("saved") if path.exists() else None
+
+
 def drop_stop_pending(store, number: int) -> None:
     _pending(store, number).unlink(missing_ok=True)
 
@@ -55,7 +86,7 @@ def complete_stop(ctx: TickContext, run: Run) -> str:
     open PR (which a tick would otherwise read as review) is cleared, and the
     next run resumes from the issue branch. A closed issue only loses running.
     """
-    from foragent.run_publish import stop_kept_work
+    from foragent.run_publish import keep_unsaved_work, stop_kept_work
 
     number = run.number
     if run.outcome != "stopped":
@@ -68,13 +99,24 @@ def complete_stop(ctx: TickContext, run: Run) -> str:
     _ensure_terminated(ctx, run)
     # A runner the stop interrupted left its worktree to be saved only now, after the
     # whole tree exited, so the evidence observed here is final.
+    # A finished record is never revised, so this save's own result is the evidence; the
+    # worktree goes only after the save positively ended as "saved" or "clean".
     worktree = Path(run.worktree)
-    if worktree.exists() and not scheduler._remove_run_worktree(
-        ctx, number, worktree, scheduler.TickReport(), outcome="stopped", tree_exited=True,
-    ):
-        drop_stop_pending(ctx.store, number)  # keep_unsaved_work flagged it and kept the worktree.
-        raise StopFailed(f"#{number}: the unfinished work could not be saved; its worktree is kept")
-    if not stop_kept_work(ctx.git, run):
+    if worktree.exists():
+        try:
+            scheduler._preserve_failed_implementation(
+                number, ctx, ctx.git.at(worktree), "stopped", approval=ctx.store.load_approval(number),
+                tracker_available=ctx.store.github_wait_until(ctx.now()) is None, tree_exited=True, strict=True,
+            )
+        except Exception as exc:
+            keep_unsaved_work(number, ctx, worktree, exc)  # Flags the issue; the worktree stays.
+            drop_stop_pending(ctx.store, number)
+            raise StopFailed(f"#{number}: the unfinished work could not be saved; its worktree is kept") from exc
+        if stop_save_of(ctx.store, number) in {"saved", "clean"}:  # Durable before the removal.
+            ctx.git.remove_worktree(worktree)
+    elif stop_save_of(ctx.store, number) is None:
+        _prove_nothing_to_save(ctx, run)
+    if not stop_kept_work(ctx.git, run, stop_save_of(ctx.store, number)):
         # No WIP names the why (for example, a runner from before an upgrade saved its own).
         scheduler.flag(ctx, number, scheduler.Reason.RETRIES_EXCEEDED,
                        "Stopped, but the unfinished work was not saved under the stop reason.",
@@ -126,6 +168,24 @@ def recorded_tree_alive(run: Run) -> bool:
         identities.get(row.pid) == row.start_time for row in table)
 
 
+def _prove_nothing_to_save(ctx: TickContext, run: Run) -> None:
+    """Record "clean" for a stop whose run never had implementer work to save.
+
+    Lifecycle paths end without a save: a stop before the worktree existed, or a
+    review-only run or a run_issue that removed its worktree in normal cleanup
+    before any implementer turn. Only an implementer turn edits a worktree, so no
+    turn, no worktree and a branch still at the request's head together prove
+    nothing was lost. Any turn without a recorded save stays unproven.
+    """
+    from foragent.run_publish import stop_head, stop_intent_lock
+
+    with stop_intent_lock(ctx.store, run.number):
+        current = ctx.store.get_run(run.number) or run
+        if current.turns == 0 and not Path(current.worktree).exists() \
+                and stop_head(ctx.git, run.number) == current.stop_head:
+            record_stop_save(ctx.store, run.number, "clean")
+
+
 def tree_proven_gone(run: Run | None) -> bool:
     """Positive proof that no recorded process may still live; an unreadable table is no proof."""
     if run is None:
@@ -158,26 +218,31 @@ def recover_pending_stops(ctx: TickContext, report: TickReport) -> None:
     except a merge or lost work. A run still recorded as running is left to
     _recover_runs.
     """
-    from foragent.run_publish import WIP_NOT_SAVED
+    from foragent.run_publish import WIP_NOT_SAVED, stop_intent_lock
 
     directory = ctx.store.root / "stops"
     for path in sorted(directory.glob("*.json")) if directory.exists() else ():
         record = json.loads(path.read_text(encoding="utf-8"))
         number = record["number"]
-        run = ctx.store.get_run(number)
-        if run is None or run.started_at != record["started_at"]:
-            drop_stop_pending(ctx.store, number)  # A newer run replaced the stopped one.
-        elif run.status == "running":
-            continue  # _recover_runs: a live runner's abandoned intent is cleared, a dead one finishes stopped.
-        elif run.outcome in {"merged", WIP_NOT_SAVED}:
-            drop_stop_pending(ctx.store, number)  # The merge or the lost-work flag owns the issue.
-        else:
-            try:
-                report.actions.append(f"#{number} completed a pending stop{complete_stop(ctx, run)}")
-            except StopFailed as exc:
-                report.actions.append(f"#{number} stop failed: {exc}")
-            except Exception as exc:
-                report.actions.append(f"#{number} stop still pending: {' '.join(str(exc).split())}")
+        # Read, decide and delete under the lock the runner's finish takes: a finish
+        # cannot land between this read and a deletion it would have changed.
+        with stop_intent_lock(ctx.store, number):
+            run = ctx.store.get_run(number)
+            if run is None or run.started_at != record["started_at"]:
+                drop_stop_pending(ctx.store, number)  # A newer run replaced the stopped one.
+                continue
+            if run.status == "running":
+                continue  # _recover_runs: a live runner's abandoned intent is cleared, a dead one finishes.
+            if run.outcome in {"merged", WIP_NOT_SAVED}:
+                drop_stop_pending(ctx.store, number)  # The merge or the lost-work flag owns the issue.
+                continue
+        # Finished: its runner can no longer write, so completion runs outside the lock.
+        try:
+            report.actions.append(f"#{number} completed a pending stop{complete_stop(ctx, run)}")
+        except StopFailed as exc:
+            report.actions.append(f"#{number} stop failed: {exc}")
+        except Exception as exc:
+            report.actions.append(f"#{number} stop still pending: {' '.join(str(exc).split())}")
 
 
 def clear_stale_stop(ctx: TickContext, run: Run) -> Run:
@@ -191,9 +256,16 @@ def clear_stale_stop(ctx: TickContext, run: Run) -> Run:
         return run
     from foragent.run_publish import STOP_REQUEST_CLEARED, STOPPED, stop_intent_lock
 
-    drop_stop_pending(ctx.store, run.number)
+    # Re-read under the lock the runner's finish takes: if the run finished (as the stop)
+    # since the caller looked, its pending record stays for recover_pending_stops to
+    # save the deferred work and return the issue to ready.
+    with stop_intent_lock(ctx.store, run.number):
+        current = ctx.store.get_run(run.number)
+        if current is None or current.status != "running" or not current.stop_why:
+            return current or run
+        drop_stop_pending(ctx.store, run.number)
+        cleared = ctx.store.update_run(run.number, **STOP_REQUEST_CLEARED,
+                                       **({"outcome": None} if current.outcome == STOPPED else {}))
     scheduler.append_event(ctx.store, ctx.now(), run.number, "stop-abandoned",
                            f"#{run.number}: a stop ended before signaling the runner; why: {run.stop_why}")
-    with stop_intent_lock(ctx.store, run.number):  # The whole request goes, including its authority.
-        return ctx.store.update_run(run.number, **STOP_REQUEST_CLEARED,
-                                    **({"outcome": None} if run.outcome == STOPPED else {}))
+    return cleared

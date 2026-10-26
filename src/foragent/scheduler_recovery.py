@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
-from foragent.orch_stop import clear_stale_stop, recover_pending_stops, tree_proven_gone
+from foragent import orch_stop  # Module import: orch_stop imports the scheduler facade.
 from foragent.scheduler_stop import _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes
 from foragent.run_publish import WIP_NOT_SAVED, keep_unsaved_work
 from foragent.state import Run
@@ -34,7 +34,7 @@ def _remove_run_worktree(
             tree_exited = tree_exited or bool(getattr(ctx.store.get_run(number), "stop_why", ""))
             scheduler._preserve_failed_implementation(
                 number, ctx, ctx.git.at(worktree), outcome, approval=ctx.store.load_approval(number),
-                tracker_available=ctx.store.github_wait_until(ctx.now()) is None, tree_exited=tree_exited,
+                tracker_available=ctx.store.github_wait_until(ctx.now()) is None, tree_exited=tree_exited, strict=True,
             )
         except Exception as exc:
             report.actions.append(f"#{number} {keep_unsaved_work(number, ctx, worktree, exc)}")
@@ -64,7 +64,7 @@ def _kill_run(
         if stopped == "gone":
             _finish_dead_run(ctx, run, report)
         return False
-    if not tree_proven_gone(ctx.store.get_run(number)):  # The killer may skip an unreadable PID.
+    if not orch_stop.tree_proven_gone(ctx.store.get_run(number)):  # The killer may skip an unreadable PID.
         return False
     if not scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome, tree_exited=True):
         ctx.store.finish_run(number, outcome=WIP_NOT_SAVED)
@@ -142,7 +142,7 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
     if scheduler.RUNNING not in issue.labels or (run is not None and run.status == "running"):
         return issue
     if run is not None and run.stop_why and run.outcome != "merged":
-        return issue  # A stop's pending record drives its save and labels, not this label.
+        return orch_stop.ensure_stop_pending(ctx.store, run, issue)  # The record, not this label, drives the stop.
     if not scheduler._remove_run_worktree(
         ctx, issue.number, scheduler.Path(run.worktree) if run is not None else ctx.store.worktree_path(issue.number),
         report, outcome=(run.outcome or "crashed") if run is not None else "crashed",
@@ -197,7 +197,7 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
-    recover_pending_stops(ctx, report)  # From the local stop record, before any label-driven recovery.
+    orch_stop.recover_pending_stops(ctx, report)  # From the local stop record, before any label-driven recovery.
     for run in ctx.store.active_runs():
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
@@ -227,7 +227,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         if run is None or run.status != "running":
             continue
         if not dead:
-            run = clear_stale_stop(ctx, run)  # No stop runs while a tick holds the lock.
+            run = orch_stop.clear_stale_stop(ctx, run)  # No stop runs while a tick holds the lock.
             if _stop_already_refused(ctx, run):
                 continue
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
@@ -256,7 +256,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
 
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
     outcome = run.outcome or "crashed"
-    if not tree_proven_gone(run):
+    if not orch_stop.tree_proven_gone(run):
         return  # Unknown liveness is never termination; the next tick tries again.
     if run.executor_pgid is not None:
         ctx.store.update_run(run.number, executor_pgid=None)
