@@ -78,3 +78,18 @@ def test_blocked_pr_is_hidden_until_timeout_escalation(ctx):
     tick(ctx)
     item, = collect(inbox_ctx).items
     assert (item.number, item.pr, item.reason) == (1, pr, "orchestrator-timeout")
+
+
+def test_timeout_clock_starts_at_this_issues_latest_run_end(ctx, tmp_path):
+    started = ctx.now()
+    ctx.tracker.comment(1, "<!-- foragent:blocked reason=risk-high -->\nOld findings")
+    for number, minutes in ((1, 3), (2, 30)):
+        ended = StateStore(tmp_path / "state", now=lambda m=minutes: started + timedelta(minutes=m))
+        ended.start_run(number, branch=f"foragent/issue-{number}", worktree=ended.worktree_path(number))
+        ended.finish_run(number, outcome="blocked")
+    ctx.now = lambda: started + timedelta(minutes=8)
+    tick(ctx)
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
+    ctx.now = lambda: started + timedelta(minutes=8, seconds=1)
+    tick(ctx)
+    assert "needs-human" in ctx.tracker.get_issue(1).labels
