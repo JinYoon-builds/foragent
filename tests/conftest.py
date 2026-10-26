@@ -119,12 +119,12 @@ class GitHistory:
     clone: Path
     tip: str | None = None
 
-    def update(self, files: dict[str, str | None], *, at: datetime = BASE_TIME) -> None:
+    def update(self, files: dict[str, str | None], *, at: datetime = BASE_TIME, message: str = "Update") -> None:
         """Import a new main commit directly into the local bare origin."""
         stream = [
             "commit refs/heads/main\n",
             f"committer Offline Tests <tests@example.com> {int(at.timestamp())} +0000\n",
-            "data 6\nUpdate\n",
+            f"data {len(message.encode('utf-8'))}\n{message}\n",
         ]
         if self.tip is not None:
             stream.append(f"from {self.tip}\n")

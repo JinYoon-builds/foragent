@@ -50,8 +50,11 @@ def test_order_progress_and_lane_totals_use_full_history_without_closed_orders(t
     assert result.order.number == 90
     assert (result.completed, result.total) == (13, 14)
     assert [issue.number for issue in result.done["api"]] == list(range(1, 14))
-    # All 14 merges finished in the last hour; one issue is left.
-    assert result.recent == 14 and result.eta == NOW + timedelta(hours=1 / 14)
+    # All 14 merges finished recently. The one approved issue left has no size label,
+    # so it counts as size:m, learned from the 14 merged runs (started and finished
+    # at the fixed clock, so they took no time).
+    assert result.recent == 14 and result.eta == NOW
+    assert result.eta_basis == {"m": 14}
     output = watch.render_frame(result, config, tmp_path)
     assert "13/14" in output and "✓ 13 done" in output and "Finished task 13" in output
     assert "Finished task 14" not in output

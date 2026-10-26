@@ -325,23 +325,20 @@ def _verify_implementation(attempt: Implementation) -> str:
     from foragent import runner
     from foragent.run_conflicts import _prepare_target
     from foragent.run_publish import _check_publication
-    from foragent.ci_mode import enabled, stage_exclusions
+    from foragent.ci_mode import enabled
     from foragent.ci_local import verify_local_only_units
-    from foragent.ci_workflow import EXCLUSIONS
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "checking")
-    stage_exclusions(attempt)
     git.stage_changes()
     if not _prepare_target(attempt):
         raise ExecutorStopped("hash-mismatch")
     attempt.paths = git.changed_paths(attempt.start_ref)
     _progress(n, ctx)
     attempt.checks = []
-    # Protocol files remain runner-owned when this run does not publish them.
-    protocol_paths = git.publication_paths | {EXCLUSIONS}
-    if not set(attempt.paths) - protocol_paths:
+    # Cleaning tracked runner scratch files is not an implementation change.
+    if not any(not path.startswith(".foragent/") for path in attempt.paths):
         return "The session made no changes."
     staged_tree = git.staged_tree_sha()
     for verification in range(2):
@@ -405,7 +402,7 @@ def _verify_implementation(attempt: Implementation) -> str:
             _check_publication(git, attempt.target_branch)
         except AttemptFailure as exc:
             return str(exc)
-        return "" if set(attempt.paths) - protocol_paths else "The session made no changes."
+        return "" if any(not path.startswith(".foragent/") for path in attempt.paths) else "The session made no changes."
     raise AssertionError("unreachable verification state")
 
 
