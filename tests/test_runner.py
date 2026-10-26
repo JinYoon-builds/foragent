@@ -408,10 +408,11 @@ def test_runner_flags_and_detail_during_a_stop_cannot_erase_its_intent(run_case,
         ctx.store.update_run(number, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
         ctx.store.update_run(number, detail="Executor progress overwrote the detail.")
         flag(ctx, number, Reason.RETRIES_EXCEEDED, "Checks failed after the executor died.")
-        raise RuntimeError("executor killed")
+        raise SystemExit(143)  # The stop's SIGTERM reaches the runner next.
 
     monkeypatch.setattr("foragent.runner._execute", execute)
-    run_issue(1, c.ctx)
+    with pytest.raises(SystemExit):
+        run_issue(1, c.ctx)
     run = c.store.get_run(1)
     # The runner's flags still land; `fa orch stop` sets the destination after every process is gone.
     assert (run.status, run.outcome, run.detail) == ("finished", "stopped", "stopped: reprioritize")
@@ -497,3 +498,113 @@ def test_tick_completes_a_pending_stop_after_a_runner_flag_erased_running(run_ca
     assert "ready" in labels and not labels & {"running", "blocked", "needs-human"}, report.actions
     assert not (c.store.root / "stops" / "1.json").exists()
     assert c.store.get_run(1).outcome == "stopped"
+
+
+def test_abandoned_stop_on_a_dead_runner_still_stops_its_recorded_descendants(run_case, fake_process_table):
+    """Class 'intent mistaken for termination': a stop that died after its intent left the
+    runner gone but a recorded descendant alive, with no executor group recorded."""
+    from foragent import processes
+    from foragent.scheduler_stop import mark_stop_pending
+
+    c, table = run_case, fake_process_table
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    (path / "unfinished.txt").write_text("partial implementation\n")
+    root = table.add(42000, cwd=path, start_time=10)
+    helper = table.add(42001, ppid=root.pid, cwd=path, start_time=11)
+    c.store.update_run(1, pid=root.pid, process_identities=[{"pid": root.pid, "start_time": 10}])
+    mark_stop_pending(c.store, c.store.get_run(1), "reprioritize")
+    c.store.update_run(1, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
+    table.exit(root.pid)  # The runner is gone; its helper was reparented and still runs.
+    assert c.store.get_run(1).executor_pgid is None and helper.pid in table.live
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+        runner_process_exists=lambda n: False, kill_runner=processes.kill_process_group,
+    )
+    _recover_runs(ctx, TickReport())
+    assert helper.pid not in table.live, "A recorded intent was taken for a terminated tree"
+    run = c.store.get_run(1)
+    assert (run.status, run.outcome) == ("finished", "stopped")
+    assert "stopped: reprioritize" in git_command(c.history.clone, "log", "-1", "--format=%B", "foragent/issue-1")
+    c.now[0] += timedelta(seconds=1)
+    report = TickReport()
+    _recover_runs(ctx, report)  # The next tick completes the pending stop from its record.
+    labels = c.tracker.get_issue(1).labels
+    assert "ready" in labels and "running" not in labels, report.actions
+
+
+def test_only_deletions_seen_in_the_live_run_are_kept_in_the_wip(run_case):
+    """Class 'count-based bypass of provenance': ownership comes from observation, not a count."""
+    from foragent.run_publish import _preserve_failed_implementation, observe_live_changes
+
+    c = run_case
+    c.history.update({"src/own.txt": "implementer deletes this\n", "src/raced.txt": "cleanup race deletes this\n"})
+    c.ctx.git.fetch("origin", "main")
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    (path / "src/own.txt").unlink()
+    observe_live_changes(c.ctx, 1, path)  # The implementer's turn ended; the deletion is its own.
+    (path / "src/raced.txt").unlink()  # Appears only during cleanup: no provenance.
+    _preserve_failed_implementation(1, c.ctx, c.ctx.git.at(path), "killed",
+                                    approval=c.store.load_approval(1), tracker_available=False)
+    tracked = git_command(path, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+    assert "src/own.txt" not in tracked and "src/raced.txt" in tracked
+    events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
+    refused = [event for event in events if event["kind"] == "wip-preservation-refused"]
+    assert len(refused) == 1 and "src/raced.txt" in refused[0]["summary"] and "own.txt" not in refused[0]["summary"]
+    c.ctx.git.remove_worktree(path)
+    c.store.finish_run(1, "killed")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_an_observation_never_drops_paths_a_newer_one_recorded(run_case):
+    """Class 'lost updates to preservation evidence': observers merge under the run's lock."""
+    from foragent.run_publish import observe_live_changes
+
+    c = run_case
+    c.history.update({"src/a.txt": "a\n", "src/b.txt": "b\n"})
+    c.ctx.git.fetch("origin", "main")
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    (path / "src/a.txt").unlink()
+    (path / "src/b.txt").unlink()
+    assert observe_live_changes(c.ctx, 1, path)
+    (path / "src/b.txt").write_text("b\n")  # A later observer sees only a.txt changed.
+    assert observe_live_changes(c.ctx, 1, path)
+    assert c.store.get_run(1).live_changes == ["src/a.txt", "src/b.txt"]
+    c.ctx.git.remove_worktree(path)
+    c.store.finish_run(1, "killed")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_a_failed_observation_keeps_unowned_deletions_in_the_worktree(run_case, monkeypatch):
+    """Class 'missing preservation evidence treated as success'."""
+    from foragent.git import GitError
+    from foragent.run_publish import ProvenanceUnavailable, _preserve_failed_implementation, observe_live_changes
+
+    c = run_case
+    c.history.update({"src/own.txt": "deleted by the implementer\n"})
+    c.ctx.git.fetch("origin", "main")
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    (path / "src/own.txt").unlink()
+    git = c.ctx.git.at(path)
+    original = type(git)._call
+
+    def unreadable(self, args):
+        if args[:1] == ["diff"]:
+            raise GitError("index.lock busy")
+        return original(self, args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(git), "_call", unreadable)
+        assert observe_live_changes(c.ctx, 1, path) is False
+    assert c.store.get_run(1).live_changes_failed
+    with pytest.raises(ProvenanceUnavailable):
+        _preserve_failed_implementation(1, c.ctx, git, "killed", approval=c.store.load_approval(1),
+                                        tracker_available=False)
+    assert not (path / "src/own.txt").exists() and path.exists(), "the only copy of the work stays"
+    c.ctx.git.remove_worktree(path)
+    c.store.finish_run(1, "killed")
+    c.tracker.remove_labels(1, ["running"])

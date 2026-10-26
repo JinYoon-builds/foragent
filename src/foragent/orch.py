@@ -223,7 +223,7 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
 
 def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
     from foragent import scheduler
-    from foragent.run_publish import STOPPED, stop_intent_lock, stop_kept_work
+    from foragent.run_publish import STOPPED, observe_live_changes, stop_intent_lock, stop_kept_work
     from foragent.scheduler_stop import (
         complete_stop, drop_stop_pending, mark_stop_pending, stop_summary, stop_target_refusal,
     )
@@ -245,15 +245,19 @@ def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
         # The durable record comes first: every later step, including labels a dying
         # runner's flag may already have removed, is recovered from it by the next tick.
         mark_stop_pending(ctx.store, run, why)
-        ctx.store.update_run(n, outcome=STOPPED, detail=detail, stop_why=why)
+        ctx.store.update_run(n, outcome=STOPPED, stop_why=why)  # detail stays the run's own until it ends
     try:
+        # What the live run changed, seen before any signal or cleanup, is the WIP's provenance;
+        # without it the work could not be kept exactly, so nothing is signaled.
+        if not observe_live_changes(ctx, n, Path(run.worktree)):
+            raise OrchError(f"#{n}: stop refused: the worktree's changes could not be read; nothing was stopped")
         scheduler._kill_run(tick_ctx, n, report, outcome=STOPPED, detail=detail)
     finally:
         with stop_intent_lock(ctx.store, n):
             current = ctx.store.get_run(n)
             if current is not None and current.status == "running":
                 # The run did not end: undo only this verb's marks; a runner's wip-not-saved stays.
-                undo = {"outcome": run.outcome, "detail": run.detail} if current.outcome == STOPPED else {}
+                undo = {"outcome": run.outcome} if current.outcome == STOPPED else {}
                 current = ctx.store.update_run(n, stop_why="", **undo)
                 drop_stop_pending(ctx.store, n)
     # Success is the finished record, whichever process wrote it, and a WIP naming the why.

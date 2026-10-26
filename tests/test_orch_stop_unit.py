@@ -347,7 +347,9 @@ def test_wip_reason_reads_the_stop_intent_at_commit_time(tmp_path, monkeypatch, 
     reason = "stopped: reprioritize" if stop_during_staging else "retries-exceeded"
     assert git.commits == [f"WIP: Locale (#1) [{reason}]"] and run.wip_reason == reason
     assert stop_kept_work(run) is stop_during_staging
-    assert final_outcome(run, "retries-exceeded") == ("stopped" if stop_during_staging else "retries-exceeded")
+    # Only a runner the stop terminated ends as stopped; one that ended on its own keeps its outcome.
+    assert final_outcome(run, "killed") == ("stopped" if stop_during_staging else "killed")
+    assert final_outcome(run, "retries-exceeded") == "retries-exceeded"
 
 
 def test_tick_drops_a_stop_intent_abandoned_before_any_signal(tmp_path, monkeypatch):
@@ -408,3 +410,57 @@ def test_pending_record_is_dropped_when_the_stop_is_undone_or_the_run_ended_its_
     store.finish_run(1, outcome="retries-exceeded")
     recover_pending_stops(SimpleNamespace(store=store, tracker=labels, now=ctx.now), scheduler.TickReport())
     assert not (store.root / "stops" / "1.json").exists() and labels.calls == []
+
+
+def test_completion_waits_until_recorded_descendants_are_gone(tmp_path, monkeypatch, kicks):
+    """Class 'intent mistaken for termination': a finished stopped record is not proof."""
+    from foragent import scheduler_stop
+
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(scheduler_stop, "recorded_tree_alive", lambda run: True)
+    monkeypatch.setattr(scheduler_stop, "_stop_run_processes", lambda *args, **kwargs: "refused")
+    monkeypatch.setattr(scheduler, "_kill_run", _finish(store))
+    with pytest.raises(orch.StopPending, match="still alive"):
+        orch.stop(ctx, 1, "reprioritize")
+    assert labels.calls == [] and _journal(store) == []
+    assert (store.root / "stops" / "1.json").exists(), "the stop stays pending until the tree is gone"
+
+
+def test_stop_is_refused_before_any_signal_when_the_worktree_cannot_be_observed(tmp_path, monkeypatch):
+    """Class 'missing preservation evidence treated as success'."""
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    before = store.get_run(1)
+    monkeypatch.setattr("foragent.run_publish.observe_live_changes", lambda *args: False)
+    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **kw: pytest.fail("signaled without provenance"))
+    with pytest.raises(orch.OrchError, match="could not be read; nothing was stopped"):
+        orch.stop(ctx, 1, "reprioritize")
+    run = store.get_run(1)
+    assert (run.status, run.outcome, run.stop_why, run.detail) == ("running", before.outcome, "", before.detail)
+    assert not (store.root / "stops" / "1.json").exists() and labels.calls == []
+
+
+@pytest.mark.parametrize(("rows", "unreadable", "owners", "alive"), [
+    # Class 'numeric PID confused with identity': a reused PID is another process.
+    ([ProcessIdentity(42000, 1, 42000, 42000, 99.0)], (), {}, False),
+    ([ProcessIdentity(42001, 1, 42001, 42001, 6.0)], (), {}, True),  # a recorded descendant lives
+    # Class 'unknown liveness treated as death': unreadable is never proof of exit...
+    ([], {42001}, {}, True),
+    # ...unless its owner is another user, which Foragent's own processes never are.
+    ([], {42001}, {42001: -1}, False),
+])
+def test_tree_liveness_uses_recorded_identities_and_never_reads_unknown_as_dead(monkeypatch, rows, unreadable,
+                                                                                 owners, alive):
+    from foragent.scheduler_stop import recorded_tree_alive
+
+    monkeypatch.setattr(processes, "list_processes", lambda: ProcessTable(rows, unreadable, owners))
+    run = _run(status="finished", process_identities=[{"pid": 42000, "start_time": 5.0},
+                                                      {"pid": 42001, "start_time": 6.0}])
+    assert recorded_tree_alive(run) is alive
+
+
+def test_an_unreadable_recorded_descendant_refuses_the_stop(monkeypatch):
+    row = ProcessIdentity(42000, 1, 42000, 42000, 5.0)
+    monkeypatch.setattr(processes, "list_processes", lambda: ProcessTable((row,), {42001}))
+    run = _run(process_identities=[{"pid": 42000, "start_time": 5.0}, {"pid": 42001, "start_time": 6.0}])
+    refusal = stop_target_refusal(run)
+    assert refusal is not None and "42001 cannot be read" in refusal

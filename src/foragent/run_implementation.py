@@ -217,6 +217,12 @@ def _implement(
             record_stop_point(ctx.store.root, n, result, log, offset)
         except OSError:
             pass
+        try:  # Provenance for the WIP: what this turn changed, before any cleanup.
+            from foragent.run_publish import observe_live_changes
+
+            observe_live_changes(ctx, n, worktree)
+        except Exception:
+            pass
     # A prepared prompt has not been delivered yet. Keep its hint through
     # availability waits, launch failures and interruptions; acknowledge it
     # only once the implementer returns an ordinary execution result.

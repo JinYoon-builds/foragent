@@ -209,9 +209,6 @@ def test_recorded_deletion_is_still_committed(wip_case, fields):
 def test_measured_files_with_glob_characters_are_literal(wip_case, field, deleted, allowed):
     c = wip_case
     c.store.update_run(1, **{field: ["src/[ab].txt"], "files_committed": True})
-    # Nine other unrecorded deletions: the tenth decides whether this is a refused mass deletion.
-    for i in range(9):
-        (c.path / f"src/file-{i:02}.txt").unlink()
     (c.path / deleted).unlink()
     before = c.git.head_sha()
     if allowed:
@@ -280,22 +277,11 @@ def test_branch_own_deletion_history_allows_deletion_without_recorded_files(wip_
     assert all(path.relative_to(c.path).as_posix() not in tracked for path in paths)
 
 
-def test_a_few_unrecorded_deletions_are_kept_as_the_implementers_work(wip_case):
-    """The locked #270 check: an implementer's single deletion belongs in the WIP."""
-    c = wip_case
-    (c.path / "src/file-00.txt").unlink()
-    preserve(c, tracker_available=False)
-    assert "src/file-00.txt" not in git_command(c.path, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
-    assert not [event for event in events(c) if event["kind"] == "wip-preservation-refused"]
-
-
 def test_target_branch_deletion_does_not_authorize_untouched_wip_deletion(wip_case):
     c = wip_case
     c.history.update({"src/file-00.txt": None})
     c.ctx.git.fetch("origin", "main")
-    # A mass of unrecorded deletions, one of them also deleted on the target branch.
-    for i in range(10):
-        (c.path / f"src/file-{i:02}.txt").unlink()
+    (c.path / "src/file-00.txt").unlink()
     before = c.git.head_sha()
     preserve(c, tracker_available=False)
     assert c.git.head_sha() == before
@@ -305,8 +291,7 @@ def test_target_branch_deletion_does_not_authorize_untouched_wip_deletion(wip_ca
 def test_recovery_preserves_other_work_and_does_not_report_refusal_as_failure(wip_case):
     c = wip_case
     before = c.git.head_sha()
-    for i in range(10):
-        (c.path / f"src/file-{i:02}.txt").unlink()
+    (c.path / "src/file-00.txt").unlink()
     (c.path / "unfinished.txt").write_text("keep this work\n")
     ctx = TickContext(
         repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,

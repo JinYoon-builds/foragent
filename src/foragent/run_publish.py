@@ -374,7 +374,8 @@ def final_outcome(run: Run | None, outcome: str, *, recorded_first: bool = False
     if run.outcome == WIP_NOT_SAVED:
         return WIP_NOT_SAVED
     if run.stop_why:
-        return STOPPED if stop_kept_work(run) else outcome
+        # Only a runner the stop terminated ends as stopped; an intent alone is no termination.
+        return STOPPED if outcome in {"killed", STOPPED} and stop_kept_work(run) else outcome
     return (run.outcome or outcome) if recorded_first else outcome
 
 
@@ -399,13 +400,39 @@ def _preserve_failed_implementation(
         )
 
 
-# Unrecorded deletions at or above this count look like a clobbered worktree, not the
-# implementer's work; fewer are kept, as the locked #270/#370 checks require.
-MASS_DELETION = 10
+class ProvenanceUnavailable(Exception):
+    """Deletions would be dropped without the evidence that could have owned them."""
+
+
+def observe_live_changes(ctx, n: int, worktree: Path) -> bool:
+    """Record what the live run changed, as provenance for its later WIP; False if it could not.
+
+    Taken when an implementer turn ends and before a stop or gate kill signals,
+    never during cleanup: deletions a racing removal causes later stay unowned
+    (#572). Observers merge into the latest record under the run's intent lock,
+    so an older observation can never replace a newer one. A failure is
+    recorded, so missing evidence is never read as "nothing was changed".
+    """
+    with stop_intent_lock(ctx.store, n):
+        run = ctx.store.get_run(n)
+        if run is None or run.status != "running" or not (worktree / ".git").exists():
+            return True  # No live worktree: no work in it to own.
+        try:
+            git = ctx.git.at(worktree)
+            base = git._own_base(f"origin/{run.files_base_branch or ctx.config.base_branch}")
+            output = git._call(["diff", "--cached", "--name-only", "--no-renames", "-z", base])
+            output += git._call(["diff", "--name-only", "--no-renames", "-z", base])
+        except (GitError, ValueError):
+            ctx.store.update_run(n, live_changes_failed=True)
+            return False
+        paths = sorted(set(filter(None, output.split("\0"))) | set(run.live_changes))
+        if paths != run.live_changes:
+            ctx.store.update_run(n, live_changes=paths)
+        return True
 
 
 def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> list[str]:
-    """Leave a mass of unowned deletions out of the index without discarding other work."""
+    """Leave unowned deletions out of the index without discarding other work."""
     deletions = git.staged_deletions()
     if not deletions:
         return []
@@ -415,6 +442,8 @@ def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> lis
         patterns.extend([escape(path) for path in run.effective_files or []]
                         if run.files_committed else run.effective_files or [])
         patterns.extend(escape(path) for path in [*(run.changed_files or []), *run.late_files])
+        # Seen in the live run's worktree before any cleanup began: the implementer's own edits.
+        patterns.extend(escape(path) for path in run.live_changes)
     base = (run.files_base_branch if run is not None else None) or ctx.config.base_branch
     committed = git.committed_paths(f"origin/{base}")
     artifacts = git.artifact_paths()
@@ -422,8 +451,6 @@ def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> lis
                      if path not in committed
                      and not any(path == root or path.startswith(root + "/") for root in artifacts)
                      and not any_overlap(ctx, [escape(path)], patterns))
-    if len(refused) < MASS_DELETION:
-        return []  # A few unrecorded deletions are the implementer's own edits.
     git.restore_staged_paths("HEAD", refused)
     return refused
 
@@ -445,11 +472,15 @@ def _preserve_locked_implementation(
     git.stage_changes()
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
-    refused = _check_wip_deletions(ctx, git, run)
     with stop_intent_lock(ctx.store, n):
-        # Read the intent now, not at entry: a stop recorded during staging still names its why,
-        # and one recorded after the commit sees which reason this WIP carries.
+        # Read the intent and the provenance now, not at entry: a stop or an observation
+        # recorded during staging still counts, and one recorded after the commit sees this WIP.
         current = ctx.store.get_run(n)
+        refused = _check_wip_deletions(ctx, git, current)
+        if refused and current is not None and current.live_changes_failed:
+            # The evidence that could own these deletions is missing: keep the worktree instead.
+            raise ProvenanceUnavailable(
+                "WIP deletions have no provenance after a failed observation: " + ", ".join(map(repr, refused[:10])))
         if current is not None and current.stop_why:
             reason = f"{STOPPED}: {current.stop_why}"
         if git.has_staged_changes():

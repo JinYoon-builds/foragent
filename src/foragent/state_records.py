@@ -45,6 +45,10 @@ class Run:
     stop_why: str = ""
     # The reason named by this run's WIP commit, recorded with the commit under the stop-intent lock.
     wip_reason: str | None = None
+    # Paths the live run changed, seen by Foragent before any cleanup touched its worktree.
+    live_changes: list[str] = field(default_factory=list)
+    # An observation failed: deletions it could have owned have no provenance (never "none changed").
+    live_changes_failed: bool = False
     lane: str = "main"
     waited_seconds: float = 0
     waiting_until: str | None = None

@@ -124,6 +124,8 @@ def stop_target_refusal(run: Run) -> str | None:
             or row.pgid == group or row.sid == session
         )):
             return f"recorded {name} PID {pid} is not a process Foragent started for this run"
+    if unreadable_identities := sorted(item["pid"] for item in run.process_identities if item["pid"] in unreadable):
+        return f"recorded process {unreadable_identities[0]} cannot be read; ownership cannot be verified"
     # Missing evidence is never proof of safety: without a recorded runner
     # identity the stop could neither verify nor signal the process it ends.
     if run.pid is None:
@@ -167,6 +169,7 @@ def complete_stop(ctx: TickContext, run: Run) -> str:
     next run resumes from the issue branch. A closed issue only loses running.
     """
     number = run.number
+    _ensure_terminated(ctx, run)
     journal = ctx.store.root / "orch-events.jsonl"
     started = scheduler.datetime.fromisoformat(run.started_at)
     recorded = journal.exists() and any(
@@ -192,6 +195,38 @@ def complete_stop(ctx: TickContext, run: Run) -> str:
         scheduler.board.sync_status(ctx, number, "Ready")
     drop_stop_pending(ctx.store, number)
     return note
+
+
+def recorded_tree_alive(run: Run) -> bool:
+    """Whether any recorded identity may still live, judged by identity, never by a bare number.
+
+    A row counts only when both its PID and its start time match a recorded
+    identity: a reused PID is another process (the safe killer ignores it too).
+    An unreadable recorded PID of this user (or of an unknown owner) is
+    unknown, which is never proof of death. A
+    table that cannot be read at all raises, so completion stays pending.
+    """
+    table = processes.list_processes()
+    identities = {item["pid"]: item["start_time"] for item in run.process_identities}
+    unreadable = getattr(table, "unreadable", frozenset())
+    owners, own = getattr(table, "unreadable_uids", {}), processes.os.getuid()
+    # Foragent's processes run as this user: an unreadable PID owned by another user is a reuse.
+    return any(pid in unreadable and owners.get(pid, own) == own for pid in identities) or any(
+        identities.get(row.pid) == row.start_time for row in table)
+
+
+def _ensure_terminated(ctx: TickContext, run: Run) -> None:
+    """A recorded intent, or even a finished `stopped` record, is not proof the run's tree is gone.
+
+    Recorded descendants still alive are stopped under #261's rules first; if they
+    cannot be, completion raises and the pending record keeps the stop for a retry.
+    """
+    if not recorded_tree_alive(run):
+        return
+    report = scheduler.TickReport()
+    if _stop_run_processes(ctx, run, report) != "refused" and not recorded_tree_alive(run):
+        return
+    raise RuntimeError("the run's recorded processes are still alive: " + ("; ".join(report.actions) or "stop refused"))
 
 
 def recover_pending_stops(ctx: TickContext, report: TickReport) -> None:

@@ -10,7 +10,7 @@ from foragent.scheduler_stop import (
     _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes, clear_stale_stop,
     complete_stop, recover_pending_stops,
 )
-from foragent.run_publish import STOPPED, WIP_NOT_SAVED, keep_unsaved_work, stop_kept_work
+from foragent.run_publish import STOPPED, WIP_NOT_SAVED, keep_unsaved_work, observe_live_changes, stop_kept_work
 from foragent.state import Run
 from foragent.tracker import Issue
 
@@ -53,6 +53,7 @@ def _kill_run(
         return False
     if count_stall:
         ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
+    observe_live_changes(ctx, number, scheduler.Path(run.worktree))  # Provenance before any signal.
     try:
         stopped = _stop_run_processes(ctx, run, report)
     except Exception:
@@ -248,7 +249,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         # Clean up a crashed group or finish an interrupted stall termination.
         # A recorded completion does not need another signal.
         stopped = _stop_run_processes(
-            ctx, run, report, stop_runner=run.outcome in {None, "crashed", "stalled-restart", "stalled"},
+            ctx, run, report, stop_runner=run.outcome in {None, "crashed", "stalled-restart", "stalled", STOPPED},
         )
         if stopped != "refused":
             _finish_dead_run(ctx, run, report)
