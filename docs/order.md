@@ -95,3 +95,38 @@ Done when이 `pnpm test -- login` 같은 테스트를 가리킬 때, 그 테스�
 | C. 구현자가 쓰고 리뷰어가 본다 | 구현자가 테스트도 쓰고, 적대적 리뷰어가 테스트가 충분히 엄격한지 본다 | order가 가볍다 | 리뷰어의 판단에 기댄다. "모델의 말을 믿지 않는다"는 원칙이 약해진다 |
 
 **결정 (2026-10-20 Jin): A를 기본으로, A가 어려운 이슈(UI 등)는 B.** 작은 단위 테스트는 구현자가 자유롭게 쓴다. 최종 시험(Done when)만 order 단계에서 구현 전에 정하고 승인과 함께 잠근다. 보장은 모델이 아니라 구조(시점 + gate의 경로 잠금)에서 나오므로 어떤 모델 조합에서도 성립한다.
+
+## Optimistic file overlap (#448)
+
+`overlap_per_file` is a positive integer, default **2**: a cautious start from one
+observed conflict (#196) in 231 runs. The orchestrator changes it only using
+conflict evidence from `fa orch facts`; the facts display is a separate issue.
+
+Plan `issues[]` and `edits[]` accept `exclusive: [path, glob]`, rendered as YAML
+metadata immediately after the version marker. These reservations remain locked
+even when effective Files narrow. Other Files may share up to the configured
+number of runs across all lanes, including main and lane-less issues. Empty
+Files and missing/currently mismatched approvals retain their own-lane rule.
+
+Until the first own commit the scheduler reserves declared Files. Afterwards it
+uses concrete changed paths against the merge base with the run's target branch,
+including later working-tree changes and deletions but excluding inherited target
+changes and injected runner artifacts. A late undeclared path waits inside the
+runner before another implementation or merge if it crosses an exclusive
+reservation or the cap. Paths released by effective-file narrowing are late
+additions if re-added, even when originally declared. Runs without late additions
+keep their place; expanding runs yield all claims, including exclusive reservations,
+to earlier expanding runs (issue number breaks equal start times). Waiting
+uses the existing credited wait and `waiting_until`, outside the merge lock.
+Measurements publish together only after every Git command succeeds; unavailable
+worktrees retain the previous measurement, and legacy unknown effective Files fall
+back to declarations.
+
+Each execution records concrete overlapping files and peer issue numbers, whether
+the merge conflicted, resolution seconds, and rebuild count. Peers that finish
+before merge remain in the record. Resolution time excludes credited waits and
+the subsequent implementation rebuild. New helper modules own this bookkeeping;
+no new interpretation of issue meaning or conflict-resolution policy is added.
+
+- Accepted limit (#448): scheduler admission can race the final late check (TOCTOU); a soft-lock breach costs one merge conflict, which the runner resolves.
+- Accepted limit (#448): multi-way glob intersections do not guarantee Unicode literal-alias equivalence such as Straße/STRASSE.

@@ -7,6 +7,11 @@ from typing import Any
 from foragent.state_records import Run
 
 
+# Updates passing any of these change or attest process ownership, so they
+# observe the process tree; every other update is metadata only.
+PROCESS_FIELDS = frozenset({"process_identities", "pid", "executor_pgid"})
+
+
 class RunRecordsMixin:
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
@@ -67,7 +72,15 @@ class RunRecordsMixin:
     def clear_run_start(self, number: int) -> None:
         (self.root / "run-starts" / f"{number}.json").unlink(missing_ok=True)
 
-    def update_run(self, number: int, *, routine: bool = False, **fields: Any) -> Run:
+    def update_run(
+        self, number: int, *, routine: bool = False, observe: bool = False, **fields: Any,
+    ) -> Run:
+        """Save ``fields``; observe the process tree only when asked or ownership changes.
+
+        Metadata-only updates keep the saved identities as they are; the tick's
+        process pass observes and prunes them once per tick.
+        """
+        observe = observe or not PROCESS_FIELDS.isdisjoint(fields)
         with self._state_lock():
             run = self.get_run(number)
             if run is None:
@@ -80,6 +93,10 @@ class RunRecordsMixin:
                     or " ".join(run.detail.split())[:500]
                     or "Run detail unavailable."
                 )
+            if not observe:
+                updated = _state.replace(run, **fields)
+                self._write_run(updated)
+                return updated
             from foragent.processes import observe_routine_tree, observe_tree
 
             # Numeric fields describe a run; only birth evidence supplied by a
@@ -121,6 +138,13 @@ class RunRecordsMixin:
                 (merged_at - _state.datetime.fromisoformat(passed)).total_seconds() if passed else None
             ), merge_lock_held_seconds=self._merge_lock_seconds.get((number, run.started_at), 0),
         )
+        # The merge moment is saved beside the record's fields (the Run schema stays
+        # as it was); finish_run carries it into history and merge_times() reads it.
+        with self._state_lock():
+            path = self.root / "runs" / f"{number}.json"
+            value = _state.json.loads(path.read_text(encoding="utf-8"))
+            value["merged_at"] = merged_at.astimezone(_state.UTC).isoformat()
+            self._write_json(path, value)
 
     def active_runs(self) -> list[Run]:
         runs = []
@@ -199,7 +223,9 @@ class RunRecordsMixin:
                                       process_identities=observe_tree(run.process_identities))
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
-            snapshot = self._run_value(finished)
+            # The finish time is saved beside the record's fields, so the Run schema
+            # stays as it was; finish_times() reads it back.
+            snapshot = {**self._run_value(finished), "finished_at": self._timestamp()}
             self._atomic_write(history_path, history + _state.json.dumps(snapshot, ensure_ascii=False) + "\n")
             self._write_run(finished, snapshot)
             return finished
@@ -215,6 +241,31 @@ class RunRecordsMixin:
             run = _state.load_record(_state.Run, _state.json.loads(line))
             runs[run.number, run.started_at] = run
         return list(runs.values())
+
+    def finish_times(self) -> dict[tuple[int, str], str]:
+        """When each finished execution ended, by (number, started_at), from its latest entry.
+
+        Records written before finish times were saved have none."""
+        return self._history_times("finished_at")
+
+    def merge_times(self) -> dict[tuple[int, str], str]:
+        """When the gate merged each execution's PR, by (number, started_at).
+
+        A record keeps the key of an earlier execution of the same issue until its
+        own merge replaces it, so a time before the execution's start is not its own."""
+        return self._history_times("merged_at")
+
+    def _history_times(self, key: str) -> dict[tuple[int, str], str]:
+        try:
+            history = (self.root / "runs.jsonl").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        times: dict[tuple[int, str], str] = {}
+        for line in history.splitlines():
+            value = _state.json.loads(line)
+            if isinstance(value.get(key), str):
+                times[value["number"], value["started_at"]] = value[key]
+        return times
 
     def prune_process_identities(self, *, inactive_only: bool = False) -> None:
         from foragent.state_processes import prune_process_identities

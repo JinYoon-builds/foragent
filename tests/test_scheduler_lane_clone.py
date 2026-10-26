@@ -45,6 +45,7 @@ def test_file_patterns_overlap_is_symmetric(left, right, expected):
 
 
 def _issue(ctx, number, files, *, running=False):
+    ctx.config = replace(ctx.config, overlap_per_file=1)
     body = BODY
     if files is not None:
         body += "\n## Files\n" + "".join(f"- {path}\n" for path in files)

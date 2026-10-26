@@ -200,11 +200,11 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             item["pid"] == run.pid and item["start_time"] == cached.start_time
             for item in run.process_identities
         ):
-            run = ctx.store.update_run(run.number, routine=True)
+            run = ctx.store.update_run(run.number, routine=True, observe=True)
             dead = False  # Routine positive liveness needs no further enumeration.
         else:
             # Keep witnessed descendants across subsequent reparenting or runner death.
-            run = ctx.store.update_run(run.number)
+            run = ctx.store.update_run(run.number, observe=True)
             identities = {item["pid"]: item["start_time"] for item in run.process_identities}
             if run.pid is None:
                 dead = (
