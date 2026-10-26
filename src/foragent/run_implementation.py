@@ -19,7 +19,7 @@ from foragent.run_execution import _available_executor, _write_claude_settings
 from foragent.run_lane_skills import lane_memory_notice, lane_notes, lane_skill_names, lane_skills
 from foragent.run_skill_catalog import available_skills, catalog_section, parse_skills_used
 from foragent.run_previous import (
-    consume_hint, pending_hint, previous_attempt_summary, record_stop_point, saved_failures_section,
+    consume_hint, pending_hint, previous_attempt_summary, record_stop_point, saved_feedback_section,
 )
 from foragent.run_parent import parent_context
 from foragent.run_prompts import build_prompt, build_resume_prompt
@@ -206,7 +206,8 @@ def _implement(
     # Each part of a check bundle or review is already limited; a saved one stays whole after restarts too.
     whole = isinstance(failure, (CIFailure, WholeFailure)) or (not str(failure) and run.resume_whole)
     moved_files = run.moved_files
-    saved_failures = saved_failures_section(ctx.store.root, n, failure_context)
+    # The saved review and failing checks reach every new attempt, fresh or resumed.
+    saved_feedback = saved_feedback_section(ctx.store.root, n, failure_context)
     if str(failure):
         # Save this turn's feedback first: a limit wait or restart before delivery must not lose it.
         ctx.store.update_run(n, resume_reason=failure_context, resume_whole=whole)
@@ -230,7 +231,7 @@ def _implement(
         moved_files=moved_files,
         skill_catalog=catalog_section(available_skills(ctx.config, fixed)),
         previous_attempt=(previous_attempt_summary(attempt, failure_context)
-                          if failure_context or reviewer_text is not None or saved_failures else ""),
+                          if failure_context or reviewer_text is not None or saved_feedback else ""),
         review_feedback=review_feedback,
         retry_default=retry_default,
     )
@@ -246,7 +247,7 @@ def _implement(
                 reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
                 review_feedback=review_feedback, retry_default=retry_default,
                 moved_files=moved_files, parent_context=attempt.approval.parent_context or "",
-            ) + (f"\n\n{saved_failures}" if saved_failures else "") + setup.memory_notice,
+            ) + (f"\n\n{saved_feedback}" if saved_feedback else "") + setup.memory_notice,
             model=model, timeout_s=remaining, log_path=log, **attempt.options,
         )
     finally:

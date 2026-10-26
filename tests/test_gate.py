@@ -107,3 +107,22 @@ def test_check_done_errors_block_stop(hook, monkeypatch, capsys, failure):
     assert "Done when failed:" in error
     if failure == "timeout":
         assert "exit 0" in error and "slow output" in error and "timed out" in error
+
+
+def test_check_done_launch_error_still_reports_earlier_failures(hook, capsys, monkeypatch):
+    """#420: an error on a later command does not hide the failures gathered before it."""
+    from foragent import runner
+    from foragent.run_checks import CheckResult
+
+    setup, worktree, counter = hook
+    args = setup(["check-a", "check-b"])
+
+    def check(command, *rest, **kwargs):
+        if command == "check-b":
+            raise OSError("cannot launch check-b")
+        return CheckResult(command, 1, False, "A failed output")
+
+    monkeypatch.setattr(runner, "_check", check)
+    assert main(args) == 2
+    err = capsys.readouterr().err
+    assert "Done when failed: check-a\nA failed output" in err and "cannot launch check-b" in err

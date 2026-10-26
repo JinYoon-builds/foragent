@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
 
 STOP_LIMIT = 1500
-REVIEW_LIMIT = 3000
 LIST_LIMIT = 50
 
 
@@ -111,6 +110,24 @@ def saved_failures_section(root: Path, n: int, failure_text: str = "") -> str:
     return f"Failing checks saved by the last verification ({path}):\n{bundle}"
 
 
+def saved_review_section(root: Path, n: int, failure_text: str = "") -> str:
+    """The latest saved review, whole: every finding reaches the next attempt."""
+    review = _latest_review(root, n)
+    if review is None:
+        return ""
+    path, text = review
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("VERDICT:")]
+    if lines and all(line in failure_text for line in lines):
+        return ""  # this attempt's failure text already carries every finding
+    return f"Latest review findings ({path.relative_to(root)}):\n" + (text or "(empty)")
+
+
+def saved_feedback_section(root: Path, n: int, failure_text: str = "") -> str:
+    """Saved review and failing checks the failure text does not already carry; fresh and resumed prompts."""
+    return "\n".join(part for part in (saved_review_section(root, n, failure_text),
+                                        saved_failures_section(root, n, failure_text)) if part)
+
+
 def previous_attempt_summary(attempt: Implementation, failure_text: str = "") -> str:
     """Short facts from Git and run artifacts; the failing output follows in its own section.
 
@@ -119,14 +136,10 @@ def previous_attempt_summary(attempt: Implementation, failure_text: str = "") ->
     """
     root, n = attempt.ctx.store.root, attempt.n
     facts = _branch_facts(attempt)
-    if review := _latest_review(root, n):
-        path, text = review
-        facts.append(f"Latest review findings ({path.relative_to(root)}):\n"
-                     + (cuts.tail(text, REVIEW_LIMIT, cuts.issue_dir(root, n), "latest-review.txt") or "(empty)"))
     stop = stop_path(root, n)
     if stop.is_file():
         facts.append("Where it stopped:\n" + stop.read_text(encoding="utf-8", errors="replace").strip())
-    if saved := saved_failures_section(root, n, failure_text):
+    if saved := saved_feedback_section(root, n, failure_text):
         facts.append(saved)
     facts.append("Failed checks or findings: see below.")
     return "\n".join(facts)

@@ -231,3 +231,24 @@ def test_native_claude_gets_the_lane_memory_cut_notice(tmp_path):
     assert f"[cut: 30 more lines; full text: {tmp_path / 'full' / 'lane-memory.md'}]" in setup.memory_notice
     assert setup.notes == ""  # Claude reads the agent itself; the notice follows the task text
     assert (tmp_path / "full" / "lane-memory.md").read_text() == memory.read_text()
+
+
+def test_partial_verification_never_deletes_failures_it_did_not_rerun(tmp_path):
+    """#420: only a complete verification replaces the saved bundle; partial ones update what they ran."""
+    from foragent.run_checks import CheckResult, save_failures
+
+    failing = [CheckResult("a", 1, False, "a broke"), CheckResult("b", 1, False, "b broke")]
+    save_failures(tmp_path, 1, failing)
+    path = cuts.failures_path(tmp_path, 1)
+    # A verification that could not launch anything leaves the bundle as it was.
+    save_failures(tmp_path, 1, [], complete=False)
+    assert "a broke" in path.read_text() and "b broke" in path.read_text()
+    # A partial run where a now passes and b was never reached keeps b only.
+    save_failures(tmp_path, 1, [CheckResult("a", 0, False, "")], complete=False)
+    assert "a broke" not in path.read_text() and "b broke" in path.read_text()
+    # A partial run that times out on b replaces b's entry with the new output.
+    save_failures(tmp_path, 1, [CheckResult("b", None, True, "b slow")], complete=False)
+    assert "b slow" in path.read_text() and "b broke" not in path.read_text()
+    # A complete verification that passes clears everything.
+    save_failures(tmp_path, 1, [CheckResult("a", 0, False, ""), CheckResult("b", 0, False, "")])
+    assert not path.exists()

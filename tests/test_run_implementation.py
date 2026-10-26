@@ -121,3 +121,43 @@ def test_new_attempt_reads_the_saved_failure_bundle_not_the_short_detail(run_cas
     prompt = c.executor.calls[0]["prompt"]
     assert "first output" in prompt and "second output" in prompt
     assert prompt.count("second output") == 1
+
+
+@pytest.mark.parametrize("resumed", [False, True], ids=["fresh", "resumed"])
+def test_saved_review_reaches_the_next_attempt_whole(run_case, resumed):
+    """#420: after rerun-review FAIL then retry, every saved finding reaches the implementer, fresh or resumed."""
+    from foragent import cuts
+
+    c = run_case
+    findings = [f"src/feature_{n}.py:{n} — retry drops required field_{n}. " + "x" * 400 for n in range(1, 10)]
+    review = cuts.issue_dir(c.store.root, 1) / "review-1.txt"
+    review.parent.mkdir(parents=True, exist_ok=True)
+    review.write_text("VERDICT: FAIL\n" + "\n".join(findings), encoding="utf-8")
+    c.store.update_run(1, detail="Re-run review FAIL.", resume_reason="retries-exceeded\nRe-run review FAIL.")
+    if resumed:
+        c.store.update_run(1, session_id="saved", session_executor=c.ctx.config.executor,
+                           session_body=c.store.load_approval(1).body)
+    assert run_issue(1, c.ctx) == "merged"
+    call = c.executor.calls[0]
+    assert (call.get("resume_session_id") == "saved") is resumed
+    missing = [finding for finding in findings if finding not in call["prompt"]]
+    assert not missing, f"{len(missing)} of 9 saved findings lost"
+
+
+def test_exception_during_checks_keeps_the_failures_gathered_before_it(run_case, monkeypatch):
+    """#420: command A fails, launching command B raises; A's failure still reaches the next attempt."""
+    from foragent import cuts, runner
+    from foragent.run_checks import CheckResult
+    from runner_support import set_done_when
+
+    c = run_case
+    set_done_when(c, ["check-a", "check-b"])
+
+    def check(command, *args, **kwargs):
+        if command == "check-b":
+            raise OSError("cannot launch check-b")
+        return CheckResult(command, 1, False, "A failed output")
+
+    monkeypatch.setattr(runner, "_check", check)
+    run_issue(1, c.ctx)
+    assert "A failed output" in cuts.failures_path(c.store.root, 1).read_text()

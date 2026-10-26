@@ -845,3 +845,48 @@ def test_pr_head_timeout_saves_earlier_failures_and_the_timed_out_output(run_cas
     assert ran == ["check-one", "check-two"]
     saved = cuts.failures_path(c.store.root, 1).read_text()
     assert "first output" in saved and "second output" in saved and "Check timed out." in saved
+
+
+def test_pr_head_exception_keeps_the_failures_gathered_before_it(run_case, monkeypatch):
+    """#420: an exception on a later PR-head command still saves the earlier failure."""
+    from foragent import cuts, runner
+    from foragent.run_checks import CheckResult, _verify_review_head
+    from foragent.issue import parse_body
+    from foragent.git import GitRepo
+
+    c = run_case
+
+    def check(command, *args, **kwargs):
+        if len(calls) == 1:
+            raise OSError("cannot launch")
+        calls.append(command)
+        return CheckResult(command, 1, False, "first failed output")
+
+    calls = []
+    monkeypatch.setattr(runner, "_check", check)
+    parsed = parse_body(c.store.load_approval(1).body)
+    parsed = parsed.__class__(**{**parsed.__dict__, "done_when_commands": ["one", "two"]})
+    with pytest.raises(OSError):
+        _verify_review_head(1, c.ctx, GitRepo(c.ctx.repo_root), parsed, "head", "link")
+    assert "first failed output" in cuts.failures_path(c.store.root, 1).read_text()
+    c.store.finish_run(1, "error")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_pr_head_launch_error_keeps_the_previously_saved_failures(run_case, monkeypatch):
+    """#420: a new PR-head verification whose first command cannot launch deletes nothing."""
+    from foragent import cuts, runner
+    from foragent.git import GitRepo
+    from foragent.issue import parse_body
+    from foragent.run_checks import CheckResult, _verify_review_head, save_failures
+
+    c = run_case
+    save_failures(c.store.root, 1, [CheckResult("one", 1, False, "earlier failure")])
+    monkeypatch.setattr(runner, "_check", lambda *a, **k: (_ for _ in ()).throw(OSError("cannot launch")))
+    parsed = parse_body(c.store.load_approval(1).body)
+    parsed = parsed.__class__(**{**parsed.__dict__, "done_when_commands": ["one", "two"]})
+    with pytest.raises(OSError):
+        _verify_review_head(1, c.ctx, GitRepo(c.ctx.repo_root), parsed, "head", "link")
+    assert "earlier failure" in cuts.failures_path(c.store.root, 1).read_text()
+    c.store.finish_run(1, "error")
+    c.tracker.remove_labels(1, ["running"])
