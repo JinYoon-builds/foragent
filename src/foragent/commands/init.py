@@ -38,6 +38,29 @@ def _offer_statusline(answer: str | None) -> None:
         print("Claude statusline: not asked (no terminal); rerun with --statusline yes|no.")
 
 
+def _offer_upstream_reports(root) -> None:
+    """Ask once, default no, whether upstream error reports may be proposed; remember either answer."""
+    from foragent.config import set_upstream_reports
+    from foragent.upstream_report import UPSTREAM
+
+    cli = facade()
+    try:
+        # Asked only after setup wrote a usable config; the answer itself is global.
+        language = cli.load_config(root).language
+        if cli.load_global_config().upstream_reports is not None:
+            return
+    except cli.ConfigError:
+        return
+    try:
+        answer = input(cli.text("upstream_reports_question", language, upstream=UPSTREAM))
+    except (EOFError, OSError):
+        print(cli.text("upstream_reports_unanswered", language))
+        return
+    enabled = answer.strip().lower() in {"y", "yes"}
+    set_upstream_reports(enabled)
+    print(cli.text("upstream_reports_on" if enabled else "upstream_reports_off", language))
+
+
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
@@ -50,5 +73,6 @@ def run(args) -> int:
     print(report.summary())
     if not args.dry_run:
         cli._offer_statusline(args.statusline)
+        _offer_upstream_reports(report.normalized_root or root)
         cli._open_lane_view(report.normalized_root or root)
     return 0
