@@ -218,8 +218,16 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     log = ctx.store.log_path(n)
 
     def call(prompt: str, log_path: Path = log) -> ExecResult:
+        # The panel decides the round's outcome from every call, so no call blocks the issue itself.
         return _available_executor(n, ctx, executor, worktree=git.root, reviewer=True, prompt=prompt,
-                                   **settings, timeout_s=runner._remaining(n, ctx), log_path=log_path)
+                                   **settings, timeout_s=runner._remaining(n, ctx), log_path=log_path,
+                                   flag_exhaustion=False)
+
+    def unusable_error(label: str, error: BaseException) -> str:
+        """Re-raise a usage limit or an interrupt; any other error becomes an UNUSABLE note."""
+        if _is_limit(error) or not isinstance(error, Exception):
+            raise error
+        return f"{label} failed: {getattr(error, 'outcome', type(error).__name__)} {error}".rstrip()
 
     # Each concurrent reviewer logs to its own file: executors derive per-call output files
     # (Claude's `<log>.stdout`) from the log path, so a shared log would mix their outputs.
@@ -239,46 +247,61 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     try:
         with ThreadPoolExecutor(max_workers=len(prompts), thread_name_prefix=f"review-{n}") as pool:
             futures = [pool.submit(call, prompt, path) for prompt, path in zip(prompts, logs)]
-        errors = [future.exception() for future in futures if future.exception() is not None]
+        errors = [future.exception() for future in futures]
     finally:
         edited = restore(before)
-    if errors:
-        # A usage limit already paused the executor and handed the issue back; the round is discarded.
-        raise next((error for error in errors if isinstance(error, ExecutorStopped)), errors[0])
-    results = [future.result() for future in futures]
+    count = len(futures)
+    # Outcome order: an interrupt propagates first; then any usage limit wins over every other
+    # reviewer outcome (the round is discarded and runs again in full); other errors are UNUSABLE.
+    raised = [error for error in errors if error is not None]
+    for error in ([error for error in raised if not isinstance(error, Exception)]
+                  + [error for error in raised if _is_limit(error)]):
+        raise error
+    problems: list[str] = []
     raws = []
-    for k, result in enumerate(results, start=1):
-        message = result.full_message if result.full_message is not None else result.last_message
-        raws.append(_raw_text(reviewer, message))
+    timed_out = False
+    for k, (future, error) in enumerate(zip(futures, errors), start=1):
+        if error is not None:
+            problems.append(unusable_error(f"Reviewer {k} of {count}", error))
+            raws.append(problems[-1])
+        else:
+            result = future.result()
+            message = result.full_message if result.full_message is not None else result.last_message
+            raws.append(_raw_text(reviewer, message))
+            timed_out |= result.timed_out
+            if result.timed_out or result.exit_code != 0:
+                problems.append(f"Reviewer {k} of {count} exit_code={result.exit_code}, timed_out={result.timed_out}")
+            elif parse_review(raws[-1]).verdict == "UNUSABLE":
+                # A reviewer without a VERDICT line gave no usable review; never let the merge cover for it.
+                problems.append(f"Reviewer {k} of {count} gave no verdict")
         _save_review(n, ctx, f"review-{round_number}-{k}.txt", raws[-1])
     _append(log, "Parallel reviewer logs:\n" + "\n".join(str(path) for path in logs))
     findings = "\n\n".join(f"Reviewer {k}:\n{raw}" for k, raw in enumerate(raws, start=1))
-    failed = [(k, result) for k, result in enumerate(results, start=1) if result.timed_out or result.exit_code != 0]
-    # A reviewer without a VERDICT line gave no usable review; never let the merge cover for it.
-    unparsed = [k for k, raw in enumerate(raws, start=1)
-                if k not in dict(failed) and parse_review(raw).verdict == "UNUSABLE"]
-    timed_out = any(result.timed_out for _, result in failed)
-    if failed or unparsed:
+    if problems:
         raw = findings
-        review = ReviewResult("UNUSABLE", "", (*(
-            f"Reviewer {k} of {len(results)} exit_code={result.exit_code}, timed_out={result.timed_out}"
-            for k, result in failed), *(f"Reviewer {k} of {len(results)} gave no verdict" for k in unparsed)))
+        review = ReviewResult("UNUSABLE", "", tuple(problems))
     else:
         try:
             result = call(build_review_prompt(parsed, diff, acceptance, rebuttals=rebuttals,
                                               risk_notes=review_perspectives.with_checklist(notes, ctx.config),
                                               panel_findings=findings))
+        except BaseException as error:
+            result = None
+            raw = unusable_error("Findings merge", error)
         finally:
             edited = restore(before) or edited
-        message = result.full_message if result.full_message is not None else result.last_message
-        raw = _raw_text(reviewer, message)
-        timed_out = result.timed_out
-        review = (ReviewResult("UNUSABLE", "", (
-            f"Findings merge exit_code={result.exit_code}, timed_out={result.timed_out}",
-        )) if result.timed_out or result.exit_code != 0 else parse_review(raw))
+        if result is None:
+            review = ReviewResult("UNUSABLE", "", (raw,))
+        else:
+            message = result.full_message if result.full_message is not None else result.last_message
+            raw = _raw_text(reviewer, message)
+            timed_out = result.timed_out
+            review = (ReviewResult("UNUSABLE", "", (
+                f"Findings merge exit_code={result.exit_code}, timed_out={result.timed_out}",
+            )) if result.timed_out or result.exit_code != 0 else parse_review(raw))
     _save_review(n, ctx, f"review-{round_number}.txt", raw)
     review = ReviewResult(review.verdict, review.findings, (
-        f"reviewers: {len(results)} in parallel, one findings merge", *review.notes,
+        f"reviewers: {count} in parallel, one findings merge", *review.notes,
     ))
     if edited:
         review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
@@ -287,6 +310,10 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}")
     _progress(n, ctx)
     return replace(review, raw=raw, timed_out=timed_out)
+
+
+def _is_limit(error: BaseException) -> bool:
+    return isinstance(error, ExecutorStopped) and error.outcome == "limit-wait"
 
 
 def _risk_notes(git: GitRepo, base_ref: str) -> str:

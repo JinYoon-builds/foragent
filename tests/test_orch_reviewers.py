@@ -12,7 +12,7 @@ from foragent.runner import run_issue  # noqa: E402
 from foragent.state import StateStore  # noqa: E402
 from test_review_parallel import PanelExecutor, install_panel  # noqa: E402
 from test_review_perspectives import perspective_case, review_offline  # noqa: E402,F401
-from test_risk_map import offline  # noqa: E402,F401
+from test_risk_map import copy_history, offline  # noqa: E402,F401
 from test_skills_autosync import isolated_home  # noqa: E402,F401
 
 
@@ -89,3 +89,65 @@ def test_reviewer_without_verdict_makes_round_unusable_without_merge(git_history
     assert panel.merges == [], "A reviewer with no verdict must not reach the merge call"
     assert outcome != "merged" and case.tracker.merged_prs == []
     assert "blocked" in case.tracker.get_issue(1).labels
+
+
+class OutcomePanel(PanelExecutor):
+    """Reviewers overlap as usual, then reviewer k returns or raises ``outcomes[k]`` instead."""
+
+    def __init__(self, messages, outcomes, *, merge_error=None):
+        super().__init__(messages)
+        self.outcomes = outcomes
+        self.merge_error = merge_error
+        self.started = 0
+
+    def run(self, **kwargs):
+        with self.lock:
+            index, self.started = self.started, self.started + 1
+        result = super().run(**kwargs)
+        if index >= len(self.messages):
+            if self.merge_error is not None:
+                raise self.merge_error
+            return result
+        outcome = self.outcomes.get(index)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome == "transient":
+            return ExecResult(1, False, "service unavailable", kwargs["log_path"], error_kind="transient")
+        if outcome == "limit":
+            return ExecResult(1, False, "usage limit reached", kwargs["log_path"], error_kind="limit")
+        return result
+
+
+def run_outcome_panel(git_history, tmp_path, monkeypatch, panel):
+    case = perspective_case(git_history, tmp_path, monkeypatch, count=len(panel.messages), review_max=0,
+                            max_retries=1, transient_max_wait_minutes=0)
+    install_panel(case, panel)
+    return case, run_issue(1, case.ctx)
+
+
+def test_usage_limit_wins_over_another_reviewers_exhausted_retries(git_history, tmp_path, monkeypatch):
+    for order in ({0: "transient", 1: "limit"}, {0: "limit", 1: "transient"}):
+        root = tmp_path / "-".join(order.values())
+        panel = OutcomePanel(["VERDICT: PASS"] * 2, order)
+        case, outcome = run_outcome_panel(copy_history(git_history, root), root, monkeypatch, panel)
+        assert outcome == "limit-wait", order
+        labels = case.tracker.get_issue(1).labels
+        assert "ready" in labels and "blocked" not in labels, (order, labels)
+        assert panel.merges == []
+
+
+def test_reviewer_and_merge_errors_make_the_round_unusable(git_history, tmp_path, monkeypatch):
+    cases = {
+        "exhausted": OutcomePanel(["VERDICT: PASS"] * 2, {1: "transient"}),
+        "raised": OutcomePanel(["VERDICT: PASS"] * 2, {0: RuntimeError("reviewer crashed")}),
+        "merge-raised": OutcomePanel(["VERDICT: PASS"] * 2, {}, merge_error=RuntimeError("merge crashed")),
+    }
+    for name, panel in cases.items():
+        root = tmp_path / name
+        case, outcome = run_outcome_panel(copy_history(git_history, root), root, monkeypatch, panel)
+        assert outcome != "merged" and case.tracker.merged_prs == [], name
+        assert "blocked" in case.tracker.get_issue(1).labels, name
+        merge_round = case.store.root / "runs" / "issue-1" / "review-1.txt"
+        assert merge_round.is_file(), f"{name}: an unusable panel still counts as one review round"
+        if name != "merge-raised":
+            assert panel.merges == [], f"{name}: a failed reviewer must not reach the merge call"
