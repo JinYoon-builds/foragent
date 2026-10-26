@@ -2661,7 +2661,7 @@ def test_crash_group_termination_failure_preserves_worktree_and_active_run(ctx, 
     tick(ctx)
     mark_running(ctx)
     ctx.process_table.add(124, ppid=123, cwd=ctx.repo_root, start_time=NOW.timestamp() + 1)
-    ctx.store.update_run(1)
+    ctx.store.update_run(1, observe=True)
     ctx.process_table.exit(ctx.store.get_run(1).pid)
     monkeypatch.setattr(ctx.git, "remove_worktree", lambda path: pytest.fail("group is not stopped"))
 

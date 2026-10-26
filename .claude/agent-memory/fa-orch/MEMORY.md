@@ -133,3 +133,4 @@
 - [#497 memory critical line](project_497_memory_critical.md) — raw kernel level, critical holds starts only, floors in IGNORED_KEYS
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
 - #532: 리뷰 관점 체크리스트는 `review_perspectives.with_checklist()`로 위험 지도 메모 뒤에 붙인다(run_review 2곳·run_publish 1곳). 새 Config 키는 `tests/test_config.py::test_exact_defaults`도 고쳐야 한다.
+- #547: `update_run`은 `observe=True` 또는 `pid`·`process_identities`·`executor_pgid`가 있을 때만 프로세스 표를 읽는다. 메타데이터만 바꾸는 갱신에 기대 후손을 관찰하던 단위 시험은 `observe=True`를 명시해 의도를 유지한다.
