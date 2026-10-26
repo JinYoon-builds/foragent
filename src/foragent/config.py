@@ -86,6 +86,8 @@ class Config:
     ouroboros_version: str | None = None
     update_check: bool = True  # The daily release check (#417); FORAGENT_UPDATE_CHECK=off also opts out.
     profile: dict[str, Any] | None = None
+    # Order perspective seat -> executor (#414); unnamed seats use the built-in split.
+    perspectives: dict[str, str] = field(default_factory=dict)
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())

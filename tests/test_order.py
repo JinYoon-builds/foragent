@@ -1194,3 +1194,111 @@ def test_new_lane_issue_is_prereaded_only_after_its_lane_exists(publishing, plan
         assert client["agent"] == "fa-web"
     publish((root, created, tracker, publishing[3], events), plan, approve=True)
     assert all("approved" in tracker.get_issue(n).labels for n in (2, 3))
+
+
+def test_perspectives_decisions_cut_keeps_titles_and_latest_twenty(tmp_path):
+    from foragent import order_perspectives
+
+    (tmp_path / "docs").mkdir()
+    entries = "".join(f"### D{n}. Decision {n}\nBody {n}\n\n#### Addendum {n}\nMore {n}\n\n" for n in range(1, 26))
+    (tmp_path / "docs/decisions.md").write_text("# Decisions\nPreamble\n\n" + entries, encoding="utf-8")
+    text = order_perspectives.decisions_text(tmp_path)
+    assert "Cut notice: docs/decisions.md has 25 decisions" in text
+    assert all(f"### D{n}. Decision {n}" in text for n in range(1, 26))
+    assert "Body 5" not in text and "Body 6" in text and "More 25" in text
+    assert "Preamble" not in text
+
+
+def test_perspectives_config_rejects_unknown_seat_or_executor():
+    from foragent.config import ConfigError, DEFAULTS
+    from foragent.config_validation import _validate
+
+    for value in ({"wizard": "codex"}, {"skeptic": "gpt"}, {"skeptic": ["codex"]}, ["skeptic"]):
+        with pytest.raises(ConfigError, match="perspectives"):
+            _validate({**DEFAULTS, "perspectives": value})
+    _validate({**DEFAULTS, "perspectives": {"skeptic": "claude"}})
+
+
+def test_perspectives_without_executors_fail_every_seat(tmp_path, monkeypatch):
+    import shutil
+    from foragent import executors, order_perspectives
+    from foragent.state import StateStore
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: None)
+    monkeypatch.setattr(executors, "executor_for", lambda name: pytest.fail("no executor may run"))
+    result = order_perspectives.run({"id": "p"}, tmp_path, Config(), StateStore(tmp_path / "state"))
+    assert result["questions"] == []
+    assert {failure["perspective"] for failure in result["failures"]} == set(order_perspectives.SEATS)
+
+
+def test_perspectives_rerun_replaces_questions_and_keeps_existing_marks(tmp_path, monkeypatch):
+    import shutil
+    from foragent import executors, order_perspectives
+    from foragent.executors import ExecResult
+    from foragent.state import StateStore
+
+    answers = iter(["First\nSecond"] * 6 + ["Only"] * 6)
+
+    class Worker:
+        def run(self, **kwargs):
+            assert kwargs["model"] is None and kwargs["read_only"] is True and "effort" not in kwargs
+            return ExecResult(0, False, next(answers), kwargs["log_path"])
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: Worker())
+    store = StateStore(tmp_path / "state")
+    first = order_perspectives.run({"id": "p"}, tmp_path, Config(), store)
+    ids = [question["id"] for question in first["questions"] if question["perspective"] == "skeptic"]
+    order_perspectives.mark(store, ids[0], True)
+    order_perspectives.mark(store, ids[1], True)
+    again = order_perspectives.run({"id": "p"}, tmp_path, Config(), store)
+    assert again["plan_hash"] == first["plan_hash"] and len(again["questions"]) == 6
+    rows = order_perspectives.stats(store)["perspectives"]
+    assert rows["skeptic"] == {"asked": 1, "changed": 1}
+    with pytest.raises(order.PlanError):
+        order_perspectives.mark(store, ids[1], False)
+
+
+def test_perspectives_human_errors_follow_the_configured_language(tmp_path, monkeypatch):
+    import shutil
+    from foragent import executors, order_perspectives
+    from foragent.config import ConfigError, DEFAULTS
+    from foragent.config_validation import _validate
+    from foragent.executors import ExecResult
+
+    store = StateStore(tmp_path / "state")
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: None)
+    missing = order_perspectives.run({"id": "p"}, tmp_path, Config(language="ko"), store)["failures"]
+    assert all("설치되어 있지 않아" in failure["error"] for failure in missing)
+
+    replies = iter([ExecResult(7, False, "boom", tmp_path / "log"), ExecResult(0, True, "", tmp_path / "log")]
+                   + [OSError("down")] * 4)
+
+    class Worker:
+        def run(self, **kwargs):
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: Worker())
+    errors = [failure["error"] for failure in
+              order_perspectives.run({"id": "q"}, tmp_path, Config(language="ko"), store)["failures"]]
+    assert sum("종료 코드 7" in error and "boom" in error for error in errors) == 1
+    assert sum("초 안에 답이 없었어요" in error for error in errors) == 1
+    assert sum("멈췄어요" in error and "down" in error for error in errors) == 4
+    with pytest.raises(order.PlanError, match="관점 질문이 없어요"):
+        order_perspectives.mark(store, "missing", True, "ko")
+    with pytest.raises(ConfigError, match="자리"):
+        _validate({**DEFAULTS, "language": "ko", "perspectives": {"wizard": "codex"}})
+
+
+@pytest.mark.parametrize("language, expected", [("ko", "질문 id (mark에서만)"), ("en", "question id (only with mark)")])
+def test_perspectives_help_follows_the_repository_language(tmp_path, monkeypatch, capsys, language, expected):
+    (tmp_path / ".foragent.yml").write_text(yaml.safe_dump({"repo": "owner/repo", "language": language}))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["order", "perspectives", "--help"])
+    assert exit_info.value.code == 0
+    assert expected in " ".join(capsys.readouterr().out.split())
