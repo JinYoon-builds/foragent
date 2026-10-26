@@ -11,7 +11,7 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board, usage_events, usage_recheck
+from foragent import board, sleep_ledger, usage_events, usage_recheck
 from foragent.actions import flag
 from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
@@ -62,7 +62,8 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         nonlocal size
         current = log.stat().st_size if log.exists() else 0
         if current > size:
-            timestamp = ctx.now().astimezone(UTC).isoformat()
+            # An awake event: a sleep ledger reading's own moment (#415).
+            timestamp = sleep_ledger.mark(ctx.now).astimezone(UTC).isoformat()
             ctx.store.update_run(n, last_progress_at=timestamp, last_activity_at=timestamp)
         size = current
 

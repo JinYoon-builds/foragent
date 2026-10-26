@@ -1,22 +1,21 @@
 ---
 name: project-415-sleep-ledger
-description: #415 machine sleep credit — capacity.slept_seconds sensor, sleep_ledger.py machine-wide ledger, conftest stub, line-limit constraints
+description: #415 machine sleep credit — final design (append-only ledger of closed intervals, one locked snapshot per consumer) and why ten review rounds pushed there
 metadata:
   type: project
 ---
 
-- Sensor `capacity.slept_seconds(since)` keeps a cumulative machine-wide interval history (`sleep-history.json`): every Darwin kern.sleeptime/waketime pair seen, plus offset growth (BOOTTIME−MONOTONIC or wall−monotonic) the pairs don't explain. Review rejected per-`since` baselines (evicted after N) and last-pair-only Darwin. Prune strictly: drop sleep ending before the oldest running run's start (and the read's own since); no age retention.
-- Python `time.monotonic` is `mach_absolute_time()` on macOS (pauses in sleep), so monotonic-timed waits hold no sleep; only wall-clock waits (`_test_slot`) must subtract sleep. Review rejected excluding sleep from runs with an open wait (lost credit, repo-local fact in a machine-wide ledger).
-- Ledger `sleep_ledger.observe()` runs at the top of `scheduler_recovery._recover_runs` (that file is a facade split module, 300-line limit). Ledger resets when its baseline is later than now — tests loop with clocks restarting at BASE_TIME in one tmp machine root.
-- `tests/conftest.py` stubs `capacity.slept_seconds` to 0 except in `test_machine_sleep`/`test_sleep_ledger`: the owner's real sleep would otherwise credit runs on fake past clocks (BASE_TIME is in the past).
-- Review round 3: read the time inside the history/ledger lock (an older reader overwrote newer facts); credit only the least sleep that must lie inside a query (`capacity.sleep_within`) since coarse intervals don't place sleep; an exact kernel pair takes its seconds out of coarse intervals it overlaps (no double source). Clock moving back drops only facts dated after now.
-- Round 4 (held after 3 rounds): never reconstruct wake as baseline+slept; take kernel wake or the read that found offset sleep (`capacity.latest_wake`). Ledger places sleep by bisecting `capacity.slept_seconds` (works with the acceptance fake, which only patches that function). Read kernel pair + offset + wall twice and retry until unchanged (`_clock_snapshot`).
-- Round 5: never compute a window's sleep as slept(a) − slept(b) from two live reads (a suspend between them goes negative); use `capacity.slept_until(since, now_fn)`, which reads now() between two equal sensor readings.
-- Round 6: judge runs at the ledger's observation moment (`Ledger.at`), not a later `ctx.now()` (a suspend after observing is uncredited). Placement must not drop fragments (epsilon 1e-6) and grace/wake line use the sensor's window total. Acceptance helpers are importable via `sys.path.insert(tests/acceptance)` (precedent `tests/test_orch_reviewers.py`).
-- Round 7 (held again): one class — sleep measured over one window, applied to another. Structural fix: every credited window starts at a sensor sample (`capacity.sleep_mark` in `start_run` and `_test_slot`); ledger window end comes from `slept_until` with a final probe that re-observes if sleep follows; scheduler re-observes per run via `sleep_ledger.current`. Verify each new test fails against `git show HEAD:<src>` before trusting it.
-- Round 8: removed ledger placement/credit entirely — credit comes from the sensor history via `capacity.slept_until_many([started, progress], ctx.now)` per run; ledger keeps only baseline + wake grace (baseline falls back to oldest running run start). Every query start is stamped then sampled (start_run, update_run progress/activity outside the state lock, sleep_mark, tick probe); offset intervals are credited up to the query overlap minus exact kernel pairs. `state_runs.py` has a 300-line limit (test_state_split).
-- Round 9: `Run.sleep_free_waits` (set by start_run) — runs from before #415 hold sleep in wall-timed waits and get no runtime sleep credit. Samples carry the event time (`sleep_sample(awake_at)`) and split offset sleep at it, so post-wake progress ends grace. Real-sensor tests must put stores under `capacity.machine_root()` or pruning drops everything. In zsh use arrays (`F=(...)`) for file loops.
-- `store.root.parent` may not exist in unit tests; guard `iterdir()`.
+Final design (2026-10-27, after three "held" reviews):
+- `capacity.slept_seconds(since)` is only the sensor: Darwin kern.sleeptime/waketime ∩ [since, now]; elsewhere a BOOTTIME−MONOTONIC or wall−monotonic offset vs its baseline keyed by `since` (`sleep-baselines.json`, few keys).
+- `sleep_ledger.read(now_fn, starts, tick=, report=, language=)` under its own lock appends `(since, until, seconds)` (previous reading → this reading) to `sleep-ledger.jsonl` and returns a Snapshot with direct sensor reads for `starts`. Credit = max(ledger lower bound, sensor). Prune only records ending at or before the oldest running start machine-wide; a reader that sees no running run prunes nothing (age-only retention was rejected).
+- Consumers (`_remaining`, `_test_slot`, scheduler runtime and stall) credit `Snapshot.credit(start)` = overlap of [start, now]. An awake event (run start, progress, wait start) inside an interval proves that sleep ended before it. Wake grace opens only at gate ticks (`tick=True`) when sleep since the previous tick > 60 s, lasting 5 min from that tick; an event ends it only if < 1 s of wall time follows it in the latest grace record.
+- Awake events are stamped by a reading (`sleep_ledger.mark(now)`: start_run, run_waits progress/waits, run_execution poll), so every event is a record boundary; following an event with a reading was rejected as non-atomic. Grace ends only for events at or after the grace record's end.
+- The last record is the checkpoint (previous = max(state read_at, last record until)); appends close a torn last line first. Darwin sensor = max(kernel pair ∩ window, mach_continuous−mach_absolute growth); the measure bracket compares with abs() because the pair can go down.
+- No version markers or legacy branches (the orchestrator rejected `sleep_free_waits`).
 
-**Why:** these were non-obvious failures found while implementing #415.
-**How to apply:** reuse the conftest opt-in pattern for any new real-machine sensor.
+Lessons:
+- When reviewers keep finding new edge cases in the same area, simplify the model instead of patching each one; ten rounds of patches (bisection placement, coarse bounds, event splits, markers) all produced new defects.
+- `tests/conftest.py` replaces `sleep_ledger.read` with an empty snapshot except in `test_machine_sleep`/`test_sleep_ledger`/`test_sleep_judgment`: a reading writes the machine root (breaks `test_state.py`'s os.replace inspection) and the owner's real sleep would credit fake-clock runs.
+- `state_runs.py` and scheduler split modules have 300-line limits (`test_state_split`, `test_scheduler_split`).
+- Python `time.monotonic` is `mach_absolute_time()` on macOS (pauses in sleep), so monotonic-timed waits hold no sleep.
+- Acceptance helpers are importable via `sys.path.insert(tests/acceptance)` (precedent `tests/test_orch_reviewers.py`). In zsh use arrays for file loops.

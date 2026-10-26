@@ -73,9 +73,6 @@ class Run:
     merge_lock_held_seconds: float | None = None
     comparison: dict | None = None
     files_committed: bool = False
-    # Set at start since #415: waits exclude sleep, so sleep is credited separately.
-    # A run from before it may hold sleep in waited_seconds and gets no sleep credit.
-    sleep_free_waits: bool = False
     files_base_branch: str | None = None
     declared_files: list[str] | None = None
     changed_files: list[str] | None = None

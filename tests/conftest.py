@@ -128,12 +128,12 @@ def isolated_test_slots(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_real_machine_sleep(request, monkeypatch):
-    """The owner's real sleep must not credit runs on fake clocks; sleep tests opt in (#415)."""
-    from foragent import capacity
+    """No sleep ledger outside the sleep tests: the owner's real sleep must not credit runs
+    on fake clocks, and a reading must not write the machine data root (#415)."""
+    from foragent import sleep_ledger
 
-    if request.module.__name__ not in {"test_machine_sleep", "test_sleep_ledger"}:
-        monkeypatch.setattr(capacity, "slept_seconds", lambda since: 0.0)
-        monkeypatch.setattr(capacity, "sleep_sample", lambda awake_at: None)
+    if request.module.__name__ not in {"test_machine_sleep", "test_sleep_ledger", "test_sleep_judgment"}:
+        monkeypatch.setattr(sleep_ledger, "read", lambda now, starts=(), **kwargs: sleep_ledger.Snapshot((), now()))
 
 
 @pytest.fixture(autouse=True)

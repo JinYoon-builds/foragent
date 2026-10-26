@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import threading
 from typing import TYPE_CHECKING
 
-from foragent import capacity, orch_github
+from foragent import capacity, orch_github, sleep_ledger
 from foragent.actions import flag
 from foragent.reasons import Reason
 from foragent.tracker import TrackerError
@@ -38,12 +38,10 @@ def _remaining(n: int, ctx: RunContext) -> int:
     run = ctx.store.get_run(n)
     if run is None:
         raise KeyError(n)
+    # Sleep is not run time: the run's window overlap with the ledger, read with now.
     started = datetime.fromisoformat(run.started_at)
-    # Machine sleep is not run time. Waits are timed without sleep, so it is credited once.
-    slept, now = capacity.slept_until(started, ctx.now)
-    # A run from before #415 may hold sleep in waited_seconds already; it keeps today's budget.
-    slept = slept if run.sleep_free_waits else 0.0
-    elapsed = (now - started).total_seconds() - run.waited_seconds - slept
+    sleep = sleep_ledger.read(ctx.now, [started])  # Also reads capacity.slept_seconds(started) directly.
+    elapsed = (sleep.now - started).total_seconds() - run.waited_seconds - sleep.credit(started)
     return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
 
 
@@ -56,14 +54,14 @@ def _timeout(n: int, ctx: RunContext) -> str:
 def _test_slot(n: int, ctx: RunContext):
     """Hold a machine-wide test slot; credit the queue time as waited, not run time."""
     run = ctx.store.get_run(n)
-    # The wait's sleep window starts at a sensor sample, never at one taken earlier.
-    started = capacity.sleep_mark(ctx.now)
+    started = sleep_ledger.mark(ctx.now)  # Awake events are ledger reading moments (#415).
     waited = False
 
     def credit() -> datetime:
-        # A wall-clock wait would include sleep, which the runtime limit credits separately.
-        slept, now = capacity.slept_until(started, ctx.now)
-        queued = (now - started).total_seconds() - slept
+        # A wall-clock wait would hold sleep, which the ledger credits once: only awake queue time.
+        sleep = sleep_ledger.read(ctx.now, [started])
+        now = sleep.now
+        queued = (now - started).total_seconds() - sleep.credit(started)
         ctx.store.update_run(
             n, waited_seconds=run.waited_seconds + max(0.0, queued),
             last_progress_at=now.astimezone(UTC).isoformat(),
@@ -88,7 +86,7 @@ def _test_slot(n: int, ctx: RunContext):
 
 
 def _progress(n: int, ctx: RunContext) -> None:
-    ctx.store.update_run(n, last_progress_at=ctx.now().astimezone(UTC).isoformat())
+    ctx.store.update_run(n, last_progress_at=sleep_ledger.mark(ctx.now).astimezone(UTC).isoformat())
 
 
 def _phase(n: int, ctx: RunContext, phase: str) -> None:
@@ -107,7 +105,7 @@ def wait_for_rate_limit(n: int, ctx: RunContext, error: TrackerError) -> bool:
 def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
     """Persist the wait before sleeping so tick cannot mistake it for a stall."""
     run = ctx.store.get_run(n)
-    started = ctx.now()
+    started = sleep_ledger.mark(ctx.now)
     started_mono = ctx.monotonic()
     ctx.store.update_run(
         n, waited_seconds=run.waited_seconds + seconds,
@@ -122,7 +120,7 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
         ctx.store.update_run(
             n, waited_seconds=run.waited_seconds + elapsed,
             executor_waited_seconds=run.executor_waited_seconds + elapsed,
-            waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
+            waiting_until=None, last_progress_at=sleep_ledger.mark(ctx.now).astimezone(UTC).isoformat(),
         )
 
 
@@ -134,7 +132,7 @@ def _credited_wait(n: int, ctx: RunContext, acquire: Callable[[], object]) -> No
     started = ctx.monotonic()
 
     def progress():
-        now = ctx.now().astimezone(UTC)
+        now = sleep_ledger.mark(ctx.now).astimezone(UTC)
         ctx.store.update_run(
             n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
             waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat(),
@@ -146,5 +144,5 @@ def _credited_wait(n: int, ctx: RunContext, acquire: Callable[[], object]) -> No
     finally:
         ctx.store.update_run(
             n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
-            waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
+            waiting_until=None, last_progress_at=sleep_ledger.mark(ctx.now).astimezone(UTC).isoformat(),
         )

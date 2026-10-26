@@ -10,13 +10,6 @@ from foragent.state_records import Run
 # Updates passing any of these change or attest process ownership, so they
 # observe the process tree; every other update is metadata only.
 PROCESS_FIELDS = frozenset({"process_identities", "pid", "executor_pgid"})
-# Fields that start a sleep window: the sensor is sampled right after they are written.
-SLEEP_WINDOW_FIELDS = frozenset({"last_progress_at", "last_activity_at"})
-
-
-def _sleep_sample(awake_at: str) -> None:
-    from foragent import capacity  # Lazy: capacity imports the state package. Outside the state lock.
-    capacity.sleep_sample(datetime.fromisoformat(awake_at))
 
 
 class RunRecordsMixin:
@@ -25,13 +18,14 @@ class RunRecordsMixin:
         lane: str = "main", tier: str = "m",
     ) -> Run:
         """Create a run; pid attests self or a newly spawned, unreaped child."""
-        run = self._start_run(number, branch, worktree, pid, lane, tier)
-        _sleep_sample(run.started_at)  # The start begins the run's sleep window (#415).
-        return run
+        from foragent import sleep_ledger  # Lazy: the ledger imports the state package.
 
-    def _start_run(self, number: int, branch: str, worktree: str | Path, pid: int | None, lane: str, tier: str) -> Run:
+        # The start is a sleep ledger reading's own moment, taken outside the state lock (#415).
+        started = sleep_ledger.mark(self._now)
+        if started.tzinfo is None or started.utcoffset() is None:
+            raise ValueError("now must return a timezone-aware datetime")
         with self._state_lock():
-            timestamp = self._timestamp()
+            timestamp = started.astimezone(_state.UTC).isoformat()
             approval = self.load_approval(number)
             previous = self.get_run(number)
             restarts = previous.restarts if previous is not None and previous.outcome in {"stalled-restart", "crashed", "limit-wait"} else 0
@@ -59,7 +53,7 @@ class RunRecordsMixin:
                       restarts=restarts, lane=lane, tier=previous.tier if resumed else tier,
                       attempt_tiers=previous.attempt_tiers if resumed else {},
                       approval_body_sha=approval.body_sha if approval is not None else None,
-                      last_activity_at=timestamp, process_identities=identities, sleep_free_waits=True, **session)
+                      last_activity_at=timestamp, process_identities=identities, **session)
             self._merge_lock_seconds.pop((number, timestamp), None)
             self._write_run(run)
             return run
@@ -92,14 +86,6 @@ class RunRecordsMixin:
         Metadata-only updates keep the saved identities as they are; the tick's
         process pass observes and prunes them once per tick.
         """
-        run = self._update_run(number, routine=routine, observe=observe, **fields)
-        if stamps := [fields[name] for name in SLEEP_WINDOW_FIELDS if fields.get(name)]:
-            _sleep_sample(max(stamps, key=datetime.fromisoformat))  # The machine was awake at this event time (#415).
-        return run
-
-    def _update_run(
-        self, number: int, *, routine: bool = False, observe: bool = False, **fields: Any,
-    ) -> Run:
         observe = observe or not PROCESS_FIELDS.isdisjoint(fields)
         with self._state_lock():
             run = self.get_run(number)
