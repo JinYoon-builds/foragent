@@ -1,9 +1,10 @@
 """`fa orch`: diagnose and recover blocked issues; the local request and question box."""
 
 from foragent.commands import facade, repo_store
-from foragent.orch_spawn import ALIVE_SECONDS  # noqa: F401  (shared with the gate's spawn check)
 
 ORDER = 120
+# An orchestrator whose heartbeat is at most this old counts as alive.
+ALIVE_SECONDS = 30
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive"}
 
 

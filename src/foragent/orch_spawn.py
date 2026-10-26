@@ -17,12 +17,11 @@ import shutil
 import subprocess
 
 from foragent import notify, watch_open
+from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.state import StateStore
 
-# An orchestrator whose heartbeat is at most this old counts as alive.
-ALIVE_SECONDS = 30
 SPAWN_SPACING = timedelta(minutes=2)
 SKILL = "/fa-orchestrator"
 
