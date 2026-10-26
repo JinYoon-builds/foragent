@@ -111,7 +111,7 @@ class IssueRefreshMixin:
 
     def read_baseline(self) -> dict[str, Any]:
         """Facts a per-issue read will depend on, taken before the read starts."""
-        snapshot = self._issue_snapshot()
+        snapshot = self._issue_view()
         return {"refresh": snapshot["refreshed_at"],
                 "observed": {key: row.get("observed") for key, row in snapshot["issues"].items()}}
 
@@ -125,7 +125,7 @@ class IssueRefreshMixin:
         row) can never confirm a read. Without a refresh after the read,
         nothing confirms it, so the caller reads again.
         """
-        snapshot = self._issue_snapshot()
+        snapshot = self._issue_view()
         rows = snapshot["issues"]
         entry = (rows.get(str(number)) or {}).get("reads", {}).get(name)
         refreshed = snapshot["refreshed_at"]

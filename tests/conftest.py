@@ -53,6 +53,7 @@ from process_fakes import fake_process_table  # noqa: E402, F401
 def no_view_windows(monkeypatch):
     """Never open real terminal windows during the test suite."""
     monkeypatch.setenv("FORAGENT_VIEW", "off")
+    monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")  # Nor real orchestrator sessions (D76).
 
 
 @pytest.fixture(autouse=True)

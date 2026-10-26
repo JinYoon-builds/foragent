@@ -100,8 +100,23 @@ def _latest_review(root: Path, n: int) -> tuple[Path, str] | None:
     return path, path.read_text(encoding="utf-8", errors="replace").strip()
 
 
-def previous_attempt_summary(attempt: Implementation) -> str:
-    """Short facts from Git and run artifacts; the failing output follows in its own section."""
+def saved_failures_section(root: Path, n: int, failure_text: str = "") -> str:
+    """The last verification's failing commands, unless the failure text below already carries them."""
+    path = cuts.failures_path(root, n)
+    if not path.is_file():
+        return ""
+    bundle = path.read_text(encoding="utf-8", errors="replace").strip()
+    if not bundle or bundle in failure_text:
+        return ""
+    return f"Failing checks saved by the last verification ({path}):\n{bundle}"
+
+
+def previous_attempt_summary(attempt: Implementation, failure_text: str = "") -> str:
+    """Short facts from Git and run artifacts; the failing output follows in its own section.
+
+    Every way into a new attempt (retry, rerun-review, resolve, restart) reads the saved
+    failure bundle here, so it never depends on a shortened run detail.
+    """
     root, n = attempt.ctx.store.root, attempt.n
     facts = _branch_facts(attempt)
     if review := _latest_review(root, n):
@@ -111,5 +126,7 @@ def previous_attempt_summary(attempt: Implementation) -> str:
     stop = stop_path(root, n)
     if stop.is_file():
         facts.append("Where it stopped:\n" + stop.read_text(encoding="utf-8", errors="replace").strip())
+    if saved := saved_failures_section(root, n, failure_text):
+        facts.append(saved)
     facts.append("Failed checks or findings: see below.")
     return "\n".join(facts)

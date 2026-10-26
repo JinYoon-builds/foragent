@@ -87,3 +87,11 @@ def read_tail(log: Path, offset: int, limit: int, name: str) -> str:
         stream.seek(offset)
         output = stream.read().decode("utf-8", errors="replace")
     return tail(output, limit, dir_for_log(log), name)
+
+
+FAILURES_FILE = "check-failures.txt"
+
+
+def failures_path(state_root: Path, n: int) -> Path:
+    """The latest verification's failing commands, each with its own tail; read by every new attempt."""
+    return issue_dir(state_root, n) / FAILURES_FILE

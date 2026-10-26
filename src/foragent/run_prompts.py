@@ -27,6 +27,13 @@ DEFAULT_RETRY_HINT = (
     "and state the class and the instances found."
 )
 
+PANEL_MERGE_PROMPT = (
+    "Independent reviewers checked this change, each from its own share of the review perspectives. "
+    "Their raw findings follow. Merge them: remove duplicates and keep only the defects you judge real "
+    "and reproducible against the diff above. Your reply is the final review: give the verdict and the "
+    "kept findings in the format above. Reviewer verdicts do not count; only yours does."
+)
+
 
 def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
     """Scope rules for reviewers; PR bodies pass the repository language for the human-read question."""
@@ -43,8 +50,9 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
 def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
     full_text_dir: Path | None = None,
-    risk_notes: str = "",
+    risk_notes: str = "", panel_findings: str = "",
 ) -> str:
+    """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings."""
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
         f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
@@ -52,6 +60,7 @@ def build_review_prompt(
         + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         f"\n\nDone when commands:\n{commands}\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
         + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
+        + (f"\n\n{PANEL_MERGE_PROMPT}\n\n{panel_findings}" if panel_findings else "")
     )
 
 

@@ -309,8 +309,9 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
         assert c.tracker.get_issue(c.pr).state == "closed"
         hint = (c.store.root / "hints/1.txt").read_text()
         assert "Verification:" in hint
-        if failure == "checks":  # #420: the failing commands themselves reach the implementer
-            assert "Failing Done when commands:" in hint and "Broken feature" in hint
+        if failure == "checks":  # #420: the next attempt reads the saved failing commands
+            from foragent.run_previous import saved_failures_section
+            assert "Broken feature" in saved_failures_section(c.store.root, 1)
     else:
         assert_blocked(c, reason)
     assert c.tracker.merged_prs == []

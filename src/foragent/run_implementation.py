@@ -18,7 +18,9 @@ from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
 from foragent.run_lane_skills import lane_memory_notice, lane_notes, lane_skill_names, lane_skills
 from foragent.run_skill_catalog import available_skills, catalog_section, parse_skills_used
-from foragent.run_previous import consume_hint, pending_hint, previous_attempt_summary, record_stop_point
+from foragent.run_previous import (
+    consume_hint, pending_hint, previous_attempt_summary, record_stop_point, saved_failures_section,
+)
 from foragent.run_parent import parent_context
 from foragent.run_prompts import build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
     from foragent.config import Config
     from foragent.runner import RunContext
     from foragent.git import GitRepo
+    from foragent.run_baseline import AcceptanceBaseline
 
 
 def lane_config(config: Config, lane: str) -> Config:
@@ -90,6 +93,41 @@ def _record_skills_used(n: int, ctx: RunContext, result: ExecResult) -> None:
     ctx.store.update_run(n, skills_reported=True, skills_used=list(dict.fromkeys([*run.skills_used, *used])))
 
 
+def capture_acceptance_baseline(
+    n: int, ctx: RunContext, git: GitRepo, target_branch: str, ref: str,
+    test_command: str | None = None,
+) -> AcceptanceBaseline | None:
+    """Capture (or reuse the cached) protected set for ``ref``; stop the run if unusable (#327).
+
+    Run at preparation and again after each result-affecting base move (#483).
+    """
+    from foragent import runner
+    from foragent.ci_local import capture_local_only
+    from foragent.ci_mode import enabled
+
+    log = ctx.store.log_path(n)
+    if test_command is None:
+        test_command = ctx.config.test_command
+    if test_command is None:
+        test_command = next(iter(runner.detect_test_commands(git.root)), None)
+    try:
+        started = ctx.monotonic()
+        if enabled(ctx, target_branch):
+            from foragent.run_baseline import _baseline_exclusions
+            base_sha = git.ref_sha(ref)
+            baseline = capture_local_only(n, ctx, git, test_command, base_sha,
+                                          _baseline_exclusions(ctx, base_sha, log))
+            return replace(baseline, test_command=test_command) if baseline else None
+        baseline = _capture_acceptance_baseline(n, ctx, test_command, ref)
+        ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})
+        return replace(baseline, test_command=test_command) if baseline else None
+    except AttemptFailure as exc:
+        _append(log, str(exc))
+        reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+        flag(ctx, n, reason, "acceptance baseline unavailable", str(exc))
+        raise ExecutorStopped(reason.value, str(exc)) from exc
+
+
 def _prepare_implementation(
     n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
     capture_baseline: bool = True,
@@ -115,28 +153,8 @@ def _prepare_implementation(
     log = ctx.store.log_path(n)
     issue = ctx.tracker.get_issue(n)
     size = issue_size(issue.labels)
-    baseline_test_command = ctx.config.test_command
-    if baseline_test_command is None:
-        baseline_test_command = next(iter(runner.detect_test_commands(worktree)), None)
-    try:
-        from foragent.ci_mode import enabled
-        from foragent.ci_local import capture_local_only
-        started = ctx.monotonic()
-        if capture_baseline and enabled(ctx, target_branch):
-            from foragent.run_baseline import _baseline_exclusions
-            base_sha = git.ref_sha(start_ref)
-            baseline = capture_local_only(n, ctx, git, baseline_test_command, base_sha,
-                                          _baseline_exclusions(ctx, base_sha, log))
-        else:
-            baseline = (_capture_acceptance_baseline(n, ctx, baseline_test_command, start_ref)
-                        if capture_baseline else None)
-            if capture_baseline:
-                ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})
-    except AttemptFailure as exc:
-        _append(log, str(exc))
-        reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
-        flag(ctx, n, reason, "acceptance baseline unavailable", str(exc))
-        raise ExecutorStopped(reason.value, str(exc)) from exc
+    baseline = (capture_acceptance_baseline(n, ctx, git, target_branch, start_ref)
+                if capture_baseline else None)
     return Implementation(
         n=n,
         ctx=ctx,
@@ -188,6 +206,7 @@ def _implement(
     # Each part of a check bundle or review is already limited; a saved one stays whole after restarts too.
     whole = isinstance(failure, (CIFailure, WholeFailure)) or (not str(failure) and run.resume_whole)
     moved_files = run.moved_files
+    saved_failures = saved_failures_section(ctx.store.root, n, failure_context)
     if str(failure):
         # Save this turn's feedback first: a limit wait or restart before delivery must not lose it.
         ctx.store.update_run(n, resume_reason=failure_context, resume_whole=whole)
@@ -210,8 +229,8 @@ def _implement(
         full_text_dir=full_text_dir,
         moved_files=moved_files,
         skill_catalog=catalog_section(available_skills(ctx.config, fixed)),
-        previous_attempt=(previous_attempt_summary(attempt)
-                          if failure_context or reviewer_text is not None else ""),
+        previous_attempt=(previous_attempt_summary(attempt, failure_context)
+                          if failure_context or reviewer_text is not None or saved_failures else ""),
         review_feedback=review_feedback,
         retry_default=retry_default,
     )
@@ -227,7 +246,7 @@ def _implement(
                 reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
                 review_feedback=review_feedback, retry_default=retry_default,
                 moved_files=moved_files, parent_context=attempt.approval.parent_context or "",
-            ) + setup.memory_notice,
+            ) + (f"\n\n{saved_failures}" if saved_failures else "") + setup.memory_notice,
             model=model, timeout_s=remaining, log_path=log, **attempt.options,
         )
     finally:

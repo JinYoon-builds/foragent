@@ -107,3 +107,17 @@ def test_claude_tier_model_and_lane_precedence(run_case, lane_model, expected):
     assert kinds == ["claude"]
     assert [call["model"] for call in c.executor.calls] == expected
     assert all("effort" not in call for call in c.executor.calls)
+
+
+def test_new_attempt_reads_the_saved_failure_bundle_not_the_short_detail(run_case):
+    """#420: a retry after rerun-review gets every saved failing command, whatever the run detail says."""
+    from foragent import cuts
+
+    c = run_case
+    bundle = "Command: first\nfirst output\n\nCommand: second\nsecond output"
+    cuts.save_full(cuts.failures_path(c.store.root, 1).parent, cuts.FAILURES_FILE, bundle)
+    c.store.update_run(1, detail="Done when failed on the PR head.", resume_reason="checks-failed")
+    assert run_issue(1, c.ctx) == "merged"
+    prompt = c.executor.calls[0]["prompt"]
+    assert "first output" in prompt and "second output" in prompt
+    assert prompt.count("second output") == 1

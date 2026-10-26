@@ -324,6 +324,21 @@ def _acceptance_matches(
     return not mismatches
 
 
+def save_failures(state_root: Path, n: int, checks: list[CheckResult]) -> WholeFailure:
+    """Save every failing check gathered so far for the next attempt; no failures clears the file."""
+    failed = [check for check in checks if check.exit_code != 0 or check.timed_out]
+    path = cuts.failures_path(state_root, n)
+    if not failed:
+        path.unlink(missing_ok=True)
+        return WholeFailure("")
+    bundle = WholeFailure("\n\n".join(
+        f"Command: {check.command}\n{check.output}" + ("\nCheck timed out." if check.timed_out else "")
+        for check in failed
+    ))
+    cuts.save_full(path.parent, path.name, bundle)
+    return bundle
+
+
 def _verify_implementation(attempt: Implementation) -> str:
     from foragent import runner
     from foragent.run_conflicts import _prepare_target
@@ -381,8 +396,11 @@ def _verify_implementation(attempt: Implementation) -> str:
             attempt.checks.append(result)
             _progress(n, ctx)
             if result.timed_out:
+                # Keep every failure gathered so far, not only the timeout, for the next attempt.
+                bundle = save_failures(ctx.store.root, n, attempt.checks)
+                ctx.store.update_run(n, resume_reason=bundle, resume_whole=True)
                 detail = f"Related unit tests timed out after {limit} s ({len(unit_tests)} selected tests)."
-                flag(ctx, n, Reason.TIMEOUT, detail)
+                flag(ctx, n, Reason.TIMEOUT, detail, bundle)
                 raise ExecutorStopped("timeout", detail)
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
@@ -393,26 +411,20 @@ def _verify_implementation(attempt: Implementation) -> str:
         checked_tree = git.staged_tree_sha()
         if checked_tree != staged_tree:
             if verification == 1:
+                save_failures(ctx.store.root, n, attempt.checks)
                 return "Done when commands modify tracked files"
             _append(log, "Done when changed staged contents; checking the final contents again.")
             staged_tree = checked_tree
             continue
-        failures = [check for check in attempt.checks if check.exit_code != 0 or check.timed_out]
-        if failures:
-            # Every failing command reaches the implementer, each with its own tail.
-            return WholeFailure("\n\n".join(
-                f"Command: {check.command}\n{check.output}" + ("\nCheck timed out." if check.timed_out else "")
-                for check in failures
-            ))
+        # Every failing command reaches the implementer, each with its own tail.
+        if bundle := save_failures(ctx.store.root, n, attempt.checks):
+            return bundle
         try:
             _check_publication(git, attempt.target_branch)
         except AttemptFailure as exc:
             return str(exc)
         return "" if any(not path.startswith(".foragent/") for path in attempt.paths) else "The session made no changes."
     raise AssertionError("unreachable verification state")
-
-
-REVIEW_HEAD_FAILURES = "review-head-checks.txt"
 
 
 def _verify_review_head(
@@ -422,23 +434,21 @@ def _verify_review_head(
 
     worktree = git.root
     log = ctx.store.log_path(n)
-    # Only this verification's failures may reach the retry hint.
-    (cuts.issue_dir(ctx.store.root, n) / REVIEW_HEAD_FAILURES).unlink(missing_ok=True)
-    failures = []
+    checks: list[CheckResult] = []
+    # Every exit saves what this verification gathered (and clears an earlier bundle).
+    save_failures(ctx.store.root, n, checks)
     for command in parsed.done_when_commands:
         if runner._remaining(n, ctx) <= 0:
+            save_failures(ctx.store.root, n, checks)
             return _timeout(n, ctx)
         check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)), progress=lambda: _progress(n, ctx),
                        slot=_test_slot(n, ctx))
+        checks.append(check)
         _progress(n, ctx)
         if check.timed_out or runner._remaining(n, ctx) <= 0:
+            save_failures(ctx.store.root, n, checks)
             return _timeout(n, ctx)
-        if check.exit_code != 0:
-            failures.append(f"Command: {command}\n{check.output}")
-    if failures:
-        # Every failing command, each with its own tail, for the flag and the retry hint.
-        bundle = "\n\n".join(failures)
-        cuts.save_full(cuts.issue_dir(ctx.store.root, n), REVIEW_HEAD_FAILURES, bundle)
+    if bundle := save_failures(ctx.store.root, n, checks):
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.", f"{bundle}\n{link}")
         return "checks-failed"
     git.stage_changes()

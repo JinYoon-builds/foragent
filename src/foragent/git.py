@@ -2,7 +2,7 @@
 
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
 import fcntl
 import os
@@ -13,12 +13,15 @@ import stat
 import subprocess
 import time
 
+from foragent.state import StateStore
+
 
 REVIEW_SCOPE_FILE = "CLAUDE.local.md"
 # A split part names its source when at least half of its added lines (of at
 # least this many, each this long once stripped) come from that source.
 SPLIT_MIN_LINES = 5
 SPLIT_MIN_LINE = 4
+ARTIFACT_PATHS = (".foragent",)
 
 
 def _conflict_marker_numbers(content: str, widths: set[int]) -> list[int]:
@@ -99,9 +102,15 @@ class GitRepo:
         return GitRepo(root, lambda args: self._call(["-C", str(root), *args]))
 
     def remove_worktree(self, path: Path) -> None:
-        if path.exists():
-            self._call(["worktree", "remove", "--force", str(path)])
-        self._call(["worktree", "prune"])
+        with ExitStack() as stack:
+            # Every issue-worktree cleanup path goes through this adapter,
+            # including runner exit, rebuild, tick recovery and explicit kills.
+            if path.parent.name == "worktrees" and path.name.startswith("issue-") and path.name[6:].isdigit():
+                store = StateStore(path.parent.parent)
+                stack.enter_context(store.worktree_lock(int(path.name[6:])))
+            if path.exists():
+                self._call(["worktree", "remove", "--force", str(path)])
+            self._call(["worktree", "prune"])
 
     def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,7 +163,7 @@ class GitRepo:
     def stage_changes(self) -> None:
         output = self._call([
             "ls-files", "--modified", "--deleted", "--others", "--exclude-standard", "-z",
-            "--", ".", ":!.foragent", f":!{REVIEW_SCOPE_FILE}",
+            "--", ".", *(f":!{path}" for path in ARTIFACT_PATHS), f":!{REVIEW_SCOPE_FILE}",
             *(f":(exclude,literal){path}" for path in sorted(self.local_skill_paths)),
         ])
         paths = sorted(set(filter(None, output.split("\0"))))
@@ -178,9 +187,13 @@ class GitRepo:
                 self._call(["--literal-pathspecs", "rm", "--cached", "-r", "-f", "--ignore-unmatch", "--", name])
         self.local_skill_paths.difference_update(owned)
 
+    def artifact_paths(self) -> set[str]:
+        """Runner-owned roots intentionally removed from the index."""
+        return {*ARTIFACT_PATHS, *self.local_skill_paths}
+
     def _exclude_artifacts(self) -> None:
         # Also remove entries staged by an executor, retaining their local files.
-        self._call(["rm", "--cached", "-r", "-f", "--ignore-unmatch", ".foragent"])
+        self._call(["rm", "--cached", "-r", "-f", "--ignore-unmatch", *ARTIFACT_PATHS])
         # Retain runner-owned protocol inputs explicitly preserved by the caller.
         self.ensure_tracked(sorted(self.publication_paths))
         if self.local_skill_paths:
@@ -473,6 +486,18 @@ class GitRepo:
 
     def has_staged_changes(self) -> bool:
         return self.staged_tree_sha() != self._call(["rev-parse", "HEAD^{tree}"]).strip()
+
+    def staged_deletions(self) -> list[str]:
+        output = self._call(["diff", "--cached", "--name-only", "--no-renames", "--diff-filter=D", "-z"])
+        return list(filter(None, output.split("\0")))
+
+    def committed_paths(self, base_ref: str) -> set[str]:
+        """Branch changes since the shared base, including earlier deletions."""
+        output = self._call(["diff", "--name-only", "--no-renames", "-z", self._own_base(base_ref), "HEAD"])
+        # Exclude the target's history, including commits already merged from it.
+        output += self._call(["log", "--format=", "--name-only", "--no-renames", "--diff-filter=D",
+                              "-z", f"{base_ref}..HEAD"])
+        return set(filter(None, output.split("\0")))
 
     def commit(self, title: str, *, allow_empty: bool = False) -> None:
         self._exclude_artifacts()

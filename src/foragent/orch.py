@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, cuts
+from foragent import capacity
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
@@ -25,7 +25,7 @@ from foragent.processes import run_logged
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
-from foragent.run_checks import REVIEW_HEAD_FAILURES, CheckResult, trusts_ci
+from foragent.run_checks import CheckResult, trusts_ci
 from foragent.run_previous import retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
@@ -218,10 +218,8 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str, say: str | None = 
             # A review verdict cannot fix failing code or CI. Give the implementer
             # the evidence and queue a fresh attempt rather than strand the issue.
             if outcome in {"checks-failed", "ci-failed"}:
-                failed = cuts.issue_dir(ctx.store.root, n) / REVIEW_HEAD_FAILURES
-                evidence = (f"\n\nFailing Done when commands:\n{failed.read_text(encoding='utf-8')}"
-                            if outcome == "checks-failed" and failed.is_file() else "")
-                _retry(ctx, n, f"{note}\n\nVerification: {outcome}{evidence}\nSee {ctx.store.log_path(n)}")
+                # The failing commands themselves reach the next implementer from the saved bundle.
+                _retry(ctx, n, f"{note}\n\nVerification: {outcome}\nSee {ctx.store.log_path(n)}")
                 outcome += "; queued implementation retry"
     finally:
         summary = f"#{n}: resolved review {verdict} for {head}; {outcome}; {note}"
