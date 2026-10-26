@@ -49,6 +49,34 @@ def lane_notes(
     return agent, "Lane notes:\n" + body.strip() + "\n\n"
 
 
+# Claude loads only the start of an agent's MEMORY.md (first 200 lines or 25 KB, whichever comes first).
+NATIVE_MEMORY_LINES = 200
+NATIVE_MEMORY_BYTES = 25 * 1024
+
+
+def lane_memory_notice(config: Config, lane: str, worktree: Path, full_text_dir: Path | None = None) -> str:
+    """For an executor that loads lane memory itself: the cut notice when memory exceeds what it loads."""
+    agent = _lane_settings(config, lane).get("agent")
+    if not isinstance(agent, str) or not re.fullmatch(r"fa-[a-z0-9-]+", agent):
+        return ""
+    memory = worktree / ".claude/agent-memory" / agent / "MEMORY.md"
+    if not memory.is_file():
+        return ""
+    text = memory.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+    loaded = "".join(lines[:NATIVE_MEMORY_LINES])
+    if len(loaded.encode("utf-8")) > NATIVE_MEMORY_BYTES:
+        loaded = loaded.encode("utf-8")[:NATIVE_MEMORY_BYTES].decode("utf-8", errors="ignore")
+        count, unit = len(text) - len(loaded), "chars"
+    elif len(lines) > NATIVE_MEMORY_LINES:
+        count, unit = len(lines) - NATIVE_MEMORY_LINES, "lines"
+    else:
+        return ""
+    full = cuts.save_full(full_text_dir, "lane-memory.md", text) if full_text_dir is not None else memory.absolute()
+    return ("\n\nYour lane memory is loaded only in part (first 200 lines or 25 KB). "
+            + cuts.notice(count, unit, full) + "\n")
+
+
 def _lane_skill_names(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> list[str]:
     return lane_skill_names(ctx.config, ctx.store.get_run(n).lane, worktree, agent)
 

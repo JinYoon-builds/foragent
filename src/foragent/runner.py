@@ -121,6 +121,7 @@ from foragent.run_attempt import (
     ConflictBudgetExhausted,
     CIFailure,
     ExecutorStopped,
+    WholeFailure,
 )
 from foragent.run_checks import _verify_implementation
 from foragent.run_conflicts import (
@@ -241,7 +242,8 @@ def _implement_and_publish(
                 outcome = _block_rebuild(attempt, str(attempt.failure))
                 return outcome
             _append(attempt.log, f"Attempt {run.attempts} failed:\n{attempt.failure}")
-            ctx.store.update_run(n, resume_reason=str(attempt.failure))
+            ctx.store.update_run(n, resume_reason=str(attempt.failure),
+                                 resume_whole=isinstance(attempt.failure, (WholeFailure, CIFailure)))
             if run.attempts < ctx.config.max_retries + 1:
                 ctx.store.update_run(n, attempts=run.attempts + 1)
                 continue

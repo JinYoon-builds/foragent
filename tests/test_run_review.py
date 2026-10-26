@@ -787,3 +787,31 @@ def test_review_text_about_limits_uses_normal_review_failure_budget(run_case):
     assert run_issue(1, c.ctx) == "retries-exceeded"
     assert len(calls) == 2 and c.store.get_run(1).attempts == 2
     assert c.store.get_run(1).waited_seconds == 0
+
+
+def test_pr_head_verification_reports_every_failing_command(run_case):
+    """#420: PR-head checks run every Done-when command and keep each failure for the retry hint."""
+    from foragent import cuts
+    from foragent.run_checks import REVIEW_HEAD_FAILURES
+    from foragent.runner import review_only
+    from runner_support import set_done_when
+
+    c = run_case
+    set_done_when(c, ["echo first-broken; exit 1", "echo second-broken; exit 2"])
+    c.tracker.edit_body(1, c.store.load_approval(1).body)
+    c.store.finish_run(1, outcome="held")
+    c.now[0] += timedelta(seconds=1)
+    c.tracker.remove_labels(1, ["running"])
+    base = c.history.tip
+    c.history.update({"feature.txt": "done"})
+    head = c.history.tip
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="PR", body="Review")
+    c.tracker.set_pr_head_sha(pr, head)
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    enable_reviewer(c, ["VERDICT: PASS"])
+    assert review_only(1, c.ctx) == "checks-failed"
+    saved = (cuts.issue_dir(c.store.root, 1) / REVIEW_HEAD_FAILURES).read_text()
+    assert "first-broken" in saved and "second-broken" in saved
+    comment = c.tracker.list_comments(1)[-1].body
+    assert "first-broken" in comment and "second-broken" in comment

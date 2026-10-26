@@ -21,10 +21,12 @@ if TYPE_CHECKING:
 
 
 def _note_moved(attempt: Implementation, moved: list[tuple[str, str]]) -> None:
-    lines = [f"{old} -> {new}" for old, new in moved]
-    lines = [line for line in lines if line not in attempt.moved_files]
+    """Queue moved or split files for the next prompt; saved in the run so restarts keep them."""
+    n, store = attempt.n, attempt.ctx.store
+    pending = store.get_run(n).moved_files
+    lines = [line for line in dict.fromkeys(f"{old} -> {new}" for old, new in moved) if line not in pending]
     if lines:
-        attempt.moved_files.extend(lines)
+        store.update_run(n, moved_files=[*pending, *lines])
         _append(attempt.log, text("moved_files_log", attempt.ctx.config.language, files="\n".join(lines)))
 
 

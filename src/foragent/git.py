@@ -1,5 +1,6 @@
 """Small, injectable Git adapter for approval integrity checks."""
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -14,6 +15,10 @@ import time
 
 
 REVIEW_SCOPE_FILE = "CLAUDE.local.md"
+# A split part names its source when at least half of its added lines (of at
+# least this many, each this long once stripped) come from that source.
+SPLIT_MIN_LINES = 5
+SPLIT_MIN_LINE = 4
 
 
 def _conflict_marker_numbers(content: str, widths: set[int]) -> list[int]:
@@ -364,7 +369,43 @@ class GitRepo:
                     moved.append((old, new))
             elif status:
                 next(fields, None)
-        return moved
+        found = set(moved)
+        return moved + [pair for pair in self._split_into(base, target, mine) if pair not in found]
+
+    def _split_into(self, base: str, target: str, mine: set[str]) -> list[tuple[str, str]]:
+        """Files whose added lines mostly come from one of ``mine``: parts of a split file.
+
+        Git's copy detection needs a whole-file similarity; a module split into
+        three parts leaves each part near a third and is not reported.
+        """
+        def lines(ref: str, path: str) -> list[str]:
+            try:
+                text = self._call(["show", f"{ref}:{path}"])
+            except (GitError, UnicodeDecodeError):
+                return []
+            return [line.strip() for line in text.splitlines() if len(line.strip()) >= SPLIT_MIN_LINE]
+
+        fields = iter(self._call(["diff", "--name-status", "--no-renames", "-z", base, target]).split("\0"))
+        changed = {}
+        for status in fields:
+            if status:
+                changed[next(fields, "")] = status[:1]
+        sources = {path: set(lines(base, path)) for path in sorted(mine) if changed.get(path) != "A"}
+        sources = {path: content for path, content in sources.items() if content}
+        pairs = []
+        for dest, status in sorted(changed.items()):
+            if status not in ("A", "M") or not sources:
+                continue
+            added = Counter(lines(target, dest))
+            if status == "M":
+                added -= Counter(lines(base, dest))
+            total = sum(added.values())
+            if total < SPLIT_MIN_LINES:
+                continue
+            for source, content in sources.items():
+                if source != dest and sum(count for line, count in added.items() if line in content) * 2 >= total:
+                    pairs.append((source, dest))
+        return pairs
 
     def merge_in_progress(self) -> bool:
         path = Path(self._call(["rev-parse", "--git-path", "MERGE_HEAD"]).strip())

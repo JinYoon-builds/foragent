@@ -254,7 +254,7 @@ def _review_implementation(attempt: Implementation) -> None:
         attempt.review_feedback = True
         if review.verdict == "UNUSABLE":
             attempt.reviewer_text = review.raw
-            attempt.failure = "A reviewer said (verbatim):\n" + review.raw
+            attempt.failure = WholeFailure("A reviewer said (verbatim):\n" + review.raw)
         else:
             attempt.failure = WholeFailure(review.findings or "Reviewer found defects (no findings provided).")
         findings = _normalized_findings(review) if _read_rebuttals(worktree).strip() else set()

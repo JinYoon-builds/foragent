@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -23,14 +22,18 @@ def parent_summary(body: str) -> str:
     return "\n".join(lines).strip()
 
 
-def parent_context(ctx: RunContext, n: int, approval: Approval) -> Approval:
-    """Freeze the parent text into the approval snapshot the first time a run reads it."""
-    if approval.parent_context is not None:
-        return approval
-    parent = ctx.tracker.parent_issue(n)  # one GitHub call per run, then frozen
-    text = parent_summary(parent.body) if parent is not None else ""
-    ctx.store.save_approval(
-        n, body=approval.body, body_sha=approval.body_sha, acceptance_blobs=approval.acceptance_blobs,
-        approved_by=approval.approved_by, approved_at=approval.approved_at, parent_context=text,
-    )
-    return replace(approval, parent_context=text)
+def parent_context(ctx: RunContext, n: int, approval: Approval | None) -> Approval | None:
+    """Freeze the parent text into the approval snapshot the first time a run reads it.
+
+    A re-approval while the parent is read wins: its snapshot is kept and read again.
+    """
+    for _ in range(3):
+        if approval is None or approval.parent_context is not None:
+            return approval
+        parent = ctx.tracker.parent_issue(n)  # one GitHub call per approval, then frozen
+        text = parent_summary(parent.body) if parent is not None else ""
+        current = ctx.store.freeze_parent_context(n, approval, text)
+        if current is not None and current.parent_context is not None:
+            return current
+        approval = current
+    return approval

@@ -16,7 +16,7 @@ from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Imp
 from foragent.run_baseline import _capture_acceptance_baseline
 from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
-from foragent.run_lane_skills import lane_notes, lane_skill_names, lane_skills
+from foragent.run_lane_skills import lane_memory_notice, lane_notes, lane_skill_names, lane_skills
 from foragent.run_skill_catalog import available_skills, catalog_section, parse_skills_used
 from foragent.run_previous import consume_hint, pending_hint, previous_attempt_summary, record_stop_point
 from foragent.run_parent import parent_context
@@ -49,6 +49,8 @@ class ImplementerSetup:
     options: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
     missing_skills: list[str] = field(default_factory=list)
+    # What part of the lane memory an executor that loads it itself does not see.
+    memory_notice: str = ""
 
 
 def implementer_setup(
@@ -66,14 +68,16 @@ def implementer_setup(
     agent, notes = lane_notes(config, lane, worktree, full_text_dir)
     missing: list[str] = []
     if native_claude:
-        # Claude reads the lane agent itself; its notes are not prepended.
+        # Claude reads the lane agent and memory itself; only a cut notice is added, after the task.
         if agent is not None:
             options["agent"] = agent
+        memory_notice = lane_memory_notice(config, lane, worktree, full_text_dir) if agent is not None else ""
         notes = ""
     else:
         skill_notes, missing = lane_skills(config, lane, worktree, agent)
         notes += skill_notes
-    return ImplementerSetup(config.executor, model, options, notes, missing)
+        memory_notice = ""
+    return ImplementerSetup(config.executor, model, options, notes, missing, memory_notice)
 
 
 def _record_skills_used(n: int, ctx: RunContext, result: ExecResult) -> None:
@@ -181,6 +185,12 @@ def _implement(
     attempt.missing_skills.extend(name for name in setup.missing_skills if name not in attempt.missing_skills)
     retry_default, hint = pending_hint(ctx.store.root, n)
     failure_context = str(failure) or run.resume_reason
+    # Each part of a check bundle or review is already limited; a saved one stays whole after restarts too.
+    whole = isinstance(failure, (CIFailure, WholeFailure)) or (not str(failure) and run.resume_whole)
+    moved_files = run.moved_files
+    if str(failure):
+        # Save this turn's feedback first: a limit wait or restart before delivery must not lose it.
+        ctx.store.update_run(n, resume_reason=failure_context, resume_whole=whole)
     review_feedback = attempt.review_feedback
     attempt.review_feedback = False
     test_command = ctx.config.test_command
@@ -195,10 +205,10 @@ def _implement(
         orchestrator_hint=hint,
         test_command=test_command,
         acceptance_baseline=attempt.baseline.node_ids if attempt.baseline else (),
-        failure_limit=None if isinstance(failure, (CIFailure, WholeFailure)) else 4000,
+        failure_limit=None if whole else 4000,
         parent_context=attempt.approval.parent_context or "",
         full_text_dir=full_text_dir,
-        moved_files=attempt.moved_files,
+        moved_files=moved_files,
         skill_catalog=catalog_section(available_skills(ctx.config, fixed)),
         previous_attempt=(previous_attempt_summary(attempt)
                           if failure_context or reviewer_text is not None else ""),
@@ -210,14 +220,14 @@ def _implement(
     try:
         result = _available_executor(
             n, ctx, attempt.executor, worktree=worktree,
-            prompt=prompt if attempt.native_claude else notes + prompt,
+            prompt=notes + prompt + setup.memory_notice,
             session_body=attempt.approval.body,
             resume_prompt=build_resume_prompt(
                 n, run.session_body, attempt.approval.body, failure_context,
                 reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
                 review_feedback=review_feedback, retry_default=retry_default,
-                moved_files=attempt.moved_files, parent_context=attempt.approval.parent_context or "",
-            ),
+                moved_files=moved_files, parent_context=attempt.approval.parent_context or "",
+            ) + setup.memory_notice,
             model=model, timeout_s=remaining, log_path=log, **attempt.options,
         )
     finally:
@@ -231,8 +241,8 @@ def _implement(
     # only once the implementer returns an ordinary execution result.
     if (retry_default or hint is not None) and classify_result(result) == "normal":
         consume_hint(ctx.store.root, n)
-    if classify_result(result) == "normal":
-        attempt.moved_files.clear()  # named once
+    if moved_files and classify_result(result) == "normal":
+        ctx.store.update_run(n, moved_files=[])  # named once, after delivery
     _record_skills_used(n, ctx, result)
     rebuttal = _read_rebuttals(worktree)
     if rebuttal.strip() and rebuttal not in attempt.rebuttals:

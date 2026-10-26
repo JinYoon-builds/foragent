@@ -125,6 +125,9 @@ def _available_executor(
             raise
 
     name = resolved_reviewer(ctx.config) if reviewer else ctx.config.executor
+    # Feedback saved for this turn stays until the implementer has actually received it.
+    saved = ctx.store.get_run(n)
+    pending, pending_whole = (saved.resume_reason, saved.resume_whole) if session_body is not None else ("", False)
     while True:
         run = ctx.store.get_run(n)
         # Another run may have hit this executor's usage limit; never launch it before the reset.
@@ -173,7 +176,9 @@ def _available_executor(
                 session_ids=[*run.session_ids, *([identity] if identity is not None else [])],
                 session_body=(session_body if result.session_id is not None or (
                     result.exit_code == 0 and not result.timed_out
-                ) else run.session_body), resume_reason=reason,
+                ) else run.session_body),
+                resume_reason=(f"{pending}\n\n{reason}" if pending else reason) if reason else "",
+                resume_whole=bool(reason and pending and pending_whole),
             )
             if reason:
                 resume_prompt = (resume_prompt or "") + "\n\n" + reason

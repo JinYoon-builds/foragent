@@ -412,6 +412,9 @@ def _verify_implementation(attempt: Implementation) -> str:
     raise AssertionError("unreachable verification state")
 
 
+REVIEW_HEAD_FAILURES = "review-head-checks.txt"
+
+
 def _verify_review_head(
     n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str,
 ) -> str | None:
@@ -419,6 +422,9 @@ def _verify_review_head(
 
     worktree = git.root
     log = ctx.store.log_path(n)
+    # Only this verification's failures may reach the retry hint.
+    (cuts.issue_dir(ctx.store.root, n) / REVIEW_HEAD_FAILURES).unlink(missing_ok=True)
+    failures = []
     for command in parsed.done_when_commands:
         if runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
@@ -428,9 +434,13 @@ def _verify_review_head(
         if check.timed_out or runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
         if check.exit_code != 0:
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.",
-                 f"Command: {command}\n{check.output}\n{link}")
-            return "checks-failed"
+            failures.append(f"Command: {command}\n{check.output}")
+    if failures:
+        # Every failing command, each with its own tail, for the flag and the retry hint.
+        bundle = "\n\n".join(failures)
+        cuts.save_full(cuts.issue_dir(ctx.store.root, n), REVIEW_HEAD_FAILURES, bundle)
+        flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.", f"{bundle}\n{link}")
+        return "checks-failed"
     git.stage_changes()
     if git.head_sha() != head or git.has_staged_changes():
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when changed the verified PR contents.", link)

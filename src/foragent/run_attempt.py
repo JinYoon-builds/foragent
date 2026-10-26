@@ -116,7 +116,5 @@ class Implementation:
     rebuild_lease: str | None = None
     pushed_head: str | None = None
     tracker_available: bool = True
-    # Files this branch edits that the last merged base moved or split, told once.
-    moved_files: list[str] = field(default_factory=list)
     # The title the open PR actually carries; a failed retitle keeps the old one.
     pr_title: str | None = None
