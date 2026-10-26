@@ -19,6 +19,20 @@ def _load() -> float:
         return 0.0
 
 
+def work_event(run: Run) -> tuple[str, str | None] | None:
+    """(event_id, repeat_of) of the run's current work instance, or None without a work identity.
+
+    Every segment of one instance (split by nested waits) shares its event_id; only a later
+    instance of the same work repeats the first. Open and closed phases use this one rule.
+    """
+    if not run.phase_work_id:
+        return None
+    instance = run.phase_work_started_at or run.phase_started_at
+    event_id = f"{run.number}:{run.phase_work_id}:{instance}"
+    first = run.work_events.get(run.phase_work_id)
+    return event_id, (first if first is not None and first != event_id else None)
+
+
 class RunRecordsMixin:
     def _close_phase(self, run: Run, closed_at: datetime) -> dict[str, Any]:
         """Journal the ended phase (#224 schema): its own seconds and the 1-minute load.
@@ -32,16 +46,18 @@ class RunRecordsMixin:
         opened = _state.datetime.fromisoformat(run.phase_started_at)
         event = {"at": closed_at.astimezone(_state.UTC).isoformat(), "issue": run.number, "kind": "phase",
                  "phase": run.phase, "seconds": max(0.0, (closed_at - opened).total_seconds()),
-                 "load": _load()}
+                 "load": _load(),
+                 # Identifies the interval, so a close journaled again (the run record failed
+                 # to persist and the phase closes once more) replaces rather than adds time.
+                 "phase_started_at": run.phase_started_at}
         changes: dict[str, Any] = {}
-        if run.phase_work_id:
-            event_id = f"{run.number}:{run.phase}:{run.phase_started_at}"
+        if (work := work_event(run)) is not None:
+            event_id, repeat_of = work
             event.update(event_id=event_id, work_id=run.phase_work_id)
-            if (first := run.work_events.get(run.phase_work_id)) is not None:
-                event["repeat_of"] = first
-            else:
+            if repeat_of is not None:
+                event["repeat_of"] = repeat_of
+            elif run.phase_work_id not in run.work_events:
                 changes["work_events"] = {**run.work_events, run.phase_work_id: event_id}
-            changes["phase_work_id"] = None
         with (self.root / "orch-events.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(_state.json.dumps(event, ensure_ascii=False) + "\n")
         return changes
@@ -130,7 +146,13 @@ class RunRecordsMixin:
             if "phase" in fields and fields["phase"] != run.phase:
                 closed = fields.get("phase_started_at")
                 changes = self._close_phase(run, _state.datetime.fromisoformat(closed) if closed else self._now())
-                fields = {**changes, **fields}
+                # A new phase has no work identity unless the caller restores or gives one.
+                fields = {**changes, "phase_work_id": None, "phase_work_started_at": None, **fields}
+                if fields["phase_work_id"] and not fields["phase_work_started_at"]:
+                    # Work named with its phase begins with that phase; nested waits keep this instance.
+                    fields["phase_work_started_at"] = fields.get("phase_started_at") or self._timestamp()
+            elif fields.get("phase_work_id") and "phase_work_started_at" not in fields:
+                fields["phase_work_started_at"] = run.phase_started_at
             if not observe:
                 updated = _state.replace(run, **fields)
                 self._write_run(updated)

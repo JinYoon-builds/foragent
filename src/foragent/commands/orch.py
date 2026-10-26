@@ -124,7 +124,10 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         _alive(args, store, config)
         return
     if args.action == "facts":
-        facts = cli.orch_facts.collect(store, config, args.repo_root.resolve())
+        from foragent.scheduler_config import tick_config
+
+        # Admission facts use the config the gate's tick applied (origin's committed file).
+        facts = cli.orch_facts.collect(store, tick_config(store, config), args.repo_root.resolve())
         print(cli.json.dumps(facts, ensure_ascii=False) if args.json else cli.orch_facts.human(facts))
         return
     if args.action == "queue":

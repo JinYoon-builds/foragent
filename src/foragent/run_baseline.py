@@ -26,7 +26,7 @@ from foragent.git import GitError
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
-from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot
+from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot, phase_identity, restore_phase
 from foragent.state import StateStore
 
 if TYPE_CHECKING:
@@ -291,13 +291,14 @@ def _capture_acceptance_baseline(
 
     def wait(acquire) -> None:
         # Waiting for another run's build of the same baseline is its own phase.
+        inside = phase_identity(ctx.store.get_run(n))
         _phase(n, ctx, "baseline-wait")
         try:
             _credited_wait(n, ctx, acquire)
         finally:
-            _phase(n, ctx, "baseline")
+            restore_phase(n, ctx, inside)
 
-    previous = ctx.store.get_run(n).phase
+    previous = phase_identity(ctx.store.get_run(n))
     try:
         return _capture_baseline(
             ctx, test_command, target_ref, log=ctx.store.log_path(n),
@@ -305,8 +306,8 @@ def _capture_acceptance_baseline(
             prepare=lambda: _phase(n, ctx, "baseline"), wait=wait,
         )
     finally:
-        if previous is not None:
-            _phase(n, ctx, previous)
+        # The capture ends here: close it and give back the phase (and work) it interrupted.
+        restore_phase(n, ctx, previous)
 
 
 def _capture_baseline(

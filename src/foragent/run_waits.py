@@ -53,7 +53,7 @@ def _test_slot(n: int, ctx: RunContext):
     run = ctx.store.get_run(n)
     started = ctx.now()
     waited = False
-    previous_phase = run.phase
+    previous = phase_identity(run)
 
     def credit() -> datetime:
         now = ctx.now()
@@ -79,13 +79,25 @@ def _test_slot(n: int, ctx: RunContext):
         finally:
             if waited:
                 now = credit()
-                ctx.store.update_run(n, waiting_until=None, phase=previous_phase,
+                ctx.store.update_run(n, waiting_until=None, **previous,
                                      phase_started_at=now.astimezone(UTC).isoformat())
         yield
 
 
 def _progress(n: int, ctx: RunContext) -> None:
     ctx.store.update_run(n, last_progress_at=ctx.now().astimezone(UTC).isoformat())
+
+
+def phase_identity(run) -> dict:
+    """What a nested wait must restore: the phase and the work it was doing."""
+    return {"phase": run.phase, "phase_work_id": run.phase_work_id,
+            "phase_work_started_at": run.phase_work_started_at}
+
+
+def restore_phase(n: int, ctx: RunContext, identity: dict) -> None:
+    run = ctx.store.get_run(n)
+    if phase_identity(run) != identity:
+        ctx.store.update_run(n, **identity, phase_started_at=ctx.now().astimezone(UTC).isoformat())
 
 
 def _phase(n: int, ctx: RunContext, phase: str) -> None:

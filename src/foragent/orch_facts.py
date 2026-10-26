@@ -18,11 +18,12 @@ from typing import Any
 from types import SimpleNamespace
 
 from foragent import capacity, machine_budget, orch_queue, tidy
-from foragent.config import Config, lane_executors
+from foragent.config import Config, in_run_hours, lane_executors
 from foragent.issue import ParsedIssue, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_order
 from foragent.processes import read_process_identity
 from foragent.state import Run, StateStore
+from foragent.state_runs import work_event
 
 RECENT = timedelta(days=7)
 PHASES = {"implementing": "implementing_seconds", "checking": "checking_seconds",
@@ -68,13 +69,21 @@ class _Execution:
     events: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _executions(store: StateStore, now: datetime) -> list[_Execution]:
+def _current_runs(store: StateStore) -> list[Run]:
+    """Each issue's current run record, read once per facts snapshot."""
+    runs = []
+    for path in sorted((store.root / "runs").glob("*.json")):
+        if path.stem.isdigit() and (run := store.get_run(int(path.stem))) is not None:
+            runs.append(run)
+    return runs
+
+
+def _executions(store: StateStore, now: datetime, current: list[Run]) -> list[_Execution]:
     """Each execution once: completion history first, then current records not finished yet."""
     finished_at = store.finish_times()
     runs: dict[tuple[int, str], Run] = {(run.number, run.started_at): run for run in store.read_history()}
-    for path in sorted((store.root / "runs").glob("*.json")):
-        if path.stem.isdigit() and (run := store.get_run(int(path.stem))) is not None:
-            runs.setdefault((run.number, run.started_at), run)
+    for run in current:
+        runs.setdefault((run.number, run.started_at), run)
     executions = []
     for key, run in runs.items():
         started = _time(run.started_at)
@@ -87,7 +96,13 @@ def _executions(store: StateStore, now: datetime) -> list[_Execution]:
     by_issue: dict[int, list[_Execution]] = {}
     for execution in executions:
         by_issue.setdefault(execution.run.number, []).append(execution)
-    for event in _jsonl(store.root / "orch-events.jsonl"):
+    # A close journaled again (its run record failed to persist) is the same interval: keep the last.
+    intervals: dict[tuple, dict[str, Any]] = {}
+    for index, event in enumerate(_jsonl(store.root / "orch-events.jsonl")):
+        if event.get("kind") == "phase":
+            opened = event.get("phase_started_at")
+            intervals[(event.get("issue"), event.get("phase"), opened) if opened else index] = event
+    for event in intervals.values():
         if event.get("kind") != "phase" or type(event.get("issue")) is not int:
             continue
         at, seconds = _time(event.get("at")), _seconds(event.get("seconds"))
@@ -103,7 +118,12 @@ def _row(execution: _Execution, now: datetime) -> dict[str, Any]:
     run = execution.run
     phases = [(event["phase"], float(event["seconds"]), bool(event.get("repeat_of"))) for event in execution.events]
     if run.status == "running" and run.phase and (opened := _time(run.phase_started_at)) is not None:
-        phases.append((run.phase, max(0.0, (now - opened).total_seconds()), False))
+        # The journal is written before the run record: time an event already closed is not open again.
+        closed = [at for event in execution.events if (at := _time(event.get("at"))) is not None]
+        opened = max([opened, *closed])
+        # The open segment repeats work by the same rule its closing event will use.
+        work = work_event(run)
+        phases.append((run.phase, max(0.0, (now - opened).total_seconds()), bool(work and work[1])))
     if run.status == "running":
         runtime = max(0.0, (now - execution.started).total_seconds())
     elif execution.finished is not None:
@@ -187,9 +207,9 @@ class _Waiting:
         return READY in self.labels and not self.labels & {BLOCKED, NEEDS_HUMAN}
 
 
-def _waiting_issues(store: StateStore, config: Config) -> list[_Waiting]:
+def _waiting_issues(store: StateStore, config: Config, running: list[Run]) -> list[_Waiting]:
     """Open approved issues not running now, with their approved snapshot."""
-    active = {run.number for run in store.active_runs()}
+    active = {run.number for run in running}
     waiting = []
     for issue in store.local_issues():
         labels = set(issue.get("labels") or [])
@@ -246,11 +266,11 @@ def _merges_since_tidy(store: StateStore) -> int:
     return count
 
 
-def _test_slots(config: Config, store: StateStore, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _test_slots(config: Config, running: list[Run], rows: list[dict[str, Any]]) -> dict[str, Any]:
     """The shared slot value (bounded by this project's test_slots), queue and waits."""
     state = capacity.read_test_slots()
     return {"current": max(1, min(state["slots"], config.test_slots) if state else config.test_slots),
-            "queue_length": sum(run.phase == "test-slot-wait" for run in store.active_runs()),
+            "queue_length": sum(run.phase == "test-slot-wait" for run in running),
             "total_wait_seconds": sum(row["test_slot_wait_seconds"] or 0 for row in rows)}
 
 
@@ -313,9 +333,11 @@ def _alive(run: Run, now: datetime) -> bool:
         return True  # Unreadable is not proof that the slot is free.
 
 
-def _machine_runs(store: StateStore, now: datetime) -> int:
+def _machine_runs(store: StateStore, now: datetime, running: list[Run]) -> int:
     """capacity.machine_runs without its signal probe: this store's runs and live sibling runs."""
-    count = capacity._store_slots(store, now, own=True)
+    numbers = {run.number for run in running}
+    count = len(running) + sum(1 for number, prepared in store.run_starts().items()
+                               if number not in numbers and capacity._within_grace(prepared, now))
     try:
         siblings = [root for root in store.root.parent.iterdir()
                     if root != store.root and ((root / "runs").is_dir() or (root / "run-starts").is_dir())]
@@ -324,7 +346,7 @@ def _machine_runs(store: StateStore, now: datetime) -> int:
     for root in siblings:
         try:
             sibling = StateStore(root, now=lambda: now)
-            runs = sibling.active_runs()
+            runs = _still_running(sibling, sibling.active_runs())
             running = {run.number for run in runs}
             count += sum(_alive(run, now) for run in runs) + sum(
                 1 for number, prepared in sibling.run_starts().items()
@@ -334,7 +356,10 @@ def _machine_runs(store: StateStore, now: datetime) -> int:
     return count
 
 
-def _admission(store: StateStore, config: Config, root, now: datetime, waiting: list[_Waiting]) -> dict[str, Any]:
+def _admission(
+    store: StateStore, config: Config, root, now: datetime, waiting: list[_Waiting], running: list[Run],
+    hold_all: str | None = None,
+) -> dict[str, Any]:
     """Replay the gate's start loop read-only: machine budget, project ceiling, lane holds, file rule.
 
     Each startable issue gets the first reason the loop would hold it for (cap,
@@ -348,7 +373,7 @@ def _admission(store: StateStore, config: Config, root, now: datetime, waiting: 
     machine_cap = int(state["parallel"]) if state else capacity.INITIAL_PARALLEL
     if (ceiling := machine_budget.values()["max_parallel"]) is not None:
         machine_cap = min(machine_cap, ceiling)
-    machine_active, project_active = _machine_runs(store, now), len(store.active_runs())
+    machine_active, project_active = _machine_runs(store, now, running), len(running)
     free = max(0, machine_cap - machine_active)
     if config.max_parallel is not None:
         free = min(free, max(0, config.max_parallel - project_active))
@@ -376,6 +401,9 @@ def _admission(store: StateStore, config: Config, root, now: datetime, waiting: 
                 held[number] = "cap"
             elif not admits(ctx, lane, item.parsed, known, unknown, union=union):
                 held[number] = "structure"
+            elif hold_all is not None:
+                # Passed every start check; the tick still starts nothing (critical memory, run hours).
+                held[number] = hold_all
             else:
                 remaining -= 1
                 run = Run(number, "", "", None, now.isoformat(), now.isoformat(), lane=lane)
@@ -389,18 +417,31 @@ def _admission(store: StateStore, config: Config, root, now: datetime, waiting: 
             "overlap_blocked": contended, "held": {str(number): reason for number, reason in sorted(held.items())}}
 
 
-def _resources(store: StateStore, config: Config, root, now: datetime, waiting, slots) -> dict[str, Any]:
+def _resources(store: StateStore, config: Config, root, now: datetime, waiting, slots, running) -> dict[str, Any]:
     with capacity.observing():
         sample = capacity.machine_load()
     pressure, load = sample[0], float(sample[1])
-    memory_headroom = pressure == "normal"
+    # The gate's rules: only critical memory holds starts and test slots (#497); load at or over
+    # OVERLOAD_LOAD shrinks the run and slot budgets; below HEADROOM_LOAD they may grow.
+    memory_headroom = pressure != "critical"
     headroom = memory_headroom and load < capacity.HEADROOM_LOAD
-    work = _admission(store, config, root, now, waiting)
-    held = set(work["held"].values())
+    overloaded = not memory_headroom or load >= capacity.OVERLOAD_LOAD
+    # Recorded holds in the tick's order: a GitHub wait skips the tick before starting,
+    # then run hours, then critical memory inside the start loop.
+    github_until = store.github_wait_until(now)
+    hold_all = ("github" if github_until is not None
+                else "run_hours" if not in_run_hours(now.astimezone(), config.run_hours)
+                else "machine" if not memory_headroom else None)
+    work = _admission(store, config, root, now, waiting, running, hold_all)
+    work["github_wait_until"] = github_until.isoformat() if github_until is not None else None
+    # Running work held in flight: a run waiting for files other runs hold.
+    work["in_flight"] = {str(run.number): "structure" for run in sorted(running, key=lambda run: run.number)
+                         if run.phase == "overlap-wait"}
+    held = set(work["held"].values()) | set(work["in_flight"].values())
     work["idle_while_waiting"] = work["free_run_slots"] > 0 and "structure" in held
-    # Executors the waiting work needs: lanes of startable waiting issues and of runs queued for a slot.
+    # Executors the waiting work needs: startable waiting issues and runs waiting in flight.
     lanes = {item.lane for item in waiting if item.startable}
-    lanes |= {run.lane for run in store.active_runs() if run.phase == "test-slot-wait"}
+    lanes |= {run.lane for run in running if run.phase in ("test-slot-wait", "overlap-wait")}
     needed = set().union(*(lane_executors(config, lane) for lane in lanes)) if lanes else set()
     quota = _quota(store, now)
     for name, value in quota.items():
@@ -409,7 +450,8 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
     waiting_now = bool(held) or slots["queue_length"] > 0
     return {
         "machine": {"load_per_cpu": load, "memory_pressure": pressure, "memory_headroom": memory_headroom,
-                    "headroom": headroom, "idle_while_waiting": headroom and waiting_now},
+                    "headroom": headroom, "overloaded": overloaded,
+                    "idle_while_waiting": headroom and waiting_now},
         "quota": quota,
         # `admitted` is what `hold_test_slot` grants now, including machine.yml's default ceiling.
         "test_slots": {**slots, "admitted": capacity.effective_test_slots(config.test_slots),
@@ -424,11 +466,21 @@ def _binding(resources: dict[str, Any]) -> dict[str, Any] | None:
     held: dict[str, list[str]] = {}
     for number, reason in work["held"].items():
         held.setdefault(reason, []).append(f"#{number}")
-    if not work["waiting_issues"] and slots["queue_length"] == 0:
+    for number, reason in work["in_flight"].items():
+        held.setdefault(reason, []).append(f"#{number} (running)")
+    if not work["waiting_issues"] and slots["queue_length"] == 0 and not work["in_flight"]:
         return None
-    if not machine["headroom"]:
+    if machine["overloaded"]:
+        # Critical memory holds every start; overload shrinks the shared budgets this tick.
         return {"kind": "machine", "normal": True,
                 "detail": f"load {machine['load_per_cpu']:.2f} per CPU, memory {machine['memory_pressure']}"}
+    if "github" in held:
+        return {"kind": "github", "normal": True,
+                "detail": f"GitHub rate limit until {work['github_wait_until']}; the tick starts nothing: "
+                          + ", ".join(held["github"])}
+    if "run_hours" in held:
+        return {"kind": "run_hours", "normal": True,
+                "detail": "outside run_hours; the gate starts nothing now: " + ", ".join(held["run_hours"])}
     if "quota" in held:
         return {"kind": "quota", "normal": True,
                 "detail": "usage-limit pause holds " + ", ".join(held["quota"])}
@@ -445,19 +497,71 @@ def _binding(resources: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+SNAPSHOT_ATTEMPTS = 5
+
+
+def _version(store: StateStore) -> dict[str, tuple[int, int, int]]:
+    """A version stamp of every record facts reads; atomic writes and appends both change it."""
+    root = store.root
+    paths = [*root.glob("*.json"), *root.glob("*.jsonl"), *(root / "approvals").glob("*.json"),
+             root.parent / capacity.STATE_FILE, machine_budget.machine_file(),
+             capacity.machine_root() / capacity.TEST_SLOTS_FILE, capacity.machine_root() / capacity.SENSOR_FILE]
+    # Run records and start reservations of this store and of every sibling (machine-wide run count).
+    try:
+        stores = [path for path in root.parent.iterdir() if path.is_dir()]
+    except OSError:
+        stores = [root]
+    for directory in stores:
+        paths += [*(directory / "runs").glob("*.json"), *(directory / "run-starts").glob("*.json")]
+    stamp = {}
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        stamp[str(path)] = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+    return stamp
+
+
 def collect(store: StateStore, config: Config, root) -> dict[str, Any]:
-    """All facts as one JSON-ready mapping."""
+    """All facts as one JSON-ready mapping, computed from one unchanged version of the records.
+
+    Writers change several files per transition (journal, then run record), so a
+    read that overlaps a write is computed again until the version is stable.
+    """
+    for _ in range(SNAPSHOT_ATTEMPTS):
+        version = _version(store)
+        facts = _collect(store, config, root)
+        if _version(store) == version:
+            return facts
+    facts["consistent"] = False  # The records kept changing; this read may mix two versions.
+    return facts
+
+
+def _still_running(store: StateStore, runs: list[Run]) -> list[Run]:
+    """Running records whose execution has no completion entry yet.
+
+    finish_run appends the history entry before it replaces the run record; a record
+    read between the two is finished, not running.
+    """
+    finished = {(run.number, run.started_at) for run in store.read_history()}
+    return [run for run in runs if run.status == "running" and (run.number, run.started_at) not in finished]
+
+
+def _collect(store: StateStore, config: Config, root) -> dict[str, Any]:
     now = store._now()
-    rows = [_row(execution, now) for execution in _executions(store, now)
+    current = _current_runs(store)
+    running = _still_running(store, current)
+    rows = [_row(execution, now) for execution in _executions(store, now, current)
             if execution.run.status == "running" or execution.started >= now - RECENT]
     history = _history(rows)
     for row in rows:
         row["comparisons"] = _comparisons(row, history["medians"])
-    waiting = _waiting_issues(store, config)
-    slots = _test_slots(config, store, rows)
+    waiting = _waiting_issues(store, config, running)
+    slots = _test_slots(config, running, rows)
     measured = [row for row in rows if row["waste_seconds"] is not None and row["runtime_seconds"] is not None]
     wasted, runtime = sum(row["waste_seconds"] for row in measured), sum(row["runtime_seconds"] for row in measured)
-    resources = _resources(store, config, root, now, waiting, slots)
+    resources = _resources(store, config, root, now, waiting, slots, running)
     return {
         "at": now.astimezone(UTC).isoformat(),
         "window_days": RECENT.days,

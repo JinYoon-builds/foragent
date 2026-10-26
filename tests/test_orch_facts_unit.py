@@ -225,3 +225,287 @@ def test_queued_test_slot_is_its_own_phase(env, monkeypatch):
     facts = orch_facts.collect(store, Config(repo="owner/repo"), root)
     row, = facts["runs"]
     assert row["test_slot_wait_seconds"] == 23 and facts["test_slots"]["total_wait_seconds"] == 23
+
+
+def test_a_transition_during_the_read_is_not_counted_as_closed_and_open(env, monkeypatch):
+    store, root = env
+    clock = [NOW - timedelta(seconds=40)]
+    store._now = lambda: clock[0]
+    store.start_run(6, branch="b", worktree=store.worktree_path(6))
+    store.update_run(6, phase="implementing", phase_started_at=clock[0].isoformat())
+    clock[0] += timedelta(seconds=10)
+    store.update_run(6, phase="checking", phase_started_at=clock[0].isoformat())
+    clock[0] += timedelta(seconds=30)  # NOW: checking has taken 30 s.
+    read = orch_facts._current_runs
+    calls = []
+
+    def racing(store_):
+        runs = read(store_)
+        if not calls:  # The phase ends right after the run record was read.
+            store.update_run(6, phase="reviewing", phase_started_at=clock[0].isoformat())
+        calls.append(1)
+        return runs
+
+    monkeypatch.setattr(orch_facts, "_current_runs", racing)
+    row, = collect(store, root)["runs"]
+    assert len(calls) == 2, "A changed version is read again"
+    assert row["checking_seconds"] == 30 and row["test_phase_share"] == pytest.approx(0.75)
+
+
+def test_open_phase_starts_after_an_event_that_already_closed_it(env, monkeypatch):
+    store, root = env
+    clock = [NOW - timedelta(seconds=30)]
+    store._now = lambda: clock[0]
+    store.start_run(6, branch="b", worktree=store.worktree_path(6))
+    store.update_run(6, phase="checking", phase_started_at=clock[0].isoformat())
+    clock[0] = NOW
+    stale = store.get_run(6)
+    store.update_run(6, phase="reviewing", phase_started_at=NOW.isoformat())
+    # A record read before the transition, with the journal read after it.
+    monkeypatch.setattr(orch_facts, "_current_runs", lambda store_: [stale])
+    row, = collect(store, root)["runs"]
+    assert row["checking_seconds"] == 30
+
+
+def test_nested_waits_keep_the_work_identity_so_waste_adds_up(env, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from foragent import run_waits
+
+    store, root = env
+    clock = [NOW - timedelta(hours=1)]
+    store._now = lambda: clock[0]
+
+    @contextmanager
+    def queued(ceiling, *, waiting=None):
+        waiting()
+        clock[0] += timedelta(seconds=20)
+        yield
+
+    monkeypatch.setattr(capacity, "hold_test_slot", queued)
+    ctx = SimpleNamespace(store=store, config=Config(repo="owner/repo"), now=lambda: clock[0])
+    for _ in range(2):
+        store.start_run(6, branch="b", worktree=store.worktree_path(6))
+        store.update_run(6, phase="baseline", phase_started_at=clock[0].isoformat())
+        store.update_run(6, phase_work_id="baseline:abc")
+        clock[0] += timedelta(seconds=40)
+        with run_waits._test_slot(6, ctx):
+            assert store.get_run(6).phase_work_id == "baseline:abc"
+            clock[0] += timedelta(seconds=60)
+        store.finish_run(6, outcome="timeout")
+        clock[0] += timedelta(seconds=5)
+    store._now = lambda: NOW
+    facts = collect(store, root)
+    assert sorted(row["waste_seconds"] for row in facts["runs"]) == [20, 120]
+    assert facts["waste"]["seconds"] == 140
+
+
+def test_recorded_usage_feeds_the_expiring_quota_estimate(env, monkeypatch):
+    from foragent import state_local
+
+    store, root = env
+    reset = (NOW + timedelta(minutes=10)).isoformat()
+    for minutes, used in ((20, 30), (0, 40)):
+        store._now = lambda minutes=minutes: NOW - timedelta(minutes=minutes)
+        store.record_usage("codex", [{"name": "5h", "used_percent": used, "resets_at": reset}])
+    store._now = lambda: NOW
+    quota = collect(store, root)["resources"]["quota"]["codex"]
+    assert quota["remaining_share"] == pytest.approx(0.6)
+    assert quota["expiring_unused_share"] == pytest.approx(0.55)
+    monkeypatch.setattr(state_local, "USAGE_HISTORY_LINES", 2)
+    store.record_usage("codex", [{"name": "5h", "used_percent": 41, "resets_at": reset}])
+    lines = (store.root / "usage-history.jsonl").read_text().splitlines()
+    assert len(lines) == 2 and json.loads(lines[-1])["windows"][0]["used_percent"] == 41
+
+
+def test_fa_tidy_done_writes_the_boundary_facts_counts_from(env):
+    from foragent import tidy
+
+    store, root = env
+    store._now = lambda: NOW - timedelta(hours=2)
+    store.start_run(1, branch="b", worktree=store.worktree_path(1))
+    store.finish_run(1, outcome="merged")
+    store._now = lambda: NOW - timedelta(hours=1)
+    tidy.done(store)
+    kinds = [json.loads(line)["kind"] for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert "tidy-done" in kinds
+    store._now = lambda: NOW - timedelta(minutes=30)
+    store.start_run(2, branch="b", worktree=store.worktree_path(2))
+    store.finish_run(2, outcome="merged")
+    store._now = lambda: NOW
+    assert collect(store, root)["merges_since_tidy"] == 1
+
+
+def test_an_open_recapture_of_recorded_work_is_waste_before_it_closes(env):
+    store, root = env
+    clock = [NOW - timedelta(hours=1)]
+    store._now = lambda: clock[0]
+    store.start_run(6, branch="b", worktree=store.worktree_path(6))
+    store.update_run(6, phase="baseline", phase_started_at=clock[0].isoformat(), phase_work_id="baseline:abc")
+    clock[0] += timedelta(seconds=30)
+    store.finish_run(6, outcome="timeout")
+    clock[0] = NOW - timedelta(seconds=50)
+    store.start_run(6, branch="b", worktree=store.worktree_path(6))
+    store.update_run(6, phase="baseline", phase_started_at=clock[0].isoformat(), phase_work_id="baseline:abc")
+    store._now = lambda: NOW
+    current = [row for row in collect(store, root)["runs"] if row["status"] == "running"]
+    assert current[0]["waste_seconds"] == 50, "The open recapture repeats recorded work"
+
+
+def test_a_restored_open_segment_of_first_work_is_not_waste(env, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from foragent import run_waits
+
+    store, root = env
+    clock = [NOW - timedelta(seconds=100)]
+    store._now = lambda: clock[0]
+
+    @contextmanager
+    def queued(ceiling, *, waiting=None):
+        waiting()
+        clock[0] += timedelta(seconds=20)
+        yield
+
+    monkeypatch.setattr(capacity, "hold_test_slot", queued)
+    ctx = SimpleNamespace(store=store, config=Config(repo="owner/repo"), now=lambda: clock[0])
+    store.start_run(6, branch="b", worktree=store.worktree_path(6))
+    store.update_run(6, phase="baseline", phase_started_at=clock[0].isoformat(), phase_work_id="baseline:abc")
+    clock[0] += timedelta(seconds=30)
+    with run_waits._test_slot(6, ctx):
+        pass  # The restored baseline segment stays open until NOW.
+    store._now = lambda: NOW
+    row, = collect(store, root)["runs"]
+    assert (row["baseline_seconds"], row["waste_seconds"]) == (80, 20)
+
+
+def test_a_sibling_start_during_the_read_is_read_again(env, monkeypatch):
+    store, root = env
+    capacity.write_state(store, 1, NOW)
+    approve(store, 5, ["src/a.py"])
+    sibling = StateStore(store.root.parent / "other__repo", now=lambda: NOW)
+    read = orch_facts._current_runs
+    calls = []
+
+    def racing(store_):
+        runs = read(store_)
+        if not calls:
+            sibling.prepare_run_start(9)  # Another gate reserves the only machine slot.
+        calls.append(1)
+        return runs
+
+    monkeypatch.setattr(orch_facts, "_current_runs", racing)
+    facts = collect(store, root)
+    assert len(calls) == 2
+    assert facts["resources"]["parallelizable_work"]["machine_runs"] == 1
+    assert facts["binding"]["kind"] == "cap"
+
+
+def test_warn_memory_does_not_hide_a_fixable_structure_hold(env, monkeypatch):
+    store, root = env
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("warn", 0.1))
+    capacity.write_state(store, 4, NOW)
+    approve(store, 1, ["src/shared.py"], labels=("approved", "running"), active=True)
+    approve(store, 2, ["src/shared.py"])
+    approve(store, 3, ["src/shared.py"])
+    facts = collect(store, root)
+    assert facts["resources"]["machine"]["memory_headroom"] is True
+    assert facts["binding"]["kind"] == "structure" and facts["binding"]["normal"] is False
+
+
+def test_critical_memory_holds_every_start_like_the_gate(env, monkeypatch):
+    store, root = env
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("critical", 0.1))
+    capacity.write_state(store, 4, NOW)
+    approve(store, 2, ["src/a.py"])
+    facts = collect(store, root)
+    assert facts["resources"]["parallelizable_work"]["held"] == {"2": "machine"}
+    assert facts["binding"]["kind"] == "machine" and facts["binding"]["normal"] is True
+
+
+def test_outside_run_hours_nothing_starts(env):
+    store, root = env
+    capacity.write_state(store, 4, NOW)
+    approve(store, 2, ["src/a.py"])
+    hour = NOW.astimezone().hour
+    facts = collect(store, root, run_hours=f"{(hour + 1) % 24:02d}-{(hour + 2) % 24:02d}")
+    assert facts["resources"]["parallelizable_work"]["held"] == {"2": "run_hours"}
+    assert facts["binding"]["kind"] == "run_hours"
+
+
+def test_facts_use_the_committed_config_the_tick_applied(env):
+    from foragent.scheduler_config import record_tick_config, tick_config
+
+    store, root = env
+    capacity.write_state(store, 4, NOW)
+    approve(store, 1, ["src/a.py"], labels=("approved", "running"), active=True)
+    approve(store, 2, ["src/b.py"])
+    local = Config(repo="owner/repo", max_parallel=4)
+    assert collect(store, root, max_parallel=4)["binding"] is None
+    record_tick_config(store, "origin/main:.foragent.yml", "repo: owner/repo\nmax_parallel: 1\n")
+    stamp = (store.root / "tick-config.json").stat().st_mtime_ns
+    record_tick_config(store, "origin/main:.foragent.yml", "repo: owner/repo\nmax_parallel: 1\n")
+    assert (store.root / "tick-config.json").stat().st_mtime_ns == stamp, "An unchanged config is not rewritten"
+    facts = orch_facts.collect(store, tick_config(store, local), root)
+    assert facts["resources"]["parallelizable_work"]["held"] == {"2": "cap"}
+    assert facts["binding"]["kind"] == "cap"
+
+
+def test_a_recorded_github_wait_holds_ready_work(env):
+    store, root = env
+    capacity.write_state(store, 4, NOW)
+    approve(store, 2, ["src/a.py"])
+    store.pause_github(NOW + timedelta(minutes=30))
+    facts = collect(store, root)
+    assert facts["resources"]["parallelizable_work"]["held"] == {"2": "github"}
+    assert facts["binding"]["kind"] == "github" and facts["binding"]["normal"] is True
+
+
+def test_a_running_overlap_wait_is_a_structure_hold(env):
+    store, root = env
+    capacity.write_state(store, 4, NOW)
+    approve(store, 1, ["src/a.py"], labels=("approved", "running"), active=True)
+    store.update_run(1, phase="overlap-wait", phase_started_at=NOW.isoformat())
+    facts = collect(store, root)
+    work = facts["resources"]["parallelizable_work"]
+    assert work["in_flight"] == {"1": "structure"} and work["idle_while_waiting"] is True
+    assert facts["binding"]["kind"] == "structure"
+
+
+def test_a_half_written_finish_is_finished_not_queued(env):
+    store, root = env
+    store.start_run(3, branch="b", worktree=store.worktree_path(3))
+    store.update_run(3, phase="test-slot-wait", phase_started_at=NOW.isoformat())
+    before = (store.root / "runs" / "3.json").read_bytes()
+    store.finish_run(3, outcome="merged")
+    (store.root / "runs" / "3.json").write_bytes(before)  # History written, record not yet replaced.
+    facts = collect(store, root)
+    assert facts["test_slots"]["queue_length"] == 0 and facts["binding"] is None
+    row, = facts["runs"]
+    assert row["status"] == "finished"
+
+
+def test_a_close_journaled_twice_counts_once(env, monkeypatch):
+    store, root = env
+    clock = [NOW - timedelta(seconds=20)]
+    store._now = lambda: clock[0]
+    store.start_run(3, branch="b", worktree=store.worktree_path(3))
+    store.update_run(3, phase="checking", phase_started_at=clock[0].isoformat())
+    clock[0] += timedelta(seconds=10)
+    write = store._write_run
+
+    def failing(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_write_run", failing)
+    with pytest.raises(OSError):
+        store.update_run(3, phase="reviewing", phase_started_at=clock[0].isoformat())
+    monkeypatch.setattr(store, "_write_run", write)
+    clock[0] += timedelta(seconds=10)
+    store.finish_run(3, outcome="merged")
+    store._now = lambda: NOW
+    row, = collect(store, root)["runs"]
+    assert row["checking_seconds"] == 20 and row["runtime_seconds"] == 20
+    assert row["test_phase_share"] == pytest.approx(1.0)

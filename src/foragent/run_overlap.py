@@ -9,7 +9,7 @@ from glob import escape
 from foragent.i18n import text
 from foragent.overlap_files import Claim, any_overlap, approved_issue, at_capacity, claims, measure, union_patterns
 from foragent.run_checks import _append
-from foragent.run_waits import _credited_wait, _phase
+from foragent.run_waits import _credited_wait, _phase, phase_identity, restore_phase
 
 # Seconds between re-checks while a late file waits for its holders. Each check
 # measures this run and every peer, so a short poll multiplies tick load.
@@ -107,7 +107,7 @@ def wait_for_overlap(attempt) -> None:
         while blocked():
             ctx.sleep(OVERLAP_POLL_SECONDS)
 
-    previous_phase = ctx.store.get_run(n).phase
+    previous = phase_identity(ctx.store.get_run(n))
     _append(ctx.store.log_path(n), text(
         "overlap_wait_started", ctx.config.language,
         blockers="; ".join(f"{path}: " + ", ".join(f"#{number}" for number in numbers)
@@ -117,7 +117,7 @@ def wait_for_overlap(attempt) -> None:
     try:
         _credited_wait(n, ctx, acquire)
     finally:
-        _phase(n, ctx, previous_phase)
+        restore_phase(n, ctx, previous)
 
 
 @contextmanager

@@ -73,6 +73,10 @@ def done(store: StateStore) -> dict[str, Any]:
         return True
 
     store.update_tidy_state(change)
+    from foragent.orch_events import append_event
+
+    # The journal's tidy-done event is the boundary `fa orch facts` counts merges from.
+    append_event(store, store._now(), None, "tidy-done", f"Tidy completed after {merged} recorded merges")
     return public(status(store))
 
 

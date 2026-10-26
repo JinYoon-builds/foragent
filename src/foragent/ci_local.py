@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import _passing_acceptance_ids, _pytest_command, junit_node_id
-from foragent.run_waits import _phase, _progress, _test_slot
+from foragent.run_waits import _phase, _progress, _test_slot, phase_identity, restore_phase
 
 
 def report_ids(report, result, measurement):
@@ -60,14 +60,13 @@ def capture_local_only(n, ctx, git, test_command, base_sha, excluded):
     if command is None:
         raise AttemptFailure("local_only checks require a supported pytest command")
     # Measuring the base is the baseline phase; a second measurement of this base repeats it.
-    previous = ctx.store.get_run(n).phase
+    previous = phase_identity(ctx.store.get_run(n))
     _phase(n, ctx, "baseline")
     ctx.store.update_run(n, phase_work_id=f"baseline-local:{base_sha}")
     try:
         return _capture_local_only(n, ctx, git, command, base_sha, excluded)
     finally:
-        if previous is not None:
-            _phase(n, ctx, previous)
+        restore_phase(n, ctx, previous)
 
 
 def _capture_local_only(n, ctx, git, command, base_sha, excluded):

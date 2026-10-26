@@ -85,4 +85,6 @@ class Run:
     # Identity of the work the current phase does (e.g. "baseline:<sha>"), journaled when it ends;
     # work_events maps each finished work identity to its first phase event, across executions.
     phase_work_id: str | None = None
+    # When this instance of the work began; segments split by nested waits share it.
+    phase_work_started_at: str | None = None
     work_events: dict[str, str] = field(default_factory=dict)
