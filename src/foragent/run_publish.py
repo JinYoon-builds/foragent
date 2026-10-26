@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from foragent import board, review_perspectives, risks
+from foragent import board, review_perspectives, risks, run_merge_group
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
@@ -68,10 +68,19 @@ def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str)
     raise failure
 
 
+@dataclass
+class _Hold:
+    # False when another group already merged this run: the leader recorded its facts.
+    record: bool = True
+    # Borrowed members merged in this hold get the group's lock hold (#459).
+    members: list[int] = field(default_factory=list)
+
+
 @contextmanager
 def _merge_lock(n: int, ctx: RunContext):
     # Keep tick informed during an unbounded blocking flock acquisition.
     started = None
+    hold = _Hold()
     try:
         with ExitStack() as stack:
             def acquire():
@@ -80,10 +89,14 @@ def _merge_lock(n: int, ctx: RunContext):
                 started = ctx.now()
 
             _credited_wait(n, ctx, acquire)
-            yield
+            yield hold
     finally:
         if started is not None:
-            ctx.store.record_merge_lock(n, (ctx.now() - started).total_seconds())
+            seconds = (ctx.now() - started).total_seconds()
+            if hold.record:
+                ctx.store.record_merge_lock(n, seconds)
+            for member in hold.members:
+                ctx.store.update_run(member, merge_lock_held_seconds=seconds)
 
 
 def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float) -> str:
@@ -421,7 +434,11 @@ def _update_open_pr(attempt: Implementation, pr: int, title: str, body: str) -> 
 
 def _publish(attempt: Implementation) -> str:
     wait_for_overlap(attempt)
-    return _publish_locked(attempt)
+    try:
+        return _publish_locked(attempt)
+    finally:
+        # A run that stops being ready leaves the merge queue (#459).
+        attempt.ctx.store.dequeue_merge(attempt.n)
 
 
 def _publish_locked(attempt: Implementation) -> str:
@@ -526,12 +543,15 @@ def _publish_locked(attempt: Implementation) -> str:
             ctx.tracker.remove_labels(n, [RUNNING])
             return "pr-open"
 
-    if stopped := policy_hold(merge_decision(
+    initial = merge_decision(
         changed_paths=ctx.tracker.pr_changed_files(pr),
         issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
         risk_always_human=_risk_always_human(ctx),
-    )):
+    )
+    if stopped := policy_hold(initial):
         return stopped
+    grouping = run_merge_group.grouping_enabled(attempt, initial.kind == "merge")
+    group_failed = False
 
     def publish_refresh(target_sha: str) -> str | None:
         nonlocal pr_ready_at, ci_wait, verified_base_sha
@@ -576,7 +596,10 @@ def _publish_locked(attempt: Implementation) -> str:
         # The final snapshot still detects changes during lock acquisition.
         ctx.git.fetch("origin", attempt.target_branch)
         target_sha = git.ref_sha(f"origin/{attempt.target_branch}")
-        if target_sha != verified_base_sha:
+        # Unclaimed ready peers check this moved main jointly instead (#459).
+        regroup = grouping and not group_failed and ctx.store.has_unclaimed_merge_peers(n, attempt.target_branch)
+        if target_sha != verified_base_sha and not regroup:
+            ctx.store.dequeue_merge(n)
             target_sha = refresh_base(capture_move(git, target_sha))
             if stopped := publish_refresh(target_sha):
                 return stopped
@@ -590,19 +613,40 @@ def _publish_locked(attempt: Implementation) -> str:
             if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
                 return _hold_changed_head(n, ctx, link)
 
+        group = None
+        if grouping:
+            # Durable before the final lock request; a newer leader may borrow it.
+            run_merge_group.enqueue(attempt, pr, verified_head_sha, verified_base_sha, pr_ready_at)
+            if not group_failed:
+                group, group_failed = run_merge_group.form(attempt)
         wait_for_overlap(attempt)
-        with _merge_lock(n, ctx):
+        with _merge_lock(n, ctx) as hold:
+            if grouping and run_merge_group.merged_by_group(attempt, pr, verified_head_sha):
+                # Another run's group merged this head and recorded its facts.
+                hold.record = False
+                _append(log, f"Merged by another run's merge group: {verified_head_sha}")
+                _progress(n, ctx)
+                return "merged"
             inputs = _final_merge_inputs(
                 n, ctx, git, pr, attempt.branch, attempt.target_branch,
                 verified_head_sha, attempt.approval, pr_ready_at, comparison=comparison,
             )
+            if group is not None and group.base_sha != inputs.base_sha:
+                group = None  # Members merged elsewhere or main moved since the joint check.
+            if (grouping and group is None and not group_failed and inputs.stop is None
+                    and ctx.store.has_unclaimed_merge_peers(n, attempt.target_branch)):
+                # Lead the unclaimed peers: their joint check runs outside the lock.
+                queued_status = inputs.status
+                continue
             move = None
+            # A passed joint check verified this run on the group's pinned main.
+            checked_base = group.base_sha if group is not None else verified_base_sha
             continue_merge = (
                 inputs.stop is None
                 and _policy_allows(inputs.decision, attempt.target_branch, inputs.batch_branch)
                 and inputs.status in {"pass", "none"}
             )
-            if continue_merge and inputs.base_sha != verified_base_sha:
+            if continue_merge and inputs.base_sha != checked_base:
                 move = capture_move(git, inputs.base_sha)
             if continue_merge and move is None and inputs.comparison_current:
                 _check_publication(git, attempt.target_branch, inputs.base_sha)
@@ -614,23 +658,51 @@ def _publish_locked(attempt: Implementation) -> str:
                 )
                 if not subject:
                     attempt.pr_title = title
+                borrowed = []
+                if group is not None:
+                    members = {member.entry["number"]: member
+                               for member in run_merge_group.member_inputs(attempt, group, inputs.base_sha)}
+                    # Queue order, including the leader's own position.
+                    for entry in group.entries:
+                        if entry["number"] == n:
+                            break
+                        if entry["number"] in members and run_merge_group.merge_member(attempt, members.pop(entry["number"])):
+                            borrowed.append(entry)
+                else:
+                    members = {}
                 try:
                     ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
                 except TrackerError as exc:
                     if exc.is_rate_limit:
                         raise
+                    if borrowed:
+                        # Members merged before the leader still finish merged.
+                        run_merge_group.finish_members(attempt, borrowed, len(borrowed))
+                        hold.members.extend(entry["number"] for entry in borrowed)
+                        runner.after_merge(ctx, pr, attempt.target_branch)
                     if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
                         inputs.stop = lambda: _hold_changed_head(n, ctx, link)
                     else:
                         raise
                 else:
                     ctx.store.record_merge(n, ctx.now())
+                    for member in members.values():
+                        if run_merge_group.merge_member(attempt, member):
+                            borrowed.append(member.entry)
+                    size = 1 + len(borrowed)
+                    ctx.store.update_run(n, merge_group_size=size, merge_group_bisect_checks=0)
+                    run_merge_group.finish_members(attempt, borrowed, size)
+                    hold.members.extend(entry["number"] for entry in borrowed)
+                    # Reinstall once per group, after its last merge.
                     if inputs.decision.kind == "merge":
                         runner.after_merge(ctx, pr, attempt.target_branch)
                     _progress(n, ctx)
+                    others = ", ".join(f"#{entry['number']}" for entry in borrowed)
                     try:
                         if attempt.target_branch == attempt.batch_branch:
                             ctx.tracker.close_issue(n, f"Merged into {attempt.batch_branch} (PR #{pr})")
+                        elif others:
+                            ctx.tracker.close_issue(n, f"Merged in a merge group with {others}.")
                         else:
                             ctx.tracker.close_issue(n)
                     except TrackerError as exc:
@@ -653,6 +725,7 @@ def _publish_locked(attempt: Implementation) -> str:
             return inputs.stop()
         if stopped := policy_hold(inputs.decision, inputs.batch_branch):
             return stopped
+        ctx.store.dequeue_merge(n)
         if not continue_merge or (move is None and not inputs.comparison_current):
             queued_status = inputs.status
             continue
@@ -753,6 +826,7 @@ def _publish_reviewed_head(
                         raise
                 else:
                     ctx.store.record_merge(n, ctx.now())
+                    ctx.store.update_run(n, merge_group_size=1, merge_group_bisect_checks=0)
                     if review_mode_for(inputs.paths, ctx.config) == "fast":
                         runner.after_merge(ctx, pr.number, pr.base)
                     try:
