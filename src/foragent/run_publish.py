@@ -14,6 +14,7 @@ from foragent import board, review_perspectives, risks, run_merge_group
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
+from foragent.i18n import text
 from foragent.issue import ParsedIssue, body_hash
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
 from foragent.orch_events import append_event
@@ -274,18 +275,24 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
         finally:
             ctx.git.remove_worktree(worktree)
     prs = {pr.head: pr for pr in ctx.tracker.list_prs("merged", "foragent/issue-") if pr.base == branch}
-    lines = [f"Closes #{parent}", "", "## Children", ""]
+    # No closing keyword: the parent's completion belongs to the gate's order
+    # aggregation (board_parents), which comments first and keeps a parent with
+    # a not-planned child open. A merge here must not close it behind that.
+    lines = [text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", ""]
     for child in sorted(children, key=lambda child: child.number):
         pr = prs.get(f"foragent/issue-{child.number}")
         lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
-    title = f"Batch: {ctx.tracker.get_issue(parent).title} (#{parent})"
+    issue = ctx.tracker.get_issue(parent)
+    title = f"Batch: {issue.title} (#{parent})"
     body = "\n".join(lines)
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
-        board.sync_status(ctx, parent, "PR open")
+        if issue.state == "open":  # A completed order (#411) stays in Done.
+            board.sync_status(ctx, parent, "PR open")
         return
     pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
-    board.sync_status(ctx, parent, "PR open")
+    if issue.state == "open":
+        board.sync_status(ctx, parent, "PR open")
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
 
 
@@ -524,17 +531,13 @@ def _publish_locked(attempt: Implementation) -> str:
             flag(ctx, n, Reason.TIMEOUT, "base kept moving")
             raise ExecutorStopped("timeout")
         _append(log, f"{REUSED if neutral else REVERIFY}: {move.target_sha}")
-        if not neutral:
-            # Protect what passes on the new base, not on the old one (#483).
-            from foragent.run_implementation import capture_acceptance_baseline
-            # Keep the command the protected set was captured with; the branch
-            # may have changed the files test-command detection reads.
-            command = attempt.baseline.test_command if attempt.baseline else None
-            attempt.baseline = capture_acceptance_baseline(
-                n, ctx, git, attempt.target_branch, move.target_sha, command)
         # Exclude the merged base's paths from policy and patch replay. The
         # separate verified_base_sha advances only after verification/push.
         attempt.start_ref = move.target_sha
+        if not neutral:
+            # Protect what passes on the new base before merging it (#483).
+            from foragent.run_implementation import follow_base
+            follow_base(attempt)
         if conflicts is None:
             conflicts = _merge_moved_base(attempt, move.target_sha)
         if conflicts:

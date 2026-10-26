@@ -44,10 +44,25 @@ class StateStore(
     # Heartbeat file stem for each side; each write overwrites one small file.
     HEARTBEATS = {"orchestrator": "orch", "gate": "gate"}
 
-    def write_heartbeat(self, side: str, at: datetime) -> None:
-        """Overwrite one side's heartbeat with ``at`` (no lock: one atomic replace)."""
+    def write_heartbeat(self, side: str, at: datetime, *, session: dict | None = None) -> None:
+        """Overwrite one side's heartbeat with ``at`` (no lock: one atomic replace).
+
+        ``session`` is the writer's Claude session ``{pid, start_time}``, if known.
+        """
         self.root.mkdir(parents=True, exist_ok=True)
-        self._write_json(self.root / f"{self.HEARTBEATS[side]}-heartbeat.json", {"at": at.isoformat()})
+        record: dict = {"at": at.isoformat()}
+        if session is not None:
+            record["session"] = session
+        self._write_json(self.root / f"{self.HEARTBEATS[side]}-heartbeat.json", record)
+
+    def heartbeat_session(self, side: str) -> dict | None:
+        """The Claude session recorded in one side's heartbeat, or None."""
+        try:
+            session = json.loads(
+                (self.root / f"{self.HEARTBEATS[side]}-heartbeat.json").read_text(encoding="utf-8"))["session"]
+            return {"pid": int(session["pid"]), "start_time": float(session["start_time"])}
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     def heartbeats(self) -> dict[str, datetime | None]:
         """Last heartbeat of each side; a missing or unreadable file is None."""

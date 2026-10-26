@@ -271,8 +271,23 @@ def set_status(issue: Issue | int, status: str) -> None:
         board_column(status)  # Validate even when there is no repository context.
 
 
-def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_only: bool = False) -> None:
+def _order_parent(ctx: BoardContext, number: int) -> bool:
+    """Whether the last listing shows ``number`` as an open order parent."""
+    from foragent.board_parents import order_parents
+
+    store = getattr(ctx, "store", None)
+    if store is None:
+        return False
+    return number in order_parents([row for row in store.local_issues() if row["number"] == number])
+
+
+def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_only: bool = False,
+                parent: bool = False) -> None:
     """Move the issue's card to the column for ``status`` when the column differs.
+
+    An open order parent's column follows its children: only the children
+    aggregation (``parent=True``) writes it, so work-state handlers such as
+    recovery, escalation or a flag leave its card alone.
 
     ``existing_only`` moves a card that is already on the board, recorded
     locally or not, and never adds one. A tracker that records board values is
@@ -282,6 +297,8 @@ def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_
     if not ctx.config.board:
         return
     if existing_only and getattr(ctx.tracker, "board_value", None) is None:
+        return
+    if not parent and _order_parent(ctx, getattr(issue, "number", issue)):
         return
     token = _current.set(Project(ctx.tracker, ctx.repo, ctx.config.board, ctx.config.board_map))
     try:
