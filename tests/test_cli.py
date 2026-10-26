@@ -34,6 +34,14 @@ class FakeGit:
     def blob_shas(self, ref, paths):
         return {path: "missing" for path in paths}
 
+    # The tick reads origin's committed .foragent.yml; model it as the checkout's file.
+    def blob_sha(self, ref, path):
+        return path if (self.root / path).is_file() else None
+
+    def _call(self, args):
+        assert args[:2] == ["cat-file", "blob"], args
+        return (self.root / args[2]).read_text(encoding="utf-8")
+
     def remove_worktree(self, path):
         pass
 
@@ -48,6 +56,7 @@ def app(tmp_path, monkeypatch):
 
     def git_repo(root):
         calls["roots"].append(root)
+        git.root = root
         return git
 
     def gh_tracker(repo):

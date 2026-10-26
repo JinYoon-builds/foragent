@@ -26,6 +26,7 @@ from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_checks import CheckResult, trusts_ci
+from foragent.run_previous import retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
 from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
@@ -167,6 +168,8 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
         ctx.store._atomic_write(path, hint)
     else:
         path.unlink(missing_ok=True)
+    # The next implementer receives the keep-work/defect-class default before any hint.
+    ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         ctx.tracker.close_pr(pr, "Closed by Foragent orchestrator retry")
     # Establish the destination before clearing the old state, including on errors.
