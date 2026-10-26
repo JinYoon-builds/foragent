@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field, replace
 import fcntl
+from glob import escape
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
@@ -17,6 +18,8 @@ from foragent.git import GitError, GitRepo, PublicationError
 from foragent.issue import ParsedIssue, body_hash
 from foragent.orch_events import append_event
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
+from foragent.orch_events import append_event
+from foragent.overlap_files import any_overlap
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped
@@ -381,6 +384,55 @@ def _preserve_failed_implementation(
     tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
 ) -> None:
     """Save stopped work before cleanup, including after the runner has died."""
+    with ctx.store.worktree_lock(n):
+        # Recheck only after acquiring the lock: a competing cleanup may have
+        # removed the worktree while we waited. A parent repository is no save.
+        if not (git.root / ".git").is_file():
+            return
+        try:
+            git.check_worktree()
+        except GitError:
+            return
+        _preserve_locked_implementation(
+            n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
+            pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
+        )
+
+
+# Unrecorded deletions at or above this count look like a clobbered worktree, not the
+# implementer's work; fewer are kept, as the locked #270/#370 checks require.
+MASS_DELETION = 10
+
+
+def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> list[str]:
+    """Leave a mass of unowned deletions out of the index without discarding other work."""
+    deletions = git.staged_deletions()
+    if not deletions:
+        return []
+    patterns = []
+    if run is not None:
+        patterns.extend(run.declared_files or [])
+        patterns.extend([escape(path) for path in run.effective_files or []]
+                        if run.files_committed else run.effective_files or [])
+        patterns.extend(escape(path) for path in [*(run.changed_files or []), *run.late_files])
+    base = (run.files_base_branch if run is not None else None) or ctx.config.base_branch
+    committed = git.committed_paths(f"origin/{base}")
+    artifacts = git.artifact_paths()
+    refused = sorted(path for path in deletions
+                     if path not in committed
+                     and not any(path == root or path.startswith(root + "/") for root in artifacts)
+                     and not any_overlap(ctx, [escape(path)], patterns))
+    if len(refused) < MASS_DELETION:
+        return []  # A few unrecorded deletions are the implementer's own edits.
+    git.restore_staged_paths("HEAD", refused)
+    return refused
+
+
+def _preserve_locked_implementation(
+    n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
+    approved_ref: str, title: str | None, pushed_head: str | None,
+    tracker_available: bool, push_branch: Callable[[], None] | None,
+) -> None:
     branch = f"foragent/issue-{n}"
     run = ctx.store.get_run(n)
     git.local_skill_paths.update(run.local_skill_paths if run is not None else ())
@@ -393,6 +445,7 @@ def _preserve_failed_implementation(
     git.stage_changes()
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
+    refused = _check_wip_deletions(ctx, git, run)
     with stop_intent_lock(ctx.store, n):
         # Read the intent now, not at entry: a stop recorded during staging still names its why,
         # and one recorded after the commit sees which reason this WIP carries.
@@ -403,6 +456,10 @@ def _preserve_failed_implementation(
             git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
             if current is not None and current.status == "running":
                 ctx.store.update_run(n, wip_reason=reason)
+    if refused:
+        detail = "WIP preservation refused: deletions outside allowed paths: " + ", ".join(map(repr, refused[:10]))
+        _append(ctx.store.log_path(n), detail)
+        append_event(ctx.store, ctx.now(), n, "wip-preservation-refused", detail)
     if git.head_sha() == pushed_head or not tracker_available:
         return
     try:

@@ -473,3 +473,27 @@ def test_tick_completes_a_stop_whose_label_update_failed(run_case):
     events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
     assert [event["kind"] for event in events if event["issue"] == 1] == ["stop"]
     assert "reprioritize" in events[-1]["summary"]
+
+
+def test_tick_completes_a_pending_stop_after_a_runner_flag_erased_running(run_case):
+    """The class 'recovery depends on an erased label': the local stop record drives the tick."""
+    from foragent.actions import flag
+    from foragent.scheduler_stop import mark_stop_pending
+
+    c = run_case
+    mark_stop_pending(c.store, c.store.get_run(1), "reprioritize")
+    c.store.update_run(1, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
+    flag(c.ctx, 1, Reason.RETRIES_EXCEEDED, "Executor died during the stop.")  # removes running, adds blocked
+    c.store.finish_run(1, outcome="stopped")
+    assert "running" not in c.tracker.get_issue(1).labels
+    c.now[0] += timedelta(seconds=1)
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+    )
+    report = TickReport()
+    _recover_runs(ctx, report)
+    labels = c.tracker.get_issue(1).labels
+    assert "ready" in labels and not labels & {"running", "blocked", "needs-human"}, report.actions
+    assert not (c.store.root / "stops" / "1.json").exists()
+    assert c.store.get_run(1).outcome == "stopped"

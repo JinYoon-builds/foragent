@@ -1,9 +1,10 @@
 from dataclasses import asdict, dataclass, replace
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 import errno
 import fcntl
 import json
-import multiprocessing
+from multiprocessing import Pipe
 from pathlib import Path
 
 import pytest
@@ -91,14 +92,14 @@ def _mutate_run(root, method, number, fields, connection, pause_read):
 
 @pytest.fixture
 def mutation_process():
-    context = multiprocessing.get_context("spawn")
+    # Independent flock descriptors contend in threads just as in processes;
+    # never launch or terminate real processes to exercise state serialization.
+    pool = ThreadPoolExecutor()
     children = []
 
     def start(root, method, number=1, *, pause_read=False, **fields):
-        parent, child = context.Pipe()
-        process = context.Process(target=_mutate_run, args=(root, method, number, fields, child, pause_read))
-        process.start()
-        child.close()
+        parent, child = Pipe()
+        process = pool.submit(_mutate_run, root, method, number, fields, child, pause_read)
         children.append((process, parent))
         assert parent.poll(10)
         assert parent.recv() == "started"
@@ -106,12 +107,9 @@ def mutation_process():
 
     yield start
     for process, connection in children:
-        process.join(timeout=5)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
+        process.result(timeout=15)
         connection.close()
-        assert process.exitcode == 0
+    pool.shutdown()
 
 
 def test_repository_root_and_paths(tmp_path, monkeypatch):
@@ -268,9 +266,8 @@ def _acquire_merge_lock(root, connection):
 
 
 def test_project_merge_lock_blocks_other_processes_and_releases_on_error(store):
-    context = multiprocessing.get_context("spawn")
-    parent, child = context.Pipe()
-    process = context.Process(target=_acquire_merge_lock, args=(store.root, child))
+    parent, child = Pipe()
+    pool = ThreadPoolExecutor(max_workers=1)
     try:
         with pytest.raises(RuntimeError, match="release lock"):
             with store.merge_lock():
@@ -278,19 +275,15 @@ def test_project_merge_lock_blocks_other_processes_and_releases_on_error(store):
                 store.start_run(1, branch="branch", worktree="worktree")
                 with store.tick_lock() as acquired:
                     assert acquired
-                process.start()
-                child.close()
+                process = pool.submit(_acquire_merge_lock, store.root, child)
                 assert parent.poll(10) and parent.recv() == "waiting"
                 assert not parent.poll(0.1)
                 raise RuntimeError("release lock")
         assert parent.poll(10) and parent.recv() == "acquired"
         parent.send("release")
-        process.join(5)
-        assert process.exitcode == 0
+        process.result(timeout=15)
     finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(5)
+        pool.shutdown()
         parent.close()
         child.close()
 

@@ -9,7 +9,7 @@ import pytest
 
 from foragent import orch, processes, scheduler
 from foragent.processes import ProcessIdentity, ProcessTable
-from foragent.run_publish import _preserve_failed_implementation
+from foragent.run_publish import _preserve_locked_implementation
 from foragent.scheduler_stop import stop_target_refusal
 from foragent.state import Run, StateStore
 
@@ -71,8 +71,17 @@ class _Git:
     def head_sha(self):
         return "wip"
 
+    def staged_deletions(self):
+        return []
+
     def push(self, branch):
         self.pushed.append(branch)
+
+
+def _preserve(ctx, git, reason):
+    # The locked inner step: main's wrapper only adds the worktree lock and a real-worktree check.
+    _preserve_locked_implementation(1, ctx, git, reason, approval=None, approved_ref="HEAD", title="Locale",
+                                    pushed_head=None, tracker_available=True, push_branch=None)
 
 
 @pytest.mark.parametrize(("outcome", "detail", "stop_why", "reason"), [
@@ -87,7 +96,7 @@ def test_wip_names_the_recorded_stop_reason_whoever_saves_it(tmp_path, outcome, 
                             update_run=lambda n, **fields: None)
     ctx = SimpleNamespace(store=store, tracker=SimpleNamespace(find_pr=lambda branch: None))
     git = _Git()
-    _preserve_failed_implementation(1, ctx, git, run.outcome, approval=None, title="Locale")
+    _preserve(ctx, git, run.outcome)
     assert git.commits == [f"WIP: Locale (#1) [{reason}]"]
 
 
@@ -117,29 +126,41 @@ def test_refused_kill_restores_the_recorded_outcome(tmp_path, monkeypatch):
 
 class _Labels:
     def __init__(self):
-        self.calls, self.pr = [], None
+        self.calls, self.pr, self.fail_once = [], None, set()
         self.issue = SimpleNamespace(state="open", labels={"approved", "running"})
 
+    def _maybe_fail(self, step):
+        if step in self.fail_once:
+            self.fail_once.discard(step)
+            raise RuntimeError(f"GitHub failed: {step}")
+
     def find_pr(self, head):
+        self._maybe_fail("find_pr")
         return self.pr
 
     def get_issue(self, n):
+        self._maybe_fail("get_issue")
         return self.issue
 
     def close_pr(self, pr, comment=None):
+        self._maybe_fail("close")
         self.calls.append(("close", pr))
+        self.pr = None
 
     def comment(self, n, body):
         self.calls.append(("comment", n))
 
     def add_labels(self, n, labels):
+        self._maybe_fail(f"add {labels[0]}")
         self.calls.append(("add", n, tuple(labels)))
 
     def remove_labels(self, n, labels):
+        self._maybe_fail(f"remove {labels[0]}")
         self.calls.append(("remove", n, tuple(labels)))
 
 
-READY = [("add", 1, ("ready",)), ("remove", 1, ("running", "blocked", "needs-human"))]
+READY = [("add", 1, ("ready",)), ("remove", 1, ("blocked",)), ("remove", 1, ("needs-human",)),
+         ("remove", 1, ("running",))]
 
 
 def _running_store(tmp_path, monkeypatch):
@@ -264,6 +285,7 @@ def test_a_closed_issue_is_stopped_without_ready(tmp_path, monkeypatch, kicks):
     summary = orch.stop(ctx, 1, "reprioritize")
     assert labels.calls == [("remove", 1, ("running",)), ("comment", 1)]
     assert "closed, so it was not returned to ready" in summary
+    assert not (store.root / "stops" / "1.json").exists()
 
 
 def test_tracker_failure_after_termination_is_pending_and_the_retry_records_one_event(tmp_path, monkeypatch, kicks):
@@ -318,7 +340,7 @@ def test_wip_reason_reads_the_stop_intent_at_commit_time(tmp_path, monkeypatch, 
     store, ctx, labels = _running_store(tmp_path, monkeypatch)
     record = lambda: store.update_run(1, outcome="stopped", stop_why="reprioritize")  # noqa: E731
     git = _StagingGit(record if stop_during_staging else lambda: None)
-    _preserve_failed_implementation(1, ctx, git, "retries-exceeded", approval=None, title="Locale")
+    _preserve(ctx, git, "retries-exceeded")
     if not stop_during_staging:
         record()  # The stop recorded its intent only after this WIP was committed.
     run = store.get_run(1)
@@ -338,3 +360,51 @@ def test_tick_drops_a_stop_intent_abandoned_before_any_signal(tmp_path, monkeypa
     assert (cleared.status, cleared.outcome, cleared.stop_why) == ("running", None, "")
     assert [event["kind"] for event in _journal(store)] == ["stop-abandoned"]
     assert clear_stale_stop(ctx, cleared) is cleared  # A run without an intent is untouched.
+
+
+@pytest.mark.parametrize("step", [
+    "get_issue", "find_pr", "close", "add ready", "remove blocked", "remove needs-human", "remove running",
+])
+def test_every_completion_step_failing_once_is_finished_by_the_next_tick(tmp_path, monkeypatch, kicks, step):
+    """Finding class: recovery must not depend on a label an earlier step already erased.
+
+    The pending record, written before the intent, drives the tick; labels never do.
+    """
+    from foragent.scheduler_stop import recover_pending_stops
+
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    labels.pr = 7
+    # A dying runner's flag already removed running and added blocked before completion.
+    labels.issue = SimpleNamespace(state="open", labels={"approved", "blocked"})
+    labels.fail_once = {step}
+    monkeypatch.setattr(scheduler, "_kill_run", _finish(store))
+    with pytest.raises(orch.StopPending):
+        orch.stop(ctx, 1, "reprioritize")
+    assert (store.root / "stops" / "1.json").exists(), "the stop must stay recorded until every step is done"
+    report = scheduler.TickReport()
+    recover_pending_stops(SimpleNamespace(store=store, tracker=labels, now=ctx.now), report)
+    assert not (store.root / "stops" / "1.json").exists(), report.actions
+    done = labels.calls
+    assert ("close", 7) in done and ("add", 1, ("ready",)) in done
+    assert {("remove", 1, (label,)) for label in ("blocked", "needs-human", "running")} <= set(done)
+    assert [event["kind"] for event in _journal(store)] == ["stop"]
+
+
+def test_pending_record_is_dropped_when_the_stop_is_undone_or_the_run_ended_its_own_way(tmp_path, monkeypatch):
+    from foragent.scheduler_stop import mark_stop_pending, recover_pending_stops
+
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+
+    def refused(tick_ctx, number, report, **kwargs):
+        assert (store.root / "stops" / "1.json").exists(), "recorded before any signal"
+        return False
+
+    monkeypatch.setattr(scheduler, "_kill_run", refused)
+    with pytest.raises(orch.OrchError, match="still running"):
+        orch.stop(ctx, 1, "reprioritize")
+    assert not (store.root / "stops" / "1.json").exists()
+    # A record left by a dead stop process whose run then ended for its own reason.
+    mark_stop_pending(store, store.get_run(1), "reprioritize")
+    store.finish_run(1, outcome="retries-exceeded")
+    recover_pending_stops(SimpleNamespace(store=store, tracker=labels, now=ctx.now), scheduler.TickReport())
+    assert not (store.root / "stops" / "1.json").exists() and labels.calls == []

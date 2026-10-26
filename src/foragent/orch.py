@@ -224,7 +224,9 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
 def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
     from foragent import scheduler
     from foragent.run_publish import STOPPED, stop_intent_lock, stop_kept_work
-    from foragent.scheduler_stop import complete_stop, stop_summary, stop_target_refusal
+    from foragent.scheduler_stop import (
+        complete_stop, drop_stop_pending, mark_stop_pending, stop_summary, stop_target_refusal,
+    )
 
     run = ctx.store.get_run(n)
     if run is None or run.status != "running":
@@ -240,6 +242,9 @@ def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
     # Record the intent before any signal, ordered against any WIP commit by the
     # intent lock: a WIP made afterwards names this why, one made before is seen.
     with stop_intent_lock(ctx.store, n):
+        # The durable record comes first: every later step, including labels a dying
+        # runner's flag may already have removed, is recovered from it by the next tick.
+        mark_stop_pending(ctx.store, run, why)
         ctx.store.update_run(n, outcome=STOPPED, detail=detail, stop_why=why)
     try:
         scheduler._kill_run(tick_ctx, n, report, outcome=STOPPED, detail=detail)
@@ -250,17 +255,19 @@ def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
                 # The run did not end: undo only this verb's marks; a runner's wip-not-saved stays.
                 undo = {"outcome": run.outcome, "detail": run.detail} if current.outcome == STOPPED else {}
                 current = ctx.store.update_run(n, stop_why="", **undo)
+                drop_stop_pending(ctx.store, n)
     # Success is the finished record, whichever process wrote it, and a WIP naming the why.
     if current is None or current.status != "finished" or current.outcome != STOPPED or not stop_kept_work(current):
         state = "still running" if current is not None and current.status == "running" else (
             f"finished as {current.outcome}" if current is not None else "no run record")
         if current is not None and current.wip_reason and current.wip_reason != detail:
             state += f"; its work was already saved as WIP for {current.wip_reason}"
+        drop_stop_pending(ctx.store, n)  # The run's own outcome owns its labels.
         raise OrchError(f"#{n}: stop did not complete ({state}): {'; '.join(report.actions) or 'no action'}")
     try:
         summary = stop_summary(n, why) + complete_stop(tick_ctx, current)
     except Exception as exc:
-        # The run is finished as stopped; the next tick's orphan recovery repeats each step.
+        # The run is finished as stopped; the pending stop record makes the next tick repeat each step.
         raise StopPending(f"{stop_summary(n, why)}; not completed ({' '.join(str(exc).split()) or type(exc).__name__}); "
                           "the next gate tick completes the stop") from exc
     try:  # The required local event is already journaled; the GitHub audit comment is extra.

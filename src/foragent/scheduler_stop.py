@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
@@ -136,14 +137,34 @@ def stop_summary(number: int, why: str) -> str:
     return f"#{number}: stopped and kept unfinished work on foragent/issue-{number}; why: {why}"
 
 
+def _pending(store, number: int) -> Path:
+    return store.root / "stops" / f"{number}.json"
+
+
+def mark_stop_pending(store, run: Run, why: str) -> None:
+    """Durably record a stop before its intent, signal or labels; only completion removes it.
+
+    Recovery reads this record, never a label an earlier step (the stop's own, or
+    a dying runner's flag) may already have removed.
+    """
+    path = _pending(store, run.number)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    store._atomic_write(path, json.dumps({"number": run.number, "started_at": run.started_at, "why": why}))
+
+
+def drop_stop_pending(store, number: int) -> None:
+    _pending(store, number).unlink(missing_ok=True)
+
+
 def complete_stop(ctx: TickContext, run: Run) -> str:
     """Finish an issue whose run `fa orch stop` ended; returns a summary note.
 
-    The stop event is required, so it is journaled first and once per run; the
-    labels follow. Every step is idempotent, so a tick's orphan recovery repeats
-    whatever a failed stop left. As `fa orch retry`, the issue returns to ready:
-    a hold or this issue's own open PR (which a tick would otherwise read as
-    review) is cleared, and the next run resumes from the issue branch.
+    The stop event is required, so it is journaled first and once per run. Each
+    label step is separate and idempotent, and the pending record is removed only
+    after all of them succeed, so any failed step is repeated by the next tick.
+    As `fa orch retry`, the issue returns to ready: a hold or this issue's own
+    open PR (which a tick would otherwise read as review) is cleared, and the
+    next run resumes from the issue branch. A closed issue only loses running.
     """
     number = run.number
     journal = ctx.store.root / "orch-events.jsonl"
@@ -156,18 +177,48 @@ def complete_stop(ctx: TickContext, run: Run) -> str:
     if not recorded:
         scheduler.append_event(ctx.store, ctx.now(), number, "stop", stop_summary(number, run.stop_why))
     issue = ctx.tracker.get_issue(number)
-    if issue.state != "open":
-        ctx.tracker.remove_labels(number, [scheduler.RUNNING])
-        return "; the issue is closed, so it was not returned to ready"
-    note = ""
-    if (pr := ctx.tracker.find_pr(f"foragent/issue-{number}")) is not None:
-        ctx.tracker.close_pr(pr, f"Closed by Foragent orchestrator stop; the next run resumes from the issue branch. "
-                                 f"Why: {run.stop_why}")
-        note = f"; closed PR #{pr} so the next run resumes from the branch"
-    ctx.tracker.add_labels(number, [scheduler.READY])
-    ctx.tracker.remove_labels(number, [scheduler.RUNNING, scheduler.BLOCKED, scheduler.NEEDS_HUMAN])
-    scheduler.board.sync_status(ctx, number, "Ready")
+    note, removals = "; the issue is closed, so it was not returned to ready", [scheduler.RUNNING]
+    if issue.state == "open":
+        note = ""
+        if (pr := ctx.tracker.find_pr(f"foragent/issue-{number}")) is not None:
+            ctx.tracker.close_pr(pr, f"Closed by Foragent orchestrator stop; the next run resumes from the issue "
+                                     f"branch. Why: {run.stop_why}")
+            note = f"; closed PR #{pr} so the next run resumes from the branch"
+        ctx.tracker.add_labels(number, [scheduler.READY])
+        removals = [scheduler.BLOCKED, scheduler.NEEDS_HUMAN, scheduler.RUNNING]
+    for label in removals:  # One label per call: a failure leaves the rest for the retry.
+        ctx.tracker.remove_labels(number, [label])
+    if issue.state == "open":
+        scheduler.board.sync_status(ctx, number, "Ready")
+    drop_stop_pending(ctx.store, number)
     return note
+
+
+def recover_pending_stops(ctx: TickContext, report: TickReport) -> None:
+    """Drive every recorded stop to its end from the local record, whatever the labels say.
+
+    No stop runs while a tick holds the lock. A record on a run that ended for
+    its own reason is dropped (that run's outcome owns its labels); a stopped run
+    is completed. A run still recorded as running is left to _recover_runs.
+    """
+    from foragent.run_publish import STOPPED, stop_kept_work
+
+    directory = ctx.store.root / "stops"
+    for path in sorted(directory.glob("*.json")) if directory.exists() else ():
+        record = json.loads(path.read_text(encoding="utf-8"))
+        number = record["number"]
+        run = ctx.store.get_run(number)
+        if run is None or run.started_at != record["started_at"]:
+            drop_stop_pending(ctx.store, number)  # A newer run replaced the stopped one.
+        elif run.status == "running":
+            continue  # _recover_runs: a live runner's abandoned intent is cleared, a dead one finishes stopped.
+        elif run.outcome == STOPPED and stop_kept_work(run):
+            try:
+                report.actions.append(f"#{number} completed a pending stop{complete_stop(ctx, run)}")
+            except Exception as exc:
+                report.actions.append(f"#{number} stop still pending: {' '.join(str(exc).split())}")
+        else:
+            drop_stop_pending(ctx.store, number)
 
 
 def clear_stale_stop(ctx: TickContext, run: Run) -> Run:
@@ -181,6 +232,7 @@ def clear_stale_stop(ctx: TickContext, run: Run) -> Run:
         return run
     from foragent.run_publish import STOPPED
 
+    drop_stop_pending(ctx.store, run.number)
     scheduler.append_event(ctx.store, ctx.now(), run.number, "stop-abandoned",
                            f"#{run.number}: a stop ended before signaling the runner; why: {run.stop_why}")
     return ctx.store.update_run(run.number, stop_why="", **({"outcome": None} if run.outcome == STOPPED else {}))

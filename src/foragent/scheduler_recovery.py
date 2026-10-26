@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from foragent import processes, scheduler
 from foragent.scheduler_stop import (
     _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes, clear_stale_stop,
-    complete_stop,
+    complete_stop, recover_pending_stops,
 )
 from foragent.run_publish import STOPPED, WIP_NOT_SAVED, keep_unsaved_work, stop_kept_work
 from foragent.state import Run
@@ -197,6 +197,7 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
+    recover_pending_stops(ctx, report)  # From the local stop record, before any label-driven recovery.
     for run in ctx.store.active_runs():
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
