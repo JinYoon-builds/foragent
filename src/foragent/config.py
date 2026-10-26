@@ -57,6 +57,8 @@ class Config:
     review_max: int = 2
     review_level: str = "low"
     review_scope: str = "claude-local"
+    review_perspectives: list[dict[str, str]] = field(default_factory=list)  # Added after the defaults (#532).
+    review_reviewers: int = 1
     test_command: str | None = None
     # Runner and premerge: auto trusts pull_request CI; ci always trusts it; all runs units locally.
     runner_unit_tests: str = "auto"

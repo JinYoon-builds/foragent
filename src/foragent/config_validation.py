@@ -3,6 +3,8 @@
 import re
 from typing import Any
 
+from foragent import review_perspectives
+
 
 def _validate(values: dict[str, Any]) -> None:
     from foragent.config import ConfigError, SKILL_ROLES, _EXECUTORS, _REVIEW_LEVELS, _hours
@@ -71,6 +73,7 @@ def _validate(values: dict[str, Any]) -> None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
+    review_perspectives.validate(values, ConfigError)
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     for key in ("always_human", "approvers"):
