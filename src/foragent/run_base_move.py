@@ -78,17 +78,9 @@ def _git_bytes(git: GitRepo, args: list[str]) -> bytes:
 def _nul_paths(output: bytes) -> list[str]:
     # Paths are taken verbatim between NUL bytes: a filename may start or end
     # with whitespace or newlines, so no character other than NUL is stripped.
-    # Bytes that are not UTF-8 stay as lone surrogates, which never classify as
-    # neutral (see _decodable), instead of becoming replacement characters.
+    # Bytes that are not UTF-8 stay as lone surrogates instead of replacement
+    # characters, so two different names never compare equal.
     return [path.decode("utf-8", "surrogateescape") for path in output.split(b"\0") if path != b""]
-
-
-def _decodable(path: str) -> bool:
-    try:
-        path.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
 
 
 def moved_paths(git: GitRepo, move: BaseMove) -> set[str]:
@@ -183,11 +175,16 @@ def _open_acceptance_owners(attempt: Implementation) -> dict[str, set[int]]:
     return owners
 
 
+def _own_paths(git: GitRepo, target_sha: str) -> set[str]:
+    """GitRepo.changed_paths(), read as exact bytes like moved_paths()."""
+    return set(_nul_paths(_git_bytes(git, [
+        "diff", "--cached", "--name-only", "--no-renames", "-z", git._own_base(target_sha),
+    ])))
+
+
 def base_move_is_neutral(attempt: Implementation, move: BaseMove) -> bool:
     paths = moved_paths(attempt.git, move)
-    if not all(_decodable(path) for path in paths):
-        return False
-    own = set(attempt.git.changed_paths(move.target_sha))
+    own = _own_paths(attempt.git, move.target_sha)
     if paths & own:
         return False
     rest = {path for path in paths if not path.startswith(NEUTRAL_DIRECTORY)}

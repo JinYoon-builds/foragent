@@ -270,17 +270,18 @@ def test_dot_slash_acceptance_dir_and_owner_paths_match_git_paths(repo, director
     assert neutral(work, target)
 
 
-def commit_bytes(root: Path, files: dict[str, bytes]) -> str:
+def commit_bytes(root: Path, files: dict[str, bytes], branch: str = "main") -> str:
     """Like move(), with raw blob bytes; names may hold surrogate-escaped bytes."""
-    index = {"GIT_INDEX_FILE": str(root.parent / "index-main")}
-    git(root, "read-tree", git(root, "rev-parse", "main"), env=index)
+    index = {"GIT_INDEX_FILE": str(root.parent / f"index-{branch}")}
+    tip = git(root, "rev-parse", branch)
+    git(root, "read-tree", tip, env=index)
     for name, data in files.items():
         blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=root, input=data,
                               check=True, capture_output=True).stdout.decode().strip()
         git(root, "update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=index)
     tree = git(root, "write-tree", env=index)
-    sha = git(root, "commit-tree", tree, "-p", git(root, "rev-parse", "main"), "-m", "bytes")
-    git(root, "update-ref", "refs/heads/main", sha)
+    sha = git(root, "commit-tree", tree, "-p", tip, "-m", "bytes")
+    git(root, "update-ref", f"refs/heads/{branch}", sha)
     return sha
 
 
@@ -298,9 +299,22 @@ def test_undecodable_config_bytes_are_unparsable(repo, data):
     assert not neutral(work, target)
 
 
-def test_undecodable_path_is_result_affecting_even_under_docs(repo):
+def test_undecodable_docs_path_keeps_the_docs_rule_and_exact_own_paths(repo):
+    """#376's docs rule is unchanged; names are compared byte for byte, never replaced."""
     name = "docs/caf\udce9.md"
     target = commit_bytes(repo, {name: b"x\n"})
     work = attempt(repo, {})
     assert moved_paths(work.git, capture_move(work.git, target)) == {name}
-    assert not neutral(work, target)
+    assert neutral(work, target)
+    # Another undecodable name that would decode to the same replacement text.
+    commit_bytes(repo, {"docs/caf\udcea.md": b"feature\n"}, branch="feature")
+    on_feature(repo)
+    assert neutral(work, target), "Different bytes must not collide as this branch's own path"
+    commit_bytes(repo, {name: b"feature\n"}, branch="feature")
+    on_feature(repo)
+    assert not neutral(work, target), "A docs path this branch changed re-verifies"
+
+
+def test_undecodable_path_outside_docs_reverifies(repo):
+    target = commit_bytes(repo, {"src/caf\udce9.py": b"x\n"})
+    assert not neutral(attempt(repo, {}), target)

@@ -42,6 +42,9 @@ class AcceptanceBaseline:
     excluded: tuple[str, ...] = ()
     # The base commit this baseline ran on; files absent there were never run (#514).
     base_sha: str | None = None
+    # The configured or detected test command this baseline came from (#483);
+    # a refresh reuses it so later edits to detected files cannot drop protection.
+    test_command: str | None = None
 
 
 @dataclass(frozen=True)

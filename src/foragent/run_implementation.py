@@ -84,6 +84,7 @@ def _record_skills_used(n: int, ctx: RunContext, result: ExecResult) -> None:
 
 def capture_acceptance_baseline(
     n: int, ctx: RunContext, git: GitRepo, target_branch: str, ref: str,
+    test_command: str | None = None,
 ) -> AcceptanceBaseline | None:
     """Capture (or reuse the cached) protected set for ``ref``; stop the run if unusable (#327).
 
@@ -94,7 +95,8 @@ def capture_acceptance_baseline(
     from foragent.ci_mode import enabled
 
     log = ctx.store.log_path(n)
-    test_command = ctx.config.test_command
+    if test_command is None:
+        test_command = ctx.config.test_command
     if test_command is None:
         test_command = next(iter(runner.detect_test_commands(git.root)), None)
     try:
@@ -102,11 +104,12 @@ def capture_acceptance_baseline(
         if enabled(ctx, target_branch):
             from foragent.run_baseline import _baseline_exclusions
             base_sha = git.ref_sha(ref)
-            return capture_local_only(n, ctx, git, test_command, base_sha,
-                                      _baseline_exclusions(ctx, base_sha, log))
+            baseline = capture_local_only(n, ctx, git, test_command, base_sha,
+                                          _baseline_exclusions(ctx, base_sha, log))
+            return replace(baseline, test_command=test_command) if baseline else None
         baseline = _capture_acceptance_baseline(n, ctx, test_command, ref)
         ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})
-        return baseline
+        return replace(baseline, test_command=test_command) if baseline else None
     except AttemptFailure as exc:
         _append(log, str(exc))
         reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
