@@ -153,9 +153,16 @@ def test_scorecard_records_phase_changes_journal_elapsed_seconds_and_load_throug
 
     pr_checks, merge_pr = case.tracker.pr_checks, case.tracker.merge_pr
 
+    ci_reads = []
+
     def ci(pr):
-        during_ci.extend(phase_events(StateStore(case.store.root)))
-        case.clock[0] += timedelta(seconds=17)
+        # Only the first CI read takes time; later safety re-reads (for example
+        # inside the merge lock) are instant, so the phase times do not depend
+        # on how many times the runner re-checks CI.
+        if not ci_reads:
+            during_ci.extend(phase_events(StateStore(case.store.root)))
+            case.clock[0] += timedelta(seconds=17)
+        ci_reads.append(pr)
         return pr_checks(pr)
 
     def merge(pr, **kwargs):

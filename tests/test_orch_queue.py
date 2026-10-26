@@ -17,3 +17,29 @@ def test_clear_removes_only_that_lane(tmp_path):
     assert orch_queue.set_order(store, "orch", []) == []
     assert orch_queue.get(store, "orch") == []
     assert StateStore(tmp_path) and orch_queue.get(StateStore(tmp_path), "view") == [4]
+
+
+def test_global_list_is_separate_from_lane_queues_and_clears(tmp_path):
+    store = StateStore(tmp_path)
+    orch_queue.set_order(store, "orch", [2])
+    assert orch_queue.get_global(store) == []
+    assert orch_queue.set_global(store, [85, 45, 85]) == [85, 45]
+    assert orch_queue.get_global(StateStore(tmp_path)) == [85, 45]
+    assert orch_queue.set_global(store, []) == []
+    assert not (tmp_path / "global-queue.json").exists()
+    assert orch_queue.get(store, "orch") == [2]
+
+
+def test_global_queue_cli_rejects_non_numbers_and_mixed_clear(tmp_path, monkeypatch):
+    import pytest
+
+    from foragent import cli
+    from foragent.config import Config
+
+    monkeypatch.setattr(cli, "load_config", lambda root: Config(repo="o/r"))
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kwargs: cls(tmp_path)))
+    for argv in (["--global", "orch"], ["--global", "4", "--clear"], []):
+        with pytest.raises(SystemExit) as raised:
+            cli.main(["orch", "queue", *argv, "--repo-root", str(tmp_path)])
+        assert raised.value.code not in (0, None)
+    assert orch_queue.get_global(StateStore(tmp_path)) == []

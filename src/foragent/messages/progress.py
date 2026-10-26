@@ -3,7 +3,6 @@
 MESSAGES = {
     "en": {
         "progress_bar": "progress {bar} {completed}/{total} · {orders} open orders",
-        "progress_done": "all done",
         "progress_finish": "done between {low} and {high}",
         "progress_unknown_finish": "no finish time yet",
         "progress_basis": "based on {items}",
@@ -21,7 +20,6 @@ MESSAGES = {
     },
     "ko": {
         "progress_bar": "진행 {bar} {completed}/{total} · 열린 주문 {orders}개",
-        "progress_done": "모두 끝냈어요",
         "progress_finish": "{low}~{high} 사이에 끝나요",
         "progress_unknown_finish": "끝나는 시각은 아직 몰라요",
         "progress_basis": "근거 {items}",
