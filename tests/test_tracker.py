@@ -1570,3 +1570,28 @@ def test_refresh_rereads_links_when_only_a_link_count_changes(tmp_path):
     clock[0] += timedelta(minutes=5)
     tracker.refresh_issues()
     assert ctx.store.local_issues()[0]["blocked_by"] == []
+
+
+def test_merged_prs_updated_since_stops_at_the_first_page_older_than_the_cutoff():
+    def pull(number, at, head="foragent/issue-1", merged=True):
+        stamp = at.isoformat().replace("+00:00", "Z")
+        return {"number": number, "head": {"ref": head}, "base": {"ref": "main"},
+                "html_url": f"https://github.com/owner/repo/pull/{number}",
+                "merged_at": stamp if merged else None, "updated_at": stamp}
+
+    # A page whose times are unknown cannot prove it is old, so reading continues.
+    first = [pull(index, NOW, head="other") for index in range(99)] + [
+        {**pull(99, NOW), "updated_at": None}]
+    second = [pull(200, NOW - timedelta(minutes=1)), pull(201, NOW, merged=False),
+              *(pull(300 + index, NOW - timedelta(days=1)) for index in range(98))]
+    run = ScriptedRun(json.dumps(first), json.dumps(second))
+    records = GhTracker(REPO, run).merged_prs_updated_since(NOW - timedelta(hours=1), "foragent/")
+    assert [record["number"] for record in records] == [99, 200, *range(300, 398)]
+    assert [args[1] for args, _ in run.calls] == [
+        f"repos/owner/repo/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"
+        for page in (1, 2)]
+
+    # Without a cutoff, reading stops only at a short page.
+    run = ScriptedRun(json.dumps(second), json.dumps([]))
+    assert len(GhTracker(REPO, run).merged_prs_updated_since(None)) == 99
+    assert len(run.calls) == 2

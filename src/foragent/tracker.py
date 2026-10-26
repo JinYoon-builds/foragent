@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 import json
 import re
@@ -260,7 +260,8 @@ class RecordingTracker:
         # These observations belong to the batch; recording them individually
         # would overwrite concurrent writes before the final version check.
         # Open PRs come last so a new PR wins over an older merged one for the same issue.
-        prs = self._tracker.list_prs("merged", "foragent/") + self._tracker.list_prs("open", "foragent/")
+        merged, listing = self._merged_prs(store, observed_at)
+        prs = merged + self._tracker.list_prs("open", "foragent/")
         comments, missing = {}, set()
         for issue in issues:
             if issue.is_pull_request or not (
@@ -297,10 +298,36 @@ class RecordingTracker:
         dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, observed_at,
                                             comments=comments, since_revision=revision, parents=parents,
                                             blocked_by=blocked_by, children=children, complete_prs=True)
+        if listing is not None:
+            # Advanced only now: a failed read or refresh keeps the old watermark.
+            store.record_merged_pr_listing(listing)
         observed = {issue.number for issue in issues}
         for number in dropped:
             reason = "remote change" if number in observed else "issue not found"
             self._outbox_dropped(number, reason)
+
+    def _merged_prs(self, store, observed_at):
+        """Every merged foragent PR, newest update first, as a full listing returns them.
+
+        With a stored listing only closed PRs updated since its watermark (less
+        a margin for clock skew) are read; they replace their stored records.
+        Returns the PRs and the listing to store after a successful refresh.
+        """
+        read = getattr(self._tracker, "merged_prs_updated_since", None)
+        if read is None:
+            return self._tracker.list_prs("merged", "foragent/"), None
+        known = store.merged_pr_listing()
+        since = None
+        if known:
+            watermark = datetime.fromisoformat(known["watermark"])
+            since = (watermark if watermark.tzinfo else watermark.replace(tzinfo=UTC)) - _WATERMARK_MARGIN
+        records = {record["number"]: record for record in (known or {}).get("prs", [])}
+        records.update((record["number"], record) for record in read(since, "foragent/"))
+        ordered = sorted(records.values(), key=lambda record: _parse_time(record["updated_at"])
+                         or datetime.min.replace(tzinfo=UTC), reverse=True)
+        prs = [PullRequest(record["number"], record["head"], record["base"], "", "",
+                           record["merged_at"], record["url"]) for record in ordered]
+        return prs, {"watermark": observed_at.isoformat(), "prs": ordered}
 
     def _issue_missing(self, number):
         """A missing write resource alone does not prove that its issue is gone."""
@@ -753,6 +780,17 @@ def _issue(data: dict[str, Any]) -> Issue:
 
 
 _EMPTY_RETRY_DELAY = 0.5
+# Closed PRs updated this long before the last refresh began are read again.
+_WATERMARK_MARGIN = timedelta(minutes=10)
+_PR_PAGE_SIZE = 100
+
+
+def _parse_time(value: Any) -> datetime | None:
+    try:
+        when = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    return when if when.tzinfo is not None else None
 
 
 class GhTracker:
@@ -989,6 +1027,30 @@ class GhTracker:
             item["title"], item.get("body") or "", item.get("merged_at"), item["html_url"],
         ) for item in data if item["head"]["ref"].startswith(head_prefix)
             and (state != "merged" or item.get("merged_at") is not None)]
+
+    def merged_prs_updated_since(self, since: datetime | None, head_prefix: str = "") -> list[dict[str, Any]]:
+        """Merged PRs from closed PRs listed newest update first, as stored records.
+
+        Pages are read one at a time and reading stops after the first page whose
+        oldest update is before ``since``; with no ``since`` every page is read.
+        Each record is a PullRequest's fields plus GitHub's ``updated_at``.
+        """
+        records, page = [], 1
+        while True:
+            data = _items(self._call([
+                "api", f"{self._path}/pulls?state=closed&sort=updated&direction=desc"
+                f"&per_page={_PR_PAGE_SIZE}&page={page}",
+            ]))
+            records.extend({
+                "number": item["number"], "head": item["head"]["ref"], "base": item["base"]["ref"],
+                "merged_at": item["merged_at"], "url": item["html_url"], "updated_at": item["updated_at"],
+            } for item in data if item["head"]["ref"].startswith(head_prefix) and item.get("merged_at"))
+            # The cutoff uses the raw page, before filtering by head or merge.
+            times = [_parse_time(item.get("updated_at")) for item in data]
+            if len(data) < _PR_PAGE_SIZE or since is not None and any(
+                    when is not None and when < since for when in times):
+                return records
+            page += 1
 
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int:
         output = self._call(

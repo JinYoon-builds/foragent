@@ -197,6 +197,20 @@ class IssueSnapshotMixin:
         return _copy({"as_of": snapshot["refreshed_at"], "error": failure.get("error"),
                       "failed_at": failure.get("failed_at")})
 
+    def merged_pr_listing(self) -> dict[str, Any] | None:
+        """The stored merged-PR listing and the refresh start it covers, if any."""
+        try:
+            listing = _state.json.loads((self.root / "merged_prs.json").read_text(encoding="utf-8"))
+            datetime.fromisoformat(listing["watermark"])
+        except (FileNotFoundError, ValueError, TypeError, KeyError):
+            # Without a readable listing the next refresh lists every closed PR.
+            return None
+        return listing if isinstance(listing.get("prs"), list) else None
+
+    def record_merged_pr_listing(self, listing: dict[str, Any]) -> None:
+        with self._state_lock():
+            self._write_json(self.root / "merged_prs.json", listing)
+
     def record_issues_refresh_failure(self, error: str, failed_at: datetime) -> None:
         """Keep the last known facts and note that a later read failed."""
         with self._state_lock():
