@@ -140,6 +140,10 @@ def _baseline_unavailable(n: int, ctx: RunContext, detail: str, cause: Exception
     raise ExecutorStopped(reason.value, detail) from cause
 
 
+# Verification runs no baseline selectors once a base sync leaves none protected (#123).
+EMPTIED = "Acceptance baseline verification skipped (count=0): no protected node ids remain"
+
+
 def follow_base(attempt: Implementation) -> None:
     """Keep the protected set on the base the branch is built on (#483).
 
@@ -156,8 +160,8 @@ def follow_base(attempt: Implementation) -> None:
     if sha == attempt.baseline_sha:
         return
     previous = attempt.baseline
-    if attempt.baseline_emptied:
-        # No protected id remained after an earlier sync: nothing to re-capture (#123).
+    if previous is not None and not previous.node_ids:
+        # An empty protected set stays empty for the run: nothing to re-capture (#123).
         attempt.baseline_sha = sha
         return
     owned: set[str] = set()
@@ -173,8 +177,9 @@ def follow_base(attempt: Implementation) -> None:
         if not set(previous.node_ids) - owned - missing:
             log_dropped_ids(attempt.log, previous, (), owned, missing, None, False)
             _append(attempt.log, "Acceptance baseline re-capture skipped: no protected node ids remain")
+            _append(attempt.log, EMPTIED)
             attempt.baseline = replace(previous, node_ids=(), collected_ids=(), failing_ids=(), base_sha=sha)
-            attempt.baseline_sha, attempt.baseline_emptied = sha, True
+            attempt.baseline_sha = sha
             return
     # Without an earlier protected set, the worktree holds the PR: read the base.
     command = previous.test_command if previous else (
@@ -189,6 +194,9 @@ def follow_base(attempt: Implementation) -> None:
         from foragent.run_baseline import log_dropped_ids
         log_dropped_ids(attempt.log, previous, baseline.node_ids, owned, missing, baseline,
                         enabled(attempt.ctx, attempt.target_branch))
+        if not baseline.node_ids:
+            # Every survivor fails on the new base: as final as protection lost by collection.
+            _append(attempt.log, EMPTIED)
     attempt.baseline, attempt.baseline_sha = baseline, sha
 
 

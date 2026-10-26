@@ -349,8 +349,6 @@ def _verify_implementation(attempt: Implementation) -> str:
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                                  slot=_test_slot(n, ctx)))
             _progress(n, ctx)
-        if attempt.baseline_emptied:
-            _append(log, "Acceptance baseline verification skipped (count=0): no protected node ids remain")
         if attempt.baseline and attempt.baseline.node_ids:
             started = ctx.monotonic()
             command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"

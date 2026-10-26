@@ -450,7 +450,12 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
     capture time limit, the run budget and a machine test slot. One
     ``--collect-only`` of all ids usually settles it; pytest exits 4 for a
     selector it does not find, and only then are the ids halved to find which.
-    Any other outcome (a collection error, a timeout) raises AttemptFailure.
+    Exit 4 is "not found" only when the same command then collects the id's
+    file, or the nearest directory left when the file is gone, cleanly (0 or
+    5): a collection error under a file::test selector or a broken
+    conftest.py also exits 4. Any other exit, a failing file
+    collection or a timeout raises AttemptFailure. No JUnit report is written:
+    the #483 harness counts every JUnit command as a baseline capture.
     """
     from foragent import runner
 
@@ -466,30 +471,52 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
         worktree = Path(directory) / "worktree"
         ctx.git.add_detached_worktree(worktree, sha)
         try:
-            def exit_code(group: tuple[str, ...]) -> int:
+            def exit_code(selectors: tuple[str, ...]) -> int:
                 remaining = runner._remaining(n, ctx)
                 if remaining <= 0:
                     raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before collection")
                 result = runner._check(
-                    f"{previous.command} --collect-only {shlex.join(group)}{ignores}", worktree, log,
+                    f"{previous.command} --collect-only {shlex.join(selectors)}{ignores}", worktree, log,
                     _baseline_capture_limit(ctx, log, remaining), progress=lambda: _progress(n, ctx),
                     slot=_test_slot(n, ctx))
                 _progress(n, ctx)
-                if result.timed_out or result.exit_code not in (0, 4):
-                    raise AttemptFailure(
-                        f"acceptance baseline unavailable: collecting the protected ids on {sha} failed "
-                        f"(exit_code={result.exit_code}, timed_out={result.timed_out})")
+                if result.timed_out:
+                    raise AttemptFailure(f"acceptance baseline unavailable: collecting the protected ids on {sha} "
+                                         "timed out")
                 return result.exit_code
 
+            def failed(selectors: tuple[str, ...], code: int) -> AttemptFailure:
+                return AttemptFailure(f"acceptance baseline unavailable: collecting {' '.join(selectors)} on {sha} "
+                                      f"failed (exit_code={code})")
+
+            files: dict[str, int] = {}
+
             def find(group: tuple[str, ...]) -> None:
-                if exit_code(group) == 0:
+                code = exit_code(group)
+                if code == 0:
                     return
-                if len(group) == 1:
-                    missing.add(group[0])
+                if code != 4:
+                    raise failed(group, code)
+                if len(group) > 1:
+                    middle = len(group) // 2
+                    find(group[:middle])
+                    find(group[middle:])
                     return
-                middle = len(group) // 2
-                find(group[:middle])
-                find(group[middle:])
+                # Exit 4 is also a SyntaxError or ImportError under a file::test
+                # selector, or a conftest.py that fails to load. "Not found"
+                # counts only when the same command then collects cleanly
+                # (0 or 5): the id's file if it is still there (it exits 2 for
+                # its own import error), else the nearest directory still there,
+                # which loads the conftest.py files on the id's path.
+                target = Path(group[0].split("::", 1)[0])
+                while target != Path(".") and not (worktree / target).exists():
+                    target = target.parent
+                key = target.as_posix()
+                if key not in files:
+                    files[key] = exit_code((key,))
+                if files[key] not in (0, 5):
+                    raise failed((key,), files[key])
+                missing.add(group[0])
 
             find(selectable)
         finally:

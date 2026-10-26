@@ -31,20 +31,27 @@ def following(git_history, monkeypatch, tmp_path, *, baseline_sha, baseline, res
         calls.append((ref, test_command))
         if isinstance(result, Exception):
             raise result
-        return result if result is not None else SimpleNamespace(test_command=test_command, at=ref)
+        return result if result is not None else SimpleNamespace(
+            test_command=test_command, at=ref, node_ids=(PROTECTED,), excluded=(), collected_ids=None,
+            failing_ids=None)
 
     monkeypatch.setattr(run_implementation, "capture_acceptance_baseline", capture)
+    # #123's collection step: every protected id is still collected on the new base.
+    from foragent import run_baseline
+    monkeypatch.setattr(run_baseline, "collect_protected_ids", lambda n, ctx, baseline, sha: (set(), set()))
     monkeypatch.setattr(run_implementation, "flag", lambda ctx, n, reason, *args: flags.append(reason))
     ctx = SimpleNamespace(config=Config(), store=StateStore(tmp_path / "state"))
     attempt = SimpleNamespace(n=1, ctx=ctx, git=GitRepo(git_history.clone), target_branch="main",
                               start_ref="origin/main", baseline=baseline, baseline_sha=baseline_sha,
-                              baseline_emptied=False, log=tmp_path / "run.log")
+                              log=tmp_path / "run.log")
     return attempt, calls, flags
 
 
 def protected(command="uv run pytest"):
-    # No protected ids: #123's collection step has nothing to check before re-capture.
-    return SimpleNamespace(test_command=command, node_ids=())
+    return SimpleNamespace(test_command=command, node_ids=(PROTECTED,))
+
+
+PROTECTED = "tests/acceptance/test_a.py::test_a"
 
 
 def test_detection_reads_the_commit_files(git_history):
@@ -147,3 +154,36 @@ def test_rebuild_verification_uses_the_rebuilt_base(git_history, tmp_path, monke
         run_checks._verify_implementation(attempt)
     assert calls == [(git_history.tip, "uv run pytest")]
     assert checks == []
+
+
+def test_protection_lost_by_the_recapture_stays_empty_for_the_run(git_history, tmp_path, monkeypatch):
+    # Every surviving id fails on the new base: the re-capture protects none (#123).
+    from foragent.run_baseline import AcceptanceBaseline
+
+    git = moved_base(git_history)
+    old = git_command(git_history.clone, "rev-parse", "HEAD")
+    node = "tests/acceptance/test_a.py::test_a"
+    previous = AcceptanceBaseline("pytest", (node,), test_command="uv run pytest")
+    empty = AcceptanceBaseline("pytest", (), collected_ids=(node,), failing_ids=(node,))
+    attempt, calls, _ = following(git_history, monkeypatch, tmp_path, baseline_sha=old, baseline=previous,
+                                  result=empty)
+    attempt.git = git
+    run_implementation.follow_base(attempt)
+    assert attempt.baseline.node_ids == ()
+    assert f"dropped protected node id {node}: failing on the new base" in attempt.log.read_text()
+    # A later sync keeps it empty and does not re-capture.
+    attempt.baseline_sha = old
+    run_implementation.follow_base(attempt)
+    assert len(calls) == 1 and attempt.baseline.node_ids == ()
+
+
+def test_an_initially_empty_baseline_stays_empty_after_a_sync(git_history, tmp_path, monkeypatch):
+    # Nothing was protected when the run started: a sync does not start protecting (#123).
+    from foragent.run_baseline import AcceptanceBaseline
+
+    old = git_command(git_history.clone, "rev-parse", "HEAD")
+    moved_base(git_history)
+    empty = AcceptanceBaseline("pytest", (), test_command="uv run pytest")
+    attempt, calls, _ = following(git_history, monkeypatch, tmp_path, baseline_sha=old, baseline=empty)
+    run_implementation.follow_base(attempt)
+    assert calls == [] and attempt.baseline is empty and attempt.baseline_sha == git_history.tip

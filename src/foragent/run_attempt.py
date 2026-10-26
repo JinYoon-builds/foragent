@@ -90,8 +90,6 @@ class Implementation:
     baseline: AcceptanceBaseline | None
     # The base commit `baseline` was taken at; None when this run keeps no baseline (#483).
     baseline_sha: str | None = None
-    # A base sync left no protected id; later syncs keep it empty (#123).
-    baseline_emptied: bool = False
     failure: str | CIFailure = ""
     reviews: list[ReviewResult] = field(default_factory=list)
     review_failures: int = 0
