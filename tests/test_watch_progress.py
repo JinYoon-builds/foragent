@@ -10,12 +10,9 @@ from foragent.watch_sections import progress
 NOW = datetime(2026, 10, 20, 8, tzinfo=UTC)
 
 
-def run(number, outcome, finished):
-    return SimpleNamespace(number=number, outcome=outcome, last_progress_at=finished.isoformat())
-
-
 def snapshot(**values):
-    base = dict(total=0, completed=0, orders=0, eta=None, recent=0, quota={}, captured_at=NOW)
+    base = dict(total=0, completed=0, orders=0, eta=None, recent=0, quota={}, captured_at=NOW,
+                eta_range=None, eta_basis={}, today=0, status={"active_runs": []})
     return SimpleNamespace(**{**base, **values})
 
 
@@ -33,34 +30,55 @@ def test_totals_sum_every_open_order_and_skip_closed_orders():
     assert progress.totals(rows) == (1, 3, 2)
 
 
-def test_recent_merges_count_only_the_last_hour_once_per_issue():
-    history = [
-        run(1, "merged", NOW - timedelta(minutes=10)),
-        run(1, "merged", NOW - timedelta(minutes=5)),
-        run(2, "cancelled", NOW - timedelta(minutes=5)),
-        run(3, "merged", NOW - timedelta(minutes=61)),
-        run(4, "merged", NOW - timedelta(minutes=59)),
-    ]
-    assert progress.recent_merges(history, NOW) == 2
+def test_size_label_alone_decides_the_size_and_otherwise_counts_as_m():
+    assert progress.size_of(["size:l", "lane:api"]) == "l"
+    assert progress.size_of(["lane:api"]) == "m"
+    assert progress.size_of(["size:s", "size:l"]) == "m"
 
 
-def test_finish_time_needs_a_rate_and_remaining_work():
-    assert progress.finish_time(29, 3, NOW) == NOW + timedelta(hours=29 / 3)
-    assert progress.finish_time(29, 0, NOW) is None
-    assert progress.finish_time(0, 3, NOW) is None
+def test_expected_uses_the_default_band_until_three_runs_then_median_and_quartiles():
+    assert progress.expected([60.0, 120.0], "s") == (900.0, 1800.0, 3600.0, None)
+    assert progress.expected([1.0, 2.0, 3.0], "l") == (1.5, 2.0, 2.5, 3)
+
+
+def test_estimate_sums_remaining_sizes_over_the_budget_and_none_without_work():
+    samples = {"l": [3600.0 * hours for hours in (4, 8, 24)]}
+    finish, low, high, basis = progress.estimate(["l", "m"], samples, 2, NOW)
+    assert finish == NOW + timedelta(minutes=(8 * 60 + 90) / 2)
+    assert low < finish < high and basis == {"m": None, "l": 3}
+    assert progress.estimate([], samples, 2, NOW) is None
+
+
+def test_parallel_budget_prefers_the_machine_budget_then_the_ceiling(tmp_path, monkeypatch):
+    from foragent import capacity
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "machine-data" / "repo")
+    assert progress.parallel_budget(store, Config()) == 1
+    assert progress.parallel_budget(store, replace(Config(), max_parallel=3)) == 3
+    capacity.write_state(store, 5, NOW)
+    assert progress.parallel_budget(store, replace(Config(), max_parallel=3)) == 5
 
 
 def test_render_words_in_both_languages():
-    eta = NOW + timedelta(minutes=30)
-    for language, finish, evidence in (("ko", "쯤 끝나요", "최근 1시간에 2개 끝냈어요"),
-                                       ("en", "done around", "2 finished in the last hour")):
-        lines = plain(progress.render(snapshot(total=10, completed=4, orders=2, eta=eta, recent=2),
+    eta, low, high = (NOW + timedelta(minutes=minutes) for minutes in (30, 20, 50))
+    for language, finish, basis, evidence in (
+            ("ko", "사이에 끝나요", "size:m 작업 4개", "최근 3시간에 2개 끝냈어요"),
+            ("en", "done between", "size:m 4 runs", "2 finished in the last 3 hours")):
+        lines = plain(progress.render(snapshot(total=10, completed=4, orders=2, eta=eta, recent=2,
+                                               eta_range=(low, high), eta_basis={"m": 4}),
                                       replace(Config(), language=language), None, now=NOW))
         assert "4/10" in lines[0] and "▓" in lines[0]
-        assert finish in lines[1] and evidence in lines[2]
-    unknown = plain(progress.render(snapshot(total=10, completed=4, orders=1),
-                                    replace(Config(), language="ko"), None, now=NOW))
-    assert unknown[1] == "끝나는 시각은 아직 몰라요"
+        assert finish in lines[1] and basis in lines[2] and evidence in lines[3]
+        # Each end of the range is a clock time; the median is not shown separately.
+        clocks = [progress._moment(at, NOW, language) for at in (low, eta, high)]
+        assert clocks[0] in lines[1] and clocks[2] in lines[1] and clocks[1] not in lines[1]
+    quiet = plain(progress.render(snapshot(total=10, completed=4, orders=1, today=3, status={"active_runs": [
+        {"number": 7, "phase": "reviewing"}]}), Config(), None, now=NOW))
+    assert quiet[1:] == ["nothing finished in the last 3 hours · 6 left", "3 finished today", "running #7 reviewing"]
+    # Without merges today there is no today line.
+    none_today = plain(progress.render(snapshot(total=10, completed=4, orders=1), Config(), None, now=NOW))
+    assert none_today[1:] == ["nothing finished in the last 3 hours · 6 left"]
     done = plain(progress.render(snapshot(total=3, completed=3, orders=1), Config(), None, now=NOW))
     assert done[1:] == ["all done"]
     assert progress.render(snapshot(), Config(), None, now=NOW) == []
@@ -68,9 +86,11 @@ def test_render_words_in_both_languages():
 
 def test_finish_time_on_another_day_names_the_day():
     tomorrow = NOW.astimezone() + timedelta(days=1)
-    lines = plain(progress.render(snapshot(total=2, completed=1, orders=1, eta=tomorrow, recent=1),
+    lines = plain(progress.render(snapshot(total=2, completed=1, orders=1, eta=tomorrow, recent=1,
+                                           eta_basis={"m": None}),
                                   replace(Config(), language="ko"), None, now=NOW))
-    assert lines[1].startswith("내일 ")
+    assert lines[1].startswith("내일 ") and lines[1].endswith("사이에 끝나요")
+    assert "size:m 기본값" in lines[2]
 
 
 def test_quota_reads_latest_executor_events_and_drops_past_resets(tmp_path):
@@ -223,3 +243,180 @@ def test_each_window_keeps_its_own_newest_reading_by_event_time(tmp_path):
     (logs / "issue-1.log").write_text(reading(2, 15, new_reset, 31) + "\n")
     (logs / "issue-2.log").write_text(reading(60, 95, old_reset, 30) + "\n")
     assert progress.quota(logs, NOW) == {"codex": (31.0, datetime.fromtimestamp(weekly, UTC))}
+
+
+def test_merged_work_counts_an_issue_once_at_its_latest_merge_and_ends_at_the_finish(tmp_path):
+    from foragent.state import StateStore
+
+    clock = [NOW - timedelta(hours=30)]
+    store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    # One reopened issue merged three times; progress stops being recorded long
+    # before each merge (as in a review-only merge), so the finish time is the end.
+    # The issue counts once, at its latest merge, from its latest run.
+    for hours in (2, 4, 6):
+        store.start_run(7, branch="issue-7", worktree="unused")
+        clock[0] += timedelta(minutes=5)
+        store.update_run(7, last_progress_at=clock[0].isoformat())
+        clock[0] += timedelta(hours=hours) - timedelta(minutes=5)
+        store.finish_run(7, "merged")
+        clock[0] += timedelta(hours=1)
+    work = progress.merged_work(store)
+    assert [(number, size, (end - start) / timedelta(hours=1)) for number, size, start, end in work] == [
+        (7, "m", 6)]
+    assert progress.learned([store], NOW)["m"] == [6 * 3600.0]
+
+
+def _refresh(store, tracker, prs):
+    store.refresh_local_issues(tracker.list_issues("all"), prs, {}, NOW, complete_prs=True)
+
+
+def test_outside_merges_survive_newest_first_listings_and_reopening(tmp_path):
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker, PullRequest
+
+    clock = [NOW - timedelta(hours=20)]
+    store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    tracker = FakeTracker()
+    tracker.add_issue(7, "Reopened work", labels=["approved", "size:l"])
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    first = PullRequest(20, "foragent/issue-7", "main", "First", "", (NOW - timedelta(hours=16)).isoformat())
+    clock[0] = NOW - timedelta(hours=16)
+    store.finish_run(7, "cancelled")  # the PR was merged by hand; the run ended without a gate merge
+    clock[0] = NOW - timedelta(hours=10)
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")  # work restarted after a reopening
+    second = PullRequest(21, "foragent/issue-7", "main", "Second", "", (NOW - timedelta(hours=2)).isoformat())
+    tracker.close_issue(7)
+    # GitHub lists merged PRs newest first: the older merge must not win.
+    _refresh(store, tracker, [second, first])
+    assert store.local_issues()[0]["merged_at"] == second.merged_at
+    # The issue counts once, at its newest merge, from the run that began before it.
+    assert [(end - start) / timedelta(hours=1) for *_, start, end in progress.merged_work(store)] == [8]
+    # Reopening the issue keeps the merge, even once the listing drops the older PR.
+    tracker.issues[7] = replace(tracker.issues[7], state="open")
+    _refresh(store, tracker, [second])
+    assert [(end - start) / timedelta(hours=1) for *_, start, end in progress.merged_work(store)] == [8]
+
+
+def test_merge_samples_keep_the_facts_seen_at_the_merge(tmp_path):
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker, PullRequest
+
+    clock = [NOW - timedelta(hours=20)]
+    store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    tracker = FakeTracker()
+    # An unapproved issue merged by hand, then reopened, approved and closed again.
+    tracker.add_issue(7, "Unapproved work", labels=["size:l"])
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    merged = PullRequest(20, "foragent/issue-7", "main", "By hand", "", (NOW - timedelta(hours=16)).isoformat())
+    tracker.close_issue(7)
+    # An approved issue merged by hand, then relabelled to another size.
+    tracker.add_issue(8, "Approved work", labels=["approved", "size:l"])
+    store.start_run(8, branch="foragent/issue-8", worktree="unused")
+    relabelled = PullRequest(21, "foragent/issue-8", "main", "By hand", "", (NOW - timedelta(hours=12)).isoformat())
+    tracker.close_issue(8)
+    # A gate merge whose issue is relabelled afterwards.
+    tracker.add_issue(9, "Gate work", labels=["approved", "size:s"])
+    store.start_run(9, branch="foragent/issue-9", worktree="unused")
+    clock[0] = NOW - timedelta(hours=18)
+    store.finish_run(9, "merged")
+    _refresh(store, tracker, [merged, relabelled])
+    before = sorted(progress.merged_work(store))
+    assert [(number, size) for number, size, *_ in before] == [(8, "l"), (9, "s")]
+    for number, labels in ((7, ["approved", "size:l"]), (8, ["approved", "size:s"]), (9, ["approved", "size:l"])):
+        tracker.issues[number] = replace(tracker.issues[number], state="open", labels=frozenset(labels))
+        _refresh(store, tracker, [merged, relabelled])
+        tracker.close_issue(number)
+    _refresh(store, tracker, [merged, relabelled])
+    assert sorted(progress.merged_work(store)) == before
+
+
+def test_issue_listed_before_the_merge_does_not_record_it_as_unclosed(tmp_path):
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker, PullRequest
+
+    clock = [NOW - timedelta(hours=6)]
+    store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    tracker = FakeTracker()
+    tracker.add_issue(7, "Raced work", labels=["approved", "size:l"])
+    tracker.issues[7] = replace(tracker.issues[7], updated_at=clock[0].isoformat())
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    stale = tracker.list_issues("all")  # listed while the PR is still open
+    clock[0] = NOW - timedelta(hours=2)
+    merged = PullRequest(20, "foragent/issue-7", "main", "By hand", "", clock[0].isoformat())
+    tracker.issues[7] = replace(tracker.issues[7], state="closed", updated_at=clock[0].isoformat())
+    store.refresh_local_issues(stale, [merged], {}, NOW, complete_prs=True)
+    assert progress.merged_work(store) == []  # undecided, not recorded as open
+    _refresh(store, tracker, [merged])
+    assert [(number, (end - start) / timedelta(hours=1)) for number, _, start, end in progress.merged_work(store)] == [
+        (7, 4)]
+    # Once decided, a reopening does not undo it.
+    tracker.issues[7] = replace(tracker.issues[7], state="open", updated_at=NOW.isoformat())
+    _refresh(store, tracker, [merged])
+    assert len(progress.merged_work(store)) == 1
+
+
+def test_outside_merge_after_a_gate_merge_is_the_latest_merge_without_a_new_run(tmp_path):
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker, PullRequest
+
+    clock = [NOW - timedelta(hours=10)]
+    store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    tracker = FakeTracker()
+    tracker.add_issue(7, "Gate then by hand", labels=["approved", "size:l"])
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    clock[0] = NOW - timedelta(hours=8)
+    gate_pr = PullRequest(20, "foragent/issue-7", "main", "Gate", "", clock[0].isoformat())
+    store.finish_run(7, "merged")
+    tracker.issues[7] = replace(tracker.issues[7], state="closed", updated_at=clock[0].isoformat())
+    _refresh(store, tracker, [gate_pr])
+    # The gate's own PR does not add a second sample.
+    assert [(end - start) / timedelta(hours=1) for *_, start, end in progress.merged_work(store)] == [2]
+    # Reopened and merged by hand, with no new run: the later merge is the latest one.
+    clock[0] = NOW - timedelta(hours=1)
+    outside = PullRequest(21, "foragent/issue-7", "main", "By hand", "", clock[0].isoformat())
+    tracker.issues[7] = replace(tracker.issues[7], state="closed", updated_at=clock[0].isoformat())
+    _refresh(store, tracker, [outside, gate_pr])
+    work = progress.merged_work(store)
+    assert [(end, (end - start) / timedelta(hours=1)) for *_, start, end in work] == [(clock[0], 9)]
+
+
+def test_outside_merge_minutes_after_a_gate_finish_is_still_the_latest_merge(tmp_path):
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker, PullRequest
+
+    clock = [NOW - timedelta(hours=10)]
+    store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    tracker = FakeTracker()
+    tracker.add_issue(7, "Gate then quickly by hand", labels=["approved", "size:l"])
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    clock[0] = NOW - timedelta(hours=8)
+    gate_pr = PullRequest(20, "foragent/issue-7", "main", "Gate", "", clock[0].isoformat())
+    store.finish_run(7, "merged")
+    later = clock[0] + timedelta(minutes=2)
+    outside = PullRequest(21, "foragent/issue-7", "main", "By hand", "", later.isoformat())
+    tracker.issues[7] = replace(tracker.issues[7], state="closed", updated_at=later.isoformat())
+    _refresh(store, tracker, [outside, gate_pr])
+    assert [(end, end - start) for *_, start, end in progress.merged_work(store)] == [
+        (later, timedelta(hours=2, minutes=2))]
+
+
+def test_gate_merge_ends_at_the_recorded_merge_not_the_later_finish(tmp_path):
+    from foragent.state import StateStore
+
+    clock = [NOW - timedelta(hours=10)]
+    store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    merged_at = NOW - timedelta(hours=8)
+    store.record_merge(7, merged_at)
+    clock[0] = NOW - timedelta(hours=7)  # installation and cleanup after the merge
+    store.finish_run(7, "merged")
+    assert [(end, end - start) for *_, start, end in progress.merged_work(store)] == [
+        (merged_at, timedelta(hours=2))]
+    # A later run of the same issue inherits the saved key until its own merge; the
+    # old merge moment, before this run began, is not its end.
+    clock[0] = NOW - timedelta(hours=4)
+    store.start_run(7, branch="foragent/issue-7", worktree="unused")
+    clock[0] = NOW - timedelta(hours=1)
+    store.finish_run(7, "merged")
+    assert [(end, end - start) for *_, start, end in progress.merged_work(store)] == [
+        (clock[0], timedelta(hours=3))]

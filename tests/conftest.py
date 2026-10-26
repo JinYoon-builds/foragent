@@ -56,6 +56,12 @@ def no_view_windows(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_release_lookup(monkeypatch):
+    """Never ask GitHub for the latest release during the test suite (#417)."""
+    monkeypatch.setenv("FORAGENT_UPDATE_CHECK", "off")
+
+
+@pytest.fixture(autouse=True)
 def isolated_test_slots(tmp_path, monkeypatch):
     """Keep machine-wide test slots away from the real data root and live runs."""
     from foragent import capacity
@@ -102,12 +108,12 @@ class GitHistory:
     clone: Path
     tip: str | None = None
 
-    def update(self, files: dict[str, str | None], *, at: datetime = BASE_TIME) -> None:
+    def update(self, files: dict[str, str | None], *, at: datetime = BASE_TIME, message: str = "Update") -> None:
         """Import a new main commit directly into the local bare origin."""
         stream = [
             "commit refs/heads/main\n",
             f"committer Offline Tests <tests@example.com> {int(at.timestamp())} +0000\n",
-            "data 6\nUpdate\n",
+            f"data {len(message.encode('utf-8'))}\n{message}\n",
         ]
         if self.tip is not None:
             stream.append(f"from {self.tip}\n")

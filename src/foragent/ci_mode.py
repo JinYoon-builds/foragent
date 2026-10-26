@@ -5,7 +5,7 @@ import json
 from math import isfinite
 
 from foragent.actions import flag
-from foragent.ci_workflow import EXCLUSIONS, WORKFLOW, acceptance_command, measurement_scope
+from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, acceptance_command, measurement_scope, read_exclusions
 from foragent.git import GitError
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
@@ -69,16 +69,23 @@ def enabled(ctx, target_branch):
             and acceptance_command(ctx.config, ctx.repo_root) is not None)
 
 
-def stage_exclusions(attempt):
-    """Publish the runner's frozen selection, including when .foragent is ignored."""
-    if not enabled(attempt.ctx, attempt.target_branch):
+def commit_exclusions(attempt, title):
+    """Carry the current selection on a content/merge commit, or one empty commit."""
+    git = attempt.git
+    committing = git.has_staged_changes() or git.merge_in_progress()
+    if enabled(attempt.ctx, attempt.target_branch):
+        excluded = _baseline_exclusions(attempt.ctx, git.ref_sha(attempt.start_ref), attempt.log)
+        excluded = sorted(set(excluded))
+        if not committing:
+            try:
+                if read_exclusions(git, attempt.start_ref) == excluded:
+                    return
+            except ValueError:
+                pass  # Replace an invalid selection before publishing this head.
+        title += f"\n\n{EXCLUSIONS_TRAILER}: {json.dumps(excluded, separators=(',', ':'))}"
+    elif not committing:
         return
-    path = attempt.worktree / EXCLUSIONS
-    path.parent.mkdir(parents=True, exist_ok=True)
-    excluded = _baseline_exclusions(attempt.ctx, attempt.git.ref_sha(attempt.start_ref), attempt.log)
-    path.write_text(json.dumps(excluded) + "\n", encoding="utf-8")
-    attempt.git.publication_paths.add(EXCLUSIONS)
-    attempt.git._call(["add", "--force", "--", EXCLUSIONS])
+    git.commit(title, allow_empty=not committing)
 
 
 def suite(value):

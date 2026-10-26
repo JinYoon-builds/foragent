@@ -19,6 +19,7 @@ from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
 from foragent.lanes import add_lane, lane_files, validate_lane
+from foragent.order_files import issue_body, validate_paths
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
@@ -285,18 +286,12 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
             label = f"{kind}[{index}]"
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
-            _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "interactive"} if kind == "issues"
-                    else {"checklist", "acceptance_files", "files"}, label)
+            _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive"} if kind == "issues"
+                    else {"checklist", "acceptance_files", "files", "exclusive"}, label)
             _text(item["goal"], f"{label}.goal")
             _text(item["out_of_scope"], f"{label}.out_of_scope")
             _strings(item["done_when"], f"{label}.done_when", nonempty=True)
-            for name in _strings(item.get("files", []), f"{label}.files"):
-                if name.splitlines() != [name]:
-                    raise PlanError(f"{label}.files items must each be a single line")
-                try:
-                    repo_path(root, name)
-                except ValueError as exc:
-                    raise PlanError(f"{label}.files: {exc}") from exc
+            validate_paths(item, root, label)
             _strings(item.get("checklist", []), f"{label}.checklist")
             if any("\n" in line or "\r" in line for line in item.get("checklist", [])):
                 raise PlanError(f"{label}.checklist items must each be a single line")
@@ -362,18 +357,6 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
         visit(key)
     return files
 
-
-def issue_body(item: dict, repo: str, base: str, acceptance_dir: str = "tests/acceptance/") -> str:
-    lines = [MARKER, "## Goal", item["goal"], "", "## Out of scope", item["out_of_scope"]]
-    if item.get("files"):
-        lines.extend(["", "## Files", *(f"- {path}" for path in item["files"])])
-    lines.extend(["", "## Done when"])
-    for command in item["done_when"]:
-        lines.extend(["```sh", command, "```"])
-    lines.extend(f"- [ ] {text}" for text in item.get("checklist", []))
-    for path in sorted(set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], acceptance_dir))):
-        lines.append(f"[{path}](https://github.com/{repo}/blob/{quote(base, safe='')}/{quote(path)})")
-    return "\n".join(lines) + "\n"
 
 
 def _plan_marker(identity: str, mapping: dict[str, int], acceptance: dict[str, dict[str, str]]) -> str:

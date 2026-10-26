@@ -71,6 +71,8 @@ def _print_machine_budget(status: dict, language: str) -> None:
 def _print_status(status: dict, language: str = "en") -> None:
     cli = facade()
     text = cli.text
+    if offer := status.get("update"):
+        print(cli.update_check.offer_line(offer, language))
     if cli.status_unknown(status):
         print(text("status_unknown", language) + (f": {status['error']}" if status.get("error") else ""))
     print(text("summary", language, **cli.summary_values(status["summary"])))
@@ -173,6 +175,8 @@ def run(args) -> int:
         status["test_slots"] = cli.capacity.effective_test_slots(config.test_slots)
         status["machine_budget"] = cli.machine_budget.read().report()
         status["tick_outcome"] = cli.orch_tick_outcome.read(store)
+        if offer := cli.update_check.check(config):
+            status["update"] = offer
         if args.json:
             print(cli.json.dumps(status))
         else:

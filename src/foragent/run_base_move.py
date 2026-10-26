@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import subprocess
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -62,20 +63,42 @@ def fetch_move(attempt: Implementation, verified_head: str) -> BaseMove:
     return BaseMove(verified_head, target)
 
 
-def _nul_paths(output: str) -> list[str]:
+def _git_bytes(git: GitRepo, args: list[str]) -> bytes:
+    """Raw Git output; GitRepo._call decodes with replacement characters, which could
+    turn two different names or an undecodable config into the same text."""
+    try:
+        return subprocess.run(["git", *args], cwd=git.root, check=True, capture_output=True,
+                              timeout=120).stdout
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        stderr = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else None
+        message = stderr.decode("utf-8", "replace") if stderr else str(exc)
+        raise GitError(message) from exc
+
+
+def _nul_paths(output: bytes) -> list[str]:
     # Paths are taken verbatim between NUL bytes: a filename may start or end
     # with whitespace or newlines, so no character other than NUL is stripped.
-    return [path for path in output.split("\0") if path != ""]
+    # Bytes that are not UTF-8 stay as lone surrogates, which never classify as
+    # neutral (see _decodable), instead of becoming replacement characters.
+    return [path.decode("utf-8", "surrogateescape") for path in output.split(b"\0") if path != b""]
+
+
+def _decodable(path: str) -> bool:
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def moved_paths(git: GitRepo, move: BaseMove) -> set[str]:
     """Paths touched by each commit in the fixed range, not only by the net diff."""
-    commits = git._call(["rev-list", f"{move.head_sha}..{move.target_sha}"]).split()
+    commits = _git_bytes(git, ["rev-list", f"{move.head_sha}..{move.target_sha}"]).decode("ascii").split()
     paths: set[str] = set()
     for commit in commits:
         # -m compares merge commits with every parent; --root covers parentless
         # commits; --no-renames keeps both sides of a rename.
-        paths.update(_nul_paths(git._call([
+        paths.update(_nul_paths(_git_bytes(git, [
             "diff-tree", "-r", "-m", "--root", "--no-commit-id", "--name-only", "--no-renames", "-z",
             commit,
         ])))
@@ -91,8 +114,10 @@ def _repo_config(git: GitRepo, sha: str) -> dict[str, Any] | None:
     if git.blob_sha(sha, CONFIG_PATH) is None:
         return None
     try:
-        value = yaml.safe_load(git._call(["show", f"{sha}:{CONFIG_PATH}"]))
-    except (GitError, yaml.YAMLError):
+        # Strict UTF-8: undecodable bytes are unparsable, not replacement characters.
+        text = _git_bytes(git, ["cat-file", "blob", f"{sha}:{CONFIG_PATH}"]).decode("utf-8")
+        value = yaml.safe_load(text)
+    except (GitError, UnicodeDecodeError, yaml.YAMLError):
         return None
     value = {} if value is None else value
     if not isinstance(value, dict) or any(key not in DEFAULTS and key not in IGNORED_KEYS for key in value):
@@ -160,6 +185,8 @@ def _open_acceptance_owners(attempt: Implementation) -> dict[str, set[int]]:
 
 def base_move_is_neutral(attempt: Implementation, move: BaseMove) -> bool:
     paths = moved_paths(attempt.git, move)
+    if not all(_decodable(path) for path in paths):
+        return False
     own = set(attempt.git.changed_paths(move.target_sha))
     if paths & own:
         return False

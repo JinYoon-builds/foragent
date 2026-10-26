@@ -268,3 +268,39 @@ def test_dot_slash_acceptance_dir_and_owner_paths_match_git_paths(repo, director
     work = attempt(repo, {2: [named]}, skipped=())
     work.ctx.config.acceptance_dir = directory
     assert neutral(work, target)
+
+
+def commit_bytes(root: Path, files: dict[str, bytes]) -> str:
+    """Like move(), with raw blob bytes; names may hold surrogate-escaped bytes."""
+    index = {"GIT_INDEX_FILE": str(root.parent / "index-main")}
+    git(root, "read-tree", git(root, "rev-parse", "main"), env=index)
+    for name, data in files.items():
+        blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=root, input=data,
+                              check=True, capture_output=True).stdout.decode().strip()
+        git(root, "update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=index)
+    tree = git(root, "write-tree", env=index)
+    sha = git(root, "commit-tree", tree, "-p", git(root, "rev-parse", "main"), "-m", "bytes")
+    git(root, "update-ref", "refs/heads/main", sha)
+    return sha
+
+
+@pytest.mark.parametrize("data", [
+    BASE_CONFIG.encode() + b"stall_minutes: 60\n# caf\xe9\n",
+    b"\xff\xfe" + BASE_CONFIG.encode(),
+], ids=["latin1-comment", "invalid-start-bytes"])
+def test_undecodable_config_bytes_are_unparsable(repo, data):
+    commit(repo, "main", {".foragent.yml": BASE_CONFIG})
+    git(repo, "update-ref", "refs/heads/feature", git(repo, "rev-parse", "main"))
+    on_feature(repo)
+    target = commit_bytes(repo, {".foragent.yml": data})
+    work = attempt(repo, {})
+    assert not config_move_is_neutral(work.git, capture_move(work.git, target))
+    assert not neutral(work, target)
+
+
+def test_undecodable_path_is_result_affecting_even_under_docs(repo):
+    name = "docs/caf\udce9.md"
+    target = commit_bytes(repo, {name: b"x\n"})
+    work = attempt(repo, {})
+    assert moved_paths(work.git, capture_move(work.git, target)) == {name}
+    assert not neutral(work, target)

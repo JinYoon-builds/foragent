@@ -478,21 +478,6 @@ def _merge_flag(method: str) -> str:
     return f"--{method}"
 
 
-class _MergedPRs(list):
-    """Merged PR numbers; compares equal to a list of the same PRs as objects or numbers."""
-
-    def __eq__(self, other):
-        if not isinstance(other, list):
-            return NotImplemented
-        return list(self) == [getattr(item, "number", item) for item in other]
-
-    def __ne__(self, other):
-        result = self.__eq__(other)
-        return result if result is NotImplemented else not result
-
-    __hash__ = None
-
-
 class FakeTracker:
     def rate_limit_reset(self) -> datetime | None:
         return None
@@ -508,7 +493,7 @@ class FakeTracker:
         self.labels: dict[str, LabelSpec] = {}
         self.comments: dict[int, list[Comment]] = {}
         self.created_prs: list[PullRequest] = []
-        self.merged_prs: list[int] = _MergedPRs()
+        self.merged_prs: list[int] = []
         self.deleted_branches: list[str] = []
         self._events: dict[int, list[LabelEvent]] = {}
         self._body_edits: dict[int, str] = {}
@@ -1263,12 +1248,13 @@ class GhTracker:
 
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
                  subject: str | None = None) -> None:
-        # An explicit subject stops GitHub from using a branch commit's message
-        # (single-commit PRs and repository defaults); the PR title is the subject.
+        # Explicit subject/body prevent GitHub's defaults from copying branch
+        # messages, including runner-only trailers, into the squash commit.
         if subject is None and method == "squash":
             subject = json.loads(self._call(["pr", "view", str(pr), "-R", self.repo, "--json", "title"]))["title"]
         self._call([
             "pr", "merge", str(pr), "-R", self.repo, _merge_flag(method), "--delete-branch",
             "--match-head-commit", expected_head_sha,
             *(["--subject", subject] if subject is not None else []),
+            *(["--body", ""] if method == "squash" else []),
         ])

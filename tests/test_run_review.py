@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -443,9 +444,13 @@ def test_code_review_json_array_reports_every_item():
 
 
 @pytest.mark.parametrize("last_result,outcome", [("(none)", "merged"), ("No verdict", "retries-exceeded")])
-def test_pr_body_reviews_published_head_and_keeps_findings_in_comments(run_case, last_result, outcome):
+@pytest.mark.parametrize("checks", ["local", "ci"])
+def test_pr_body_reviews_published_head_and_keeps_findings_in_comments(run_case, last_result, outcome, checks):
+    from foragent.ci_workflow import EXCLUSIONS_TRAILER
+
     c = run_case
-    c.ctx.config = replace(c.ctx.config, reviewer="claude", review_scope="pr-body")
+    c.ctx.config = replace(c.ctx.config, reviewer="claude", review_scope="pr-body", checks=checks,
+                           checks_fallback="local", test_command=f"{sys.executable} -m pytest")
     c.executor.steps.append({"fix.txt": "fixed"})
     finding = "feature.txt:1 — Fix the feature"
     messages = iter([finding, last_result])
@@ -460,6 +465,9 @@ def test_pr_body_reviews_published_head_and_keeps_findings_in_comments(run_case,
         head = git_command(kwargs["worktree"], "rev-parse", "HEAD")
         assert head == git_command(c.history.origin, "rev-parse", "foragent/issue-1")
         assert head == c.tracker.pr_head_sha(pr.number)
+        if checks == "ci":
+            value = git_command(c.history.origin, "log", "-1", f"--format=%(trailers:key={EXCLUSIONS_TRAILER},valueonly)", head)
+            assert json.loads(value) == [ACCEPTANCE]
         heads.append(head)
         return ExecResult(0, False, json.dumps({"result": next(messages)}), kwargs["log_path"])
 
@@ -471,6 +479,45 @@ def test_pr_body_reviews_published_head_and_keeps_findings_in_comments(run_case,
     assert any(finding in comment.body for comment in comments)
     if outcome != "merged":
         assert any(last_result in comment.body for comment in comments)
+
+
+@pytest.mark.parametrize("mutates_file", [False, True], ids=["no-op", "changed-file"])
+def test_review_of_legacy_head_preserves_tracked_exclusions(run_case, mutates_file):
+    from foragent.ci_workflow import read_exclusions
+    from foragent.git import GitRepo
+    from foragent.runner import review_only
+    from runner_support import set_done_when
+
+    c = run_case
+    legacy_file = ".foragent/acceptance-exclusions.json"
+    command = f"printf '[\"changed\"]' > {legacy_file}" if mutates_file else "true"
+    set_done_when(c, [command])
+    c.tracker.edit_body(1, c.store.load_approval(1).body)
+    c.store.finish_run(1, outcome="held")
+    c.now[0] += timedelta(seconds=1)
+    c.tracker.remove_labels(1, ["running"])
+    base = c.history.tip
+    c.history.update({"feature.txt": "done", legacy_file: "[]\n"})
+    head = c.history.tip
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="Legacy PR", body="Review")
+    c.tracker.set_pr_head_sha(pr, head)
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    assert read_exclusions(GitRepo(c.history.origin), base) is None
+
+    def review(worktree):
+        assert git_command(worktree, "ls-files", "--", legacy_file) == legacy_file
+        assert git_command(worktree, "diff", "--cached", "HEAD") == ""
+
+    calls = enable_reviewer(c, ["VERDICT: PASS"], review)
+    c.operations.clear()
+    assert review_only(1, c.ctx) == ("checks-failed" if mutates_file else "merged")
+    assert len(calls) == (0 if mutates_file else 1)
+    assert c.tracker.merged_prs == ([] if mutates_file else [pr])
+    assert not c.executor.calls
+    assert not any("commit" in args or "push" in args for _, args in c.operations)
+    assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == head
+    assert git_command(c.history.origin, "show", f"{head}:{legacy_file}") == "[]"
 
 
 @pytest.mark.parametrize("original", [None, b"", b"# Personal instructions\r\nKeep exact bytes: \xff\n"],

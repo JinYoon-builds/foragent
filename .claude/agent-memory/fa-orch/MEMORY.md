@@ -128,6 +128,8 @@
 - #105 병합(2026-10-25): main의 #157이 `usage_events.py`와 `StateStore.record_usage(executor, windows)`·`usage()`를 먼저 넣었다. 중복 `usage.py`를 지우고 파서·`limit_reset`을 `usage_events`로 합쳤다. 저장 형식은 `test_tidy.py`가 정확히 비교하므로 `name/used_percent/resets_at`만 저장하고 `exhausted`는 `record_from_log()` 반환값에만 둔다. 시작 판단은 `scheduler_start.py`(`_lane_held`)로 옮겨졌다. 리뷰어 한도도 사용량 판독 여부와 무관하게 실행기를 멈춘다(오케스트레이터 지시). `test_fa_brief.py` 실패는 #113 미구현 범위다.
 - #105 리뷰: 실행기 멈춤은 시작 때만이 아니라 `_available_executor()`가 매 실행 직전 `store.executor_pause_until()`로 확인하고 `_limit_wait()`로 limit-wait 처리한다. 한도 뒤 곧바로 재시작하는 시험은 시계를 `limit_wait_minutes` 뒤로 옮겨야 한다(`test_worker_sessions.py`). `test_executor_choice.py` 6개는 main에서도 실패하는 quota 범위다.
 - [#104 skill catalog](project_104_skill_catalog.md) — Available skills prompt section, Skills used in Run/PR, claude plain VERDICT fallback
+- [#379 risk map](project_379_risk_map.md) — base-ref map read, review/tier/always_human hooks, commands/*.py import rule
+- [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order, conftest opt-out
 - [#497 memory critical line](project_497_memory_critical.md) — raw kernel level, critical holds starts only, floors in IGNORED_KEYS
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
 - [#514 neutral config/locked moves](project_514_neutral_more.md) — config key rules; Done when included #483 test → applied #483 WIP diff

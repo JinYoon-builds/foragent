@@ -1044,7 +1044,7 @@ def test_gh_pr_create_files_and_merge():
         (["api", "--paginate", "repos/owner/repo/pulls/42/files?per_page=100"], None),
         (["pr", "view", "42", "-R", REPO, "--json", "title"], None),
         (["pr", "merge", "42", "-R", REPO, "--squash", "--delete-branch", "--match-head-commit", "a" * 40,
-          "--subject", "Title (#1)"], None),
+          "--subject", "Title (#1)", "--body", ""], None),
     ]
 
 
@@ -1053,7 +1053,7 @@ def test_gh_squash_merge_uses_an_explicit_subject_without_reading_the_title():
     GhTracker(REPO, run).merge_pr(42, expected_head_sha="a" * 40, subject="Feature (#1)")
     assert run.calls == [([
         "pr", "merge", "42", "-R", REPO, "--squash", "--delete-branch",
-        "--match-head-commit", "a" * 40, "--subject", "Feature (#1)",
+        "--match-head-commit", "a" * 40, "--subject", "Feature (#1)", "--body", "",
     ], None)]
 
 
