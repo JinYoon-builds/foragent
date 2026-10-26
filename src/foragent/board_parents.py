@@ -53,21 +53,6 @@ def order_parents(rows: list[dict[str, Any]]) -> set[int]:
             and APPROVED not in row.get("labels", ())}
 
 
-def batch_pending(number: int, rows: list[dict[str, Any]]) -> bool:
-    """Whether this parent's batch PR has yet to merge.
-
-    In batch review each child merges into ``foragent/batch-<parent>``, so a
-    completed child is not yet on the base branch. The gate creates (and
-    retries) the batch PR only while the parent is open, so closing earlier
-    would strand the children's work. Once the batch PR merges, this is False
-    and the parent completes like any other order.
-    """
-    branch = f"foragent/batch-{number}"
-    if any(row.get("pr_head") == branch and row.get("merged") for row in rows):
-        return False
-    return any(branch in (row.get("pr_base"), row.get("pr_head")) for row in rows)
-
-
 def follow_children(ctx, report) -> None:
     """Move each order parent's card to its children's column; close it when all are done."""
     rows = ctx.store.local_issues()
@@ -89,9 +74,6 @@ def follow_children(ctx, report) -> None:
                                children=", ".join(f"#{child}" for child in cancelled))
                 append_event(ctx.store, at, number, NOT_PLANNED_FLAG, summary)
                 report.actions.append(summary)
-        if state == "Done" and batch_pending(number, rows):
-            # Completion waits only for the batch PR to reach the base branch.
-            state = "PR open"
         if state == "Done":
             ctx.tracker.close_issue(number, text("parent_children_done", language, count=len(children)))
             report.actions.append(text("parent_closed_report", language, number=number,

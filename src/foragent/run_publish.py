@@ -261,14 +261,17 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
     for child in sorted(children, key=lambda child: child.number):
         pr = prs.get(f"foragent/issue-{child.number}")
         lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
-    title = f"Batch: {ctx.tracker.get_issue(parent).title} (#{parent})"
+    issue = ctx.tracker.get_issue(parent)
+    title = f"Batch: {issue.title} (#{parent})"
     body = "\n".join(lines)
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
-        board.sync_status(ctx, parent, "PR open")
+        if issue.state == "open":  # A completed order (#411) stays in Done.
+            board.sync_status(ctx, parent, "PR open")
         return
     pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
-    board.sync_status(ctx, parent, "PR open")
+    if issue.state == "open":
+        board.sync_status(ctx, parent, "PR open")
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
 
 
