@@ -13,6 +13,7 @@ from foragent.capacity import (  # noqa: F401
     machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
 )
 from foragent.config import lane_executors
+from foragent.orch_tick_outcome import step, timed  # noqa: F401
 from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
 from foragent.tracker import Issue
 
@@ -202,3 +203,30 @@ def _start_ready(
             if not scheduler._has_slot(ctx, budget):
                 return started
     return started
+
+
+def _reopen_view(ctx: TickContext, report: TickReport) -> None:
+    with step("view_reopen"):
+        try:
+            scheduler.watch_open.reopen(ctx.repo_root, ctx.store, ctx.config.language, ctx.now())
+        except Exception as exc:
+            # Optional progress display must never hide successfully started runs.
+            error = " ".join(str(exc).split())[:200]
+            report.actions.append(scheduler.text("watch_open_failed", ctx.config.language, error=error))
+
+
+def _github_wait(ctx: TickContext, ready: dict[str, list[int]], name: str) -> str | None:
+    """One timed check of the GitHub pause; budgets still apply while it lasts."""
+    with step(name):
+        if until := ctx.store.github_wait_until(ctx.now()):
+            scheduler._apply_budgets(ctx, ready)
+            return f"GitHub rate limit until {until.isoformat()}"
+    return None
+
+
+def _github_pause(ctx: TickContext, exc: Exception) -> str:
+    """Record a GitHub rate limit as one timed step and apply this tick's budgets."""
+    with step("github_pause"):
+        until = scheduler.orch_github.pause(ctx, exc)
+        scheduler._apply_budgets(ctx, {})
+    return f"GitHub rate limit until {until.isoformat()}"
