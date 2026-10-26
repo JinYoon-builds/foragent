@@ -22,6 +22,7 @@ from time import monotonic
 from typing import IO, TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
+from foragent import cuts
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
@@ -279,7 +280,8 @@ def _capture_acceptance_baseline(
             raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before capture")
         result = runner._check(command, worktree, ctx.store.log_path(n),
                                _baseline_capture_limit(ctx, ctx.store.log_path(n), remaining),
-                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                               full_text_dir=cuts.issue_dir(ctx.store.root, n))
         _progress(n, ctx)
         return result
 
