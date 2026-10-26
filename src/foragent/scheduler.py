@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, orch_github, orch_queue, tidy, usage_recheck, watch_open
+from foragent import board, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -80,8 +80,8 @@ from foragent.scheduler_lanes import (  # noqa: E402
 
 
 def tick(ctx: TickContext) -> TickReport:
-    with ctx.store.tick_lock() as acquired:
-        if not acquired:  # The tick that holds the lock renews the gate heartbeat.
+    with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep:
+        if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
         ctx.store.write_heartbeat("gate", ctx.now())
         with tick_processes(ctx.store) as snapshot:
@@ -91,7 +91,7 @@ def tick(ctx: TickContext) -> TickReport:
             usage_recheck.recheck(ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
             if until := ctx.store.github_wait_until(ctx.now()):
                 _apply_budgets(ctx, {})
-                return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
+                return keep(TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions))
             if not isinstance(ctx.tracker, RecordingTracker):
                 ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
             try:
@@ -102,11 +102,11 @@ def tick(ctx: TickContext) -> TickReport:
                     raise
                 until = orch_github.pause(ctx, exc)
                 _apply_budgets(ctx, {})
-                return TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions)
+                return keep(TickReport(skipped=f"GitHub rate limit until {until.isoformat()}", actions=cleanup.actions))
             # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
             if request := tidy.post_if_due(ctx.store):
                 report.actions.append(f"Tidy due; inbox request {request['id']}")
-            return report
+            return keep(report)
 
 
 def _tick_locked(ctx: TickContext) -> TickReport:
