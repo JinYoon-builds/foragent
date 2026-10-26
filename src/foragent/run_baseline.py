@@ -458,52 +458,41 @@ def _base_moved(git, base_sha: str, target_ref: str) -> bool:
     return False
 
 
-def _with_plugin_path(command: str, directory: str) -> str:
-    """Make the plugin importable without discarding the command's own PYTHONPATH.
-
-    An inline `PYTHONPATH=src pytest` assignment overrides an outer one, so the
-    plugin directory joins every assignment before the pytest executable.
-    """
-    words = shlex.split(command)
-    executable = next((i for i, word in enumerate(words) if Path(word).name == "pytest"), len(words))
-    assignments = [i for i in range(executable) if words[i].startswith("PYTHONPATH=")]
-    for i in assignments:
-        words[i] = "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, words[i].split("=", 1)[1]]))
-    if not assignments:
-        words.insert(0, "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, os.environ.get("PYTHONPATH")])))
-    return shlex.join(words)
-
-
 def _collected_ids(baseline: AcceptanceBaseline, worktree: Path,
-                   check: Callable[[str, Path], CheckResult], scratch: Path | None) -> set[str] | None:
+                   check: Callable[[str, Path], CheckResult]) -> set[str] | None:
     """Node ids the current tree collects, or None when collection is not proven.
 
     The measurement plugin records pytest's own item ids in a file, so terminal
     settings (verbosity_test_cases, -p no:terminal, addopts) cannot change them.
-    Baseline files are named explicitly, as the verification names their ids:
-    pytest collects an explicit file even when `python_files` no longer matches.
+    It is loaded as the conftest of a directory named on the command line:
+    pytest imports that file itself, so `python -I` and an inline PYTHONPATH
+    cannot hide it. Baseline files are named explicitly, as the verification
+    names their ids: pytest collects an explicit file even when `python_files`
+    no longer matches.
     """
     # The pytest command pins --rootdir=., so ids are paths in this worktree.
     files = sorted({node.split("::", 1)[0] for node in baseline.node_ids})
     existing = [name for name in files if (worktree / name).is_file()]
     if not existing:
         return set()
-    if scratch is not None:
-        scratch.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="baseline-collect-", dir=scratch) as directory:
-        plugin = Path(directory)
-        shutil.copyfile(Path(__file__).with_name("ci_pytest.py"), plugin / "fa_baseline_collection.py")
-        evidence = plugin / "results.json"
-        command = _with_plugin_path(
-            f"{baseline.command} {shlex.join(existing)} -p fa_baseline_collection --collect-only", directory)
+    # Runner-owned and never published; removed before the run stages again.
+    (worktree / ".foragent").mkdir(exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix="collect-", dir=worktree / ".foragent"))
+    try:
+        shutil.copyfile(Path(__file__).with_name("ci_pytest.py"), directory / "conftest.py")
+        evidence = directory / "results.json"
+        arguments = " ".join(shlex.quote(word) for word in [
+            *existing, directory.relative_to(worktree).as_posix(), "--collect-only"])
         environment = f"FA_REPORT={shlex.quote(str(evidence))} FA_SHARD=0 FA_SHARDS=1"
-        result = check(f"{environment} {command}", worktree)
+        result = check(f"{environment} {baseline.command} {arguments}", worktree)
         if result.timed_out or result.exit_code not in (0, 5):
             return None
         try:
             measurement = json.loads(evidence.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
     # A module that fails to import collects nothing; its ids have not vanished.
     if not isinstance(measurement, dict) or measurement.get("exit_code") != result.exit_code:
         return None
@@ -515,7 +504,7 @@ def _collected_ids(baseline: AcceptanceBaseline, worktree: Path,
 
 def surviving_baseline(baseline: AcceptanceBaseline, git, worktree: Path,
                        check: Callable[[str, Path], CheckResult], log: Path,
-                       target_ref: str, *, scratch: Path | None = None) -> AcceptanceBaseline:
+                       target_ref: str) -> AcceptanceBaseline:
     """Drop baseline node ids that the current tree no longer collects (#123).
 
     A base sync can rename or delete a locked test. Selecting its old id makes
@@ -529,7 +518,7 @@ def surviving_baseline(baseline: AcceptanceBaseline, git, worktree: Path,
     # Ids measured on this tree's own base still exist unless the work removed them.
     if not _base_moved(git, baseline.base_sha, target_ref):
         return baseline
-    collected = _collected_ids(baseline, worktree, check, scratch)
+    collected = _collected_ids(baseline, worktree, check)
     if collected is None:
         _append(log, "Acceptance baseline collection failed; keeping every baseline node id")
         return baseline

@@ -347,23 +347,26 @@ def _verify_implementation(attempt: Implementation) -> str:
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                                  slot=_test_slot(n, ctx)))
             _progress(n, ctx)
-        if attempt.baseline and attempt.baseline.node_ids:
+        # Filter from the captured baseline on every pass: a later base sync can
+        # restore an id that an earlier one removed, and it must be checked again.
+        baseline = attempt.baseline
+        if baseline and baseline.node_ids:
             from foragent.run_baseline import surviving_baseline
 
-            attempt.baseline = surviving_baseline(
-                attempt.baseline, git, worktree,
+            baseline = surviving_baseline(
+                baseline, git, worktree,
                 lambda command, root: runner._check(command, root, log, 900, progress=lambda: _progress(n, ctx),
                                                     slot=_test_slot(n, ctx)), log,
-                f"origin/{attempt.target_branch}", scratch=ctx.store.root / "runs")
-            if not attempt.baseline.node_ids:
+                f"origin/{attempt.target_branch}")
+            if not baseline.node_ids:
                 _append(log, "Acceptance baseline verification skipped (count=0): no baseline node ids remain")
-        if attempt.baseline and attempt.baseline.node_ids:
+        if baseline and baseline.node_ids:
             started = ctx.monotonic()
-            command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
+            command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
             result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                             slot=_test_slot(n, ctx))
             attempt.checks.append(result)
-            _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
+            _append(log, f"Acceptance baseline verification count={len(baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
             _progress(n, ctx)
             if not enabled(ctx, attempt.target_branch):

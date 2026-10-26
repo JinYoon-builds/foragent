@@ -508,14 +508,14 @@ def test_base_moved_counts_a_merged_root_conftest_change(tmp_path):
     assert _base_moved(repo, base, "main")
 
 
-def _real_pytest(tmp_path, ini, command, *, files=None):
+def _real_pytest(tmp_path, ini, command, *, files=None, project_name="project"):
     """Run the real collection step on a tiny project; return (kept ids, log text)."""
     import subprocess
 
     from foragent.run_baseline import AcceptanceBaseline, surviving_baseline
     from foragent.run_checks import CheckResult, _pytest_command
 
-    project = tmp_path / "project"
+    project = tmp_path / project_name
     (project / "tests/acceptance").mkdir(parents=True)
     (project / "pytest.ini").write_text(ini)
     (project / "tests/acceptance/test_a.py").write_text(
@@ -533,8 +533,9 @@ def _real_pytest(tmp_path, ini, command, *, files=None):
     baseline = AcceptanceBaseline(_pytest_command(command), ("tests/acceptance/test_a.py::test_kept[1]",
                                                              "tests/acceptance/test_a.py::test_gone"),
                                   base_sha="base")
-    kept = surviving_baseline(baseline, _MovedGit(), project, check, log, "origin/main",
-                              scratch=tmp_path / "scratch")
+    kept = surviving_baseline(baseline, _MovedGit(), project, check, log, "origin/main")
+    # The collection helper is removed again; nothing is left to publish.
+    assert not list((project / ".foragent").glob("*"))
     return kept.node_ids, log.read_text()
 
 
@@ -572,5 +573,25 @@ def test_surviving_baseline_keeps_the_commands_own_pythonpath(tmp_path):
                                            "import pytest\n\n@pytest.mark.parametrize('x', [VALUE])\n"
                                            "def test_kept(x):\n    assert False\n"}
     kept, log = _real_pytest(tmp_path, "[pytest]\n", f"PYTHONPATH=src {_python_pytest()}", files=files)
+    assert kept == ("tests/acceptance/test_a.py::test_kept[1]",), log
+    assert "dropped missing node id: tests/acceptance/test_a.py::test_gone" in log
+
+
+def test_surviving_baseline_collects_with_isolated_python(tmp_path):
+    # `python -I` ignores PYTHONPATH; the plugin must load without it.
+    kept, log = _real_pytest(tmp_path, "[pytest]\n", _python_pytest().replace(" -m pytest", " -I -m pytest"),
+                             project_name="isolated project")
+    assert kept == ("tests/acceptance/test_a.py::test_kept[1]",), log
+    assert "dropped missing node id: tests/acceptance/test_a.py::test_gone" in log
+
+
+def test_surviving_baseline_collects_when_paths_and_pythonpath_contain_spaces(tmp_path):
+    # Spaces in the project (and so the plugin) path and the command's own PYTHONPATH.
+    files = {"my src/helper.py": "VALUE = 1\n",
+             "tests/acceptance/test_a.py": "from helper import VALUE\n\n"
+                                           "import pytest\n\n@pytest.mark.parametrize('x', [VALUE])\n"
+                                           "def test_kept(x):\n    assert False\n"}
+    kept, log = _real_pytest(tmp_path, "[pytest]\n", f"PYTHONPATH='my src' {_python_pytest()}", files=files,
+                             project_name="my project")
     assert kept == ("tests/acceptance/test_a.py::test_kept[1]",), log
     assert "dropped missing node id: tests/acceptance/test_a.py::test_gone" in log
