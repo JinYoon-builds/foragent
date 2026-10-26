@@ -33,19 +33,21 @@ def _copy(value: Any) -> Any:
     return value
 
 
-# Parsed issues.json per path, keyed by the file version one stat shows. Shared by every
-# store instance in the process; an atomic replace gives a new inode, so it is seen next read.
+# Parsed issues.json per state directory, keyed by the file version one stat shows. Shared by
+# every store instance in the process; an atomic replace gives a new inode, so it is seen next read.
+# The directory's identity, not its spelling, names the entry, so symlinked or relative roots share it.
 # Only readers use it: a locked write always parses the current file (_issue_snapshot).
-_RECORDS: dict[str, tuple[tuple[int, int, int], dict[str, Any]]] = {}
+# Every value leaving the cache through a public method is copied (_copy), so no caller holds it.
+_RECORDS: dict[tuple[int, int], tuple[tuple[int, int, int, int], dict[str, Any]]] = {}
 _RECORDS_LOCK = _threading.Lock()
 _EMPTY = {"refreshed_at": None, "issues": {}}
 
 
-def _version(stat: Any) -> tuple[int, int, int]:
-    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+def _version(stat: Any) -> tuple[int, int, int, int]:
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
 
 
-def _read_issue_file(path: Any) -> tuple[tuple[int, int, int], dict[str, Any]] | None:
+def _read_issue_file(path: Any) -> tuple[tuple[int, int, int, int], dict[str, Any]] | None:
     """Parse the file and the version of exactly the bytes parsed (fstat of the open file)."""
     try:
         with path.open(encoding="utf-8") as stream:
@@ -59,7 +61,11 @@ class IssueSnapshotMixin:
     def _issue_record(self) -> dict[str, Any]:
         """The parsed record of the current file version; shared, so callers must not mutate it."""
         path = self.root / "issues.json"
-        key = str(path)
+        try:
+            directory = _state.os.stat(self.root)
+        except FileNotFoundError:
+            return _EMPTY
+        key = (directory.st_dev, directory.st_ino)
 
         def current() -> dict[str, Any] | None:
             try:
@@ -100,9 +106,9 @@ class IssueSnapshotMixin:
         return _copy(self._issue_record().get("outbox", []))
 
     def local_board_value(self, number: int, project: str, field: str) -> Any:
-        """The board value last recorded for an issue's card, without copying the record."""
+        """The board value last recorded for an issue's card, copying only that value."""
         row = self._issue_record()["issues"].get(str(number)) or {}
-        return (row.get("board_values") or {}).get(project, {}).get(field)
+        return _copy((row.get("board_values") or {}).get(project, {}).get(field))
 
     def drop_missing_github_issue(self, number: int) -> None:
         """Remove a confirmed missing issue and all its pending writes atomically."""
@@ -188,8 +194,8 @@ class IssueSnapshotMixin:
         """When the snapshot was last read and whether a later read failed."""
         snapshot = self._issue_record()
         failure = snapshot.get("refresh_failure") or {}
-        return {"as_of": snapshot["refreshed_at"], "error": failure.get("error"),
-                "failed_at": failure.get("failed_at")}
+        return _copy({"as_of": snapshot["refreshed_at"], "error": failure.get("error"),
+                      "failed_at": failure.get("failed_at")})
 
     def record_issues_refresh_failure(self, error: str, failed_at: datetime) -> None:
         """Keep the last known facts and note that a later read failed."""
@@ -199,7 +205,7 @@ class IssueSnapshotMixin:
             self._write_json(self.root / "issues.json", snapshot)
 
     def issues_revision(self) -> int:
-        return self._issue_record().get("revision", 0)
+        return _copy(self._issue_record().get("revision", 0))
 
     def _save_local_issue(self, snapshot: dict[str, Any], row: dict[str, Any]) -> None:
         snapshot["revision"] = snapshot.get("revision", 0) + 1

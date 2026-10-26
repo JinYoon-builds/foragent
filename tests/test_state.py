@@ -894,3 +894,26 @@ def test_concurrent_cache_misses_parse_one_version_once(store, monkeypatch):
 
     assert results[2] == "Todo" and results[1] == []
     assert len(parses) == 1
+
+
+def test_values_leaving_the_read_cache_are_detached(store):
+    store.update_local_issue(7, board_values={"p": {"f": ["Todo"]}})
+    store.record_issues_refresh_failure("offline", NOW)
+
+    store.local_board_value(7, "p", "f").append("caller-only")
+    store.issues_observation()["error"] = "caller-only"
+
+    assert store.local_board_value(7, "p", "f") == ["Todo"]
+    assert store.local_issues()[0]["board_values"] == {"p": {"f": ["Todo"]}}
+    assert store.issues_observation()["error"] == "offline"
+
+
+def test_one_state_directory_shares_one_parse_across_path_spellings(store, tmp_path, monkeypatch):
+    store.update_local_issue(7, title="shared")
+    link = tmp_path / "linked-state"
+    link.symlink_to(store.root, target_is_directory=True)
+    spellings = [store.root, link, store.root / ".." / store.root.name]
+    parses = _counted_parses(monkeypatch)
+
+    assert {StateStore(root, now=lambda: NOW).local_issues()[0]["title"] for root in spellings} == {"shared"}
+    assert len(parses) == 1
