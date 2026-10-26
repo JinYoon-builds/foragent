@@ -138,7 +138,7 @@ def _tick(args, root, git, config, repo, tracker, store) -> None:
         repo=repo, repo_root=root, tracker=tracker, store=store, config=config,
         git=git, now=lambda: cli.datetime.now(cli.UTC), launcher=cli.spawn_runner(root, store),
         start_runs=not args.no_start,
-        baseline_launcher=cli.start_baseline_process,
+        baseline_launcher=cli.start_baseline_process, committed_config=True,
     ))) or cli.TickReport(skipped=cli.BUSY_TICK)
     if args.json:
         print(cli.json.dumps(cli.asdict(report)))
