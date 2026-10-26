@@ -15,7 +15,7 @@ from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
-from foragent.harness_guard import changed_harness_paths
+from foragent.harness_guard import changed_harness_paths, guard_measurements, hold_details
 from foragent.labels import APPROVED
 from foragent import orch_reviewers, review_perspectives, risks
 from foragent.executors import ExecResult
@@ -458,34 +458,42 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         flag(ctx, n, Reason.RISK_HIGH, "PR base changed; retry implementation on the current base.", link)
         return "base-changed"
 
-    if harness := changed_harness_paths(git, base_ref, parsed.files):
-        return _hold_harness_change(n, ctx, harness, link)
-    if stopped := _verify_review_head(n, ctx, git, parsed, head, link):
-        return stopped
-    _check_publication(git, pr.base)
+    def guard() -> None:
+        # Between every measurement of this head (Done when, comparison, CI evidence).
+        git.stage_changes()
+        if harness := changed_harness_paths(git, base_ref, parsed.files):
+            raise ExecutorStopped(_hold_harness_change(n, ctx, harness, link), hold_details(harness))
 
-    if verdict_head is None and ctx.config.reviewer != "none":
-        if runner._remaining(n, ctx) <= 0:
-            return _timeout(n, ctx)
-        if ctx.config.review_scope == "pr-body":
-            # Native PR review reads only the PR body: refresh the risk notes for this head and base.
-            body = with_review_scope(pr.body, ctx.config.acceptance_dir, ctx.config.language)
-            body = risks.refresh_notes(body, review_perspectives.with_checklist(_risk_notes(git, base_ref), ctx.config))
-            if body != pr.body:
-                pr = replace(pr, body=body)
-                ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
-        review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx),
-                         pr=pr.number if ctx.config.review_scope == "pr-body" else None)
-        ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
-        if review.timed_out or runner._remaining(n, ctx) <= 0:
-            return _timeout(n, ctx)
-        if review.verdict != "PASS":
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
-            return "review-failed"
+    stop_guarding = guard_measurements(git.root, guard)
+    try:
+        if stopped := _verify_review_head(n, ctx, git, parsed, head, link, base_ref):
+            return stopped
+        _check_publication(git, pr.base)
 
-    from foragent.ci_mode import enabled, review_checks
-    comparison_attempt = review_checks(n, ctx, git, pr.base) if enabled(ctx, pr.base) else None
-    return _publish_reviewed_head(
-        n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
-        comparison_attempt=comparison_attempt,
-    )
+        if verdict_head is None and ctx.config.reviewer != "none":
+            if runner._remaining(n, ctx) <= 0:
+                return _timeout(n, ctx)
+            if ctx.config.review_scope == "pr-body":
+                # Native PR review reads only the PR body: refresh the risk notes for this head and base.
+                body = with_review_scope(pr.body, ctx.config.acceptance_dir, ctx.config.language)
+                body = risks.refresh_notes(body, review_perspectives.with_checklist(_risk_notes(git, base_ref), ctx.config))
+                if body != pr.body:
+                    pr = replace(pr, body=body)
+                    ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
+            review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx),
+                             pr=pr.number if ctx.config.review_scope == "pr-body" else None)
+            ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
+            if review.timed_out or runner._remaining(n, ctx) <= 0:
+                return _timeout(n, ctx)
+            if review.verdict != "PASS":
+                flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
+                return "review-failed"
+
+        from foragent.ci_mode import enabled, review_checks
+        comparison_attempt = review_checks(n, ctx, git, pr.base) if enabled(ctx, pr.base) else None
+        return _publish_reviewed_head(
+            n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
+            comparison_attempt=comparison_attempt,
+        )
+    finally:
+        stop_guarding()

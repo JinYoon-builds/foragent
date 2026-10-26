@@ -69,6 +69,12 @@ def _guard_harness(attempt: Implementation) -> None:
                           hold_details(paths))
 
 
+def _guard_staged(attempt: Implementation) -> None:
+    """Before a head measurement: include files earlier checks generated, then guard."""
+    attempt.git.stage_changes()
+    _guard_harness(attempt)
+
+
 def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
     """Jobs that never ran are infrastructure: hold with the evidence, keep the PR open."""
     if not getattr(logs, "not_started", False):

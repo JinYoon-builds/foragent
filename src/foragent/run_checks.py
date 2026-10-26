@@ -55,7 +55,9 @@ def _check(
     slot: AbstractContextManager | None = None,
 ) -> CheckResult:
     from foragent import runner
+    from foragent.harness_guard import before_measurement
 
+    before_measurement(worktree)
     _append(log, f"\nDone when command:\n{command}")
     offset = log.stat().st_size
 
@@ -337,6 +339,9 @@ def _verify_implementation(attempt: Implementation) -> str:
     attempt.paths = git.changed_paths(attempt.start_ref)
     _progress(n, ctx)
     attempt.checks = []
+
+    # _check repeats this before each measurement (see _implement_and_publish).
+    git.stage_changes()
     _guard_harness(attempt)
     # Cleaning tracked runner scratch files is not an implementation change.
     if not any(not path.startswith(".foragent/") for path in attempt.paths):
@@ -390,6 +395,7 @@ def _verify_implementation(attempt: Implementation) -> str:
         if not _prepare_target(attempt):
             raise ExecutorStopped("hash-mismatch")
         attempt.paths = git.changed_paths(attempt.start_ref)
+        _guard_harness(attempt)
         checked_tree = git.staged_tree_sha()
         if checked_tree != staged_tree:
             if verification == 1:
@@ -410,15 +416,20 @@ def _verify_implementation(attempt: Implementation) -> str:
 
 
 def _verify_review_head(
-    n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str,
+    n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str, base_ref: str,
 ) -> str | None:
     from foragent import runner
+    from foragent.harness_guard import changed_harness_paths
+    from foragent.run_publish import _hold_harness_change
 
     worktree = git.root
     log = ctx.store.log_path(n)
     for command in parsed.done_when_commands:
         if runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
+        git.stage_changes()
+        if harness := changed_harness_paths(git, base_ref, parsed.files):
+            return _hold_harness_change(n, ctx, harness, link)
         check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)), progress=lambda: _progress(n, ctx),
                        slot=_test_slot(n, ctx))
         _progress(n, ctx)

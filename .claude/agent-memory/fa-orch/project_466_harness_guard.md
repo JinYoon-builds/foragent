@@ -10,3 +10,4 @@ metadata:
 - **Why:** `flag()` only adds `blocked`; specs asking for needs-human need an explicit `add_labels`.
 - **How to apply:** unit tests in this repo must use plumbing git (`write-tree`/`commit-tree`/`update-ref`); conftest asserts against commit/checkout/reset/push/stash. In zsh, `fa test $files` passes one argument — use `xargs`.
 - Related: [[project_376_base_move]]
+- Review round 2 lessons: run the guard (stage first) before EVERY `runner._check` on the head, inside the verify loop and in `_verify_review_head`, not once up front. A Done when command can generate harness files, and pass 2 would otherwise accept them. Read Git data as raw bytes (`subprocess` without `text=`), because `GitRepo._call` decodes with `errors="replace"`. An absent pyproject must normalize to the same value as a pytest-free one. APFS rejects non-UTF-8 file names, so such tests skip on macOS.

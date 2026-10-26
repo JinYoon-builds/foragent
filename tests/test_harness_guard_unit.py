@@ -3,8 +3,11 @@
 import pytest
 
 from conftest import git_command
+from foragent import runner
 from foragent.git import GitRepo
-from foragent.harness_guard import changed_harness_paths
+from foragent.harness_guard import changed_harness_paths, guard_measurements
+from foragent.reasons import Reason
+from runner_support import run_case, set_done_when  # noqa: F401
 
 PYPROJECT = '[project]\nname = "x"\nversion = "0"\n\n[tool.pytest.ini_options]\naddopts = "-q"\n'
 
@@ -72,3 +75,131 @@ def test_added_nested_pyproject_with_pytest_table_and_deletion_count(repo):
     (repo / "pkg/pyproject.toml").write_text('[tool.pytest]\naddopts = ["-q"]\n')
     (repo / "pyproject.toml").unlink()
     assert changed_harness_paths(staged(repo), "target", []) == ["pkg/pyproject.toml", "pyproject.toml"]
+
+
+@pytest.mark.parametrize("change", ["add", "delete", "rename"])
+def test_pytest_free_pyproject_added_deleted_or_renamed_proceeds(repo, change):
+    plain = '[project]\nname = "pkg"\nversion = "0"\n'
+    (repo / "pkg").mkdir()
+    if change != "add":
+        (repo / "pkg/pyproject.toml").write_text(plain)
+        commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD").strip())
+        git_command(repo, "update-ref", "refs/heads/target", "HEAD")
+    if change == "add":
+        (repo / "pkg/pyproject.toml").write_text(plain)
+    elif change == "delete":
+        (repo / "pkg/pyproject.toml").unlink()
+    else:
+        (repo / "lib").mkdir()
+        (repo / "pkg/pyproject.toml").rename(repo / "lib/pyproject.toml")
+    assert changed_harness_paths(staged(repo), "target", []) == []
+
+
+@pytest.mark.parametrize("side", ["head", "base"])
+def test_invalid_utf8_pyproject_counts_even_when_tables_look_equal(repo, side):
+    invalid = PYPROJECT.encode() + b"# comment \xff\n"
+    if side == "base":
+        (repo / "pyproject.toml").write_bytes(invalid)
+        commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD").strip())
+        git_command(repo, "update-ref", "refs/heads/target", "HEAD")
+        (repo / "pyproject.toml").write_bytes(invalid.replace(b"comment", b"note"))
+    else:
+        (repo / "pyproject.toml").write_bytes(invalid)
+    assert changed_harness_paths(staged(repo), "target", []) == ["pyproject.toml"]
+
+
+def test_non_utf8_directory_is_read_by_its_exact_bytes(repo):
+    directory = repo.parent / "repo" / "caf\udcff"  # bytes b"caf\xff" on POSIX
+    try:
+        directory.mkdir()
+    except (OSError, UnicodeEncodeError):
+        pytest.skip("filesystem rejects non-UTF-8 names")
+    (directory / "pyproject.toml").write_text("[tool.pytest]\n")
+    assert changed_harness_paths(staged(repo), "target", []) == ["caf\ufffd/pyproject.toml"]
+
+
+def test_harness_generated_by_a_done_when_command_is_held_before_later_measurements(run_case):
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done"}]
+    set_done_when(c, [
+        "mkdir -p tests/gen && printf '# generated\\n' > tests/gen/conftest.py",
+        'test "$(cat feature.txt)" = done',
+    ])
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert "needs-human" in c.tracker.get_issue(1).labels
+    assert c.tracker.merged_prs == []
+    assert any("tests/gen/conftest.py" in comment.body for comment in c.tracker.list_comments(1)
+               if "reason=test-harness-changed" in comment.body)
+
+
+@pytest.mark.parametrize("before,after,held", [
+    ("xfail_strict = false", "xfail_strict = 0", True),
+    ("minversion = 1", "minversion = 1.0", True),
+    ("timeout = 1.0", "timeout = 1.00", False),
+    ("ratio = nan", "ratio = nan", False),
+    ("when = 2026-01-01T00:00:00Z", "when = 2026-01-01T00:00:00+00:00", False),
+    ("when = 2026-01-01T00:00:00Z", "when = 2026-01-01T00:00:00", True),
+])
+@pytest.mark.parametrize("table", ["tool.pytest.ini_options", "tool.pytest.ini_options.sub",
+                                   "project.entry-points.pytest11"])
+def test_pytest_tables_compare_toml_types_exactly(repo, before, after, held, table):
+    base = '[project]\nname = "x"\nversion = "0"\n'
+    (repo / "pyproject.toml").write_text(f"{base}\n[{table}]\n{before}\n")
+    commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD").strip())
+    git_command(repo, "update-ref", "refs/heads/target", "HEAD")
+    # A change outside the pytest tables rides along; only the tables decide.
+    (repo / "pyproject.toml").write_text(f"{base.replace('0', '1')}\n[{table}]\n{after}\n")
+    assert changed_harness_paths(staged(repo), "target", []) == (["pyproject.toml"] if held else [])
+
+
+def test_every_check_in_a_guarded_worktree_runs_the_guard_first(tmp_path):
+    class Held(Exception):
+        pass
+
+    def guard():
+        raise Held
+
+    log = tmp_path / "log.txt"
+    log.write_text("")
+    stop = guard_measurements(tmp_path, guard)
+    try:
+        with pytest.raises(Held):
+            runner._check("touch measured", tmp_path, log, 5)
+        assert not (tmp_path / "measured").exists()
+    finally:
+        stop()
+    assert runner._check("touch measured", tmp_path, log, 5).exit_code == 0
+
+
+def test_harness_created_by_local_only_collection_is_guarded_before_selection(run_case, tmp_path):
+    from types import SimpleNamespace
+    from foragent.ci_local import verify_local_only_units
+
+    c = run_case
+    c.store.start_run(1, branch="foragent/issue-1", worktree=c.store.worktree_path(1))
+    root = tmp_path / "head"
+    (root / "tests").mkdir(parents=True)
+    (root / "tests/test_marked.py").write_text("import pytest\n\n@pytest.mark.local_only\ndef test_x(): pass\n")
+    script = root / "fake-pytest"
+    script.write_text('#!/bin/sh\ncase "$*" in *--collect-only*) echo "# generated" > conftest.py ;;'
+                      ' *) touch measured ;; esac\n')
+    script.chmod(0o755)
+
+    class Held(Exception):
+        pass
+
+    def guard():
+        if (root / "conftest.py").exists():
+            raise Held
+
+    attempt = SimpleNamespace(n=1, ctx=c.ctx, worktree=root)
+    stop = guard_measurements(root, guard)
+    try:
+        with pytest.raises(Held):
+            verify_local_only_units(attempt, str(script))
+    finally:
+        stop()
+        c.store.finish_run(1, outcome="held")
+        c.tracker.remove_labels(1, ["running"])
+    assert (root / "conftest.py").exists() and not (root / "measured").exists()

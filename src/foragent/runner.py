@@ -127,7 +127,8 @@ from foragent.run_conflicts import (
     _block_rebuild, _rebuild, _rebuild_after_conflicts, _recover_replay, _resume_implementation,
 )
 from foragent.run_implementation import _implement, _prepare_implementation
-from foragent.run_publish import _publish, _push_branch
+from foragent.harness_guard import guard_measurements
+from foragent.run_publish import _guard_staged, _publish, _push_branch
 from foragent.run_review import _review_implementation
 
 
@@ -192,6 +193,7 @@ def _implement_and_publish(
     """Run named implementation, check, review and publication steps."""
     attempt = _prepare_implementation(n, ctx, git, target_branch=target_branch, failure=failure)
     outcome = "error"
+    stop_guarding = guard_measurements(git.root, lambda: _guard_staged(attempt))
     try:
         resume_verified = _resume_implementation(attempt)
         if not _acceptance_matches(n, ctx, git, attempt.approval):
@@ -259,6 +261,7 @@ def _implement_and_publish(
         outcome = "killed"
         raise
     finally:
+        stop_guarding()
         if outcome != "merged":
             run = ctx.store.get_run(n)
             _preserve_failed_implementation(
