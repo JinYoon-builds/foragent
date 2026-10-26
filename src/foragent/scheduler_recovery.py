@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import processes, scheduler
+from foragent import processes, scheduler, sleep_ledger
 from foragent.scheduler_stop import (
     _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes,
 )
@@ -191,6 +191,7 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
+    slept = sleep_ledger.observe(ctx, report)  # Sleep is neither run time nor stall time.
     for run in ctx.store.active_runs():
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
@@ -223,13 +224,16 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             if _stop_already_refused(ctx, run):
                 continue
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
+            progress = run.last_progress_at or run.started_at
             runtime = (ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
+            runtime -= slept.credit(run.started_at, ctx.now())
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
                 if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit."):
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
-            elif run.pid is not None and not waiting and ctx.now() - scheduler.datetime.fromisoformat(
-                run.last_progress_at or run.started_at,
+            elif run.pid is not None and not waiting and not slept.defers_stall(run, ctx.now()) and (
+                ctx.now() - scheduler.datetime.fromisoformat(progress)
+                - scheduler.timedelta(seconds=slept.credit(progress, ctx.now()))
             ) > scheduler.timedelta(minutes=ctx.config.stall_minutes):
                 restarts = run.restarts + 1
                 outcome = "stalled-restart" if restarts <= 1 else "stalled"

@@ -127,6 +127,15 @@ def isolated_test_slots(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_real_machine_sleep(request, monkeypatch):
+    """The owner's real sleep must not credit runs on fake clocks; sleep tests opt in (#415)."""
+    from foragent import capacity
+
+    if request.module.__name__ not in {"test_machine_sleep", "test_sleep_ledger"}:
+        monkeypatch.setattr(capacity, "slept_seconds", lambda since: 0.0)
+
+
+@pytest.fixture(autouse=True)
 def kicks(monkeypatch):
     """Record event hooks without starting background ticks in any test."""
     from foragent import cli, orch, order, runner
