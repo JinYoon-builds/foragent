@@ -196,7 +196,7 @@ def test_launch_inside_tick_keeps_its_separate_birth_evidence(fake_process_table
     with tick_processes(store):
         root = table.add(42000, cwd=tmp_path, start_time=10)
         store.start_run(1, branch="branch", worktree=tmp_path, pid=root.pid)
-        store.update_run(1, phase="implement")
+        store.update_run(1, phase="implement", observe=True)
     assert store.get_run(1).process_identities == [{"pid": root.pid, "start_time": root.start_time}]
     assert table.list_calls == 5, "Launch and state updates retain their original two fresh listings"
     assert not table.signals

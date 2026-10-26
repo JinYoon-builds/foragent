@@ -64,6 +64,9 @@ def measure(ctx, run: Run, parsed: ParsedIssue, target: str | None = None) -> Ru
             or not any_overlap(ctx, [escape(path)], parsed.files)]
     fields.update(changed_files=changed, files_committed=committed,
                   effective_files=changed if committed else parsed.files, late_files=late)
+    if all(getattr(run, name) == value for name, value in fields.items()):
+        # An unchanged measurement is read-only: no state lock, no write.
+        return run
     return ctx.store.update_run(run.number, **fields)
 
 
