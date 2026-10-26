@@ -167,3 +167,88 @@ def test_missing_approval_keeps_the_own_lane_rule_at_a_runner_boundary(context):
     context.store.clear_approval(1)
     context.sleep = lambda seconds: pytest.fail('Unknown Files must not count across lanes')
     wait_for_overlap(owner)
+
+
+@pytest.mark.parametrize('previous_phase', [None, 'implementing', 'merging'])
+@pytest.mark.parametrize('interrupted', [False, True], ids=['released', 'interrupted'])
+def test_late_wait_logs_blockers_once_and_restores_phase_at_wait_end(context, previous_phase, interrupted):
+    now = clock(context)
+    context.config = replace(context.config, overlap_per_file=1, language='en')
+    reserve(context, 1, ['own.py'])
+    reserve(context, 2, ['a.py', 'b.py'])
+    edit(context, 1, {'own.py': 'own\n'}, commit=True)
+    edit(context, 1, {'a.py': 'late\n', 'b.py': 'late\n'})
+    context.store.update_run(1, phase=previous_phase,
+                             phase_started_at=(now[0] - timedelta(minutes=5)).isoformat())
+    started, sleeps = now[0], []
+
+    def sleep(seconds):
+        run = context.store.get_run(1)
+        assert run.phase == 'overlap-wait' and run.phase_started_at == started.isoformat()
+        assert run.waiting_until is not None
+        lines = context.store.log_path(1).read_text().splitlines()
+        assert len(lines) == 1 and 'a.py: #2' in lines[0] and 'b.py: #2' in lines[0]
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=3)
+        if interrupted:
+            raise RuntimeError('Wait interrupted')
+        if len(sleeps) == 2:
+            context.store.finish_run(2, 'merged')
+
+    context.sleep = sleep
+    if interrupted:
+        with pytest.raises(RuntimeError, match='Wait interrupted'):
+            wait_for_overlap(attempt(context, 1))
+    else:
+        wait_for_overlap(attempt(context, 1))
+    run = context.store.get_run(1)
+    assert run.phase == previous_phase and run.phase_started_at == now[0].isoformat()
+    assert run.waited_seconds == (now[0] - started).total_seconds()
+    assert run.waiting_until is None
+    assert len(context.store.log_path(1).read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize('exclusive', [False, True])
+def test_batch_late_union_uses_configured_base_and_preserves_exclusive(context, git_history, exclusive):
+    from conftest import git_command
+
+    now = clock(context)
+    git_history.update({'.gitattributes': '*.md merge=union\n'})
+    context.git.fetch('origin', 'main')
+    git_command(context.repo_root, 'update-ref', 'refs/remotes/origin/trunk', git_history.tip)
+    context.config = replace(context.config, base_branch='trunk', overlap_per_file=1)
+    reserve(context, 1, ['own.py'])
+    reserve(context, 2, ['*.md'], exclusive=['shared*.md'] if exclusive else [])
+    edit(context, 1, {'own.py': 'own\n'}, commit=True)
+    path = edit(context, 1, {'shared[1].md': 'late\n'})
+    # Batch attributes disagree with the configured base, as do local edits.
+    git_history.update({'.gitattributes': '*.md merge=text\n'})
+    context.git.fetch('origin', 'main')
+    git_command(context.repo_root, 'update-ref', 'refs/remotes/origin/batch', git_history.tip)
+    (path / '.gitattributes').write_text('*.md merge=text\n')
+    calls, call = [], context.git._call
+
+    def observe(args):
+        if args[:1] == ['check-attr']:
+            calls.append(args)
+        return call(args)
+
+    context.git._call = observe
+    waits = []
+
+    def sleep(seconds):
+        assert exclusive, 'Union capacity must not cause a late wait'
+        assert 'shared[1].md: #2' in context.store.log_path(1).read_text()
+        waits.append(seconds)
+        now[0] += timedelta(seconds=1)
+        context.store.finish_run(2, 'merged')
+
+    context.sleep = sleep
+    owner = attempt(context, 1)
+    owner.target_branch = 'batch'
+    wait_for_overlap(owner)
+    assert waits == ([1] if exclusive else [])
+    assert len(calls) == (3 if exclusive else 1), 'Read one attribute batch per wait check'
+    assert all('--source=origin/trunk' in args for args in calls)
+    assert context.store.get_run(1).overlap_records == []
+

@@ -13,6 +13,7 @@ from foragent.issue import body_hash, parse_body
 from foragent.overlap_files import can_start, claims, measure
 from foragent.state import StateStore
 from runner_support import import_index
+from conftest import git_command
 
 
 @pytest.fixture
@@ -153,3 +154,59 @@ def test_recorded_target_branch_drives_subsequent_scheduler_measurement(context)
     run = measure(context, context.store.get_run(1), parse_body(context.store.load_approval(1).body), 'batch')
     assert run.effective_files == ['src/b.py']
     assert claims(context)[0][0].run.effective_files == ['src/b.py']
+
+
+@pytest.mark.parametrize('candidate,holder', [
+    (['shared.md'], ['shared.md']),
+    (['*.md'], ['shared.md']),
+    (['shared.md'], ['*.md']),
+])
+def test_union_paths_do_not_consume_capacity_with_literal_or_glob_peers(context, git_history, candidate, holder):
+    git_history.update({'.gitattributes': 'shared.md merge=union\n'})
+    context.git.fetch('origin', 'main')
+    context.config = replace(context.config, overlap_per_file=1)
+    reserve(context, 1, holder)
+    reserve(context, 2, candidate, running=False)
+    assert can_start(context, 'main', 2)
+
+
+@pytest.mark.parametrize('exclusive_owner', [1, 2])
+def test_union_paths_still_honor_exclusive_in_both_directions(context, git_history, exclusive_owner):
+    git_history.update({'.gitattributes': 'shared.md merge=union\n'})
+    context.git.fetch('origin', 'main')
+    for number in (1, 2):
+        reserve(context, number, ['shared.md'], running=number == 1,
+                exclusive=['shared.md'] if number == exclusive_owner else [])
+    assert not can_start(context, 'main', 2)
+
+
+def test_admission_attributes_use_configured_base_and_recheck_changes(context, git_history):
+    git_history.update({'.gitattributes': 'shared.md merge=union\n'})
+    context.git.fetch('origin', 'main')
+    git_command(context.repo_root, 'update-ref', 'refs/remotes/origin/trunk', git_history.tip)
+    context.config = replace(context.config, base_branch='trunk', overlap_per_file=1)
+    reserve(context, 1, ['shared.md'])
+    reserve(context, 2, ['shared.md'], running=False)
+    assert can_start(context, 'main', 2)
+    git_history.update({'.gitattributes': 'shared.md merge=text\n'})
+    context.git.fetch('origin', 'main')
+    # The main ref changed, but admission must still use the configured trunk.
+    assert can_start(context, 'main', 2)
+    git_command(context.repo_root, 'update-ref', 'refs/remotes/origin/trunk', git_history.tip)
+    assert not can_start(context, 'main', 2)
+
+
+def test_unreadable_attributes_keep_the_existing_cap(context):
+    context.config = replace(context.config, base_branch='missing', overlap_per_file=1)
+    reserve(context, 1, ['shared.md'])
+    reserve(context, 2, ['shared.md'], running=False)
+    assert not can_start(context, 'main', 2)
+
+
+def test_union_glob_does_not_exempt_a_non_union_exception(context, git_history):
+    git_history.update({'.gitattributes': 'docs/** merge=union\ndocs/normal.md merge=text\n'})
+    context.git.fetch('origin', 'main')
+    context.config = replace(context.config, overlap_per_file=1)
+    reserve(context, 1, ['docs/*.md'])
+    reserve(context, 2, ['docs/*.md'], running=False)
+    assert not can_start(context, 'main', 2)
