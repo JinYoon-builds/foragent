@@ -43,7 +43,8 @@ def test_kick_detaches_same_python_and_appends_both_streams(environment, monkeyp
     assert kick.kick_tick(Path(root.name)) is None
     assert kick.kick_tick(root) is None
     assert calls[0][0] == [sys.executable, "-m", "foragent.cli", "gate", "tick", "--repo-root", str(root)]
-    assert set(calls[0][1]) == {"cwd", "stdin", "start_new_session", "stdout", "stderr"}
+    assert set(calls[0][1]) == {"cwd", "stdin", "start_new_session", "stdout", "stderr", "env"}
+    assert calls[0][1]["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
     assert calls[0][1]["cwd"] == root
     assert calls[0][1]["stdin"] == subprocess.DEVNULL
     assert calls[0][1]["start_new_session"] is True

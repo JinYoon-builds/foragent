@@ -62,6 +62,12 @@ def _bootout(call: Callable[[list[str]], subprocess.CompletedProcess[str]], targ
         raise LaunchdError(f"launchctl bootout: {message or result.returncode}")
 
 
+# Gate processes must not write __pycache__ into the tool directory that a
+# reinstall empties. A job loaded from an older plist is covered by the
+# installed package itself (foragent/__init__.py).
+GATE_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
+
+
 @dataclass(frozen=True)
 class InstalledJob:
     """A gate job exactly as its plist file names it, including legacy labels."""
@@ -153,6 +159,7 @@ class Launchd:
             "EnvironmentVariables": {
                 "PATH": f"{self.home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
                 "HOME": str(self.home), "LANG": "en_US.UTF-8",
+                **GATE_ENVIRONMENT,
             },
             "StandardOutPath": str(self.state_root / "launchd.out.log"),
             "StandardErrorPath": str(self.state_root / "launchd.err.log"),

@@ -51,7 +51,7 @@ def test_plist_round_trip_has_exact_job_and_environment(job):
         "ProcessType": "Standard",
         "EnvironmentVariables": {
             "PATH": f"{job.home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-            "HOME": str(job.home), "LANG": "en_US.UTF-8",
+            "HOME": str(job.home), "LANG": "en_US.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
         },
         "StandardOutPath": str(job.state_root / "launchd.out.log"),
         "StandardErrorPath": str(job.state_root / "launchd.err.log"),
@@ -281,3 +281,4 @@ def test_module_entry_points_forward_dependencies(job, operation):
     )
     assert result == (launchd.LaunchdStatus(job.label, False, True) if operation == "status" else job.label)
     assert calls[0][1] == job.target
+

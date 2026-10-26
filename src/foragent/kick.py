@@ -8,6 +8,7 @@ import sys
 
 from foragent.config import load_config
 from foragent.git import GitRepo
+from foragent.launcher import gate_environment
 from foragent.state import StateStore
 
 
@@ -25,7 +26,7 @@ def kick_tick(repo_root: Path) -> None:
                 subprocess.Popen(
                     [sys.executable, "-m", "foragent.cli", "gate", "tick", "--repo-root", str(root)],
                     cwd=root, stdin=subprocess.DEVNULL, start_new_session=True,
-                    stdout=stream, stderr=stream,
+                    stdout=stream, stderr=stream, env=gate_environment(),
                 )
             except Exception as exc:
                 stream.write(f"foragent: tick kick failed: {' '.join(str(exc).split())}\n".encode("utf-8"))

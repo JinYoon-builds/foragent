@@ -147,3 +147,5 @@
 - [#567 CI exclusions drift](project_567_ci_exclusions_drift.md) — subset rule, keep payload/scope excluded equal, slow test_ci_mode under load
 - `test_scheduler_split.py`가 facade `scheduler.py`를 250줄로 제한한다. scheduler에 줄을 더하면 같은 수만큼 줄이거나 분할 모듈로 옮긴다. 바꾼 파일마다 `tests/acceptance/test_*split*.py` 전부를 돌려 확인한다.
 - [#128 orch spawn](project_128_orch_spawn.md) — gate opens orchestrator; conftest opt-out; scheduler.py 250-line cap
+- #591: `orch_reinstall._uv()`가 uv 설치의 디렉터리 경쟁 오류만 3회까지 재시도(`sleep` 모듈 속성)하며 update_check도 이 함수를 공유한다. 게이트 자식 환경은 `launcher.gate_environment()`; launcher·kick·launchd 단위 시험은 Popen 인자 집합을 정확히 비교한다.
+- #591 리뷰: plist 옮기기는 첫 `fa update`가 옛 코드로 돌아 실패하고, 디스크 plist 검사는 launchd 적재본과 어긋난다. 설치본 `foragent/__init__.py`가 `site-packages` 아래면 `sys.dont_write_bytecode`를 켜서 plist와 무관하게 막았다.
