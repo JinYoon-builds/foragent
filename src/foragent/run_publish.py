@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field, replace
+from glob import escape
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
@@ -13,8 +14,11 @@ from foragent import board, review_perspectives, risks
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
+from foragent.i18n import text
 from foragent.issue import ParsedIssue, body_hash
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
+from foragent.orch_events import append_event
+from foragent.overlap_files import any_overlap
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped
@@ -46,8 +50,11 @@ from foragent.run_publish_merge import (  # noqa: E402
     retitle_for_merge,
 )
 from foragent.run_publish_pr import (  # noqa: E402
-    _open_or_update_pr, _preserve_failed_implementation, _push_branch, _render_pr_body,
-    _risk_always_human, _risk_notes, _skills_line, _update_open_pr,
+    _open_or_update_pr, _push_branch, _render_pr_body, _risk_always_human, _risk_notes,
+    _skills_line, _update_open_pr,
+)
+from foragent.run_publish_preserve import (  # noqa: E402
+    _check_wip_deletions, _preserve_failed_implementation, _preserve_locked_implementation,
 )
 from foragent.run_publish_flow import _publish, _publish_locked  # noqa: E402
 from foragent.run_publish_reviewed import _publish_reviewed_head  # noqa: E402

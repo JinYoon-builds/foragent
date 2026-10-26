@@ -12,20 +12,24 @@ that request done; it sends no push.
 from __future__ import annotations
 
 import json
+import sys
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
-from foragent import notify, orch_inbox
+from foragent import i18n, notify, orch_inbox
 from foragent.config import Config
 from foragent.state import StateStore
 
 OUTCOME_FILE = "tick-outcome.json"
 LOG_FILE = "tick-failure.log"
 MESSAGE_LIMIT = 500
+SLOW_STEP_SECONDS = 60
 T = TypeVar("T")
 
 _PUSH = {
@@ -52,6 +56,46 @@ def _summary(exc: BaseException) -> str:
     return text if len(text) <= MESSAGE_LIMIT else text[:MESSAGE_LIMIT - 3] + "..."
 
 
+class _Steps:
+    """The ordered ``{name, seconds}`` timings of one recorded tick."""
+
+    def __init__(self, language: str) -> None:
+        self.language = language
+        self.items: list[dict[str, Any]] = []
+
+
+_CURRENT: ContextVar[_Steps | None] = ContextVar("tick_steps", default=None)
+
+
+@contextmanager
+def step(name: str) -> Iterator[None]:
+    """Time one top-level tick step on the monotonic clock.
+
+    Outside ``run_recorded`` this only runs the step. A step that raises still
+    records its elapsed time. A step of 60 s or more writes one stderr line.
+    Timing never changes what the step does.
+    """
+    steps = _CURRENT.get()
+    if steps is None:
+        yield
+        return
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        seconds = time.monotonic() - started
+        steps.items.append({"name": name, "seconds": seconds})
+        if seconds >= SLOW_STEP_SECONDS:
+            print(i18n.text("tick_step_slow", steps.language, step=name, seconds=seconds),
+                  file=sys.stderr, flush=True)
+
+
+def timed(name: str, call: Callable[..., T], *args: Any) -> T:
+    """Run ``call(*args)`` as one timed tick step (see ``step``)."""
+    with step(name):
+        return call(*args)
+
+
 def run_recorded(store: StateStore, config: Config, repo: str, run: Callable[[], T]) -> T | None:
     """Run one tick and record its outcome while holding the tick lock.
 
@@ -61,24 +105,35 @@ def run_recorded(store: StateStore, config: Config, repo: str, run: Callable[[],
     with store.hold_tick_lock() as acquired:
         if not acquired:
             return None
+        steps = _Steps(config.language)
+        token = _CURRENT.set(steps)
         started = time.monotonic()
         try:
             result = run()
         except Exception as exc:
-            record_failure(store, config, repo, exc, duration_seconds=time.monotonic() - started)
+            _CURRENT.reset(token)
+            record_failure(store, config, repo, exc, steps=steps.items,
+                           duration_seconds=_duration(started, steps.items))
             raise
-        record_success(store, duration_seconds=time.monotonic() - started)
+        _CURRENT.reset(token)
+        record_success(store, steps=steps.items, duration_seconds=_duration(started, steps.items))
         return result
 
 
-def record_success(store: StateStore, *, duration_seconds: float = 0) -> dict[str, Any]:
+def _duration(started: float, steps: list[dict[str, Any]]) -> float:
+    # Rounding in separate differences must never make the steps exceed the whole.
+    return max(time.monotonic() - started, sum(item["seconds"] for item in steps))
+
+
+def record_success(store: StateStore, *, duration_seconds: float = 0,
+                   steps: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Record a successful tick; close an open streak alert without a push.
 
     Callers hold the tick lock (see ``run_recorded``).
     """
     previous = read(store) or {}
     record = {"at": store._now().isoformat(), "status": "ok", "consecutive_failures": 0,
-              "duration_seconds": duration_seconds}
+              "duration_seconds": duration_seconds, "steps": list(steps or [])}
     store._write_json(outcome_path(store), record)
     alert = previous.get("alert_request")
     if alert:
@@ -90,7 +145,8 @@ def record_success(store: StateStore, *, duration_seconds: float = 0) -> dict[st
 
 
 def record_failure(store: StateStore, config: Config, repo: str, exc: BaseException, *,
-                   duration_seconds: float = 0) -> dict[str, Any]:
+                   duration_seconds: float = 0,
+                   steps: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Record a failed tick with its traceback log; alert once when the streak reaches the threshold.
 
     Callers hold the tick lock (see ``run_recorded``).
@@ -102,7 +158,7 @@ def record_failure(store: StateStore, config: Config, repo: str, exc: BaseExcept
     store._atomic_write(log_path, f"gate tick failed at {at}\n" + "".join(traceback.format_exception(exc)))
     record: dict[str, Any] = {
         "at": at, "status": "failed", "consecutive_failures": streak,
-        "duration_seconds": duration_seconds,
+        "duration_seconds": duration_seconds, "steps": list(steps or []),
         "error_type": type(exc).__name__, "error_message": _summary(exc), "log_path": str(log_path),
     }
     alert = previous.get("alert_request")  # Success records never carry one.

@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
+import heapq
 import json
 import subprocess
 from types import SimpleNamespace
@@ -43,6 +44,7 @@ def routine_scan(fake_process_table, tmp_path, monkeypatch):
 
 def test_many_routine_observers_share_one_scan_pair_across_repositories(routine_scan, tmp_path, monkeypatch):
     scan = routine_scan
+    previous_poll = scan.clock.now
     reads, locks = [], []
     read_text = type(scan.path).read_text
     flock = processes._routine_scan_lock
@@ -64,7 +66,7 @@ def test_many_routine_observers_share_one_scan_pair_across_repositories(routine_
         repo = tmp_path / f"repo-{observer}"
         repo.mkdir()
         monkeypatch.chdir(repo)
-        assert processes.observe_tree(scan.identities, shared=True) == [
+        assert processes.observe_tree(scan.identities, shared=True, not_before=previous_poll) == [
             *scan.identities, {"pid": scan.child.pid, "start_time": scan.child.start_time},
         ]
         scan.clock.now += 0.05
@@ -73,30 +75,118 @@ def test_many_routine_observers_share_one_scan_pair_across_repositories(routine_
     assert locks == [scan.path.with_suffix(".lock")]
 
 
-def test_child_born_just_after_shared_capture_is_witnessed_within_one_second(routine_scan, tmp_path):
-    scan = routine_scan
-    processes.shared_routine_rows()
-    captured_at = scan.clock.now
-    born_at = captured_at + 0.001
-    scan.clock.now = born_at
-    child = scan.table.add(42002, ppid=scan.root.pid, cwd=tmp_path, start_time=born_at)
-
-    scan.clock.now = captured_at + processes.OBSERVER_POLL_INTERVAL
-    assert child.pid not in {item["pid"] for item in processes.observe_tree(scan.identities, shared=True)}
-    assert scan.table.list_calls == 2  # The last pre-birth cache is still valid at its age boundary.
-
-    scan.clock.now += processes.OBSERVER_POLL_INTERVAL
-    assert child.pid in {item["pid"] for item in processes.observe_tree(scan.identities, shared=True)}
-    assert scan.clock.now - born_at <= 1.0
-    assert processes.OBSERVER_POLL_INTERVAL + processes.ROUTINE_SCAN_MAX_AGE <= 1.0
-    assert scan.table.list_calls == 4
-
-
-def test_contended_routine_scan_lock_has_immediate_direct_fallback(routine_scan, monkeypatch):
+def test_staggered_routine_observers_share_slow_scan_pairs_for_five_seconds(routine_scan, monkeypatch):
     from process_fakes import _ModuleView
 
     scan = routine_scan
-    processes.shared_routine_rows()
+    started_at = scan.clock.now
+    deadline = started_at + 5
+    scan_started, polls = [], [0] * 10
+    direct_scan = processes._scan_tree_rows
+
+    def slow_scan():
+        scan_started.append(scan.clock.now)
+        result = direct_scan()
+        scan.clock.now += 0.4
+        return result
+
+    monkeypatch.setattr(processes, "_scan_tree_rows", slow_scan)
+    monkeypatch.setattr(processes, "fcntl", _ModuleView(processes.fcntl, flock=lambda *args: None))
+    # Each caller has its own launch observation and staggered polling phase.
+    pending = [(started_at + observer / 10, observer,
+                started_at + observer / 10 - processes.OBSERVER_POLL_INTERVAL)
+               for observer in range(10)]
+    heapq.heapify(pending)
+    while pending:
+        scheduled_at, observer, previous_poll = heapq.heappop(pending)
+        scan.clock.now = max(scan.clock.now, scheduled_at)
+        if scan.clock.now >= deadline:
+            break
+        poll_started_at = scan.clock.now
+        assert processes.observe_tree(scan.identities, shared=True, not_before=previous_poll) == [
+            *scan.identities, {"pid": scan.child.pid, "start_time": scan.child.start_time},
+        ]
+        polls[observer] += 1
+        # As in observe_children, wait one interval after this observation.
+        heapq.heappush(pending, (scan.clock.now + processes.OBSERVER_POLL_INTERVAL,
+                                observer, poll_started_at))
+
+    assert min(polls) >= 3  # All ten observers polled repeatedly during the five-second window.
+    assert 1 <= len(scan_started) <= 7
+    assert scan.table.list_calls == 2 * len(scan_started)
+
+
+def test_child_born_just_after_poll_start_is_witnessed_by_second_following_poll(routine_scan, tmp_path):
+    scan = routine_scan
+    previous_poll = scan.clock.now - processes.OBSERVER_POLL_INTERVAL
+    first_poll = scan.clock.now
+    processes.shared_routine_rows(not_before=previous_poll)
+    born_at = first_poll + 0.001
+    scan.clock.now = born_at
+    child = scan.table.add(42002, ppid=scan.root.pid, cwd=tmp_path, start_time=born_at)
+
+    scan.clock.now = first_poll + processes.OBSERVER_POLL_INTERVAL
+    assert child.pid not in {item["pid"] for item in processes.observe_tree(
+        scan.identities, shared=True, not_before=first_poll,
+    )}
+    assert scan.table.list_calls == 2  # A scan exactly at the previous poll's start is reusable.
+
+    previous_poll = scan.clock.now
+    scan.clock.now += processes.OBSERVER_POLL_INTERVAL
+    assert child.pid in {item["pid"] for item in processes.observe_tree(
+        scan.identities, shared=True, not_before=previous_poll,
+    )}
+    assert scan.clock.now - born_at <= 2 * processes.OBSERVER_POLL_INTERVAL
+    assert processes.OBSERVER_POLL_INTERVAL == 1.0
+    assert scan.table.list_calls == 4
+
+
+def test_contended_routine_scan_waiter_uses_writer_snapshot_without_scanning(routine_scan, monkeypatch):
+    from process_fakes import _ModuleView
+
+    scan = routine_scan
+    processes.shared_routine_rows(not_before=scan.clock.now)
+    payload = json.loads(scan.path.read_text())
+    scan.clock.now += 1
+    started_at = scan.clock.now
+    release_at = started_at + 0.4
+    payload["captured_at"] = started_at
+    operations, sleeps = [], []
+    writer = SimpleNamespace(held=True)
+
+    def flock(descriptor, operation):
+        operations.append(operation)
+        if operation == processes.fcntl.LOCK_UN:
+            return
+        assert operation == processes.fcntl.LOCK_EX | processes.fcntl.LOCK_NB
+        if writer.held:
+            raise BlockingIOError("fake writer scanning")
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        scan.clock.now += seconds
+        if writer.held and scan.clock.now >= release_at:
+            scan.path.write_text(json.dumps(payload))
+            writer.held = False
+
+    monkeypatch.setattr(processes, "fcntl", _ModuleView(processes.fcntl, flock=flock))
+    monkeypatch.setattr(processes.time, "sleep", sleep)
+    monkeypatch.setattr(processes, "_scan_tree_rows", lambda: pytest.fail("Waiter scanned instead of re-reading"))
+
+    rows, confirmed = processes.shared_routine_rows(not_before=started_at)
+    assert rows[scan.child.pid].start_time == confirmed[scan.child.pid].start_time == scan.child.start_time
+    assert scan.table.list_calls == 2  # Only the initial cache setup enumerated.
+    assert not writer.held
+    assert 0.4 <= sum(sleeps) < processes.ROUTINE_SCAN_LOCK_TIMEOUT
+    assert operations[-1] == processes.fcntl.LOCK_UN
+    assert json.loads(scan.path.read_text()) == payload
+
+
+def test_contended_routine_scan_lock_has_bounded_direct_fallback(routine_scan, monkeypatch):
+    from process_fakes import _ModuleView
+
+    scan = routine_scan
+    processes.shared_routine_rows(not_before=scan.clock.now)
     previous = scan.path.read_text()
     scan.clock.now += 1
     started_at = scan.clock.now
@@ -116,7 +206,9 @@ def test_contended_routine_scan_lock_has_immediate_direct_fallback(routine_scan,
 
     def scan_directly():
         scans.append(scan.clock.now - started_at)
-        return direct_scan()
+        result = direct_scan()
+        scan.clock.now += 0.4
+        return result
 
     def open_lock(path, *args, **kwargs):
         stream = open_path(path, *args, **kwargs)
@@ -137,9 +229,12 @@ def test_contended_routine_scan_lock_has_immediate_direct_fallback(routine_scan,
     assert processes.observe_tree(scan.identities, shared=True) == [
         *scan.identities, {"pid": scan.child.pid, "start_time": scan.child.start_time},
     ]
-    assert attempts == [processes.fcntl.LOCK_EX | processes.fcntl.LOCK_NB]
-    assert sleeps == []
-    assert scans == [0.0]
+    assert len(attempts) > 1
+    assert sum(sleeps) == pytest.approx(processes.ROUTINE_SCAN_LOCK_TIMEOUT)
+    assert all(0 < seconds <= processes.ROUTINE_SCAN_LOCK_RETRY_INTERVAL for seconds in sleeps)
+    assert scans == [processes.ROUTINE_SCAN_LOCK_TIMEOUT]
+    assert processes.ROUTINE_SCAN_LOCK_TIMEOUT == 2.0
+    assert scan.clock.now - started_at == pytest.approx(processes.ROUTINE_SCAN_LOCK_TIMEOUT + 0.4)
     assert scan.table.list_calls == 4
     assert len(streams) == 1 and streams[0].closed
     assert scan.path.read_text() == previous
@@ -147,10 +242,10 @@ def test_contended_routine_scan_lock_has_immediate_direct_fallback(routine_scan,
     assert not list(scan.path.parent.glob(".process-scan.json.*.tmp"))
 
 
-@pytest.mark.parametrize("elapsed", [0.51, -0.01])
+@pytest.mark.parametrize("elapsed", [1.0, -0.01])
 def test_stale_or_future_routine_scan_is_replaced_atomically(routine_scan, tmp_path, monkeypatch, elapsed):
     scan = routine_scan
-    processes.shared_routine_rows()
+    processes.shared_routine_rows(not_before=scan.clock.now)
     previous = scan.path.read_text()
     scan.clock.now += elapsed
     added = scan.table.add(42002, ppid=scan.child.pid, cwd=tmp_path, start_time=12)
@@ -172,13 +267,16 @@ def test_stale_or_future_routine_scan_is_replaced_atomically(routine_scan, tmp_p
     assert len(replacements) == 1 and not replacements[0].exists()
 
 
-def test_routine_scan_accepts_max_age_boundary_and_rereads_after_lock(routine_scan, monkeypatch):
+@pytest.mark.parametrize("offset", [-0.01, 0.0, 0.01])
+def test_routine_scan_checks_previous_poll_boundary_and_rereads_after_lock(routine_scan, monkeypatch, offset):
     scan = routine_scan
-    processes.shared_routine_rows()
+    captured_at = scan.clock.now
+    processes.shared_routine_rows(not_before=captured_at)
     payload = scan.path.read_text()
-    scan.clock.now += processes.ROUTINE_SCAN_MAX_AGE
-    processes.shared_routine_rows()
-    assert scan.table.list_calls == 2
+    scan.clock.now += 10  # Reuse is independent of fixed cache age.
+    not_before = captured_at - offset
+    processes.shared_routine_rows(not_before=not_before)
+    assert scan.table.list_calls == (4 if offset < 0 else 2)
     scan.path.unlink()
     locks = []
 
@@ -189,8 +287,8 @@ def test_routine_scan_accepts_max_age_boundary_and_rereads_after_lock(routine_sc
         yield
 
     monkeypatch.setattr(processes, "_routine_scan_lock", another_observer_published)
-    processes.shared_routine_rows()
-    assert scan.table.list_calls == 2
+    processes.shared_routine_rows(not_before=not_before)
+    assert scan.table.list_calls == (6 if offset < 0 else 2)
     assert locks == [scan.path.with_suffix(".lock")]
 
 
@@ -198,18 +296,22 @@ def test_backward_wall_clock_step_does_not_extend_routine_scan_reuse(routine_sca
     scan = routine_scan
     wall_clock = SimpleNamespace(now=1_700_000_000.0)
     monkeypatch.setattr(processes.time, "time", lambda: wall_clock.now)
-    processes.shared_routine_rows()
+    previous_poll = scan.clock.now
+    processes.shared_routine_rows(not_before=previous_poll)
     assert json.loads(scan.path.read_text())["captured_at"] == scan.clock.now
 
-    scan.clock.now += processes.ROUTINE_SCAN_MAX_AGE
-    wall_clock.now += processes.ROUTINE_SCAN_MAX_AGE
-    processes.shared_routine_rows()
+    scan.clock.now += processes.OBSERVER_POLL_INTERVAL
+    wall_clock.now += processes.OBSERVER_POLL_INTERVAL
+    processes.shared_routine_rows(not_before=previous_poll)
     assert scan.table.list_calls == 2
 
-    wall_clock.now -= processes.ROUTINE_SCAN_MAX_AGE / 2
+    previous_poll = scan.clock.now
+    wall_clock.now -= 10
     scan.clock.now += 0.01
     added = scan.table.add(42002, ppid=scan.child.pid, cwd=tmp_path, start_time=12)
-    assert added.pid in {item["pid"] for item in processes.observe_tree(scan.identities, shared=True)}
+    assert added.pid in {item["pid"] for item in processes.observe_tree(
+        scan.identities, shared=True, not_before=previous_poll,
+    )}
     assert scan.table.list_calls == 4
     assert json.loads(scan.path.read_text())["captured_at"] == scan.clock.now
 
@@ -217,7 +319,7 @@ def test_backward_wall_clock_step_does_not_extend_routine_scan_reuse(routine_sca
 @pytest.mark.parametrize("damage", ["json", "depth", "encoding", "version", "version_type", "time_type", "shape", "identity"])
 def test_invalid_shared_routine_scan_uses_correct_direct_rows(routine_scan, damage):
     scan = routine_scan
-    processes.shared_routine_rows()
+    processes.shared_routine_rows(not_before=scan.clock.now)
     value = json.loads(scan.path.read_text())
     if damage == "json":
         scan.path.write_text("{")
@@ -327,15 +429,15 @@ def test_shared_routine_cache_unlock_error_does_not_mask_enumeration_error(routi
 
 def test_shared_routine_rejects_cached_lifetime_and_adopts_reused_pid_next_scan(routine_scan, tmp_path):
     scan = routine_scan
-    processes.shared_routine_rows()
+    processes.shared_routine_rows(not_before=scan.clock.now)
     scan.table.exit(scan.child.pid)
     current = scan.table.add(scan.child.pid, ppid=scan.root.pid, cwd=tmp_path, start_time=12)
 
     identities = processes.observe_tree(scan.identities, shared=True)
     assert identities == scan.identities
-    assert scan.table.list_calls == 2  # The stale row is still within the shared interval.
+    assert scan.table.list_calls == 2  # The cached scan still meets this observation's threshold.
 
-    scan.clock.now += 0.51
+    scan.clock.now += processes.OBSERVER_POLL_INTERVAL
     assert processes.observe_tree(identities, shared=True) == [
         *scan.identities, {"pid": current.pid, "start_time": current.start_time},
     ]
@@ -360,7 +462,7 @@ def test_shared_routine_validates_every_adoption_before_traversing_descendants(
     descendant = scan.table.add(44000, ppid=candidate.pid, cwd=tmp_path, start_time=13)
     sibling = scan.table.add(45000, ppid=scan.root.pid, cwd=tmp_path, start_time=14)
     if cached:
-        processes.shared_routine_rows()
+        processes.shared_routine_rows(not_before=scan.clock.now)
     read_identity = processes.read_process_identity
     reads = []
 

@@ -5,47 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from foragent.actions import FlagContext
     from foragent.git import GitRepo
     from foragent.run_attempt import Implementation
     from foragent.runner import RunContext
-    from foragent.state import Approval, Run
-
-
-def _preserve_failed_implementation(
-    n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
-    approved_ref: str = "HEAD", title: str | None = None, pushed_head: str | None = None,
-    tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
-) -> None:
-    """Save stopped work before cleanup, including after the runner has died."""
-    branch = f"foragent/issue-{n}"
-    run = ctx.store.get_run(n)
-    git.local_skill_paths.update(run.local_skill_paths if run is not None else ())
-    conflicts = sorted(set(git.conflict_paths()) | set(run.merge_conflicts if run is not None else ()))
-    if conflicts:
-        ctx.store.update_run(n, merge_conflicts=conflicts)
-        if git.merge_in_progress():
-            # Save the exact partial resolution without declaring its target merged.
-            git.quit_merge()
-    git.stage_changes()
-    if approval is not None:
-        git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
-    if git.has_staged_changes():
-        git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
-    if git.head_sha() == pushed_head or not tracker_available:
-        return
-    try:
-        pr = ctx.tracker.find_pr(branch)
-    except run_publish.TrackerError as exc:
-        run_publish._append(ctx.store.log_path(n), f"WIP kept on local branch {branch}; open PR lookup failed: {exc}")
-        return
-    # An unverified WIP must not replace the head seen by an open PR's CI/review.
-    if pr is None:
-        if push_branch is not None:
-            push_branch()
-        else:
-            git.push(branch)
+    from foragent.state import Run
 
 
 def _push_branch(attempt: Implementation) -> None:

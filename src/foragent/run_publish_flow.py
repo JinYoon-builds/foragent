@@ -47,6 +47,10 @@ def _publish_locked(attempt: Implementation) -> str:
         # Exclude the merged base's paths from policy and patch replay. The
         # separate verified_base_sha advances only after verification/push.
         attempt.start_ref = move.target_sha
+        if not neutral:
+            # Protect what passes on the new base before merging it (#483).
+            from foragent.run_implementation import follow_base
+            follow_base(attempt)
         if conflicts is None:
             conflicts = _merge_moved_base(attempt, move.target_sha)
         if conflicts:

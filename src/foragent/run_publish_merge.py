@@ -140,18 +140,24 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
         finally:
             ctx.git.remove_worktree(worktree)
     prs = {pr.head: pr for pr in ctx.tracker.list_prs("merged", "foragent/issue-") if pr.base == branch}
-    lines = [f"Closes #{parent}", "", "## Children", ""]
+    # No closing keyword: the parent's completion belongs to the gate's order
+    # aggregation (board_parents), which comments first and keeps a parent with
+    # a not-planned child open. A merge here must not close it behind that.
+    lines = [run_publish.text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", ""]
     for child in sorted(children, key=lambda child: child.number):
         pr = prs.get(f"foragent/issue-{child.number}")
         lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
-    title = f"Batch: {ctx.tracker.get_issue(parent).title} (#{parent})"
+    issue = ctx.tracker.get_issue(parent)
+    title = f"Batch: {issue.title} (#{parent})"
     body = "\n".join(lines)
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
-        run_publish.board.sync_status(ctx, parent, "PR open")
+        if issue.state == "open":  # A completed order (#411) stays in Done.
+            run_publish.board.sync_status(ctx, parent, "PR open")
         return
     pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
-    run_publish.board.sync_status(ctx, parent, "PR open")
+    if issue.state == "open":
+        run_publish.board.sync_status(ctx, parent, "PR open")
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
 
 
