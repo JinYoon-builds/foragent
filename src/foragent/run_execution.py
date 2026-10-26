@@ -100,8 +100,10 @@ def _limit_wait(n: int, ctx: RunContext, detail: str) -> None:
 
 def _available_executor(
     n: int, ctx: RunContext, executor: Executor, *, reviewer: bool = False,
-    session_body: str | None = None, resume_prompt: str | None = None, **kwargs,
+    session_body: str | None = None, resume_prompt: str | None = None, flag_exhaustion: bool = True,
+    **kwargs,
 ) -> ExecResult:
+    """Run until the executor is available; ``flag_exhaustion=False`` leaves the block to the caller."""
     from foragent import runner
     from foragent.run_checks import _append
 
@@ -197,8 +199,9 @@ def _available_executor(
                 _append(kwargs["log_path"], f"Executor fallback model: {ctx.config.executor_fallback_model}")
         budget = ctx.config.transient_max_wait_minutes * 60 - ctx.store.get_run(n).executor_waited_seconds
         if budget <= 0:
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Executor unavailable (transient errors)",
-                 result.last_message or result.log_tail)
-            raise ExecutorStopped("retries-exceeded")
+            detail = result.last_message or result.log_tail
+            if flag_exhaustion:
+                flag(ctx, n, Reason.RETRIES_EXCEEDED, "Executor unavailable (transient errors)", detail)
+            raise ExecutorStopped("retries-exceeded", detail)
         _executor_wait(n, ctx, min(120 * 2 ** min(errors, 3), budget))
         errors += 1
