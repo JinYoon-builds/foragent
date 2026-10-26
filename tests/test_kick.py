@@ -130,6 +130,12 @@ def test_launchd_kickstart_needs_an_installed_job(monkeypatch, tmp_path):
     from foragent import launchd
     plist = tmp_path / "Library/LaunchAgents" / f"{launchd.label_for('owner/repo')}.plist"
     plist.parent.mkdir(parents=True)
-    plist.write_text("")
+    import plistlib
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"HOME": str(tmp_path)}}))
+    # An older job would start a tick without the gate environment: start directly instead.
+    assert kick._launchd_kickstart("owner/repo") is False and calls == []
+    plist.write_text("not a plist")  # Unknown environment: never trusted for a kickstart.
+    assert kick._launchd_kickstart("owner/repo") is False and calls == []
+    plist.write_bytes(plistlib.dumps({"EnvironmentVariables": dict(launchd.GATE_ENVIRONMENT)}))
     assert kick._launchd_kickstart("owner/repo") is True
     assert calls[0][:2] == ["launchctl", "kickstart"] and calls[0][2].endswith(launchd.label_for("owner/repo"))

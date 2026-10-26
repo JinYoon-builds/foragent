@@ -45,7 +45,10 @@ def _launchd_kickstart(repo: str) -> bool:
     from foragent import launchd
 
     label = launchd.label_for(repo)
-    if not (Path.home() / "Library/LaunchAgents" / f"{label}.plist").is_file():
+    plist = launchd.installed_plist(repo)
+    # Kickstart only a job known to carry the gate environment; an older or
+    # unreadable one gets the direct start, which sets it (launchd.refresh_if_stale).
+    if not launchd.has_gate_environment(plist):
         return False
     try:
         result = subprocess.run(["launchctl", "kickstart", f"gui/{os.getuid()}/{label}"],
