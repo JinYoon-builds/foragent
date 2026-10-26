@@ -151,3 +151,15 @@ def test_done_item_with_a_lane_name_wider_than_the_line_wraps_instead_of_cutting
     lines = plain(done.render(snapshot, config, None, width=40))
     assert all(watch._cells(line) <= 40 for line in lines)
     assert " ".join(" ".join(lines[1:]).split()).endswith(" ".join(lane_title.split()))
+
+
+def test_idle_lane_continuation_lines_keep_their_indent(tmp_path):
+    tracker = FakeTracker()
+    store = StateStore(tmp_path, now=lambda: NOW)
+    lanes = {f"lane-{i}": {"title": f"Long lane name {i}", "emoji": "🧩"} for i in range(6)}
+    config = Config(lanes=lanes)
+    tracker.add_issue(90, "Order")
+    finish(tracker, store, 1, 90, lane="lane-0")
+    lines = watch.render_frame(collected(tracker, store, config), config, tmp_path, width=80).splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("idle lanes:"))
+    assert lines[start + 1].startswith("  ") and lines[start + 1][2] != " "

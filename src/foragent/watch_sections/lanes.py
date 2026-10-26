@@ -147,7 +147,9 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         for index, row in idle:
             count = len(snapshot.done.get(row["slug"], []))
             items.append(f"{index} {row['lane_display']}" + (" " + t("done_state_lane_done", count=count) if count else ""))
-        roads += [watch._line(line) for line in _flow(t("watch_idle_lanes") + ":", items, road_width)]
+        # Clean the parts first: cleaning a finished line would collapse the continuation indent.
+        flowed = _flow(watch._clean(t("watch_idle_lanes") + ":"), [watch._clean(item) for item in items], road_width)
+        roads += [[(line, "")] for line in flowed]
         roads.append([("━" * road_width, "edge")])
     context.get("hits", []).append((0, top, orchestrator_width, top + len(left), ("orchestrator", None)))
     # The arrows point from the orchestrator to working lanes; with every lane idle they go.
