@@ -1,6 +1,7 @@
 """Wait for late file claims and persist file-level overlap/conflict evidence."""
 
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 from glob import escape
@@ -10,17 +11,34 @@ from foragent.overlap_files import Claim, any_overlap, approved_issue, at_capaci
 from foragent.run_checks import _append
 from foragent.run_waits import _credited_wait, _phase
 
+# Seconds between re-checks while a late file waits for its holders. Each check
+# measures this run and every peer, so a short poll multiplies tick load.
+OVERLAP_POLL_SECONDS = 15
+
+
+def _edited(run, edit) -> list[dict] | None:
+    """The edited rows, or None when ``edit`` leaves them as they are."""
+    rows = {row["file"]: deepcopy(row) for row in run.overlap_records}
+    edit(rows)
+    records = [rows[path] for path in sorted(rows)]
+    return None if records == run.overlap_records else records
+
 
 def _edit_records(ctx, number, edit) -> None:
     # Each runner may observe the same peer. Merge evidence under the state
     # lock so one observer cannot overwrite another's peers or conflict time.
+    # Edits only add evidence, so rows that already hold it need neither the
+    # lock nor a write.
+    run = ctx.store.get_run(number)
+    if run is None or run.status == "finished" or _edited(run, edit) is None:
+        return
     with ctx.store._state_lock():
         run = ctx.store.get_run(number)
         if run.status == "finished":
             return
-        rows = {row["file"]: dict(row) for row in run.overlap_records}
-        edit(rows)
-        ctx.store._write_run(replace(run, overlap_records=[rows[path] for path in sorted(rows)]))
+        records = _edited(run, edit)
+        if records is not None:
+            ctx.store._write_run(replace(run, overlap_records=records))
 
 
 def _record_peers(ctx, owner: Claim, peers: list[Claim], *, union: set[str] | None = None) -> None:
@@ -87,7 +105,7 @@ def wait_for_overlap(attempt) -> None:
 
     def acquire():
         while blocked():
-            ctx.sleep(1)
+            ctx.sleep(OVERLAP_POLL_SECONDS)
 
     previous_phase = ctx.store.get_run(n).phase
     _append(ctx.store.log_path(n), text(

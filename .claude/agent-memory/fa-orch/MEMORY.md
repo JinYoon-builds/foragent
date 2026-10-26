@@ -134,3 +134,4 @@
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
 - #127: `StateStore.write_heartbeat(side, at)`/`heartbeats()`(state.py)가 `<state>/orch-heartbeat.json`·`gate-heartbeat.json`을 덮어쓴다. watch는 매 읽기 전, gate는 `tick()`에서 tick lock을 얻은 직후 쓴다(busy tick은 ctx에 store만 있는 `test_kick` 시험 때문에 쓰지 않음). `fa orch alive`는 `INBOX_ACTIONS`에 넣어 GitHub 없이 처리, 30초 이하면 alive. 인수 `tests/acceptance/test_heartbeats.py` 4개.
 - #521 이후 CI 제외 목록은 커밋 trailer로 전달되고 main은 `.foragent/acceptance-exclusions.json`을 추적하지 않는다. 병합 충돌(UD)이면 파일을 지운다.
+- #547: `update_run`은 `observe=True` 또는 `pid`·`process_identities`·`executor_pgid`가 있을 때만 프로세스 표를 읽는다. 메타데이터만 바꾸는 갱신에 기대 후손을 관찰하던 단위 시험은 `observe=True`를 명시해 의도를 유지한다.
