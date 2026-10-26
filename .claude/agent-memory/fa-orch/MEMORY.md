@@ -140,3 +140,4 @@
 - #547: `update_run`은 `observe=True` 또는 `pid`·`process_identities`·`executor_pgid`가 있을 때만 프로세스 표를 읽는다. 메타데이터만 바꾸는 갱신에 기대 후손을 관찰하던 단위 시험은 `observe=True`를 명시해 의도를 유지한다.
 - #551: tick의 origin 설정 읽기는 `TickContext.committed_config`(gate만 True)로 켠다. 기본 False라 Config를 직접 주는 단위 시험은 영향 없음. test_cli의 FakeGit은 `blob_sha`·`_call(cat-file)`로 로컬 파일을 커밋본처럼 흉내 낸다. `fa test`는 .foragent.yml 있는 곳에서만 돈다: 기준선은 worktree에서 `PYTHONPATH=<archive>/src`로.
 - `test_scheduler_split.py`가 facade `scheduler.py`를 250줄로 제한한다. scheduler에 줄을 더하면 같은 수만큼 줄이거나 분할 모듈로 옮긴다. 바꾼 파일마다 `tests/acceptance/test_*split*.py` 전부를 돌려 확인한다.
+- [#128 orch spawn](project_128_orch_spawn.md) — gate opens orchestrator; conftest opt-out; scheduler.py 250-line cap
