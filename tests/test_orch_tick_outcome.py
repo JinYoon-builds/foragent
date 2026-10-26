@@ -99,3 +99,66 @@ def test_tick_inside_a_held_lock_reenters_but_plain_nesting_stays_busy(store):
     with store.tick_lock() as outer, store.tick_lock() as nested:
         assert (outer, nested) == (True, False)
     assert orch_tick_outcome.read(store)["status"] == "ok"
+
+
+def test_step_outside_a_recorded_tick_only_runs_the_step(capsys):
+    with orch_tick_outcome.step("alone"):
+        pass
+    assert orch_tick_outcome.timed("alone", lambda value: value + 1, 1) == 2
+    assert capsys.readouterr().err == ""
+
+
+def test_recorded_steps_keep_order_and_never_exceed_duration(store, pushes, monkeypatch, capsys):
+    clock = [0.0]
+    monkeypatch.setattr(orch_tick_outcome.time, "monotonic", lambda: clock[0])
+
+    def tick():
+        for name, seconds in (("first", 0.1), ("second", 0.2)):
+            with orch_tick_outcome.step(name):
+                clock[0] += seconds
+
+    orch_tick_outcome.run_recorded(store, Config(), "o/r", tick)
+    record = orch_tick_outcome.read(store)
+    assert [item["name"] for item in record["steps"]] == ["first", "second"]
+    assert sum(item["seconds"] for item in record["steps"]) <= record["duration_seconds"]
+    assert capsys.readouterr().err == ""
+
+
+def test_failing_step_records_its_elapsed_time_and_slow_line(store, pushes, monkeypatch, capsys):
+    clock = [0.0]
+    monkeypatch.setattr(orch_tick_outcome.time, "monotonic", lambda: clock[0])
+
+    def tick():
+        with orch_tick_outcome.step("slow"):
+            clock[0] += 61.0
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        orch_tick_outcome.run_recorded(store, Config(), "o/r", tick)
+    record = orch_tick_outcome.read(store)
+    assert record["steps"] == [{"name": "slow", "seconds": 61.0}]
+    assert capsys.readouterr().err.count("slow") == 1
+
+
+def test_github_wait_budget_failure_records_its_step_and_slow_line(store, pushes, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from foragent import scheduler
+
+    clock = [0.0]
+    monkeypatch.setattr(orch_tick_outcome.time, "monotonic", lambda: clock[0])
+    store.github_wait_until = lambda now: now + timedelta(minutes=5)
+
+    def budgets(ctx, ready):
+        clock[0] += 75.0
+        raise RuntimeError("budget failed")
+
+    monkeypatch.setattr(scheduler, "_apply_budgets", budgets)
+    ctx = SimpleNamespace(store=store, now=lambda: store.clock[0])
+    with pytest.raises(RuntimeError):
+        orch_tick_outcome.run_recorded(
+            store, Config(), "o/r", lambda: scheduler._github_wait(ctx, {}, "github_wait_check"))
+    record = orch_tick_outcome.read(store)
+    assert record["steps"] == [{"name": "github_wait_check", "seconds": 75.0}]
+    err = capsys.readouterr().err.splitlines()
+    assert len(err) == 1 and "github_wait_check" in err[0] and "75" in err[0]
