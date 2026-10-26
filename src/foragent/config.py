@@ -2,7 +2,7 @@
 
 from collections import Counter
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 import re
@@ -436,6 +436,13 @@ def set_profile(repo_root: Path, *, kind: str, stage: str, priority: str) -> dic
 
 def resolved_reviewer(config: Config) -> str:
     return config.reviewer or ("claude" if config.executor == "codex" else "codex")
+
+
+def lane_executors(config: Config, lane: str) -> set[str]:
+    """The implementer and reviewer a lane uses; an unset reviewer follows the lane's implementer."""
+    settings = config.lanes.get(lane, {}) if lane != "main" else {}
+    lane_config = replace(config, executor=settings.get("executor") or config.executor)
+    return {lane_config.executor, resolved_reviewer(lane_config)}
 
 
 def in_run_hours(now: datetime, run_hours: str) -> bool:

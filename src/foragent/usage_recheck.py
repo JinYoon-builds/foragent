@@ -25,7 +25,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from foragent import statusline
-from foragent.config import resolved_reviewer
+from foragent.config import lane_executors
 from foragent.orch_events import append_event
 from foragent.usage_events import _number, _window_name
 
@@ -54,13 +54,39 @@ def _read_pauses(store: StateStore) -> dict[str, str]:
     return value if isinstance(value, dict) else {}
 
 
-def note_limit(store: StateStore, executor: str, until: datetime, windows: list[dict] | None, now: datetime) -> None:
-    """Pause ``executor`` and remember which windows were exhausted, and how full, in one write.
+def _pause_lane(store: StateStore, lane: str, until: datetime) -> None:
+    """Hold ``lane`` until ``until``; the caller holds the state lock."""
+    path = store.root / "lane-pauses.json"
+    lanes = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if lane not in lanes or datetime.fromisoformat(lanes[lane]) < until:
+        lanes[lane] = until.astimezone(UTC).isoformat()
+    store._write_json(path, lanes)
 
-    The pause and its note change together under the state lock, so a recheck
-    never sees one without the other. Like ``pause_executor`` the later deadline
+
+def hold_lane(store: StateStore, executor: str, lane: str, now: datetime) -> datetime | None:
+    """Pause ``lane`` behind an active pause of ``executor`` and return its end, or None when free.
+
+    The check and the lane write share one state-lock section, so a recovery
+    that clears the executor cannot leave a lane paused behind nothing.
+    """
+    with store._state_lock():
+        stamp = _read_pauses(store).get(executor)
+        until = datetime.fromisoformat(stamp) if stamp else None
+        if until is None or now >= until:
+            return None
+        _pause_lane(store, lane, until)
+        return until
+
+
+def note_limit(store: StateStore, executor: str, until: datetime, windows: list[dict] | None, now: datetime,
+               lane: str | None = None) -> datetime:
+    """Pause ``executor`` (and ``lane``) and note which windows were exhausted, in one write.
+
+    The pauses and the note change together under the state lock, so a recheck
+    never sees one without the others. Like ``pause_executor`` the later deadline
     wins; an active pause's exhausted windows are kept and each window keeps its
     lowest (strictest) level, so a repeated limit never loosens recovery.
+    Returns the deadline now in force.
     """
     exhausted = [{"name": window["name"], "used_percent": window.get("used_percent")}
                  for window in windows or [] if window.get("exhausted")]
@@ -88,6 +114,9 @@ def note_limit(store: StateStore, executor: str, until: datetime, windows: list[
         records[executor] = {"until": stamp, "since": now.astimezone(UTC).isoformat(),
                              "exhausted": exhausted, "checked_at": None}
         store._write_json(store.root / _RECORD, records)
+        if lane is not None:
+            _pause_lane(store, lane, until)
+    return until
 
 
 def _claim(store: StateStore, executor: str, pause: str, now: datetime, interval: timedelta) -> dict | None:
@@ -246,10 +275,7 @@ def _clear(ctx: TickContext, executor: str, until: datetime, pause: str, mark: d
         path = store.root / "lane-pauses.json"
         lanes = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         for lane, value in list(lanes.items()):
-            settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
-            implementer = settings.get("executor") or ctx.config.executor
-            uses = executor in {implementer, resolved_reviewer(ctx.config)}
-            if uses and datetime.fromisoformat(value) <= until:
+            if executor in lane_executors(ctx.config, lane) and datetime.fromisoformat(value) <= until:
                 del lanes[lane]
         store._write_json(path, lanes)
     return True

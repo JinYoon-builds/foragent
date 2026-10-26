@@ -169,3 +169,59 @@ def test_limit_note_written_between_the_pause_read_and_the_mark_survives(tmp_pat
     assert original("codex", ctx.now()) == renewed
     # A later deadline is a newer view than this tick's, so it waits; the same deadline is checked now.
     assert len(reads) == (0 if renewal == "later-until" else 1)
+
+
+def test_recovery_frees_a_lane_whose_default_reviewer_follows_its_own_executor(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state")
+    until = NOW + timedelta(hours=2)
+    usage_recheck.note_limit(store, "codex", until, [{"name": "5h", "used_percent": 100, "exhausted": True}], NOW)
+    store.pause_lane("ui", until)
+    # Global codex with no reviewer set: the claude lane's reviewer is codex, not claude.
+    config = Config(executor="codex", lanes={"ui": {"executor": "claude"}})
+    ctx = SimpleNamespace(store=store, config=config, now=lambda: NOW + timedelta(minutes=10))
+    monkeypatch.setattr(usage_recheck, "read_codex", lambda now: [{"name": "5h", "used_percent": 3}])
+    assert usage_recheck.recheck(ctx) == ["codex"]
+    assert not store.lane_paused("ui", ctx.now())
+
+
+@pytest.mark.parametrize("lane,expected", [("main", {"codex", "claude"}), ("ui", {"claude", "codex"}),
+                                           ("data", {"codex", "claude"}), ("solo", {"claude"})])
+def test_lane_executors_resolve_the_reviewer_per_lane(lane, expected):
+    from foragent.config import lane_executors
+
+    config = Config(executor="codex", lanes={"ui": {"executor": "claude"}, "data": {}})
+    if lane == "solo":
+        config = Config(executor="codex", reviewer="claude", lanes={"solo": {"executor": "claude"}})
+    assert lane_executors(config, lane) == expected
+
+
+def test_limit_pauses_executor_and_lane_in_one_write_so_recovery_frees_both(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state")
+    until = NOW + timedelta(hours=2)
+    writes = []
+    original = store._write_json
+    monkeypatch.setattr(store, "_write_json", lambda path, value: writes.append(path.name) or original(path, value))
+    assert usage_recheck.note_limit(store, "codex", until, [{"name": "5h", "used_percent": 100, "exhausted": True}],
+                                    NOW, lane="ui") == until
+    assert store.lane_paused("ui", NOW) and store.executor_paused("codex", NOW)
+    ctx = SimpleNamespace(store=store, config=Config(executor="codex", reviewer="codex"),
+                          now=lambda: NOW + timedelta(minutes=10))
+    monkeypatch.setattr(usage_recheck, "read_codex", lambda now: [{"name": "5h", "used_percent": 3}])
+    assert usage_recheck.recheck(ctx) == ["codex"]
+    assert not store.lane_paused("ui", ctx.now()) and not store.executor_paused("codex", ctx.now())
+    assert writes[:3] == ["executor-pauses.json", "usage-recheck.json", "lane-pauses.json"]
+
+
+def test_hold_lane_after_recovery_leaves_the_lane_free(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state")
+    until = NOW + timedelta(hours=2)
+    usage_recheck.note_limit(store, "codex", until, [{"name": "5h", "used_percent": 100, "exhausted": True}], NOW)
+    assert usage_recheck.hold_lane(store, "codex", "ui", NOW) == until
+    assert store.lane_paused("ui", NOW)
+    ctx = SimpleNamespace(store=store, config=Config(executor="codex", reviewer="codex"),
+                          now=lambda: NOW + timedelta(minutes=10))
+    monkeypatch.setattr(usage_recheck, "read_codex", lambda now: [{"name": "5h", "used_percent": 3}])
+    assert usage_recheck.recheck(ctx) == ["codex"]
+    # A runner that checks after the recovery sees no pause and writes no lane pause.
+    assert usage_recheck.hold_lane(store, "codex", "data", ctx.now()) is None
+    assert not store.lane_paused("data", ctx.now()) and not store.lane_paused("ui", ctx.now())

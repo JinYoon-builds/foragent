@@ -89,11 +89,9 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         _progress(n, ctx)
 
 
-def _limit_wait(n: int, ctx: RunContext, executor: str, lane: str, until: datetime, detail: str) -> None:
-    """Pause ``executor`` for every lane until ``until`` and hand the issue back to the queue."""
+def _limit_wait(n: int, ctx: RunContext, detail: str) -> None:
+    """Hand the issue back to the queue; ``usage_recheck`` already wrote the executor and lane pauses."""
     ctx.store.update_run(n, detail=detail)
-    ctx.store.pause_executor(executor, until)
-    ctx.store.pause_lane(lane, until)
     ctx.tracker.add_labels(n, [READY])
     ctx.tracker.remove_labels(n, [RUNNING])
     board.sync_status(ctx, n, "Ready")
@@ -132,9 +130,8 @@ def _available_executor(
     while True:
         run = ctx.store.get_run(n)
         # Another run may have hit this executor's usage limit; never launch it before the reset.
-        if (until := ctx.store.executor_pause_until(name, ctx.now())) is not None:
-            _limit_wait(n, ctx, name, run.lane, until,
-                        f"{name} is paused for a usage limit until {until.isoformat()}.")
+        if (until := usage_recheck.hold_lane(ctx.store, name, run.lane, ctx.now())) is not None:
+            _limit_wait(n, ctx, f"{name} is paused for a usage limit until {until.isoformat()}.")
         if not reviewer and run.fallback_model is not None:
             kwargs["model"] = run.fallback_model
         kwargs["timeout_s"] = runner._remaining(n, ctx)
@@ -190,9 +187,9 @@ def _available_executor(
             now = ctx.now()
             windows = (result.usage or {}).get(name)
             until = usage_events.limit_reset(windows, now, now + timedelta(minutes=ctx.config.limit_wait_minutes))
-            usage_recheck.note_limit(ctx.store, name, until, windows, now)  # The gate may end it early.
-            _limit_wait(n, ctx, name, run.lane, until,
-                        result.last_message or result.log_tail or "Executor usage limit reached.")
+            # One write pauses the executor and lane and notes the levels; the gate may end it early.
+            usage_recheck.note_limit(ctx.store, name, until, windows, now, lane=run.lane)
+            _limit_wait(n, ctx, result.last_message or result.log_tail or "Executor usage limit reached.")
         if kind == "transient" and not reviewer:
             run = ctx.store.update_run(n, transient_errors=run.transient_errors + 1)
             if run.transient_errors >= 2 and ctx.config.executor_fallback_model and run.fallback_model is None:
