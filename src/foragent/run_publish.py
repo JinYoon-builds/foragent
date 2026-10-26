@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field, replace
+from glob import escape
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
@@ -15,6 +16,8 @@ from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, req
 from foragent.git import GitError, GitRepo, PublicationError
 from foragent.issue import ParsedIssue, body_hash
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
+from foragent.orch_events import append_event
+from foragent.overlap_files import any_overlap
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped
@@ -322,6 +325,48 @@ def _preserve_failed_implementation(
     tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
 ) -> None:
     """Save stopped work before cleanup, including after the runner has died."""
+    with ctx.store.worktree_lock(n):
+        # Recheck only after acquiring the lock: a competing cleanup may have
+        # removed the worktree while we waited. A parent repository is no save.
+        if not (git.root / ".git").is_file():
+            return
+        try:
+            git.check_worktree()
+        except GitError:
+            return
+        _preserve_locked_implementation(
+            n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
+            pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
+        )
+
+
+def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> list[str]:
+    """Leave unowned deletions out of the index without discarding other work."""
+    deletions = git.staged_deletions()
+    if not deletions:
+        return []
+    patterns = []
+    if run is not None:
+        patterns.extend(run.declared_files or [])
+        patterns.extend([escape(path) for path in run.effective_files or []]
+                        if run.files_committed else run.effective_files or [])
+        patterns.extend(escape(path) for path in [*(run.changed_files or []), *run.late_files])
+    base = (run.files_base_branch if run is not None else None) or ctx.config.base_branch
+    committed = git.committed_paths(f"origin/{base}")
+    artifacts = git.artifact_paths()
+    refused = sorted(path for path in deletions
+                     if path not in committed
+                     and not any(path == root or path.startswith(root + "/") for root in artifacts)
+                     and not any_overlap(ctx, [escape(path)], patterns))
+    git.restore_staged_paths("HEAD", refused)
+    return refused
+
+
+def _preserve_locked_implementation(
+    n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
+    approved_ref: str, title: str | None, pushed_head: str | None,
+    tracker_available: bool, push_branch: Callable[[], None] | None,
+) -> None:
     branch = f"foragent/issue-{n}"
     run = ctx.store.get_run(n)
     git.local_skill_paths.update(run.local_skill_paths if run is not None else ())
@@ -334,8 +379,13 @@ def _preserve_failed_implementation(
     git.stage_changes()
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
+    refused = _check_wip_deletions(ctx, git, run)
     if git.has_staged_changes():
         git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
+    if refused:
+        detail = "WIP preservation refused: deletions outside allowed paths: " + ", ".join(map(repr, refused[:10]))
+        _append(ctx.store.log_path(n), detail)
+        append_event(ctx.store, ctx.now(), n, "wip-preservation-refused", detail)
     if git.head_sha() == pushed_head or not tracker_available:
         return
     try:
@@ -474,6 +524,14 @@ def _publish_locked(attempt: Implementation) -> str:
             flag(ctx, n, Reason.TIMEOUT, "base kept moving")
             raise ExecutorStopped("timeout")
         _append(log, f"{REUSED if neutral else REVERIFY}: {move.target_sha}")
+        if not neutral:
+            # Protect what passes on the new base, not on the old one (#483).
+            from foragent.run_implementation import capture_acceptance_baseline
+            # Keep the command the protected set was captured with; the branch
+            # may have changed the files test-command detection reads.
+            command = attempt.baseline.test_command if attempt.baseline else None
+            attempt.baseline = capture_acceptance_baseline(
+                n, ctx, git, attempt.target_branch, move.target_sha, command)
         # Exclude the merged base's paths from policy and patch replay. The
         # separate verified_base_sha advances only after verification/push.
         attempt.start_ref = move.target_sha

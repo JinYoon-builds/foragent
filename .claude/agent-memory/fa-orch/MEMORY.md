@@ -132,6 +132,7 @@
 - [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order, conftest opt-out
 - [#497 memory critical line](project_497_memory_critical.md) — raw kernel level, critical holds starts only, floors in IGNORED_KEYS
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
+- [#514 neutral config/locked moves](project_514_neutral_more.md) — config key rules; Done when included #483 test → applied #483 WIP diff
 - #127: `StateStore.write_heartbeat(side, at)`/`heartbeats()`(state.py)가 `<state>/orch-heartbeat.json`·`gate-heartbeat.json`을 덮어쓴다. watch는 매 읽기 전, gate는 `tick()`에서 tick lock을 얻은 직후 쓴다(busy tick은 ctx에 store만 있는 `test_kick` 시험 때문에 쓰지 않음). `fa orch alive`는 `INBOX_ACTIONS`에 넣어 GitHub 없이 처리, 30초 이하면 alive. 인수 `tests/acceptance/test_heartbeats.py` 4개.
 - #521 이후 CI 제외 목록은 커밋 trailer로 전달되고 main은 `.foragent/acceptance-exclusions.json`을 추적하지 않는다. 병합 충돌(UD)이면 파일을 지운다.
 - [#416 retry fixes](project_416_retry_fixes.md) — retry marker, stop file path, majority-only rebuild, contradicting locked tests
@@ -140,4 +141,12 @@
 - #547: `update_run`은 `observe=True` 또는 `pid`·`process_identities`·`executor_pgid`가 있을 때만 프로세스 표를 읽는다. 메타데이터만 바꾸는 갱신에 기대 후손을 관찰하던 단위 시험은 `observe=True`를 명시해 의도를 유지한다.
 - #551: tick의 origin 설정 읽기는 `TickContext.committed_config`(gate만 True)로 켠다. 기본 False라 Config를 직접 주는 단위 시험은 영향 없음. test_cli의 FakeGit은 `blob_sha`·`_call(cat-file)`로 로컬 파일을 커밋본처럼 흉내 낸다. `fa test`는 .foragent.yml 있는 곳에서만 돈다: 기준선은 worktree에서 `PYTHONPATH=<archive>/src`로.
 - [#459 merge groups](project_459_merge_group.md) — claim timing, regroup on moved base, dequeue before merge, _HOLDS registry, needs-human hold
+- [#533 review panel](project_533_review_panel.md) — _panel_review threads+merge, orch_reviewers state override, limit re-raise
 - `test_scheduler_split.py`가 facade `scheduler.py`를 250줄로 제한한다. scheduler에 줄을 더하면 같은 수만큼 줄이거나 분할 모듈로 옮긴다. 바꾼 파일마다 `tests/acceptance/test_*split*.py` 전부를 돌려 확인한다.
+- #561: `tests/acceptance/test_ci_mode.py`(54개)는 부하 중 ~30분 걸려 Stop hook의 check-done이 "Check timed out"을 낸다. 실패가 아니므로 `fa test`를 timeout 7200000 백그라운드로 따로 돌려 확인한다.
+- [#564 tick step times](project_564_step_times.md) — step/timed contextvar, scheduler.py 250-line cap via scheduler_start re-export
+- [#567 CI exclusions drift](project_567_ci_exclusions_drift.md) — subset rule, keep payload/scope excluded equal, slow test_ci_mode under load
+- `test_scheduler_split.py`가 facade `scheduler.py`를 250줄로 제한한다. scheduler에 줄을 더하면 같은 수만큼 줄이거나 분할 모듈로 옮긴다. 바꾼 파일마다 `tests/acceptance/test_*split*.py` 전부를 돌려 확인한다.
+- [#128 orch spawn](project_128_orch_spawn.md) — gate opens orchestrator; conftest opt-out; scheduler.py 250-line cap
+- #591: `orch_reinstall._uv()`가 uv 설치의 디렉터리 경쟁 오류만 3회까지 재시도(`sleep` 모듈 속성)하며 update_check도 이 함수를 공유한다. 게이트 자식 환경은 `launcher.gate_environment()`; launcher·kick·launchd 단위 시험은 Popen 인자 집합을 정확히 비교한다.
+- #591 리뷰: 패키지 안 `sys.dont_write_bytecode`는 `__init__.pyc`가 먼저 써져 늦다. 틱이 `launchd.refresh_from_tick()`로 예전 plist를 따로 떨어진 갱신 프로세스(틱 잠금 대기→`update_check._restart`)로 다시 올린다. scheduler 파사드는 250줄 제한. 게이트 작업은 파일 이름이 아니라 `installed_jobs()`의 `--repo-root`로 찾고(옛 이름·개명 plist 포함), 읽지 못한 plist는 최신으로 보지 않는다. plist는 bootout→수정→bootstrap 안에서만 바꾸고, `launchctl print` 실패는 없음(113)과 모름을 나눈다.
