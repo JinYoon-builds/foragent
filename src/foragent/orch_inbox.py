@@ -177,8 +177,9 @@ def note_location(environ: dict[str, str], title: str | None = None,
                   tmux_pane: str | None = None) -> dict[str, Any]:
     """Where this orchestrator session runs, from facts in its environment only."""
     handle = environ.get("ORCA_TERMINAL_HANDLE")
-    if handle:
-        return {"kind": "orca", "handle": handle,
+    # An explicit Orca title is a fact too, even when the handle is not in this environment.
+    if handle or (title and not tmux_pane):
+        return {"kind": "orca", "handle": handle or None,
                 "title": title or environ.get("FORAGENT_ORCH_TITLE")}
     pane = tmux_pane or (environ.get("TMUX_PANE") if environ.get("TMUX") else None)
     if pane:
