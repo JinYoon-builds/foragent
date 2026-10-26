@@ -1,6 +1,5 @@
 """`fa gate`: schedule and inspect approved issues."""
 
-from foragent import gh
 from foragent.commands import facade
 
 ORDER = 110
@@ -178,7 +177,7 @@ def run(args) -> int:
     tracker = cli.GhTracker(repo)
     store = cli.StateStore.for_repo(repo)
     # Status, watch and run gh calls count too, not only those inside a tick context.
-    gh.set_recorder(store, lambda: cli.datetime.now(cli.UTC))
+    cli.gh.set_recorder(store, lambda: cli.datetime.now(cli.UTC))
     if args.action == "tick":
         _tick(args, root, git, config, repo, tracker, store)
     elif args.action == "status":
