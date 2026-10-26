@@ -82,8 +82,10 @@ def _add_inbox(orch_actions) -> None:
     alive = orch_actions.add_parser("alive", help=cli.text("heartbeats_help"))
     alive.add_argument("--json", action="store_true")
     alive.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-    queue = orch_actions.add_parser("queue", help="Set, show or clear a lane's preferred start order")
-    queue.add_argument("lane")
+    queue = orch_actions.add_parser("queue", help="Set, show or clear a lane's or the cross-lane start order")
+    queue.add_argument("lane", nargs="?", help="Lane name; with --global, the first issue number")
+    queue.add_argument("--global", dest="global_", action="store_true",
+                       help="The cross-lane priority list instead of one lane's queue")
     queue.add_argument("numbers", type=int, nargs="*", help="Issue numbers in start order; none shows the queue")
     queue.add_argument("--clear", action="store_true")
     queue.add_argument("--json", action="store_true")
@@ -115,6 +117,28 @@ def _reviewers(args, store, config) -> None:
     print(text("orch_reviewers_set", language, issue=args.issue, count=args.count))
 
 
+def _global_queue(args, store, config) -> None:
+    """Cross-lane priority list in the state directory; argparse puts the first number in ``lane``."""
+    cli = facade()
+    text, language = cli.text, config.language
+    numbers = list(args.numbers)
+    if args.lane is not None:
+        try:
+            numbers.insert(0, int(args.lane))
+        except ValueError:
+            raise SystemExit(text("orch_queue_global_number", language, value=args.lane)) from None
+    if args.clear and numbers:
+        raise SystemExit(text("orch_queue_global_usage", language))
+    order = cli.orch_queue.set_global(store, []) if args.clear else (
+        cli.orch_queue.set_global(store, numbers) if numbers else cli.orch_queue.get_global(store))
+    if args.json:
+        print(cli.json.dumps({"lane": None, "order": order}))
+    elif order:
+        print(text("orch_queue_global_show", language, order=" ".join(f"#{n}" for n in order)))
+    else:
+        print(text("orch_queue_global_empty", language))
+
+
 def _orch_inbox(args, store, config, repo: str) -> None:
     """Local request/question box; never reads GitHub or starts an executor."""
     cli = facade()
@@ -126,6 +150,11 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         _alive(args, store, config)
         return
     if args.action == "queue":
+        if args.global_:
+            _global_queue(args, store, config)
+            return
+        if args.lane is None:
+            raise SystemExit(cli.text("orch_queue_lane_required", config.language))
         if args.clear and args.numbers:
             raise SystemExit("fa orch queue: give issue numbers or --clear, not both")
         order = cli.orch_queue.set_order(store, args.lane, []) if args.clear else (

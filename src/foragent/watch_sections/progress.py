@@ -321,9 +321,8 @@ def render(snapshot: Any, config: Config, repo_root: Path, **context: Any) -> li
         lines.append([(text("progress_bar", language, bar=bar, completed=snapshot.completed,
                                  total=snapshot.total, orders=snapshot.orders), "green")])
         remaining = snapshot.total - snapshot.completed
-        if remaining <= 0:
-            lines.append([(text("progress_done", language), "")])
-        else:
+        # A finished order has no line here: the done section announces it.
+        if remaining > 0:
             # Without remaining approved work there is no estimate line.
             if snapshot.eta is not None:
                 low, high = snapshot.eta_range or (snapshot.eta, snapshot.eta)

@@ -133,6 +133,7 @@
 - [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order, conftest opt-out
 - [#497 memory critical line](project_497_memory_critical.md) — raw kernel level, critical holds starts only, floors in IGNORED_KEYS
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
+- [#483 baseline follows base](project_483_baseline_follows_base.md) — re-capture baseline on result-affecting base move; detect test command at new base
 - [#514 neutral config/locked moves](project_514_neutral_more.md) — config key rules; Done when included #483 test → applied #483 WIP diff
 - #127: `StateStore.write_heartbeat(side, at)`/`heartbeats()`(state.py)가 `<state>/orch-heartbeat.json`·`gate-heartbeat.json`을 덮어쓴다. watch는 매 읽기 전, gate는 `tick()`에서 tick lock을 얻은 직후 쓴다(busy tick은 ctx에 store만 있는 `test_kick` 시험 때문에 쓰지 않음). `fa orch alive`는 `INBOX_ACTIONS`에 넣어 GitHub 없이 처리, 30초 이하면 alive. 인수 `tests/acceptance/test_heartbeats.py` 4개.
 - #521 이후 CI 제외 목록은 커밋 trailer로 전달되고 main은 `.foragent/acceptance-exclusions.json`을 추적하지 않는다. 병합 충돌(UD)이면 파일을 지운다.
@@ -151,3 +152,6 @@
 - [#590 orch liveness](project_590_orch_liveness.md) — heartbeat session, /fa-orchestrator scan, nearest Claude literally; conftest hides real ancestors
 - #591: `orch_reinstall._uv()`가 uv 설치의 디렉터리 경쟁 오류만 3회까지 재시도(`sleep` 모듈 속성)하며 update_check도 이 함수를 공유한다. 게이트 자식 환경은 `launcher.gate_environment()`; launcher·kick·launchd 단위 시험은 Popen 인자 집합을 정확히 비교한다.
 - #591 리뷰: 패키지 안 `sys.dont_write_bytecode`는 `__init__.pyc`가 먼저 써져 늦다. 틱이 `launchd.refresh_from_tick()`로 예전 plist를 따로 떨어진 갱신 프로세스(틱 잠금 대기→`update_check._restart`)로 다시 올린다. scheduler 파사드는 250줄 제한. 게이트 작업은 파일 이름이 아니라 `installed_jobs()`의 `--repo-root`로 찾고(옛 이름·개명 plist 포함), 읽지 못한 plist는 최신으로 보지 않는다. plist는 bootout→수정→bootstrap 안에서만 바꾸고, `launchctl print` 실패는 없음(113)과 모름을 나눈다.
+- [#603 cross-lane start](project_603_cross_lane.md) — _ranked sort key, global-queue.json; no main-last key; ranking applies in one lane too
+- #604: `orch_stale_files.report()`가 board_sync 뒤 tick마다 승인 스냅샷의 Files를 `rev-list -1 --first-parent --until=<unix ts>`(포함; first-parent 없으면 나중에 병합된 토픽 커밋이 기준이 됨)로 찾은 승인 시점 base 트리와 현재 트리로 비교, `stale-files.json`(이슈→보고한 SHA 목록, 닫힌 이슈도 지우지 않음)으로 SHA당 한 번만 기록. 시험의 conftest 가드가 git commit/checkout을 막으니 commit-tree 등 plumbing으로 이력을 만든다. scheduler.py facade는 `test_scheduler_split`이 250줄 상한을 강제하므로 줄을 더하면 기존 `with step` 블록을 `timed(...)` 한 줄로 접는다.
+- #604 리뷰: 잠금을 잡은 tick의 모든 종료(GitHub 대기·한도 예외 포함)에서 돌아야 하는 로컬 사실 검사는 `orch_spawn.deciding()` 래퍼에 넣는다(scheduler 본문의 중간 호출은 이른 반환에 건너뛰어짐). `ls-tree -z` 출력은 split 뒤 빈 이름을 빼야 `**`가 빈 트리에 일치하지 않는다. scheduler에 git 호출을 더하면 test_cli의 엄격한 가짜 git이 깨지므로 대상이 있을 때만 git을 읽는다.
