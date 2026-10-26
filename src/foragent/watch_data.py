@@ -29,7 +29,7 @@ class Snapshot:
     captured_at: datetime
     # The durable request box (D76), oldest first.
     requests: list[dict[str, Any]] = field(default_factory=list)
-    # Every open order together: their count, merges in the last hour, and quota by executor.
+    # Every open order together: their count, merges in the last three hours, and quota by executor.
     orders: int = 0
     recent: int = 0
     quota: dict[str, tuple[float, datetime]] = field(default_factory=dict)
@@ -40,6 +40,11 @@ class Snapshot:
     # Each running worker's own state from its issue labels, with the same
     # precedence as status.collect_lanes: needs-human, then blocked, then working.
     worker_states: dict[int, str] = field(default_factory=dict)
+    # The finish estimate's spread (earliest, latest), the merged runs behind each
+    # remaining size (None while it uses the default), and merges since local midnight.
+    eta_range: tuple[datetime, datetime] | None = None
+    eta_basis: dict[str, int | None] = field(default_factory=dict)
+    today: int = 0
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -132,8 +137,15 @@ def collect(
             continue
         if (issue := issues.get(number)) is not None:
             done.setdefault(run.lane, []).append(issue)
-    recent = progress.recent_merges(history, now)
-    eta = progress.finish_time(total - completed, recent, now)
+    finished = [end for *_, end in progress.merged_work(store) if end <= now]
+    recent = sum(now - progress.RATE_WINDOW <= end for end in finished)
+    midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = sum(midnight <= end for end in finished)
+    sizes = [progress.size_of(rows[number]["labels"]) for number in sorted(child_numbers)
+             if rows[number]["state"] == "open" and progress.APPROVED in rows[number]["labels"]]
+    found = progress.estimate(sizes, progress.learned(progress.machine_stores(store), now),
+                              progress.parallel_budget(store, config), now)
+    eta, eta_range, basis = (found[0], found[1:3], found[3]) if found else (None, None, {})
     try:
         requests = orch_inbox.requests(store)
     except (OSError, ValueError):
@@ -146,4 +158,4 @@ def collect(
                                         else "blocked" if BLOCKED in labels else "working")
     return watch.Snapshot(status, done, order, completed, total, eta, watch.recent_events(store), now,
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
-                          worker_states)
+                          worker_states, eta_range, basis, today)

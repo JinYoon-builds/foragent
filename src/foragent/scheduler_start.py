@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -13,7 +12,7 @@ from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
     machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
 )
-from foragent.config import resolved_reviewer
+from foragent.config import lane_executors
 from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
 from foragent.tracker import Issue
 
@@ -25,9 +24,7 @@ def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
     """A lane waits while it, its implementer or its reviewer is paused for a usage limit."""
     if ctx.store.lane_paused(lane, now):
         return True
-    settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
-    config = replace(ctx.config, executor=settings.get("executor") or ctx.config.executor)
-    return any(ctx.store.executor_paused(name, now) for name in {config.executor, resolved_reviewer(config)})
+    return any(ctx.store.executor_paused(name, now) for name in lane_executors(ctx.config, lane))
 
 
 def _apply_budgets(
@@ -45,6 +42,8 @@ def _apply_budgets(
     scheduler.update_test_slots(
         machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
         swapins=getattr(sample, "swapins", None),
+        load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
+        cpu_busy=getattr(sample, "cpu_busy", None),
     )
     if workers:
         scheduler._machine_budget(ctx, ready, sample)
@@ -72,6 +71,8 @@ def _machine_budget(
             scheduler.append_budget_history(
                 ctx.store.root.parent, now, "parallel", current, ceiling, pressure=pressure,
                 load_per_cpu=load, swapins=getattr(sample, "swapins", None), wanted=ceiling,
+                load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
+                cpu_busy=getattr(sample, "cpu_busy", None),
             )
             return max(1, min(ceiling, scheduler.machine_runs(ctx.store, now) + waiting))
         changed_at = scheduler.datetime.fromisoformat(state["changed_at"]) if state else now
@@ -93,6 +94,8 @@ def _machine_budget(
         scheduler.append_budget_history(
             ctx.store.root.parent, now, "parallel", current, value,
             pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None), wanted=wanted,
+            load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
+            cpu_busy=getattr(sample, "cpu_busy", None),
         )
     return max(1, min(value, demand))
 
@@ -159,6 +162,8 @@ def _start_ready(
                 scheduler.append_memory_hold(
                     ctx.store.root.parent, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
                     swapins=getattr(sample, "swapins", None),
+                    load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
+                    cpu_busy=getattr(sample, "cpu_busy", None),
                 )
                 return False
             if not scheduler._reserve_slot(ctx, number, budget):

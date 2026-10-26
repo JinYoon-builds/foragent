@@ -18,8 +18,10 @@ from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
 from foragent.run_lane_skills import lane_notes, lane_skill_names, lane_skills
 from foragent.run_skill_catalog import available_skills, catalog_section, parse_skills_used
+from foragent.run_previous import consume_hint, pending_hint, previous_attempt_summary, record_stop_point
 from foragent.run_prompts import build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
+from foragent.run_overlap import wait_for_overlap
 from foragent.run_waits import _phase, _timeout
 
 if TYPE_CHECKING:
@@ -221,6 +223,7 @@ def _implement(
     from foragent import runner
 
     n, ctx = attempt.n, attempt.ctx
+    wait_for_overlap(attempt)
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")
     remaining = runner._remaining(n, ctx)
@@ -233,9 +236,10 @@ def _implement(
     model, notes = setup.model, setup.notes
     attempt.options.update(setup.options)
     attempt.missing_skills.extend(name for name in setup.missing_skills if name not in attempt.missing_skills)
-    hint_path = ctx.store.root / "hints" / f"{n}.txt"
-    hint = hint_path.read_text(encoding="utf-8") if hint_path.is_file() else None
+    retry_default, hint = pending_hint(ctx.store.root, n)
     failure_context = str(failure) or run.resume_reason
+    review_feedback = attempt.review_feedback
+    attempt.review_feedback = False
     test_command = ctx.config.test_command
     if test_command is None:
         test_command = next(iter(runner.detect_test_commands(worktree)), None)
@@ -250,22 +254,36 @@ def _implement(
         acceptance_baseline=attempt.baseline.node_ids if attempt.baseline else (),
         failure_limit=None if isinstance(failure, CIFailure) else 4000,
         skill_catalog=catalog_section(available_skills(ctx.config, fixed)),
+        previous_attempt=(previous_attempt_summary(attempt)
+                          if failure_context or reviewer_text is not None else ""),
+        review_feedback=review_feedback,
+        retry_default=retry_default,
     )
-    result = _available_executor(
-        n, ctx, attempt.executor, worktree=worktree,
-        prompt=prompt if attempt.native_claude else notes + prompt,
-        session_body=attempt.approval.body,
-        resume_prompt=build_resume_prompt(
-            n, run.session_body, attempt.approval.body, failure_context,
-            reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
-        ),
-        model=model, timeout_s=remaining, log_path=log, **attempt.options,
-    )
+    offset = log.stat().st_size if log.exists() else 0
+    result = None
+    try:
+        result = _available_executor(
+            n, ctx, attempt.executor, worktree=worktree,
+            prompt=prompt if attempt.native_claude else notes + prompt,
+            session_body=attempt.approval.body,
+            resume_prompt=build_resume_prompt(
+                n, run.session_body, attempt.approval.body, failure_context,
+                reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
+                review_feedback=review_feedback, retry_default=retry_default,
+            ),
+            model=model, timeout_s=remaining, log_path=log, **attempt.options,
+        )
+    finally:
+        # Every way a turn ends (result, limit wait, launch failure, interruption) leaves its stop point.
+        try:
+            record_stop_point(ctx.store.root, n, result, log, offset)
+        except OSError:
+            pass
     # A prepared prompt has not been delivered yet. Keep its hint through
     # availability waits, launch failures and interruptions; acknowledge it
     # only once the implementer returns an ordinary execution result.
-    if hint is not None and classify_result(result) == "normal":
-        hint_path.unlink()
+    if (retry_default or hint is not None) and classify_result(result) == "normal":
+        consume_hint(ctx.store.root, n)
     _record_skills_used(n, ctx, result)
     rebuttal = _read_rebuttals(worktree)
     if rebuttal.strip() and rebuttal not in attempt.rebuttals:
@@ -278,3 +296,4 @@ def _implement(
             details = stream.read(6000)
         flag(ctx, n, Reason.SPEC_QUESTION, "The executor needs a product decision.", details)
         raise ExecutorStopped("spec-question")
+    wait_for_overlap(attempt)

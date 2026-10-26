@@ -510,7 +510,7 @@ def test_observed_detached_child_survives_reload_as_owned(fake_process_table, tm
     store = StateStore(tmp_path / "state")
     store.start_run(1, branch="branch", worktree=tmp_path, pid=root.pid)
     child = table.add(42001, ppid=root.pid, cwd=tmp_path.parent, start_time=11)
-    store.update_run(1, phase="implement")
+    store.update_run(1, phase="implement", observe=True)
     table.exit(root.pid)
     table.rows[child.pid] = replace(child, ppid=1)
     reloaded = StateStore(store.root).get_run(1)
@@ -728,7 +728,7 @@ def test_explicit_new_executor_birth_can_reuse_a_previous_executors_pid(fake_pro
     assert not {root.pid, new.pid} & table.live
 
 
-def test_logged_observer_scans_once_per_second_and_keeps_reparented_children(fake_process_table, tmp_path, monkeypatch):
+def test_logged_observer_uses_shared_rows_twice_per_second_and_keeps_reparented_children(fake_process_table, tmp_path, monkeypatch):
     from process_fakes import _ModuleView, install_popen
 
     table = fake_process_table
@@ -737,7 +737,7 @@ def test_logged_observer_scans_once_per_second_and_keeps_reparented_children(fak
     clock = SimpleNamespace(now=0.0, target=None, process=None, waits=[])
 
     def observe_at_clock(*args, **kwargs):
-        observations.append(clock.now)
+        observations.append((clock.now, kwargs.get("shared", False)))
         return observe(*args, **kwargs)
 
     class Event:
@@ -777,13 +777,18 @@ def test_logged_observer_scans_once_per_second_and_keeps_reparented_children(fak
 
     install_popen(monkeypatch, table, matches=lambda argv: argv == ["offline-executor"], communicate=communicate)
     monkeypatch.setattr(processes, "threading", _ModuleView(processes.threading, Thread=Thread, Event=Event))
+    monkeypatch.setattr(processes.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(processes, "read_process_identity", lambda pid: table.rows.get(pid) if pid in table.live else None)
     monkeypatch.setattr(processes, "observe_tree", observe_at_clock)
     with processes.track_process_group(lambda pid: None, tree_callback=lambda identities: recorded.append(identities)):
         assert processes.run_logged(["offline-executor"], cwd=tmp_path, timeout_s=10,
                                     log_path=tmp_path / "run.log")[:2] == (0, False)
-    assert observations == [0, 1, 2, 3, 3.25]  # Launch, periodic observations, final snapshot.
-    assert clock.waits == [1, 1, 1, 1]
-    assert table.list_calls == 2 * len(observations)
+    assert observations == [
+        (0, False), (0.5, True), (1, True), (1.5, True),
+        (2, True), (2.5, True), (3, True), (3.25, False),
+    ]
+    assert clock.waits == [0.5] * 7
+    assert table.list_calls == 10  # Birth/final are fresh; each cache serves two periodic polls.
     assert {item["pid"] for item in recorded[-1]} == {42000, 42001, 42002}
     assert table.rows[42002].ppid == 1 and 42002 in table.live
     assert owned_stop(42000, recorded[-1]) == 1

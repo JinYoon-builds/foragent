@@ -62,6 +62,37 @@ def no_release_lookup(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_real_usage_source(request, monkeypatch):
+    """A paused executor's recheck must not start the real `codex app-server` or read the real
+    Claude snapshot. Tests that supply their own fake server (`codex_server`) keep the real readers."""
+    from foragent import usage_recheck
+
+    if "codex_server" not in request.fixturenames and request.module.__name__ != "test_usage_recheck_unit":
+        monkeypatch.setattr(usage_recheck, "read_codex", lambda now: None)
+        monkeypatch.setattr(usage_recheck, "read_claude", lambda now, interval, since: None)
+
+
+@pytest.fixture(autouse=True)
+def no_live_cpu_times(monkeypatch):
+    """Tests opt into fake CPU counters instead of depending on the shared machine."""
+    import psutil
+
+    popen = subprocess.Popen
+
+    def isolated_cpu(*args, **kwargs):
+        # Child interpreters cannot inherit the parent's monkeypatched counters.
+        env = kwargs.get("env")
+        kwargs["env"] = {**(os.environ if env is None else env), "FORAGENT_CPU_BUSY": "off"}
+        return popen(*args, **kwargs)
+
+    def unavailable(*args, **kwargs):
+        raise OSError("CPU counters are unavailable unless the test supplies them")
+
+    monkeypatch.setattr(subprocess, "Popen", isolated_cpu)
+    monkeypatch.setattr(psutil, "cpu_times", unavailable)
+
+
+@pytest.fixture(autouse=True)
 def isolated_test_slots(tmp_path, monkeypatch):
     """Keep machine-wide test slots away from the real data root and live runs."""
     from foragent import capacity
@@ -108,12 +139,12 @@ class GitHistory:
     clone: Path
     tip: str | None = None
 
-    def update(self, files: dict[str, str | None], *, at: datetime = BASE_TIME) -> None:
+    def update(self, files: dict[str, str | None], *, at: datetime = BASE_TIME, message: str = "Update") -> None:
         """Import a new main commit directly into the local bare origin."""
         stream = [
             "commit refs/heads/main\n",
             f"committer Offline Tests <tests@example.com> {int(at.timestamp())} +0000\n",
-            "data 6\nUpdate\n",
+            f"data {len(message.encode('utf-8'))}\n{message}\n",
         ]
         if self.tip is not None:
             stream.append(f"from {self.tip}\n")
