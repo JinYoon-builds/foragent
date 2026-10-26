@@ -46,28 +46,28 @@ def _load(store: StateStore) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _update(store: StateStore, executor: str, value: dict[str, Any] | None) -> None:
-    with store._state_lock():
-        records = _load(store)
-        if value is None:
-            records.pop(executor, None)
-        else:
-            records[executor] = value
-        store._write_json(store.root / _RECORD, records)
+def _read_pauses(store: StateStore) -> dict[str, str]:
+    try:
+        value = json.loads((store.root / "executor-pauses.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def note_limit(store: StateStore, executor: str, until: datetime, windows: list[dict] | None, now: datetime) -> None:
-    """Remember which windows were exhausted, and how full, when ``executor`` hit its limit.
+    """Pause ``executor`` and remember which windows were exhausted, and how full, in one write.
 
-    Called before the pause is written. ``pause_executor`` keeps the later of an
-    active pause and ``until``, so the note uses that same deadline and keeps the
-    active pause's exhausted windows; each window keeps its lowest (strictest)
-    level, so a repeated limit never loosens what counts as recovered.
+    The pause and its note change together under the state lock, so a recheck
+    never sees one without the other. Like ``pause_executor`` the later deadline
+    wins; an active pause's exhausted windows are kept and each window keeps its
+    lowest (strictest) level, so a repeated limit never loosens recovery.
     """
     exhausted = [{"name": window["name"], "used_percent": window.get("used_percent")}
                  for window in windows or [] if window.get("exhausted")]
     with store._state_lock():
-        active = store.executor_pause_until(executor, now)
+        pauses = _read_pauses(store)
+        active = datetime.fromisoformat(pauses[executor]) if executor in pauses else None
+        active = active if active is not None and now < active else None
         records = _load(store)
         previous = records.get(executor)
         if (active is not None and isinstance(previous, dict) and previous.get("until")
@@ -82,9 +82,40 @@ def note_limit(store: StateStore, executor: str, until: datetime, windows: list[
             exhausted = [{"name": name, "used_percent": level} for name, level in levels.items()]
         if active is not None and active > until:
             until = active
-        records[executor] = {"until": until.astimezone(UTC).isoformat(), "since": now.astimezone(UTC).isoformat(),
+        stamp = until.astimezone(UTC).isoformat()
+        pauses[executor] = stamp
+        store._write_json(store.root / "executor-pauses.json", pauses)
+        records[executor] = {"until": stamp, "since": now.astimezone(UTC).isoformat(),
                              "exhausted": exhausted, "checked_at": None}
         store._write_json(store.root / _RECORD, records)
+
+
+def _claim(store: StateStore, executor: str, pause: str, now: datetime, interval: timedelta) -> dict | None:
+    """Mark a due recheck of the pause ``pause``, or return None when it is not due.
+
+    Compare-and-set under the state lock: a pause or note written since ``pause``
+    was read is newer than this tick's view, so it is left alone until next tick.
+    """
+    with store._state_lock():
+        if _read_pauses(store).get(executor) != pause:
+            return None
+        records = _load(store)
+        record = records.get(executor)
+        until = datetime.fromisoformat(pause)
+        if not isinstance(record, dict) or not record.get("until"):
+            record = None
+        elif datetime.fromisoformat(record["until"]) > until:
+            return None  # A note ahead of its pause belongs to a writer that is not done.
+        elif datetime.fromisoformat(record["until"]) < until:
+            record = None  # The note of an older pause says nothing about this one.
+        if record is None:
+            record = {"until": until.astimezone(UTC).isoformat(), "since": None, "exhausted": [], "checked_at": None}
+        checked = record.get("checked_at")
+        if checked is not None and now - datetime.fromisoformat(checked) < interval:
+            return None
+        records[executor] = mark = {**record, "checked_at": now.astimezone(UTC).isoformat()}
+        store._write_json(store.root / _RECORD, records)
+        return mark
 
 
 def read_codex(now: datetime) -> list[dict] | None:
@@ -204,7 +235,7 @@ def _clear(ctx: TickContext, executor: str, until: datetime, pause: str, mark: d
     store = ctx.store
     with store._state_lock():
         path = store.root / "executor-pauses.json"
-        pauses = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        pauses = _read_pauses(store)
         if pauses.get(executor) != pause or _load(store).get(executor) != mark:
             return False
         pauses.pop(executor, None)
@@ -227,27 +258,18 @@ def _clear(ctx: TickContext, executor: str, until: datetime, pause: str, mark: d
 def recheck(ctx: TickContext) -> list[str]:
     """Re-read usage of each paused executor that is due; return the executors that recovered."""
     now, interval = ctx.now(), timedelta(minutes=ctx.config.usage_recheck_minutes)
-    try:
-        pauses = json.loads((ctx.store.root / "executor-pauses.json").read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError):
-        return []
+    pauses = _read_pauses(ctx.store)
     done = []
     for executor in sorted(pauses):
         until = ctx.store.executor_pause_until(executor, now)
         if executor not in SOURCES or until is None:
             continue
-        record = _load(ctx.store).get(executor)
-        if not isinstance(record, dict) or record.get("until") != until.astimezone(UTC).isoformat():
-            # A pause without a note (or a newer one) has no known exhausted levels.
-            record = {"until": until.astimezone(UTC).isoformat(), "since": None, "exhausted": [], "checked_at": None}
-        checked = record.get("checked_at")
-        if checked is not None and now - datetime.fromisoformat(checked) < interval:
+        # Marked before the read, so a renewal during the read is visible to ``_clear``.
+        if (mark := _claim(ctx.store, executor, pauses[executor], now, interval)) is None:
             continue
-        since = datetime.fromisoformat(record["since"]) if record.get("since") else None
-        mark = {**record, "checked_at": now.astimezone(UTC).isoformat()}
-        _update(ctx.store, executor, mark)  # Before the read, so a renewal during it is visible.
+        since = datetime.fromisoformat(mark["since"]) if mark.get("since") else None
         windows = read_codex(now) if executor == "codex" else read_claude(now, interval, since)
-        if windows is None or not recovered(windows, record.get("exhausted") or []):
+        if windows is None or not recovered(windows, mark.get("exhausted") or []):
             continue
         if not _clear(ctx, executor, until, pauses[executor], mark):
             continue

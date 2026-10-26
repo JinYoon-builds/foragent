@@ -270,3 +270,13 @@ def test_first_line_shows_snapshot_time_and_warns_when_nothing_was_read(tmp_path
                                config, tmp_path).splitlines()[0]
     local_time = datetime.fromisoformat(observed["as_of"]).astimezone().strftime("%H:%M")
     assert first.endswith(f"queued 1 · as of {local_time}") and "⚠" not in first
+
+
+@pytest.mark.parametrize('language,label', [('en', 'waiting for shared files'), ('ko', '공유 파일 기다려요')])
+def test_overlap_wait_activity_uses_translated_waiting_phase(language, label):
+    from foragent.watch_layout import _activity
+
+    row = {'state': 'working', 'phase': 'overlap-wait', 'last_activity_seconds': 0}
+    assert _activity(row, language, 0, 10, None, phase_seconds=120) == (
+        f'● {label} ' + ('2 min' if language == 'en' else '2분')
+    )

@@ -325,13 +325,9 @@ def test_lane_validation(repo, settings):
         load_config(repo)
 
 
-<<<<<<< HEAD
 @pytest.mark.parametrize("key", [
-    "max_parallel", "transient_max_wait_minutes", "limit_wait_minutes", "usage_recheck_minutes",
+    "max_parallel", "overlap_per_file", "transient_max_wait_minutes", "limit_wait_minutes", "usage_recheck_minutes",
 ])
-=======
-@pytest.mark.parametrize("key", ["max_parallel", "overlap_per_file", "transient_max_wait_minutes", "limit_wait_minutes"])
->>>>>>> 822219d909d5b46b1f2e0c936617dac21f7a2256
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_parallel_and_wait_settings_are_positive(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})

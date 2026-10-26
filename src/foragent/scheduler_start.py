@@ -45,6 +45,8 @@ def _apply_budgets(
     scheduler.update_test_slots(
         machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
         swapins=getattr(sample, "swapins", None),
+        load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
+        cpu_busy=getattr(sample, "cpu_busy", None),
     )
     if workers:
         scheduler._machine_budget(ctx, ready, sample)
@@ -72,6 +74,8 @@ def _machine_budget(
             scheduler.append_budget_history(
                 ctx.store.root.parent, now, "parallel", current, ceiling, pressure=pressure,
                 load_per_cpu=load, swapins=getattr(sample, "swapins", None), wanted=ceiling,
+                load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
+                cpu_busy=getattr(sample, "cpu_busy", None),
             )
             return max(1, min(ceiling, scheduler.machine_runs(ctx.store, now) + waiting))
         changed_at = scheduler.datetime.fromisoformat(state["changed_at"]) if state else now
@@ -93,6 +97,8 @@ def _machine_budget(
         scheduler.append_budget_history(
             ctx.store.root.parent, now, "parallel", current, value,
             pressure=pressure, load_per_cpu=load, swapins=getattr(sample, "swapins", None), wanted=wanted,
+            load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
+            cpu_busy=getattr(sample, "cpu_busy", None),
         )
     return max(1, min(value, demand))
 
@@ -159,6 +165,8 @@ def _start_ready(
                 scheduler.append_memory_hold(
                     ctx.store.root.parent, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
                     swapins=getattr(sample, "swapins", None),
+                    load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
+                    cpu_busy=getattr(sample, "cpu_busy", None),
                 )
                 return False
             if not scheduler._reserve_slot(ctx, number, budget):

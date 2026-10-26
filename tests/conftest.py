@@ -73,6 +73,26 @@ def no_real_usage_source(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_live_cpu_times(monkeypatch):
+    """Tests opt into fake CPU counters instead of depending on the shared machine."""
+    import psutil
+
+    popen = subprocess.Popen
+
+    def isolated_cpu(*args, **kwargs):
+        # Child interpreters cannot inherit the parent's monkeypatched counters.
+        env = kwargs.get("env")
+        kwargs["env"] = {**(os.environ if env is None else env), "FORAGENT_CPU_BUSY": "off"}
+        return popen(*args, **kwargs)
+
+    def unavailable(*args, **kwargs):
+        raise OSError("CPU counters are unavailable unless the test supplies them")
+
+    monkeypatch.setattr(subprocess, "Popen", isolated_cpu)
+    monkeypatch.setattr(psutil, "cpu_times", unavailable)
+
+
+@pytest.fixture(autouse=True)
 def isolated_test_slots(tmp_path, monkeypatch):
     """Keep machine-wide test slots away from the real data root and live runs."""
     from foragent import capacity

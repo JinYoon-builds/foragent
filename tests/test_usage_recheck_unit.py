@@ -129,3 +129,43 @@ def test_repeated_limit_with_earlier_reset_keeps_the_strictest_baseline(tmp_path
     reading[0]["used_percent"] = 50
     ctx.now = lambda: NOW + timedelta(minutes=20)
     assert usage_recheck.recheck(ctx) == ["claude"]
+
+
+def test_limit_note_and_pause_are_written_together(tmp_path):
+    store = StateStore(tmp_path / "state")
+    until = NOW + timedelta(hours=2)
+    usage_recheck.note_limit(store, "codex", until, [{"name": "5h", "used_percent": 100, "exhausted": True}], NOW)
+    assert store.executor_pause_until("codex", NOW) == until
+    usage_recheck.note_limit(store, "codex", NOW + timedelta(hours=1), [], NOW)
+    assert store.executor_pause_until("codex", NOW) == until  # The later deadline wins.
+
+
+@pytest.mark.parametrize("renewal", ["later-until", "same-until"])
+def test_limit_note_written_between_the_pause_read_and_the_mark_survives(tmp_path, monkeypatch, renewal):
+    store = StateStore(tmp_path / "state")
+    until = NOW + timedelta(hours=2)
+    usage_recheck.note_limit(store, "codex", until, [{"name": "5h", "used_percent": 100, "exhausted": True}], NOW)
+    renewed = until + timedelta(hours=1) if renewal == "later-until" else until
+    ctx = SimpleNamespace(store=store, config=Config(executor="codex", reviewer="codex"),
+                          now=lambda: NOW + timedelta(minutes=10))
+    original, writes = store.executor_pause_until, []
+
+    def interleaved(executor, now):
+        # Another runner hits a new limit after recheck read the pauses, before it marks them.
+        if not writes:
+            writes.append(1)
+            usage_recheck.note_limit(store, "codex", renewed,
+                                     [{"name": "7d", "used_percent": 100, "exhausted": True}], now)
+        return original(executor, now)
+
+    reads = []
+    monkeypatch.setattr(store, "executor_pause_until", interleaved)
+    monkeypatch.setattr(usage_recheck, "read_codex", lambda now: reads.append(now) or [
+        {"name": "5h", "used_percent": 3}, {"name": "7d", "used_percent": 100}])
+    assert usage_recheck.recheck(ctx) == []
+    note = json.loads((store.root / "usage-recheck.json").read_text())["codex"]
+    assert {window["name"] for window in note["exhausted"]} == {"5h", "7d"}
+    assert note["until"] == renewed.isoformat()
+    assert original("codex", ctx.now()) == renewed
+    # A later deadline is a newer view than this tick's, so it waits; the same deadline is checked now.
+    assert len(reads) == (0 if renewal == "later-until" else 1)
