@@ -11,7 +11,6 @@ planning session, so nothing here splits a pane or switches focus.
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -94,15 +93,6 @@ def _record_session(store: StateStore, now: datetime, screen: str, pid) -> None:
                                             "pid": pid, "start_time": row.start_time})
 
 
-def _last_spawn(store: StateStore) -> dict | None:
-    """The spawn record as stored, or None when there is none or it cannot be read."""
-    try:
-        record = json.loads(_record_path(store).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return record if isinstance(record, dict) else None
-
-
 def _approved_work(store: StateStore) -> bool:
     """Running work or a stored approval snapshot (queued or waiting to start)."""
     return bool(store.active_runs()) or any((store.root / "approvals").glob("*.json"))
@@ -132,95 +122,17 @@ def _command(root: Path, store: StateStore, title: str) -> tuple[str, list[str]]
     return "background", [claude, "--bg", "-n", title, SKILL]
 
 
-def skip_reason(repo_root: Path, store: StateStore, now: datetime) -> str | None:
-    """Why no orchestrator should open now, as a word, or None when one may open (spacing aside)."""
-    if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
-        return "off"
-    if _alive(store, now):
-        return "alive"
-    if not _approved_work(store):
-        return "no_work"
-    if _session_alive(store, repo_root.resolve()):
-        return "session"
-    return None
-
-
-@contextmanager
-def _explicit_lock(store: StateStore):
-    """Take the openers' lock (the same file as ``watch_open._opening``); yield whether it was busy.
-
-    Busy means another opener was mid-open when this call began, so a spawn
-    record it wrote before this call read the record is still a fresh spawn.
-    """
-    store.root.mkdir(parents=True, exist_ok=True)
-    fd = os.open(store.root / "watch-open.lock", os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            busy = False
-        except BlockingIOError:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            busy = True
-        yield busy
-    finally:
-        os.close(fd)
-
-
-def _ensure_explicit(repo_root: Path, store: StateStore, config: Config, now: datetime,
-                     why: list | None) -> str | None:
-    """``fa orch ensure``: the gate's spawn without its spacing, never a second orchestrator.
-
-    The gate's own path is unchanged. Here every guard is checked again inside
-    the lock, and a spawn that another opener made while this call waited (the
-    record changed) or was making when it began (lock busy and a spawn within
-    the spacing) stops this call. Each stop appends its reason word to ``why``.
-    """
-    why = [] if why is None else why
-    seen = _last_spawn(store)
-    reason = skip_reason(repo_root, store, now)
-    if reason is not None:
-        if reason == "session":
-            _note_silent(store, now)
-        why.append(reason)
-        return None
-    root = repo_root.resolve()
-    with _explicit_lock(store) as busy:
-        if (reason := skip_reason(root, store, now)) is not None:
-            why.append(reason)
-            return None
-        if _last_spawn(store) != seen or (busy and _spaced(store, now)):
-            why.append("raced")
-            return None
-        chosen = _command(root, store, f"orch: {root.name}")
-        if chosen is None:
-            why.append("failed")
-            return None
-        screen, argv = chosen
-        # The same record as the gate writes, so the gate's spacing also covers this spawn.
-        store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen})
-        try:
-            result = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, check=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            why.append("failed")
-            return None
-        _record_session(store, now, screen, getattr(result, "pid", None))
-    language = config.language
-    notify.send(config, text("orch_spawn_title", language),
-                text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
-    return screen
-
-
 def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, now: datetime,
                         spacing: bool = True, why: list | None = None) -> str | None:
     """Open one orchestrator if needed; return the screen used, or None.
 
     ``spacing=False`` is the explicit planning-session call (``fa orch ensure``,
-    see ``_ensure_explicit``, which appends why it opened nothing to ``why``);
+    see ``orch_ensure.ensure_explicit``, which appends why it opened nothing to ``why``);
     the gate's default path below is unchanged.
     """
     if not spacing:
-        return _ensure_explicit(repo_root, store, config, now, why)
+        from foragent.orch_ensure import ensure_explicit  # Late: orch_ensure imports this module.
+        return ensure_explicit(repo_root, store, config, now, why)
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
         return None
     if _alive(store, now) or not _approved_work(store):

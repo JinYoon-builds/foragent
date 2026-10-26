@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 import shutil
 import subprocess
 
-from foragent import notify, orch_spawn
+from foragent import notify, orch_ensure, orch_spawn
 from foragent.config import Config
 from foragent.state import StateStore
 
@@ -59,7 +59,7 @@ def _explicit_lock_doing(monkeypatch, before, *, busy=False):
     """Run ``before()`` while the explicit call waits for the lock, then report ``busy``."""
     from contextlib import contextmanager
 
-    real = orch_spawn._explicit_lock
+    real = orch_ensure._explicit_lock
 
     @contextmanager
     def lock(store):
@@ -67,7 +67,7 @@ def _explicit_lock_doing(monkeypatch, before, *, busy=False):
         with real(store):
             yield busy
 
-    monkeypatch.setattr(orch_spawn, "_explicit_lock", lock)
+    monkeypatch.setattr(orch_ensure, "_explicit_lock", lock)
 
 
 def _write_spawn(store, at):
@@ -299,8 +299,8 @@ def test_explicit_lock_reports_busy_while_another_opener_holds_it(tmp_path, monk
     thread.start()
     held.wait(5)
     threading.Timer(0.2, release.set).start()
-    with orch_spawn._explicit_lock(store) as busy:
+    with orch_ensure._explicit_lock(store) as busy:
         assert busy is True
     thread.join(5)
-    with orch_spawn._explicit_lock(store) as busy:
+    with orch_ensure._explicit_lock(store) as busy:
         assert busy is False

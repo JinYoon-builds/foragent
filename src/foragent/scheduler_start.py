@@ -6,13 +6,14 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, scheduler
+from foragent import machine_budget, orch_queue, overlap_files, scheduler
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
     machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
 )
 from foragent.config import lane_executors
+from foragent.issue import parse_body
 from foragent.orch_tick_outcome import step, timed  # noqa: F401
 from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
 from foragent.tracker import Issue
@@ -117,11 +118,36 @@ def _reserve_slot(ctx: TickContext, number: int, budget: int) -> bool:
         return True
 
 
+def _overlap_count(ctx: TickContext, number: int, claims: list) -> int:
+    """How many of the issue's declared files overlap the files running runs hold."""
+    if not claims or (approval := ctx.store.load_approval(number)) is None:
+        return 0
+    return sum(any(overlap_files.any_overlap(ctx, [path], claim.files) for claim in claims)
+               for path in parse_body(approval.body).files)
+
+
+def _ranked(ctx: TickContext, ready: dict[str, list[int]]) -> list[tuple[str, int]]:
+    """Every lane's candidates in one start order; each still meets every start rule.
+
+    Fewer declared files overlapping running runs first, then the cross-lane
+    priority list, then the position in the lane's (already queue-ordered) list,
+    then the issue number.
+    """
+    claims = overlap_files.claims(ctx)[0] if ctx.store.active_runs() else []
+    priority = {number: index for index, number in enumerate(orch_queue.get_global(ctx.store))}
+    unlisted = len(priority)
+    keyed = [
+        ((_overlap_count(ctx, number, claims), priority.get(number, unlisted), position, number), lane, number)
+        for lane in ready for position, number in enumerate(ready[lane])
+    ]
+    return [(lane, number) for _, lane, number in sorted(keyed)]
+
+
 def _start_ready(
     ctx: TickContext, ready: dict[str, list[int]], lane_for: Callable[[Issue], str], base_ref: str,
     report: TickReport, sample: tuple[str, float] | None = None,
 ) -> bool | None:
-    """Start ready lanes within the machine budget; None means a GitHub wait began."""
+    """Start ranked ready issues across lanes within the machine budget; None means a GitHub wait began."""
     def eligible(issue: Issue, lane: str) -> bool:
         return (
             issue.state == "open" and not issue.is_pull_request
@@ -132,76 +158,76 @@ def _start_ready(
     sample = sample if sample is not None else scheduler.machine_load()
     budget = scheduler._machine_budget(ctx, ready, sample)
     started = False
-    for lane in sorted(ready, key=scheduler.lane_order):
+    held: dict[str, bool] = {}
+    for lane, number in _ranked(ctx, ready):
         if not scheduler._has_slot(ctx, budget):
             break
-        if _lane_held(ctx, lane, ctx.now()):
+        if held.setdefault(lane, _lane_held(ctx, lane, ctx.now())):
             continue
-        for number in ready[lane]:
-            local = scheduler._local_issue(ctx, number)
-            if local is not None and not eligible(local, lane):
-                continue
-            issue = ctx.tracker.get_issue(number)
-            if not eligible(issue, lane):
-                continue
-            if not scheduler._can_start_in_lane(ctx, lane, issue):
-                continue
-            approval = ctx.store.load_approval(number)
-            event, _ = scheduler._latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
-            if approval is None or event is None or event.created_at != approval.approved_at:
-                continue
-            if not scheduler._check_integrity(ctx, issue, approval, base_ref, report):
-                continue
-            if not scheduler._check_prerequisites(ctx, issue, approval, report):
-                continue
+        local = scheduler._local_issue(ctx, number)
+        if local is not None and not eligible(local, lane):
+            continue
+        issue = ctx.tracker.get_issue(number)
+        if not eligible(issue, lane):
+            continue
+        if not scheduler._can_start_in_lane(ctx, lane, issue):
+            continue
+        approval = ctx.store.load_approval(number)
+        event, _ = scheduler._latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
+        if approval is None or event is None or event.created_at != approval.approved_at:
+            continue
+        if not scheduler._check_integrity(ctx, issue, approval, base_ref, report):
+            continue
+        if not scheduler._check_prerequisites(ctx, issue, approval, report):
+            continue
 
-            if not eligible(scheduler._local_issue(ctx, number) or issue, lane):
-                continue
-            if sample[0] == "critical":
-                # This issue passed every start check; only critical memory holds it (#497).
-                # Running work is left alone, and one row records the held tick.
-                scheduler.append_memory_hold(
-                    ctx.store.root.parent, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
-                    swapins=getattr(sample, "swapins", None),
-                    load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
-                    cpu_busy=getattr(sample, "cpu_busy", None),
-                )
-                return False
-            if not scheduler._reserve_slot(ctx, number, budget):
-                return started
-            try:
-                ctx.tracker.remove_labels(number, [scheduler.READY])
-                ctx.tracker.add_labels(number, [scheduler.RUNNING])
-                scheduler.board.sync_status(ctx, number, "Running")
-                if until := ctx.store.github_wait_until(ctx.now()):
-                    report.skipped = f"GitHub rate limit until {until.isoformat()}"
-                    return None
-            except scheduler.TrackerError as exc:
-                if not exc.is_rate_limit:
-                    raise
-                until = scheduler.orch_github.pause(ctx, exc)
-                # A label may already say running even though no process started.
-                # Record availability, so recovery does not charge a crash.
-                ctx.store.start_run(
-                    number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number),
-                    lane=lane, tier=scheduler.issue_size(issue.labels),
-                )
-                ctx.store.clear_run_start(number)
-                scheduler.orch_github.wait_run(ctx, number, until)
-                ctx.store.finish_run(number, "limit-wait", detail=str(exc))
+        if not eligible(scheduler._local_issue(ctx, number) or issue, lane):
+            continue
+        if sample[0] == "critical":
+            # This issue passed every start check; only critical memory holds it (#497).
+            # Running work is left alone, and one row records the held tick.
+            scheduler.append_memory_hold(
+                ctx.store.root.parent, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
+                swapins=getattr(sample, "swapins", None),
+                load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
+                cpu_busy=getattr(sample, "cpu_busy", None),
+            )
+            return False
+        if not scheduler._reserve_slot(ctx, number, budget):
+            return started
+        try:
+            ctx.tracker.remove_labels(number, [scheduler.READY])
+            ctx.tracker.add_labels(number, [scheduler.RUNNING])
+            scheduler.board.sync_status(ctx, number, "Running")
+            if until := ctx.store.github_wait_until(ctx.now()):
                 report.skipped = f"GitHub rate limit until {until.isoformat()}"
                 return None
+        except scheduler.TrackerError as exc:
+            if not exc.is_rate_limit:
+                raise
+            until = scheduler.orch_github.pause(ctx, exc)
+            # A label may already say running even though no process started.
+            # Record availability, so recovery does not charge a crash.
             ctx.store.start_run(
-                number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
-                tier=scheduler.issue_size(issue.labels),
+                number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number),
+                lane=lane, tier=scheduler.issue_size(issue.labels),
             )
             ctx.store.clear_run_start(number)
-            pid = ctx.launcher(number)
-            ctx.store.update_run(number, pid=pid)
-            report.actions.append(f"#{number} started running (pid={pid})")
-            started = True
-            if not scheduler._has_slot(ctx, budget):
-                return started
+            scheduler.orch_github.wait_run(ctx, number, until)
+            ctx.store.finish_run(number, "limit-wait", detail=str(exc))
+            report.skipped = f"GitHub rate limit until {until.isoformat()}"
+            return None
+        ctx.store.start_run(
+            number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
+            tier=scheduler.issue_size(issue.labels),
+        )
+        ctx.store.clear_run_start(number)
+        pid = ctx.launcher(number)
+        ctx.store.update_run(number, pid=pid)
+        report.actions.append(f"#{number} started running (pid={pid})")
+        started = True
+        if not scheduler._has_slot(ctx, budget):
+            return started
     return started
 
 
