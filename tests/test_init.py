@@ -39,7 +39,8 @@ def without_roles(text):
     return "".join(kept)
 
 
-def config_values(path):
+def fresh_config_values(path):
+    """A freshly initialized config without its roles block, which must hold every default role."""
     return yaml.safe_load(without_roles(path.read_text()))
 
 
@@ -239,7 +240,7 @@ def test_existing_config_does_not_probe_tools_or_change_worker_and_reviewer(setu
 
     monkeypatch.setattr(subprocess, "run", no_probes)
     setup.init()
-    assert without_roles((setup.root / PATHS[0]).read_text()) == original + "checks: local\n"
+    assert (setup.root / PATHS[0]).read_text() == original + "checks: local\n"
 
 
 def test_board_default_is_persisted_and_idempotent(setup):
@@ -263,7 +264,7 @@ def test_init_adds_board_to_existing_config_and_commits_it(setup, existing):
     assert path.read_text().count("board:") == 1
     if existing.startswith("#"):
         assert path.read_text().startswith(existing)
-    assert report.added_keys == ["checks", "board", "roles"] and report.committed and report.pushed
+    assert report.added_keys == ["checks", "board"] and report.committed and report.pushed
 
 
 def test_board_opt_out_and_dry_run_do_not_call_graphql(setup):
@@ -349,7 +350,7 @@ def test_existing_partial_config_and_template_remain_byte_for_byte(setup):
     template.parent.mkdir(parents=True)
     template.write_text("Existing template\n")
     report = setup.init(review="fast", approvers=["new"])
-    assert without_roles((setup.root / PATHS[0]).read_text()) == config + "checks: local\n"
+    assert (setup.root / PATHS[0]).read_text() == config + "checks: local\n"
     assert template.read_text() == "Existing template\n"
     assert report.created == [PATHS[2], *ROLE_PATHS]
     assert ["add", "-f", "--", PATHS[2], *ROLE_PATHS, *PATHS[:2]] in setup.git_calls
@@ -363,7 +364,7 @@ def test_existing_acceptance_directory_gets_no_placeholder(setup):
 
 def test_only_nondefault_keys_and_explicit_approvers_are_written(setup):
     setup.init(review="fast", executor="claude", run_hours="22-08", approvers=["alice", "bob"])
-    assert config_values(setup.root / PATHS[0]) == {
+    assert fresh_config_values(setup.root / PATHS[0]) == {
         "review": "fast", "executor": "claude", "approvers": ["alice", "bob"], "run_hours": "22-08",
         "reviewer": "claude", "checks": "local",
     }
@@ -374,7 +375,7 @@ def test_only_nondefault_keys_and_explicit_approvers_are_written(setup):
 @pytest.mark.parametrize("language", ["ko", "en", "ja"])
 def test_init_writes_explicit_language(setup, language):
     setup.init(language=language)
-    assert config_values(setup.root / PATHS[0])["language"] == language
+    assert yaml.safe_load((setup.root / PATHS[0]).read_text())["language"] == language
     assert load_config(setup.root).language == language
 
 
@@ -387,8 +388,8 @@ def test_existing_config_adds_only_missing_explicit_keys(setup, key, value):
     (setup.root / PATHS[0]).write_text(config)
     report = setup.init(**{key: value})
     assert (setup.root / PATHS[0]).read_text().startswith(config)
-    assert config_values(setup.root / PATHS[0]) == {"base_branch": "main", key: value, "checks": "local"}
-    assert report.added_keys == [key, "checks", "roles"]
+    assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {"base_branch": "main", key: value, "checks": "local"}
+    assert report.added_keys == [key, "checks"]
     assert f"Added config key: {key}" in report.summary()
     setup.git_calls.clear()
     report = setup.init(**{key: value})
@@ -412,10 +413,10 @@ def test_init_null_configuration_dry_run_and_multiple_missing_keys(setup):
     path = setup.root / PATHS[0]
     path.write_text("~\n")
     report = setup.init(language="ko", executor="claude", dry_run=True)
-    assert report.added_keys == ["executor", "language", "checks", "roles"]
+    assert report.added_keys == ["executor", "language", "checks"]
     assert path.read_text() == "~\n"
     setup.init(language="ko", executor="claude")
-    assert config_values(path) == {"executor": "claude", "language": "ko", "checks": "local"}
+    assert yaml.safe_load(path.read_text()) == {"executor": "claude", "language": "ko", "checks": "local"}
     assert not setup.init(language="ko", executor="claude").added_keys
 
 
@@ -432,14 +433,14 @@ def test_existing_language_is_never_overwritten_and_missing_values_override_glob
     report = setup.init(language="en", executor="codex")
     assert load_config(setup.root).language == "ko"
     assert load_config(setup.root).executor == "codex"
-    assert report.added_keys == ["executor", "checks", "roles"]
+    assert report.added_keys == ["executor", "checks"]
 
 
 def test_init_dry_run_reports_missing_keys_without_writing(setup):
     (setup.root / PATHS[0]).write_text("review: fast\n")
     report = setup.init(language="ko", dry_run=True)
     assert (setup.root / PATHS[0]).read_text() == "review: fast\n"
-    assert report.added_keys == ["language", "checks", "roles"]
+    assert report.added_keys == ["language", "checks"]
     assert "Would add config key: language" in report.summary()
     assert not report.committed and report.commit_planned
 
@@ -691,7 +692,7 @@ def test_explicit_default_options_override_global_config(setup):
     global_path.parent.mkdir(parents=True)
     global_path.write_text("executor: claude\nrun_hours: 22-08\nreview: careful\napprovers: [global]\n")
     setup.init(executor="codex", run_hours="always", review="batch", approvers=["human"])
-    assert config_values(setup.root / PATHS[0]) == {
+    assert fresh_config_values(setup.root / PATHS[0]) == {
         "executor": "codex", "run_hours": "always", "review": "batch", "approvers": ["human"],
         "checks": "local",
     }
@@ -781,9 +782,7 @@ def test_init_rerun_removes_only_generated_publisher_and_commits_deletion(setup,
         '    steps:\n      - run: python -m foragent.ci_publish\n')
     history = GitHistory(setup.root.parent / 'origin.git', setup.root,
                          git_command(setup.root, 'rev-parse', 'HEAD'))
-    # Keep the roles the first init wrote, so only the publisher can change.
-    kept_roles = yaml.safe_dump({'roles': yaml.safe_load((setup.root / '.foragent.yml').read_text())['roles']})
-    history.update({'.foragent.yml': f'checks: {mode}\ntest_command: python -m pytest\n' + kept_roles,
+    history.update({'.foragent.yml': f'checks: {mode}\ntest_command: python -m pytest\n',
                     WORKFLOW: 'name: customized measurement\n', **({legacy: original} if tracked else {})})
     git_command(setup.root, 'fetch', 'origin')
     git_command(setup.root, 'merge', '--ff-only', 'origin/main')
@@ -885,7 +884,7 @@ def test_missing_checks_in_existing_config_is_selected_without_input_and_kept(
     report = setup.init()
     assert path.read_text().startswith(original)
     assert yaml.safe_load(path.read_text())['checks'] == mode
-    assert report.added_keys == ['checks', 'roles']
+    assert report.added_keys == ['checks']
     assert (setup.root / WORKFLOW).exists() is (mode == 'ci')
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1 and f'checks: {mode}' in lines[0]
@@ -1110,7 +1109,12 @@ def _role_command_after_hand_deletion(tmp_path, monkeypatch, command, *, staged)
     assert git_command(root, "ls-files", "--others", "--", *owned) == "", "Nothing owned is left untracked"
     staged = sorted(git_command(root, "diff", "--name-only", "HEAD~1", "HEAD", "--", *owned).splitlines())
     assert git_command(root, "status", "--porcelain", "--", *owned) == "", "Nothing owned is left uncommitted"
-    assert commits == [staged], "One commit with every owned change"
+    commit, = commits
+    assert [path for path in commit if path in staged] == staged, "One commit with every owned change"
+    derived = tuple(f".claude/{kind}/fa-{name}" for name in roles.DEFAULT_ROLES
+                    for kind in ("agents", "agent-memory", "skills"))
+    assert all(path in staged or path.startswith(derived) for path in commit), (
+        "Anything else in the commit is a default role the command added to the source")
     assert ".claude/agent-memory/fa-security/old.md" in staged, "Commit the deletion made by hand"
     memory = ".claude/agent-memory/fa-security/MEMORY.md"
     # set recreates MEMORY.md with HEAD's bytes, so only add and remove change it.
@@ -1148,7 +1152,9 @@ def test_role_commands_keep_every_byte_outside_the_roles_block(tmp_path, monkeyp
         text = (root / ".foragent.yml").read_text()
         assert text.startswith(head) and text.endswith(tail), "Bytes outside the roles block stay identical"
         assert text[len(head):len(text) - len(tail)].startswith("roles:\n")
-    assert yaml.safe_load(text)["roles"] == {"orchestrator": orchestrator}
+    final = yaml.safe_load(text)["roles"]
+    assert final["orchestrator"] == orchestrator and set(final) == set(roles.DEFAULT_ROLES), (
+        "The first role command fills in the missing default entries; remove leaves them")
     assert "dropped 1 comment" in capsys.readouterr().err, "Say once that the block's comment was dropped"
 
 
@@ -1163,35 +1169,33 @@ def test_init_adds_roles_without_changing_bytes_outside_the_block(setup, origina
     path.write_bytes(original.encode())
     setup.init()
     written = path.read_bytes().decode()
-    source = yaml.safe_load(written)["roles"]
-    assert set(roles.DEFAULT_ROLES) <= source.keys()
     if "roles:" in original:
+        source = yaml.safe_load(written)["roles"]
+        assert set(roles.DEFAULT_ROLES) <= source.keys()
         head, tail = original[:original.index("roles:")], original[original.index("# tail"):]
         assert written.startswith(head) and written.endswith(tail), "Bytes outside the roles block stay identical"
         assert "\n" not in written.replace("\r\n", ""), "A CRLF file keeps CRLF line ends"
         assert source["orchestrator"]["skills"] == ["fa-orchestrator"]
     else:
-        assert written.startswith(original), "Trailing blank lines stay; the roles block is appended after them"
+        assert written == original, "Re-init leaves a config without a roles key byte-identical"
 
 
 def test_init_leaves_a_flow_style_config_unchanged_and_warns(setup, capsys):
     """The role agents derive from the roles source, so init refuses instead of creating them without it."""
     path = setup.root / PATHS[0]
-    path.write_bytes(b"{review: fast, checks: local}  # one line\n")
+    path.write_bytes(b"{review: fast, checks: local, roles: {}}  # one line\n")
     with pytest.raises(ConfigError, match="roles"):
         setup.init()
-    assert path.read_bytes() == b"{review: fast, checks: local}  # one line\n"
+    assert path.read_bytes() == b"{review: fast, checks: local, roles: {}}  # one line\n"
     assert not (setup.root / ".claude/agents").exists(), "No agent without its roles source"
 
 
-def test_init_puts_roles_inside_a_document_with_an_explicit_end(setup):
-    path = setup.root / PATHS[0]
-    path.write_bytes(b"review: fast\nchecks: local\n...\n# after the document\n")
-    setup.init()
-    written = path.read_bytes().decode()
+def test_edit_roles_puts_the_block_inside_a_document_with_an_explicit_end():
+    text = "review: fast\nchecks: local\n...\n# after the document\n"
+    written = roles.edit_roles(text, {"docs": roles.default_entry("docs")})
     assert written.startswith("review: fast\nchecks: local\nroles:\n")
     assert written.endswith("...\n# after the document\n")
-    assert set(roles.DEFAULT_ROLES) <= yaml.safe_load(written)["roles"].keys()
+    assert set(yaml.safe_load(written)["roles"]) == {"docs"}
 
 
 def test_init_copies_the_skills_the_roles_entry_lists(setup):
@@ -1260,3 +1264,35 @@ def test_init_reports_dropped_roles_comments_once_with_board_settings(setup, cap
     assert "board" in report.added_keys and "roles" in report.added_keys
     notices = [line for line in capsys.readouterr().err.splitlines() if "dropped" in line]
     assert notices == ["Note: rewrote the roles block of .foragent.yml and dropped 1 comment(s) inside it."]
+
+
+@pytest.mark.parametrize("command", ["add", "set", "remove"])
+def test_role_commands_derive_the_default_roles_they_add_to_a_legacy_config(tmp_path, monkeypatch, command):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    root = tmp_path / "project"
+    git_command(tmp_path, "init", "-q", "-b", "main", str(root))
+    git_command(root, "remote", "add", "origin", "git@github.com:owner/repo.git")
+    files = {".foragent.yml": "review: fast\n"}  # a config from before roles existed
+    for path, text in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(text)
+    git_command(root, "add", "-A")
+    base = git_command(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+                       git_command(root, "write-tree"), "-m", "base")
+    git_command(root, "update-ref", "refs/heads/main", base)
+    commits = []
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
+    if command == "add":
+        roles.add_role(root, "security", skills=[], scope=[], signals=[])
+    else:
+        # set and remove need a security entry; the first command writes the block with the defaults.
+        roles.add_role(root, "audit", skills=[], scope=[], signals=[])
+        commits.clear()
+        roles.set_role(root, "audit", scope=["src/**"]) if command == "set" else roles.remove_role(root, "audit")
+    declared = yaml.safe_load((root / ".foragent.yml").read_text())["roles"]
+    assert set(roles.DEFAULT_ROLES) <= declared.keys()
+    assert roles.role_drift(root, load_config(root)) == [], "Every declared role has its agent and memory"
+    head = git_command(root, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+    for name in roles.DEFAULT_ROLES:
+        assert f".claude/agents/fa-{name}.md" in head and f".claude/agent-memory/fa-{name}/MEMORY.md" in head
+    assert git_command(root, "status", "--porcelain", "--", ".claude", ".foragent.yml") == ""

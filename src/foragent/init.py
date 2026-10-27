@@ -221,9 +221,10 @@ def init_repo(
             added["claude_quota"] = {**(block if isinstance(block, dict) else {}), "mode": claude_quota}
         if "checks" not in local:
             added["checks"] = initial_checks(repo, run, command=config.test_command or next(iter(detect_test_commands(root)), None))
-        # Existing role entries are kept; missing defaults are added (#769).
-        # The roles writer appends a missing block itself, so roles never pass through _add_config.
-        role_source = roles.with_defaults(root, local.get("roles") or {})
+        # Existing role entries are kept; missing defaults are added to an existing roles block (#769).
+        # A config without a roles key stays byte-identical on re-init; the first fa role command
+        # writes the block from the defaults. The roles writer never goes through _add_config.
+        role_source = roles.with_defaults(root, local.get("roles") or {}) if "roles" in local else None
         if role_source is not None:
             _validate({**asdict(config), **added, "roles": role_source})
             config = replace(config, roles=role_source)
