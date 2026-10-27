@@ -89,3 +89,10 @@ def test_briefing_ends_with_the_named_choices_from_the_registry():
     step = brief.next_step("ko")
     assert step["question"] == "무엇을 할까요?"
     assert [choice["id"] for choice in step["choices"]] == ["order", "design", "inspect"]
+
+
+def test_scorecard_line_sits_just_before_the_closing_question():
+    facts = {**sample(), "scorecard_line": "Worse than the days before: minutes to merge 10.0 -> 36.0"}
+    lines = brief.render(facts, "en").splitlines()
+    assert lines[-2] == facts["scorecard_line"]
+    assert "->" not in brief.render({**sample(), "scorecard_line": None}, "en")
