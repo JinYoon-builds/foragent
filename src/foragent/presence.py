@@ -18,6 +18,28 @@ def project_root(start: Path) -> Path | None:
     return None
 
 
+def gate_merges(store) -> dict[tuple[int, str], str]:
+    """Merge times from the gate's record_merge records, by (number, started_at).
+
+    The one merge source (#754): merges outside the gate, in issue snapshots or PR
+    listings, are not counted. record_merge writes runs/<n>.json at the merge;
+    finish_run copies it into the history merge_times() reads, after the gate's
+    GitHub calls. Reading both shows a merge at once; the key counts it once.
+    """
+    import json
+
+    times = dict(store.merge_times())
+    for path in (store.root / "runs").glob("*.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and isinstance(record.get("merged_at"), str) \
+                and isinstance(record.get("started_at"), str) and isinstance(record.get("number"), int):
+            times[record["number"], record["started_at"]] = record["merged_at"]
+    return times
+
+
 def counts(store, now: datetime) -> tuple[int, int, int]:
     """(working lanes, person's-turn issues, merges on the local calendar day of ``now``)."""
     from foragent.orch_inbox import waiting_issues
@@ -28,7 +50,7 @@ def counts(store, now: datetime) -> tuple[int, int, int]:
     turns |= waiting_issues(store)
     today = now.astimezone().date()
     merged = 0
-    for (_, started), value in store.merge_times().items():
+    for (_, started), value in gate_merges(store).items():
         try:
             at, start = datetime.fromisoformat(value), datetime.fromisoformat(started)
         except ValueError:

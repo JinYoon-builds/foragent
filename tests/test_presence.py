@@ -63,3 +63,21 @@ def test_a_failed_rerun_does_not_count_the_earlier_merge_again(tmp_path):
     clock[0] = now - timedelta(minutes=30)
     store.finish_run(7, outcome="checks-failed")
     assert presence.counts(store, now) == (0, 0, 1)
+
+
+def test_a_gate_merge_counts_before_its_run_is_finished_and_only_once(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from foragent import presence
+    from foragent.state import StateStore
+
+    now = datetime(2026, 10, 27, 12, tzinfo=UTC)
+    clock = [now - timedelta(hours=2)]
+    store = StateStore(tmp_path / "state", lambda: clock[0])
+    store.start_run(8, branch="foragent/issue-8", worktree=tmp_path / "w8", lane="api")
+    clock[0] = now - timedelta(hours=1)
+    store.record_merge(8, clock[0])
+    # The gate still has GitHub calls to make before finish_run moves the merge into history.
+    assert presence.counts(store, now) == (1, 0, 1)
+    store.finish_run(8, outcome="merged")
+    assert presence.counts(store, now) == (0, 0, 1)
