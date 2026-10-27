@@ -35,7 +35,7 @@ from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
 from foragent.order import detect_test_commands
 from foragent.orch_reinstall import after_merge
-from foragent.orch_stop import STOPPED, leave_to_stop, stop_owns
+from foragent.orch_stop import STOPPED, StopRequested, guard_runner, leave_to_stop, stop_owns
 from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.processes import observe_tree, run_logged, track_process_group
 from foragent.reasons import Reason
@@ -268,7 +268,7 @@ def _implement_and_publish(
         if outcome != "merged" and not stop_owns(ctx.store, n):
             run = ctx.store.get_run(n)
             _preserve_failed_implementation(
-                n, ctx, git, run.outcome or outcome, approval=attempt.approval, approved_ref=attempt.approved_ref,
+                n, ctx, git, run.outcome or outcome, approval=attempt.approval,
                 title=attempt.issue.title, pushed_head=attempt.pushed_head, tracker_available=attempt.tracker_available,
                 push_branch=lambda: _push_branch(attempt),
             )
@@ -277,7 +277,19 @@ def _implement_and_publish(
 def review_only(
     n: int, ctx: RunContext, *, verdict_head: str | None = None, repair_ci: bool = True,
 ) -> str:
-    """Review a PR, optionally repairing CI inline instead of returning its failure."""
+    """Review a PR, optionally repairing CI inline instead of returning its failure.
+
+    Once a stop request owns the run, every write (labels, comments, PR, flag,
+    WIP, record) is left to `fa orch stop`, and the result is "stopped".
+    """
+    try:
+        with guard_runner(ctx, n):
+            return _review_issue(n, ctx, verdict_head=verdict_head, repair_ci=repair_ci)
+    except StopRequested:
+        return STOPPED
+
+
+def _review_issue(n: int, ctx: RunContext, *, verdict_head: str | None, repair_ci: bool) -> str:
     worktree = ctx.store.worktree_path(n)
     outcome = "error"
     detail = ""
@@ -361,13 +373,23 @@ def review_only(
                     outcome = "limit-wait"
                 finally:
                     try:
-                        ctx.store.finish_run(n, outcome=outcome, detail=detail)
+                        if not stop_owns(ctx.store, n):  # A request may have landed during the repair.
+                            ctx.store.finish_run(n, outcome=outcome, detail=detail)
                     finally:
                         kick_tick(ctx.repo_root)
     return outcome
 
 
 def run_issue(n: int, ctx: RunContext) -> str:
+    """Run one approved issue; "stopped" when a stop request took the run over (exit 0)."""
+    try:
+        with guard_runner(ctx, n):
+            return _run_issue(n, ctx)
+    except StopRequested:
+        return STOPPED
+
+
+def _run_issue(n: int, ctx: RunContext) -> str:
     outcome = "error"
     detail = ""
     worktree = ctx.store.worktree_path(n)

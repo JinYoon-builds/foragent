@@ -53,26 +53,27 @@ def _kill_run(
         return False
     if outcome == orch_stop.STOPPED:  # The stop only terminates the tree; orch_stop owns the rest.
         return _stop_run_processes(ctx, run, report) in {"stopped", "gone"}
-    if orch_stop.stop_request(ctx.store, number) is not None:
-        return False  # While a stop request exists, other kills leave the run to it.
-    if count_stall:
-        ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
-    try:
-        stopped = _stop_run_processes(ctx, run, report)
-    except Exception:
+    with orch_stop.tick_owns(ctx.store, number) as owned:  # No stop claims N mid-decision.
+        if not owned or (run := ctx.store.get_run(number)) is None or run.status != "running":
+            return False  # A stop request owns it, or the run ended since it was read.
         if count_stall:
-            ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
-        raise
-    if stopped != "stopped":
-        if count_stall:
-            ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
-        if stopped == "gone":
-            _finish_dead_run(ctx, run, report)
-        return False
-    scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome)
-    ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
-    report.actions.append(f"#{number} runner killed")
-    return True
+            ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
+        try:
+            stopped = _stop_run_processes(ctx, run, report)
+        except Exception:
+            if count_stall:
+                ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
+            raise
+        if stopped != "stopped":
+            if count_stall:
+                ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
+            if stopped == "gone":
+                _finish_dead_run(ctx, run, report)
+            return False
+        scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome)
+        ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
+        report.actions.append(f"#{number} runner killed")
+        return True
 
 
 def _crash_detail(ctx: TickContext, number: int) -> str:
@@ -197,10 +198,8 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
     sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
-    stopping = orch_stop.recover_requests(ctx, report)  # Requests own their runs; see orch_stop.
+    orch_stop.recover_requests(ctx, report)  # Requests own their runs; tick_owns keeps it so below.
     for run in ctx.store.active_runs():
-        if run.number in stopping:
-            continue
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
         if cached is not None and any(
@@ -250,11 +249,12 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             continue
         # Clean up a crashed group or finish an interrupted stall termination.
         # A recorded completion does not need another signal.
-        stopped = _stop_run_processes(
-            ctx, run, report, stop_runner=run.outcome in {None, "crashed", "stalled-restart", "stalled"},
-        )
-        if stopped != "refused":
-            _finish_dead_run(ctx, run, report)
+        with orch_stop.tick_owns(ctx.store, run.number) as owned:  # A request now makes it the stop's.
+            stopped = _stop_run_processes(
+                ctx, run, report, stop_runner=run.outcome in {None, "crashed", "stalled-restart", "stalled"},
+            ) if owned else "refused"
+            if stopped != "refused":
+                _finish_dead_run(ctx, run, report)
 
 
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:

@@ -17,6 +17,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
+from foragent.orch_stop_checkpoint import checkpoint, worktree_state
 from foragent import orch_events, orch_reviewers, review_perspectives, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
@@ -163,6 +164,8 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
             scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir, rebuttals,
                                                       risk_notes))
         before = git.review_state()
+        # The reviewer's edits are not the run's work: a stop that cuts the review saves this instead.
+        scope.enter_context(checkpoint(ctx.store, n, worktree_state(git, f"foragent/issue-{n}")))
         try:
             result = _available_executor(
                 n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
@@ -287,12 +290,13 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
                                    risk_notes=review_perspectives.with_checklist(notes, ctx.config, share))
                for share in shares]
     before = git.review_state()
-    try:
-        with ThreadPoolExecutor(max_workers=len(prompts), thread_name_prefix=f"review-{n}") as pool:
-            futures = [pool.submit(call, prompt, path) for prompt, path in zip(prompts, logs)]
-        errors = [future.exception() for future in futures]
-    finally:
-        edited = restore(before)
+    with checkpoint(ctx.store, n, worktree_state(git, f"foragent/issue-{n}")):  # As in _review.
+        try:
+            with ThreadPoolExecutor(max_workers=len(prompts), thread_name_prefix=f"review-{n}") as pool:
+                futures = [pool.submit(call, prompt, path) for prompt, path in zip(prompts, logs)]
+            errors = [future.exception() for future in futures]
+        finally:
+            edited = restore(before)
     count = len(futures)
     # A member's spec conflict stops the run whatever else happened in the round, so it is read
     # before any usage limit discards the round and it skips the merge call (which could drop it).

@@ -618,6 +618,26 @@ def test_review_only_leaves_a_stop_requested_run_to_the_stop_command(review_case
     _finish_as_the_stop_would(c, worktree)
 
 
+def test_review_fail_after_a_stop_request_writes_no_refusal(review_case, monkeypatch):
+    from foragent import run_review
+
+    c = review_case
+    c.review_calls = enable_reviewer(c, ["VERDICT: FAIL\n- src/x.py:1: wrong"])
+    flag_before = c.store.load_flag(1)
+    finish_review = run_review._finish_review
+
+    def requested_during_review(n, ctx, review, round_number):
+        _request_stop(c, n)  # `fa orch stop` writes its request while the reviewer runs.
+        return finish_review(n, ctx, review, round_number)
+
+    monkeypatch.setattr(run_review, "_finish_review", requested_during_review)
+    assert runner.review_only(1, c.ctx) == "stopped"
+    assert c.store.load_flag(1) == flag_before, "No retries-exceeded flag after the request"
+    assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"running"}
+    assert c.store.get_run(1).status == "running"
+    _finish_as_the_stop_would(c, c.store.worktree_path(1))
+
+
 @pytest.mark.parametrize("ending", ["signal", "error", "finished"])
 def test_run_issue_leaves_a_stop_requested_run_to_the_stop_command(review_case, monkeypatch, ending):
     c = review_case

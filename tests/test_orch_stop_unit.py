@@ -153,7 +153,7 @@ def _killer(case, *, dies=True):
         calls.append(kwargs)
         assert orch_stop.read_request(ctx.store, number) is not None, "The request must be durable before the kill"
         if dies:
-            case.table.rows.pop(RUNNER)
+            case.table.rows.pop(RUNNER, None)
         return True
 
     return calls, kill
@@ -197,28 +197,89 @@ def test_a_descendant_found_after_the_kill_keeps_the_tree_alive(case):
     assert orch_stop.tree_alive(case.store.get_run(1)), "A recorded descendant reparented to init still lives"
 
 
-def test_a_busy_worktree_lock_exits_after_5_minutes_with_the_request_kept(case, monkeypatch):
+@pytest.mark.parametrize("step", [1, 10])
+def test_a_busy_worktree_lock_after_the_kill_exits_on_the_5_minute_deadline_with_the_request_kept(
+    case, monkeypatch, step,
+):
     _, kill = _killer(case)
     monkeypatch.setattr(scheduler, "_kill_run", kill)
     held, release = threading.Event(), threading.Event()
 
-    def holder():
+    def holder():  # Not the runner: its lock dies with it. Another holder never blocks the kill.
         with case.store.worktree_lock(1):
             held.set()
             release.wait(10)
 
+    def sleep(seconds):  # A late wakeup: each 1 s sleep may take longer on the clock.
+        case.sleeps.append(seconds)
+        case.clock[0] += timedelta(seconds=step)
+
+    case.ctx.sleep = sleep
     thread = threading.Thread(target=holder)
     thread.start()
     held.wait(10)
+    start = case.clock[0]
     try:
         with pytest.raises(orch.OrchError, match="worktree-lock"):
             orch.stop(case.ctx, 1, "reprioritize")
     finally:
         release.set()
         thread.join()
-    assert len(case.sleeps) == orch_stop.LOCK_WAIT_S
-    assert orch_stop.read_request(case.store, 1) is not None
-    assert case.store.get_run(1).status == "running", "Nothing is written before the lock is held"
+    assert case.clock[0] - start <= timedelta(seconds=orch_stop.LOCK_WAIT_S + step)
+    assert len(case.sleeps) == orch_stop.LOCK_WAIT_S // step, "The deadline is elapsed time, not a count"
+    assert orch_stop.read_request(case.store, 1) is not None, "After the kill the request stays for the tick"
+    assert case.store.get_run(1).status == "running" and case.tracker.calls == []
+
+
+def test_a_kill_inside_a_checkpointed_step_saves_the_checkpointed_work(case, monkeypatch):
+    from foragent import orch_stop_checkpoint
+
+    state = {"head": "src000", "tree": "tree000", "branch": "foragent/issue-1", "branch_tip": "src000"}
+    # The runner entered a destructive step (rebuild then re-apply) and was killed inside it.
+    cut = orch_stop_checkpoint.checkpoint(case.store, 1, state)  # Kept: a dead runner never unwinds it.
+    cut.__enter__()
+    order = []
+    worktree = _Worktree()
+    _saved_worktree(case, monkeypatch, worktree)
+    monkeypatch.setattr(orch_stop_checkpoint, "restore", lambda ctx, path, cut: order.append(("restore", cut)))
+    _, kill = _killer(case)
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    orch.stop(case.ctx, 1, "reprioritize")
+    assert order == [("restore", {"started_at": case.store.get_run(1).started_at, **state})]
+    assert orch_stop_checkpoint.read_checkpoint(case.store, 1) is None
+
+
+def test_a_merge_call_in_flight_completes_before_the_kill_and_the_stop_reports_it(case, monkeypatch):
+    from foragent import orch_stop_checkpoint
+
+    marker = orch_stop_checkpoint.merging(case.store, 1)
+    marker.__enter__()  # The runner called merge before the request.
+
+    def sleep(seconds):
+        case.clock[0] += timedelta(seconds=seconds)
+        case.store.record_merge(1, case.clock[0])  # The merge call returns.
+        case.store.finish_run(1, outcome="merged")
+        marker.__exit__(None, None, None)
+        case.table.rows.pop(RUNNER, None)
+
+    case.ctx.sleep = sleep
+    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **k: pytest.fail("A merge in flight is never cut"))
+    assert "runner merged" in orch.stop(case.ctx, 1, "reprioritize")
+    assert orch_stop.read_request(case.store, 1) is None and case.tracker.calls == []
+
+
+def test_an_unreadable_scan_before_the_kill_removes_the_request(case, monkeypatch):
+    def unreadable():
+        raise PermissionError("ps denied")
+
+    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **k: pytest.fail("No kill after a failed scan"))
+    monkeypatch.setattr(processes, "list_processes", unreadable)
+    monkeypatch.setattr(orch_stop, "write_request", lambda store, run, why, now, previous=None: orch_stop._write(
+        store, record := {"number": 1, "started_at": run.started_at, "why": why, "requested_at": now.isoformat(),
+                          "pid": COMMAND, "start_time": 1.0}) or record)
+    with pytest.raises(orch.OrchError, match="before the kill.*nothing was changed"):
+        orch.stop(case.ctx, 1, "reprioritize")
+    assert orch_stop.read_request(case.store, 1) is None
 
 
 def test_a_failed_kill_keeps_the_request_for_the_tick(case, monkeypatch):
@@ -282,16 +343,20 @@ def test_a_closed_issue_changes_nothing_else(case, monkeypatch):
 
 class _Worktree:
     def __init__(self, push_error=None):
-        self.push_error, self.pushes = push_error, []
+        self.push_error, self.pushes, self.head = push_error, [], "base000000000000"
+        self.published = "base000000000000"  # origin's foragent/issue-1
 
     def head_sha(self):
-        return "abc123def4567890"
+        return self.head
 
     def _call(self, args):
         if args[0] == "push":
             self.pushes.append(args)
             if self.push_error:
                 raise GitError(self.push_error)
+            self.published = self.head
+        if args[:2] == ["rev-list", "--count"]:
+            return "0" if self.head == args[-1] else "1"
         return ""
 
 
@@ -299,9 +364,15 @@ def _saved_worktree(case, monkeypatch, worktree):
     path = case.ctx.repo_root / "wt"
     path.mkdir()
     removed = []
-    case.ctx.git = SimpleNamespace(at=lambda root: worktree, remove_worktree=lambda root: removed.append(root))
-    monkeypatch.setattr("foragent.run_publish._preserve_failed_implementation",
-                        lambda n, ctx, git, reason, **kwargs: "saved" if reason == "stopped: reprioritize" else None)
+    case.ctx.git = SimpleNamespace(at=lambda root: worktree, remove_worktree=lambda root: removed.append(root),
+                                   remote_branch_sha=lambda branch: worktree.published)
+    def preserve(n, ctx, git, reason, **kwargs):
+        if git.head == "base000000000000" and reason == "stopped: reprioritize":
+            git.head = "abc123def4567890"  # The WIP commit.
+            return "saved"
+        return "clean"
+
+    monkeypatch.setattr("foragent.run_publish._preserve_failed_implementation", preserve)
     return removed
 
 
@@ -466,6 +537,12 @@ def test_replay_source_restoration_holds_the_worktree_lock_from_recreation_to_re
         def ref_sha(self, ref):
             return "sha"
 
+        def head_sha(self):
+            return "dest"
+
+        def staged_tree_sha(self):
+            return "dest-tree"
+
         def remove_worktree(self, path):
             with store.worktree_lock(1):  # Main's removal takes the lock itself; it reenters here.
                 seen.append(("remove", _locked_from_another_thread(store)))
@@ -474,13 +551,267 @@ def test_replay_source_restoration_holds_the_worktree_lock_from_recreation_to_re
             seen.append(("add", _locked_from_another_thread(store)))
 
         def _call(self, args):
-            seen.append((args[0], _locked_from_another_thread(store)))
+            if args[0] != "symbolic-ref":
+                seen.append((args[0], _locked_from_another_thread(store)))
             return ""
 
     git = Git()
     attempt = SimpleNamespace(n=1, ctx=SimpleNamespace(store=store, git=git), git=git, worktree=case.ctx.repo_root / "wt",
                               start_ref="old", branch="foragent/issue-1", target_branch="batch-1", log=case.ctx.repo_root / "log")
     error = PatchReplayError("conflict", own_paths=[], source_head="head", source_tree="tree", source_target="main")
+    from foragent import orch_stop_checkpoint
+
+    monkeypatch.setattr(run_conflicts, "_inject_lane_skills", lambda *a: seen.append(
+        ("skills", _locked_from_another_thread(store), orch_stop_checkpoint.read_checkpoint(store, 1)["head"])))
     run_conflicts._restore_replay_source(attempt, error)
-    assert seen == [("remove", True), ("add", True), ("skills", True), ("read-tree", True)]
+    assert seen == [("remove", True), ("add", True), ("skills", True, "head"), ("read-tree", True)], \
+        "The source, not the half-built worktree, is checkpointed for the whole step"
     assert not _locked_from_another_thread(store)
+    assert orch_stop_checkpoint.read_checkpoint(store, 1) is None, "A finished step leaves no checkpoint"
+
+
+def test_a_takeover_keeps_the_save_checkpoint_and_pushes_the_kept_wip(case, monkeypatch):
+    worktree = _Worktree("! [rejected] (fetch first)")
+    _saved_worktree(case, monkeypatch, worktree)
+    _, kill = _killer(case)
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    with pytest.raises(orch.OrchError, match="push"):
+        orch.stop(case.ctx, 1, "reprioritize")
+    case.table.rows.pop(COMMAND)  # The first stop command died; a second one takes over.
+    processes.os.pid = 91010
+    case.table.rows[91010] = ProcessIdentity(91010, 1, 91010, 91010, 2.0)
+    worktree.push_error = None
+    summary = orch.stop(case.ctx, 1, "reprioritize")
+    assert "abc123def456" in summary and "nothing to save" not in summary
+    assert len(worktree.pushes) == 2, "The kept WIP must still be pushed"
+
+
+def test_unpublished_commits_made_before_the_save_are_pushed_not_called_nothing(case, monkeypatch):
+    worktree = _Worktree()
+    _saved_worktree(case, monkeypatch, worktree)
+    worktree.head = "abc123def4567890"  # The run committed this itself (or a save died after committing).
+    monkeypatch.setattr("foragent.run_publish._preserve_failed_implementation", lambda *a, **k: "clean")
+    _, kill = _killer(case)
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    summary = orch.stop(case.ctx, 1, "reprioritize")
+    assert "abc123def456" in summary and "nothing to save" not in summary and worktree.pushes
+
+
+def test_a_published_branch_with_nothing_new_is_nothing_to_save(case, monkeypatch):
+    worktree = _Worktree()
+    _saved_worktree(case, monkeypatch, worktree)
+    monkeypatch.setattr("foragent.run_publish._preserve_failed_implementation", lambda *a, **k: "clean")
+    _, kill = _killer(case)
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    assert "nothing to save" in orch.stop(case.ctx, 1, "reprioritize") and not worktree.pushes
+
+
+def test_a_leaderless_executor_group_and_a_reparented_descendant_keep_the_tree_alive(case):
+    case.store.update_run(1, executor_pgid=42001, process_identities=[
+        {"pid": RUNNER, "start_time": 5.0}, {"pid": 42001, "start_time": 6.0}])
+    run = case.store.get_run(1)
+    case.table.rows.pop(RUNNER)
+    case.table.rows[42005] = ProcessIdentity(42005, 1, 42001, 42001, 7.0)  # Unrecorded group member.
+    assert orch_stop.tree_alive(run), "The group outlives its leader"
+    case.table.rows.pop(42005)
+    case.table.rows[42006] = ProcessIdentity(42006, 42002, 42006, 42006, 8.0)
+    case.table.rows[42002] = ProcessIdentity(42002, 42001, 42002, 42002, 7.5)
+    case.store.update_run(1, process_identities=[{"pid": 42002, "start_time": 7.5}])
+    seen = {}
+    assert orch_stop.tree_alive(case.store.get_run(1), seen) and 42006 in seen
+    case.table.rows.pop(42002)
+    case.table.rows[42006] = ProcessIdentity(42006, 1, 42006, 42006, 8.0)  # Reparented after its parent died.
+    assert orch_stop.tree_alive(case.store.get_run(1), seen)
+    assert not orch_stop.tree_alive(case.store.get_run(1)), "Without the earlier scan it would look dead"
+
+
+def test_a_finished_stopped_run_with_a_live_process_is_not_finished_or_taken_over(case, monkeypatch):
+    orch_stop.write_request(case.store, case.store.get_run(1), "why", case.clock[0])
+    case.table.rows.pop(COMMAND)
+    case.store.finish_run(1, outcome="stopped")
+    assert orch_stop.recover_requests(case.ctx, scheduler.TickReport()) == {1}
+    assert orch_stop.read_request(case.store, 1) is not None and case.tracker.calls == []
+    processes.os.pid = 91010
+    case.table.rows[91010] = ProcessIdentity(91010, 1, 91010, 91010, 2.0)
+    with pytest.raises(orch.OrchError, match="wait-for-tree"):
+        orch.stop(case.ctx, 1, "again")
+    assert case.tracker.calls == []
+
+
+def test_a_tick_leaves_a_request_another_command_is_claiming(case):
+    orch_stop.write_request(case.store, case.store.get_run(1), "why", case.clock[0])
+    case.table.rows.pop(COMMAND)
+    held, release = threading.Event(), threading.Event()
+
+    def claimer():
+        with orch_stop.claim_lock(case.store, 1):
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=claimer)
+    thread.start()
+    held.wait(10)
+    try:
+        assert orch_stop.recover_requests(case.ctx, scheduler.TickReport()) == {1}
+    finally:
+        release.set()
+        thread.join()
+    assert orch_stop.read_request(case.store, 1) is not None and not _stop_events(case.store, "stop-request-expired")
+
+
+def test_a_request_is_only_deleted_by_its_own_claim(case):
+    old = orch_stop.write_request(case.store, case.store.get_run(1), "first", case.clock[0])
+    case.clock[0] += timedelta(seconds=5)
+    new = orch_stop.write_request(case.store, case.store.get_run(1), "second", case.clock[0])
+    orch_stop.drop_request(case.store, 1, old)
+    assert orch_stop.read_request(case.store, 1) == new
+    orch_stop.drop_request(case.store, 1, new)
+    assert orch_stop.read_request(case.store, 1) is None
+
+
+def test_a_merge_time_from_an_earlier_run_is_not_this_runs_merge(case):
+    case.store.record_merge(1, case.clock[0] - timedelta(days=1))
+    run = case.store.get_run(1)
+    assert not orch_stop.runner_merged(case.store, run)
+    case.store.record_merge(1, case.clock[0])
+    assert orch_stop.runner_merged(case.store, run)
+
+
+def test_a_runner_refusal_or_tracker_write_after_a_request_is_left_to_the_stop(case, monkeypatch):
+    from foragent.actions import flag
+    from foragent.reasons import Reason
+
+    case.store.update_run(1, pid=COMMAND)  # This process is the run's runner.
+    orch_stop.write_request(case.store, case.store.get_run(1), "why", case.clock[0])
+    with pytest.raises(orch_stop.StopRequested):
+        flag(case.ctx, 1, Reason.RETRIES_EXCEEDED, "Re-run review FAIL.")
+    assert case.store.load_flag(1) is None and case.tracker.calls == []
+    with orch_stop.guard_runner(case.ctx, 1):
+        with pytest.raises(orch_stop.StopRequested):
+            case.ctx.tracker.add_labels(1, ["blocked"])
+        assert case.ctx.tracker.get_issue(1) is case.tracker.issue, "Reads still pass"
+    assert case.ctx.tracker is case.tracker, "The runner's context gets its own tracker back"
+    case.store.update_run(1, pid=RUNNER)  # The gate or the stop command is another process: it may flag.
+    flag(case.ctx, 1, Reason.RETRIES_EXCEEDED, "Stop refused")
+    assert case.store.load_flag(1) is not None
+
+
+def test_a_ready_issue_with_a_stop_request_is_not_started(case, monkeypatch):
+    from foragent import scheduler_start
+
+    issue = SimpleNamespace(number=1, state="open", is_pull_request=False, labels={"approved", "ready"})
+    orch_stop.write_request(case.store, case.store.get_run(1), "why", case.clock[0])
+    monkeypatch.setattr(scheduler, "_machine_budget", lambda *a: None)
+    monkeypatch.setattr(scheduler, "_has_slot", lambda *a: True)
+    monkeypatch.setattr(scheduler_start, "_lane_held", lambda *a: False)
+    monkeypatch.setattr(scheduler_start, "_at_plan_width", lambda *a: False)
+    monkeypatch.setattr(scheduler_start, "_ranked", lambda ctx, ready: [("main", 1)])
+    monkeypatch.setattr(scheduler, "_local_issue", lambda ctx, n: issue)
+    case.tracker.issue = issue
+    case.ctx.launcher = lambda n: pytest.fail("A stop request owns the issue until it is deleted")
+    scheduler_start._start_ready(case.ctx, {"main": [1]}, lambda i: "main", "origin/main",
+                                 scheduler.TickReport(), sample=("normal", 0))
+
+
+def test_preservation_restores_the_approved_acceptance_blobs_not_head(tmp_path):
+    import subprocess
+
+    from foragent.git import GitRepo
+    from foragent.run_publish import _restore_approved_blobs
+
+    def git(*args, input=None):
+        return subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True,
+                              text=True, input=input).stdout.strip()
+
+    git("init", "-q")
+    approved = git("hash-object", "-w", "--stdin", input="def test_x():\n    assert True\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_x.py").write_text("def test_x():\n    pass  # weakened\n")
+    git("add", "-A")  # The executor committed the weakened locked test (plumbing: no porcelain commit).
+    head = git("-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", git("write-tree"), "-m", "weakened")
+    git("update-ref", "HEAD", head)
+    (tmp_path / "tests/test_new.py").write_text("def test_new():\n    pass\n")
+    git("add", "-A")  # An executor added a locked file approved as absent.
+    approval = SimpleNamespace(acceptance_blobs={"tests/test_x.py": approved, "tests/test_new.py": "missing"})
+    _restore_approved_blobs(GitRepo(tmp_path), approval)
+    assert git("rev-parse", ":tests/test_x.py") == approved
+    assert git("ls-files", "--", "tests/test_new.py") == ""
+
+
+def test_a_tick_decision_holds_the_claim_so_a_late_request_cannot_slip_in(case):
+    with orch_stop.tick_owns(case.store, 1) as owned:
+        assert owned
+        with orch_stop.tick_owns(case.store, 1) as nested:  # _kill_run inside the decision keeps the claim.
+            assert nested
+        seen = []
+        thread = threading.Thread(target=lambda: seen.append(
+            orch_stop.claim_lock(case.store, 1, blocking=False).__enter__()))
+        thread.start()
+        thread.join()
+        assert seen == [False], "A stop command cannot claim N in the middle of the tick's decision"
+    orch_stop.write_request(case.store, case.store.get_run(1), "why", case.clock[0])
+    with orch_stop.tick_owns(case.store, 1) as owned:
+        assert not owned, "With a request the dead-run and kill paths leave N to the stop"
+
+
+def test_a_dead_runner_with_a_surviving_descendant_is_finished_as_a_stop_not_expired(case, monkeypatch):
+    case.store.update_run(1, process_identities=[{"pid": RUNNER, "start_time": 5.0},
+                                                 {"pid": 42003, "start_time": 9.0}])
+    orch_stop.write_request(case.store, case.store.get_run(1), "why", case.clock[0])
+    case.table.rows.pop(COMMAND)
+    case.table.rows.pop(RUNNER)
+    case.table.rows[42003] = ProcessIdentity(42003, 1, 42003, 42003, 9.0)
+    kills = []
+
+    def kill(ctx, number, report, **kwargs):
+        kills.append(kwargs)
+        case.table.rows.pop(42003)
+        return True
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    orch_stop.recover_requests(case.ctx, scheduler.TickReport())
+    assert kills == [{"outcome": "stopped"}] and not _stop_events(case.store, "stop-request-expired")
+    assert case.store.get_run(1).outcome == "stopped" and orch_stop.read_request(case.store, 1) is None
+
+
+def test_processes_found_by_a_scan_are_kept_in_the_request_for_later_owners(case, monkeypatch):
+    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **k: False)  # The leftover does not die yet.
+    case.table.rows[42006] = ProcessIdentity(42006, RUNNER, 42006, 42006, 8.0)
+    record = orch_stop.write_request(case.store, case.store.get_run(1), "why", case.clock[0])
+    assert orch_stop.scan_tree(case.store, case.store.get_run(1), record)
+    assert orch_stop.read_request(case.store, 1)["seen"]["42006"] == 8.0
+    case.table.rows.pop(RUNNER)
+    case.table.rows[42006] = ProcessIdentity(42006, 1, 42006, 42006, 8.0)  # Reparented; the command died.
+    case.table.rows.pop(COMMAND)
+    assert orch_stop.recover_requests(case.ctx, scheduler.TickReport()) == {1}
+    assert case.store.get_run(1).status == "running", "A live reparented descendant blocks the save"
+
+
+def test_restore_puts_the_checkpointed_work_back_in_a_fresh_worktree(tmp_path):
+    import subprocess
+
+    from foragent.git import GitRepo
+    from foragent.orch_stop_checkpoint import restore
+
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def git(*args, cwd=root, input=None):
+        return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True,
+                              text=True, input=input).stdout.strip()
+
+    git("init", "-q")
+    (root / "a.txt").write_text("base\n")
+    git("add", "-A")
+    base = git("-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", git("write-tree"), "-m", "base")
+    git("update-ref", "refs/heads/foragent/issue-1", base)
+    (root / "a.txt").write_text("unfinished work\n")
+    git("add", "-A")
+    tree = git("write-tree")  # The run's staged work, as the checkpoint recorded it.
+    worktree = tmp_path / "wt"
+    repo = GitRepo(root)
+    repo.add_detached_worktree(worktree, base)  # A half-rebuilt worktree on the base.
+    ctx = SimpleNamespace(git=repo)
+    restore(ctx, worktree, {"head": base, "tree": tree, "branch": "foragent/issue-1", "branch_tip": base})
+    assert (worktree / "a.txt").read_text() == "unfinished work\n"
+    assert git("write-tree", cwd=worktree) == tree

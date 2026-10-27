@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from foragent.actions import flag
 from foragent.git import GitError
+from foragent.orch_stop_checkpoint import checkpoint, worktree_state
 from foragent.i18n import text
 from foragent.policy import review_mode_for
 from foragent.reasons import Reason
@@ -54,14 +55,16 @@ def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
 
 
 def _recreate_worktree(attempt: Implementation) -> None:
-    """Replace the worktree under worktree_lock(N), so a stop's save never sees it half rebuilt.
+    """Replace the worktree under worktree_lock(N), with the work it held checkpointed.
 
-    Callers with more steps that must not be seen apart (a patch to apply, a
-    tree to restore) hold the lock around all of them; this then reenters it.
+    A stop's kill may land inside: the checkpoint (HEAD and staged tree) lets
+    the stop save that work instead of a half-built worktree. Callers with more
+    steps that must not be seen apart (a patch to apply, a tree to restore) hold
+    the lock and their own checkpoint around all of them; this then reenters.
     """
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree = attempt.worktree
-    with ctx.store.worktree_lock(n):
+    with ctx.store.worktree_lock(n), checkpoint(ctx.store, n, worktree_state(git, attempt.branch)):
         artifacts = {name: path.read_bytes() for name in ("TRY.md", "REBUTTAL.md")
                      if (path := worktree / ".foragent" / name).is_file()}
         attempt.start_ref = git.ref_sha(attempt.start_ref)
@@ -97,8 +100,8 @@ def _prepare_target(attempt: Implementation) -> bool:
         attempt.start_ref = git.ref_sha(f"origin/{destination}")
         _note_moved(attempt, git.moved_between(previous, attempt.start_ref, sorted(set(paths) | set(own))))
         attempt.target_branch = destination
-        # One locked step from the old worktree to the new one with its work applied.
-        with ctx.store.worktree_lock(n):
+        # One locked, checkpointed step from the old worktree to the new one with its work applied.
+        with ctx.store.worktree_lock(n), checkpoint(ctx.store, n, worktree_state(git, attempt.branch)):
             _recreate_worktree(attempt)
             if not _acceptance_matches(n, ctx, git, attempt.approval):
                 return False
@@ -172,7 +175,10 @@ def _restore_replay_source(attempt: Implementation, exc: PatchReplayError) -> No
         return
     git = attempt.git
     try:
-        with attempt.ctx.store.worktree_lock(attempt.n):  # Recreate and restore as one step.
+        # Recreate and restore as one step; a cut one is restored from the source by the stop.
+        source = {"head": exc.source_head, "tree": exc.source_tree, "branch": attempt.branch,
+                  "branch_tip": exc.source_head}
+        with attempt.ctx.store.worktree_lock(attempt.n), checkpoint(attempt.ctx.store, attempt.n, source):
             attempt.start_ref, attempt.target_branch = exc.source_head, exc.source_target
             _recreate_worktree(attempt)
             git._call(["read-tree", "--reset", "-u", exc.source_tree])

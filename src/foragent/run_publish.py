@@ -312,7 +312,7 @@ def _check_publication(git: GitRepo, target_branch: str, base_sha: str | None = 
 
 def _preserve_failed_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
-    approved_ref: str = "HEAD", title: str | None = None, pushed_head: str | None = None,
+    title: str | None = None, pushed_head: str | None = None,
     tracker_available: bool = True, push_branch: Callable[[], None] | None = None, stop: bool = False,
 ) -> str | None:
     """Save stopped work before cleanup, including after the runner has died.
@@ -332,7 +332,7 @@ def _preserve_failed_implementation(
         except GitError:
             return None
         return _preserve_locked_implementation(
-            n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
+            n, ctx, git, reason, approval=approval, title=title,
             pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch, stop=stop,
         )
 
@@ -363,7 +363,7 @@ def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> lis
 
 def _preserve_locked_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
-    approved_ref: str, title: str | None, pushed_head: str | None,
+    title: str | None, pushed_head: str | None,
     tracker_available: bool, push_branch: Callable[[], None] | None, stop: bool = False,
 ) -> str:
     branch = f"foragent/issue-{n}"
@@ -377,7 +377,7 @@ def _preserve_locked_implementation(
             git.quit_merge()
     git.stage_changes()
     if approval is not None:
-        git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
+        _restore_approved_blobs(git, approval)
     # After a stop the whole tree is dead, so every deletion left in the worktree is its own.
     refused = [] if stop else _check_wip_deletions(ctx, git, run)
     if stop:
@@ -403,6 +403,23 @@ def _preserve_locked_implementation(
         else:
             git.push(branch)
     return status
+
+
+def _restore_approved_blobs(git: GitRepo, approval: Approval) -> None:
+    """Stage the approved acceptance files by their recorded blob hashes.
+
+    Never from a ref: an executor may have committed changed locked tests, so
+    HEAD (or any branch commit) can hold altered blobs. A missing approved blob
+    fails the save, which keeps the worktree.
+    """
+    for path, sha in sorted(approval.acceptance_blobs.items()):
+        entry = git._call(["--literal-pathspecs", "ls-files", "--stage", "--", path]).split(maxsplit=1)
+        if sha == "missing":  # Approved as absent: an executor's version stays out of the WIP.
+            if entry:
+                git._call(["update-index", "--force-remove", "--", path])
+            continue
+        mode = entry[0] if entry and entry[0] in {"100644", "100755"} else "100644"
+        git._call(["update-index", "--add", "--cacheinfo", f"{mode},{sha},{path}"])
 
 
 def _push_branch(attempt: Implementation) -> None:

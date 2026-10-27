@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, orch_plan, orch_queue, overlap_files, scheduler
+from foragent import machine_budget, orch_plan, orch_queue, orch_stop, overlap_files, scheduler
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
@@ -160,6 +160,8 @@ def _start_ready(
             issue.state == "open" and not issue.is_pull_request
             and {scheduler.APPROVED, scheduler.READY}.issubset(issue.labels)
             and not issue.labels & {scheduler.BLOCKED, scheduler.NEEDS_HUMAN, scheduler.RUNNING} and lane_for(issue) == lane
+            # A stop request owns its issue until its last step deletes it, ready label or not.
+            and orch_stop.read_request(ctx.store, issue.number) is None
         )
 
     sample = sample if sample is not None else scheduler.machine_load()
