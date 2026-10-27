@@ -30,6 +30,7 @@ where = ["src"]
 "share/foragent/skills/fa-orchestrator" = ["skills/fa-orchestrator/*.md"]
 "share/foragent/skills/fa-orchestrator/references" = ["skills/fa-orchestrator/references/*.md"]
 "share/foragent/skills/fa-architect" = ["skills/fa-architect/*.md"]
+"share/foragent/skills/fa-architect/references" = ["skills/fa-architect/references/*.md"]
 
 [tool.uv]
 cache-keys = [{ file = "pyproject.toml" }, { file = "setup.py" }, { git = { commit = true } }]

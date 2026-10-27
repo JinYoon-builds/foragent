@@ -903,3 +903,17 @@ def test_dry_run_lists_role_files_and_creates_none(setup):
     assert "Would create: .claude/agents/fa-orchestrator.md" in report.summary()
     assert "Would create: .claude/agent-memory/fa-architect/MEMORY.md" in report.summary()
     assert not (setup.root / ".claude").exists()
+
+
+def test_package_data_covers_every_file_of_both_role_skills():
+    import tomllib
+    root = Path(__file__).resolve().parents[1]
+    data_files = tomllib.loads((root / "pyproject.toml").read_text())["tool"]["setuptools"]["data-files"]
+    for role in role_agents.ROLES:
+        source = root / "skills" / role
+        files = [path.relative_to(root) for path in source.rglob("*") if path.is_file()]
+        assert files, f"{role} skill is missing"
+        for path in files:
+            destination = (Path("share/foragent") / path.parent).as_posix()
+            assert any(path.match(pattern) and path.parent == Path(pattern).parent
+                       for pattern in data_files.get(destination, [])), f"{path} is not packaged"
