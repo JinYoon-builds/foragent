@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, orch_queue, overlap_files, scheduler
+from foragent import machine_budget, orch_plan, orch_queue, overlap_files, scheduler
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
@@ -23,10 +23,16 @@ if TYPE_CHECKING:
 
 
 def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
-    """A lane waits while it, its implementer or its reviewer is paused for a usage limit."""
-    if ctx.store.lane_paused(lane, now):
+    """A lane waits while a live plan pauses it, or it, its implementer or its reviewer is paused for a usage limit."""
+    if ctx.store.lane_paused(lane, now) or orch_plan.lane_paused(ctx.store, lane, now):
         return True
     return any(ctx.store.executor_paused(name, now) for name in lane_executors(ctx.config, lane))
+
+
+def _at_plan_width(ctx: TickContext, lane: str) -> bool:
+    """A live plan width caps the lane's running runs; without one the lane has no fixed cap."""
+    width = orch_plan.width(ctx.store, lane, ctx.now())
+    return width is not None and sum(run.lane == lane for run in ctx.store.active_runs()) >= width
 
 
 def _apply_budgets(
@@ -126,14 +132,15 @@ def _overlap_count(ctx: TickContext, number: int, claims: list) -> int:
                for path in parse_body(approval.body).files)
 
 
-def _ranked(ctx: TickContext, ready: dict[str, list[int]]) -> list[tuple[str, int]]:
+def _ranked(ctx: TickContext, ready: dict[str, list[int]], claims: list | None = None) -> list[tuple[str, int]]:
     """Every lane's candidates in one start order; each still meets every start rule.
 
     Fewer declared files overlapping running runs first, then the cross-lane
     priority list, then the position in the lane's (already queue-ordered) list,
-    then the issue number.
+    then the issue number. ``claims`` lets a read-only view pass its recorded claims.
     """
-    claims = overlap_files.claims(ctx)[0] if ctx.store.active_runs() else []
+    if claims is None:
+        claims = overlap_files.claims(ctx)[0] if ctx.store.active_runs() else []
     priority = {number: index for index, number in enumerate(orch_queue.get_global(ctx.store))}
     unlisted = len(priority)
     keyed = [
@@ -163,6 +170,8 @@ def _start_ready(
         if not scheduler._has_slot(ctx, budget):
             break
         if held.setdefault(lane, _lane_held(ctx, lane, ctx.now())):
+            continue
+        if _at_plan_width(ctx, lane):
             continue
         local = scheduler._local_issue(ctx, number)
         if local is not None and not eligible(local, lane):

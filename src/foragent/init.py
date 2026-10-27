@@ -9,7 +9,7 @@ import subprocess
 
 import yaml
 
-from foragent import board, launchd
+from foragent import board, gh, launchd
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
@@ -111,7 +111,7 @@ class InitReport:
 
 
 def _run_gh(args: list[str], input: str | None = None) -> str:
-    return subprocess.run(["gh", *args], input=input, check=True, capture_output=True, text=True).stdout
+    return gh.run(args, input=input, check=True, capture_output=True, text=True).stdout
 
 
 def _gh_call(run: Callable[..., str], args: list[str]) -> str:
@@ -256,7 +256,8 @@ def init_repo(
                           normalized_root=normalized_root, added_keys=list(added), board_planned=board_planned,
                           removed=removed)
 
-    tracker = tracker or GhTracker(repo, run=run)
+    # GhTracker counts its own attempts; its default runner must not count them again.
+    tracker = tracker or GhTracker(repo, run=gh_run)
     tracker.ensure_labels(LABELS)
     board_id = config.board
     if not no_board:

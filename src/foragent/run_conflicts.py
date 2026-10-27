@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from foragent.actions import flag
 from foragent.git import GitError
+from foragent.i18n import text
 from foragent.policy import review_mode_for
 from foragent.reasons import Reason
 from foragent.run_attempt import ConflictBudgetExhausted, ExecutorStopped, PatchReplayError
@@ -19,38 +20,59 @@ if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
 
 
+def _note_moved(attempt: Implementation, moved: list[tuple[str, str]]) -> None:
+    """Queue moved or split files for the next prompt; saved in the run so restarts keep them."""
+    if not moved:
+        return  # nothing to tell; the run record is left untouched
+    n, store = attempt.n, attempt.ctx.store
+    pending = store.get_run(n).moved_files
+    lines = [line for line in dict.fromkeys(f"{old} -> {new}" for old, new in moved) if line not in pending]
+    if lines:
+        store.update_run(n, moved_files=[*pending, *lines])
+        _append(attempt.log, text("moved_files_log", attempt.ctx.config.language, files="\n".join(lines)))
+
+
 def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
     """Merge a pinned base; let the caller release its lock before resolving conflicts."""
     from foragent.ci_mode import commit_exclusions, enabled
 
     ci = enabled(attempt.ctx, attempt.target_branch)
     _inject_lane_skills(attempt.ctx, attempt.n, attempt.git, target_sha)
+    moved = attempt.git.moved_by(target_sha)
     try:
         attempt.git.merge_base(target_sha, commit=not ci)
     except GitError:
+        _note_moved(attempt, moved)
         conflicts = attempt.git.conflict_paths()
         if not conflicts:
             raise
         return conflicts
+    _note_moved(attempt, moved)
     if ci and attempt.git.merge_in_progress():
         commit_exclusions(attempt, f"{attempt.issue.title} (#{attempt.n})")
     return []
 
 
 def _recreate_worktree(attempt: Implementation) -> None:
+    """Replace the worktree under worktree_lock(N), so a stop's save never sees it half rebuilt.
+
+    Callers with more steps that must not be seen apart (a patch to apply, a
+    tree to restore) hold the lock around all of them; this then reenters it.
+    """
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree = attempt.worktree
-    artifacts = {name: path.read_bytes() for name in ("TRY.md", "REBUTTAL.md")
-                 if (path := worktree / ".foragent" / name).is_file()}
-    attempt.start_ref = git.ref_sha(attempt.start_ref)
-    ctx.git.remove_worktree(worktree)
-    ctx.git.add_worktree(worktree, attempt.branch, attempt.start_ref)
-    ctx.store.update_run(n, merge_conflicts=[])
-    _inject_lane_skills(ctx, n, git, attempt.start_ref)
-    for name, content in artifacts.items():
-        path = worktree / ".foragent" / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+    with ctx.store.worktree_lock(n):
+        artifacts = {name: path.read_bytes() for name in ("TRY.md", "REBUTTAL.md")
+                     if (path := worktree / ".foragent" / name).is_file()}
+        attempt.start_ref = git.ref_sha(attempt.start_ref)
+        ctx.git.remove_worktree(worktree)
+        ctx.git.add_worktree(worktree, attempt.branch, attempt.start_ref)
+        ctx.store.update_run(n, merge_conflicts=[])
+        _inject_lane_skills(ctx, n, git, attempt.start_ref)
+        for name, content in artifacts.items():
+            path = worktree / ".foragent" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
 
 
 def _prepare_target(attempt: Implementation) -> bool:
@@ -71,16 +93,20 @@ def _prepare_target(attempt: Implementation) -> bool:
         source = (git.head_sha(), git.staged_tree_sha(), attempt.target_branch)
         # The PR's own files are merge base to branch head, not uncommitted staged work.
         own = _own_paths(attempt, attempt.start_ref)
+        previous = attempt.start_ref
         attempt.start_ref = git.ref_sha(f"origin/{destination}")
+        _note_moved(attempt, git.moved_between(previous, attempt.start_ref, sorted(set(paths) | set(own))))
         attempt.target_branch = destination
-        _recreate_worktree(attempt)
-        if not _acceptance_matches(n, ctx, git, attempt.approval):
-            return False
-        try:
-            git.apply_staged_patch(Path(patch.name))
-        except GitError as exc:
-            raise PatchReplayError(str(exc), own_paths=own, source_head=source[0],
-                                   source_tree=source[1], source_target=source[2]) from exc
+        # One locked step from the old worktree to the new one with its work applied.
+        with ctx.store.worktree_lock(n):
+            _recreate_worktree(attempt)
+            if not _acceptance_matches(n, ctx, git, attempt.approval):
+                return False
+            try:
+                git.apply_staged_patch(Path(patch.name))
+            except GitError as exc:
+                raise PatchReplayError(str(exc), own_paths=own, source_head=source[0],
+                                       source_tree=source[1], source_target=source[2]) from exc
     return True
 
 
@@ -146,9 +172,10 @@ def _restore_replay_source(attempt: Implementation, exc: PatchReplayError) -> No
         return
     git = attempt.git
     try:
-        attempt.start_ref, attempt.target_branch = exc.source_head, exc.source_target
-        _recreate_worktree(attempt)
-        git._call(["read-tree", "--reset", "-u", exc.source_tree])
+        with attempt.ctx.store.worktree_lock(attempt.n):  # Recreate and restore as one step.
+            attempt.start_ref, attempt.target_branch = exc.source_head, exc.source_target
+            _recreate_worktree(attempt)
+            git._call(["read-tree", "--reset", "-u", exc.source_tree])
         attempt.start_ref = git.ref_sha(f"origin/{exc.source_target}")
     except GitError as restore:
         _append(attempt.log, f"Could not restore the PR's changes after the replay failure: {restore}")
@@ -307,6 +334,7 @@ def _resume_implementation(attempt: Implementation) -> bool:
         # Preparation stays unlocked; publication rechecks the verified base
         # and all merge inputs under its final short merge lock.
         if not git.is_ancestor(attempt.start_ref, git.head_sha()):
+            moved = git.moved_by(attempt.start_ref)
             try:
                 # A saved partial resolution still needs its marker checks,
                 # even when Git can merge the target without index conflicts.
@@ -314,7 +342,9 @@ def _resume_implementation(attempt: Implementation) -> bool:
                 git.merge_base(attempt.start_ref, commit=not conflicts and not ci)
                 if ci and not conflicts and git.merge_in_progress():
                     commit_exclusions(attempt, f"{attempt.issue.title} (#{n})")
+                _note_moved(attempt, moved)
             except GitError:
+                _note_moved(attempt, moved)
                 unmerged = git.conflict_paths()
                 if not unmerged:
                     raise

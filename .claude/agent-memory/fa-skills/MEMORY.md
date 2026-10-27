@@ -27,3 +27,5 @@
 - [.foragent.yml 줄 단위 편집](settings_roundtrip.md) — lanes add/skills는 compose 위치로 줄만 고치고 다시 읽어 확인; ruamel 왕복은 거절됨 (#233)
 - [게이트 슬롯 환경 변수](gate_slot_env.md) — FORAGENT_TEST_SLOT=held가 시험에 새면 capacity 슬롯 시험이 게이트에서만 실패
 - 오케스트레이터 시간 초과(`scheduler_checks._escalate_overdue_blocker`) 시계는 최신 blocked 댓글과 그 이슈의 최신 `store.finish_times()`(키 `(번호, started_at)`) 중 늦은 쪽부터 센다(#642). 시험에서 종료 시각을 바꾸려면 같은 state 경로로 `now`가 다른 `StateStore`를 새로 만들어 `finish_run`한다.
+- 모든 시험의 HOME·XDG·GIT_CONFIG_GLOBAL 격리는 conftest의 `pytest_runtest_setup`(tryfirst) 훅이 한다(#655). 같은 범위 autouse fixture는 선언 순서대로 준비되지 않으므로 fixture로 하면 다른 fixture가 시작 HOME을 본다. 복원은 `pytest_runtest_teardown` hookwrapper의 yield 뒤. 확인은 `pytest_fixture_setup`에서 HOME을 기록하는 `-p` 임시 플러그인으로 한다(`--setup-plan`엔 훅이 안 보임). `REAL_HOME`은 시작 HOME, gates 가드는 `temporary_home`도 "격리 안 함"으로 본다. 넓은 acceptance 묶음은 미구현 주문 시험이 원래 실패하므로 회귀 판단은 단위 시험이나 변경 전후 비교로 한다.
+- `src/foragent/commands/*.py`(밑줄 도우미 포함)의 최상위 import는 `facade`·`repo_store`만 허용된다(`tests/test_cli_commands.py::test_command_modules_import_nothing_that_cli_already_binds`). 다른 모듈 이름을 다시 내보내려면 함수 안 import나 모듈 `__getattr__`를 쓴다. 명령 파일을 쪼갤 땐 이 단위 시험을 꼭 같이 돌린다(#662 CI 실패).

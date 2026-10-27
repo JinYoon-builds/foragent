@@ -35,6 +35,7 @@ from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
 from foragent.order import detect_test_commands
 from foragent.orch_reinstall import after_merge
+from foragent.orch_stop import STOPPED, leave_to_stop, stop_owns
 from foragent.policy import merge_decision, review_mode_for, touched
 from foragent.processes import observe_tree, run_logged, track_process_group
 from foragent.reasons import Reason
@@ -121,16 +122,14 @@ from foragent.run_attempt import (
     ConflictBudgetExhausted,
     CIFailure,
     ExecutorStopped,
+    WholeFailure,
 )
 from foragent.run_checks import _verify_implementation
 from foragent.run_conflicts import (
     _block_rebuild, _rebuild, _rebuild_after_conflicts, _recover_replay, _resume_implementation,
 )
 from foragent.run_implementation import _implement, _prepare_implementation
-from foragent.run_publish import (
-    STOPPED, WIP_NOT_SAVED, SaveDeferredToStop, WipNotSaved, _publish, _push_branch,
-    begin_teardown, end_teardown, final_outcome, keep_unsaved_work, stop_intent_lock, stop_safe_point,
-)
+from foragent.run_publish import _publish, _push_branch
 from foragent.run_review import _review_implementation
 
 
@@ -222,7 +221,7 @@ def _implement_and_publish(
                 return outcome
             if not attempt.failure or attempt.review_hold:
                 try:
-                    stop_safe_point(ctx, n)  # A cooperative stop ends the run here, before anything is published.
+                    leave_to_stop(ctx.store, n)  # Publication is a finalizer: a stop owns the run now.
                     outcome = _publish(attempt)
                     return outcome
                 except ConflictBudgetExhausted as exc:
@@ -235,7 +234,7 @@ def _implement_and_publish(
                     attempt.failure = exc
                     continue
                 except (AttemptFailure, PatchReplayError) as exc:
-                    attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else str(exc)
+                    attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else exc.failure
                     if not attempt.failure:
                         # The replay was resolved and verified in place; publish it without a new turn.
                         resume_verified = True
@@ -245,10 +244,12 @@ def _implement_and_publish(
                 outcome = _block_rebuild(attempt, str(attempt.failure))
                 return outcome
             _append(attempt.log, f"Attempt {run.attempts} failed:\n{attempt.failure}")
-            ctx.store.update_run(n, resume_reason=str(attempt.failure))
+            ctx.store.update_run(n, resume_reason=str(attempt.failure),
+                                 resume_whole=isinstance(attempt.failure, (WholeFailure, CIFailure)))
             if run.attempts < ctx.config.max_retries + 1:
                 ctx.store.update_run(n, attempts=run.attempts + 1)
                 continue
+            leave_to_stop(ctx.store, n)
             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", attempt.failure)
             outcome = "retries-exceeded"
             return outcome
@@ -263,24 +264,14 @@ def _implement_and_publish(
         outcome = "killed"
         raise
     finally:
-        # Teardown (this save, its push, the worktree removal and the finish in run_issue) is
-        # one section under the stop's intent lock: a request either came first, and the
-        # stopper owns the run, or waits until the run is finished.
-        if not begin_teardown(ctx.store, n):
-            raise SaveDeferredToStop()
-        if outcome != "merged":
-            try:
-                run = ctx.store.get_run(n)
-                status = _preserve_failed_implementation(
-                    n, ctx, git, (run.outcome if run is not None else None) or outcome, approval=attempt.approval,
-                    approved_ref=attempt.approved_ref, title=attempt.issue.title, pushed_head=attempt.pushed_head,
-                    tracker_available=attempt.tracker_available, push_branch=lambda: _push_branch(attempt),
-                    defer_to_stop=True, strict=True,  # An unverifiable worktree is kept, never removed unsaved.
-                )
-            except Exception as exc:
-                raise WipNotSaved(keep_unsaved_work(n, ctx, git.root, exc)) from exc
-            if status == "deferred":
-                raise SaveDeferredToStop()
+        # With a stop request the stop command saves the worktree after the tree is dead.
+        if outcome != "merged" and not stop_owns(ctx.store, n):
+            run = ctx.store.get_run(n)
+            _preserve_failed_implementation(
+                n, ctx, git, run.outcome or outcome, approval=attempt.approval, approved_ref=attempt.approved_ref,
+                title=attempt.issue.title, pushed_head=attempt.pushed_head, tracker_available=attempt.tracker_available,
+                push_branch=lambda: _push_branch(attempt),
+            )
 
 
 def review_only(
@@ -291,7 +282,7 @@ def review_only(
     outcome = "error"
     detail = ""
     previous = ctx.store.get_run(n)
-    started = kept = False
+    started = False
     try:
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
@@ -325,44 +316,40 @@ def review_only(
     except ExecutorStopped as exc:
         outcome = exc.outcome
         detail = str(exc)
-    except WipNotSaved as exc:
-        # CI repair could not save its work; the worktree is the only copy (already flagged).
-        outcome, detail, kept = WIP_NOT_SAVED, str(exc), True
-    except SaveDeferredToStop:
-        outcome, kept = STOPPED, True  # The stop saves this worktree once the tree has exited.
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
-        if not started:
+        if started and stop_owns(ctx.store, n):
+            outcome = STOPPED
+        elif not started:
             if not isinstance(exc, TrackerError) or not exc.is_rate_limit:
                 raise
             ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
                                 lane=previous.lane if previous is not None else "main")
             started = True
         _append(ctx.store.log_path(n), traceback.format_exc())
-        if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
+        if outcome == STOPPED:
+            pass  # Refusing is a finalizer: the stop command owns the labels now.
+        elif isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
             outcome = "limit-wait"
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Review runner exited: {exc}"
-        if started and (stopped := ctx.store.get_run(n)) is not None and stopped.stop_why:
-            # `fa orch stop` recorded its why before the signal and owns the labels.
-            outcome = STOPPED
-        raise
+        if not (started and stop_owns(ctx.store, n)):
+            raise
+        outcome = STOPPED
     finally:
-        if started and not begin_teardown(ctx.store, n):
-            kept = True  # A stop came first: it saves this worktree and finishes the run.
-        if started:
+        if started and stop_owns(ctx.store, n):
+            outcome = STOPPED  # The stop command owns the worktree, labels and record now.
+            kick_tick(ctx.repo_root)
+        elif started:
             try:
-                if not kept:
-                    ctx.git.remove_worktree(worktree)
+                ctx.git.remove_worktree(worktree)
             finally:
                 try:
-                    stopping = bool(getattr(ctx.store.get_run(n), "stop_why", ""))
                     # A rate-limit wait is discoverable locally; defer label repair.
-                    # A run `fa orch stop` is ending leaves its labels to the stop.
-                    if outcome not in {"limit-wait", STOPPED, WIP_NOT_SAVED} and not stopping:
+                    if outcome != "limit-wait":
                         current = ctx.tracker.current_issue(n)
                         if current.state == "open" and not current.labels & {BLOCKED, READY}:
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
@@ -374,15 +361,8 @@ def review_only(
                     outcome = "limit-wait"
                 finally:
                     try:
-                        # Read and finish under the stop's intent lock: a request either sees this
-                        # run finished (and refuses), or this finish sees the request and leaves the
-                        # record to the stop, the only writer of a run it was asked to end.
-                        with stop_intent_lock(ctx.store, n):
-                            run = ctx.store.get_run(n)
-                            if run is None or not run.stop_why:
-                                ctx.store.finish_run(n, outcome=final_outcome(run, outcome), detail=detail)
+                        ctx.store.finish_run(n, outcome=outcome, detail=detail)
                     finally:
-                        end_teardown(ctx.store, n)
                         kick_tick(ctx.repo_root)
     return outcome
 
@@ -402,26 +382,20 @@ def run_issue(n: int, ctx: RunContext) -> str:
         from foragent.run_implementation import lane_config
 
         ctx = replace(ctx, config=lane_config(ctx.config, run.lane))
-        kept = False
         try:
             outcome = _execute(n, ctx, worktree)
-        except (WipNotSaved, SaveDeferredToStop):
-            kept = True  # The only copy of the unfinished work is this worktree.
-            raise
         finally:
-            if not kept:
+            if not stop_owns(ctx.store, n):
                 ctx.git.remove_worktree(worktree)
     except ExecutorStopped as exc:
         outcome = exc.outcome
         detail = str(exc)
-    except WipNotSaved as exc:
-        outcome, detail = WIP_NOT_SAVED, str(exc)  # Already flagged by keep_unsaved_work.
-    except SaveDeferredToStop:
-        outcome = STOPPED  # `fa orch stop` saves the kept worktree after the whole tree exits.
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())
-        if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
+        if stop_owns(ctx.store, n):
+            outcome = STOPPED
+        elif isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
             outcome = "limit-wait"
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
@@ -429,26 +403,25 @@ def run_issue(n: int, ctx: RunContext) -> str:
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Runner exited: {exc}"
+        if stop_owns(ctx.store, n):
+            return STOPPED  # The finally leaves everything to the stop command; exit 0.
         stopped = ctx.store.get_run(n)
-        if stopped is None or (stopped.outcome != "stalled-restart" and not stopped.stop_why):
+        if stopped is None or stopped.outcome != "stalled-restart":
             # A handled stop must not look like an orphan to the next tick.
             ctx.tracker.add_labels(n, [BLOCKED])
             ctx.tracker.remove_labels(n, [READY, RUNNING])
-        # A first stall or an orchestrator stop was recorded before the signal;
-        # the tick or `fa orch stop` owns the labels that follow.
+        # A first stall was recorded before the signal; the tick owns its
+        # restart decision (ready, or blocked with an open PR), so keep labels.
         raise
     finally:
         # A tick may already have finished the record while terminating this runner.
         try:
-            # Under the stop's intent lock: a request either sees this run finished (and
-            # refuses), or this finish sees the request and leaves the record to the stop,
-            # the only writer of a run it was asked to end.
-            with stop_intent_lock(ctx.store, n):
-                run = ctx.store.get_run(n)
-                if run is not None and run.status != "finished" and not run.stop_why:
-                    ctx.store.finish_run(n, outcome=final_outcome(run, outcome, recorded_first=True), detail=detail)
+            run = ctx.store.get_run(n)
+            if stop_owns(ctx.store, n):
+                outcome = STOPPED  # The stop command finishes the record after the tree is dead.
+            elif run is not None and run.status != "finished":
+                ctx.store.finish_run(n, outcome=run.outcome or outcome, detail=detail)
         finally:
-            end_teardown(ctx.store, n)
             kick_tick(ctx.repo_root)
     return outcome
 

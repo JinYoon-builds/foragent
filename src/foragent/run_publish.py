@@ -2,26 +2,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field, replace
-import fcntl
 from glob import escape
 from pathlib import Path
 import tempfile
-import threading
-import time
 from typing import TYPE_CHECKING
 
-from foragent import board, review_perspectives, risks
+from foragent import board, cuts, review_perspectives, risks
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
 from foragent.i18n import text
 from foragent.issue import ParsedIssue, body_hash
-from foragent.orch_events import append_event
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
 from foragent.orch_events import append_event
+from foragent.orch_stop import _attach_issue_branch, _merge_unless_stopped, observe_live_changes  # noqa: F401
 from foragent.overlap_files import any_overlap
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
@@ -35,93 +32,6 @@ from foragent.run_skill_catalog import report_line
 from foragent.run_waits import _credited_wait, _phase, _progress, _timeout
 from foragent.state import Approval, Run
 from foragent.tracker import TrackerError
-
-# A run outcome `fa orch stop` records before signaling; Run.stop_why holds the why.
-STOPPED = "stopped"
-
-
-# Intent-lock files this thread holds: nested sections reenter instead of deadlocking on
-# their own flock, and a runner's teardown keeps its hold across functions. Per thread,
-# so another thread (like another process) waits on the flock as it should.
-_LOCAL = threading.local()
-
-
-def _held() -> dict:
-    if not hasattr(_LOCAL, "held"):
-        _LOCAL.held = {}
-    return _LOCAL.held
-
-
-def _intent_path(store, n: int) -> Path:
-    path = store.root / "runs" / f"{n}.stop.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _acquire(path: Path, timeout: float | None):
-    stream = path.open("a", encoding="utf-8")
-    deadline = None if timeout is None else time.monotonic() + timeout
-    while True:
-        try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | (0 if deadline is None else fcntl.LOCK_NB))
-            return stream
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                stream.close()
-                raise TimeoutError(f"{path} is held") from None
-            time.sleep(0.1)
-
-
-@contextmanager
-def stop_intent_lock(store, n: int, *, timeout: float | None = None) -> Iterator[None]:
-    """Order `fa orch stop` recording its intent against the runner's turns, saves, merge and teardown.
-
-    Separate from the state lock, which is not reentrant and is taken by update_run.
-    """
-    key = str(_intent_path(store, n))
-    if key in _held():
-        yield
-        return
-    stream = _acquire(Path(key), timeout)
-    _held()[key] = stream
-    try:
-        yield
-    finally:
-        _held().pop(key, None)
-        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        stream.close()
-
-
-def begin_teardown(store, n: int) -> bool:
-    """Start the runner's teardown (final save, push, worktree removal, finish) as one section.
-
-    Returns False, holding nothing, when a stop was requested first: the stopper then owns
-    the whole run. Otherwise the intent lock stays held until end_teardown, so a request
-    waits until the run is finished (and is then refused as not running) instead of
-    landing mid-teardown, where the runner could no longer honour it.
-    """
-    key = str(_intent_path(store, n))
-    if key in _held():
-        return True  # Already inside this run's teardown (or another section of it).
-    stream = _acquire(Path(key), None)
-    run = store.get_run(n)
-    if run is not None and run.stop_why:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        stream.close()
-        return False
-    _held()[key] = stream
-    return True
-
-
-def end_teardown(store, n: int) -> None:
-    stream = _held().pop(str(_intent_path(store, n)), None)
-    if stream is not None:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-        stream.close()
-
-
-# A run outcome: unfinished work could not be saved, so its worktree was kept.
-WIP_NOT_SAVED = "wip-not-saved"
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
@@ -148,7 +58,7 @@ def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
 
 def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str) -> None:
     """Spend one implementation retry, preserving the raw logs from every run."""
-    logs = ctx.tracker.pr_failed_logs(pr)
+    logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=cuts.issue_dir(ctx.store.root, n))
     failure = CIFailure(logs, target_branch)
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     if ctx.tracker.pr_head_sha(pr) != head:
@@ -174,7 +84,7 @@ def _merge_lock(n: int, ctx: RunContext):
                 stack.enter_context(ctx.store.merge_lock())
                 started = ctx.now()
 
-            _credited_wait(n, ctx, acquire)
+            _credited_wait(n, ctx, acquire, "merge-lock-wait", eager=False)  # Phase only if it waits.
             yield
     finally:
         if started is not None:
@@ -400,251 +310,31 @@ def _check_publication(git: GitRepo, target_branch: str, base_sha: str | None = 
         raise AttemptFailure(str(exc), target_branch) from exc
 
 
-class SaveDeferredToStop(Exception):
-    """`fa orch stop` saves this worktree after the run's whole tree exits; keep it in place."""
-
-
-class WipNotSaved(Exception):
-    """Unfinished work could not be saved; its worktree must be kept."""
-
-
-def keep_unsaved_work(n: int, ctx: FlagContext, worktree: Path, error: BaseException) -> str:
-    """Record a failed WIP save without removing its worktree; block the issue for recovery.
-
-    No caller may then report a stop as done or return the issue to ready:
-    the run outcome becomes WIP_NOT_SAVED and the issue is flagged.
-    """
-    reason = " ".join(str(error).split()) or type(error).__name__
-    detail = f"WIP preservation failed; worktree kept at {worktree}: {reason}"
-
-    def outcome() -> None:
-        run = ctx.store.get_run(n)
-        if run is not None and run.status == "running":
-            ctx.store.update_run(n, outcome=WIP_NOT_SAVED)
-
-    # Each report is best effort and never raises: the caller keeps the worktree
-    # and ends the run as WIP_NOT_SAVED from its own state, whichever step fails.
-    for step in (
-        lambda: _append(ctx.store.log_path(n), detail),
-        lambda: append_event(ctx.store, ctx.now(), n, "wip-preservation-failed", detail),
-        outcome,
-        lambda: flag(ctx, n, Reason.RETRIES_EXCEEDED,
-                     "Unfinished work could not be saved; its worktree is kept for recovery.", detail),
-    ):
-        try:
-            step()
-        except Exception:
-            pass
-    return detail
-
-
-def stop_head(git: GitRepo, n: int) -> str | None:
-    try:
-        return git.ref_sha(f"refs/heads/foragent/issue-{n}")
-    except GitError:
-        return None
-
-
-def stop_kept_work(git: GitRepo, run: Run, saved: str | None) -> bool:
-    """Positive evidence from Git that the stop kept its work under its why.
-
-    Either the issue branch did not move since the intent (nothing was saved,
-    because nothing was unsaved), or its newest commit names `stopped: <why>`.
-    A recorded field alone is not evidence: a runner from before an upgrade
-    saves WIP without ever recording one. The save itself must have been proven
-    under the request (`saved`, kept in the pending stop record so it survives the
-    run's own finish and the worktree's removal), since a skipped save leaves the
-    branch still.
-    """
-    if not run.stop_why:
-        return False
-    if saved == "clean":
-        # A save under the request found nothing to save; an earlier WIP must still name the why.
-        return run.wip_reason in {None, f"{STOPPED}: {run.stop_why}"}
-    if saved != "saved":
-        return False  # No save under the request was proven: an unchanged branch proves nothing.
-    head = stop_head(git, run.number)
-    try:
-        message = git._call(["log", "-1", "--format=%B", head]) if head else ""
-    except GitError:
-        return False
-    return f"[{STOPPED}: {run.stop_why}]" in message
-
-
-def final_outcome(run: Run | None, outcome: str, *, recorded_first: bool = False) -> str:
-    """A runner's last outcome: lost work and merges win over a recorded one.
-
-    A runner never finishes a run with a stop request: the stop does (see run_issue).
-    """
-    if outcome in {"merged", WIP_NOT_SAVED} or run is None:
-        return outcome
-    if run.outcome == WIP_NOT_SAVED:
-        return WIP_NOT_SAVED
-    return (run.outcome or outcome) if recorded_first else outcome
-
-
 def _preserve_failed_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
     approved_ref: str = "HEAD", title: str | None = None, pushed_head: str | None = None,
-    tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
-    defer_to_stop: bool = False, tree_exited: bool = False, strict: bool = False,
-) -> str:
+    tracker_available: bool = True, push_branch: Callable[[], None] | None = None, stop: bool = False,
+) -> str | None:
     """Save stopped work before cleanup, including after the runner has died.
 
-    Returns how it ended: "saved" (a WIP commit), "clean" (nothing to save),
-    "absent" (no worktree), "unproven" (a directory that cannot be verified as
-    the worktree, so nothing about its files is known) or "deferred", when a
-    runner (`defer_to_stop`) left the save to `fa orch stop`:
-    the stop saves only after the run's whole tree exited, so nothing a still
-    running executor deletes afterwards is missing from the WIP. `tree_exited`
-    marks such a save: the worktree is final, so its deletions are the run's own.
+    Returns "saved" (a WIP commit), "clean" (nothing to commit) or None (no
+    verifiable worktree). `stop` is `fa orch stop`'s save after the runner's
+    whole tree died: the worktree is final, so its deletions are the run's own,
+    and the WIP goes onto the issue branch (the caller pushes it).
     """
     with ctx.store.worktree_lock(n):
         # Recheck only after acquiring the lock: a competing cleanup may have
         # removed the worktree while we waited. A parent repository is no save.
-        if not git.root.exists():
-            return "absent"
+        if not (git.root / ".git").is_file():
+            return None
         try:
-            if not (git.root / ".git").is_file():
-                raise GitError(f"{git.root} is not a Git worktree")
             git.check_worktree()
-        except GitError as exc:
-            if strict:  # Callers that delete the directory next must not lose files they could not see.
-                raise WorktreeUnverified(f"the worktree could not be verified, so its files are kept: {exc}") from exc
-            return "unproven"
+        except GitError:
+            return None
         return _preserve_locked_implementation(
             n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
-            pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
-            defer_to_stop=defer_to_stop, tree_exited=tree_exited,
+            pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch, stop=stop,
         )
-
-
-# Every field a stop request grants; cancelling a request clears all of them together,
-# so no authority (such as owning an exited tree's deletions) outlives the request.
-STOP_REQUEST_CLEARED = {"stop_why": "", "stop_head": None, "stop_in_turn": False}
-
-
-# Phases in which a live executor is the implementer; a reviewer runs (and its review
-# state is restored) under "reviewing". No phase yet means the implementer's first turn.
-IMPLEMENTER_PHASES = {None, "implementing", "resolving-conflict"}
-
-
-def implementer_turn_open(run: Run) -> bool:
-    """Edit provenance, not mere liveness: an open turn or a live executor in an implementer phase."""
-    return run.phase in IMPLEMENTER_PHASES and (run.in_turn or run.executor_pgid is not None)
-
-
-def merge_unless_stopped(ctx, n: int, merge) -> None:
-    """Merge only if no stop was requested, atomically with the request under the intent lock.
-
-    A merge is the one irreversible step: checked only before it, a request arriving
-    during the call (or the push and CI before it) could not prevent it. The merge is
-    recorded in the same section, so a later request sees a merged run and refuses.
-    """
-    with stop_intent_lock(ctx.store, n):
-        run = ctx.store.get_run(n)
-        if run is not None and run.stop_why:
-            raise SaveDeferredToStop()  # The stopper ends the run; nothing lands after the request.
-        merge()
-        if run is not None and run.status == "running":
-            ctx.store.update_run(n, merged=True)
-
-
-def stop_safe_point(ctx, n: int) -> None:
-    """Between phases: once a stop is requested, the runner writes nothing more; the stopper does."""
-    with stop_intent_lock(ctx.store, n):
-        run = ctx.store.get_run(n)
-    if run is not None and run.stop_why:
-        raise SaveDeferredToStop()
-
-
-def begin_turn(ctx, n: int) -> None:
-    """Open an implementer turn, unless a stop already asked the run to end."""
-    with stop_intent_lock(ctx.store, n):
-        run = ctx.store.get_run(n)
-        if run is not None and run.stop_why:
-            raise SaveDeferredToStop()  # No new executor after a stop request.
-        ctx.store.update_run(n, in_turn=True, turns=(run.turns if run is not None else 0) + 1)
-
-
-def end_turn(ctx, n: int, worktree: Path) -> None:
-    """Close a turn with its provenance; under a stop request, leave it open and stop here.
-
-    The request arrived while the turn ran, so the stopper owns what the exited
-    tree leaves; going on (checks, cleanup) could change the worktree it saves.
-    """
-    with stop_intent_lock(ctx.store, n):  # One step: a stop sees either an open turn or its provenance.
-        run = ctx.store.get_run(n)
-        if run is not None and run.stop_why:
-            raise SaveDeferredToStop()
-        _observe_locked(ctx, n, worktree, in_turn=False)
-
-
-def _attach_issue_branch(git: GitRepo, branch: str) -> None:
-    """Put a stop's WIP on the issue branch, which the next run and the evidence check read.
-
-    A review-only worktree sits on a detached PR head. Attaching moves the branch to it
-    only when that keeps every branch commit (a fast-forward); otherwise nothing is
-    committed and the save fails, keeping the worktree.
-    """
-    try:
-        if git._call(["symbolic-ref", "-q", "HEAD"]).strip() == f"refs/heads/{branch}":
-            return
-    except GitError:
-        pass  # Detached HEAD.
-    try:
-        tip = git.ref_sha(f"refs/heads/{branch}")
-    except GitError:
-        tip = None
-    if tip is not None:
-        try:
-            git._call(["merge-base", "--is-ancestor", tip, "HEAD"])
-        except GitError as exc:
-            raise WorktreeUnverified(f"the worktree's HEAD does not contain {branch}; nothing is committed") from exc
-    git.attach_branch(branch)
-
-
-class WorktreeUnverified(Exception):
-    """The directory could not be verified as the run's worktree; nothing proves its files were saved."""
-
-
-class ProvenanceUnavailable(Exception):
-    """Deletions would be dropped without the evidence that could have owned them."""
-
-
-def observe_live_changes(ctx, n: int, worktree: Path) -> bool:
-    """Record what the live run changed, as provenance for its later WIP; False if it could not.
-
-    Taken when an implementer turn ends, never during cleanup: deletions a racing
-    removal causes later stay unowned (#572). Observers merge into the latest
-    record under the run's intent lock, so an older observation can never
-    replace a newer one. A failure is recorded, so missing evidence is never
-    read as "nothing was changed".
-    """
-    with stop_intent_lock(ctx.store, n):
-        return _observe_locked(ctx, n, worktree)
-
-
-def _observe_locked(ctx, n: int, worktree: Path, **fields) -> bool:
-    run = ctx.store.get_run(n)
-    if run is None or run.status != "running":
-        return True
-    if not (worktree / ".git").exists():
-        if fields:
-            ctx.store.update_run(n, **fields)
-        return True  # No live worktree: no work in it to own.
-    try:
-        git = ctx.git.at(worktree)
-        base = git._own_base(f"origin/{run.files_base_branch or ctx.config.base_branch}")
-        output = git._call(["diff", "--cached", "--name-only", "--no-renames", "-z", base])
-        output += git._call(["diff", "--name-only", "--no-renames", "-z", base])
-    except (GitError, ValueError):
-        ctx.store.update_run(n, live_changes_failed=True, **fields)
-        return False
-    paths = sorted(set(filter(None, output.split("\0"))) | set(run.live_changes))
-    if paths != run.live_changes or fields:
-        ctx.store.update_run(n, live_changes=paths, **fields)
-    return True
 
 
 def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> list[str]:
@@ -658,7 +348,7 @@ def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> lis
         patterns.extend([escape(path) for path in run.effective_files or []]
                         if run.files_committed else run.effective_files or [])
         patterns.extend(escape(path) for path in [*(run.changed_files or []), *run.late_files])
-        # Seen in the live run's worktree before any cleanup began: the implementer's own edits.
+        # Seen in the live worktree when an implementer turn ended, before any cleanup: its own edits.
         patterns.extend(escape(path) for path in run.live_changes)
     base = (run.files_base_branch if run is not None else None) or ctx.config.base_branch
     committed = git.committed_paths(f"origin/{base}")
@@ -674,8 +364,7 @@ def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> lis
 def _preserve_locked_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
     approved_ref: str, title: str | None, pushed_head: str | None,
-    tracker_available: bool, push_branch: Callable[[], None] | None, defer_to_stop: bool = False,
-    tree_exited: bool = False,
+    tracker_available: bool, push_branch: Callable[[], None] | None, stop: bool = False,
 ) -> str:
     branch = f"foragent/issue-{n}"
     run = ctx.store.get_run(n)
@@ -689,40 +378,13 @@ def _preserve_locked_implementation(
     git.stage_changes()
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
-    with stop_intent_lock(ctx.store, n):
-        # Read the intent and the provenance now, not at entry: a stop or an observation
-        # recorded during staging still counts, and one recorded after the commit sees this WIP.
-        current = ctx.store.get_run(n)
-        if defer_to_stop and current is not None and current.stop_why:
-            return "deferred"  # The stopper saves after the whole tree exits; staged changes stay in place.
-        # Only a stop that interrupted an implementer turn owns everything the exited tree left:
-        # outside a turn the runner itself may have begun cleanup, so provenance is still checked.
-        owned = tree_exited and current is not None and bool(current.stop_why) and current.stop_in_turn
-        refused = [] if owned else _check_wip_deletions(ctx, git, current)
-        if refused and current is not None and current.live_changes_failed:
-            # The evidence that could own these deletions is missing: keep the worktree instead.
-            raise ProvenanceUnavailable(
-                "WIP deletions have no provenance after a failed observation: " + ", ".join(map(repr, refused[:10])))
-        if current is not None and current.stop_why:
-            reason = f"{STOPPED}: {current.stop_why}"
-        if current is not None and current.stop_why:
-            _attach_issue_branch(git, branch)  # Evidence is the issue branch's WIP, never a detached commit.
-        status = "saved" if git.has_staged_changes() else "clean"
-        if status == "clean" and current is not None and current.stop_why:
-            status = "saved"  # Under a stop the WIP always names the why, even with nothing new to keep.
-            git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]", allow_empty=True)
-        elif status == "saved":
-            git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
-        if current is not None and current.stop_why and git.head_sha() != stop_head(git, n):
-            raise WorktreeUnverified(f"the stop's WIP is not the head of {branch}; nothing is proven saved")
-        if current is not None and current.status == "running" and status == "saved":
-            ctx.store.update_run(n, wip_reason=reason)
-        if current is not None and current.stop_why:
-            # Proof for the stop, written to its pending record: unlike the run record it can
-            # still change after the runner finished, and it outlives the worktree's removal.
-            from foragent.orch_stop import record_stop_save
-
-            record_stop_save(ctx.store, n, status)
+    # After a stop the whole tree is dead, so every deletion left in the worktree is its own.
+    refused = [] if stop else _check_wip_deletions(ctx, git, run)
+    if stop:
+        _attach_issue_branch(git, branch)
+    status = "saved" if git.has_staged_changes() else "clean"
+    if status == "saved":
+        git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
     if refused:
         detail = "WIP preservation refused: deletions outside allowed paths: " + ", ".join(map(repr, refused[:10]))
         _append(ctx.store.log_path(n), detail)
@@ -968,7 +630,7 @@ def _publish_locked(attempt: Implementation) -> str:
 
     def ci_failed() -> None:
         if attempt.rebuilt:
-            logs = ctx.tracker.pr_failed_logs(pr)
+            logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=cuts.issue_dir(ctx.store.root, n))
             _hold_if_not_started(n, ctx, pr, logs)
             raise ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
         _ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)
@@ -1028,7 +690,7 @@ def _publish_locked(attempt: Implementation) -> str:
                 if not subject:
                     attempt.pr_title = title
                 try:
-                    merge_unless_stopped(ctx, n, lambda: ctx.tracker.merge_pr(
+                    _merge_unless_stopped(ctx, n, lambda: ctx.tracker.merge_pr(
                         pr, method="squash", expected_head_sha=verified_head_sha, **subject))
                 except TrackerError as exc:
                     if exc.is_rate_limit:
@@ -1038,7 +700,6 @@ def _publish_locked(attempt: Implementation) -> str:
                     else:
                         raise
                 else:
-                    ctx.store.record_merge(n, ctx.now())
                     if inputs.decision.kind == "merge":
                         runner.after_merge(ctx, pr, attempt.target_branch)
                     _progress(n, ctx)
@@ -1157,7 +818,7 @@ def _publish_reviewed_head(
                 )
                 pr = replace(pr, title=title)
                 try:
-                    merge_unless_stopped(ctx, n, lambda: ctx.tracker.merge_pr(
+                    _merge_unless_stopped(ctx, n, lambda: ctx.tracker.merge_pr(
                         pr.number, method="squash", expected_head_sha=head, **subject))
                 except TrackerError as exc:
                     if exc.is_rate_limit:
@@ -1167,7 +828,6 @@ def _publish_reviewed_head(
                     else:
                         raise
                 else:
-                    ctx.store.record_merge(n, ctx.now())
                     if review_mode_for(inputs.paths, ctx.config) == "fast":
                         runner.after_merge(ctx, pr.number, pr.base)
                     try:

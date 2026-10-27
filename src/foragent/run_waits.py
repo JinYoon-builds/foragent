@@ -38,7 +38,9 @@ def _remaining(n: int, ctx: RunContext) -> int:
     run = ctx.store.get_run(n)
     if run is None:
         raise KeyError(n)
-    elapsed = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
+    # The gate tick credits machine sleep to the run record; the runner never reads the sensor.
+    elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
+               - run.waited_seconds - run.slept_seconds)
     return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
 
 
@@ -53,6 +55,7 @@ def _test_slot(n: int, ctx: RunContext):
     run = ctx.store.get_run(n)
     started = ctx.now()
     waited = False
+    wait = WaitPhase(n, ctx, "test-slot-wait", started)
 
     def credit() -> datetime:
         now = ctx.now()
@@ -64,6 +67,8 @@ def _test_slot(n: int, ctx: RunContext):
 
     def waiting() -> None:
         nonlocal waited
+        # Queued time is its own phase, so facts can see the slot queue and its wait.
+        wait.open()
         waited = True
         now = credit()
         # Tick reads a future waiting_until as alive; refresh it while queued.
@@ -74,13 +79,69 @@ def _test_slot(n: int, ctx: RunContext):
             stack.enter_context(capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting))
         finally:
             if waited:
-                credit()
+                now = credit()
                 ctx.store.update_run(n, waiting_until=None)
+                wait.close(now)
         yield
 
 
 def _progress(n: int, ctx: RunContext) -> None:
     ctx.store.update_run(n, last_progress_at=ctx.now().astimezone(UTC).isoformat())
+
+
+def phase_identity(run) -> dict:
+    """What a nested wait must restore: the phase and the work it was doing."""
+    return {"phase": run.phase, "phase_work_id": run.phase_work_id,
+            "phase_work_started_at": run.phase_work_started_at}
+
+
+def restore_phase(n: int, ctx: RunContext, identity: dict) -> None:
+    run = ctx.store.get_run(n)
+    if phase_identity(run) != identity:
+        ctx.store.update_run(n, **identity, phase_started_at=ctx.now().astimezone(UTC).isoformat())
+
+
+class WaitPhase:
+    """One credited wait as its own phase: every place that credits waited time uses this.
+
+    The wait phase starts at ``started`` (so the interrupted phase closes there) and the
+    interrupted phase and work identity come back when it ends. ``open()`` may be called
+    lazily; a wait that ended without opening but took time is still journaled.
+    """
+
+    def __init__(self, n: int, ctx: RunContext, phase: str, started: datetime | None = None):
+        self.n, self.ctx, self.phase = n, ctx, phase
+        self.started = started or ctx.now()
+        self.previous = phase_identity(ctx.store.get_run(n))
+        self.opened = False
+
+    def open(self) -> None:
+        if not self.opened and self.previous["phase"] != self.phase:
+            self.ctx.store.update_run(self.n, phase=self.phase,
+                                      phase_started_at=self.started.astimezone(UTC).isoformat())
+            self.opened = True
+
+    def close(self, now: datetime | None = None) -> None:
+        now = now or self.ctx.now()
+        if not self.opened and now > self.started:
+            self.open()
+        if self.opened:
+            self.ctx.store.update_run(self.n, **self.previous, phase_started_at=now.astimezone(UTC).isoformat())
+            self.opened = False
+
+
+@contextmanager
+def in_phase(n: int, ctx: RunContext, phase: str):
+    """Run a block as ``phase`` (e.g. checking), then give back the interrupted phase and work."""
+    previous = phase_identity(ctx.store.get_run(n))
+    if previous["phase"] == phase:
+        yield
+        return
+    _phase(n, ctx, phase)
+    try:
+        yield
+    finally:
+        restore_phase(n, ctx, previous)
 
 
 def _phase(n: int, ctx: RunContext, phase: str) -> None:
@@ -101,6 +162,8 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
     run = ctx.store.get_run(n)
     started = ctx.now()
     started_mono = ctx.monotonic()
+    wait = WaitPhase(n, ctx, "executor-wait", started)
+    wait.open()
     ctx.store.update_run(
         n, waited_seconds=run.waited_seconds + seconds,
         executor_waited_seconds=run.executor_waited_seconds + seconds,
@@ -116,23 +179,35 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
             executor_waited_seconds=run.executor_waited_seconds + elapsed,
             waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
         )
+        wait.close()
 
 
-def _credited_wait(n: int, ctx: RunContext, acquire: Callable[[], object]) -> None:
-    """Block in acquire; credit the time as waited and keep tick informed meanwhile."""
+def _credited_wait(
+    n: int, ctx: RunContext, acquire: Callable[[], object], phase: str, *, eager: bool = True,
+) -> None:
+    """Block in acquire as the ``phase`` wait; credit the time as waited and keep tick informed.
+
+    ``eager=False`` opens the wait phase only once the wait lasts (a lock that is usually
+    free adds no phase events when it is acquired at once).
+    """
     from foragent import runner
 
     run = ctx.store.get_run(n)
     started = ctx.monotonic()
+    wait = WaitPhase(n, ctx, phase)
+    if eager:
+        wait.open()
 
-    def progress():
+    def progress(polled: bool = True):
+        if polled:
+            wait.open()
         now = ctx.now().astimezone(UTC)
         ctx.store.update_run(
             n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
             waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat(),
         )
 
-    progress()
+    progress(polled=False)
     try:
         runner.poll_executor(acquire, progress)
     finally:
@@ -140,3 +215,4 @@ def _credited_wait(n: int, ctx: RunContext, acquire: Callable[[], object]) -> No
             n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
             waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
         )
+        wait.close()

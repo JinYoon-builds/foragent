@@ -1,50 +1,45 @@
 ---
 name: project-370-orch-stop
-description: #370 fa orch stop — records outcome stopped+why before signaling, reuses scheduler._kill_run, no-write PID safety precheck
+description: #370 fa orch stop under D95 — one owner per run; request file first, kill, wait for dead tree and worktree_lock, then the stop is the fallback writer
 metadata:
   type: project
 ---
 
-Current design (2026-10-26, after review round 9):
-- `orch.stop()` holds the tick lock (`STOP_LOCK_WAIT_S` poll) from the precheck to the labels, then kicks a tick. `stop_target_refusal` reads processes without any write. It refuses unsafe, unreadable or unrecorded runner/executor PIDs, including `run.pid is None` and a pid that is not in `process_identities`.
-- Intent: `update_run(outcome="stopped", detail, stop_why=why)` runs under `run_publish.stop_intent_lock(store, n)` (`runs/<n>.stop.lock`; the state lock is not reentrant). Only orch writes `Run.stop_why`. `_preserve_failed_implementation` re-reads the run under the same lock at commit time, names `stopped: <why>` if the intent is there, and records `Run.wip_reason`.
-- Success means the run finished as `stopped` and `stop_kept_work(run)` holds: `wip_reason` is None or names the why. `final_outcome()` in the runners applies the same rule, and merged and wip-not-saved always win. A run that saved WIP for its own reason before the intent keeps its own outcome, and the stop reports failure.
-- Destination: `scheduler_stop.complete_stop(ctx, run)` journals the required `stop` event first, once per run (idempotent check against `started_at`). It then closes this issue's own open PR, removes blocked, needs-human and running, and adds ready (retry semantics). A closed issue only loses running. If this fails, orch raises `StopPending` and kicks a tick; `_recover_orphan` repeats `complete_stop` for a finished stopped run when `stop_kept_work` holds. The GitHub comment is best effort, sent after the journal.
-- Durable completion record (round 9, defect class "recovery depends on a label an earlier step erased"): `scheduler_stop.mark_stop_pending` writes `<state>/stops/<n>.json` (number, started_at, why) inside the intent lock, before the intent. `complete_stop` removes each label in its own call and deletes the record only after every step succeeds. `recover_pending_stops` (first line of `_recover_runs`) drives each record. A finished stopped run whose work was kept is completed; other runs drop the record; running runs are left to the live/dead branches. Never drive stop recovery from the `running` label: a dying runner's `flag()` removes it first.
-- No flag suppression: labels are decided after every process is gone, so a dying runner's flags are overwritten by `complete_stop`. Earlier designs that blocked on an open PR, kept holds, or suppressed flags were rejected by review as alternate destinations or stale-read races.
-- WIP loss: `keep_unsaved_work` reports best effort and never raises. A failed save keeps the worktree and records `wip-not-saved` (`_kill_run`, `_finish_dead_run`, `_recover_orphan`, `run_issue`, `review_only` CI repair).
-- `clear_stale_stop` (tick, live-run branch) drops an intent left by a stop process that died before signaling.
-- Runner SIGTERM handlers (`run_issue`, `review_only`) leave labels to the stop when `stop_why` is set.
-- `--keep-work`/`--why` are argparse-required; the verb lives in `commands/orch.py`.
-- Limits and pitfalls: `scheduler_recovery.py` is near the 300-line split limit, so add helpers to `scheduler_stop.py`. `.foragent/acceptance-exclusions.json` is owned by the runner and untracked since 502b4c8. For a base comparison, use the merge's second parent, not `HEAD^`.
-- Tests: acceptance `test_orch_stop.py` and `test_keep_unfinished_work.py`; boundary tests in `tests/test_orch_stop_unit.py` plus stop tests in `test_runner.py` and `test_orch.py`. The run_case teardown requires `running` to be removed.
-- #572 vs #270/#370 (round 10): a count threshold was rejected as a provenance bypass. `run_publish.observe_live_changes` records `Run.live_changes` (diff vs own base) at the end of every implementer turn (`run_implementation` stop-point finally) and in orch.stop before the kill. `_check_wip_deletions` accepts those paths. Deletions that first appear during cleanup stay refused. #572's tests are unchanged.
-- Round 10, class "intent mistaken for termination": `_recover_runs`' dead branch now passes `stop_runner=True` for `STOPPED`. `complete_stop` first runs `_ensure_terminated`: if recorded processes are alive it stops them, and if it cannot, it raises so the record stays pending. `final_outcome` gives `stopped` only to a signal-terminated runner (`killed`/`stopped`).
-- Round 11:
-  - Lost updates: `observe_live_changes` reads, diffs and unions inside `stop_intent_lock`. `_check_wip_deletions` reads the run fresh inside the same lock.
-  - Missing evidence: a failed observation sets `Run.live_changes_failed`. Preservation then raises `ProvenanceUnavailable` if unowned deletions exist, so the worktree is kept. orch.stop refuses before signaling when observation fails, and `_kill_run` observes before signaling.
-  - Liveness: `scheduler_stop.recorded_tree_alive` matches (pid, start_time) only and treats an unreadable own-user pid as alive. `stop_target_refusal` also refuses unreadable recorded descendants. Main's `_run_processes_exist` is left alone (rebutted).
-  - The intent no longer writes `detail`: `update_run` cannot restore an empty detail.
-- Round 12 (supersedes the observation parts of rounds 10–11):
-  - Stale evidence: never read a stop's evidence before the signal. `_kill_run` and `complete_stop` save with `tree_exited=True` after the whole tree is gone (the tick lock rules out racing cleanup), so all deletions there are owned. A runner whose run has `stop_why` defers its save (`defer_to_stop` → `SaveDeferredToStop`) and keeps the worktree. `_remove_run_worktree` treats a recorded stop as tree_exited. `observe_live_changes` remains only for the runner's own turn-end provenance.
-  - Completion races: `final_outcome` returns `stopped` whenever `stop_why` is set (merged and wip-not-saved win). orch and `recover_pending_stops` complete any finished run except merged or wip-not-saved. `_recover_orphan` returns early for a run with `stop_why`.
-  - Evidence: `Run.stop_head` holds the branch head at the request. `stop_kept_work(git, run)` holds if the branch did not move and `wip_reason` is None or the why, or if the newest commit message contains `[stopped: <why>]`. Without that, `complete_stop` flags, drops the record and raises `StopFailed`, and orch turns it into an OrchError.
-- Module split (round 12): `scheduler_stop.py` hit the 300-line split limit, so stop completion moved to `src/foragent/orch_stop.py` (orch lane). It holds `stop_summary`, the pending record helpers, `StopFailed`, `complete_stop`, `recorded_tree_alive`, `_ensure_terminated`, `recover_pending_stops` and `clear_stale_stop`. `scheduler_stop.py` keeps `stop_target_refusal` and main's stop helpers. Tests patch `foragent.orch_stop.*`.
-- Round 13:
-  - Unsynchronized completion: the finishes in `run_issue`/`review_only` read and finish under `stop_intent_lock`. `complete_stop` refuses (flag + `StopFailed`) when the finished outcome is not `stopped`.
-  - Termination proof: `orch_stop.tree_proven_gone` (`recorded_tree_alive` false; a PermissionError is no proof). `_kill_run` returns False and `_finish_dead_run` returns early before any save or removal when the tree is not proven gone.
-  - Provenance: `Run.in_turn` is set atomically under the intent lock by `run_publish.begin_turn`/`end_turn` around the executor call in `run_implementation._implement`; `end_turn` raises `SaveDeferredToStop` when a stop exists. orch records `stop_in_turn` (`in_turn` or `executor_pgid`) with the request. `tree_exited` owns deletions only if `stop_in_turn`.
-  - scheduler_recovery.py is at exactly 300 lines (its scheduler_stop import is on one line).
-- Round 14:
-  - Liveness is not provenance: `run_publish.implementer_turn_open(run)` requires phase in `IMPLEMENTER_PHASES` (None/implementing/resolving-conflict) plus `in_turn` or `executor_pgid`, because reviewers set `executor_pgid` under phase "reviewing". The locked orch-stop fixture has phase None and an executor_pgid.
-  - Stale authority: `STOP_REQUEST_CLEARED` (stop_why, stop_head, stop_in_turn) is applied by both the orch undo and `clear_stale_stop`. Ownership in preservation also requires an active `stop_why`.
-- Round 15:
-  - Missing evidence: `_preserve_failed_implementation` returns saved/clean/absent/unproven/deferred. `strict=True` (the runner, `_remove_run_worktree`, `complete_stop`) raises `WorktreeUnverified` instead of returning unproven. Main's #572 test needs the non-strict default. A save under an active request records `Run.stop_saved` (saved/clean). `stop_kept_work` requires stop_saved; an unchanged branch alone is no proof. `complete_stop` uses its own save result, because finished records cannot be updated, and removes the worktree only after saved/clean.
-  - Record races: `recover_pending_stops` reads, decides and drops under `stop_intent_lock`. `clear_stale_stop` re-reads under the lock and leaves the record if the run already finished. `_recover_orphan` calls `ensure_stop_pending` to recreate a lost record. `stop_saved` is in `STOP_REQUEST_CLEARED`.
-- Round 16, lost save evidence: the stop's save proof moved from `Run.stop_saved` (removed) to the pending record (`orch_stop.record_stop_save`/`stop_save_of`, key "saved"), because finished runs cannot be updated and the record outlives worktree removal. Preservation writes it under the intent lock whenever `stop_why` is set, and never downgrades "saved" to "clean". `stop_kept_work(git, run, saved)` takes the evidence explicitly.
-- Round 17, lifecycle paths without a save: `Run.turns` (incremented by `begin_turn`). `orch_stop._prove_nothing_to_save` records "clean" when there is no recorded save, no worktree, `turns == 0` and the branch head equals `stop_head`. This covers a stop before the worktree existed and review-only or run_issue cleanup before any turn. scheduler_recovery imports `orch_stop` as a module (orch_stop imports the scheduler facade, so name imports were circular); tests patch `foragent.orch_stop.*`.
-- Round 18, single writer per request (7th hold; the hint asked for a cooperative stop, but the locked test requires `_kill_run`): `Run.stop_mode` is "kill" when the request lands inside an implementer turn and "cooperative" otherwise. In kill mode the runner never finishes its record or saves (the gate does after exit). In cooperative mode orch only records and returns; the runner raises `StopRequested` at `stop_safe_point`/`begin_turn`, saves under the why (an empty commit if nothing is staged), finishes as stopped and calls `orch_stop.finish_stop`. `Run.closing` is set under the lock when the runner's final save starts, and orch refuses after it. `complete_stop` is the gate path; `finish_stop` is the shared tail.
-- Round 19 (supersedes round 18's cooperative mode, which the reviewer rejected as a phase bypass): stop always kills via `_kill_run`. After a request the runner writes nothing (`begin_turn`/`stop_safe_point`/`end_turn`/final save → `SaveDeferredToStop`; `run_issue`/`review_only` do not finish a run with `stop_why`). `run_publish.merge_unless_stopped` merges under the intent lock and records `Run.merged`; orch refuses merged runs. `complete_stop` accepts only outcome "stopped". `stop_mode`, `closing` and `StopRequested` were removed.
-- Round 20:
-  - Teardown serialized: `begin_teardown`/`end_teardown` hold the per-thread reentrant intent lock (`_held()` thread-local) from the final save in `_implement_and_publish`'s finally through the finish in `run_issue`/`review_only`. orch waits up to `TEARDOWN_WAIT_S`, then terminates via `scheduler_stop._stop_run_processes` (the facade lacks it), which releases the lock, and only then records the request.
-  - Branch binding: a save under a stop calls `_attach_issue_branch` (fast-forward `switch -C`, else `WorktreeUnverified`) and checks that HEAD equals the branch head.
+Design (2026-10-27, D95 redesign; replaces rounds 1–20, which were held 7+ times for one defect
+class: two writers on one run):
+
+- **Ownership.** While its process lives, the runner alone writes the run record, worktree and
+  labels. `fa orch stop` is a fallback writer that acts only after the whole tree is dead.
+- **Request** `<state>/stops/N.json` (`orch_stop.write_request`): number, started_at, why,
+  requested_at, the stop command's pid and start_time. `stop_request()` matches it to the current
+  run by started_at, so an old run's request never stops a new run.
+- **Command order** (`orch.stop`): refuse (not running, batch branch, live other stop command,
+  `scheduler_stop.stop_target_refusal`) → write request → one `scheduler._kill_run(outcome="stopped")`
+  (that branch only terminates; "gone" counts as success) → `wait_tree_dead` (60 s) →
+  `worktree_lock_within` (5 min, non-blocking tries) → `orch_stop.finish`. Waits poll with the
+  RunContext `sleep`/`now`, 1 s steps, bounded by count too (a fixed test clock cannot loop).
+- **finish** (idempotent, also the tick's path): merged (`merged_at` beside the run record, written
+  by `run_publish._merge_unless_stopped` under worktree_lock) or closed issue → drop request, change
+  nothing. Else save (`_preserve_failed_implementation(stop=True)`: no #572 deletion check, attach
+  to `foragent/issue-N` fast-forward only, normal push `HEAD:refs/heads/...`; saved SHA kept in the
+  request) → one `stop` event (journal check by started_at) + best-effort comment → finish_run
+  stopped → close own PR → ready labels → drop request last. Failures raise `StopStepFailed`.
+- **Runner**: `orch_stop.stop_owns()` (request exists and not merged) at every finalizer of
+  `run_issue`/`review_only`/`_implement_and_publish` (publish, flag, preservation, worktree
+  removal, finish). `leave_to_stop` raises `StopRequested` (an `ExecutorStopped("stopped")`).
+  run_issue returns "stopped"; the CLI maps non-"error" to exit 0.
+- **Locks**: `worktree_lock` is reentrant per thread (`state_locks._held_worktree_locks`), plus
+  `try_worktree_lock`. Destructive transitions hold it at the outermost level: `_recreate_worktree`,
+  `_prepare_target` (recreate → apply patch), `_restore_replay_source` (recreate → read-tree),
+  review-state restoration in run_review.
+- **Tick**: `orch_stop.recover_requests` first in `_recover_runs`; returns issues to skip. Live
+  command → skip. Dead command + live tree → `stop-request-expired` ("Removed a stale stop request
+  for #N"). Dead command + dead tree, or run finished as stopped → finish. Finished otherwise or
+  missing → expire after 10 min from requested_at. `_kill_run` (non-stop outcomes) and
+  `_recover_orphan` leave a run with a current request alone.
+- **#572 vs #270**: main's deletion check breaks the locked #270 tests; `Run.live_changes` (the only
+  Run field added) is recorded by `run_publish.observe_live_changes` at each implementer turn end
+  and owns those deletions.
+- Pitfalls: scheduler_recovery.py is at 299/300 lines. orch_stop must not import scheduler at
+  module level (runner imports it). Tests use a fake process table and a `processes.os` view; never
+  patch the real `os.getpid`.

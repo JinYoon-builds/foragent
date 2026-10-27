@@ -307,7 +307,11 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
     if entry == "resolve" and failure in {"checks", "ci"}:
         assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"ready"}
         assert c.tracker.get_issue(c.pr).state == "closed"
-        assert "Verification:" in (c.store.root / "hints/1.txt").read_text()
+        hint = (c.store.root / "hints/1.txt").read_text()
+        assert "Verification:" in hint
+        if failure == "checks":  # #420: the next attempt reads the saved failing commands
+            from foragent.run_previous import saved_failures_section
+            assert "Broken feature" in saved_failures_section(c.store.root, 1)
     else:
         assert_blocked(c, reason)
     assert c.tracker.merged_prs == []
@@ -576,46 +580,83 @@ def test_cli_routes_all_verbs_to_injected_context(review_case, monkeypatch, caps
     assert "resolved review fail" in capsys.readouterr().out
 
 
-def test_review_only_stopped_by_orchestrator_keeps_reason_and_leaves_labels(review_case, monkeypatch):
-    c = review_case
-    flag_before = c.store.load_flag(1)
+def _request_stop(c, n=1):
+    from foragent import orch_stop
 
-    def review(n, ctx, worktree, verdict_head):
-        # `fa orch stop` records its why before signaling the review runner.
-        ctx.store.update_run(n, outcome="stopped", detail="stopped: reprioritize", stop_why="reprioritize")
-        raise SystemExit(143)
+    orch_stop.write_request(c.store, c.store.get_run(n), "reprioritize", c.now[0])
 
-    monkeypatch.setattr(runner, "_review_only", review)
-    with pytest.raises(SystemExit):
-        runner.review_only(1, c.ctx)
-    run = c.store.get_run(1)
-    assert (run.status, run.stop_why) == ("running", "reprioritize"), "the stop, not the runner, finishes it"
-    assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"running"}
-    assert c.store.load_flag(1) == flag_before, "A stopped review must not be flagged blocked"
-    c.store.finish_run(1, "stopped")  # `fa orch stop` then finishes it and returns it to ready
+
+def _finish_as_the_stop_would(c, worktree):
+    from foragent import orch_stop
+
+    c.ctx.git.remove_worktree(worktree)
+    c.store.finish_run(1, "stopped")
     c.tracker.add_labels(1, ["ready"])
     c.tracker.remove_labels(1, ["running"])
+    orch_stop.drop_request(c.store, 1)
 
 
-def test_review_ci_repair_keeps_worktree_when_its_work_cannot_be_saved(review_case, monkeypatch):
-    from foragent.run_attempt import AttemptFailure
-    from foragent.run_publish import WipNotSaved, keep_unsaved_work
-
+@pytest.mark.parametrize("ending", ["signal", "error"])
+def test_review_only_leaves_a_stop_requested_run_to_the_stop_command(review_case, monkeypatch, ending):
     c = review_case
+    flag_before = c.store.load_flag(1)
     worktree = c.store.worktree_path(1)
 
-    def failing_ci(n, ctx, path, verdict_head):
+    def review(n, ctx, path, verdict_head):
         ctx.git.add_detached_worktree(path, c.head)
-        raise AttemptFailure("CI failed", "main")
+        (path / "review-note.txt").write_text("unsaved\n")
+        _request_stop(c, n)  # `fa orch stop` writes its request, then terminates the tree.
+        raise SystemExit(143) if ending == "signal" else RuntimeError("executor killed")
 
-    def unsaved_repair(n, ctx, git, **kwargs):
-        (git.root / "repair.txt").write_text("unfinished repair\n")
-        raise WipNotSaved(keep_unsaved_work(n, ctx, git.root, RuntimeError("push unavailable")))
+    monkeypatch.setattr(runner, "_review_only", review)
+    assert runner.review_only(1, c.ctx) == "stopped"
+    run = c.store.get_run(1)
+    assert run.status == "running", "The stop command, not the runner, finishes the record"
+    assert (worktree / "review-note.txt").exists(), "The worktree is left for the stop's save"
+    assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"running"}
+    assert c.store.load_flag(1) == flag_before, "A stopping run must not be flagged"
+    _finish_as_the_stop_would(c, worktree)
 
-    monkeypatch.setattr(runner, "_review_only", failing_ci)
-    monkeypatch.setattr(runner, "_implement_and_publish", unsaved_repair)
-    assert runner.review_only(1, c.ctx) == "wip-not-saved"
-    assert (worktree / "repair.txt").read_text() == "unfinished repair\n", "The only copy was deleted"
-    assert c.store.get_run(1).outcome == "wip-not-saved"
-    assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"blocked"}
-    c.ctx.git.remove_worktree(worktree)  # A person recovers the kept work.
+
+@pytest.mark.parametrize("ending", ["signal", "error", "finished"])
+def test_run_issue_leaves_a_stop_requested_run_to_the_stop_command(review_case, monkeypatch, ending):
+    c = review_case
+    c.tracker.remove_labels(1, ["blocked"])
+    c.tracker.add_labels(1, ["running"])
+    c.now[0] += timedelta(seconds=1)
+    c.store.start_run(1, branch="foragent/issue-1", worktree=c.store.worktree_path(1))
+    worktree = c.store.worktree_path(1)
+    flag_before = c.store.load_flag(1)
+
+    def execute(n, ctx, path):
+        ctx.git.add_worktree(path, "foragent/issue-1", c.head)
+        (path / "draft.txt").write_text("unsaved\n")
+        _request_stop(c, n)
+        if ending == "signal":
+            raise SystemExit(143)
+        if ending == "error":
+            raise RuntimeError("executor killed")
+        return "retries-exceeded"
+
+    monkeypatch.setattr(runner, "_execute", execute)
+    monkeypatch.setattr(runner, "kick_tick", lambda root: None)
+    assert runner.run_issue(1, c.ctx) == "stopped"
+    assert c.store.get_run(1).status == "running" and (worktree / "draft.txt").exists()
+    assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"running"}
+    assert c.store.load_flag(1) == flag_before
+    _finish_as_the_stop_would(c, worktree)
+
+
+def test_review_only_spec_conflict_stops_with_spec_question_and_keeps_pr_open(review_case):
+    c = review_case
+    conflict = f"SPEC-CONFLICT: {ACCEPTANCE}:1 requires X; the finding wants Y"
+    c.review_calls = enable_reviewer(c, [f"VERDICT: PASS\n{conflict}"])
+
+    assert runner.review_only(1, c.ctx) == "spec-question"
+
+    assert_blocked(c, Reason.SPEC_QUESTION)
+    question = [comment.body for comment in c.tracker.list_comments(1)
+                if comment.body.startswith("<!-- foragent:blocked reason=spec-question -->")]
+    assert len(question) == 1 and conflict in question[0]
+    events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [e["verdict"] for e in events if e["kind"] == "review"] == ["SPEC-CONFLICT"]

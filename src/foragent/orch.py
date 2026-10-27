@@ -187,116 +187,63 @@ def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = No
     return summary
 
 
-STOP_LOCK_WAIT_S = 120
-# How long a stop waits for a runner's teardown (final save, push, finish) before terminating it.
-TEARDOWN_WAIT_S = 60
-
-
-@contextmanager
-def _tick_lock_for_stop(ctx: RunContext) -> Iterator[None]:
-    """Hold the gate's tick lock so no tick recovers or relaunches the run mid-stop."""
-    deadline = time.monotonic() + STOP_LOCK_WAIT_S
-    while True:
-        with ctx.store.hold_tick_lock() as acquired:
-            if acquired:
-                yield
-                return
-        if time.monotonic() >= deadline:
-            raise OrchError(f"a gate tick held the lock for {STOP_LOCK_WAIT_S}s; try the stop again")
-        time.sleep(1)
-
-
-class StopPending(OrchError):
-    """The run stopped and its work was kept, but its labels still wait for the next tick."""
-
-
 def stop(ctx: RunContext, n: int, why: str) -> str:
-    """Stop a running issue through the gate's kill path, keeping its work as WIP."""
-    why = _text(why, "--why")
-    try:
-        with _tick_lock_for_stop(ctx):
-            summary = _stop_locked(ctx, n, why)
-    except StopPending:
-        kick_tick(ctx.repo_root)  # The tick completes the labels of the finished stop.
-        raise
-    # The terminated runner's own kick found the lock held; wake the gate now.
-    kick_tick(ctx.repo_root)
-    return summary
+    """Stop a running issue and keep its work, in D95's order.
 
-
-def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
-    from foragent import scheduler
-    from foragent.run_publish import (
-        STOP_REQUEST_CLEARED, STOPPED, WIP_NOT_SAVED, implementer_turn_open, stop_head, stop_intent_lock,
-    )
-    from foragent.orch_stop import StopFailed, complete_stop, drop_stop_pending, mark_stop_pending, stop_summary
+    The request is written first, then the runner's tree is terminated through
+    scheduler._kill_run; only after the whole tree is dead and worktree_lock(N)
+    is free does this command, as the run's fallback owner, save the WIP, write
+    the stop event, finish the run and return the issue to ready. A failure
+    before the kill removes the request; a failure after it keeps the request,
+    and the next gate tick finishes the stop.
+    """
+    from foragent import orch_stop, scheduler
     from foragent.scheduler_stop import stop_target_refusal
 
+    why = _text(why, "--why")
     run = ctx.store.get_run(n)
-    if run is None or run.status != "running":
+    record = orch_stop.read_request(ctx.store, n)
+    if record is not None and orch_stop.command_alive(record):
+        raise OrchError(f"#{n}: stop refused: fa orch stop (PID {record['pid']}) is already stopping it")
+    takeover = (record is not None and run is not None and run.started_at == record["started_at"]
+                and (run.status == "running" or run.outcome == orch_stop.STOPPED))
+    if run is None or (run.status != "running" and not takeover):
         raise OrchError(f"issue #{n} is not running; nothing to stop")
-    if (refusal := stop_target_refusal(run)) is not None:
+    if run.branch.startswith("foragent/batch-"):
+        raise OrchError(f"#{n}: stop refused: batch runs ({run.branch}) are not stopped")
+    if run.status == "running" and (refusal := stop_target_refusal(run)) is not None:
         raise OrchError(f"#{n}: stop refused: {refusal}")
     tick_ctx = scheduler.TickContext(
         repo=ctx.repo, repo_root=ctx.repo_root, tracker=ctx.tracker, store=ctx.store,
         config=ctx.config, git=ctx.git, now=ctx.now, launcher=lambda number: None,
     )
     report = scheduler.TickReport()
-    detail = f"{STOPPED}: {why}"
-    # Record the request under the run's intent lock, atomically with the runner's turn
-    # boundaries, final save, merge and finish. From the request on, whatever phase it is in,
-    # the runner writes nothing more (it defers its save and leaves its record), and this
-    # stop terminates the tree and is the only writer of the run. A merged run is refused:
-    # its work already landed, irreversibly. A runner holds this lock through its teardown;
-    # if that teardown is stuck (a final push that never returns), the tree is terminated
-    # first, which releases the lock, and the request is recorded on the dead run.
     try:
-        with stop_intent_lock(ctx.store, n, timeout=TEARDOWN_WAIT_S):
-            pass
-    except TimeoutError:
-        from foragent import scheduler_stop
-
-        if scheduler_stop._stop_run_processes(tick_ctx, run, report) != "stopped":
-            raise OrchError(f"#{n}: stop refused: its stuck teardown could not be terminated: "
-                            f"{'; '.join(report.actions) or 'no action'}") from None
-    with stop_intent_lock(ctx.store, n):
-        run = ctx.store.get_run(n)
-        if run is None or run.status != "running":
-            raise OrchError(f"issue #{n} is not running; nothing to stop")
-        if run.merged:
-            raise OrchError(f"issue #{n} was already merged by its run; nothing to stop")
-        mark_stop_pending(ctx.store, run, why)  # Durable first: every later step is recovered from it.
-        ctx.store.update_run(n, outcome=STOPPED, stop_why=why, stop_head=stop_head(ctx.git, n),
-                             stop_in_turn=implementer_turn_open(run))
-    try:
-        # The tree is stopped before the worktree is observed and saved (in _kill_run), so
-        # nothing a still-running executor deletes can be missing from the WIP.
-        scheduler._kill_run(tick_ctx, n, report, outcome=STOPPED, detail=detail)
-    finally:
-        with stop_intent_lock(ctx.store, n):
-            current = ctx.store.get_run(n)
-            if current is not None and current.status == "running":
-                # The run did not end: undo only this verb's marks; a runner's wip-not-saved stays.
-                undo = {"outcome": run.outcome} if current.outcome == STOPPED else {}
-                current = ctx.store.update_run(n, **STOP_REQUEST_CLEARED, **undo)
-                drop_stop_pending(ctx.store, n)
-    if current is None or current.status != "finished" or current.outcome in {"merged", WIP_NOT_SAVED}:
-        state = "still running" if current is not None and current.status == "running" else (
-            f"finished as {current.outcome}" if current is not None else "no run record")
-        drop_stop_pending(ctx.store, n)  # A merge, a lost-work flag or the live run owns the issue.
-        raise OrchError(f"#{n}: stop did not complete ({state}): {'; '.join(report.actions) or 'no action'}")
-    try:
-        summary = stop_summary(n, why) + complete_stop(tick_ctx, current)
-    except StopFailed as exc:
-        raise OrchError(f"#{n}: stop did not complete: {exc}") from exc
-    except Exception as exc:
-        # The run is finished; the pending stop record makes the next tick repeat each step.
-        raise StopPending(f"{stop_summary(n, why)}; not completed ({' '.join(str(exc).split()) or type(exc).__name__}); "
-                          "the next gate tick completes the stop") from exc
-    try:  # The required local event is already journaled; the GitHub audit comment is extra.
-        RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(n, "<!-- foragent:orch -->\n" + summary)
-    except Exception as exc:
-        summary += f"; audit comment not posted: {exc}"
+        record = orch_stop.write_request(ctx.store, run, why, ctx.now())
+    except Exception:
+        orch_stop.drop_request(ctx.store, n)
+        raise
+    kept = "the stop request is kept and the next gate tick finishes the stop"
+    if run.status == "running":
+        try:
+            killed = scheduler._kill_run(tick_ctx, n, report, outcome=orch_stop.STOPPED)
+        except Exception as exc:
+            raise OrchError(f"#{n}: stop failed at step kill: {exc}; {kept}") from exc
+        if not killed:
+            raise OrchError(f"#{n}: stop failed at step kill: {'; '.join(report.actions) or 'refused'}; {kept}")
+        if not orch_stop.wait_tree_dead(ctx, run):
+            raise OrchError(f"#{n}: stop failed at step wait-for-tree: the runner's processes are still alive "
+                            f"after {orch_stop.TREE_WAIT_S}s; {kept}")
+    with orch_stop.worktree_lock_within(ctx, n) as held:
+        if not held:
+            raise OrchError(f"#{n}: stop failed at step worktree-lock: worktree_lock({n}) was not free within "
+                            f"{orch_stop.LOCK_WAIT_S}s; {kept}")
+        try:
+            summary = orch_stop.finish(tick_ctx, n, record)
+        except orch_stop.StopStepFailed as exc:
+            note = kept if orch_stop.read_request(ctx.store, n) is not None else "the stop request was removed"
+            raise OrchError(f"#{n}: stop {exc}; {note}") from exc
+    kick_tick(ctx.repo_root)  # The next run may start from the branch now.
     return summary
 
 
@@ -332,6 +279,7 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str, say: str | None = 
             # A review verdict cannot fix failing code or CI. Give the implementer
             # the evidence and queue a fresh attempt rather than strand the issue.
             if outcome in {"checks-failed", "ci-failed"}:
+                # The failing commands themselves reach the next implementer from the saved bundle.
                 _retry(ctx, n, f"{note}\n\nVerification: {outcome}\nSee {ctx.store.log_path(n)}")
                 outcome += "; queued implementation retry"
     finally:
@@ -367,7 +315,10 @@ def log(ctx: RunContext) -> list[dict]:
     with ctx.store._state_lock():
         if path.exists():
             with path.open(encoding="utf-8") as stream:
-                events = [json.loads(line) for line in deque(stream, maxlen=20)]
+                # Phase timings (kind=phase) are measurements for `fa orch facts`, not actions.
+                events = deque((event for line in stream
+                                if (event := json.loads(line)).get("kind") != "phase"), maxlen=20)
+                events = list(events)
         else:
             events = []
     _event(ctx, None, "log", f"Read {len(events)} recent orchestrator events")

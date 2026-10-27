@@ -11,6 +11,9 @@ class Approval:
     acceptance_blobs: dict[str, str]
     approved_by: str
     approved_at: str
+    # A Foragent order parent's shared outcome and constraints, frozen once
+    # per approval; None means not read yet, "" means there is none.
+    parent_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -41,24 +44,8 @@ class Run:
     status: str = "running"
     outcome: str | None = None
     detail: str = ""
-    # Written only by `fa orch stop`: its --why while it ends this run (detail is overwritten by others).
-    stop_why: str = ""
-    # The issue branch head when `fa orch stop` recorded its intent; None if there was no branch.
-    stop_head: str | None = None
-    # The reason named by this run's WIP commit, recorded with the commit under the stop-intent lock.
-    wip_reason: str | None = None
-    # Paths the live run changed, seen by Foragent before any cleanup touched its worktree.
+    # Paths the live worktree changed when an implementer turn ended: provenance for WIP deletions.
     live_changes: list[str] = field(default_factory=list)
-    # An observation failed: deletions it could have owned have no provenance (never "none changed").
-    live_changes_failed: bool = False
-    # An implementer turn is open: set before the executor starts, cleared when the turn ends.
-    in_turn: bool = False
-    # Implementer turns this run began: none means no implementer edit can exist in its worktree.
-    turns: int = 0
-    # The run's PR was merged (recorded under the intent lock with the merge): nothing is left to stop.
-    merged: bool = False
-    # The stop request arrived during an implementer turn: what the tree leaves is the turn's work.
-    stop_in_turn: bool = False
     lane: str = "main"
     waited_seconds: float = 0
     waiting_until: str | None = None
@@ -77,6 +64,10 @@ class Run:
     session_ids: list[str] = field(default_factory=list)
     session_body: str | None = None
     resume_reason: str = ""
+    # The saved failure is already limited part by part (every check, every finding): keep it whole.
+    resume_whole: bool = False
+    # Files this branch edits that a merged base moved or split, until the next prompt names them.
+    moved_files: list[str] = field(default_factory=list)
     resume_failures: int = 0
     merge_conflicts: list[str] = field(default_factory=list)
     # From-scratch rebuilds in this run and the fixed English machine reason for the latest one.
@@ -91,9 +82,22 @@ class Run:
     merge_lock_held_seconds: float | None = None
     comparison: dict | None = None
     files_committed: bool = False
+    # Machine sleep credited by the gate tick alone (#415): over the whole run, and since
+    # the last progress for the stall check. A record from before it reads as 0.
+    slept_seconds: float = 0
+    slept_since_progress: float = 0
     files_base_branch: str | None = None
     declared_files: list[str] | None = None
     changed_files: list[str] | None = None
     effective_files: list[str] | None = None
     late_files: list[str] = field(default_factory=list)
     overlap_records: list[dict] = field(default_factory=list)
+    # One entry per related-unit-test check: changed_file_count, selected_files,
+    # file_seconds (JUnit testcase seconds per file), total_seconds and timed_out.
+    related_tests: list[dict] = field(default_factory=list)
+    # Identity of the work the current phase does (e.g. "baseline:<sha>"), journaled when it ends;
+    # work_events maps each finished work identity to its first phase event, across executions.
+    phase_work_id: str | None = None
+    # When this instance of the work began; segments split by nested waits share it.
+    phase_work_started_at: str | None = None
+    work_events: dict[str, str] = field(default_factory=dict)
