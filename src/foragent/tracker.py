@@ -606,8 +606,10 @@ class FakeTracker:
 
     def issues_closed_since(self, since: datetime) -> list[Issue]:
         """Closed issues updated at or after ``since``; an unknown time counts as recent."""
-        return [issue for issue in self.list_issues("closed")
-                if (updated := _parse_time(issue.updated_at)) is None or updated >= since]
+        # Its own light read, not a full listing (like GhTracker's since-filtered call).
+        return [issue for issue in self.issues.values()
+                if issue.state == "closed" and not issue.is_pull_request
+                and ((updated := _parse_time(issue.updated_at)) is None or updated >= since)]
 
     def update_issue(self, n: int, *, title: str, body: str) -> None:
         self.edit_body(n, body)

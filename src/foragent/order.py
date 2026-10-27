@@ -602,7 +602,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     if approved_numbers:
         kick_tick(root)
     if childless and (parent not in by_number or by_number[parent].state == "open"):
-        tracker.close_issue(parent, text("order_record_closed", config.language))
+        tracker.close_issue(parent, text("order_record_closed", config.language, count=0))
     for item, row in zip(plan["issues"], rows):
         row["number"] = mapping[item["key"]]
         row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]

@@ -37,3 +37,5 @@
 - 다른 이슈가 주인인 상수(예: park 이슈의 `WAITING_PERSON`)는 main에 들어오기 전까지 정의하지 말고 문자열을 직접 쓴다. 지시에 "do not define it here"가 있으면 리뷰가 소유권 위반으로 막는다(#694).
 - 주문 기록 닫기(#705): publish만 하위 이슈 없는 주문(`not plan["issues"] and not mapping`)의 기록을 보드에 넣지 않고 닫는다. tick은 하위 이슈 없는 기록을 닫지 않는다(#411 "빈 작업은 완료가 아니다", 오케 답변). 닫힌 이슈 가벼운 읽기는 `RecordingTracker.observe_closed_issues`(watermark `closed_issues.json`, 없으면 `issues_observation()["as_of"]`부터; 로컬에 closed가 아닌 모든 닫힌 이슈 기록)를 `_reconcile_batches` 맨 앞에서 부른다. 증분 읽기 리뷰 함정: 첫 호출에 읽기를 건너뛰거나 캐시된 행으로 원격 변경을 거르면 막힌다. scheduler.py는 Files에 없으면 손대지 않는다.
 - `test_github_outbox.py::...rate_limited_close`는 #705 기준선에서 이미 실패한다. 기준선 비교는 `git diff > .foragent/wip.patch; git apply -R`, 시험, `git apply`로 한다(`git checkout --`은 권한 거부).
+- 가짜 추적기에 가벼운 읽기를 더할 때 `self.list_issues()`를 재사용하지 말고 `self.issues`를 직접 거른다. `test_tick_step_times.py` 등은 `list_issues` 호출을 GitHub 단계로 세므로 tick당 한 번을 넘으면 기준선이 깨진다(#705).
+- "공유 메시지 키" 요구는 같은 일을 하는 모든 쓰기 지점(#705: publish의 주문 기록 닫기 + tick의 #411 부모 닫기)이 한 키를 쓰라는 뜻이다. 새 키만 만들고 기존 경로의 옛 키를 두면 리뷰가 막는다. 잠긴 시험의 요구(개수 포함 한 줄)는 `{count}` 인자로 맞춘다.
