@@ -5,7 +5,7 @@ evidence warning, elapsed time and the five acorns. Columns align by terminal
 cells; at 60–99 columns the title goes and below 60 the elapsed time too.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,8 @@ CHECK_WORDS = {"baseline": "squirrel_baseline", "checking": "squirrel_checking",
 PERSON_PHASES = frozenset({"needs-human", "waiting-person"})
 # The five acorns: code, local tests, review, CI and merge, each finished by its phase.
 ACORNS = ("implementing", "checking", "reviewing", "ci", "merging")
+# A baseline being measured (or awaited) is still unfinished.
+BASELINE_PHASES = frozenset({"baseline", "baseline-wait"})
 # The orchestrator's conflict fix comes after code, local tests and review.
 RESOLVING_DONE = 3
 
@@ -70,25 +72,40 @@ def _time(value: Any) -> datetime | None:
         return None
 
 
-def finished_acorns(phase: str | None, events: list[dict[str, Any]], started_at: Any = None) -> set[int]:
+def _after(opened: datetime, started: datetime) -> bool:
+    """Compare times that may mix naive and aware values (naive ones are UTC)."""
+    aware = lambda moment: moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+    return aware(opened) >= aware(started)
+
+
+def finished_acorns(phase: str | None, events: list[dict[str, Any]], started_at: Any = None,
+                    waiting_from: str | None = None) -> set[int]:
     """The finished acorns of one run.
 
     With this run's closed phase events (those opened since the run started), a
-    phase counts once it has one; local tests also need any baseline to be over.
-    Without any, the phases before the current one in the fixed order count;
-    resolving counts code, local tests and review, and waits count none.
+    phase counts once it has one and stays earned. Local tests count once checking
+    has closed and no baseline of the run is still unfinished: an open baseline
+    (the current phase) holds the acorn back unless an earlier baseline already
+    closed. Without any events the phases before the current one in the fixed order
+    count; resolving counts code, local tests and review; a wait, a person or a
+    blocked row counts those before ``waiting_from``, the phase its run was in.
     """
+    # Only events that this run opened count: without its start time, none can be shown to be its own.
     started = _time(started_at)
-    own = [event for event in events
-           if started is None or (opened := _time(event.get("phase_started_at"))) is None or opened >= started]
+    own = [event for event in events if started is not None
+           and (opened := _time(event.get("phase_started_at"))) is not None and _after(opened, started)]
     if own:
-        done = {ACORNS.index(event["phase"]) for event in own if event["phase"] in ACORNS}
-        if phase == "baseline":
-            done.discard(1)
+        closed = {event["phase"] for event in own}
+        done = {ACORNS.index(name) for name in closed if name in ACORNS and name != "checking"}
+        if "checking" in closed and ("baseline" in closed or phase not in BASELINE_PHASES):
+            done.add(ACORNS.index("checking"))
         return done
-    if phase in ACORNS:
-        return set(range(ACORNS.index(phase)))
-    if phase in CODE_PHASES - {"implementing"}:
+    current = phase
+    if phase not in ACORNS and phase not in CODE_PHASES and phase not in CHECK_WORDS:
+        current = waiting_from  # A wait keeps what its run had reached when it began waiting.
+    if current in ACORNS:
+        return set(range(ACORNS.index(current)))
+    if current in CODE_PHASES - {"implementing"}:
         return set(range(RESOLVING_DONE))
     return set()
 
@@ -124,9 +141,17 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
     language = config.language
     kind, words = _kind(state, phase)
     age = max(0.0, (now - snapshot.captured_at).total_seconds())
+    # The run behind the row: the active one, else (except for a queued issue, which has no
+    # run yet) the issue's latest recorded run from the full history, then status.history.
+    past = None if run or state == "queued" else next(
+        (item for item in reversed(snapshot.status.get("history") or []) if item.get("number") == number), {})
+    started = (run or {}).get("started_at") if run else None if past is None else (
+        snapshot.run_starts.get(number) or past.get("started_at"))
+    waiting_from = None if past is None else (
+        snapshot.run_phases[number] if number in snapshot.run_phases else past.get("phase"))
     elapsed = None
-    if run and _time(run.get("started_at")) is not None:
-        elapsed = (now - _time(run["started_at"])).total_seconds()
+    if _time(started) is not None:
+        elapsed = (now - _time(started)).total_seconds()
     elif state != "queued" and number == row.get("issue") and row.get("elapsed_seconds") is not None:
         elapsed = row["elapsed_seconds"] + age
     activity = ""
@@ -140,7 +165,9 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
             _runner_progress(run, snapshot.captured_at), _age(run.get("phase_started_at"), snapshot.captured_at))
         # The row's phase word and time already say what is normal; only warnings add a cell.
         activity = found if found.startswith(("○", "?")) else ""
-    done = finished_acorns(phase, snapshot.phases.get(number, []), run.get("started_at") if run else None)
+    # Acorns belong to that one run; without it nothing was earned, so older events never count.
+    events = snapshot.phases.get(number, []) if _time(started) is not None else []
+    done = finished_acorns(phase, events, started, waiting_from)
     acorns = "".join(glyphs["done" if index in done else "left"] for index in range(len(ACORNS)))
     return {"glyph": glyphs[kind], "lane": name, "number": f"#{number}", "title": watch._clean(title or ""),
             "words": watch.text(words, language), "activity": activity,
@@ -165,18 +192,21 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
                 own = number == row.get("issue")
                 state = snapshot.worker_states.get(number) or (row["state"] if own else "working")
                 phase = run.get("phase") or (row.get("phase") if own else None)
-                title = titles.get(number) or (row.get("title") if own else "") or ""
+                # Status lists only some workers; the local issue records name every one.
+                title = titles.get(number) or snapshot.titles.get(number) or (row.get("title") if own else "") or ""
                 label = f"{name} {position}" if len(workers) > 1 else name
                 found.append(_issue_row(snapshot, config, row, label, number, run, state, phase, title, glyphs, now))
         elif row.get("issue") is not None and row["state"] in {"working", "waiting-human", "blocked"}:
-            found.append(_issue_row(snapshot, config, row, name, row["issue"], None, row["state"],
-                                    row.get("phase"), row.get("title") or "", glyphs, now))
+            found.append(_issue_row(snapshot, config, row, name, row["issue"], None, row["state"], row.get("phase"),
+                                    row.get("title") or snapshot.titles.get(row["issue"]) or "", glyphs, now))
         elif row.get("queued"):
             item = row["queued"][0]
             found.append(_issue_row(snapshot, config, row, name, item["number"], None, "queued",
                                     row.get("phase"), item.get("title") or "", glyphs, now))
         else:
-            count = len(snapshot.done.get(slug, []))
+            # Today's merges in this lane; a snapshot built without them keeps the order's done list.
+            count = (snapshot.today_done.get(slug, 0) if snapshot.today_done is not None
+                     else len(snapshot.done.get(slug, [])))
             rest = "✓ " + watch.text("done_state_lane_done", language, count=count) if count else ""
             found.append({"glyph": glyphs["idle"], "lane": name, "rest": rest})
     return found
@@ -203,6 +233,12 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     else:
         others = sum(value + 1 for key, value in widths.items() if key != "title" and value)
         widths["title"] = min(widths["title"], max(0, width - others - 1))
+    # The row must fit: warnings, then the lane name, then the phase word give way, so the
+    # glyph, number, elapsed time and acorns at the end are never pushed off the line.
+    for key, least in (("activity", 0), ("lane", 4), ("words", 4), ("lane", 1), ("words", 1)):
+        over = sum(value + 1 for value in widths.values() if value) - 1 - width
+        if over > 0:
+            widths[key] = max(min(widths[key], least), widths[key] - over)
     shown = [key for key in columns if widths[key]]
     lines: list[Line] = []
     for row in rows:

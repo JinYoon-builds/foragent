@@ -105,3 +105,186 @@ def test_wide_screens_put_the_orchestrator_box_beside_the_sections(tmp_path):
     narrow = watch.render_frame(busy_snapshot(1), config, tmp_path, width=120).splitlines()
     assert any("┌" in line and "orchestrator" in line and not line.startswith("┌") for line in wide)
     assert any(line == "🧭 orchestrator" for line in narrow) and not any("┌🧭" in line for line in narrow)
+
+
+def one_lane(state="working", phase="merging", lane="abcdefghijklmno", run=True, history=(), events=()):
+    status = {"lanes": {"x": {"slug": "x", "lane_display": lane, "state": state, "issue": 7, "title": "Task",
+                              "phase": phase, "elapsed_seconds": 60, "last_activity_seconds": 0,
+                              "queued": [{"number": 7, "title": "Task"}] if state == "queued" else [],
+                              "running": [], "waiting_for": []}},
+              "summary": {"working": 1, "blocked": 0, "waiting_human": 0, "queued": 0},
+              "active_runs": [{"number": 7, "lane": "x", "phase": phase, "status": "running", "attempts": 1,
+                               "started_at": (NOW - timedelta(minutes=12)).isoformat(),
+                               "last_activity_at": NOW.isoformat()}] if run else [],
+              "history": list(history)}
+    snapshot = watch.Snapshot(status, {}, None, 0, 1, None, [], NOW)
+    snapshot.phases = {7: list(events)}
+    return snapshot
+
+
+def row_of(frame):
+    return next(line for line in frame.splitlines() if "#7" in line)
+
+
+@pytest.mark.parametrize("width", [40, 50, 60, 70])
+@pytest.mark.parametrize("phase,mode", [("merging", "emoji"), ("merging", "ascii"), ("overlap-wait", "ascii")])
+def test_the_five_acorns_stay_at_the_end_however_long_the_other_columns(tmp_path, width, phase, mode):
+    """Defect class: trailing columns lost when earlier columns take more cells than the line has."""
+    config = Config(language="en", view_glyphs=mode, lanes={"x": {}})
+    acorns = {"emoji": ("🌰", "○"), "ascii": ("#", ".")}[mode]
+    expected = 4 if phase == "merging" else 0
+    row = row_of(watch.render_frame(one_lane(phase=phase), config, tmp_path, width=width))
+    assert row.endswith(acorns[0] * expected + acorns[1] * (5 - expected)), row
+    assert watch._cells(row) <= width
+
+
+def test_a_warning_cell_gives_way_before_the_acorns(tmp_path, monkeypatch):
+    monkeypatch.setattr(watch, "_activity", lambda *args: "○ " + "warning " * 20)
+    config = Config(language="en", view_glyphs="ascii", lanes={"x": {}})
+    row = row_of(watch.render_frame(one_lane(), config, tmp_path, width=60))
+    assert row.endswith("####.") and watch._cells(row) <= 60
+
+
+def test_rows_without_their_own_run_show_no_acorns_of_older_runs(tmp_path):
+    """Defect class: acorns counted from phase events without knowing which run they belong to."""
+    config = Config(language="en", view_glyphs="ascii", lanes={"x": {}})
+    old = NOW - timedelta(hours=3)
+    events = [phase("implementing", old), phase("checking", old + timedelta(minutes=5)),
+              phase("reviewing", old + timedelta(minutes=9))]
+    # A queued issue with no run has earned nothing, whatever an earlier run did.
+    queued = one_lane(state="queued", phase=None, run=False, events=events)
+    assert row_of(watch.render_frame(queued, config, tmp_path)).endswith(".....")
+    # A blocked issue keeps what its latest recorded run earned, and only that.
+    latest = {"number": 7, "started_at": (old + timedelta(minutes=7)).isoformat(), "status": "finished"}
+    blocked = one_lane(state="blocked", phase=None, run=False, events=events,
+                       history=[{"number": 7, "started_at": (old - timedelta(hours=1)).isoformat()}, latest])
+    assert row_of(watch.render_frame(blocked, config, tmp_path)).endswith("..#..")
+    # Events without their own start time cannot be shown to belong to the run.
+    undated = [{**event, "phase_started_at": None} for event in events]
+    assert lanes.finished_acorns("ci", undated, NOW.isoformat()) == {0, 1, 2}  # The fixed order instead.
+    assert lanes.finished_acorns("ci", events, None) == {0, 1, 2}
+
+
+@pytest.mark.parametrize("width", [1, 2, 3, 5])
+def test_very_narrow_frames_finish_rendering(tmp_path, width):
+    """Defect class: wrapping given fewer cells than one character after the clamp went away."""
+    snapshot = one_lane()
+    snapshot.events = [{"at": NOW.isoformat(), "kind": "note", "summary": "검사 완료 handled"}]
+    config = Config(language="ko", lanes={"x": {}})
+    frame = watch._frame(snapshot, config, tmp_path, tick=0, width=width, selected="x", now=NOW, height=None)
+    assert frame and all(watch._cells("".join(value for value, _ in line)) <= width for line in frame)
+    assert watch._wrap("한글 word", 1)
+
+
+def test_every_worker_row_names_its_title_from_the_local_records(tmp_path):
+    """Defect class: worker facts taken only from status lists that leave some workers out."""
+    from foragent.tracker import FakeTracker
+    from test_watch import snapshot as collected
+
+    tracker, store = FakeTracker(), StateStore(tmp_path, now=lambda: NOW)
+    config = Config(language="en", view_glyphs="ascii", lanes={"api": {"title": "Server"}})
+    for number, title in ((1, "First asks a person"), (2, "Second asks a person")):
+        tracker.add_issue(number, title, labels=["approved", "running", "needs-human", "lane:api"])
+        store.start_run(number, branch=f"issue-{number}", worktree="unused", lane="api")
+    frame = watch.render_frame(collected(tracker, store, config), config, tmp_path)
+    rows = [line for line in frame.splitlines() if line.startswith("[!]")]
+    assert len(rows) == 2 and "First asks a person" in rows[0] and "Second asks a person" in rows[1], frame
+
+
+def test_a_waiting_issue_keeps_its_acorns_after_ten_other_runs(tmp_path):
+    """Defect class: the ten-run status history used as if it were the whole history."""
+    from foragent.tracker import FakeTracker
+    from test_watch import snapshot as collected
+
+    clock = [NOW - timedelta(hours=5)]
+    tracker, store = FakeTracker(), StateStore(tmp_path, now=lambda: clock[0])
+    config = Config(language="en", view_glyphs="ascii", lanes={"api": {"title": "Server"}})
+    tracker.add_issue(5, "Blocked task", labels=["approved", "blocked", "lane:api"])
+    store.start_run(5, branch="issue-5", worktree="unused", lane="api")
+    started = store.get_run(5).started_at
+    store.finish_run(5, "blocked")
+    for number in range(20, 31):
+        clock[0] += timedelta(minutes=10)
+        tracker.add_issue(number, f"Other {number}", labels=["lane:api"], state="closed")
+        store.start_run(number, branch=f"issue-{number}", worktree="unused", lane="api")
+        store.finish_run(number, "failed")
+    opened = datetime_of(started)
+    (tmp_path / "orch-events.jsonl").write_text(json.dumps(phase("implementing", opened, issue=5)) + "\n")
+    result = collected(tracker, store, config)
+    assert 5 not in {run["number"] for run in result.status["history"]}
+    row = next(line for line in watch.render_frame(result, config, tmp_path).splitlines() if "#5" in line)
+    assert row.endswith("#...."), row
+
+
+def datetime_of(value):
+    from datetime import datetime
+
+    return datetime.fromisoformat(value)
+
+
+def test_idle_rows_count_todays_merges_in_the_lane_only(tmp_path):
+    """Defect class: the order's done list used where the spec asks for today's count."""
+    from foragent.tracker import FakeTracker
+    from test_watch import snapshot as collected
+
+    clock = [NOW - timedelta(days=1)]
+    tracker, store = FakeTracker(), StateStore(tmp_path, now=lambda: clock[0])
+    config = Config(language="en", view_glyphs="ascii", lanes={"docs": {"title": "Docs"}, "api": {"title": "Server"}})
+    tracker.add_issue(90, "Order")
+    for number, when in ((1, NOW - timedelta(days=1)), (2, NOW - timedelta(minutes=30)), (3, NOW - timedelta(minutes=20))):
+        clock[0] = when
+        tracker.add_issue(number, f"Docs {number}", labels=["approved", "lane:docs"], state="closed")
+        if number != 3:
+            tracker.set_parent(number, 90)  # #3 belongs to no open order but merged today.
+        store.start_run(number, branch=f"issue-{number}", worktree="unused", lane="docs")
+        store.finish_run(number, "merged")
+    clock[0] = NOW
+    result = collected(tracker, store, config)
+    assert result.today_done == {"docs": 2}
+    frame = watch.render_frame(result, config, tmp_path).splitlines()
+    docs = next(line for line in frame if line.startswith("[z]") and "Docs" in line)
+    server = next(line for line in frame if line.startswith("[z]") and "Server" in line)
+    assert docs.endswith("✓ 2 done") and "✓" not in server, frame
+
+
+def test_a_waiting_row_without_an_active_run_uses_its_latest_recorded_run(tmp_path):
+    """Defect class: recorded run facts ignored when a waiting row has no active run."""
+    config = Config(language="en", view_glyphs="ascii", lanes={"x": {}})
+    latest = {"number": 7, "started_at": (NOW - timedelta(minutes=30)).isoformat(), "phase": "reviewing"}
+    for state in ("blocked", "waiting-human"):
+        snapshot = one_lane(state=state, phase=None, run=False, history=[latest])
+        snapshot.status["lanes"]["x"]["elapsed_seconds"] = None
+        row = row_of(watch.render_frame(snapshot, config, tmp_path))
+        # 30 minutes since the run began, and code and local tests reached before it waited.
+        assert "30m" in row and row.endswith("##..."), row
+    # The full history wins over the ten-run status history.
+    snapshot = one_lane(state="blocked", phase=None, run=False, history=[latest])
+    snapshot.run_starts, snapshot.run_phases = {7: (NOW - timedelta(minutes=50)).isoformat()}, {7: "ci"}
+    row = row_of(watch.render_frame(snapshot, config, tmp_path))
+    assert "50m" in row and row.endswith("###.."), row
+    # A queued issue has no run yet: no time and no acorns from an earlier attempt.
+    queued = one_lane(state="queued", phase=None, run=False, history=[latest])
+    queued.run_starts, queued.run_phases = {7: latest["started_at"]}, {7: "reviewing"}
+    row = row_of(watch.render_frame(queued, config, tmp_path))
+    assert "30m" not in row and row.endswith("....."), row
+
+
+def test_local_tests_need_checking_and_any_baseline_finished_and_stay_earned():
+    """Defect class: completion that ignores a combined prerequisite or forgets earned progress."""
+    start = NOW
+    at = lambda minutes: start + timedelta(minutes=minutes)
+    code, checking = phase("implementing", at(1)), phase("checking", at(20))
+    baseline = phase("baseline", at(10))
+    # Checking closed while the run's first baseline is still being measured or awaited: not yet.
+    for current in ("baseline", "baseline-wait"):
+        assert lanes.finished_acorns(current, [code, checking], start.isoformat()) == {0}
+    # Both closed: earned, and a later baseline (a new base) does not take it back.
+    assert lanes.finished_acorns("reviewing", [code, baseline, checking], start.isoformat()) == {0, 1}
+    assert lanes.finished_acorns("baseline", [code, baseline, checking], start.isoformat()) == {0, 1}
+    # A baseline alone never fills it; a run whose baseline came from the cache had none to finish.
+    assert lanes.finished_acorns("checking", [code, baseline], start.isoformat()) == {0}
+    assert lanes.finished_acorns("reviewing", [code, checking], start.isoformat()) == {0, 1}
+    # Later phases stay earned through waits, a person and a block.
+    review = phase("reviewing", at(30))
+    for current in ("test-slot-wait", "needs-human", None):
+        assert lanes.finished_acorns(current, [code, checking, review], start.isoformat()) == {0, 1, 2}
