@@ -261,8 +261,22 @@ class SkillManager:
             raise SkillError(f"ambiguous skill: {identity}; use one of: {', '.join(skill.id for skill in matches)}")
         raise SkillError(f"unknown skill: {identity}")
 
+    def _repo_skill(self, identity: str, root: Path) -> Skill | None:
+        """A product skill kept in the repository's skills/<name>/, which wins by name over libraries."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", identity) or identity in {".", ".."}:
+            return None
+        path = repo_path(root, f"skills/{identity}")
+        if not (path / "SKILL.md").is_file():
+            return None
+        meta = _frontmatter(path / "SKILL.md")
+        library = Library("repo", str(root), root)
+        license_id, license_file = _license(path, root)
+        skill_id = f"repo:{identity}"
+        return Skill(skill_id, meta["name"], meta["description"], library, path, license_id, license_file,
+                     (path,), _runs_scripts(path), self.config.skill_roles.get(skill_id))
+
     def check_install(self, identity: str, root: Path, *, commit: bool = False) -> Skill:
-        skill = self._select(identity)
+        skill = self._repo_skill(identity, root) or self._select(identity)
         if skill.path.is_symlink() or any(path.is_symlink() for path in skill.path.rglob("*")):
             raise SkillError(f"skill contains a symlink: {identity}")
         if commit and skill.license not in OPEN_SOURCE_LICENSES:
@@ -331,7 +345,7 @@ class SkillManager:
 
 
 def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: SkillManager) -> list[str]:
-    """Copy local dependencies, leaving skills already in the checkout intact."""
+    """Copy repository product skills, local installs or cached library skills, leaving the checkout's own intact."""
     copied = []
     for name in dict.fromkeys(names):
         if not isinstance(name, str) or not name or Path(name).name != name or name in {".", ".."}:
@@ -340,7 +354,10 @@ def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: Skil
         destination = repo_path(worktree, relative)
         if destination.exists():
             continue  # In particular, preserve user-authored, committed skills.
-        source = repo_path(root, relative)
+        # Product skills in the repository's skills/ win by name over local installs and libraries.
+        source = repo_path(root, f"skills/{name}")
+        if not (source / "SKILL.md").is_file():
+            source = repo_path(root, relative)
         if not (source / "SKILL.md").is_file():
             source = manager.cached_skill(name)
         if source is None:

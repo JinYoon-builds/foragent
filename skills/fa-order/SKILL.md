@@ -230,9 +230,9 @@ check). Done when commands must run with the repo's normal tooling from the repo
 Once the spec is roughly formed, before you lock it for approval, write the plan JSON
 (schema in `fa order publish --help`) to a temp file and run
 `fa order perspectives PLAN.json --json`. Read-only agents question it in parallel from
-fixed seats: skeptic, first-time user, attacker, operator, maintainer in six months, and
-incidents (risk map and decisions). A failed seat is listed under `failures`; the others
-still count. Merge duplicate questions across seats into one. Answer what the code, the
+fixed seats: skeptic, first-time user, attacker, operator, maintainer in six months,
+incidents (risk map and decisions), and other users. A failed seat is listed under
+`failures`; the others still count. Merge duplicate questions across seats into one. Answer what the code, the
 docs or a settled decision already answers, and fold it into the spec yourself. Ask the
 person only the questions D71 leaves to them: behaviour, scope or approval. Then record
 each question once with `fa order perspectives mark ID --changed yes|no` (yes when it
@@ -259,6 +259,14 @@ This order: 7 issues
  docs/              README                                      [s]
  runs in parallel: api, web · skills: api=testing-strategy
 ```
+Before asking for approval, check every issue and fix the plan where a check fails:
+- (a) Reuse: does existing code already do this or most of it? If so, why is reusing it
+  not enough? Name the measured gap.
+- (b) Bar: is the Done-when bar stricter than what the existing proven path meets? If so,
+  justify it with an incident.
+- (c) Reversibility (principle 10): if this fails, can it be undone? If yes, the Goal asks
+  for detection and recovery, not zero races; only irreversible failures (uncommitted work
+  deleted, permanent deletion, sending outside) are prevented structurally.
 Then AskUserQuestion: Approve all (recommended) / Approve some / Change something.
 Show the acceptance test of any issue the user asks about.
 Show which issues are interactive and why before asking for approval.

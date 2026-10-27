@@ -261,7 +261,7 @@ def test_order_perspectives_one_executor_error_preserves_other_questions(perspec
     assert error["perspective"].replace("_", " ") in prompt
     assert EXECUTOR_ERROR in error["error"], "List the failed seat's executor error without discarding successful seats"
     stats = invoke(case, capsys, "stats")["perspectives"]
-    assert sum(row["asked"] for row in stats.values()) == 10, "A failed agent did not ask questions"
+    assert sum(row["asked"] for row in stats.values()) == 2 * (len(SEATS) - 1), "A failed agent did not ask questions"
 
 
 def objects(value):
