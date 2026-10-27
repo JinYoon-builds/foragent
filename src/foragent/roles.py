@@ -52,9 +52,14 @@ def default_entry(name: str, skills: list[str] | None = None) -> dict[str, Any]:
 
 
 def load_roles(config: Config) -> dict[str, dict[str, Any]]:
-    """Every configured role with its optional fields filled in."""
+    """Every configured role with its optional fields filled in.
+
+    With no roles key (a config from before roles), the three default entries are derived,
+    not stored (D95): re-init leaves the file as is, and the first fa role command writes them.
+    """
+    stored = config.roles or {name: {**default_entry(name), "created_at": None} for name in DEFAULT_ROLES}
     roles = {}
-    for name, entry in config.roles.items():
+    for name, entry in stored.items():
         scope = entry.get("scope", [])
         roles[name] = {
             "agent": entry.get("agent") or f"fa-{name}",
@@ -191,12 +196,13 @@ def _ensure_memory(root: Path, name: str, entry: dict[str, Any]) -> str:
 
 
 def role_drift(root: Path, config: Config) -> list[str]:
-    """Roles whose agent file or memory is missing, or whose agent skills differ from the roles source.
+    """Stored roles whose agent file or memory is missing, or whose agent skills differ from the roles source.
 
-    Only reports; ``fa role set`` rewrites the missing or drifted files.
+    Only reports; ``fa role set`` rewrites the missing or drifted files. Derived defaults (no roles
+    key yet) have no stored entry to drift from, so they are not checked.
     """
     problems = []
-    for name, entry in load_roles(config).items():
+    for name, entry in load_roles(config).items() if config.roles else ():
         memory = entry["memory"].rstrip("/") + "/MEMORY.md"
         if not repo_path(root, memory).is_file():
             problems.append(f"FAIL role {name}: memory {memory} is missing; run `fa role set {name}` to create it")

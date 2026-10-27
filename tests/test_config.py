@@ -445,3 +445,19 @@ def test_edit_roles_touches_only_changed_entries_and_fields(capsys):
     assert plain == "review: fast  # top\nroles:\n  docs:\n    agent: fa-docs\n    skills: []\n    signals: []\n"
     report_dropped_comments("review: fast  # top")
     assert capsys.readouterr().err == "", "No notice when no comment was dropped"
+
+
+def test_roles_are_derived_when_the_config_has_no_roles_key(repo):
+    """Spec answer 2026-10-27 (option 3, D95): derive the defaults instead of storing them."""
+    from foragent.roles import ARCHITECT_KINDS, DEFAULT_ROLES, load_roles, role_drift
+
+    (repo / ".foragent.yml").write_text("review: fast\n")
+    config = load_config(repo)
+    derived = load_roles(config)
+    assert list(derived) == list(DEFAULT_ROLES)
+    assert derived["architect"]["signals"] == [{"paths": [], "kinds": [kind]} for kind in ARCHITECT_KINDS]
+    assert derived["docs"]["scope"] == ["docs/**", "README*"] and derived["docs"]["skills"] == ["fa-docs"]
+    assert all(entry["created_at"] is None and entry["idle_days"] == 14 for entry in derived.values())
+    assert role_drift(repo, config) == [], "Derived defaults have no stored entry to drift from"
+    (repo / ".foragent.yml").write_text(yaml.safe_dump({"roles": {"security": {"agent": "fa-security"}}}))
+    assert list(load_roles(load_config(repo))) == ["security"], "A stored block is the whole source"
