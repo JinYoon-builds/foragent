@@ -43,7 +43,10 @@ class Terminals:
             if probe and not self.alive:
                 # Real Orca answers a closed terminal's handle with an ok:false envelope.
                 stale = {"id": "req-9", "ok": False, "error": {"code": "terminal_handle_stale"}}
-                raise subprocess.CalledProcessError(1, argv, output=json.dumps(stale) if name == "orca" else "")
+                if name == "orca":
+                    raise subprocess.CalledProcessError(1, argv, output=json.dumps(stale))
+                # tmux's evidence: a working list-windows reply that leaves the window out.
+                return subprocess.CompletedProcess(argv, 0, stdout="@1\n", stderr="")
             # Real Orca wraps answers in {"id": <request id>, "ok": true, "result": {...}}.
             envelope = {"id": "req-1", "ok": True, "result": {"terminal": {"handle": "term_1"}}}
             stdout = {"orca": json.dumps(envelope), "tmux": "@7\n"}.get(name, "")
@@ -488,24 +491,6 @@ def test_orca_error_other_than_a_stale_handle_is_not_a_closure(tmp_path, monkeyp
     assert lane_talk._alive(record, tmp_path, show=False) is None
 
 
-def test_tmux_failure_while_its_server_listens_is_not_a_closure(tmp_path, monkeypatch):
-    import socket
-
-    path = Path("/tmp") / f"fa-talk-{os.getpid()}.sock"  # AF_UNIX paths must stay short.
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(path))
-    server.listen(1)
-    try:
-        monkeypatch.setattr(lane_talk.subprocess, "run", lambda argv, **kw: (_ for _ in ()).throw(
-            subprocess.CalledProcessError(1, argv)))
-        record = {"kind": "tmux", "executable": "/bin/tmux", "socket": str(path), "handle": "@7"}
-        assert lane_talk._alive(record, tmp_path, show=False) is None
-    finally:
-        server.close()
-        path.unlink()
-    assert lane_talk._alive(record, tmp_path, show=False) is False  # Socket gone: server gone.
-
-
 def test_queue_uses_the_session_recorded_while_the_terminal_opened(store, tmp_path, monkeypatch):
     session(store, "codex")
     terminals = Terminals(monkeypatch)
@@ -581,33 +566,6 @@ def test_open_talk_and_open_wait_pause_the_live_budget_once(tmp_path):
     store.begin_talk(1, run.started_at, clock[0])
     clock[0] += timedelta(minutes=10)
     assert run_waits._remaining(1, ctx) == 60 * 60  # Both open for 10 minutes: paused 10, not 20.
-
-
-def test_orca_show_failure_without_an_envelope_is_unknown_when_orca_cannot_list(tmp_path, monkeypatch):
-    calls = []
-
-    def run(argv, **kwargs):
-        calls.append(argv[1:3])
-        raise subprocess.CalledProcessError(1, argv, output="", stderr="Traceback: crashed")
-
-    monkeypatch.setattr(lane_talk.subprocess, "run", run)
-    record = {"kind": "orca", "executable": "/bin/orca", "handle": "term_1"}
-    assert lane_talk._alive(record, tmp_path, show=False) is None
-    assert calls == [["terminal", "show"], ["terminal", "list"]]
-
-
-@pytest.mark.parametrize("listed,expected", [(["term_1", "term_2"], True), (["term_2"], False)])
-def test_orca_show_failure_without_an_envelope_asks_the_terminal_list(tmp_path, monkeypatch, listed, expected):
-    def run(argv, **kwargs):
-        if argv[1:3] == ["terminal", "show"]:
-            raise subprocess.CalledProcessError(1, argv, output="", stderr="")
-        terminals = [{"handle": handle} for handle in listed]
-        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(
-            {"id": "req-3", "ok": True, "result": {"terminals": terminals}}), stderr="")
-
-    monkeypatch.setattr(lane_talk.subprocess, "run", run)
-    record = {"kind": "orca", "executable": "/bin/orca", "handle": "term_1"}
-    assert lane_talk._alive(record, tmp_path, show=False) is expected
 
 
 def test_orca_cli_killed_by_a_signal_is_unknown(tmp_path, monkeypatch):
@@ -712,3 +670,57 @@ def test_an_empty_or_unrecognised_orca_listing_keeps_the_talk_open(store, tmp_pa
     monkeypatch.setattr(lane_talk.subprocess, "run", run)
     run_record, still_open = lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW)
     assert still_open and store.get_run(1).talking is True and lane_talk.talk_path(store, 1).exists()
+
+
+@pytest.mark.parametrize("failure", [
+    subprocess.CalledProcessError(1, ["orca"], output="", stderr="Traceback: crashed"),
+    subprocess.CalledProcessError(1, ["orca"], output=json.dumps({"handle": "term_1"}), stderr=""),
+    subprocess.CalledProcessError(1, ["orca"], output="{}", stderr=""),
+    subprocess.TimeoutExpired(["orca"], 10),
+])
+def test_orca_closes_only_on_its_structured_stale_or_missing_answer(tmp_path, monkeypatch, failure):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv[1:3])
+        raise failure
+
+    monkeypatch.setattr(lane_talk.subprocess, "run", run)
+    record = {"kind": "orca", "executable": "/bin/orca", "handle": "term_1"}
+    assert lane_talk._alive(record, tmp_path, show=False) is None
+    assert calls == [["terminal", "show"]]  # No second guess from a listing.
+
+
+@pytest.mark.parametrize("code", ["terminal_handle_stale", "terminal_not_found"])
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_orca_stale_or_missing_envelope_on_stdout_closes_with_any_exit_code(tmp_path, monkeypatch, code, exit_code):
+    gone = json.dumps({"id": "req-5", "ok": False, "error": {"code": code}})
+
+    def run(argv, **kwargs):
+        if exit_code:
+            raise subprocess.CalledProcessError(exit_code, argv, output=gone)
+        return subprocess.CompletedProcess(argv, 0, stdout=gone, stderr="")
+
+    monkeypatch.setattr(lane_talk.subprocess, "run", run)
+    record = {"kind": "orca", "executable": "/bin/orca", "handle": "term_1"}
+    assert lane_talk._alive(record, tmp_path, show=False) is False
+
+
+def test_tmux_closes_only_on_a_working_reply_on_the_recorded_socket(tmp_path, monkeypatch):
+    replies = []
+    monkeypatch.setattr(lane_talk.subprocess, "run", lambda argv, **kw: replies.pop(0)(argv))
+    ok = lambda stdout: lambda argv: subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")  # noqa: E731
+
+    def fail(argv):
+        raise subprocess.CalledProcessError(1, argv, stderr="no server running on /tmp/sock")
+
+    with_socket = {"kind": "tmux", "executable": "/bin/tmux", "socket": "/tmp/sock", "handle": "@7"}
+    no_socket = {"kind": "tmux", "executable": "/bin/tmux", "handle": "@7"}
+    replies[:] = [fail]
+    assert lane_talk._alive(with_socket, tmp_path, show=False) is None  # A failing server tells nothing.
+    replies[:] = [ok("@1\n@7\n")]
+    assert lane_talk._alive(with_socket, tmp_path, show=False) is True
+    replies[:] = [ok("@1\n")]
+    assert lane_talk._alive(with_socket, tmp_path, show=False) is False  # Working reply without the window.
+    replies[:] = [ok("@1\n")]
+    assert lane_talk._alive(no_socket, tmp_path, show=False) is None  # Another server may have answered.

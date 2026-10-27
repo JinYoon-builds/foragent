@@ -9,7 +9,6 @@ Opening terminals and sending messages live in ``lane_talk_open``.
 from __future__ import annotations
 
 import json
-import socket as pysocket
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -61,51 +60,22 @@ def _orca_handle(stdout: str) -> str | None:
     return handle if isinstance(handle, str) and handle else None
 
 
-def _tmux_server_up(socket_path: str) -> bool | None:
-    """Whether a tmux server listens on ``socket_path``: False when nothing can (gone or refused)."""
-    probe = pysocket.socket(pysocket.AF_UNIX, pysocket.SOCK_STREAM)
-    probe.settimeout(2)
-    try:
-        probe.connect(socket_path)
-        return True
-    except (FileNotFoundError, ConnectionRefusedError):
-        return False
-    except OSError:
-        return None
-    finally:
-        probe.close()
-
-
-def _orca_listed(executable: str, handle: str, cwd: Path) -> bool | None:
-    """After a ``terminal show`` failure without an envelope: is the handle among Orca's terminals?
-
-    Only positive evidence closes a talk. None when Orca cannot list (it is down or
-    crashing), answers nothing (``{}``), or answers an envelope without a terminal
-    list. In Orca's envelope, whether the handle is listed decides. The one remaining
-    case is a non-empty answer in another shape: Orca served this request, so the
-    failed ``show`` stands as its answer for the handle. (Older Orca, and the locked
-    acceptance fake, answer every call that way.)
-    """
-    try:
-        data = _orca_envelope(_call([executable, "terminal", "list", "--json"], cwd).stdout)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if not data or data.get("ok") is False:
-        return None
-    if "result" in data or "ok" in data:
-        result = data.get("result")
-        terminals = result.get("terminals") if isinstance(result, dict) else None
-        if not isinstance(terminals, list):
-            return None  # An envelope we do not recognise tells nothing.
-        return any(isinstance(item, dict) and item.get("handle") == handle for item in terminals)
-    return False
+def _orca_closed(stdout: str | None) -> bool:
+    """Orca's structured answer that the handle names no terminal: an ``ok:false`` stdout envelope
+    whose error code says so, whatever the exit code."""
+    data = _orca_envelope(stdout)
+    error = data.get("error") if data is not None and data.get("ok") is False else None
+    return isinstance(error, dict) and error.get("code") in ORCA_ABSENT
 
 
 def _alive(record: dict, cwd: Path, *, show: bool) -> bool | None:
-    """Whether a recorded terminal is open: True, False (confirmed closed) or None (could not tell).
+    """Whether a recorded terminal is open: True, False (closed) or None (could not tell).
 
-    A probe that times out, cannot start, or fails for another reason is not
-    evidence that the terminal closed. ``show`` also brings an open terminal forward.
+    Only structured evidence says closed: Orca's ``terminal_handle_stale`` /
+    ``terminal_not_found`` envelope on stdout, or a working tmux ``list-windows``
+    reply on the recorded server socket that leaves out the window. A timeout, a
+    crash, a failing socket, any other error or an unrecognised answer tells nothing,
+    and the talk stays open. ``show`` also brings an open terminal forward.
     """
     executable, handle = record.get("executable"), record.get("handle")
     if not isinstance(executable, str) or not isinstance(handle, str):
@@ -114,17 +84,11 @@ def _alive(record: dict, cwd: Path, *, show: bool) -> bool | None:
         try:
             answer = _call([executable, "terminal", "show", "--terminal", handle, "--json"], cwd).stdout
         except subprocess.CalledProcessError as exc:
-            envelope = _orca_envelope(exc.stdout)
-            if envelope is not None:  # Orca answered: its own error code decides.
-                error = envelope.get("error")
-                code = error.get("code") if isinstance(error, dict) else None
-                return False if code in ORCA_ABSENT else None
-            if exc.returncode < 0:
-                return None  # The CLI was killed by a signal: no answer at all.
-            # No envelope (a crash, or a stderr-only reply): ask Orca a second, independent question.
-            return _orca_listed(executable, handle, cwd)
+            return False if _orca_closed(exc.stdout) else None
         except (OSError, subprocess.SubprocessError):
             return None
+        if _orca_closed(answer):
+            return False
         if (_orca_envelope(answer) or {}).get("ok") is False:
             return None
         if show:
@@ -133,18 +97,16 @@ def _alive(record: dict, cwd: Path, *, show: bool) -> bool | None:
             except (OSError, subprocess.SubprocessError):
                 pass  # Still open; it just did not come forward.
         return True
-    # The gate's tick has no TMUX of its own; the recorded server socket names the server.
+    # The gate's tick has no TMUX of its own; only the recorded server socket names the server.
     socket = record.get("socket") if isinstance(record.get("socket"), str) else None
     tmux = [executable, *(["-S", socket] if socket else [])]
     try:
         windows = _call([*tmux, "list-windows", "-a", "-F", "#{window_id}"], cwd).stdout.split()
-    except subprocess.CalledProcessError:
-        # tmux fails both when its server is gone and when it cannot ask; the socket tells which.
-        return False if socket and _tmux_server_up(socket) is False else None
     except (OSError, subprocess.SubprocessError):
-        return None
+        return None  # A failing server or socket is not evidence the window is gone.
     if handle not in windows:
-        return False
+        # Without the recorded socket the reply may come from another server: not evidence.
+        return False if socket else None
     if show:
         try:
             _call([*tmux, "select-window", "-t", handle], cwd)

@@ -22,6 +22,8 @@ import time
 
 import psutil
 
+from foragent.records import load_record
+
 
 # Each observer accepts scans started at or after its previous poll's start.
 # A child alive then and still alive at the scan is witnessed; discovery takes
@@ -423,7 +425,9 @@ def _read_routine_rows(path: Path, not_before: float):
             raise ValueError("Invalid process scan rows")
         rows = {}
         for record in records:
-            row = ProcessIdentity(**record)
+            if not isinstance(record, dict):
+                raise ValueError("Invalid process scan identity")
+            row = load_record(ProcessIdentity, record)
             if (any(type(getattr(row, name)) is not int for name in ("pid", "ppid", "pgid", "sid"))
                     or type(row.start_time) not in (int, float) or not math.isfinite(row.start_time)
                     or (row.uid is not None and type(row.uid) is not int)

@@ -6,7 +6,7 @@ ORDER = 120
 # An orchestrator whose heartbeat is at most this old counts as alive.
 ALIVE_SECONDS = 30
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive",
-                 "reviewers", "ensure"}
+                 "reviewers", "ensure", "facts"}
 
 
 def add(commands) -> None:
@@ -86,6 +86,7 @@ def _add_inbox(orch_actions) -> None:
     queue.add_argument("--clear", action="store_true")
     queue.add_argument("--json", action="store_true")
     queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    cli.orch_facts.add_parser(orch_actions)
     reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")
     reviewers.add_argument("issue", type=int)
     reviewers.add_argument("count", type=int, nargs="?", help="Reviewer count (1 or more); wins over review_reviewers")
@@ -145,6 +146,8 @@ def _orch_inbox(args, store, config, repo: str) -> None:
     if args.action == "alive":
         _alive(args, store, config)
         return
+    if args.action == "facts":
+        return cli.orch_facts.command(args, store, config)
     if args.action == "ensure":
         _ensure(args, store, config)
         return

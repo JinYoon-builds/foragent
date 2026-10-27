@@ -9,6 +9,14 @@ from foragent.state_records import Run
 
 
 class TalkRecordsMixin:
+    def _drop_talk_record(self, number: int) -> None:
+        (self.root / "talk" / f"{number}.json").unlink(missing_ok=True)
+
+    @staticmethod
+    def _talk_ended(run: Run, now: datetime, *, restart_stall: bool) -> Run:
+        """The one accounting for every talk ending (``finish_run`` uses it too)."""
+        return _talk_ended(run, now, restart_stall=restart_stall)
+
     @contextmanager
     def talk_lock(self, number: int, *, blocking: bool = True) -> Iterator[bool]:
         """Serialize an issue's talk lifecycle with session changes; yields False when busy and not blocking.

@@ -265,7 +265,8 @@ def review_checks(n, ctx, git, target_branch):
     from types import SimpleNamespace
     from foragent import runner
     from foragent.ci_local import capture_local_only, check, verify_local_only_units
-    from foragent.run_checks import _related_unit_tests, trusts_ci
+    from foragent.run_checks import _related_unit_tests, run_related_check, trusts_ci
+    from foragent.run_waits import in_phase
     import shlex
 
     base = f"origin/{target_branch}"
@@ -278,14 +279,19 @@ def review_checks(n, ctx, git, target_branch):
         raise ExecutorStopped("held", str(exc)) from exc
     attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=git.root, target_branch=target_branch,
                               baseline=baseline, log=ctx.store.log_path(n))
-    local_units = verify_local_only_units(attempt, baseline.command)
-    checks = [local_units] if local_units is not None else []
-    own = _related_unit_tests(git.root, git.changed_paths(base), ctx.config.acceptance_dir,
-                              own_only=ctx.config.runner_unit_tests != "all"
-                              and (enabled(ctx, target_branch) or trusts_ci(git.root, ctx.config)))
-    ids = [*baseline.node_ids, *own]
-    if ids:
-        checks.append(check(n, ctx, f"{baseline.command} {shlex.join(ids)}", git.root))
+    with in_phase(n, ctx, "checking"):
+        local_units = verify_local_only_units(attempt, baseline.command)
+        checks = [local_units] if local_units is not None else []
+        changed = git.changed_paths(base)
+        own = _related_unit_tests(git.root, changed, ctx.config.acceptance_dir,
+                                  own_only=ctx.config.runner_unit_tests != "all"
+                                  and (enabled(ctx, target_branch) or trusts_ci(git.root, ctx.config)))
+        if baseline.node_ids:
+            checks.append(check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", git.root))
+        if own:
+            # Related tests are a recorded check of their own, as in an implementation's verification.
+            checks.append(run_related_check(n, ctx, git.root, baseline.command, own, len(changed),
+                                            max(1, runner._remaining(n, ctx))))
     for result in checks:
         if result.exit_code != 0 or result.timed_out:
             raise AttemptFailure(f"{result.command}\n{result.output}", target_branch)

@@ -128,10 +128,12 @@
 - #105 병합(2026-10-25): main의 #157이 `usage_events.py`와 `StateStore.record_usage(executor, windows)`·`usage()`를 먼저 넣었다. 중복 `usage.py`를 지우고 파서·`limit_reset`을 `usage_events`로 합쳤다. 저장 형식은 `test_tidy.py`가 정확히 비교하므로 `name/used_percent/resets_at`만 저장하고 `exhausted`는 `record_from_log()` 반환값에만 둔다. 시작 판단은 `scheduler_start.py`(`_lane_held`)로 옮겨졌다. 리뷰어 한도도 사용량 판독 여부와 무관하게 실행기를 멈춘다(오케스트레이터 지시). `test_fa_brief.py` 실패는 #113 미구현 범위다.
 - #105 리뷰: 실행기 멈춤은 시작 때만이 아니라 `_available_executor()`가 매 실행 직전 `store.executor_pause_until()`로 확인하고 `_limit_wait()`로 limit-wait 처리한다. 한도 뒤 곧바로 재시작하는 시험은 시계를 `limit_wait_minutes` 뒤로 옮겨야 한다(`test_worker_sessions.py`). `test_executor_choice.py` 6개는 main에서도 실패하는 quota 범위다.
 - [#104 skill catalog](project_104_skill_catalog.md) — Available skills prompt section, Skills used in Run/PR, claude plain VERDICT fallback
+- [#420 whole picture](project_420_whole_picture.md) — cuts.py notice, WholeFailure, parent_context snapshot, moved_by on base merges
 - [#379 risk map](project_379_risk_map.md) — base-ref map read, review/tier/always_human hooks, commands/*.py import rule
 - [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order, conftest opt-out
 - [#497 memory critical line](project_497_memory_critical.md) — raw kernel level, critical holds starts only, floors in IGNORED_KEYS
 - [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
+- #547: `update_run`은 `observe=True` 또는 `pid`·`process_identities`·`executor_pgid`가 있을 때만 프로세스 표를 읽는다. 메타데이터만 바꾸는 갱신에 기대 후손을 관찰하던 단위 시험은 `observe=True`를 명시해 의도를 유지한다.
 - [#483 baseline follows base](project_483_baseline_follows_base.md) — re-capture baseline on result-affecting base move; detect test command at new base
 - [#514 neutral config/locked moves](project_514_neutral_more.md) — config key rules; Done when included #483 test → applied #483 WIP diff
 - #127: `StateStore.write_heartbeat(side, at)`/`heartbeats()`(state.py)가 `<state>/orch-heartbeat.json`·`gate-heartbeat.json`을 덮어쓴다. watch는 매 읽기 전, gate는 `tick()`에서 tick lock을 얻은 직후 쓴다(busy tick은 ctx에 store만 있는 `test_kick` 시험 때문에 쓰지 않음). `fa orch alive`는 `INBOX_ACTIONS`에 넣어 GitHub 없이 처리, 30초 이하면 alive. 인수 `tests/acceptance/test_heartbeats.py` 4개.
@@ -148,6 +150,7 @@
 - [#567 CI exclusions drift](project_567_ci_exclusions_drift.md) — subset rule, keep payload/scope excluded equal, slow test_ci_mode under load
 - `test_scheduler_split.py`가 facade `scheduler.py`를 250줄로 제한한다. scheduler에 줄을 더하면 같은 수만큼 줄이거나 분할 모듈로 옮긴다. 바꾼 파일마다 `tests/acceptance/test_*split*.py` 전부를 돌려 확인한다.
 - [#128 orch spawn](project_128_orch_spawn.md) — gate opens orchestrator; conftest opt-out; scheduler.py 250-line cap
+- [#333 orch facts](project_333_facts.md) — read-only facts view, capacity.observing(), related-check junit flag form
 - [#590 orch liveness](project_590_orch_liveness.md) — heartbeat session, /fa-orchestrator scan, nearest Claude literally; conftest hides real ancestors
 - #591: `orch_reinstall._uv()`가 uv 설치의 디렉터리 경쟁 오류만 3회까지 재시도(`sleep` 모듈 속성)하며 update_check도 이 함수를 공유한다. 게이트 자식 환경은 `launcher.gate_environment()`; launcher·kick·launchd 단위 시험은 Popen 인자 집합을 정확히 비교한다.
 - #591 리뷰: 패키지 안 `sys.dont_write_bytecode`는 `__init__.pyc`가 먼저 써져 늦다. 틱이 `launchd.refresh_from_tick()`로 예전 plist를 따로 떨어진 갱신 프로세스(틱 잠금 대기→`update_check._restart`)로 다시 올린다. scheduler 파사드는 250줄 제한. 게이트 작업은 파일 이름이 아니라 `installed_jobs()`의 `--repo-root`로 찾고(옛 이름·개명 plist 포함), 읽지 못한 plist는 최신으로 보지 않는다. plist는 bootout→수정→bootstrap 안에서만 바꾸고, `launchctl print` 실패는 없음(113)과 모름을 나눈다.

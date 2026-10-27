@@ -4,8 +4,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from foragent.state_phases import close_phase, work_event  # noqa: F401
 from foragent.state_records import Run
-from foragent.state_talk import _talk_ended
 
 
 # Updates passing any of these change or attest process ownership, so they
@@ -14,6 +14,10 @@ PROCESS_FIELDS = frozenset({"process_identities", "pid", "executor_pgid"})
 
 
 class RunRecordsMixin:
+    def _close_phase(self, run: Run, closed_at: datetime) -> dict[str, Any]:
+        """Journal the ended phase; called under the state lock (see state_phases.close_phase)."""
+        return close_phase(self.root, run, closed_at)
+
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
         lane: str = "main", tier: str = "m",
@@ -34,10 +38,11 @@ class RunRecordsMixin:
                 session = {
                     "session_id": previous.session_id, "session_executor": previous.session_executor,
                     "session_ids": previous.session_ids, "session_body": previous.session_body,
-                    # Inherited, not running: only a launch that resumes it makes it the worker's again.
-                    "session_stale": previous.session_id is not None,
+                    "session_stale": previous.session_id is not None,  # not the worker's until resumed
                     "merge_conflicts": previous.merge_conflicts,
+                    "resume_whole": previous.resume_whole, "moved_files": previous.moved_files,
                     "local_skill_paths": previous.local_skill_paths,
+                    "work_events": previous.work_events,
                     "resume_reason": reason + (
                         "\nThe runner recreated the worktree from its target branch; "
                         "earlier uncommitted changes are no longer present."
@@ -53,8 +58,7 @@ class RunRecordsMixin:
                       last_activity_at=timestamp, process_identities=identities, **session)
             self._merge_lock_seconds.pop((number, timestamp), None)
             self._write_run(run)
-            # A talk record belongs to an earlier run (a resume or log terminal); this run starts untalked.
-            (self.root / "talk" / f"{number}.json").unlink(missing_ok=True)
+            self._drop_talk_record(number)  # An earlier run's; this run starts untalked.
             return run
 
     def prepare_run_start(self, number: int) -> None:
@@ -98,6 +102,16 @@ class RunRecordsMixin:
                     or " ".join(run.detail.split())[:500]
                     or "Run detail unavailable."
                 )
+            if "phase" in fields and fields["phase"] != run.phase:
+                closed = fields.get("phase_started_at")
+                changes = self._close_phase(run, _state.datetime.fromisoformat(closed) if closed else self._now())
+                # A new phase has no work identity unless the caller restores or gives one.
+                fields = {**changes, "phase_work_id": None, "phase_work_started_at": None, **fields}
+                if fields["phase_work_id"] and not fields["phase_work_started_at"]:
+                    # Work named with its phase begins with that phase; nested waits keep this instance.
+                    fields["phase_work_started_at"] = fields.get("phase_started_at") or self._timestamp()
+            elif fields.get("phase_work_id") and "phase_work_started_at" not in fields:
+                fields["phase_work_started_at"] = run.phase_started_at
             if not observe:
                 updated = _state.replace(run, **fields)
                 self._write_run(updated)
@@ -224,12 +238,11 @@ class RunRecordsMixin:
                 detail = " ".join(run.detail.split())[:500] or f"Run finished with outcome {outcome}."
             from foragent.processes import observe_tree
 
-            # An open talk ends with the run, credited like any other ending.
-            finished = _state.replace(_talk_ended(run, self._now(), restart_stall=False),
+            finished = _state.replace(run, **self._close_phase(run, self._now()))
+            finished = _state.replace(self._talk_ended(finished, self._now(), restart_stall=False),
                                       status="finished", outcome=outcome, detail=detail,
                                       process_identities=observe_tree(run.process_identities))
-            # A live-log record belongs to the running run only; publish_talk will not recreate it.
-            (self.root / "talk" / f"{number}.json").unlink(missing_ok=True)
+            self._drop_talk_record(number)  # Belongs to the running run; publish_talk won't recreate it.
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
             # The finish time is saved beside the record's fields, so the Run schema
