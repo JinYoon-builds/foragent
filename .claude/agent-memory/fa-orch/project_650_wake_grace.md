@@ -14,3 +14,5 @@ metadata:
 **How to apply:** tests `tests/acceptance/test_wake_grace.py`, `test_machine_sleep.py`, `tests/test_sleep_credit.py` (all fast, ~5 s).
 - Unit tests that reuse acceptance helpers (`sleep_case`, `tick_case`) need `monkeypatch.syspath_prepend(tests/acceptance)`; the directory is on the path only when an acceptance module is collected. The wake-line test in `tests/test_sleep_credit.py` does this.
 - Break-it is done by `sed` mutation plus `git show HEAD:<file> > <file>` to restore. Copying to /tmp and `git checkout` are both blocked here.
+- Baseline regression in test_orch_facts (2026-10-27) was not reproducible on the branch; facts reads sibling state roots and the live load sensor, so it can flake under machine activity. Answered with REBUTTAL.
+- Review (state/report deadline drift): the wake line must print the stored `until` from `wake_grace(store)` as HH:MM:SS, never recompute from a second `ctx.now()`. The test fakes a 2 s delay in credit() just before a minute boundary to prove this.

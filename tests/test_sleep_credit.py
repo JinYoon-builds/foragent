@@ -187,10 +187,20 @@ def test_the_tick_report_shows_one_wake_line_only_after_a_long_sleep(git_history
 
     monkeypatch.setattr(time, "sleep", lambda seconds: pytest.fail("No real sleep"))
     machine = sleep_case(git_history, tmp_path, monkeypatch, max_runtime_minutes=2000)
+    credit = sleep_credit.credit
+
+    def slow_credit(store, now):  # The tick's clock moves on while credit() runs.
+        increment = credit(store, now)
+        machine.clock[0] += timedelta(seconds=2)
+        return increment
+
+    monkeypatch.setattr(sleep_credit, "credit", slow_credit)
+    machine.clock[0] = machine.clock[0].replace(second=0) + timedelta(minutes=1, seconds=-1)
     machine.facts.advance(2 * 3600 + 5 * 60, asleep=True)
     lines = [line for line in tick_case(machine).actions if line.startswith("Machine slept")]
-    until = (machine.clock[0] + timedelta(seconds=sleep_credit.WAKE_GRACE_SECONDS)).astimezone()
-    assert lines == [f"Machine slept 2 h 5 min; stall checks wait until {until:%H:%M} "
-                     "or until a run shows activity."]
+    until = sleep_credit.wake_grace(machine.store)[1].astimezone()
+    assert until.second == 59, "The stored end sits just before a minute boundary"
+    assert lines == [f"Machine slept 2 h 5 min; stall checks wait until {until:%H:%M:%S} "
+                     "or until a run shows activity."], "Report the stored grace end exactly"
     machine.facts.advance(60, asleep=True)
     assert not [line for line in tick_case(machine).actions if line.startswith("Machine slept")]

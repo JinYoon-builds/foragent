@@ -192,11 +192,11 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
     slept = sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
-    if slept > sleep_credit.WAKE_THRESHOLD_SECONDS:
-        until = (ctx.now() + scheduler.timedelta(seconds=sleep_credit.WAKE_GRACE_SECONDS)).astimezone()
+    grace = sleep_credit.wake_grace(ctx.store) if slept > sleep_credit.WAKE_THRESHOLD_SECONDS else None
+    if grace is not None:  # Report the stored end, not a second clock reading.
         report.actions.append(scheduler.text(
             "sleep_wake", ctx.config.language, hours=int(slept // 3600),
-            minutes=int(slept % 3600 // 60), until=until.strftime("%H:%M")))
+            minutes=int(slept % 3600 // 60), until=grace[1].astimezone().strftime("%H:%M:%S")))
     for run in ctx.store.active_runs():
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
