@@ -329,8 +329,9 @@ def test_runner_stop_leaves_orchestrator_stop_labels_and_reason_to_the_verb(run_
         run_issue(1, c.ctx)
     assert c.tracker.get_issue(1).labels & {"running", "ready", "blocked"} == {"running"}
     run = c.store.get_run(1)
-    assert (run.status, run.outcome, run.detail) == ("finished", "stopped", "stopped: reprioritize")
-    c.tracker.remove_labels(1, ["running"])  # `fa orch stop` then returns it to ready
+    assert (run.status, run.stop_why) == ("running", "reprioritize"), "the stop finishes the record, not the runner"
+    c.store.finish_run(1, "stopped")  # `fa orch stop` then finishes it and returns it to ready
+    c.tracker.remove_labels(1, ["running"])
 
 
 def test_runner_still_kicks_when_a_tick_already_finished_its_record(run_case, monkeypatch, kicks):
@@ -414,8 +415,9 @@ def test_runner_flags_and_detail_during_a_stop_cannot_erase_its_intent(run_case,
     with pytest.raises(SystemExit):
         run_issue(1, c.ctx)
     run = c.store.get_run(1)
-    # The runner's flags still land; `fa orch stop` sets the destination after every process is gone.
-    assert (run.status, run.outcome, run.detail) == ("finished", "stopped", "stopped: reprioritize")
+    # The runner's flags still land; `fa orch stop` finishes the run and sets the destination.
+    assert (run.status, run.outcome, run.stop_why) == ("running", "stopped", "reprioritize")
+    c.store.finish_run(1, "stopped")
 
 
 def test_failed_reporting_of_unsaved_work_still_keeps_the_worktree(run_case, monkeypatch):
@@ -669,8 +671,9 @@ def test_a_runner_that_finishes_before_its_sigterm_still_ends_as_the_stop(run_ca
     monkeypatch.setattr("foragent.runner.kick_tick", lambda root: None)
     run_issue(1, c.ctx)
     run = c.store.get_run(1)
-    assert (run.status, run.outcome, run.detail) == ("finished", "stopped", "stopped: reprioritize")
+    assert (run.status, run.stop_why) == ("running", "reprioritize"), "only the stop writes a run it ends"
     assert worktree.exists() is (ending == "deferred"), "a deferred save keeps the worktree for the stop"
+    c.store.finish_run(1, "stopped")
     c.ctx.git.remove_worktree(worktree)
     c.tracker.remove_labels(1, ["running"])
 
@@ -824,4 +827,155 @@ def test_a_turn_is_counted_so_a_missing_worktree_after_it_is_never_called_clean(
     begin_turn(c.ctx, 1)
     assert c.store.get_run(1).turns == 1
     c.store.finish_run(1, "killed")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_a_stop_arriving_during_push_stops_the_run_synchronously_and_nothing_merges(run_case, monkeypatch):
+    """No phase bypasses the contract: a request during push leaves the runner writing nothing, and
+    the request is checked atomically with the merge, so the push cannot be followed by a merge."""
+    from foragent.run_publish import SaveDeferredToStop, merge_unless_stopped
+
+    c = run_case
+    merges = []
+
+    def publish_with_a_stop_during_push(attempt):
+        attempt.git.push(attempt.branch)
+        c.store.update_run(1, outcome="stopped", stop_why="reprioritize")  # The request lands mid-push.
+        merge_unless_stopped(c.ctx, 1, lambda: merges.append(1))
+        return "merged"
+
+    monkeypatch.setattr("foragent.runner._publish", publish_with_a_stop_during_push)
+    run_issue(1, c.ctx)
+    run = c.store.get_run(1)
+    assert merges == [] and (run.status, run.stop_why) == ("running", "reprioritize")
+    assert c.store.worktree_path(1).exists(), "the unfinished work is left for the stop to save"
+    c.store.finish_run(1, "stopped")
+    c.ctx.git.remove_worktree(c.store.worktree_path(1))
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_a_stop_on_a_dead_runner_is_completed_by_crash_recovery(run_case, fake_process_table):
+    """The runner (and the stop process) died after the request: crash recovery saves under the why."""
+    from foragent import processes
+    from foragent.orch_stop import mark_stop_pending
+
+    c, table = run_case, fake_process_table
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_worktree(path, "foragent/issue-1", "origin/main")
+    (path / "unfinished.txt").write_text("partial implementation\n")
+    root = table.add(42000, cwd=path, start_time=10)
+    c.store.update_run(1, pid=root.pid, process_identities=[{"pid": root.pid, "start_time": 10}])
+    mark_stop_pending(c.store, c.store.get_run(1), "reprioritize")
+    c.store.update_run(1, outcome="stopped", stop_why="reprioritize")
+    table.exit(root.pid)
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+        runner_process_exists=lambda n: False, kill_runner=processes.kill_process_group,
+    )
+    _recover_runs(ctx, TickReport())  # Finishes the dead run, saving its WIP under the why.
+    c.now[0] += timedelta(seconds=1)
+    _recover_runs(ctx, TickReport())  # Completes the pending stop from its record.
+    assert c.store.get_run(1).outcome == "stopped"
+    assert "[stopped: reprioritize]" in git_command(c.history.clone, "log", "-1", "--format=%B", "foragent/issue-1")
+    labels = c.tracker.get_issue(1).labels
+    assert "ready" in labels and "running" not in labels
+
+
+def test_an_honoured_stop_request_does_not_reach_the_next_run(run_case):
+    from foragent.orch_stop import complete_stop, mark_stop_pending
+    from foragent.run_publish import begin_turn, stop_head, stop_safe_point
+
+    c = run_case
+    mark_stop_pending(c.store, c.store.get_run(1), "pause")
+    c.store.update_run(1, outcome="stopped", stop_why="pause", stop_head=stop_head(c.ctx.git, 1))
+    c.store.finish_run(1, outcome="stopped")  # Stopped before any turn or worktree.
+    ctx = TickContext(
+        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
+        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda n: None,
+    )
+    complete_stop(ctx, c.store.get_run(1))
+    assert not (c.store.root / "stops" / "1.json").exists()
+    c.now[0] += timedelta(minutes=1)
+    c.store.start_run(1, branch="foragent/issue-1", worktree=c.store.worktree_path(1))
+    fresh = c.store.get_run(1)
+    assert (fresh.stop_why, fresh.merged) == ("", False)
+    stop_safe_point(c.ctx, 1)  # No request: the next run proceeds.
+    begin_turn(c.ctx, 1)
+    c.store.finish_run(1, "killed")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_a_stop_during_the_final_wip_push_waits_for_the_teardown_and_then_changes_nothing(run_case, monkeypatch):
+    """Class 'teardown not serialized with stop intent': the request cannot land mid-teardown."""
+    import threading
+    from foragent import orch
+
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    c.executor.steps = [{"feature.txt": "unfinished"}]
+    monkeypatch.setattr("foragent.scheduler_stop.stop_target_refusal", lambda run: None)
+    git_run, results, started = c.ctx.git._run, [], threading.Event()
+
+    def stop_in_another_process():
+        started.set()
+        try:
+            results.append(orch.stop(c.ctx, 1, "reprioritize"))
+        except orch.OrchError as exc:
+            results.append(exc)
+
+    def push_while_a_stop_arrives(args):
+        command = args
+        while command[:1] == ["-C"]:
+            command = command[2:]
+        if command[:1] == ["push"] and not started.is_set():
+            stopper = threading.Thread(target=stop_in_another_process)
+            stopper.start()
+            started.wait()
+            stopper.join(0.5)
+            assert stopper.is_alive(), "the stop must wait for the runner's teardown"
+            push_while_a_stop_arrives.stopper = stopper
+        return git_run(args)
+
+    monkeypatch.setattr(c.ctx.git, "_run", push_while_a_stop_arrives)
+    assert run_issue(1, c.ctx) == "retries-exceeded"
+    push_while_a_stop_arrives.stopper.join(10)
+    assert isinstance(results[0], orch.OrchError) and "not running" in str(results[0])
+    assert c.store.get_run(1).outcome == "retries-exceeded"
+    assert "[retries-exceeded]" in git_command(c.history.clone, "log", "-1", "--format=%B", "foragent/issue-1")
+    assert not (c.store.root / "stops" / "1.json").exists()
+
+
+@pytest.mark.parametrize("diverged", [False, True])
+def test_a_stop_save_from_a_detached_review_worktree_lands_on_the_issue_branch(run_case, diverged):
+    """Class 'save evidence not bound to the destination branch' (review-only worktrees)."""
+    from foragent.git import GitError
+    from foragent.run_publish import WorktreeUnverified, _preserve_failed_implementation
+
+    c = run_case
+    root = c.history.clone
+    head = git_command(root, "rev-parse", "origin/main")
+    git_command(root, "branch", "-f", "foragent/issue-1", head)
+    path = c.store.worktree_path(1)
+    c.ctx.git.add_detached_worktree(path, head)  # As review_only checks out the PR head.
+    if diverged:  # The branch has a commit the detached HEAD does not contain.
+        git_command(root, "commit-tree", "-m", "ahead", "-p", head, f"{head}^{{tree}}")
+        ahead = git_command(root, "commit-tree", "-m", "ahead", "-p", head, f"{head}^{{tree}}")
+        git_command(root, "update-ref", "refs/heads/foragent/issue-1", ahead)
+    c.store.update_run(1, outcome="stopped", stop_why="reprioritize")
+    (path / "review-notes.txt").write_text("unfinished\n")
+    save = lambda: _preserve_failed_implementation(  # noqa: E731
+        1, c.ctx, c.ctx.git.at(path), "stopped", approval=c.store.load_approval(1),
+        tracker_available=False, tree_exited=True, strict=True)
+    if diverged:
+        with pytest.raises(WorktreeUnverified, match="does not contain foragent/issue-1"):
+            save()
+        assert (path / "review-notes.txt").exists()
+    else:
+        assert save() == "saved"
+        message = git_command(root, "log", "-1", "--format=%B", "foragent/issue-1")
+        assert "[stopped: reprioritize]" in message
+        assert git_command(root, "show", "foragent/issue-1:review-notes.txt") == "unfinished"
+    c.ctx.git.remove_worktree(path)
+    c.store.finish_run(1, "stopped")
     c.tracker.remove_labels(1, ["running"])

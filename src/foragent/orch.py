@@ -188,6 +188,8 @@ def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = No
 
 
 STOP_LOCK_WAIT_S = 120
+# How long a stop waits for a runner's teardown (final save, push, finish) before terminating it.
+TEARDOWN_WAIT_S = 60
 
 
 @contextmanager
@@ -241,15 +243,29 @@ def _stop_locked(ctx: RunContext, n: int, why: str) -> str:
     )
     report = scheduler.TickReport()
     detail = f"{STOPPED}: {why}"
-    # Record the request before any signal, ordered against any WIP commit by the
-    # intent lock. From here the request wins: a runner defers its save to this stop,
-    # and however it finishes (children die first), it ends as stopped.
+    # Record the request under the run's intent lock, atomically with the runner's turn
+    # boundaries, final save, merge and finish. From the request on, whatever phase it is in,
+    # the runner writes nothing more (it defers its save and leaves its record), and this
+    # stop terminates the tree and is the only writer of the run. A merged run is refused:
+    # its work already landed, irreversibly. A runner holds this lock through its teardown;
+    # if that teardown is stuck (a final push that never returns), the tree is terminated
+    # first, which releases the lock, and the request is recorded on the dead run.
+    try:
+        with stop_intent_lock(ctx.store, n, timeout=TEARDOWN_WAIT_S):
+            pass
+    except TimeoutError:
+        from foragent import scheduler_stop
+
+        if scheduler_stop._stop_run_processes(tick_ctx, run, report) != "stopped":
+            raise OrchError(f"#{n}: stop refused: its stuck teardown could not be terminated: "
+                            f"{'; '.join(report.actions) or 'no action'}") from None
     with stop_intent_lock(ctx.store, n):
         run = ctx.store.get_run(n)
         if run is None or run.status != "running":
             raise OrchError(f"issue #{n} is not running; nothing to stop")
+        if run.merged:
+            raise OrchError(f"issue #{n} was already merged by its run; nothing to stop")
         mark_stop_pending(ctx.store, run, why)  # Durable first: every later step is recovered from it.
-        # Whether an implementer turn is open now decides who owns what the tree leaves.
         ctx.store.update_run(n, outcome=STOPPED, stop_why=why, stop_head=stop_head(ctx.git, n),
                              stop_in_turn=implementer_turn_open(run))
     try:

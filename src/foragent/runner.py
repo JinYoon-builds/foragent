@@ -128,8 +128,8 @@ from foragent.run_conflicts import (
 )
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import (
-    STOPPED, WIP_NOT_SAVED, SaveDeferredToStop, WipNotSaved, _publish, _push_branch, final_outcome,
-    keep_unsaved_work, stop_intent_lock,
+    STOPPED, WIP_NOT_SAVED, SaveDeferredToStop, WipNotSaved, _publish, _push_branch,
+    begin_teardown, end_teardown, final_outcome, keep_unsaved_work, stop_intent_lock, stop_safe_point,
 )
 from foragent.run_review import _review_implementation
 
@@ -222,6 +222,7 @@ def _implement_and_publish(
                 return outcome
             if not attempt.failure or attempt.review_hold:
                 try:
+                    stop_safe_point(ctx, n)  # A cooperative stop ends the run here, before anything is published.
                     outcome = _publish(attempt)
                     return outcome
                 except ConflictBudgetExhausted as exc:
@@ -262,6 +263,11 @@ def _implement_and_publish(
         outcome = "killed"
         raise
     finally:
+        # Teardown (this save, its push, the worktree removal and the finish in run_issue) is
+        # one section under the stop's intent lock: a request either came first, and the
+        # stopper owns the run, or waits until the run is finished.
+        if not begin_teardown(ctx.store, n):
+            raise SaveDeferredToStop()
         if outcome != "merged":
             try:
                 run = ctx.store.get_run(n)
@@ -345,6 +351,8 @@ def review_only(
             outcome = STOPPED
         raise
     finally:
+        if started and not begin_teardown(ctx.store, n):
+            kept = True  # A stop came first: it saves this worktree and finishes the run.
         if started:
             try:
                 if not kept:
@@ -367,13 +375,14 @@ def review_only(
                 finally:
                     try:
                         # Read and finish under the stop's intent lock: a request either sees this
-                        # run finished (and refuses), or this finish sees the request (and is stopped).
+                        # run finished (and refuses), or this finish sees the request and leaves the
+                        # record to the stop, the only writer of a run it was asked to end.
                         with stop_intent_lock(ctx.store, n):
                             run = ctx.store.get_run(n)
-                            final = final_outcome(run, outcome)
-                            ctx.store.finish_run(n, outcome=final, detail=(
-                                f"{STOPPED}: {run.stop_why}" if final == STOPPED and run is not None else detail))
+                            if run is None or not run.stop_why:
+                                ctx.store.finish_run(n, outcome=final_outcome(run, outcome), detail=detail)
                     finally:
+                        end_teardown(ctx.store, n)
                         kick_tick(ctx.repo_root)
     return outcome
 
@@ -432,15 +441,14 @@ def run_issue(n: int, ctx: RunContext) -> str:
         # A tick may already have finished the record while terminating this runner.
         try:
             # Under the stop's intent lock: a request either sees this run finished (and
-            # refuses), or this finish sees the request (and records the stop).
+            # refuses), or this finish sees the request and leaves the record to the stop,
+            # the only writer of a run it was asked to end.
             with stop_intent_lock(ctx.store, n):
                 run = ctx.store.get_run(n)
-                if run is not None and run.status != "finished":
-                    # Lost work wins over every recorded outcome, then a stop's own record.
-                    final = final_outcome(run, outcome, recorded_first=True)
-                    ctx.store.finish_run(n, outcome=final,
-                                         detail=f"{STOPPED}: {run.stop_why}" if final == STOPPED else detail)
+                if run is not None and run.status != "finished" and not run.stop_why:
+                    ctx.store.finish_run(n, outcome=final_outcome(run, outcome, recorded_first=True), detail=detail)
         finally:
+            end_teardown(ctx.store, n)
             kick_tick(ctx.repo_root)
     return outcome
 

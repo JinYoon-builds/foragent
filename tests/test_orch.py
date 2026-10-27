@@ -589,10 +589,11 @@ def test_review_only_stopped_by_orchestrator_keeps_reason_and_leaves_labels(revi
     with pytest.raises(SystemExit):
         runner.review_only(1, c.ctx)
     run = c.store.get_run(1)
-    assert (run.status, run.outcome, run.detail) == ("finished", "stopped", "stopped: reprioritize")
+    assert (run.status, run.stop_why) == ("running", "reprioritize"), "the stop, not the runner, finishes it"
     assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"running"}
     assert c.store.load_flag(1) == flag_before, "A stopped review must not be flagged blocked"
-    c.tracker.add_labels(1, ["ready"])  # `fa orch stop` then returns it to ready
+    c.store.finish_run(1, "stopped")  # `fa orch stop` then finishes it and returns it to ready
+    c.tracker.add_labels(1, ["ready"])
     c.tracker.remove_labels(1, ["running"])
 
 

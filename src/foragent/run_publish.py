@@ -9,6 +9,8 @@ import fcntl
 from glob import escape
 from pathlib import Path
 import tempfile
+import threading
+import time
 from typing import TYPE_CHECKING
 
 from foragent import board, review_perspectives, risks
@@ -38,20 +40,86 @@ from foragent.tracker import TrackerError
 STOPPED = "stopped"
 
 
+# Intent-lock files this thread holds: nested sections reenter instead of deadlocking on
+# their own flock, and a runner's teardown keeps its hold across functions. Per thread,
+# so another thread (like another process) waits on the flock as it should.
+_LOCAL = threading.local()
+
+
+def _held() -> dict:
+    if not hasattr(_LOCAL, "held"):
+        _LOCAL.held = {}
+    return _LOCAL.held
+
+
+def _intent_path(store, n: int) -> Path:
+    path = store.root / "runs" / f"{n}.stop.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _acquire(path: Path, timeout: float | None):
+    stream = path.open("a", encoding="utf-8")
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | (0 if deadline is None else fcntl.LOCK_NB))
+            return stream
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                stream.close()
+                raise TimeoutError(f"{path} is held") from None
+            time.sleep(0.1)
+
+
 @contextmanager
-def stop_intent_lock(store, n: int) -> Iterator[None]:
-    """Order `fa orch stop` recording its intent against a WIP commit choosing its reason.
+def stop_intent_lock(store, n: int, *, timeout: float | None = None) -> Iterator[None]:
+    """Order `fa orch stop` recording its intent against the runner's turns, saves, merge and teardown.
 
     Separate from the state lock, which is not reentrant and is taken by update_run.
     """
-    path = store.root / "runs" / f"{n}.stop.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    key = str(_intent_path(store, n))
+    if key in _held():
+        yield
+        return
+    stream = _acquire(Path(key), timeout)
+    _held()[key] = stream
+    try:
+        yield
+    finally:
+        _held().pop(key, None)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
+
+
+def begin_teardown(store, n: int) -> bool:
+    """Start the runner's teardown (final save, push, worktree removal, finish) as one section.
+
+    Returns False, holding nothing, when a stop was requested first: the stopper then owns
+    the whole run. Otherwise the intent lock stays held until end_teardown, so a request
+    waits until the run is finished (and is then refused as not running) instead of
+    landing mid-teardown, where the runner could no longer honour it.
+    """
+    key = str(_intent_path(store, n))
+    if key in _held():
+        return True  # Already inside this run's teardown (or another section of it).
+    stream = _acquire(Path(key), None)
+    run = store.get_run(n)
+    if run is not None and run.stop_why:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
+        return False
+    _held()[key] = stream
+    return True
+
+
+def end_teardown(store, n: int) -> None:
+    stream = _held().pop(str(_intent_path(store, n)), None)
+    if stream is not None:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
+
+
 # A run outcome: unfinished work could not be saved, so its worktree was kept.
 WIP_NOT_SAVED = "wip-not-saved"
 
@@ -404,17 +472,14 @@ def stop_kept_work(git: GitRepo, run: Run, saved: str | None) -> bool:
 
 
 def final_outcome(run: Run | None, outcome: str, *, recorded_first: bool = False) -> str:
-    """A runner's last outcome: lost work and merges win; then a recorded stop request wins.
+    """A runner's last outcome: lost work and merges win over a recorded one.
 
-    Children are signaled first, so a runner may finish on an ordinary path
-    (an executor error) before its own SIGTERM; the stop still owns that end.
+    A runner never finishes a run with a stop request: the stop does (see run_issue).
     """
     if outcome in {"merged", WIP_NOT_SAVED} or run is None:
         return outcome
     if run.outcome == WIP_NOT_SAVED:
         return WIP_NOT_SAVED
-    if run.stop_why:
-        return STOPPED
     return (run.outcome or outcome) if recorded_first else outcome
 
 
@@ -469,6 +534,30 @@ def implementer_turn_open(run: Run) -> bool:
     return run.phase in IMPLEMENTER_PHASES and (run.in_turn or run.executor_pgid is not None)
 
 
+def merge_unless_stopped(ctx, n: int, merge) -> None:
+    """Merge only if no stop was requested, atomically with the request under the intent lock.
+
+    A merge is the one irreversible step: checked only before it, a request arriving
+    during the call (or the push and CI before it) could not prevent it. The merge is
+    recorded in the same section, so a later request sees a merged run and refuses.
+    """
+    with stop_intent_lock(ctx.store, n):
+        run = ctx.store.get_run(n)
+        if run is not None and run.stop_why:
+            raise SaveDeferredToStop()  # The stopper ends the run; nothing lands after the request.
+        merge()
+        if run is not None and run.status == "running":
+            ctx.store.update_run(n, merged=True)
+
+
+def stop_safe_point(ctx, n: int) -> None:
+    """Between phases: once a stop is requested, the runner writes nothing more; the stopper does."""
+    with stop_intent_lock(ctx.store, n):
+        run = ctx.store.get_run(n)
+    if run is not None and run.stop_why:
+        raise SaveDeferredToStop()
+
+
 def begin_turn(ctx, n: int) -> None:
     """Open an implementer turn, unless a stop already asked the run to end."""
     with stop_intent_lock(ctx.store, n):
@@ -489,6 +578,30 @@ def end_turn(ctx, n: int, worktree: Path) -> None:
         if run is not None and run.stop_why:
             raise SaveDeferredToStop()
         _observe_locked(ctx, n, worktree, in_turn=False)
+
+
+def _attach_issue_branch(git: GitRepo, branch: str) -> None:
+    """Put a stop's WIP on the issue branch, which the next run and the evidence check read.
+
+    A review-only worktree sits on a detached PR head. Attaching moves the branch to it
+    only when that keeps every branch commit (a fast-forward); otherwise nothing is
+    committed and the save fails, keeping the worktree.
+    """
+    try:
+        if git._call(["symbolic-ref", "-q", "HEAD"]).strip() == f"refs/heads/{branch}":
+            return
+    except GitError:
+        pass  # Detached HEAD.
+    try:
+        tip = git.ref_sha(f"refs/heads/{branch}")
+    except GitError:
+        tip = None
+    if tip is not None:
+        try:
+            git._call(["merge-base", "--is-ancestor", tip, "HEAD"])
+        except GitError as exc:
+            raise WorktreeUnverified(f"the worktree's HEAD does not contain {branch}; nothing is committed") from exc
+    git.attach_branch(branch)
 
 
 class WorktreeUnverified(Exception):
@@ -592,9 +705,16 @@ def _preserve_locked_implementation(
                 "WIP deletions have no provenance after a failed observation: " + ", ".join(map(repr, refused[:10])))
         if current is not None and current.stop_why:
             reason = f"{STOPPED}: {current.stop_why}"
+        if current is not None and current.stop_why:
+            _attach_issue_branch(git, branch)  # Evidence is the issue branch's WIP, never a detached commit.
         status = "saved" if git.has_staged_changes() else "clean"
-        if status == "saved":
+        if status == "clean" and current is not None and current.stop_why:
+            status = "saved"  # Under a stop the WIP always names the why, even with nothing new to keep.
+            git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]", allow_empty=True)
+        elif status == "saved":
             git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
+        if current is not None and current.stop_why and git.head_sha() != stop_head(git, n):
+            raise WorktreeUnverified(f"the stop's WIP is not the head of {branch}; nothing is proven saved")
         if current is not None and current.status == "running" and status == "saved":
             ctx.store.update_run(n, wip_reason=reason)
         if current is not None and current.stop_why:
@@ -908,7 +1028,8 @@ def _publish_locked(attempt: Implementation) -> str:
                 if not subject:
                     attempt.pr_title = title
                 try:
-                    ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
+                    merge_unless_stopped(ctx, n, lambda: ctx.tracker.merge_pr(
+                        pr, method="squash", expected_head_sha=verified_head_sha, **subject))
                 except TrackerError as exc:
                     if exc.is_rate_limit:
                         raise
@@ -1036,7 +1157,8 @@ def _publish_reviewed_head(
                 )
                 pr = replace(pr, title=title)
                 try:
-                    ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
+                    merge_unless_stopped(ctx, n, lambda: ctx.tracker.merge_pr(
+                        pr.number, method="squash", expected_head_sha=head, **subject))
                 except TrackerError as exc:
                     if exc.is_rate_limit:
                         raise

@@ -55,6 +55,8 @@ class Run:
     in_turn: bool = False
     # Implementer turns this run began: none means no implementer edit can exist in its worktree.
     turns: int = 0
+    # The run's PR was merged (recorded under the intent lock with the merge): nothing is left to stop.
+    merged: bool = False
     # The stop request arrived during an implementer turn: what the tree leaves is the turn's work.
     stop_in_turn: bool = False
     lane: str = "main"

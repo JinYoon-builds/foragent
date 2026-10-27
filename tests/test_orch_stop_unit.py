@@ -74,6 +74,12 @@ class _Git:
     def staged_deletions(self):
         return []
 
+    def _call(self, args):  # HEAD is on the issue branch, as an implementer worktree is.
+        return "refs/heads/foragent/issue-1\n" if args[:1] == ["symbolic-ref"] else ""
+
+    def ref_sha(self, ref):
+        return self.head_sha()
+
     def push(self, branch):
         self.pushed.append(branch)
 
@@ -111,7 +117,7 @@ def test_refused_kill_restores_the_recorded_outcome(tmp_path, monkeypatch):
     store = StateStore(tmp_path / "state", lambda: datetime(2026, 10, 26, tzinfo=UTC))
     monkeypatch.setattr(processes, "observe_tree", lambda identities=(), roots=(): list(identities))
     store.start_run(1, branch="foragent/issue-1", worktree=tmp_path / "wt")
-    store.update_run(1, detail="Implementing.")
+    store.update_run(1, detail="Implementing.", in_turn=True)
     monkeypatch.setattr("foragent.scheduler_stop.stop_target_refusal", lambda run: None)
     seen = []
 
@@ -174,6 +180,7 @@ def _running_store(tmp_path, monkeypatch):
     store = StateStore(tmp_path / "state", lambda: datetime(2026, 10, 26, tzinfo=UTC))
     monkeypatch.setattr(processes, "observe_tree", lambda identities=(), roots=(): list(identities))
     store.start_run(1, branch="foragent/issue-1", worktree=tmp_path / "wt")
+    store.update_run(1, in_turn=True)  # Inside an implementer turn: the stop terminates the tree.
     monkeypatch.setattr("foragent.scheduler_stop.stop_target_refusal", lambda run: None)
     labels = _Labels()
     monkeypatch.setattr(scheduler, "TickContext", lambda **kw: SimpleNamespace(**{**kw, "tracker": labels}))
@@ -380,7 +387,7 @@ class _StagingGit(_Git):
 def test_wip_reason_reads_the_stop_intent_at_commit_time(tmp_path, monkeypatch, stop_during_staging):
     """Stale intent reads: a WIP after the request names it; one before it does not count."""
     from foragent.orch_stop import mark_stop_pending, stop_save_of
-    from foragent.run_publish import final_outcome, stop_kept_work
+    from foragent.run_publish import stop_kept_work
 
     store, ctx, labels = _running_store(tmp_path, monkeypatch)
 
@@ -395,7 +402,6 @@ def test_wip_reason_reads_the_stop_intent_at_commit_time(tmp_path, monkeypatch, 
     run = store.get_run(1)
     reason = "stopped: reprioritize" if stop_during_staging else "retries-exceeded"
     assert git.commits == [f"WIP: Locale (#1) [{reason}]"] and run.wip_reason == reason
-    assert final_outcome(run, "executor-error") == "stopped"  # The request wins the race to finish.
     moved = SimpleNamespace(ref_sha=lambda ref: "wip", _call=lambda args: f"WIP: Locale (#1) [{reason}]\n")
     saved = stop_save_of(store, 1)  # Proven only by a save made under the request.
     assert saved == ("saved" if stop_during_staging else None)
@@ -541,7 +547,7 @@ def test_a_stop_that_cannot_prove_the_tree_gone_changes_no_worktree(tmp_path, mo
 ])
 def test_only_an_implementer_turn_grants_the_stop_its_deletions(tmp_path, monkeypatch, kicks, phase, executor,
                                                                    in_turn, owned):
-    """Class 'process liveness mistaken for edit provenance'."""
+    """Class 'process liveness mistaken for edit provenance'; every phase is stopped by the kill."""
     store, ctx, labels = _running_store(tmp_path, monkeypatch)
     store.update_run(1, phase=phase, executor_pgid=executor, in_turn=in_turn)
     granted = []
@@ -554,7 +560,7 @@ def test_only_an_implementer_turn_grants_the_stop_its_deletions(tmp_path, monkey
 
     monkeypatch.setattr(scheduler, "_kill_run", kill)
     orch.stop(ctx, 1, "reprioritize")
-    assert granted == [owned]
+    assert granted == [owned], "the stop terminates the tree in every phase; only a turn owns deletions"
 
 
 def test_cancelling_a_stop_clears_every_authority_it_granted(tmp_path, monkeypatch):
@@ -632,3 +638,68 @@ def test_a_stop_without_a_worktree_needs_proof_that_nothing_was_lost(tmp_path, m
         with pytest.raises(orch.OrchError, match="no WIP commit names the stop reason"):
             orch.stop(ctx, 1, "reprioritize")
         assert ("add", 1, ("ready",)) not in labels.calls and flags
+
+
+@pytest.mark.parametrize("outcome", ["killed", "stalled-restart", "stalled", "crashed", "executor-error"])
+def test_only_a_run_finished_as_stopped_completes_the_stop(tmp_path, monkeypatch, outcome):
+    """Class 'accepting terminal states that violate the required result'."""
+    from foragent.orch_stop import StopFailed, complete_stop, mark_stop_pending
+
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    mark_stop_pending(store, store.get_run(1), "reprioritize")
+    store.update_run(1, stop_why="reprioritize", stop_head="base")
+    store.finish_run(1, outcome=outcome)
+    flags = []
+    monkeypatch.setattr(scheduler, "flag", lambda tick_ctx, n, reason, summary, details=None: flags.append(summary))
+    with pytest.raises(StopFailed, match=f"finished as {outcome}, not as stopped"):
+        complete_stop(SimpleNamespace(store=store, tracker=labels, now=ctx.now, git=ctx.git), store.get_run(1))
+    assert ("add", 1, ("ready",)) not in labels.calls and flags and _journal(store) == []
+
+
+def test_a_stop_after_a_merge_is_refused_and_a_merge_after_a_stop_never_happens(tmp_path, monkeypatch):
+    """Class 'cancellation checked only before a long operation': the merge is atomic with requests."""
+    from foragent.run_publish import SaveDeferredToStop, merge_unless_stopped
+
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    merged = []
+    merge_unless_stopped(ctx, 1, lambda: merged.append(1))
+    assert merged == [1] and store.get_run(1).merged
+    with pytest.raises(orch.OrchError, match="already merged"):
+        orch.stop(ctx, 1, "reprioritize")
+    assert not (store.root / "stops" / "1.json").exists()
+
+    store.update_run(1, merged=False, stop_why="reprioritize")  # A request arrived during push or CI.
+    with pytest.raises(SaveDeferredToStop):
+        merge_unless_stopped(ctx, 1, lambda: pytest.fail("merged after the stop request"))
+
+
+def test_a_stuck_teardown_is_terminated_before_the_request_is_recorded(tmp_path, monkeypatch, kicks):
+    """Class 'teardown not serialized with stop intent': a teardown stuck pushing never blocks a stop."""
+    from foragent.run_publish import begin_teardown, end_teardown
+
+    store, ctx, labels = _running_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(orch, "TEARDOWN_WAIT_S", 0.2)
+    holding, release = threading.Event(), threading.Event()
+
+    def stuck_runner_teardown():
+        assert begin_teardown(store, 1)
+        holding.set()
+        release.wait(10)  # Its final push never returns, until the process is terminated.
+        end_teardown(store, 1)
+
+    runner = threading.Thread(target=stuck_runner_teardown)
+    runner.start()
+    holding.wait(5)
+    terminated = []
+
+    def terminate(tick_ctx, run, report, **kwargs):
+        terminated.append(run.number)
+        release.set()
+        runner.join(5)  # The dead process releases its lock.
+        return "stopped"
+
+    monkeypatch.setattr("foragent.scheduler_stop._stop_run_processes", terminate)
+    monkeypatch.setattr(scheduler, "_kill_run", _finish(store))
+    orch.stop(ctx, 1, "reprioritize")
+    assert terminated == [1] and store.get_run(1).outcome == "stopped"
+    assert labels.calls == [*READY, ("comment", 1)]

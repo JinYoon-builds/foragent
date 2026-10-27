@@ -89,6 +89,8 @@ def complete_stop(ctx: TickContext, run: Run) -> str:
     from foragent.run_publish import keep_unsaved_work, stop_kept_work
 
     number = run.number
+    # The required result is a run finished as stopped; finish_run never revises a record,
+    # so any other end (one from a runner that predates the upgrade) fails the stop.
     if run.outcome != "stopped":
         # The finished record is final (finish_run never revises it): a runner that ended on
         # its own path after the request, such as one from before an upgrade, is not this stop.
@@ -114,7 +116,18 @@ def complete_stop(ctx: TickContext, run: Run) -> str:
             raise StopFailed(f"#{number}: the unfinished work could not be saved; its worktree is kept") from exc
         if stop_save_of(ctx.store, number) in {"saved", "clean"}:  # Durable before the removal.
             ctx.git.remove_worktree(worktree)
-    elif stop_save_of(ctx.store, number) is None:
+    return finish_stop(ctx, run)
+
+
+def finish_stop(ctx, run: Run) -> str:
+    """Prove the work was kept under the why, then journal the stop and return the issue to ready.
+
+    Called by the stop path, the only writer of the run, after the tree has exited.
+    """
+    from foragent.run_publish import stop_kept_work
+
+    number = run.number
+    if stop_save_of(ctx.store, number) is None and not Path(run.worktree).exists():
         _prove_nothing_to_save(ctx, run)
     if not stop_kept_work(ctx.git, run, stop_save_of(ctx.store, number)):
         # No WIP names the why (for example, a runner from before an upgrade saved its own).
