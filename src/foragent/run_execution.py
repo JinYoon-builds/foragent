@@ -54,7 +54,8 @@ def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
     return path
 
 
-def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> ExecResult:
+def _run_executor(n: int, ctx: RunContext, executor: Executor, *, spender: str | None = None,
+                  **kwargs) -> ExecResult:
     log = kwargs["log_path"]
     size = log.stat().st_size if log.exists() else 0
     offset = size
@@ -85,12 +86,13 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         poll()
         # Executors report plan usage in their own output; keep the latest numbers.
         usage.update(usage_events.record_from_log(ctx.store, log, offset, ctx.now()))
-        _record_spend(n, ctx, log, offset)
+        if spender is not None:
+            _record_spend(ctx, spender, log, offset)
         _progress(n, ctx)
 
 
-def _record_spend(n: int, ctx: RunContext, log: Path, offset: int) -> None:
-    """Money spent by this session, from the Claude result line (#786); nothing without a cost field."""
+def _record_spend(ctx: RunContext, name: str, log: Path, offset: int) -> None:
+    """Money spent by one session, from the Claude result line (#786); nothing without a cost field."""
     from foragent.scheduler_quota import record_cost
 
     try:
@@ -99,8 +101,23 @@ def _record_spend(n: int, ctx: RunContext, log: Path, offset: int) -> None:
             lines = stream.read().decode("utf-8", errors="replace").splitlines()
     except OSError:
         return
-    run = ctx.store.get_run(n)
-    record_cost(ctx.store, ctx.config, run.started_at if run is not None else None, lines)
+    record_cost(ctx.store, name, lines)
+
+
+def _session_hold(ctx: RunContext, name: str, lane: str | None) -> str | None:
+    """Why a session of ``name`` may not launch now; the same quota rules ``decide`` applies."""
+    from foragent.scheduler_quota import blocked, entry_for
+
+    now = ctx.now()
+    entry = entry_for(ctx.config, name)
+    why = blocked(entry, ctx.store, now, {}, "keep", keep=False)[0]
+    if why is not None and why.key != "switch_reason_limit":  # A plain pause keeps today's words below.
+        return why.reason + "."
+    if entry.get("quota") == "subscription" and entry.get("spend_cap") is not None:
+        return None  # Credits under the cap run past the executor pause; a lane pause mirrors it.
+    if (until := usage_recheck.hold_lane(ctx.store, name, lane, now)) is not None:
+        return f"{name} is paused for a usage limit until {until.isoformat()}."
+    return None
 
 
 def _limit_wait(n: int, ctx: RunContext, detail: str) -> None:
@@ -125,15 +142,23 @@ def _available_executor(
     """
     from foragent import runner
     from foragent.run_checks import _append
+    from foragent.scheduler_quota import credits
 
     errors = 0
     full_prompt = kwargs["prompt"]
 
     def execute() -> ExecResult:
+        # Every launch, including a fresh start after a failed resume and each retry, is admitted
+        # here: another run may have paused this executor, or this run reached its spend_cap (#786).
+        # A keep-mode switched run (#107) never pauses its lane: the lane's own pair may be free.
+        current = ctx.store.get_run(n)
+        if (hold := _session_hold(ctx, name, current.lane if current.implementer is None else None)) is not None:
+            _limit_wait(n, ctx, hold)
         log = kwargs["log_path"]
         offset = log.stat().st_size if log.exists() else 0
         try:
-            result = _run_executor(n, ctx, executor, **kwargs)
+            spender = name if credits(ctx.store, ctx.config, name, ctx.now()) else None
+            result = _run_executor(n, ctx, executor, spender=spender, **kwargs)
             if on_result is not None:
                 on_result(result)
             return result
@@ -156,11 +181,6 @@ def _available_executor(
     pending, pending_whole = (saved.resume_reason, saved.resume_whole) if session_body is not None else ("", False)
     while True:
         run = ctx.store.get_run(n)
-        # Another run may have hit this executor's usage limit; never launch it before the reset.
-        # A keep-mode switched run (#107) never pauses its lane: the lane's own pair may be free.
-        lane = run.lane if run.implementer is None else None
-        if (until := usage_recheck.hold_lane(ctx.store, name, lane, ctx.now())) is not None:
-            _limit_wait(n, ctx, f"{name} is paused for a usage limit until {until.isoformat()}.")
         if not reviewer and run.fallback_model is not None:
             kwargs["model"] = run.fallback_model
         kwargs["timeout_s"] = runner._remaining(n, ctx)

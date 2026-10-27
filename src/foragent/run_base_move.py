@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from foragent import labels
-from foragent.config import DEFAULTS, IGNORED_KEYS, Config, _overlay, _validate
+from foragent.config import DEFAULTS, IGNORED_KEYS, Config, _apply_executors, _overlay, _validate
 from foragent.git import GitError
 from foragent.issue import acceptance_paths, parse_body
 
@@ -129,6 +129,7 @@ def _repo_config(git: GitRepo, sha: str) -> dict[str, Any] | None:
     values = deepcopy(DEFAULTS)
     try:
         _overlay(values, value)
+        _apply_executors(values, {}, value)  # The same file rules as load_config (#786).
         _validate(values)
         Config(**values)
     except Exception:  # noqa: BLE001 - odd shapes or cyclic values can fail anywhere in validation

@@ -110,50 +110,83 @@ def fallback_order(config: Config) -> list[dict]:
     return entries[index:] + entries[:index]
 
 
-def blocked(entry: dict, store: StateStore, now: datetime, usage: dict, mode: str) -> tuple[Switch | None, bool]:
-    """Why ``entry`` cannot implement now (None when it can), and whether a hard limit without a cap holds it."""
+def entry_for(config: Config, name: str) -> dict:
+    """``name``'s executors entry; an unlisted executor counts as a plain subscription."""
+    return next((dict(entry) for entry in config.executors if entry["name"] == name),
+                {"name": name, "quota": "subscription"})
+
+
+def blocked(entry: dict, store: StateStore, now: datetime, usage: dict, mode: str,
+            keep: bool = True) -> tuple[Switch | None, bool]:
+    """Why ``entry`` cannot run now (None when it can), and whether a hard limit without a cap holds it.
+
+    A reached daily spend_cap counts as a pause until the next UTC day, whatever else is paused.
+    ``keep=False`` skips keep_percent, which only moves implementers.
+    """
     name, quota, cap = entry["name"], entry.get("quota", "subscription"), entry.get("spend_cap")
-    until = store.executor_pause_until(name, now)
-    limit = None if until is None else Switch(
-        f"{label(name)} paused at its limit until {until.isoformat()}", "switch_reason_limit",
-        {"name": label(name), "until": until.isoformat()}, name)
+    if quota == "api" and name not in MEASURED:  # A cap that is never measured cannot hold spending back.
+        return Switch(f"{label(name)} reports no cost, so its api spend cannot be measured against spend_cap",
+                      "switch_reason_unmeasured", {"name": label(name)}, name), False
     spent = store.spend_today(name, now) if cap is not None else 0.0
-    capped = None if cap is None or spent < cap else Switch(
-        f"{label(name)} spent {spent:g} of its daily cap {cap:g}", "switch_reason_cap",
-        {"name": label(name), "spent": f"{spent:g}", "cap": f"{cap:g}"}, name)
-    if quota == "api":
-        if name not in MEASURED:  # A cap that is never measured cannot hold spending back.
-            return Switch(f"{label(name)} reports no cost for its api cap", "switch_reason_unmeasured",
-                          {"name": label(name)}, name), False
-        return capped or limit, False
-    if quota == "unlimited":
-        return limit, False
-    if limit is not None:  # Past the subscription limit only credits under a cap can run.
-        return (limit, True) if cap is None else (capped, False)
-    keep = None if name == "claude" and mode == "burn" else entry.get("keep_percent")
+    if cap is not None and spent >= cap:
+        return Switch(f"{label(name)} spent {spent:g} of its daily cap {cap:g}", "switch_reason_cap",
+                      {"name": label(name), "spent": f"{spent:g}", "cap": f"{cap:g}"}, name), False
+    until = store.executor_pause_until(name, now)
+    if until is not None and not (quota == "subscription" and cap is not None):
+        # Past a subscription limit only credits under a cap run; others wait for the reset.
+        return Switch(f"{label(name)} paused at its limit until {until.isoformat()}", "switch_reason_limit",
+                      {"name": label(name), "until": until.isoformat()}, name), quota == "subscription"
+    if until is not None or quota != "subscription" or not keep:
+        return None, False
     percent = _percent(usage, name, now)
-    if keep is None or percent is None or percent < keep:
+    share = None if name == "claude" and mode == "burn" else entry.get("keep_percent")
+    if share is None or percent is None or percent < share:
         return None, False
     shown = f"{percent:g}"
-    return Switch(f"{label(name)} keep share {shown}% >= {keep}%", "switch_reason_keep",
-                  {"name": label(name), "percent": shown, "keep": keep}, name), False
+    return Switch(f"{label(name)} keep share {shown}% >= {share}%", "switch_reason_keep",
+                  {"name": label(name), "percent": shown, "keep": share}, name), False
 
 
-def switched_config(config: Config, implementer: str | None, claude_paused: bool = False) -> Config:
-    """A lane-adjusted config with the run's stored implementer and Claude's hard-limit fallback.
+def credits(store: StateStore, config: Config, name: str, now: datetime) -> bool:
+    """Whether a session of ``name`` launched now spends money: an api executor, or
+    credits past a subscription hard-limit pause under a spend_cap."""
+    entry = entry_for(config, name)
+    if entry.get("spend_cap") is None:
+        return False
+    return entry.get("quota") == "api" or store.executor_paused(name, now)
 
-    ``implementer`` None keeps the lane's executor. A run keeps its configured reviewer
-    unless that reviewer is the executor it fell back to; then the executor it fell back
-    from reviews, when that is Claude or Codex. While Claude is paused at its hard limit,
-    a Claude reviewer moves to Codex.
+
+def can_review(config: Config, name: str) -> bool:
+    """Unlimited and unknown executors never review."""
+    return name in ("claude", "codex") and entry_for(config, name).get("quota") != "unlimited"
+
+
+def switched_config(config: Config, implementer: str | None, claude_paused: bool = False,
+                    available: Callable[[str], bool] | None = None) -> Config:
+    """A lane-adjusted config with the run's stored implementer and its reviewer.
+
+    ``implementer`` None keeps the lane's executor; that run keeps its configured reviewer,
+    with a Claude reviewer moving to Codex while Claude is paused at its hard limit, and
+    the run's own executor reviewing when the configured one can never review.
+    A fallback run never waits for a reviewer: the executor it fell back from reviews when
+    available, else the configured reviewer when available and not the run's executor,
+    else the run's own executor. Unlimited and unknown executors never review: when no
+    candidate can, the reviewer is ``none``. ``available`` says which executors can run now.
     """
+    available = available or (lambda name: not (claude_paused and name == "claude"))
     previous = resolved_reviewer(config)
     executor = implementer if implementer is not None else config.executor
-    reviewer = previous
-    if executor != config.executor and previous == executor and config.executor in ("claude", "codex"):
-        reviewer = config.executor
-    if claude_paused and reviewer == "claude":
-        reviewer = "codex"
+    if previous == "none":
+        chain, free = [], False
+    elif executor != config.executor:
+        chain, free = [config.executor, *([previous] if previous != executor else []), executor], True
+    else:
+        chain, free = ["codex" if claude_paused and previous == "claude" else previous, executor], False
+    # Only an executor that can review is chosen; with none left, the run is not reviewed.
+    eligible = [name for name in chain if can_review(config, name)]
+    reviewer = next((name for name in eligible if not free or name == executor or available(name)),
+                    None if free else (eligible[0] if eligible else None))
+    reviewer = "none" if reviewer is None else reviewer
     if executor == config.executor and reviewer == previous:
         return config
     same = executor == config.executor
@@ -162,6 +195,12 @@ def switched_config(config: Config, implementer: str | None, claude_paused: bool
         executor_fallback_model=config.executor_fallback_model if same else None, reviewer=reviewer,
         reviewer_model=config.reviewer_model if reviewer == previous else None,
     )
+
+
+def run_config(store: StateStore, config: Config, implementer: str | None, now: datetime) -> Config:
+    """The runner's config for a lane-adjusted ``config``, choosing the reviewer as ``decide`` does."""
+    return switched_config(config, implementer, store.executor_paused("claude", now),
+                           lambda name: blocked(entry_for(config, name), store, now, {}, "keep", keep=False)[0] is None)
 
 
 # A new run record after one of these continues the same run (as ``restarts`` counts it).
@@ -181,14 +220,15 @@ class Start(NamedTuple):
     implementer: str | None
     switch: Switch | None
     held: bool
+    reason: str | None = None  # Why the start waits, in the executor-wait words; None when it starts.
 
 
 def decide(store: StateStore, config: Config, lane: str, now: datetime, number: int | None = None) -> Start:
     """Decide a gate start from one usage read; ``number`` lets a continued run keep its implementer.
 
     The first executor in the lane's fallback order that can run implements. When none can,
-    the start waits, and each subscription executor whose hard limit (without a spend_cap)
-    holds it records one credits question, once ever.
+    the start waits with the first executor's reason, and each subscription executor whose
+    hard limit (without a spend_cap) holds it records one credits question, once ever.
     """
     from foragent.config import lane_executors
     from foragent.run_implementation import lane_config
@@ -201,7 +241,9 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
         order = [next((entry for entry in order if entry["name"] == kept), {"name": kept, "quota": "subscription"})]
     switch, chosen, asks = None, None, []
     for entry in order:
-        why, ask = blocked(entry, store, now, usage, mode)
+        # A continued run (crashed, stalled-restart, limit-wait) keeps its implementer: only a hard
+        # limit, cap or unmeasured spend holds it, never keep_percent, as #107 continuations did.
+        why, ask = blocked(entry, store, now, usage, mode, keep=kept is None)
         if why is None:
             chosen = entry["name"]
             break
@@ -211,16 +253,24 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
     if chosen is None:
         for name in asks:
             _ask_credits(store, config, name)
-        return Start(adjusted, kept, None, True)
+        return Start(adjusted, kept, None, True, switch.reason)
     implementer = kept if kept is not None else (None if chosen == adjusted.executor else chosen)
     switch = replace(switch, target=chosen) if kept is None and implementer is not None else None
-    run_config = switched_config(adjusted, implementer, store.executor_paused("claude", now))
-    held = store.executor_paused(resolved_reviewer(run_config), now)
-    if not held and store.lane_paused(lane, now):
+    chosen_config = run_config(store, adjusted, implementer, now)
+    reason = None
+    reviewer = resolved_reviewer(chosen_config)
+    if chosen_config.executor == adjusted.executor and reviewer != "none":
+        # Today's rule: a run on its own executor waits for its reviewer; a fallback never does.
+        why, ask = blocked(entry_for(adjusted, reviewer), store, now, usage, mode, keep=False)
+        reason = why and why.reason
+        if ask:  # The reviewer's hard limit holds this start: its one credits question.
+            _ask_credits(store, config, reviewer)
+    if reason is None and store.lane_paused(lane, now) and not any(
+            store.executor_paused(name, now) for name in lane_executors(config, lane)):
         # A lane pause mirrors a limit of the lane's configured pair. One caused by an executor
         # this run no longer needs does not hold it; the pause itself stays in place.
-        held = not any(store.executor_paused(name, now) for name in lane_executors(config, lane))
-    return Start(run_config, implementer, switch, held)
+        reason = f"lane {lane} is paused"
+    return Start(chosen_config, implementer, switch, reason is not None, reason)
 
 
 def _ask_credits(store: StateStore, config: Config, name: str) -> None:
@@ -261,23 +311,8 @@ def switch_line(number: int, switch: Switch, language: str) -> str:
                 target=label(switch.target), reason=reason)
 
 
-def spend_counts(store: StateStore, config: Config, name: str, started_at: str | None) -> bool:
-    """Whether a run's cost on ``name`` is money: an api executor, or credits on a
-    subscription executor started past its hard-limit pause under a spend_cap."""
-    entry = next((entry for entry in config.executors if entry["name"] == name), None)
-    if entry is None or entry.get("spend_cap") is None:
-        return False
-    if entry.get("quota") == "api":
-        return True
-    try:
-        started = datetime.fromisoformat(started_at) if started_at else None
-    except ValueError:
-        return False
-    return started is not None and store.executor_paused(name, started)
-
-
-def record_cost(store: StateStore, config: Config, started_at: str | None, lines: list[str]) -> float | None:
-    """Record the Claude result's ``total_cost_usd`` from a session's log lines when it is money."""
+def record_cost(store: StateStore, name: str, lines: list[str]) -> float | None:
+    """Record a money session's Claude result ``total_cost_usd`` against ``name``; nothing without one."""
     import json
 
     cost = None
@@ -289,7 +324,6 @@ def record_cost(store: StateStore, config: Config, started_at: str | None, lines
         value = event.get("total_cost_usd") if isinstance(event, dict) and event.get("type") == "result" else None
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             cost = (cost or 0.0) + float(value)
-    if cost is None or not spend_counts(store, config, "claude", started_at):
-        return None
-    store.record_spend("claude", cost)
+    if cost is not None:
+        store.record_spend(name, cost)
     return cost

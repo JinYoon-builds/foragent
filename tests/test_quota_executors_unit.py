@@ -9,7 +9,9 @@ import yaml
 
 from foragent.config import Config, ConfigError, load_config
 from foragent.orch_inbox import questions
-from foragent.scheduler_quota import Switch, decide, record_cost, switch_journal, switch_line, switched_config
+from foragent.scheduler_quota import (
+    Switch, credits, decide, record_cost, switch_journal, switch_line, switched_config,
+)
 from foragent.state import StateStore
 
 NOW = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
@@ -33,13 +35,13 @@ def store_at(tmp_path):
 
 @pytest.mark.parametrize("data,key", [
     ({"executors": []}, "executors"),
+    ({"executors": None}, "executors"),
     ({"executors": [entry("claude"), entry("claude")]}, "twice"),
     ({"executors": [entry("local", "unlimited", keep_percent=50)]}, "keep_percent"),
     ({"executors": [entry("local", "unlimited", spend_cap=5)]}, "spend_cap"),
     ({"executors": [entry("claude", "api", spend_cap=5, keep_percent=50)]}, "keep_percent"),
     ({"executors": [entry("claude", keep_percent=0)]}, "keep_percent"),
     ({"executors": [entry("claude", spend_cap=0)]}, "spend_cap"),
-    ({"executors": [entry("local", "api", spend_cap=5)]}, "reports cost"),
     ({"executors": [entry("claude")], "claude_quota": {"mode": "burn"}}, "not both"),
     ({"executors": [entry("claude")], "executor": "codex"}, "first executors entry"),
 ])
@@ -92,15 +94,81 @@ def test_switch_event_and_line_use_the_real_names(tmp_path):
     assert switch_line(1, switch, "en") == "#1 starts with local instead of Codex: Codex paused at its limit until x."
 
 
-@pytest.mark.parametrize("executor,implementer,reviewer,expected", [
-    ("claude", "codex", None, "claude"),   # fell back to its own reviewer: the source reviews
-    ("codex", "claude", "codex", "codex"),  # configured reviewer is not the target: kept
-    ("codex", "local", None, "claude"),    # a run on another executor keeps the configured reviewer
-    ("local", "codex", "codex", "codex"),  # the source is not claude or codex: kept
+@pytest.mark.parametrize("executor,implementer,reviewer,paused,expected", [
+    ("claude", "codex", None, (), "claude"),           # the source reviews when it is free
+    ("codex", "local", None, (), "codex"),             # also on an executor other than claude or codex
+    ("codex", "local", None, ("codex",), "claude"),    # source paused: the configured reviewer
+    ("claude", "codex", None, ("claude",), "codex"),   # configured is the run's executor: it reviews itself
+    ("codex", "claude", "codex", ("codex",), "claude"),
+    ("claude", "codex", "none", (), "none"),
 ])
-def test_fallback_reviewer(executor, implementer, reviewer, expected):
+def test_fallback_reviewer(executor, implementer, reviewer, paused, expected):
     config = Config(executor=executor, reviewer=reviewer)
-    assert switched_config(config, implementer).reviewer == expected
+    assert switched_config(config, implementer, available=lambda name: name not in paused).reviewer == expected
+
+
+def test_unlimited_executors_never_review(tmp_path):
+    config = load(tmp_path, {"executors": [entry("codex"), entry("claude", "unlimited")]})
+    store = store_at(tmp_path)
+    start = decide(store, config, "main", NOW)
+    assert (start.config.executor, start.config.reviewer, start.held) == ("codex", "codex", False)
+
+
+@pytest.mark.parametrize("lane,paused", [("main", ()), ("main", ("codex",)), ("ui", ())])
+def test_no_eligible_reviewer_means_no_review(tmp_path, lane, paused):
+    config = load(tmp_path, {"executors": [entry("codex", "unlimited"), entry("claude", "unlimited")],
+                             "lanes": {"ui": {"executor": "claude"}}})
+    store = store_at(tmp_path)
+    for name in paused:
+        store.pause_executor(name, NOW + timedelta(hours=1))
+    start = decide(store, config, lane, NOW)
+    assert not start.held and start.config.reviewer == "none", "unlimited executors never review"
+
+
+def test_fallback_reviewer_is_none_when_no_eligible_reviewer_is_free():
+    config = Config(executor="claude", reviewer="codex", executors=[entry("claude"), entry("local", "unlimited")])
+    switched = switched_config(config, "local", available=lambda name: name not in ("claude", "codex"))
+    assert switched.reviewer == "none", "a fallback never waits for a reviewer"
+
+
+def test_base_move_check_applies_the_executors_file_rules(monkeypatch):
+    from foragent import run_base_move
+
+    def config_at(data):
+        monkeypatch.setattr(run_base_move, "_blob_exists", lambda git, sha, path: True)
+        monkeypatch.setattr(run_base_move, "_git_bytes", lambda git, args: yaml.safe_dump(data).encode())
+        return run_base_move._repo_config(None, "sha")
+
+    assert config_at({"executors": [entry("claude")], "executor": "codex"}) is None
+    assert config_at({"executors": [entry("claude")], "claude_quota": {"mode": "burn"}}) is None
+    assert config_at({"executors": None}) is None
+    assert config_at({"executors": [entry("claude")]}) is not None
+
+
+def test_reviewer_at_its_spend_cap_holds_a_run_on_its_own_executor(tmp_path):
+    config = load(tmp_path, {"reviewer": "claude", "executors": [entry("codex"), entry("claude", "api", spend_cap=2)]})
+    store = store_at(tmp_path)
+    assert not decide(store, config, "main", NOW).held
+    store.record_spend("claude", 2)
+    start = decide(store, config, "main", NOW)
+    assert start.held and "daily cap" in start.reason
+
+
+def test_derived_list_lane_does_not_wrap(tmp_path):
+    config = load(tmp_path, {"executor": "claude", "reviewer": "none", "lanes": {"ui": {"executor": "codex"}}})
+    store = store_at(tmp_path)
+    store.pause_executor("codex", NOW + timedelta(hours=1))
+    assert decide(store, config, "ui", NOW).held, "a codex lane waits when Codex is paused, as today"
+
+
+def test_reached_subscription_cap_stays_paused_after_the_pause_ends(tmp_path):
+    config = load(tmp_path, {"reviewer": "none", "executors": [entry("claude", spend_cap=3), entry("codex")]})
+    store = store_at(tmp_path)
+    store.pause_executor("claude", NOW + timedelta(minutes=1))
+    store.record_spend("claude", 3)
+    later = NOW + timedelta(hours=1)
+    assert decide(store, config, "main", later).config.executor == "codex"
+    assert decide(store, config, "main", later + timedelta(days=1)).config.executor == "claude"
 
 
 def test_burn_turns_off_claude_keep_percent_only(tmp_path):
@@ -134,21 +202,94 @@ def result_line(cost):
     return json.dumps({"type": "result", "total_cost_usd": cost})
 
 
-def test_spend_is_recorded_only_for_api_runs_and_credits_past_a_pause(tmp_path):
+def test_record_cost_sums_result_lines_and_needs_a_cost_field(tmp_path):
     store = store_at(tmp_path)
-    api = load(tmp_path, {"executors": [entry("claude", "api", spend_cap=10)]})
-    assert record_cost(store, api, NOW.isoformat(), ["noise", result_line(1.5), result_line(0.5)]) == 2.0
-    assert record_cost(store, api, NOW.isoformat(), [json.dumps({"type": "result"})]) is None
-    plan = load(tmp_path, {"executors": [entry("claude", spend_cap=10)]})
-    assert record_cost(store, plan, NOW.isoformat(), [result_line(3)]) is None, "inside the plan is not money"
-    store.pause_executor("claude", NOW + timedelta(hours=1))
-    assert record_cost(store, plan, NOW.isoformat(), [result_line(3)]) == 3.0
-    uncapped = load(tmp_path, {"executors": [entry("claude")]})
-    assert record_cost(store, uncapped, NOW.isoformat(), [result_line(3)]) is None
-    assert store.spend_today("claude", NOW) == 5.0
+    assert record_cost(store, "claude", ["noise", result_line(1.5), result_line(0.5)]) == 2.0
+    assert record_cost(store, "claude", [json.dumps({"type": "result"})]) is None
+    assert store.spend_today("claude", NOW) == 2.0
     assert store.spend_today("claude", NOW + timedelta(days=1)) == 0.0
 
 
-def test_codex_api_is_held_because_its_cost_is_not_measured(tmp_path):
-    config = load(tmp_path, {"reviewer": "none", "executors": [entry("codex", "api", spend_cap=5)]})
-    assert decide(store_at(tmp_path), config, "main", NOW).held
+def test_credits_is_decided_when_the_session_launches(tmp_path):
+    store = store_at(tmp_path)
+    plan = load(tmp_path, {"executors": [entry("claude", spend_cap=10)]})
+    assert not credits(store, plan, "claude", NOW), "inside the plan is not money"
+    store.pause_executor("claude", NOW + timedelta(hours=1))
+    assert credits(store, plan, "claude", NOW)
+    assert not credits(store, load(tmp_path, {"executors": [entry("claude")]}), "claude", NOW)
+    assert credits(store, load(tmp_path, {"executors": [entry("claude", "api", spend_cap=1)]}), "claude", NOW)
+
+
+def runner_ctx(tmp_path, config):
+    from types import SimpleNamespace
+
+    store = store_at(tmp_path)
+    store.start_run(1, branch="b", worktree=tmp_path / "w")
+    return SimpleNamespace(store=store, config=config, now=lambda: NOW)
+
+
+def test_failed_resume_relaunch_is_admitted_again(tmp_path, monkeypatch):
+    from foragent import run_execution
+    from foragent.executors import ExecResult
+    from foragent.run_attempt import ExecutorStopped
+
+    ctx = runner_ctx(tmp_path, load(tmp_path, {"executors": [entry("claude", "api", spend_cap=1)]}))
+    ctx.store.update_run(1, session_id="s1", session_executor="claude")
+    launches = []
+
+    def launch(n, context, executor, *, spender=None, **kwargs):
+        launches.append(spender)
+        context.store.record_spend("claude", 1)  # This paid session reaches the cap.
+        return ExecResult(exit_code=1, timed_out=False, log_path=kwargs["log_path"], session_id=None,
+                          last_message="resume failed", log_tail="")
+
+    monkeypatch.setattr(run_execution, "_run_executor", launch)
+    monkeypatch.setattr(run_execution, "_limit_wait", lambda n, context, detail: (_ for _ in ()).throw(
+        ExecutorStopped("limit-wait", detail)))
+    monkeypatch.setattr("foragent.runner._remaining", lambda n, context: 60)
+    with pytest.raises(ExecutorStopped, match="daily cap"):
+        run_execution._available_executor(1, ctx, object(), session_body="body", resume_prompt="go on",
+                                          prompt="full", log_path=tmp_path / "log")
+    assert launches == ["claude"], "the fresh start after a failed resume must not launch past the cap"
+
+
+def test_session_gate_stops_at_the_cap_and_lets_credits_past_the_pause(tmp_path):
+    from foragent.run_execution import _session_hold
+
+    ctx = runner_ctx(tmp_path, load(tmp_path, {"executors": [entry("claude", spend_cap=4), entry("codex")]}))
+    ctx.store.pause_executor("claude", NOW + timedelta(hours=1))
+    ctx.store.pause_executor("codex", NOW + timedelta(hours=1))
+    assert _session_hold(ctx, "claude", "main") is None, "credits under the cap launch past the pause"
+    assert "paused for a usage limit" in _session_hold(ctx, "codex", "main")
+    ctx.store.record_spend("claude", 4)
+    assert "daily cap" in _session_hold(ctx, "claude", "main"), "a later session stops at the cap"
+
+
+@pytest.mark.parametrize("name", ["codex", "local"])
+def test_codex_api_is_held_because_its_cost_is_not_measured(tmp_path, name):
+    config = load(tmp_path, {"reviewer": "none", "executors": [entry(name, "api", spend_cap=5)]})
+    start = decide(store_at(tmp_path), config, "main", NOW)
+    assert start.held and "cannot be measured" in start.reason
+
+
+def test_paused_reviewer_that_holds_a_start_records_its_credits_question(tmp_path):
+    config = load(tmp_path, {"executor": "claude", "reviewer": "codex", "claude_quota": {"mode": "burn"}})
+    store = store_at(tmp_path)
+    store.pause_executor("codex", NOW + timedelta(hours=1))
+    for _ in range(2):
+        start = decide(store, config, "main", NOW)
+        assert start.held and start.config.executor == "claude"
+    assert [q["key"] for q in questions(store)] == ["credits:codex"]
+
+
+@pytest.mark.parametrize("outcome", ["crashed", "stalled-restart", "limit-wait"])
+def test_continued_run_is_not_held_by_keep_percent(tmp_path, outcome):
+    config = load(tmp_path, {"reviewer": "none", "executors": [entry("claude"), entry("codex", keep_percent=50)]})
+    store = store_at(tmp_path)
+    store.start_run(1, branch="b", worktree=tmp_path / "w", implementer="codex")
+    store.finish_run(1, outcome)
+    store.record_usage("codex", [{"name": "5h", "used_percent": 90, "resets_at": None}])
+    start = decide(store, config, "main", NOW, 1)
+    assert (start.held, start.config.executor) == (False, "codex"), "a continuation keeps Codex over its keep share"
+    store.pause_executor("codex", NOW + timedelta(hours=1))
+    assert decide(store, config, "main", NOW, 1).held, "a hard limit still holds the continuation"

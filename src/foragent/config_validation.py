@@ -185,16 +185,15 @@ def _validate(values: dict[str, Any]) -> None:
 
 
 QUOTAS = ("subscription", "api", "unlimited")
-# Executors whose runs report a cost (Claude's total_cost_usd); only these can spend through an api quota.
-COST_REPORTING = frozenset({"claude", "codex"})
 
 
 def _validate_executors(entries: Any) -> set[str]:
     """Check an explicit ordered executors list (#786); return its names."""
     from foragent.config import ConfigError, DerivedExecutors
 
-    if entries is None or isinstance(entries, DerivedExecutors):
+    if isinstance(entries, DerivedExecutors):
         return set()
+    # The default is always a derived list, so None here is an explicit `executors: null`.
     if not isinstance(entries, list) or not entries:
         raise ConfigError("executors must be a nonempty list of {name, quota} entries")
     names: list[str] = []
@@ -220,6 +219,4 @@ def _validate_executors(entries: Any) -> set[str]:
             raise ConfigError(f"{where}.spend_cap must be a number above 0 on a subscription or api executor")
         if quota == "api" and cap is None:
             raise ConfigError(f"{where}.spend_cap is required for an api executor; spending needs a daily cap")
-        if quota == "api" and name not in COST_REPORTING:
-            raise ConfigError(f"{where}.quota api needs an executor that reports cost (claude or codex)")
     return set(names)
