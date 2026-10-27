@@ -63,12 +63,14 @@ def repository_private(repo, run=None):
 def initial_checks(repo, run, *, command=None):
     from foragent.run_checks import _pytest_command
 
+    if command is None or _pytest_command(command) is None:
+        # Visibility only matters for CI mode, which needs pytest; skip the GitHub call.
+        print("checks: local (CI acceptance requires pytest; using local checks for this test command); "
+              "change checks in .foragent.yml.")
+        return "local"
     private = repository_private(repo, run)
     mode = "ci" if private is False else "local"
-    if command is None or _pytest_command(command) is None:
-        mode = "local"
-        reason = "CI acceptance requires pytest; using local checks for this test command"
-    elif private is False:
+    if private is False:
         reason = "public repository; GitHub-hosted Actions minutes are free"
     elif private is True:
         reason = "private repository; avoid paid Actions minutes"
