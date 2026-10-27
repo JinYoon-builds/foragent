@@ -7,18 +7,22 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING, Any
 
+from foragent import cuts
 from foragent.actions import flag
 from foragent.executors import ExecResult, classify_result
 from foragent.issue import parse_body
 from foragent.labels import attempt_tier, issue_size
 from foragent.reasons import Reason
-from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation
+from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation, WholeFailure
 from foragent.run_baseline import _capture_acceptance_baseline
 from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
-from foragent.run_lane_skills import lane_notes, lane_skill_names, lane_skills
+from foragent.run_lane_skills import lane_memory_notice, lane_notes, lane_skill_names, lane_skills
 from foragent.run_skill_catalog import available_skills, catalog_section, parse_skills_used
-from foragent.run_previous import consume_hint, pending_hint, previous_attempt_summary, record_stop_point
+from foragent.run_previous import (
+    consume_hint, pending_hint, previous_attempt_summary, record_stop_point, saved_feedback_section,
+)
+from foragent.run_parent import parent_context
 from foragent.run_prompts import build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
 from foragent.run_overlap import wait_for_overlap
@@ -49,9 +53,13 @@ class ImplementerSetup:
     options: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
     missing_skills: list[str] = field(default_factory=list)
+    # What part of the lane memory an executor that loads it itself does not see.
+    memory_notice: str = ""
 
 
-def implementer_setup(config: Config, lane: str, tier: str, worktree: Path) -> ImplementerSetup:
+def implementer_setup(
+    config: Config, lane: str, tier: str, worktree: Path, full_text_dir: Path | None = None,
+) -> ImplementerSetup:
     """Choose executor, model, lane agent, lane instructions and skills from a lane-adjusted config."""
     native_claude = config.executor == "claude"
     settings = config.tiers[tier]
@@ -61,17 +69,19 @@ def implementer_setup(config: Config, lane: str, tier: str, worktree: Path) -> I
         model = (config.lanes.get(lane, {}) if lane != "main" else {}).get("model") or settings["claude_model"] or model
     else:
         options["effort"] = settings["codex_effort"]
-    agent, notes = lane_notes(config, lane, worktree)
+    agent, notes = lane_notes(config, lane, worktree, full_text_dir)
     missing: list[str] = []
     if native_claude:
-        # Claude reads the lane agent itself; its notes are not prepended.
+        # Claude reads the lane agent and memory itself; only a cut notice is added, after the task.
         if agent is not None:
             options["agent"] = agent
+        memory_notice = lane_memory_notice(config, lane, worktree, full_text_dir) if agent is not None else ""
         notes = ""
     else:
         skill_notes, missing = lane_skills(config, lane, worktree, agent)
         notes += skill_notes
-    return ImplementerSetup(config.executor, model, options, notes, missing)
+        memory_notice = ""
+    return ImplementerSetup(config.executor, model, options, notes, missing, memory_notice)
 
 
 def _record_skills_used(n: int, ctx: RunContext, result: ExecResult) -> None:
@@ -207,7 +217,7 @@ def _prepare_implementation(
     """Set up an implementer; a throwaway doctor task has no acceptance baseline to keep."""
     from foragent import runner
 
-    approval = ctx.store.load_approval(n)
+    approval = parent_context(ctx, n, ctx.store.load_approval(n))
     parsed = parse_body(approval.body)
     worktree = git.root
     branch = f"foragent/issue-{n}"
@@ -274,12 +284,21 @@ def _implement(
     run = ctx.store.get_run(n)
     tier = attempt_tier(attempt.size, run.attempts)
     ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, str(run.attempts): tier})
-    setup = implementer_setup(ctx.config, run.lane, tier, worktree)
+    full_text_dir = cuts.issue_dir(ctx.store.root, n)
+    setup = implementer_setup(ctx.config, run.lane, tier, worktree, full_text_dir)
     model, notes = setup.model, setup.notes
     attempt.options.update(setup.options)
     attempt.missing_skills.extend(name for name in setup.missing_skills if name not in attempt.missing_skills)
     retry_default, hint = pending_hint(ctx.store.root, n)
     failure_context = str(failure) or run.resume_reason
+    # Each part of a check bundle or review is already limited; a saved one stays whole after restarts too.
+    whole = isinstance(failure, (CIFailure, WholeFailure)) or (not str(failure) and run.resume_whole)
+    moved_files = run.moved_files
+    # The saved review and failing checks reach every new attempt, fresh or resumed.
+    saved_feedback = saved_feedback_section(ctx.store.root, n, failure_context)
+    if str(failure):
+        # Save this turn's feedback first: a limit wait or restart before delivery must not lose it.
+        ctx.store.update_run(n, resume_reason=failure_context, resume_whole=whole)
     review_feedback = attempt.review_feedback
     attempt.review_feedback = False
     test_command = ctx.config.test_command
@@ -294,10 +313,13 @@ def _implement(
         orchestrator_hint=hint,
         test_command=test_command,
         acceptance_baseline=attempt.baseline.node_ids if attempt.baseline else (),
-        failure_limit=None if isinstance(failure, CIFailure) else 4000,
+        failure_limit=None if whole else 4000,
+        parent_context=attempt.approval.parent_context or "",
+        full_text_dir=full_text_dir,
+        moved_files=moved_files,
         skill_catalog=catalog_section(available_skills(ctx.config, fixed)),
-        previous_attempt=(previous_attempt_summary(attempt)
-                          if failure_context or reviewer_text is not None else ""),
+        previous_attempt=(previous_attempt_summary(attempt, failure_context)
+                          if failure_context or reviewer_text is not None or saved_feedback else ""),
         review_feedback=review_feedback,
         retry_default=retry_default,
     )
@@ -306,13 +328,14 @@ def _implement(
     try:
         result = _available_executor(
             n, ctx, attempt.executor, worktree=worktree,
-            prompt=prompt if attempt.native_claude else notes + prompt,
+            prompt=notes + prompt + setup.memory_notice,
             session_body=attempt.approval.body,
             resume_prompt=build_resume_prompt(
                 n, run.session_body, attempt.approval.body, failure_context,
                 reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
                 review_feedback=review_feedback, retry_default=retry_default,
-            ),
+                moved_files=moved_files, parent_context=attempt.approval.parent_context or "",
+            ) + (f"\n\n{saved_feedback}" if saved_feedback else "") + setup.memory_notice,
             model=model, timeout_s=remaining, log_path=log, **attempt.options,
         )
     finally:
@@ -326,6 +349,8 @@ def _implement(
     # only once the implementer returns an ordinary execution result.
     if (retry_default or hint is not None) and classify_result(result) == "normal":
         consume_hint(ctx.store.root, n)
+    if moved_files and classify_result(result) == "normal":
+        ctx.store.update_run(n, moved_files=[])  # named once, after delivery
     _record_skills_used(n, ctx, result)
     rebuttal = _read_rebuttals(worktree)
     if rebuttal.strip() and rebuttal not in attempt.rebuttals:
@@ -334,8 +359,8 @@ def _implement(
         raise ExecutorStopped(_timeout(n, ctx))
     question = worktree / ".foragent/QUESTION.md"
     if question.exists():
-        with question.open(encoding="utf-8", errors="replace") as stream:
-            details = stream.read(6000)
+        details = cuts.head(question.read_text(encoding="utf-8", errors="replace"), 6000,
+                            cuts.issue_dir(ctx.store.root, n), "QUESTION.md")
         flag(ctx, n, Reason.SPEC_QUESTION, "The executor needs a product decision.", details)
         raise ExecutorStopped("spec-question")
     wait_for_overlap(attempt)

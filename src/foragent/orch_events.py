@@ -2,15 +2,19 @@
 
 from datetime import UTC, datetime
 import json
+from typing import Any
 
 from foragent.state import StateStore
 
 
 def append_event(store: StateStore, at: datetime, issue: int | None, kind: str, summary: str,
-                 say: str | None = None) -> dict:
-    """Append one event; ``say`` is an optional line for a person, kept beside the raw summary."""
+                 say: str | None = None, **fields: Any) -> dict:
+    """Append one event; ``say`` is an optional line for a person, kept beside the raw summary.
+
+    Extra ``fields`` (for example a review's verdict) follow the shared keys.
+    """
     event = {"at": at.astimezone(UTC).isoformat(), "issue": issue,
-             "kind": kind, "summary": " ".join(summary.split())}
+             "kind": kind, "summary": " ".join(summary.split()), **fields}
     if say is not None and " ".join(say.split()):
         event["say"] = " ".join(say.split())
     with store._state_lock():

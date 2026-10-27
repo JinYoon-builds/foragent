@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 import json
+from pathlib import Path
 import re
 import subprocess
 import time
@@ -12,6 +13,8 @@ import zlib
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
 from zipfile import BadZipFile, ZipFile
+
+from foragent import cuts, gh
 
 
 IssueState = Literal["open", "closed"]
@@ -91,6 +94,7 @@ class Tracker(Protocol):
     def label_events(self, n: int) -> list[LabelEvent]: ...
     def blocked_by(self, n: int) -> list[Dependency]: ...
     def parent_of(self, n: int) -> int | None: ...
+    def parent_issue(self, n: int) -> Issue | None: ...
     def sub_issues(self, n: int) -> list[Issue]: ...
     def add_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
     def remove_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
@@ -109,7 +113,7 @@ class Tracker(Protocol):
     def pr_acceptance_checks(self, pr: int) -> list[dict]: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
     def pr_default_branch(self) -> str: ...
-    def pr_failed_logs(self, pr: int) -> str: ...
+    def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
                  subject: str | None = None) -> None: ...
@@ -178,6 +182,10 @@ class RecordingTracker:
         self._tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
         self._context = context
         self.queue_writes = queue_writes
+        # GitHub calls made for this context count in its own store and clock.
+        store, now = getattr(context, "store", None), getattr(context, "now", None)
+        if store is not None and now is not None:
+            gh.set_recorder(store, now)
 
     @property
     def _now(self):
@@ -613,6 +621,10 @@ class FakeTracker:
     def parent_of(self, n: int) -> int | None:
         return self._parents.get(n)
 
+    def parent_issue(self, n: int) -> Issue | None:
+        parent = self._parents.get(n)
+        return self.get_issue(parent) if parent is not None else None
+
     def sub_issues(self, n: int) -> list[Issue]:
         return [self.get_issue(child) for child, parent in self._parents.items() if parent == n]
 
@@ -715,7 +727,7 @@ class FakeTracker:
     def set_pr_failed_logs(self, pr: int, text: str) -> None:
         self._pr_failed_logs[pr] = text
 
-    def pr_failed_logs(self, pr: int) -> str:
+    def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str:
         return self._pr_failed_logs.get(pr, "")
 
     def set_pr_head_sha(self, pr: int, sha: str) -> None:
@@ -797,13 +809,16 @@ def _parse_time(value: Any) -> datetime | None:
 
 
 class GhTracker:
-    def __init__(self, repo: str, run: Callable[..., str | bytes] | None = None):
+    def __init__(self, repo: str, run: Callable[..., str | bytes] | None = None,
+                 sleep: Callable[[float], None] = time.sleep):
         self.repo = repo
         self._run = run or _run_gh
+        self._sleep = sleep
         self._path = f"repos/{repo}"
         self._seen_states: set[str] = set()
 
     def _call(self, args: list[str], input: str | None = None, *, binary: bool = False) -> str | bytes:
+        gh.count_call()  # Every attempt counts, injected runners and retries included.
         try:
             output = self._run(args, input=input)
             return output.decode() if isinstance(output, bytes) and not binary else output
@@ -850,7 +865,7 @@ class GhTracker:
         if not issues:
             # GitHub sometimes answers a listing with an empty page by mistake.
             # One retry separates that hiccup from a repository that is empty.
-            time.sleep(_EMPTY_RETRY_DELAY)
+            self._sleep(_EMPTY_RETRY_DELAY)
             issues = self._fetch_issues(state)
         if issues:
             states = {issue.state for issue in issues}
@@ -959,6 +974,15 @@ class GhTracker:
     def parent_of(self, n: int) -> int | None:
         try:
             return json.loads(self._call(["api", f"{self._path}/issues/{n}/parent"]))["number"]
+        except TrackerError as exc:
+            if re.search(r"\bHTTP\s+404\b", str(exc)):
+                return None
+            raise
+
+    def parent_issue(self, n: int) -> Issue | None:
+        """The parent issue with its body, read in one GitHub call."""
+        try:
+            return _issue(json.loads(self._call(["api", f"{self._path}/issues/{n}/parent"])))
         except TrackerError as exc:
             if re.search(r"\bHTTP\s+404\b", str(exc)):
                 return None
@@ -1256,7 +1280,7 @@ class GhTracker:
                 raise
             raise TrackerError(f"Unusable acceptance artifacts: {exc}") from exc
 
-    def pr_failed_logs(self, pr: int) -> CIEvidence:
+    def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.
 
         ``not_started`` is true only when every failed job never ran (no steps or a
@@ -1302,7 +1326,7 @@ class GhTracker:
                     if "log not found" not in f"{exc}\n{exc.stdout}".lower():
                         raise
                     output = f"(failed log unavailable: {str(exc).strip()})"
-                lines.append(output[-4000:])
+                lines.append(cuts.tail(output, 4000, full_text_dir, f"ci-run-{run['id']}.log"))
             parts.append("\n".join(lines))
         return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
 
