@@ -43,6 +43,7 @@ lanes:
     - testing-strategy
     - principle-prove-it-works
     - principle-fix-root-causes
+    - fa-state-design
   view:
     paths:
     - src/foragent/watch*.py
@@ -62,7 +63,7 @@ lanes:
     - src/foragent/order.py
     - src/foragent/tracker.py
     agent: fa-board
-    skills: [principle-prove-it-works, principle-fix-root-causes]
+    skills: [principle-prove-it-works, principle-fix-root-causes, fa-state-design]
   skills:
     paths:
     - src/foragent/skills.py
@@ -73,6 +74,7 @@ lanes:
     - skill-creator
     - principle-prove-it-works
     - principle-fix-root-causes
+    - fa-state-design
   design:
     paths:
     - src/foragent/design*.py
