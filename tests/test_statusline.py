@@ -12,6 +12,8 @@ from foragent import statusline
 def homes(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    # Pass-through tests run outside any Foragent project, so presence adds nothing.
+    monkeypatch.chdir(tmp_path)
     return tmp_path
 
 
