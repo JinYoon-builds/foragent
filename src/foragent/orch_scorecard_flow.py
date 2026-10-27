@@ -57,6 +57,10 @@ def _labels_at(issue: dict[str, Any], moment: datetime) -> set[str]:
         # not applied, so today's labels never rewrite earlier days. Own runs come from run records.
         if issue["approved_at"] is None or moment < issue["approved_at"]:
             return set()
+        if not issue["closed"] and "approved" not in issue["labels"] and not issue.get("running"):
+            # Approval removed at an unrecorded time and no run of its own: never startable in the
+            # window (the scorecard is a diagnostic; a wrong minute is reversible).
+            return set()
         labels = {"approved", "ready"}
         held = issue["labels"] & {"blocked", "needs-human"}
         if held and (since := issue["flagged_at"] or issue["updated_at"]) is not None and moment >= since:
