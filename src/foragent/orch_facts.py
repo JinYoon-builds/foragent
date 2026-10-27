@@ -21,7 +21,6 @@ from typing import Any
 
 from foragent import capacity, machine_budget, orch_facts_reviews, orch_plan
 from foragent.config import Config
-from foragent.i18n import text
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
     RECENT, _comparisons, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
@@ -229,25 +228,6 @@ def _pct(value: float | None) -> str:
     return "?" if value is None else f"{value * 100:.1f}%"
 
 
-def _review_lines(facts: dict[str, Any], language: str) -> list[str]:
-    """The run with the most review rounds and the most repeated finding class."""
-    summary, days = facts["review_rounds"], facts["window_days"]
-    if not summary["top_runs"]:
-        lines = [text("facts_review_rounds_none", language, days=days)]
-    else:
-        worst = summary["top_runs"][0]
-        lines = [text("facts_review_rounds", language, days=days, median=f"{summary['median']:g}",
-                      issue=worst["issue"], rounds=worst["review_rounds"])]
-    if (top := orch_facts_reviews.most_repeated(facts["finding_classes"])) is not None:
-        slug, entry = top
-        issues = ", ".join(f"#{n}" for n in entry["issues"][:HUMAN_ITEMS])
-        if len(entry["issues"]) > HUMAN_ITEMS:
-            issues += ", ..."
-        lines.append(text("facts_repeated_class", language, slug=slug[:40], within=entry["repeated_rounds"],
-                                 across=entry["repeated_runs"], issues=issues))
-    return lines
-
-
 def human(facts: dict[str, Any], language: str = "en") -> str:
     """Five short blocks: runs with review rounds, test slots and resources, hot files, failures, merges since tidy."""
     rows = facts["runs"]
@@ -293,7 +273,7 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
     reasons = list(facts["failure_reasons"].items())
     reason_lines = [f"Failure reasons (last {facts['window_days']} days): {'none' if not reasons else len(reasons)}"]
     reason_lines += [f"  {count}x {text[:100]}" for text, count in reasons[:HUMAN_ITEMS]]
-    blocks = [runs + ["  " + line for line in _review_lines(facts, language)], capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}"]]
+    blocks = [runs + ["  " + line for line in orch_facts_reviews.human_lines(facts, language, HUMAN_ITEMS)], capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}"]]
     return "\n\n".join("\n".join(block) for block in blocks)
 
 
