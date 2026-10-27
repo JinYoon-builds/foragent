@@ -42,7 +42,9 @@ def world(tmp_path, monkeypatch):
         assert recorded is not None, "a stop needs recorded ownership"
         killed.append(pid)
         owned = {(item["pid"], item["start_time"]) for item in recorded}
-        table[0] = processes.ProcessTable([item for item in table[0] if (item.pid, item.start_time) not in owned])
+        current = table[0]  # Unreadable processes stay unreadable: the killer cannot see them.
+        table[0] = processes.ProcessTable([item for item in current if (item.pid, item.start_time) not in owned],
+                                          current.unreadable, current.unreadable_uids)
 
     ctx = SimpleNamespace(store=store, config=config, now=lambda: clock[0], kill_runner=kill, tracker=NoIssues(),
                           repo_root=(tmp_path / "repo").resolve(), git=SimpleNamespace(remove_worktree=removed.append),
@@ -53,8 +55,11 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr("foragent.sleep_credit.credit", lambda store, now: 0)
     alive = {}
     # Like os.kill(pid, 0): a listed pid exists, unless a test says otherwise.
-    monkeypatch.setattr("foragent.scheduler_stop._pid_exists",
-                        lambda pid: alive.get(pid, any(item.pid == pid for item in table[0])))
+    def exists(pid):
+        return alive.get(pid, any(item.pid == pid for item in table[0]))
+
+    for where in ("foragent.scheduler_stop._pid_exists", "foragent.scheduler_recovery._pid_exists"):
+        monkeypatch.setattr(where, exists)
     return SimpleNamespace(store=store, config=config, ctx=ctx, clock=clock, killed=killed,
                            removed=removed, table=table, alive=alive)
 
@@ -430,3 +435,58 @@ def test_active_dreams_are_no_issue_rows_or_issue_logs(world):
             if isinstance(state, list) for item in state]
     assert not any(isinstance(item, dict) and item.get("number") == 0 for item in rows)
     assert collected["summary"]["working"] == 1
+
+
+def test_unreadable_worker_is_unknown_so_recovery_keeps_the_dream(world):
+    dreaming(world)
+    world.table[0] = processes.ProcessTable([], unreadable=[4100])  # Alive, but its row cannot be read.
+    world.alive[4100] = True
+    recover(world)
+    assert world.store.get_dream("orch").status == "running" and world.removed == []
+
+
+def test_manual_completion_with_unknown_liveness_only_appends_the_event(world):
+    run = dreaming(world)
+    world.table[0] = processes.ProcessTable([], unreadable=[4100])
+    world.alive[4100] = True
+    assert orch_dream.dreamed_command(world.store, world.config, "orch") == 0
+    assert orch_dream.last_dream_at(world.store, "orch") is not None
+    assert world.store.get_dream("orch") == run
+
+
+def test_refused_stop_with_an_unreadable_recorded_executor_keeps_the_dream(world):
+    dreaming(world, executor=4200, extra=[{"pid": 4200, "start_time": 2.0}])
+    world.table[0] = processes.ProcessTable([], unreadable=[4200])  # Worker gone; executor unreadable.
+
+    def refuse(pid):
+        raise ValueError("ownership cannot be verified")
+
+    world.ctx.kill_runner = refuse
+    report = recover(world)
+    assert world.store.get_dream("orch").status == "running" and world.removed == []
+    assert any("Stop refused" in action for action in report.actions)
+
+
+def test_stalled_dream_whose_stop_cannot_be_confirmed_keeps_its_record(world):
+    dreaming(world)
+    world.table[0] = processes.ProcessTable([], unreadable=[4100])  # The killer cannot see it.
+    world.alive[4100] = True
+    world.clock[0] += timedelta(minutes=11)
+    report = recover(world)
+    run = world.store.get_dream("orch")
+    assert run.status == "running" and world.removed == []
+    assert any("cannot be confirmed" in action for action in report.actions)
+
+
+def test_progress_recorded_after_the_stall_check_voids_the_kill(world, monkeypatch):
+    dreaming(world)
+    world.table[0] = processes.ProcessTable([row(4100)])
+    world.clock[0] += timedelta(minutes=11)
+
+    def wake_grace(store, run, now):  # Evaluated inside the stall check, before the stop.
+        world.store.update_run(KEY, last_progress_at=now.isoformat())
+        return False
+
+    monkeypatch.setattr("foragent.sleep_credit.in_wake_grace", wake_grace)
+    recover(world)
+    assert world.killed == [] and world.store.get_dream("orch").status == "running"

@@ -218,7 +218,7 @@ def dreamed_command(store: StateStore, config: Config, lane: str) -> int:
     from foragent.scheduler_stop import runner_alive
 
     run = store.get_dream(lane)  # A fresh read; the record itself is never written here.
-    if run is not None and run.status == "running" and run.pid is not None and runner_alive(run):
+    if run is not None and run.status == "running" and run.pid is not None and runner_alive(run) is True:
         print(f"foragent: lane {lane} is dreaming now; wait for it to finish", flush=True)
         return 2
     # Not confirmed alive (gone or unknown): only the completed-dream event is appended;

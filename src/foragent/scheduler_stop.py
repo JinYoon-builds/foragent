@@ -74,27 +74,49 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
-def runner_alive(run: Run) -> bool:
+# The fields a runtime or stall decision reads; a change after the check voids it (_kill_run).
+DECISION_FIELDS = ("last_progress_at", "waiting_until", "waited_seconds", "slept_seconds", "slept_since_progress")
+
+
+def runner_alive(run: Run, exists=None) -> bool | None:
     """The one liveness rule for a recorded runner (issue or dream) with a pid.
 
     It is alive when its pid exists with the recorded start time; a reused pid (another
     start time) is dead. With no recorded start time (no birth identity), it is alive
-    while the pid exists.
+    while the pid exists. A pid the listing could not read is unknown (None), never dead.
+    ``exists`` is the caller's signal-0 probe (recovery passes its own, patchable one).
     """
     identities = {item["pid"]: item["start_time"] for item in run.process_identities}
-    if run.pid in identities and not any(
-        row.pid == run.pid and row.start_time == identities[run.pid] for row in processes.list_processes()
-    ):
-        return False  # Never probe a replacement as if it were the recorded runner.
-    return _pid_exists(run.pid)
+    if run.pid in identities:
+        table = processes.list_processes()
+        if run.pid in getattr(table, "unreadable", frozenset()):
+            return None  # Unknown liveness is not confirmed death (D95).
+        if not any(row.pid == run.pid and row.start_time == identities[run.pid] for row in table):
+            return False  # Never probe a replacement as if it were the recorded runner.
+    return (exists or _pid_exists)(run.pid)
 
 
 def _run_processes_exist(run: Run) -> bool:
+    """Whether any recorded process may remain; an unreadable recorded pid counts (unknown is not gone)."""
     rows = processes.list_processes()
     identities = {item["pid"]: item["start_time"] for item in run.process_identities}
+    unreadable = getattr(rows, "unreadable", frozenset())
     return (any(_pid_exists(pid) for pid in (run.pid, run.executor_pgid) if pid is not None)
+            or bool(unreadable & {run.pid, run.executor_pgid, *identities})
             or any((run.executor_pgid is not None and row.pgid == run.executor_pgid)
                    or identities.get(row.pid) == row.start_time for row in rows))
+
+
+def _stop_unconfirmed(run: Run) -> bool:
+    """Whether a stop that raised nothing may still have left the run's processes alive.
+
+    kill_process_group waits until every readable recorded identity is gone, so only a
+    recorded pid the listing cannot read stays unconfirmed. A runner recorded without a
+    birth identity is trusted to the injected killer, as the locked stop tests require.
+    """
+    identities = {item["pid"] for item in run.process_identities}
+    unreadable = getattr(processes.list_processes(), "unreadable", frozenset())
+    return bool(unreadable & {run.pid, run.executor_pgid, *identities})
 
 
 def _stop_run_processes(
@@ -108,6 +130,8 @@ def _stop_run_processes(
             with processes.recorded_tree(run.process_identities):
                 ctx.kill_runner(run.pid)
         scheduler._kill_executor(ctx, run.key)
+        if _stop_unconfirmed(run):
+            raise ValueError("the stop cannot be confirmed: a recorded process is unreadable or has no birth identity")
     except (ValueError, PermissionError, TimeoutError) as exc:
         try:
             if not _run_processes_exist(ctx.store.get_run(run.key) or run):

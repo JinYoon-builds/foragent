@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler, sleep_credit
 from foragent.scheduler_stop import (
-    _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes, runner_alive,
+    DECISION_FIELDS, _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused,
+    _stop_run_processes, runner_alive,
 )
 from foragent.state import Run
 from foragent.tracker import Issue
@@ -46,11 +47,13 @@ def _remove_run_worktree(
 
 def _kill_run(
     ctx: TickContext, number: int | str, report: TickReport, *, outcome: str = "killed",
-    count_stall: bool = False, detail: str = "",
+    count_stall: bool = False, detail: str = "", decided: Run | None = None,
 ) -> bool:
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
         return False
+    if decided is not None and any(getattr(run, name) != getattr(decided, name) for name in DECISION_FIELDS):
+        return False  # The runner recorded progress or a wait after the limit check: decide again next tick.
     if count_stall:
         ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
     try:
@@ -217,7 +220,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                     and not (issue and ctx.runner_process_exists(run.number))
                 )
             else:
-                dead = not runner_alive(run)
+                dead = runner_alive(run, _pid_exists) is False  # Only confirmed death; unknown waits.
         # The runner may have finished while another run or its process was checked.
         run = ctx.store.get_run(run.key)
         if run is None or run.status != "running":
@@ -230,7 +233,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                        - run.waited_seconds - run.slept_seconds)
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
                 if scheduler._kill_run(ctx, run.key, report, outcome="killed" if issue else "error",
-                                       detail="Runner exceeded its runtime limit.") and issue:
+                                       detail="Runner exceeded its runtime limit.", decided=run) and issue:
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
             elif run.pid is not None and not waiting and not sleep_credit.in_wake_grace(
@@ -240,7 +243,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 minutes=ctx.config.stall_minutes):
                 restarts = run.restarts + 1
                 outcome = ("stalled-restart" if restarts <= 1 else "stalled") if issue else "error"
-                if scheduler._kill_run(ctx, run.key, report, outcome=outcome, count_stall=True,
+                if scheduler._kill_run(ctx, run.key, report, outcome=outcome, count_stall=True, decided=run,
                           detail="Runner stopped making progress past the stall limit.") and issue:
                     scheduler._restore_stalled(ctx, run.number, restarts, report)
             continue
