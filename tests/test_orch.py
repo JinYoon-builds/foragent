@@ -98,8 +98,10 @@ def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch):
 
     monkeypatch.setattr(c.tracker, "merge_pr", failed_merge)
     monkeypatch.setattr(runner, "after_merge", lambda *args: calls.append(args))
-    assert runner.review_only(1, c.ctx) == "error"
-    assert_blocked(c, Reason.RETRIES_EXCEEDED)
+    c.ctx.config = replace(c.ctx.config, max_runtime_minutes=5)
+    # A refused merge rejoins the merge queue for later turns until the time budget ends (#712).
+    assert runner.review_only(1, c.ctx) == "timeout"
+    assert_blocked(c, Reason.TIMEOUT)
     assert "merge failed" in c.store.log_path(1).read_text()
     assert calls == []
 

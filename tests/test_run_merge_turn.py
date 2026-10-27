@@ -163,3 +163,38 @@ def queue_behind_live_run(c, monkeypatch):
     monkeypatch.setattr(turn, "_live", lambda store, key: ahead_live[0] if key[0] == 9 else live(store, key))
     turn.join(c.ctx, turn.Seat(9, "2026-10-20T08:00:00+00:00", "main"), "a" * 40)
     return ahead_live
+
+
+@pytest.mark.parametrize("path", ["implementation", "review-only"])
+def test_failed_merge_rejoins_at_the_tail_and_takes_a_later_turn(run_case, monkeypatch, path):
+    from foragent import runner
+    from foragent.tracker import TrackerError
+
+    c = run_case
+    if path == "review-only":
+        c.ctx.config = replace(c.ctx.config, review="careful")
+        assert run_issue(1, c.ctx) == "pr-open"
+        c.ctx.config = replace(c.ctx.config, review="fast")
+        c.now[0] += timedelta(seconds=1)
+    started = c.store.get_run(1).started_at
+    merge, tries, sleeps = c.tracker.merge_pr, [], []
+
+    def flaky(pr, **kwargs):
+        tries.append(pr)
+        if len(tries) == 1:
+            raise TrackerError("Pull request is not mergeable right now")
+        return merge(pr, **kwargs)
+
+    monkeypatch.setattr(c.tracker, "merge_pr", flaky)
+    c.ctx.sleep = lambda seconds: sleeps.append(seconds) or c.now.__setitem__(0, c.now[0] + timedelta(seconds=seconds))
+    outcome = (runner.review_only(1, c.ctx, verdict_head=c.tracker.pr_head_sha(2))
+               if path == "review-only" else run_issue(1, c.ctx))
+    assert outcome == "merged"
+    assert len(tries) == 2 and c.tracker.merged_prs == [2]
+    own = [(row["event"], row.get("result")) for row in rows(c.ctx)
+           if row["n"] == 1 and row.get("started_at") == c.store.get_run(1).started_at]
+    assert own == [("ready", None), ("turn", "merged"), ("turn", "failed"), ("withdrawn", None),
+                   ("ready", None), ("turn", "merged")]
+    assert sleeps == [30], "The retry is spaced out once before rejoining"
+    assert "rejoining the merge queue: Pull request is not mergeable" in c.store.log_path(1).read_text()
+    assert path == "review-only" or started == c.store.get_run(1).started_at

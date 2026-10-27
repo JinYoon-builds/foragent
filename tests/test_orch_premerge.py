@@ -361,3 +361,99 @@ def test_premerge_suite_releases_slot_and_propagates_it_to_nested_tests(merge_ca
     else:
         assert orch.premerge(c.ctx, c.pr)["waited_seconds"] == 0
     assert holding == []
+
+
+def queue_events(c):
+    path = c.ctx.store.root / "merge-queue.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+@pytest.mark.parametrize("holder", ["live", "finished", None])
+def test_orch_merge_takes_the_fifo_merge_turn(merge_case, holder):
+    """A human merge never overtakes a live turn holder and records its own turn (#712)."""
+    from foragent import run_merge_turn as turn
+
+    c = merge_case
+    store = c.ctx.store
+    if holder is not None:
+        store.start_run(7, branch="foragent/issue-7", worktree=store.worktree_path(7))
+        turn.join(c.ctx, turn.seat(c.ctx, 7, "main"), "a" * 40)
+        if holder == "finished":
+            store.finish_run(7, outcome="merged")
+    before = queue_events(c)
+    if holder == "live":
+        with pytest.raises(orch.OrchError, match="waits for the merge turn: #7 holds it"):
+            orch.merge(c.ctx, c.pr, approved_by="jin")
+        assert c.tracker.merged_prs == []
+        assert queue_events(c) == before
+        return
+    orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == [c.pr]
+    own = queue_events(c)[len(before):]
+    base = git_command(c.history.origin, "rev-parse", "main")
+    assert [(row["n"], row["event"]) for row in own] == [(c.pr, "ready"), (c.pr, "turn")]
+    assert own[1]["members"] == [c.pr] and own[1]["base_sha"] == base and own[1]["result"] == "merged"
+    assert own[0]["head_sha"] == c.head
+    # Its entry never blocks a later run: no run carries its started_at.
+    store.start_run(8, branch="foragent/issue-8", worktree=store.worktree_path(8))
+    later = turn.seat(c.ctx, 8, "main")
+    turn.join(c.ctx, later, "b" * 40)
+    assert turn.holds_turn(store, later)
+
+
+def test_orch_merge_failure_records_failed_turn_and_withdraws(merge_case, monkeypatch):
+    c = merge_case
+    monkeypatch.setattr(c.tracker, "merge_pr", lambda *a, **kw: (_ for _ in ()).throw(TrackerError("refused")))
+    with pytest.raises(TrackerError, match="refused"):
+        orch.merge(c.ctx, c.pr, approved_by="jin")
+    events = [(row["event"], row.get("result")) for row in queue_events(c)]
+    assert events == [("ready", None), ("turn", "merged"), ("turn", "failed"), ("withdrawn", None)]
+
+
+def test_orch_merge_claims_the_turn_atomically_against_a_joining_run(merge_case, monkeypatch):
+    """A run joining while orch.merge checks the queue lands behind it, never between check and join."""
+    import threading
+    from foragent import run_merge_turn as turn
+
+    c = merge_case
+    store = c.ctx.store
+    store.start_run(6, branch="foragent/issue-6", worktree=store.worktree_path(6))
+    turn.join(c.ctx, turn.seat(c.ctx, 6, "main"), "a" * 40)
+    store.finish_run(6, outcome="merged")
+    store.start_run(7, branch="foragent/issue-7", worktree=store.worktree_path(7))
+    joiner = threading.Thread(target=turn.join, args=(c.ctx, turn.seat(c.ctx, 7, "main"), "b" * 40))
+    append = turn._append
+
+    def join_before_claim_appends(store, row):
+        if row["n"] == c.pr and row["event"] == "ready":
+            # Between the claim's check and its append, a run tries to join. A non-atomic claim
+            # lets it finish here; an atomic one keeps it blocked on the state lock.
+            joiner.start()
+            joiner.join(1)
+        append(store, row)
+
+    monkeypatch.setattr(turn, "_append", join_before_claim_appends)
+    orch.merge(c.ctx, c.pr, approved_by="jin")
+    joiner.join(5)
+    assert not joiner.is_alive()
+    ready = [row["n"] for row in queue_events(c) if row["event"] == "ready"]
+    assert ready == [6, c.pr, 7], "The run that joined during the claim must queue behind the human merge"
+
+
+def test_orch_merge_rechecks_the_base_after_waiting_for_the_merge_lock(merge_case, monkeypatch):
+    c = merge_case
+    lock = c.ctx.store.merge_lock
+    from contextlib import contextmanager
+
+    @contextmanager
+    def base_moves_while_waiting():
+        c.history.update({"other.txt": "Another merge landed while waiting for the lock"})
+        with lock():
+            yield
+
+    monkeypatch.setattr(c.ctx.store, "merge_lock", base_moves_while_waiting)
+    with pytest.raises(orch.OrchError, match="head or base changed"):
+        orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == []
+    assert c.tracker.list_comments(c.pr) == [], "Approval is recorded only for a fresh base"
+    assert [row["event"] for row in queue_events(c)] == ["ready", "withdrawn"]

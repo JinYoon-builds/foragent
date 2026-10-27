@@ -661,6 +661,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 return _hold_changed_head(n, ctx, link)
 
         wait_for_overlap(attempt)
+        failed_merge = None
         with _merge_lock(n, ctx):
             inputs = _final_merge_inputs(
                 n, ctx, git, pr, attempt.branch, attempt.target_branch,
@@ -694,7 +695,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                     if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
                         inputs.stop = lambda: _hold_changed_head(n, ctx, link)
                     else:
-                        raise
+                        failed_merge = exc
                 else:
                     ctx.store.record_merge(n, ctx.now())
                     if inputs.decision.kind == "merge":
@@ -721,6 +722,11 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                             _append(log, f"Batch PR finalization deferred to tick: {exc}")
                     _progress(n, ctx)
                     return "merged"
+        if failed_merge is not None:
+            # Re-enter at the FIFO tail for a later turn instead of ending the run (#712).
+            merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge)
+            queued_status = None
+            continue
         if inputs.stop is not None:
             return inputs.stop()
         if stopped := policy_hold(inputs.decision, inputs.batch_branch):
@@ -865,6 +871,7 @@ def _publish_reviewed_in_turn(
                                             deadline=ci_wait.deadline)
             if stopped := unchanged():
                 return stopped
+        failed_merge = None
         with _merge_lock(n, ctx):
             inputs = _final_merge_inputs(
                 n, ctx, git, pr.number, pr.head, pr.base, head, approval, started,
@@ -893,7 +900,7 @@ def _publish_reviewed_in_turn(
                     if ctx.tracker.pr_head_sha(pr.number) != head:
                         inputs.stop = lambda: _hold_changed_head(n, ctx, link)
                     else:
-                        raise
+                        failed_merge = exc
                 else:
                     ctx.store.record_merge(n, ctx.now())
                     if review_mode_for(inputs.paths, ctx.config) == "fast":
@@ -917,6 +924,11 @@ def _publish_reviewed_in_turn(
                                 raise
                             _append(log, f"Batch PR finalization deferred to tick: {exc}")
                     return "merged"
+        if failed_merge is not None:
+            # Re-enter at the FIFO tail for a later turn instead of ending the run (#712).
+            merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge)
+            queued_status = None
+            continue
         if inputs.stop is not None:
             return inputs.stop()
         if stopped := policy_hold(inputs.decision, inputs.batch_branch):

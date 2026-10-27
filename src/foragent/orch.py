@@ -15,6 +15,7 @@ import time
 import xml.etree.ElementTree as ET
 
 from foragent import capacity
+from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
@@ -491,23 +492,40 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
         broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
         raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
                         f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
+    # A human merge takes the target's FIFO merge turn too (#712). The merge lock is held from the
+    # turn claim to the merge, so every freshness check below runs after any lock wait.
     current = _open_pr(ctx, n)
-    ctx.git.fetch("origin", current.base)
-    if (current.base != checked.pr.base or current.head != checked.pr.head
-            or ctx.git.ref_sha(f"refs/remotes/origin/{current.base}") != checked.base
-            or ctx.tracker.pr_head_sha(n) != checked.head):
-        raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
-    ci = ctx.tracker.pr_checks(n)
-    if ci not in {"pass", "none"}:
-        raise OrchError(f"PR #{n} is not ready: CI {ci}")
-    RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
-        n, f"Approved by {approved_by} in the orchestrator ({at}). "
-           f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
-    subject = retitle_for_merge(
-        ctx, n, title=_merge_title(ctx, current), current_title=current.title, base=current.base,
-        body=lambda: current.body, note=print,
-    )
-    ctx.tracker.merge_pr(n, expected_head_sha=checked.head, **subject)
+    place = merge_turn.Seat(pr_issue_number(current.head) or n, f"orch-merge {at}", current.base)
+    with ctx.store.merge_lock():
+        if (holder := merge_turn.claim(ctx, place, checked.head)) is not None:
+            raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "
+                            "run again after it finishes")
+        try:
+            current = _open_pr(ctx, n)
+            ctx.git.fetch("origin", current.base)
+            if (current.base != checked.pr.base or current.head != checked.pr.head
+                    or ctx.git.ref_sha(f"refs/remotes/origin/{current.base}") != checked.base
+                    or ctx.tracker.pr_head_sha(n) != checked.head):
+                raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
+            ci = ctx.tracker.pr_checks(n)
+            if ci not in {"pass", "none"}:
+                raise OrchError(f"PR #{n} is not ready: CI {ci}")
+            RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
+                n, f"Approved by {approved_by} in the orchestrator ({at}). "
+                   f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
+            subject = retitle_for_merge(
+                ctx, n, title=_merge_title(ctx, current), current_title=current.title, base=current.base,
+                body=lambda: current.body, note=print,
+            )
+            merge_turn.record_turn(ctx, place, checked.base, "merged")
+            try:
+                ctx.tracker.merge_pr(n, expected_head_sha=checked.head, **subject)
+            except TrackerError:
+                merge_turn.record_turn(ctx, place, checked.base, "failed")
+                raise
+        except BaseException:
+            merge_turn.withdraw(ctx, place)
+            raise
     summary = (f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; "
                f"tests pass{_base_note(report)}, no conflicts, CI {ci}")
     _event(ctx, None, "merge", summary)

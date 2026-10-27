@@ -144,3 +144,34 @@ def await_turn(n: int, ctx: RunContext, place: Seat, head_sha: str) -> tuple[boo
         _progress(n, ctx)
         ctx.sleep(min(30, remaining))
     return waited, None
+
+
+def rejoin_after_failed_merge(n: int, ctx: RunContext, place: Seat, error: Exception) -> None:
+    """A refused merge of an unchanged head: withdraw now and rejoin at the tail when ready again.
+
+    The run is not ended; it takes a later turn (and appends another turn record).
+    Only the run's time budget bounds the retries; a short pause spaces them out.
+    """
+    from foragent import runner
+    from foragent.run_checks import _append as append_log
+
+    withdraw(ctx, place)
+    append_log(ctx.store.log_path(n), f"Merge failed with the head unchanged; rejoining the merge queue: {error}")
+    _progress(n, ctx)
+    ctx.sleep(min(30, max(1, runner._remaining(n, ctx))))
+
+
+def claim(ctx: RunContext, place: Seat, head_sha: str) -> int | None:
+    """Take ``place.target``'s turn for a merge made outside a run, atomically.
+
+    Under one state lock: return the issue of a live entry that holds the turn,
+    or append this ready entry, so no run can join between the check and the join.
+    Such an entry has no run record, so it is never live afterwards; the caller
+    holds the merge lock for the whole merge, which keeps every later entry waiting.
+    """
+    with ctx.store._state_lock():
+        for key in _waiting(_rows(ctx.store), place.target):
+            if _live(ctx.store, key):
+                return key[0]
+        _append(ctx.store, _row(ctx, place, "ready", head_sha=head_sha))
+    return None
