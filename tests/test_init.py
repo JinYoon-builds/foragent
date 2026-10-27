@@ -977,11 +977,23 @@ def test_reinit_writes_missing_default_agent_from_its_roles_entry(setup):
     assert roles.role_drift(setup.root, load_config(setup.root)) == []
 
 
+def recording_commit(commits):
+    """A commit_paths stand-in: record the paths and commit the index with plumbing (real commits are guarded)."""
+    def commit(self, paths, title):
+        commits.append(sorted(paths))
+        tree = git_command(self.root, "write-tree")
+        head = git_command(self.root, "rev-parse", "HEAD")
+        new = git_command(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-p", head,
+                          "-m", title)
+        git_command(self.root, "update-ref", "HEAD", new)
+    return commit
+
+
 def test_role_add_uses_an_installed_skill_copy_and_records_why_without_github(setup, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     setup.init()
     commits = []
-    monkeypatch.setattr(GitRepo, "commit_paths", lambda self, paths, title: commits.append(paths))
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
     monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: None)
     installed = setup.root / ".claude/skills/house-style"
     installed.mkdir(parents=True)
@@ -991,7 +1003,7 @@ def test_role_add_uses_an_installed_skill_copy_and_records_why_without_github(se
                    why="Keep the house style")
     entry = yaml.safe_load((setup.root / PATHS[0]).read_text())["roles"]["style"]
     assert entry["skills"] == ["house-style"]
-    assert commits == [[".foragent.yml", ".claude/agents/fa-style.md", ".claude/agent-memory/fa-style/MEMORY.md"]]
+    assert commits == [[".claude/agent-memory/fa-style/MEMORY.md", ".claude/agents/fa-style.md", ".foragent.yml"]]
     assert entry["signals"] == [{"paths": [], "kinds": ["hot_overlap_files"]}]
     events = list((tmp_path / "home").rglob("orch-events.jsonl"))
     assert len(events) == 1
@@ -1005,7 +1017,7 @@ def test_role_set_keeps_an_empty_body_and_records_why_when_nothing_changes(setup
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     setup.init()
     commits = []
-    monkeypatch.setattr(GitRepo, "commit_paths", lambda self, paths, title: commits.append(list(paths)))
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
     monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: None)
     monkeypatch.setattr(GitRepo, "remote_slug", lambda self: "owner/repo")
     agent = setup.root / ".claude/agents/fa-architect.md"
@@ -1013,7 +1025,7 @@ def test_role_set_keeps_an_empty_body_and_records_why_when_nothing_changes(setup
     roles.set_role(setup.root, "architect", scope=["src/**"], why="Own the source tree")
     assert agent.read_text().endswith("\n---\n") and "description: Foragent architect role" in agent.read_text(), (
         "Regenerate the frontmatter; an empty body stays empty")
-    assert commits == [[".foragent.yml", ".claude/agents/fa-architect.md"]]
+    assert commits == [[".claude/agents/fa-architect.md", ".foragent.yml"]]
     roles.set_role(setup.root, "architect", scope=["src/**"], why="Same settings, new evidence")
     assert len(commits) == 1, "Nothing changed, so nothing is committed"
     events, = (tmp_path / "home").rglob("orch-events.jsonl")
@@ -1026,7 +1038,7 @@ def test_role_set_recreates_missing_memory_and_doctor_reports_it(setup, monkeypa
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     setup.init()
     commits = []
-    monkeypatch.setattr(GitRepo, "commit_paths", lambda self, paths, title: commits.append(list(paths)))
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
     monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: None)
     monkeypatch.setattr(GitRepo, "remote_slug", lambda self: "owner/repo")
     memory = setup.root / ".claude/agent-memory/fa-docs/MEMORY.md"
@@ -1036,8 +1048,76 @@ def test_role_set_recreates_missing_memory_and_doctor_reports_it(setup, monkeypa
     assert len(drift) == 1 and "docs" in drift[0] and "memory" in drift[0]
     roles.set_role(setup.root, "docs", why="Repair the docs memory")
     assert memory.read_text() == "# fa-docs memory\n\n## Proposals\n\n## Lessons\n"
-    assert commits and commits[-1][-1] == ".claude/agent-memory/fa-docs/MEMORY.md"
+    # The recreated memory equals HEAD's, so only the regenerated agent frontmatter is committed.
+    assert commits == [[".claude/agents/fa-docs.md"]]
     assert roles.role_drift(setup.root, load_config(setup.root)) == []
     memory.write_text("")
     roles.set_role(setup.root, "docs", why="Again")
-    assert memory.read_text() == "" and len(commits) == 1, "An existing memory, even empty, is kept"
+    assert memory.read_text() == "", "An existing memory, even empty, is kept"
+    assert commits[1:] == [[".claude/agent-memory/fa-docs/MEMORY.md"]], "The hand edit is committed with the role"
+
+
+@pytest.mark.parametrize("command", ["add", "set", "remove"])
+def test_role_commands_commit_files_deleted_by_hand_before_them(tmp_path, monkeypatch, command):
+    _role_command_after_hand_deletion(tmp_path, monkeypatch, command, staged=False)
+
+
+@pytest.mark.parametrize("command", ["add", "set", "remove"])
+def test_role_commands_commit_deletions_already_staged_with_git_rm(tmp_path, monkeypatch, command):
+    """A `git rm` deletion is gone from both the worktree and the index; only HEAD still has the path."""
+    _role_command_after_hand_deletion(tmp_path, monkeypatch, command, staged=True)
+
+
+def _role_command_after_hand_deletion(tmp_path, monkeypatch, command, *, staged):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    root = tmp_path / "project"
+    git_command(tmp_path, "init", "-q", "-b", "main", str(root))
+    git_command(root, "remote", "add", "origin", "git@github.com:owner/repo.git")
+    owned = [".foragent.yml", ".claude/agents/fa-security.md", ".claude/agent-memory/fa-security"]
+    files = {".foragent.yml": "review: fast  # keep\n",
+             ".claude/agent-memory/fa-security/old.md": "Stale lesson\n"}
+    if command != "add":
+        entry = {"agent": "fa-security", "skills": [], "memory": ".claude/agent-memory/fa-security/",
+                 "signals": []}
+        files[".foragent.yml"] += yaml.safe_dump({"roles": {"security": entry}})
+        files[".claude/agents/fa-security.md"] = "---\nname: fa-security\nmemory: project\nskills: []\n---\nBody\n"
+        files[".claude/agent-memory/fa-security/MEMORY.md"] = "# fa-security memory\n"
+    for path, text in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(text)
+    git_command(root, "add", "-A")
+    base = git_command(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+                       git_command(root, "write-tree"), "-m", "base")
+    git_command(root, "update-ref", "refs/heads/main", base)
+    commits = []
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
+    deleted = [".claude/agent-memory/fa-security/old.md"]  # deleted by hand before the command
+    if command == "set":
+        deleted.append(".claude/agent-memory/fa-security/MEMORY.md")
+    if command == "remove":
+        deleted += [".claude/agent-memory/fa-security", ".claude/agents/fa-security.md"] if staged else [
+            ".claude/agent-memory/fa-security/MEMORY.md"]
+    for path in deleted:
+        if staged:
+            git_command(root, "rm", "-rq", "--", path)
+        elif (root / path).exists():
+            (root / path).unlink()
+    {"add": lambda: roles.add_role(root, "security", skills=[], scope=[], signals=[]),
+     "set": lambda: roles.set_role(root, "security", scope=["src/**"]),
+     "remove": lambda: roles.remove_role(root, "security")}[command]()
+    # The index now holds the owned paths' whole state; the one commit carries exactly what differs from HEAD.
+    assert git_command(root, "diff", "--name-only", "--", *owned) == "", "Nothing owned is left unstaged"
+    assert git_command(root, "ls-files", "--others", "--", *owned) == "", "Nothing owned is left untracked"
+    staged = sorted(git_command(root, "diff", "--name-only", "HEAD~1", "HEAD", "--", *owned).splitlines())
+    assert git_command(root, "status", "--porcelain", "--", *owned) == "", "Nothing owned is left uncommitted"
+    assert commits == [staged], "One commit with every owned change"
+    assert ".claude/agent-memory/fa-security/old.md" in staged, "Commit the deletion made by hand"
+    memory = ".claude/agent-memory/fa-security/MEMORY.md"
+    # set recreates MEMORY.md with HEAD's bytes, so only add and remove change it.
+    assert (memory in staged) is (command != "set")
+    assert git_command(root, "ls-files", "--", memory) == ("" if command == "remove" else memory)
+    if command == "remove":
+        assert ".claude/agents/fa-security.md" in staged
+        assert git_command(root, "ls-tree", "-r", "--name-only", "HEAD", "--", *owned[1:]) == "", (
+            "Removal leaves no agent or memory file in HEAD")
+    assert git_command(root, "show", "HEAD:.foragent.yml").startswith("review: fast  # keep\n")

@@ -303,21 +303,30 @@ class _Edit:
             self.manager.install(identity, self.root)
         self.path.write_bytes(edited.encode("utf-8"))
 
-    def snapshot(self, paths: list[str]) -> dict[str, bytes | None]:
-        """Bytes of each path before the command writes, None when absent."""
-        return {path: (target.read_bytes() if (target := repo_path(self.root, path)).is_file() else None)
-                for path in paths}
+    def publish(self, owned: list[str], title: str) -> list[str]:
+        """Commit the whole current state of the paths a role owns, against HEAD.
 
-    def publish(self, before: dict[str, bytes | None], title: str) -> list[str]:
-        """Commit the paths this command changed; changing nothing is no error.
-
-        An unchanged setting still gets its orch event, so a commit never gates the event.
+        ``owned`` is the role's settings file, agent file and memory directory (plus
+        .gitignore for new skill copies). Edits and deletions made by hand before the
+        command are staged too (``git add -A``), not only the files this command wrote.
+        Nothing to commit is no error: the orch event never depends on a commit.
         """
-        paths = [path for path, old in before.items() if self.snapshot([path])[path] != old]
-        if paths:
-            self.git.ensure_tracked([path for path in paths if repo_path(self.root, path).exists()])
-            self.git.commit_paths(paths, title)
-        return paths
+        def listed(args: list[str]) -> list[str]:
+            return [path for path in self.git._call([*args, "-z", "--", *owned]).split("\0") if path]
+
+        def under(files: list[str], path: str) -> bool:
+            return any(file == path or file.startswith(path.rstrip("/") + "/") for file in files)
+
+        # git add only takes paths the worktree or index still has; a deletion already
+        # staged (git rm) is known only to HEAD and is picked up by the diff below.
+        index = listed(["ls-files", "--cached"])
+        stageable = [path for path in owned if repo_path(self.root, path).exists() or under(index, path)]
+        if stageable:
+            self.git._call(["add", "-A", "-f", "--", *stageable])
+        changed = listed(["diff", "--cached", "--name-only", "--no-renames", "HEAD"])
+        if changed:
+            self.git.commit_paths(changed, title)
+        return changed
 
     def store(self):
         """The orchestrator journal's store; a repository without a GitHub origin uses its path as the key."""
@@ -356,14 +365,13 @@ def add_role(root: Path, name: str, *, skills: list[str], scope: list[str], sign
     if idle_days is not None:
         entry["idle_days"] = idle_days
     memory = _memory_file(edit.root, name, entry["memory"])
-    published = [".foragent.yml", agent, memory, *([".gitignore"] if edit.to_install else [])]
-    before = edit.snapshot(published)
+    owned = [".foragent.yml", agent, memory.removesuffix("/MEMORY.md"), *([".gitignore"] if edit.to_install else [])]
     edit.save({**edit.roles, name: entry})
     destination = repo_path(edit.root, agent)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(_agent_text(name, installed), encoding="utf-8")
     _ensure_memory(edit.root, name, entry)
-    edit.publish(before, f"Foragent role {name}")
+    edit.publish(owned, f"Foragent role {name}")
     edit.event(store, "role-added", name, why)
     return entry
 
@@ -399,15 +407,14 @@ def set_role(root: Path, name: str, *, skills: list[str] | None = None, scope: l
         # Only a missing agent gets the generated body; an existing one, even empty, keeps its own.
         body = _agent_text(name, header["skills"]).split("---\n", 2)[2]
     memory = _memory_file(edit.root, name, entry.get("memory") or memory_dir(name))
-    published = [".foragent.yml", agent, memory, *([".gitignore"] if edit.to_install else [])]
-    before = edit.snapshot(published)
+    owned = [".foragent.yml", agent, memory.removesuffix("/MEMORY.md"), *([".gitignore"] if edit.to_install else [])]
     edit.save({**edit.roles, name: entry})
     _ensure_memory(edit.root, name, entry)
     destination = repo_path(edit.root, agent)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text("---\n" + yaml.safe_dump(header, sort_keys=False, allow_unicode=True) + "---\n" + body,
                            encoding="utf-8")
-    edit.publish(before, f"Foragent role {name}")
+    edit.publish(owned, f"Foragent role {name}")
     edit.event(store, "role-set", name, why)
     return entry
 
@@ -424,11 +431,9 @@ def remove_role(root: Path, name: str, *, git: GitRepo | None = None) -> None:
     memory = _memory_file(edit.root, name, entry.get("memory") or memory_dir(name)).removesuffix("/MEMORY.md")
     memory_path = repo_path(edit.root, memory)
     edit.check_branch("remove")
-    tracked = [path for path in edit.git._call(["ls-files", "--cached", "-z", "--", agent, memory]).split("\0") if path]
     roles = {key: value for key, value in edit.roles.items() if key != name}
-    before = edit.snapshot([".foragent.yml", *tracked])
     edit.save(roles)
     repo_path(edit.root, agent).unlink(missing_ok=True)
     if memory_path.is_dir():
         shutil.rmtree(memory_path)
-    edit.publish(before, f"Foragent role {name} removed")
+    edit.publish([".foragent.yml", agent, memory], f"Foragent role {name} removed")
