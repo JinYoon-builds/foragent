@@ -178,6 +178,7 @@
 - #421 2차 리뷰: review 이벤트 중 `source: orchestrator`는 파일 없이 다음 round 번호를 쓰므로 파일 짝짓기에서 뺀다. SPEC-CONFLICT 기록은 리뷰어 판정을 잃었으므로 runner `_journal_review`에 `review_verdict` 필드를 더했다(기존 시험은 verdict만 봄). 옛 SPEC-CONFLICT는 원문 판정.
 - [#449 overlap facts](project_449_overlap_facts.md) — file_conflicts in orch_facts_runs, 30-line human cap, zsh array for test lists
 - #421 3차: 지적 추출은 `run_review.code_review_findings()`(parse_code_review에서 꺼낸 공용 함수, JSON 객체를 그대로 반환)를 쓴다. 판정은 라운드를 셀지만 정하고 PASS의 path:line 지적도 센다. 형식 판별을 facts에서 다시 구현하지 않는다.
+- [#650 wake grace](project_650_wake_grace.md) — wake-grace.json beside sleep baseline, per-run activity ends it, sleep_wake line
 - [#226 review NOTE lines](project_226_review_notes.md) — review_notes.py, break-it rule, SKILL.md 150-line pitfalls
 - #445: facts 실행 행의 `comparison`은 `Run.comparison`(#442가 `update_run(comparison=...)`로 저장)을 `_row()`에서 그대로 복사, 없으면 null. zsh에서 `$files` 목록은 `${=files}`로 나눠야 pytest에 넘어간다. facts 관련 시험 287개 중 74개는 변경 전에도 같은 ID로 실패(다른 이슈 범위).
 - #421 main 동기화: main(#226)이 `review_notes.strip()`으로 NOTE 줄을 지적에서 뺀다. 공용 `code_review_findings()` 첫 줄에서 strip하고, facts의 class 줄 탐색도 `note_text()`로 NOTE를 건너뛴다. `NOTE:src/a.py:3 — x`(콜론 뒤 공백 없음)은 FINDING_LINE에 걸리므로 시험에 쓴다.

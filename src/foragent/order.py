@@ -14,6 +14,7 @@ from foragent import board, design
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
+from foragent.i18n import text
 from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, latest_flag
 from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
@@ -523,11 +524,15 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
         return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n"
 
+    # An order with no sub-issues (edits or approvals only) is finished once it
+    # applies: publish closes its record below, so it never gets a Backlog card.
+    childless = not plan["issues"] and not mapping
     if parent is None:
         parent = tracker.create_issue(plan["title"], parent_body(), [])
     else:
         tracker.update_issue(parent, title=plan["title"], body=parent_body())
-    board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
+    if not childless:
+        board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
     for item in plan["issues"]:
         body = issue_body(item, repo, config.base_branch, config.acceptance_dir) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
@@ -587,6 +592,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
     if approved_numbers:
         kick_tick(root)
+    if childless and (parent not in by_number or by_number[parent].state == "open"):
+        tracker.close_issue(parent, text("order_record_closed", config.language, count=0))
     for item, row in zip(plan["issues"], rows):
         row["number"] = mapping[item["key"]]
         row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
