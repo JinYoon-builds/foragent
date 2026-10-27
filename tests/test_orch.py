@@ -582,9 +582,18 @@ def test_cli_routes_all_verbs_to_injected_context(review_case, monkeypatch, caps
 
 @pytest.mark.parametrize("entry", ["review-only", "resolve"])
 def test_review_entries_hold_unlisted_harness_change_before_measuring_head(review_case, monkeypatch, entry):
-    c = review_case
+    assert_review_harness_hold(review_case, monkeypatch, entry, "tests/sub/conftest.py")
+
+
+@pytest.mark.parametrize("entry", ["review-only", "resolve"])
+def test_review_hold_sees_head_paths_the_runner_index_omits(review_case, monkeypatch, entry):
+    """The review worktree's staging drops .foragent/; the measured head still has it."""
+    assert_review_harness_hold(review_case, monkeypatch, entry, ".foragent/conftest.py")
+
+
+def assert_review_harness_hold(c, monkeypatch, entry, path):
     base = git_command(c.history.origin, "rev-parse", "refs/heads/main")
-    c.history.update({"tests/sub/conftest.py": "# changed harness\n"})
+    c.history.update({path: "# changed harness\n"})
     c.head = c.history.tip
     c.tracker.set_pr_head_sha(c.pr, c.head)
     git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", c.head)
@@ -601,5 +610,5 @@ def test_review_entries_hold_unlisted_harness_change_before_measuring_head(revie
     assert c.tracker.get_issue(c.pr).state == "open"
     assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
     assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
-    assert any("tests/sub/conftest.py" in comment.body for comment in c.tracker.list_comments(1)
+    assert any(path in comment.body for comment in c.tracker.list_comments(1)
                if "reason=test-harness-changed" in comment.body)

@@ -6,7 +6,9 @@ from collections.abc import Callable
 import math
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
+import tempfile
 import tomllib
 from typing import TYPE_CHECKING
 
@@ -58,10 +60,11 @@ def _canonical(value: object) -> object:
     return (type(value).__name__, value)
 
 
-def _git(git: GitRepo, args: list[str]) -> subprocess.CompletedProcess[bytes]:
+def _git(git: GitRepo, args: list[str], index: Path | None = None) -> subprocess.CompletedProcess[bytes]:
     """Run Git without decoding, so paths and file bytes are never replaced."""
+    env = {**os.environ, "GIT_INDEX_FILE": str(index)} if index is not None else None
     try:
-        return subprocess.run(["git", *args], cwd=git.root, capture_output=True, timeout=120)
+        return subprocess.run(["git", *args], cwd=git.root, capture_output=True, timeout=120, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GitError(str(exc)) from exc
 
@@ -81,31 +84,56 @@ def _pytest_tables(data: bytes | None) -> object:
     return tables
 
 
-def _blob(git: GitRepo, spec: bytes) -> bytes | None:
+def _blob(git: GitRepo, spec: bytes, index: Path | None = None) -> bytes | None:
     """Exact blob bytes, or None when the path is absent on that side."""
-    if _git(git, ["cat-file", "-e", os.fsdecode(spec)]).returncode != 0:
+    if _git(git, ["cat-file", "-e", os.fsdecode(spec)], index).returncode != 0:
         return None
-    result = _git(git, ["cat-file", "blob", os.fsdecode(spec)])
+    result = _git(git, ["cat-file", "blob", os.fsdecode(spec)], index)
     if result.returncode != 0:
         raise GitError(result.stderr.decode("utf-8", "replace") or f"cannot read {spec!r}")
     return result.stdout
 
 
-def changed_harness_paths(git: GitRepo, target_ref: str, listed: list[str]) -> list[str]:
-    """Harness paths the staged PR contents change since its merge base with the target.
+def _required(result: subprocess.CompletedProcess[bytes], what: str) -> bytes:
+    if result.returncode != 0:
+        raise GitError(result.stderr.decode("utf-8", "replace") or f"git {what} failed")
+    return result.stdout
 
-    Renames count as a deletion plus an addition, so both paths are reported.
+
+def changed_harness_paths(git: GitRepo, target_ref: str, listed: list[str]) -> list[str]:
+    """Harness paths the measured contents change since the merge base with the target.
+
+    The measured contents are HEAD plus the worktree, read into a private index.
+    The runner's own index omits paths it never publishes (.foragent/, local
+    skills, its review-scope file), yet checks still load them from disk.
+    Ignored untracked files stay out, as in Git. Renames count as a deletion
+    plus an addition, so both paths are reported.
     """
     base = git._own_base(target_ref)
-    diff = _git(git, ["diff", "--cached", "--name-only", "--no-renames", "-z", base])
-    if diff.returncode != 0:
-        raise GitError(diff.stderr.decode("utf-8", "replace") or "git diff failed")
+    with tempfile.TemporaryDirectory(prefix="harness-index-") as directory:
+        index = Path(directory) / "index"
+        # Start from a copy of the real index so unchanged files keep their stat
+        # data; a single-tree merge then resets its entries to HEAD.
+        current = Path(os.fsdecode(_required(_git(git, ["rev-parse", "--git-path", "index"]), "rev-parse").strip()))
+        if not current.is_absolute():
+            current = git.root / current
+        if current.is_file():
+            shutil.copyfile(current, index)
+        if _git(git, ["read-tree", "-m", "HEAD"], index).returncode != 0:
+            index.unlink(missing_ok=True)  # e.g. unmerged entries during a merge
+            _required(_git(git, ["read-tree", "HEAD"], index), "read-tree")
+        _required(_git(git, ["add", "-A", "--", "."], index), "add")
+        return _harness_paths(git, base, listed, index)
+
+
+def _harness_paths(git: GitRepo, base: str, listed: list[str], index: Path) -> list[str]:
+    diff = _required(_git(git, ["diff", "--cached", "--name-only", "--no-renames", "-z", base], index), "diff")
     found = []
-    for raw in filter(None, diff.stdout.split(b"\0")):
+    for raw in filter(None, diff.split(b"\0")):
         name = PurePosixPath(os.fsdecode(raw)).name
         if name == "pyproject.toml":
             before = _pytest_tables(_blob(git, base.encode() + b":" + raw))
-            after = _pytest_tables(_blob(git, b":" + raw))
+            after = _pytest_tables(_blob(git, b":" + raw, index))
             if before is not _UNPARSABLE and after is not _UNPARSABLE and before == after:
                 continue
         elif name not in HARNESS_NAMES:

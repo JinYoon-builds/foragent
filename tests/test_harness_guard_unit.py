@@ -203,3 +203,52 @@ def test_harness_created_by_local_only_collection_is_guarded_before_selection(ru
         c.store.finish_run(1, outcome="held")
         c.tracker.remove_labels(1, ["running"])
     assert (root / "conftest.py").exists() and not (root / "measured").exists()
+
+
+@pytest.mark.parametrize("restore", [True, False], ids=["reverts-target-change", "inherits-target-change"])
+def test_guard_compares_with_the_current_target_not_the_pinned_start(repo, monkeypatch, restore):
+    """The branch merged an advanced target; start_ref still names the old base."""
+    from types import SimpleNamespace
+    from foragent import run_publish
+    from foragent.run_attempt import ExecutorStopped
+
+    start = git_command(repo, "rev-parse", "HEAD").strip()
+    (repo / "tests/conftest.py").write_text("# target\n")
+    target = commit(repo, "refs/remotes/origin/main", parent=start)
+    if restore:
+        (repo / "tests/conftest.py").write_text("# base\n")
+    (repo / "feature.txt").write_text("done\n")
+    git_command(repo, "add", "-A")
+    tree = git_command(repo, "write-tree").strip()
+    merged = git_command(repo, "commit-tree", tree, "-p", start, "-p", target, "-m", "merge target").strip()
+    git_command(repo, "update-ref", "refs/heads/main", merged)
+
+    held = []
+    monkeypatch.setattr(run_publish, "_append", lambda *args: None)
+    monkeypatch.setattr(run_publish, "_push_branch", lambda attempt: None)
+    monkeypatch.setattr(run_publish, "_open_or_update_pr", lambda *args: 7)
+    monkeypatch.setattr(run_publish, "_render_pr_body", lambda attempt: "")
+    monkeypatch.setattr(run_publish, "_hold_harness_change", lambda n, ctx, paths, link: held.append(paths) or "held")
+    ctx = SimpleNamespace(repo="owner/repo", tracker=SimpleNamespace(get_issue=lambda n: SimpleNamespace(title="T")))
+    attempt = SimpleNamespace(n=1, ctx=ctx, git=GitRepo(repo), start_ref=start, target_branch="main",
+                              parsed=SimpleNamespace(files=[]), log=None)
+    if restore:
+        with pytest.raises(ExecutorStopped):
+            run_publish._guard_harness(attempt)
+        assert held == [["tests/conftest.py"]]
+    else:
+        run_publish._guard_harness(attempt)
+        assert held == []
+
+
+def test_paths_the_runner_never_stages_are_still_measured(repo):
+    """stage_changes drops .foragent/ from the index; checks still load it from disk."""
+    (repo / ".foragent").mkdir()
+    (repo / ".foragent/conftest.py").write_text("# generated\n")
+    (repo / "feature.txt").write_text("done\n")
+    git = GitRepo(repo)
+    git.stage_changes()
+    assert ".foragent/conftest.py" not in git.changed_paths("target")
+    assert changed_harness_paths(git, "target", []) == [".foragent/conftest.py"]
+    # The runner's own index is left exactly as it was.
+    assert ".foragent/conftest.py" not in git.changed_paths("target")

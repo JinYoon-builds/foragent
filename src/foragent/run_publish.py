@@ -56,7 +56,9 @@ def _hold_harness_change(n: int, ctx: RunContext, paths: list[str], link: str) -
 def _guard_harness(attempt: Implementation) -> None:
     """Publish an unlisted harness change for a human before any head measurement."""
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
-    paths = changed_harness_paths(git, attempt.start_ref, attempt.parsed.files)
+    # The PR's own changes are measured from its current target, not the
+    # start_ref pinned for policy and replay: a merged-in target moves the base.
+    paths = changed_harness_paths(git, f"origin/{attempt.target_branch}", attempt.parsed.files)
     if not paths:
         return
     _append(attempt.log, hold_details(paths))
