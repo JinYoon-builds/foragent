@@ -11,7 +11,8 @@ from typing import Any
 
 from foragent import orch_inbox
 from foragent.config import Config
-from foragent.labels import BLOCKED, NEEDS_HUMAN, WAITING_PERSON, issue_lane
+from foragent.labels import issue_lane
+from foragent.status import issue_state
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
 from foragent.watch_sections import orch_panel, progress
@@ -210,8 +211,8 @@ def collect(
     worker_states = {}
     for run in status["active_runs"]:
         labels = issues[run["number"]].labels if run["number"] in issues else frozenset()
-        worker_states[run["number"]] = ("waiting-human" if {NEEDS_HUMAN, WAITING_PERSON} & labels
-                                        else "blocked" if BLOCKED in labels else "working")
+        # The same mapping as status.collect_lanes, for a running worker.
+        worker_states[run["number"]] = issue_state(labels, True)
     phases, say = journal_facts(store)
     shown = {run["number"] for run in status["active_runs"]} | {
         row["issue"] for row in lanes.values() if row.get("issue") is not None}

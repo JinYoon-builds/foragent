@@ -288,3 +288,61 @@ def test_local_tests_need_checking_and_any_baseline_finished_and_stay_earned():
     review = phase("reviewing", at(30))
     for current in ("test-slot-wait", "needs-human", None):
         assert lanes.finished_acorns(current, [code, checking, review], start.isoformat()) == {0, 1, 2}
+
+
+def test_a_waiting_person_issue_without_a_run_waits_for_a_person_everywhere(tmp_path):
+    """Defect class: state markers read only for some of the issues the view shows."""
+    from foragent.status import issue_state
+    from foragent.tracker import FakeTracker
+    from test_watch import snapshot as collected
+
+    tracker, store = FakeTracker(), StateStore(tmp_path, now=lambda: NOW)
+    config = Config(language="en", view_glyphs="ascii", lanes={"api": {"title": "Server"}, "web": {"title": "Web"}})
+    tracker.add_issue(4, "Parked for a person", labels=["approved", "ready", "waiting-person", "lane:api"])
+    tracker.add_issue(5, "Running then parked", labels=["approved", "running", "waiting-person", "lane:web"])
+    store.start_run(5, branch="issue-5", worktree="unused", lane="web")
+    result = collected(tracker, store, config)
+    frame = watch.render_frame(result, config, tmp_path).splitlines()
+    for number in (4, 5):
+        row = next(line for line in frame if f"#{number}" in line)
+        assert row.startswith("[!]") and "waiting for a person" in row, frame
+    # The header and gate status count both as waiting, none as queued.
+    assert result.status["summary"]["waiting_human"] == 2 and result.status["summary"]["queued"] == 0
+    assert frame[0].startswith("today ✓0 · working 0 · waiting 2 · queued 0"), frame[0]
+    # One mapping decides every row, in collect_lanes order.
+    assert [issue_state(labels, active) for labels, active in (
+        ({"waiting-person"}, False), ({"needs-human", "blocked"}, True), ({"blocked"}, True),
+        ({"running"}, False), ({"approved"}, False), (set(), True), (set(), False))] == [
+        "waiting-human", "waiting-human", "blocked", "working", "queued", "working", None]
+
+
+@pytest.mark.parametrize("columns,title,elapsed", [(100, True, True), (99, False, True), (60, False, True),
+                                                   (59, False, False)])
+def test_the_live_terminal_uses_its_own_width_for_the_column_rules(tmp_path, monkeypatch, columns, title, elapsed):
+    """Defect class: the live terminal rendering at a different width than the terminal has."""
+    import curses
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    snapshot = one_lane(phase="implementing", lane="api")
+    snapshot.status["lanes"]["x"]["title"] = "TITLE_COLUMN"
+    config = Config(language="en", view_glyphs="ascii", lanes={"x": {}})
+    screen = Mock()
+    screen.getmaxyx.return_value = (24, columns)
+    screen.getch.return_value = ord("q")
+    monkeypatch.setattr(watch.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(watch.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(watch, "collect", lambda *args: snapshot)
+    monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
+    monkeypatch.setattr(curses, "has_colors", lambda: False)
+    monkeypatch.setattr(curses, "curs_set", lambda *args: None)
+    monkeypatch.setattr(curses, "wrapper", lambda terminal, *args: terminal(screen, *args))
+    watch.run(lambda: {}, Mock(), StateStore(tmp_path), config, tmp_path, now=lambda: NOW)
+    painted: dict[int, str] = {}
+    for call in screen.addstr.call_args_list:
+        y, x, value = call.args[:3]
+        painted[y] = painted.get(y, "") + value
+    row = next(line for line in painted.values() if "#7" in line)
+    assert ("TITLE_COLUMN" in row) == title and ("12m" in row) == elapsed, row
+    assert row.rstrip().endswith("....."), row
+    assert all(watch._cells(line) <= columns for line in painted.values())
