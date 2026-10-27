@@ -121,6 +121,12 @@ Finish with one sentence saying what you changed.
 """
 
 
+def _files(directory: Path) -> dict[str, bytes]:
+    """Every file under the memory directory, read directly: .gitignore cannot hide a change."""
+    return {path.relative_to(directory).as_posix(): path.read_bytes()
+            for path in sorted(directory.rglob("*")) if path.is_file()} if directory.is_dir() else {}
+
+
 def _changed_lines(before: str, after: str) -> int:
     return sum(line[:2] in {"+ ", "- "} for line in difflib.ndiff(before.splitlines(), after.splitlines()))
 
@@ -211,6 +217,8 @@ def run_dream(lane: str, ctx: RunContext) -> int:
         memory = memory_path(config, lane)
         memory_file = worktree / memory
         before = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
+        memory_dir = worktree / Path(memory).parent
+        before_files = _files(memory_dir)
         lane_settings = lane_config(config, lane)
         tier = config.tiers["s"]
         options: dict[str, Any] = {}
@@ -253,9 +261,8 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             with log.open("a", encoding="utf-8") as stream:
                 stream.write(f"foragent: media {publish_media(proposal, target, bundle.get(target))}\n")
         directory = str(Path(memory).parent)
-        status = git._call(["status", "--porcelain", "--untracked-files=all", "--", directory])
         count, pr = 0, None
-        if status.strip():
+        if _files(memory_dir) != before_files:  # commit_paths stages with `git add -f`, ignored files too.
             after = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
             count = _changed_lines(before, after)
             git.commit_paths([directory], f"Lane {lane} memory: {ctx.now().astimezone().date().isoformat()}")

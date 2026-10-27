@@ -29,6 +29,9 @@ def add(commands) -> None:
     run_dream = actions.add_parser("run-dream", help="Run one lane's memory dream")
     run_dream.add_argument("lane")
     run_dream.add_argument("--repo-root", type=cli.Path, required=True)
+    from foragent.commands._orch_architect import add_gate
+
+    add_gate(actions)
     done = actions.add_parser("check-done", help="Check Done when for a native Stop hook")
     done.add_argument("--snapshot", type=cli.Path, required=True)
     done.add_argument("--worktree", type=cli.Path, required=True)
@@ -168,6 +171,8 @@ def _tick(args, root, git, config, repo, tracker, store) -> None:
 
 
 def run(args) -> int:
+    if handler := getattr(args, "handler", None):
+        return handler(args)
     cli = facade()
     if args.action == "check-done":
         return cli.check_done(args.snapshot.resolve(), args.worktree.resolve(), args.acceptance_dir)

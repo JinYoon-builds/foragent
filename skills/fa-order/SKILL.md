@@ -148,6 +148,24 @@ skill in the pack). Then refresh the catalog and apply confirmed style choices.
 If none fits or discovery is unavailable, state the reason and settle an explicit
 no-match or deferred choice with the person; do not invent candidates or hand them commands.
 
+### Roles: lightest fix first
+When someone asks for a new standing role (for example "a security owner"), first look
+for a cheaper fit and propose it instead. Try these in order and stop at the first that fits:
+1. A line in the lane memory: edit `.claude/agent-memory/fa-<lane>/MEMORY.md` of the lane
+   that owns the area directly. The orchestrator commits it in its next batched commit.
+2. A skill attached to the lane that owns the area: `fa lanes skills <lane> <skill-id>`
+   (the lanes code is the one writer of lane skills).
+3. A reviewer perspective scoped to paths: add a `review_perspectives` entry
+   (`{name, focus}`) whose focus names the paths, for example security on
+   `src/payment/**`. This needs no new schema.
+4. A new role only when the work must judge across areas and send proposals.
+In the multiple-choice confirmation, show the cheaper option first, with the reason it
+fits; offer the role after it. Only after the person confirms a role, run
+`fa role add <name> --scope "<paths>" --signal "paths:<paths>" --skill <skill-id> --why "<confirmed reason>"`
+with the name, scope, call conditions (repeat `--signal`) and skills (repeat `--skill`).
+Every role may be idle. Roles never message the person; everything goes through the
+orchestrator.
+
 ## Design first (D33)
 Use `ui.frameworks` and `ui.has_design_foundation` from the context alongside the request.
 For UI work without a foundation, first suggest the design interview (디자인 인터뷰); if the
@@ -230,9 +248,9 @@ check). Done when commands must run with the repo's normal tooling from the repo
 Once the spec is roughly formed, before you lock it for approval, write the plan JSON
 (schema in `fa order publish --help`) to a temp file and run
 `fa order perspectives PLAN.json --json`. Read-only agents question it in parallel from
-fixed seats: skeptic, first-time user, attacker, operator, maintainer in six months, and
-incidents (risk map and decisions). A failed seat is listed under `failures`; the others
-still count. Merge duplicate questions across seats into one. Answer what the code, the
+fixed seats: skeptic, first-time user, attacker, operator, maintainer in six months,
+incidents (risk map and decisions), and other users. A failed seat is listed under
+`failures`; the others still count. Merge duplicate questions across seats into one. Answer what the code, the
 docs or a settled decision already answers, and fold it into the spec yourself. Ask the
 person only the questions D71 leaves to them: behaviour, scope or approval. Then record
 each question once with `fa order perspectives mark ID --changed yes|no` (yes when it
@@ -259,6 +277,14 @@ This order: 7 issues
  docs/              README                                      [s]
  runs in parallel: api, web · skills: api=testing-strategy
 ```
+Before asking for approval, check every issue and fix the plan where a check fails:
+- (a) Reuse: does existing code already do this or most of it? If so, why is reusing it
+  not enough? Name the measured gap.
+- (b) Bar: is the Done-when bar stricter than what the existing proven path meets? If so,
+  justify it with an incident.
+- (c) Reversibility (principle 10): if this fails, can it be undone? If yes, the Goal asks
+  for detection and recovery, not zero races; only irreversible failures (uncommitted work
+  deleted, permanent deletion, sending outside) are prevented structurally.
 Then AskUserQuestion: Approve all (recommended) / Approve some / Change something.
 Show the acceptance test of any issue the user asks about.
 Show which issues are interactive and why before asking for approval.

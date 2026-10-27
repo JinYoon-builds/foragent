@@ -19,15 +19,23 @@ from typing import Any
 from foragent import executors
 from foragent.i18n import text
 
-SEATS = ("skeptic", "first_time_user", "attacker", "operator", "maintainer", "incidents")
+SEATS = ("skeptic", "first_time_user", "attacker", "operator", "maintainer", "incidents", "other_users")
 # With both tools installed, at least two default seats run on Codex and the rest on Claude.
 DEFAULT_EXECUTORS = {"skeptic": "claude", "first_time_user": "claude", "attacker": "codex",
-                     "operator": "claude", "maintainer": "codex", "incidents": "claude"}
+                     "operator": "claude", "maintainer": "codex", "incidents": "claude",
+                     "other_users": "claude"}
 QUESTION = ("What would you ask that the person has not thought of, "
             "and how does this fail from your seat?")
 SEAT_FOCUS = {
     "skeptic": "You are the skeptic. Ask whether this is needed at all and whether a simpler "
-               "approach would reach the same goal with less work or less risk.",
+               "approach would reach the same goal with less work or less risk. "
+               "Reuse: does existing code already do this or most of it? If so, why is reusing it "
+               "not enough? Name the measured gap. "
+               "Bar: is the Done-when bar stricter than what the existing proven path meets? If so, "
+               "justify it with an incident. "
+               "Reversibility (principle 10): if this fails, can it be undone? If yes, the Goal asks "
+               "for detection and recovery, not zero races; only irreversible failures (uncommitted "
+               "work deleted, permanent deletion, sending outside) are prevented structurally.",
     "first_time_user": "You are a first-time user who has never seen this project. Ask what is "
                        "confusing, what you would try first, and where you would get lost or stuck.",
     "attacker": "You are the attacker. Look for abuse: inputs, paths and permissions someone could "
@@ -39,6 +47,10 @@ SEAT_FOCUS = {
                   "hard to understand, change or debug, and which choices need recording now.",
     "incidents": "You are the incidents reviewer. Compare the plan with the risk map and past "
                  "decisions below; ask where it repeats a known failure or contradicts a decision.",
+    "other_users": "Other users: does this assume the maintainer's tools, accounts, OS, language or "
+                   "habits? Does it still work for a Claude-only, Codex-only or API-key user, a "
+                   "non-Korean user, or a project without a screen? Should this be a setting asked "
+                   "once at init instead of a constant?",
 }
 DECISIONS_FILE = "docs/decisions.md"
 RISK_FILE = ".foragent-risks.yml"

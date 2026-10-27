@@ -75,7 +75,7 @@ def follow_children(ctx, report) -> None:
                 append_event(ctx.store, at, number, NOT_PLANNED_FLAG, summary)
                 report.actions.append(summary)
         if state == "Done":
-            ctx.tracker.close_issue(number, text("parent_children_done", language, count=len(children)))
+            ctx.tracker.close_issue(number, text("order_record_closed", language, count=len(children)))
             report.actions.append(text("parent_closed_report", language, number=number,
                                        count=len(children)))
         board.sync_status(ctx, number, state, parent=True)

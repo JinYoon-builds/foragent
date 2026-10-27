@@ -1242,7 +1242,7 @@ def test_batch_pr_merged_before_any_tick_leaves_parent_completion_to_the_gate(ru
     context = _merge_batch_then_tick(c)
     parent = c.tracker.get_issue(99)
     assert parent.state == "closed", "The gate closes the order once every child is done"
-    completion = text("parent_children_done", c.ctx.config.language, count=1)
+    completion = text("order_record_closed", c.ctx.config.language, count=1)
     added = c.tracker.list_comments(99)[len(before):]
     assert [comment.body for comment in added].count(completion) == 1
     tick(context)

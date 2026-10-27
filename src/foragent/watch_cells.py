@@ -17,11 +17,16 @@ def _clean(value: Any) -> str:
                             for c in str(value)).split())
 
 
+# Emoji the lane rows use whose Unicode width is narrow by default; terminals draw them two cells wide.
+WIDE_EMOJI = frozenset("🐿")
+
+
 def _cells(value: str) -> int:
     from foragent import watch
 
     return sum(0 if watch.unicodedata.combining(c) or watch.unicodedata.category(c) in {"Mn", "Me", "Cf"}
-               else 2 if watch.unicodedata.east_asian_width(c) in {"W", "F"} else 1 for c in value)
+               else 2 if c in WIDE_EMOJI or watch.unicodedata.east_asian_width(c) in {"W", "F"} else 1
+               for c in value)
 
 
 def _fit(line: Line, width: int) -> Line:
@@ -55,6 +60,9 @@ def _line(value: Any, style: str = "") -> Line:
 def _wrap(value: str, width: int, style: str = "") -> list[Line]:
     from foragent import watch
 
+    # Without the old 40-column clamp a caller may pass any width; every line takes at
+    # least one character, so wrapping always ends (the frame cuts what still overflows).
+    width = max(1, width)
     lines: list[Line] = []
     current = ""
     for word in watch._clean(value).split():
@@ -62,7 +70,7 @@ def _wrap(value: str, width: int, style: str = "") -> list[Line]:
             lines.append([(current, style)])
             current = ""
         while watch._cells(word) > width:
-            piece = watch._fit([(word, style)], width)[0][0]
+            piece = watch._fit([(word, style)], width)[0][0] or word[0]
             lines.append([(piece, style)])
             word = word[len(piece):]
         current += (" " if current else "") + word

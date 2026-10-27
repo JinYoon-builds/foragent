@@ -10,7 +10,7 @@ from foragent.status import summary_values, unknown as status_unknown
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
-ORDER = 10
+ORDER = 24
 # The gate runs every few minutes; this long without its heartbeat is a warning (D67).
 GATE_STALE_SECONDS = 15 * 60
 

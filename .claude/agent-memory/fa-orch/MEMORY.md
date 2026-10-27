@@ -130,6 +130,7 @@
 - #105 병합(2026-10-25): main의 #157이 `usage_events.py`와 `StateStore.record_usage(executor, windows)`·`usage()`를 먼저 넣었다. 중복 `usage.py`를 지우고 파서·`limit_reset`을 `usage_events`로 합쳤다. 저장 형식은 `test_tidy.py`가 정확히 비교하므로 `name/used_percent/resets_at`만 저장하고 `exhausted`는 `record_from_log()` 반환값에만 둔다. 시작 판단은 `scheduler_start.py`(`_lane_held`)로 옮겨졌다. 리뷰어 한도도 사용량 판독 여부와 무관하게 실행기를 멈춘다(오케스트레이터 지시). `test_fa_brief.py` 실패는 #113 미구현 범위다.
 - #105 리뷰: 실행기 멈춤은 시작 때만이 아니라 `_available_executor()`가 매 실행 직전 `store.executor_pause_until()`로 확인하고 `_limit_wait()`로 limit-wait 처리한다. 한도 뒤 곧바로 재시작하는 시험은 시계를 `limit_wait_minutes` 뒤로 옮겨야 한다(`test_worker_sessions.py`). `test_executor_choice.py` 6개는 main에서도 실패하는 quota 범위다.
 - [#104 skill catalog](project_104_skill_catalog.md) — Available skills prompt section, Skills used in Run/PR, claude plain VERDICT fallback
+- [#123 baseline survivors](project_123_baseline_survivors.md) — one exact collect-only listing in follow_base; never infer ids from probe exits
 - [#420 whole picture](project_420_whole_picture.md) — cuts.py notice, WholeFailure, parent_context snapshot, moved_by on base merges
 - [#379 risk map](project_379_risk_map.md) — base-ref map read, review/tier/always_human hooks, commands/*.py import rule
 - [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order, conftest opt-out
@@ -166,6 +167,15 @@
 - [#287 lane plan](project_287_plan.md) — plan.json, non-reentrant state lock, CLI stderr exits, stall vs 1h clock in locked test
 - #673: 리뷰 결과의 `SPEC-CONFLICT:` 줄은 `run_review.spec_conflicts()`가 모으고(panel은 모든 구성원 raw + merge raw), `_finish_review()`가 journal verdict `SPEC-CONFLICT`로 기록한다. `_stop_on_spec_conflict()`가 `_review_implementation`·`_review_only`에서 flag(spec-question) 후 `ExecutorStopped("spec-question")`; 브랜치 push는 `_execute` finally의 보존 경로가 맡는다. 규칙 문구는 `review_scope_rules`에 있어 `tests/runner_support.expected_review_rules`도 같이 바꾼다. 경계 시험 `tests/test_review_conflict_paths.py`. panel은 구성원 충돌을 사용량 한도 재발생보다 먼저 읽고 merge 호출을 건너뛴다. `with_review_scope`는 옛 PR 본문에 빠진 규칙 줄을 모두 채운다.
 - #274 재작업(10-27): main이 SKILL.md를 이미 154줄로 넘겨 놓았다. 인수 시험은 대부분 공백을 합친 본문을 읽으므로, 같은 절의 문단을 합치거나 설명을 `references/<topic>.md`로 옮기고 한 줄 링크를 남겨 줄인다(design-handoff.md). 옮기기 전후로 `grep -ln fa-orchestrator tests/acceptance/*.py` 묶음의 실패 집합을 비교한다. tests/test_runner.py는 분할됐고 새 시험은 해당 모듈의 시험 파일(test_run_prompts.py 등)에 둔다; test_runner.py 전체 실행 금지(관련 시험 예산 초과). `run_publish.py` 842줄 상한 초과는 main 기준선 실패.
+- #334: `fa orch architect`는 `orch_architect.py`+`commands/_orch_architect.py`(set_defaults handler, orch·gate run()이 먼저 분기). commands/*.py 본문 import는 facade·repo_store만 허용(test_cli_commands) → argparse는 `cli.argparse`. refactor.md는 pstack 시험 정규식(백틱 단독 `architect` 금지)도 지킨다.
 - #225: `orch_scorecard.py`는 `fa orch scorecard`(읽기 전용). 버킷은 `(now-t)//24h`(새 끝 포함). pr-open의 merged_at은 `record_merge`가 finish_run 전에 써야 runs.jsonl에 들어간다. 동사 등록은 `_orch_box` + INBOX_ACTIONS.
+- [#674 SKILL.md line budget](project_674_skill_space.md) — move untested prose to references/, also catch helper-import readers (question_routing)
 - #310: SKILL.md 150줄 상한은 시험이 정규식으로 읽지 않는 설명(watch 세부·주문 카드)을 `references/watch.md`·`order-card.md`로 옮겨 맞췄다. 비교: SKILL을 읽는 인수 16개 파일의 PASSED/FAILED 집합(zsh는 `$(grep -l ...)`로 넘겨야 단어 분리됨).
 - [#189 lane dream](project_189_lane_dream.md) — dream Run records, dream-done event, budget demand, offline-test traps
+- #693: park/unpark 본체는 `orch_park.py`, CLI는 `commands/_orch_park.py`(orch.py run에서 ctx 만든 뒤 분기). 시간 초과는 `parked_at() > since`면 생략. 인수 시험 1은 라벨 제거만으로 통과하므로 경계는 `tests/test_orch_park_unit.py`가 local_issues를 교체해 확인.
+- [#716 role agents](project_716_role_agents.md) — architect prompt/skill split, --agent launches, pstack test pins refactor.md
+- [#449 overlap facts](project_449_overlap_facts.md) — file_conflicts in orch_facts_runs, 30-line human cap, zsh array for test lists
+- [#650 wake grace](project_650_wake_grace.md) — wake-grace.json beside sleep baseline, per-run activity ends it, sleep_wake line
+- [#226 review NOTE lines](project_226_review_notes.md) — review_notes.py, break-it rule, SKILL.md 150-line pitfalls
+- #445: facts 실행 행의 `comparison`은 `Run.comparison`(#442가 `update_run(comparison=...)`로 저장)을 `_row()`에서 그대로 복사, 없으면 null. zsh에서 `$files` 목록은 `${=files}`로 나눠야 pytest에 넘어간다. facts 관련 시험 287개 중 74개는 변경 전에도 같은 ID로 실패(다른 이슈 범위).
+- 상태 설계(D95)는 제품 스킬 `fa-state-design`(쓰는 곳 하나·저장 대신 계산·덮어쓰기 대신 덧붙이기)에 일반 규칙으로 있다. 이 저장소 사례: #370 정지는 실행기 혼자 맡는 얇은 호출로 끝났고(정지 경로가 둘이면 매번 새 경합), #415 수면 시간은 tick의 `sleep_credit.credit()` 하나만 기록해 끝났다([[project-415-sleep-ledger]]), #154 대화 생존 판정은 공유 함수 하나가 open·closed·unknown을 돌려주고 구조화된 증거가 있을 때만 closed로 본다. 같은 영역에서 보류가 두 번이면 지적 자리를 고치지 말고 각 상태의 쓰는 곳을 다시 정한다.

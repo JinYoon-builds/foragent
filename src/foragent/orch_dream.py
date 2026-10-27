@@ -241,12 +241,11 @@ def dreamed_command(store: StateStore, config: Config, lane: str) -> int:
         return 2
     from foragent.orch_dream_stop import dream_liveness
 
-    run = store.get_dream(lane)
-    live = dream_liveness(run)
-    if live or (live is None and run.pid is not None):
-        print(f"foragent: lane {lane} is dreaming now (or its process cannot be checked); "
-              "wait for it to finish", flush=True)
+    if dream_liveness(store.get_dream(lane)) is True:
+        print(f"foragent: lane {lane} is dreaming now; wait for it to finish", flush=True)
         return 2
+    # Not confirmed alive (gone or unknown): only the completed-dream event is appended;
+    # the record stays for the tick, which finishes it once its process is confirmed dead.
     event = record_done(store, lane, 0, config.language)
     print(event["say"])
     return 0

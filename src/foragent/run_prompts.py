@@ -28,6 +28,10 @@ DEFAULT_RETRY_HINT = (
     "and state the class and the instances found."
 )
 
+BREAK_IT = ("Make the code return a wrong value, skip an effect, or do the effect twice. "
+            "If the test still passes, it proves nothing.")
+IMPLEMENTER_TEST_RULE = "When you write or fix a test, check it by the break-it rule: " + BREAK_IT
+
 PANEL_MERGE_PROMPT = (
     "Independent reviewers checked this change, each from its own share of the review perspectives. "
     "Their raw findings follow. Merge them: remove duplicates and keep only the defects you judge real "
@@ -49,6 +53,11 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
         "conflict, not a defect: report it as one line "
         "`SPEC-CONFLICT: <locked test path:line> <what the test requires>; <what the finding wants>` "
         "instead of a finding.\n"
+        "A test that asserts nothing or proves nothing is a weakened check. Judge each new or changed "
+        f"test by the break-it rule: {BREAK_IT}\n"
+        "Write root-cause and structure findings (why the defect could happen, a better design) as separate "
+        "plain lines `NOTE: <finding>`, beside the findings. NOTE lines are recorded for the orchestrator "
+        "and are never a reason to FAIL.\n"
         + text("review_class_question", language)
     )
 
@@ -135,6 +144,8 @@ def build_prompt(
 ) -> str:
     from foragent import runner
 
+    previous_attempt, reviewer_text, orchestrator_hint = _without_notes(
+        previous_attempt, reviewer_text, orchestrator_hint)
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     acceptance_rule = "" if acceptance_locked else f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
     test_rule = (
@@ -156,6 +167,7 @@ def build_prompt(
         "Rules:\n"
         f"{acceptance_rule}"
         f"{test_rule}"
+        f"- {IMPLEMENTER_TEST_RULE}\n"
         "- If the issue needs a product decision you cannot make from the text and the code, do not guess:\n"
         "  write .foragent/QUESTION.md with the question, 2–3 options and your recommendation, then stop.\n"
         f"  Write it in {language}. Include an `## Evidence` section quoting the exact conflicting lines "
@@ -217,6 +229,13 @@ def build_prompt(
     return f"/goal {runner.goal_condition(acceptance_dir)}\n\n{prompt}" if native_goal else prompt
 
 
+def _without_notes(*texts: str | None) -> tuple[str | None, ...]:
+    """Feedback channels without reviewer NOTE lines: notes are recorded, never work to do."""
+    from foragent import review_notes
+
+    return tuple(None if text is None else review_notes.strip(text) for text in texts)
+
+
 def build_resume_prompt(
     n: int, previous_body: str | None, body: str, failure: str = "", *,
     reviewer_text: str | None = None, orchestrator_hint: str | None = None,
@@ -224,7 +243,8 @@ def build_resume_prompt(
     moved_files: list[str] | None = None, parent_context: str = "", procedure: str | None = None,
 ) -> str:
     """Deliver exact specification edits and feedback to an existing session."""
-    parts = [f"Continue implementing GitHub issue #{n} in this repository."]
+    reviewer_text, orchestrator_hint = _without_notes(reviewer_text, orchestrator_hint)
+    parts = [f"Continue implementing GitHub issue #{n} in this repository.", IMPLEMENTER_TEST_RULE]
     if parent_context:
         # Always restated: the session may predate a newly read or re-approved parent text.
         parts.append(parent_section(parent_context))

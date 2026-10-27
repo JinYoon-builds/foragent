@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -13,8 +14,8 @@ from foragent.state import StateStore
 NOW = datetime(2026, 10, 27, 12, tzinfo=UTC)
 
 
-def row(pid, start=1.0, argv=None):
-    return SimpleNamespace(pid=pid, start_time=start, argv=argv, ppid=1, pgid=pid, sid=pid)
+def row(pid, start=1.0, argv=None, uid=None):
+    return SimpleNamespace(pid=pid, start_time=start, argv=argv, ppid=1, pgid=pid, sid=pid, uid=uid)
 
 
 @pytest.fixture
@@ -54,7 +55,51 @@ def test_unreadable_worker_is_unknown_not_dead(world):
     report = SimpleNamespace(actions=[])
     orch_dream.recover(world.ctx, run, report)
     assert world.store.get_dream("orch").status == "running" and world.removed == []
+
+
+def test_manual_completion_refuses_only_a_confirmed_live_worker(world):
+    run = dreaming(world)
+    world.table[0] = processes.ProcessTable([row(4100)])  # Confirmed alive: same pid and start time.
     assert orch_dream.dreamed_command(world.store, world.config, "orch") == 2
+    assert orch_dream.last_dream_at(world.store, "orch") is None
+    world.table[0] = processes.ProcessTable([], unreadable=[4100])  # Unknown: event only.
+    assert orch_dream.dreamed_command(world.store, world.config, "orch") == 0
+    assert orch_dream.last_dream_at(world.store, "orch") is not None
+    assert world.store.get_dream("orch") == run, "the record belongs to the worker and the tick"
+
+
+@pytest.mark.parametrize("table", [
+    processes.ProcessTable([row(4500, argv=None)]),  # Our own process whose argv cannot be read.
+    processes.ProcessTable([], unreadable=[4500]),  # An unreadable process of unknown owner.
+], ids=["unreadable-argv", "unreadable-process"])
+def test_pidless_dream_is_not_finished_while_a_worker_might_be_unreadable(world, table):
+    from foragent import scheduler
+
+    dreaming(world, pid=None, identities=False)
+    world.table[0] = table
+    world.clock[0] += scheduler.LAUNCH_GRACE + timedelta(seconds=1)
+    orch_dream.recover(world.ctx, world.store.get_dream("orch"), SimpleNamespace(actions=[]))
+    assert world.store.get_dream("orch").status == "running" and world.removed == []
+
+
+def test_pidless_dream_with_every_process_read_and_no_worker_is_finished(world):
+    from foragent import scheduler
+
+    dreaming(world, pid=None, identities=False)
+    other = os.getuid() + 1
+    world.table[0] = processes.ProcessTable([row(4500, argv=("python", "other"), uid=os.getuid())],
+                                            unreadable=[4600], unreadable_uids={4600: other})
+    world.clock[0] += scheduler.LAUNCH_GRACE + timedelta(seconds=1)
+    orch_dream.recover(world.ctx, world.store.get_dream("orch"), SimpleNamespace(actions=[]))
+    assert world.store.get_dream("orch").outcome == "error" and world.removed
+
+
+def test_refused_stop_with_an_unreadable_recorded_process_keeps_the_record(world):
+    dreaming(world, identities=False)
+    world.table[0] = processes.ProcessTable([], unreadable=[4100])
+    world.ctx.kill_runner = processes.kill_process_group  # No recorded identity: the stop raises.
+    run = world.store.get_dream("orch")
+    assert orch_dream_stop._stop(world.ctx, run, SimpleNamespace(actions=[])) is False
 
 
 def test_stalled_dream_stops_worker_and_executor_with_recorded_ownership(world):
@@ -219,3 +264,42 @@ def test_second_dream_starts_from_the_dream_branch_with_the_base_merged(tmp_path
         assert ("add", "foragent/dream-orch", start) in calls
         merged = [args for args in calls if isinstance(args, list) and "merge" in args]
         assert merged == ([[*orch_dream_worker.GIT_IDENTITY, "merge", "--no-edit", "origin/main"]] if exists else [])
+
+
+def test_new_memory_file_in_an_ignored_directory_is_published_and_counted(world, tmp_path):
+    worktree = world.store.root / "worktrees/dream-orch"
+    committed, published = [], []
+
+    class Executor:
+        def run(self, **kwargs):
+            path = kwargs["worktree"] / ".claude/agent-memory/orch/MEMORY.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("one lesson\ntwo lesson\n")
+            from foragent.executors import ExecResult
+            return ExecResult(0, False, "done", kwargs["log_path"])
+
+    def add_worktree(path, branch, ref):
+        path.mkdir(parents=True)
+
+    def remove_worktree(path):
+        import shutil
+        shutil.rmtree(path, ignore_errors=True)
+
+    # git status shows nothing: the memory directory is ignored.
+    git = SimpleNamespace(_call=lambda args: "", commit_paths=lambda paths, title: committed.append(paths))
+    world.ctx.git = SimpleNamespace(_call=lambda args: "", add_worktree=add_worktree,
+                                    remove_worktree=remove_worktree, at=lambda path: git)
+    world.ctx.executor_factory = lambda name: Executor()
+    world.ctx.poll_hook = lambda execute, poll: execute()
+    world.ctx.tracker = None
+    original = orch_dream_worker._publish
+    orch_dream_worker._publish = lambda ctx, git, lane, memory, count: published.append(count) or 7
+    try:
+        dreaming(world)
+        assert orch_dream_worker.run_dream("orch", world.ctx) == 0
+    finally:
+        orch_dream_worker._publish = original
+    assert committed == [[".claude/agent-memory/orch"]] and published == [2]
+    saved = json.loads((world.store.root / "orch-events.jsonl").read_text().splitlines()[-1])
+    assert saved["memories"] == 2 and saved["pr"] == 7
+    assert not worktree.exists()
