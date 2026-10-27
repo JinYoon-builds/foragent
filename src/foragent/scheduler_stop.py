@@ -99,39 +99,24 @@ def _stop_run_processes(
     return "stopped"
 
 
-def stop_target_refusal(run: Run) -> str | None:
-    """Why a recorded runner or executor PID fails #261's rules, read without signaling.
+def _restore_stopped(ctx: TickContext, number: int, why: str, report: TickReport) -> None:
+    """After `fa orch stop`'s kill: ready again, as a stall restart, with one stop event naming the why.
 
-    A live recorded PID must be a recorded identity outside PID 1 and this
-    process's own lineage, group and session. An unreadable one, or a runner
-    PID that is missing or was never recorded as an identity, cannot be
-    verified and is refused; a dead recorded one is left to the stop path.
+    The run's WIP was already saved by the kill path. An open PR flags the issue as
+    _restore_stalled does; a closed, blocked or needs-human issue only loses running.
+    A stop counts toward neither the crash streak nor the stall restart budget.
     """
-    try:
-        table = processes.list_processes()
-    except PermissionError as exc:
-        return str(exc)
-    rows = {row.pid: row for row in table}
-    unreadable = getattr(table, "unreadable", frozenset())
-    lineage, group, session = processes._protected(rows)
-    identities = {item["pid"]: item["start_time"] for item in run.process_identities}
-    for name, pid in (("runner", run.pid), ("executor", run.executor_pgid)):
-        if pid is None:
-            continue
-        if pid in unreadable:
-            return f"recorded {name} PID {pid} cannot be read; ownership cannot be verified"
-        row = rows.get(pid)
-        if pid <= 1 or pid in lineage or (row is not None and (
-            identities.get(pid) != row.start_time or row.pgid in lineage or row.sid in lineage
-            or row.pgid == group or row.sid == session
-        )):
-            return f"recorded {name} PID {pid} is not a process Foragent started for this run"
-    if unreadable_identities := sorted(item["pid"] for item in run.process_identities if item["pid"] in unreadable):
-        return f"recorded process {unreadable_identities[0]} cannot be read; ownership cannot be verified"
-    # Missing evidence is never proof of safety: without a recorded runner
-    # identity the stop could neither verify nor signal the process it ends.
-    if run.pid is None:
-        return "no runner PID is recorded for this run; ownership cannot be verified"
-    if run.pid not in identities:
-        return f"recorded runner PID {run.pid} has no recorded process identity; ownership cannot be verified"
-    return None
+    issue = ctx.tracker.get_issue(number)
+    if issue.state != "open" or issue.labels & {scheduler.BLOCKED, scheduler.NEEDS_HUMAN}:
+        ctx.tracker.remove_labels(number, [scheduler.RUNNING])
+    elif ctx.tracker.find_pr(f"foragent/issue-{number}") is not None:
+        scheduler.flag(ctx, number, scheduler.Reason.STALLED,
+                       "Runner stopped with an open PR; rerun review or retry implementation.")
+        report.actions.append(f"#{number} flagged stalled with open PR")
+    else:
+        ctx.tracker.add_labels(number, [scheduler.READY])
+        ctx.tracker.remove_labels(number, [scheduler.RUNNING])
+        report.actions.append(f"#{number} returned to ready after stop")
+        scheduler.board.sync_status(ctx, number, "Ready")
+    scheduler.append_event(ctx.store, ctx.now(), number, "stop",
+                           f"Stopped by fa orch stop; unfinished work kept on foragent/issue-{number}. Why: {why}")

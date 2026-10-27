@@ -20,9 +20,6 @@ class FlagContext(board.BoardContext, Protocol):
 def flag(
     ctx: FlagContext, n: int, reason: Reason, summary: str, details: str | None = None,
 ) -> None:
-    from foragent.orch_stop import yield_to_stop
-
-    yield_to_stop(ctx.store, n)  # A runner refuses nothing once a stop request owns its run.
     run = ctx.store.get_run(n)
     if run is not None and run.status == "running":
         ctx.store.update_run(n, detail=f"{summary}\n{details}" if details else summary)

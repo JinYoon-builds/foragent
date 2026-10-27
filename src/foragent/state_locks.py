@@ -14,37 +14,6 @@ def _held_tick_locks() -> set[str]:
     return _state._TICK_LOCKS_HELD.__dict__.setdefault("paths", set())
 
 
-# Worktree-lock paths this thread holds: the outermost holder takes the flock once and
-# code it calls (WIP preservation, worktree removal) sees the lock as already held.
-_WORKTREE_LOCKS_HELD = threading.local()
-
-
-def _held_worktree_locks() -> set[str]:
-    return _WORKTREE_LOCKS_HELD.__dict__.setdefault("paths", set())
-
-
-@contextmanager
-def _worktree_file_lock(path: Path, *, blocking: bool = True) -> Iterator[bool]:
-    """Yield whether this thread holds the lock; a nested call reenters without a second flock."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    key, held = str(path.parent.resolve() / path.name), _held_worktree_locks()
-    if key in held:
-        yield True
-        return
-    with path.open("a", encoding="utf-8") as stream:
-        try:
-            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX | (0 if blocking else _state.fcntl.LOCK_NB))
-        except BlockingIOError:
-            yield False
-            return
-        held.add(key)
-        try:
-            yield True
-        finally:
-            held.discard(key)
-            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
-
-
 @contextmanager
 def _file_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,12 +23,6 @@ def _file_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
-
-
-@contextmanager
-def _blocking(lock: AbstractContextManager[bool]) -> Iterator[None]:
-    with lock:
-        yield
 
 
 class StateLocksMixin:
@@ -106,22 +69,15 @@ class StateLocksMixin:
         return _file_lock(self.root / "state.lock")
 
     def worktree_lock(self, number: int) -> AbstractContextManager[None]:
-        """Serialize an issue's destructive worktree transitions, WIP preservation and removal.
+        """Serialize an issue's WIP preservation and worktree removal.
 
         Lock order: tick (if held) -> worktree -> state. Never wait for a
         worktree lock under the state lock, or take the tick lock under a
-        worktree lock. The outermost holder on a thread takes the lock once;
-        nested calls on that thread reenter it. Keep lock files after removal
-        so all contenders continue to lock the same inode.
+        worktree lock. These locks are not reentrant; cleanup acquires it
+        separately from preservation. Keep lock files after removal so all
+        contenders continue to lock the same inode.
         """
-        return _blocking(_worktree_file_lock(self._worktree_lock_path(number)))
-
-    def try_worktree_lock(self, number: int) -> AbstractContextManager[bool]:
-        """Try the worktree lock once without waiting; yield whether it is held."""
-        return _worktree_file_lock(self._worktree_lock_path(number), blocking=False)
-
-    def _worktree_lock_path(self, number: int) -> Path:
-        return self.root / "runs" / f"issue-{number}.worktree.lock"
+        return _file_lock(self.root / "runs" / f"issue-{number}.worktree.lock")
 
     @contextmanager
     def merge_lock(self) -> Iterator[None]:

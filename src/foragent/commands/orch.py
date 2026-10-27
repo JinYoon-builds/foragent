@@ -45,10 +45,14 @@ def add(commands) -> None:
     stop.add_argument("number", type=int)
     stop.add_argument("--keep-work", action="store_true", required=True,
                       help="Save unfinished changes as a WIP commit on the issue branch")
-    stop.add_argument("--why", required=True, help="Reason for stopping, kept in the WIP commit and event log")
+    stop.add_argument("--why", required=True, help="Why the run is stopped; named in the WIP commit and event")
+    from foragent.commands import _orch_park
+    from foragent.commands._orch_architect import add_orch
     from foragent.commands._orch_box import _add_inbox
 
+    _orch_park.add_parsers(orch_actions)
     _add_inbox(orch_actions)
+    add_orch(orch_actions)
 
 
 def __getattr__(name):
@@ -78,6 +82,8 @@ def _list(ctx, args) -> None:
 
 
 def run(args) -> int:
+    if handler := getattr(args, "handler", None):
+        return handler(args)
     cli = facade()
     root = args.repo_root.resolve()
     if args.action in cli.INBOX_ACTIONS:
@@ -92,6 +98,10 @@ def run(args) -> int:
     ctx = cli.RunContext(repo=repo, repo_root=root, tracker=tracker, store=store,
                          config=config, git=git, now=lambda: cli.datetime.now(cli.UTC))
     orch = cli.orch
+    from foragent.commands import _orch_park
+
+    if args.action in _orch_park.ACTIONS:
+        return _orch_park.run(ctx, args)
     if args.action == "list":
         _list(ctx, args)
     elif args.action == "log":

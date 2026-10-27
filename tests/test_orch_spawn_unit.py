@@ -304,3 +304,14 @@ def test_explicit_lock_reports_busy_while_another_opener_holds_it(tmp_path, monk
     thread.join(5)
     with orch_ensure._explicit_lock(store) as busy:
         assert busy is False
+
+
+def test_spawn_loads_the_orchestrator_role_agent_only_when_the_project_defines_it(tmp_path, monkeypatch):
+    store, repo, calls, pushes = _setup(tmp_path, monkeypatch)
+    root = repo.resolve()
+    assert orch_spawn._command(root, store, "t")[1][-1:] == ["/fa-orchestrator"]
+    assert "--agent" not in orch_spawn._command(root, store, "t")[1]
+    (root / ".claude/agents").mkdir(parents=True)
+    (root / ".claude/agents/fa-orchestrator.md").write_text("---\nname: fa-orchestrator\n---\n")
+    argv = orch_spawn._command(root, store, "t")[1]
+    assert argv[-3:] == ["--agent", "fa-orchestrator", "/fa-orchestrator"]

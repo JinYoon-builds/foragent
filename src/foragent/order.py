@@ -202,18 +202,9 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         languages.add("JavaScript")
     if (root / "go.mod").is_file():
         languages.add("Go")
+    # D95: .foragent.yml is the lanes' only skills source; agent frontmatter is a projection of it.
     lanes = {name: {"paths": lane.get("paths", []), "agent": lane.get("agent"),
                     "skills": lane.get("skills", [])} for name, lane in config.lanes.items()}
-    # Existing lane definitions can keep their installed skills in agent frontmatter.
-    for name, lane in lanes.items():
-        if lane["agent"] and not lane["skills"]:
-            path = root / ".claude/agents" / f"{lane['agent']}.md"
-            if path.is_file():
-                import yaml
-                match = re.match(r"\A---\s*\n(.*?)\n---", path.read_text(encoding="utf-8"), re.S)
-                if match:
-                    meta = yaml.safe_load(match[1])
-                    lane["skills"] = meta.get("skills", []) if isinstance(meta, dict) else []
     return {
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "interview": _interview_context(config),

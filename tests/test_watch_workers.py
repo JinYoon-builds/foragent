@@ -19,7 +19,8 @@ def workers_case(tmp_path, starts):
     clock = [NOW]
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: clock[0])
-    config = Config(language="en", lanes={slug: dict(lane) for slug, lane in LANES.items()}, max_parallel=5)
+    config = Config(language="en", lanes={slug: dict(lane) for slug, lane in LANES.items()}, max_parallel=5,
+                    view_glyphs="emoji")
     for number, minutes in starts.items():
         tracker.add_issue(number, f"Task {number}", labels=["approved", "running", "lane:orch"])
         clock[0] = NOW + timedelta(minutes=minutes)
@@ -65,16 +66,14 @@ def test_numbers_are_positions_among_current_workers(tmp_path):
     assert not rows_with(text, "orch 1") and "#3" in text, "one worker left shows the plain lane name"
 
 
-def test_queue_and_done_line_stay_on_the_first_worker_and_table_uses_plain_name(tmp_path):
+def test_a_lane_with_workers_shows_only_their_rows(tmp_path):
     tracker, store, config, clock = workers_case(tmp_path, {1: 0, 2: 1})
     tracker.add_issue(9, "Waiting task", labels=["approved", "ready", "lane:orch"])
     text = frame(tracker, store, config, clock)
-    lines = text.splitlines()
-    first = next(index for index, row in enumerate(lines) if "orch 1" in row)
-    assert "#9" in lines[first] and "#9" not in rows_with(text, "orch 2")[0], text
-    assert "done" in lines[first + 1] and "orch 2" in lines[first + 2], text
-    table = [row for row in lines if row.startswith("│🧭 orch ")]
-    assert len(table) == 2 and all("orch 1" not in row and "orch 2" not in row for row in table), text
+    assert "#9" not in text, text
+    first, second = rows_with(text, "orch 1"), rows_with(text, "orch 2")
+    assert len(first) == len(second) == 1 and "#1" in first[0] and "#2" in second[0], text
+    assert not any(row.startswith("│") for row in text.splitlines()), "no work table"
 
 
 def test_orchestrator_claim_needs_a_fresh_heartbeat(tmp_path):
@@ -117,20 +116,10 @@ def test_log_age_decides_working_or_quiet(tmp_path):
         assert ("quiet" not in row) if expected is None else (expected in row), row
 
 
-def test_table_lists_several_workers_in_start_order(tmp_path):
+def test_rows_list_several_workers_in_start_order(tmp_path):
     tracker, store, config, clock = workers_case(tmp_path, {7: 0, 3: 5})
-    table = [row for row in frame(tracker, store, config, clock).splitlines() if row.startswith("│🧭 orch ")]
-    assert "#7" in table[0] and "#3" in table[1], table
-
-
-def test_long_lane_name_gives_way_to_the_worker_number(tmp_path):
-    tracker, store, config, clock = workers_case(tmp_path, {1: 0, 2: 1})
-    config.lanes["orch"]["title"] = "orchestration"
-    text = frame(tracker, store, config, clock)
-    first = [row for row in text.splitlines() if " 1 ▸ " in row and "#1" in row]
-    second = [row for row in text.splitlines() if " 2 ▸ " in row and "#2" in row]
-    assert len(first) == 1 and len(second) == 1, text
-    assert "…" in first[0] and "#2" not in first[0] and "#1" not in second[0], text
+    rows = [row for row in frame(tracker, store, config, clock).splitlines() if row.startswith("🐿")]
+    assert "orch 1" in rows[0] and "#7" in rows[0] and "orch 2" in rows[1] and "#3" in rows[1], rows
 
 
 def test_each_worker_row_shows_its_own_state(tmp_path):
@@ -140,21 +129,16 @@ def test_each_worker_row_shows_its_own_state(tmp_path):
     text = frame(tracker, store, config, clock)
     for worker in ("orch 1", "orch 2"):
         row = rows_with(text, worker)[0]
-        assert "●" in row and "⛏" not in row, text
+        assert row.startswith("⏳") and "waiting for the orchestrator" in row, text
     tracker.remove_labels(1, ["blocked"])
     tracker.remove_labels(2, ["blocked"])
     tracker.add_labels(2, ["needs-human"])
     text = frame(tracker, store, config, clock)
-    assert "⛏" in rows_with(text, "orch 1")[0] and "✋" not in rows_with(text, "orch 1")[0], text
-    assert "✋" in rows_with(text, "orch 2")[0] and "⛏" not in rows_with(text, "orch 2")[0], text
+    assert rows_with(text, "orch 1")[0].startswith("🐿"), text
+    assert rows_with(text, "orch 2")[0].startswith("✋"), text
 
 
-def test_first_row_keeps_waiting_state_of_a_non_running_issue(tmp_path):
-    tracker, store, config, clock = workers_case(tmp_path, {1: 0, 2: 1})
-    tracker.add_labels(1, ["blocked"])
-    tracker.add_labels(2, ["blocked"])
-    tracker.add_issue(5, "Needs a person", labels=["approved", "needs-human", "lane:orch"])
+def test_elapsed_counts_from_each_runs_start(tmp_path):
+    tracker, store, config, clock = workers_case(tmp_path, {1: 0, 2: 25})
     text = frame(tracker, store, config, clock)
-    first, second = rows_with(text, "orch 1")[0], rows_with(text, "orch 2")[0]
-    assert "#5" in first and "#1" in first and "✋" in first and "●" not in first, text
-    assert "#2" in second and "●" in second and "✋" not in second, text
+    assert "30m" in rows_with(text, "orch 1")[0] and "5m" in rows_with(text, "orch 2")[0], text

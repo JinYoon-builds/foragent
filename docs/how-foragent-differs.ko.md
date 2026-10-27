@@ -56,12 +56,17 @@ goal은 에이전트를 믿고 맡기는 방식이에요. foragent는 에이전�
 
 git 워크트리로 작업 공간을 나누는 건 이 분야의 기본이에요. foragent가 그 위에 더하는 것은 세 가지예요. 영역을 맡는 레인, 배우는 레인, 기계 부하를 따라 늘고 주는 동시 실행 수예요.
 
-## 비슷한 오픈소스와 비교 (2026-10-26 조사)
+foragent는 Claude Code와 Codex CLI를 순정 그대로 써요. 레인은 `.claude/agents` 아래의 표준 에이전트 파일이고, 스킬은 표준 `SKILL.md`예요. 레인 기억은 Claude Code의 프로젝트 기억이고, 완료 확인은 Claude Code의 goal과 훅을 그대로 써요. 사람은 평소처럼 Claude Code와 이야기해요. `/fa`도 그냥 스킬이에요. 게이트만 바깥에서 돌아요. 쓰던 구독, 설정, 스킬, 훅을 그대로 가져가요. foragent를 지워도 남는 건 평범한 Claude Code 설정이에요.
+
+"레인"이라는 말을 다르게 쓰는 프로젝트도 있어요. oh-my-hermes에서 레인은 작업의 종류예요. 깊은 사고, 화면 작업, 빠른 수정 같은 것이고, 종류에 따라 모델이 정해져요. foragent에서 레인은 코드의 한 영역을 맡아요. 이슈와 날짜가 바뀌어도 그 영역을 계속 배워요.
+
+## 비슷한 오픈소스와 비교 (2026-10-26 조사, oh-my-hermes는 2026-10-27 추가)
 
 | 계층 | 예 | 기본으로 사람 없이 머지하나 |
 |---|---|---|
 | 회사 단위 관리 | Paperclip | 아니요. 완료는 설정한 리뷰나 승인 단계가 정해요 |
 | 조율과 검증 | Gas Town, OpenAI Symphony, Orchestrator.inc, foragent | Gas Town은 예(이분 탐색 머지 큐). Symphony는 "Human Review"에서 멈춰요. Orchestrator.inc는 "머지 준비 완료"에서 멈춰요 |
+| 세션 안 조율 | oh-my-hermes (Hermes Agent 위에서 동작) | 머지 단계 설명이 없어요. 목표를 대화 하나 안에서 병렬 단계로 쪼개 돌려요. 시험, 리뷰, CI 관문을 실제로 통과해야만 검증으로 쳐요 |
 | 병렬 실행 도구 | Claude Squad, Vibe Kanban, Orca, Conductor | 아니요. 사람이 변경 내용을 보고 머지해요 |
 | 단일 에이전트 | Claude Code, Codex CLI, OpenCode, Goose, 가재코드 | 아니요. 세션 하나에 작업 하나예요 |
 

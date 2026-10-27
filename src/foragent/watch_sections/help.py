@@ -9,11 +9,15 @@ from foragent.watch_data import Snapshot
 
 ORDER = 60
 GAP = False  # The help line sits directly under the section above it.
+KEEP = True  # The footer stays when the screen is short.
 
 
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
     from foragent import watch
 
+    if context.get("short"):
+        # Sections gave way to the lane rows: one short line of the key letters.
+        return [watch._line(watch.text("squirrel_footer", config.language))]
     count = len(snapshot.status["lanes"])
     key = "watch_help_many" if count > 9 else "watch_help"
     return [watch._line(watch.text(key, config.language, count=count))]

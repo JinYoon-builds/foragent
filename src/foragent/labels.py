@@ -9,6 +9,8 @@ READY = "ready"
 RUNNING = "running"
 BLOCKED = "blocked"
 NEEDS_HUMAN = "needs-human"
+# Set only by `fa orch park --for-person`, removed only by `fa orch unpark`.
+WAITING_PERSON = "waiting-person"
 FEEDBACK = "feedback"
 RISK_HIGH = "risk:high"
 
@@ -59,6 +61,7 @@ LABELS: list[LabelSpec] = [
     LabelSpec(RUNNING, "5319e7", "A runner is working on this issue."),
     LabelSpec(BLOCKED, "fbca04", "Waiting for the orchestrator to resolve a blocker."),
     LabelSpec(NEEDS_HUMAN, "d93f0b", "Human input is required before work can resume."),
+    LabelSpec(WAITING_PERSON, "e4e669", "Waits for a person's decision"),
     LabelSpec(FEEDBACK, "fbca04", "Human feedback for future planning."),
     LabelSpec(RISK_HIGH, "b60205", "High risk changes require human review."),
     *(LabelSpec(f"size:{size}", color, f"Difficulty tier {size}.")

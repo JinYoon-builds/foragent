@@ -1,10 +1,13 @@
 """Acceptance test for ci-mode-facts. Locked by Foragent; do not edit."""
 
 import json
+import subprocess
 
 import pytest
 
 from test_ci_mode import comparison_record, mode_case, run
+from test_orch_review_handoff import bind_cli
+from test_skills_autosync import cli_exit
 
 
 @pytest.mark.parametrize("mode", ["local", "ci"])

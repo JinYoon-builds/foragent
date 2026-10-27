@@ -10,7 +10,8 @@ from datetime import datetime
 from typing import Any
 
 from foragent.config import Config
-from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_display, lane_order
+from foragent.labels import (APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, WAITING_PERSON, issue_lane,
+                             lane_display, lane_order)
 from foragent.reasons import parse_reason
 from foragent.state import StateStore
 from foragent.tracker import Issue
@@ -90,6 +91,27 @@ def summary_values(summary: dict[str, Any]) -> dict[str, Any]:
     return {key: "?" if value is None else value for key, value in summary.items()}
 
 
+def issue_state(labels: Any, active: bool, group: str | None = None) -> str | None:
+    """One issue's row state from its local facts, the same for status and the lane view.
+
+    A person (needs-human or waiting-person) comes first, then blocked, then a running
+    worker; an open PR waits for a person; approved or ready work is queued. None means
+    the issue is not shown.
+    """
+    labels = set(labels or ())
+    if {NEEDS_HUMAN, WAITING_PERSON} & labels:
+        return "waiting-human"
+    if BLOCKED in labels:
+        return "blocked"
+    if active or RUNNING in labels:
+        return "working"
+    if group == "pr-open":
+        return "waiting-human"
+    if APPROVED in labels or READY in labels:
+        return "queued"
+    return None
+
+
 def collect_lanes(
     issues: list[Issue], groups: dict[str, list[dict[str, Any]]], waiting: dict[int, list[int]],
     store: StateStore, config: Config, now: datetime, *, titles: dict[int, str] | None = None,
@@ -129,17 +151,8 @@ def collect_lanes(
         group, item = grouped[issue.number]
         if group in {RUNNING, READY}:
             row[group].append(item)
-        if NEEDS_HUMAN in issue.labels:
-            state = "waiting-human"
-        elif BLOCKED in issue.labels:
-            state = "blocked"
-        elif active or RUNNING in issue.labels:
-            state = "working"
-        elif group == "pr-open":
-            state = "waiting-human"
-        elif APPROVED in issue.labels or READY in issue.labels:
-            state = "queued"
-        else:
+        state = issue_state(issue.labels, active, group)
+        if state is None:
             continue
         summary[state.replace("-", "_")] += 1
         if state == "queued":

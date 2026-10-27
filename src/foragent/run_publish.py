@@ -18,7 +18,6 @@ from foragent.i18n import text
 from foragent.issue import ParsedIssue, body_hash
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
 from foragent.orch_events import append_event
-from foragent.orch_stop import _attach_issue_branch, _merge_unless_stopped, observe_live_changes  # noqa: F401
 from foragent.overlap_files import any_overlap
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
 from foragent.reasons import Reason
@@ -312,28 +311,30 @@ def _check_publication(git: GitRepo, target_branch: str, base_sha: str | None = 
 
 def _preserve_failed_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
-    title: str | None = None, pushed_head: str | None = None,
-    tracker_available: bool = True, push_branch: Callable[[], None] | None = None, stop: bool = False,
-) -> str | None:
+    approved_ref: str = "HEAD", title: str | None = None, pushed_head: str | None = None,
+    tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
+    owned_deletions: bool = False,
+) -> None:
     """Save stopped work before cleanup, including after the runner has died.
 
-    Returns "saved" (a WIP commit), "clean" (nothing to commit) or None (no
-    verifiable worktree). `stop` is `fa orch stop`'s save after the runner's
-    whole tree died: the worktree is final, so its deletions are the run's own,
-    and the WIP goes onto the issue branch (the caller pushes it).
+    Deletions outside the run's recorded files are left out (#572), unless no
+    other process can be removing files meanwhile: the runner's own save after
+    its executor ended (it passes `push_branch`), or `owned_deletions` (`fa orch
+    stop`'s save of a killed tree under the tick lock).
     """
     with ctx.store.worktree_lock(n):
         # Recheck only after acquiring the lock: a competing cleanup may have
         # removed the worktree while we waited. A parent repository is no save.
         if not (git.root / ".git").is_file():
-            return None
+            return
         try:
             git.check_worktree()
         except GitError:
-            return None
-        return _preserve_locked_implementation(
-            n, ctx, git, reason, approval=approval, title=title,
-            pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch, stop=stop,
+            return
+        _preserve_locked_implementation(
+            n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
+            pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
+            owned_deletions=owned_deletions or push_branch is not None,
         )
 
 
@@ -348,8 +349,6 @@ def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> lis
         patterns.extend([escape(path) for path in run.effective_files or []]
                         if run.files_committed else run.effective_files or [])
         patterns.extend(escape(path) for path in [*(run.changed_files or []), *run.late_files])
-        # Seen in the live worktree when an implementer turn ended, before any cleanup: its own edits.
-        patterns.extend(escape(path) for path in run.live_changes)
     base = (run.files_base_branch if run is not None else None) or ctx.config.base_branch
     committed = git.committed_paths(f"origin/{base}")
     artifacts = git.artifact_paths()
@@ -363,9 +362,9 @@ def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> lis
 
 def _preserve_locked_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
-    title: str | None, pushed_head: str | None,
-    tracker_available: bool, push_branch: Callable[[], None] | None, stop: bool = False,
-) -> str:
+    approved_ref: str, title: str | None, pushed_head: str | None,
+    tracker_available: bool, push_branch: Callable[[], None] | None, owned_deletions: bool = False,
+) -> None:
     branch = f"foragent/issue-{n}"
     run = ctx.store.get_run(n)
     git.local_skill_paths.update(run.local_skill_paths if run is not None else ())
@@ -377,49 +376,27 @@ def _preserve_locked_implementation(
             git.quit_merge()
     git.stage_changes()
     if approval is not None:
-        _restore_approved_blobs(git, approval)
-    # After a stop the whole tree is dead, so every deletion left in the worktree is its own.
-    refused = [] if stop else _check_wip_deletions(ctx, git, run)
-    if stop:
-        _attach_issue_branch(git, branch)
-    status = "saved" if git.has_staged_changes() else "clean"
-    if status == "saved":
+        git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
+    refused = [] if owned_deletions else _check_wip_deletions(ctx, git, run)
+    if git.has_staged_changes():
         git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
     if refused:
         detail = "WIP preservation refused: deletions outside allowed paths: " + ", ".join(map(repr, refused[:10]))
         _append(ctx.store.log_path(n), detail)
         append_event(ctx.store, ctx.now(), n, "wip-preservation-refused", detail)
     if git.head_sha() == pushed_head or not tracker_available:
-        return status
+        return
     try:
         pr = ctx.tracker.find_pr(branch)
     except TrackerError as exc:
         _append(ctx.store.log_path(n), f"WIP kept on local branch {branch}; open PR lookup failed: {exc}")
-        return status
+        return
     # An unverified WIP must not replace the head seen by an open PR's CI/review.
     if pr is None:
         if push_branch is not None:
             push_branch()
         else:
             git.push(branch)
-    return status
-
-
-def _restore_approved_blobs(git: GitRepo, approval: Approval) -> None:
-    """Stage the approved acceptance files by their recorded blob hashes.
-
-    Never from a ref: an executor may have committed changed locked tests, so
-    HEAD (or any branch commit) can hold altered blobs. A missing approved blob
-    fails the save, which keeps the worktree.
-    """
-    for path, sha in sorted(approval.acceptance_blobs.items()):
-        entry = git._call(["--literal-pathspecs", "ls-files", "--stage", "--", path]).split(maxsplit=1)
-        if sha == "missing":  # Approved as absent: an executor's version stays out of the WIP.
-            if entry:
-                git._call(["update-index", "--force-remove", "--", path])
-            continue
-        mode = entry[0] if entry and entry[0] in {"100644", "100755"} else "100644"
-        git._call(["update-index", "--add", "--cacheinfo", f"{mode},{sha},{path}"])
 
 
 def _push_branch(attempt: Implementation) -> None:
@@ -707,8 +684,7 @@ def _publish_locked(attempt: Implementation) -> str:
                 if not subject:
                     attempt.pr_title = title
                 try:
-                    _merge_unless_stopped(ctx, n, lambda: ctx.tracker.merge_pr(
-                        pr, method="squash", expected_head_sha=verified_head_sha, **subject))
+                    ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
                 except TrackerError as exc:
                     if exc.is_rate_limit:
                         raise
@@ -717,6 +693,7 @@ def _publish_locked(attempt: Implementation) -> str:
                     else:
                         raise
                 else:
+                    ctx.store.record_merge(n, ctx.now())
                     if inputs.decision.kind == "merge":
                         runner.after_merge(ctx, pr, attempt.target_branch)
                     _progress(n, ctx)
@@ -835,8 +812,7 @@ def _publish_reviewed_head(
                 )
                 pr = replace(pr, title=title)
                 try:
-                    _merge_unless_stopped(ctx, n, lambda: ctx.tracker.merge_pr(
-                        pr.number, method="squash", expected_head_sha=head, **subject))
+                    ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
                 except TrackerError as exc:
                     if exc.is_rate_limit:
                         raise
@@ -845,6 +821,7 @@ def _publish_reviewed_head(
                     else:
                         raise
                 else:
+                    ctx.store.record_merge(n, ctx.now())
                     if review_mode_for(inputs.paths, ctx.config) == "fast":
                         runner.after_merge(ctx, pr.number, pr.base)
                     try:

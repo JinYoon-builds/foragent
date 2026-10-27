@@ -21,6 +21,7 @@ from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issu
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
+from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
@@ -185,93 +186,6 @@ def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = No
     _event(ctx, n, "retry", summary, say=say)
     kick_tick(ctx.repo_root)
     return summary
-
-
-def stop(ctx: RunContext, n: int, why: str) -> str:
-    """Stop a running issue and keep its work, in D95's order.
-
-    The request is claimed and written first. Then, after any merge call the
-    live runner already made, the tree is terminated through scheduler._kill_run;
-    the command waits (60 s) until every process of the tree is gone and then
-    (5 min) for worktree_lock(N). Only then does it, as the run's fallback owner,
-    save the WIP, write the stop event, finish the run and return the issue to
-    ready. A failure before the kill removes the request; a failure after it
-    keeps the request, and the next gate tick finishes the stop. A kill that cut
-    a destructive runner step is safe: the step left a checkpoint the save uses.
-    """
-    from foragent import orch_stop, scheduler
-
-    why = _text(why, "--why")
-    with orch_stop.claim_lock(ctx.store, n):
-        run, record, takeover = _claim_stop(ctx, n, why)
-    tick_ctx = scheduler.TickContext(
-        repo=ctx.repo, repo_root=ctx.repo_root, tracker=ctx.tracker, store=ctx.store,
-        config=ctx.config, git=ctx.git, now=ctx.now, launcher=lambda number: None,
-    )
-    report = scheduler.TickReport()
-    kept = "the stop request is kept and the next gate tick finishes the stop"
-    try:  # Before the kill: any failure removes the request (a takeover keeps the earlier one).
-        orch_stop.scan_tree(ctx.store, run, record)  # The tree before the kill, recorded in the request.
-        if run.status == "running":
-            orch_stop.wait_merge(ctx, run)
-    except Exception as exc:
-        if not takeover:
-            orch_stop.drop_request(ctx.store, n, record)
-        raise OrchError(f"#{n}: stop failed before the kill: {' '.join(str(exc).split()) or type(exc).__name__}; "
-                        + (kept if takeover else "nothing was changed")) from exc
-    current = ctx.store.get_run(n)
-    if current is not None and current.status == "running":
-        try:
-            killed = scheduler._kill_run(tick_ctx, n, report, outcome=orch_stop.STOPPED)
-        except Exception as exc:
-            raise OrchError(f"#{n}: stop failed at step kill: {exc}; {kept}") from exc
-        current = ctx.store.get_run(n)
-        if not killed and current is not None and current.status == "running":
-            raise OrchError(f"#{n}: stop failed at step kill: {'; '.join(report.actions) or 'refused'}; {kept}")
-    # A run that finished meanwhile (a merge that was in flight) goes to finish, which reports it.
-    if not orch_stop.wait_tree_dead(ctx, run, record):
-        raise OrchError(f"#{n}: stop failed at step wait-for-tree: the runner's processes are still alive "
-                        f"after {orch_stop.TREE_WAIT_S}s; {kept}")
-    with orch_stop.worktree_lock_within(ctx, n) as held:
-        if not held:
-            raise OrchError(f"#{n}: stop failed at step worktree-lock: worktree_lock({n}) was not free within "
-                            f"{orch_stop.LOCK_WAIT_S}s; {kept}")
-        try:
-            summary = orch_stop.finish(tick_ctx, n, record)
-        except orch_stop.StopStepFailed as exc:
-            note = kept if orch_stop.read_request(ctx.store, n) is not None else "the stop request was removed"
-            raise OrchError(f"#{n}: stop {exc}; {note}") from exc
-    kick_tick(ctx.repo_root)  # The next run may start from the branch now.
-    return summary
-
-
-def _claim_stop(ctx: RunContext, n: int, why: str):
-    """Under the claim lock: refuse, or take the request (over a dead stop command's) and write it.
-
-    Returns the run, the written request and whether it replaced a dead command's request.
-    """
-    from foragent import orch_stop
-    from foragent.scheduler_stop import stop_target_refusal
-
-    run = ctx.store.get_run(n)
-    record = orch_stop.read_request(ctx.store, n)
-    if record is not None and orch_stop.command_alive(record):
-        raise OrchError(f"#{n}: stop refused: fa orch stop (PID {record['pid']}) is already stopping it")
-    takeover = (record is not None and run is not None and run.started_at == record["started_at"]
-                and (run.status == "running" or run.outcome == orch_stop.STOPPED))
-    if run is None or (run.status != "running" and not takeover):
-        raise OrchError(f"issue #{n} is not running; nothing to stop")
-    if run.branch.startswith("foragent/batch-"):
-        raise OrchError(f"#{n}: stop refused: batch runs ({run.branch}) are not stopped")
-    if run.status == "running" and (refusal := stop_target_refusal(run)) is not None:
-        raise OrchError(f"#{n}: stop refused: {refusal}")
-    try:
-        written = orch_stop.write_request(ctx.store, run, why, ctx.now(), previous=record if takeover else None)
-        return run, written, takeover
-    except Exception:
-        if not takeover:
-            orch_stop.drop_request(ctx.store, n)
-        raise
 
 
 def rerun_review(ctx: RunContext, n: int, say: str | None = None) -> str:

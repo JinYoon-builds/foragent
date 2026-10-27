@@ -150,6 +150,10 @@ def _baseline_unavailable(n: int, ctx: RunContext, detail: str, cause: Exception
     raise ExecutorStopped(reason.value, detail) from cause
 
 
+# Verification runs no baseline selectors once a base sync leaves none protected (#123).
+EMPTIED = "Acceptance baseline verification skipped (count=0): no protected node ids remain"
+
+
 def follow_base(attempt: Implementation) -> None:
     """Keep the protected set on the base the branch is built on (#483).
 
@@ -166,6 +170,31 @@ def follow_base(attempt: Implementation) -> None:
     if sha == attempt.baseline_sha:
         return
     previous = attempt.baseline
+    if previous is not None and not previous.node_ids:
+        # An empty protected set stays empty for the run: nothing to re-capture (#123).
+        attempt.baseline_sha = sha
+        return
+    owned: set[str] = set()
+    missing: set[str] = set()
+    if previous is not None and previous.node_ids:
+        # Collect the protected ids on the new base first; an id it does not
+        # collect drops as missing, and none left skips the re-capture (#123).
+        from foragent.run_baseline import collect_protected_ids, log_dropped_ids
+        try:
+            owned, missing = collect_protected_ids(attempt.n, attempt.ctx, previous, sha)
+        except AttemptFailure as exc:
+            # The run stops (#327) and drops nothing. #483 still measures the new
+            # base once; its unusable capture usually stops the run first.
+            capture_acceptance_baseline(attempt.n, attempt.ctx, attempt.git, attempt.target_branch, sha,
+                                        previous.test_command)
+            _baseline_unavailable(attempt.n, attempt.ctx, str(exc), exc)
+        if not set(previous.node_ids) - owned - missing:
+            log_dropped_ids(attempt.log, previous, (), owned, missing, None, False)
+            _append(attempt.log, "Acceptance baseline re-capture skipped: no protected node ids remain")
+            _append(attempt.log, EMPTIED)
+            attempt.baseline = replace(previous, node_ids=(), collected_ids=(), failing_ids=(), base_sha=sha)
+            attempt.baseline_sha = sha
+            return
     # Without an earlier protected set, the worktree holds the PR: read the base.
     command = previous.test_command if previous else (
         attempt.ctx.config.test_command or _detect_test_command_at(attempt.git, sha))
@@ -174,6 +203,14 @@ def follow_base(attempt: Implementation) -> None:
         # A run that had protection must not continue with none (#327).
         _baseline_unavailable(attempt.n, attempt.ctx,
                               f"acceptance baseline unavailable: no baseline could be captured for the new base {sha}")
+    if previous is not None and previous.node_ids:
+        from foragent.ci_mode import enabled
+        from foragent.run_baseline import log_dropped_ids
+        log_dropped_ids(attempt.log, previous, baseline.node_ids, owned, missing, baseline,
+                        enabled(attempt.ctx, attempt.target_branch))
+        if not baseline.node_ids:
+            # Every survivor fails on the new base: as final as protection lost by collection.
+            _append(attempt.log, EMPTIED)
     attempt.baseline, attempt.baseline_sha = baseline, sha
 
 
@@ -314,12 +351,6 @@ def _implement(
         try:
             record_stop_point(ctx.store.root, n, result, log, offset)
         except OSError:
-            pass
-        from foragent.run_publish import observe_live_changes
-
-        try:  # Provenance for a later WIP: what this turn changed, before any cleanup.
-            observe_live_changes(ctx, n, worktree)
-        except Exception:
             pass
     # A prepared prompt has not been delivered yet. Keep its hint through
     # availability waits, launch failures and interruptions; acknowledge it

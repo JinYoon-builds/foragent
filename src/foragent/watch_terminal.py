@@ -94,15 +94,16 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             height, width = screen.getmaxyx()
             layout: dict = {}
             try:
-                frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(40, width - 1), selected=selected,
-                                     now=now(), **({} if store is None else {"layout": layout}))
+                # The terminal's own width, so the 60- and 100-column rules hold as in a plain frame.
+                frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(1, width), selected=selected,
+                                     now=now(), **({} if store is None else {"layout": layout}), height=height)
             except ImportError:
                 # A reinstall can briefly leave modules missing; restart on the installed code.
                 return _restart(cleanup)
             # Keep keyboard help on screen even when there are more lanes than rows.
             body, footer = frame[:-1], frame[-1]
             if error:
-                footer = watch._line(error, "yellow")
+                footer = watch._fit(watch._line(error, "yellow"), max(1, width))
             if show_detail:
                 offset = len(body)
                 show_detail = False
@@ -111,11 +112,14 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             screen.erase()
             for y, line in [*enumerate(visible), (height - 1, footer)]:
                 x = 0
-                for value, style in watch._fit(line, max(0, width - 1)):
+                # _frame already cut every line to the width; it is painted as it is.
+                for value, style in line:
                     try:
                         screen.addstr(y, x, value, styles.get(style, 0))
                     except curses.error:
-                        pass  # A resize may occur between measuring and painting.
+                        # Writing the bottom-right cell reports an error after drawing it;
+                        # a resize between measuring and painting does too.
+                        pass
                     x += watch._cells(value)
             screen.refresh()
             key = screen.getch()

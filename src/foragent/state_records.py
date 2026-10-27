@@ -44,8 +44,6 @@ class Run:
     status: str = "running"
     outcome: str | None = None
     detail: str = ""
-    # Paths the live worktree changed when an implementer turn ended: provenance for WIP deletions.
-    live_changes: list[str] = field(default_factory=list)
     lane: str = "main"
     waited_seconds: float = 0
     waiting_until: str | None = None
