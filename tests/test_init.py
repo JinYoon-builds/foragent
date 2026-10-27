@@ -343,7 +343,8 @@ def test_only_nondefault_keys_and_explicit_approvers_are_written(setup):
         "review": "fast", "executor": "claude", "approvers": ["alice", "bob"], "run_hours": "22-08",
         "reviewer": "claude", "checks": "local",
     }
-    assert setup.gh_calls == [(["auth", "status"], None), (["repo", "view", "owner/repo", "--json", "isPrivate"], None)]
+    # No pytest command here, so the repository's visibility is not needed (#419).
+    assert setup.gh_calls == [(["auth", "status"], None)]
 
 
 @pytest.mark.parametrize("language", ["ko", "en", "ja"])
