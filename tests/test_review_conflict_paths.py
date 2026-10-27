@@ -46,6 +46,17 @@ def test_code_review_conflict_outside_json_stops_whatever_the_verdict(run_case):
     assert c.tracker.merged_prs == []
 
 
+def test_conflict_round_keeps_the_reviewers_own_verdict_and_classes_beside_it(run_case):
+    from foragent.orch_facts_reviews import _artifacts
+
+    c = run_case
+    enable_native_reviewer(c, [json.dumps({"result": f"- feature.txt:1 — bug\n  class: stale-base\n{CONFLICT}"})])
+    assert run_issue(1, c.ctx) == "spec-question"
+    event, = review_events(c.store)
+    assert (event["verdict"], event["review_verdict"]) == ("SPEC-CONFLICT", "FAIL")
+    assert [classes for _, _, classes in _artifacts(c.store)[1]] == [{"stale-base"}]
+
+
 def test_panel_member_conflict_stops_without_a_merge_call_that_could_drop_it(git_history, tmp_path, monkeypatch):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
     panel = PanelExecutor(["VERDICT: PASS", f"VERDICT: FAIL\n{CONFLICT}"], merged="VERDICT: PASS")
