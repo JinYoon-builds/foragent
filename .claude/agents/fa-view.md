@@ -4,7 +4,7 @@ description: 'Foragent lane "view": implements issues in src/foragent/watch*.py,
   src/foragent/cli.py, src/foragent/notify*.py, src/foragent/i18n*.py.'
 memory: project
 skills:
-- toss-ux-writing
+- fa-ux-copy
 - principle-prove-it-works
 - principle-fix-root-causes
 ---
