@@ -10,3 +10,5 @@ build/
 /.claude/skills/principle-prove-it-works/
 /.claude/skills/skill-creator/
 .foragent/acceptance-exclusions.json
+/.claude/skills/fa-ux-copy/
+/.claude/skills/principle-fix-root-causes/
