@@ -142,7 +142,9 @@ def _available_executor(
     while True:
         run = ctx.store.get_run(n)
         # Another run may have hit this executor's usage limit; never launch it before the reset.
-        if (until := usage_recheck.hold_lane(ctx.store, name, run.lane, ctx.now())) is not None:
+        # A keep-mode switched run (#107) never pauses its lane: the lane's own pair may be free.
+        lane = run.lane if run.implementer is None else None
+        if (until := usage_recheck.hold_lane(ctx.store, name, lane, ctx.now())) is not None:
             _limit_wait(n, ctx, f"{name} is paused for a usage limit until {until.isoformat()}.")
         if not reviewer and run.fallback_model is not None:
             kwargs["model"] = run.fallback_model
@@ -202,7 +204,8 @@ def _available_executor(
             windows = (result.usage or {}).get(name)
             until = usage_events.limit_reset(windows, now, now + timedelta(minutes=ctx.config.limit_wait_minutes))
             # One write pauses the executor and lane and notes the levels; the gate may end it early.
-            usage_recheck.note_limit(ctx.store, name, until, windows, now, lane=run.lane)
+            usage_recheck.note_limit(ctx.store, name, until, windows, now,
+                                     lane=run.lane if run.implementer is None else None)
             _limit_wait(n, ctx, result.last_message or result.log_tail or "Executor usage limit reached.")
         if kind == "transient" and not reviewer:
             run = ctx.store.update_run(n, transient_errors=run.transient_errors + 1)

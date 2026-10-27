@@ -183,7 +183,7 @@ def init_repo(
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
     no_push: bool = False,
     no_launchd: bool = False, no_board: bool = False, dry_run: bool = False, git: GitRepo | None = None,
-    board_map: str | None = None,
+    board_map: str | None = None, claude_quota: str | None = None,
     gh_run: Callable[..., str] | None = None, tracker: Tracker | None = None,
     install_launchd: Callable[[Path], str] | None = None,
 ) -> InitReport:
@@ -216,6 +216,9 @@ def init_repo(
         explicit = {"approvers": approvers, "review": review, "executor": executor,
                     "run_hours": run_hours, "language": language}
         added = {key: value for key, value in explicit.items() if value is not None and key not in local}
+        if claude_quota is not None:  # Sets the mode and keeps the block's other keys.
+            block = local.get("claude_quota")
+            added["claude_quota"] = {**(block if isinstance(block, dict) else {}), "mode": claude_quota}
         if "checks" not in local:
             added["checks"] = initial_checks(repo, run, command=config.test_command or next(iter(detect_test_commands(root)), None))
         # Existing role entries are kept; missing defaults are added (#769).
@@ -225,8 +228,10 @@ def init_repo(
             _validate({**asdict(config), **added, "roles": role_source})
             config = replace(config, roles=role_source)
         if added:
-            _validate({**asdict(config), **added})
-            config = replace(config, **added)
+            full = {**added, **({"claude_quota": {**config.claude_quota, **added["claude_quota"]}}
+                                if "claude_quota" in added else {})}
+            _validate({**asdict(config), **full})
+            config = replace(config, **full)
         updated_config = _config_text(config_path, local, added, role_source)
     else:
         codex_available = _logged_in("codex")
@@ -254,6 +259,10 @@ def init_repo(
         config = Config(**{**DEFAULTS, **values})
         minimal = {key: value for key, value in values.items()
                    if key in {"review", "approvers", "checks", "roles"} or options[key] is not None or value != DEFAULTS[key]}
+        if claude_quota is not None:
+            minimal["claude_quota"] = {"mode": claude_quota}
+            _validate({**asdict(config), "claude_quota": {**config.claude_quota, "mode": claude_quota}})
+            config = replace(config, claude_quota={**config.claude_quota, "mode": claude_quota})
         contents = {".foragent.yml": CONFIG_COMMENT + yaml.safe_dump(minimal, sort_keys=False), **contents}
     if config.checks == "ci":
         contents[WORKFLOW] = workflow_text(config)
