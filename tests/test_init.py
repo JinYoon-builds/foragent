@@ -11,6 +11,7 @@ import yaml
 from foragent.config import ConfigError, load_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
+from foragent import role_agents
 from foragent.issue import parse_body
 from foragent.labels import LABELS
 from foragent.tracker import FakeTracker, TrackerError
@@ -19,6 +20,9 @@ from conftest import GitHistory, git_command
 
 
 PATHS = [".foragent.yml", ".github/ISSUE_TEMPLATE/foragent-task.md", "tests/acceptance/.gitkeep"]
+# The orchestrator and architect agents, memory and skill copies follow the setup files.
+ROLE_PATHS = list(role_agents.missing_files(Path("/nonexistent-foragent-project"))[0])
+ALL_PATHS = [*PATHS, *ROLE_PATHS]
 EXPECTED_CONFIG = (
     "# Configuration: Foragent docs/gate.md (section 9), docs/contract.md (section 4).\n"
     "review: batch\napprovers:\n- human\nchecks: local\n"
@@ -148,7 +152,7 @@ def setup(tmp_path, monkeypatch):
 
 def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     report = setup.init()
-    assert report.created == PATHS and report.existed == []
+    assert report.created == ALL_PATHS and report.existed == []
     assert (setup.root / PATHS[0]).read_text() == EXPECTED_CONFIG
     assert (setup.root / PATHS[1]).read_text() == EXPECTED_TEMPLATE
     assert (setup.root / PATHS[2]).read_bytes() == b""
@@ -160,10 +164,10 @@ def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     assert config.executor == "codex" and config.acceptance_dir == "tests/acceptance/"
     assert config.run_hours == "always"
     assert list(setup.tracker.labels.values()) == LABELS
-    assert ["add", "-f", "--", *PATHS] in setup.git_calls
+    assert ["add", "-f", "--", *ALL_PATHS] in setup.git_calls
     assert [
         "-c", "user.name=Test Human", "-c", "user.email=human@example.com",
-        "commit", "--only", "-m", "Set up Foragent", "--", *PATHS, ":!CLAUDE.local.md",
+        "commit", "--only", "-m", "Set up Foragent", "--", *ALL_PATHS, ":!CLAUDE.local.md",
     ] in setup.git_calls
     assert ["push", "origin", "refs/heads/main:refs/heads/main"] in setup.git_calls
     assert report.committed and report.pushed and setup.installs == [setup.root]
@@ -181,7 +185,7 @@ def test_claude_default_when_codex_is_missing_or_probe_times_out(setup, monkeypa
 
     monkeypatch.setattr(subprocess, "run", probe)
     report = setup.init(dry_run=True)
-    assert report.created == PATHS and not (setup.root / PATHS[0]).exists()
+    assert report.created == ALL_PATHS and not (setup.root / PATHS[0]).exists()
     setup.init()
     config = load_config(setup.root)
     assert config.executor == config.reviewer == "claude"
@@ -327,13 +331,13 @@ def test_existing_partial_config_and_template_remain_byte_for_byte(setup):
     report = setup.init(review="fast", approvers=["new"])
     assert (setup.root / PATHS[0]).read_text() == config + "checks: local\n"
     assert template.read_text() == "Existing template\n"
-    assert report.created == [PATHS[2]]
-    assert ["add", "-f", "--", PATHS[2], *PATHS[:2]] in setup.git_calls
+    assert report.created == [PATHS[2], *ROLE_PATHS]
+    assert ["add", "-f", "--", PATHS[2], *ROLE_PATHS, *PATHS[:2]] in setup.git_calls
 
 
 def test_existing_acceptance_directory_gets_no_placeholder(setup):
     (setup.root / "tests/acceptance").mkdir(parents=True)
-    assert setup.init().created == PATHS[:2]
+    assert setup.init().created == [*PATHS[:2], *ROLE_PATHS]
     assert not (setup.root / PATHS[2]).exists()
 
 
@@ -440,8 +444,8 @@ def test_dirty_worktree_and_unrelated_staged_changes_are_preserved(setup):
     assert readme.read_text() == "Unstaged user change\n"
     assert (setup.root / "untracked.txt").read_text() == "Keep me\n"
     commit = next(args for args in setup.git_calls if "commit" in args)
-    assert "--only" in commit and commit[commit.index("--") + 1:] == [*PATHS, ":!CLAUDE.local.md"]
-    assert [args for args in setup.git_calls if args[0] == "add"] == [["add", "-f", "--", *PATHS]]
+    assert "--only" in commit and commit[commit.index("--") + 1:] == [*ALL_PATHS, ":!CLAUDE.local.md"]
+    assert [args for args in setup.git_calls if args[0] == "add"] == [["add", "-f", "--", *ALL_PATHS]]
 
 
 def test_no_push_still_commits_and_no_launchd_skips_install(setup):
@@ -564,7 +568,7 @@ def test_rerun_recovers_after_commit_hook_failure(setup):
     with pytest.raises(GitError, match="pre-commit hook failed"):
         setup.init()
     assert git_command(setup.root, "rev-parse", "HEAD") == before
-    assert set(git_command(setup.root, "diff", "--cached", "--name-only").splitlines()) == set(PATHS)
+    assert set(git_command(setup.root, "diff", "--cached", "--name-only").splitlines()) == set(ALL_PATHS)
     setup.commit_fails = False
     setup.git_calls.clear()
     report = setup.init()
@@ -874,3 +878,42 @@ def test_missing_checks_in_existing_config_is_selected_without_input_and_kept(
     assert not setup.init().committed
     assert path.read_bytes() == before
     assert setup.gh_calls == [(['auth', 'status'], None)]
+
+
+def test_role_agent_with_wrong_frontmatter_is_kept_with_one_warning(setup, capsys):
+    agent = setup.root / ".claude/agents/fa-architect.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("No frontmatter here\n")
+    skill = setup.root / ".claude/skills/fa-orchestrator/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("Project's own orchestrator skill\n")
+    report = setup.init()
+    assert agent.read_text() == "No frontmatter here\n"
+    assert skill.read_text() == "Project's own orchestrator skill\n"
+    assert ".claude/agents/fa-architect.md" not in report.created
+    assert not any(path.startswith(".claude/skills/fa-orchestrator/") for path in report.created)
+    assert (setup.root / ".claude/agents/fa-orchestrator.md").read_text() == role_agents.agent_text("fa-orchestrator")
+    assert (setup.root / ".claude/agent-memory/fa-architect/MEMORY.md").read_text() == "# fa-architect memory\n"
+    warnings = [line for line in capsys.readouterr().err.splitlines() if "fa-architect.md" in line]
+    assert len(warnings) == 1 and warnings[0].startswith("Warning:")
+
+
+def test_dry_run_lists_role_files_and_creates_none(setup):
+    report = setup.init(dry_run=True)
+    assert "Would create: .claude/agents/fa-orchestrator.md" in report.summary()
+    assert "Would create: .claude/agent-memory/fa-architect/MEMORY.md" in report.summary()
+    assert not (setup.root / ".claude").exists()
+
+
+def test_package_data_covers_every_file_of_both_role_skills():
+    import tomllib
+    root = Path(__file__).resolve().parents[1]
+    data_files = tomllib.loads((root / "pyproject.toml").read_text())["tool"]["setuptools"]["data-files"]
+    for role in role_agents.ROLES:
+        source = root / "skills" / role
+        files = [path.relative_to(root) for path in source.rglob("*") if path.is_file()]
+        assert files, f"{role} skill is missing"
+        for path in files:
+            destination = (Path("share/foragent") / path.parent).as_posix()
+            assert any(path.match(pattern) and path.parent == Path(pattern).parent
+                       for pattern in data_files.get(destination, [])), f"{path} is not packaged"
