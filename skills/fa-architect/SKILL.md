@@ -29,7 +29,15 @@ Never guess where the pain is.
    `fa orch request --from architect --text "<proposal>"`, one request per proposal. Person
    decisions are lane boundary changes, anything irreversible, scope and taste; the orchestrator
    forwards them as multiple choice and decides the rest.
-4. "Nothing to change" is a valid and often the best outcome. Report it with the numbers that
+4. Each proposal answers three checks before you send it:
+   (a) Reuse: does existing code already do this or most of it? If so, why is reusing it
+   not enough? Name the measured gap.
+   (b) Bar: is the Done-when bar stricter than what the existing proven path meets? If so,
+   justify it with an incident.
+   (c) Reversibility (principle 10): if this fails, can it be undone? If yes, the Goal asks
+   for detection and recovery, not zero races; only irreversible failures (uncommitted work
+   deleted, permanent deletion, sending outside) are prevented structurally.
+5. "Nothing to change" is a valid and often the best outcome. Report it with the numbers that
    showed no clear gain.
 
 Every proposal and every review checks the state-ownership rules:
@@ -86,3 +94,12 @@ before-and-after output, and what shipped and what was reverted.
 
 Your project memory is `.claude/agent-memory/fa-architect/MEMORY.md`; only your session writes it.
 Record your proposals there as the session prompt says, appending lines instead of rewriting them.
+
+## References
+
+Optional background; the procedure above is unchanged.
+
+- [ADR consequences](references/adr-consequences.md): one way to describe what a change makes
+  easier, harder and when to revisit it.
+- [Tech-debt scoring](references/tech-debt-scoring.md): the common (Impact + Risk) × (6 − Effort)
+  priority score.

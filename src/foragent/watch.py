@@ -33,6 +33,7 @@ from foragent.watch_data import Snapshot, collect, recent_events
 from foragent.watch_art import ORCHESTRATOR, PALETTE, half_blocks
 from foragent.watch_layout import PICK, _activity, _frame, _has_work, render_frame
 from foragent.watch_sections.detail import render_detail
+from foragent.watch_sections.finished import FIREWORKS_SECONDS, calm
 from foragent.watch_sections.stage import _stage
 from foragent.watch_mouse import handle_mouse, hit_test, switch_to_orchestrator
 from foragent.watch_open import LOCK_FD_ENV, exclusive, registered
@@ -68,7 +69,9 @@ def run(
     reload_requested = False
     refresh = lambda: collect(status(), tracker, store, config, now())
     if once:
-        print(render_frame(refresh(), config, repo_root))
+        # A single printed frame is the calm finished scene, never fireworks.
+        with calm():
+            print(render_frame(refresh(), config, repo_root))
         return
     with exclusive(store) as lock:
         if lock is None:

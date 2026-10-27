@@ -82,17 +82,12 @@ def _lane_skill_names(ctx: RunContext, n: int, worktree: Path, agent: str | None
 
 
 def lane_skill_names(config: Config, lane: str, worktree: Path, agent: str | None) -> list[str]:
-    settings = _lane_settings(config, lane)
-    skills = settings.get("skills", [])
-    frontmatter = re.compile(r"\A---[^\S\n]*\n(.*?)^---[^\S\n]*(?:\n|$)", re.DOTALL | re.MULTILINE)
-    if not skills and agent is not None:
-        definition = (worktree / ".claude/agents" / f"{agent}.md").read_text(encoding="utf-8", errors="replace")
-        match = frontmatter.match(definition)
-        try:
-            metadata = yaml.safe_load(match[1]) if match else None
-        except yaml.YAMLError:
-            metadata = None
-        skills = metadata.get("skills", []) if isinstance(metadata, dict) else []
+    """The lane's skills from .foragent.yml, its single source (D95).
+
+    The agent file's frontmatter is a projection the lanes code writes; an empty
+    configured list means no skills, never the agent's list.
+    """
+    skills = _lane_settings(config, lane).get("skills", [])
     return [name for name in skills if isinstance(name, str)] if isinstance(skills, list) else []
 
 

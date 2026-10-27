@@ -33,9 +33,10 @@ def test_exact_defaults(repo):
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
-        "interview": "native", "ouroboros_version": None, "profile": None, "update_check": True,
+        "interview": "native", "ouroboros_version": None, "profile": None, "animation": True, "update_check": True,
         "upstream_reports": None, "perspectives": {}, "claude_quota": {"mode": "keep", "keep_percent": 80},
         "view_glyphs": "auto",
+        "presence": {"statusline": True, "session_start": True, "report": True},
         "skill_roles": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,
@@ -66,6 +67,22 @@ def test_tiers_merge_global_and_repository_fields(repo, tmp_path):
 def test_invalid_tiers_are_rejected(repo, value):
     write_settings(repo / ".foragent.yml", {"tiers": value})
     with pytest.raises(ConfigError, match="tiers"):
+        load_config(repo)
+
+
+def test_presence_parts_merge_global_and_repository(repo, tmp_path):
+    global_path = tmp_path / "global.yml"
+    write_settings(global_path, {"presence": {"report": False}})
+    write_settings(repo / ".foragent.yml", {"presence": {"statusline": False}})
+    assert load_config(repo, global_path).presence == {
+        "statusline": False, "session_start": True, "report": False}
+
+
+@pytest.mark.parametrize("value", [None, [], "off", {"statusline": "no"}, {"statusline": 0},
+                                    {"squirrel": True}])
+def test_invalid_presence_is_rejected(repo, value):
+    write_settings(repo / ".foragent.yml", {"presence": value})
+    with pytest.raises(ConfigError, match="presence"):
         load_config(repo)
 
 

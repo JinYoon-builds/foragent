@@ -43,6 +43,7 @@ def _pr_body(
         lines.append(f"Round {round_number}: VERDICT: {review.verdict}")
         if review.findings:
             lines.append(review.findings)
+        lines.extend(f"NOTE: {note}" for note in review.review_notes)
         lines.extend(review.notes)
         lines.append("")
     if rebuttals:

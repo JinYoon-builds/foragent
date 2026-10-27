@@ -19,6 +19,7 @@ class ConfigError(ValueError):
 
 
 SKILL_ROLES = {"style", "review", "tool", "domain"}
+PRESENCE_DEFAULTS = {"statusline": True, "session_start": True, "report": True}
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class Config:
     language: str = "en"
     interview: str = "native"
     ouroboros_version: str | None = None
+    animation: bool = True  # Lane-view fireworks and the big squirrel sprite (#168).
     update_check: bool = True  # The daily release check (#417); FORAGENT_UPDATE_CHECK=off also opts out.
     profile: dict[str, Any] | None = None
     # Whether `fa report propose` may prepare upstream error reports; None means not asked yet (#419).
@@ -94,6 +96,8 @@ class Config:
     claude_quota: dict[str, Any] = field(default_factory=lambda: {"mode": "keep", "keep_percent": 80})
     # Lane view glyphs (#167): emoji, ascii, or auto (ascii on dumb/linux terminals or non-UTF-8 locales).
     view_glyphs: str = "auto"
+    # Foragent presence in Claude Code (#754); each part switches off on its own.
+    presence: dict[str, bool] = field(default_factory=lambda: dict(PRESENCE_DEFAULTS))
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
@@ -438,6 +442,9 @@ def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
     quota = overrides.get("claude_quota")
     if isinstance(quota, dict) and isinstance(values["claude_quota"], dict):
         overrides = {**overrides, "claude_quota": {**values["claude_quota"], **quota}}
+    presence = overrides.get("presence")
+    if isinstance(presence, dict) and isinstance(values["presence"], dict):
+        overrides = {**overrides, "presence": {**values["presence"], **presence}}
     values.update(overrides)
 
 

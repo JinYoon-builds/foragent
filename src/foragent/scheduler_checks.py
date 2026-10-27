@@ -1,4 +1,4 @@
-"""Per-issue prerequisite reads, blocker escalation and batch reconciliation."""
+"""Per-issue prerequisite reads, blocker escalation, closed-issue catch-up and batch reconciliation."""
 
 from __future__ import annotations
 
@@ -149,6 +149,10 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
 
 
 def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
+    # Housekeeping first, on every tick: issues closed outside the gate since the
+    # last tick (one light read) reach this reconciliation and the board sync.
+    if (observe := getattr(ctx.tracker, "observe_closed_issues", None)) is not None:
+        observe(observed_at=ctx.now())
     issues = {issue.number: issue for issue in scheduler.local_issue_models(ctx.store) if issue.state == "open"}
     parents: set[int] = set()
     rows = ctx.store.local_issues()

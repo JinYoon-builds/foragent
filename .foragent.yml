@@ -10,7 +10,7 @@ lanes:
     - skills/fa-init/**
     - tests/test_adopt.py
     agent: fa-adopt
-    skills: []
+    skills: [principle-prove-it-works, principle-fix-root-causes]
   order:
     paths:
     - src/foragent/order.py
@@ -22,13 +22,15 @@ lanes:
     skills:
     - skill-creator
     - testing-strategy
+    - principle-prove-it-works
+    - principle-fix-root-causes
   bench:
     paths:
     - src/foragent/bench.py
     - bench/**
     - tests/test_bench.py
     agent: fa-bench
-    skills: []
+    skills: [principle-prove-it-works, principle-fix-root-causes]
   orch:
     paths:
     - src/foragent/orch*.py
@@ -39,6 +41,9 @@ lanes:
     agent: fa-orch
     skills:
     - testing-strategy
+    - principle-prove-it-works
+    - principle-fix-root-causes
+    - fa-state-design
   view:
     paths:
     - src/foragent/watch*.py
@@ -48,8 +53,9 @@ lanes:
     - src/foragent/i18n*.py
     agent: fa-view
     skills:
-    - toss-ux-writing
+    - fa-ux-copy
     - principle-prove-it-works
+    - principle-fix-root-causes
   board:
     paths:
     - src/foragent/board*.py
@@ -57,7 +63,7 @@ lanes:
     - src/foragent/order.py
     - src/foragent/tracker.py
     agent: fa-board
-    skills: []
+    skills: [principle-prove-it-works, principle-fix-root-causes, fa-state-design]
   skills:
     paths:
     - src/foragent/skills.py
@@ -66,6 +72,9 @@ lanes:
     agent: fa-skills
     skills:
     - skill-creator
+    - principle-prove-it-works
+    - principle-fix-root-causes
+    - fa-state-design
   design:
     paths:
     - src/foragent/design*.py
@@ -75,6 +84,7 @@ lanes:
     skills:
     - skill-creator
     - principle-prove-it-works
+    - principle-fix-root-causes
 board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards
 test_slots: 5  # 2026-10-26: CPU 47% idle and memory 76% free while 3 slots were held and more than four runs waited to check; the gate's CPU-busy AIMD climbs within this ceiling
 checks: ci  # 2026-10-26 Jin: CI mode on after #493/#506 (evidence = the measurement run's own artifacts). Revert to local in one commit if evidence is missing or rejected
