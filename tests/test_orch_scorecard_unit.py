@@ -80,7 +80,8 @@ def test_human_output_names_each_worse_metric_and_failures(store):
     assert card["repeated_failures"] == [{"reason": "Boom", "count": 2, "issues": [1, 2]}]
     assert card["unexplained_failures"] == [3]
     lines = orch_scorecard.human(card, "en").splitlines()
-    assert len(lines) == 5 and "Boom" in lines[3] and "#3" in lines[4]
+    # Today, its flow line, the previous days, their flow line, then the verdict and failures.
+    assert len(lines) == 7 and "flow" in lines[1] and "Boom" in lines[5] and "#3" in lines[6]
 
 
 @pytest.mark.parametrize("value", ["1", "0", "x", "2.5"])
@@ -119,3 +120,227 @@ def test_worst_line_uses_registry_labels_and_raw_phase_names():
     assert orch_scorecard.worst_line(raw, "en") == "Worse than the days before: packing minutes 3.0 -> 9.0"
     rate = card(["merge_rate"], {"merge_rate": 0.5}, {"merge_rate": 1.0})
     assert orch_scorecard.worst_line(rate, "ko") == "그 전 며칠보다 나빠졌어요: 머지 비율 100.0% -> 50.0%"
+
+
+@pytest.mark.parametrize("records", ["missing", "non-directory", "empty"])
+def test_missing_optional_machine_records_keep_scorecard_consumers_working(store, tmp_path, monkeypatch, records):
+    from foragent import capacity
+    from foragent.config import Config
+
+    machine = tmp_path / "machine"
+    if records == "non-directory":
+        machine.write_text("")
+        machine /= "foragent"
+    elif records == "empty":
+        machine.mkdir()
+        (machine / capacity.HISTORY_FILE).write_text("")
+    monkeypatch.setattr(capacity, "machine_root", lambda: machine)
+    finish(store, 1, at=NOW - timedelta(days=1, hours=1), minutes=10)
+    finish(store, 2, at=NOW - timedelta(hours=1), minutes=30)
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    result = orch_scorecard.collect(store, days=2)
+    today = result["window"]["today"]
+    assert today["idle_minutes"] == 0  # No capacity observation: unknown, never idle.
+    assert today["waste_share"] == 0
+    assert today["lead_time_minutes"] is None  # No approval record.
+    assert today["person_interventions"] == 0
+    assert today["wait_minutes_by_cause"] == dict.fromkeys(("slot", "overlap", "merge", "quota"), 0)
+    assert orch_scorecard.binding(store, Config(), tmp_path, result) == {"today": "none", "previous": "none"}
+    assert orch_scorecard.worst(result) == "median_minutes_to_merge"
+    assert orch_scorecard.worst_line(result, "en") == (
+        "Worse than the days before: minutes to merge 10.0 -> 30.0")
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+
+
+def test_flow_idle_counts_sibling_repositories_on_the_shared_budgets(tmp_path, monkeypatch):
+    from foragent import capacity
+    from foragent.issue import body_hash
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    start = NOW - timedelta(hours=1)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=start.isoformat())
+    store.update_local_issue(1, title="t", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+    for name in ("parallel", "test_slots"):
+        capacity.append_budget_history(tmp_path, start, name, 0, 1, pressure="normal", load_per_cpu=0.1, swapins=0)
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(60)
+    clock = [start]
+    sibling = StateStore(tmp_path / "other-repo", now=lambda: clock[0])
+    sibling.start_run(5, branch="foragent/issue-5", worktree=sibling.worktree_path(5))
+    sibling.update_run(5, pid=4242, phase="checking", phase_started_at=start.isoformat())
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == 0, (
+        "A sibling's live run and its checking phase fill the machine-wide budgets")
+
+
+def test_flow_waste_counts_ongoing_runtime_and_merged_running_records(store):
+    finish(store, 1, at=NOW - timedelta(hours=2), minutes=10, outcome="error")
+    store.clock[0] = NOW - timedelta(minutes=90)
+    store.start_run(2, branch="foragent/issue-2", worktree=store.worktree_path(2))
+    store.clock[0] = NOW
+    today = orch_scorecard.collect(store, 2)["window"]["today"]
+    assert today["waste_share"] == pytest.approx(0.1), "10 failed of 100 runtime minutes, 90 still running"
+    assert today["merges"] == 0
+    store.record_merge(2, NOW - timedelta(minutes=5))
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["merges"] == 1, (
+        "A merged runner still cleaning up has merged")
+
+
+def test_flow_idle_without_label_events_uses_records_not_current_labels(tmp_path, monkeypatch):
+    from foragent import capacity
+    from foragent.issue import body_hash
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    approved, started = NOW - timedelta(hours=2), NOW - timedelta(minutes=90)
+    capacity.append_budget_history(tmp_path, NOW - timedelta(days=1), "parallel", 0, 1,
+                                   pressure="normal", load_per_cpu=0.1, swapins=0)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=approved.isoformat())
+    clock[0] = started
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    clock[0] = NOW - timedelta(minutes=60)
+    store.record_merge(1, clock[0])
+    store.finish_run(1, outcome="merged")
+    # Only `approved` is left now; `ready` was removed when it started (no label history).
+    store.update_local_issue(1, title="t", body=body, labels=["approved"], state="closed", blocked_by=[],
+                             merged=True, merged_at=clock[0].isoformat())
+    clock[0] = NOW
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(30)
+    # A hold counts from its flag time, not from the approval.
+    store.update_local_issue(2, title="t2", body=body, labels=["approved", "ready", "blocked"], state="open",
+                             blocked_by=[])
+    store.save_approval(2, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=(NOW - timedelta(minutes=20)).isoformat())
+    store.save_flag(2, "stalled", flagged_at=(NOW - timedelta(minutes=10)).isoformat())
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(40)
+
+
+def test_flow_idle_counts_a_merged_blocker_until_its_merge(tmp_path, monkeypatch):
+    from foragent import capacity
+    from foragent.issue import body_hash
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    capacity.append_budget_history(tmp_path, NOW - timedelta(days=1), "parallel", 0, 1,
+                                   pressure="normal", load_per_cpu=0.1, swapins=0)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=(NOW - timedelta(hours=1)).isoformat())
+    store.update_local_issue(99, title="b", labels=[], state="closed", merged=True,
+                             merged_at=(NOW - timedelta(minutes=30)).isoformat())
+    store.update_local_issue(1, title="t", body=body, labels=["approved", "ready"], state="open",
+                             blocked_by=[{"number": 99, "state": "closed", "repository": None}])
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(30), (
+        "The blocker was open until its merge 30 minutes ago")
+
+
+def _paused_case(tmp_path, monkeypatch):
+    """Issue 1 approved two hours ago with a free slot ever since; the clock drives plan edits."""
+    from foragent import capacity
+    from foragent.issue import body_hash
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    clock = [NOW - timedelta(hours=2)]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    capacity.append_budget_history(tmp_path, NOW - timedelta(days=1), "parallel", 0, 1,
+                                   pressure="normal", load_per_cpu=0.1, swapins=0)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=clock[0].isoformat())
+    store.update_local_issue(1, title="t", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+    return store, clock
+
+
+def _idle_now(store, clock):
+    clock[0] = NOW
+    return orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"]
+
+
+def test_flow_idle_a_later_pause_of_the_lane_replaces_the_earlier_one(tmp_path, monkeypatch):
+    from foragent import orch_plan
+
+    store, clock = _paused_case(tmp_path, monkeypatch)
+    orch_plan.pause(store, "main", NOW + timedelta(hours=1), "long")  # 10:00 until 13:00
+    clock[0] = NOW - timedelta(minutes=90)
+    orch_plan.pause(store, "main", NOW - timedelta(minutes=20), "shorter")  # 10:30 until 11:40
+    assert _idle_now(store, clock) == pytest.approx(20), "Only 11:40 to 12:00 is unpaused"
+
+
+def test_flow_idle_a_pause_ends_at_the_recorded_plan_expiry_not_when_noticed(tmp_path, monkeypatch):
+    from foragent import orch_plan
+
+    store, clock = _paused_case(tmp_path, monkeypatch)
+    orch_plan.pause(store, "main", NOW + timedelta(hours=1), "long")
+    orch_plan.set_plan(store, {}, NOW + timedelta(minutes=30))
+    clock[0] = NOW - timedelta(minutes=60)
+    orch_plan.set_plan(store, {}, NOW - timedelta(minutes=30))  # The later record replaces the earlier expiry.
+    assert _idle_now(store, clock) == pytest.approx(30), "The plan expired at 11:30 with no tick watching"
+    clock[0] = NOW - timedelta(minutes=10)
+    orch_plan.record_expiry(store, clock[0])  # A tick notices it at 11:50.
+    assert _idle_now(store, clock) == pytest.approx(30), "The noticing time is not the end"
+
+
+def test_flow_a_recorded_merge_counts_even_when_a_later_step_failed(store):
+    store.save_approval(1, body="b", body_sha="s", acceptance_blobs={}, approved_by="human",
+                        approved_at=(NOW - timedelta(hours=2)).isoformat())
+    store.update_local_issue(1, title="t", labels=["approved"], state="closed")
+    finish(store, 1, at=NOW - timedelta(hours=1), minutes=30, outcome="error",
+           merged_at=NOW - timedelta(hours=1, minutes=10))
+    today = orch_scorecard.collect(store, 2)["window"]["today"]
+    assert today["waste_share"] == 0, "Merged work is not wasted because cleanup failed"
+    assert today["merges"] == 1
+    assert today["lead_time_minutes"] == pytest.approx(50), "Approval 10:00 to merge 10:50 keeps its sample"
+
+
+def test_flow_idle_a_current_label_change_never_rewrites_earlier_days(tmp_path, monkeypatch):
+    """Without label events, today's labels apply only from the issue's recorded update time."""
+    from foragent import capacity
+    from foragent.issue import body_hash
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    clock = [NOW - timedelta(days=3)]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    capacity.append_budget_history(tmp_path, clock[0], "parallel", 0, 1, pressure="normal",
+                                   load_per_cpu=0.1, swapins=0)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=clock[0].isoformat())
+    store.update_local_issue(1, title="t", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+
+    def idle():
+        clock[0] = NOW
+        window = orch_scorecard.collect(store, 2)["window"]
+        return window["previous"]["idle_minutes"], window["today"]["idle_minutes"]
+
+    assert idle() == (pytest.approx(1440), pytest.approx(1440))
+    clock[0] = NOW - timedelta(hours=1)
+    store.update_local_issue(1, labels=["ready"])  # Approval removed an hour ago.
+    assert idle() == (pytest.approx(1440), pytest.approx(1380)), "Yesterday stays idle"
+    clock[0] = NOW - timedelta(days=3)
+    store.update_local_issue(2, title="t2", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+    store.save_approval(2, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=clock[0].isoformat())
+    clock[0] = NOW - timedelta(minutes=30)
+    store.update_local_issue(2, labels=["approved", "ready", "blocked"])  # No flag record.
+    assert idle() == (pytest.approx(1440), pytest.approx(1410)), "The hold counts from its update, not all along"
+
+
+def test_flow_idle_reads_the_parallel_state_file_from_its_changed_at(tmp_path, monkeypatch):
+    from foragent import capacity
+    from foragent.issue import body_hash
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=(NOW - timedelta(hours=2)).isoformat())
+    store.update_local_issue(1, title="t", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == 0, "No budget record: unknown"
+    capacity.write_state(store, 1, NOW - timedelta(hours=1))
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(60), (
+        "The budget file is a record from its changed_at")
