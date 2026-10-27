@@ -150,3 +150,30 @@ def test_sensor_clock_baselines_are_pruned_by_age_only(tmp_path, monkeypatch):
     wall[0] += 2 * 3600
     capacity.slept_seconds(Clock.now())
     assert len(json.loads(path.read_text())) == 2, "Only the one older than 48 h is dropped"
+
+
+def test_only_sleep_above_a_minute_starts_wake_grace(case):
+    case.tick()
+    case.facts.sleep(60)
+    case.tick()
+    assert sleep_credit.wake_grace(case.store) is None
+    case.facts.sleep(61)
+    case.tick()
+    wake, until = sleep_credit.wake_grace(case.store)
+    assert wake == case.facts.now() and until == wake + timedelta(seconds=sleep_credit.WAKE_GRACE_SECONDS)
+
+
+def test_activity_ends_grace_only_for_its_run_and_a_short_sleep_does_not_restart_it(case, tmp_path):
+    case.store.start_run(2, branch="b", worktree=tmp_path / "w2")
+    case.tick()
+    case.facts.sleep(NIGHT)
+    case.tick()
+    assert all(sleep_credit.in_wake_grace(case.store, case.store.get_run(n), case.facts.now()) for n in (1, 2))
+    case.facts.awake(30)
+    case.store.update_run(1, last_activity_at=case.facts.now().isoformat())
+    case.facts.sleep(30)
+    case.tick()
+    assert not sleep_credit.in_wake_grace(case.store, case.store.get_run(1), case.facts.now())
+    assert sleep_credit.in_wake_grace(case.store, case.store.get_run(2), case.facts.now())
+    case.facts.awake(sleep_credit.WAKE_GRACE_SECONDS)
+    assert not sleep_credit.in_wake_grace(case.store, case.store.get_run(2), case.facts.now())

@@ -191,7 +191,12 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
-    sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
+    slept = sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
+    if slept > sleep_credit.WAKE_THRESHOLD_SECONDS:
+        until = (ctx.now() + scheduler.timedelta(seconds=sleep_credit.WAKE_GRACE_SECONDS)).astimezone()
+        report.actions.append(scheduler.text(
+            "sleep_wake", ctx.config.language, hours=int(slept // 3600),
+            minutes=int(slept % 3600 // 60), until=until.strftime("%H:%M")))
     for run in ctx.store.active_runs():
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
@@ -230,7 +235,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit."):
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
-            elif run.pid is not None and not waiting and ctx.now() - scheduler.datetime.fromisoformat(
+            elif run.pid is not None and not waiting and not sleep_credit.in_wake_grace(
+                    ctx.store, run, ctx.now()) and ctx.now() - scheduler.datetime.fromisoformat(
                 run.last_progress_at or run.started_at,
             ) - scheduler.timedelta(seconds=run.slept_since_progress) > scheduler.timedelta(
                 minutes=ctx.config.stall_minutes):
