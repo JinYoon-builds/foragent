@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -43,6 +44,11 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"
+        f"Tests under {acceptance_dir} that this issue lists are locked acceptance tests. If a finding would "
+        "require behaviour a locked acceptance test forbids, or forbid behaviour it requires, it is a spec "
+        "conflict, not a defect: report it as one line "
+        "`SPEC-CONFLICT: <locked test path:line> <what the test requires>; <what the finding wants>` "
+        "instead of a finding.\n"
         + text("review_class_question", language)
     )
 
@@ -80,6 +86,35 @@ def goal_condition(acceptance_dir: str) -> str:
     return prefix + acceptance_dir[:3500 - len(prefix) - len(suffix)] + suffix
 
 
+BUG_FIX_REFERENCE = "skills/fa-orchestrator/references/bug-fix.md"
+# The D79 skeleton, adapted from pstack/playbooks/bug-fix.md (MIT); the full text is BUG_FIX_REFERENCE.
+BUG_FIX_STEPS = (
+    "This issue is a bug. Follow these steps:\n"
+    "1. Reproduce the bug on the surface where it was reported before changing anything.\n"
+    "2. Rule out hypotheses with runtime evidence until one survives. Do not guess; when the state is "
+    "unclear, add logging or instrumentation and read its output.\n"
+    "3. Plan the smallest fix of the root cause that the evidence justifies; revert changes "
+    "that refuted hypotheses motivated.\n"
+    "4. Confirm the bug at the same place as the reproduction after the fix.\n"
+    "5. Write a failing regression test first, and see it fail before you change the code.\n"
+    "6. Report the root cause and the evidence (failing-then-passing output) in your final message.\n"
+)
+
+
+def is_bug_label(label: str) -> bool:
+    name = label.strip().lower()
+    return name == "bug" or name.endswith((":bug", " bug"))
+
+
+def bug_fix_steps(labels: Iterable[str], worktree: Path) -> str | None:
+    """Return the bug-fix summary for a bug-labelled issue, else None."""
+    if not any(is_bug_label(label) for label in labels):
+        return None
+    if (worktree / BUG_FIX_REFERENCE).is_file():
+        return BUG_FIX_STEPS + f"The full procedure is in `{BUG_FIX_REFERENCE}`.\n"
+    return BUG_FIX_STEPS
+
+
 def build_prompt(
     n: int, parsed: ParsedIssue, acceptance_dir: str, failure: str = "", language: str = "en",
     *, native_goal: bool = False, acceptance_locked: bool = False,
@@ -96,6 +131,7 @@ def build_prompt(
     parent_context: str = "",
     full_text_dir: Path | None = None,
     moved_files: list[str] | None = None,
+    procedure: str | None = None,
 ) -> str:
     from foragent import runner
 
@@ -146,6 +182,8 @@ def build_prompt(
         "  steps:\n"
         "  - <what to click or type>\n"
     )
+    if procedure is not None:
+        prompt += "\n" + procedure
     if previous_attempt:
         prompt += "\nPrevious attempt (from local records):\n" + previous_attempt + "\n"
     if reviewer_text is not None:
@@ -183,7 +221,7 @@ def build_resume_prompt(
     n: int, previous_body: str | None, body: str, failure: str = "", *,
     reviewer_text: str | None = None, orchestrator_hint: str | None = None,
     merge_conflicts: list[str] | None = None, review_feedback: bool = False, retry_default: bool = False,
-    moved_files: list[str] | None = None, parent_context: str = "",
+    moved_files: list[str] | None = None, parent_context: str = "", procedure: str | None = None,
 ) -> str:
     """Deliver exact specification edits and feedback to an existing session."""
     parts = [f"Continue implementing GitHub issue #{n} in this repository."]
@@ -200,6 +238,8 @@ def build_resume_prompt(
                 "\n".join(new[new_start:new_end]) if new_start != new_end else
                 "Remove these previous requirements:\n" + "\n".join(old[start:end])
             ))
+    if procedure is not None:
+        parts.append(procedure.rstrip("\n"))
     if reviewer_text is not None:
         parts.append("A reviewer said (verbatim):\n" + reviewer_text)
     elif failure:

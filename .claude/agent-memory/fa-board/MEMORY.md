@@ -33,3 +33,5 @@
 - [issues.json 캐시 (#588)](issue_record_cache.md) — 읽기만 캐시, 잠금 쓰기는 새로 해석; fstat으로 버전 고정; deepcopy 금지
 - [닫힌 PR watermark (#589)](closed_pr_watermark.md) — merged_prs.json 목록+watermark, GhTracker만 증분, 성공 뒤에만 기록
 - `tests/acceptance/test_scheduler_split.py`가 `scheduler.py`를 250줄로 제한한다(#411에서 251줄로 기준선 회귀). scheduler에 줄을 더할 때는 `wc -l`로 확인하고, 주석은 줄 끝에 붙인다. 새 로직은 board_parents 같은 별도 모듈에 둔다.
+- Your turn 덮어쓰기(#694): `board.sync_status` 안에서 열린 이슈가 needs-human·waiting-person 라벨이나 열린 질문(`orch_inbox.waiting_issues`)에 걸리면 Done/closed/merged와 `parent=True`를 빼고 "Needs human"으로 바꾼다. `test_board_parents`의 가짜 store에는 `root`가 없으므로 질문 읽기 실패는 경고만 남기고 계속한다.
+- 다른 이슈가 주인인 상수(예: park 이슈의 `WAITING_PERSON`)는 main에 들어오기 전까지 정의하지 말고 문자열을 직접 쓴다. 지시에 "do not define it here"가 있으면 리뷰가 소유권 위반으로 막는다(#694).

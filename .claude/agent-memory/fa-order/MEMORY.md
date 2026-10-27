@@ -53,3 +53,4 @@
 - `tests/acceptance/test_cli_split.py::test_cli_split_modules_meet_line_limits`: `src/foragent/*.py`와 `commands/*.py`는 300줄 한도다. 모듈을 키우면 이 시험을 돌리고, 넘으면 도우미 모듈로 나눈다(#419: `upstream_traceback.py`).
 - #419 10차: 보낼 글은 ID가 내용의 해시여야 한다(`load`가 다시 계산해 확인). GitHub 검색은 `incomplete_results`/`total_count`를 보고, 일치가 없는데 결과가 불완전하면 새 이슈를 열지 않는다. help 언어는 하위 parser의 `parse_known_args`를 감싸 `--repo-root`를 먼저 읽고 정한다.
 - #419 11차: 명령의 모든 실패는 자기 명령 안에서 등록부 키로 바꾼다(`ReportError(key, **values)`). `cli.main`의 공통 처리로 새면 영어 원문이 나온다. 공유 모듈(tracker 등)에 새 영어 오류 문구를 넣지 말고 호출한 쪽에서 판단한다. 기반 도구 원문은 `{error}`로만 덧붙인다. 내 파일이 main에서도 바뀌면 `git merge-file`로 3방향 병합한다.
+- #227: `fa brief`의 점수표 한 줄은 `orch_scorecard.worst_line(collect(store))`(지표 이름표는 `messages/orch_scorecard.py`의 `scorecard_label_*`, 없는 단계는 `scorecard_label_phase`). 검증: `fa test tests/acceptance/test_fa_briefing_scorecard.py tests/test_brief.py tests/test_orch_scorecard_unit.py`.

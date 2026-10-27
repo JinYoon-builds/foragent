@@ -232,6 +232,11 @@ def test_usage_recheck_unavailable_source_keeps_announced_reset_as_upper_bound(
     from foragent.scheduler import tick
 
     case = exhausted_case(git_history, tmp_path, monkeypatch, executor=executor)
+    if executor == "claude":
+        # Codex is at its limit too, so no quota mode can move the run to it (#107):
+        # the lane must wait for the announced Claude reset.
+        case.store.pause_executor("codex", case.until)
+        codex_server.unavailable = True  # keep that Codex pause in place
     case.clock[0] += timedelta(minutes=10)
     if executor == "codex":
         codex_server.unavailable = fault == "unavailable"
