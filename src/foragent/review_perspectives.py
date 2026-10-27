@@ -1,6 +1,6 @@
 """Review perspectives: a checklist the reviewer works through on risk-map PRs.
 
-Six product-generic defaults come first, in a fixed order; a project adds its
+Seven product-generic defaults come first, in a fixed order; a project adds its
 own from `.foragent.yml` `review_perspectives` ({name, focus} items). A project
 item named like a default replaces that default's focus in place; other items
 follow the defaults in the order written. The defaults are never mutated.
@@ -27,6 +27,9 @@ DEFAULT_PERSPECTIVES: tuple[dict[str, str], ...] = (
     {"name": "docs",
      "focus": "Behaviour changed, docs unchanged? The lane that changes behaviour updates the related docs "
               "(README, docs/**, skills) in the same PR."},
+    {"name": "performance",
+     "focus": "Hot paths, repeated work and unbounded growth: extra subprocesses, GitHub calls, file scans "
+              "or memory per tick or run."},
 )
 
 
