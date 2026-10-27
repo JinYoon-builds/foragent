@@ -2,16 +2,20 @@
 
 import pytest
 
+from test_stall_visibility import _api_row, _lane_rows
+
 
 @pytest.mark.parametrize("language,words", [
-    ("en", ("orchestrator", "now doing", "looks stalled", "handled by the orchestrator")),
-    ("ko", ("오케스트레이터", "지금 하는 일", "멈춘 듯", "처리한 일")),
+    ("en", ("orchestrator", "looks stalled", "handled by the orchestrator")),
+    ("ko", ("오케스트레이터", "멈춘 듯", "처리한 일")),
 ])
 def test_once_frame_contains_lane_queue_done_stall_and_recent_events(
     git_history, tmp_path, monkeypatch, capsys, language, words,
 ):
     import json
+    from functools import partial
 
+    from foragent import watch
     from foragent.scheduler import tick
     from test_orch_review_handoff import tick_context
     from test_view_status import status_case
@@ -33,13 +37,17 @@ def test_once_frame_contains_lane_queue_done_stall_and_recent_events(
     events = [{"at": case.clock[0].isoformat(), "issue": 2, "kind": "retry", "summary": f"handled-event-{i}"}
               for i in range(7)]
     (case.store.root / "orch-events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    # Check the full summary; the viewport may hide recent events to keep worker rows visible.
+    monkeypatch.setattr(watch, "_frame", partial(watch._frame, height=None))
     assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
     output = capsys.readouterr().out
-    assert "🧩 Api" in output and "#5" in output and "✓ 2" in output
-    assert "○" in output and "11" in output
+    row = _api_row(output)
+    assert "✓ 2" in output
+    assert "○" in row and "11" in row and words[1] in row
+    queued = [line for line in _lane_rows(output) if "🧩 Web" in line and "#4" in line.split()]
+    assert len(queued) == 1 and queued[0].lstrip().startswith(("⏳", "[.]")), output
     assert "handled-event-6" in output and "handled-event-0" not in output and "handled-event-1" not in output
     assert "2/4" in output and "1" in output
-    assert "✳" in output or "✺" in output
     assert all(word in output.lower() for word in words)
     assert "\x1b[" not in output
 

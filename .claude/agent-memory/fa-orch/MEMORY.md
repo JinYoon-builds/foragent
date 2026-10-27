@@ -130,6 +130,7 @@
 - #105 병합(2026-10-25): main의 #157이 `usage_events.py`와 `StateStore.record_usage(executor, windows)`·`usage()`를 먼저 넣었다. 중복 `usage.py`를 지우고 파서·`limit_reset`을 `usage_events`로 합쳤다. 저장 형식은 `test_tidy.py`가 정확히 비교하므로 `name/used_percent/resets_at`만 저장하고 `exhausted`는 `record_from_log()` 반환값에만 둔다. 시작 판단은 `scheduler_start.py`(`_lane_held`)로 옮겨졌다. 리뷰어 한도도 사용량 판독 여부와 무관하게 실행기를 멈춘다(오케스트레이터 지시). `test_fa_brief.py` 실패는 #113 미구현 범위다.
 - #105 리뷰: 실행기 멈춤은 시작 때만이 아니라 `_available_executor()`가 매 실행 직전 `store.executor_pause_until()`로 확인하고 `_limit_wait()`로 limit-wait 처리한다. 한도 뒤 곧바로 재시작하는 시험은 시계를 `limit_wait_minutes` 뒤로 옮겨야 한다(`test_worker_sessions.py`). `test_executor_choice.py` 6개는 main에서도 실패하는 quota 범위다.
 - [#104 skill catalog](project_104_skill_catalog.md) — Available skills prompt section, Skills used in Run/PR, claude plain VERDICT fallback
+- [#123 baseline survivors](project_123_baseline_survivors.md) — one exact collect-only listing in follow_base; never infer ids from probe exits
 - [#420 whole picture](project_420_whole_picture.md) — cuts.py notice, WholeFailure, parent_context snapshot, moved_by on base merges
 - [#379 risk map](project_379_risk_map.md) — base-ref map read, review/tier/always_human hooks, commands/*.py import rule
 - [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order, conftest opt-out
@@ -171,3 +172,4 @@
 - [#674 SKILL.md line budget](project_674_skill_space.md) — move untested prose to references/, also catch helper-import readers (question_routing)
 - #310: SKILL.md 150줄 상한은 시험이 정규식으로 읽지 않는 설명(watch 세부·주문 카드)을 `references/watch.md`·`order-card.md`로 옮겨 맞췄다. 비교: SKILL을 읽는 인수 16개 파일의 PASSED/FAILED 집합(zsh는 `$(grep -l ...)`로 넘겨야 단어 분리됨).
 - #693: park/unpark 본체는 `orch_park.py`, CLI는 `commands/_orch_park.py`(orch.py run에서 ctx 만든 뒤 분기). 시간 초과는 `parked_at() > since`면 생략. 인수 시험 1은 라벨 제거만으로 통과하므로 경계는 `tests/test_orch_park_unit.py`가 local_issues를 교체해 확인.
+- [#716 role agents](project_716_role_agents.md) — architect prompt/skill split, --agent launches, pstack test pins refactor.md

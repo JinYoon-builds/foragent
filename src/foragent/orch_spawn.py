@@ -29,6 +29,7 @@ from foragent.state import StateStore
 
 SPAWN_SPACING = timedelta(minutes=2)
 SKILL = "/fa-orchestrator"
+AGENT = ".claude/agents/fa-orchestrator.md"
 # A live orchestrator without a fresh heartbeat is noted at most this often.
 SILENT_NOTE_SPACING = timedelta(hours=1)
 
@@ -112,14 +113,16 @@ def _command(root: Path, store: StateStore, title: str) -> tuple[str, list[str]]
     claude = shutil.which("claude")
     if not claude:
         return None
-    session = shlex.join([claude, SKILL])
+    # The role agent loads its skill and project memory when the project defines it.
+    agent = ["--agent", "fa-orchestrator"] if (root / AGENT).is_file() else []
+    session = shlex.join([claude, *agent, SKILL])
     if orca := _orca(store, root):
         return "orca", [orca, "terminal", "create", "--worktree", f"path:{root}",
                         "--title", title, "--command", session]
     tmux = shutil.which("tmux") if os.environ.get("TMUX") else None
     if tmux:
         return "tmux", [tmux, "new-window", "-d", "-n", title, "-c", str(root), session]
-    return "background", [claude, "--bg", "-n", title, SKILL]
+    return "background", [claude, "--bg", "-n", title, *agent, SKILL]
 
 
 def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, now: datetime,

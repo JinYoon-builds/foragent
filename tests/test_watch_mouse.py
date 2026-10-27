@@ -79,4 +79,5 @@ def test_request_line_and_bubble_in_english_and_width_tiers(tmp_path):
     text = watch.render_frame(snapshot(rows), config, tmp_path, width=40, now=NOW)
     assert "Planning request" in text and "▀" not in text
     idle = watch.render_frame(snapshot([]), config, tmp_path, width=160, now=NOW)
-    assert "requests" not in idle and "▀" not in idle
+    # Without a request the stage is gone; the idle header's squirrel has no bubble.
+    assert "requests" not in idle and "Planning request" not in idle
