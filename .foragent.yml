@@ -76,4 +76,8 @@ lanes:
     - skill-creator
     - principle-prove-it-works
 board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards
-test_slots: 3  # 2026-10-24: 6 runs waited ~1 h for 2 test slots while load was ~0.7/CPU; back to default once #325 prebuilds baselines
+test_slots: 5  # 2026-10-26: CPU 47% idle and memory 76% free while 3 slots were held and more than four runs waited to check; the gate's CPU-busy AIMD climbs within this ceiling
+checks: ci  # 2026-10-26 Jin: CI mode on after #493/#506 (evidence = the measurement run's own artifacts). Revert to local in one commit if evidence is missing or rejected
+max_runtime_minutes: 360  # 2026-10-25 Jin (D89): interim until the #435 watchdog; progressing runs were cut at 90 min. stall_minutes (30, no progress) still ends silent runs
+# Raised from 2 on 2026-10-26: 1 conflict (598 s, no redo) in 107 overlap records; earlier 33 conflict events took 189 s median, while cap waits held 5 ready issues for hours.
+overlap_per_file: 3

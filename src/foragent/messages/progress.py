@@ -1,0 +1,39 @@
+"""Strings for the combined progress section of the lane view."""
+
+MESSAGES = {
+    "en": {
+        "progress_bar": "progress {bar} {completed}/{total} · {orders} open orders",
+        "progress_finish": "done between {low} and {high}",
+        "progress_unknown_finish": "no finish time yet",
+        "progress_basis": "based on {items}",
+        "progress_basis_runs": "size:{size} {count} runs",
+        "progress_basis_default": "size:{size} default",
+        "progress_evidence": "{count} finished in the last 3 hours · {remaining} left",
+        "progress_no_evidence": "nothing finished in the last 3 hours · {remaining} left",
+        "progress_today": "{count} finished today",
+        "progress_running": "running {items}",
+        "progress_quota": "quota {items}",
+        "progress_quota_item": "{executor} {percent}% used (resets {when})",
+        "progress_clock": "{hour:02d}:{minute:02d}",
+        "progress_tomorrow": "tomorrow {time}",
+        "progress_on_day": "{month}/{day} {time}",
+    },
+    "ko": {
+        "progress_bar": "진행 {bar} {completed}/{total} · 열린 주문 {orders}개",
+        "progress_finish": "{low}~{high} 사이에 끝나요",
+        "progress_unknown_finish": "끝나는 시각은 아직 몰라요",
+        "progress_basis": "근거 {items}",
+        "progress_basis_runs": "size:{size} 작업 {count}개",
+        "progress_basis_default": "size:{size} 기본값",
+        "progress_evidence": "최근 3시간에 {count}개 끝냈어요 · {remaining}개 남았어요",
+        "progress_no_evidence": "최근 3시간에 끝낸 작업이 없어요 · {remaining}개 남았어요",
+        "progress_today": "오늘은 {count}개 끝냈어요",
+        "progress_running": "진행 중 {items}",
+        "progress_quota": "쿼터 {items}",
+        "progress_quota_item": "{executor} {percent}% 썼어요({when} 리셋)",
+        "progress_clock": "{hour}시 {minute:02d}분",
+        "progress_tomorrow": "내일 {time}",
+        "progress_on_day": "{month}월 {day}일 {time}",
+    },
+}
+

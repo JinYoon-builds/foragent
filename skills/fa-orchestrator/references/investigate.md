@@ -1,6 +1,6 @@
 # Investigation
 
-Source: adapted from pstack by Lauren Tan, playbook `skills/poteto-mode/playbooks/investigation.md` (https://github.com/cursor/plugins/tree/9b93e81fb2921b9263d9463c15bafeabfe3903aa/pstack), MIT License.
+Source: adapted from `pstack/playbooks/investigation.md` (pstack by Lauren Tan, MIT License).
 
 An investigation answers a question with a cited explanation or a recommendation.
 It changes no code. Use it before deciding what to do with a blocker, a repeated

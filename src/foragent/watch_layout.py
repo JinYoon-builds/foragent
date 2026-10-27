@@ -1,14 +1,18 @@
-"""Lane conveyor layout and the plain-text and detail views.
+"""Compose the lane view from the discovered foragent.watch_sections modules.
 
 Runtime dependencies resolve through foragent.watch to preserve its patch points.
+The visible groups live in foragent/watch_sections/<name>.py; this module only
+discovers them, stacks them by ORDER and keeps the helpers they share.
 """
 
 from datetime import datetime
+import importlib
 from pathlib import Path
+import pkgutil
+from types import ModuleType
 from typing import Any
 
 from foragent.config import Config
-from foragent.status import _age, summary_values, unknown as status_unknown
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
@@ -17,43 +21,29 @@ from foragent.watch_data import Snapshot
 PICK = ("  ⛏ ", " ⛏  ", "⛏✦  ", " ⛏  ")
 
 
-def render_detail(config: Config, slug: str, repo_root: Path, done_count: int = 0) -> str:
-    """Show lane configuration and exactly the first three memory lines."""
-    from foragent import watch
-
-    language = config.language
-    lane = config.lanes.get(slug, {})
-    executor = lane.get("executor") or config.executor
-    model = lane.get("model") or config.executor_model or watch.text("watch_default_model", language)
-    none = watch.text("watch_none", language)
-    lines = [
-        f"{watch.text('watch_lane', language)}: {watch.lane_display(config, slug, language)} ({slug})",
-        f"{watch.text('watch_paths', language)}: {', '.join(lane.get('paths', [])) or none}",
-        f"{watch.text('watch_executor', language)}: {executor}",
-        f"{watch.text('watch_model', language)}: {model}",
-        f"{watch.text('watch_skills', language)}: {', '.join(lane.get('skills', [])) or none}",
-        watch.text("watch_done_count", language, count=done_count),
-        watch.text("watch_memory", language) + ":",
-    ]
-    agent = lane.get("agent") or f"fa-{slug}"
-    memory = watch.Path(repo_root) / ".claude" / "agent-memory" / agent / "MEMORY.md"
-    try:
-        with memory.open(encoding="utf-8", errors="replace") as stream:
-            lessons = [line.rstrip("\n") for line in watch.islice(stream, 3)]
-    except FileNotFoundError:
-        lessons = []
-    lines.extend(lessons or [watch.text("watch_no_memory", language)])
-    return "\n".join(watch._clean(line) for line in lines)
-
-
 def _has_work(row: dict[str, Any]) -> bool:
     return (row["issue"] is not None or bool(row["queued"])
             or row["state"] in {"working", "blocked", "waiting-human"})
 
 
+# Run phases in which the runner waits on checks, CI, a merge or a review.
+# Waits inside them (merge.lock, a test slot) need no phase of their own.
+WAITING_PHASES = frozenset({"checking", "ci", "merging", "reviewing", "overlap-wait",
+                            "test-slot-wait", "baseline", "baseline-wait", "executor-wait",
+                            "merge-lock-wait"})
+
+
 def _activity(
     row: dict[str, Any], language: str, age: float, stall_minutes: float, pid: int | None,
+    log_seconds: float | None = None, progress_seconds: float | None = None,
+    phase_seconds: float | None = None,
 ) -> str:
+    """The activity cell, judged by evidence: a live PID, the worker's last activity
+    (its runner log when present) and the runner's own last progress (D67).
+
+    A run looks stalled or quiet only when both the worker and the runner have been
+    silent past the threshold. Otherwise a waiting phase shows the phase and its age.
+    """
     from foragent import watch
 
     if row["state"] == "blocked":
@@ -67,188 +57,124 @@ def _activity(
             return watch.text("watch_runner_gone", language)
         except PermissionError:
             pass  # A process owned by another user still exists.
-    seconds = row["last_activity_seconds"]
-    if seconds is not None and seconds + age > min(10, stall_minutes) * 60:
-        return watch.text("watch_stalled", language, minutes=int((seconds + age) // 60))
+    limit = min(10, stall_minutes) * 60
+
+    def silent(seconds: float | None) -> float | None:
+        if seconds is None:
+            return None
+        quiet = seconds + age
+        if progress_seconds is not None:
+            quiet = min(quiet, progress_seconds + age)
+        return quiet
+
+    if log_seconds is not None:
+        # The log's growth is the evidence; state metadata is not.
+        quiet = silent(log_seconds)
+        if quiet >= limit:
+            return watch.text("watch_quiet", language, minutes=int(quiet // 60))
+    else:
+        quiet = silent(row["last_activity_seconds"])
+        if quiet is not None and quiet > limit:
+            return watch.text("watch_stalled", language, minutes=int(quiet // 60))
+    if row.get("phase") in WAITING_PHASES and phase_seconds is not None:
+        return watch.text("watch_in_phase", language, phase=watch.text(row["phase"], language),
+                          minutes=int((phase_seconds + age) // 60))
     return "●"
+
+
+def _widths(width: int) -> tuple[bool, int, int, int, int]:
+    """Side-by-side flag, orchestrator, road, work-table and events widths."""
+    side_by_side = width >= 100
+    # Wide screens give the orchestrator note room for a label and its value on one line.
+    orchestrator_width = (36 if width >= 140 else 28) if side_by_side else width
+    road_width = width - orchestrator_width - 2 if side_by_side else width
+    table_width = (width - 2) * 3 // 5 if side_by_side else width
+    events_width = width - table_width - 2 if side_by_side else width
+    return side_by_side, orchestrator_width, road_width, table_width, events_width
+
+
+def _split(status: dict[str, Any]) -> tuple[list[tuple[int, dict]], list[tuple[int, dict]]]:
+    """Lanes with and without work, numbered by their position among all lanes."""
+    from foragent import watch
+
+    rows = list(status["lanes"].values())
+    busy = [(index, row) for index, row in enumerate(rows, 1) if watch._has_work(row)]
+    idle = [(index, row) for index, row in enumerate(rows, 1) if not watch._has_work(row)]
+    return busy, idle
+
+
+def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Running runs by lane in start order; ties in start time break by issue number."""
+    clones: dict[str, list[dict[str, Any]]] = {}
+    running = [run for run in status["active_runs"] if run.get("status", "running") == "running"]
+    for run in sorted(running, key=lambda run: (run.get("started_at") or "", run["number"])):
+        clones.setdefault(run["lane"], []).append(run)
+    return clones
+
+
+def _lane_name(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> str:
+    """The plain lane name; workers are told apart by their own road rows."""
+    return row["lane_display"]
+
+
+def _worker_rows(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[tuple[str, list[int]]]:
+    """One road row per running worker, named '<lane> N' in start order when there are several."""
+    workers = clones.get(row["slug"], [])
+    if len(workers) < 2:
+        return [(row["lane_display"], _lane_issues(row, clones))]
+    numbers = [run["number"] for run in workers]
+    # A blocked or waiting issue that is not a running worker keeps today's place on the first row.
+    extra = [number for number in _lane_issues(row, clones) if number not in numbers]
+    return [(f"{row['lane_display']} {position}", (extra if position == 1 else []) + [number])
+            for position, number in enumerate(numbers, 1)]
+
+
+def _lane_issues(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[int]:
+    """The lane's shown issues: its current issue first, or its workers in start order when it has several."""
+    current = row["issue"] if row["state"] in {"working", "blocked", "waiting-human"} else None
+    workers = [run["number"] for run in clones.get(row["slug"], [])]
+    if len(workers) > 1:
+        return workers + ([current] if current is not None and current not in workers else [])
+    numbers = [current] if current is not None else []
+    return numbers + [number for number in workers if number not in numbers]
+
+
+def _sections() -> list[ModuleType]:
+    """Discover every section module afresh, ordered by its unique ORDER."""
+    package = importlib.import_module("foragent.watch_sections")
+    found: dict[int, ModuleType] = {}
+    for info in pkgutil.iter_modules(package.__path__, package.__name__ + "."):
+        if info.ispkg:
+            continue
+        module = importlib.import_module(info.name)
+        order = module.ORDER
+        if order in found:
+            first, second = sorted((found[order].__name__, module.__name__))
+            raise ValueError(f"watch sections {first} and {second} both use ORDER {order}")
+        found[order] = module
+    return [found[order] for order in sorted(found)]
 
 
 def _frame(
     snapshot: Snapshot, config: Config, repo_root: Path, *, tick: int, width: int,
     selected: str | None, now: datetime, layout: dict[str, Any] | None = None,
 ) -> list[Line]:
+    """Stack the sections by ORDER with one blank line between non-empty ones."""
     from foragent import watch
 
     hits: list[tuple[int, int, int, int, Any]] = []
-
-    language = config.language
-    status = snapshot.status
-    rows = list(status["lanes"].values())
-    busy = [(index, row) for index, row in enumerate(rows, 1) if watch._has_work(row)]
-    idle = [(index, row) for index, row in enumerate(rows, 1) if not watch._has_work(row)]
-    t = lambda key, **values: watch.text(key, language, **values)
-    side_by_side = width >= 100
-    orchestrator_width = 28 if side_by_side else width
-    road_width = width - orchestrator_width - 2 if side_by_side else width
-    state = "watch_handling" if status["summary"]["blocked"] else "watch_monitoring"
-    overview = [watch._line(t(state), "yellow" if status["summary"]["blocked"] else "green")]
-    if snapshot.order:
-        filled = round(10 * snapshot.completed / snapshot.total) if snapshot.total else 0
-        overview += [watch._line(t("watch_order") + f" #{snapshot.order.number}"),
-                     watch._line(snapshot.order.title),
-                     watch._line("▓" * filled + "░" * (10 - filled) + f" {snapshot.completed}/{snapshot.total}", "green")]
-    else:
-        overview.append(watch._line(t("watch_no_order")))
-    overview.append(watch._line(t("watch_waiting", **summary_values({"count": status["summary"]["waiting_human"]})), "bold"))
-    eta = (t("watch_complete") if snapshot.order and snapshot.completed == snapshot.total
-           else t("watch_eta", time="~" + snapshot.eta.astimezone().strftime("%H:%M") if snapshot.eta
-                  else t("watch_estimating") if snapshot.order else "—"))
-    overview.append(watch._line(eta))
-    if snapshot.requests:
-        count = lambda name: sum(row.get("status") == name for row in snapshot.requests)
-        overview.append(watch._line(t("watch_requests", processing=count("processing"), done=count("done"))))
-    left = watch._panel(overview, orchestrator_width, "🧭 " + t("watch_orchestrator"))
-    roads: list[Line] = [[("━" * road_width, "edge")]]
-    # Several runs in one lane are clones of its agent: name the lane once with ×N.
-    clones: dict[str, list[dict[str, Any]]] = {}
-    for run in sorted(status["active_runs"], key=lambda run: run["number"]):
-        clones.setdefault(run["lane"], []).append(run)
-
-    def lane_name(row: dict[str, Any]) -> str:
-        count = len(clones.get(row["slug"], []))
-        return row["lane_display"] + (f" ×{count}" if count > 1 else "")
-
-    def lane_issues(row: dict[str, Any]) -> list[int]:
-        current = row["issue"] if row["state"] in {"working", "blocked", "waiting-human"} else None
-        numbers = [current] if current is not None else []
-        return numbers + [run["number"] for run in clones.get(row["slug"], []) if run["number"] not in numbers]
-
-    for index, row in busy:
-        slug, state = row["slug"], row["state"]
-        lane = config.lanes.get(slug, {})
-        executor = lane.get("executor") or config.executor
-        color, badge = ("claude", "✳") if executor == "claude" else ("codex", "✺")
-        display = lane_name(row)
-        # The lane title (without its decorative emoji) names its responsible agent.
-        title = lane.get("title") or watch.lane_display(config, slug, language).removeprefix("🧰 ")
-        prefix = watch._fit(watch._line(f"{index} {display} ▸ ", "bold"), min(19, road_width // 3))
-        queue = row["queued"]
-        label_width = min(25, max(8, road_width // 3))
-        agent_label = "".join(value for value, style in watch._fit(watch._line(t('watch_agent', lane=title)), label_width)).rstrip()
-        label = f"▐ {badge} {agent_label} ▌"
-        tool = watch.PICK[tick % 4] if state == "working" else " ✋ " if state == "waiting-human" else " ●  " if state == "blocked" else " zZ "
-        hit = "hit" if state == "working" and tick % 4 == 2 else color
-        tail: Line = [(f" #{number} ", hit) for number in lane_issues(row)]
-        tail += [(tool, "yellow"), (label, color)]
-        space = max(0, road_width - sum(watch._cells(value) for value, style in prefix + tail))
-        shown = len(queue)
-        while True:
-            road: Line = []
-            if shown < len(queue):
-                road.append((f"+{len(queue) - shown} ", ""))
-            for item in reversed(queue[:shown]):
-                road += [(f" #{item['number']} ", "queue"), (" ", "road")]
-            road_cells = sum(watch._cells(value) for value, style in road)
-            if road_cells <= space or shown == 0:
-                break
-            shown -= 1
-        roads.append(watch._fit([*prefix, (" " * max(0, space - road_cells), "road"), *road, *tail], road_width))
-        done = snapshot.done.get(slug, [])
-        roads.append(watch._fit(watch._line("  " + t("watch_done", count=len(done), title=done[-1].title if done else "—"), "green"), road_width))
-        last = index == busy[-1][0] and not idle
-        edge = "━" * road_width if last else ("▬▬▬   " * (road_width // 6 + 1))[:road_width]
-        roads.append([(edge, "edge" if last else "divider")])
-    if idle:
-        items = []
-        for index, row in idle:
-            count = len(snapshot.done.get(row["slug"], []))
-            items.append(f"{index} {row['lane_display']}" + (f" ✓{count}" if count else ""))
-        roads.append(watch._fit(watch._line(t("watch_idle_lanes") + ": " + " · ".join(items)), road_width))
-        roads.append([("━" * road_width, "edge")])
-    age = max(0, (now - snapshot.captured_at).total_seconds())
-    runs = {run["number"]: run for run in status["active_runs"]}
-    table_width = (width - 2) * 3 // 5 if side_by_side else width
-    events_width = width - table_width - 2 if side_by_side else width
-    inner = table_width - 2
-    lane_width = min(13, inner // 6)
-    phase_width = min(11, inner // 6)
-    activity_width = min(24, inner // 3)
-    widths = [lane_width, inner - lane_width - phase_width - activity_width - 3, phase_width, activity_width]
-    table = watch._columns([t("watch_lane"), t("watch_now"), t("watch_phase"), ""], widths, "bold")
-    for _, row in busy:
-        titles = {item["number"]: item.get("title") for item in row.get("running", [])}
-        for number in lane_issues(row) or [row["issue"]]:
-            run = runs.get(number)
-            if number == row["issue"]:
-                shown = row
-            else:
-                # A clone run: its own phase and title, judged as a working run.
-                shown = {**row, "state": "working", "issue": number, "title": titles.get(number) or "",
-                         "phase": run["phase"] if run else None,
-                         "last_activity_seconds": _age(run.get("last_activity_at") or run.get("started_at"),
-                                                       snapshot.captured_at) if run else None}
-            phase = "" if shown["state"] == "blocked" else watch.text(shown["phase"] or shown["state"], language)
-            task = f"#{number} {shown['title'] or ''}".rstrip() if number is not None else "—"
-            if run and run["attempts"] > 1:
-                task += " · " + t("watch_retry", count=run["attempts"])
-            activity = watch._activity(shown, language, age, config.stall_minutes, run.get("pid") if run else None)
-            table += watch._columns([lane_name(row), task, phase, activity], widths,
-                              "yellow" if activity.startswith("○") or shown["state"] == "blocked" else "")
-    if not busy:
-        table.append(watch._line(t("watch_all_idle")))
-    events: list[Line] = []
-    for event in snapshot.events:
-        when = watch.datetime.fromisoformat(event["at"]).astimezone().strftime("%H:%M") if event.get("at") else "—"
-        number = f" #{event['issue']}" if event.get("issue") is not None else ""
-        events.extend(watch._wrap(f"{when}{number} {event['summary']} ✓", events_width - 2))
-    if not events:
-        events.append(watch._line(t("watch_no_events")))
-    work = watch._panel(table, table_width, t("watch_now"))
-    handled = watch._panel(events, events_width, t("watch_events"))
-    summary = t("summary", **summary_values(status["summary"]))
-    if status.get("as_of"):
-        observed = watch.datetime.fromisoformat(status["as_of"]).astimezone().strftime("%H:%M")
-        summary += " · " + t("status_as_of", time=observed)
-    first = [watch._line(t("status_unknown") + "  " + summary, "yellow")] if status_unknown(status) else []
-    frame = (first or [watch._line(summary, "bold")]) + [[]]
-    stage = watch._stage(snapshot, language, width)
-    if stage:
-        hits.append((0, len(frame), width if width < 44 else 18, len(frame) + len(stage), ("orchestrator", None)))
-        frame += stage + [[]]
-    hits.append((0, len(frame), orchestrator_width, len(frame) + len(left), ("orchestrator", None)))
-    frame += watch._beside(left, roads, orchestrator_width, links=True) if side_by_side else left + roads
-    frame += [[]] + (watch._beside(work, handled, table_width) if side_by_side else work + handled)
-    if selected is not None:
-        detail = watch.render_detail(config, selected, repo_root, done_count=len(snapshot.done.get(selected, [])))
-        frame += [[]] + watch._panel([watch._line(line) for line in detail.splitlines()], width, t("watch_detail"))
-    frame += [watch._line(t("watch_help_many" if len(rows) > 9 else "watch_help", count=len(rows)))]
+    frame: list[Line] = []
+    for section in _sections():
+        gap = bool(frame) and getattr(section, "GAP", True)
+        lines = section.render(
+            snapshot, config, repo_root, tick=tick, width=width, selected=selected, now=now,
+            layout=layout, top=len(frame) + gap, hits=hits,
+        )
+        if lines:
+            frame += [[]] * gap + list(lines)
     if layout is not None:
         layout["hits"] = hits
     return [watch._fit(list(line), width) for line in frame]
-
-
-def _stage(snapshot: Snapshot, language: str, width: int) -> list[Line]:
-    """The big orchestrator squirrel saying which planning request it is handling (D76).
-
-    Shown only while a request in the durable box is being processed. The speech
-    shares the squirrel's pixel rows from 56 columns, sits below it from 44, and
-    is plain text below that.
-    """
-    from foragent import watch
-
-    processing = [row for row in snapshot.requests if row.get("status") == "processing"]
-    if not processing:
-        return []
-    request = (processing[-1].get("text") or "").strip().splitlines() or [""]
-    speech = watch.text("watch_request_bubble", language, text=request[0])
-    if width < 44:
-        return [watch._fit(watch._line(speech, "bold"), width)]
-    art: list[Line] = [[(glyph, "art") for glyph, foreground, background in row]
-                       for row in watch.half_blocks(watch.ORCHESTRATOR, watch.PALETTE)]
-    if width < 56:
-        return art + [watch._fit(watch._line(speech, "bold"), width)]
-    art[1] = [*art[1], ("  ", ""), *watch._fit(watch._line(speech, "bold"), width - 20)]
-    return art
 
 
 def render_frame(

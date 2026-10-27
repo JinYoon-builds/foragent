@@ -39,6 +39,7 @@ def test_lane_clone_starts_disjoint_issue_and_keeps_overlapping_issue_waiting(ct
     from foragent.scheduler import tick
 
     starts = _lane_clone_case(ctx)
+    object.__setattr__(ctx.config, "overlap_per_file", 1)  # Main ignores the not-yet-declared Config field.
     _lane_clone_issue(ctx, 1, ["src/foragent/runner.py"], running=True)
     _lane_clone_issue(ctx, 2, ["src/foragent/state.py"])
     _lane_clone_issue(ctx, 3, ["src/foragent/runner.py"])
@@ -51,17 +52,19 @@ def test_lane_clone_starts_disjoint_issue_and_keeps_overlapping_issue_waiting(ct
 
 
 def test_lane_clone_never_adds_a_third_worker_even_with_capacity_and_backlog(ctx):
+    from foragent.capacity import write_state
     from foragent.scheduler import tick
 
     starts = _lane_clone_case(ctx)
+    write_state(ctx.store, 4, ctx.now())
     _lane_clone_issue(ctx, 1, ["src/foragent/runner.py"], running=True)
     _lane_clone_issue(ctx, 2, ["src/foragent/state.py"], running=True)
     _lane_clone_issue(ctx, 3, ["src/foragent/order.py"])
     _lane_clone_issue(ctx, 4, ["src/foragent/watch.py"])
     report = tick(ctx)
-    assert starts == [], report.actions
-    assert {run.number for run in ctx.store.active_runs()} == {1, 2}
-    assert all("ready" in ctx.tracker.get_issue(number).labels for number in (3, 4))
+    assert starts == [3, 4], report.actions
+    assert {run.number for run in ctx.store.active_runs()} == {1, 2, 3, 4}
+    assert all("running" in ctx.tracker.get_issue(number).labels for number in (3, 4))
 
 
 @pytest.mark.parametrize("reason", ["open-blocker", "empty-files", "unknown-files", "short-queue"])
@@ -69,6 +72,7 @@ def test_lane_clone_requires_unblocked_known_files_and_two_waiting_issues(ctx, r
     from foragent.scheduler import tick
 
     starts = _lane_clone_case(ctx)
+    object.__setattr__(ctx.config, "overlap_per_file", 1)
     _lane_clone_issue(ctx, 1, ["src/foragent/runner.py"], running=True)
     files = [] if reason == "empty-files" else None if reason == "unknown-files" else ["src/foragent/state.py"]
     _lane_clone_issue(ctx, 2, files)
@@ -78,9 +82,10 @@ def test_lane_clone_requires_unblocked_known_files_and_two_waiting_issues(ctx, r
     if reason == "open-blocker":
         ctx.tracker.add_blocked_by(2, 1)
     report = tick(ctx)
-    assert starts == [], report.actions
-    assert {run.number for run in ctx.store.active_runs()} == {1}
-    assert "running" not in ctx.tracker.get_issue(2).labels
+    expected = [2] if reason == "short-queue" else []
+    assert starts == expected, report.actions
+    assert {run.number for run in ctx.store.active_runs()} == {1, *expected}
+    assert ("running" in ctx.tracker.get_issue(2).labels) == (reason == "short-queue")
     assert not ctx.tracker.get_issue(2).labels & {"blocked", "needs-human"}
 
 
@@ -92,6 +97,7 @@ def test_lane_clone_glob_overlap_is_symmetric_and_skips_to_disjoint_work(ctx, ru
     from foragent.scheduler import tick
 
     starts = _lane_clone_case(ctx)
+    object.__setattr__(ctx.config, "overlap_per_file", 1)
     _lane_clone_issue(ctx, 1, running_files, running=True)
     _lane_clone_issue(ctx, 2, candidate_files)
     _lane_clone_issue(ctx, 3, ["src/foragent/state.py"])

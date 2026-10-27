@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -24,6 +25,14 @@ from conftest import BASE_TIME, git_command
 
 
 FILE = "tests/acceptance/test_login.py"
+
+REQUIRE_CLEAN_PREREAD = order.require_clean_preread
+
+
+@pytest.fixture(autouse=True)
+def preread_done(monkeypatch):
+    """Publication tests here assume a clean preread; the gate is tested on its own."""
+    monkeypatch.setattr(order, "require_clean_preread", lambda plan, root, config, items: None)
 
 
 class PublishingGit:
@@ -219,8 +228,8 @@ def test_publish_projects_are_idempotent_and_failure_does_not_stop_publication(p
         assert "Could not add issue" in caplog.text and "Could not set board Status" in caplog.text
     else:
         assert len(snapshot(tracker, project_id)["items"]["nodes"]) == 3
-        assert item_values(tracker, project_id, 2) == {"Lane": "api", "Size": "m", "Status": "Approved"}
-        assert item_values(tracker, project_id, 3) == {"Lane": "main", "Size": "s", "Status": "Approved"}
+        assert item_values(tracker, project_id, 2) == {"Lane": "api", "Size": "m", "Status": "🌰 Up next"}
+        assert item_values(tracker, project_id, 3) == {"Lane": "main", "Size": "s", "Status": "🌰 Up next"}
 
 
 @pytest.mark.parametrize("options,approved", [
@@ -942,3 +951,399 @@ def test_order_progress_cli_uses_configured_repo_without_external_services(tmp_p
     assert cli.main(["order", "progress", "tests", "--done", "3", "--total", "2"]) == 1
     assert "0 <= done <= total" in capsys.readouterr().err
     assert StateStore(tmp_path / "owner/repo").order_progress()["step"] == "start"
+
+
+def _record_preread(root, config, plan, item, unknowns):
+    path = root / order.PREREAD_FILE
+    records = json.loads(path.read_text()) if path.exists() else {}
+    records[order.preread_target(plan, item, config, root)[2]] = {"key": item["key"], "unknowns": unknowns}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(records))
+
+
+def test_preread_gate_checks_only_the_approved_keys(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root = publishing[0]
+    _record_preread(root, publishing[1], plan, plan["issues"][0], [])
+    _record_preread(root, publishing[1], plan, plan["issues"][1], ["Which locale?"])
+    publish(publishing, plan, approve_keys=["api"])
+    assert publishing[4]
+    with pytest.raises(order.PlanError, match=r"client: Which locale\?"):
+        publish(publishing, deepcopy(plan), approve=True)
+
+
+def test_preread_gate_does_not_apply_without_approval(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    publish(publishing, plan)
+    with pytest.raises(order.PlanError, match="run fa order preread"):
+        REQUIRE_CLEAN_PREREAD(plan, publishing[0], publishing[1], plan["issues"])
+
+
+@pytest.mark.parametrize("message,unknowns", [
+    ("NONE", []), ("  NONE\n", []),
+    ("- Which region?\n\n2. Which error?\n", ["Which region?", "Which error?"]),
+])
+def test_preread_reply_lists_one_unknown_per_line(message, unknowns):
+    assert order._unknowns(message) == unknowns
+
+
+def test_preread_failed_execution_records_nothing(publishing, plan, monkeypatch):
+    from foragent.executors import ExecResult
+
+    class Failing:
+        def run(self, **kwargs):
+            assert kwargs["read_only"] is True
+            return ExecResult(1, False, "", kwargs["log_path"])
+
+    monkeypatch.setattr(order, "executor_for", lambda name: Failing())
+    root, config = publishing[0], publishing[1]
+    with pytest.raises(order.PlanError, match="preread of issue api"):
+        order.preread(plan, root, config)
+    assert not (root / order.PREREAD_FILE).exists()
+    assert (root / ".foragent/.gitignore").read_text() == "*\n"
+
+
+class _NoUnknowns:
+    def __init__(self):
+        self.calls = []
+
+    def run(self, **kwargs):
+        from foragent.executors import ExecResult
+
+        self.calls.append(kwargs)
+        return ExecResult(0, False, "NONE", kwargs["log_path"])
+
+
+def test_preread_reads_and_gates_approved_edits(publishing, plan, monkeypatch):
+    root, config, tracker = publishing[0], publishing[1], publishing[2]
+    tracker.add_issue(3, "Keep this title", "old", ["size:l", "lane:api"])
+    plan["issues"] = []
+    plan["edits"] = [{"number": 3, "goal": "New goal", "out_of_scope": "Payments.", "done_when": ["true"],
+                      "checklist": [], "acceptance_files": {}}]
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    with pytest.raises(order.PlanError, match="#3"):
+        publish(publishing, plan, approve_numbers=[3])
+    assert publishing[4] == []
+    worker = _NoUnknowns()
+    monkeypatch.setattr(order, "executor_for", lambda name: worker)
+    assert order.preread(plan, root, config, lambda: tracker) == [{"key": "#3", "unknowns": []}]
+    assert "Edit of existing issue #3: Keep this title" in worker.calls[0]["prompt"]
+    assert "Lane: api" in worker.calls[0]["prompt"]
+    publish(publishing, plan, approve_numbers=[3])
+    assert "approved" in tracker.get_issue(3).labels
+
+
+@pytest.mark.parametrize("change", ["blocked_by", "interactive", "new_lanes"])
+def test_preread_evidence_follows_dependency_interactive_and_lane_changes(publishing, plan, change):
+    config, item = publishing[1], plan["issues"][1]
+    before = order.preread_target(plan, item, config, publishing[0])[2]
+    if change == "blocked_by":
+        item["blocked_by"] = []
+    elif change == "interactive":
+        item["interactive"] = True
+    else:
+        plan["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": []}]
+    assert order.preread_target(plan, item, config, publishing[0])[2] != before
+
+
+def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
+    """What the runner's first implementation attempt passes to the executor."""
+    from foragent import run_implementation, runner
+
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def capture(n, ctx, executor, **kwargs):
+        seen.update(kwargs, executor=ctx.config.executor)
+        raise Stop
+
+    monkeypatch.setattr(run_implementation, "_available_executor", capture)
+    monkeypatch.setattr(runner, "_remaining", lambda n, ctx: 60)
+    monkeypatch.setattr(run_implementation, "_phase", lambda *a, **kw: None)
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha="x", acceptance_blobs={}, approved_by="human",
+                        approved_at=BASE_TIME.isoformat())
+    store.start_run(1, branch="b", worktree=tmp_path / "w", lane=lane)
+    ctx = SimpleNamespace(config=run_implementation.lane_config(config, lane), store=store)
+    attempt = SimpleNamespace(n=1, ctx=ctx, worktree=tmp_path / "repo", log=tmp_path / "log",
+                              size=size, options={}, missing_skills=[], native_claude=ctx.config.executor == "claude",
+                              parsed=parse_body(body), baseline=None, executor=None,
+                              approval=store.load_approval(1), review_feedback=False)
+    monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
+    monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
+    with pytest.raises(Stop):
+        run_implementation._implement(attempt, "")
+    return seen
+
+
+@pytest.mark.parametrize("executor,lane,lane_model", [
+    ("codex", "api", None), ("claude", "api", None), ("claude", "api", "lane-model"), ("codex", "main", None),
+])
+def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_path, monkeypatch,
+                                                        executor, lane, lane_model):
+    repo = tmp_path / "repo"
+    (repo / ".claude/agents").mkdir(parents=True)
+    (repo / ".claude/agents/fa-api.md").write_text("---\nname: fa-api\nskills: [polish]\n---\nAPI lane rules.\n")
+    (repo / ".claude/skills/polish").mkdir(parents=True)
+    (repo / ".claude/skills/polish/SKILL.md").write_text("---\nname: polish\ndescription: Polish text\n---\nBody\n")
+    settings = {"paths": ["api/**"], "agent": "fa-api", **({"model": lane_model} if lane_model else {})}
+    tiers = {"s": {"codex_effort": "medium", "claude_model": "small-model"},
+             "m": {"codex_effort": "high", "claude_model": "tier-m-model"},
+             "l": {"codex_effort": "xhigh", "claude_model": "large-model"}}
+    config = replace(publishing[1], executor=executor, executor_model="base-model", tiers=tiers,
+                     lanes={"api": settings})
+    item = {**plan["issues"][0], "lane": lane, "size": "m"}
+    setup, prompt, _ = order.preread_target(plan, item, config, repo)
+    implementation = _implementation_setup(tmp_path, config, lane, "m", monkeypatch)
+    assert setup.executor == implementation["executor"] == executor
+    assert setup.model == implementation["model"]
+    if executor == "claude":
+        assert setup.model == (lane_model or "tier-m-model")
+    assert {key: implementation[key] for key in setup.options} == setup.options
+    if lane == "api":
+        assert ("agent" in setup.options) == (executor == "claude")
+    expected_prefix = implementation["prompt"].removesuffix("PROMPT")
+    assert prompt.startswith(expected_prefix) and prompt.removeprefix(expected_prefix) == order.preread_prompt(plan, item)
+    if executor == "codex" and lane == "api":
+        assert "API lane rules." in expected_prefix and "polish" in expected_prefix
+
+
+def test_preread_evidence_follows_the_lane_model(publishing, plan, tmp_path):
+    config = replace(publishing[1], lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "model": "one"}})
+    digest = order.preread_target(plan, plan["issues"][0], config, tmp_path)[2]
+    other = replace(config, lanes={"api": {**config.lanes["api"], "model": "two"}})
+    assert order.preread_target(plan, plan["issues"][0], other, tmp_path)[2] != digest
+
+
+@pytest.mark.parametrize("change", ["own_size", "other_goal", "other_size", "other_acceptance"])
+def test_preread_evidence_covers_the_whole_plan(publishing, plan, change):
+    config, item = publishing[1], plan["issues"][0]
+    before = order.preread_target(plan, item, config, publishing[0])[2]
+    if change == "own_size":
+        item["size"] = "l"
+    elif change == "other_goal":
+        plan["issues"][1]["goal"] += " Keep the locale."
+    elif change == "other_size":
+        plan["issues"][1]["size"] = "m"
+    else:
+        plan["issues"][1]["acceptance_files"] = {"tests/acceptance/other.py": "assert True\n"}
+    assert order.preread_target(plan, item, config, publishing[0])[2] != before
+
+
+def test_preread_gate_rejects_stale_evidence_after_another_issue_changes(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config = publishing[0], publishing[1]
+    for item in plan["issues"]:
+        _record_preread(root, config, plan, item, [])
+    plan["issues"][1]["size"] = "l"
+    with pytest.raises(order.PlanError, match="no preread of the current content"):
+        publish(publishing, plan, approve_keys=["api"])
+    assert publishing[4] == []
+
+
+@pytest.mark.parametrize("recorded", [None, "client_unknown"])
+def test_preread_gate_covers_numbers_of_children_created_now(publishing, plan, monkeypatch, recorded):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config = publishing[0], publishing[1]
+    if recorded:
+        _record_preread(root, config, plan, plan["issues"][0], [])
+        _record_preread(root, config, plan, plan["issues"][1], ["Which locale?"])
+    # First publication: #3 will be the new client child, so the gate must not let it through.
+    with pytest.raises(order.PlanError, match="client"):
+        publish(publishing, plan, approve_numbers=[3])
+    assert publishing[4] == [] and publishing[2].issues == {}
+
+
+def test_preread_gate_passes_numbers_of_new_children_after_clean_preread(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config = publishing[0], publishing[1]
+    for item in plan["issues"]:
+        _record_preread(root, config, plan, item, [])
+    publish(publishing, plan, approve_numbers=[3])
+    assert "approved" in publishing[2].get_issue(3).labels
+    assert "approved" not in publishing[2].get_issue(2).labels
+
+
+def test_new_lane_issue_is_prereaded_only_after_its_lane_exists(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config, tracker, _, events = publishing
+    plan["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": []}]
+    plan["issues"][1]["lane"] = "web"
+    worker = _NoUnknowns()
+    monkeypatch.setattr(order, "executor_for", lambda name: worker)
+    # Before publication there is no web implementer: no generic preread, no evidence.
+    with pytest.raises(order.PlanError, match=r"client.*new lane\(s\) web.*without --approve"):
+        order.preread(plan, root, config)
+    assert worker.calls == [] and not (root / order.PREREAD_FILE).exists()
+    with pytest.raises(order.PlanError, match=r"client.*new lane\(s\) web"):
+        publish(publishing, plan, approve=True)
+    assert events == [] and tracker.issues == {}
+    publish(publishing, plan)
+    created = load_config(root)
+    assert created.lanes["web"]["agent"] == "fa-web"
+    assert [item["key"] for item in order.preread(plan, root, created)] == ["api", "client"]
+    client = worker.calls[1]
+    setup, prompt, _ = order.preread_target(plan, plan["issues"][1], created, root)
+    assert client["prompt"] == prompt and setup.executor == created.executor
+    if created.executor == "codex":
+        assert "repository's web lane" in prompt, "The created lane agent's instructions reach the preread"
+    else:
+        assert client["agent"] == "fa-web"
+    publish((root, created, tracker, publishing[3], events), plan, approve=True)
+    assert all("approved" in tracker.get_issue(n).labels for n in (2, 3))
+
+
+def test_perspectives_decisions_cut_keeps_titles_and_latest_twenty(tmp_path):
+    from foragent import order_perspectives
+
+    (tmp_path / "docs").mkdir()
+    entries = "".join(f"### D{n}. Decision {n}\nBody {n}\n\n#### Addendum {n}\nMore {n}\n\n" for n in range(1, 26))
+    (tmp_path / "docs/decisions.md").write_text("# Decisions\nPreamble\n\n" + entries, encoding="utf-8")
+    text = order_perspectives.decisions_text(tmp_path)
+    assert "Cut notice: docs/decisions.md has 25 decisions" in text
+    assert all(f"### D{n}. Decision {n}" in text for n in range(1, 26))
+    assert "Body 5" not in text and "Body 6" in text and "More 25" in text
+    assert "Preamble" not in text
+
+
+def test_perspectives_config_rejects_unknown_seat_or_executor():
+    from foragent.config import ConfigError, DEFAULTS
+    from foragent.config_validation import _validate
+
+    for value in ({"wizard": "codex"}, {"skeptic": "gpt"}, {"skeptic": ["codex"]}, ["skeptic"]):
+        with pytest.raises(ConfigError, match="perspectives"):
+            _validate({**DEFAULTS, "perspectives": value})
+    _validate({**DEFAULTS, "perspectives": {"skeptic": "claude"}})
+
+
+def test_perspectives_without_executors_fail_every_seat(tmp_path, monkeypatch):
+    import shutil
+    from foragent import executors, order_perspectives
+    from foragent.state import StateStore
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: None)
+    monkeypatch.setattr(executors, "executor_for", lambda name: pytest.fail("no executor may run"))
+    result = order_perspectives.run({"id": "p"}, tmp_path, Config(), StateStore(tmp_path / "state"))
+    assert result["questions"] == []
+    assert {failure["perspective"] for failure in result["failures"]} == set(order_perspectives.SEATS)
+
+
+def test_perspectives_rerun_replaces_questions_and_keeps_existing_marks(tmp_path, monkeypatch):
+    import shutil
+    from foragent import executors, order_perspectives
+    from foragent.executors import ExecResult
+    from foragent.state import StateStore
+
+    answers = iter(["First\nSecond"] * 6 + ["Only"] * 6)
+
+    class Worker:
+        def run(self, **kwargs):
+            assert kwargs["model"] is None and kwargs["read_only"] is True and "effort" not in kwargs
+            return ExecResult(0, False, next(answers), kwargs["log_path"])
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: Worker())
+    store = StateStore(tmp_path / "state")
+    first = order_perspectives.run({"id": "p"}, tmp_path, Config(), store)
+    ids = [question["id"] for question in first["questions"] if question["perspective"] == "skeptic"]
+    order_perspectives.mark(store, ids[0], True)
+    order_perspectives.mark(store, ids[1], True)
+    again = order_perspectives.run({"id": "p"}, tmp_path, Config(), store)
+    assert again["plan_hash"] == first["plan_hash"] and len(again["questions"]) == 6
+    rows = order_perspectives.stats(store)["perspectives"]
+    assert rows["skeptic"] == {"asked": 1, "changed": 1}
+    with pytest.raises(order.PlanError):
+        order_perspectives.mark(store, ids[1], False)
+
+
+def test_perspectives_human_errors_follow_the_configured_language(tmp_path, monkeypatch):
+    import shutil
+    from foragent import executors, order_perspectives
+    from foragent.config import ConfigError, DEFAULTS
+    from foragent.config_validation import _validate
+    from foragent.executors import ExecResult
+
+    store = StateStore(tmp_path / "state")
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: None)
+    missing = order_perspectives.run({"id": "p"}, tmp_path, Config(language="ko"), store)["failures"]
+    assert all("설치되어 있지 않아" in failure["error"] for failure in missing)
+
+    replies = iter([ExecResult(7, False, "boom", tmp_path / "log"), ExecResult(0, True, "", tmp_path / "log")]
+                   + [OSError("down")] * 4)
+
+    class Worker:
+        def run(self, **kwargs):
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: Worker())
+    errors = [failure["error"] for failure in
+              order_perspectives.run({"id": "q"}, tmp_path, Config(language="ko"), store)["failures"]]
+    assert sum("종료 코드 7" in error and "boom" in error for error in errors) == 1
+    assert sum("초 안에 답이 없었어요" in error for error in errors) == 1
+    assert sum("멈췄어요" in error and "down" in error for error in errors) == 4
+    with pytest.raises(order.PlanError, match="관점 질문이 없어요"):
+        order_perspectives.mark(store, "missing", True, "ko")
+    with pytest.raises(ConfigError, match="자리"):
+        _validate({**DEFAULTS, "language": "ko", "perspectives": {"wizard": "codex"}})
+
+
+@pytest.mark.parametrize("language, expected", [("ko", "질문 id (mark에서만)"), ("en", "question id (only with mark)")])
+def test_perspectives_help_follows_the_repository_language(tmp_path, monkeypatch, capsys, language, expected):
+    (tmp_path / ".foragent.yml").write_text(yaml.safe_dump({"repo": "owner/repo", "language": language}))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["order", "perspectives", "--help"])
+    assert exit_info.value.code == 0
+    assert expected in " ".join(capsys.readouterr().out.split())
+
+
+def test_perspectives_korean_config_yields_korean_questions_end_to_end(tmp_path, monkeypatch, capsys):
+    import shutil
+    from foragent import executors
+    from foragent.executors import ExecResult
+
+    (tmp_path / ".foragent.yml").write_text(yaml.safe_dump({"repo": "owner/repo", "language": "ko"}))
+    (tmp_path / "PLAN.json").write_text(json.dumps({"id": "p", "title": "복구"}), encoding="utf-8")
+    store = StateStore(tmp_path / "state")
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kw: store))
+    prompts = []
+
+    class Worker:
+        def run(self, **kwargs):
+            prompts.append(kwargs["prompt"])
+            korean = "Write every question in Korean" in kwargs["prompt"]
+            return ExecResult(0, False, "선택한 언어를 유지해야 하나요?" if korean else "Keep the locale?",
+                              kwargs["log_path"])
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: Worker())
+    argv = ["order", "perspectives", str(tmp_path / "PLAN.json"), "--repo-root", str(tmp_path)]
+    assert cli.main(argv) == 0
+    out = capsys.readouterr().out
+    assert len(prompts) == 6
+    assert out.count("선택한 언어를 유지해야 하나요?") == 6 and "Keep the locale?" not in out
+    labels = {line.split(" (", 1)[0] for line in out.splitlines() if " (" in line}
+    assert labels == {"회의론자", "처음 쓰는 사람", "공격자", "운영자", "6개월 뒤 유지보수자", "사고 기록"}
+    assert "질문 6개" in out
+    assert cli.main([*argv, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["language"] == "ko" and {q["language"] for q in payload["questions"]} == {"ko"}
+    ledger = json.loads((store.root / "perspectives" / f"{payload['plan_hash']}.json").read_text(encoding="utf-8"))
+    assert ledger["language"] == "ko" and all(q["language"] == "ko" for q in ledger["questions"])
+    assert cli.main(["order", "perspectives", "stats", "--repo-root", str(tmp_path)]) == 0
+    assert "회의론자: 질문 1개" in capsys.readouterr().out
+
+
+def test_perspectives_prompt_names_the_configured_language(tmp_path):
+    from foragent import order_perspectives
+
+    assert "Write every question in Korean" in order_perspectives.prompt("skeptic", {}, tmp_path, "ko-KR")
+    assert "Write every question in English" in order_perspectives.prompt("skeptic", {}, tmp_path)
+    assert "'fr'" in order_perspectives.prompt("skeptic", {}, tmp_path, "fr")

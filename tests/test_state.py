@@ -1,9 +1,10 @@
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
 import errno
 import fcntl
 import json
-import multiprocessing
+from multiprocessing import Pipe
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,54 @@ def store(tmp_path):
     return StateStore(tmp_path / "state", now=lambda: NOW)
 
 
+@pytest.mark.parametrize("error", [PermissionError, OSError])
+def test_update_run_keeps_recorded_ownership_when_process_table_is_unreadable(
+    store, fake_process_table, tmp_path, monkeypatch, error,
+):
+    from foragent import processes
+
+    table = fake_process_table
+    root = table.add(42000, cwd=tmp_path, start_time=10)
+    table.add(42001, ppid=root.pid, cwd=tmp_path, start_time=11)
+    run = store.start_run(1, branch="branch", worktree=tmp_path, pid=root.pid)
+    child = table.add(42002, ppid=root.pid, cwd=tmp_path, start_time=12)
+    birth = {"pid": child.pid, "start_time": child.start_time}
+
+    def unavailable():
+        raise error("fake process table unavailable")
+
+    monkeypatch.setattr(processes, "list_processes", unavailable)
+    updated = store.update_run(1, detail="Stop refused: ownership unreadable", process_identities=[birth])
+    assert updated.detail == "Stop refused: ownership unreadable"
+    assert updated.process_identities == [*run.process_identities, birth]
+    assert store.get_run(1) == updated
+    assert updated.status == "running"
+    assert not store.read_history() and not table.signals
+
+
+@pytest.mark.parametrize("invalid", [
+    {"node_ids": "passing"},
+    {"collected_ids": []},
+    {"failing_ids": ["passing"]},
+    {"failing_ids": ["absent"]},
+    {"excluded": "tests/acceptance/test_pending.py"},
+])
+def test_acceptance_baseline_cache_rejects_inconsistent_coverage(store, invalid):
+    saved = {
+        "created_at": NOW.isoformat(), "node_ids": ["passing"],
+        "collected_ids": ["passing", "failing", "skipped"], "failing_ids": ["failing"],
+        "excluded": ["tests/acceptance/test_pending.py"],
+    }
+    store._write_json(store.root / "baseline.json", saved)
+    assert store.load_acceptance_baseline("baseline") == saved
+    store._write_json(store.root / "baseline.json", {**saved, **invalid})
+    assert store.load_acceptance_baseline("baseline") is None
+
+
 def _mutate_run(root, method, number, fields, connection, pause_read):
+    from foragent import processes
+
+    processes.list_processes = lambda: ()  # PIDs here are serialization fixtures.
     store = StateStore(root)
     if pause_read:
         original_get = store.get_run
@@ -44,14 +92,14 @@ def _mutate_run(root, method, number, fields, connection, pause_read):
 
 @pytest.fixture
 def mutation_process():
-    context = multiprocessing.get_context("spawn")
+    # Independent flock descriptors contend in threads just as in processes;
+    # never launch or terminate real processes to exercise state serialization.
+    pool = ThreadPoolExecutor()
     children = []
 
     def start(root, method, number=1, *, pause_read=False, **fields):
-        parent, child = context.Pipe()
-        process = context.Process(target=_mutate_run, args=(root, method, number, fields, child, pause_read))
-        process.start()
-        child.close()
+        parent, child = Pipe()
+        process = pool.submit(_mutate_run, root, method, number, fields, child, pause_read)
         children.append((process, parent))
         assert parent.poll(10)
         assert parent.recv() == "started"
@@ -59,12 +107,9 @@ def mutation_process():
 
     yield start
     for process, connection in children:
-        process.join(timeout=5)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
+        process.result(timeout=15)
         connection.close()
-        assert process.exitcode == 0
+    pool.shutdown()
 
 
 def test_repository_root_and_paths(tmp_path, monkeypatch):
@@ -221,9 +266,8 @@ def _acquire_merge_lock(root, connection):
 
 
 def test_project_merge_lock_blocks_other_processes_and_releases_on_error(store):
-    context = multiprocessing.get_context("spawn")
-    parent, child = context.Pipe()
-    process = context.Process(target=_acquire_merge_lock, args=(store.root, child))
+    parent, child = Pipe()
+    pool = ThreadPoolExecutor(max_workers=1)
     try:
         with pytest.raises(RuntimeError, match="release lock"):
             with store.merge_lock():
@@ -231,19 +275,15 @@ def test_project_merge_lock_blocks_other_processes_and_releases_on_error(store):
                 store.start_run(1, branch="branch", worktree="worktree")
                 with store.tick_lock() as acquired:
                     assert acquired
-                process.start()
-                child.close()
+                process = pool.submit(_acquire_merge_lock, store.root, child)
                 assert parent.poll(10) and parent.recv() == "waiting"
                 assert not parent.poll(0.1)
                 raise RuntimeError("release lock")
         assert parent.poll(10) and parent.recv() == "acquired"
         parent.send("release")
-        process.join(5)
-        assert process.exitcode == 0
+        process.result(timeout=15)
     finally:
-        if process.is_alive():
-            process.terminate()
-            process.join(5)
+        pool.shutdown()
         parent.close()
         child.close()
 
@@ -257,7 +297,7 @@ def test_approval_exact_body_and_metadata_round_trip(store):
     }
     assert store.load_approval(42) is None
     store.save_approval(42, **values)
-    assert asdict(store.load_approval(42)) == {"number": 42, **values}
+    assert asdict(store.load_approval(42)) == {"number": 42, **values, "parent_context": None}
     snapshot = json.loads((store.root / "approvals/42.json").read_text(encoding="utf-8"))
     assert snapshot == {"number": 42, **values}
     assert [path.name for path in (store.root / "approvals").iterdir()] == ["42.json"]
@@ -337,7 +377,10 @@ def test_runs_round_trip_update_active_and_history(store):
     store.finish_run(2, "failed")
     assert [run.number for run in store.active_runs()] == [10]
     history = [json.loads(line) for line in (store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert history == [asdict(finished), asdict(store.get_run(2))]
+    # Each history entry also saves when the run finished, beside the Run fields.
+    ended = store._timestamp()
+    assert history == [{**asdict(finished), "finished_at": ended}, {**asdict(store.get_run(2)), "finished_at": ended}]
+    assert store.finish_times() == {(1, finished.started_at): ended, (2, store.get_run(2).started_at): ended}
     assert store.read_history() == [finished, store.get_run(2)]
     assert store.finish_run(1, "success") == finished
     assert len((store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 2
@@ -727,3 +770,213 @@ def test_link_count_change_alone_voids_a_read(store, field):
     store.record_read(1, "blocked_by", [], baseline=store.read_baseline())
     store.refresh_local_issues([replace(issue, **{field: (("total", 0),)})], [], {}, NOW + timedelta(minutes=5))
     assert store.confirmed_read(1, "blocked_by") is None
+
+
+def test_facade_globals_patched_on_foragent_state_reach_the_split_implementation(store, monkeypatch):
+    store.refresh_local_issues([], [], {}, NOW)
+    assert not store.issues_refresh_due(NOW)
+    monkeypatch.setattr(state_module, "REFRESH_INTERVAL", timedelta(0))
+    assert store.issues_refresh_due(NOW)
+
+    built = []
+    original_run = state_module.Run
+
+    @dataclass(frozen=True)
+    class RecordingRun(original_run):
+        def __post_init__(self):
+            built.append(self.number)
+
+    monkeypatch.setattr(state_module, "Run", RecordingRun)
+    store.start_run(3, branch="foragent/issue-3", worktree=store.worktree_path(3))
+    assert built == [3]
+    assert store.get_run(3).branch == "foragent/issue-3"
+    assert built == [3, 3]
+
+    facts = []
+    monkeypatch.setattr(state_module, "observed_issue_facts", lambda issue: facts.append(issue) or {})
+    issue = type("Issue", (), {"number": 5, "title": "t", "body": "b", "labels": [], "state": "open",
+                                "updated_at": None, "is_pull_request": False})()
+    store.refresh_local_issues([issue], [], {}, NOW)
+    assert facts == [issue]
+
+
+def test_merge_facts_keep_unmerged_runs_null_and_reset_on_a_new_record(store):
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.update_run(1, last_review_pass_at=NOW.isoformat())
+    store.record_merge_lock(1, 7)
+    run = store.get_run(1)
+    assert run.review_pass_to_merge_seconds is None
+    assert run.merge_lock_held_seconds is None
+    store.record_merge(1, NOW + timedelta(seconds=20))
+    store.record_merge_lock(1, 3)
+    store.finish_run(1, "merged")
+    saved = json.loads((store.root / "runs/1.json").read_text())
+    assert saved["review_pass_to_merge_seconds"] == 20
+    assert saved["merge_lock_held_seconds"] == 10
+    restarted = store.start_run(1, branch="branch", worktree="worktree")
+    assert restarted.last_review_pass_at is None
+    assert restarted.review_pass_to_merge_seconds is None
+    assert restarted.merge_lock_held_seconds is None
+    store.record_merge(1, NOW)
+    store.record_merge_lock(1, 2)
+    assert store.get_run(1).review_pass_to_merge_seconds is None
+    assert store.get_run(1).merge_lock_held_seconds == 2
+
+
+def _counted_parses(monkeypatch):
+    parses = []
+    loads = json.loads
+
+    def counted(text, *args, **kwargs):
+        value = loads(text, *args, **kwargs)
+        if isinstance(value, dict) and "issues" in value:
+            parses.append(value)
+        return value
+
+    monkeypatch.setattr(state_module.json, "loads", counted)
+    return parses
+
+
+def test_locked_write_reads_the_current_file_not_the_read_cache(store):
+    import os
+
+    store.update_local_issue(7, title="aaaa")
+    assert store.local_issues()[0]["title"] == "aaaa"  # warms the read cache
+    path = store.root / "issues.json"
+    before = path.stat()
+    # Same size, same inode, restored mtime: invisible to the read cache's version.
+    path.write_text(path.read_text(encoding="utf-8").replace('"aaaa"', '"bbbb"'), encoding="utf-8")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    store.update_local_issue(7, lane="other")
+
+    saved = json.loads(path.read_text(encoding="utf-8"))["issues"]["7"]
+    assert (saved["title"], saved["lane"]) == ("bbbb", "other")
+
+
+def test_replace_between_stat_and_read_is_parsed_once(store, monkeypatch):
+    from foragent import state_issues
+
+    store.update_local_issue(7, title="first")
+    peer = StateStore(store.root, now=lambda: NOW)
+    parses = _counted_parses(monkeypatch)
+    read_issue_file = state_issues._read_issue_file
+
+    def replaced_first(path):
+        # A peer's atomic replace lands after the reader's stat and before its read.
+        monkeypatch.setattr(state_issues, "_read_issue_file", read_issue_file)
+        peer.update_local_issue(7, title="second")
+        parses.clear()
+        return read_issue_file(path)
+
+    monkeypatch.setattr(state_issues, "_read_issue_file", replaced_first)
+    assert store.local_issues()[0]["title"] == "second"
+    assert store.github_outbox() == []
+    assert store.local_board_value(7, "p", "f") is None
+    assert len(parses) == 1
+
+
+def test_concurrent_cache_misses_parse_one_version_once(store, monkeypatch):
+    import threading
+
+    store.update_local_issue(7, title="shared")
+    store.update_local_issue(8, board_values={"p": {"f": "Todo"}})
+    parses = _counted_parses(monkeypatch)
+    start = threading.Barrier(6)
+
+    def lookup(index):
+        start.wait()
+        return [store.local_issues, store.github_outbox,
+                lambda: store.local_board_value(8, "p", "f")][index % 3]()
+
+    with ThreadPoolExecutor(6) as pool:
+        results = list(pool.map(lookup, range(6)))
+
+    assert results[2] == "Todo" and results[1] == []
+    assert len(parses) == 1
+
+
+def test_values_leaving_the_read_cache_are_detached(store):
+    store.update_local_issue(7, board_values={"p": {"f": ["Todo"]}})
+    store.record_issues_refresh_failure("offline", NOW)
+
+    store.local_board_value(7, "p", "f").append("caller-only")
+    store.issues_observation()["error"] = "caller-only"
+
+    assert store.local_board_value(7, "p", "f") == ["Todo"]
+    assert store.local_issues()[0]["board_values"] == {"p": {"f": ["Todo"]}}
+    assert store.issues_observation()["error"] == "offline"
+
+
+def test_one_state_directory_shares_one_parse_across_path_spellings(store, tmp_path, monkeypatch):
+    store.update_local_issue(7, title="shared")
+    link = tmp_path / "linked-state"
+    link.symlink_to(store.root, target_is_directory=True)
+    spellings = [store.root, link, store.root / ".." / store.root.name]
+    parses = _counted_parses(monkeypatch)
+
+    assert {StateStore(root, now=lambda: NOW).local_issues()[0]["title"] for root in spellings} == {"shared"}
+    assert len(parses) == 1
+
+
+@pytest.mark.parametrize("content", [
+    "not json", "[]", '{"prs": []}', '{"watermark": "later", "prs": []}',
+    '{"watermark": "2026-10-20T09:00:00+00:00", "prs": {}}',
+    '{"watermark": "2026-10-20T09:00:00+00:00", "prs": [{"number": 1}]}',
+])
+def test_unreadable_merged_pr_listing_means_a_full_listing(store, content):
+    store.root.mkdir(parents=True, exist_ok=True)
+    (store.root / "merged_prs.json").write_text(content, encoding="utf-8")
+    assert store.merged_pr_listing() is None
+
+
+def test_merged_pr_listing_round_trips(store):
+    listing = {"watermark": NOW.isoformat(), "prs": [{
+        "number": 1, "head": "foragent/issue-1", "base": "main", "merged_at": NOW.isoformat(),
+        "url": "u", "updated_at": None}]}
+    store.record_merged_pr_listing(listing)
+    assert store.merged_pr_listing() == listing
+
+
+def test_github_calls_buckets_by_utc_hour_prunes_30_days_and_filters_since(tmp_path):
+    clock = [datetime(2026, 10, 20, 18, 59, tzinfo=timezone(timedelta(hours=9)))]
+    store = StateStore(tmp_path, now=lambda: clock[0])
+    assert store.github_calls() == []
+    store.count_github_call(datetime(2026, 9, 1, 0, 5, tzinfo=UTC))
+    store.count_github_call(clock[0])
+    store.count_github_call(clock[0] + timedelta(minutes=1))
+    store.count_github_call(clock[0] + timedelta(minutes=2))
+    assert json.loads((tmp_path / "github-calls.json").read_text()) == {
+        "2026-10-20T09": 1, "2026-10-20T10": 2,
+    }
+    assert StateStore(tmp_path).github_calls() == [
+        {"hour": "2026-10-20T09:00:00+00:00", "calls": 1},
+        {"hour": "2026-10-20T10:00:00+00:00", "calls": 2},
+    ]
+    assert store.github_calls(since=datetime(2026, 10, 20, 10, tzinfo=UTC)) == [
+        {"hour": "2026-10-20T10:00:00+00:00", "calls": 2},
+    ]
+
+
+def test_phase_changes_and_finish_journal_each_segment(tmp_path, monkeypatch):
+    clock = [NOW]
+    store = StateStore(tmp_path, now=lambda: clock[0])
+    store.start_run(1, branch="foragent/issue-1", worktree=tmp_path / "w")
+    store.update_run(1, phase="implementing", phase_started_at=NOW.isoformat())
+    store.update_run(1, phase="implementing", phase_started_at=NOW.isoformat())  # no change, no event
+    monkeypatch.setattr(state_module.os, "getloadavg", lambda: (2.5, 0, 0))
+    store.update_run(1, phase="checking", phase_started_at=(NOW + timedelta(seconds=7.6)).isoformat())
+
+    def broken():
+        raise OSError("no load average")
+
+    monkeypatch.setattr(state_module.os, "getloadavg", broken)
+    clock[0] = NOW + timedelta(seconds=20)
+    store.finish_run(1, outcome="merged")
+    store.finish_run(1, outcome="merged")  # already finished: no second final event
+    events = [json.loads(line) for line in (tmp_path / "orch-events.jsonl").read_text().splitlines()]
+    assert [(e["kind"], e["summary"], e["phase"], e["seconds"], e["load"]) for e in events] == [
+        ("phase", "implementing -> checking", "implementing", 8, 2.5),
+        ("phase", "checking -> merged", "checking", 12, None),
+    ]
+    assert events[-1]["at"] == clock[0].isoformat()

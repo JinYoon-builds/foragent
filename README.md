@@ -27,6 +27,7 @@
 지정한 목록으로 `.foragent.yml`과 해당 에이전트의 스킬 목록을 교체하고, 스킬은 로컬에 설치한다.
 ID 없이 `fa lanes skills <lane>`을 실행하면 목록을 비운다. `style` 스킬은 레인당 하나까지 지정할 수 있다.
 변경은 작업 트리에 남으므로 확인한 뒤 커밋한다.
+`.foragent.yml` 수정은 커밋해서 기본 브랜치에 푸시해야 gate tick에 반영된다.
 
 ## 문서
 
@@ -41,3 +42,12 @@ ID 없이 `fa lanes skills <lane>`을 실행하면 목록을 비운다. `style` 
 Say what you want. Agents build it while you're away, and show you exactly what to check.
 Multi-agent lanes, isolated worktrees and task graphs — without setting up any of it.
 -->
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

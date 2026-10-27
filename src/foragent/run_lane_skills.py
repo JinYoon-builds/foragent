@@ -2,23 +2,38 @@
 
 from __future__ import annotations
 
-from itertools import islice
 from pathlib import Path
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from foragent import cuts
 from foragent.git import GitRepo
 from foragent.skills import SkillManager, copy_lane_skills
 
 if TYPE_CHECKING:
+    from foragent.config import Config
     from foragent.runner import RunContext
 
 
+def _lane_settings(config: Config, lane: str) -> dict[str, Any]:
+    return config.lanes.get(lane, {}) if lane != "main" else {}
+
+
 def _lane_notes(ctx: RunContext, n: int, worktree: Path) -> tuple[str | None, str]:
-    lane = ctx.store.get_run(n).lane
-    settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
+    return lane_notes(ctx.config, ctx.store.get_run(n).lane, worktree)
+
+
+def lane_notes(
+    config: Config, lane: str, worktree: Path, full_text_dir: Path | None = None,
+) -> tuple[str | None, str]:
+    """The lane agent and its instructions and memory, as read from the worktree.
+
+    Memory keeps its 200-line limit; a longer memory ends with the cut notice,
+    linking a full copy under ``full_text_dir`` (or the memory file itself).
+    """
+    settings = _lane_settings(config, lane)
     agent = settings.get("agent")
     if not isinstance(agent, str) or not re.fullmatch(r"fa-[a-z0-9-]+", agent):
         return None, ""
@@ -29,14 +44,45 @@ def _lane_notes(ctx: RunContext, n: int, worktree: Path) -> tuple[str | None, st
     body = re.sub(r"\A---\s*\n.*?\n---[^\S\n]*(?:\n|$)", "", body, count=1, flags=re.DOTALL)
     memory = worktree / ".claude/agent-memory" / agent / "MEMORY.md"
     if memory.is_file():
-        with memory.open(encoding="utf-8", errors="replace") as stream:
-            body += "\n\nMemory:\n" + "".join(islice(stream, 200))
+        text = memory.read_text(encoding="utf-8", errors="replace")
+        body += "\n\nMemory:\n" + cuts.head_lines(text, 200, full_text_dir, "lane-memory.md", full=memory.absolute())
     return agent, "Lane notes:\n" + body.strip() + "\n\n"
 
 
+# Claude loads only the start of an agent's MEMORY.md (first 200 lines or 25 KB, whichever comes first).
+NATIVE_MEMORY_LINES = 200
+NATIVE_MEMORY_BYTES = 25 * 1024
+
+
+def lane_memory_notice(config: Config, lane: str, worktree: Path, full_text_dir: Path | None = None) -> str:
+    """For an executor that loads lane memory itself: the cut notice when memory exceeds what it loads."""
+    agent = _lane_settings(config, lane).get("agent")
+    if not isinstance(agent, str) or not re.fullmatch(r"fa-[a-z0-9-]+", agent):
+        return ""
+    memory = worktree / ".claude/agent-memory" / agent / "MEMORY.md"
+    if not memory.is_file():
+        return ""
+    text = memory.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+    loaded = "".join(lines[:NATIVE_MEMORY_LINES])
+    if len(loaded.encode("utf-8")) > NATIVE_MEMORY_BYTES:
+        loaded = loaded.encode("utf-8")[:NATIVE_MEMORY_BYTES].decode("utf-8", errors="ignore")
+        count, unit = len(text) - len(loaded), "chars"
+    elif len(lines) > NATIVE_MEMORY_LINES:
+        count, unit = len(lines) - NATIVE_MEMORY_LINES, "lines"
+    else:
+        return ""
+    full = cuts.save_full(full_text_dir, "lane-memory.md", text) if full_text_dir is not None else memory.absolute()
+    return ("\n\nYour lane memory is loaded only in part (first 200 lines or 25 KB). "
+            + cuts.notice(count, unit, full) + "\n")
+
+
 def _lane_skill_names(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> list[str]:
-    lane = ctx.store.get_run(n).lane
-    settings = ctx.config.lanes.get(lane, {}) if lane != "main" else {}
+    return lane_skill_names(ctx.config, ctx.store.get_run(n).lane, worktree, agent)
+
+
+def lane_skill_names(config: Config, lane: str, worktree: Path, agent: str | None) -> list[str]:
+    settings = _lane_settings(config, lane)
     skills = settings.get("skills", [])
     frontmatter = re.compile(r"\A---[^\S\n]*\n(.*?)^---[^\S\n]*(?:\n|$)", re.DOTALL | re.MULTILINE)
     if not skills and agent is not None:
@@ -63,8 +109,12 @@ def _inject_lane_skills(ctx: RunContext, n: int, git: GitRepo, target_ref: str |
 
 
 def _lane_skills(ctx: RunContext, n: int, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
+    return lane_skills(ctx.config, ctx.store.get_run(n).lane, worktree, agent)
+
+
+def lane_skills(config: Config, lane: str, worktree: Path, agent: str | None) -> tuple[str, list[str]]:
     """List installed skills so Codex can read them when relevant."""
-    skills = _lane_skill_names(ctx, n, worktree, agent)
+    skills = lane_skill_names(config, lane, worktree, agent)
     frontmatter = re.compile(r"\A---[^\S\n]*\n(.*?)^---[^\S\n]*(?:\n|$)", re.DOTALL | re.MULTILINE)
     sections, missing = [], []
     for name in skills:

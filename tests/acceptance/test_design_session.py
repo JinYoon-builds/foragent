@@ -40,7 +40,9 @@ class TerminalCommands:
                     return subprocess.CompletedProcess(argv, 0, stdout=claude_reply(list(argv), kwargs), stderr="")
                 assert Path(argv[0]).name in {"orca", "tmux", "open"}, "Only the opener may run; Claude stays in the fake terminal"
                 if argv[1:3] == ["terminal", "show"] and not self.alive:
-                    raise subprocess.CalledProcessError(1, argv, stderr="terminal is gone")
+                    # Real Orca reports a closed handle as a structured envelope on stdout.
+                    gone = json.dumps({"ok": False, "error": {"code": "terminal_handle_stale"}})
+                    raise subprocess.CalledProcessError(1, argv, output=gone, stderr="terminal is gone")
                 if argv[1:3] == ["terminal", "create"] and self.on_create is not None:
                     self.on_create()
                 output = json.dumps({"handle": "term_design", "terminal": "term_design", "id": "term_design"})

@@ -1,6 +1,6 @@
 # Performance
 
-Source: adapted from pstack by Lauren Tan, playbook `skills/poteto-mode/playbooks/perf-issue.md` (https://github.com/cursor/plugins/tree/9b93e81fb2921b9263d9463c15bafeabfe3903aa/pstack), MIT License.
+Source: adapted from `pstack/playbooks/perf-issue.md` (pstack by Lauren Tan, MIT License).
 
 Tie every change to a measurement. Do not read source instead of measuring.
 

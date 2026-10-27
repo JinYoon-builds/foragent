@@ -112,6 +112,8 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 
 ## 9. 설정: `.foragent.yml`
 
+`.foragent.yml` 수정은 커밋해서 기본 브랜치에 푸시해야 반영된다. gate tick은 fetch 뒤 `origin/<base>`의 파일을 읽는다(공유 checkout은 당기지 않는다). 그 파일이 없거나 잘못되면 로컬 파일을 쓰고 stderr에 한 줄 알린다.
+
 ```yaml
 review: batch            # fast | batch | careful
 review_paths:            # 경로별 덮어쓰기 (선택)
@@ -127,6 +129,9 @@ reviewer: claude         # codex | claude | none (기본 = executor와 다른 �
 reviewer_model: null
 review_level: low       # Claude /code-review: low | medium | high | xhigh | max
 review_scope: claude-local  # claude-local | pr-body
+review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 6개(security·concurrency·failure·compatibility·realism·docs)와 이름이 같으면 그 focus를 바꿈
+review_reviewers: 1      # 1 이상 정수; 1이면 리뷰어 하나가 모든 관점을 체크리스트로 받음
+perspectives: {}         # fa order perspectives 자리별 실행기 {skeptic|first_time_user|attacker|operator|maintainer|incidents: codex|claude}; 없으면 attacker·maintainer는 codex, 나머지는 claude
 review_max: 2            # 리뷰 FAIL 허용 수; 초과하면 PR을 열고 risk-high로 보류
 approvers: [JinYoon-builds]   # v1 승인 라벨을 붙일 수 있는 사람 (D14)
 acceptance_dir: tests/acceptance/   # order가 구현 전에 쓰고 잠그는 인수 시험 (D11)

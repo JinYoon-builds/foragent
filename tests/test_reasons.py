@@ -17,9 +17,12 @@ def test_groups_cover_exact_contract_codes():
         Reason.ALWAYS_HUMAN_PATH: "review", Reason.ACCEPTANCE_TOUCHED: "review",
         Reason.RISK_HIGH: "review", Reason.RETRIES_EXCEEDED: "tech-failure",
         Reason.STALLED: "tech-failure", Reason.TIMEOUT: "tech-failure",
+        Reason.STOP_REFUSED: "tech-failure",
         Reason.NO_MACHINE_CHECK: "decision",
         Reason.ORCHESTRATOR_TIMEOUT: "tech-failure",
         Reason.REVIEW_DISPUTE: "tech-failure",
+        Reason.ACCEPTANCE_BASELINE_UNAVAILABLE: "tech-failure",
+        Reason.CI_NOT_STARTED: "tech-failure",
     }
     assert set(GROUP) == set(Reason)
     assert str(Reason.TIMEOUT) == "timeout"

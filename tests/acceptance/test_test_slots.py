@@ -29,6 +29,17 @@ class SlotConfig(Config):
     test_slots: int = 2
 
 
+def machine_yml(*, slots, max_parallel=None):
+    """Write the machine budget file (#365) under the isolated machine data root."""
+    import yaml
+    from foragent import capacity
+
+    root = capacity.machine_root()
+    root.mkdir(parents=True, exist_ok=True)
+    values = {"test_slots": slots, **({"max_parallel": max_parallel} if max_parallel is not None else {})}
+    (root / "machine.yml").write_text(yaml.safe_dump(values), encoding="utf-8")
+
+
 def slot_case(history, directory, monkeypatch, *, slots=1, repo="owner/repo", **settings):
     from foragent import runner
 
@@ -296,15 +307,17 @@ def test_test_slots_cli_waits_for_runner_then_forwards_pytest_args_output_and_ex
     assert "queued pytest stderr" in output.err
 
 
-@pytest.mark.parametrize("pressure,load", [("normal", 2.0), ("warn", 0.5), ("critical", 0.5)])
+@pytest.mark.parametrize("pressure", ["normal", "warn", "critical"],
+                         ids=["normal-2.0", "warn-0.5", "critical-0.5"])
 def test_test_slots_tick_decreases_one_then_recovers_to_ceiling_in_gate_status(
-    git_history, tmp_path, monkeypatch, capsys, pressure, load,
+    git_history, tmp_path, monkeypatch, capsys, pressure,
 ):
-    from foragent import scheduler
+    from foragent import capacity, scheduler
 
     case = slot_case(git_history, tmp_path, monkeypatch, slots=3)
+    machine_yml(slots=3, max_parallel=8)  # Machine-wide budgets come from machine.yml (#365).
     main = bind_cli(case, monkeypatch)
-    signal = [pressure, load]
+    signal = ["normal", 2.0]  # Tick-level decreases come only from CPU overload.
     samples = []
 
     def machine_load():
@@ -314,6 +327,7 @@ def test_test_slots_tick_decreases_one_then_recovers_to_ceiling_in_gate_status(
     # #106 names this public sensor, but it is not merged in the baseline yet.
     monkeypatch.setattr(scheduler, "machine_load", machine_load, raising=False)
     context = tick_context(case, start_runs=False)
+    context.baseline_launcher = lambda *args, **kwargs: None
 
     def tick_slots(expected):
         case.clock[0] += timedelta(minutes=10)
@@ -330,8 +344,26 @@ def test_test_slots_tick_decreases_one_then_recovers_to_ceiling_in_gate_status(
     for expected in (2, 1, 1):
         tick_slots(expected)
     # Worker capacity still follows #106's multiplicative decrease, independently.
-    assert scheduler.next_parallel(4, pressure=pressure, load_per_cpu=load, lanes_with_work=8,
+    assert scheduler.next_parallel(4, pressure="normal", load_per_cpu=2.0, lanes_with_work=8,
                                    ceiling=8, increase_ok=True) == 2
     signal[:] = ["normal", 0.5]
     for expected in (2, 3, 3):
         tick_slots(expected)
+
+    signal[:] = [pressure, 0.5]
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: signal[0])
+    monkeypatch.setattr(capacity, "memory_pressure", lambda: signal[0])
+    waiting = []
+
+    def clear_pressure():
+        waiting.append(signal[0])
+        signal[:] = ["normal", 0.5]
+
+    with capacity.hold_test_slot(3, waiting=clear_pressure):
+        assert waiting == (["critical"] if pressure == "critical" else []), (
+            "critical must defer a free test slot until pressure clears; normal/warn must claim it immediately"
+        )
+        assert signal[0] != "critical", "critical must claim no new test slot"
+
+    signal[:] = [pressure, 0.5]
+    tick_slots(3)  # Neither warn nor critical at low CPU may change the recovered budget.

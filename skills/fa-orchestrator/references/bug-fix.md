@@ -1,6 +1,6 @@
 # Bug fix
 
-Source: adapted from pstack by Lauren Tan, playbook `skills/poteto-mode/playbooks/bug-fix.md` (https://github.com/cursor/plugins/tree/9b93e81fb2921b9263d9463c15bafeabfe3903aa/pstack), MIT License.
+Source: adapted from `pstack/playbooks/bug-fix.md` (pstack by Lauren Tan, MIT License).
 
 Every shipped line traces to runtime evidence. A change that "might help" is a
 hypothesis, not a fix, and it does not ship. When evidence refutes a hypothesis,

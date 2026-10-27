@@ -69,11 +69,12 @@ def _update(store: StateStore, kind: str, record_id: str, change) -> dict[str, A
     return record
 
 
-def add_request(store: StateStore, source: str, text: str) -> dict[str, Any]:
+def add_request(store: StateStore, source: str, text: str,
+                extra: dict[str, Any] | None = None) -> dict[str, Any]:
     if not text.strip():
         raise InboxError("request text must not be empty")
     record = _create(store, "requests", "r", {
-        "from": source, "text": text, "status": "new", "notes": [],
+        **(extra or {}), "from": source, "text": text, "status": "new", "notes": [],
     })
     append_event(store, store._now(), None, "request", f"{record['id']} from {source}: {text}")
     return record
@@ -169,15 +170,16 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def note_path(store: StateStore) -> Path:
-    return store.root / "orch-note.json"
+    return store.root / store.ORCH_NOTE_FILE
 
 
 def note_location(environ: dict[str, str], title: str | None = None,
                   tmux_pane: str | None = None) -> dict[str, Any]:
     """Where this orchestrator session runs, from facts in its environment only."""
     handle = environ.get("ORCA_TERMINAL_HANDLE")
-    if handle:
-        return {"kind": "orca", "handle": handle,
+    # An explicit Orca title is a fact too, even when the handle is not in this environment.
+    if handle or (title and not tmux_pane):
+        return {"kind": "orca", "handle": handle or None,
                 "title": title or environ.get("FORAGENT_ORCH_TITLE")}
     pane = tmux_pane or (environ.get("TMUX_PANE") if environ.get("TMUX") else None)
     if pane:
@@ -197,8 +199,4 @@ def write_note(store: StateStore, now: str, why: str | None, next_step: str | No
 
 
 def read_note(store: StateStore) -> dict[str, Any] | None:
-    try:
-        record = _read(note_path(store))
-    except (OSError, ValueError):
-        return None
-    return record if isinstance(record, dict) else None
+    return store.orch_note()

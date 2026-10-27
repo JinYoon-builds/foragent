@@ -18,15 +18,16 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import capacity
+from foragent import capacity, cuts
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config
 from foragent.git import GitRepo
 from foragent.issue import ParsedIssue, has_machine_check, parse_body
 from foragent.reasons import Reason
-from foragent.run_attempt import AttemptFailure, ExecutorStopped
+from foragent.records import load_record
+from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout
+from foragent.run_waits import _phase, _progress, _test_slot, _timeout, in_phase
 from foragent.state import Approval
 
 if TYPE_CHECKING:
@@ -40,6 +41,8 @@ class CheckResult:
     exit_code: int | None
     timed_out: bool
     output: str
+    # Elapsed command time (excluding any test-slot queue) when a clock was supplied.
+    seconds: float | None = None
 
 
 def _append(log: Path, text: str) -> None:
@@ -52,28 +55,43 @@ def _check(
     command: str, worktree: Path, log: Path, timeout_s: int,
     *, progress: Callable[[], None] | None = None,
     slot: AbstractContextManager | None = None,
+    clock: Callable[[], float] | None = None,
+    full_text_dir: Path | None = None,
 ) -> CheckResult:
+    """Run one check; a cut output tail links its full copy under ``full_text_dir`` (the issue's folder)."""
     from foragent import runner
 
     _append(log, f"\nDone when command:\n{command}")
     offset = log.stat().st_size
 
+    # Checks run in the implementation worktree, whose changes are staged and
+    # published afterwards. Bytecode written by the checks must not join them.
+    environment = {"PYTHONDONTWRITEBYTECODE": "1"}
+
+    elapsed: list[float] = []
+
+    def timed(env):
+        started = clock() if clock is not None else None
+        try:
+            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
+                                     env=env)
+        finally:
+            if started is not None:
+                elapsed.append(max(0.0, clock() - started))
+
     def execute():
         # The slot covers only the command; timeout_s counts execution, not the queue.
         if slot is None:
-            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log)
+            return timed(environment)
         with slot:
             # A nested `fa test` in the command shares this slot instead of waiting for another.
-            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
-                              env=capacity.HELD_ENV)
+            return timed({**environment, **capacity.HELD_ENV})
 
     # A quiet check is still running; keep the scheduler informed while it waits.
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
-    with log.open("rb") as stream:
-        stream.seek(max(offset, log.stat().st_size - 16000))
-        tail = stream.read().decode("utf-8", errors="replace")[-4000:]
+    tail = cuts.read_tail(log, offset, 4000, "check", full_text_dir)
     _append(log, f"\nCheck exit_code={code}, timed_out={timed_out}\nOutput tail:\n{tail}")
-    return CheckResult(command, code, timed_out, tail)
+    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None)
 
 
 def _pytest_command(command: str) -> str | None:
@@ -187,6 +205,61 @@ def _passing_acceptance_ids(report: Path) -> tuple[str, ...]:
     return tuple(sorted(passed - failed))
 
 
+def _junit_file_seconds(report: Path) -> dict[str, float]:
+    """Sum legacy JUnit testcase times per file; a missing or unreadable report has none."""
+    seconds: dict[str, float] = {}
+    try:
+        cases = list(ET.parse(report).iter("testcase"))
+    except (OSError, ET.ParseError):
+        return seconds
+    for case in cases:
+        file = case.get("file")
+        try:
+            value = float(case.get("time", ""))
+        except ValueError:
+            continue
+        if file:
+            seconds[file] = seconds.get(file, 0) + value
+    return seconds
+
+
+def _record_related_check(
+    n: int, ctx: RunContext, changed: int, selected: list[str], report: Path, result: CheckResult,
+) -> None:
+    """Append this related-unit-test check to the run, before a timeout ends it."""
+    check = {"changed_file_count": changed, "selected_files": sorted(selected),
+             "file_seconds": _junit_file_seconds(report),
+             "total_seconds": result.seconds if result.seconds is not None else 0,
+             "timed_out": bool(result.timed_out)}
+    report.unlink(missing_ok=True)
+    run = ctx.store.get_run(n)
+    if run is not None:
+        ctx.store.update_run(n, related_tests=[*run.related_tests, check])
+
+
+def run_related_check(
+    n: int, ctx: RunContext, worktree: Path, unit_command: str, unit_tests: list[str], changed: int, limit: int,
+) -> CheckResult:
+    """Run the selected related unit tests with their own JUnit report and record the check.
+
+    Every verification path that runs related tests (implementation, review-only CI
+    checks) goes through here, so each check lands in Run.related_tests.
+    """
+    from foragent import runner
+
+    report = ctx.store.root / "runs" / f"issue-{n}-related.xml"
+    # A stale report from an earlier check must never supply this check's timings.
+    report.unlink(missing_ok=True)
+    # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
+    junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
+    result = runner._check(f"{unit_command} {junit} {shlex.join(unit_tests)}", worktree, ctx.store.log_path(n), limit,
+                           progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
+                           full_text_dir=cuts.issue_dir(ctx.store.root, n))
+    _record_related_check(n, ctx, changed, unit_tests, report, result)
+    _progress(n, ctx)
+    return result
+
+
 def has_pull_request_ci(root: Path) -> bool:
     """Whether a GitHub Actions workflow in this checkout runs on pull_request (read from files)."""
     workflows = root / ".github" / "workflows"
@@ -277,27 +350,38 @@ def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
     directory.mkdir(parents=True, exist_ok=True)
     counter = directory / "stop-block-count"
     blocked = 0
+    failures: list[CheckResult] = []
+
+    def report(extra: str = "") -> int:
+        counter.write_text(str(blocked + 1), encoding="utf-8")
+        print("\n\n".join([
+            *(f"Done when failed: {result.command}\n"
+              + cuts.tail(result.output, 2000, directory, f"stop-check-{index}.log")
+              + ("\nCheck timed out." if result.timed_out else "") for index, result in enumerate(failures)),
+            *([extra] if extra else []),
+        ]), file=sys.stderr)
+        return 2
+
     try:
         blocked = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
         if blocked >= 8:
             print("Done when: Stop hook block cap reached; runner verification will decide.")
             return 0
-        approval = Approval(**json.loads(snapshot.read_text(encoding="utf-8")))
+        approval = load_record(Approval, json.loads(snapshot.read_text(encoding="utf-8")))
         parsed = parse_body(approval.body)
         if not has_machine_check(parsed):
             raise ValueError("Done when has no machine check")
+        # Every failing command is reported, each with its own limited tail and cut notice.
         for command in parsed.done_when_commands:
             result = runner._check(command, worktree, directory / "check-done.log", 900)
             if result.exit_code != 0 or result.timed_out:
-                counter.write_text(str(blocked + 1), encoding="utf-8")
-                print(f"Done when failed: {command}\n{result.output[-2000:]}"
-                      + ("\nCheck timed out." if result.timed_out else ""), file=sys.stderr)
-                return 2
+                failures.append(result)
+        if failures:
+            return report()
     except (OSError, ValueError, TypeError) as exc:
-        # Malformed snapshots and check-launch failures must also block a stop.
-        counter.write_text(str(blocked + 1), encoding="utf-8")
-        print(f"Done when failed: {exc}", file=sys.stderr)
-        return 2
+        # Malformed snapshots and check-launch failures must also block a stop,
+        # still reporting the failures gathered before the error.
+        return report(f"Done when failed: {exc}")
     print(f"Done when: all {len(parsed.done_when_commands)} commands passed; acceptance lock: {acceptance_dir}.")
     return 0
 
@@ -315,10 +399,71 @@ def _acceptance_matches(
     return not mismatches
 
 
+def _invocation_keys(checks: list[CheckResult]) -> list[str]:
+    """One key per invocation: the command and which run of that command it is, so duplicates stay apart."""
+    seen: dict[str, int] = {}
+    keys = []
+    for check in checks:
+        seen[check.command] = seen.get(check.command, -1) + 1
+        keys.append(f"{seen[check.command]}:{check.command}")
+    return keys
+
+
+def save_failures(state_root: Path, n: int, checks: list[CheckResult], *, complete: bool = True) -> WholeFailure:
+    """Update the saved failure bundle the next attempt reads, and return what this call found failing.
+
+    Results are kept per invocation, not per command text: a passing duplicate never hides
+    another invocation's failure. A complete verification (every invocation ran) replaces
+    the bundle; all passing clears it. A partial one (timeout, budget, exception) updates only
+    the invocations it ran, and the others keep their earlier failures. The new bundle is
+    written before it replaces the old one.
+    """
+    def block(check: CheckResult) -> str:
+        return f"Command: {check.command}\n{check.output}" + ("\nCheck timed out." if check.timed_out else "")
+
+    path = cuts.failures_path(state_root, n)
+    index = path.with_suffix(".json")
+    entries: dict[str, str] = {}
+    if not complete:
+        try:
+            saved = json.loads(index.read_text(encoding="utf-8"))
+            entries = {str(key): str(value) for key, value in saved.items()} if isinstance(saved, dict) else {}
+        except (OSError, ValueError):
+            entries = {}
+    failed = []
+    for key, check in zip(_invocation_keys(checks), checks):
+        entries.pop(key, None)
+        if check.exit_code != 0 or check.timed_out:
+            entries[key] = block(check)
+            failed.append(check)
+    if entries:
+        cuts.save_full(path.parent, index.name, json.dumps(entries))
+        cuts.save_full(path.parent, path.name, "\n\n".join(entries.values()))
+    elif complete or checks:
+        path.unlink(missing_ok=True)
+        index.unlink(missing_ok=True)
+    return WholeFailure("\n\n".join(block(check) for check in failed))
+
+
+def _keep_gathered(state_root: Path, n: int, checks: list[CheckResult]) -> None:
+    """On an exceptional exit, record what the commands that ran found; the rest keep their saved failures."""
+    save_failures(state_root, n, checks, complete=False)
+
+
 def _verify_implementation(attempt: Implementation) -> str:
+    try:
+        return _verify_contents(attempt)
+    except BaseException:
+        _keep_gathered(attempt.ctx.store.root, attempt.n, attempt.checks)
+        raise
+
+
+def _verify_contents(attempt: Implementation) -> str:
     from foragent import runner
     from foragent.run_conflicts import _prepare_target
     from foragent.run_publish import _check_publication
+    from foragent.ci_mode import enabled
+    from foragent.ci_local import verify_local_only_units
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree, log = attempt.worktree, attempt.log
@@ -329,38 +474,54 @@ def _verify_implementation(attempt: Implementation) -> str:
     attempt.paths = git.changed_paths(attempt.start_ref)
     _progress(n, ctx)
     attempt.checks = []
-    if not attempt.paths:
+    # Cleaning tracked runner scratch files is not an implementation change.
+    if not any(not path.startswith(".foragent/") for path in attempt.paths):
         return "The session made no changes."
     staged_tree = git.staged_tree_sha()
     for verification in range(2):
+        from foragent.run_implementation import follow_base
+        follow_base(attempt)
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
-                                 slot=_test_slot(n, ctx)))
+                                 slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n)))
             _progress(n, ctx)
         if attempt.baseline and attempt.baseline.node_ids:
+            started = ctx.monotonic()
             command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
             result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
-                            slot=_test_slot(n, ctx))
+                            slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n))
             attempt.checks.append(result)
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
             _progress(n, ctx)
+            if not enabled(ctx, attempt.target_branch):
+                previous = ctx.store.get_run(n).comparison or {}
+                ctx.store.update_run(n, comparison={"source": "local", "duration_seconds":
+                    previous.get("duration_seconds", 0) + max(0, ctx.monotonic() - started)})
         test_command = ctx.config.test_command
         if test_command is None:
             test_command = next(iter(runner.detect_test_commands(worktree)), None)
         unit_command = _pytest_command(test_command) if test_command else None
         unit_tests = _related_unit_tests(worktree, attempt.paths, ctx.config.acceptance_dir,
-                                         own_only=trusts_ci(worktree, ctx.config))
+                                         own_only=ctx.config.runner_unit_tests != "all"
+                                         and (enabled(ctx, attempt.target_branch) or trusts_ci(worktree, ctx.config)))
+        if unit_command:
+            local_units = verify_local_only_units(attempt, unit_command)
+            if local_units is not None:
+                attempt.checks.append(local_units)
         if unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
-            result = runner._check(f"{unit_command} {shlex.join(unit_tests)}", worktree, log, limit,
-                            progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+            result = run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths), limit)
             attempt.checks.append(result)
-            _progress(n, ctx)
             if result.timed_out:
+                # Keep every failure gathered so far, not only the timeout, for the next attempt.
+                # Done when and the baseline ran; the unit run did not finish: a partial update.
+                save_failures(ctx.store.root, n, attempt.checks, complete=False)
+                bundle = WholeFailure(cuts.failures_path(ctx.store.root, n).read_text(encoding="utf-8"))
+                ctx.store.update_run(n, resume_reason=bundle, resume_whole=True)
                 detail = f"Related unit tests timed out after {limit} s ({len(unit_tests)} selected tests)."
-                flag(ctx, n, Reason.TIMEOUT, detail)
+                flag(ctx, n, Reason.TIMEOUT, detail, bundle)
                 raise ExecutorStopped("timeout", detail)
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
@@ -370,42 +531,62 @@ def _verify_implementation(attempt: Implementation) -> str:
         attempt.paths = git.changed_paths(attempt.start_ref)
         checked_tree = git.staged_tree_sha()
         if checked_tree != staged_tree:
+            # Save this pass before anything replaces it: if re-verification cannot finish,
+            # these failures still reach the next attempt.
+            save_failures(ctx.store.root, n, attempt.checks)
             if verification == 1:
                 return "Done when commands modify tracked files"
             _append(log, "Done when changed staged contents; checking the final contents again.")
             staged_tree = checked_tree
             continue
-        failures = [check for check in attempt.checks if check.exit_code != 0 or check.timed_out]
-        if failures:
-            check = failures[-1]
-            return f"Command: {check.command}\n{check.output}" + ("\nCheck timed out." if check.timed_out else "")
+        # Every failing command reaches the implementer, each with its own tail.
+        if bundle := save_failures(ctx.store.root, n, attempt.checks):
+            return bundle
         try:
             _check_publication(git, attempt.target_branch)
         except AttemptFailure as exc:
             return str(exc)
-        return "" if attempt.paths else "The session made no changes."
+        return "" if any(not path.startswith(".foragent/") for path in attempt.paths) else "The session made no changes."
     raise AssertionError("unreachable verification state")
 
 
 def _verify_review_head(
     n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str,
 ) -> str | None:
+    checks: list[CheckResult] = []
+    # The saved bundle changes only once this verification knows the replacement.
+    try:
+        return _check_review_head(n, ctx, git, parsed, head, link, checks)
+    except BaseException:
+        _keep_gathered(ctx.store.root, n, checks)
+        raise
+
+
+def _check_review_head(
+    n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str, checks: list[CheckResult],
+) -> str | None:
     from foragent import runner
 
     worktree = git.root
     log = ctx.store.log_path(n)
-    for command in parsed.done_when_commands:
-        if runner._remaining(n, ctx) <= 0:
-            return _timeout(n, ctx)
-        check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)), progress=lambda: _progress(n, ctx),
-                       slot=_test_slot(n, ctx))
-        _progress(n, ctx)
-        if check.timed_out or runner._remaining(n, ctx) <= 0:
-            return _timeout(n, ctx)
-        if check.exit_code != 0:
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.",
-                 f"Command: {command}\n{check.output}\n{link}")
-            return "checks-failed"
+    # Done when on the PR head is checking time, as in an implementation's verification.
+    with in_phase(n, ctx, "checking"):
+        for command in parsed.done_when_commands:
+            if runner._remaining(n, ctx) <= 0:
+                save_failures(ctx.store.root, n, checks, complete=False)
+                return _timeout(n, ctx)
+            check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)),
+                                  progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                                  full_text_dir=cuts.issue_dir(ctx.store.root, n))
+            checks.append(check)
+            _progress(n, ctx)
+            if check.timed_out or runner._remaining(n, ctx) <= 0:
+                save_failures(ctx.store.root, n, checks, complete=False)
+                return _timeout(n, ctx)
+    # PR-head checks rerun only Done when: other saved failures (baseline, units) are not re-verified here.
+    if bundle := save_failures(ctx.store.root, n, checks, complete=False):
+        flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.", f"{bundle}\n{link}")
+        return "checks-failed"
     git.stage_changes()
     if git.head_sha() != head or git.has_staged_changes():
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when changed the verified PR contents.", link)

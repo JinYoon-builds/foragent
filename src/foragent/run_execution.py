@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -11,8 +11,9 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board
+from foragent import board, cuts, usage_events, usage_recheck
 from foragent.actions import flag
+from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
 from foragent.labels import READY, RUNNING
 from foragent.processes import track_process_group
@@ -66,25 +67,41 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         size = current
 
     def execute():
-        with track_process_group(lambda pgid: ctx.store.update_run(n, executor_pgid=pgid)):
+        with track_process_group(
+            lambda pgid: ctx.store.update_run(n, executor_pgid=pgid),
+            tree_callback=lambda identities: ctx.store.update_run(n, process_identities=identities),
+        ):
             return executor.run(**kwargs)
 
+    usage: dict = {}
     try:
         result = ctx.poll_hook(execute, poll)
+        result.usage = usage  # filled in ``finally`` once the log is complete
         if log.exists():
-            with log.open("rb") as stream:
-                stream.seek(max(offset, log.stat().st_size - 16000))
-                result.log_tail = stream.read().decode("utf-8", errors="replace")[-4000:]
+            result.log_tail = cuts.read_tail(log, offset, 4000, "executor", cuts.issue_dir(ctx.store.root, n))
         return result
     finally:
         poll()
+        # Executors report plan usage in their own output; keep the latest numbers.
+        usage.update(usage_events.record_from_log(ctx.store, log, offset, ctx.now()))
         _progress(n, ctx)
+
+
+def _limit_wait(n: int, ctx: RunContext, detail: str) -> None:
+    """Hand the issue back to the queue; ``usage_recheck`` already wrote the executor and lane pauses."""
+    ctx.store.update_run(n, detail=detail)
+    ctx.tracker.add_labels(n, [READY])
+    ctx.tracker.remove_labels(n, [RUNNING])
+    board.sync_status(ctx, n, "Ready")
+    raise ExecutorStopped("limit-wait")
 
 
 def _available_executor(
     n: int, ctx: RunContext, executor: Executor, *, reviewer: bool = False,
-    session_body: str | None = None, resume_prompt: str | None = None, **kwargs,
+    session_body: str | None = None, resume_prompt: str | None = None, flag_exhaustion: bool = True,
+    **kwargs,
 ) -> ExecResult:
+    """Run until the executor is available; ``flag_exhaustion=False`` leaves the block to the caller."""
     from foragent import runner
     from foragent.run_checks import _append
 
@@ -109,8 +126,15 @@ def _available_executor(
                     )
             raise
 
+    name = resolved_reviewer(ctx.config) if reviewer else ctx.config.executor
+    # Feedback saved for this turn stays until the implementer has actually received it.
+    saved = ctx.store.get_run(n)
+    pending, pending_whole = (saved.resume_reason, saved.resume_whole) if session_body is not None else ("", False)
     while True:
         run = ctx.store.get_run(n)
+        # Another run may have hit this executor's usage limit; never launch it before the reset.
+        if (until := usage_recheck.hold_lane(ctx.store, name, run.lane, ctx.now())) is not None:
+            _limit_wait(n, ctx, f"{name} is paused for a usage limit until {until.isoformat()}.")
         if not reviewer and run.fallback_model is not None:
             kwargs["model"] = run.fallback_model
         kwargs["timeout_s"] = runner._remaining(n, ctx)
@@ -132,6 +156,7 @@ def _available_executor(
             result.session_id is None and result.exit_code not in {None, 0}
             and not result.timed_out and classify_result(result) == "normal"
         )):
+            ctx.store.update_run(n, resume_failures=run.resume_failures + 1)
             if result is not None:
                 _append(kwargs["log_path"], f"Session resume failed; starting fresh:\n{result.last_message}\n{result.log_tail}")
             session_id = None
@@ -153,7 +178,9 @@ def _available_executor(
                 session_ids=[*run.session_ids, *([identity] if identity is not None else [])],
                 session_body=(session_body if result.session_id is not None or (
                     result.exit_code == 0 and not result.timed_out
-                ) else run.session_body), resume_reason=reason,
+                ) else run.session_body),
+                resume_reason=(f"{pending}\n\n{reason}" if pending else reason) if reason else "",
+                resume_whole=bool(reason and pending and pending_whole),
             )
             if reason:
                 resume_prompt = (resume_prompt or "") + "\n\n" + reason
@@ -161,13 +188,13 @@ def _available_executor(
             return result
         if kind == "transient" and runner._remaining(n, ctx) <= 0:
             return replace(result, timed_out=True)
-        if kind == "limit" and not reviewer:
-            ctx.store.update_run(n, detail=result.last_message or result.log_tail or "Executor usage limit reached.")
-            ctx.store.pause_lane(run.lane, ctx.now() + timedelta(minutes=ctx.config.limit_wait_minutes))
-            ctx.tracker.add_labels(n, [READY])
-            ctx.tracker.remove_labels(n, [RUNNING])
-            board.sync_status(ctx, n, "Ready")
-            raise ExecutorStopped("limit-wait")
+        if kind == "limit":
+            now = ctx.now()
+            windows = (result.usage or {}).get(name)
+            until = usage_events.limit_reset(windows, now, now + timedelta(minutes=ctx.config.limit_wait_minutes))
+            # One write pauses the executor and lane and notes the levels; the gate may end it early.
+            usage_recheck.note_limit(ctx.store, name, until, windows, now, lane=run.lane)
+            _limit_wait(n, ctx, result.last_message or result.log_tail or "Executor usage limit reached.")
         if kind == "transient" and not reviewer:
             run = ctx.store.update_run(n, transient_errors=run.transient_errors + 1)
             if run.transient_errors >= 2 and ctx.config.executor_fallback_model and run.fallback_model is None:
@@ -175,10 +202,9 @@ def _available_executor(
                 _append(kwargs["log_path"], f"Executor fallback model: {ctx.config.executor_fallback_model}")
         budget = ctx.config.transient_max_wait_minutes * 60 - ctx.store.get_run(n).executor_waited_seconds
         if budget <= 0:
-            if reviewer and kind == "limit":
-                return replace(result, exit_code=result.exit_code or 1)
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Executor unavailable (transient errors)",
-                 result.last_message or result.log_tail)
-            raise ExecutorStopped("retries-exceeded")
+            detail = result.last_message or result.log_tail
+            if flag_exhaustion:
+                flag(ctx, n, Reason.RETRIES_EXCEEDED, "Executor unavailable (transient errors)", detail)
+            raise ExecutorStopped("retries-exceeded", detail)
         _executor_wait(n, ctx, min(120 * 2 ** min(errors, 3), budget))
         errors += 1

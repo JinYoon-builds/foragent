@@ -1,6 +1,6 @@
 # Refactoring
 
-Source: adapted from pstack by Lauren Tan, playbook `skills/poteto-mode/playbooks/refactoring.md` (https://github.com/cursor/plugins/tree/9b93e81fb2921b9263d9463c15bafeabfe3903aa/pstack), MIT License.
+Source: adapted from `pstack/playbooks/refactoring.md` (pstack by Lauren Tan, MIT License).
 
 A refactor changes structure, not behavior. If the cleanup reveals a missing feature
 or a real bug, split it out into its own issue and ship the structural change first.

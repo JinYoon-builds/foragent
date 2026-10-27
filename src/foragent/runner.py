@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,11 +36,11 @@ from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, atte
 from foragent.order import detect_test_commands
 from foragent.orch_reinstall import after_merge
 from foragent.policy import merge_decision, review_mode_for, touched
-from foragent.processes import run_logged, track_process_group
+from foragent.processes import observe_tree, run_logged, track_process_group
 from foragent.reasons import Reason
 from foragent.skills import SkillManager, copy_lane_skills
 from foragent.state import Approval, StateStore
-from foragent.tracker import RecordingTracker, Tracker, TrackerError
+from foragent.tracker import FakeTracker, RecordingTracker, Tracker, TrackerError
 
 
 # Preserve the original facade bindings for callers and monkeypatches.
@@ -120,9 +121,12 @@ from foragent.run_attempt import (
     ConflictBudgetExhausted,
     CIFailure,
     ExecutorStopped,
+    WholeFailure,
 )
 from foragent.run_checks import _verify_implementation
-from foragent.run_conflicts import _block_rebuild, _rebuild, _recover_replay, _resume_implementation
+from foragent.run_conflicts import (
+    _block_rebuild, _rebuild, _rebuild_after_conflicts, _recover_replay, _resume_implementation,
+)
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import _publish, _push_branch
 from foragent.run_review import _review_implementation
@@ -219,7 +223,7 @@ def _implement_and_publish(
                     outcome = _publish(attempt)
                     return outcome
                 except ConflictBudgetExhausted as exc:
-                    attempt.failure = _rebuild(attempt, exc)
+                    attempt.failure = _rebuild_after_conflicts(attempt, exc)
                     continue
                 except CIFailure as exc:
                     if attempt.rebuilt:
@@ -228,13 +232,18 @@ def _implement_and_publish(
                     attempt.failure = exc
                     continue
                 except (AttemptFailure, PatchReplayError) as exc:
-                    attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else str(exc)
+                    attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else exc.failure
+                    if not attempt.failure:
+                        # The replay was resolved and verified in place; publish it without a new turn.
+                        resume_verified = True
+                        continue
                     run = ctx.store.get_run(n)
             if attempt.rebuilt:
                 outcome = _block_rebuild(attempt, str(attempt.failure))
                 return outcome
             _append(attempt.log, f"Attempt {run.attempts} failed:\n{attempt.failure}")
-            ctx.store.update_run(n, resume_reason=str(attempt.failure))
+            ctx.store.update_run(n, resume_reason=str(attempt.failure),
+                                 resume_whole=isinstance(attempt.failure, (WholeFailure, CIFailure)))
             if run.attempts < ctx.config.max_retries + 1:
                 ctx.store.update_run(n, attempts=run.attempts + 1)
                 continue
@@ -351,16 +360,15 @@ def run_issue(n: int, ctx: RunContext) -> str:
     worktree = ctx.store.worktree_path(n)
     log = ctx.store.log_path(n)
     try:
-        run = ctx.store.update_run(n, pid=os.getpid())
+        run = ctx.store.update_run(n, pid=os.getpid(),
+                                   process_identities=observe_tree(roots=(os.getpid(),)))
         if until := ctx.store.github_wait_until(ctx.now()):
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
         board.sync_status(ctx, n, "Running")
-        lane = ctx.config.lanes.get(run.lane, {}) if run.lane != "main" else {}
-        ctx = replace(ctx, config=replace(
-            ctx.config, executor=lane.get("executor") or ctx.config.executor,
-            executor_model=lane.get("model") if lane.get("model") is not None else ctx.config.executor_model,
-        ))
+        from foragent.run_implementation import lane_config
+
+        ctx = replace(ctx, config=lane_config(ctx.config, run.lane))
         try:
             outcome = _execute(n, ctx, worktree)
         finally:
@@ -379,9 +387,13 @@ def run_issue(n: int, ctx: RunContext) -> str:
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Runner exited: {exc}"
-        # A handled stop must not look like an orphan to the next tick.
-        ctx.tracker.add_labels(n, [BLOCKED])
-        ctx.tracker.remove_labels(n, [READY, RUNNING])
+        stopped = ctx.store.get_run(n)
+        if stopped is None or stopped.outcome != "stalled-restart":
+            # A handled stop must not look like an orphan to the next tick.
+            ctx.tracker.add_labels(n, [BLOCKED])
+            ctx.tracker.remove_labels(n, [READY, RUNNING])
+        # A first stall was recorded before the signal; the tick owns its
+        # restart decision (ready, or blocked with an open PR), so keep labels.
         raise
     finally:
         # A tick may already have finished the record while terminating this runner.
@@ -392,3 +404,14 @@ def run_issue(n: int, ctx: RunContext) -> str:
         finally:
             kick_tick(ctx.repo_root)
     return outcome
+
+
+from foragent import runner_doctor
+from foragent.runner_doctor import (
+    SMOKE_FILE, SMOKE_CHECK, LiveCheck, _one_line, DOCTOR_ISSUE, DOCTOR_BODY, _RecordedExecutor,
+)
+
+
+def live_check(repo_root: Path, config: Config, executor_name: str, *, timeout_s: int = 900) -> LiveCheck:
+    """`fa doctor --live` enters through the issue runner; the throwaway task lives in runner_doctor."""
+    return runner_doctor.live_check(repo_root, config, executor_name, timeout_s=timeout_s)

@@ -1,6 +1,7 @@
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 import json
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -568,6 +569,14 @@ def test_fake_failed_logs_default_and_pr_isolation():
     assert tracker.pr_failed_logs(43) == ""
 
 
+STARTED_STEPS = json.dumps([{"name": "Run tests", "status": "completed", "conclusion": "failure"}])
+
+
+def failed_job(number, name="test", steps=STARTED_STEPS):
+    return json.dumps([{"id": number, "name": name, "conclusion": "failure",
+                        "steps": json.loads(steps), "html_url": f"https://job/{number}"}])
+
+
 def test_gh_failed_logs_use_head_sha_all_pages_and_per_run_tails():
     head = "a" * 40
     runs = [
@@ -579,32 +588,84 @@ def test_gh_failed_logs_use_head_sha_all_pages_and_per_run_tails():
     run = ScriptedRun(
         json.dumps({"head": {"sha": head}}),
         json.dumps(runs) + "\n" + json.dumps(second_page),
-        "discard me" + "A" * 4000,
-        "discard me too" + "B" * 4000,
+        failed_job(11), "[]", "discard me" + "A" * 4000,
+        failed_job(14), "[]", "discard me too" + "B" * 4000,
     )
-    assert GhTracker(REPO, run).pr_failed_logs(42) == "A" * 4000 + "\n\n" + "B" * 4000
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "A" * 4000 in logs and "B" * 4000 in logs
+    assert "discard me" not in logs
+    assert logs.index("Actions run 1") < logs.index("A" * 4000) < logs.index("Actions run 4")
+    assert not logs.not_started
     assert run.calls == [
         (["api", "repos/owner/repo/pulls/42"], None),
         (["api", "--paginate", "--jq", ".workflow_runs",
           f"repos/owner/repo/actions/runs?head_sha={head}&per_page=100"], None),
+        (["api", "--paginate", "--jq", ".jobs", "repos/owner/repo/actions/runs/1/jobs?per_page=100"], None),
+        (["api", "--paginate", "repos/owner/repo/check-runs/11/annotations"], None),
         (["run", "view", "1", "-R", REPO, "--log-failed"], None),
+        (["api", "--paginate", "--jq", ".jobs", "repos/owner/repo/actions/runs/4/jobs?per_page=100"], None),
+        (["api", "--paginate", "repos/owner/repo/check-runs/14/annotations"], None),
         (["run", "view", "4", "-R", REPO, "--log-failed"], None),
     ]
 
 
 def test_gh_failed_logs_empty_when_head_has_no_failed_actions():
     run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"success"}]')
-    assert GhTracker(REPO, run).pr_failed_logs(42) == ""
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs == "" and not logs.not_started
     assert len(run.calls) == 2
 
 
 def test_gh_failed_log_errors_propagate():
     run = ScriptedRun(
-        '{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]',
+        '{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]', failed_job(11), "[]",
         subprocess.CalledProcessError(1, ["gh"], stderr="logs unavailable"),
     )
     with pytest.raises(TrackerError, match="logs unavailable"):
         GhTracker(REPO, run).pr_failed_logs(42)
+
+
+@pytest.mark.parametrize("steps,annotation", [
+    ("[]", "A runner could not be provisioned."),
+    (json.dumps([{"name": "Run tests", "status": "queued", "conclusion": None}]),
+     "The job was not started because the spending limit needs to be increased."),
+])
+def test_gh_failed_logs_mark_jobs_that_never_started_without_reading_logs(steps, annotation):
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', '[{"id":7,"name":"ci","conclusion":"failure","html_url":"https://run/7"}]',
+        failed_job(70, steps=steps), json.dumps([{"message": annotation}]),
+    )
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs.not_started
+    assert annotation in logs and "Actions run 7" in logs and "Job test did not start" in logs
+    assert not any("--log-failed" in call[0] for call in run.calls)
+
+
+def test_gh_failed_logs_mixed_jobs_are_a_code_failure_and_keep_both():
+    jobs = json.loads(failed_job(70, "build", steps="[]")) + json.loads(failed_job(71, "unit"))
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"failure"}]', json.dumps(jobs),
+        json.dumps([{"message": "The job was not started."}]), "[]", "assert 1 == 2",
+    )
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert not logs.not_started
+    assert "The job was not started." in logs and "Job unit failed" in logs and "assert 1 == 2" in logs
+
+
+def test_gh_failed_logs_missing_log_of_started_job_is_kept_as_evidence():
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"failure"}]', failed_job(70), "[]",
+        subprocess.CalledProcessError(1, ["gh"], stderr="log not found: 70"),
+    )
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert not logs.not_started and "log not found: 70" in logs
+
+
+def test_gh_failed_run_without_failed_jobs_is_a_code_failure():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"startup_failure"}]', "[]",
+                      "invalid workflow file")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert not logs.not_started and "invalid workflow file" in logs
 
 
 def gh_error(stderr, stdout="", code=1):
@@ -740,6 +801,14 @@ def test_parent_and_paginated_sub_issues_gh():
         (["api", "repos/owner/repo/issues/1/parent"], None),
         (["api", "--paginate", "repos/owner/repo/issues/99/sub_issues?per_page=100"], None),
     ]
+
+
+def test_parent_issue_gh_reads_parent_body_in_one_call():
+    run = ScriptedRun(json.dumps(issue_json(99, body="Shared outcome.")))
+    parent = GhTracker(REPO, run).parent_issue(1)
+    assert (parent.number, parent.body) == (99, "Shared outcome.")
+    assert run.calls == [(["api", "repos/owner/repo/issues/1/parent"], None)]
+    assert GhTracker(REPO, ScriptedRun(gh_error("gh: error (HTTP 404)"))).parent_issue(1) is None
 
 
 @pytest.mark.parametrize("code", [404, 403, 500])
@@ -972,7 +1041,8 @@ def test_gh_close_issue_with_optional_comment():
 
 
 def test_gh_pr_create_files_and_merge():
-    run = ScriptedRun("https://github.com/owner/repo/pull/42\n", '[{"filename": "src/a.py"}]\n[{"filename": "tests/a.py"}]', "")
+    run = ScriptedRun("https://github.com/owner/repo/pull/42\n", '[{"filename": "src/a.py"}]\n[{"filename": "tests/a.py"}]',
+                      json.dumps({"title": "Title (#1)"}), "")
     tracker = GhTracker(REPO, run)
     assert tracker.create_pr(head="feature", base="main", title="Title", body="Closes #1\nDetails") == 42
     assert tracker.pr_changed_files(42) == ["src/a.py", "tests/a.py"]
@@ -980,8 +1050,19 @@ def test_gh_pr_create_files_and_merge():
     assert run.calls == [
         (["pr", "create", "-R", REPO, "--head", "feature", "--base", "main", "--title", "Title", "--body-file", "-"], "Closes #1\nDetails"),
         (["api", "--paginate", "repos/owner/repo/pulls/42/files?per_page=100"], None),
-        (["pr", "merge", "42", "-R", REPO, "--squash", "--delete-branch", "--match-head-commit", "a" * 40], None),
+        (["pr", "view", "42", "-R", REPO, "--json", "title"], None),
+        (["pr", "merge", "42", "-R", REPO, "--squash", "--delete-branch", "--match-head-commit", "a" * 40,
+          "--subject", "Title (#1)", "--body", ""], None),
     ]
+
+
+def test_gh_squash_merge_uses_an_explicit_subject_without_reading_the_title():
+    run = ScriptedRun("")
+    GhTracker(REPO, run).merge_pr(42, expected_head_sha="a" * 40, subject="Feature (#1)")
+    assert run.calls == [([
+        "pr", "merge", "42", "-R", REPO, "--squash", "--delete-branch",
+        "--match-head-commit", "a" * 40, "--subject", "Feature (#1)", "--body", "",
+    ], None)]
 
 
 def test_gh_unparseable_pr_url_is_an_error():
@@ -1011,10 +1092,11 @@ def test_gh_pr_head_sha_reads_current_head():
     (["cancel"], "fail"), (["pass", "pending", "fail"], "fail"),
     (["cancel", "pending"], "fail"),
 ])
-def test_gh_check_bucket_mapping(buckets, expected):
-    run = ScriptedRun(json.dumps([{"bucket": bucket} for bucket in buckets]))
+@pytest.mark.parametrize('link', [None, 'https://github.com/owner/repo/actions/runs/42'])
+def test_gh_check_bucket_mapping(buckets, expected, link):
+    run = ScriptedRun(json.dumps([{"bucket": bucket, "link": link} for bucket in buckets]))
     assert GhTracker(REPO, run).pr_checks(42) == expected
-    assert run.calls == [(["pr", "checks", "42", "-R", REPO, "--json", "bucket"], None)]
+    assert run.calls == [(["pr", "checks", "42", "-R", REPO, "--json", "bucket,name,workflow,link"], None)]
 
 
 @pytest.mark.parametrize("response,expected", [
@@ -1025,6 +1107,138 @@ def test_gh_check_bucket_mapping(buckets, expected):
 ])
 def test_gh_checks_expected_nonzero_exit(response, expected):
     assert GhTracker(REPO, ScriptedRun(response)).pr_checks(42) == expected
+
+
+@pytest.mark.parametrize('changed', [[], [{'filename': '.github/workflows/ci.yml'}],
+    [{'filename': '.github/workflows/foragent-acceptance.yml'}],
+    [{'filename': '.github/workflows/nested/custom.yaml'}],
+    [{'filename': 'moved.yml', 'previous_filename': '.github/workflows/old.yml'}]])
+@pytest.mark.parametrize('unit_bucket', ['pass', 'fail'])
+@pytest.mark.parametrize('path', ['.github/workflows/foragent-acceptance.yml',
+    '.github/workflows/foragent-acceptance.yml@refs/heads/main',
+    '.github/workflows/foragent-acceptance-publish.yml'])
+def test_renamed_unit_workflow_cannot_hide_failed_checks(changed, unit_bucket, path):
+    fixtures = Path(__file__).parent / 'fixtures/github_ci'
+    measurement = json.loads((fixtures / 'measurement_run.json').read_text())
+    measurement['path'] = path
+    measurement['name'] = 'foragent-acceptance'
+    measurement['repository'] = {'full_name': REPO}
+    unit = {**measurement, 'id': measurement['id'] + 1, 'name': 'foragent-acceptance',
+            'check_suite_id': measurement['check_suite_id'] + 1,
+            'path': '.github/workflows/ci.yml',
+            'html_url': f"https://github.com/{REPO}/actions/runs/{measurement['id'] + 1}"}
+    checks = [
+        {'bucket': 'fail', 'name': 'acceptance (0)', 'workflow': measurement['name'],
+         'link': measurement['html_url'] + '/job/100'},
+        {'bucket': unit_bucket, 'name': 'foragent-acceptance/0', 'workflow': unit['name'],
+         'link': unit['html_url'] + '/job/101'},
+    ]
+
+    def github(args, input=None):
+        if args[:2] == ['pr', 'checks']:
+            raise gh_error('', json.dumps(checks), 1)
+        endpoint = args[-1]
+        if endpoint.endswith('/pulls/42'):
+            return json.dumps({'head': {'sha': measurement['head_sha']}})
+        if '/commits/' in endpoint and '/check-runs?' in endpoint:
+            return json.dumps([
+                {'id': index, 'name': check['name'], 'details_url': check['link'],
+                 'app': {'slug': 'github-actions'}, 'check_suite': {'id': run['check_suite_id']}}
+                for index, (check, run) in enumerate(zip(checks, [measurement, unit]), 1)
+            ])
+        if '/actions/runs?check_suite_id=' in endpoint:
+            return json.dumps([run for run in [measurement, unit]
+                               if f"check_suite_id={run['check_suite_id']}&" in endpoint])
+        if '/pulls/42/files?' in endpoint:
+            return json.dumps(changed)
+        raise AssertionError(args)
+
+    excluded = not changed and path == '.github/workflows/foragent-acceptance.yml'
+    expected = unit_bucket if excluded else 'fail'
+    assert GhTracker(REPO, github).pr_checks(42) == expected
+
+
+@pytest.mark.parametrize('external_status', [False, True])
+@pytest.mark.parametrize('damage', [None, 'missing-suite', 'foreign-repo', 'wrong-path',
+                                  'wrong-suite', 'non-actions', 'api-failure', 'workflow-change', 'colliding-check'])
+def test_commit_status_cannot_impersonate_acceptance_job(external_status, damage):
+    from foragent.ci_workflow import WORKFLOW
+
+    link = f'https://github.com/{REPO}/actions/runs/42/job/100'
+    checks = [{'bucket': 'fail', 'name': 'acceptance (0)', 'workflow': 'foragent-acceptance', 'link': link}]
+    if external_status:
+        # gh's StatusContext row: target_url may duplicate every display field,
+        # but it has no CheckSuite/WorkflowRun and therefore no workflow value.
+        checks.append({'bucket': 'fail', 'name': 'acceptance (0)', 'workflow': '', 'link': link})
+    if damage == 'colliding-check':
+        checks.append(dict(checks[0]))
+    check = {'id': 100, 'name': checks[0]['name'], 'details_url': link,
+             'app': {'slug': 'github-actions'}, 'check_suite': {'id': 99}}
+    run = {'id': 42, 'check_suite_id': 99, 'path': WORKFLOW, 'repository': {'full_name': REPO}}
+    if damage == 'missing-suite':
+        check.pop('check_suite')
+    elif damage == 'foreign-repo':
+        run['repository']['full_name'] = 'someone/else'
+    elif damage == 'wrong-path':
+        run['path'] += '@refs/heads/main'
+    elif damage == 'wrong-suite':
+        run['check_suite_id'] = 98
+    elif damage == 'non-actions':
+        check['app']['slug'] = 'external-ci'
+    responses = [gh_error('', json.dumps(checks), 1),
+                 json.dumps([{'filename': '.github/workflows/ci.yml'}] if damage == 'workflow-change' else [])]
+    if damage != 'workflow-change':
+        raw_checks = [check]
+        if damage == 'colliding-check':
+            raw_checks.append({**check, 'id': 101, 'check_suite': {'id': 98}})
+        responses.extend(['{"head":{"sha":"head"}}', json.dumps(raw_checks)])
+        if damage not in {'missing-suite', 'non-actions'}:
+            responses.append(gh_error('HTTP 403') if damage == 'api-failure' else json.dumps([run]))
+        if damage == 'colliding-check':
+            responses.append(json.dumps([{**run, 'id': 43, 'check_suite_id': 98,
+                                          'path': '.github/workflows/ci.yml'}]))
+    github = ScriptedRun(*responses)
+
+    assert GhTracker(REPO, github).pr_checks(42) == ('fail' if external_status or damage else 'none')
+    assert not github.responses
+    if not damage:
+        assert github.calls[-1][0][-1] == f'repos/{REPO}/actions/runs?check_suite_id=99&per_page=100'
+
+
+@pytest.mark.parametrize('ordinary,expected', [(None, 'none'), ('pass', 'pass'), ('pending', 'pending'),
+                                              ('fail', 'fail'), ('cancel', 'fail')])
+@pytest.mark.parametrize('acceptance', ['fail', 'pending'])
+def test_ordinary_ci_excludes_acceptance_jobs_reports_and_failed_logs(ordinary, expected, acceptance):
+    from foragent.ci_workflow import WORKFLOW
+
+    checks = [
+        {'name': 'acceptance (0)', 'workflow': 'custom measurement name', 'bucket': acceptance,
+         'link': 'https://github.com/owner/repo/actions/runs/1/job/10'},
+    ]
+    if ordinary is not None:
+        checks.append({'name': 'unit', 'workflow': 'ci', 'bucket': ordinary})
+    response = gh_error('', json.dumps(checks), 1 if acceptance == 'fail' or expected == 'fail' else 8)
+    runs = [{'id': 1, 'check_suite_id': 9, 'repository': {'full_name': REPO},
+             'name': 'custom measurement name', 'path': WORKFLOW, 'conclusion': 'failure',
+             'html_url': 'https://github.com/owner/repo/actions/runs/1'}]
+    failed = expected == 'fail'
+    if failed:
+        runs.append({'id': 3, 'name': 'ci', 'path': '.github/workflows/ci.yml', 'conclusion': 'failure'})
+    responses = [response, '[]', '{"head":{"sha":"head"}}',
+                 json.dumps([{'id': 10, 'name': checks[0]['name'], 'details_url': checks[0]['link'],
+                              'app': {'slug': 'github-actions'}, 'check_suite': {'id': 9}}]),
+                 json.dumps(runs[:1]),
+                 '{"head":{"sha":"head"}}', json.dumps(runs), '[]']
+    if failed:
+        responses.extend([failed_job(30), '[]', 'ordinary CI failure'])
+    run = ScriptedRun(*responses)
+    tracker = GhTracker(REPO, run)
+    assert tracker.pr_checks(42) == expected
+    logs = tracker.pr_failed_logs(42)
+    assert 'custom measurement name' not in logs and not logs.not_started
+    assert ('ordinary CI failure' in logs) is failed
+    assert not run.responses
+    assert all('/actions/runs/1/jobs' not in args[-1] for args, _ in run.calls)
 
 
 @pytest.mark.parametrize("response", [
@@ -1065,7 +1279,7 @@ def test_default_runner_invokes_subprocess_without_a_shell(monkeypatch):
     assert GhTracker(REPO).comment(1, "body") == 5
     assert calls == [(
         ["gh", "api", "-X", "POST", "repos/owner/repo/issues/1/comments", "--input", "-"],
-        {"input": json.dumps({"body": "body"}), "check": True, "capture_output": True, "text": True,
+        {"input": json.dumps({"body": "body"}).encode(), "check": True, "capture_output": True,
          "timeout": 120},
     )]
 
@@ -1201,6 +1415,70 @@ def test_remove_blocked_by_propagates_api_failure():
         GhTracker(REPO, run).remove_blocked_by(1, 2)
 
 
+@pytest.fixture
+def local_records(tmp_path, monkeypatch):
+    from foragent import tracker as tracker_module
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    monkeypatch.setattr(tracker_module, "_EMPTY_RETRY_DELAY", 0)
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kwargs: store))
+    return store
+
+
+@pytest.mark.parametrize(("local_state", "state", "raises"), [
+    ("open", "open", True),
+    ("closed", "open", False),
+    ("closed", "all", True),
+    (None, "all", False),
+])
+def test_empty_listing_checks_local_issue_records(local_records, local_state, state, raises):
+    if local_state is not None:
+        local_records.update_local_issue(1, state=local_state)
+    calls = []
+    tracker = GhTracker("owner/repo", run=lambda args, input=None: calls.append(args) or "[]")
+    if raises:
+        with pytest.raises(TrackerError, match="empty listing"):
+            tracker.list_issues(state)
+    else:
+        assert tracker.list_issues(state) == []
+    assert len(calls) == 2
+
+
+def test_empty_open_listing_after_nonempty_all_listing_is_trusted(local_records):
+    replies = [json.dumps([issue_json(1, state="closed")]), "[]", "[]"]
+    tracker = GhTracker("owner/repo", run=lambda args, input=None: replies.pop(0))
+    assert [issue.number for issue in tracker.list_issues("all")] == [1]
+    assert tracker.list_open_issues() == [], "Every issue may be closed"
+
+
+def test_empty_open_listing_after_all_listing_with_open_issue_raises(local_records):
+    still_open = json.dumps([issue_json(1, state="open")])
+    replies = [still_open, "[]", "[]", still_open]
+    tracker = GhTracker("owner/repo", run=lambda args, input=None: replies.pop(0))
+    assert [issue.number for issue in tracker.list_issues("all")] == [1]
+    with pytest.raises(TrackerError, match="empty listing"):
+        tracker.list_open_issues()
+    assert replies == [], "The earlier sighting is checked against a fresh full listing"
+
+
+def test_empty_open_listing_is_trusted_when_earlier_open_issue_was_closed_since(local_records):
+    calls = []
+    replies = [json.dumps([issue_json(1, state="open")]), "[]", "[]",
+               json.dumps([issue_json(1, state="closed")]), "[]", "[]"]
+
+    def run(args, input=None):
+        calls.append(args[-1])
+        return replies.pop(0)
+
+    tracker = GhTracker("owner/repo", run=run)
+    assert [issue.number for issue in tracker.list_open_issues()] == [1]
+    assert tracker.list_open_issues() == [], "Closing the last open issue is not a GitHub hiccup"
+    assert "state=all" in calls[3]
+    assert tracker.list_open_issues() == [], "Once settled, the old sighting is not checked again"
+    assert replies == []
+
+
 def test_fake_advances_updated_at_on_each_issue_change():
     clock = [NOW]
     tracker = FakeTracker(now=lambda: clock[0])
@@ -1300,3 +1578,77 @@ def test_refresh_rereads_links_when_only_a_link_count_changes(tmp_path):
     clock[0] += timedelta(minutes=5)
     tracker.refresh_issues()
     assert ctx.store.local_issues()[0]["blocked_by"] == []
+
+
+def test_merged_prs_updated_since_stops_at_the_first_page_older_than_the_cutoff():
+    def pull(number, at, head="foragent/issue-1", merged=True):
+        stamp = at.isoformat().replace("+00:00", "Z")
+        return {"number": number, "head": {"ref": head}, "base": {"ref": "main"},
+                "html_url": f"https://github.com/owner/repo/pull/{number}",
+                "merged_at": stamp if merged else None, "updated_at": stamp}
+
+    # A page whose times are unknown cannot prove it is old, so reading continues.
+    first = [pull(index, NOW, head="other") for index in range(99)] + [
+        {**pull(99, NOW), "updated_at": None}]
+    second = [pull(200, NOW - timedelta(minutes=1)), pull(201, NOW, merged=False),
+              *(pull(300 + index, NOW - timedelta(days=1)) for index in range(98))]
+    run = ScriptedRun(json.dumps(first), json.dumps(second))
+    records = GhTracker(REPO, run).merged_prs_updated_since(NOW - timedelta(hours=1), "foragent/")
+    assert [record["number"] for record in records] == [99, 200, *range(300, 398)]
+    assert [args[1] for args, _ in run.calls] == [
+        f"repos/owner/repo/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"
+        for page in (1, 2)]
+
+    # Without a cutoff, reading stops only at a short page.
+    run = ScriptedRun(json.dumps(second), json.dumps([]))
+    assert len(GhTracker(REPO, run).merged_prs_updated_since(None)) == 99
+    assert len(run.calls) == 2
+
+
+def test_merged_prs_updated_since_accepts_pulls_without_updated_at():
+    item = {"number": 5, "head": {"ref": "foragent/issue-5"}, "base": {"ref": "main"},
+            "html_url": "https://github.com/owner/repo/pull/5", "merged_at": NOW.isoformat()}
+    run = ScriptedRun(json.dumps([item]))
+    assert GhTracker(REPO, run).merged_prs_updated_since(NOW, "foragent/") == [{
+        "number": 5, "head": "foragent/issue-5", "base": "main", "merged_at": NOW.isoformat(),
+        "url": item["html_url"], "updated_at": None}]
+
+
+def test_gh_attempts_count_only_with_a_recorder_and_include_failures(tmp_path):
+    from foragent import gh
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path, now=lambda: datetime(2026, 10, 20, 9, 30, tzinfo=UTC))
+    attempts = []
+
+    def run(args, input=None):
+        attempts.append(args)
+        if len(attempts) == 1:
+            raise subprocess.CalledProcessError(1, ["gh", *args], stderr="boom")
+        return "[]"
+
+    tracker = GhTracker("owner/repo", run=run, sleep=lambda seconds: None)
+    with pytest.raises(TrackerError):
+        tracker.list_open_issues()
+    assert store.github_calls() == []  # No recorder: nothing counts.
+    gh.set_recorder(store, lambda: datetime(2026, 10, 20, 9, 45, tzinfo=UTC))
+    tracker.list_open_issues()  # An empty listing is retried once: two attempts.
+    assert store.github_calls() == [{"hour": "2026-10-20T09:00:00+00:00", "calls": 2}]
+
+
+def test_recording_tracker_installs_its_context_as_the_gh_recorder(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import gh
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path)
+    when = datetime(2026, 10, 20, 11, tzinfo=UTC)
+    RecordingTracker(FakeTracker(), SimpleNamespace(store=store, now=lambda: when))
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kwargs: calls.append(argv) or
+                        subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))
+    gh.run(["auth", "status"], capture_output=True, check=False)
+    assert calls == [["gh", "auth", "status"]]
+    assert store.github_calls() == [{"hour": "2026-10-20T11:00:00+00:00", "calls": 1}]

@@ -24,6 +24,15 @@ if TYPE_CHECKING:
 class PatchReplayError(GitError):
     """A child patch could not be replayed onto its selected destination."""
 
+    def __init__(self, message: str, own_paths: list[str] | tuple[str, ...] = (), *,
+                 source_head: str | None = None, source_tree: str | None = None, source_target: str = ""):
+        super().__init__(message)
+        self.own_paths = list(own_paths)
+        # The branch head and staged tree before replay, so a stop can restore the PR's work.
+        self.source_head = source_head
+        self.source_tree = source_tree
+        self.source_target = source_target
+
 
 class AttemptFailure(Exception):
     """Checks failed and need another implementation attempt."""
@@ -32,15 +41,31 @@ class AttemptFailure(Exception):
         super().__init__(message)
         self.target_branch = target_branch
 
+    @property
+    def failure(self) -> str:
+        """The failure text for the next attempt, keeping a WholeFailure whole."""
+        message = self.args[0] if self.args else ""
+        return message if isinstance(message, WholeFailure) else str(self)
+
 
 class ConflictBudgetExhausted(Exception):
-    """Conflict resolution needs one fresh implementation on the latest target."""
+    """In-place conflict resolution used its budget; the PR's own files decide on a rebuild."""
+
+    def __init__(self, message: str, conflicts: list[str] | tuple[str, ...] = (),
+                 own_paths: list[str] | tuple[str, ...] = ()):
+        super().__init__(message)
+        self.conflicts = list(conflicts)
+        self.own_paths = list(own_paths)
 
 
 class CIFailure(AttemptFailure):
     def __init__(self, logs: str, target_branch: str):
         super().__init__(f"CI failed:\n{logs}")
         self.target_branch = target_branch
+
+
+class WholeFailure(str):
+    """Failure text whose parts are already limited (each check tail, every review finding); kept whole."""
 
 
 class ExecutorStopped(Exception):
@@ -73,12 +98,16 @@ class Implementation:
     issue: Issue
     size: str
     baseline: AcceptanceBaseline | None
+    # The base commit `baseline` was taken at; None when this run keeps no baseline (#483).
+    baseline_sha: str | None = None
     failure: str | CIFailure = ""
     reviews: list[ReviewResult] = field(default_factory=list)
     review_failures: int = 0
     review_hold: bool = False
     review_hold_reason: Reason = Reason.RISK_HIGH
     reviewer_text: str | None = None
+    # The pending failure came from a review round; the next prompt asks for a defect-class sweep.
+    review_feedback: bool = False
     rebuttals: list[str] = field(default_factory=list)
     previous_rebutted_findings: set[str] = field(default_factory=set)
     checks: list[CheckResult] = field(default_factory=list)
@@ -89,3 +118,5 @@ class Implementation:
     rebuild_lease: str | None = None
     pushed_head: str | None = None
     tracker_available: bool = True
+    # The title the open PR actually carries; a failed retitle keeps the old one.
+    pr_title: str | None = None

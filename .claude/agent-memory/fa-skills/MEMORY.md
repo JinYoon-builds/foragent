@@ -24,3 +24,7 @@
 - 레인 에이전트는 삭제되거나 처음부터 없을 수 있다. `set_lane_skills()`는 설치 전에 `read_text()`의 `OSError`를 경로가 포함된 `LaneError`로 변환한다. 누락·미생성·디렉터리 경로의 CLI 오류와 프로젝트 파일 무변경을 함께 검증한다.
 - 설정 `_overlay()`는 `tiers`만 깊게 병합하며 `lanes`는 전역 → 로컬 순으로 목록 전체를 교체한다. 로컬 `lanes`가 있으면 `config.lanes`에 전역 전용 레인이 섞이지 않는다. 목록을 처음 로컬에 저장할 때는 상속한 다른 레인을 보존해야 한다. 전역·로컬 혼합 회귀는 `test_set_lane_skills_does_not_copy_overridden_global_lanes`다.
 - `SkillManager._scan()`은 (유효 스킬, 건너뜀 `{path, error}`)를 돌려준다. 깨진 SKILL.md는 catalog·install에서 조용히 빠지고, `add`는 `skipped`로 알린다. 유효 스킬 0개+건너뜀 있음일 때만 모든 경로를 담아 실패한다. #232 검증: `fa test tests/acceptance/test_skills_add_partial_pack.py`. `fa test`는 슬롯 대기로 10분을 넘길 수 있으니 백그라운드로 돌린다.
+- [.foragent.yml 줄 단위 편집](settings_roundtrip.md) — lanes add/skills는 compose 위치로 줄만 고치고 다시 읽어 확인; ruamel 왕복은 거절됨 (#233)
+- [게이트 슬롯 환경 변수](gate_slot_env.md) — FORAGENT_TEST_SLOT=held가 시험에 새면 capacity 슬롯 시험이 게이트에서만 실패
+- 오케스트레이터 시간 초과(`scheduler_checks._escalate_overdue_blocker`) 시계는 최신 blocked 댓글과 그 이슈의 최신 `store.finish_times()`(키 `(번호, started_at)`) 중 늦은 쪽부터 센다(#642). 시험에서 종료 시각을 바꾸려면 같은 state 경로로 `now`가 다른 `StateStore`를 새로 만들어 `finish_run`한다.
+- 모든 시험의 HOME·XDG·GIT_CONFIG_GLOBAL 격리는 conftest의 `pytest_runtest_setup`(tryfirst) 훅이 한다(#655). 같은 범위 autouse fixture는 선언 순서대로 준비되지 않으므로 fixture로 하면 다른 fixture가 시작 HOME을 본다. 복원은 `pytest_runtest_teardown` hookwrapper의 yield 뒤. 확인은 `pytest_fixture_setup`에서 HOME을 기록하는 `-p` 임시 플러그인으로 한다(`--setup-plan`엔 훅이 안 보임). `REAL_HOME`은 시작 HOME, gates 가드는 `temporary_home`도 "격리 안 함"으로 본다. 넓은 acceptance 묶음은 미구현 주문 시험이 원래 실패하므로 회귀 판단은 단위 시험이나 변경 전후 비교로 한다.

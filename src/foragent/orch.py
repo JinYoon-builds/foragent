@@ -2,6 +2,7 @@
 
 from collections import deque
 from collections.abc import Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -13,13 +14,20 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
+from foragent import capacity
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
-from foragent.processes import run_logged
+from foragent.processes import claude_session, run_logged
+from foragent.records import load_record
+from foragent.run_attempt import AttemptFailure
+from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
+from foragent.run_checks import CheckResult, trusts_ci
+from foragent.run_previous import retry_marker
+from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
 from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
@@ -54,7 +62,12 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
     path = ctx.store.root / "orch-watch.json"
     unknown_path = ctx.store.root / "orch-watch-unknown.json"
     last_error = None
+    session = claude_session()  # The gate's spawn check trusts it past a stale heartbeat.
     while True:
+        try:  # Every read, changed or not, shows the orchestrator is alive.
+            ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session)
+        except Exception:
+            pass  # a heartbeat is best effort; the read below reports state errors
         try:
             snapshot = _watch_snapshot(ctx)
             with ctx.store._state_lock():
@@ -109,8 +122,9 @@ def _text(value: str, name: str) -> str:
     return value.strip()
 
 
-def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = ()) -> dict:
-    event = append_event(ctx.store, ctx.now(), n, kind, summary)
+def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
+           say: str | None = None) -> dict:
+    event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
     if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
         return event
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
@@ -126,7 +140,7 @@ def list_blocked(ctx: RunContext) -> list[dict]:
         if row["state"] != "open" or BLOCKED not in row["labels"]:
             continue
         issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
-        comments = [Comment(**item) for item in row["comments"]]
+        comments = [load_record(Comment, item) for item in row["comments"]]
         flags = [(comment, match[1]) for comment in comments
                  if (match := re.fullmatch(r"<!-- foragent:blocked reason=([a-z-]+) -->",
                                            comment.body.splitlines()[0] if comment.body else ""))]
@@ -155,6 +169,8 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
         ctx.store._atomic_write(path, hint)
     else:
         path.unlink(missing_ok=True)
+    # The next implementer receives the keep-work/defect-class default before any hint.
+    ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         ctx.tracker.close_pr(pr, "Closed by Foragent orchestrator retry")
     # Establish the destination before clearing the old state, including on errors.
@@ -162,27 +178,27 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
 
 
-def retry(ctx: RunContext, n: int, hint: str | None = None) -> str:
+def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
     _issue(ctx, n)
     _retry(ctx, n, hint)
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
-    _event(ctx, n, "retry", summary)
+    _event(ctx, n, "retry", summary, say=say)
     kick_tick(ctx.repo_root)
     return summary
 
 
-def rerun_review(ctx: RunContext, n: int) -> str:
+def rerun_review(ctx: RunContext, n: int, say: str | None = None) -> str:
     _issue(ctx, n)
     outcome = "interrupted"
     try:
         outcome = review_only(n, ctx)
     finally:
         summary = f"#{n}: reran review on the existing PR; {outcome}"
-        _event(ctx, n, "rerun-review", summary)
+        _event(ctx, n, "rerun-review", summary, say=say)
     return summary
 
 
-def resolve(ctx: RunContext, n: int, verdict: str, note: str) -> str:
+def resolve(ctx: RunContext, n: int, verdict: str, note: str, say: str | None = None) -> str:
     _issue(ctx, n)
     if verdict not in {"pass", "fail"}:
         raise OrchError("verdict must be pass or fail")
@@ -203,17 +219,18 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str) -> str:
             # A review verdict cannot fix failing code or CI. Give the implementer
             # the evidence and queue a fresh attempt rather than strand the issue.
             if outcome in {"checks-failed", "ci-failed"}:
+                # The failing commands themselves reach the next implementer from the saved bundle.
                 _retry(ctx, n, f"{note}\n\nVerification: {outcome}\nSee {ctx.store.log_path(n)}")
                 outcome += "; queued implementation retry"
     finally:
         summary = f"#{n}: resolved review {verdict} for {head}; {outcome}; {note}"
-        _event(ctx, n, "resolve", summary)
+        _event(ctx, n, "resolve", summary, say=say)
         kick_tick(ctx.repo_root)
     return summary
 
 
 def escalate(ctx: RunContext, n: int, summary: str, tried: str,
-             options: list[str] | None = None, recommend: int | None = None) -> str:
+             options: list[str] | None = None, recommend: int | None = None, say: str | None = None) -> str:
     _issue(ctx, n)
     summary, tried = _text(summary, "summary"), _text(tried, "tried")
     options = [_text(option, "option") for option in (options or [])]
@@ -228,7 +245,7 @@ def escalate(ctx: RunContext, n: int, summary: str, tried: str,
     tracker.add_labels(n, [NEEDS_HUMAN])
     tracker.remove_labels(n, [READY])
     event_summary = f"#{n}: escalated to human; {summary}; tried: {tried}"
-    _event(ctx, n, "escalate", event_summary)
+    _event(ctx, n, "escalate", event_summary, say=say)
     return event_summary
 
 
@@ -238,7 +255,10 @@ def log(ctx: RunContext) -> list[dict]:
     with ctx.store._state_lock():
         if path.exists():
             with path.open(encoding="utf-8") as stream:
-                events = [json.loads(line) for line in deque(stream, maxlen=20)]
+                # Phase timings (kind=phase) are measurements for `fa orch facts`, not actions.
+                events = deque((event for line in stream
+                                if (event := json.loads(line)).get("kind") != "phase"), maxlen=20)
+                events = list(events)
         else:
             events = []
     _event(ctx, None, "log", f"Read {len(events)} recent orchestrator events")
@@ -266,21 +286,29 @@ class _SuiteRun:
     failing: frozenset[str] | None  # None: no per-test result to compare
 
 
+def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
+                   log_path: Path, label: str, slot: AbstractContextManager) -> CheckResult:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
+    with slot:
+        code, timed_out, output = run_logged(
+            ["/bin/sh", "-c", command], cwd=worktree,
+            timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path, env=capacity.HELD_ENV,
+        )
+    return CheckResult(command, code, timed_out, output)
+
+
 def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Path,
-               log_path: Path, label: str) -> _SuiteRun:
-    """Run one full-suite command; pytest also reports its failing node ids."""
+               log_path: Path, label: str, slot: AbstractContextManager, *, allow_empty: bool = False) -> _SuiteRun:
+    """Run one suite inside a slot; pytest also reports its failing node ids."""
     pytest = _pytest_command(command) is not None
     if pytest:
         junit.unlink(missing_ok=True)
         command = (f"{command} --rootdir=. -o junit_family=legacy --junit-prefix= "
                    f"--junitxml={shlex.quote(str(junit.resolve()))}")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as stream:
-        stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
-    code, timed_out, _ = run_logged(
-        ["/bin/sh", "-c", command], cwd=worktree,
-        timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path,
-    )
+    result = _suite_process(ctx, n, command, worktree, log_path, label, slot)
+    code, timed_out = result.exit_code, result.timed_out
     passed = code == 0 and not timed_out
     if not pytest or timed_out:
         return _SuiteRun(passed, None)
@@ -291,6 +319,8 @@ def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Pat
     failing = frozenset(node_id for case in cases
                         if any(case.find(tag) is not None for tag in ("failure", "error"))
                         and (node_id := junit_node_id(case)) is not None)
+    if allow_empty and code == 5 and not cases:
+        return _SuiteRun(True, frozenset())
     # Exit 1 is pytest's "some tests failed"; other codes are session failures.
     if code not in (0, 1) or (code == 1 and not failing):
         return _SuiteRun(False, None)
@@ -305,6 +335,31 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
     ctx.git._call(["fetch", "origin", head])
     base = ctx.git.ref_sha(f"refs/remotes/origin/{pr.base}")
     log_path = ctx.store.root / "runs" / f"premerge-pr-{n}.log"
+    waited_seconds = 0.0
+
+    def wait(acquire):
+        nonlocal waited_seconds
+        started = ctx.now()
+        try:
+            return acquire()
+        finally:
+            waited_seconds += max(0.0, (ctx.now() - started).total_seconds())
+
+    @contextmanager
+    def test_slot():
+        nonlocal waited_seconds
+        started = ctx.now()
+        queued = False
+
+        def waiting():
+            nonlocal queued
+            queued = True
+
+        with capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting):
+            if queued:
+                waited_seconds += max(0.0, (ctx.now() - started).total_seconds())
+            yield
+
     broken: list[str] = []
     failing_on_base: list[str] = []
     with TemporaryDirectory(prefix=f"foragent-premerge-{n}-") as directory:
@@ -333,34 +388,73 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                         else detect_test_commands(worktree))
             if not commands:
                 raise OrchError("no full test command detected; set test_command in .foragent.yml")
+            ci_units = trusts_ci(ctx.repo_root, ctx.config)
+            excluded = _baseline_exclusions(ctx, base, log_path)
             label = f"head={head} merged with base={base}" if merged else f"head={head} (base merge conflicts)"
-            runs = [(command, _run_suite(ctx, n, command, worktree, Path(directory) / f"head-{i}.xml",
-                                         log_path, label))
-                    for i, command in enumerate(commands)]
+            runs = []
+            for i, command in enumerate(commands):
+                pytest_command = _pytest_command(command)
+                acceptance_only = ci_units and pytest_command is not None
+                selection = command
+                if acceptance_only:
+                    selection = f"{pytest_command} {shlex.quote(ctx.config.acceptance_dir)}"
+                    selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
+                if acceptance_only and not (worktree / ctx.config.acceptance_dir).is_dir():
+                    run = _SuiteRun(True, frozenset())
+                else:
+                    run = _run_suite(ctx, n, selection, worktree, Path(directory) / f"head-{i}.xml",
+                                     log_path, label, test_slot(), allow_empty=acceptance_only)
+                runs.append((command, run, acceptance_only))
         finally:
             ctx.git.remove_worktree(worktree)
         tests = "pass"
-        for i, (command, run) in enumerate(runs):
-            if run.passed:
+        for i, (command, run, acceptance_only) in enumerate(runs):
+            if run.passed and not acceptance_only:
                 continue
-            if run.failing is None:
+            if not run.passed and run.failing is None:
                 tests = "fail"
                 continue
             # D53: failures the base already has do not block; any other failure does.
-            ctx.git.add_detached_worktree(worktree, base)
-            try:
-                on_base = _run_suite(ctx, n, command, worktree, Path(directory) / f"base-{i}.xml",
-                                     log_path, f"base={base}")
-            finally:
-                ctx.git.remove_worktree(worktree)
-            base_failing = on_base.failing or frozenset()
-            broken.extend(sorted(run.failing - base_failing))
-            failing_on_base.extend(sorted(run.failing & base_failing))
-            if run.failing - base_failing:
+            head_failing = run.failing or frozenset()
+            base_failing = frozenset()
+            if acceptance_only:
+                try:
+                    baseline = _capture_baseline(
+                        ctx, command, base, log=log_path, report=Path(directory) / f"base-{i}.xml",
+                        check=lambda selection, root: _suite_process(
+                            ctx, n, selection, root, log_path, f"base={base}", test_slot()),
+                        prepare=lambda: None, wait=wait, required_ids=head_failing,
+                    )
+                except AttemptFailure:
+                    tests = "fail"
+                    broken.extend(sorted(head_failing))
+                    continue
+                if baseline is not None:
+                    base_failing = frozenset(baseline.failing_ids)
+            else:
+                selection = command
+                if _pytest_command(command) is not None:
+                    saved = _premerge_baseline(ctx, command, base, excluded, head_failing)
+                    if saved is not None:
+                        base_failing = frozenset(saved["failing_ids"])
+                        # Keep units and uncached/locked tests in the original full suite.
+                        selection += "".join(f" {shlex.quote('--deselect=' + node)}"
+                                             for node in [*saved["collected_ids"], *saved["excluded"]])
+                ctx.git.add_detached_worktree(worktree, base)
+                try:
+                    on_base = _run_suite(ctx, n, selection, worktree, Path(directory) / f"base-{i}.xml",
+                                         log_path, f"base={base}", test_slot())
+                finally:
+                    ctx.git.remove_worktree(worktree)
+                base_failing |= on_base.failing or frozenset()
+            broken.extend(sorted(head_failing - base_failing))
+            failing_on_base.extend(sorted(head_failing & base_failing))
+            if head_failing - base_failing:
                 tests = "fail"
     ci = ctx.tracker.pr_checks(n)
     report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
               "broken": broken, "failing_on_base": failing_on_base,
+              "waited_seconds": waited_seconds,
               "ready": tests == "pass" and not conflicts and ci in {"pass", "none"}}
     return _Premerge(pr, head, base, report)
 
@@ -373,6 +467,14 @@ def premerge(ctx: RunContext, n: int) -> dict:
 def _base_note(report: dict) -> str:
     count = len(report["failing_on_base"])
     return f" ({count} failing on the base too)" if count else ""
+
+
+def _merge_title(ctx: RunContext, pr: PullRequest) -> str:
+    """The issue's current title decides the squash subject; unlinked PRs keep theirs."""
+    if (number := pr_issue_number(pr.head)) is None:
+        return pr.title
+    title = f"{ctx.tracker.get_issue(number).title} (#{number})"
+    return f"Batch: {title}" if pr.head.startswith("foragent/batch-") else title
 
 
 def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -> str:
@@ -401,7 +503,11 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
         n, f"Approved by {approved_by} in the orchestrator ({at}). "
            f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
-    ctx.tracker.merge_pr(n, expected_head_sha=checked.head)
+    subject = retitle_for_merge(
+        ctx, n, title=_merge_title(ctx, current), current_title=current.title, base=current.base,
+        body=lambda: current.body, note=print,
+    )
+    ctx.tracker.merge_pr(n, expected_head_sha=checked.head, **subject)
     summary = (f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; "
                f"tests pass{_base_note(report)}, no conflicts, CI {ci}")
     _event(ctx, None, "merge", summary)
