@@ -83,6 +83,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError(text("perspectives_config_shape", language, seats=", ".join(SEATS)))
     if not isinstance(values["view_glyphs"], str) or values["view_glyphs"] not in {"emoji", "ascii", "auto"}:
         raise ConfigError("view_glyphs must be emoji, ascii, or auto")
+    if type(values["animation"]) is not bool:
+        raise ConfigError("animation must be true or false")
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     if values["upstream_reports"] is not None and type(values["upstream_reports"]) is not bool:
