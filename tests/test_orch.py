@@ -647,3 +647,22 @@ def test_review_done_when_that_leaves_a_fifo_pyproject_is_held_not_a_staging_err
     assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
     assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
     assert c.tracker.merged_prs == [] and c.tracker.get_issue(c.pr).state == "open"
+
+
+def test_review_fifo_between_done_when_commands_is_held_before_staging(review_case):
+    """The guard before the second measurement decides before it stages the FIFO."""
+    from runner_support import set_done_when
+
+    c = review_case
+    c.history.update({"pyproject.toml": '[tool.pytest.ini_options]\naddopts = "-q"\n'})
+    c.head = c.history.tip
+    c.tracker.set_pr_head_sha(c.pr, c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", c.head)
+    c.ctx.git.fetch()
+    set_done_when(c, ["rm pyproject.toml && mkfifo pyproject.toml", "true"])
+    c.tracker.edit_body(1, c.store.load_approval(1).body)
+
+    assert runner.review_only(1, c.ctx) == "held"
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels

@@ -836,3 +836,43 @@ def test_bug_steps_are_left_out_of_the_conflict_resolution_turn(conflicting_lane
     assert "This issue is a bug. Follow these steps:" in first
     assert "Resolve the conflict markers" in conflict
     assert "This issue is a bug. Follow these steps:" not in conflict
+
+
+def test_conflict_resolution_that_leaves_a_fifo_pyproject_is_held_before_staging(conflicting_lanes, monkeypatch):
+    """The resolver's turn is guarded before the staging Git would refuse."""
+    import os
+
+    from foragent.reasons import Reason
+
+    c = conflicting_lanes
+    c.history.update({"pyproject.toml": '[tool.pytest.ini_options]\naddopts = "-q"\n'})
+    c.executor.steps += [{"cli.py": "commands = ['help', 'base', 'issue']\n"}]
+    run = c.executor.run
+
+    def implement(**kwargs):
+        result = run(**kwargs)
+        if len(c.executor.calls) == 2:  # the conflict resolver
+            path = kwargs["worktree"] / "pyproject.toml"
+            path.unlink()
+            os.mkfifo(path)
+        return result
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    outcome = run_issue(1, c.ctx)
+    assert outcome == "held", c.store.log_path(1).read_text()[-3000:]
+    assert len(c.executor.calls) == 2
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert "needs-human" in c.tracker.get_issue(1).labels
+
+
+def test_conflict_resolution_hold_publishes_the_resolved_merge(conflicting_lanes):
+    """The resolver's unstaged resolution and harness change are what the held PR carries."""
+    from foragent.reasons import Reason
+
+    c = conflicting_lanes
+    resolved = "commands = ['help', 'base', 'issue']\n"
+    c.executor.steps += [{"cli.py": resolved, "tests/sub/conftest.py": "# harness\n"}]
+    assert run_issue(1, c.ctx) == "held"
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == resolved.strip()
+    assert git_command(c.history.origin, "show", "foragent/issue-1:tests/sub/conftest.py") == "# harness"

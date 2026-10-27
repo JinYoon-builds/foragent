@@ -63,17 +63,24 @@ def _guard_harness(attempt: Implementation) -> None:
         return
     _append(attempt.log, hold_details(paths))
     title = f"{ctx.tracker.get_issue(n).title} (#{n})"
-    # Publication is for the human's convenience; a contents problem Git
-    # refuses (for example a FIFO it cannot index) must not replace the hold.
+    # The guard runs before staging, so publish the worktree it judged: stage
+    # what Git accepts, and name what it refuses (for example a FIFO). A
+    # publication problem must not replace the hold.
+    refused: list[str] = []
     try:
+        refused = git.stage_changes(skip_refused=True)
         if git.has_staged_changes():
             git.commit(title)
         _push_branch(attempt)
         pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))
         link = f"https://github.com/{ctx.repo}/pull/{pr}"
-    except (GitError, AttemptFailure) as exc:
+    except (GitError, AttemptFailure, TrackerError) as exc:
+        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            raise  # the existing GitHub wait restarts the run, and the guard holds again
         link = f"The PR could not be published: {' '.join(str(exc).split())}"
-        _append(attempt.log, link)
+    if refused:
+        link += "\n\nNot published; Git refused to stage: " + ", ".join(f"`{path}`" for path in refused)
+    _append(attempt.log, link)
     raise ExecutorStopped(_hold_harness_change(n, ctx, paths, link), hold_details(paths))
 
 
@@ -409,12 +416,7 @@ def _preserve_locked_implementation(
         if git.merge_in_progress():
             # Save the exact partial resolution without declaring its target merged.
             git.quit_merge()
-    try:
-        git.stage_changes()
-    except GitError as exc:
-        # Keep the stop's own outcome (for example a harness hold on a FIFO);
-        # what was already staged is still saved.
-        _append(ctx.store.log_path(n), f"WIP staging failed; saving the staged work only: {exc}")
+    git.stage_changes()
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
     refused = _check_wip_deletions(ctx, git, run)

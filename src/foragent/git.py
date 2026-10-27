@@ -160,16 +160,31 @@ class GitRepo:
         """Continue work on a detached PR head without replacing its worktree."""
         self._call(["switch", "-C", branch, "HEAD"])
 
-    def stage_changes(self) -> None:
+    def stage_changes(self, *, skip_refused: bool = False) -> list[str]:
+        """Stage the worktree; with skip_refused, stage what Git accepts and return the rest.
+
+        Git refuses some contents (for example a FIFO) and then stages nothing.
+        """
         output = self._call([
             "ls-files", "--modified", "--deleted", "--others", "--exclude-standard", "-z",
             "--", ".", *(f":!{path}" for path in ARTIFACT_PATHS), f":!{REVIEW_SCOPE_FILE}",
             *(f":(exclude,literal){path}" for path in sorted(self.local_skill_paths)),
         ])
         paths = sorted(set(filter(None, output.split("\0"))))
+        refused: list[str] = []
         if paths:
-            self._call(["--literal-pathspecs", "add", "-A", "--", *paths])
+            try:
+                self._call(["--literal-pathspecs", "add", "-A", "--", *paths])
+            except GitError:
+                if not skip_refused:
+                    raise
+                for path in paths:
+                    try:
+                        self._call(["--literal-pathspecs", "add", "-A", "--", path])
+                    except GitError:
+                        refused.append(path)
         self._exclude_artifacts()
+        return refused
 
     def reconcile_local_skills(self, target_ref: str) -> None:
         """Release injected dependencies only after clearing copies owned by target."""

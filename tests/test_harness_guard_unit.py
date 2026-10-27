@@ -372,3 +372,105 @@ def test_fifo_pyproject_from_the_implementer_is_held_not_a_staging_error(run_cas
     assert "needs-human" in c.tracker.get_issue(1).labels
     assert any("pyproject.toml" in comment.body for comment in c.tracker.list_comments(1)
                if "reason=test-harness-changed" in comment.body)
+
+
+@pytest.mark.parametrize("commands", [
+    ["rm pyproject.toml && mkfifo pyproject.toml"],
+    ["rm pyproject.toml && mkfifo pyproject.toml", "true"],
+], ids=["last-command-before-end-of-pass-staging", "between-measurements"])
+def test_fifo_left_by_a_done_when_command_is_held_before_staging(run_case, commands):
+    c = run_case
+    c.history.update({"pyproject.toml": PYPROJECT})
+    set_done_when(c, commands)
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert "needs-human" in c.tracker.get_issue(1).labels
+
+
+def test_hold_survives_a_failed_publication(run_case, monkeypatch):
+    from foragent import run_publish
+    from foragent.git import GitError
+
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done", "tests/sub/conftest.py": "# harness\n"}]
+
+    def refuse(attempt):
+        raise GitError("push refused")
+
+    monkeypatch.setattr(run_publish, "_push_branch", refuse)
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert "needs-human" in c.tracker.get_issue(1).labels
+    held = [comment.body for comment in c.tracker.list_comments(1) if "reason=test-harness-changed" in comment.body]
+    assert held and "could not be published: push refused" in held[-1]
+
+
+def _held_comment(c):
+    held = [comment.body for comment in c.tracker.list_comments(1) if "reason=test-harness-changed" in comment.body]
+    assert held, "the hold must be flagged"
+    return held[-1]
+
+
+def test_hold_publishes_the_unstaged_changes_it_judged(run_case):
+    """The guard runs before staging; the PR must carry what it judged, not the old HEAD."""
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done", "tests/sub/conftest.py": "# harness\n"}]
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert "needs-human" in c.tracker.get_issue(1).labels
+    assert git_command(c.history.origin, "show", "foragent/issue-1:tests/sub/conftest.py") == "# harness"
+    assert git_command(c.history.origin, "show", "foragent/issue-1:feature.txt") == "done"
+
+
+def test_hold_publishes_what_git_accepts_and_names_what_it_refuses(run_case, monkeypatch):
+    import os
+
+    c = run_case
+    c.history.update({"pyproject.toml": PYPROJECT})
+    run = c.executor.run
+
+    def implement(**kwargs):
+        result = run(**kwargs)
+        (kwargs["worktree"] / "pyproject.toml").unlink()
+        os.mkfifo(kwargs["worktree"] / "pyproject.toml")
+        return result
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert git_command(c.history.origin, "show", "foragent/issue-1:feature.txt") == "done"
+    assert "Git refused to stage: `pyproject.toml`" in _held_comment(c)
+
+
+def test_hold_survives_a_rejected_pull_request(run_case, monkeypatch):
+    from foragent.tracker import TrackerError
+
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done", "tests/sub/conftest.py": "# harness\n"}]
+
+    def reject(**kwargs):
+        raise TrackerError("No commits between main and foragent/issue-1")
+
+    monkeypatch.setattr(c.tracker, "create_pr", reject)
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert "needs-human" in c.tracker.get_issue(1).labels
+    assert "could not be published: No commits between" in _held_comment(c)
+
+
+def test_hold_between_measurements_publishes_the_generated_harness(run_case):
+    c = run_case
+    set_done_when(c, ["mkdir -p tests/gen && echo '# generated' > tests/gen/conftest.py", "true"])
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert git_command(c.history.origin, "show", "foragent/issue-1:tests/gen/conftest.py") == "# generated"
+
+
+def test_rate_limit_while_publishing_a_hold_waits_and_holds_again_later(run_case, monkeypatch):
+    from foragent.tracker import TrackerError
+
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done", "tests/sub/conftest.py": "# harness\n"}]
+
+    def limited(**kwargs):
+        raise TrackerError("API rate limit exceeded")
+
+    monkeypatch.setattr(c.tracker, "create_pr", limited)
+    assert runner.run_issue(1, c.ctx) == "limit-wait"
+    assert c.store.load_flag(1) is None

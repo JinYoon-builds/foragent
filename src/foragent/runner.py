@@ -30,6 +30,7 @@ from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
 from foragent.git import GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
+from foragent.orch_events import append_event
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
@@ -266,11 +267,20 @@ def _implement_and_publish(
         stop_guarding()
         if outcome != "merged":
             run = ctx.store.get_run(n)
-            _preserve_failed_implementation(
-                n, ctx, git, run.outcome or outcome, approval=attempt.approval, approved_ref=attempt.approved_ref,
-                title=attempt.issue.title, pushed_head=attempt.pushed_head, tracker_available=attempt.tracker_available,
-                push_branch=lambda: _push_branch(attempt),
-            )
+            try:
+                _preserve_failed_implementation(
+                    n, ctx, git, run.outcome or outcome, approval=attempt.approval,
+                    approved_ref=attempt.approved_ref, title=attempt.issue.title, pushed_head=attempt.pushed_head,
+                    tracker_available=attempt.tracker_available, push_branch=lambda: _push_branch(attempt),
+                )
+            except GitError as exc:
+                if outcome != "held":
+                    raise
+                # A hold already reported its evidence; contents Git refuses to
+                # stage (for example a FIFO) must not replace it with an error.
+                detail = f"WIP preservation failed after the hold: {exc}"
+                _append(ctx.store.log_path(n), detail)
+                append_event(ctx.store, ctx.now(), n, "wip-preservation-failed", detail)
 
 
 def review_only(
