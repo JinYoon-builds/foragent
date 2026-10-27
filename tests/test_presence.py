@@ -102,3 +102,23 @@ def test_the_repo_key_wins_over_origin(project, monkeypatch):
     monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo: seen.append(repo) or cls(project)))
     presence.statusline_segment(project, statusline.datetime.now(statusline.UTC))
     assert seen == ["offline/no-state"]
+
+
+def test_project_without_a_repository_still_gets_its_first_minute_squirrel(project):
+    """No repo key and no GitHub origin: the hook still records the start; the squirrel shows."""
+    import json
+    from datetime import datetime, timedelta
+
+    from foragent import presence
+
+    (project / ".foragent.yml").write_text(yaml.safe_dump({"language": "en"}), encoding="utf-8")
+    out = io.BytesIO()
+    payload = json.dumps({"session_id": "no-repo", "cwd": str(project)}).encode()
+    assert statusline.session_start(io.BytesIO(payload), out) == 0
+    message = json.loads(out.getvalue())["systemMessage"]
+    assert message == "since the last report: 0 merges · ✋ 0 · /fa for the report"
+    started = datetime.fromisoformat(json.loads(
+        presence._session_path("no-repo").read_text(encoding="utf-8"))["started_at"])
+    assert presence.squirrel(project, "no-repo", started + timedelta(seconds=59)) is not None
+    assert presence.squirrel(project, "no-repo", started + timedelta(seconds=60)) is None
+    assert presence.squirrel(project, "other-session", started) is None
