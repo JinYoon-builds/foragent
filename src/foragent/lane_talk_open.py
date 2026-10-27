@@ -1,45 +1,48 @@
-"""`fa lanes talk`: open an issue's live log or session and send a message (D55 addendum).
+"""`fa lanes talk`: open an issue's live log or session and send a message (D55 addendum, D95).
 
-A running issue opens its live log (``tail -F``) in a terminal. A message goes
-to a running Codex worker through ``codex queue``; for Claude it is saved as the
-next attempt's hint. A finished or blocked issue opens ``codex resume`` /
-``claude --resume`` instead. Terminals opened through Terminal.app have no
-handle, so they are not recorded and pause nothing. Records, probes and talk
-endings live in ``lane_talk``.
+A running issue opens its live log (``tail -F``) in a terminal. A message goes to a
+running Codex worker through ``codex queue``; for Claude it is saved as the next
+attempt's hint. A finished or blocked issue opens ``codex resume`` / ``claude
+--resume`` instead. The command never writes the run record: after the terminal
+opens it appends one ``talk-opened`` event, and the gate tick owns the talk from
+there (``lane_talk``). Every judgement of a terminal's reply is in ``lane_talk_probe``.
+Terminal.app gives no handle, so its terminals get no event and pause nothing.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 import os
+from pathlib import Path
 import shlex
 import shutil
 import subprocess
-from datetime import datetime
-from pathlib import Path
 from uuid import uuid4
 
-from foragent import orch_spawn
+from foragent import lane_talk_probe as probe, orch_spawn
 from foragent.config import Config
 from foragent.i18n import text
-from foragent.lane_talk import (
-    RecordUnreadable,
-    _alive,
-    _call,
-    _orca_handle,
-    _read_record,
-    find_pending,
-    talk_path,  # noqa: F401 - re-exported for callers of the command side
-)
 from foragent.lanes import LaneError
+from foragent.orch_events import append_event
 from foragent.run_previous import hint_path
 from foragent.state import StateStore
 from foragent.state_records import Run
+from foragent.state_talk import TALK_OPENED
 
 QUEUE_TIMEOUT = 30
 
 
+def _call(argv: list[str], cwd: Path, timeout: int = probe.OPEN_TIMEOUT) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          check=True, timeout=timeout)
+
+
 class TalkError(LaneError):
-    """The talk command could not reach the issue's session."""
+    """The talk command failed; ``stdout`` is a line it still owes (a message it delivered)."""
+
+    def __init__(self, message: str, stdout: str = ""):
+        super().__init__(message)
+        self.stdout = stdout
 
 
 def _lane_executor(run: Run, config: Config) -> str:
@@ -80,12 +83,11 @@ def _launch(opener: dict, cwd: Path, title: str, command: list[str]) -> str | No
     line, executable = shlex.join(command), opener["executable"]
     if opener["kind"] == "orca":
         # Orca starts a terminal in the selected worktree; it knows issue worktrees by path.
-        return _orca_handle(_call([executable, "terminal", "create", "--worktree", f"path:{cwd}", "--title", title,
-                                   "--command", line, "--json"], cwd).stdout)
+        return probe.created_handle(_call([executable, "terminal", "create", "--worktree", f"path:{cwd}",
+                                           "--title", title, "--command", line, "--json"], cwd).stdout)
     if opener["kind"] == "tmux":
-        handle = _call([executable, "-S", opener["socket"], "new-window", "-P", "-F", "#{window_id}", "-n", title,
-                        "-c", str(cwd), line], cwd).stdout.strip()
-        return handle or None
+        return probe.created_window(_call([executable, "-S", opener["socket"], "new-window", "-P", "-F",
+                                           "#{window_id}", "-n", title, "-c", str(cwd), line], cwd).stdout)
     # The shell line goes in as an argument, so no AppleScript quoting is needed.
     _call([executable, "-e", "on run argv", "-e", 'tell application "Terminal" to activate',
            "-e", 'tell application "Terminal" to do script (item 1 of argv)', "-e", "end run",
@@ -112,31 +114,19 @@ def _queue(thread: str, message: str, cwd: Path, number: int, language: str) -> 
 
 def talk(number: int, *, message: str | None = None, store: StateStore, config: Config,
          repo_root: Path | None = None, now: datetime | None = None) -> str:
-    """Open the issue's live log or resume terminal; return the one line to print."""
+    """Open or bring forward the issue's talk terminal; return the line to print on stdout."""
     language = config.language
     root = (repo_root or Path.cwd()).resolve()
     run = store.get_run(number)
     if run is None:
         raise TalkError(text("talk_no_session", language, n=number))
     executor, session = _session(run, config)
-    if session is None and not (run.status == "running" and executor == "claude"):
-        raise TalkError(text("talk_no_session", language, n=number))
-    with store.talk_lock(number):
-        # Another talk may have changed the run while this one waited for the lock.
-        run = store.get_run(number)
-        executor, session = _session(run, config)
-        running = run.status == "running"
-        if session is None and not (running and executor == "claude"):
-            raise TalkError(text("talk_no_session", language, n=number))
-        return _talk_locked(number, run, executor, session, message, store, root, now, language)
-
-
-def _talk_locked(number: int, run: Run, executor: str, session: str | None, message: str | None,
-                 store: StateStore, root: Path, now: datetime | None, language: str) -> str:
     running = run.status == "running"
+    if session is None and not (running and executor == "claude"):
+        raise TalkError(text("talk_no_session", language, n=number))
     worktree = store.worktree_path(number)
     cwd = worktree if worktree.is_dir() else root
-    # A unique title lets a later tick find a terminal whose handle was never saved.
+    # A unique title lets a later probe find a terminal whose handle was never saved.
     token = uuid4().hex[:8]
     if running:
         title = f"talk #{number} {token}"
@@ -148,87 +138,77 @@ def _talk_locked(number: int, run: Run, executor: str, session: str | None, mess
         extra = [message] if message else []
         command = ([program, "resume", session, *extra, "-C", str(cwd)] if executor == "codex"
                    else [program, "--resume", session, *extra])
-    try:
-        record = _read_record(store, number)
-    except RecordUnreadable as exc:
-        if run.talking:  # An open talk's terminal may be open: never open a second one or end that talk.
-            raise TalkError(text("talk_record_unreadable", language, n=number, path=str(exc))) from exc
-        record = None  # No talk is open, so the record is stale.
+
+    def deliver() -> str:
+        return _deliver(store, run, number, executor, message, cwd, language) if running and message else ""
+
+    current = store.talk_state(run)[0] if running else _latest_resume(store, run)
+    target = probe.resolved(current, cwd) if current is not None else None
+    state = None if current is None else probe.liveness(target, cwd) if target is not None else probe.UNKNOWN
+    if running and state == probe.UNKNOWN:
+        # It may still be open: bring nothing forward and never open a second terminal beside it.
+        raise TalkError(text("talk_unknown", language, n=number), stdout=deliver())
+    if state == probe.OPEN:
+        sent = deliver()
+        if not probe.bring_forward(target, cwd):
+            raise TalkError(text("talk_bring_failed", language, n=number), stdout=sent)
+        if running and target is not current:  # A pending terminal found by title: save its handle now.
+            found = {"kind": "tmux", "socket": current.get("socket")} if "socket" in current else {"kind": "orca"}
+            _opened(store, run, number, executor, found, current.get("title", title),
+                    target.get("window_id") or target.get("handle"), now)
+        return sent or text("talk_reshown", language, n=number, screen="tmux" if "socket" in current else "orca")
     opener = _opener(store, root)
-    trackable = opener is not None and opener["kind"] in {"orca", "tmux"}
-    pending = ({**opener, "title": title, "number": number, "running": running}
-               if opener is not None else None)
-    state = None
-    if running and run.talking and record is not None:
-        if isinstance(record.get("handle"), str):
-            state = _alive(record, cwd, show=True)
-        else:
-            state, handle = find_pending(record, cwd)
-            if state:
-                record = {**record, "handle": handle}
-                store.publish_talk(number, run.started_at, "running", record)
-                state = _alive(record, cwd, show=True)
-    # Only a confirmed closure (a stale handle, or tmux on its socket without the window) opens
-    # another terminal; an open, pending or unknown one is never doubled.
-    reshown = state is not None and state is not False or (state is None and run.talking and record is not None)
-    began = False
-    if running and not run.talking and trackable:
-        # Talking and the pending record start together, before anything opens, so no tick stops
-        # the worker meanwhile and a later tick can find the terminal even if this command dies.
-        began = store.begin_talk(number, run.started_at, _now(store, now), pending) is not None
-    elif running and run.talking and not reshown and trackable:
-        store.publish_talk(number, run.started_at, "running", pending)  # Replaces a closed terminal's record.
-    talking = run.talking or began
-    handle = None
-    screen = ""
+    if opener is None:
+        return " ".join(filter(None, [deliver(), text("talk_manual", language, command=f"cd {shlex.quote(str(cwd))} && "
+                                                       + shlex.join(command))]))
+    trackable = opener["kind"] in {"orca", "tmux"}
     try:
-        if reshown:
-            screen = record["kind"]
-        elif opener is not None:
-            screen = opener["kind"]
-            with orch_spawn.watch_open._opening(store):  # Shared with the gate's other openers.
-                handle = _launch(opener, cwd, title, command)
+        with orch_spawn.watch_open._opening(store):  # Shared with the gate's other openers.
+            handle = _launch(opener, cwd, title, command)
     except subprocess.SubprocessError as exc:
-        # A timeout, a crash or a failed reply (even a signal, or an error after creating the
-        # terminal) does not prove nothing opened: the pending record keeps the talk.
+        # The terminal may have opened anyway: a pending event keeps the talk until a probe finds it.
+        if trackable:
+            _opened(store, run, number, executor, opener, title, None, now)
         raise TalkError(text("talk_open_unknown", language, n=number)) from exc
-    except OSError:
-        # The opener could not start at all, so no terminal exists and nothing is left to pause for.
-        if talking and not reshown:
-            store.end_talk(number, _now(store, now), restart_stall=False)
-        raise
-    # Any other interruption may come after the terminal opened: the pending record stays.
-    try:
-        sent = ""
-        if running and message:
-            if executor == "codex":
-                # The session may have changed while the terminal opened; the runner records a new
-                # one under this same lock, so the one read now is the worker's until the send ends.
-                session = _current_session(store, run, number, language)
-                _queue(session, message, cwd, number, language)
-                sent = text("talk_sent", language, n=number)
-            else:
-                _save_hint(store, number, message)
-                sent = text("talk_hint_saved", language, n=number)
-    except BaseException:
-        if talking:  # A failed send leaves the terminal unrecorded and nothing paused (the decision).
-            store.end_talk(number, _now(store, now), restart_stall=False)
-        raise
-    if not reshown and handle is not None:
-        store.publish_talk(number, run.started_at, run.status, {**pending, "handle": handle})
-    # A trackable opener without a handle keeps its pending record: a tick finds it by title.
-    if not screen:
-        return " ".join(filter(None, [sent, text("talk_manual", language, command=f"cd {shlex.quote(str(cwd))} && "
-                                                  + shlex.join(command))]))
-    if reshown and state is None:
-        opened = text("talk_probe_unknown", language, n=number)
-    else:
-        opened = text("talk_reshown" if reshown else ("talk_log_opened" if running else "talk_resume_opened"),
-                      language, n=number, screen=screen)
+    sent = deliver()  # A failed Codex send raises here, so no event is appended (the decision).
+    if trackable:
+        _opened(store, run, number, executor, opener, title, handle, now)
+    opened = text("talk_log_opened" if running else "talk_resume_opened", language, n=number, screen=opener["kind"])
     parts = [sent or opened]
     if running and not trackable:
         parts.append(text("talk_no_handle", language))
     return " ".join(parts)
+
+
+def _deliver(store: StateStore, run: Run, number: int, executor: str, message: str, cwd: Path, language: str) -> str:
+    if executor == "codex":
+        # The session is read from the run record now, at send time: never an earlier copy.
+        _queue(_current_session(store, run, number, language), message, cwd, number, language)
+        return text("talk_sent", language, n=number)
+    _save_hint(store, number, message)
+    return text("talk_hint_saved", language, n=number)
+
+
+def _latest_resume(store: StateStore, run: Run) -> dict | None:
+    """A finished or blocked issue's latest resume terminal (nothing reads it while no run is active)."""
+    opened = [event for event in store.talk_events(run.number)
+              if event["kind"] == TALK_OPENED and event.get("run_started_at") == run.started_at]
+    return opened[-1] if opened else None
+
+
+def _opened(store: StateStore, run: Run, number: int, executor: str, opener: dict, title: str,
+            handle: str | None, now: datetime | None) -> None:
+    """Append the one talk-opened event: handle, socket and window id, or the pending title."""
+    fields: dict = {"run_started_at": run.started_at, "executor": executor}
+    if opener["kind"] == "tmux":
+        fields["socket"] = opener["socket"]
+    if handle and opener["kind"] == "orca":
+        fields["handle"] = handle
+    elif handle:
+        fields["window_id"] = handle
+    else:
+        fields["title"] = title
+    append_event(store, _now(store, now), number, TALK_OPENED, f"Talk opened for #{number} ({executor})", **fields)
 
 
 def _current_session(store: StateStore, run: Run, number: int, language: str) -> str:

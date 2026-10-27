@@ -1,46 +1,34 @@
-"""Talk state on run records: begin, publish, end and the waited-time credit (D55 addendum)."""
+"""Talk state derived from append-only talk events, and the union pause credit (D55 addendum, D95).
 
-from collections.abc import Iterator
-from contextlib import contextmanager
+`fa lanes talk` appends ``talk-opened`` events to the orch events journal and never
+writes the run record. A run's current talk is its latest ``talk-opened`` event (for
+its ``run_started_at``) with no matching ``talk-closed`` event; ``Run.talking`` and
+``talking_since`` are derived from it on every read and never stored. Only the gate
+tick (and ``finish_run``) writes: one ``talk-closed`` event and the paused-time credit,
+through ``add_waited``, the helper every pause credit goes through.
+"""
+
 from datetime import datetime
+from itertools import pairwise
+import json
 from typing import Any
 
 from foragent.state_records import Run
 
+TALK_OPENED, TALK_CLOSED = "talk-opened", "talk-closed"
+# A talk-closed event names the talk-opened event it ends by these fields.
+IDENTITY = ("run_started_at", "handle", "socket", "window_id", "title")
+
+
+def talk_identity(event: dict) -> tuple:
+    return tuple(event.get(name) for name in IDENTITY)
+
+
+def _minutes(seconds: float) -> str:
+    return "<1 min" if seconds < 60 else f"{int(seconds // 60)} min"
+
 
 class TalkRecordsMixin:
-    def _drop_talk_record(self, number: int) -> None:
-        (self.root / "talk" / f"{number}.json").unlink(missing_ok=True)
-
-    def _finish_talk(self, run: Run) -> Run:
-        """``finish_run``'s talk ending: the shared accounting, and the live-log record goes.
-
-        Called under the state lock; ``publish_talk`` never recreates a finished run's record.
-        """
-        self._drop_talk_record(run.number)
-        return _talk_ended(run, self._now(), restart_stall=False)
-
-    @contextmanager
-    def talk_lock(self, number: int, *, blocking: bool = True) -> Iterator[bool]:
-        """Serialize an issue's talk lifecycle with session changes; yields False when busy and not blocking.
-
-        Lock order: talk -> worktree -> state. `fa lanes talk` holds it while it
-        opens a terminal and sends; the runner holds it while it records a new
-        session; the tick only tries it.
-        """
-        path = self.root / "talk" / f"{number}.lock"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as stream:
-            try:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX | (0 if blocking else _state.fcntl.LOCK_NB))
-            except BlockingIOError:
-                yield False
-                return
-            try:
-                yield True
-            finally:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
-
     def add_waited(self, number: int, seconds: float, *, wait: str | None = None,
                    key: str | None = None, now: datetime | None = None, **fields: Any) -> Run:
         """The one helper every pause credit goes through: ``waited_seconds`` stays the union.
@@ -60,67 +48,99 @@ class TalkRecordsMixin:
             self._write_run(updated)
             return updated
 
-    def begin_talk(self, number: int, started_at: str, now: datetime, record: dict | None = None) -> Run | None:
-        """Mark the run ``started_at`` as talking before its terminal opens; None if it is no longer running.
+    def talk_events(self, number: int) -> list[dict]:
+        """This issue's talk events in journal order; the scan is cached by the file's size and mtime."""
+        path = self.root / "orch-events.jsonl"
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return []
+        key = (stat.st_size, stat.st_mtime_ns)
+        cached = getattr(self, "_talk_cache", None)
+        if cached is None or cached[0] != key:
+            by_issue: dict[int, list[dict]] = {}
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict) and event.get("kind") in (TALK_OPENED, TALK_CLOSED):
+                        by_issue.setdefault(event.get("issue"), []).append(event)
+            cached = (key, by_issue)
+            self._talk_cache = cached
+        return list(cached[1].get(number, []))
 
-        ``record`` (the pending terminal: opener, socket and unique title, no handle yet) is
-        written in the same state-lock step, so a talking run always has a record that can
-        find its terminal, even if the command dies right after opening it.
-        """
-        with self._state_lock():
-            run = self.get_run(number)
-            if run is None or run.status != "running" or run.started_at != started_at:
-                return None
-            if run.talking:
-                return run
-            updated = _state.replace(run, talking=True, talking_since=now.isoformat(), talk_slept_base=None,
-                                     **_pause_event(run, now, 0.0, "open", "talk"))
-            self._write_run(updated)
-            if record is not None:
-                self._write_json(self.root / "talk" / f"{number}.json", record)
-            return updated
+    def talk_state(self, run: Run) -> tuple[dict | None, list[tuple[dict, str]]]:
+        """``(current talk-opened event or None, [(superseded open event, its closing time)])``."""
+        events = self.talk_events(run.number)
+        closed = {talk_identity(event) for event in events if event["kind"] == TALK_CLOSED}
+        opened = [event for event in events
+                  if event["kind"] == TALK_OPENED and event.get("run_started_at") == run.started_at]
+        superseded = [(event, newer["at"]) for event, newer in pairwise(opened)
+                      if talk_identity(event) not in closed]
+        current = opened[-1] if opened and talk_identity(opened[-1]) not in closed else None
+        return current, superseded
 
-    def anchor_talk_sleep(self, number: int) -> None:
-        """At the first tick after a talk began, fix the sleep total later sleep is counted from."""
-        with self._state_lock():
-            run = self.get_run(number)
-            if run is not None and run.status == "running" and run.talking and run.talk_slept_base is None:
-                self._write_run(_state.replace(run, talk_slept_base=run.slept_seconds))
+    def talk_closed_at(self, run: Run) -> str | None:
+        """When this run's latest talk closed; the stall clock restarts there."""
+        times = [event["at"] for event in self.talk_events(run.number)
+                 if event["kind"] == TALK_CLOSED and event.get("run_started_at") == run.started_at]
+        return max(times) if times else None
 
-    def publish_talk(self, number: int, started_at: str, status: str, record: dict) -> bool:
-        """Save a talk terminal record only while the run is still the same run in the same state."""
-        with self._state_lock():
-            run = self.get_run(number)
-            if run is None or run.started_at != started_at or run.status != status:
-                return False
-            if status == "running" and not run.talking:
-                return False  # The talk already ended (or never began); nothing may pause.
-            self._write_json(self.root / "talk" / f"{number}.json", record)
-            return True
-
-    def end_talk(self, number: int, now: datetime, *, restart_stall: bool = True) -> Run | None:
-        """End a talk: credit its paused time, drop its record and, if asked, restart the stall clock at ``now``."""
-        with self._state_lock():
-            run = self.get_run(number)
-            if run is None or run.status == "finished" or not run.talking:
-                return run
-            updated = _talk_ended(run, now, restart_stall=restart_stall)
-            self._write_run(updated)
-            (self.root / "talk" / f"{number}.json").unlink(missing_ok=True)
-            return updated
-
-
-def _talk_ended(run: Run, now: datetime, *, restart_stall: bool) -> Run:
-    """The one accounting for every talk ending: credit the paused seconds, clear talking."""
-    if not run.talking:
+    def _with_talk(self, run: Run | None) -> Run | None:
+        """The run with its derived talk; a finished run never talks."""
+        if run is not None and run.status == "running":
+            current, _ = self.talk_state(run)
+            if current is not None:
+                object.__setattr__(run, "_talk_since", current["at"])
         return run
-    fields = {"last_progress_at": now.isoformat()} if restart_stall else {}
-    since = _state.datetime.fromisoformat(run.pauses_open.get("talk") or run.talking_since or now.isoformat())
-    # Machine sleep during the talk is the tick's sleep credit already; it counts once.
-    length = max(0.0, (now - since).total_seconds() - run.talk_slept())
-    # The talk's whole length, through the shared union accounting.
-    return _state.replace(run, talking=False, talking_since=None,
-                          **_pause_event(run, now, length, "close", "talk"), **fields)
+
+    def open_talk_pause(self, number: int, event: dict, now: datetime) -> None:
+        """The tick marks a current talk's pause open in the union, once (keyed by the event's time)."""
+        with self._state_lock():
+            run = self.get_run(number)
+            if run is None or run.status != "running" or event["at"] in run.pauses_open:
+                return
+            at = _state.datetime.fromisoformat(event["at"])
+            mark = _state.datetime.fromisoformat(run.pause_mark) if run.pause_mark else at
+            # The union only moves forward: a talk seen after another pause began opens from there.
+            self._write_run(_state.replace(run, **_pause_event(run, max(at, mark), 0.0,
+                                                               "open", event["at"])))
+
+    def close_talk(self, number: int, event: dict, closed_at: datetime) -> Run | None:
+        """The tick closes one talk: one talk-closed event and its paused time credited once."""
+        with self._state_lock():
+            run = self.get_run(number)
+            if run is None or run.status != "running":
+                return run
+            ended = self._talk_ended(run, event, closed_at)
+            if ended is not run:
+                self._write_run(ended)
+            return ended
+
+    def _talk_ended(self, run: Run, event: dict, closed_at: datetime) -> Run:
+        """Under the state lock: append talk-closed and credit, unless the talk is already closed."""
+        from foragent.orch_events import append_event
+
+        if any(other["kind"] == TALK_CLOSED and talk_identity(other) == talk_identity(event)
+               for other in self.talk_events(run.number)):
+            return run
+        length = max(0.0, (closed_at - _state.datetime.fromisoformat(event["at"])).total_seconds())
+        fields = {name: event[name] for name in IDENTITY if name in event}
+        append_event(self, closed_at, run.number, TALK_CLOSED,
+                     f"Talk closed for #{run.number} after {_minutes(length)}", locked=True,
+                     **{"executor": event.get("executor"), **fields})
+        return _state.replace(run, **_pause_event(run, closed_at, length, "close", event["at"]))
+
+    def _finish_talk(self, run: Run) -> Run:
+        """``finish_run`` (under the state lock): an open talk ends with the run, credited once."""
+        current, superseded = self.talk_state(run)
+        for event, newer_at in superseded:
+            run = self._talk_ended(run, event, _state.datetime.fromisoformat(newer_at))
+        if current is not None:
+            run = self._talk_ended(run, current, self._now())
+        return run
 
 
 def _pause_event(run: Run, now: datetime | None, seconds: float, wait: str | None, key: str | None) -> dict:

@@ -58,7 +58,6 @@ class RunRecordsMixin:
                       last_activity_at=timestamp, process_identities=identities, **session)
             self._merge_lock_seconds.pop((number, timestamp), None)
             self._write_run(run)
-            self._drop_talk_record(number)  # An earlier run's; this run starts untalked.
             return run
 
     def prepare_run_start(self, number: int) -> None:
@@ -140,7 +139,7 @@ class RunRecordsMixin:
             value = (self.root / "runs" / f"{number}.json").read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        return _state.load_record(_state.Run, _state.json.loads(value))
+        return self._with_talk(_state.load_record(_state.Run, _state.json.loads(value)))  # Talk is derived (D95).
 
     def record_merge_lock(self, number: int, seconds: float) -> None:
         run = self.get_run(number)

@@ -21,6 +21,8 @@ def _add_inbox(orch_actions) -> None:
     ask.add_argument("--question", required=True)
     ask.add_argument("--option", action="append", default=[])
     ask.add_argument("--recommend", type=int)
+    ask.add_argument("--issue", dest="issues", type=int, action="append", default=[],
+                     help="Issue that waits on this answer (repeatable); shown in the board's Your turn")
     questions = orch_actions.add_parser("questions", help="List open human questions")
     questions.add_argument("--all", action="store_true", help="Include answered questions")
     answer = orch_actions.add_parser("answer", help="Record the answer and close one question")
@@ -49,7 +51,13 @@ def _add_inbox(orch_actions) -> None:
     queue.add_argument("--clear", action="store_true")
     queue.add_argument("--json", action="store_true")
     queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    from foragent import orch_plan_cli
+
+    orch_plan_cli.add_parsers(orch_actions, queue)  # pause, resume, plan and every verb's --by
     cli.orch_facts.add_parser(orch_actions)
+    from foragent import orch_scorecard
+
+    orch_scorecard.add_parser(orch_actions)
     reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")
     reviewers.add_argument("issue", type=int)
     reviewers.add_argument("count", type=int, nargs="?", help="Reviewer count (1 or more); wins over review_reviewers")
@@ -111,26 +119,23 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         return
     if args.action == "facts":
         return cli.orch_facts.command(args, store, config)
+    if args.action == "scorecard":
+        from foragent import orch_scorecard
+
+        return orch_scorecard.command(args, store, config)
     if args.action == "ensure":
         _ensure(args, store, config)
+        return
+    from foragent import orch_plan_cli
+
+    if args.action in orch_plan_cli.ACTIONS:
+        orch_plan_cli.run(args, store, config)
         return
     if args.action == "queue":
         if args.global_:
             _global_queue(args, store, config)
             return
-        if args.lane is None:
-            raise SystemExit(cli.text("orch_queue_lane_required", config.language))
-        if args.clear and args.numbers:
-            raise SystemExit("fa orch queue: give issue numbers or --clear, not both")
-        order = cli.orch_queue.set_order(store, args.lane, []) if args.clear else (
-            cli.orch_queue.set_order(store, args.lane, args.numbers) if args.numbers
-            else cli.orch_queue.get(store, args.lane))
-        if args.json:
-            print(cli.json.dumps({"lane": args.lane, "order": order}))
-        elif order:
-            print(f"lane:{args.lane} queue: " + " ".join(f"#{n}" for n in order))
-        else:
-            print(f"lane:{args.lane} queue is empty; issues start by number.")
+        orch_plan_cli.lane_queue(args, store, config)
         return
     if args.action == "request":
         record = box.add_request(store, args.source, args.text)
@@ -143,7 +148,7 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         record = box.write_note(store, args.now, args.why, args.next_step, where)
         print(f"Note saved at {record['at']} ({where['kind']}).")
     elif args.action == "ask":
-        record = box.ask(store, args.question, args.option, args.recommend)
+        record = box.ask(store, args.question, args.option, args.recommend, args.issues)
         pushed = box.route_question(store, config, repo, record)
         print(f"Question {record['id']} saved (open)"
               + ("; no planning session is alive, so a notification was sent." if pushed else "."))
@@ -169,6 +174,8 @@ def _orch_inbox(args, store, config, repo: str) -> None:
             print("No open questions.")
         for row in [] if args.json else rows:
             print(f"{row['id']} [{row['status']}] {row['question']}")
+            if row.get("issues"):
+                print("  issues: " + ", ".join(f"#{number}" for number in row["issues"]))
             for index, option in enumerate(row["options"], 1):
                 mark = " (recommended)" if index == row["recommend"] else ""
                 print(f"  {index}. {option}{mark}")

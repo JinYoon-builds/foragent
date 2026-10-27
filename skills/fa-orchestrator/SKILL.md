@@ -8,6 +8,7 @@ description: Keep a project's Claude orchestrator session running, respond to bl
 Be the project's continuing point of contact. The gate schedules work; you diagnose technical stops
 and bring product decisions to the user. Read `fa order context --json` for settled decisions, lanes
 and `language`. Speak to the user in that language. GitHub and gate records are current truth.
+To pause, resume, order or cap lanes for a while, follow `plan.md` (always pass `--by orchestrator`).
 
 ## Request box (D76)
 
@@ -48,16 +49,22 @@ each turn as evidence". Print the command's actual JSON output every turn, inclu
 action. When the condition holds, wait quietly for a new event or user message.
 
 Keep `fa orch watch --follow` running in a Monitor for this session's whole life; it is the heartbeat
-and records this session, so the gate opens no second orchestrator. One-shot
-`fa orch watch --interval 5` prints one JSON line and exits on a change; calls share
-`<state>/orch-watch.json`, so an unchanged state waits. Restart the follow monitor if it ever stops.
-Its fields are `blocked`, `needs_human`, `merged` (sorted issue numbers), and `queue_empty` (no open
-approved/ready/running issues and no active runs). A line `{"unknown": true, "error": ...}` means the
-state could not be read: treat it as unknown, not empty. One-shot watch then exits non-zero;
-`--follow` keeps retrying; the next good read always prints the real snapshot. Read fresh status after
-a wake-up; a snapshot is a signal to inspect, not a report. Say you are watching only while
-`fa orch watch --follow` is running in this session and renewing the heartbeat. If the watcher is not
-running, say it is stopped and restart it; never claim to be watching without it.
+and records this session, so the gate opens no second orchestrator. Restart it if it ever stops; see
+[watch](references/watch.md). Say you are watching only while `fa orch watch --follow` is running in
+this session and renewing the heartbeat; otherwise say it is stopped and restart it.
+
+## Check loop (D80)
+
+Run a check after every merge, every 30 minutes and in the morning (first pass after 07:00 local time;
+write the day's plan and briefing with `fa orch note`). Each check looks at the current goal, idle
+lanes, overlapping checks, quota, and repeated failures. Hold the current goal and decide order and
+resources inside it: reorder with `fa orch queue`; hold or restart a lane with `fa orch pause` and
+`fa orch resume` (when available). Record why with `fa orch note --why "<evidence>"` after each change.
+Keep blocked_by for real dependencies only, not ordering. When a failure repeats, measure first with
+references/bug-fix.md or references/investigate.md. Example (2026-10-24): six runs waited about an hour
+for test slots: flow, so the orchestrator raised test slots from two to three. test_runner.py took 65 %
+of unit time: structure, so call the architect with that number as evidence (`fa orch architect --why`,
+when available). Never call the architect on a fixed threshold; judge each case from measured evidence.
 
 ## Handle blocked items first
 
@@ -118,18 +125,11 @@ Classify each message using its context; a message may contain several kinds.
 | Change to a running issue | Propose an edit to that issue; ask whether to stop the running work or wait. A changed body needs explicit re-approval through order publication. |
 | Thought | Record it in the project's decision notes only; it creates no issues or approval. |
 
-Do not turn every sentence into a new issue. Keep one durable order draft in `docs/specs/` and use
-the project's decision log for settled context. Use the repository's `fa-order` skill to clarify
-only unresolved product choices, split work into independently verifiable issues and prepare a plan
-JSON. When clear, propose one card with new issues grouped by lane, dependencies, Done when checks,
-and any new lanes (human name, paths, skills). AskUserQuestion: [add] (recommended) / [edit] /
-[later]. [edit] revises the draft; [later] keeps it for later without publication. After the user
-chose [add], validate with `fa order publish PLAN.json --dry-run`, then publish with
-`fa order publish --approve PLAN.json` (use selective approval flags if requested). Existing issue
-changes go in the plan's `edits` and need the user's re-approval. Never add `approved` except
-through `fa order publish` after the user chose it. Summarize what was recorded or published and
-resume watching without asking the user to prompt you again. Retain compact pending decisions,
-attempts and draft references across turns; re-read current facts when handling the next event.
+Keep one order draft in `docs/specs/`; split it with the `fa-order` skill. When clear, propose one
+card with new issues by lane, dependencies and Done when checks. AskUserQuestion: [add]
+(recommended) / [edit] / [later]. After the user chose [add], publish with
+`fa order publish --approve PLAN.json`. Never add `approved` except through `fa order publish` after
+the user chose it. Card details: [order card](references/order-card.md).
 
 ## Design handoff from planning
 

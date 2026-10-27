@@ -36,7 +36,12 @@ def run(args) -> int:
         from foragent.commands import repo_store
 
         config, _, store = repo_store(root)
-        print(lanes.talk(args.number, message=args.message, store=store, config=config, repo_root=root))
+        try:
+            print(lanes.talk(args.number, message=args.message, store=store, config=config, repo_root=root))
+        except lanes.LaneError as exc:
+            if getattr(exc, "stdout", ""):  # A message still delivered goes to stdout; the failure to stderr.
+                print(exc.stdout)
+            raise
         return 0
     if args.action == "skills":
         lane = cli.set_lane_skills(root, args.name, args.ids)

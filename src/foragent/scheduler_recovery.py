@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import processes, scheduler
+from foragent import processes, scheduler, sleep_credit
 from foragent.scheduler_stop import (
     _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes,
 )
@@ -48,10 +48,9 @@ def _kill_run(
     ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
     count_stall: bool = False, detail: str = "", unless_talking: bool = False,
 ) -> bool:
-    """Stop a run; ``unless_talking`` (runtime and stall stops) re-reads talk under its lock first."""
-    if unless_talking:
-        with scheduler.lane_talk.unless_talking(ctx.store, number) as may_stop:
-            return may_stop and _kill_run(ctx, number, report, outcome=outcome, count_stall=count_stall, detail=detail)
+    """Stop a run; ``unless_talking`` (runtime and stall stops) reads the talk again right before."""
+    if unless_talking and scheduler.lane_talk.talking_now(ctx.store, number):
+        return False
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
         return False
@@ -195,6 +194,7 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
+    sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
     for run in ctx.store.active_runs():
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
@@ -232,14 +232,16 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                     continue
                 report.actions.append(scheduler.text("talk_ended", ctx.config.language, n=run.number))
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
-            runtime = (ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
+            runtime = ((ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds()
+                       - run.waited_seconds - run.slept_seconds)
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
                 if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit.", unless_talking=True):
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
-            elif run.pid is not None and not waiting and ctx.now() - scheduler.datetime.fromisoformat(
-                run.last_progress_at or run.started_at,
-            ) > scheduler.timedelta(minutes=ctx.config.stall_minutes):
+            elif run.pid is not None and not waiting and ctx.now() - scheduler.lane_talk.stall_since(
+                ctx.store, run,  # The later of the last progress and the latest talk closing (D95).
+            ) - scheduler.timedelta(seconds=run.slept_since_progress) > scheduler.timedelta(
+                minutes=ctx.config.stall_minutes):
                 restarts = run.restarts + 1
                 outcome = "stalled-restart" if restarts <= 1 else "stalled"
                 if scheduler._kill_run(ctx, run.number, report, outcome=outcome, count_stall=True,
@@ -257,8 +259,6 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
 
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
     outcome = run.outcome or "crashed"
-    if run.talking:
-        run = scheduler.lane_talk.end_talk(ctx.store, run, ctx.now())
     if run.executor_pgid is not None:
         ctx.store.update_run(run.number, executor_pgid=None)
     scheduler._remove_run_worktree(ctx, run.number, scheduler.Path(run.worktree), report, outcome=outcome)

@@ -443,3 +443,23 @@ def test_refresh_cards_records_every_card_and_marks_issues_without_one(recording
     board.refresh_cards(ctx)
     assert ctx.tracker.board_value(1, ctx.config.board, "Status") == board.board_column("Running")
     assert ctx.tracker.board_value(2, ctx.config.board, "Status") == board.NO_CARD
+
+
+def test_sync_status_shows_person_waits_in_your_turn_except_final_states(tmp_path, monkeypatch):
+    """A waiting-person label or open question wins over work state; Done and closed do not change."""
+    from foragent import orch_inbox
+
+    store = StateStore(tmp_path / "state")
+    monkeypatch.setattr(store, "local_issues", lambda: [
+        {"number": 1, "state": "open", "labels": ["approved", "running", "waiting-person"]},
+        {"number": 2, "state": "open", "labels": []},
+        {"number": 3, "state": "open", "labels": ["approved", "ready"]},
+    ])
+    orch_inbox.ask(store, "Which one?", ["A", "B"], 1, [2])
+    written = []
+    monkeypatch.setattr(board, "set_status", lambda issue, status: written.append((issue, status)))
+    ctx = SimpleNamespace(tracker=SimpleNamespace(), repo="owner/repo",
+                          config=SimpleNamespace(board="PVT_1", board_map=None), store=store)
+    for number, status in ((1, "Running"), (2, "Ready"), (3, "Ready"), (1, "Done"), (2, "closed")):
+        board.sync_status(ctx, number, status)
+    assert written == [(1, "Needs human"), (2, "Needs human"), (3, "Ready"), (1, "Done"), (2, "closed")]
