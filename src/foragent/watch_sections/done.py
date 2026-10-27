@@ -10,7 +10,7 @@ from foragent.config import Config
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
-ORDER = 22
+ORDER = 23
 SHOWN = 8
 
 
