@@ -112,3 +112,11 @@ def test_verdict_line_followed_by_claude_json_findings_keeps_class_fields():
             ' {"file": "b.py", "line": 1, "summary": "y", "class": "retry-context"}]\n```\n')
     assert round_classes(text) == {"stale-base", "retry-context"}
     assert round_classes(text, "FAIL") == {"stale-base", "retry-context"}
+
+
+def test_note_lines_are_never_findings_like_the_runner_reads_them():
+    # A NOTE written without a space after the colon still looks like path:line to the finding pattern.
+    text = "VERDICT: FAIL\nNOTE:src/a.py:3 — the root cause is upstream\n  class: noted\n- src/b.py:1 — bug\n  class: real\n"
+    assert round_classes(text) == {"real"}
+    assert round_classes('```json\n[{"file": "b.py", "line": 1, "summary": "y", "class": "real"}]\n```\n'
+                         "NOTE:src/a.py:3 — upstream\n") == {"real"}

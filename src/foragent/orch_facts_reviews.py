@@ -15,6 +15,7 @@ import re
 from statistics import median
 from typing import Any
 
+from foragent import review_notes
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.run_review import FINDING_LINE, SPEC_CONFLICT, code_review_findings, parse_code_review, parse_review
 from foragent.state import StateStore
@@ -41,7 +42,8 @@ def finding_classes(text: str) -> set[str]:
     lines = text.splitlines()
     classes = set()
     for index, line in enumerate(lines):
-        if line.strip().startswith(SPEC_CONFLICT) or not FINDING_LINE.match(line):
+        if (line.strip().startswith(SPEC_CONFLICT) or review_notes.note_text(line) is not None
+                or not FINDING_LINE.match(line)):
             continue
         match = CLASS_LINE.match(lines[index + 1]) if index + 1 < len(lines) else None
         classes.add(match[1] if match else UNCLASSIFIED)
