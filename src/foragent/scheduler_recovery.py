@@ -48,22 +48,20 @@ def _kill_run(
     ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
     count_stall: bool = False, detail: str = "", unless_talking: bool = False,
 ) -> bool:
-    """Stop a run; ``unless_talking`` (runtime and stall stops) reads the talk again right before."""
-    if unless_talking and scheduler.lane_talk.talking_now(ctx.store, number):
-        return False
+    """Stop a run; ``unless_talking`` (runtime and stall stops) re-reads the talk under worktree_lock."""
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
         return False
-    if count_stall:
-        ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
-    try:
-        stopped = _stop_run_processes(ctx, run, report)
+    mark = (lambda: ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)) if count_stall else None
+    try:  # A timed stop writes its stall mark only under the lock, after reading the talk again.
+        stopped = (scheduler.lane_talk.guarded_stop(ctx, number, report, lambda c: _stop_run_processes(c, run, report), mark)
+                   if unless_talking else (mark and mark(), _stop_run_processes(ctx, run, report))[1])
     except Exception:
         if count_stall:
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         raise
     if stopped != "stopped":
-        if count_stall:
+        if count_stall and stopped != "skipped":  # A skipped stop wrote nothing to undo.
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         if stopped == "gone":
             _finish_dead_run(ctx, run, report)

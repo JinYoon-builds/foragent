@@ -139,7 +139,8 @@ class RunRecordsMixin:
             value = (self.root / "runs" / f"{number}.json").read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        return self._with_talk(_state.load_record(_state.Run, _state.json.loads(value)))  # Talk is derived (D95).
+        data = _state.json.loads(value)  # Talk is derived from the events (D95), never stored.
+        return self._with_talk(_state.load_record(_state.Run, data), data.get("finished_at"))
 
     def record_merge_lock(self, number: int, seconds: float) -> None:
         run = self.get_run(number)
@@ -238,9 +239,9 @@ class RunRecordsMixin:
                 detail = " ".join(run.detail.split())[:500] or f"Run finished with outcome {outcome}."
             from foragent.processes import observe_tree
 
-            # Every run exit closes its last open phase segment and its talk.
+            # Every run exit closes its last open phase segment; an open talk ends at finished_at (derived).
             finished = _state.replace(run, **self._close_phase(run, self._now(), outcome))
-            finished = _state.replace(self._finish_talk(finished), status="finished", outcome=outcome, detail=detail,
+            finished = _state.replace(finished, status="finished", outcome=outcome, detail=detail,
                                       process_identities=observe_tree(run.process_identities))
             history_path = self.root / "runs.jsonl"
             history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
@@ -249,7 +250,6 @@ class RunRecordsMixin:
             snapshot = {**self._run_value(finished), "finished_at": self._timestamp()}
             self._atomic_write(history_path, history + _state.json.dumps(snapshot, ensure_ascii=False) + "\n")
             self._write_run(finished, snapshot)
-            self._flush_talk_closes(finished)  # Only after the credit is written.
             return finished
 
     def read_history(self) -> list[Run]:
