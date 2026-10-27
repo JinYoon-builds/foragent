@@ -69,6 +69,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     next_refresh = animation_started + 5
     pending = None
     started_build = watch._installed_build()
+    view_state: dict = {}  # Memory across frames, such as when each order's fireworks began.
     with ExitStack() as cleanup:
         worker = cleanup.enter_context(watch.ThreadPoolExecutor(max_workers=1))
         while True:
@@ -96,7 +97,8 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             try:
                 # The terminal's own width, so the 60- and 100-column rules hold as in a plain frame.
                 frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(1, width), selected=selected,
-                                     now=now(), **({} if store is None else {"layout": layout}), height=height)
+                                     now=now(), **({} if store is None else {"layout": layout}), height=height,
+                                     state=view_state)
             except ImportError:
                 # A reinstall can briefly leave modules missing; restart on the installed code.
                 return _restart(cleanup)

@@ -1,7 +1,7 @@
 """The header above the lane rows: the one big orchestrator squirrel, or one text line (#167).
 
 The squirrel shows on the first run (no run ever recorded) or when every lane is
-idle, unless the D76 speech stage below already draws it. Otherwise the header
+idle, unless the D76 speech stage below already draws it or ``animation`` is off. Otherwise the header
 is one line: the orchestrator's latest say line, or today's counts.
 """
 
@@ -67,7 +67,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     first_run = not status.get("history") and not status["active_runs"]
     idle = not status["active_runs"] and not any(watch._has_work(row) for row in status["lanes"].values())
     staged = any(row.get("status") == "processing" for row in snapshot.requests)
-    if (first_run or idle) and not staged:
+    # With animation off the header keeps its one-line form on every screen (#168).
+    if (first_run or idle) and not staged and config.animation:
         art: list[Line] = [[(glyph, "art") for glyph, foreground, background in row]
                            for row in watch.half_blocks(watch.ORCHESTRATOR, watch.PALETTE)]
         if say:
