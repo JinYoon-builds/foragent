@@ -10,12 +10,12 @@ from foragent.watch_data import Snapshot
 ORDER = 20
 
 
-def _stage(snapshot: Snapshot, language: str, width: int) -> list[Line]:
+def _stage(snapshot: Snapshot, language: str, width: int, animation: bool = True) -> list[Line]:
     """The big orchestrator squirrel saying which planning request it is handling (D76).
 
     Shown only while a request in the durable box is being processed. The speech
     shares the squirrel's pixel rows from 56 columns, sits below it from 44, and
-    is plain text below that.
+    is plain text below that, or when ``animation`` is off (no sprite, #168).
     """
     from foragent import watch
 
@@ -24,7 +24,7 @@ def _stage(snapshot: Snapshot, language: str, width: int) -> list[Line]:
         return []
     request = (processing[-1].get("text") or "").strip().splitlines() or [""]
     speech = watch.text("watch_request_bubble", language, text=request[0])
-    if width < 44:
+    if width < 44 or not animation:
         return [watch._fit(watch._line(speech, "bold"), width)]
     art: list[Line] = [[(glyph, "art") for glyph, foreground, background in row]
                        for row in watch.half_blocks(watch.ORCHESTRATOR, watch.PALETTE)]
@@ -38,8 +38,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     from foragent import watch
 
     width, top = context["width"], context.get("top", 0)
-    stage = watch._stage(snapshot, config.language, width)
+    stage = watch._stage(snapshot, config.language, width, config.animation)
     if stage:
         context.get("hits", []).append(
-            (0, top, width if width < 44 else 18, top + len(stage), ("orchestrator", None)))
+            (0, top, width if width < 44 or not config.animation else 18, top + len(stage), ("orchestrator", None)))
     return stage
