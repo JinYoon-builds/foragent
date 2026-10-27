@@ -1,4 +1,7 @@
-"""The finished-order section: a completion sentence and the merged issues by lane."""
+"""The finished-order section: a completion sentence and the merged issues by lane.
+
+While the order still runs it is one line: the finished count and the newest title.
+"""
 
 from pathlib import Path
 from typing import Any
@@ -7,7 +10,7 @@ from foragent.config import Config
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
-ORDER = 12
+ORDER = 22
 SHOWN = 8
 
 
@@ -55,7 +58,12 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     from foragent import watch
 
     if not finished(snapshot):
-        return []
+        # While the order runs, one line names the count and the newest finished issue.
+        items = _newest_first(snapshot)
+        if not items:
+            return []
+        line = watch.text("watch_done", config.language, count=len(items), title=watch._clean(items[0][0].title))
+        return [watch._fit(watch._line(line, "green"), context["width"])]
     language, width = config.language, context["width"]
     lines = _wrapped(watch.text("done_state_heading", language), width, "green")
     items = _newest_first(snapshot)
