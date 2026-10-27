@@ -59,7 +59,7 @@ def _pause_lane(store: StateStore, lane: str, until: datetime) -> None:
     store._write_json(path, lanes)
 
 
-def hold_lane(store: StateStore, executor: str, lane: str, now: datetime) -> datetime | None:
+def hold_lane(store: StateStore, executor: str, lane: str | None, now: datetime) -> datetime | None:
     """Pause ``lane`` behind an active pause of ``executor`` and return its end, or None when free.
 
     The check and the lane write share one state-lock section, so a recovery
@@ -70,7 +70,8 @@ def hold_lane(store: StateStore, executor: str, lane: str, now: datetime) -> dat
         until = datetime.fromisoformat(stamp) if stamp else None
         if until is None or now >= until:
             return None
-        _pause_lane(store, lane, until)
+        if lane is not None:
+            _pause_lane(store, lane, until)
         return until
 
 
