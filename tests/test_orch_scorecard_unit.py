@@ -87,3 +87,35 @@ def test_human_output_names_each_worse_metric_and_failures(store):
 def test_days_below_two_or_not_an_integer_is_a_usage_error(value):
     with pytest.raises(argparse.ArgumentTypeError):
         orch_scorecard._days(value)
+
+
+def card(worse, today, previous):
+    blank = {"phase_minutes": {}}
+    return {"worse": worse, "window": {"today": {**blank, **today}, "previous": {**blank, **previous}}}
+
+
+def test_worst_picks_the_largest_relative_change_with_zero_as_full_change_and_ties_in_order():
+    sample = card(["median_minutes_to_merge", "review_returns", "phase_minutes.checking"],
+                  {"median_minutes_to_merge": 15.0, "review_returns": 1,
+                   "phase_minutes": {"checking": 30.0}},
+                  {"median_minutes_to_merge": 10.0, "review_returns": 0,
+                   "phase_minutes": {"checking": 20.0}})
+    # 50%, 100% (before 0), 50%: the zero baseline wins.
+    assert orch_scorecard.worst(sample) == "review_returns"
+    tie = card(["median_minutes_to_merge", "phase_minutes.checking"],
+               {"median_minutes_to_merge": 20.0, "phase_minutes": {"checking": 4.0}},
+               {"median_minutes_to_merge": 10.0, "phase_minutes": {"checking": 2.0}})
+    assert orch_scorecard.worst(tie) == "median_minutes_to_merge"
+    assert orch_scorecard.worst(card([], {}, {})) is None
+    assert orch_scorecard.worst_line(card([], {}, {}), "en") is None
+
+
+def test_worst_line_uses_registry_labels_and_raw_phase_names():
+    phase = card(["phase_minutes.checking"], {"phase_minutes": {"checking": 9.0}},
+                 {"phase_minutes": {"checking": 3.0}})
+    assert orch_scorecard.worst_line(phase, "en") == "Worse than the days before: checking minutes 3.0 -> 9.0"
+    raw = card(["phase_minutes.packing"], {"phase_minutes": {"packing": 9.0}},
+               {"phase_minutes": {"packing": 3.0}})
+    assert orch_scorecard.worst_line(raw, "en") == "Worse than the days before: packing minutes 3.0 -> 9.0"
+    rate = card(["merge_rate"], {"merge_rate": 0.5}, {"merge_rate": 1.0})
+    assert orch_scorecard.worst_line(rate, "ko") == "그 전 며칠보다 나빠졌어요: 머지 비율 100.0% -> 50.0%"
