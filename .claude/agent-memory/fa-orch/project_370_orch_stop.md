@@ -27,3 +27,8 @@ shared races as non-goals instead of building new ownership machinery.
   a bare call still refuse untouched deletions (#572 tests).
 - Permission: `git reset --hard` is denied here; to restart from main inside an in-progress merge,
   `git restore --source=MERGE_HEAD --staged --worktree -- .` gives main's exact tree.
+- scheduler_recovery.py is at the 300-line split limit (main grew it to 297 on 2026-10-27); a sync
+  with main can push this change over, so re-run test_scheduler_split after every base sync.
+- Finalization order (review 2026-10-27): `_restore_stopped` writes the stop event and the orch
+  audit comment first, once per run (journal check by started_at), while `running` still lets
+  orphan recovery retry; `running` is removed last. `board.sync_status` raises only on rate limits.

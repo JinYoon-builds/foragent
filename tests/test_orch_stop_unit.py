@@ -61,7 +61,6 @@ def case(tmp_path, monkeypatch):
                           config=SimpleNamespace(language="en"), now=lambda: datetime(2026, 10, 27, tzinfo=UTC),
                           sleep=sleep, monotonic=lambda: clock[0])
     monkeypatch.setattr(scheduler, "TickContext", lambda **kw: SimpleNamespace(**kw))
-    monkeypatch.setattr(orch_stop, "RecordingTracker", lambda tracker, context, **kw: tracker)
     return SimpleNamespace(ctx=ctx, store=store, tracker=tracker, clock=clock)
 
 
@@ -184,7 +183,7 @@ def test_an_open_pr_is_flagged_as_a_stall_and_kept_open(case):
                                      {"labels": ("approved", "running", "needs-human")}])
 def test_a_closed_blocked_or_needs_human_issue_only_loses_running(case, tracker):
     result, flags = _restore(case, **tracker)
-    assert result.calls == [("remove", ("running",))] and flags == []
+    assert result.calls == [("comment", "<!-- foragent:orch -->"), ("remove", ("running",))] and flags == []
     assert len([event for event in _events(case.store) if event["kind"] == "stop"]) == 1
 
 
@@ -198,3 +197,54 @@ def test_an_orphaned_stopped_run_is_restored_by_the_next_tick(case, monkeypatch)
     scheduler._recover_orphan(case.ctx, issue, scheduler.TickReport())
     assert seen == [(1, "reprioritize")], "A stop command that died after its kill is finished by the tick"
 
+
+def _stops(case):
+    return [event for event in _events(case.store) if event["kind"] == "stop"]
+
+
+def test_a_board_rate_limit_after_ready_keeps_running_for_the_retry_and_records_once(case, monkeypatch):
+    from foragent.tracker import TrackerError
+
+    limited = [TrackerError("API rate limit exceeded")]
+
+    def board(ctx, n, status):
+        if limited:
+            raise limited.pop()
+
+    monkeypatch.setattr(scheduler.board, "sync_status", board)
+    case.ctx.tracker = _Tracker()
+    with pytest.raises(TrackerError):
+        _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert len(_stops(case)) == 1, "The stop event is recorded before the step that failed"
+    assert ("comment", "<!-- foragent:orch -->") in case.ctx.tracker.calls, "So is the audit comment"
+    assert "running" in case.ctx.tracker.issue.labels, "Orphan recovery still finds the issue"
+    _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())  # The next tick's retry.
+    assert len(_stops(case)) == 1
+    assert case.ctx.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1
+    assert case.ctx.tracker.issue.labels == {"approved", "ready"}
+
+
+def test_a_failing_open_pr_flag_still_leaves_the_stop_event_and_comment(case):
+    case.ctx.tracker = _Tracker(pr=17)
+    scheduler_flag = scheduler.flag
+
+    def flag(*args):
+        raise RuntimeError("board rate limit inside flag")
+
+    scheduler.flag = flag
+    try:
+        with pytest.raises(RuntimeError):
+            _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    finally:
+        scheduler.flag = scheduler_flag
+    assert len(_stops(case)) == 1 and ("comment", "<!-- foragent:orch -->") in case.ctx.tracker.calls
+
+
+def test_the_command_posts_one_audit_comment(case, monkeypatch):
+    def kill(ctx, number, report, **kwargs):
+        ctx.store.finish_run(number, outcome="stopped", detail=kwargs["detail"])
+        return True
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    orch.stop(case.ctx, 1, "reprioritize")
+    assert case.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1

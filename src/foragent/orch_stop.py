@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING
 from foragent import processes
 from foragent.i18n import text
 from foragent.state import Run
-from foragent.tracker import RecordingTracker
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
@@ -97,6 +96,4 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
                 raise OrchError(text("orch_stop_not_running", language, n=n))
             raise OrchError(text("orch_stop_failed", language, n=n, actions="; ".join(report.actions)))
         _restore_stopped(tick_ctx, n, why, report)
-    summary = text("orch_stop_done", language, n=n, why=why)
-    RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(n, "<!-- foragent:orch -->\n" + summary)
-    return summary
+    return text("orch_stop_done", language, n=n, why=why)  # _restore_stopped posted it as the audit comment.
