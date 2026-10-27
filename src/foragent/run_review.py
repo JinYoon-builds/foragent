@@ -17,7 +17,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import orch_events, orch_reviewers, review_perspectives, risks
+from foragent import orch_events, orch_reviewers, review_notes, review_perspectives, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -40,6 +40,7 @@ class ReviewResult:
     raw: str = ""
     timed_out: bool = False
     conflicts: tuple[str, ...] = ()
+    review_notes: tuple[str, ...] = ()  # reviewer NOTE lines: recorded, never findings
 
 
 SPEC_CONFLICT = "SPEC-CONFLICT:"
@@ -63,8 +64,12 @@ def parse_review(message: str) -> ReviewResult:
     lines = message.splitlines()
     for index, line in enumerate(lines):
         if match := re.fullmatch(r"VERDICT: (PASS|FAIL)\s*", line):
-            findings = [line for line in lines[index + 1:] if line.strip()]
-            return ReviewResult(match[1], "\n".join(findings))
+            rest = [line for line in lines[index + 1:] if line.strip()]
+            findings = [line for line in rest if review_notes.note_text(line) is None]
+            notes = review_notes.extract(message)
+            # A FAIL whose findings are all NOTE lines rejects nothing.
+            verdict = "PASS" if match[1] == "FAIL" and notes and not findings else match[1]
+            return ReviewResult(verdict, "\n".join(findings), review_notes=notes)
     return ReviewResult("UNUSABLE", "", ("reviewer gave no verdict",))
 
 
@@ -75,7 +80,8 @@ def parse_code_review(message: str) -> ReviewResult:
         event = None
     if not isinstance(event, dict) or event.get("is_error") or not isinstance(event.get("result"), str):
         return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
-    text = event["result"]
+    # NOTE lines are plain text beside the findings; they never count as findings.
+    text = review_notes.strip(event["result"])
     lines = [line for line in text.splitlines() if line.strip()]
     findings = [line for line in lines if re.match(r"^(?:[-*]|\d+[.)])?\s*`?\S+?:\d+`?\s+(—|-|--)\s+", line)]
     if findings:
@@ -173,7 +179,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
                     risk_notes=risk_notes,
                 ),
                 **settings, timeout_s=runner._remaining(n, ctx),
-                log_path=ctx.store.log_path(n), **options,
+                log_path=ctx.store.log_path(n), on_result=notes_of(n, ctx, reviewer, round_number), **options,
             )
             message = result.full_message if result.full_message is not None else result.last_message
             raw = _raw_text(reviewer, message)
@@ -197,15 +203,23 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     if edited:
         review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=result.timed_out, conflicts=spec_conflicts(raw)),
-                          round_number)
+                          round_number, (raw,))
 
 
-def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: int) -> ReviewResult:
-    """Log and journal one round; a round with spec conflicts is journaled as SPEC-CONFLICT."""
+def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: int,
+                   texts: tuple[str, ...]) -> ReviewResult:
+    """Log and journal one round; a round with spec conflicts is journaled as SPEC-CONFLICT.
+
+    Every NOTE line in ``texts`` (each reviewer's raw text), whatever the verdict, is recorded
+    once per issue as a review-note event.
+    """
+    review = replace(review, review_notes=review_notes.extract(*texts))
+    _record_notes(n, ctx, round_number, *texts)
     if review.verdict == "PASS" and not review.conflicts:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
     log = ctx.store.log_path(n)
-    _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}")
+    _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}"
+            + "".join(f"\nNOTE: {note}" for note in review.review_notes))
     if review.conflicts:
         _append(log, "Review spec conflicts:\n" + "\n".join(review.conflicts))
         _journal_review(n, ctx, "SPEC-CONFLICT", "\n".join(review.conflicts), round_number)
@@ -250,6 +264,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
 
     settings = risks.review_options(ctx.config, reviewer, ctx.config.reviewer_model)
     executor = ctx.executor_factory(reviewer)
+    record = notes_of(n, ctx, reviewer, round_number)
     diff = git.staged_diff(base_ref)
     acceptance = ctx.config.acceptance_dir
     log = ctx.store.log_path(n)
@@ -258,7 +273,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
         # The panel decides the round's outcome from every call, so no call blocks the issue itself.
         return _available_executor(n, ctx, executor, worktree=git.root, reviewer=True, prompt=prompt,
                                    **settings, timeout_s=runner._remaining(n, ctx), log_path=log_path,
-                                   flag_exhaustion=False)
+                                   flag_exhaustion=False, on_result=record)
 
     def failure(label: str, error: BaseException) -> str:
         return f"{label} failed: {getattr(error, 'outcome', type(error).__name__)} {error}".rstrip()
@@ -353,7 +368,21 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
         review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
     # A member's conflict stops the round even when the merge call drops it.
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=timed_out,
-                                          conflicts=spec_conflicts(*raws, raw)), round_number)
+                                          conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw))
+
+
+def notes_of(n: int, ctx: RunContext, reviewer: str, round_number: int):
+    """An executor ``on_result`` hook: record each reviewer response's NOTE lines as it arrives.
+
+    The executor wrapper discards a response on a usage limit or a transient retry; the hook
+    sees it first, so a limit after the reviewer wrote its NOTE lines still keeps them.
+    """
+    return lambda result: _record_notes(n, ctx, round_number, _raw_text(reviewer, _message(result) or ""))
+
+
+def _record_notes(n: int, ctx: RunContext, round_number: int, *texts: str) -> None:
+    """Record a reviewer's NOTE lines as soon as its text exists, so no later exit can lose them."""
+    review_notes.record(ctx.store, ctx.now(), n, review_notes.extract(*texts), round=round_number)
 
 
 _FINDING_LOCATION = re.compile(r"[\w.-]*[/.][\w./-]*:\d+")
@@ -431,18 +460,19 @@ def _review_implementation(attempt: Implementation) -> None:
         ctx.tracker.comment(pr, "\n".join([f"Round {len(attempt.reviews) + 1}: SPEC-CONFLICT", *review.conflicts]))
     _stop_on_spec_conflict(n, ctx, review)
     if review.verdict == "UNUSABLE":
-        review = replace(review, findings=review.raw)
+        review = replace(review, findings=review_notes.strip(review.raw))
     attempt.reviews.append(review)
     if pr is not None:
         ctx.tracker.comment(pr, "\n".join([
-            f"Round {len(attempt.reviews)}: VERDICT: {review.verdict}", review.findings, *review.notes,
+            f"Round {len(attempt.reviews)}: VERDICT: {review.verdict}", review.findings,
+            *(f"NOTE: {note}" for note in review.review_notes), *review.notes,
         ]))
     if review.verdict != "PASS":
         attempt.review_failures += 1
         attempt.review_feedback = True
         if review.verdict == "UNUSABLE":
-            attempt.reviewer_text = review.raw
-            attempt.failure = WholeFailure("A reviewer said (verbatim):\n" + review.raw)
+            attempt.reviewer_text = review.findings
+            attempt.failure = WholeFailure("A reviewer said (verbatim):\n" + review.findings)
         else:
             attempt.failure = WholeFailure(review.findings or "Reviewer found defects (no findings provided).")
         findings = _normalized_findings(review) if _read_rebuttals(worktree).strip() else set()
