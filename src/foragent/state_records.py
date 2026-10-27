@@ -99,3 +99,5 @@ class Run:
     # When this instance of the work began; segments split by nested waits share it.
     phase_work_started_at: str | None = None
     work_events: dict[str, str] = field(default_factory=dict)
+    # The implementer the tick chose at start (#107); None means the lane's configured executor.
+    implementer: str | None = None
