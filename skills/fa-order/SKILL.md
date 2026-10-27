@@ -148,6 +148,24 @@ skill in the pack). Then refresh the catalog and apply confirmed style choices.
 If none fits or discovery is unavailable, state the reason and settle an explicit
 no-match or deferred choice with the person; do not invent candidates or hand them commands.
 
+### Roles: lightest fix first
+When someone asks for a new standing role (for example "a security owner"), first look
+for a cheaper fit and propose it instead. Try these in order and stop at the first that fits:
+1. A line in the lane memory: edit `.claude/agent-memory/fa-<lane>/MEMORY.md` of the lane
+   that owns the area directly. The orchestrator commits it in its next batched commit.
+2. A skill attached to the lane that owns the area: `fa lanes skills <lane> <skill-id>`
+   (the lanes code is the one writer of lane skills).
+3. A reviewer perspective scoped to paths: add a `review_perspectives` entry
+   (`{name, focus}`) whose focus names the paths, for example security on
+   `src/payment/**`. This needs no new schema.
+4. A new role only when the work must judge across areas and send proposals.
+In the multiple-choice confirmation, show the cheaper option first, with the reason it
+fits; offer the role after it. Only after the person confirms a role, run
+`fa role add <name> --scope "<paths>" --signal "paths:<paths>" --skill <skill-id> --why "<confirmed reason>"`
+with the name, scope, call conditions (repeat `--signal`) and skills (repeat `--skill`).
+Every role may be idle. Roles never message the person; everything goes through the
+orchestrator.
+
 ## Design first (D33)
 Use `ui.frameworks` and `ui.has_design_foundation` from the context alongside the request.
 For UI work without a foundation, first suggest the design interview (디자인 인터뷰); if the

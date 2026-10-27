@@ -175,5 +175,7 @@
 - #693: park/unpark 본체는 `orch_park.py`, CLI는 `commands/_orch_park.py`(orch.py run에서 ctx 만든 뒤 분기). 시간 초과는 `parked_at() > since`면 생략. 인수 시험 1은 라벨 제거만으로 통과하므로 경계는 `tests/test_orch_park_unit.py`가 local_issues를 교체해 확인.
 - [#716 role agents](project_716_role_agents.md) — architect prompt/skill split, --agent launches, pstack test pins refactor.md
 - [#449 overlap facts](project_449_overlap_facts.md) — file_conflicts in orch_facts_runs, 30-line human cap, zsh array for test lists
+- [#650 wake grace](project_650_wake_grace.md) — wake-grace.json beside sleep baseline, per-run activity ends it, sleep_wake line
 - [#226 review NOTE lines](project_226_review_notes.md) — review_notes.py, break-it rule, SKILL.md 150-line pitfalls
 - #445: facts 실행 행의 `comparison`은 `Run.comparison`(#442가 `update_run(comparison=...)`로 저장)을 `_row()`에서 그대로 복사, 없으면 null. zsh에서 `$files` 목록은 `${=files}`로 나눠야 pytest에 넘어간다. facts 관련 시험 287개 중 74개는 변경 전에도 같은 ID로 실패(다른 이슈 범위).
+- 상태 설계(D95)는 제품 스킬 `fa-state-design`(쓰는 곳 하나·저장 대신 계산·덮어쓰기 대신 덧붙이기)에 일반 규칙으로 있다. 이 저장소 사례: #370 정지는 실행기 혼자 맡는 얇은 호출로 끝났고(정지 경로가 둘이면 매번 새 경합), #415 수면 시간은 tick의 `sleep_credit.credit()` 하나만 기록해 끝났다([[project-415-sleep-ledger]]), #154 대화 생존 판정은 공유 함수 하나가 open·closed·unknown을 돌려주고 구조화된 증거가 있을 때만 closed로 본다. 같은 영역에서 보류가 두 번이면 지적 자리를 고치지 말고 각 상태의 쓰는 곳을 다시 정한다.
