@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
@@ -110,9 +111,14 @@ def _limit_wait(n: int, ctx: RunContext, detail: str) -> None:
 def _available_executor(
     n: int, ctx: RunContext, executor: Executor, *, reviewer: bool = False,
     session_body: str | None = None, resume_prompt: str | None = None, flag_exhaustion: bool = True,
+    on_result: Callable[[ExecResult], None] | None = None,
     **kwargs,
 ) -> ExecResult:
-    """Run until the executor is available; ``flag_exhaustion=False`` leaves the block to the caller."""
+    """Run until the executor is available; ``flag_exhaustion=False`` leaves the block to the caller.
+
+    ``on_result`` sees every result the executor returns, including the ones a usage limit,
+    a transient retry or transient exhaustion discards, before this function decides on it.
+    """
     from foragent import runner
     from foragent.run_checks import _append
 
@@ -140,7 +146,10 @@ def _available_executor(
             # yet, so the recorded session must not receive messages until its new ID is recorded.
             ctx.store.update_run(n, session_stale=kwargs.get("resume_session_id") is None)
         try:
-            return _run_executor(n, ctx, executor, on_session=live, **kwargs)
+            result = _run_executor(n, ctx, executor, on_session=live, **kwargs)
+            if on_result is not None:
+                on_result(result)
+            return result
         except BaseException:
             # run_logged flushes stdout into the log during interruption cleanup.
             # Recover this call's lifecycle before run_issue finishes its history.

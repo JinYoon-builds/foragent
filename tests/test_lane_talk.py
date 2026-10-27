@@ -1128,3 +1128,35 @@ def test_the_stall_mark_is_written_under_the_lock_right_before_the_signal(store,
                                  count_stall=True, unless_talking=True)
     assert order[:2] == [("mark", "stalled-restart"), ("signal", 4242)]
     assert store.get_run(1).restarts == 0  # The refused stop was undone.
+
+
+def test_the_runner_records_the_live_session_through_its_executor_loop(run_case):
+    from dataclasses import replace
+
+    from foragent.executors import ExecResult
+    from foragent.run_execution import _available_executor
+
+    c = run_case
+    polls, seen = [], []
+
+    def hook(execute, poll):
+        polls.append(poll)
+        return execute()
+
+    ctx = replace(c.ctx, config=replace(c.ctx.config, executor="codex"), poll_hook=hook)
+    log = c.store.log_path(1)
+
+    class Executor:
+        def run(self, **kwargs):
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a") as stream:
+                stream.write(json.dumps({"type": "thread.started", "thread_id": "live-thread"}) + "\n")
+            polls[-1]()  # The 30-second poll fires while the worker is still running.
+            seen.append(c.store.get_run(1).session_id)
+            return ExecResult(0, False, "done", kwargs["log_path"], num_turns=1)
+
+    _available_executor(1, ctx, Executor(), session_body="body", resume_prompt=None,
+                        worktree=ctx.repo_root, prompt="full task", model=None, log_path=log)
+    assert seen == ["live-thread"]
+    c.store.finish_run(1, "merged")
+    c.tracker.remove_labels(1, ["running"])

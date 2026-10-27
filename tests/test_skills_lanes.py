@@ -266,14 +266,20 @@ def test_complete_standard_licenses_are_accepted(library, tmp_path, license_id, 
 
 
 @pytest.mark.parametrize("license_id", STANDARD_LICENSES)
-@pytest.mark.parametrize("variant", ["appended", "inserted", "truncated"])
+def test_library_license_with_appended_text_counts_as_the_standard_license(library, license_id):
+    source, _, manager, _ = library
+    text = STANDARD_LICENSES[license_id] + "\nThird-party components are listed in NOTICE.\n"
+    (source / "engineering/skills/testing-strategy/LICENSE.txt").write_text(text)
+    assert manager.catalog()[0]["license"] == license_id
+
+
+@pytest.mark.parametrize("license_id", STANDARD_LICENSES)
+@pytest.mark.parametrize("variant", ["inserted", "truncated"])
 def test_modified_standard_licenses_are_unknown_and_install_writes_nothing(library, tmp_path, license_id, variant):
     source, _, manager, commands = library
     text = STANDARD_LICENSES[license_id]
     restriction = "The Software shall be used for Good, not Evil.\n"
-    if variant == "appended":
-        text += restriction
-    elif variant == "inserted":
+    if variant == "inserted":
         position = text.index("\n\n")
         text = text[:position] + "\n" + restriction + text[position:]
     else:
@@ -839,3 +845,90 @@ def test_repo_product_skill_wins_by_name_over_library_for_install_and_copy(libra
     (root / ".claude/skills/testing-strategy/SKILL.md").write_text("Stale local install\n")
     assert copy_lane_skills(root, worktree, ["testing-strategy"], manager) == [".claude/skills/testing-strategy"]
     assert (worktree / ".claude/skills/testing-strategy/SKILL.md").read_text().endswith("Repo body.\n")
+
+
+def _nested_skill(root, relative, name):
+    directory = root / relative
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {name} fixture\n---\nBody.\n")
+    return directory
+
+
+def test_nested_catalog_skill_uses_the_nearest_license(library):
+    source, _, manager, _ = library
+    _nested_skill(source, "plugins/design/skills/ux-copy", "ux-copy")
+    _nested_skill(source, "plugins/sales/skills/pitch", "pitch")
+    (source / "plugins/design/LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+    licenses = {item["name"]: item["license"] for item in manager.catalog()}
+    assert licenses == {"testing-strategy": "Apache-2.0", "ux-copy": "MIT", "pitch": "Apache-2.0"}
+
+
+def test_repo_product_skill_keeps_exact_license_matching(library, tmp_path):
+    _, _, manager, _ = library
+    root = tmp_path / "repo"
+    _nested_skill(root, "skills/house-style", "house-style")
+    (root / "skills/house-style/LICENSE").write_text(STANDARD_LICENSES["MIT"] + "\nExtra terms.\n")
+    assert manager._repo_skill("house-style", root).license == "unknown"
+
+
+def test_only_clashing_catalog_ids_use_the_skill_folder_path(library):
+    source, _, manager, _ = library
+    _nested_skill(source, "plugins/a/skills/review", "review")
+    _nested_skill(source, "plugins/a/.claude/skills/review", "review")
+    _nested_skill(source, "plugins/b/skills/review", "review")
+    _nested_skill(source, "plugins/b/skills/solo", "solo")
+    _nested_skill(source, "skills/shared", "shared")
+    _nested_skill(source, ".claude/skills/shared", "shared")
+    catalog = {item["id"]: item["copies"] for item in manager.catalog()}
+    assert catalog == {
+        "kwp:engineering/testing-strategy": ["engineering/skills/testing-strategy"],
+        "kwp:plugins/a/skills/review": ["plugins/a/.claude/skills/review", "plugins/a/skills/review"],
+        "kwp:plugins/b/skills/review": ["plugins/b/skills/review"],
+        "kwp:plugins/solo": ["plugins/b/skills/solo"],
+        "kwp:shared": [".claude/skills/shared", "skills/shared"],
+    }
+
+
+def test_catalog_discovery_skips_hidden_folders_and_node_modules(library):
+    source, _, manager, _ = library
+    _nested_skill(source, ".git/objects/skills/hidden", "hidden")
+    _nested_skill(source, ".cache/plugins/skills/cached", "cached")
+    _nested_skill(source, "node_modules/pkg/skills/vendored", "vendored")
+    _nested_skill(source, "plugins/x/node_modules/skills/deep", "deep")
+    assert [item["name"] for item in manager.catalog()] == ["testing-strategy"]
+
+
+@pytest.mark.parametrize("appended", [
+    "SPDX-License-Identifier: Apache-2.0",
+    "SPDX-License-Identifier: Apache-2.0\nSPDX-License-Identifier: GPL-3.0-only",
+    "SPDX-License-Identifier:",
+])
+def test_appended_spdx_lines_do_not_override_the_leading_standard_license(library, appended):
+    source, _, manager, _ = library
+    (source / "engineering/skills/testing-strategy/LICENSE").write_text(
+        STANDARD_LICENSES["MIT"] + "\nThird-party component:\n" + appended + "\n")
+    assert manager.catalog()[0]["license"] == "MIT"
+
+
+@pytest.mark.parametrize("link", ["skill", "skills", "plugin", "tool-root"])
+def test_catalog_follows_directory_symlinks_without_looping(library, tmp_path, link):
+    source, _, manager, _ = library
+    outside = _nested_skill(tmp_path / "outside", "real/skills/linked", "linked").parent.parent
+    if link == "skill":
+        (source / "skills").mkdir()
+        (source / "skills/linked").symlink_to(outside / "skills/linked", target_is_directory=True)
+        expected = "skills/linked"
+    elif link == "skills":
+        (source / "plugins/p").mkdir(parents=True)
+        (source / "plugins/p/skills").symlink_to(outside / "skills", target_is_directory=True)
+        expected = "plugins/p/skills/linked"
+    elif link == "plugin":
+        (source / "plugins").mkdir()
+        (source / "plugins/p").symlink_to(outside, target_is_directory=True)
+        expected = "plugins/p/skills/linked"
+    else:
+        (source / ".claude").symlink_to(outside, target_is_directory=True)
+        expected = ".claude/skills/linked"
+    (outside / "skills/linked/loop").symlink_to(source, target_is_directory=True)
+    copies = {item["name"]: item["copies"] for item in manager.catalog()}
+    assert copies == {"testing-strategy": ["engineering/skills/testing-strategy"], "linked": [expected]}
