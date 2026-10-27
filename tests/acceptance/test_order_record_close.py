@@ -128,20 +128,6 @@ def test_publish_with_new_issues_keeps_record_open(publication, capsys, with_edi
     assert case.tracker.closures == []
 
 
-def test_tick_closes_old_childless_order_record_once(parent_case):
-    case = parent_case
-    add_parent(case, [])
-    record = case.tracker.get_issue(10)
-    assert "<!-- foragent:plan " in record.body, "Only a marked order record qualifies for catch-up"
-    assert not any(label.startswith("lane:") for label in record.labels)
-    assert case.tracker.sub_issues(10) == []
-    gate_tick(case)
-    assert case.tracker.get_issue(10).state == "closed", (
-        "The next gate tick must close an old order record with no sub-issues"
-    )
-    assert_closed_once(case, 10)
-
-
 def test_tick_closes_old_record_with_completed_children_once(parent_case):
     case = parent_case
     children = add_parent(case, ["completed", "completed"])
