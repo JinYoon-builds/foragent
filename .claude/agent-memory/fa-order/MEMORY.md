@@ -54,3 +54,4 @@
 - #419 10차: 보낼 글은 ID가 내용의 해시여야 한다(`load`가 다시 계산해 확인). GitHub 검색은 `incomplete_results`/`total_count`를 보고, 일치가 없는데 결과가 불완전하면 새 이슈를 열지 않는다. help 언어는 하위 parser의 `parse_known_args`를 감싸 `--repo-root`를 먼저 읽고 정한다.
 - #419 11차: 명령의 모든 실패는 자기 명령 안에서 등록부 키로 바꾼다(`ReportError(key, **values)`). `cli.main`의 공통 처리로 새면 영어 원문이 나온다. 공유 모듈(tracker 등)에 새 영어 오류 문구를 넣지 말고 호출한 쪽에서 판단한다. 기반 도구 원문은 `{error}`로만 덧붙인다. 내 파일이 main에서도 바뀌면 `git merge-file`로 3방향 병합한다.
 - #227: `fa brief`의 점수표 한 줄은 `orch_scorecard.worst_line(collect(store))`(지표 이름표는 `messages/orch_scorecard.py`의 `scorecard_label_*`, 없는 단계는 `scorecard_label_phase`). 검증: `fa test tests/acceptance/test_fa_briefing_scorecard.py tests/test_brief.py tests/test_orch_scorecard_unit.py`.
+- #745: 잠긴 `test_order_perspectives.py:264`가 자리 수와 상관없이 실패 합계 `== 10`(6자리 기준)을 고정해 둬서, 자리를 더하면 깨져요. 7자리 추가는 QUESTION.md로 넘겼어요. 자리를 더할 때는 `messages/order_perspectives.py`의 `perspectives_seat_<자리>` 이름표와 fa-order 5b의 자리 목록도 함께 고쳐요.
