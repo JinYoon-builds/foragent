@@ -578,3 +578,18 @@ def test_cli_routes_all_verbs_to_injected_context(review_case, monkeypatch, caps
     assert c.tracker.get_issue(1).labels & {"blocked", "ready"} == {"ready"}
     assert cli.main(["orch", "log"]) == 0
     assert "resolved review fail" in capsys.readouterr().out
+
+
+def test_review_only_spec_conflict_stops_with_spec_question_and_keeps_pr_open(review_case):
+    c = review_case
+    conflict = f"SPEC-CONFLICT: {ACCEPTANCE}:1 requires X; the finding wants Y"
+    c.review_calls = enable_reviewer(c, [f"VERDICT: PASS\n{conflict}"])
+
+    assert runner.review_only(1, c.ctx) == "spec-question"
+
+    assert_blocked(c, Reason.SPEC_QUESTION)
+    question = [comment.body for comment in c.tracker.list_comments(1)
+                if comment.body.startswith("<!-- foragent:blocked reason=spec-question -->")]
+    assert len(question) == 1 and conflict in question[0]
+    events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [e["verdict"] for e in events if e["kind"] == "review"] == ["SPEC-CONFLICT"]
