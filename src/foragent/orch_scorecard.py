@@ -183,16 +183,53 @@ def _window_line(key: str, metrics: dict[str, Any], language: str, days: int) ->
                 phases=phases or "-")
 
 
+def _pair(card: dict[str, Any], name: str) -> tuple[Any, Any]:
+    """(before, now) for a metric in ``card["worse"]``, phases included."""
+    today, previous = card["window"]["today"], card["window"]["previous"]
+    if name.startswith("phase_minutes."):
+        phase = name.split(".", 1)[1]
+        return previous["phase_minutes"][phase], today["phase_minutes"][phase]
+    return previous[name], today[name]
+
+
+def worst(card: dict[str, Any]) -> str | None:
+    """The worse metric with the largest relative change; a before of 0 is 100%, ties keep card order."""
+    best, change = None, -1.0
+    for name in card["worse"]:
+        before, now = _pair(card, name)
+        relative = 1.0 if before == 0 else abs(now - before) / abs(before)
+        if relative > change:
+            best, change = name, relative
+    return best
+
+
+def label(name: str, language: str) -> str:
+    """A readable metric name from the registry; an unlabelled phase reads '<phase> minutes'."""
+    if name.startswith("phase_minutes."):
+        phase = name.split(".", 1)[1]
+        try:
+            return text(f"scorecard_label_phase_{phase}", language)
+        except KeyError:
+            return text("scorecard_label_phase", language, phase=phase)
+    return text(f"scorecard_label_{name}", language)
+
+
+def worst_line(card: dict[str, Any], language: str) -> str | None:
+    """One line naming the worst metric with before -> now, or None when nothing got worse."""
+    name = worst(card)
+    if name is None:
+        return None
+    before, now = _pair(card, name)
+    return text("scorecard_worst", language, metric=label(name, language),
+                before=_shown(name, before), now=_shown(name, now))
+
+
 def human(card: dict[str, Any], language: str) -> str:
     today, previous = card["window"]["today"], card["window"]["previous"]
     lines = [_window_line("scorecard_today", today, language, card["days"]),
              _window_line("scorecard_previous", previous, language, card["days"])]
     for name in card["worse"]:
-        if name.startswith("phase_minutes."):
-            phase = name.split(".", 1)[1]
-            before, now = previous["phase_minutes"][phase], today["phase_minutes"][phase]
-        else:
-            before, now = previous[name], today[name]
+        before, now = _pair(card, name)
         lines.append(text("scorecard_worse", language, metric=name, before=_shown(name, before),
                           now=_shown(name, now)))
     if not card["worse"]:
