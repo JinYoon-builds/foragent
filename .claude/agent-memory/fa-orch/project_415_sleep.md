@@ -1,21 +1,18 @@
 ---
 name: project-415-sleep-ledger
-description: #415 machine sleep credit — final design (append-only ledger of closed intervals, one locked snapshot per consumer) and why ten review rounds pushed there
+description: #415 machine sleep credit — final single-writer design after the orchestrator narrowed the issue (2026-10-27); why ten ledger rounds failed
 metadata:
   type: project
 ---
 
-Final design (2026-10-27, after three "held" reviews):
-- `capacity.slept_seconds(since)` is only the sensor: Darwin kern.sleeptime/waketime ∩ [since, now]; elsewhere a BOOTTIME−MONOTONIC or wall−monotonic offset vs its baseline keyed by `since` (`sleep-baselines.json`, few keys).
-- `sleep_ledger.read(now_fn, starts, tick=, report=, language=)` under its own lock appends `(since, until, seconds)` (previous reading → this reading) to `sleep-ledger.jsonl` and returns a Snapshot with direct sensor reads for `starts`. Credit = max(ledger lower bound, sensor). Prune only records ending at or before the oldest running start machine-wide; a reader that sees no running run prunes nothing (age-only retention was rejected).
-- Consumers (`_remaining`, `_test_slot`, scheduler runtime and stall) credit `Snapshot.credit(start)` = overlap of [start, now]. An awake event (run start, progress, wait start) inside an interval proves that sleep ended before it. Wake grace opens only at gate ticks (`tick=True`) when sleep since the previous tick > 60 s, lasting 5 min from that tick; an event ends it only if < 1 s of wall time follows it in the latest grace record.
-- Awake events are stamped by a reading (`sleep_ledger.mark(now)`: start_run, run_waits progress/waits, run_execution poll), so every event is a record boundary; following an event with a reading was rejected as non-atomic. Grace ends only for events at or after the grace record's end.
-- The last record is the checkpoint (previous = max(state read_at, last record until)); appends close a torn last line first. Darwin sensor = max(kernel pair ∩ window, mach_continuous−mach_absolute growth); the measure bracket compares with abs() because the pair can go down.
-- No version markers or legacy branches (the orchestrator rejected `sleep_free_waits`).
+Final design (2026-10-27, issue narrowed after four review holds; wake grace moved to #650):
+- `capacity.slept_seconds(since)` is the sensor: Darwin = max(kernel sleep/wake pair ∩ [since, now], mach_continuous−mach_absolute growth); elsewhere BOOTTIME−MONOTONIC or wall−monotonic vs a per-point baseline in the machine-wide `sleep-baselines.json`, pruned by age (48 h) only.
+- `sleep_credit.credit(store, now)` is the only reader and writer: called at the top of `scheduler_recovery._recover_runs` (full tick only), under the state lock, from `<state>/sleep-baseline.json`'s previous tick time. The increment is clamped to 0..wall time and added to `Run.slept_seconds` and `Run.slept_since_progress` of non-waiting runs (phase ending `-wait` or future `waiting_until`) that started at or before the previous tick. Progress newer than the previous tick resets `slept_since_progress` first.
+- Runtime limit = elapsed − waited − slept_seconds; stall = since progress − slept_since_progress; `run_waits._remaining` reads the run record only. `_test_slot`, `run_execution`, `state_runs` are main's versions.
 
 Lessons:
-- When reviewers keep finding new edge cases in the same area, simplify the model instead of patching each one; ten rounds of patches (bisection placement, coarse bounds, event splits, markers) all produced new defects.
-- `tests/conftest.py` replaces `sleep_ledger.read` with an empty snapshot except in `test_machine_sleep`/`test_sleep_ledger`/`test_sleep_judgment`: a reading writes the machine root (breaks `test_state.py`'s os.replace inspection) and the owner's real sleep would credit fake-clock runs.
-- `state_runs.py` and scheduler split modules have 300-line limits (`test_state_split`, `test_scheduler_split`).
-- Python `time.monotonic` is `mach_absolute_time()` on macOS (pauses in sleep), so monotonic-timed waits hold no sleep.
-- Acceptance helpers are importable via `sys.path.insert(tests/acceptance)` (precedent `tests/test_orch_reviewers.py`). In zsh use arrays for file loops.
+- Ten rounds of ledger/placement/marker patches each produced new races. The fix was a single writer (D95 state-ownership rule: one writer per state, derive, append), not more cases. After two holds in one area, redesign.
+- `state_runs.py` is at 298/300 lines (`test_state_split`); new state logic goes in its own module.
+- `tests/conftest.py` stubs `capacity.slept_seconds` to 0 except in `test_machine_sleep`/`test_sleep_credit`.
+- Python `time.monotonic` is `mach_absolute_time()` on macOS (pauses in sleep).
+- During a runner-driven merge, resolve conflicts in the working tree and leave the index to the runner (undo any `git rm --cached` with `git reset -- <path>`).

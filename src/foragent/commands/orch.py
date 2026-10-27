@@ -6,7 +6,7 @@ ORDER = 120
 # An orchestrator whose heartbeat is at most this old counts as alive.
 ALIVE_SECONDS = 30
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive",
-                 "reviewers"}
+                 "reviewers", "ensure", "facts"}
 
 
 def add(commands) -> None:
@@ -76,6 +76,8 @@ def _add_inbox(orch_actions) -> None:
     alive = orch_actions.add_parser("alive", help=cli.text("heartbeats_help"))
     alive.add_argument("--json", action="store_true")
     alive.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    ensure = orch_actions.add_parser("ensure", help=cli.text("orch_ensure_help"))
+    ensure.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     queue = orch_actions.add_parser("queue", help="Set, show or clear a lane's or the cross-lane start order")
     queue.add_argument("lane", nargs="?", help="Lane name; with --global, the first issue number")
     queue.add_argument("--global", dest="global_", action="store_true",
@@ -84,6 +86,7 @@ def _add_inbox(orch_actions) -> None:
     queue.add_argument("--clear", action="store_true")
     queue.add_argument("--json", action="store_true")
     queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    cli.orch_facts.add_parser(orch_actions)
     reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")
     reviewers.add_argument("issue", type=int)
     reviewers.add_argument("count", type=int, nargs="?", help="Reviewer count (1 or more); wins over review_reviewers")
@@ -142,6 +145,11 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         return
     if args.action == "alive":
         _alive(args, store, config)
+        return
+    if args.action == "facts":
+        return cli.orch_facts.command(args, store, config)
+    if args.action == "ensure":
+        _ensure(args, store, config)
         return
     if args.action == "queue":
         if args.global_:
@@ -219,6 +227,28 @@ def _alive(args, store, config) -> None:
     else:
         key = "heartbeats_alive" if alive else "heartbeats_gone"
         print(cli.text(key, config.language, age=age, at=last.isoformat()))
+
+
+def _ensure(args, store, config) -> None:
+    """Explicit planning-session call (D76): the gate's spawn without its spacing; one line either way.
+
+    The reason is read before the call, so a live orchestrator never reaches the
+    spawn; a call that opened nothing reports why from inside its lock.
+    """
+    cli = facade()
+    from foragent import orch_ensure, orch_spawn
+
+    root = args.repo_root.resolve()
+    now = cli.datetime.now(cli.UTC)
+    reason = orch_ensure.skip_reason(root, store, now)
+    if reason is None:
+        why = []
+        screen = orch_spawn.ensure_orchestrator(root, store, config, now=now, spacing=False, why=why)
+        if screen:
+            print(cli.text("orch_ensure_opened", config.language, screen=screen))
+            return
+        reason = why[-1] if why else "failed"
+    print(cli.text(f"orch_ensure_{reason}", config.language))
 
 
 def _list(ctx, args) -> None:

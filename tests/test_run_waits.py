@@ -213,3 +213,37 @@ def test_backoff_records_monotonic_elapsed_even_if_interrupted_or_wall_clock_mov
     assert run.waited_seconds == 10 + elapsed
     assert run.executor_waited_seconds == 5 + elapsed
     assert run.waiting_until is None and run.last_progress_at == wall[0].isoformat()
+
+
+@pytest.mark.parametrize("queued", [True, False])
+def test_test_slot_wait_is_a_phase_only_when_the_run_queues(tmp_path, monkeypatch, queued):
+    import json
+
+    from foragent import capacity
+    from foragent.run_waits import _test_slot
+
+    now = [BASE_TIME]
+    store = StateStore(tmp_path / "state", now=lambda: now[0])
+    store.start_run(1, branch="branch", worktree="worktree")
+    store.update_run(1, phase="checking", phase_started_at=BASE_TIME.isoformat())
+    ctx = SimpleNamespace(store=store, now=lambda: now[0], config=SimpleNamespace(test_slots=1))
+
+    @contextmanager
+    def hold(slots, *, waiting):
+        if queued:
+            now[0] += timedelta(seconds=5)
+            waiting()
+            assert store.get_run(1).phase == "test-slot-wait"
+            now[0] += timedelta(seconds=30)
+            waiting()  # A refresh while still queued opens no new segment.
+            now[0] += timedelta(seconds=10)
+        yield
+
+    monkeypatch.setattr(capacity, "hold_test_slot", hold)
+    with _test_slot(1, ctx):
+        assert store.get_run(1).phase == "checking"
+    journal = store.root / "orch-events.jsonl"
+    events = [json.loads(line) for line in journal.read_text().splitlines()] if journal.exists() else []
+    # The queue segment starts when the run asks for a slot, so checking closes at 0 seconds.
+    expected = [("checking -> test-slot-wait", 0), ("test-slot-wait -> checking", 45)] if queued else []
+    assert [(event["summary"], event["seconds"]) for event in events] == expected

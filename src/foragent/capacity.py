@@ -6,6 +6,7 @@ matters, and it holds new starts and new test slots without changing a budget.
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 import ctypes
 from datetime import UTC, datetime, timedelta
 import fcntl
@@ -51,6 +52,9 @@ HELD_ENV = {TEST_SLOT_ENV: "held"}
 SLOT_POLL_SECONDS = 0.1
 # How often a waiting test command reports that it is still waiting.
 SLOT_HEARTBEAT_SECONDS = 10.0
+
+# Inside observing(), machine_load() reads the sensors without writing their baselines.
+_OBSERVING: ContextVar[bool] = ContextVar("foragent_capacity_observing", default=False)
 
 _DARWIN_PRESSURE = {1: "normal", 2: "warn", 4: "critical"}
 
@@ -199,6 +203,31 @@ def _read_sensor(root: Path) -> dict[str, Any]:
         return {}
 
 
+def _busy_now(sensor: dict[str, Any]) -> tuple[float | None, dict[str, Any] | None]:
+    """The busy fraction from the current CPU counters against the saved ones.
+
+    Returns ``(busy, update)``: ``update`` is the new baseline to save, or None when
+    the interval is too short and the saved fraction is reused, as the gate does.
+    """
+    times = psutil.cpu_times()
+    # Linux guest time is already included in user/nice counters.
+    total = sum(times) - getattr(times, "guest", 0) - getattr(times, "guest_nice", 0)
+    idle = times.idle + getattr(times, "iowait", 0)
+    previous_total, previous_idle = sensor.get("cpu_total"), sensor.get("cpu_idle")
+    busy = None
+    if (type(previous_total) in (int, float) and type(previous_idle) in (int, float)
+            and 0 <= previous_idle <= previous_total):
+        elapsed, idle_elapsed = total - previous_total, idle - previous_idle
+        # Subtracting float counters can put an all-idle delta just above total.
+        if elapsed >= 0 and 0 <= idle_elapsed <= elapsed + 2 * math.ulp(total):
+            if elapsed < CPU_BUSY_MIN_SECONDS * (os.cpu_count() or 1):
+                busy = sensor.get("cpu_busy")
+                return (busy if type(busy) in (int, float) and 0 <= busy <= 1 else None), None
+            busy = max(0.0, min(1.0, 1 - idle_elapsed / elapsed))
+    # First samples and counter resets discard the old fraction and rebase.
+    return busy, {"cpu_total": total, "cpu_idle": idle, "cpu_busy": busy}
+
+
 def cpu_busy() -> float | None:
     """Busy fraction since the last persisted CPU sample; iowait is idle, steal is busy."""
     if os.environ.get("FORAGENT_CPU_BUSY") == "off":
@@ -206,31 +235,47 @@ def cpu_busy() -> float | None:
     try:
         root = machine_root()
         with _flock(root / SENSOR_LOCK):
-            times = psutil.cpu_times()
-            # Linux guest time is already included in user/nice counters.
-            total = sum(times) - getattr(times, "guest", 0) - getattr(times, "guest_nice", 0)
-            idle = times.idle + getattr(times, "iowait", 0)
             sensor = _read_sensor(root)
-            previous_total, previous_idle = sensor.get("cpu_total"), sensor.get("cpu_idle")
-            busy = None
-            if (type(previous_total) in (int, float) and type(previous_idle) in (int, float)
-                    and 0 <= previous_idle <= previous_total):
-                elapsed, idle_elapsed = total - previous_total, idle - previous_idle
-                # Subtracting float counters can put an all-idle delta just above total.
-                if elapsed >= 0 and 0 <= idle_elapsed <= elapsed + 2 * math.ulp(total):
-                    if elapsed < CPU_BUSY_MIN_SECONDS * (os.cpu_count() or 1):
-                        busy = sensor.get("cpu_busy")
-                        return busy if type(busy) in (int, float) and 0 <= busy <= 1 else None
-                    busy = max(0.0, min(1.0, 1 - idle_elapsed / elapsed))
-            # First samples and counter resets discard the old fraction and rebase.
-            sensor.update(cpu_total=total, cpu_idle=idle, cpu_busy=busy)
-            (root / SENSOR_FILE).write_text(json.dumps(sensor), encoding="utf-8")
+            busy, update = _busy_now(sensor)
+            if update is not None:
+                sensor.update(update)
+                (root / SENSOR_FILE).write_text(json.dumps(sensor), encoding="utf-8")
         return busy
     except (OSError, ValueError, TypeError, AttributeError, NotImplementedError, psutil.Error):
         return None
 
 
+@contextmanager
+def observing() -> Iterator[None]:
+    """Read machine_load() for display only: no lock, no sensor baseline written."""
+    token = _OBSERVING.set(True)
+    try:
+        yield
+    finally:
+        _OBSERVING.reset(token)
+
+
+def _observed_load() -> LoadSample:
+    """The sample the gate would take now, read-only: current counters against the saved ones.
+
+    The saved fraction is reused only where the gate reuses it (a too-short interval);
+    otherwise the busy fraction is measured now, so it matches the current load average.
+    """
+    busy = None
+    # FORAGENT_CPU_BUSY=off turns the busy fraction off, including a previously saved one.
+    if os.environ.get("FORAGENT_CPU_BUSY") != "off":
+        try:
+            busy, _ = _busy_now(_read_sensor(machine_root()))
+        except (OSError, ValueError, TypeError, AttributeError, NotImplementedError, psutil.Error):
+            busy = None
+    raw_load = load_per_cpu()
+    load = min(raw_load, busy / 0.6) if busy is not None else raw_load
+    return LoadSample(kernel_pressure(), load, None, load_average_per_cpu=raw_load, cpu_busy=busy)
+
+
 def machine_load() -> LoadSample:
+    if _OBSERVING.get():
+        return _observed_load()
     root = machine_root()
     with _flock(root / SENSOR_LOCK):
         pressure, total = kernel_pressure(), swapins_total()
@@ -359,12 +404,19 @@ def read_test_slots() -> dict[str, Any] | None:
     return value
 
 
-def effective_test_slots(ceiling: int) -> int:
-    """The shared AIMD value, capped by machine.yml and this repository's lower ceiling."""
+def effective_test_slots(
+    ceiling: int, *, state: dict[str, Any] | None | bool = False, machine: dict[str, Any] | None = None,
+) -> int:
+    """The shared AIMD value, capped by machine.yml and this repository's lower ceiling.
+
+    ``state`` and ``machine`` let a caller that already read test-slots.json and machine.yml
+    reuse those values instead of reading the files again.
+    """
     from foragent import machine_budget
 
-    ceiling = min(ceiling, machine_budget.values()["test_slots"])
-    state = read_test_slots()
+    ceiling = min(ceiling, (machine if machine is not None else machine_budget.values())["test_slots"])
+    if state is False:
+        state = read_test_slots()
     return max(1, min(state["slots"], ceiling)) if state else max(1, ceiling)
 
 
@@ -517,26 +569,8 @@ def hold_test_slot(ceiling: int, *, waiting: Callable[[], None] | None = None) -
 
 
 SLEEP_BASELINES_FILE = "sleep-baselines.json"
-SLEEP_BASELINES_NEWEST = 8
-
-
-def oldest_running_start() -> datetime | None:
-    """The earliest start among running runs in every store under the machine data root.
-
-    None when no running run is seen: callers then keep all sleep history.
-    """
-    starts = []
-    try:
-        roots = [path for path in machine_root().iterdir() if (path / "runs").is_dir()]
-    except OSError:
-        return None
-    for root in roots:
-        try:
-            for run in StateStore(root).active_runs():
-                starts.append(datetime.fromisoformat(run.started_at))
-        except (OSError, ValueError, TypeError, KeyError):
-            continue
-    return min(starts, default=None)
+# A clock baseline is kept this long; a gate tick reads from its previous tick, minutes ago.
+SLEEP_BASELINES_KEEP = timedelta(hours=48)
 
 
 class _Timeval(ctypes.Structure):
@@ -602,13 +636,10 @@ def _sleep_baseline(since: datetime, kind: str, offset: float) -> float:
         if isinstance(baselines.get(key), (int, float)):
             return float(baselines[key])
         baselines[key] = offset
-        # A point before every running run starts no window any more; with none seen, keep all.
-        # The newest points stay: the sleep ledger reads from its previous reading.
-        oldest = oldest_running_start()
-        when = {name: datetime.fromisoformat(name.split("@", 1)[1]) for name in baselines}
-        newest = set(sorted(baselines, key=when.get)[-SLEEP_BASELINES_NEWEST:])
+        # Pruned by age only, never by which runs are running.
+        cutoff = datetime.now(UTC) - SLEEP_BASELINES_KEEP
         keep = {name: value for name, value in baselines.items()
-                if oldest is None or name in newest or when[name] >= oldest}
+                if datetime.fromisoformat(name.split("@", 1)[1]) >= cutoff}
         descriptor, temporary = tempfile.mkstemp(dir=root, prefix=f".{SLEEP_BASELINES_FILE}.")
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(keep, stream)
@@ -623,8 +654,7 @@ def slept_seconds(since: datetime) -> float:
     also compares its sleep-since-boot clock with its value at ``since``.
     Elsewhere a sleep-counting clock offset is compared with its value at
     ``since``, recorded in the machine data root by the first read at that point.
-    The sleep ledger (``sleep_ledger``) reads it from its previous reading and
-    from each window's own start, inside one consistent snapshot.
+    Only the gate tick reads it (``sleep_credit``), from the previous tick's time.
     """
     if sys.platform == "darwin":
         # The kernel's last sleep pair, and the cumulative sleep since boot: the pair alone

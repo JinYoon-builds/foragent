@@ -9,13 +9,14 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import BASE_TIME, git_command
-from foragent import orch_reinstall
+from foragent import orch_reinstall, tool_install
 from foragent.git import GitError, GitRepo
 from foragent.state import StateStore
 
 
 @pytest.fixture
 def reinstall(git_history, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
     history = git_history
     history.update({
         "pyproject.toml": '[project]\nname = "foragent"\n',
@@ -24,23 +25,32 @@ def reinstall(git_history, tmp_path, monkeypatch):
     })
     ctx = SimpleNamespace(git=GitRepo(history.clone), store=StateStore(tmp_path / "state"),
                           now=lambda: BASE_TIME)
-    package = tmp_path / "tools/foragent/lib/python3.12/site-packages/foragent"
     calls = []
+    case = SimpleNamespace(ctx=ctx, history=history, calls=calls)
+    bin_dir = tmp_path / "bin"
 
-    def uv(args, *, cwd):
+    def uv(args, *, cwd, env=None):
         calls.append((args, cwd))
         if args[:2] == ["tool", "install"]:
+            assert args[2] == "--force" and "--reinstall" not in args
+            case.package = Path(env["UV_TOOL_DIR"]) / "foragent/lib/python3.12/site-packages/foragent"
             # Like setup.py, the build writes metadata into the source tree.
             source = Path(args[-1]) / "src/foragent"
             (source / "_build.py").write_text(f"GIT_SHA = '{history.tip}'\n")
-            shutil.copytree(source, package)
+            shutil.copytree(source, case.package)
+            for name in tool_install.ENTRY_POINTS:
+                shim = Path(env["UV_TOOL_BIN_DIR"]) / name
+                shim.parent.mkdir(parents=True, exist_ok=True)
+                shim.write_text("installed")
         else:
-            assert args == ["tool", "dir"]
-        return str(tmp_path / "tools")
+            assert args == ["tool", "dir", "--bin"]
+        return str(bin_dir)
 
     monkeypatch.setattr(orch_reinstall, "_uv", uv)
+    monkeypatch.setattr(tool_install.psutil, "process_iter", lambda *a, **kw: iter(()))
+    case.uv = uv
     before = git_command(history.clone, "worktree", "list", "--porcelain")
-    yield SimpleNamespace(ctx=ctx, history=history, package=package, uv=uv, calls=calls)
+    yield case
     assert git_command(history.clone, "worktree", "list", "--porcelain") == before
     assert not (history.clone / "pyproject.toml").exists()
     for _, worktree in calls:
@@ -55,9 +65,9 @@ def failures(case):
 def test_build_metadata_and_python_caches_match_merged_base(reinstall, monkeypatch, capsys):
     c = reinstall
 
-    def uv(args, *, cwd):
-        result = c.uv(args, cwd=cwd)
-        if args == ["tool", "dir"]:
+    def uv(args, *, cwd, env=None):
+        result = c.uv(args, cwd=cwd, env=env)
+        if args[:2] == ["tool", "install"]:
             cache = c.package / "__pycache__"
             cache.mkdir()
             (cache / "__init__.cpython-312.pyc").write_bytes(b"cache")
@@ -77,9 +87,9 @@ def test_identical_init_does_not_hide_package_differences(reinstall, monkeypatch
     filename = "data/settings.json" if change in {"changed", "missing"} else (
         "data/stale.json" if change == "extra" else "_build.py")
 
-    def uv(args, *, cwd):
-        result = c.uv(args, cwd=cwd)
-        if args == ["tool", "dir"]:
+    def uv(args, *, cwd, env=None):
+        result = c.uv(args, cwd=cwd, env=env)
+        if args[:2] == ["tool", "install"]:
             path = c.package / filename
             if change == "missing":
                 path.unlink()
@@ -99,15 +109,15 @@ def test_identical_init_does_not_hide_package_differences(reinstall, monkeypatch
 def test_installed_package_must_be_found_unambiguously(reinstall, monkeypatch, capsys, layout):
     c = reinstall
 
-    def uv(args, *, cwd):
-        result = c.uv(args, cwd=cwd)
-        if args == ["tool", "dir"]:
+    def uv(args, *, cwd, env=None):
+        result = c.uv(args, cwd=cwd, env=env)
+        if layout == "empty-tool-dir" and args == ["tool", "dir", "--bin"]:
+            return ""
+        if args[:2] == ["tool", "install"]:
             if layout == "missing":
                 shutil.rmtree(c.package)
             elif layout == "ambiguous":
                 shutil.copytree(c.package, c.package.parents[2] / "python3.13/site-packages/foragent")
-            else:
-                return ""
         return result
 
     monkeypatch.setattr(orch_reinstall, "_uv", uv)

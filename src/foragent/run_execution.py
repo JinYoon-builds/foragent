@@ -11,7 +11,7 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board, sleep_ledger, usage_events, usage_recheck
+from foragent import board, cuts, usage_events, usage_recheck
 from foragent.actions import flag
 from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
@@ -62,8 +62,7 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         nonlocal size
         current = log.stat().st_size if log.exists() else 0
         if current > size:
-            # An awake event: a sleep ledger reading's own moment (#415).
-            timestamp = sleep_ledger.mark(ctx.now).astimezone(UTC).isoformat()
+            timestamp = ctx.now().astimezone(UTC).isoformat()
             ctx.store.update_run(n, last_progress_at=timestamp, last_activity_at=timestamp)
         size = current
 
@@ -79,9 +78,7 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         result = ctx.poll_hook(execute, poll)
         result.usage = usage  # filled in ``finally`` once the log is complete
         if log.exists():
-            with log.open("rb") as stream:
-                stream.seek(max(offset, log.stat().st_size - 16000))
-                result.log_tail = stream.read().decode("utf-8", errors="replace")[-4000:]
+            result.log_tail = cuts.read_tail(log, offset, 4000, "executor", cuts.issue_dir(ctx.store.root, n))
         return result
     finally:
         poll()
@@ -130,6 +127,9 @@ def _available_executor(
             raise
 
     name = resolved_reviewer(ctx.config) if reviewer else ctx.config.executor
+    # Feedback saved for this turn stays until the implementer has actually received it.
+    saved = ctx.store.get_run(n)
+    pending, pending_whole = (saved.resume_reason, saved.resume_whole) if session_body is not None else ("", False)
     while True:
         run = ctx.store.get_run(n)
         # Another run may have hit this executor's usage limit; never launch it before the reset.
@@ -178,7 +178,9 @@ def _available_executor(
                 session_ids=[*run.session_ids, *([identity] if identity is not None else [])],
                 session_body=(session_body if result.session_id is not None or (
                     result.exit_code == 0 and not result.timed_out
-                ) else run.session_body), resume_reason=reason,
+                ) else run.session_body),
+                resume_reason=(f"{pending}\n\n{reason}" if pending else reason) if reason else "",
+                resume_whole=bool(reason and pending and pending_whole),
             )
             if reason:
                 resume_prompt = (resume_prompt or "") + "\n\n" + reason

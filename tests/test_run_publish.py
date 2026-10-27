@@ -49,7 +49,7 @@ def test_base_only_paths_merged_during_ci_do_not_retarget_the_pr(run_case, monke
 
 
 def test_parallel_self_merges_cannot_install_an_older_tree_last(run_case, monkeypatch, tmp_path, capsys):
-    from foragent import orch_reinstall, runner
+    from foragent import runner, tool_install
 
     c = run_case
     c.history.update({
@@ -64,7 +64,9 @@ def test_parallel_self_merges_cannot_install_an_older_tree_last(run_case, monkey
     for pr in (3, 4):
         c.tracker.set_pr_files(pr, ["feature.txt", "src/foragent/__init__.py"])
         c.tracker.set_pr_checks(pr, "pass")
-    package = tmp_path / "tools/foragent/lib/python3.12/site-packages/foragent"
+    packages = []
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(tool_install.psutil, "process_iter", lambda *a, **kw: iter(()))
     first_captured, release_first = threading.Event(), threading.Event()
     local = threading.local()
     holder = [None]
@@ -96,17 +98,23 @@ def test_parallel_self_merges_cannot_install_an_older_tree_last(run_case, monkey
         git_command(c.history.origin, "update-ref", "refs/heads/main", kwargs["expected_head_sha"])
         c.history.tip = kwargs["expected_head_sha"]
 
-    def uv(args, *, cwd):
+    def uv(args, *, cwd, env=None):
         if args[:2] == ["tool", "install"]:
             if local.number == 1:
                 # _reinstall has already captured A's source at this point.
                 first_captured.set()
                 assert release_first.wait(10)
-            shutil.copytree(Path(args[-1]) / "src/foragent", package, dirs_exist_ok=True)
+            package = Path(env["UV_TOOL_DIR"]) / "foragent/lib/python3.12/site-packages/foragent"
+            shutil.copytree(Path(args[-1]) / "src/foragent", package)
+            packages.append(package)
+            for name in tool_install.ENTRY_POINTS:
+                shim = Path(env["UV_TOOL_BIN_DIR"]) / name
+                shim.parent.mkdir(parents=True, exist_ok=True)
+                shim.symlink_to(package / "__init__.py")
             installed.append(local.number)
         else:
-            assert args == ["tool", "dir"]
-        return str(tmp_path / "tools")
+            assert args == ["tool", "dir", "--bin"]
+        return str(tmp_path / "bin")
 
     def install_and_verify(*args):
         try:
@@ -120,7 +128,7 @@ def test_parallel_self_merges_cannot_install_an_older_tree_last(run_case, monkey
     monkeypatch.setattr(c.executor, "run", implement)
     monkeypatch.setattr(c.store, "merge_lock", observed_lock)
     monkeypatch.setattr(c.tracker, "merge_pr", merge_into_main)
-    monkeypatch.setattr(orch_reinstall, "_uv", uv)
+    monkeypatch.setattr(tool_install, "run_uv", uv)
     monkeypatch.setattr(runner, "after_merge", install_and_verify)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(run_issue, 1, c.ctx)
@@ -132,6 +140,8 @@ def test_parallel_self_merges_cannot_install_an_older_tree_last(run_case, monkey
         finally:
             release_first.set()
     assert installed == [1, 2]
+    package = packages[-1]
+    assert (tmp_path / "bin/fa").resolve() == package / "__init__.py"
     assert (package / "__init__.py").read_text() == git_command(
         c.history.origin, "show", "main:src/foragent/__init__.py",
     ) + "\n"
