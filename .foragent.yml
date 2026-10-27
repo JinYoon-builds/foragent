@@ -53,7 +53,7 @@ lanes:
     - src/foragent/i18n*.py
     agent: fa-view
     skills:
-    - toss-ux-writing
+    - fa-ux-copy
     - principle-prove-it-works
     - principle-fix-root-causes
   board:
