@@ -19,6 +19,14 @@ NOW = datetime(2026, 10, 20, 9, tzinfo=UTC)
 BODY = "## Done when\n```sh\ntrue\n```\n"
 
 
+class FixedClock(datetime):
+    """The fakes' clock for a command: the real one moves fixtures merged at NOW out of time windows."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return NOW if tz else NOW.replace(tzinfo=None)
+
+
 class FakeGit:
     def __init__(self):
         self.fetches = []
@@ -590,14 +598,7 @@ def test_inspect_empty_output(app, capsys, json_output):
 def test_inspect_renders_card_prepared_results_and_language(app, monkeypatch, capsys, json_output):
     root, git, tracker, store, _ = app
     monkeypatch.setattr(cli, "load_config", lambda root: Config(language="ko"))
-
-    class Clock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return NOW if tz else NOW.replace(tzinfo=None)
-
-    # The merge happens at NOW; inspect reads its last-7-days window from the CLI clock.
-    monkeypatch.setattr(cli, "datetime", Clock)
+    monkeypatch.setattr(cli, "datetime", FixedClock)  # The PR merged at NOW is inside inspect's 7-day window.
     card = "## What changed\n합계 표시\n## Try it\nkind: cli\n```sh\necho 합계:3\n```\n## Expect\n합계:3"
     number = tracker.create_pr(head="foragent/issue-7", base="main", title="합계", body="## Try it\n\n" + card)
     tracker.merge_pr(number, expected_head_sha=tracker.pr_head_sha(number))

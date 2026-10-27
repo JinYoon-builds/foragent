@@ -5,10 +5,11 @@ Between work, the gate runs a lane's *dream*: the lane's implementer tidies its 
 name) on branch `foragent/dream-<lane>`. A dream that changed the memory opens or updates a PR
 titled `Lane <lane> memory: <date>`. Its `dream-done` event in `fa orch log` names the PR.
 
-- A dream PR is ready to merge when its CI passes and its diff touches only that lane's memory
-  directory: every path in `gh pr diff PR --name-only` starts with `.claude/agent-memory/<memory dir>/`.
-  Merge it through the merge procedure in SKILL.md (`fa orch premerge PR --json`, then
-  `fa orch merge PR ...`).
+- Dream PRs are the exception to SKILL.md's human merge rule (decision in issue #189, 2026-10-27):
+  merge an open dream PR yourself, without asking the person, once its CI passes and its diff
+  touches only that lane's memory directory (every path in `gh pr diff PR --name-only` starts with
+  `.claude/agent-memory/<memory dir>/`). Run
+  `fa orch merge PR --approved-by "$(gh api user --jq .login)"`, your own gh login.
 - A dream PR whose diff touches anything else is not a memory edit: do not merge it; close it with
   a one-line reason.
 - The dream records its own completion (`fa lanes dreamed <lane>` does the same by hand), so the

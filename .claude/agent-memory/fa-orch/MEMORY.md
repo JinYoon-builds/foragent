@@ -174,8 +174,15 @@
 - [#189 lane dream](project_189_lane_dream.md) — dream Run records, dream-done event, budget demand, offline-test traps
 - #693: park/unpark 본체는 `orch_park.py`, CLI는 `commands/_orch_park.py`(orch.py run에서 ctx 만든 뒤 분기). 시간 초과는 `parked_at() > since`면 생략. 인수 시험 1은 라벨 제거만으로 통과하므로 경계는 `tests/test_orch_park_unit.py`가 local_issues를 교체해 확인.
 - [#716 role agents](project_716_role_agents.md) — architect prompt/skill split, --agent launches, pstack test pins refactor.md
+- #421: 리뷰 라운드·지적 종류는 `orch_facts_reviews.attach()`. `_freeze`가 `runs/issue-*/review-*.txt`를 `shutil.copy2`로 mtime 보존 복사(실행 귀속 기준). human은 test_orch_facts가 5블록을 강제해 Runs 블록 안에 줄을 넣는다.
+- #421 리뷰: 리뷰 원문은 UNUSABLE이어도 VERDICT 줄이 남는다(시간 초과·패널 실패 "Reviewer 1:\nVERDICT: ..."). 판정은 `orch-events.jsonl`의 kind=review(issue·round·verdict)를 쓰고, 파일 저장 직후 기록되므로 mtime 이후 첫 이벤트를 고른다(같은 round의 앞선 orchestrator PASS 제외). 기록 없는 옛 파일만 원문 파싱.
+- #421 2차 리뷰: review 이벤트 중 `source: orchestrator`는 파일 없이 다음 round 번호를 쓰므로 파일 짝짓기에서 뺀다. SPEC-CONFLICT 기록은 리뷰어 판정을 잃었으므로 runner `_journal_review`에 `review_verdict` 필드를 더했다(기존 시험은 verdict만 봄). 옛 SPEC-CONFLICT는 원문 판정.
 - [#449 overlap facts](project_449_overlap_facts.md) — file_conflicts in orch_facts_runs, 30-line human cap, zsh array for test lists
+- #421 3차: 지적 추출은 `run_review.code_review_findings()`(parse_code_review에서 꺼낸 공용 함수, JSON 객체를 그대로 반환)를 쓴다. 판정은 라운드를 셀지만 정하고 PASS의 path:line 지적도 센다. 형식 판별을 facts에서 다시 구현하지 않는다.
 - [#650 wake grace](project_650_wake_grace.md) — wake-grace.json beside sleep baseline, per-run activity ends it, sleep_wake line
 - [#226 review NOTE lines](project_226_review_notes.md) — review_notes.py, break-it rule, SKILL.md 150-line pitfalls
 - #445: facts 실행 행의 `comparison`은 `Run.comparison`(#442가 `update_run(comparison=...)`로 저장)을 `_row()`에서 그대로 복사, 없으면 null. zsh에서 `$files` 목록은 `${=files}`로 나눠야 pytest에 넘어간다. facts 관련 시험 287개 중 74개는 변경 전에도 같은 ID로 실패(다른 이슈 범위).
+- #421 main 동기화: main(#226)이 `review_notes.strip()`으로 NOTE 줄을 지적에서 뺀다. 공용 `code_review_findings()` 첫 줄에서 strip하고, facts의 class 줄 탐색도 `note_text()`로 NOTE를 건너뛴다. `NOTE:src/a.py:3 — x`(콜론 뒤 공백 없음)은 FINDING_LINE에 걸리므로 시험에 쓴다.
 - 상태 설계(D95)는 제품 스킬 `fa-state-design`(쓰는 곳 하나·저장 대신 계산·덮어쓰기 대신 덧붙이기)에 일반 규칙으로 있다. 이 저장소 사례: #370 정지는 실행기 혼자 맡는 얇은 호출로 끝났고(정지 경로가 둘이면 매번 새 경합), #415 수면 시간은 tick의 `sleep_credit.credit()` 하나만 기록해 끝났다([[project-415-sleep-ledger]]), #154 대화 생존 판정은 공유 함수 하나가 open·closed·unknown을 돌려주고 구조화된 증거가 있을 때만 closed로 본다. 같은 영역에서 보류가 두 번이면 지적 자리를 고치지 말고 각 상태의 쓰는 곳을 다시 정한다.
+- 시간 폭탄(2026-10-27): `tests/test_cli.py` 가짜 tracker·store는 고정 `NOW`(10-20)인데 inspect 명령 시계는 `cli.datetime.now`(실제)라 7일 창을 벗어나 CI가 깨졌다. fixture 전체 고정은 실제 시계를 기대하는 mark-seen 시험을 깨므로 해당 시험에만 `FixedClock`을 쓴다. 고정 시각 fixture를 쓰는 CI 실패는 먼저 main 소스로 재현해 본다.
+- 모듈 줄 수: `tests/acceptance/test_cli_split.py`가 `src/foragent/*.py`와 `commands/`에 300줄 상한을 건다(run_*.py는 test_runner_split의 600). orch_facts.py는 상한 근처라 새 기능은 helper 모듈(`orch_facts_reviews.human_lines`)에 둔다.

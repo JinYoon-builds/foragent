@@ -14,31 +14,61 @@ if TYPE_CHECKING:
     from foragent.scheduler import TickContext, TickReport
 
 
-def dream_liveness(run) -> bool | None:
-    """True when the dream's process is confirmed alive, False when confirmed gone, None when unknown.
+def process_alive(pid: int | None, start_time: float | None, table) -> bool | None:
+    """The one identity rule for a dream's recorded process: True alive, False gone, None unknown.
 
-    An unreadable process, an unavailable listing or a record without a pid never proves death.
+    A process is alive only when its pid exists with the recorded start time; a reused pid
+    (another start time) is gone. A null start time (none could be read at launch, so no
+    identity was recorded) means alive when the pid exists. An unreadable pid is unknown.
     """
-    from foragent import processes
     from foragent.scheduler_stop import _pid_exists
 
-    if run is None or run.status != "running":
+    if pid is None:
         return False
-    if run.pid is None:
-        return None
+    unreadable = getattr(table, "unreadable", frozenset())
+    if start_time is None:
+        return pid in unreadable or _pid_exists(pid)
+    for row in table:
+        if row.pid == pid:
+            return row.start_time == start_time
+    return None if pid in unreadable else False
+
+
+def _table():
+    from foragent import processes
+
     try:
-        table = processes.list_processes()
+        return processes.list_processes()
     except (OSError, PermissionError):
         return None
-    unreadable = getattr(table, "unreadable", frozenset())
-    identities = {item["pid"]: item["start_time"] for item in run.process_identities}
-    if run.pid in identities:
-        if any(row.pid == run.pid and row.start_time == identities[run.pid] for row in table):
-            return True
-        return None if run.pid in unreadable else False
-    if run.pid in unreadable:
+
+
+def _starts(run) -> dict[int, float]:
+    return {item["pid"]: item["start_time"] for item in run.process_identities}
+
+
+def dream_liveness(run) -> bool | None:
+    """Whether the dream's worker lives (``process_alive``); a record without a pid is unknown."""
+    if run is None or run.status != "running":
+        return False
+    if run.pid is None or (table := _table()) is None:
         return None
-    return _pid_exists(run.pid)
+    return process_alive(run.pid, _starts(run).get(run.pid), table)
+
+
+def _remaining(run) -> bool | None:
+    """Whether anything of the dream lives: worker, executor group leader, its members, recorded tree."""
+    if (table := _table()) is None:
+        return None
+    starts = _starts(run)
+    results = [process_alive(pid, starts.get(pid), table) for pid in {run.pid, run.executor_pgid, *starts}]
+    group = run.executor_pgid
+    if group is not None:
+        leader = process_alive(group, starts.get(group), table)
+        # Members of a group whose leader pid now belongs to another process are not ours.
+        reused = leader is False and any(row.pid == group for row in table)
+        results.append(not reused and any(row.pgid == group and row.pid != group for row in table))
+    return True if True in results else None if None in results else False
 
 
 def _maybe_ours(uid: int | None) -> bool:
@@ -68,18 +98,6 @@ def _worker_listed(lane: str) -> bool | None:
     return False
 
 
-def _recorded_unreadable(run) -> bool:
-    """Whether any recorded process of the dream is unreadable now (so its absence is unknown)."""
-    from foragent import processes
-
-    try:
-        unreadable = getattr(processes.list_processes(), "unreadable", frozenset())
-    except (OSError, PermissionError):
-        return True
-    recorded = {run.pid, run.executor_pgid, *(item["pid"] for item in run.process_identities)}
-    return bool(recorded & unreadable)
-
-
 def _stop(ctx: TickContext, run, report: TickReport) -> bool:
     """Stop the dream's recorded tree (worker and executor); True only once all of it is confirmed gone.
 
@@ -87,7 +105,6 @@ def _stop(ctx: TickContext, run, report: TickReport) -> bool:
     in the recorded tree, so the killer may stop the executor and leave the worker alive.
     """
     from foragent import processes
-    from foragent.scheduler_stop import _run_processes_exist
 
     refusal = None
     try:
@@ -97,11 +114,8 @@ def _stop(ctx: TickContext, run, report: TickReport) -> bool:
                     ctx.kill_runner(pid)
     except (ValueError, PermissionError, TimeoutError) as exc:
         refusal = exc
-    try:
-        if not _recorded_unreadable(run) and not _run_processes_exist(run):
-            return True  # Nothing of the dream is left, confirmed by a full read.
-    except PermissionError:
-        pass  # An unreadable table cannot prove death.
+    if _remaining(run) is False:
+        return True  # Nothing of the dream is left, confirmed by one full read (process_alive).
     reason = f"stop refused: {refusal}" if refusal is not None else "still running after the stop"
     report.actions.append(f"lane {run.lane} dream {' '.join(reason.split())[:200]}")
     return False

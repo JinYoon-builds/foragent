@@ -361,3 +361,47 @@ def test_active_dreams_are_no_issue_rows_or_issue_logs(world):
             if isinstance(state, list) for item in state]
     assert not any(isinstance(item, dict) and item.get("number") == 0 for item in rows)
     assert collected["summary"]["working"] == 1
+
+
+def test_reused_worker_pid_finishes_the_dream_as_error_and_the_lane_is_due(world):
+    world.store.start_run(3, branch="b", worktree="w", lane="orch")
+    world.store.finish_run(3, outcome="merged")
+    dreaming(world)  # Worker 4100 recorded with start time 1.0.
+    world.table[0] = processes.ProcessTable([row(4100, start=9.0)])  # Same pid, another process.
+    world.alive[4100] = True  # os.kill(4100, 0) succeeds for the reused pid.
+    sent = []
+
+    def kill(pid):  # The recorded identity no longer matches, so nothing is signaled.
+        assert processes._recorded_tree.get() is not None
+        sent.append(pid)
+
+    world.ctx.kill_runner = kill
+    assert orch_dream_stop.dream_liveness(world.store.get_dream("orch")) is False
+    orch_dream.recover(world.ctx, world.store.get_dream("orch"), SimpleNamespace(actions=[]))
+    finished = world.store.get_dream("orch")
+    assert finished.status == "finished" and finished.outcome == "error"
+    assert world.removed, "the dead dream's worktree is removed"
+    assert orch_dream.dream_due(world.store, world.config, SimpleNamespace(list_open_issues=lambda: []),
+                                world.clock[0]) == ["orch"]
+    assert orch_dream.dreamed_command(world.store, world.config, "orch") == 0
+
+
+def test_reused_executor_group_is_not_the_dreams(world):
+    dreaming(world, executor=4200)
+    world.store.update_dream("orch", process_identities=[{"pid": 4200, "start_time": 2.0}])
+    reused = [row(4200, start=7.0), SimpleNamespace(pid=4201, start_time=7.5, argv=(), ppid=4200, pgid=4200,
+                                                     sid=4200, uid=None)]
+    world.table[0] = processes.ProcessTable(reused)
+    world.alive.update({4200: True, 4201: True})
+    assert orch_dream_stop._remaining(world.store.get_dream("orch")) is False
+    world.table[0] = processes.ProcessTable([reused[1]])  # The leader exited; its member is still ours.
+    assert orch_dream_stop._remaining(world.store.get_dream("orch")) is True
+
+
+def test_null_start_time_means_alive_while_the_pid_exists(world):
+    run = dreaming(world, identities=False)
+    world.alive[4100] = True
+    assert orch_dream_stop.dream_liveness(run) is True
+    assert orch_dream.dreamed_command(world.store, world.config, "orch") == 2
+    world.alive[4100] = False
+    assert orch_dream_stop.dream_liveness(run) is False
