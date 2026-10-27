@@ -237,6 +237,10 @@ class CodexExecutor:
                           error_kind=error_kind, session_id=session_id, num_turns=turns)
 
 
+# A headless session that backgrounds a long command ends its turn and stalls (#712, #466).
+CLAUDE_SESSION_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+
+
 class ClaudeExecutor:
     def run(
         self, *, worktree: Path, prompt: str, model: str | None,
@@ -267,6 +271,7 @@ class ClaudeExecutor:
         code, timed_out, _ = run_logged(
             command, cwd=worktree, prompt=None if review_level is not None else prompt, timeout_s=timeout_s,
             log_path=log_path, capture_stdout=True, stdout_path=output_path,
+            env=CLAUDE_SESSION_ENV,
         )
         result = claude_stream_result(output_path) if review_level is None else {}
         value = result.get("result")
