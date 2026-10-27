@@ -34,7 +34,7 @@ def test_exact_defaults(repo):
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
         "interview": "native", "ouroboros_version": None, "profile": None, "update_check": True,
-        "upstream_reports": None, "perspectives": {},
+        "upstream_reports": None, "perspectives": {}, "claude_quota": {"mode": "keep", "keep_percent": 80},
         "skill_roles": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,

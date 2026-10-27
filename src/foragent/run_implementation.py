@@ -38,9 +38,12 @@ if TYPE_CHECKING:
 def lane_config(config: Config, lane: str) -> Config:
     """The configuration a run on this lane uses: the lane's executor and model win."""
     settings = config.lanes.get(lane, {}) if lane != "main" else {}
+    reviewer = settings.get("reviewer") or config.reviewer
     return replace(
         config, executor=settings.get("executor") or config.executor,
         executor_model=settings.get("model") if settings.get("model") is not None else config.executor_model,
+        # A lane-pinned reviewer wins; the global reviewer model belongs to the global reviewer only.
+        reviewer=reviewer, reviewer_model=config.reviewer_model if reviewer == config.reviewer else None,
     )
 
 

@@ -6,13 +6,13 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, orch_queue, overlap_files, scheduler
+from foragent import machine_budget, orch_queue, overlap_files, scheduler, scheduler_quota
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
     machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
 )
-from foragent.config import lane_executors
+from foragent.config import resolved_reviewer
 from foragent.issue import parse_body
 from foragent.orch_tick_outcome import step, timed  # noqa: F401
 from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
@@ -24,9 +24,12 @@ if TYPE_CHECKING:
 
 def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
     """A lane waits while it, its implementer or its reviewer is paused for a usage limit."""
-    if ctx.store.lane_paused(lane, now):
+    config, reason = scheduler_quota.lane_start(ctx.store, ctx.config, lane, now)
+    # Lane pauses mirror a limit of the lane's configured pair; a keep-mode switch
+    # starts another pair, so only that pair's executor pauses hold it (#107).
+    if reason is None and ctx.store.lane_paused(lane, now):
         return True
-    return any(ctx.store.executor_paused(name, now) for name in lane_executors(ctx.config, lane))
+    return any(ctx.store.executor_paused(name, now) for name in {config.executor, resolved_reviewer(config)})
 
 
 def _apply_budgets(
@@ -218,10 +221,13 @@ def _start_ready(
             ctx.store.finish_run(number, "limit-wait", detail=str(exc))
             report.skipped = f"GitHub rate limit until {until.isoformat()}"
             return None
+        config, reason = scheduler_quota.lane_start(ctx.store, ctx.config, lane, ctx.now())
         ctx.store.start_run(
             number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
-            tier=scheduler.issue_size(issue.labels),
+            tier=scheduler.issue_size(issue.labels), implementer=config.executor if reason else None,
         )
+        if reason:  # Keep mode holds Claude back: this run implements with Codex (#107).
+            report.actions.append(scheduler_quota.record_switch(ctx.store, ctx.now(), number, reason, ctx.config.language))
         ctx.store.clear_run_start(number)
         pid = ctx.launcher(number)
         ctx.store.update_run(number, pid=pid)

@@ -90,6 +90,8 @@ class Config:
     upstream_reports: bool | None = None
     # Order perspective seat -> executor (#414); unnamed seats use the built-in split.
     perspectives: dict[str, str] = field(default_factory=dict)
+    # Claude plan share (#107): keep starts no Claude implementer at keep_percent; burn runs to the limit.
+    claude_quota: dict[str, Any] = field(default_factory=lambda: {"mode": "keep", "keep_percent": 80})
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
@@ -431,6 +433,9 @@ def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
             **previous, **{name: {**(previous[name] if isinstance(previous.get(name), dict) else {}), **tier}
                            if isinstance(tier, dict) else tier for name, tier in tiers.items()},
         }}
+    quota = overrides.get("claude_quota")
+    if isinstance(quota, dict) and isinstance(values["claude_quota"], dict):
+        overrides = {**overrides, "claude_quota": {**values["claude_quota"], **quota}}
     values.update(overrides)
 
 
@@ -513,7 +518,8 @@ def resolved_reviewer(config: Config) -> str:
 def lane_executors(config: Config, lane: str) -> set[str]:
     """The implementer and reviewer a lane uses; an unset reviewer follows the lane's implementer."""
     settings = config.lanes.get(lane, {}) if lane != "main" else {}
-    lane_config = replace(config, executor=settings.get("executor") or config.executor)
+    lane_config = replace(config, executor=settings.get("executor") or config.executor,
+                          reviewer=settings.get("reviewer") or config.reviewer)
     return {lane_config.executor, resolved_reviewer(lane_config)}
 
 
