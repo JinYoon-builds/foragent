@@ -20,7 +20,7 @@ class RunRecordsMixin:
 
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
-        lane: str = "main", tier: str = "m", implementer: str | None = None,
+        lane: str = "main", tier: str = "m", implementer: str | None = None, journal: Any = None,
     ) -> Run:
         """Create a run; pid attests self or a newly spawned, unreaped child."""
         with self._state_lock():
@@ -57,6 +57,8 @@ class RunRecordsMixin:
                       last_activity_at=timestamp, process_identities=identities, implementer=implementer, **session)
             self._merge_lock_seconds.pop((number, timestamp), None)
             self._write_run(run)
+            if journal is not None:  # The audit event of this record (#107), under the same lock.
+                journal()
             return run
 
     def prepare_run_start(self, number: int) -> None:

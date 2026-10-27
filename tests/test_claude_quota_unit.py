@@ -235,3 +235,120 @@ def test_lane_reviewer_value_is_validated(tmp_path):
     (tmp_path / ".foragent.yml").write_text(yaml.safe_dump({"lanes": {"ui": {"reviewer": "gpt"}}}))
     with pytest.raises(ConfigError, match=r"lanes\.ui\.reviewer"):
         load_config(tmp_path, global_path=tmp_path / "missing.yml")
+
+
+@pytest.mark.parametrize("outcome", ["limit-wait", "crashed", "stalled-restart"])
+def test_continued_switched_run_keeps_its_implementer(tmp_path, outcome):
+    from foragent.scheduler_quota import run_start
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    store.start_run(1, branch="foragent/issue-1", worktree=tmp_path / "w", implementer="codex")
+    store.finish_run(1, outcome)
+    store.set_claude_quota_mode("burn")  # Claude is allowed again; the run still keeps Codex.
+    config, implementer, reason = run_start(store, Config(executor="claude"), "main", 1, NOW)
+    assert (config.executor, config.reviewer, implementer, reason) == ("codex", "claude", "codex", None)
+
+
+def test_finished_run_chooses_afresh(tmp_path):
+    from foragent.scheduler_quota import run_start
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    store.start_run(1, branch="foragent/issue-1", worktree=tmp_path / "w", implementer="codex")
+    store.finish_run(1, "merged")
+    config, implementer, reason = run_start(store, Config(executor="claude"), "main", 1, NOW)
+    assert (config.executor, implementer, reason) == ("claude", None, None)
+
+
+def test_tick_restart_after_limit_wait_keeps_codex_without_a_new_switch(ctx):
+    ctx.config = replace(ctx.config, executor="claude")
+    ctx.start_runs = True
+    usage(ctx.store, 81.0)
+    approve(ctx, 1)
+    tick(ctx)
+    ctx.store.finish_run(1, "limit-wait")
+    ctx.process_table.exit(7001)
+    ctx.tracker.remove_labels(1, ["running"])
+    ctx.tracker.add_labels(1, ["ready"])
+    usage(ctx.store, 5.0)  # Claude's share has reset.
+    tick(ctx)
+    run = ctx.store.get_run(1)
+    assert run.status == "running" and run.implementer == "codex"
+    assert len([event for event in events(ctx.store) if event["kind"] == "executor-switch"]) == 1
+
+
+def test_tick_restart_of_kept_codex_run_waits_while_codex_is_paused(ctx):
+    ctx.config = replace(ctx.config, executor="claude")
+    ctx.start_runs = True
+    usage(ctx.store, 81.0)
+    approve(ctx, 1)
+    tick(ctx)
+    ctx.store.finish_run(1, "limit-wait")
+    ctx.process_table.exit(7001)
+    ctx.tracker.remove_labels(1, ["running"])
+    ctx.tracker.add_labels(1, ["ready"])
+    usage(ctx.store, 5.0)
+    ctx.store.pause_executor("codex", NOW + timedelta(hours=1))
+    tick(ctx)
+    assert ctx.store.get_run(1).outcome == "limit-wait"
+
+
+def test_switch_event_is_written_with_the_run_record(ctx):
+    from foragent.scheduler_quota import Snapshot, Switch, switch_journal
+
+    switch = Switch("Claude keep share 90% >= 80%", "switch_reason_keep", {"percent": "90", "keep": 80})
+    ctx.store.start_run(1, branch="b", worktree="w", implementer="codex",
+                        journal=switch_journal(ctx.store, NOW, 1, switch))
+    [event] = [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
+    assert event["reason"] == switch.reason and ctx.store.get_run(1).implementer == "codex"
+    assert Snapshot(None, 90.0, "keep").claude_paused is False
+
+
+def test_github_limit_during_start_stores_no_unjournaled_switch_then_next_start_records_it(ctx, monkeypatch):
+    from foragent import board
+    from foragent.tracker import TrackerError
+
+    ctx.config = replace(ctx.config, executor="claude")
+    ctx.start_runs = True
+    usage(ctx.store, 85.0)
+    approve(ctx, 1)
+    calls = []
+
+    def limited(context, issue, status, **kwargs):
+        calls.append(status)
+        if calls.count("Running") == 1 and status == "Running":
+            raise TrackerError("API rate limit exceeded (HTTP 403)",
+                               stdout=f"X-RateLimit-Reset: {int((NOW + timedelta(minutes=5)).timestamp())}\r\n")
+
+    monkeypatch.setattr(board, "sync_status", limited)
+    tick(ctx)
+    run = ctx.store.get_run(1)
+    assert run.outcome == "limit-wait" and run.implementer is None
+    assert not [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
+    from foragent.scheduler_quota import run_start
+
+    assert run_start(ctx.store, ctx.config, "main", 1, NOW)[2] is not None, "the next start still switches"
+
+
+def test_usage_changing_between_reads_cannot_break_the_decision(ctx, monkeypatch):
+    from foragent.scheduler_quota import decide
+
+    ctx.config = replace(ctx.config, executor="claude")
+    reads = iter([
+        {"claude": {"windows": [{"name": "five_hour", "used_percent": 90.0,
+                                 "resets_at": (NOW + timedelta(hours=1)).isoformat()}]}},
+    ])
+    later = {"claude": {"windows": [{"name": "five_hour", "used_percent": None, "resets_at": None}]}}
+    monkeypatch.setattr(ctx.store, "usage", lambda: next(reads, later))
+    start = decide(ctx.store, ctx.config, "main", NOW, 1)
+    assert start.implementer == "codex" and start.switch.reason == "Claude keep share 90% >= 80%"
+
+
+def test_korean_report_line_uses_the_registry(ctx):
+    ctx.config = replace(ctx.config, executor="claude", language="ko")
+    ctx.start_runs = True
+    usage(ctx.store, 81.0)
+    approve(ctx, 1)
+    report = tick(ctx)
+    assert "#1은 Claude 대신 Codex로 시작해요: Claude 사용량 81%가 keep 기준 80% 이상이에요" in report.actions
+    [event] = [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
+    assert event["reason"] == "Claude keep share 81% >= 80%"

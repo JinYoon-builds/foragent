@@ -5,11 +5,11 @@ metadata:
   type: project
 ---
 
-- `scheduler_quota.py` holds `claude_allowed`/`claude_percent`/`switch_reason`/`switched_config`/`lane_start`/`record_switch`. `scheduler.py` re-exports `claude_allowed` through its `scheduler_start` import list (facade is 250/250 after main's plan merge).
+- `scheduler_quota.py` holds `claude_allowed`/`claude_percent`, a one-read `Snapshot`, `switch_for`→`Switch(reason, key, values)`, `decide()`→`Start(config, implementer, switch, held)` (used by `_lane_held` and `_start_ready`), and `switch_journal` passed as `start_run(journal=...)` so the run record and its executor-switch event share one state lock. The GitHub-limit branch stores only a kept implementer, never a fresh switch. Report line goes through `switch_reason_keep/limit` messages; the event reason stays English. `scheduler.py` re-exports `claude_allowed` through its `scheduler_start` import list (facade is 250/250 after main's plan merge).
 - Window expiry uses `store._now()` (the injected clock), not real time: the acceptance fixture's five_hour reset (2026-10-22) is already past in real time.
 - Orchestrator answer (2026-10-27): Claude hard-limit pause switches in keep AND burn; reason `Claude paused at its limit until <t>`. `_lane_held` skips a lane pause only when switched and `claude_caused` (Claude paused + lane pair has Claude), leaving the pause file unchanged. Switched runs never write lane pauses (`note_limit`/`hold_lane` get lane=None). Lane `reviewer` key is supported in validation, `lane_config`, `lane_executors`.
 - `_lane_held` checks the switched executor pair, so "Codex paused too → lane waits" and `orch facts` follow it.
-- Tick writes `Run.implementer` once via `start_run(implementer=...)`; runner applies `switched_config(lane_config(...), run.implementer, claude paused)`. Restarts decide afresh.
+- Tick writes `Run.implementer` once via `start_run(implementer=...)`; runner applies `switched_config(lane_config(...), run.implementer, claude paused)`. A continued run (previous outcome limit-wait/crashed/stalled-restart) keeps its stored implementer via `scheduler_quota.run_start`/`kept_implementer` — the tick's GitHub-limit branch and the orphan-crash record in scheduler_recovery pass it too; only implementer None chooses afresh. `_start_ready` also skips a start whose own pair is paused (`pair_paused`).
 - `state_runs.py` is at 298/300 lines: add params on existing lines.
 - `fa init` passes `claude_quota` only when the flag is given (fake `init_repo`s in other tests may not accept it).
 - `tests/acceptance/test_runner_split.py` fails on base (capacity.py, run_publish.py over 600) — not ours.

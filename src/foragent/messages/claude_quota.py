@@ -3,6 +3,8 @@
 MESSAGES = {
     "en": {
         "executor_switch": "#{number} starts with Codex instead of Claude: {reason}.",
+        "switch_reason_keep": "Claude keep share {percent}% >= {keep}%",
+        "switch_reason_limit": "Claude paused at its limit until {until}",
         "quota_mode_status": "Claude quota mode: {mode} (from {source}); keep stops at {keep_percent}%; "
                              "latest Claude usage: {usage}.",
         "quota_usage_unknown": "unknown",
@@ -13,6 +15,8 @@ MESSAGES = {
     },
     "ko": {
         "executor_switch": "#{number}은 Claude 대신 Codex로 시작해요: {reason}",
+        "switch_reason_keep": "Claude 사용량 {percent}%가 keep 기준 {keep}% 이상이에요",
+        "switch_reason_limit": "Claude가 {until}까지 사용 한도로 멈췄어요",
         "quota_mode_status": "Claude 사용 방식: {mode}({source}에서 정함). keep은 {keep_percent}%에서 멈춰요. "
                              "최근 Claude 사용량: {usage}",
         "quota_usage_unknown": "모름",

@@ -159,6 +159,7 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
             issue.number, branch=f"foragent/issue-{issue.number}",
             worktree=ctx.store.worktree_path(issue.number),
             lane=scheduler.issue_lane(issue.labels, ctx.config.lanes),
+            implementer=run.implementer if run is not None else None,  # A crash keeps the run's implementer (#107).
         )
         ctx.store.finish_run(issue.number, outcome="crashed", detail=detail)
     report.actions.append(f"#{issue.number} orphaned running label recovered as crashed")

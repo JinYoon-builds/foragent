@@ -6,8 +6,10 @@ The tick writes a run's ``implementer`` once, when it starts the run.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from foragent.config import Config, resolved_reviewer
 
@@ -52,20 +54,55 @@ def claude_allowed(store: StateStore, config: Config, now: datetime | None = Non
     return percent is None or percent < config.claude_quota["keep_percent"]
 
 
-def switch_reason(store: StateStore, config: Config, now: datetime) -> str | None:
-    """Why a new run on this lane-adjusted ``config`` starts with Codex instead of Claude, or None.
+@dataclass(frozen=True)
+class Switch:
+    """Why one start uses Codex instead of Claude.
+
+    ``reason`` is the fixed English machine reason kept in the event; ``key`` and
+    ``values`` render it for a person through the messages registry.
+    """
+
+    reason: str
+    key: str
+    values: dict
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """Claude's pause, share and mode, each read once for one start decision."""
+
+    claude_until: datetime | None
+    percent: float | None
+    mode: str
+
+    @classmethod
+    def read(cls, store: StateStore, config: Config, now: datetime) -> Snapshot:
+        return cls(store.executor_pause_until("claude", now), claude_percent(store, now), quota_mode(store, config)[0])
+
+    @property
+    def claude_paused(self) -> bool:
+        return self.claude_until is not None
+
+    def paused(self, store: StateStore, name: str, now: datetime) -> bool:
+        return self.claude_paused if name == "claude" else store.executor_paused(name, now)
+
+
+def switch_for(config: Config, snap: Snapshot) -> Switch | None:
+    """The switch a start on this lane-adjusted ``config`` takes, from one snapshot.
 
     Claude paused at its hard limit switches in keep and burn mode alike; keep mode
     also switches once a current Claude window reaches keep_percent.
     """
     if config.executor != "claude":
         return None
-    if (until := store.executor_pause_until("claude", now)) is not None:
-        return f"Claude paused at its limit until {until.isoformat()}"
-    if claude_allowed(store, config, now):
+    if snap.claude_until is not None:
+        until = snap.claude_until.isoformat()
+        return Switch(f"Claude paused at its limit until {until}", "switch_reason_limit", {"until": until})
+    keep = config.claude_quota["keep_percent"]
+    if snap.mode == "burn" or snap.percent is None or snap.percent < keep:
         return None
-    percent = claude_percent(store, now)
-    return f"Claude keep share {percent:g}% >= {config.claude_quota['keep_percent']}%"
+    percent = f"{snap.percent:g}"
+    return Switch(f"Claude keep share {percent}% >= {keep}%", "switch_reason_keep", {"percent": percent, "keep": keep})
 
 
 def switched_config(config: Config, implementer: str | None, claude_paused: bool = False) -> Config:
@@ -74,8 +111,6 @@ def switched_config(config: Config, implementer: str | None, claude_paused: bool
     A reviewer pinned to ``none`` stays; otherwise Claude reviews the switched run
     (cross-model), and Codex only while Claude is paused at its hard limit.
     """
-    from dataclasses import replace
-
     if implementer is None or implementer == config.executor:
         return config
     previous = resolved_reviewer(config)
@@ -86,29 +121,67 @@ def switched_config(config: Config, implementer: str | None, claude_paused: bool
     )
 
 
-def claude_caused(store: StateStore, config: Config, lane: str, now: datetime) -> bool:
-    """A lane pause is Claude's when Claude is paused and the lane's configured pair includes Claude."""
-    from foragent.config import lane_executors
-
-    return store.executor_paused("claude", now) and "claude" in lane_executors(config, lane)
+# A new run record after one of these continues the same run (as ``restarts`` counts it).
+CONTINUED_OUTCOMES = frozenset({"stalled-restart", "crashed", "limit-wait"})
 
 
-def lane_start(store: StateStore, config: Config, lane: str, now: datetime) -> tuple[Config, str | None]:
-    """The config a new gate-started run on ``lane`` uses, and the switch reason when keep mode applies."""
+def kept_implementer(store: StateStore, number: int) -> str | None:
+    """The implementer a continued run keeps; None when the next start chooses afresh."""
+    previous = store.get_run(number)
+    return previous.implementer if previous is not None and previous.outcome in CONTINUED_OUTCOMES else None
+
+
+class Start(NamedTuple):
+    """One start decision: the run's config, stored implementer, switch, and whether its pair waits."""
+
+    config: Config
+    implementer: str | None
+    switch: Switch | None
+    held: bool
+
+
+def decide(store: StateStore, config: Config, lane: str, now: datetime, number: int | None = None) -> Start:
+    """Decide a gate start from one snapshot; ``number`` lets a continued run keep its implementer."""
     from foragent.run_implementation import lane_config
 
+    snap = Snapshot.read(store, config, now)
     adjusted = lane_config(config, lane)
-    reason = switch_reason(store, adjusted, now)
-    if reason is None:
-        return adjusted, None
-    return switched_config(adjusted, "codex", store.executor_paused("claude", now)), reason
+    kept = kept_implementer(store, number) if number is not None else None
+    switch = None if kept is not None else switch_for(adjusted, snap)
+    implementer = kept if kept is not None else ("codex" if switch is not None else None)
+    run_config = switched_config(adjusted, implementer, snap.claude_paused)
+    held = any(snap.paused(store, name, now) for name in {run_config.executor, resolved_reviewer(run_config)})
+    if not held and store.lane_paused(lane, now):
+        # A lane pause mirrors a limit of the lane's configured pair. Only a run that
+        # implements with Codex instead (new or kept) skips a Claude-caused one, leaving it in place.
+        from foragent.config import lane_executors
+
+        claude_caused = snap.claude_paused and "claude" in lane_executors(config, lane)
+        held = not (implementer is not None and claude_caused)
+    return Start(run_config, implementer, switch, held)
 
 
-def record_switch(store: StateStore, now: datetime, number: int, reason: str, language: str) -> str:
-    """Journal one executor-switch event and return the tick report line."""
-    from foragent.i18n import text
+def run_start(store: StateStore, config: Config, lane: str, number: int,
+              now: datetime) -> tuple[Config, str | None, Switch | None]:
+    """The config, stored implementer and switch for a gate start of ``number``.
+
+    A continued run keeps its stored implementer and records no new switch.
+    """
+    start = decide(store, config, lane, now, number)
+    return start.config, start.implementer, start.switch
+
+
+def switch_journal(store: StateStore, now: datetime, number: int, switch: Switch) -> Callable[[], None]:
+    """Write the run's executor-switch event; ``start_run`` calls it under the lock that stores the run."""
     from foragent.orch_events import append_event
 
-    append_event(store, now, number, "executor-switch", f"#{number} implementer claude -> codex: {reason}",
-                 **{"from": "claude", "to": "codex", "reason": reason})
-    return text("executor_switch", language, number=number, reason=reason)
+    return lambda: append_event(store, now, number, "executor-switch",
+                                f"#{number} implementer claude -> codex: {switch.reason}", locked=True,
+                                **{"from": "claude", "to": "codex", "reason": switch.reason})
+
+
+def switch_line(number: int, switch: Switch, language: str) -> str:
+    """The tick report line for a switch, in the repository's language."""
+    from foragent.i18n import text
+
+    return text("executor_switch", language, number=number, reason=text(switch.key, language, **switch.values))
