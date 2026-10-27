@@ -192,17 +192,40 @@ def session_options(config: Config, store: StateStore) -> dict:
             "add_dirs": (store.root,)}
 
 
+def events_path(store: StateStore, started_at: str) -> Path:
+    """The session's JSON events beside its log, as Claude keeps its ``.stdout``."""
+    return log_path(store, started_at).with_suffix(".stdout")
+
+
+MESSAGE_LIMIT = 4000
+
+
+def _keep_message(log: Path, message: str) -> str:
+    """Append the session's final answer to its log; return the tail for the event."""
+    message = message.strip()
+    with log.open("a", encoding="utf-8") as stream:
+        stream.write(f"\n--- architect final message ---\n{message or '(empty)'}\n")
+    return message[-MESSAGE_LIMIT:]
+
+
 def run_session(root: Path, store: StateStore, config: Config, why: str, started_at: str,
                 now) -> int:
     """Run the architect turn in the repository root; append one architect-done event on exit."""
-    code = 1
+    code, message = 1, ""
+    log = log_path(store, started_at)
+    options = session_options(config, store)
+    if config.executor != "claude":
+        options["events_path"] = events_path(store, started_at)
     try:
         result = executors.executor_for(config.executor).run(
             worktree=root, prompt=build_prompt(why), timeout_s=config.max_runtime_minutes * 60,
-            log_path=log_path(store, started_at), **session_options(config, store),
+            log_path=log, **options,
         )
         code = 1 if result.timed_out or result.exit_code is None else result.exit_code
+        message = _keep_message(log, result.full_message or result.last_message or "")
     finally:
-        append_event(store, now(), None, "architect-done", f"exit code {code}",
-                     started_at=started_at, exit_code=code)
+        first = message.splitlines()[0][:200] if message else ""
+        append_event(store, now(), None, "architect-done",
+                     f"exit code {code}" + (f": {first}" if first else ""),
+                     started_at=started_at, exit_code=code, message=message)
     return code

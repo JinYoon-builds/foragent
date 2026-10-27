@@ -211,11 +211,12 @@ class CodexExecutor:
         self, *, worktree: Path, prompt: str, model: str | None,
         timeout_s: int, log_path: Path, effort: str | None = None,
         resume_session_id: str | None = None, read_only: bool = False,
-        add_dirs: tuple[Path, ...] = (),
+        add_dirs: tuple[Path, ...] = (), events_path: Path | None = None,
     ) -> ExecResult:
         with tempfile.TemporaryDirectory(prefix="foragent-codex-") as temporary:
             output_path = Path(temporary) / "last-message.txt"
-            events_path = Path(temporary) / "events.jsonl"
+            # A caller that must keep the session's JSON events names a durable path.
+            events_path = events_path or Path(temporary) / "events.jsonl"
             options = {"resume_session_id": resume_session_id, "prompt": prompt} if resume_session_id is not None else {}
             if read_only:
                 options["read_only"] = True
