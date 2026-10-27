@@ -8,7 +8,7 @@ import yaml
 from test_local_truth import record_gh
 from test_orch_review_handoff import bind_cli, make_case
 from test_skills_autosync import cli_exit, isolated_home
-from test_squirrel_running import plain_frame, running_snapshot, view_offline
+from test_squirrel_running import issue_row, plain_frame, running_snapshot, view_offline
 
 
 def settings_case(git_history, tmp_path, monkeypatch):
@@ -33,15 +33,43 @@ def stored_settings(case, main, capsys):
     return json.loads(capsys.readouterr().out)
 
 
-def test_settings_window_s_opens_three_tabs_with_values_and_one_line_descriptions(
-    git_history, tmp_path, monkeypatch,
-):
-    from foragent.watch import handle_key, settings_view
+def settings_api(*names):
+    from foragent import watch
 
-    case, _ = settings_case(git_history, tmp_path, monkeypatch)
+    for name in names:
+        assert callable(getattr(watch, name, None)), f"the public lane-view settings API must expose {name}"
+    return tuple(getattr(watch, name) for name in names)
+
+
+def readable_settings(case):
+    """The shared helper's dump includes None; load_config requires omitted optionals.
+
+    Keep settings_case unchanged for importers; normalize only these tests' files.
+    """
+    path = case.root / ".foragent.yml"
+    values = yaml.safe_load(path.read_text(encoding="utf-8"))
+    path.write_text(yaml.safe_dump({k: v for k, v in values.items() if v is not None},
+                                   allow_unicode=True), encoding="utf-8")
+
+
+def test_settings_window_s_opens_three_tabs_with_values_and_one_line_descriptions(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    handle_key, settings_view = settings_api("handle_key", "settings_view")
+
+    case, main = settings_case(git_history, tmp_path, monkeypatch)
+    readable_settings(case)
     state = {}
     handle_key("s", case.store, case.config, state=state, repo_root=case.root)
     assert state["settings"] is True
+    capsys.readouterr()
+    assert cli_exit(main, ["settings", "list", "--json", "--repo-root", str(case.root)]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    glyphs = next((item for item in listed if item["key"] == "view_glyphs"), None)
+    assert glyphs is not None, "settings must list view_glyphs"
+    assert glyphs["scope"] == "me" and set(glyphs["choices"]) == {"auto", "emoji", "ascii"}
+    assert glyphs["description"].strip(), "view_glyphs needs a one-line description"
+    assert stored_settings(case, main, capsys)["view_glyphs"] == "auto"
     items = {
         "team": (("머지", "모아서 물어보기"), ("작업자", "claude"), ("리뷰어", "codex")),
         "me": (("언어", "ko"),),
@@ -52,6 +80,10 @@ def test_settings_window_s_opens_three_tabs_with_values_and_one_line_description
         assert isinstance(lines, list) and all(isinstance(line, str) for line in lines)
         rendered = plain_frame("\n".join(lines))
         assert all(label in rendered for label in ("👥 팀", "🙋 나", "💻 이 컴퓨터"))
+        if tab == "me":
+            glyph_rows = [line for line in map(plain_frame, lines) if "auto" in line or "자동" in line]
+            assert glyph_rows, "the personal tab must show the default glyph choice"
+            assert any(row.partition("auto" if "auto" in row else "자동")[2].strip(" │·—:-") for row in glyph_rows), "the glyph choice needs a one-line description"
         for label, value in expected:
             row = next((line for line in map(plain_frame, lines) if label in line and value in line), "")
             assert row, (tab, label, rendered)
@@ -62,10 +94,13 @@ def test_settings_window_team_choice_confirms_once_and_uses_the_cli_setter(
     git_history, tmp_path, monkeypatch, capsys,
 ):
     from foragent import cli, config as config_module
-    from foragent.config import load_config, set_setting
-    from foragent.watch import handle_key
+    from foragent.config import load_config
+    assert callable(getattr(config_module, "set_setting", None)), "CLI and settings window must share config.set_setting"
+    set_setting = config_module.set_setting
+    handle_key, = settings_api("handle_key")
 
     case, main = settings_case(git_history, tmp_path, monkeypatch)
+    readable_settings(case)
     calls, confirmations = [], []
 
     def save(*args, **kwargs):
@@ -101,12 +136,15 @@ def test_settings_window_footer_reflects_review_changes(
     from foragent.watch import render_frame
 
     case, main = settings_case(git_history, tmp_path, monkeypatch)
+    readable_settings(case)
     snapshot, _ = running_snapshot()
-    before = plain_frame(render_frame(snapshot, load_config(case.root), case.root, width=160))
+    before = plain_frame(render_frame(snapshot, load_config(case.root), case.root, width=100))
+    assert issue_row(before, 101).lstrip().startswith(("🐿", "[*]")), "review settings must appear below the one-row lane view"
     assert "머지: 모아서 물어보기" in before.splitlines()[-1]
     assert cli_exit(main, ["settings", "set", "review", "careful", "--repo-root", str(case.root)]) == 0
     assert stored_settings(case, main, capsys)["review"] == "careful"
-    after = plain_frame(render_frame(snapshot, load_config(case.root), case.root, width=160))
+    after = plain_frame(render_frame(snapshot, load_config(case.root), case.root, width=100))
+    assert issue_row(after, 101).lstrip().startswith(("🐿", "[*]"))
     assert "머지: 하나씩" in after.splitlines()[-1]
     assert "머지: 모아서 물어보기" not in after.splitlines()[-1]
 
@@ -116,9 +154,10 @@ def test_settings_window_no_executor_needed_for_personal_changes_or_m_shortcut(
 ):
     from foragent import executors
     from foragent.config import load_config
-    from foragent.watch import handle_key, settings_view
+    handle_key, settings_view = settings_api("handle_key", "settings_view")
 
     case, main = settings_case(git_history, tmp_path, monkeypatch)
+    readable_settings(case)
     called = []
 
     def forbidden(*args, **kwargs):
@@ -133,6 +172,15 @@ def test_settings_window_no_executor_needed_for_personal_changes_or_m_shortcut(
     # Personal settings save without the team confirmation gate.
     assert cli_exit(main, ["settings", "set", "animation", "false", "--repo-root", str(case.root)]) == 0
     assert stored_settings(case, main, capsys)["animation"] is False
+    assert cli_exit(main, ["settings", "set", "view_glyphs", "ascii", "--repo-root", str(case.root)]) == 0
+    assert stored_settings(case, main, capsys)["view_glyphs"] == "ascii"
+    choices = plain_frame("\n".join(settings_view(case.store, load_config(case.root), case.root, "me")))
+    assert "ascii" in choices, "the personal settings tab must show the saved glyph choice"
+    snapshot, _ = running_snapshot()
+    from foragent.watch import render_frame
+    rendered = plain_frame(render_frame(snapshot, load_config(case.root), case.root, width=100))
+    assert issue_row(rendered, 101).lstrip().startswith("[*]"), "personal glyph changes must reach rendered lane rows"
+    assert "▀" not in rendered and "▄" not in rendered
     for expected in ("burn", "keep"):
         handle_key("m", case.store, load_config(case.root), state=state, repo_root=case.root)
         assert stored_settings(case, main, capsys)["claude_quota"]["mode"] == expected
