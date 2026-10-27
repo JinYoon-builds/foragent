@@ -15,6 +15,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+from foragent import orch_scorecard_flow as flow
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _seconds, _time
@@ -23,7 +24,7 @@ from foragent.state import StateStore
 DAY = timedelta(hours=24)
 # Finished outcomes that are not failures; pr-open waits for a person unless it later merged.
 NOT_FAILURES = {"merged", "pr-open", "spec-question", "limit-wait", "stalled-restart", "killed"}
-INTEGERS = ("runs", "review_returns", "reverts_after_merge", "spec_questions")
+INTEGERS = ("runs", "review_returns", "reverts_after_merge", "spec_questions", "merges")
 # Metric -> +1 when a higher value is worse, -1 when a lower value is worse; runs is never worse.
 DIRECTION = {"merge_rate": -1, "median_minutes_to_merge": 1, "github_calls_per_hour": 1,
              "review_returns": 1, "reverts_after_merge": 1, "spec_questions": 1, "load": 1}
@@ -135,7 +136,8 @@ def _worse(today: dict[str, Any], previous: dict[str, Any]) -> list[str]:
             if now is not None and before is not None and (now - before) * direction > 0]
 
 
-def collect(store: StateStore, days: int = 7) -> dict[str, Any]:
+def collect(store: StateStore, days: int = 7, lanes: dict | None = None) -> dict[str, Any]:
+    """The card; ``lanes`` (the config's lanes) places issues in lanes for plan pauses."""
     now = store._now()
     runs, events = _runs(store, now, days), _events(store, now, days)
     calls = [0] * days
@@ -153,11 +155,15 @@ def collect(store: StateStore, days: int = 7) -> dict[str, Any]:
         value = _median([day[name] for day in daily[1:] if day[name] is not None])
         previous[name] = _half_up(value) if name in INTEGERS and value is not None else value
     previous["phase_minutes"], previous["load"] = _phases([event for index, event in events if index > 0])
-    order = [*_day([], [], 0), "phase_minutes", "load"]
+    flows = flow.daily(store, now, days, lanes)
+    today.update(flows[0])
+    previous.update(flow.previous(flows[1:]))
+    previous["merges"] = _half_up(previous["merges"]) if previous["merges"] is not None else None
+    order = [*_day([], [], 0), "phase_minutes", "load", "merges", *flow.NAMES]
     today, previous = {name: today[name] for name in order}, {name: previous[name] for name in order}
     repeated, unexplained = _failures([run for index, run in runs if index == 0])
     return {"now": now.isoformat(), "days": days, "window": {"today": today, "previous": previous},
-            "worse": _worse(today, previous), "repeated_failures": repeated,
+            "worse": _worse(today, previous) + flow.worse_names(today, previous), "repeated_failures": repeated,
             "unexplained_failures": unexplained}
 
 
@@ -183,12 +189,28 @@ def _window_line(key: str, metrics: dict[str, Any], language: str, days: int) ->
                 phases=phases or "-")
 
 
+def _flow_line(key: str, metrics: dict[str, Any], language: str) -> str:
+    waits = ", ".join(f"{cause} {_number(minutes)}" for cause, minutes in metrics["wait_minutes_by_cause"].items())
+    waste = metrics["waste_share"]
+    return text(key, language, idle=_number(metrics["idle_minutes"]),
+                waste=_number(None if waste is None else waste * 100, "%"), waits=waits,
+                lead=_number(metrics["lead_time_minutes"]), people=_number(metrics["person_interventions"]),
+                merges=_number(metrics["merges"]))
+
+
+def _binding_line(binding: dict[str, Any], language: str) -> str:
+    today, before = binding["today"], binding["previous"]
+    if before is not None and before != today:
+        return text("scorecard_binding_changed", language, now=today, before=before)
+    return text("scorecard_binding", language, now=today)
+
+
 def _pair(card: dict[str, Any], name: str) -> tuple[Any, Any]:
     """(before, now) for a metric in ``card["worse"]``, phases included."""
     today, previous = card["window"]["today"], card["window"]["previous"]
-    if name.startswith("phase_minutes."):
-        phase = name.split(".", 1)[1]
-        return previous["phase_minutes"][phase], today["phase_minutes"][phase]
+    group, _, key = name.partition(".")
+    if key:
+        return previous[group][key], today[group][key]
     return previous[name], today[name]
 
 
@@ -196,6 +218,8 @@ def worst(card: dict[str, Any]) -> str | None:
     """The worse metric with the largest relative change; a before of 0 is 100%, ties keep card order."""
     best, change = None, -1.0
     for name in card["worse"]:
+        if name.partition(".")[0] in flow.NAMES:
+            continue  # D96 flow metrics: fa brief and role signals keep their choices.
         before, now = _pair(card, name)
         relative = 1.0 if before == 0 else abs(now - before) / abs(before)
         if relative > change:
@@ -227,7 +251,11 @@ def worst_line(card: dict[str, Any], language: str) -> str | None:
 def human(card: dict[str, Any], language: str) -> str:
     today, previous = card["window"]["today"], card["window"]["previous"]
     lines = [_window_line("scorecard_today", today, language, card["days"]),
-             _window_line("scorecard_previous", previous, language, card["days"])]
+             _flow_line("scorecard_flow_today", today, language),
+             _window_line("scorecard_previous", previous, language, card["days"]),
+             _flow_line("scorecard_flow_previous", previous, language)]
+    if "binding" in card:
+        lines.append(_binding_line(card["binding"], language))
     for name in card["worse"]:
         before, now = _pair(card, name)
         lines.append(text("scorecard_worse", language, metric=name, before=_shown(name, before),
@@ -243,6 +271,23 @@ def human(card: dict[str, Any], language: str) -> str:
         lines.append(text("scorecard_unexplained", language,
                           issues=", ".join(f"#{n}" for n in card["unexplained_failures"])))
     return "\n".join(lines)
+
+
+def binding(store: StateStore, config: Config, root, card: dict[str, Any]) -> dict[str, Any]:
+    """Today's binding and the previous day's, from the tick's binding events.
+
+    With no event yet, today's comes from fa orch facts' local (read-only) view and the
+    previous day's is unknown (None)."""
+    from foragent import orch_binding
+
+    now = _time(card["now"])
+    today = orch_binding.at(store, now)
+    if today is not None:
+        return {"today": today, "previous": orch_binding.at(store, now - DAY)}
+    from foragent import orch_facts
+
+    found = orch_facts.collect(store, config, root)["binding"]
+    return {"today": found["kind"] if found else orch_binding.NONE, "previous": None}
 
 
 def _days(value: str) -> int:
@@ -265,5 +310,6 @@ def add_parser(orch_actions) -> None:
 
 
 def command(args, store: StateStore, config: Config) -> None:
-    card = collect(store, args.days)
+    card = collect(store, args.days, config.lanes)
+    card["binding"] = binding(store, config, args.repo_root, card)
     print(json.dumps(card, ensure_ascii=False) if args.json else human(card, config.language))

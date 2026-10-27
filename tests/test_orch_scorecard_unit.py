@@ -80,7 +80,8 @@ def test_human_output_names_each_worse_metric_and_failures(store):
     assert card["repeated_failures"] == [{"reason": "Boom", "count": 2, "issues": [1, 2]}]
     assert card["unexplained_failures"] == [3]
     lines = orch_scorecard.human(card, "en").splitlines()
-    assert len(lines) == 5 and "Boom" in lines[3] and "#3" in lines[4]
+    # Today, its flow line, the previous days, their flow line, then the verdict and failures.
+    assert len(lines) == 7 and "flow" in lines[1] and "Boom" in lines[5] and "#3" in lines[6]
 
 
 @pytest.mark.parametrize("value", ["1", "0", "x", "2.5"])

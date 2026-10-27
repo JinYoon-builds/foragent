@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from types import SimpleNamespace
 
-from foragent import notify, orch_stale_files, processes, watch_open
+from foragent import notify, orch_binding, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
@@ -211,6 +211,8 @@ def deciding(ctx, acquired: bool = True):
         with step("orchestrator_spawn"):
             on_tick(ctx, SimpleNamespace(actions=[]))  # The tick's report is lost with the error.
         raise
+    with step("binding_record"):  # D96: the tick is the binding event's only writer.
+        orch_binding.record_tick(ctx)
     # Stale Files are facts for the orchestrator, so they are read before its spawn decision.
     with step("stale_files"):
         orch_stale_files.report(ctx)
