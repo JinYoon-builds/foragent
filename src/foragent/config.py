@@ -19,6 +19,7 @@ class ConfigError(ValueError):
 
 
 SKILL_ROLES = {"style", "review", "tool", "domain"}
+PRESENCE_DEFAULTS = {"statusline": True, "session_start": True, "report": True}
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,8 @@ class Config:
     perspectives: dict[str, str] = field(default_factory=dict)
     # Lane view glyphs (#167): emoji, ascii, or auto (ascii on dumb/linux terminals or non-UTF-8 locales).
     view_glyphs: str = "auto"
+    # Foragent presence in Claude Code (#754); each part switches off on its own.
+    presence: dict[str, bool] = field(default_factory=lambda: dict(PRESENCE_DEFAULTS))
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
@@ -436,6 +439,9 @@ def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
             **previous, **{name: {**(previous[name] if isinstance(previous.get(name), dict) else {}), **tier}
                            if isinstance(tier, dict) else tier for name, tier in tiers.items()},
         }}
+    presence = overrides.get("presence")
+    if isinstance(presence, dict) and isinstance(values["presence"], dict):
+        overrides = {**overrides, "presence": {**values["presence"], **presence}}
     values.update(overrides)
 
 
