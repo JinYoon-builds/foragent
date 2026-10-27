@@ -344,14 +344,19 @@ def init_repo(
         destination = root / path
         destination.parent.mkdir(parents=True, exist_ok=True)
         if path != WORKFLOW:
-            with destination.open("x", encoding="utf-8") as stream:
-                stream.write(contents[path])
+            data = contents[path]
+            # Copied skill files are bytes; text is written as UTF-8 bytes too, so line ends are exact.
+            with destination.open("xb") as stream:
+                stream.write(data if isinstance(data, bytes) else data.encode("utf-8"))
     for path in removed:
         (root / path).unlink()
     if WORKFLOW in created:
         write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:
+        original = config_path.read_bytes().decode("utf-8")
         config_path.write_bytes(updated_config.encode("utf-8"))
+        if role_source is not None:
+            roles.report_dropped_comments(original)
     if pending:
         git.commit_paths(pending, "Set up Foragent")
     if push_planned:

@@ -1211,3 +1211,52 @@ def test_init_copies_the_skills_the_roles_entry_lists(setup):
     assert ".claude/skills/audit/SKILL.md" in report.created
     assert not (setup.root / ".claude/skills/fa-architect/SKILL.md").exists(), "Copy the listed skill, not the role's"
     assert roles.role_drift(setup.root, load_config(setup.root)) == []
+
+
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe"
+
+
+def test_init_copies_role_skill_files_as_bytes(setup):
+    setup.init()
+    path = setup.root / PATHS[0]
+    text = path.read_text()
+    source = yaml.safe_load(text)["roles"]
+    source["architect"]["skills"] = ["audit"]
+    path.write_text(roles.edit_roles(text, source))
+    product = setup.root / "skills/audit"
+    (product / "assets").mkdir(parents=True)
+    (product / "SKILL.md").write_bytes(b"---\r\nname: audit\r\ndescription: Audit\r\n---\r\nCRLF body\r\n")
+    (product / "assets/diagram.png").write_bytes(PNG)
+    setup.init()
+    copy = setup.root / ".claude/skills/audit"
+    assert (copy / "assets/diagram.png").read_bytes() == PNG, "Binary skill files are copied byte for byte"
+    assert (copy / "SKILL.md").read_bytes() == (product / "SKILL.md").read_bytes(), "CRLF text stays CRLF"
+    assert set(role_agents.setup_paths(setup.root, {"fa-architect": ["audit"]})) >= {
+        ".claude/skills/audit/SKILL.md", ".claude/skills/audit/assets/diagram.png"}, "Recovery compares bytes too"
+
+
+def test_role_set_keeps_crlf_agent_body_bytes(setup, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    setup.init()
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit([]))
+    monkeypatch.setattr(GitRepo, "remote_slug", lambda self: "owner/repo")
+    agent = setup.root / ".claude/agents/fa-architect.md"
+    body = b"Line one\r\nLine two\r\n\r\nLast line without end"
+    agent.write_bytes(b"---\r\nname: fa-architect\r\nmemory: project\r\nskills:\r\n- fa-architect\r\n---\r\n" + body)
+    roles.set_role(setup.root, "architect", scope=["src/**"])
+    written = agent.read_bytes()
+    assert written.endswith(b"---\r\n" + body), "The body keeps its exact bytes, CRLF included"
+    assert b"description: Foragent architect role\r\n" in written and b"\n" not in written.replace(b"\r\n", b"")
+
+
+def test_init_reports_dropped_roles_comments_once_with_board_settings(setup, capsys):
+    setup.init()
+    path = setup.root / PATHS[0]
+    path.write_text("review: fast\nroles:  # team roles\n  orchestrator:\n    agent: fa-orchestrator\n"
+                    "    skills: [fa-orchestrator]\n    memory: .claude/agent-memory/fa-orchestrator/\n"
+                    "    signals: []\n")
+    capsys.readouterr()
+    report = setup.init(no_board=False)
+    assert "board" in report.added_keys and "roles" in report.added_keys
+    notices = [line for line in capsys.readouterr().err.splitlines() if "dropped" in line]
+    assert notices == ["Note: rewrote the roles block of .foragent.yml and dropped 1 comment(s) inside it."]

@@ -55,8 +55,8 @@ def _skills(role: str, skills: dict[str, list[str]] | None) -> list[str]:
 
 
 def _templates(root: Path, *, existing_skills: bool = False,
-               skills: dict[str, list[str]] | None = None) -> dict[str, str]:
-    """What init writes for the roles, keyed by repository path.
+               skills: dict[str, list[str]] | None = None) -> dict[str, str | bytes]:
+    """What init writes for the roles, keyed by repository path: text, or bytes for skill files.
 
     ``skills`` maps an agent name to its skills in the roles source (#769).
     An existing skill directory is kept whole, so its files are listed only on request.
@@ -72,7 +72,8 @@ def _templates(root: Path, *, existing_skills: bool = False,
             if source is not None and (existing_skills or not repo_path(root, skill).exists()):
                 for file in sorted(source.rglob("*")):
                     if file.is_file() and not file.is_symlink():
-                        contents[f"{skill}/{file.relative_to(source).as_posix()}"] = file.read_text(encoding="utf-8")
+                        # Bytes: a skill may hold images, and CRLF text must stay CRLF.
+                        contents[f"{skill}/{file.relative_to(source).as_posix()}"] = file.read_bytes()
     return contents
 
 
@@ -89,8 +90,9 @@ def _skill_dir(root: Path, name: str) -> Path | None:
     return skill_source(name)
 
 
-def missing_files(root: Path, skills: dict[str, list[str]] | None = None) -> tuple[dict[str, str], list[str]]:
-    """Files to create (relative path -> text) and agent files left alone with bad frontmatter."""
+def missing_files(root: Path,
+                  skills: dict[str, list[str]] | None = None) -> tuple[dict[str, str | bytes], list[str]]:
+    """Files to create (relative path -> text or bytes) and agent files left alone with bad frontmatter."""
     contents = {path: text for path, text in _templates(root, skills=skills).items()
                 if not repo_path(root, path).exists()}
     invalid = [f".claude/agents/{role}.md" for role in ROLES
@@ -104,6 +106,6 @@ def setup_paths(root: Path, skills: dict[str, list[str]] | None = None) -> list[
     owned = []
     for path, text in _templates(root, existing_skills=True, skills=skills).items():
         target = repo_path(root, path)
-        if target.is_file() and not target.is_symlink() and target.read_bytes() == text.encode("utf-8"):
+        if target.is_file() and not target.is_symlink() and target.read_bytes() == (text if isinstance(text, bytes) else text.encode("utf-8")):
             owned.append(path)
     return owned

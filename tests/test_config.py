@@ -419,7 +419,7 @@ def test_roles_load_with_defaults_for_optional_fields(repo):
 
 def test_edit_roles_touches_only_changed_entries_and_fields(capsys):
     """Bar set 2026-10-27: only the top-level roles block is rewritten; bytes outside it stay identical."""
-    from foragent.roles import edit_roles
+    from foragent.roles import edit_roles, report_dropped_comments
 
     head = "# Settings header\nreview: fast  # top\n\n"
     tail = "# about lanes\nlanes: {}  # none yet\n# tail\n"
@@ -436,8 +436,11 @@ def test_edit_roles_touches_only_changed_entries_and_fields(capsys):
         middle = edited[len(head):len(edited) - len(tail)]
         assert middle == yaml.safe_dump({"roles": changed}, sort_keys=False), "Block-style roles at the same place"
         assert yaml.safe_load(edited) == {**yaml.safe_load(text), "roles": changed}
+        assert capsys.readouterr().err == "", "Preparing the text reports nothing; the writer reports once"
+        report_dropped_comments(text)
         notice = capsys.readouterr().err
         assert notice.count("\n") == 1 and "dropped 3 comment" in notice, "One line names the dropped comments"
     plain = edit_roles("review: fast  # top", {"docs": {"agent": "fa-docs", "skills": [], "signals": []}})
     assert plain == "review: fast  # top\nroles:\n  docs:\n    agent: fa-docs\n    skills: []\n    signals: []\n"
+    report_dropped_comments("review: fast  # top")
     assert capsys.readouterr().err == "", "No notice when no comment was dropped"

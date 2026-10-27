@@ -73,18 +73,24 @@ def load_roles(config: Config) -> dict[str, dict[str, Any]]:
     return roles
 
 
-def _split_agent(path: Path) -> tuple[dict | None, str]:
-    """Agent frontmatter (None when absent or invalid) and the body after it."""
+def _split_agent(path: Path) -> tuple[dict | None, bytes, str]:
+    """Agent frontmatter (None when absent or invalid), the exact body bytes after it, and its line end.
+
+    Bytes, so a CRLF body is not normalized: fa role set changes only the frontmatter.
+    """
     try:
-        content = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None, ""
-    match = re.match(r"\A---[ \t]*\n(.*?)^---[ \t]*(?:\n|$)", content, re.S | re.M)
-    try:
-        header = yaml.safe_load(match[1]) if match else None
-    except yaml.YAMLError:
-        header = None
-    return (header if isinstance(header, dict) else None), (content[match.end():] if match else content)
+        data = path.read_bytes()
+    except OSError:
+        return None, b"", "\n"
+    match = re.match(rb"\A---[ \t]*(\r?\n)(.*?)^---[ \t]*(?:\r?\n|\Z)", data, re.S | re.M)
+    header = None
+    if match:
+        try:
+            header = yaml.safe_load(match[2].decode("utf-8"))
+        except (UnicodeDecodeError, yaml.YAMLError):
+            header = None
+    return ((header if isinstance(header, dict) else None), data[match.end():] if match else data,
+            match[1].decode() if match else "\n")
 
 
 def with_defaults(root: Path, roles: dict[str, Any]) -> dict[str, Any] | None:
@@ -97,7 +103,7 @@ def with_defaults(root: Path, roles: dict[str, Any]) -> dict[str, Any] | None:
         return None
     result = deepcopy(roles)
     for name in missing:
-        header, _ = _split_agent(repo_path(root, f".claude/agents/fa-{name}.md"))
+        header, _, _ = _split_agent(repo_path(root, f".claude/agents/fa-{name}.md"))
         skills = header.get("skills") if header else None
         valid = isinstance(skills, list) and all(isinstance(skill, str) for skill in skills)
         result[name] = default_entry(name, skills if valid else None)
@@ -116,7 +122,8 @@ def edit_roles(text: str, roles: dict[str, Any]) -> str:
     """Rewrite only the top-level ``roles`` block, as block-style YAML at its current position.
 
     With no ``roles`` key the block is appended at the end of the file. Every byte outside
-    the block stays identical; comments inside it are dropped, and one line says so.
+    the block stays identical; comments inside it are dropped. Pure: the writer reports
+    dropped comments once with ``report_dropped_comments``.
     """
     lines = _LINES.findall(text)
     try:
@@ -142,7 +149,6 @@ def edit_roles(text: str, roles: dict[str, Any]) -> str:
         column = 0
     else:
         start, end, column = pair[0].start_mark.line, _last_line(*pair) + 1, pair[0].start_mark.column
-    dropped = sum(_comments(lines[start:end]).values())
     lines[start:end] = _dump({"roles": roles}, column, newline)
     edited = "".join(lines)
     try:
@@ -151,10 +157,22 @@ def edit_roles(text: str, roles: dict[str, Any]) -> str:
         written = None
     if written != {**before, "roles": roles}:
         raise RoleError("cannot rewrite the roles block of .foragent.yml; edit it by hand")
+    return edited
+
+
+def report_dropped_comments(original: str) -> None:
+    """Say once, from the code that writes the file, how many comments the roles block rewrite dropped."""
+    try:
+        pair = _pair(yaml.compose(original), "roles")
+    except yaml.YAMLError:
+        return
+    if pair is None:
+        return
+    lines = _LINES.findall(original)
+    dropped = sum(_comments(lines[pair[0].start_mark.line:_last_line(*pair) + 1]).values())
     if dropped:
         print(f"Note: rewrote the roles block of .foragent.yml and dropped {dropped} comment(s) inside it.",
               file=sys.stderr)
-    return edited
 
 
 def _memory_file(root: Path, name: str, memory: str) -> str:
@@ -193,7 +211,7 @@ def role_drift(root: Path, config: Config) -> list[str]:
             problems.append(f"FAIL role {name}: agent file {relative} is missing; "
                             f"run `fa role set {name} --skill ...` to rewrite it")
             continue
-        header, _ = _split_agent(path)
+        header, _, _ = _split_agent(path)
         declared = header.get("skills") if header else None
         if declared != entry["skills"]:
             problems.append(f"FAIL role {name}: skills differ: .foragent.yml={entry['skills']!r}, "
@@ -285,6 +303,7 @@ class _Edit:
         for identity in self.to_install:
             self.manager.install(identity, self.root)
         self.path.write_bytes(edited.encode("utf-8"))
+        report_dropped_comments(self.text)
 
     def publish(self, owned: list[str], title: str) -> list[str]:
         """Commit the whole current state of the paths a role owns, against HEAD.
@@ -383,20 +402,21 @@ def set_role(root: Path, name: str, *, skills: list[str] | None = None, scope: l
     if idle_days is not None:
         entry["idle_days"] = idle_days
     agent_path = repo_path(edit.root, agent)
-    header, body = _split_agent(agent_path)
+    header, body, newline = _split_agent(agent_path)
     header = {"name": entry.get("agent") or f"fa-{name}", "memory": "project", **(header or {}),
               "description": _description(name), "skills": entry.get("skills", [])}
     if not agent_path.exists():
         # Only a missing agent gets the generated body; an existing one, even empty, keeps its own.
-        body = _agent_text(name, header["skills"]).split("---\n", 2)[2]
+        body = _agent_text(name, header["skills"]).split("---\n", 2)[2].encode("utf-8")
     memory = _memory_file(edit.root, name, entry.get("memory") or memory_dir(name))
     owned = [".foragent.yml", agent, memory.removesuffix("/MEMORY.md"), *([".gitignore"] if edit.to_install else [])]
     edit.save({**edit.roles, name: entry})
     _ensure_memory(edit.root, name, entry)
     destination = repo_path(edit.root, agent)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text("---\n" + yaml.safe_dump(header, sort_keys=False, allow_unicode=True) + "---\n" + body,
-                           encoding="utf-8")
+    # Only the frontmatter is regenerated, in the file's own line end; the body keeps its bytes.
+    front = yaml.safe_dump(header, sort_keys=False, allow_unicode=True).replace("\n", newline)
+    destination.write_bytes(f"---{newline}{front}---{newline}".encode("utf-8") + body)
     edit.publish(owned, f"Foragent role {name}")
     edit.event(store, "role-set", name, why)
     return entry
