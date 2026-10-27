@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from foragent.git import GitRepo
+    from foragent.policy import Decision
     from foragent.run_attempt import Implementation
     from foragent.runner import RunContext
     from foragent.state import Run
@@ -47,6 +48,13 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
 def _risk_notes(attempt: Implementation) -> str:
     paths = sorted(set(attempt.paths) | set(attempt.git.changed_paths(attempt.base_ref)))
     return run_publish.risks.review_notes(run_publish.risks.matching(run_publish.risks.load_at(attempt.git, attempt.base_ref), paths), paths)
+
+
+def _merge_decision(n: int, ctx: RunContext, git: GitRepo, paths: list[str], labels) -> Decision:
+    """Merge policy after first-touch deploy/migration paths join always_human (#785)."""
+    run_publish.irreversible_paths.register(ctx, n, git, paths)
+    return run_publish.merge_decision(changed_paths=paths, issue_labels=labels, config=ctx.config,
+                                      risk_always_human=run_publish._risk_always_human(ctx))
 
 
 def _risk_always_human(ctx: RunContext) -> list[str]:

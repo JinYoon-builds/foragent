@@ -121,11 +121,8 @@ def _publish_locked(attempt: Implementation) -> str:
             ctx.tracker.remove_labels(n, [run_publish.RUNNING])
             return "pr-open"
 
-    if stopped := policy_hold(run_publish.merge_decision(
-        changed_paths=ctx.tracker.pr_changed_files(pr),
-        issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
-        risk_always_human=run_publish._risk_always_human(ctx),
-    )):
+    if stopped := policy_hold(run_publish._merge_decision(
+            n, ctx, git, ctx.tracker.pr_changed_files(pr), ctx.tracker.get_issue(n).labels)):
         return stopped
 
     def publish_refresh(target_sha: str) -> str | None:
@@ -141,11 +138,7 @@ def _publish_locked(attempt: Implementation) -> str:
         verified_base_sha = target_sha
         if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
             return run_publish._hold_changed_head(n, ctx, link)
-        decision = run_publish.merge_decision(
-            changed_paths=git.changed_paths(target_sha),
-            issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
-            risk_always_human=run_publish._risk_always_human(ctx),
-        )
+        decision = run_publish._merge_decision(n, ctx, git, git.changed_paths(target_sha), ctx.tracker.get_issue(n).labels)
         return policy_hold(decision)
 
     def ci_failed() -> None:

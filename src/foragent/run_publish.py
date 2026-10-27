@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from foragent import board, cuts, review_perspectives, risks
+from foragent import board, cuts, irreversible_paths, review_perspectives, risks
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
@@ -50,7 +50,7 @@ from foragent.run_publish_merge import (  # noqa: E402
     retitle_for_merge,
 )
 from foragent.run_publish_pr import (  # noqa: E402
-    _open_or_update_pr, _push_branch, _render_pr_body, _risk_always_human, _risk_notes,
+    _merge_decision, _open_or_update_pr, _push_branch, _render_pr_body, _risk_always_human, _risk_notes,
     _skills_line, _update_open_pr,
 )
 from foragent.run_publish_preserve import (  # noqa: E402

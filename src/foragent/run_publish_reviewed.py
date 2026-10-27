@@ -51,11 +51,9 @@ def _publish_reviewed_head(
             return "pr-open"
         return None
 
-    if stopped := policy_hold(run_publish.merge_decision(
-        changed_paths=sorted(set(git.changed_paths(base_sha)) | set(ctx.tracker.pr_changed_files(pr.number))),
-        issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
-        risk_always_human=run_publish._risk_always_human(ctx),
-    )):
+    if stopped := policy_hold(run_publish._merge_decision(
+            n, ctx, git, sorted(set(git.changed_paths(base_sha)) | set(ctx.tracker.pr_changed_files(pr.number))),
+            ctx.tracker.get_issue(n).labels)):
         return stopped
     started = ctx.now().timestamp()
     ci_wait = run_publish._CIWait(started)

@@ -103,8 +103,7 @@ def _final_merge_inputs(
         if any(blobs.get(path) != sha for path, sha in approval.acceptance_blobs.items()):
             return run_publish._MergeInputs(stop=invalid_approval)
     paths = sorted(set(git.changed_paths(target_sha)) | set(ctx.tracker.pr_changed_files(pr)))
-    decision = run_publish.merge_decision(changed_paths=paths, issue_labels=issue.labels, config=ctx.config,
-                                          risk_always_human=run_publish._risk_always_human(ctx))
+    decision = run_publish._merge_decision(n, ctx, git, paths, issue.labels)
     # Bind this status and all verification evidence to the exact head we merge.
     if git.head_sha() != head or ctx.tracker.pr_head_sha(pr) != head:
         return run_publish._MergeInputs(stop=lambda: run_publish._hold_changed_head(n, ctx, link))
