@@ -50,6 +50,9 @@ def _add_inbox(orch_actions) -> None:
     queue.add_argument("--json", action="store_true")
     queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     cli.orch_facts.add_parser(orch_actions)
+    from foragent import orch_scorecard
+
+    orch_scorecard.add_parser(orch_actions)
     reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")
     reviewers.add_argument("issue", type=int)
     reviewers.add_argument("count", type=int, nargs="?", help="Reviewer count (1 or more); wins over review_reviewers")
@@ -111,6 +114,10 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         return
     if args.action == "facts":
         return cli.orch_facts.command(args, store, config)
+    if args.action == "scorecard":
+        from foragent import orch_scorecard
+
+        return orch_scorecard.command(args, store, config)
     if args.action == "ensure":
         _ensure(args, store, config)
         return
