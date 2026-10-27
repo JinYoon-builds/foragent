@@ -11,15 +11,17 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
+from foragent import cuts
 from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.harness_guard import changed_harness_paths, guard_measurements, hold_details
 from foragent.labels import APPROVED
-from foragent import orch_reviewers, review_perspectives, risks
+from foragent import orch_events, orch_reviewers, review_perspectives, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
+from foragent.run_attempt import WholeFailure
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
 from foragent.run_attempt import ExecutorStopped
 from foragent.run_execution import _available_executor
@@ -44,7 +46,7 @@ def parse_review(message: str) -> ReviewResult:
     lines = message.splitlines()
     for index, line in enumerate(lines):
         if match := re.fullmatch(r"VERDICT: (PASS|FAIL)\s*", line):
-            findings = [line for line in lines[index + 1:] if line.strip()][:5]
+            findings = [line for line in lines[index + 1:] if line.strip()]
             return ReviewResult(match[1], "\n".join(findings))
     return ReviewResult("UNUSABLE", "", ("reviewer gave no verdict",))
 
@@ -150,6 +152,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
                 reviewer=True,
                 prompt="" if reviewer == "claude" else build_review_prompt(
                     parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
+                    full_text_dir=cuts.issue_dir(ctx.store.root, n),
                     risk_notes=risk_notes,
                 ),
                 **settings, timeout_s=runner._remaining(n, ctx),
@@ -179,6 +182,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     if review.verdict == "PASS":
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
     _append(ctx.store.log_path(n), f"Review: VERDICT: {review.verdict}\n{review.findings}")
+    _journal_review(n, ctx, review.verdict, review.findings, round_number)
     _progress(n, ctx)
     return replace(review, raw=raw, timed_out=result.timed_out)
 
@@ -242,6 +246,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
         return True
 
     prompts = [build_review_prompt(parsed, diff, acceptance, rebuttals=rebuttals,
+                                   full_text_dir=cuts.issue_dir(ctx.store.root, n),
                                    risk_notes=review_perspectives.with_checklist(notes, ctx.config, share))
                for share in shares]
     before = git.review_state()
@@ -284,6 +289,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     else:
         try:
             result = call(build_review_prompt(parsed, diff, acceptance, rebuttals=rebuttals,
+                                              full_text_dir=cuts.issue_dir(ctx.store.root, n),
                                               risk_notes=review_perspectives.with_checklist(notes, ctx.config),
                                               panel_findings=findings))
         except BaseException as error:
@@ -309,8 +315,21 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     if review.verdict == "PASS":
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
     _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}")
+    _journal_review(n, ctx, review.verdict, review.findings, round_number)
     _progress(n, ctx)
     return replace(review, raw=raw, timed_out=timed_out)
+
+
+_FINDING_LOCATION = re.compile(r"[\w.-]*[/.][\w./-]*:\d+")
+
+
+def _journal_review(n: int, ctx: RunContext, verdict: str, findings: str, round_number: int,
+                    source: str = "reviewer") -> None:
+    """Record the round's verdict locally before any next round can start."""
+    count = 0 if verdict == "UNUSABLE" else sum(
+        1 for line in findings.splitlines() if _FINDING_LOCATION.search(line))
+    orch_events.append_event(ctx.store, ctx.now(), n, "review", f"{verdict} {count} findings",
+                             verdict=verdict, findings=count, round=round_number, source=source)
 
 
 def _is_limit(error: BaseException) -> bool:
@@ -384,9 +403,9 @@ def _review_implementation(attempt: Implementation) -> None:
         attempt.review_feedback = True
         if review.verdict == "UNUSABLE":
             attempt.reviewer_text = review.raw
-            attempt.failure = "A reviewer said (verbatim):\n" + review.raw
+            attempt.failure = WholeFailure("A reviewer said (verbatim):\n" + review.raw)
         else:
-            attempt.failure = review.findings or "Reviewer found defects (no findings provided)."
+            attempt.failure = WholeFailure(review.findings or "Reviewer found defects (no findings provided).")
         findings = _normalized_findings(review) if _read_rebuttals(worktree).strip() else set()
         if findings & attempt.previous_rebutted_findings:
             attempt.review_hold = True
@@ -423,6 +442,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return _hold_changed_head(n, ctx, link)
     if verdict_head is not None:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
+        # The orchestrator's verdict for this exact head stands in for a reviewer round.
+        _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator")
 
     def approved() -> bool:
         issue = ctx.tracker.get_issue(n)
@@ -466,7 +487,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
 
     stop_guarding = guard_measurements(git.root, guard)
     try:
-        if stopped := _verify_review_head(n, ctx, git, parsed, head, link, base_ref):
+        guard()  # before any measurement; _check repeats it before each later one
+        if stopped := _verify_review_head(n, ctx, git, parsed, head, link):
             return stopped
         _check_publication(git, pr.base)
 

@@ -220,6 +220,9 @@ def test_lane_width_is_only_a_cap_set_by_a_live_plan(queue_case, capsys, monkeyp
     wide_lane(case, monkeypatch, {3: ["src/foragent/state.py"], 5: ["src/foragent/order.py"],
                                   7: ["src/foragent/watch.py"]})
     assert plan(case, capsys).get("width", {}) == {}
+    # The clock jumps an hour below; keep the stall rule out of this width check.
+    from dataclasses import replace
+    case.tick_ctx.config = replace(case.tick_ctx.config, stall_minutes=120)
     fa_ok(case, capsys, "plan", "--width", "orch=2", "--expires", at(case, hours=1))
     assert plan(case, capsys)["width"]["orch"] == 2
     running, actions = tick_lane(case)
@@ -237,6 +240,9 @@ def test_plan_width_never_starts_overlapping_files(queue_case, capsys, monkeypat
     # 7 shares a file with 5, not with the first run 3: every running issue counts.
     wide_lane(case, monkeypatch, {3: ["src/foragent/state.py"], 5: ["src/foragent/order.py"],
                                   7: ["src/foragent/order.py"], 9: ["src/foragent/watch.py"]})
+    # Pin the overlap cap to one run per file, so the cap (not the width) holds 7 back.
+    from dataclasses import replace
+    case.tick_ctx.config = replace(case.tick_ctx.config, overlap_per_file=1)
     fa_ok(case, capsys, "plan", "--width", "orch=3")
     running, actions = tick_lane(case, ticks=5)
     assert running == [3, 5, 9], actions

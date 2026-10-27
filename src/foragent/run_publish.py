@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from foragent import board, review_perspectives, risks
+from foragent import board, cuts, review_perspectives, risks
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
@@ -88,7 +88,7 @@ def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
 
 def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str) -> None:
     """Spend one implementation retry, preserving the raw logs from every run."""
-    logs = ctx.tracker.pr_failed_logs(pr)
+    logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=cuts.issue_dir(ctx.store.root, n))
     failure = CIFailure(logs, target_branch)
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     if ctx.tracker.pr_head_sha(pr) != head:
@@ -114,7 +114,7 @@ def _merge_lock(n: int, ctx: RunContext):
                 stack.enter_context(ctx.store.merge_lock())
                 started = ctx.now()
 
-            _credited_wait(n, ctx, acquire)
+            _credited_wait(n, ctx, acquire, "merge-lock-wait", eager=False)  # Phase only if it waits.
             yield
     finally:
         if started is not None:
@@ -647,7 +647,7 @@ def _publish_locked(attempt: Implementation) -> str:
 
     def ci_failed() -> None:
         if attempt.rebuilt:
-            logs = ctx.tracker.pr_failed_logs(pr)
+            logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=cuts.issue_dir(ctx.store.root, n))
             _hold_if_not_started(n, ctx, pr, logs)
             raise ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
         _ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)

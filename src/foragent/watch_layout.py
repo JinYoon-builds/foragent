@@ -28,7 +28,9 @@ def _has_work(row: dict[str, Any]) -> bool:
 
 # Run phases in which the runner waits on checks, CI, a merge or a review.
 # Waits inside them (merge.lock, a test slot) need no phase of their own.
-WAITING_PHASES = frozenset({"checking", "ci", "merging", "reviewing", "overlap-wait"})
+WAITING_PHASES = frozenset({"checking", "ci", "merging", "reviewing", "overlap-wait",
+                            "test-slot-wait", "baseline", "baseline-wait", "executor-wait",
+                            "merge-lock-wait"})
 
 
 def _activity(
@@ -83,7 +85,8 @@ def _activity(
 def _widths(width: int) -> tuple[bool, int, int, int, int]:
     """Side-by-side flag, orchestrator, road, work-table and events widths."""
     side_by_side = width >= 100
-    orchestrator_width = 28 if side_by_side else width
+    # Wide screens give the orchestrator note room for a label and its value on one line.
+    orchestrator_width = (36 if width >= 140 else 28) if side_by_side else width
     road_width = width - orchestrator_width - 2 if side_by_side else width
     table_width = (width - 2) * 3 // 5 if side_by_side else width
     events_width = width - table_width - 2 if side_by_side else width

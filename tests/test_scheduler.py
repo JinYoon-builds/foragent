@@ -2431,8 +2431,11 @@ def test_unknown_lane_reports_once_per_tick_and_uses_main_slot(ctx):
         assert ctx.store.get_run(1).lane == "main"
 
 
-@pytest.mark.parametrize("cap,expected", [(1, [2]), (2, [2, 4]), (3, [2, 4, 1])])
-def test_lane_single_run_cap_order_and_lowest_issue(ctx, cap, expected):
+@pytest.mark.parametrize("cap,expected,finished,following", [
+    (1, [1], 1, 2), (2, [1, 2], 2, 3), (3, [1, 2, 4], 2, 3),
+])
+def test_lane_single_run_cap_order_and_lowest_issue(ctx, cap, expected, finished, following):
+    # Lanes rank together by issue number (#603); a lane still runs one issue at a time.
     ctx.config = replace(ctx.config, lanes={"beta": {}, "alpha": {}}, max_parallel=cap)
     # A roomy machine-wide AIMD value leaves the project ceiling as the binding cap.
     write_state(ctx.store, 8, NOW - timedelta(hours=1))
@@ -2446,11 +2449,11 @@ def test_lane_single_run_cap_order_and_lowest_issue(ctx, cap, expected):
     assert launches == expected
     assert len(ctx.store.active_runs()) == cap
     assert len({run.lane for run in ctx.store.active_runs()}) == cap
-    ctx.tracker.close_issue(2)
-    ctx.tracker.remove_labels(2, ["running"])
-    ctx.store.finish_run(2, "merged")
+    ctx.tracker.close_issue(finished)
+    ctx.tracker.remove_labels(finished, ["running"])
+    ctx.store.finish_run(finished, "merged")
     tick(ctx)
-    assert launches == [*expected, 3]
+    assert launches == [*expected, following]
 
 
 def test_integrity_is_rechecked_before_each_lane_start(ctx):
@@ -2852,7 +2855,8 @@ def test_project_ceiling_counts_only_this_repositorys_runs(ctx, tmp_path):
     ctx.start_runs = True
     tick(ctx)
     # Machine: 2 elsewhere + 2 here fills the shared 4; the ceiling of 2 is per repository.
-    assert sorted(run.number for run in ctx.store.active_runs()) == [2, 3]
+    # Lanes rank together by issue number (#603), so main's #1 is not held back.
+    assert sorted(run.number for run in ctx.store.active_runs()) == [1, 2]
     tick(ctx)
     assert len(ctx.store.active_runs()) == 2
 
