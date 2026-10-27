@@ -42,6 +42,15 @@ def _empty() -> dict:
             "authors": {"queues": {}, "width": {}, "expires_at": None}}
 
 
+# Every key the plan loader reads; anything else (e.g. a throughput goal) is not plan state here.
+STORED_KEYS = ("queues", "paused", "width", "expires_at", "authors", "written_by")
+
+
+def plan_fields(data: dict) -> dict:
+    """Only the plan keys of a stored plan, for a reader that must never see other fields."""
+    return {key: data[key] for key in STORED_KEYS if key in data}
+
+
 def _legacy_path(store: StateStore) -> Path:
     return store.root / "lane-queues.json"
 

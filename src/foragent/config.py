@@ -86,6 +86,8 @@ class Config:
     ouroboros_version: str | None = None
     update_check: bool = True  # The daily release check (#417); FORAGENT_UPDATE_CHECK=off also opts out.
     profile: dict[str, Any] | None = None
+    # Whether `fa report propose` may prepare upstream error reports; None means not asked yet (#419).
+    upstream_reports: bool | None = None
     # Order perspective seat -> executor (#414); unnamed seats use the built-in split.
     perspectives: dict[str, str] = field(default_factory=dict)
 
@@ -441,17 +443,11 @@ def load_global_config(global_path: Path | None = None) -> Config:
     return Config(**values)
 
 
-def register_skill_library(name: str, repo: str, roles: dict[str, str]) -> Config:
-    """Persist an approved library and roles, preserving unrelated global settings."""
-    path = Path.home() / ".config/foragent/config.yml"
-    config = load_global_config(path)
-    values = _read_yaml(path) if path.exists() else {}
-    libraries = deepcopy(config.skill_libraries)
-    if not any((entry if isinstance(entry, str) else entry["repo"]) == repo for entry in libraries):
-        libraries.append({"name": name, "repo": repo})
-    values.update(skill_libraries=libraries, skill_roles={**config.skill_roles, **roles})
-    registered = {**asdict(config), "skill_libraries": libraries, "skill_roles": values["skill_roles"]}
-    _validate(registered)
+def _global_path() -> Path:
+    return Path.home() / ".config/foragent/config.yml"
+
+
+def _write_global(path: Path, values: dict[str, Any]) -> None:
     content = yaml.safe_dump(values, sort_keys=False, allow_unicode=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
@@ -463,7 +459,39 @@ def register_skill_library(name: str, repo: str, roles: dict[str, str]) -> Confi
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def register_skill_library(name: str, repo: str, roles: dict[str, str]) -> Config:
+    """Persist an approved library and roles, preserving unrelated global settings."""
+    path = _global_path()
+    config = load_global_config(path)
+    values = _read_yaml(path) if path.exists() else {}
+    libraries = deepcopy(config.skill_libraries)
+    if not any((entry if isinstance(entry, str) else entry["repo"]) == repo for entry in libraries):
+        libraries.append({"name": name, "repo": repo})
+    values.update(skill_libraries=libraries, skill_roles={**config.skill_roles, **roles})
+    registered = {**asdict(config), "skill_libraries": libraries, "skill_roles": values["skill_roles"]}
+    _validate(registered)
+    _write_global(path, values)
     return Config(**registered)
+
+
+def set_upstream_reports(enabled: bool) -> None:
+    """Remember the user's upstream-report answer, preserving unrelated global settings."""
+    path = _global_path()
+    load_global_config(path)
+    values = _read_yaml(path) if path.exists() else {}
+    values["upstream_reports"] = enabled
+    _write_global(path, values)
+
+
+def config_key_names(repo_root: Path) -> list[str]:
+    """Names of the keys set in the global and repository config files, never their values."""
+    names: set[str] = set()
+    for path in (_global_path(), repo_root / ".foragent.yml"):
+        if path.is_file():
+            names.update(str(key) for key in _read_yaml(path))
+    return sorted(names)
 
 
 def set_profile(repo_root: Path, *, kind: str, stage: str, priority: str) -> dict[str, str]:

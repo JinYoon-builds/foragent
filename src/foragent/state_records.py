@@ -80,6 +80,10 @@ class Run:
     merge_lock_held_seconds: float | None = None
     comparison: dict | None = None
     files_committed: bool = False
+    # Machine sleep credited by the gate tick alone (#415): over the whole run, and since
+    # the last progress for the stall check. A record from before it reads as 0.
+    slept_seconds: float = 0
+    slept_since_progress: float = 0
     files_base_branch: str | None = None
     declared_files: list[str] | None = None
     changed_files: list[str] | None = None

@@ -1,4 +1,4 @@
-"""`fa orch pause|resume|plan|queue`: the command side of the lane plan and the start-order lists.
+"""`fa orch pause|resume|plan` and `fa orch queue LANE`: the command side of the lane plan.
 
 ``foragent.commands.orch`` registers these parsers and calls ``run``; the plan rules live in
 ``foragent.orch_plan``. Errors go to stderr with exit code 1, so a refusal is readable.
@@ -16,27 +16,6 @@ from foragent.i18n import text
 from foragent.labels import lane_order
 
 ACTIONS = {"pause", "resume", "plan"}
-
-
-def global_queue(args, store, config) -> None:
-    """Cross-lane priority list in the state directory; argparse puts the first number in ``lane``."""
-    language = config.language
-    numbers = list(args.numbers)
-    if args.lane is not None:
-        try:
-            numbers.insert(0, int(args.lane))
-        except ValueError:
-            raise SystemExit(text("orch_queue_global_number", language, value=args.lane)) from None
-    if args.clear and numbers:
-        raise SystemExit(text("orch_queue_global_usage", language))
-    order = orch_queue.set_global(store, []) if args.clear else (
-        orch_queue.set_global(store, numbers) if numbers else orch_queue.get_global(store))
-    if args.json:
-        print(json.dumps({"lane": None, "order": order}))
-    elif order:
-        print(text("orch_queue_global_show", language, order=" ".join(f"#{n}" for n in order)))
-    else:
-        print(text("orch_queue_global_empty", language))
 
 
 def lane_queue(args, store, config) -> None:
