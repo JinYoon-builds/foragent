@@ -35,3 +35,5 @@
 - `tests/acceptance/test_scheduler_split.py`가 `scheduler.py`를 250줄로 제한한다(#411에서 251줄로 기준선 회귀). scheduler에 줄을 더할 때는 `wc -l`로 확인하고, 주석은 줄 끝에 붙인다. 새 로직은 board_parents 같은 별도 모듈에 둔다.
 - Your turn 덮어쓰기(#694): `board.sync_status` 안에서 열린 이슈가 needs-human·waiting-person 라벨이나 열린 질문(`orch_inbox.waiting_issues`)에 걸리면 Done/closed/merged와 `parent=True`를 빼고 "Needs human"으로 바꾼다. `test_board_parents`의 가짜 store에는 `root`가 없으므로 질문 읽기 실패는 경고만 남기고 계속한다.
 - 다른 이슈가 주인인 상수(예: park 이슈의 `WAITING_PERSON`)는 main에 들어오기 전까지 정의하지 말고 문자열을 직접 쓴다. 지시에 "do not define it here"가 있으면 리뷰가 소유권 위반으로 막는다(#694).
+- 주문 기록 닫기(#705): publish는 하위 이슈 없는 주문(`not plan["issues"] and not mapping`)의 기록을 보드에 넣지 않고 닫는다. tick 정리는 `board_parents.childless_records`로 listing tick마다 하나씩(같은 tick의 부모 닫기 포함) 닫는다. 잠긴 `test_completed_children...`의 #30(하위 없음)이 첫 tick 뒤 열려 있어야 해서 생긴 속도 제한이다. 닫힌 이슈 가벼운 읽기는 `RecordingTracker.observe_closed_issues`(watermark `closed_issues.json`)를 `_reconcile_batches` 맨 앞에서 부른다. scheduler.py는 Files에 없으면 손대지 않는다.
+- `test_github_outbox.py::...rate_limited_close`는 #705 기준선에서 이미 실패한다. 기준선 비교는 `git diff > .foragent/wip.patch; git apply -R`, 시험, `git apply`로 한다(`git checkout --`은 권한 거부).

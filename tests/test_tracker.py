@@ -1652,3 +1652,41 @@ def test_recording_tracker_installs_its_context_as_the_gh_recorder(tmp_path, mon
     gh.run(["auth", "status"], capture_output=True, check=False)
     assert calls == [["gh", "auth", "status"]]
     assert store.github_calls() == [{"hour": "2026-10-20T11:00:00+00:00", "calls": 1}]
+
+
+def test_gh_issues_closed_since_is_one_filtered_listing_without_pull_requests():
+    items = [{"number": 4, "title": "t", "body": "", "labels": [], "state": "closed"},
+             {"number": 5, "title": "p", "body": "", "labels": [], "state": "closed", "pull_request": {}}]
+    calls = []
+    tracker = GhTracker(REPO, run=lambda args, input=None: calls.append(args) or json.dumps(items))
+    assert [issue.number for issue in tracker.issues_closed_since(NOW)] == [4]
+    assert calls == [["api", "--paginate",
+                      "repos/owner/repo/issues?state=closed&since=2026-10-20T09%3A00%3A00Z&per_page=100"]]
+
+
+def test_observe_closed_issues_records_outside_closes_after_the_first_watermark(tmp_path):
+    from types import SimpleNamespace
+
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    clock = [NOW]
+    remote = FakeTracker(now=lambda: clock[0])
+    remote.add_issue(1, "Work", "body")
+    remote.add_issue(2, "Other", "body")
+    ctx = SimpleNamespace(config=Config(), now=lambda: clock[0],
+                          store=StateStore(tmp_path, now=lambda: clock[0]))
+    tracker = RecordingTracker(remote, ctx)
+    tracker.refresh_issues()
+
+    def states():
+        return {row["number"]: row["state"] for row in ctx.store.local_issues()}
+
+    remote.close_issue(1)
+    tracker.observe_closed_issues(observed_at=clock[0])  # The first call only stores the watermark.
+    assert states() == {1: "open", 2: "open"}
+    clock[0] += timedelta(minutes=1)
+    tracker.observe_closed_issues(observed_at=clock[0])
+    assert states() == {1: "closed", 2: "open"}
+    assert ctx.store.closed_issue_watermark() == clock[0]

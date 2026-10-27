@@ -141,3 +141,33 @@ def test_batch_parent_completes_when_its_children_are_done(monkeypatch, batch_ro
     board_parents.follow_children(ctx, report)
     assert closed == [(9, text("parent_children_done", "en", count=1))]
     assert synced == [(9, "Done")]
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_childless_order_records_close_one_per_tick_and_others_stay_open(monkeypatch, language):
+    from types import SimpleNamespace
+
+    from foragent import board, board_parents
+
+    marker = "<!-- foragent:plan id=x map={} acceptance={} -->"
+    rows = [{"number": 1, "state": "open", "labels": [], "children": [], "body": marker},
+            {"number": 2, "state": "open", "labels": [], "children": [], "body": marker},
+            {"number": 3, "state": "open", "labels": ["lane:main"], "children": [], "body": marker},
+            {"number": 4, "state": "open", "labels": [], "children": [], "body": "Plain work."},
+            {"number": 5, "state": "open", "labels": ["approved"], "children": [], "body": marker}]
+    closed, synced = [], []
+
+    def close(n, comment):
+        closed.append((n, comment))
+        next(row for row in rows if row["number"] == n)["state"] = "closed"
+
+    ctx = SimpleNamespace(store=SimpleNamespace(local_issues=lambda: rows),
+                          tracker=SimpleNamespace(sub_issues=lambda n: [], close_issue=close),
+                          config=SimpleNamespace(language=language))
+    monkeypatch.setattr(board, "sync_status", lambda ctx, n, state, parent=False: synced.append((n, state, parent)))
+    assert board_parents.childless_records(rows) == {1, 2}
+    for _ in range(3):
+        board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    comment = text("order_record_closed", language)
+    assert closed == [(1, comment), (2, comment)]
+    assert synced == [(1, "Done", True), (2, "Done", True)]

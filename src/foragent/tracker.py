@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 import json
+import logging
 from pathlib import Path
 import re
 import subprocess
@@ -15,6 +16,8 @@ from urllib.parse import quote
 from zipfile import BadZipFile, ZipFile
 
 from foragent import cuts, gh
+
+log = logging.getLogger(__name__)
 
 
 IssueState = Literal["open", "closed"]
@@ -339,6 +342,33 @@ class RecordingTracker:
                            record["merged_at"], record["url"]) for record in ordered]
         return prs, {"watermark": observed_at.isoformat(), "prs": ordered}
 
+    def observe_closed_issues(self, *, observed_at):
+        """Record issues closed since the stored watermark: one light read per tick.
+
+        Only issues the local record still shows open change, so the board sync
+        moves their cards to Done on this tick instead of the next full listing.
+        The first call only stores the watermark; a full listing covers the past.
+        """
+        read = getattr(self._tracker, "issues_closed_since", None)
+        if read is None:
+            return
+        store = self._context.store
+        watermark = store.closed_issue_watermark()
+        if watermark is not None:
+            since = (watermark if watermark.tzinfo else watermark.replace(tzinfo=UTC)) - _WATERMARK_MARGIN
+            try:
+                issues = read(since)
+            except TrackerError as exc:
+                if exc.is_rate_limit:
+                    raise
+                log.warning("Could not read recently closed issues: %s", exc)
+                return  # Keep the watermark; the next tick reads this span again.
+            known_open = {row["number"] for row in store.local_issues() if row.get("state") == "open"}
+            for issue in issues:
+                if issue.state == "closed" and issue.number in known_open and not issue.is_pull_request:
+                    store.record_issue(issue, self._context.config.lanes)
+        store.record_closed_issue_watermark(observed_at)
+
     def _issue_missing(self, number):
         """A missing write resource alone does not prove that its issue is gone."""
         try:
@@ -570,6 +600,11 @@ class FakeTracker:
     def list_issues(self, state: str = "all") -> list[Issue]:
         return [issue for issue in self.issues.values()
                 if not issue.is_pull_request and (state == "all" or issue.state == state)]
+
+    def issues_closed_since(self, since: datetime) -> list[Issue]:
+        """Closed issues updated at or after ``since``; an unknown time counts as recent."""
+        return [issue for issue in self.list_issues("closed")
+                if (updated := _parse_time(issue.updated_at)) is None or updated >= since]
 
     def update_issue(self, n: int, *, title: str, body: str) -> None:
         self.edit_body(n, body)
@@ -891,6 +926,13 @@ class GhTracker:
 
     def _fetch_issues(self, state: str) -> list[Issue]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues?state={state}&per_page=100"]))
+        return [_issue(item) for item in data if "pull_request" not in item]
+
+    def issues_closed_since(self, since: datetime) -> list[Issue]:
+        """Closed issues updated since ``since``: one light read, no empty-listing retry."""
+        stamp = quote(since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        data = _items(self._call(["api", "--paginate",
+                                  f"{self._path}/issues?state=closed&since={stamp}&per_page=100"]))
         return [_issue(item) for item in data if "pull_request" not in item]
 
     def _evidence_of_issues(self, state: str) -> str | None:
