@@ -127,8 +127,9 @@ def test_executor_pause_holds_every_lane_that_uses_it(tmp_path):
     assert _lane_held(ctx, "main", later) and _lane_held(ctx, "api", later) and _lane_held(ctx, "ui", later)
     assert not _lane_held(ctx, "main", NOW + timedelta(hours=1))
     store.pause_executor("claude", NOW + timedelta(hours=2))
-    # main reviews with Claude and waits; ui implements with Claude, so it starts on Codex instead (#107).
-    assert _lane_held(ctx, "main", NOW + timedelta(hours=1)) and not _lane_held(ctx, "ui", NOW + timedelta(hours=1))
+    # Claude's roles move to Codex while Codex is free (#107): main reviews and ui implements with Codex.
+    assert not _lane_held(ctx, "main", NOW + timedelta(hours=1)) and not _lane_held(ctx, "ui", NOW + timedelta(hours=1))
     assert not _lane_held(ctx, "api", NOW + timedelta(hours=2))
     store.pause_executor("codex", NOW + timedelta(hours=3))
     assert _lane_held(ctx, "ui", NOW + timedelta(hours=1)), "ui waits once Codex is paused too"
+    assert _lane_held(ctx, "main", NOW + timedelta(hours=1)), "main waits once Codex is paused too"

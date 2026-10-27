@@ -352,3 +352,60 @@ def test_korean_report_line_uses_the_registry(ctx):
     assert "#1은 Claude 대신 Codex로 시작해요: Claude 사용량 81%가 keep 기준 80% 이상이에요" in report.actions
     [event] = [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
     assert event["reason"] == "Claude keep share 81% >= 80%"
+
+
+@pytest.mark.parametrize("mode", ["keep", "burn"])
+@pytest.mark.parametrize("executor,reviewer,implementer", [
+    ("codex", None, None),        # default pair: Codex implements, Claude reviews
+    ("claude", None, "codex"),    # Claude implements, Codex reviews
+    ("claude", "claude", "codex"),  # Claude-only lane
+])
+def test_claude_hard_limit_moves_every_claude_role_to_free_codex(ctx, mode, executor, reviewer, implementer):
+    from foragent import usage_recheck
+    from foragent.run_implementation import lane_config
+
+    ctx.config = replace(ctx.config, executor=executor, reviewer=reviewer,
+                         claude_quota={"mode": mode, "keep_percent": 80})
+    ctx.start_runs = True
+    until = NOW + timedelta(hours=1)
+    usage_recheck.note_limit(ctx.store, "claude", until, [{"name": "five_hour", "exhausted": True}], NOW, lane="main")
+    pauses = (ctx.store.root / "lane-pauses.json").read_bytes()
+    approve(ctx, 1)
+    tick(ctx)
+    run = ctx.store.get_run(1)
+    assert run is not None and run.status == "running" and run.implementer == implementer
+    config = switched_config(lane_config(ctx.config, "main"), run.implementer, ctx.store.executor_paused("claude", NOW))
+    assert (config.executor, config.reviewer) == ("codex", "codex")
+    assert (ctx.store.root / "lane-pauses.json").read_bytes() == pauses, "the Claude pause stays in place"
+    switches = [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
+    assert len(switches) == (0 if implementer is None else 1)
+
+
+@pytest.mark.parametrize("executor,reviewer", [("codex", None), ("claude", None), ("claude", "claude")])
+def test_claude_hard_limit_waits_when_codex_is_paused_too(ctx, executor, reviewer):
+    from foragent import usage_recheck
+
+    ctx.config = replace(ctx.config, executor=executor, reviewer=reviewer)
+    ctx.start_runs = True
+    usage_recheck.note_limit(ctx.store, "claude", NOW + timedelta(hours=1), [], NOW, lane="main")
+    ctx.store.pause_executor("codex", NOW + timedelta(hours=1))
+    approve(ctx, 1)
+    tick(ctx)
+    assert ctx.store.get_run(1) is None
+
+
+def test_runner_moves_claude_review_to_codex_while_claude_is_paused(monkeypatch, tmp_path):
+    from foragent import runner
+
+    seen = []
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    store.start_run(1, branch="foragent/issue-1", worktree=tmp_path / "w")
+    store.pause_executor("claude", NOW + timedelta(hours=1))
+    context = runner.RunContext(repo="owner/repo", repo_root=tmp_path, tracker=None, store=store,
+                                config=Config(executor="codex", reviewer_model="opus"), git=None, now=lambda: NOW)
+    context.git = type("Git", (), {"remove_worktree": lambda self, path: None})()
+    monkeypatch.setattr(runner.board, "sync_status", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_execute", lambda n, ctx, worktree: seen.append(ctx.config) or "merged")
+    monkeypatch.setattr(runner, "observe_tree", lambda roots: [])
+    runner.run_issue(1, context)
+    assert (seen[0].executor, seen[0].reviewer, seen[0].reviewer_model) == ("codex", "codex", None)

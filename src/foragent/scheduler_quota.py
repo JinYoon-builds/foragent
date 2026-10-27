@@ -1,4 +1,5 @@
-"""Claude plan share (#107): keep mode starts new runs with Codex once Claude passes keep_percent.
+"""Claude plan share (#107): keep mode starts new runs with Codex once Claude passes keep_percent;
+Claude paused at its hard limit moves every Claude role of a new run to Codex in either mode.
 
 `fa quota mode` is the only writer of ``<state>/claude-quota.json``; the tick only reads it.
 The tick writes a run's ``implementer`` once, when it starts the run.
@@ -106,17 +107,24 @@ def switch_for(config: Config, snap: Snapshot) -> Switch | None:
 
 
 def switched_config(config: Config, implementer: str | None, claude_paused: bool = False) -> Config:
-    """A lane-adjusted config with the run's stored implementer; None keeps the lane's executor.
+    """A lane-adjusted config with the run's stored implementer and Claude's hard-limit fallback.
 
-    A reviewer pinned to ``none`` stays; otherwise Claude reviews the switched run
-    (cross-model), and Codex only while Claude is paused at its hard limit.
+    ``implementer`` None keeps the lane's executor. A switched run's reviewer is Claude
+    (cross-model) unless it is pinned to ``none``. While Claude is paused at its hard
+    limit, every role Claude would fill moves to Codex: the implementer through the
+    stored choice, the reviewer here, whichever executor the lane configures.
     """
-    if implementer is None or implementer == config.executor:
-        return config
     previous = resolved_reviewer(config)
-    reviewer = "none" if previous == "none" else ("codex" if claude_paused else "claude")
+    executor = implementer if implementer is not None else config.executor
+    reviewer = previous if executor == config.executor else ("none" if previous == "none" else "claude")
+    if claude_paused and reviewer == "claude":
+        reviewer = "codex"
+    if executor == config.executor and reviewer == previous:
+        return config
+    same = executor == config.executor
     return replace(
-        config, executor=implementer, executor_model=None, executor_fallback_model=None, reviewer=reviewer,
+        config, executor=executor, executor_model=config.executor_model if same else None,
+        executor_fallback_model=config.executor_fallback_model if same else None, reviewer=reviewer,
         reviewer_model=config.reviewer_model if reviewer == previous else None,
     )
 
@@ -152,12 +160,13 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
     run_config = switched_config(adjusted, implementer, snap.claude_paused)
     held = any(snap.paused(store, name, now) for name in {run_config.executor, resolved_reviewer(run_config)})
     if not held and store.lane_paused(lane, now):
-        # A lane pause mirrors a limit of the lane's configured pair. Only a run that
-        # implements with Codex instead (new or kept) skips a Claude-caused one, leaving it in place.
+        # A lane pause mirrors a limit of the lane's configured pair. A Claude-caused one does
+        # not hold the start: every Claude role of this run already moved to Codex, which is free.
+        # The pause itself stays in place.
         from foragent.config import lane_executors
 
         claude_caused = snap.claude_paused and "claude" in lane_executors(config, lane)
-        held = not (implementer is not None and claude_caused)
+        held = not (claude_caused and "claude" not in {run_config.executor, resolved_reviewer(run_config)})
     return Start(run_config, implementer, switch, held)
 
 
