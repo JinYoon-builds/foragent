@@ -17,11 +17,16 @@ def _clean(value: Any) -> str:
                             for c in str(value)).split())
 
 
+# Emoji the lane rows use whose Unicode width is narrow by default; terminals draw them two cells wide.
+WIDE_EMOJI = frozenset("🐿")
+
+
 def _cells(value: str) -> int:
     from foragent import watch
 
     return sum(0 if watch.unicodedata.combining(c) or watch.unicodedata.category(c) in {"Mn", "Me", "Cf"}
-               else 2 if watch.unicodedata.east_asian_width(c) in {"W", "F"} else 1 for c in value)
+               else 2 if c in WIDE_EMOJI or watch.unicodedata.east_asian_width(c) in {"W", "F"} else 1
+               for c in value)
 
 
 def _fit(line: Line, width: int) -> Line:

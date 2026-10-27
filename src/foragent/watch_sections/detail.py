@@ -8,6 +8,7 @@ from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
 ORDER = 50
+KEEP = True  # A person asked for these details; they stay when the screen is short.
 
 
 def render_detail(config: Config, slug: str, repo_root: Path, done_count: int = 0) -> str:

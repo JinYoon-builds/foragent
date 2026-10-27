@@ -11,7 +11,7 @@ from typing import Any
 
 from foragent import orch_inbox
 from foragent.config import Config
-from foragent.labels import BLOCKED, NEEDS_HUMAN
+from foragent.labels import BLOCKED, NEEDS_HUMAN, WAITING_PERSON
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
 from foragent.watch_sections import orch_panel, progress
@@ -49,6 +49,9 @@ class Snapshot:
     merged_at: dict[int, datetime] = field(default_factory=dict)
     # The orchestrator note, its age in seconds and the fresh `fa inspect` count (orch_panel.collect).
     panel: dict[str, Any] = field(default_factory=dict)
+    # Closed phase events (kind=phase, #224) by issue, and the latest journal event with a say line.
+    phases: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    say: dict[str, Any] | None = None
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -68,6 +71,30 @@ def recent_events(store: StateStore) -> list[dict[str, Any]]:
     except FileNotFoundError:
         pass
     return list(reversed(events))
+
+
+def journal_facts(store: StateStore) -> tuple[dict[int, list[dict[str, Any]]], dict[str, Any] | None]:
+    """Every closed phase event by issue and the latest event with a say line, from the whole journal."""
+    from foragent import watch
+
+    phases: dict[int, list[dict[str, Any]]] = {}
+    say = None
+    try:
+        with (store.root / "orch-events.jsonl").open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    event = watch.json.loads(line)
+                except watch.json.JSONDecodeError:
+                    continue  # An append still being written.
+                if not isinstance(event, dict):
+                    continue
+                if event.get("kind") == "phase" and isinstance(event.get("issue"), int) and event.get("phase"):
+                    phases.setdefault(event["issue"], []).append(event)
+                if isinstance(event.get("say"), str) and event["say"].strip():
+                    say = event
+    except FileNotFoundError:
+        pass
+    return phases, say
 
 
 def evidence(store: StateStore, numbers: list[int], now: datetime) -> tuple[dict[str, float], dict[int, float]]:
@@ -164,8 +191,10 @@ def collect(
     worker_states = {}
     for run in status["active_runs"]:
         labels = issues[run["number"]].labels if run["number"] in issues else frozenset()
-        worker_states[run["number"]] = ("waiting-human" if NEEDS_HUMAN in labels
+        worker_states[run["number"]] = ("waiting-human" if {NEEDS_HUMAN, WAITING_PERSON} & labels
                                         else "blocked" if BLOCKED in labels else "working")
+    phases, say = journal_facts(store)
     return watch.Snapshot(status, done, order, completed, total, eta, watch.recent_events(store), now,
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
-                          worker_states, eta_range, basis, today, merged_at, orch_panel.collect(store, now))
+                          worker_states, eta_range, basis, today, merged_at, orch_panel.collect(store, now),
+                          phases, say)

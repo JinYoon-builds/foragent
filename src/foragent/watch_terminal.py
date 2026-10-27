@@ -94,8 +94,8 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             height, width = screen.getmaxyx()
             layout: dict = {}
             try:
-                frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(40, width - 1), selected=selected,
-                                     now=now(), **({} if store is None else {"layout": layout}))
+                frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(1, width - 1), selected=selected,
+                                     now=now(), **({} if store is None else {"layout": layout}), height=height)
             except ImportError:
                 # A reinstall can briefly leave modules missing; restart on the installed code.
                 return _restart(cleanup)
