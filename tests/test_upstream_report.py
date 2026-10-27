@@ -150,12 +150,13 @@ def test_report_help_follows_the_repository_language(tmp_path, monkeypatch, caps
 class SearchTracker:
     """Records search and writes; ``rows`` is what GitHub search returned."""
 
-    def __init__(self, rows):
+    def __init__(self, rows, **response):
         self.rows, self.queries, self.comments, self.created = rows, [], [], []
+        self.response = {"items": rows, "total_count": len(rows), "incomplete_results": False, **response}
 
     def search_issues(self, query):
         self.queries.append(query)
-        return self.rows
+        return self.response
 
     def comment(self, number, body):
         self.comments.append((number, body))
@@ -199,7 +200,7 @@ def test_search_asks_github_for_comment_fragments_and_a_full_page():
 
     calls = []
     tracker = GhTracker("JinYoon-builds/foragent", run=lambda args, input=None: calls.append(args) or '{"items": []}')
-    assert tracker.search_issues('"fa-sig-1"') == []
+    assert tracker.search_issues('"fa-sig-1"') == {"items": []}
     assert "Accept: application/vnd.github.text-match+json" in calls[0] and "per_page=100" in calls[0]
 
 
@@ -265,3 +266,134 @@ def test_gate_tick_failure_event_reads_the_tick_failure_log(tmp_path):
                  f"gate-1 from gate: 3 consecutive gate ticks failed. Traceback: {log}")
     report = upstream_report.propose(store, "event:1", [])
     assert "OSError" in report["title"] and "foragent/scheduler.py" in report["title"]
+
+
+@pytest.mark.parametrize("response", [{"incomplete_results": True}, {"total_count": 250}],
+                         ids=["incomplete-results", "more-than-one-page"])
+def test_partial_search_without_a_match_sends_nothing(tmp_path, response):
+    store, report = prepared(tmp_path)
+    tracker = SearchTracker([], **response)
+    with pytest.raises(upstream_report.ReportError, match="report_search_incomplete"):
+        upstream_report.send(store, report, tracker)
+    assert tracker.created == [] and tracker.comments == []
+
+
+def test_partial_search_that_found_the_match_still_appends(tmp_path):
+    store, report = prepared(tmp_path)
+    row = {"number": 811, "state": "open", "title": "", "body": report["signature"]}
+    tracker = SearchTracker([row], incomplete_results=True)
+    assert upstream_report.send(store, report, tracker)[0] == "comment"
+
+
+@pytest.mark.parametrize("field,value", [("body", "PRIVATE_USER_CODE"), ("title", "PRIVATE"),
+                                         ("signature", "fa-sig-000000000000"), ("id", "rep-0000000000000000")])
+def test_a_report_changed_after_it_was_shown_is_refused(tmp_path, field, value):
+    import json
+
+    store, report = prepared(tmp_path)
+    path = store.root / "upstream-reports" / f"{report['id']}.json"
+    saved = json.loads(path.read_text())
+    saved[field] = value
+    path.write_text(json.dumps(saved))
+    with pytest.raises(upstream_report.ReportError, match="report_changed"):
+        upstream_report.load(store, report["id"])
+
+
+def test_an_unchanged_report_loads(tmp_path):
+    store, report = prepared(tmp_path)
+    assert {key: upstream_report.load(store, report["id"])[key] for key in report} == report
+
+
+@pytest.mark.parametrize("form", ["separate", "equals"])
+def test_report_help_follows_the_repo_root_language_from_elsewhere(tmp_path, monkeypatch, capsys, form):
+    from foragent import cli
+
+    korean = tmp_path / "korean"
+    korean.mkdir()
+    (korean / ".foragent.yml").write_text("language: ko\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    root = ["--repo-root", str(korean)] if form == "separate" else [f"--repo-root={korean}"]
+    with pytest.raises(SystemExit):
+        cli.main(["report", "send", *root, "--help"])
+    assert "보내도록 승인해요" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        cli.main(["report", "send", "--help"])
+    assert "Approve sending this report" in capsys.readouterr().out
+
+
+class FailingTracker(SearchTracker):
+    def __init__(self, *, search=None, write=None):
+        super().__init__([])
+        self.search_result, self.write_error = search, write
+
+    def search_issues(self, query):
+        if isinstance(self.search_result, Exception):
+            raise self.search_result
+        return self.search_result if self.search_result is not None else self.response
+
+    def create_issue(self, title, body, labels):
+        if self.write_error:
+            raise self.write_error
+        return super().create_issue(title, body, labels)
+
+
+@pytest.mark.parametrize("tracker,key", [
+    (lambda: FailingTracker(search=["not", "an", "object"]), "report_search_invalid"),
+    (lambda: FailingTracker(search={"items": "nope"}), "report_search_invalid"),
+    (lambda: FailingTracker(search=ValueError("Expecting value: line 1 column 1")), "report_upstream_failed"),
+    (lambda: FailingTracker(search=__import__("foragent.tracker").tracker.TrackerError("HTTP 502")),
+     "report_upstream_failed"),
+    (lambda: FailingTracker(write=FileNotFoundError("gh")), "report_upstream_failed"),
+], ids=["list-response", "items-not-list", "bad-json", "gh-failure", "gh-missing"])
+def test_every_upstream_failure_becomes_a_message_key(tmp_path, tracker, key):
+    store, report = prepared(tmp_path)
+    with pytest.raises(upstream_report.ReportError) as raised:
+        upstream_report.send(store, report, tracker())
+    assert str(raised.value) == key
+
+
+def test_search_returns_github_json_without_its_own_english_error():
+    from foragent.tracker import GhTracker
+
+    tracker = GhTracker("JinYoon-builds/foragent", run=lambda args, input=None: "[1, 2]")
+    assert tracker.search_issues('"fa-sig-1"') == [1, 2]
+
+
+@pytest.mark.parametrize("key", ["report_upstream_failed", "report_search_invalid", "report_config_invalid",
+                                 "report_repo_invalid", "report_save_failed", "report_sent_unrecorded",
+                                 "upstream_reports_save_failed"])
+def test_failure_messages_exist_in_english_and_korean(key):
+    from foragent.i18n import text
+
+    values = {"error": "x", "url": "u"}
+    assert text(key, "en", **values) != text(key, "ko", **values)
+
+
+def test_send_failure_prints_in_the_repository_language(tmp_path, monkeypatch, capsys):
+    import yaml
+    from foragent import cli
+    from foragent.tracker import TrackerError
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".config/foragent").mkdir(parents=True)
+    (home / ".config/foragent/config.yml").write_text(yaml.safe_dump({"upstream_reports": True}))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".foragent.yml").write_text("language: ko\nrepo: owner/repo\n", encoding="utf-8")
+    store, report = prepared(tmp_path)
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kw: store))
+
+    class Broken:
+        def __init__(self, repo):
+            pass
+
+        def search_issues(self, query):
+            raise TrackerError("invalid search response: expected an object")
+
+    monkeypatch.setattr(cli, "GhTracker", Broken)
+    assert cli.main(["report", "send", report["id"], "--yes", "--repo-root", str(repo)]) == 1
+    err = capsys.readouterr().err
+    assert "GitHub 요청을 끝내지 못했어요" in err

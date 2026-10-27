@@ -11,10 +11,21 @@ MESSAGES = {
         "config_upstream_reports_invalid": "upstream_reports must be true or false.",
         "report_not_allowed": (
             "Upstream reports are off. To allow them, set upstream_reports: true in {path}."),
+        "upstream_reports_save_failed": "Upstream reports: couldn't save your answer ({error}); fa init will ask next time.",
+        "report_repo_invalid": "Foragent couldn't read this repository's setup, so nothing was done. ({error})",
+        "report_config_invalid": "Foragent couldn't read your global config, so nothing was done. ({error})",
+        "report_save_failed": "Couldn't save the report on this computer, so nothing was prepared. ({error})",
+        "report_upstream_failed": "Couldn't finish the request to GitHub; nothing new was sent. ({error})",
+        "report_search_invalid": "GitHub sent a search answer Foragent can't read, so nothing was sent. Try again later.",
+        "report_sent_unrecorded": "Sent ({url}), but couldn't record it on this computer, so don't send it again. ({error})",
         "report_bad_source": "Use --from flag:N or event:N (N is an issue number or a journal line).",
         "report_source_missing": "Nothing found for {source}.",
         "report_no_error": "{source} has no Python error Foragent can read. For a one-line journal event, try the issue's flag:N.",
         "report_unknown": "No prepared report {report_id}. Run fa report propose first.",
+        "report_changed": ("Report {report_id} changed after it was shown, so it was not sent. "
+                           "Run fa report propose again and review the new report."),
+        "report_search_incomplete": ("GitHub returned partial search results, so Foragent can't tell whether "
+                                     "this error is already reported. Nothing was sent; try again later."),
         "report_already_sent": "Report {report_id} was already sent: {url}",
         "report_send_hint": "Nothing was sent. To send this report: fa report send {report_id} --yes",
         "report_send_question": "Send this report to {upstream}? [y/N] ",
@@ -54,10 +65,21 @@ MESSAGES = {
         "config_upstream_reports_invalid": "upstream_reports는 true 또는 false여야 해요.",
         "report_not_allowed": (
             "Upstream report가 꺼져 있어요. 켜려면 {path}에 upstream_reports: true를 넣어 주세요."),
+        "upstream_reports_save_failed": "Upstream report: 답을 저장하지 못했어요({error}). 다음 fa init 때 다시 물어요.",
+        "report_repo_invalid": "이 저장소의 설정을 읽지 못해서 아무것도 하지 않았어요. ({error})",
+        "report_config_invalid": "전역 설정을 읽지 못해서 아무것도 하지 않았어요. ({error})",
+        "report_save_failed": "이 컴퓨터에 보고서를 저장하지 못해서 준비하지 않았어요. ({error})",
+        "report_upstream_failed": "GitHub 요청을 끝내지 못했어요. 새로 보낸 것은 없어요. ({error})",
+        "report_search_invalid": "GitHub의 검색 응답을 읽을 수 없어서 보내지 않았어요. 나중에 다시 해 주세요.",
+        "report_sent_unrecorded": "보냈어요({url}). 하지만 이 컴퓨터에 기록하지 못했으니 다시 보내지 마세요. ({error})",
         "report_bad_source": "--from flag:N 또는 event:N을 쓰세요(N은 이슈 번호 또는 기록 줄 번호).",
         "report_source_missing": "{source}에서 찾은 기록이 없어요.",
         "report_no_error": "{source}에서 읽을 수 있는 Python 오류가 없어요. 한 줄짜리 기록이면 그 이슈의 flag:N을 써 보세요.",
         "report_unknown": "준비된 보고서 {report_id}가 없어요. 먼저 fa report propose를 실행하세요.",
+        "report_changed": ("보고서 {report_id}가 보여 준 뒤에 바뀌어서 보내지 않았어요. "
+                           "fa report propose를 다시 실행하고 새 보고서를 확인해 주세요."),
+        "report_search_incomplete": ("GitHub이 검색 결과를 일부만 줘서 이미 보고된 오류인지 알 수 없어요. "
+                                     "아무것도 보내지 않았어요. 나중에 다시 해 주세요."),
         "report_already_sent": "보고서 {report_id}는 이미 보냈어요: {url}",
         "report_send_hint": "아무것도 보내지 않았어요. 보내려면: fa report send {report_id} --yes",
         "report_send_question": "이 보고서를 {upstream}에 보낼까요? [y/N] ",

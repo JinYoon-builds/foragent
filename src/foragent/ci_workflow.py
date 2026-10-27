@@ -7,6 +7,7 @@ import sys
 
 import yaml
 
+from foragent import gh
 from foragent.config import load_config
 from foragent.git import GitError, GitRepo
 
@@ -48,8 +49,8 @@ def parse_exclusions(value):
 def repository_private(repo, run=None):
     try:
         if run is None:
-            output = subprocess.run(["gh", "repo", "view", repo, "--json", "isPrivate"],
-                                    check=True, capture_output=True, text=True).stdout
+            output = gh.run(["repo", "view", repo, "--json", "isPrivate"],
+                            check=True, capture_output=True, text=True).stdout
         else:
             output = run(["repo", "view", repo, "--json", "isPrivate"], input=None)
         data = json.loads(output)

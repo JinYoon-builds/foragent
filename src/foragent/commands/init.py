@@ -58,7 +58,12 @@ def _offer_upstream_reports(root) -> None:
         print(cli.text("upstream_reports_unanswered", language))
         return
     enabled = answer.strip().lower() in {"y", "yes"}
-    set_upstream_reports(enabled)
+    try:
+        set_upstream_reports(enabled)
+    except (OSError, cli.ConfigError) as exc:
+        # Setup itself succeeded; say so in the repository's language and ask again next time.
+        print(cli.text("upstream_reports_save_failed", language, error=" ".join(str(exc).split())[:300]))
+        return
     print(cli.text("upstream_reports_on" if enabled else "upstream_reports_off", language))
 
 

@@ -6,31 +6,23 @@ in the local record (messages, user code, issue text, other paths, repository
 names, config values) stays on this machine.
 """
 
-import builtins
 from dataclasses import fields
 import hashlib
 import json
 from pathlib import Path
 import re
-import sys
+import subprocess
 from tempfile import NamedTemporaryFile
 from typing import Any
 
 import foragent
 from foragent.orch_tick_outcome import LOG_FILE as TICK_FAILURE_LOG
 from foragent.state import StateStore
+from foragent.tracker import TrackerError
+from foragent.upstream_traceback import _joined_traceback, _log_traceback, parse_traceback  # noqa: F401
 
 UPSTREAM = "JinYoon-builds/foragent"
-# The whole function token is captured (up to whitespace), so a frame is never verified by a prefix.
-_FRAME = re.compile(r'File "([^"]+)", line (\d+), in (\S+)(?=\s|$)')
-_TYPE = r"(?:[A-Za-z_]\w*\.)*[A-Z]\w*"
-_TYPE_INLINE = re.compile(rf"(?<![\w.])({_TYPE})(?::(?=\s|$)|$)")
-# Traceback structure: indented frame lines, then the exception line at column 0.
-_FRAME_LINE = re.compile(r'^\s+File "([^"]+)", line (\d+), in (\S+)\s*$')
-_TYPE_LINE = re.compile(rf"^({_TYPE})(?::(?=\s|$)|$)")
-_HEADER = "Traceback (most recent call last):"
 _LOG_TAIL = 2_000_000  # Bytes read from the end of a log; tracebacks are appended last.
-_SYNTHETIC_FUNCTIONS = {"<module>", "<lambda>", "<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>"}
 # Run fields that are counts or durations; everything else in a run can hold private text.
 _RUN_NUMBERS = ("attempts", "restarts", "transient_errors", "resume_failures", "rebuild_count",
                 "waited_seconds", "executor_waited_seconds", "review_pass_to_merge_seconds",
@@ -38,112 +30,23 @@ _RUN_NUMBERS = ("attempts", "restarts", "transient_errors", "resume_failures", "
 
 
 class ReportError(ValueError):
-    """A report could not be prepared or sent; the message is for a person."""
+    """A report could not be prepared or sent: a message key plus values for its text.
 
-
-def _package_file(path: str) -> Path | None:
-    """The file ``path`` names if it really is a .py file of this foragent package, after resolving."""
-    package = Path(foragent.__file__).resolve().parent
-    try:
-        resolved = Path(path).resolve()
-        resolved.relative_to(package)
-    except (OSError, RuntimeError, ValueError):
-        return None
-    return resolved if resolved.suffix == ".py" and resolved.is_file() else None
-
-
-def _verified_frame(path: str, line: str, function: str) -> tuple[str, int | None, str] | None:
-    """A frame rebuilt from this package's own files, as (foragent/<path>, line or None, function).
-
-    Traceback text is free text, so every field reported is checked against the real file:
-    the path is the resolved package file's own relative path; the function must be one plain
-    name (Python prints ``co_name``, never a dotted name) that the file defines; the line number
-    is kept only if the file has that line, since it may come from another installed version.
-    Anything else drops the frame, so no unchecked text reaches a report.
+    Every failure of `fa report` is turned into one of these, so the person reads it in the
+    repository's language; ``error`` carries the underlying tool's own words for diagnosis.
     """
-    file = _package_file(path)
-    if file is None:
-        return None
-    try:
-        source = file.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
-    if function not in _SYNTHETIC_FUNCTIONS and not (
-            re.fullmatch(r"[A-Za-z_]\w*", function) and re.search(
-                rf"^\s*(?:async\s+def|def|class)\s+{re.escape(function)}\b", source, re.M)):
-        return None
-    number = int(line)
-    lines = source.count("\n") + (0 if source.endswith("\n") else 1)
-    package = Path(foragent.__file__).resolve().parent
-    return ("/".join(("foragent", *file.relative_to(package).parts)),
-            number if 1 <= number <= lines else None, function)
+
+    def __init__(self, key: str, **values: Any):
+        super().__init__(key)
+        self.values = values
 
 
-def _known_exception(name: str) -> bool:
-    """Whether ``name`` is a real exception class: built-in, a loaded module's, or foragent's own."""
-    module, _, cls = name.rpartition(".")
-    candidates = [sys.modules.get(module)] if module else [builtins]
-    if any(isinstance(getattr(owner, cls, None), type) and issubclass(getattr(owner, cls), BaseException)
-           for owner in candidates if owner is not None):
-        return True
-    if module and not (module == "foragent" or module.startswith("foragent.")):
-        return False
-    package = Path(foragent.__file__).resolve().parent
-    pattern = re.compile(rf"^class\s+{re.escape(cls)}\b", re.M)
-    return any(pattern.search(path.read_text(encoding="utf-8")) for path in package.rglob("*.py"))
+def _detail(exc: BaseException) -> str:
+    return " ".join(str(exc).split())[:300] or type(exc).__name__
 
 
-def parse_traceback(text: str) -> tuple[str | None, list[tuple[str, int, str]]]:
-    """The final exception's class name and its verified Foragent frames, read from structure only.
-
-    Python prints frames as indented ``File "...", line N, in f`` lines, then the exception as
-    the first line at column 0. Source and caret lines are indented display text and are never
-    read. With chained exceptions only the last ``Traceback`` block counts. The class name must
-    be a real exception class, so free text at column 0 never becomes the type.
-    """
-    lines = text.splitlines()
-    starts = [index for index, line in enumerate(lines) if line.rstrip().endswith(_HEADER)]
-    block = lines[starts[-1] + 1:] if starts else lines
-    raw, last = [], -1
-    for index, line in enumerate(block):
-        found = _FRAME_LINE.match(line)
-        if found:
-            raw.append(found.groups())
-            last = index
-    name = None
-    line = next((item for item in block[last + 1:] if item.strip() and not item[:1].isspace()), "")
-    found = _TYPE_LINE.match(line)
-    if found and _known_exception(found.group(1)):
-        name = found.group(1).rsplit(".", 1)[-1]
-    return name, [frame for frame in (_verified_frame(*item) for item in raw) if frame]
-
-
-def _log_traceback(text: str) -> tuple[str | None, list[tuple[str, int, str]]]:
-    """The last traceback in a log that has verified Foragent frames.
-
-    Issue logs also hold executor output, such as a user project's failing tests; those
-    tracebacks have no Foragent frames, so they are skipped rather than reported.
-    """
-    lines = text.splitlines()
-    starts = [index for index, line in enumerate(lines) if line.rstrip().endswith(_HEADER)]
-    for position in reversed(range(len(starts))):
-        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
-        name, frames = parse_traceback("\n".join(lines[starts[position]:end]))
-        if name and frames:
-            return name, frames
-    return None, []
-
-
-def _joined_traceback(text: str) -> tuple[str | None, list[tuple[str, int, str]]]:
-    """A journal line with its line breaks removed: frames stay readable, the type only if unambiguous."""
-    last = None
-    for last in _FRAME.finditer(text):
-        pass
-    tail = text[last.end():] if last else text
-    names = {match.group(1).rsplit(".", 1)[-1] for match in _TYPE_INLINE.finditer(tail)
-             if _known_exception(match.group(1))}
-    frames = [frame for frame in (_verified_frame(*item) for item in _FRAME.findall(text)) if frame]
-    return (names.pop() if len(names) == 1 else None), frames
+# What a GitHub call can raise: gh failures, bad JSON, missing gh, timeouts.
+_UPSTREAM_ERRORS = (TrackerError, OSError, ValueError, subprocess.SubprocessError)
 
 
 def signature(kind: str, frame: tuple[str, int, str] | None) -> str:
@@ -250,14 +153,21 @@ def propose(store: StateStore, source: str, config_keys: list[str], language: st
     lines += ["", say("report_config_keys", language, keys=", ".join(config_keys) or say("report_none", language)),
               "", say("report_footer", language)]
     body = "\n".join(lines) + "\n"
-    report_id = "rep-" + hashlib.sha256(f"{title}\n{body}".encode()).hexdigest()[:10]
-    report = {"id": report_id, "title": title, "body": body, "signature": token}
-    _save(store, {**report, "sent": None})
+    report = {"id": _report_id(title, body, token), "title": title, "body": body, "signature": token}
+    try:
+        _save(store, {**report, "sent": None})
+    except OSError as exc:
+        raise ReportError("report_save_failed", error=_detail(exc)) from exc
     return report
 
 
+def _report_id(title: str, body: str, token: str) -> str:
+    """The ID a person approves names the exact outbound text: a hash of title, body and signature."""
+    return "rep-" + hashlib.sha256(json.dumps([title, body, token]).encode()).hexdigest()[:16]
+
+
 def _path(store: StateStore, report_id: str) -> Path:
-    if not re.fullmatch(r"rep-[0-9a-f]{10}", report_id):
+    if not re.fullmatch(r"rep-[0-9a-f]{16}", report_id):
         raise ReportError("report_unknown")
     return store.root / "upstream-reports" / f"{report_id}.json"
 
@@ -277,10 +187,21 @@ def _save(store: StateStore, report: dict[str, Any]) -> None:
 
 
 def load(store: StateStore, report_id: str) -> dict[str, Any]:
+    """The saved report, only if its title, body and signature still hash to ``report_id``.
+
+    The file is local and editable; a changed report is refused, so `fa report send` can only
+    transmit the text `fa report propose` showed under that ID.
+    """
     try:
-        return json.loads(_path(store, report_id).read_text(encoding="utf-8"))
+        report = json.loads(_path(store, report_id).read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         raise ReportError("report_unknown") from None
+    fields_ok = isinstance(report, dict) and all(isinstance(report.get(key), str) for key in
+                                                  ("id", "title", "body", "signature"))
+    if not fields_ok or report["id"] != report_id or not re.fullmatch(r"fa-sig-[0-9a-f]{12}", report["signature"]) \
+            or _report_id(report["title"], report["body"], report["signature"]) != report_id:
+        raise ReportError("report_changed")
+    return report
 
 
 def _searchable_text(row: dict[str, Any]) -> str:
@@ -296,18 +217,35 @@ def _searchable_text(row: dict[str, Any]) -> str:
 def send(store: StateStore, report: dict[str, Any], tracker) -> tuple[str, str]:
     """Search upstream by signature, then append to the matching open issue or open one.
 
-    Returns ("comment" | "create", issue URL).
+    Returns ("comment" | "create", issue URL). Every failure is a ReportError with a message key.
     """
-    rows = tracker.search_issues(f'repo:{UPSTREAM} is:issue is:open "{report["signature"]}"')
+    try:
+        result = tracker.search_issues(f'repo:{UPSTREAM} is:issue is:open "{report["signature"]}"')
+    except _UPSTREAM_ERRORS as exc:
+        raise ReportError("report_upstream_failed", error=_detail(exc)) from exc
+    rows = result.get("items") if isinstance(result, dict) else None
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise ReportError("report_search_invalid")
     match = next((row for row in rows if str(row.get("state", "")).lower() == "open"
                   and report["signature"] in _searchable_text(row)), None)
-    if match is not None:
-        number = int(match["number"])
-        tracker.comment(number, report["body"])
-        action = "comment"
-    else:
-        number = tracker.create_issue(report["title"], report["body"], [])
-        action = "create"
+    # No match proves absence only if GitHub returned every result; otherwise a new issue may duplicate one.
+    total = result.get("total_count")
+    complete = (not result.get("incomplete_results") and isinstance(total, int) and total <= len(rows))
+    if match is None and not complete:
+        raise ReportError("report_search_incomplete")
+    try:
+        if match is not None:
+            number = int(match["number"])
+            tracker.comment(number, report["body"])
+            action = "comment"
+        else:
+            number = tracker.create_issue(report["title"], report["body"], [])
+            action = "create"
+    except _UPSTREAM_ERRORS as exc:
+        raise ReportError("report_upstream_failed", error=_detail(exc)) from exc
     url = f"https://github.com/{UPSTREAM}/issues/{number}"
-    _save(store, {**report, "sent": {"action": action, "number": number, "url": url}})
+    try:
+        _save(store, {**report, "sent": {"action": action, "number": number, "url": url}})
+    except OSError as exc:
+        raise ReportError("report_sent_unrecorded", url=url, error=_detail(exc)) from exc
     return action, url

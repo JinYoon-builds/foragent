@@ -176,6 +176,8 @@ def run(args) -> int:
     repo = config.repo or git.remote_slug()
     tracker = cli.GhTracker(repo)
     store = cli.StateStore.for_repo(repo)
+    # Status, watch and run gh calls count too, not only those inside a tick context.
+    cli.gh.set_recorder(store, lambda: cli.datetime.now(cli.UTC))
     if args.action == "tick":
         _tick(args, root, git, config, repo, tracker, store)
     elif args.action == "status":

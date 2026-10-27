@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from glob import escape, has_magic
 from itertools import combinations, product
+import json
 from pathlib import Path
 
 from foragent.git import GitError, REVIEW_SCOPE_FILE
@@ -70,7 +71,10 @@ def measure(ctx, run: Run, parsed: ParsedIssue, target: str | None = None) -> Ru
     return ctx.store.update_run(run.number, **fields)
 
 
-def claims(ctx, *, exclude: int | None = None) -> tuple[list[Claim], list[Run]]:
+def claims(
+    ctx, *, exclude: int | None = None, measured: bool = True,
+) -> tuple[list[Claim], list[Run]]:
+    """Active runs' file claims; ``measured=False`` uses only the recorded measurement (read-only)."""
     known, unknown = [], []
     for run in ctx.store.active_runs():
         if run.number == exclude:
@@ -79,7 +83,8 @@ def claims(ctx, *, exclude: int | None = None) -> tuple[list[Claim], list[Run]]:
         if parsed is None or not parsed.files:
             unknown.append(run)
             continue
-        run = measure(ctx, run, parsed)
+        if measured:
+            run = measure(ctx, run, parsed)
         files = ([escape(path) for path in run.effective_files]
                  if run.files_committed and run.effective_files is not None else parsed.files)
         known.append(Claim(run, parsed, files))
@@ -105,7 +110,36 @@ def union_patterns(ctx, files: list[str], peers: list[Claim]) -> set[str]:
         paths.update(peer.run.changed_files or [])
         if peer.run.files_committed:
             paths.update(peer.run.effective_files or [])
-    return {escape(path) for path in ctx.git.union_merge_paths(f"origin/{ctx.config.base_branch}", paths)}
+    union = ctx.git.union_merge_paths(f"origin/{ctx.config.base_branch}", paths)
+    record_union(ctx.store, paths, union)
+    return {escape(path) for path in union}
+
+
+UNION_FILE = "union-merge-paths.json"
+
+
+def record_union(store, checked: set[str], union: set[str]) -> None:
+    """Keep the gate's merge=union answers, so read-only views apply the same exemptions."""
+    if not checked:
+        return
+    path = store.root / UNION_FILE
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    known = saved.get("paths") if isinstance(saved, dict) and isinstance(saved.get("paths"), dict) else {}
+    updated = {**known, **{name: name in union for name in checked}}
+    if updated != known:
+        store._write_json(path, {"paths": dict(sorted(updated.items()))})
+
+
+def recorded_union(store) -> set[str]:
+    """Escaped paths the gate last found to merge with union; unchecked paths keep their limits."""
+    try:
+        saved = json.loads((store.root / UNION_FILE).read_text(encoding="utf-8"))
+        return {escape(name) for name, union in saved["paths"].items() if union is True}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return set()
 
 
 def at_capacity(ctx, files: list[str], peers: list[Claim], *, union: set[str] | None = None) -> bool:
@@ -129,6 +163,14 @@ def can_start(ctx, lane: str, number: int) -> bool:
     known, unknown = claims(ctx)
     approval = ctx.store.load_approval(number)
     parsed = parse_body(approval.body) if approval is not None else None
+    return admits(ctx, lane, parsed, known, unknown)
+
+
+def admits(
+    ctx, lane: str, parsed: ParsedIssue | None, known: list[Claim], unknown: list[Run],
+    *, union: set[str] | None = None,
+) -> bool:
+    """The gate's file rule: lane serialisation without Files, exclusive reservations, overlap_per_file."""
     if parsed is None or not parsed.files:
         return not any(run.lane == lane for run in [*(claim.run for claim in known), *unknown])
     if any(run.lane == lane for run in unknown):
@@ -136,4 +178,4 @@ def can_start(ctx, lane: str, number: int) -> bool:
     if any(any_overlap(ctx, parsed.files + parsed.exclusive, peer.parsed.exclusive)
            or any_overlap(ctx, parsed.exclusive, peer.files) for peer in known):
         return False
-    return not at_capacity(ctx, parsed.files, known)
+    return not at_capacity(ctx, parsed.files, known, union=union)
