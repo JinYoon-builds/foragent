@@ -21,7 +21,7 @@ from test_skills_autosync import cli_exit, isolated_home
 # JSON {plan_hash, questions: [{id, perspective, executor, text}], failures: [...]};
 # stats {perspectives: {seat: {asked, changed}}}. Executor replies use preread's
 # one-question-per-line convention. Duplicate selection belongs to the interviewer.
-SEATS = {"skeptic", "first_time_user", "attacker", "operator", "maintainer", "incidents"}
+SEATS = {"skeptic", "first_time_user", "attacker", "operator", "maintainer", "incidents", "other_users"}
 QUESTION = ("What would you ask that the person has not thought of, "
             "and how does this fail from your seat?")
 COMMON = "Should recovery preserve the person's selected locale?"
@@ -234,7 +234,7 @@ def test_order_perspectives_honors_per_perspective_executor_config(perspectives_
     payload, calls = run_perspectives(case, capsys)
     assert_questions(payload, calls)
     assert {question["perspective"]: question["executor"] for question in payload["questions"]} == configured
-    assert Counter(call["executor"] for call in calls) == {"codex": 1, "claude": 5}
+    assert Counter(call["executor"] for call in calls) == {"codex": 1, "claude": len(SEATS) - 1}
 
 
 @pytest.mark.parametrize("unavailable", ["codex", "claude"])
@@ -261,7 +261,7 @@ def test_order_perspectives_one_executor_error_preserves_other_questions(perspec
     assert error["perspective"].replace("_", " ") in prompt
     assert EXECUTOR_ERROR in error["error"], "List the failed seat's executor error without discarding successful seats"
     stats = invoke(case, capsys, "stats")["perspectives"]
-    assert sum(row["asked"] for row in stats.values()) == 10, "A failed agent did not ask questions"
+    assert sum(row["asked"] for row in stats.values()) == 2 * (len(SEATS) - 1), "A failed agent did not ask questions"
 
 
 def objects(value):

@@ -39,3 +39,4 @@
 - `test_github_outbox.py::...rate_limited_close`는 #705 기준선에서 이미 실패한다. 기준선 비교는 `git diff > .foragent/wip.patch; git apply -R`, 시험, `git apply`로 한다(`git checkout --`은 권한 거부).
 - 가짜 추적기에 가벼운 읽기를 더할 때 `self.list_issues()`를 재사용하지 말고 `self.issues`를 직접 거른다. `test_tick_step_times.py` 등은 `list_issues` 호출을 GitHub 단계로 세므로 tick당 한 번을 넘으면 기준선이 깨진다(#705).
 - "공유 메시지 키" 요구는 같은 일을 하는 모든 쓰기 지점(#705: publish의 주문 기록 닫기 + tick의 #411 부모 닫기)이 한 키를 쓰라는 뜻이다. 새 키만 만들고 기존 경로의 옛 키를 두면 리뷰가 막는다. 잠긴 시험의 요구(개수 포함 한 줄)는 `{count}` 인자로 맞춘다.
+- [init 역할 에이전트 (#717)](role_agents_init.md) — skill은 data-files로 배포, 커밋 실패 복구는 내용 일치 파일만, test_init ALL_PATHS

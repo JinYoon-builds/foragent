@@ -61,6 +61,8 @@ class Snapshot:
     # The phase each issue's latest recorded run was in when it stopped (finish_run keeps it).
     run_phases: dict[int, str | None] = field(default_factory=dict)
     today_done: dict[str, int] | None = None
+    # Order preparation facts from ``fa order progress`` (StateStore.order_progress); None when none.
+    prep: dict[str, Any] | None = None
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -214,11 +216,18 @@ def collect(
         # The same mapping as status.collect_lanes, for a running worker.
         worker_states[run["number"]] = issue_state(labels, True)
     phases, say = journal_facts(store)
+    try:
+        prep = store.order_progress()
+    except (OSError, ValueError):
+        prep = None  # A half-written record must not take the whole view down.
+    if not isinstance(prep, dict):
+        prep = None
+    published = [number for number in (prep or {}).get("published", []) if isinstance(number, int)]
     shown = {run["number"] for run in status["active_runs"]} | {
-        row["issue"] for row in lanes.values() if row.get("issue") is not None}
+        row["issue"] for row in lanes.values() if row.get("issue") is not None} | set(published)
     titles = {number: title for number, title in titles.items() if number in shown}
     return watch.Snapshot(status, done, order, completed, total, eta, watch.recent_events(store), now,
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
                           worker_states, eta_range, basis, today, merged_at, orch_panel.collect(store, now),
                           phases, say, titles=titles, run_starts=run_starts, run_phases=run_phases,
-                          today_done=today_done)
+                          today_done=today_done, prep=prep)
