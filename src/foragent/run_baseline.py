@@ -12,6 +12,7 @@ from math import isfinite
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -456,6 +457,159 @@ def _capture_baseline(
                 return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded), base_sha)
             finally:
                 ctx.git.remove_worktree(worktree)
+
+
+# Written into a throwaway checkout of the new base. It prints nothing, so the
+# configured command's terminal flags (-q, verbosity_test_cases, -p no:terminal)
+# cannot change the listing; the listing path is part of the source, not the environment.
+COLLECT_PLUGIN = """\
+import json
+
+_ids, _errors = [], 0
+
+
+def pytest_collectreport(report):
+    global _errors
+    if report.failed:  # A collection error; an importorskip skip is not one.
+        _errors += 1
+
+
+def pytest_collection_finish(session):
+    _ids[:] = [item.nodeid for item in session.items]
+
+
+def pytest_sessionfinish(session, exitstatus):
+    with open({listing!r}, "w", encoding="utf-8") as stream:
+        json.dump({{"ids": _ids, "errors": _errors, "rootdir": str(session.config.rootpath)}}, stream)
+"""
+def _with_python_path(command: str, directory: str) -> str:
+    """Give only this subprocess ``directory`` on PYTHONPATH, joined with the command's own.
+
+    Inline assignments win over outer ones, so the directory joins every
+    PYTHONPATH assignment before the command and right after an ``env``
+    launcher; without one it is added in front. Assignments keep NAME=
+    unquoted (a quoted 'NAME=v' is run as a command, exit 127).
+    """
+    words = shlex.split(command)
+
+    def assignment(word: str) -> bool:
+        return re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", word, re.S) is not None
+
+    # Positions of the leading assignments and of those right after each `env`.
+    positions: list[int] = []
+    index = 0
+    while True:
+        while index < len(words) and assignment(words[index]):
+            positions.append(index)
+            index += 1
+        if index < len(words) and Path(words[index]).name == "env":
+            index += 1
+            continue
+        break
+    joined = False
+    for position in positions:
+        name, value = words[position].split("=", 1)
+        if name == "PYTHONPATH":
+            words[position] = "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, value]))
+            joined = True
+    if not joined:
+        words.insert(0, "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, os.environ.get("PYTHONPATH")])))
+        positions = [0, *(position + 1 for position in positions)]
+    rendered = []
+    for position, word in enumerate(words):
+        if position in positions:
+            name, value = word.split("=", 1)
+            rendered.append(f"{name}={shlex.quote(value)}")
+        else:
+            rendered.append(shlex.quote(word))
+    return " ".join(rendered)
+
+
+def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
+                          sha: str) -> tuple[set[str], set[str]]:
+    """(owned, missing) ids of ``previous`` on base ``sha``, from one exact collection (#123).
+
+    One ``--collect-only`` over the acceptance directory of a checkout of
+    ``sha`` (with its exclusions) lists the exact collected node ids; an id is
+    missing only when it is not in that list. It always runs, also when every
+    id is owned by an open issue, so a broken collection still stops the run.
+    No tests collected (exit 5) or no acceptance directory means nothing is
+    collected. A collection error, another exit, a missing listing or a
+    timeout raises AttemptFailure. Runs locally with the capture time limit,
+    the run budget and a machine test slot.
+
+    The listing plugin is a module with a private random name
+    (``_foragent_nodeids_<hex>``, never a test or project module name) in a
+    temporary directory outside the checkout. Only the collection subprocess
+    gets that directory, through PYTHONPATH, and loads it with ``-p``; nothing
+    is added to the project's tree or import path. Like a capture, a
+    collection that modified tracked files raises AttemptFailure.
+    """
+    from foragent import runner
+
+    log = ctx.store.log_path(n)
+    excluded = _baseline_exclusions(ctx, sha, log)
+    owned = {node for node in previous.node_ids if node.split("::", 1)[0] in excluded}
+    selectable = set(previous.node_ids) - owned
+    acceptance_dir = ctx.config.acceptance_dir
+    with tempfile.TemporaryDirectory(prefix="foragent-protected-") as directory:
+        worktree = Path(directory) / "worktree"
+        listing = Path(directory) / "collected.json"
+        source = COLLECT_PLUGIN.format(listing=str(listing))
+        ctx.git.add_detached_worktree(worktree, sha)
+        try:
+            if not (worktree / acceptance_dir).is_dir():
+                return owned, selectable
+            remaining = runner._remaining(n, ctx)
+            if remaining <= 0:
+                raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before collection")
+            plugins = Path(directory) / "plugins"
+            plugins.mkdir()
+            plugin = f"_foragent_nodeids_{secrets.token_hex(8)}"
+            (plugins / f"{plugin}.py").write_text(source, encoding="utf-8")
+            selection = f"{previous.command} {shlex.quote(acceptance_dir)}"
+            selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
+            command = _with_python_path(f"{selection} --collect-only -p {plugin}", str(plugins))
+            result = runner._check(command, worktree, log, _baseline_capture_limit(ctx, log, remaining),
+                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+            _progress(n, ctx)
+            # Like a capture: a collection that changed tracked files proves nothing.
+            _validate_baseline_checkout(ctx.git.at(worktree), sha)
+            try:
+                found = json.loads(listing.read_text(encoding="utf-8"))
+                ids, errors, rootdir = list(found["ids"]), int(found["errors"]), Path(found["rootdir"])
+            except (OSError, ValueError, KeyError, TypeError):
+                ids, errors, rootdir = None, None, None
+            if result.timed_out or result.exit_code not in (0, 5) or ids is None or errors:
+                raise AttemptFailure(
+                    f"acceptance baseline unavailable: collecting {acceptance_dir} on {sha} failed "
+                    f"(exit_code={result.exit_code}, timed_out={result.timed_out}, "
+                    f"collection_errors={'unknown' if errors is None else errors})")
+            # pytest's node ids are relative to its rootdir; baseline ids to the repository root.
+            prefix = rootdir.resolve().relative_to(worktree.resolve()).as_posix()
+            collected = {node if prefix == "." else f"{prefix}/{node}" for node in ids}
+        finally:
+            ctx.git.remove_worktree(worktree)
+    return owned, selectable - collected
+
+
+def log_dropped_ids(log: Path, previous: AcceptanceBaseline, protected: tuple[str, ...], owned: set[str],
+                    missing: set[str], new: AcceptanceBaseline | None, ci: bool) -> None:
+    """One audit line per id protected before a base sync and not after it (#123)."""
+    excluded = set(new.excluded) if new else set()
+    for node in previous.node_ids:
+        if node in protected:
+            continue
+        if node in owned or node.split("::", 1)[0] in excluded:
+            reason = "owned by an open issue"
+        elif node in missing:
+            reason = "missing on the new base"
+        elif (not ci and new is not None and new.collected_ids is not None and node in new.collected_ids
+              and new.failing_ids is not None and node in new.failing_ids):
+            reason = "failing on the new base"
+        else:
+            reason = "no longer protected on the new base"
+        _append(log, f"Acceptance baseline dropped protected node id {node}: {reason}")
 
 
 if __name__ == "__main__":

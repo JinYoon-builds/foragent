@@ -60,25 +60,18 @@ def test_order_progress_and_lane_totals_use_full_history_without_closed_orders(t
     assert "Finished task 14" not in output
 
 
-def test_road_keeps_dependency_queue_and_hit_only_flashes_active_block(tmp_path):
+def test_a_lane_with_a_worker_shows_only_its_worker_row(tmp_path):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
-    config = Config(lanes={"api": {"title": "Server"}})
+    config = Config(lanes={"api": {"title": "Server"}}, view_glyphs="emoji")
     tracker.add_issue(1, "Working", labels=["approved", "running", "lane:api"])
     tracker.add_issue(2, "Ready", labels=["approved", "ready", "lane:api"])
     tracker.add_issue(3, "Waiting", labels=["approved", "lane:api"])
     store.start_run(1, branch="active", worktree="unused", lane="api")
-    result = snapshot(tracker, store, config)
-    output = watch.render_frame(result, config, tmp_path)
-    assert "#2" in output and "#3" in output
-    frames = [watch._frame(result, config, tmp_path, tick=tick, width=120, selected=None, now=NOW)
-              for tick in range(4)]
-    for tick, frame in enumerate(frames):
-        spans = [span for line in frame for span in line]
-        assert [(value, style) for value, style in spans if style == "hit"] == (
-            [(" #1 ", "hit")] if tick == 2 else [])
-        assert [(value, style) for value, style in spans if style == "queue"] == [
-            (" #3 ", "queue"), (" #2 ", "queue")]
+    output = watch.render_frame(snapshot(tracker, store, config), config, tmp_path)
+    rows = [line for line in output.splitlines() if "Server" in line]
+    assert len(rows) == 1 and rows[0].startswith("🐿") and "#1 Working" in rows[0]
+    assert "#2" not in output and "#3" not in output
 
 
 def test_open_order_after_last_child_and_no_order_are_renderable(tmp_path):
@@ -94,51 +87,39 @@ def test_open_order_after_last_child_and_no_order_are_renderable(tmp_path):
     assert "1/1" in output and "This order is all done ✓" in output
 
 
-@pytest.mark.parametrize("language,idle_label,all_idle", [
-    ("en", "idle lanes:", "all lanes are idle"),
-    ("ko", "쉬는 레인:", "모든 레인이 쉬는 중"),
-])
-def test_idle_done_count_and_automatic_unfold_keep_original_lane_numbers(
-    tmp_path, language, idle_label, all_idle,
-):
+@pytest.mark.parametrize("language,done_words", [("en", "1 done"), ("ko", "1개 끝냄")])
+def test_idle_lanes_have_one_row_each_and_a_queued_lane_waits_for_a_turn(tmp_path, language, done_words):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
-    config = Config(language=language, lanes={
+    config = Config(language=language, view_glyphs="ascii", lanes={
         "api": {"title": "Server", "emoji": "🔧"},
         "docs": {"title": "Docs", "emoji": "🧩"},
     })
     tracker.add_issue(90, "Order")
     finish(tracker, store, 1, 90, lane="docs")
-    idle = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80)
-    folded = [line for line in idle.splitlines() if idle_label in line]
-    assert len(folded) == 1
-    done_words = "1 done" if language == "en" else "1개 끝냄"
-    assert f"1 🔧 Server · 2 🧩 Docs {done_words} · 3 🧰" in folded[0]
-    # With every lane idle the work table is hidden, so its idle sentence is gone too.
-    assert all_idle not in idle and "1–3" in idle
-    assert "▐" not in idle
+    idle = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80).splitlines()
+    rows = {name: [line for line in idle if name in line and line.startswith("[z]")] for name in ("Server", "Docs")}
+    assert [len(found) for found in rows.values()] == [1, 1]
+    assert rows["Server"][0].startswith("[z]") and rows["Docs"][0].startswith("[z]")
+    assert f"✓ {done_words}" in rows["Docs"][0] and "✓" not in rows["Server"][0]
+    assert "▐" not in "\n".join(idle)
 
     tracker.add_issue(2, "Next docs task", labels=["approved", "ready", "lane:docs"])
-    active = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80)
-    assert all_idle not in active
-    assert any("2 🧩 Docs" in line and "▐" in line for line in active.splitlines())
-    folded = next(line for line in active.splitlines() if idle_label in line)
-    assert "1 🔧 Server · 3 🧰" in folded and "Docs" not in folded
-    assert "1–3" in active
+    active = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80).splitlines()
+    docs = [line for line in active if "Docs" in line and "#2" in line]
+    assert len(docs) == 1 and docs[0].startswith("[.]")
+    assert "waiting for a turn" in docs[0] or "차례 기다리는 중" in docs[0]
 
 
 @pytest.mark.parametrize("width", [40, 80, 120])
-def test_work_table_has_one_row_per_busy_lane_with_unicode_ellipsis(tmp_path, width):
+def test_a_long_title_never_wraps_its_row(tmp_path, width):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
     config = Config(language="ko", lanes={"api": {"title": "서버", "emoji": "🔧"}})
     tracker.add_issue(1, "긴 작업 이름 " * 30, labels=["approved", "ready", "lane:api"])
-    frame = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=width)
-    lines = frame.splitlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith("┌") and "지금 하는 일" in line)
-    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("└"))
-    assert end - start == 3  # heading, column names, one work row, bottom border
-    assert "…" in lines[start + 2]
+    lines = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=width).splitlines()
+    rows = [line for line in lines if "#1" in line]
+    assert len(rows) == 1 and ("…" in rows[0]) == (width >= 100 or watch._cells(rows[0]) == width)
     assert all(watch._cells(line) <= width for line in lines)
 
 
@@ -175,7 +156,7 @@ def test_live_runner_death_is_visible_without_refresh_and_permission_is_alive(tm
         raise PermissionError
 
     monkeypatch.setattr(watch.os, "kill", inaccessible)
-    assert "○" not in watch.render_frame(result, config, tmp_path)
+    assert gone not in watch.render_frame(result, config, tmp_path)
 
     def dead(pid, signal):
         raise ProcessLookupError
@@ -183,6 +164,7 @@ def test_live_runner_death_is_visible_without_refresh_and_permission_is_alive(tm
     monkeypatch.setattr(watch.os, "kill", dead)
     assert gone in watch.render_frame(result, config, tmp_path)
     result.status["lanes"]["main"]["state"] = "blocked"
+    result.worker_states[1] = "blocked"  # A worker row follows its own issue's labels.
     assert gone not in watch.render_frame(result, config, tmp_path)
 
 
@@ -195,7 +177,7 @@ def test_live_liveness_uses_configured_threshold_between_refreshes(tmp_path, sta
     store.start_run(1, branch="active", worktree="unused")
     result = snapshot(tracker, store, config)
     result.status["lanes"]["main"]["last_activity_seconds"] = threshold - 1
-    assert "○" not in watch.render_frame(result, config, tmp_path, now=NOW)
+    assert "○ looks stalled" not in watch.render_frame(result, config, tmp_path, now=NOW)
     assert "○ looks stalled" in watch.render_frame(result, config, tmp_path, now=NOW + timedelta(seconds=2))
 
 
@@ -260,19 +242,19 @@ def test_live_watch_without_a_terminal_explains_once_option(tmp_path, monkeypatc
         watch.run(lambda: {}, FakeTracker(), StateStore(tmp_path), Config(), tmp_path)
 
 
-def test_first_line_shows_snapshot_time_and_warns_when_nothing_was_read(tmp_path):
+def test_header_warns_when_nothing_was_read_and_summary_keeps_the_snapshot_time(tmp_path):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
     config = Config()
     empty = watch.collect(cli._status(tracker, store, config), tracker, store, config, NOW)
-    first = watch.render_frame(empty, config, tmp_path).splitlines()[0]
-    assert first.startswith("⚠ Couldn't read the status") and "working ?" in first
+    frame = watch.render_frame(empty, config, tmp_path)
+    assert "⚠ Couldn't read the status" in frame and "working ?" in frame
     tracker.add_issue(1, "Queued", labels=["approved"])
     observed = local_status(tracker, store, config)
-    first = watch.render_frame(watch.collect(observed, tracker, store, config, NOW),
-                               config, tmp_path).splitlines()[0]
+    frame = watch.render_frame(watch.collect(observed, tracker, store, config, NOW), config, tmp_path)
     local_time = datetime.fromisoformat(observed["as_of"]).astimezone().strftime("%H:%M")
-    assert first.endswith(f"queued 1 · as of {local_time}") and "⚠" not in first
+    assert "Couldn't read the status" not in frame  # No run yet: the big squirrel heads the frame.
+    assert any(line.endswith(f"queued 1 · as of {local_time}") for line in frame.splitlines())
 
 
 @pytest.mark.parametrize('language,label', [('en', 'waiting for shared files'), ('ko', '공유 파일 기다려요')])

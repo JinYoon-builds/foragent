@@ -97,49 +97,20 @@ def test_only_the_events_panel_remains_and_takes_the_full_width(tmp_path):
     assert activity.render(replace(snapshot, events=[]), config, tmp_path, width=120, now=NOW) == []
 
 
-def test_idle_lanes_wrap_between_lanes_instead_of_cutting_off(tmp_path):
+def test_each_idle_lane_has_one_row_with_its_whole_name_and_done_count(tmp_path):
     tracker = FakeTracker()
     store = StateStore(tmp_path, now=lambda: NOW)
     lanes = {f"lane-{i}": {"title": f"Long lane name {i}", "emoji": "🧩"} for i in range(6)}
-    config = Config(lanes=lanes)
+    config = Config(lanes=lanes, view_glyphs="emoji")
     tracker.add_issue(90, "Order")
     finish(tracker, store, 1, 90, lane="lane-0")
     frame = watch.render_frame(collected(tracker, store, config), config, tmp_path, width=80)
     assert all(watch._cells(line) <= 80 for line in frame.splitlines())
     for lane in lanes.values():
-        assert lane["title"] in frame
-    assert "Long lane name 0 1 done" in frame and "✓1" not in frame
+        rows = [line for line in frame.splitlines() if line.startswith("💤") and lane["title"] in line]
+        assert len(rows) == 1, lane
+    assert "Long lane name 0 ✓ 1 done" in frame and "✓1" not in frame
     assert "▶" not in frame
-
-
-def test_an_idle_lane_too_wide_for_one_line_wraps_and_keeps_its_done_count(tmp_path):
-    """Defect class: a single lane item wider than the line was cut, first or later."""
-    long_title = "Very long lane title " * 3 + "ending"  # 69 characters
-    for first in (True, False):
-        lanes = {"short": {"title": "Short", "emoji": "🧩"}, "wide": {"title": long_title, "emoji": "🧩"}}
-        if first:
-            lanes = dict(reversed(list(lanes.items())))
-        config = Config(lanes=lanes)
-        tracker = FakeTracker()
-        store = StateStore(tmp_path / str(first), now=lambda: NOW)
-        tracker.add_issue(90, "Order")
-        finish(tracker, store, 1, 90, lane="wide")
-        frame = watch.render_frame(collected(tracker, store, config), config, tmp_path, width=80)
-        lines = frame.splitlines()
-        assert all(watch._cells(line) <= 80 for line in lines)
-        words = " ".join(" ".join(lines).split())
-        assert long_title + " 1 done" in words and "Short" in words
-
-
-def test_flow_wraps_heading_items_and_oversized_items_without_losing_text():
-    from foragent.watch_sections import lanes
-
-    items = ["1 🧩 A", "2 🧩 " + "word " * 12 + "1 done", "3 🧩 C"]
-    lines = lanes._flow("idle lanes:", items, 30)
-    assert all(watch._cells(line) <= 30 for line in lines)
-    # A new line starts between items, so no separator is left dangling at a line end.
-    assert lines[0] == "idle lanes: 1 🧩 A" and lines[-1] == "  3 🧩 C"
-    assert " ".join(" ".join(lines).split()) == "idle lanes: 1 🧩 A " + " ".join(items[1].split()) + " 3 🧩 C"
 
 
 def test_done_item_with_a_lane_name_wider_than_the_line_wraps_instead_of_cutting():
@@ -151,15 +122,3 @@ def test_done_item_with_a_lane_name_wider_than_the_line_wraps_instead_of_cutting
     lines = plain(done.render(snapshot, config, None, width=40))
     assert all(watch._cells(line) <= 40 for line in lines)
     assert " ".join(" ".join(lines[1:]).split()).endswith(" ".join(lane_title.split()))
-
-
-def test_idle_lane_continuation_lines_keep_their_indent(tmp_path):
-    tracker = FakeTracker()
-    store = StateStore(tmp_path, now=lambda: NOW)
-    lanes = {f"lane-{i}": {"title": f"Long lane name {i}", "emoji": "🧩"} for i in range(6)}
-    config = Config(lanes=lanes)
-    tracker.add_issue(90, "Order")
-    finish(tracker, store, 1, 90, lane="lane-0")
-    lines = watch.render_frame(collected(tracker, store, config), config, tmp_path, width=80).splitlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith("idle lanes:"))
-    assert lines[start + 1].startswith("  ") and lines[start + 1][2] != " "

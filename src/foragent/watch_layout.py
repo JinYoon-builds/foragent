@@ -17,7 +17,7 @@ from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
 
-# Only the pickaxe moves. One hit every four 0.3-second frames.
+# The lane-road pickaxe frames; the lane rows (#167) no longer animate, but foragent.watch keeps the name.
 PICK = ("  ⛏ ", " ⛏  ", "⛏✦  ", " ⛏  ")
 
 
@@ -82,27 +82,6 @@ def _activity(
     return "●"
 
 
-def _widths(width: int) -> tuple[bool, int, int, int, int]:
-    """Side-by-side flag, orchestrator, road, work-table and events widths."""
-    side_by_side = width >= 100
-    # Wide screens give the orchestrator note room for a label and its value on one line.
-    orchestrator_width = (36 if width >= 140 else 28) if side_by_side else width
-    road_width = width - orchestrator_width - 2 if side_by_side else width
-    table_width = (width - 2) * 3 // 5 if side_by_side else width
-    events_width = width - table_width - 2 if side_by_side else width
-    return side_by_side, orchestrator_width, road_width, table_width, events_width
-
-
-def _split(status: dict[str, Any]) -> tuple[list[tuple[int, dict]], list[tuple[int, dict]]]:
-    """Lanes with and without work, numbered by their position among all lanes."""
-    from foragent import watch
-
-    rows = list(status["lanes"].values())
-    busy = [(index, row) for index, row in enumerate(rows, 1) if watch._has_work(row)]
-    idle = [(index, row) for index, row in enumerate(rows, 1) if not watch._has_work(row)]
-    return busy, idle
-
-
 def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     """Running runs by lane in start order; ties in start time break by issue number."""
     clones: dict[str, list[dict[str, Any]]] = {}
@@ -110,33 +89,6 @@ def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     for run in sorted(running, key=lambda run: (run.get("started_at") or "", run["number"])):
         clones.setdefault(run["lane"], []).append(run)
     return clones
-
-
-def _lane_name(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> str:
-    """The plain lane name; workers are told apart by their own road rows."""
-    return row["lane_display"]
-
-
-def _worker_rows(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[tuple[str, list[int]]]:
-    """One road row per running worker, named '<lane> N' in start order when there are several."""
-    workers = clones.get(row["slug"], [])
-    if len(workers) < 2:
-        return [(row["lane_display"], _lane_issues(row, clones))]
-    numbers = [run["number"] for run in workers]
-    # A blocked or waiting issue that is not a running worker keeps today's place on the first row.
-    extra = [number for number in _lane_issues(row, clones) if number not in numbers]
-    return [(f"{row['lane_display']} {position}", (extra if position == 1 else []) + [number])
-            for position, number in enumerate(numbers, 1)]
-
-
-def _lane_issues(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[int]:
-    """The lane's shown issues: its current issue first, or its workers in start order when it has several."""
-    current = row["issue"] if row["state"] in {"working", "blocked", "waiting-human"} else None
-    workers = [run["number"] for run in clones.get(row["slug"], [])]
-    if len(workers) > 1:
-        return workers + ([current] if current is not None and current not in workers else [])
-    numbers = [current] if current is not None else []
-    return numbers + [number for number in workers if number not in numbers]
 
 
 def _sections() -> list[ModuleType]:
@@ -155,23 +107,76 @@ def _sections() -> list[ModuleType]:
     return [found[order] for order in sorted(found)]
 
 
+# A terminal's usual height; a plain frame keeps to it.
+SCREEN_ROWS = 24
+
+
 def _frame(
     snapshot: Snapshot, config: Config, repo_root: Path, *, tick: int, width: int,
-    selected: str | None, now: datetime, layout: dict[str, Any] | None = None,
+    selected: str | None, now: datetime, layout: dict[str, Any] | None = None, height: int | None = SCREEN_ROWS,
 ) -> list[Line]:
-    """Stack the sections by ORDER with one blank line between non-empty ones."""
+    """Stack the sections by ORDER with one blank line between non-empty ones.
+
+    Within ``height`` rows, sections marked KEEP (header, lane rows, details and
+    footer) always stay; the others give way from the bottom up.
+    """
     from foragent import watch
 
-    hits: list[tuple[int, int, int, int, Any]] = []
-    frame: list[Line] = []
-    for section in _sections():
-        gap = bool(frame) and getattr(section, "GAP", True)
-        lines = section.render(
-            snapshot, config, repo_root, tick=tick, width=width, selected=selected, now=now,
-            layout=layout, top=len(frame) + gap, hits=hits,
-        )
-        if lines:
-            frame += [[]] * gap + list(lines)
+    sections = _sections()
+    rendered: list[tuple[ModuleType, list[Line], list[tuple[int, int, int, int, Any]]]] = []
+    for section in sections:
+        # Each section draws once from row 0; its click areas move with it below.
+        own: list[tuple[int, int, int, int, Any]] = []
+        lines = section.render(snapshot, config, repo_root, tick=tick, width=width, selected=selected,
+                               now=now, layout=layout, top=0, hits=own, rows=True)
+        rendered.append((section, list(lines), own))
+    # From its SIDE width on, a section (the orchestrator box) stands to the right
+    # of the sections between the lane rows and itself.
+    side = next((index for index, (section, _, _) in enumerate(rendered) if getattr(section, "SIDE", None)), None)
+    wide = side is not None and width >= rendered[side][0].SIDE
+    rows_end = max((index for index, (section, _, _) in enumerate(rendered)
+                    if getattr(section, "KEEP", False) and (side is None or index < side)), default=-1)
+
+    def assemble() -> tuple[list[Line], list[tuple[int, int, int, int, Any]]]:
+        hits: list[tuple[int, int, int, int, Any]] = []
+        frame: list[Line] = []
+        mark = None  # Where the sections beside the SIDE section begin.
+        for index, (section, lines, own) in enumerate(rendered):
+            if not lines:
+                continue
+            gap = bool(frame) and getattr(section, "GAP", True)
+            if wide and index == side and mark is not None and mark < len(frame):
+                left_width = width - max(watch._cells("".join(value for value, _ in line)) for line in lines) - 2
+                left = frame[mark:]
+                del frame[mark:]
+                frame += watch._beside(left, lines, left_width)
+                hits += [(x0 + left_width + 2, y0 + mark, x1 + left_width + 2, y1 + mark, target)
+                         for x0, y0, x1, y1, target in own]
+                continue
+            top = len(frame) + gap
+            if wide and mark is None and rows_end < index < side:
+                mark = top
+            frame += [[]] * gap + lines
+            hits += [(x0, y0 + top, x1, y1 + top, target) for x0, y0, x1, y1, target in own]
+        return frame, hits
+
+    frame, hits = assemble()
+    if height is not None and len(frame) > height:
+        # Lane rows win: the other sections give way from the bottom up.
+        for index in reversed(range(len(rendered))):
+            section, lines, _ = rendered[index]
+            if lines and not getattr(section, "KEEP", False):
+                rendered[index] = (section, [], [])
+                if len(assemble()[0]) <= height:
+                    break
+        # The footer becomes one short line of the key letters.
+        for index, (section, lines, own) in enumerate(rendered):
+            if section.__name__.endswith(".help"):
+                own = []
+                rendered[index] = (section, list(section.render(
+                    snapshot, config, repo_root, tick=tick, width=width, selected=selected, now=now,
+                    layout=layout, top=0, hits=own, rows=True, short=True)), own)
+        frame, hits = assemble()
     if layout is not None:
         layout["hits"] = hits
     return [watch._fit(list(line), width) for line in frame]
@@ -186,6 +191,6 @@ def render_frame(
     from foragent import watch
 
     return "\n".join("".join(value for value, style in line).rstrip() for line in watch._frame(
-        snapshot, config, repo_root, tick=tick, width=max(40, width), selected=selected,
+        snapshot, config, repo_root, tick=tick, width=max(1, width), selected=selected,
         now=now or snapshot.captured_at, **({} if layout is None else {"layout": layout}),
     ))
