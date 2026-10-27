@@ -646,6 +646,17 @@ class GitRepo:
                     return None
             raise
 
+    def tree_files(self, ref: str) -> list[str]:
+        """Every file path tracked at ``ref``."""
+        return [path for path in self._call(["ls-tree", "-r", "--name-only", "-z", ref]).split("\0") if path]
+
+    def file_at(self, ref: str, path: str) -> str | None:
+        """A tracked file's text at ``ref``, or None when it is missing or not text."""
+        try:
+            return self._call(["show", f"{ref}:{path}"])
+        except (GitError, UnicodeDecodeError):
+            return None
+
     def blob_shas(self, ref: str, paths: Iterable[str]) -> dict[str, str]:
         return {path: self.blob_sha(ref, path) or "missing" for path in paths}
 
