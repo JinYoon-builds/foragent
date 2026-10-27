@@ -35,8 +35,9 @@ def test_record_appends_once_per_change(tmp_path):
     assert not (store.root / "orch-events.jsonl").exists(), "The action journal stays free of binding events"
 
 
-def _waiting(store, number, at=NOW, files="src/a.py"):
-    body = (f"<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- {files}\n## Out of scope\nO\n"
+def _waiting(store, number, at=NOW, files="src/a.py", exclusive=None):
+    header = f"exclusive: [{exclusive}]\n" if exclusive else ""
+    body = (f"<!-- foragent:v1 -->\n{header}## Goal\nG\n## Files\n- {files}\n## Out of scope\nO\n"
             "## Done when\n```sh\ntrue\n```\n")
     store.save_approval(number, body=body, body_sha=body_hash(body), acceptance_blobs={},
                         approved_by="human", approved_at=at.isoformat())
@@ -228,7 +229,8 @@ def test_from_tick_does_not_probe_the_file_system(tmp_path, monkeypatch):
     store.update_local_issue(5, labels=["approved", "running"])
     _waiting(store, 7, files="src/a.py")
     _waiting(store, 8, files="src/b.py")
-    assert _tick(store, config, tmp_path) == "structure"
+    # Facts' start order: #8 overlaps nothing and takes the last free slot, so #7 waits on cap.
+    assert _tick(store, config, tmp_path) == "cap"
     assert calls == [], "No file-system probe during the tick's binding"
     from foragent import orch_facts_resources
     from foragent.orch_facts_runs import _waiting_issues
@@ -237,3 +239,101 @@ def test_from_tick_does_not_probe_the_file_system(tmp_path, monkeypatch):
     orch_facts_resources._admission(store, config, tmp_path, NOW, _waiting_issues(store, config, running), running,
                                     machine={"budget": {"max_parallel": None}, "alive": {}})
     assert calls, "fa orch facts itself still checks the case rule"
+
+
+def _running(store, number, files, exclusive=None):
+    _waiting(store, number, at=NOW - timedelta(hours=2), files=files, exclusive=exclusive)
+    store.clock[0] = NOW - timedelta(hours=1)
+    store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
+    store.update_local_issue(number, labels=["approved", "running"])
+    store.clock[0] = NOW
+
+
+def test_unknown_case_rule_never_makes_different_paths_overlap(tmp_path, monkeypatch):
+    """The tick knows no case rule; running src/a.py and waiting src/b.py at overlap_per_file=1 hold nothing."""
+    store, config = _store(tmp_path), Config(overlap_per_file=1)
+    _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 3)
+    _running(store, 5, "src/a.py")
+    _waiting(store, 7, files="src/b.py")
+    assert _tick(store, config, tmp_path) == "none", "Spare capacity and different files: no structure binding"
+    assert orch_binding.at(store, NOW) is None
+    ctx = SimpleNamespace(store=store, config=config, repo_root=tmp_path, now=lambda: NOW,
+                          _budget_sample=("normal", 0.1))
+    orch_binding.record_tick(ctx)
+    assert orch_binding.at(store, NOW) == "none", "The tick records no structure binding"
+    _waiting(store, 7, files="src/a.py")
+    assert _tick(store, config, tmp_path) == "structure", "The same path still overlaps"
+
+
+def test_unknown_case_rule_keeps_exclusive_reservations_and_ranking_to_their_paths(tmp_path, monkeypatch):
+    from foragent import overlap_files
+    from foragent.scheduler_start import _overlap_count
+
+    store, config = _store(tmp_path), Config(overlap_per_file=1)
+    _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 3)
+    _running(store, 5, "src/a.py", exclusive="src/z.py")
+    _waiting(store, 7, files="src/b.py")
+    assert _tick(store, config, tmp_path) == "none", "An exclusive reservation of src/z.py leaves src/b.py free"
+    _waiting(store, 7, files="src/z.py")
+    assert _tick(store, config, tmp_path) == "structure", "It still reserves its own path"
+    ctx = SimpleNamespace(store=store, config=config, repo_root=tmp_path, case_sensitive=None)
+    known, _ = overlap_files.claims(ctx, measured=False)
+    _waiting(store, 7, files="src/b.py")
+    assert _overlap_count(ctx, 7, known) == 0, "Ranking counts no overlap between different paths"
+    assert overlap_files.intersects(ctx, "src/a.py", "src/A.py") is False, "Unknown is case-sensitive"
+    assert overlap_files.intersects(ctx, "src/a.py", "src/a.py") is True
+
+
+def test_replay_reads_the_parallel_state_file_like_facts(tmp_path, monkeypatch):
+    """With no budget history, parallel-state.json holds its value from its changed_at."""
+    from foragent import capacity
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    store, config = _store(tmp_path), Config()
+    _waiting(store, 7, at=NOW - timedelta(hours=3), files="src/a.py")
+    _waiting(store, 8, at=NOW - timedelta(hours=3), files="src/b.py")
+    capacity.write_state(store, 1, NOW - timedelta(hours=1))
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "cap", "One slot for two issues"
+    assert _tick(store, config, tmp_path) == "cap", "fa orch facts' own rule agrees"
+    assert flow.binding_at(store, config, tmp_path, NOW - timedelta(hours=2), current=False) == "none", (
+        "Before its changed_at the file says nothing; facts' default budget then fits both")
+
+
+def test_replay_uses_the_recorded_machine_sample_like_facts(tmp_path, monkeypatch):
+    from foragent import capacity
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    store, config = _store(tmp_path), Config()
+    _waiting(store, 7, at=NOW - timedelta(hours=3))
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "none"
+    capacity.append_memory_hold(tmp_path, NOW - timedelta(minutes=10), pressure="critical",
+                                load_per_cpu=0.2, swapins=0)
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "machine", "Critical memory was recorded"
+    assert _tick(store, config, tmp_path, ("critical", 0.2)) == "machine", "Facts says the same for that sample"
+    capacity.append_budget_history(tmp_path, NOW - timedelta(minutes=5), "parallel", 2, 3, pressure="normal",
+                                   load_per_cpu=capacity.OVERLOAD_LOAD, swapins=0)
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "machine", "Overload load was recorded"
+    capacity.append_budget_history(tmp_path, NOW - timedelta(minutes=1), "parallel", 3, 4, pressure="normal",
+                                   load_per_cpu=0.1, swapins=0)
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "none", "The latest sample is normal"
+    assert flow.binding_at(store, config, tmp_path, NOW - timedelta(minutes=7), current=False) == "machine"
+
+
+def test_replay_candidates_use_facts_labels_not_idles_assumed_ready(tmp_path, monkeypatch):
+    from foragent import capacity
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    store, config = _store(tmp_path), Config()
+    capacity.write_state(store, 1, NOW - timedelta(days=1))
+    for number, files in ((7, "src/a.py"), (8, "src/b.py")):
+        _waiting(store, number, at=NOW - timedelta(hours=3), files=files)
+        store.update_local_issue(number, labels=["approved"])  # Approved, not ready; no label events.
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "none", "Facts needs ready"
+    assert _tick(store, config, tmp_path) == "none"
+    for number in (7, 8):
+        store.update_local_issue(number, labels=["approved", "ready", "running"])
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "none", "A running label holds it"
+    for number in (7, 8):
+        store.update_local_issue(number, labels=["approved", "ready"])
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "cap"
+    assert _tick(store, config, tmp_path) == "cap"

@@ -102,7 +102,8 @@ def intersects(ctx, *patterns: str) -> bool:
     # A caller that must not probe passes its answer (None: unknown) as ``ctx.case_sensitive``.
     sensitive = (ctx.case_sensitive if hasattr(ctx, "case_sensitive")
                  else scheduler._filesystem_case_sensitive(ctx.repo_root))
-    return sensitive is None or scheduler._file_patterns_overlap(*patterns, case_sensitive=sensitive)
+    # Unknown never makes two different paths overlap: compare them case-sensitively (D96).
+    return scheduler._file_patterns_overlap(*patterns, case_sensitive=sensitive is not False)
 
 
 def any_overlap(ctx, left: list[str], right: list[str]) -> bool:

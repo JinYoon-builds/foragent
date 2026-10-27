@@ -41,7 +41,7 @@ def from_tick(store: StateStore, config: Config, root, now: datetime, sample: An
 
     The tick passes its memory sample. Nothing is probed: sibling runs count as alive, as in
     facts' frozen read when a pid was not probed, and the file system's case rule is unknown
-    (``probe=False``), so paths that differ only in case count as overlapping."""
+    (``probe=False``), so paths are compared case-sensitively and different paths never overlap."""
     from foragent import machine_budget
     from foragent.orch_facts_resources import _binding, _resources, _still_running
     from foragent.orch_facts_runs import _test_slots, _waiting_issues

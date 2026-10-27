@@ -143,14 +143,36 @@ def _occupancy(store: StateStore, now: datetime, executions: list[dict[str, Any]
     return occupied, testing
 
 
-def _budgets(now: datetime) -> dict[str, list[tuple[datetime, int]]]:
-    """Each shared budget's recorded values over time; before the first record it is unknown."""
+def _budgets(store: StateStore, now: datetime) -> dict[str, list[tuple[datetime, int]]]:
+    """Each shared budget's recorded values over time; before the first record it is unknown.
+
+    Records are the budget history and each budget's current file (parallel-state.json,
+    test-slots.json), which holds its value from its own ``changed_at``."""
     rows: dict[str, list[tuple[datetime, int]]] = {"parallel": [], "test_slots": []}
     for row in _jsonl(capacity.machine_root() / capacity.HISTORY_FILE):
         at = _time(row.get("at"))
         if row.get("budget") in rows and at is not None and at <= now and type(row.get("to")) is int:
             rows[row["budget"]].append((at, row["to"]))
+    for name, state, key in (("parallel", capacity.read_state(store), "parallel"),
+                             ("test_slots", capacity.read_test_slots(), "slots")):
+        at = _time((state or {}).get("changed_at"))
+        if at is not None and at <= now and type(state.get(key)) is int:
+            rows[name].append((at, state[key]))
     return {name: sorted(values) for name, values in rows.items()}
+
+
+def _machine_at(moment: datetime) -> tuple[str, float]:
+    """The memory pressure and load per CPU recorded last at or before ``moment``.
+
+    Every budget-history row (a budget change, or a tick that critical memory held) keeps
+    the sample it was decided on. With no row yet, the machine is taken as not overloaded."""
+    latest = None
+    for row in _jsonl(capacity.machine_root() / capacity.HISTORY_FILE):
+        at = _time(row.get("at"))
+        if (at is not None and at <= moment and isinstance(row.get("pressure"), str)
+                and type(row.get("load_per_cpu")) in (int, float) and (latest is None or at >= latest[0])):
+            latest = (at, row["pressure"], float(row["load_per_cpu"]))
+    return (latest[1], latest[2]) if latest else ("normal", 0.0)
 
 
 def _value_at(values: list[tuple[datetime, int]], moment: datetime) -> int | None:
@@ -262,14 +284,24 @@ def _labels_at(issue: dict[str, Any], moment: datetime) -> set[str]:
     return labels
 
 
+def _facts_labels_at(issue: dict[str, Any], moment: datetime) -> set[str]:
+    """The labels fa orch facts would read: label events where recorded, else the current labels.
+
+    Facts reads only current labels, so without label events no ``ready`` is assumed (that
+    is idle's rule) and a current ``running`` label still holds the issue."""
+    if issue["events"]:
+        return _labels_at(issue, moment)
+    return set(issue["labels"]) if issue["approved_at"] is not None and moment >= issue["approved_at"] else set()
+
+
 def _startable(issue: dict[str, Any], moment: datetime, pauses: dict[str, list[Interval]], *,
-               blockers: bool = True) -> bool:
+               facts: bool = False) -> bool:
     """Approved, ready and open at ``moment``, not held by a label or a plan pause in ``pauses``.
 
-    ``blockers=False`` skips the open-blocker rule, as facts' waiting list does."""
-    if blockers and any(until is None or moment < until for until in issue["blocked_until"]) or (issue["closed"] and (issue["open_until"] is None or moment >= issue["open_until"])):
+    ``facts=True`` is facts' waiting list: no open-blocker rule and facts' labels."""
+    if not facts and any(until is None or moment < until for until in issue["blocked_until"]) or (issue["closed"] and (issue["open_until"] is None or moment >= issue["open_until"])):
         return False
-    labels = _labels_at(issue, moment)
+    labels = (_facts_labels_at if facts else _labels_at)(issue, moment)
     return ({"approved", "ready"} <= labels and not labels & HOLDING
             and not _inside(pauses.get(issue["lane"], []), moment))
 
@@ -285,7 +317,7 @@ def _latest_approval(issue: dict[str, Any], moment: datetime) -> datetime | None
 def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[str, Any]],
           executions: list[dict[str, Any]], phases: list[tuple[int | None, str, Interval]]) -> list[float]:
     """Wall minutes with a startable approved issue while a run or test slot sat unused."""
-    budgets, pauses = _budgets(now), _pauses(store)
+    budgets, pauses = _budgets(store, now), _pauses(store)
     occupied, testing = _occupancy(store, now, executions, phases)
     start = now - days * DAY
     points = {start, now}
@@ -413,15 +445,17 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     approvals = {number: approval for number in issues if (approval := store.load_approval(number)) is not None}
     lanes: dict[str, list[int]] = {}
     for number, issue in sorted(issues.items()):
-        if number in approvals and number not in busy and _startable(issue, moment, {}, blockers=False):
+        if number in approvals and number not in busy and _startable(issue, moment, {}, facts=True):
             lanes.setdefault(issue["lane"], []).append(number)
     ready = {lane: orch_queue.ordered(store, lane, numbers) for lane, numbers in lanes.items()}
     ranked = _ranked(ctx, ready, claims=list(known))
     github = current and store.github_wait_until(moment) is not None
     outside = not in_run_hours(moment.astimezone(), config.run_hours)
-    parallel = _value_at(_budgets(moment)["parallel"], moment)
+    budgets, machine = _budgets(store, moment), machine_budget.values()
+    pressure, load = _machine_at(moment)
+    parallel = _value_at(budgets["parallel"], moment)  # Facts' default when nothing is recorded yet.
     cap = parallel if parallel is not None else capacity.INITIAL_PARALLEL
-    if (ceiling := machine_budget.values()["max_parallel"]) is not None:
+    if (ceiling := machine["max_parallel"]) is not None:
         cap = min(cap, ceiling)
     free = max(0, cap - len(holding))
     if config.max_parallel is not None:
@@ -448,9 +482,14 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
             else:
                 unknown.append(started)
     resources = {
-        "machine": {"overloaded": False, "load_per_cpu": 0.0, "memory_pressure": "normal"},
+        # Facts' rule over the recorded sample: critical memory, or load at OVERLOAD_LOAD.
+        "machine": {"overloaded": pressure == "critical" or load >= capacity.OVERLOAD_LOAD,
+                    "load_per_cpu": load, "memory_pressure": pressure},
         "test_slots": {"queue_length": sum(phase == "test-slot-wait" for _, phase in open_phases),
-                       "admitted": _value_at(_budgets(moment)["test_slots"], moment)},
+                       "admitted": capacity.effective_test_slots(
+                           config.test_slots, machine=machine,
+                           state=None if (slots := _value_at(budgets["test_slots"], moment)) is None
+                           else {"slots": slots})},
         "parallelizable_work": {
             "waiting_issues": [number for _, number in ranked], "held": {str(n): r for n, r in held.items()},
             "in_flight": {str(n): "structure" for n, phase in open_phases if phase == "overlap-wait"},

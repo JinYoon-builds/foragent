@@ -297,3 +297,19 @@ def test_flow_idle_a_current_label_change_never_rewrites_earlier_days(tmp_path, 
     clock[0] = NOW - timedelta(minutes=30)
     store.update_local_issue(2, labels=["approved", "ready", "blocked"])  # No flag record.
     assert idle() == (pytest.approx(1440), pytest.approx(1410)), "The hold counts from its update, not all along"
+
+
+def test_flow_idle_reads_the_parallel_state_file_from_its_changed_at(tmp_path, monkeypatch):
+    from foragent import capacity
+    from foragent.issue import body_hash
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=(NOW - timedelta(hours=2)).isoformat())
+    store.update_local_issue(1, title="t", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == 0, "No budget record: unknown"
+    capacity.write_state(store, 1, NOW - timedelta(hours=1))
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(60), (
+        "The budget file is a record from its changed_at")

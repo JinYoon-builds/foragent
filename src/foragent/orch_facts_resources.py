@@ -155,7 +155,7 @@ def _admission(
 
     ctx = SimpleNamespace(store=store, config=config, repo_root=root)
     if not probe:
-        ctx.case_sensitive = None  # Unknown: the file rule treats differing case as overlapping.
+        ctx.case_sensitive = None  # Unknown: intersects() then compares paths case-sensitively.
     state = capacity.read_state(store)
     machine_cap = int(state["parallel"]) if state else capacity.INITIAL_PARALLEL
     if (ceiling := machine["budget"]["max_parallel"]) is not None:
