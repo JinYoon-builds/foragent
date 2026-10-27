@@ -5,9 +5,6 @@ Discovery skips this module because its name starts with an underscore.
 
 from foragent.commands import facade
 
-# An orchestrator whose heartbeat is at most this old counts as alive.
-ALIVE_SECONDS = 30
-
 
 def _add_inbox(orch_actions) -> None:
     cli = facade()
@@ -180,6 +177,8 @@ def _orch_inbox(args, store, config, repo: str) -> None:
 
 
 def _alive(args, store, config) -> None:
+    from foragent.commands.orch import ALIVE_SECONDS
+
     cli = facade()
     last = store.heartbeats()["orchestrator"]
     elapsed = None if last is None else (store._now() - last).total_seconds()

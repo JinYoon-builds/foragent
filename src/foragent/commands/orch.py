@@ -1,9 +1,10 @@
 """`fa orch`: diagnose and recover blocked issues; the local request and question box."""
 
 from foragent.commands import facade, repo_store
-from foragent.commands._orch_box import ALIVE_SECONDS, _add_inbox, _alive, _orch_inbox  # noqa: F401
 
 ORDER = 120
+# An orchestrator whose heartbeat is at most this old counts as alive.
+ALIVE_SECONDS = 30
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive",
                  "reviewers", "ensure", "facts"}
 
@@ -39,7 +40,18 @@ def add(commands) -> None:
             command.add_argument("--tried", required=True)
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
+    from foragent.commands._orch_box import _add_inbox
+
     _add_inbox(orch_actions)
+
+
+def __getattr__(name):
+    """The box handlers live in _orch_box; `from foragent.commands.orch import _orch_inbox` keeps working."""
+    if name in ("_add_inbox", "_alive", "_orch_inbox"):
+        from foragent.commands import _orch_box
+
+        return getattr(_orch_box, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _list(ctx, args) -> None:
