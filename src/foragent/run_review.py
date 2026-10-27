@@ -208,7 +208,8 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}")
     if review.conflicts:
         _append(log, "Review spec conflicts:\n" + "\n".join(review.conflicts))
-        _journal_review(n, ctx, "SPEC-CONFLICT", "\n".join(review.conflicts), round_number)
+        _journal_review(n, ctx, "SPEC-CONFLICT", "\n".join(review.conflicts), round_number,
+                        review_verdict=review.verdict)
     else:
         _journal_review(n, ctx, review.verdict, review.findings, round_number)
     _progress(n, ctx)
@@ -360,12 +361,17 @@ _FINDING_LOCATION = re.compile(r"[\w.-]*[/.][\w./-]*:\d+")
 
 
 def _journal_review(n: int, ctx: RunContext, verdict: str, findings: str, round_number: int,
-                    source: str = "reviewer") -> None:
-    """Record the round's verdict locally before any next round can start."""
+                    source: str = "reviewer", review_verdict: str | None = None) -> None:
+    """Record the round's verdict locally before any next round can start.
+
+    A SPEC-CONFLICT round also keeps the reviewer's own verdict (PASS, FAIL or UNUSABLE),
+    so a reader can still count the defects found beside the conflict.
+    """
     count = 0 if verdict == "UNUSABLE" else sum(
         1 for line in findings.splitlines() if _FINDING_LOCATION.search(line))
     orch_events.append_event(ctx.store, ctx.now(), n, "review", f"{verdict} {count} findings",
-                             verdict=verdict, findings=count, round=round_number, source=source)
+                             verdict=verdict, findings=count, round=round_number, source=source,
+                             **({} if review_verdict is None else {"review_verdict": review_verdict}))
 
 
 def _is_limit(error: BaseException) -> bool:
