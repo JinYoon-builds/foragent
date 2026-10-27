@@ -130,6 +130,18 @@ def check(config: Config | None) -> dict[str, str] | None:
     return _offer(cache.get("latest"), cache.get("installed"))
 
 
+def cached(config: Config | None) -> dict[str, str] | None:
+    """The offer from the last recorded check only: no lookup, no lock, no write.
+
+    For commands that must not call GitHub (`fa brief --report`); while the cache is
+    fresh this is the same offer ``check`` returns.
+    """
+    if opted_out(config):
+        return None
+    cache = _read_cache()
+    return _offer(cache.get("latest"), cache.get("installed"))
+
+
 def offer_line(offer: dict[str, str], language: str) -> str:
     return text("update_offer", language, latest=offer["latest"], current=offer["current"],
                 command=offer["command"])

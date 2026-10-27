@@ -606,6 +606,15 @@ def test_inspect_empty_output(app, capsys, json_output):
 @pytest.mark.parametrize("json_output", [False, True])
 def test_inspect_renders_card_prepared_results_and_language(app, monkeypatch, capsys, json_output):
     root, git, tracker, store, _ = app
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW.astimezone(tz) if tz else NOW.replace(tzinfo=None)
+
+    # inspect reads merges from the last 7 days of its clock; pin it to the tracker's NOW,
+    # so the merge below stays inside the window whatever today's date is.
+    monkeypatch.setattr(cli, "datetime", Clock)
     monkeypatch.setattr(cli, "load_config", lambda root: Config(language="ko"))
     monkeypatch.setattr(cli, "datetime", FixedClock)  # The PR merged at NOW is inside inspect's 7-day window.
     card = "## What changed\n합계 표시\n## Try it\nkind: cli\n```sh\necho 합계:3\n```\n## Expect\n합계:3"
