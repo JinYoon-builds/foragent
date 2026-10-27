@@ -936,3 +936,47 @@ def test_merged_pr_listing_round_trips(store):
         "url": "u", "updated_at": None}]}
     store.record_merged_pr_listing(listing)
     assert store.merged_pr_listing() == listing
+
+
+def test_github_calls_buckets_by_utc_hour_prunes_30_days_and_filters_since(tmp_path):
+    clock = [datetime(2026, 10, 20, 18, 59, tzinfo=timezone(timedelta(hours=9)))]
+    store = StateStore(tmp_path, now=lambda: clock[0])
+    assert store.github_calls() == []
+    store.count_github_call(datetime(2026, 9, 1, 0, 5, tzinfo=UTC))
+    store.count_github_call(clock[0])
+    store.count_github_call(clock[0] + timedelta(minutes=1))
+    store.count_github_call(clock[0] + timedelta(minutes=2))
+    assert json.loads((tmp_path / "github-calls.json").read_text()) == {
+        "2026-10-20T09": 1, "2026-10-20T10": 2,
+    }
+    assert StateStore(tmp_path).github_calls() == [
+        {"hour": "2026-10-20T09:00:00+00:00", "calls": 1},
+        {"hour": "2026-10-20T10:00:00+00:00", "calls": 2},
+    ]
+    assert store.github_calls(since=datetime(2026, 10, 20, 10, tzinfo=UTC)) == [
+        {"hour": "2026-10-20T10:00:00+00:00", "calls": 2},
+    ]
+
+
+def test_phase_changes_and_finish_journal_each_segment(tmp_path, monkeypatch):
+    clock = [NOW]
+    store = StateStore(tmp_path, now=lambda: clock[0])
+    store.start_run(1, branch="foragent/issue-1", worktree=tmp_path / "w")
+    store.update_run(1, phase="implementing", phase_started_at=NOW.isoformat())
+    store.update_run(1, phase="implementing", phase_started_at=NOW.isoformat())  # no change, no event
+    monkeypatch.setattr(state_module.os, "getloadavg", lambda: (2.5, 0, 0))
+    store.update_run(1, phase="checking", phase_started_at=(NOW + timedelta(seconds=7.6)).isoformat())
+
+    def broken():
+        raise OSError("no load average")
+
+    monkeypatch.setattr(state_module.os, "getloadavg", broken)
+    clock[0] = NOW + timedelta(seconds=20)
+    store.finish_run(1, outcome="merged")
+    store.finish_run(1, outcome="merged")  # already finished: no second final event
+    events = [json.loads(line) for line in (tmp_path / "orch-events.jsonl").read_text().splitlines()]
+    assert [(e["kind"], e["summary"], e["phase"], e["seconds"], e["load"]) for e in events] == [
+        ("phase", "implementing -> checking", "implementing", 8, 2.5),
+        ("phase", "checking -> merged", "checking", 12, None),
+    ]
+    assert events[-1]["at"] == clock[0].isoformat()

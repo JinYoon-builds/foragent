@@ -2,24 +2,23 @@
 
 from datetime import UTC, datetime
 import json
+from typing import Any
 
 from foragent.state import StateStore
 
 
 def append_event(store: StateStore, at: datetime, issue: int | None, kind: str, summary: str,
-                 say: str | None = None, details: dict | None = None, *, locked: bool = False) -> dict:
+                 say: str | None = None, *, locked: bool = False, **fields: Any) -> dict:
     """Append one event; ``say`` is an optional line for a person, kept beside the raw summary.
 
-    ``details`` adds structured facts (e.g. a plan edit's lane, values and author).
-    ``locked`` means the caller already holds the (non-reentrant) state lock, so a
-    state change and its event are written under one lock.
+    Extra ``fields`` (for example a review's verdict, or a plan edit's lane, values and
+    author) follow the shared keys. ``locked`` means the caller already holds the
+    (non-reentrant) state lock, so a state change and its event are written under one lock.
     """
     event = {"at": at.astimezone(UTC).isoformat(), "issue": issue,
-             "kind": kind, "summary": " ".join(summary.split())}
+             "kind": kind, "summary": " ".join(summary.split()), **fields}
     if say is not None and " ".join(say.split()):
         event["say"] = " ".join(say.split())
-    for key, value in (details or {}).items():
-        event.setdefault(key, value)
     if locked:
         _write_line(store, event)
     else:

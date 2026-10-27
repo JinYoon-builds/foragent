@@ -130,7 +130,6 @@ def test_tidy_done_count_matches_the_tidy_schedule(env):
 
 
 def test_replay_follows_the_lane_queue_order(env):
-    """Lane queues live in plan.json, which facts never read; the replay keeps number order."""
     from foragent import orch_queue
 
     store, root = env
@@ -140,8 +139,8 @@ def test_replay_follows_the_lane_queue_order(env):
     approve(store, 3, ["src/b.py"])
     orch_queue.set_order(store, "main", [2, 3, 1])
     facts = collect(store, root, overlap_per_file=1)
-    assert facts["resources"]["parallelizable_work"]["held"] == {"2": "structure", "3": "structure"}
-    assert facts["binding"]["kind"] == "structure"
+    assert facts["resources"]["parallelizable_work"]["held"] == {"1": "cap"}
+    assert facts["binding"]["kind"] == "cap"
 
 
 def test_replay_applies_the_gates_recorded_union_answers(env):

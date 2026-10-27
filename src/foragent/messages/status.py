@@ -44,7 +44,7 @@ MESSAGES = {
         "ci": "CI 기다려요",
         "merging": "합치는 중",
         "overlap-wait": "공유 파일 기다려요",
-        "test-slot-wait": "시험 자리 기다려요",
+        "test-slot-wait": "시험 자리 기다리는 중",
         "baseline": "기준선 재는 중",
         "baseline-wait": "기준선 기다려요",
         "executor-wait": "모델 재시도 기다려요",

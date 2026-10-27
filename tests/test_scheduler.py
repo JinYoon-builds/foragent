@@ -3077,6 +3077,7 @@ def test_tick_budget_ceiling_history_records_cpu_measurements(ctx, monkeypatch, 
 
 
 def test_tick_during_github_wait_still_expires_the_plan_and_drops_lapsed_pauses(ctx):
+    """D95: the tick journals the expiry and derives the plan in force; it never writes plan.json."""
     from foragent import orch_plan
 
     ctx.store.root.mkdir(parents=True, exist_ok=True)
@@ -3085,9 +3086,11 @@ def test_tick_during_github_wait_still_expires_the_plan_and_drops_lapsed_pauses(
         "authors": {"queues": {"main": "human"}, "width": {}, "expires_at": "human"},
     }))
     ctx.store.pause_github(NOW + timedelta(minutes=30))
+    before = (ctx.store.root / "plan.json").read_text()
     report = tick(ctx)
     assert report.skipped and "GitHub rate limit" in report.skipped
-    assert json.loads((ctx.store.root / "plan.json").read_text())["queues"] == {}
+    assert (ctx.store.root / "plan.json").read_text() == before, "The tick never writes the plan"
+    assert orch_plan.load(ctx.store, NOW)["queues"] == {}
     kinds = [json.loads(line)["kind"] for line in (ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
     assert kinds.count("plan-expired") == 1
 
@@ -3097,5 +3100,6 @@ def test_tick_during_github_wait_still_expires_the_plan_and_drops_lapsed_pauses(
     }))
     tick(ctx)
     stored = json.loads((ctx.store.root / "plan.json").read_text())
-    assert stored["paused"] == {} and stored["width"] == {"main": 2}
+    assert list(stored["paused"]) == ["main"], "The tick never writes the plan"
+    assert orch_plan.load(ctx.store, NOW)["paused"] == {}
     assert orch_plan.load(ctx.store, NOW)["width"] == {"main": 2}

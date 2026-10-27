@@ -14,7 +14,7 @@ from typing import Any, Literal, Protocol
 from urllib.parse import quote
 from zipfile import BadZipFile, ZipFile
 
-from foragent import cuts
+from foragent import cuts, gh
 
 
 IssueState = Literal["open", "closed"]
@@ -182,6 +182,10 @@ class RecordingTracker:
         self._tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
         self._context = context
         self.queue_writes = queue_writes
+        # GitHub calls made for this context count in its own store and clock.
+        store, now = getattr(context, "store", None), getattr(context, "now", None)
+        if store is not None and now is not None:
+            gh.set_recorder(store, now)
 
     @property
     def _now(self):
@@ -805,13 +809,16 @@ def _parse_time(value: Any) -> datetime | None:
 
 
 class GhTracker:
-    def __init__(self, repo: str, run: Callable[..., str | bytes] | None = None):
+    def __init__(self, repo: str, run: Callable[..., str | bytes] | None = None,
+                 sleep: Callable[[float], None] = time.sleep):
         self.repo = repo
         self._run = run or _run_gh
+        self._sleep = sleep
         self._path = f"repos/{repo}"
         self._seen_states: set[str] = set()
 
     def _call(self, args: list[str], input: str | None = None, *, binary: bool = False) -> str | bytes:
+        gh.count_call()  # Every attempt counts, injected runners and retries included.
         try:
             output = self._run(args, input=input)
             return output.decode() if isinstance(output, bytes) and not binary else output
@@ -858,7 +865,7 @@ class GhTracker:
         if not issues:
             # GitHub sometimes answers a listing with an empty page by mistake.
             # One retry separates that hiccup from a repository that is empty.
-            time.sleep(_EMPTY_RETRY_DELAY)
+            self._sleep(_EMPTY_RETRY_DELAY)
             issues = self._fetch_issues(state)
         if issues:
             states = {issue.state for issue in issues}

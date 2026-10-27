@@ -23,10 +23,12 @@ def test_legacy_lane_queues_migrate_once_as_human(tmp_path):
     (tmp_path / "lane-queues.json").write_text(json.dumps({"orch": [7, 3], "view": []}))
     store = store_at(tmp_path, [NOW])
     assert orch_queue.get(store, "orch") == [7, 3]
+    assert not (tmp_path / "plan.json").exists(), "Readers never write the plan"
+    orch_queue.set_order(store, "view", [5])  # The first command write moves the old queues in.
     assert not (tmp_path / "lane-queues.json").exists()
     stored = json.loads((tmp_path / "plan.json").read_text())
-    assert stored["queues"] == {"orch": [7, 3]}
-    assert stored["authors"]["queues"] == {"orch": "human"}
+    assert stored["queues"] == {"orch": [7, 3], "view": [5]}
+    assert stored["authors"]["queues"] == {"orch": "human", "view": "human"}
     assert stored["written_by"] == "human"
     with pytest.raises(orch_plan.PlanRefused, match="human"):
         orch_queue.set_order(store, "orch", [], by="orchestrator")
@@ -67,21 +69,29 @@ def test_lapsed_pause_drops_silently_and_expiry_writes_one_event(tmp_path):
     orch_plan.set_plan(store, {"orch": 1}, NOW + timedelta(hours=1), "orchestrator")
     clock[0] += timedelta(minutes=10)
     assert not orch_plan.lane_paused(store, "orch", clock[0])
-    orch_plan.refresh(store, clock[0])
-    assert "orch" not in json.loads((tmp_path / "plan.json").read_text())["paused"]
+    before = (tmp_path / "plan.json").read_text()
+    orch_plan.record_expiry(store, clock[0])
+    assert (tmp_path / "plan.json").read_text() == before, "Only the commands write the plan"
+    assert "orch" not in orch_plan.load(store)["paused"]
     assert events(tmp_path, "plan-resume") == []
 
     clock[0] += timedelta(hours=1)
     assert orch_plan.view(orch_plan.load(store))["written_by"] is None  # Read only: no event yet.
     assert events(tmp_path, "plan-expired") == []
     for _ in range(2):
-        orch_plan.refresh(store, clock[0])
+        orch_plan.record_expiry(store, clock[0])
     assert len(events(tmp_path, "plan-expired")) == 1
+    assert (tmp_path / "plan.json").read_text() == before
     shown = orch_plan.view(orch_plan.load(store))
     assert (shown["queues"], shown["paused"], shown["width"], shown["expires_at"], shown["written_by"]) == (
         {}, {}, {}, None, None)
     orch_plan.set_plan(store, {"orch": 2}, None, "orchestrator")
     assert orch_plan.load(store)["expires_at"] is None
+    assert json.loads((tmp_path / "plan.json").read_text())["paused"] == {}
+    orch_plan.set_plan(store, {}, clock[0] + timedelta(hours=1), "orchestrator")
+    clock[0] += timedelta(hours=2)
+    orch_plan.record_expiry(store, clock[0])
+    assert len(events(tmp_path, "plan-expired")) == 2, "A later plan that expires again writes another"
 
 
 def test_plan_cli_validates_lanes_widths_and_times(tmp_path, monkeypatch, capsys):
@@ -119,6 +129,7 @@ def test_refused_edit_after_expiry_keeps_the_expired_event(tmp_path):
     with pytest.raises(orch_plan.PlanRefused, match="past"):
         orch_plan.pause(store, "orch", NOW, "late", "human")
     assert len(events(tmp_path, "plan-expired")) == 1
-    assert json.loads((tmp_path / "plan.json").read_text())["width"] == {}
-    orch_plan.refresh(store, clock[0])
+    assert json.loads((tmp_path / "plan.json").read_text())["width"] == {"orch": 2}, "A refused edit writes nothing"
+    assert orch_plan.load(store)["width"] == {}
+    orch_plan.record_expiry(store, clock[0])
     assert len(events(tmp_path, "plan-expired")) == 1

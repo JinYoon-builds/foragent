@@ -4,12 +4,16 @@ One file holds the lane queues, plan pauses (until, why), lane widths and the
 plan's expiry, each with the author who wrote it (``human`` or
 ``orchestrator``). The plan is a preference above the safety lines: the tick
 still applies blockers, budgets, the overlap cap and exclusive rules, and a
-queue never unpauses a lane.
+queue never unpauses a lane. An orchestrator never changes or clears an item a
+person wrote.
 
-A pause lapses when its ``until`` passes; the tick drops it without an event.
-When ``expires_at`` passes, the whole plan lapses: the first tick (or edit)
-after it rewrites the file to an empty plan and writes one ``plan-expired``
-event. An orchestrator never changes or clears an item a person wrote.
+One writer (D95): only the ``fa orch`` commands (pause, resume, plan, queue)
+write ``plan.json``. Readers derive the plan in force: an expired plan reads as
+empty, and a pause whose ``until`` has passed is ignored. The tick appends one
+``plan-expired`` event per ``expires_at`` value, deciding from the events
+journal. Until a command first writes ``plan.json``, readers take the lane
+queues from a pre-plan ``lane-queues.json``; that first write moves them in and
+removes the old file.
 """
 
 from __future__ import annotations
@@ -38,40 +42,35 @@ def _empty() -> dict:
             "authors": {"queues": {}, "width": {}, "expires_at": None}}
 
 
+def _legacy_path(store: StateStore) -> Path:
+    return store.root / "lane-queues.json"
+
+
 def _read(store: StateStore) -> dict:
-    """The stored plan in canonical form; the caller holds the state lock."""
+    """The stored plan in canonical form, or the pre-plan lane queues (a person's) before it exists."""
     plan = _empty()
     path = _path(store)
-    if path.is_file():
-        data = json.loads(path.read_text(encoding="utf-8"))
-        authors = data.get("authors") or {}
-        plan["queues"] = {str(lane): [int(n) for n in numbers] for lane, numbers in (data.get("queues") or {}).items()}
-        plan["paused"] = {str(lane): {"until": item["until"], "why": item.get("why", ""), "by": item.get("by", "human")}
-                          for lane, item in (data.get("paused") or {}).items()}
-        plan["width"] = {str(lane): int(n) for lane, n in (data.get("width") or {}).items()}
-        plan["expires_at"] = data.get("expires_at")
-        plan["authors"] = {
-            "queues": {lane: (authors.get("queues") or {}).get(lane, "human") for lane in plan["queues"]},
-            "width": {lane: (authors.get("width") or {}).get(lane, "human") for lane in plan["width"]},
-            "expires_at": (authors.get("expires_at") or "human") if plan["expires_at"] else None,
-        }
+    if not path.is_file():
+        legacy = _legacy_path(store)
+        if legacy.is_file():
+            for lane, numbers in json.loads(legacy.read_text(encoding="utf-8")).items():
+                if order := list(dict.fromkeys(int(n) for n in numbers)):
+                    plan["queues"][str(lane)] = order
+                    plan["authors"]["queues"][str(lane)] = "human"
+        return plan
+    data = json.loads(path.read_text(encoding="utf-8"))
+    authors = data.get("authors") or {}
+    plan["queues"] = {str(lane): [int(n) for n in numbers] for lane, numbers in (data.get("queues") or {}).items()}
+    plan["paused"] = {str(lane): {"until": item["until"], "why": item.get("why", ""), "by": item.get("by", "human")}
+                      for lane, item in (data.get("paused") or {}).items()}
+    plan["width"] = {str(lane): int(n) for lane, n in (data.get("width") or {}).items()}
+    plan["expires_at"] = data.get("expires_at")
+    plan["authors"] = {
+        "queues": {lane: (authors.get("queues") or {}).get(lane, "human") for lane in plan["queues"]},
+        "width": {lane: (authors.get("width") or {}).get(lane, "human") for lane in plan["width"]},
+        "expires_at": (authors.get("expires_at") or "human") if plan["expires_at"] else None,
+    }
     return plan
-
-
-def _migrate(store: StateStore, plan: dict) -> bool:
-    """Move a pre-plan ``lane-queues.json`` into the plan once (written by a person)."""
-    legacy = store.root / "lane-queues.json"
-    if not legacy.is_file():
-        return False
-    data = json.loads(legacy.read_text(encoding="utf-8"))
-    for lane, numbers in data.items():
-        order = list(dict.fromkeys(int(n) for n in numbers))
-        if order and str(lane) not in plan["queues"]:
-            plan["queues"][str(lane)] = order
-            plan["authors"]["queues"][str(lane)] = "human"
-    _write(store, plan)
-    legacy.unlink()
-    return True
 
 
 def _write(store: StateStore, plan: dict) -> None:
@@ -99,56 +98,48 @@ def _expired(plan: dict, now: datetime) -> bool:
     return bool(plan["expires_at"]) and now >= datetime.fromisoformat(plan["expires_at"])
 
 
-def _drop_lapsed(plan: dict, now: datetime) -> bool:
-    lapsed = [lane for lane, item in plan["paused"].items() if now >= datetime.fromisoformat(item["until"])]
-    for lane in lapsed:
-        del plan["paused"][lane]
-    return bool(lapsed)
-
-
-def _bring_up_to_date(store: StateStore, now: datetime) -> dict:
-    """Migrate, expire and drop lapsed pauses; the caller holds the state lock.
-
-    This upkeep is the plan's own change over time, not part of any edit, so it is
-    kept even when the edit that triggered it is refused. Each write and its event
-    happen under the same lock: an expiry is never stored without its event.
-    """
-    plan = _read(store)
-    _migrate(store, plan)
+def _in_force(plan: dict, now: datetime) -> dict:
+    """The derived plan: empty once expired; pauses whose ``until`` has passed left out."""
     if _expired(plan, now):
-        expired_at = plan["expires_at"]
-        _write(store, _empty())
-        _journal(store, now, [("plan-expired", None, f"plan expired at {expired_at}; defaults apply",
-                               {"expires_at": expired_at, "by": None})])
         return _empty()
-    if _drop_lapsed(plan, now):
-        _write(store, plan)
+    plan["paused"] = {lane: item for lane, item in plan["paused"].items()
+                      if now < datetime.fromisoformat(item["until"])}
     return plan
+
+
+def _record_expiry(store: StateStore, plan: dict, now: datetime) -> None:
+    """Append one ``plan-expired`` per ``expires_at`` value; the caller holds the state lock."""
+    if not _expired(plan, now):
+        return
+    expired_at = plan["expires_at"]
+    journal = store.root / "orch-events.jsonl"
+    if journal.is_file():
+        for line in journal.read_text(encoding="utf-8").splitlines():
+            if line.strip() and '"plan-expired"' in line:
+                event = json.loads(line)
+                if event.get("kind") == "plan-expired" and event.get("expires_at") == expired_at:
+                    return
+    _journal(store, now, [("plan-expired", None, f"plan expired at {expired_at}; defaults apply",
+                           {"expires_at": expired_at, "by": None})])
 
 
 def _journal(store: StateStore, now: datetime, events: list) -> None:
     """Append events; the caller holds the state lock."""
-    for kind, lane, summary, details in events:
-        orch_events.append_event(store, now, None, kind, summary, details={"lane": lane, **details}, locked=True)
+    for kind, lane, summary, fields in events:
+        orch_events.append_event(store, now, None, kind, summary, locked=True, lane=lane, **fields)
 
 
 def load(store: StateStore, now: datetime | None = None) -> dict:
-    """The plan in force, read only (apart from the one-time queue migration)."""
-    now = now or store._now()
-    if (store.root / "lane-queues.json").is_file():
-        with store._state_lock():
-            _migrate(store, _read(store))
-    plan = _read(store)
-    if _expired(plan, now):
-        return _empty()
-    _drop_lapsed(plan, now)
-    return plan
+    """The plan in force at ``now``; reading never writes ``plan.json``."""
+    return _in_force(_read(store), now or store._now())
 
 
-def refresh(store: StateStore, now: datetime) -> dict:
-    """Once per tick: drop lapsed pauses silently and expire the plan with one event."""
+def record_expiry(store: StateStore, now: datetime) -> None:
+    """Once per tick: journal an expiry that has passed, once per ``expires_at`` value."""
+    if not _path(store).is_file():
+        return
     with store._state_lock():
-        return _bring_up_to_date(store, now)
+        _record_expiry(store, _read(store), now)
 
 
 def view(plan: dict) -> dict:
@@ -179,11 +170,14 @@ def _edit(store: StateStore, by: str, change) -> dict:
         raise PlanRefused(f"--by must be one of: {', '.join(AUTHORS)}")
     now = store._now()
     with store._state_lock():
-        edited = deepcopy(_bring_up_to_date(store, now))
+        stored = _read(store)
+        _record_expiry(store, stored, now)  # The edit replaces an expired plan; its expiry stays recorded.
+        edited = _in_force(deepcopy(stored), now)  # An expired plan's next edit starts a fresh plan.
         changes = change(edited, now)  # A refusal raises before the edit is written.
         _write(store, edited)
-        _journal(store, now, [(kind, lane, summary, {"by": by, **details})
-                              for kind, lane, summary, details in changes])
+        _legacy_path(store).unlink(missing_ok=True)  # Its queues are in plan.json now.
+        _journal(store, now, [(kind, lane, summary, {"by": by, **fields})
+                              for kind, lane, summary, fields in changes])
     return edited
 
 

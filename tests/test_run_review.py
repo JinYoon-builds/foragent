@@ -778,6 +778,12 @@ def test_review_returns_conflicted_pr_to_implementer_even_with_pass_verdict(run_
     assert "충돌 마커가 남음: notes.txt:1" in c.executor.calls[0]["prompt"]
     assert c.tracker.merged_prs == [pr]
     assert git_command(c.history.origin, "show", "foragent/issue-1:notes.txt") == "resolved"
+    journal = c.store.root / "orch-events.jsonl"
+    reviews = [event for line in journal.read_text().splitlines()
+               if (event := json.loads(line))["kind"] == "review"]
+    # The orchestrator's verdict for the PR head is journaled as its own review source.
+    assert ("orchestrator" in {event["source"] for event in reviews}) is resolved
+    assert all(event["verdict"] == "PASS" and event["findings"] == 0 for event in reviews)
 
 
 def test_review_text_about_limits_uses_normal_review_failure_budget(run_case):

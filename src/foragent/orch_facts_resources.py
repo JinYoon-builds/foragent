@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from foragent import capacity
+from foragent import capacity, orch_queue
 from foragent.config import Config, in_run_hours, lane_executors
 from foragent.processes import read_process_identity
 from foragent.state import Run, StateStore
@@ -179,12 +179,10 @@ def _admission(
     for item in items.values():
         lanes.setdefault(item.lane, []).append(item.number)
     # The tick's own start order (scheduler_start._ranked): fewest files overlapping running
-    # claims, the global priority list, then the issue number. Ranked once, before starts.
-    # Lane queues live in plan.json, which facts never read (it may hold a throughput goal),
-    # so the replay leaves the lane-queue preference out and keeps number order.
+    # claims, the global priority list, then each lane's queue order. Ranked once, before starts.
     from foragent.scheduler_start import _ranked
 
-    ready = {lane: sorted(numbers) for lane, numbers in lanes.items()}
+    ready = {lane: orch_queue.ordered(store, lane, numbers) for lane, numbers in lanes.items()}
     ranked = _ranked(ctx, ready, claims=list(known))
     if hold_all in ("github", "run_hours"):
         # The tick skips the whole start loop before any cap, quota or file check.
