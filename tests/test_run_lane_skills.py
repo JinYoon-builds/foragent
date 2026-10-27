@@ -130,9 +130,15 @@ def test_lane_skills_come_from_worktree_and_only_extend_codex_prompts(run_case, 
     assert run_issue(1, c.ctx) == "merged"
     call = c.executor.calls[0]
     pr = c.tracker.created_prs[0]
-    if kind == "codex":
-        name = "configured" if source == "config" else "agent-skill"
-        assert f"- {name}: Skill metadata (.claude/skills/{name}/SKILL.md)\n\n" in call["prompt"]
+    if kind == "codex" and source != "config":
+        # D95: .foragent.yml is the only source; the agent frontmatter is never a fallback.
+        assert call["prompt"].startswith("Lane notes:\nLane instructions.\n\n")
+        assert "Lane skills (read the file" not in call["prompt"]
+        assert "Agent strategy." not in call["prompt"]
+        assert "missing skill:" not in pr.body
+        assert "agent" not in call
+    elif kind == "codex":
+        assert "- configured: Skill metadata (.claude/skills/configured/SKILL.md)\n\n" in call["prompt"]
         assert call["prompt"].startswith("Lane notes:\nLane instructions.\n\nLane skills (read the file when relevant and follow it):\n")
         assert "Configured strategy." not in call["prompt"] and "Agent strategy." not in call["prompt"]
         assert "description: Skill metadata" not in call["prompt"]
