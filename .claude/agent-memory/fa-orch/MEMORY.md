@@ -169,3 +169,4 @@
 - #334: `fa orch architect`는 `orch_architect.py`+`commands/_orch_architect.py`(set_defaults handler, orch·gate run()이 먼저 분기). commands/*.py 본문 import는 facade·repo_store만 허용(test_cli_commands) → argparse는 `cli.argparse`. refactor.md는 pstack 시험 정규식(백틱 단독 `architect` 금지)도 지킨다.
 - #225: `orch_scorecard.py`는 `fa orch scorecard`(읽기 전용). 버킷은 `(now-t)//24h`(새 끝 포함). pr-open의 merged_at은 `record_merge`가 finish_run 전에 써야 runs.jsonl에 들어간다. 동사 등록은 `_orch_box` + INBOX_ACTIONS.
 - #310: SKILL.md 150줄 상한은 시험이 정규식으로 읽지 않는 설명(watch 세부·주문 카드)을 `references/watch.md`·`order-card.md`로 옮겨 맞췄다. 비교: SKILL을 읽는 인수 16개 파일의 PASSED/FAILED 집합(zsh는 `$(grep -l ...)`로 넘겨야 단어 분리됨).
+- #693: park/unpark 본체는 `orch_park.py`, CLI는 `commands/_orch_park.py`(orch.py run에서 ctx 만든 뒤 분기). 시간 초과는 `parked_at() > since`면 생략. 인수 시험 1은 라벨 제거만으로 통과하므로 경계는 `tests/test_orch_park_unit.py`가 local_issues를 교체해 확인.
