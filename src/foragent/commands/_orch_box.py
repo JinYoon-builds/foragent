@@ -21,6 +21,8 @@ def _add_inbox(orch_actions) -> None:
     ask.add_argument("--question", required=True)
     ask.add_argument("--option", action="append", default=[])
     ask.add_argument("--recommend", type=int)
+    ask.add_argument("--issue", dest="issues", type=int, action="append", default=[],
+                     help="Issue that waits on this answer (repeatable); shown in the board's Your turn")
     questions = orch_actions.add_parser("questions", help="List open human questions")
     questions.add_argument("--all", action="store_true", help="Include answered questions")
     answer = orch_actions.add_parser("answer", help="Record the answer and close one question")
@@ -146,7 +148,7 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         record = box.write_note(store, args.now, args.why, args.next_step, where)
         print(f"Note saved at {record['at']} ({where['kind']}).")
     elif args.action == "ask":
-        record = box.ask(store, args.question, args.option, args.recommend)
+        record = box.ask(store, args.question, args.option, args.recommend, args.issues)
         pushed = box.route_question(store, config, repo, record)
         print(f"Question {record['id']} saved (open)"
               + ("; no planning session is alive, so a notification was sent." if pushed else "."))
@@ -172,6 +174,8 @@ def _orch_inbox(args, store, config, repo: str) -> None:
             print("No open questions.")
         for row in [] if args.json else rows:
             print(f"{row['id']} [{row['status']}] {row['question']}")
+            if row.get("issues"):
+                print("  issues: " + ", ".join(f"#{number}" for number in row["issues"]))
             for index, option in enumerate(row["options"], 1):
                 mark = " (recommended)" if index == row["recommend"] else ""
                 print(f"  {index}. {option}{mark}")
