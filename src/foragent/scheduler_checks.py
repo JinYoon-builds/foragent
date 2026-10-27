@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from foragent import scheduler
+from foragent import orch_park, scheduler
 from foragent.records import load_record
 from foragent.state import Approval
 from foragent.tracker import Dependency, Issue, LabelEvent
@@ -130,6 +130,9 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
         for (number, _), ended in ctx.store.finish_times().items() if number == issue.number
     ])
     if ctx.now() - since <= scheduler.timedelta(minutes=ctx.config.orchestrator_timeout_minutes):
+        return issue
+    # A park newer than the clock's start is the orchestrator's response to these blockers.
+    if (parked := orch_park.parked_at(ctx.store, issue.number)) is not None and parked > since:
         return issue
     ctx.tracker.add_labels(issue.number, [scheduler.NEEDS_HUMAN])
     scheduler.board.sync_status(ctx, issue, "Needs human")

@@ -281,6 +281,31 @@ def _order_parent(ctx: BoardContext, number: int) -> bool:
     return number in order_parents([row for row in store.local_issues() if row["number"] == number])
 
 
+_FINAL = frozenset({"Done", "merged", "closed"})
+
+
+def _waits_on_person(ctx: BoardContext, issue: Issue | int) -> bool:
+    """Whether a person holds the issue: needs-human, waiting-person or an open question."""
+    from foragent import orch_inbox
+    from foragent.labels import NEEDS_HUMAN
+
+    number = getattr(issue, "number", issue)
+    store = getattr(ctx, "store", None)
+    labels = getattr(issue, "labels", None)
+    if labels is None and store is not None:
+        labels = next((row["labels"] for row in store.local_issues() if row["number"] == number), ())
+    # "waiting-person" is written only by fa orch park/unpark; switch to its constant once on main.
+    if {NEEDS_HUMAN, "waiting-person"} & set(labels or ()):
+        return True
+    if store is None:
+        return False
+    try:
+        return number in orch_inbox.waiting_issues(store)
+    except Exception:  # An unreadable question box must not stop the board sync.
+        log.warning("Could not read open questions for issue #%s", number, exc_info=True)
+        return False
+
+
 def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_only: bool = False,
                 parent: bool = False) -> None:
     """Move the issue's card to the column for ``status`` when the column differs.
@@ -288,6 +313,9 @@ def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_
     An open order parent's column follows its children: only the children
     aggregation (``parent=True``) writes it, so work-state handlers such as
     recovery, escalation or a flag leave its card alone.
+
+    An open issue that waits on a person (``_waits_on_person``) goes to the
+    Your turn group whatever work state the caller passes.
 
     ``existing_only`` moves a card that is already on the board, recorded
     locally or not, and never adds one. A tracker that records board values is
@@ -300,6 +328,8 @@ def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_
         return
     if not parent and _order_parent(ctx, getattr(issue, "number", issue)):
         return
+    if not parent and status not in _FINAL and _waits_on_person(ctx, issue):
+        status = "Needs human"
     token = _current.set(Project(ctx.tracker, ctx.repo, ctx.config.board, ctx.config.board_map))
     try:
         if not existing_only:
