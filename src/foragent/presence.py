@@ -4,8 +4,10 @@ session-start summary with the first minute's big squirrel (#755).
 Built from local state only (no GitHub call, no child process), because Claude
 Code refreshes the statusline often.
 
-Session start times live in ``<state>/sessions/<hash of session_id>.json``
-({session_id, started_at}); the SessionStart hook is their only writer.
+Session start times live in ``$XDG_DATA_HOME/foragent/presence-sessions/<hash of
+session_id>.json`` ({session_id, started_at}); the SessionStart hook is their only
+writer. Claude's session ids are unique on the machine, so the record needs no
+repository: a project without a repo key or GitHub origin still gets its squirrel.
 """
 
 from datetime import datetime, timedelta
@@ -14,7 +16,7 @@ import json
 from pathlib import Path
 
 PERSON_LABELS = frozenset({"needs-human", "waiting-person"})
-SESSIONS = "sessions"
+SESSIONS = "presence-sessions"
 SQUIRREL_FOR = timedelta(seconds=60)
 # The hook drops start records older than this; a squirrel never needs them again.
 SESSION_KEEP = timedelta(days=1)
@@ -105,9 +107,14 @@ def statusline_segment(cwd: Path, now: datetime) -> str | None:
         return None
 
 
-def _session_path(store, session_id: str) -> Path:
+def _sessions() -> Path:
+    from foragent.statusline import data_dir
+    return data_dir() / SESSIONS
+
+
+def _session_path(session_id: str) -> Path:
     # Hashed: a session id is outside input and must not name a path by itself.
-    return store.root / SESSIONS / (hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32] + ".json")
+    return _sessions() / (hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32] + ".json")
 
 
 def _started_at(path: Path) -> datetime | None:
@@ -118,15 +125,17 @@ def _started_at(path: Path) -> datetime | None:
     return at if at.tzinfo else None
 
 
-def record_session_start(store, session_id: str, now: datetime) -> None:
+def record_session_start(session_id: str, now: datetime) -> None:
     """The one writer of session start times: record this one, drop day-old ones."""
-    folder = store.root / SESSIONS
+    from foragent.statusline import _write_json
+
+    folder = _sessions()
     folder.mkdir(parents=True, exist_ok=True)
     for path in folder.glob("*.json"):
         at = _started_at(path)
         if at is None or at < now - SESSION_KEEP:
             path.unlink(missing_ok=True)
-    store._write_json(_session_path(store, session_id), {"session_id": session_id, "started_at": now.isoformat()})
+    _write_json(_session_path(session_id), {"session_id": session_id, "started_at": now.isoformat()})
 
 
 def session_start_message(cwd: Path, session_id: str | None, now: datetime) -> str | None:
@@ -142,14 +151,14 @@ def session_start_message(cwd: Path, session_id: str | None, now: datetime) -> s
     if project is None or not project[0].presence["session_start"]:
         return None
     config, store = project
+    if session_id:
+        record_session_start(session_id, now)
     merged = turns = 0
-    if store is not None:
-        if session_id:
-            record_session_start(store, session_id, now)
-        if store.root.is_dir():
-            since = brief_report.last_report(store, now) or now - brief_report.FIRST_WINDOW
-            merged = sum(since < at <= now for at in brief_report._merges(store).values())
-            turns = counts(store, now)[1]
+    # No local state yet (never run here, or no repo to name it): the counts are zero.
+    if store is not None and store.root.is_dir():
+        since = brief_report.last_report(store, now) or now - brief_report.FIRST_WINDOW
+        merged = sum(since < at <= now for at in brief_report._merges(store).values())
+        turns = counts(store, now)[1]
     return text("presence_session_start", config.language, merged=merged, turns=turns)
 
 
@@ -159,9 +168,9 @@ def squirrel(cwd: Path, session_id: str | None, now: datetime) -> str | None:
 
     try:
         project = _project(cwd)
-        if not session_id or project is None or not project[0].presence["session_start"] or project[1] is None:
+        if not session_id or project is None or not project[0].presence["session_start"]:
             return None
-        started = _started_at(_session_path(project[1], session_id))
+        started = _started_at(_session_path(session_id))
         if started is None or not timedelta(0) <= now - started < SQUIRREL_FOR:
             return None
         return "\n".join(watch_art.ansi_rows(watch_art.ORCHESTRATOR, watch_art.PALETTE))
