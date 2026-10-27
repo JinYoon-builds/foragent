@@ -106,6 +106,13 @@ def has_hook(settings: dict) -> bool:
         for group in groups)
 
 
+def wrapper_active(settings: dict) -> bool:
+    """True when the effective statusLine runs `fa statusline`."""
+    current = settings.get("statusLine")
+    return (isinstance(current, dict) and current.get("type") == "command"
+            and isinstance(current.get("command"), str) and is_wrapper(current["command"]))
+
+
 def with_hook(settings: dict) -> dict:
     """``settings`` with Foragent's SessionStart hook added (unchanged when it is there)."""
     if has_hook(settings):
@@ -298,17 +305,23 @@ def _sync_hook() -> str:
 
 
 def _sync_hook_locked() -> str:
-    """Match the SessionStart hook to the recorded decision: "hooked" when it was added, else "kept".
+    """Match the SessionStart hook to the statusline: "hooked" when it was added, else "kept".
 
-    Installs from before the hook existed get it at the next init; a declined or
-    uninstalled statusline has none.
+    Installs from before the hook existed get it at the next init. The hook is added
+    only beside an active wrapper, so a statusLine the user replaced does not bring it
+    back; a declined or uninstalled statusline has none.
     """
     record = load_record() or {}
     settings_file = claude_settings_path()
     settings = _read_settings(settings_file) if settings_file.parent.is_dir() else None
     if settings is None:
         return "kept"
-    wanted = with_hook(settings) if record.get("enabled") else without_hook(settings)
+    if not record.get("enabled"):
+        wanted = without_hook(settings)
+    elif wrapper_active(settings):
+        wanted = with_hook(settings)
+    else:
+        return "kept"
     if wanted is settings:
         return "kept"
     _write_json(settings_file.resolve(), wanted)
@@ -378,10 +391,27 @@ def _write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
+def _strip_hook(content: str, intended: dict) -> tuple[str, dict]:
+    """Remove Foragent's SessionStart hook from ``content``/``intended``, keeping other bytes."""
+    stripped = without_hook(intended)
+    if stripped is intended:
+        return content, intended
+    if "hooks" in stripped:
+        # The last duplicate is the effective one; replace only its value.
+        span = _member_span(content, "hooks")
+        return (content[:span[1]] + json.dumps(stripped["hooks"], ensure_ascii=False)
+                + content[span[2]:]), stripped
+    while (span := _member_span(content, "hooks")) is not None:
+        content = content[:span[0]] + content[span[3]:]
+    return content, stripped
+
+
 def uninstall(language: str = "en") -> tuple[int, str]:
     """Undo the wrapper: put back the recorded command, or remove our statusLine.
 
-    Only the statusLine value (or member) changes; every other byte of
+    Foragent's SessionStart hook goes too, whatever happened to the statusline:
+    a statusLine the user changed, or a record that is missing or already off,
+    still leaves no hook behind. Only those members change; every other byte of
     settings.json stays. Returns (exit code, message for the user).
     """
     from foragent.i18n import text
@@ -389,13 +419,16 @@ def uninstall(language: str = "en") -> tuple[int, str]:
     settings_file = claude_settings_path()
     with _install_lock():
         record = load_record()
-        if not record or not record.get("enabled"):
-            return 0, text("statusline_not_installed", language)
+        installed = bool(record and record.get("enabled"))
         try:
             raw = settings_file.read_bytes()
         except FileNotFoundError:
+            if not installed:
+                return 0, text("statusline_not_installed", language)
             return 1, text("statusline_settings_missing", language, path=settings_file)
         except OSError as exc:
+            if not installed:
+                return 0, text("statusline_not_installed", language)
             return 1, text("statusline_settings_unreadable", language, path=settings_file,
                            error=exc.strerror or exc)
         try:
@@ -405,41 +438,43 @@ def uninstall(language: str = "en") -> tuple[int, str]:
                 raise ValueError("settings is not a JSON object")
             span = _member_span(content, "statusLine")
         except ValueError as exc:
+            if not installed:
+                return 0, text("statusline_not_installed", language)
             return 1, text("statusline_settings_unreadable", language, path=settings_file, error=exc)
-        current = settings.get("statusLine")
-        command = current.get("command") if isinstance(current, dict) else None
-        if (span is None or not isinstance(command, str) or current.get("type") != "command"
-                or not is_wrapper(command)):
-            return 0, text("statusline_user_changed", language, path=settings_file)
-        removal_start, value_start, value_end, removal_end = span
-        previous = record.get("previous_command")
-        intended = dict(settings)
-        if isinstance(previous, str) and previous.strip():
-            intended["statusLine"] = {**current, "command": previous}
-            value = json.dumps(intended["statusLine"], ensure_ascii=False)
-            # The last duplicate is the one every JSON reader uses; earlier ones stay inactive.
-            updated = content[:value_start] + value + content[value_end:]
-            message = text("statusline_restored", language, command=previous.strip())
+        updated, intended = content, dict(settings)
+        unwrap = installed and span is not None and wrapper_active(settings)
+        if not installed:
+            message = text("statusline_not_installed", language)
+        elif not unwrap:
+            message = text("statusline_user_changed", language, path=settings_file)
         else:
-            del intended["statusLine"]
-            updated = content[:removal_start] + content[removal_end:]
-            # Duplicate members: removing the last would expose an earlier one, so remove them all.
-            while (span := _member_span(updated, "statusLine")) is not None:
-                updated = updated[:span[0]] + updated[span[3]:]
-            message = text("statusline_removed", language)
-        if (stripped := without_hook(intended)) is not intended:
-            intended = stripped
-            if "hooks" in intended:
-                span = _member_span(updated, "hooks")
-                updated = (updated[:span[1]] + json.dumps(intended["hooks"], ensure_ascii=False)
-                           + updated[span[2]:])
+            current = settings["statusLine"]
+            removal_start, value_start, value_end, removal_end = span
+            previous = record.get("previous_command")
+            if isinstance(previous, str) and previous.strip():
+                intended["statusLine"] = {**current, "command": previous}
+                value = json.dumps(intended["statusLine"], ensure_ascii=False)
+                # The last duplicate is the one every JSON reader uses; earlier ones stay inactive.
+                updated = content[:value_start] + value + content[value_end:]
+                message = text("statusline_restored", language, command=previous.strip())
             else:
-                while (span := _member_span(updated, "hooks")) is not None:
+                del intended["statusLine"]
+                updated = content[:removal_start] + content[removal_end:]
+                # Duplicate members: removing the last would expose an earlier one, so remove them all.
+                while (span := _member_span(updated, "statusLine")) is not None:
                     updated = updated[:span[0]] + updated[span[3]:]
+                message = text("statusline_removed", language)
+        unhooked = without_hook(intended) is not intended
+        updated, intended = _strip_hook(updated, intended)
+        if unhooked:
+            message += "\n" + text("statusline_hook_removed", language)
+        if updated == content:
+            return 0, message
         if json.loads(updated) != intended:
             # Never write a file whose effective settings differ from what we report.
             return 1, text("statusline_settings_unreadable", language, path=settings_file,
-                           error="could not edit statusLine without changing other settings")
+                           error="could not edit settings without changing other settings")
         _write_bytes(settings_file.resolve(), updated.encode("utf-8"))
-        _write_json(record_path(), {**record, "enabled": False})
+        if unwrap:
+            _write_json(record_path(), {**record, "enabled": False})
     return 0, message

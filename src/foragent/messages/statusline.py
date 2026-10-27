@@ -9,6 +9,7 @@ MESSAGES = {
                                     "Foragent installed it."),
         "statusline_settings_missing": "Could not uninstall: {path} is missing (not found).",
         "statusline_settings_unreadable": "Could not uninstall: could not read {path} ({error}).",
+        "statusline_hook_removed": "Removed the Foragent session-start hook from Claude settings.",
         "statusline_hook_added": "Claude statusline: added the session-start summary (presence.session_start: false turns it off).",
     },
     "ko": {
@@ -18,6 +19,7 @@ MESSAGES = {
         "statusline_user_changed": "설치 뒤 사용자가 statusLine을 바꾸거나 지워서 {path}는 그대로 뒀어요",
         "statusline_settings_missing": "{path} 파일이 없어서 상태 줄을 뺄 수 없어요",
         "statusline_settings_unreadable": "{path} 파일을 읽지 못해서 상태 줄을 뺄 수 없어요({error})",
+        "statusline_hook_removed": "Claude 설정에서 Foragent 세션 시작 훅을 뺐어요",
         "statusline_hook_added": "Claude 상태 줄: 세션 시작 요약을 더했어요(presence.session_start: false로 끌 수 있어요)",
     },
 }
