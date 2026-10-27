@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 import re
 import shutil
+import subprocess
 from typing import Any
 
 import yaml
@@ -255,13 +256,25 @@ def _agent_text(name: str, skills: list[str]) -> str:
             "Propose changes to the orchestrator; never message a person directly.\n")
 
 
+def _local_git(root: Path):
+    """A runner for role commands' local-only Git calls (no fetch or push).
+
+    Without a timeout, subprocess waits for git in one blocking wait; with one, it
+    polls with sleeps and kills git if anything interrupts that wait.
+    """
+    def run(args: list[str]) -> str:
+        return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True,
+                              errors="replace").stdout
+    return run
+
+
 class _Edit:
     """One role command: load, check the branch, write the source and its files, commit."""
 
     def __init__(self, root: Path, git: GitRepo | None, manager=None):
         self.root = Path(root).resolve()
         self.config = load_config(self.root)
-        self.git = git or GitRepo(self.root)
+        self.git = git or GitRepo(self.root, _local_git(self.root))
         self.manager = manager
         self.to_install: list[str] = []
         self.path = repo_path(self.root, ".foragent.yml")
