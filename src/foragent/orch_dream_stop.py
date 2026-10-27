@@ -6,8 +6,9 @@ the tick finish a dream record; unknown liveness waits for a later tick.
 
 from __future__ import annotations
 
+from datetime import datetime
 import os
-import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -57,17 +58,15 @@ def dream_liveness(run) -> bool | None:
 
 
 def _remaining(run) -> bool | None:
-    """Whether anything of the dream lives: worker, executor group leader, its members, recorded tree."""
+    """Whether anything of the dream lives: worker, executor group leader and the recorded tree.
+
+    Only recorded identities count. A process-group number alone proves nothing: after the
+    group's processes exit, the number can name an unrelated group, whose members are not ours.
+    """
     if (table := _table()) is None:
         return None
     starts = _starts(run)
     results = [process_alive(pid, starts.get(pid), table) for pid in {run.pid, run.executor_pgid, *starts}]
-    group = run.executor_pgid
-    if group is not None:
-        leader = process_alive(group, starts.get(group), table)
-        # Members of a group whose leader pid now belongs to another process are not ours.
-        reused = leader is False and any(row.pid == group for row in table)
-        results.append(not reused and any(row.pgid == group and row.pid != group for row in table))
     return True if True in results else None if None in results else False
 
 
@@ -76,11 +75,21 @@ def _maybe_ours(uid: int | None) -> bool:
     return uid is None or uid == os.getuid()
 
 
-def _worker_listed(lane: str) -> bool | None:
-    """Whether a `gate run-dream <lane>` process is listed; None when that cannot be known.
+def _worker_argv(lane: str, repo_root) -> list[str]:
+    """The launcher's exact worker command after the interpreter (launcher.spawn_runner)."""
+    return ["-m", "foragent.cli", "gate", "run-dream", lane, "--repo-root", str(Path(repo_root).resolve())]
 
-    A process whose argv or identity is unreadable, and which may be ours, could be the
-    worker: absence is confirmed only when every possibly-ours process was read.
+
+def _workers_listed(lane: str, repo_root) -> list | None:
+    """This repository's dream workers for the lane; None when that cannot be known.
+
+    A worker is matched by its whole argv, element by element, as the launcher builds it
+    (any interpreter, then exactly ``-m foragent.cli gate run-dream <lane> --repo-root <root>``):
+    a search tool or shell whose arguments merely contain that text is not a worker, and
+    another repository's worker of a lane with the same name has another root. A process
+    whose argv or identity is unreadable, and which may be ours, could be the worker, so
+    an empty list is returned only when every possibly-ours process was read. A listing
+    is evidence of life only; `adoptable` decides whether the tick may stop it.
     """
     from foragent import processes
 
@@ -88,14 +97,29 @@ def _worker_listed(lane: str) -> bool | None:
         table = processes.list_processes()
     except (OSError, PermissionError):
         return None
-    pattern = re.compile(rf"(?:^|\s)gate\s+run-dream\s+{re.escape(lane)}(?=\s|$)")
-    if any(row.argv is not None and pattern.search(" ".join(row.argv)) for row in table):
-        return True
+    expected = _worker_argv(lane, repo_root)
+    found = [row for row in table if row.argv is not None and list(row.argv[1:]) == expected
+             and _maybe_ours(row.uid)]
+    if found:
+        return found
     uids = getattr(table, "unreadable_uids", {})
     if any(row.argv is None and _maybe_ours(row.uid) for row in table) or any(
             _maybe_ours(uids.get(pid)) for pid in getattr(table, "unreadable", ())):
         return None
-    return False
+    return []
+
+
+def adoptable(row, run, grace_seconds: float) -> bool:
+    """Whether a listed worker is this record's own process, strongly enough to stop it.
+
+    The launcher starts the worker as a new session right after it writes the record, so
+    the worker is ours (same uid), leads its own session and group, and was born between
+    the record's start and the launch grace. A listing that fails any of these is only
+    evidence of life, never signal ownership.
+    """
+    started = datetime.fromisoformat(run.started_at).timestamp()
+    return (row.uid == os.getuid() and row.pid == row.pgid == row.sid
+            and started - 1 <= row.start_time <= started + grace_seconds)
 
 
 def _stop(ctx: TickContext, run, report: TickReport) -> bool:

@@ -203,15 +203,22 @@ def recover(ctx: TickContext, run, report: TickReport) -> None:
     stops what is left of the recorded tree (a surviving executor) first.
     """
     from foragent import scheduler
-    from foragent.orch_dream_stop import _stop, _worker_listed, dream_liveness
+    from foragent.orch_dream_stop import _stop, _workers_listed, adoptable, dream_liveness
 
     now = ctx.now()
     live = dream_liveness(run)
     if run.pid is None:
         if now - datetime.fromisoformat(run.started_at) < scheduler.LAUNCH_GRACE:
             return
-        listed = _worker_listed(run.lane)
-        live = None if listed is None else listed
+        listed = _workers_listed(run.lane, ctx.repo_root)
+        if listed is not None and len(listed) == 1 and adoptable(
+                listed[0], run, scheduler.LAUNCH_GRACE.total_seconds()):
+            # This record's own worker, proven by its birth (see adoptable): record its
+            # identity as the launcher would have, so the limits below can stop it as ours.
+            worker = listed[0]
+            run = ctx.store.update_dream(run.lane, pid=worker.pid, process_identities=[
+                {"pid": worker.pid, "start_time": worker.start_time}]) or run
+        live = None if listed is None else bool(listed)
     if live is None:
         return  # Unknown liveness: wait for a later tick.
     detail = "Dream process died."
@@ -225,8 +232,9 @@ def recover(ctx: TickContext, run, report: TickReport) -> None:
             detail = "Dream stopped making progress past the stall limit."
         else:
             return
-        if run.pid is None:
-            return  # A listed worker without a recorded pid cannot be stopped as ours.
+        if run.pid is None:  # Listed, but not proven ours: evidence of life only, never a stop.
+            report.actions.append(f"lane {run.lane} dream over its limits; its worker is not verified, not stopped")
+            return
     if not _stop(ctx, run, report):
         return
     try:
