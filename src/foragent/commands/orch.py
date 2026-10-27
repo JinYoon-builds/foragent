@@ -6,7 +6,7 @@ ORDER = 120
 # An orchestrator whose heartbeat is at most this old counts as alive.
 ALIVE_SECONDS = 30
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive",
-                 "reviewers", "ensure", "facts"}
+                 "reviewers", "ensure", "facts", "scorecard"}
 
 
 def add(commands) -> None:
