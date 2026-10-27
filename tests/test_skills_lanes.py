@@ -820,3 +820,22 @@ def test_settings_document_refuses_to_add_a_line_end_to_the_last_setting(tmp_pat
         else:
             settings.set_skills("api", skills, {}, {})
     assert path.read_bytes() == text.encode()
+
+
+def test_repo_product_skill_wins_by_name_over_library_for_install_and_copy(library, tmp_path):
+    source, config, manager, _ = library
+    root, worktree = tmp_path / "repo", tmp_path / "worktree"
+    product = root / "skills/testing-strategy"
+    product.mkdir(parents=True)
+    (product / "SKILL.md").write_text("---\nname: testing-strategy\ndescription: Product copy\n---\nRepo body.\n")
+    (product / "LICENSE").write_text("SPDX-License-Identifier: MIT\nCopyright (c) 2026 Example\n")
+    skill = manager.check_install("testing-strategy", root)
+    assert (skill.path, skill.license, skill.description) == (product, "MIT", "Product copy")
+    assert manager.install("testing-strategy", root) == "testing-strategy"
+    assert (root / ".claude/skills/testing-strategy/SKILL.md").read_text().endswith("Repo body.\n")
+    # A fully qualified library ID still selects the library copy.
+    assert manager.check_install("kwp:engineering/testing-strategy", tmp_path / "other").path == (
+        source / "engineering/skills/testing-strategy")
+    (root / ".claude/skills/testing-strategy/SKILL.md").write_text("Stale local install\n")
+    assert copy_lane_skills(root, worktree, ["testing-strategy"], manager) == [".claude/skills/testing-strategy"]
+    assert (worktree / ".claude/skills/testing-strategy/SKILL.md").read_text().endswith("Repo body.\n")
