@@ -128,6 +128,18 @@ class IssueRefreshMixin:
         with self._state_lock():
             self._write_json(self.root / "merged_prs.json", listing)
 
+    def closed_issue_watermark(self) -> datetime | None:
+        """When the last light read of closed issues began, if one was recorded."""
+        try:
+            data = _state.json.loads((self.root / "closed_issues.json").read_text(encoding="utf-8"))
+            return datetime.fromisoformat(data["watermark"])
+        except (FileNotFoundError, ValueError, TypeError, KeyError):
+            return None
+
+    def record_closed_issue_watermark(self, at: datetime) -> None:
+        with self._state_lock():
+            self._write_json(self.root / "closed_issues.json", {"watermark": at.isoformat()})
+
     def read_baseline(self) -> dict[str, Any]:
         """Facts a per-issue read will depend on, taken before the read starts."""
         snapshot = self._issue_view()
