@@ -102,7 +102,39 @@ def _row(execution: _Execution, now: datetime) -> dict[str, Any]:
         "waste_share": waste / runtime if waste is not None and runtime else None,
         "test_phase_share": checking / runtime if checking is not None and runtime else None,
         "related_tests": list(run.related_tests),
+        # Measured file counts; a legacy record without them is unknown (null), not zero.
+        "declared_file_count": None if run.declared_files is None else len(run.declared_files),
+        "changed_file_count": None if run.changed_files is None else len(run.changed_files),
+        "overlap_records": [dict(record) for record in run.overlap_records],
     }
+
+
+def _file_conflicts(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per file: merged executions that overlapped on it, how many conflicted, and their cost.
+
+    Rows are already one per execution; a file counts once per execution however many peers.
+    Unfinished or unmerged executions are not evidence for the optimistic conflict rate.
+    """
+    totals: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row["status"] != "finished" or row["outcome"] != "merged":
+            continue
+        seen: dict[str, dict[str, Any]] = {}
+        for record in row["overlap_records"]:
+            if isinstance(path := record.get("file"), str):
+                seen.setdefault(path, record)
+        for path, record in seen.items():
+            total = totals.setdefault(path, {"overlapping_merges": 0, "conflicted_merges": 0,
+                                             "conflict_rate": 0, "resolution_seconds": 0, "redo_count": 0})
+            total["overlapping_merges"] += 1
+            total["conflicted_merges"] += bool(record.get("conflicted"))
+            total["resolution_seconds"] += _seconds(record.get("resolution_seconds")) or 0
+            redo = record.get("redo_count")
+            total["redo_count"] += redo if type(redo) is int and redo > 0 else 0
+    for total in totals.values():
+        total["conflict_rate"] = total["conflicted_merges"] / total["overlapping_merges"]
+    return dict(sorted(totals.items(), key=lambda item: (-item[1]["conflicted_merges"],
+                                                         -item[1]["overlapping_merges"], item[0])))
 
 
 def _history(rows: list[dict[str, Any]]) -> dict[str, Any]:
