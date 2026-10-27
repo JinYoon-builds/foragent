@@ -40,9 +40,11 @@ def add(commands) -> None:
             command.add_argument("--tried", required=True)
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
+    from foragent.commands._orch_architect import add_orch
     from foragent.commands._orch_box import _add_inbox
 
     _add_inbox(orch_actions)
+    add_orch(orch_actions)
 
 
 def __getattr__(name):
@@ -72,6 +74,8 @@ def _list(ctx, args) -> None:
 
 
 def run(args) -> int:
+    if handler := getattr(args, "handler", None):
+        return handler(args)
     cli = facade()
     root = args.repo_root.resolve()
     if args.action in cli.INBOX_ACTIONS:

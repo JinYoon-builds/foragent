@@ -153,7 +153,8 @@ class Executor(Protocol):
 
 def codex_command(worktree: Path, output_path: Path, model: str | None = None,
                   effort: str | None = None, *, resume_session_id: str | None = None,
-                  read_only: bool = False, prompt: str | None = None) -> list[str]:
+                  read_only: bool = False, prompt: str | None = None,
+                  add_dirs: tuple[Path, ...] = ()) -> list[str]:
     if resume_session_id is not None and (prompt is None or not prompt.strip()):
         raise ValueError("Session resume requires a non-empty prompt")
     # Resume has its own CLI options; cwd is supplied by run_logged.
@@ -165,6 +166,8 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
         "codex", "exec", "-", "-C", str(worktree), "-s", sandbox,
         "--skip-git-repo-check", "--json", "-o", str(output_path),
     ]
+    # Extra writable roots, e.g. the state directory for the architect's `fa orch request`.
+    args += [part for path in add_dirs for part in ("--add-dir", str(path))]
     return args + (["-m", model] if model is not None else []) + (
         ["-c", f"model_reasoning_effort={effort}"] if effort is not None else []
     )
@@ -208,6 +211,7 @@ class CodexExecutor:
         self, *, worktree: Path, prompt: str, model: str | None,
         timeout_s: int, log_path: Path, effort: str | None = None,
         resume_session_id: str | None = None, read_only: bool = False,
+        add_dirs: tuple[Path, ...] = (),
     ) -> ExecResult:
         with tempfile.TemporaryDirectory(prefix="foragent-codex-") as temporary:
             output_path = Path(temporary) / "last-message.txt"
@@ -215,6 +219,8 @@ class CodexExecutor:
             options = {"resume_session_id": resume_session_id, "prompt": prompt} if resume_session_id is not None else {}
             if read_only:
                 options["read_only"] = True
+            if add_dirs:
+                options["add_dirs"] = tuple(add_dirs)
             code, timed_out, _ = run_logged(
                 codex_command(worktree, output_path, model, effort, **options), cwd=worktree, prompt=prompt,
                 timeout_s=timeout_s, log_path=log_path,
