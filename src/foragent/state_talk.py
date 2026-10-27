@@ -12,10 +12,13 @@ class TalkRecordsMixin:
     def _drop_talk_record(self, number: int) -> None:
         (self.root / "talk" / f"{number}.json").unlink(missing_ok=True)
 
-    @staticmethod
-    def _talk_ended(run: Run, now: datetime, *, restart_stall: bool) -> Run:
-        """The one accounting for every talk ending (``finish_run`` uses it too)."""
-        return _talk_ended(run, now, restart_stall=restart_stall)
+    def _finish_talk(self, run: Run) -> Run:
+        """``finish_run``'s talk ending: the shared accounting, and the live-log record goes.
+
+        Called under the state lock; ``publish_talk`` never recreates a finished run's record.
+        """
+        self._drop_talk_record(run.number)
+        return _talk_ended(run, self._now(), restart_stall=False)
 
     @contextmanager
     def talk_lock(self, number: int, *, blocking: bool = True) -> Iterator[bool]:

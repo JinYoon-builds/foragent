@@ -20,7 +20,7 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import capacity, launchd, tool_install
+from foragent import capacity, gh, launchd, tool_install
 from foragent.config import Config, ConfigError, load_config
 from foragent.git import GitRepo
 from foragent.i18n import text
@@ -79,7 +79,7 @@ def _write_cache(record: dict[str, Any]) -> None:
 def lookup() -> str | None:
     """The latest release tag, or None when GitHub cannot say or the tag is not a version."""
     try:
-        result = subprocess.run(["gh", "api", RELEASE_API], capture_output=True, text=True,
+        result = gh.run(["api", RELEASE_API], capture_output=True, text=True,
                                 timeout=LOOKUP_SECONDS, check=True)
         tag = json.loads(result.stdout).get("tag_name")
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):

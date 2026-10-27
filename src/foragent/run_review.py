@@ -18,7 +18,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import orch_reviewers, review_perspectives, risks
+from foragent import orch_events, orch_reviewers, review_perspectives, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -182,6 +182,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     if review.verdict == "PASS":
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
     _append(ctx.store.log_path(n), f"Review: VERDICT: {review.verdict}\n{review.findings}")
+    _journal_review(n, ctx, review.verdict, review.findings, round_number)
     _progress(n, ctx)
     return replace(review, raw=raw, timed_out=result.timed_out)
 
@@ -316,8 +317,21 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     if review.verdict == "PASS":
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
     _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}")
+    _journal_review(n, ctx, review.verdict, review.findings, round_number)
     _progress(n, ctx)
     return replace(review, raw=raw, timed_out=timed_out)
+
+
+_FINDING_LOCATION = re.compile(r"[\w.-]*[/.][\w./-]*:\d+")
+
+
+def _journal_review(n: int, ctx: RunContext, verdict: str, findings: str, round_number: int,
+                    source: str = "reviewer") -> None:
+    """Record the round's verdict locally before any next round can start."""
+    count = 0 if verdict == "UNUSABLE" else sum(
+        1 for line in findings.splitlines() if _FINDING_LOCATION.search(line))
+    orch_events.append_event(ctx.store, ctx.now(), n, "review", f"{verdict} {count} findings",
+                             verdict=verdict, findings=count, round=round_number, source=source)
 
 
 def _is_limit(error: BaseException) -> bool:
@@ -428,6 +442,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return _hold_changed_head(n, ctx, link)
     if verdict_head is not None:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
+        # The orchestrator's verdict for this exact head stands in for a reviewer round.
+        _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator")
 
     def approved() -> bool:
         issue = ctx.tracker.get_issue(n)

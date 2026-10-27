@@ -29,12 +29,14 @@ from foragent.state_local import LocalRecordsMixin
 from foragent.state_locks import _TICK_LOCKS_HELD, StateLocksMixin, _held_tick_locks  # noqa: F401
 from foragent.state_records import Approval, Flag, InspectState, Run  # noqa: F401
 from foragent.state_refresh import IssueRefreshMixin
+from foragent.state_github import GithubCallsMixin
 from foragent.state_runs import RunRecordsMixin
 from foragent.state_talk import TalkRecordsMixin
 
 
 class StateStore(
-    IssueSnapshotMixin, IssueRefreshMixin, RunRecordsMixin, TalkRecordsMixin, LocalRecordsMixin, StateLocksMixin, StateBase,
+    IssueSnapshotMixin, IssueRefreshMixin, RunRecordsMixin, TalkRecordsMixin, GithubCallsMixin, LocalRecordsMixin,
+    StateLocksMixin, StateBase,
 ):
     @classmethod
     def for_repo(cls, repo: str, *, now: Callable[[], datetime] | None = None) -> "StateStore":
