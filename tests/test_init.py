@@ -11,7 +11,7 @@ import yaml
 from foragent.config import ConfigError, load_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
-from foragent import role_agents
+from foragent import role_agents, roles
 from foragent.issue import parse_body
 from foragent.labels import LABELS
 from foragent.tracker import FakeTracker, TrackerError
@@ -23,6 +23,27 @@ PATHS = [".foragent.yml", ".github/ISSUE_TEMPLATE/foragent-task.md", "tests/acce
 # The orchestrator and architect agents, memory and skill copies follow the setup files.
 ROLE_PATHS = list(role_agents.missing_files(Path("/nonexistent-foragent-project"))[0])
 ALL_PATHS = [*PATHS, *ROLE_PATHS]
+def without_roles(text):
+    """Settings text without the roles block init writes (#769); each default role must be in it."""
+    lines, kept, inside = text.splitlines(keepends=True), [], False
+    for line in lines:
+        if line.rstrip("\n") == "roles:":
+            inside = True
+            continue
+        if inside and line.startswith((" ", "-")):
+            continue
+        inside = False
+        kept.append(line)
+    # Only for configs init wrote: each must carry every default role.
+    assert set(roles.DEFAULT_ROLES) <= (yaml.safe_load(text) or {}).get("roles", {}).keys()
+    return "".join(kept)
+
+
+def fresh_config_values(path):
+    """A freshly initialized config without its roles block, which must hold every default role."""
+    return yaml.safe_load(without_roles(path.read_text()))
+
+
 EXPECTED_CONFIG = (
     "# Configuration: Foragent docs/gate.md (section 9), docs/contract.md (section 4).\n"
     "review: batch\napprovers:\n- human\nchecks: local\n"
@@ -153,7 +174,7 @@ def setup(tmp_path, monkeypatch):
 def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     report = setup.init()
     assert report.created == ALL_PATHS and report.existed == []
-    assert (setup.root / PATHS[0]).read_text() == EXPECTED_CONFIG
+    assert without_roles((setup.root / PATHS[0]).read_text()) == EXPECTED_CONFIG
     assert (setup.root / PATHS[1]).read_text() == EXPECTED_TEMPLATE
     assert (setup.root / PATHS[2]).read_bytes() == b""
     body = EXPECTED_TEMPLATE.split("---\n", 2)[2]
@@ -343,7 +364,7 @@ def test_existing_acceptance_directory_gets_no_placeholder(setup):
 
 def test_only_nondefault_keys_and_explicit_approvers_are_written(setup):
     setup.init(review="fast", executor="claude", run_hours="22-08", approvers=["alice", "bob"])
-    assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {
+    assert fresh_config_values(setup.root / PATHS[0]) == {
         "review": "fast", "executor": "claude", "approvers": ["alice", "bob"], "run_hours": "22-08",
         "reviewer": "claude", "checks": "local",
     }
@@ -671,7 +692,7 @@ def test_explicit_default_options_override_global_config(setup):
     global_path.parent.mkdir(parents=True)
     global_path.write_text("executor: claude\nrun_hours: 22-08\nreview: careful\napprovers: [global]\n")
     setup.init(executor="codex", run_hours="always", review="batch", approvers=["human"])
-    assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {
+    assert fresh_config_values(setup.root / PATHS[0]) == {
         "executor": "codex", "run_hours": "always", "review": "batch", "approvers": ["human"],
         "checks": "local",
     }
@@ -909,7 +930,8 @@ def test_package_data_covers_every_file_of_both_role_skills():
     import tomllib
     root = Path(__file__).resolve().parents[1]
     data_files = tomllib.loads((root / "pyproject.toml").read_text())["tool"]["setuptools"]["data-files"]
-    for role in role_agents.ROLES:
+    # fa-docs ships with the docs-role issue; until then init lists it without copying.
+    for role in [role for role in role_agents.ROLES if role != "fa-docs" or (root / "skills" / role).is_dir()]:
         source = root / "skills" / role
         files = [path.relative_to(root) for path in source.rglob("*") if path.is_file()]
         assert files, f"{role} skill is missing"
@@ -917,3 +939,360 @@ def test_package_data_covers_every_file_of_both_role_skills():
             destination = (Path("share/foragent") / path.parent).as_posix()
             assert any(path.match(pattern) and path.parent == Path(pattern).parent
                        for pattern in data_files.get(destination, [])), f"{path} is not packaged"
+
+
+def test_reinit_keeps_role_entries_and_adds_missing_defaults_from_agent_skills(setup):
+    path = setup.root / PATHS[0]
+    custom = {"agent": "fa-orchestrator", "skills": ["kept-skill"], "memory": ".claude/agent-memory/fa-orchestrator/",
+              "signals": [], "idle_days": 3}
+    path.write_text("# Keep this comment\nreview: fast\nroles:\n  orchestrator: "
+                    + yaml.safe_dump(custom, default_flow_style=True))
+    agent = setup.root / ".claude/agents/fa-architect.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("---\nname: fa-architect\nmemory: project\nskills: [own-architect]\n---\nBody\n")
+    report = setup.init()
+    text = path.read_text()
+    assert text.startswith("# Keep this comment\nreview: fast\n") and report.committed
+    source = yaml.safe_load(text)["roles"]
+    assert source["orchestrator"] == custom
+    assert source["architect"]["skills"] == ["own-architect"] and source["architect"]["created_at"]
+    assert source["docs"]["skills"] == ["fa-docs"] and source["docs"]["scope"] == ["docs/**", "README*"]
+    assert agent.read_text().endswith("Body\n")
+    assert not setup.init().committed
+
+
+def test_reinit_writes_missing_default_agent_from_its_roles_entry(setup):
+    setup.init()
+    path = setup.root / PATHS[0]
+    source = yaml.safe_load(path.read_text())["roles"]
+    source["architect"]["skills"] = ["project-architect"]
+    path.write_text(path.read_text().replace("    - fa-architect\n", "    - project-architect\n", 1))
+    assert yaml.safe_load(path.read_text())["roles"] == source
+    (setup.root / ".claude/agents/fa-architect.md").unlink()
+    setup.init()
+    agent = (setup.root / ".claude/agents/fa-architect.md").read_text()
+    assert yaml.safe_load(agent.split("---\n")[1])["skills"] == ["project-architect"]
+    assert yaml.safe_load(path.read_text())["roles"] == source
+    assert roles.role_drift(setup.root, load_config(setup.root)) == []
+
+
+def recording_commit(commits):
+    """A commit_paths stand-in: record the paths and commit the index with plumbing (real commits are guarded)."""
+    def commit(self, paths, title):
+        commits.append(sorted(paths))
+        tree = git_command(self.root, "write-tree")
+        head = git_command(self.root, "rev-parse", "HEAD")
+        new = git_command(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-p", head,
+                          "-m", title)
+        git_command(self.root, "update-ref", "HEAD", new)
+    return commit
+
+
+def test_role_add_uses_an_installed_skill_copy_and_records_why_without_github(setup, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    setup.init()
+    commits = []
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
+    monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: None)
+    installed = setup.root / ".claude/skills/house-style"
+    installed.mkdir(parents=True)
+    (installed / "SKILL.md").write_text("---\nname: house-style\ndescription: Installed copy\n---\nBody\n")
+    monkeypatch.setattr(GitRepo, "remote_slug", lambda self: (_ for _ in ()).throw(GitError("local origin")))
+    roles.add_role(setup.root, "style", skills=["house-style"], scope=[], signals=["kinds:hot_overlap_files"],
+                   why="Keep the house style")
+    entry = yaml.safe_load((setup.root / PATHS[0]).read_text())["roles"]["style"]
+    assert entry["skills"] == ["house-style"]
+    assert commits == [[".claude/agent-memory/fa-style/MEMORY.md", ".claude/agents/fa-style.md", ".foragent.yml"]]
+    assert entry["signals"] == [{"paths": [], "kinds": ["hot_overlap_files"]}]
+    events = list((tmp_path / "home").rglob("orch-events.jsonl"))
+    assert len(events) == 1
+    rows = [json.loads(line) for line in events[0].read_text().splitlines()]
+    assert [(row["kind"], row["why"]) for row in rows] == [("role-added", "Keep the house style")]
+    with pytest.raises(Exception, match="unknown skill|not found|no skill"):
+        roles.add_role(setup.root, "other", skills=["missing-skill"], scope=[], signals=[])
+
+
+def test_role_set_keeps_an_empty_body_and_records_why_when_nothing_changes(setup, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    setup.init()
+    commits = []
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
+    monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: None)
+    monkeypatch.setattr(GitRepo, "remote_slug", lambda self: "owner/repo")
+    agent = setup.root / ".claude/agents/fa-architect.md"
+    agent.write_text("---\nname: fa-architect\nmemory: project\nskills:\n- fa-architect\n---\n")
+    roles.set_role(setup.root, "architect", scope=["src/**"], why="Own the source tree")
+    assert agent.read_text().endswith("\n---\n") and "description: Foragent architect role" in agent.read_text(), (
+        "Regenerate the frontmatter; an empty body stays empty")
+    assert commits == [[".claude/agents/fa-architect.md", ".foragent.yml"]]
+    roles.set_role(setup.root, "architect", scope=["src/**"], why="Same settings, new evidence")
+    assert len(commits) == 1, "Nothing changed, so nothing is committed"
+    events, = (tmp_path / "home").rglob("orch-events.jsonl")
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    assert [(row["kind"], row["why"]) for row in rows] == [
+        ("role-set", "Own the source tree"), ("role-set", "Same settings, new evidence")]
+
+
+def test_role_set_recreates_missing_memory_and_doctor_reports_it(setup, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    setup.init()
+    commits = []
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
+    monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: None)
+    monkeypatch.setattr(GitRepo, "remote_slug", lambda self: "owner/repo")
+    memory = setup.root / ".claude/agent-memory/fa-docs/MEMORY.md"
+    memory.unlink()
+    memory.parent.rmdir()
+    drift = roles.role_drift(setup.root, load_config(setup.root))
+    assert len(drift) == 1 and "docs" in drift[0] and "memory" in drift[0]
+    roles.set_role(setup.root, "docs", why="Repair the docs memory")
+    assert memory.read_text() == "# fa-docs memory\n\n## Proposals\n\n## Lessons\n"
+    # The recreated memory equals HEAD's, so only the regenerated agent frontmatter is committed.
+    assert commits == [[".claude/agents/fa-docs.md"]]
+    assert roles.role_drift(setup.root, load_config(setup.root)) == []
+    memory.write_text("")
+    roles.set_role(setup.root, "docs", why="Again")
+    assert memory.read_text() == "", "An existing memory, even empty, is kept"
+    assert commits[1:] == [[".claude/agent-memory/fa-docs/MEMORY.md"]], "The hand edit is committed with the role"
+
+
+@pytest.mark.parametrize("command", ["add", "set", "remove"])
+def test_role_commands_commit_files_deleted_by_hand_before_them(tmp_path, monkeypatch, command):
+    _role_command_after_hand_deletion(tmp_path, monkeypatch, command, staged=False)
+
+
+@pytest.mark.parametrize("command", ["add", "set", "remove"])
+def test_role_commands_commit_deletions_already_staged_with_git_rm(tmp_path, monkeypatch, command):
+    """A `git rm` deletion is gone from both the worktree and the index; only HEAD still has the path."""
+    _role_command_after_hand_deletion(tmp_path, monkeypatch, command, staged=True)
+
+
+def _role_command_after_hand_deletion(tmp_path, monkeypatch, command, *, staged):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    root = tmp_path / "project"
+    git_command(tmp_path, "init", "-q", "-b", "main", str(root))
+    git_command(root, "remote", "add", "origin", "git@github.com:owner/repo.git")
+    owned = [".foragent.yml", ".claude/agents/fa-security.md", ".claude/agent-memory/fa-security"]
+    files = {".foragent.yml": "review: fast  # keep\n",
+             ".claude/agent-memory/fa-security/old.md": "Stale lesson\n"}
+    if command != "add":
+        entry = {"agent": "fa-security", "skills": [], "memory": ".claude/agent-memory/fa-security/",
+                 "signals": []}
+        files[".foragent.yml"] += yaml.safe_dump({"roles": {"security": entry}})
+        files[".claude/agents/fa-security.md"] = "---\nname: fa-security\nmemory: project\nskills: []\n---\nBody\n"
+        files[".claude/agent-memory/fa-security/MEMORY.md"] = "# fa-security memory\n"
+    for path, text in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(text)
+    git_command(root, "add", "-A")
+    base = git_command(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+                       git_command(root, "write-tree"), "-m", "base")
+    git_command(root, "update-ref", "refs/heads/main", base)
+    commits = []
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
+    deleted = [".claude/agent-memory/fa-security/old.md"]  # deleted by hand before the command
+    if command == "set":
+        deleted.append(".claude/agent-memory/fa-security/MEMORY.md")
+    if command == "remove":
+        deleted += [".claude/agent-memory/fa-security", ".claude/agents/fa-security.md"] if staged else [
+            ".claude/agent-memory/fa-security/MEMORY.md"]
+    for path in deleted:
+        if staged:
+            git_command(root, "rm", "-rq", "--", path)
+        elif (root / path).exists():
+            (root / path).unlink()
+    {"add": lambda: roles.add_role(root, "security", skills=[], scope=[], signals=[]),
+     "set": lambda: roles.set_role(root, "security", scope=["src/**"]),
+     "remove": lambda: roles.remove_role(root, "security")}[command]()
+    # The index now holds the owned paths' whole state; the one commit carries exactly what differs from HEAD.
+    assert git_command(root, "diff", "--name-only", "--", *owned) == "", "Nothing owned is left unstaged"
+    assert git_command(root, "ls-files", "--others", "--", *owned) == "", "Nothing owned is left untracked"
+    staged = sorted(git_command(root, "diff", "--name-only", "HEAD~1", "HEAD", "--", *owned).splitlines())
+    assert git_command(root, "status", "--porcelain", "--", *owned) == "", "Nothing owned is left uncommitted"
+    commit, = commits
+    assert [path for path in commit if path in staged] == staged, "One commit with every owned change"
+    derived = tuple(f".claude/{kind}/fa-{name}" for name in roles.DEFAULT_ROLES
+                    for kind in ("agents", "agent-memory", "skills"))
+    assert all(path in staged or path.startswith(derived) for path in commit), (
+        "Anything else in the commit is a default role the command added to the source")
+    assert ".claude/agent-memory/fa-security/old.md" in staged, "Commit the deletion made by hand"
+    memory = ".claude/agent-memory/fa-security/MEMORY.md"
+    # set recreates MEMORY.md with HEAD's bytes, so only add and remove change it.
+    assert (memory in staged) is (command != "set")
+    assert git_command(root, "ls-files", "--", memory) == ("" if command == "remove" else memory)
+    if command == "remove":
+        assert ".claude/agents/fa-security.md" in staged
+        assert git_command(root, "ls-tree", "-r", "--name-only", "HEAD", "--", *owned[1:]) == "", (
+            "Removal leaves no agent or memory file in HEAD")
+    assert git_command(root, "show", "HEAD:.foragent.yml").startswith("review: fast  # keep\n")
+
+
+def test_role_commands_keep_every_byte_outside_the_roles_block(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    root = tmp_path / "project"
+    git_command(tmp_path, "init", "-q", "-b", "main", str(root))
+    git_command(root, "remote", "add", "origin", "git@github.com:owner/repo.git")
+    head, tail = "# Team settings\nreview: fast  # agreed 10-27\n\n", "# keep the tail\nlanes: {}  # none\n"
+    orchestrator = {"agent": "fa-orchestrator", "skills": [], "memory": ".claude/agent-memory/fa-orchestrator/",
+                    "signals": []}
+    (root / ".foragent.yml").write_text(head + "roles:  # roles note\n  orchestrator:\n    agent: fa-orchestrator\n"
+                                        "    skills: []\n    memory: .claude/agent-memory/fa-orchestrator/\n"
+                                        "    signals: []\n" + tail)
+    assert yaml.safe_load((root / ".foragent.yml").read_text())["roles"] == {"orchestrator": orchestrator}
+    git_command(root, "add", "-A")
+    base = git_command(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+                       git_command(root, "write-tree"), "-m", "base")
+    git_command(root, "update-ref", "refs/heads/main", base)
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit([]))
+    steps = [lambda: roles.add_role(root, "security", skills=[], scope=["src/**"], signals=["paths:src/**"]),
+             lambda: roles.set_role(root, "security", signals=["kinds:hot_overlap_files"]),
+             lambda: roles.remove_role(root, "security")]
+    for step in steps:
+        step()
+        text = (root / ".foragent.yml").read_text()
+        assert text.startswith(head) and text.endswith(tail), "Bytes outside the roles block stay identical"
+        assert text[len(head):len(text) - len(tail)].startswith("roles:\n")
+    final = yaml.safe_load(text)["roles"]
+    assert final["orchestrator"] == orchestrator and set(final) == set(roles.DEFAULT_ROLES), (
+        "The first role command fills in the missing default entries; remove leaves them")
+    assert "dropped 1 comment" in capsys.readouterr().err, "Say once that the block's comment was dropped"
+
+
+@pytest.mark.parametrize("original", [
+    "# keep\r\nreview: fast\r\nchecks: local\r\nroles:\r\n  orchestrator:\r\n    agent: fa-orchestrator\r\n"
+    "    skills: [fa-orchestrator]\r\n    memory: .claude/agent-memory/fa-orchestrator/\r\n    signals: []\r\n"
+    "# tail\r\n",
+    "# keep\nreview: fast\nchecks: local\n\n\n",
+], ids=["crlf-missing-defaults", "trailing-blank-lines-no-roles"])
+def test_init_adds_roles_without_changing_bytes_outside_the_block(setup, original):
+    path = setup.root / PATHS[0]
+    path.write_bytes(original.encode())
+    setup.init()
+    written = path.read_bytes().decode()
+    if "roles:" in original:
+        source = yaml.safe_load(written)["roles"]
+        assert set(roles.DEFAULT_ROLES) <= source.keys()
+        head, tail = original[:original.index("roles:")], original[original.index("# tail"):]
+        assert written.startswith(head) and written.endswith(tail), "Bytes outside the roles block stay identical"
+        assert "\n" not in written.replace("\r\n", ""), "A CRLF file keeps CRLF line ends"
+        assert source["orchestrator"]["skills"] == ["fa-orchestrator"]
+    else:
+        assert written == original, "Re-init leaves a config without a roles key byte-identical"
+
+
+def test_init_leaves_a_flow_style_config_unchanged_and_warns(setup, capsys):
+    """The role agents derive from the roles source, so init refuses instead of creating them without it."""
+    path = setup.root / PATHS[0]
+    path.write_bytes(b"{review: fast, checks: local, roles: {}}  # one line\n")
+    with pytest.raises(ConfigError, match="roles"):
+        setup.init()
+    assert path.read_bytes() == b"{review: fast, checks: local, roles: {}}  # one line\n"
+    assert not (setup.root / ".claude/agents").exists(), "No agent without its roles source"
+
+
+def test_edit_roles_puts_the_block_inside_a_document_with_an_explicit_end():
+    text = "review: fast\nchecks: local\n...\n# after the document\n"
+    written = roles.edit_roles(text, {"docs": roles.default_entry("docs")})
+    assert written.startswith("review: fast\nchecks: local\nroles:\n")
+    assert written.endswith("...\n# after the document\n")
+    assert set(yaml.safe_load(written)["roles"]) == {"docs"}
+
+
+def test_init_copies_the_skills_the_roles_entry_lists(setup):
+    setup.init()
+    path = setup.root / PATHS[0]
+    text = path.read_text()
+    source = yaml.safe_load(text)["roles"]
+    source["architect"]["skills"] = ["audit"]
+    path.write_text(roles.edit_roles(text, source))
+    for relative in (".claude/agents/fa-architect.md", ".claude/skills/fa-architect/SKILL.md"):
+        (setup.root / relative).unlink()
+    product = setup.root / "skills/audit"
+    product.mkdir(parents=True)
+    (product / "SKILL.md").write_text("---\nname: audit\ndescription: Audit\n---\nAudit the code.\n")
+    report = setup.init()
+    assert (setup.root / ".claude/skills/audit/SKILL.md").read_text() == (product / "SKILL.md").read_text()
+    assert ".claude/skills/audit/SKILL.md" in report.created
+    assert not (setup.root / ".claude/skills/fa-architect/SKILL.md").exists(), "Copy the listed skill, not the role's"
+    assert roles.role_drift(setup.root, load_config(setup.root)) == []
+
+
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe"
+
+
+def test_init_copies_role_skill_files_as_bytes(setup):
+    setup.init()
+    path = setup.root / PATHS[0]
+    text = path.read_text()
+    source = yaml.safe_load(text)["roles"]
+    source["architect"]["skills"] = ["audit"]
+    path.write_text(roles.edit_roles(text, source))
+    product = setup.root / "skills/audit"
+    (product / "assets").mkdir(parents=True)
+    (product / "SKILL.md").write_bytes(b"---\r\nname: audit\r\ndescription: Audit\r\n---\r\nCRLF body\r\n")
+    (product / "assets/diagram.png").write_bytes(PNG)
+    setup.init()
+    copy = setup.root / ".claude/skills/audit"
+    assert (copy / "assets/diagram.png").read_bytes() == PNG, "Binary skill files are copied byte for byte"
+    assert (copy / "SKILL.md").read_bytes() == (product / "SKILL.md").read_bytes(), "CRLF text stays CRLF"
+    assert set(role_agents.setup_paths(setup.root, {"fa-architect": ["audit"]})) >= {
+        ".claude/skills/audit/SKILL.md", ".claude/skills/audit/assets/diagram.png"}, "Recovery compares bytes too"
+
+
+def test_role_set_keeps_crlf_agent_body_bytes(setup, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    setup.init()
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit([]))
+    monkeypatch.setattr(GitRepo, "remote_slug", lambda self: "owner/repo")
+    agent = setup.root / ".claude/agents/fa-architect.md"
+    body = b"Line one\r\nLine two\r\n\r\nLast line without end"
+    agent.write_bytes(b"---\r\nname: fa-architect\r\nmemory: project\r\nskills:\r\n- fa-architect\r\n---\r\n" + body)
+    roles.set_role(setup.root, "architect", scope=["src/**"])
+    written = agent.read_bytes()
+    assert written.endswith(b"---\r\n" + body), "The body keeps its exact bytes, CRLF included"
+    assert b"description: Foragent architect role\r\n" in written and b"\n" not in written.replace(b"\r\n", b"")
+
+
+def test_init_reports_dropped_roles_comments_once_with_board_settings(setup, capsys):
+    setup.init()
+    path = setup.root / PATHS[0]
+    path.write_text("review: fast\nroles:  # team roles\n  orchestrator:\n    agent: fa-orchestrator\n"
+                    "    skills: [fa-orchestrator]\n    memory: .claude/agent-memory/fa-orchestrator/\n"
+                    "    signals: []\n")
+    capsys.readouterr()
+    report = setup.init(no_board=False)
+    assert "board" in report.added_keys and "roles" in report.added_keys
+    notices = [line for line in capsys.readouterr().err.splitlines() if "dropped" in line]
+    assert notices == ["Note: rewrote the roles block of .foragent.yml and dropped 1 comment(s) inside it."]
+
+
+@pytest.mark.parametrize("command", ["add", "set", "remove"])
+def test_role_commands_derive_the_default_roles_they_add_to_a_legacy_config(tmp_path, monkeypatch, command):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    root = tmp_path / "project"
+    git_command(tmp_path, "init", "-q", "-b", "main", str(root))
+    git_command(root, "remote", "add", "origin", "git@github.com:owner/repo.git")
+    files = {".foragent.yml": "review: fast\n"}  # a config from before roles existed
+    for path, text in files.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text(text)
+    git_command(root, "add", "-A")
+    base = git_command(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+                       git_command(root, "write-tree"), "-m", "base")
+    git_command(root, "update-ref", "refs/heads/main", base)
+    commits = []
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
+    if command == "add":
+        roles.add_role(root, "security", skills=[], scope=[], signals=[])
+    else:
+        # set and remove need a security entry; the first command writes the block with the defaults.
+        roles.add_role(root, "audit", skills=[], scope=[], signals=[])
+        commits.clear()
+        roles.set_role(root, "audit", scope=["src/**"]) if command == "set" else roles.remove_role(root, "audit")
+    declared = yaml.safe_load((root / ".foragent.yml").read_text())["roles"]
+    assert set(roles.DEFAULT_ROLES) <= declared.keys()
+    assert roles.role_drift(root, load_config(root)) == [], "Every declared role has its agent and memory"
+    head = git_command(root, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+    for name in roles.DEFAULT_ROLES:
+        assert f".claude/agents/fa-{name}.md" in head and f".claude/agent-memory/fa-{name}/MEMORY.md" in head
+    assert git_command(root, "status", "--porcelain", "--", ".claude", ".foragent.yml") == ""

@@ -128,6 +128,7 @@ def _validate(values: dict[str, Any]) -> None:
             not isinstance(skill, str) for skill in lane.get("skills", [])
         ):
             raise ConfigError(f"lanes.{name}.skills must be a list of strings")
+    _validate_roles(values["roles"])
     quota = values["claude_quota"]
     if not isinstance(quota, dict):
         raise ConfigError("claude_quota must be a mapping with mode and keep_percent")
@@ -181,3 +182,44 @@ def _validate(values: dict[str, Any]) -> None:
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
+
+
+def _strings(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _validate_roles(roles: Any) -> None:
+    """The roles source (#769): name -> agent, skills, memory, signals and optional settings."""
+    from datetime import datetime
+
+    from foragent.config import ConfigError
+
+    if not isinstance(roles, dict):
+        raise ConfigError("roles must be a mapping")
+    for name, role in roles.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9-]+", name):
+            raise ConfigError(f"invalid roles name: {name}")
+        if not isinstance(role, dict) or role.keys() - {
+            "agent", "skills", "memory", "signals", "scope", "created_at", "idle_days",
+        }:
+            raise ConfigError(f"invalid roles entry: {name}")
+        for key in ("agent", "memory"):
+            if role.get(key) is not None and not isinstance(role[key], str):
+                raise ConfigError(f"roles.{name}.{key} must be a string")
+        if not _strings(role.get("skills", [])):
+            raise ConfigError(f"roles.{name}.skills must be a list of strings")
+        scope = role.get("scope", [])
+        if not isinstance(scope, str) and not _strings(scope):
+            raise ConfigError(f"roles.{name}.scope must be a list of path globs")
+        signals = role.get("signals", [])
+        if not isinstance(signals, list) or any(
+            not isinstance(signal, dict) or signal.keys() != {"paths", "kinds"}
+            or not all(_strings(signal[key]) for key in ("paths", "kinds"))
+            for signal in signals
+        ):
+            raise ConfigError(f"roles.{name}.signals must be a list of items with both paths and kinds string lists")
+        if role.get("created_at") is not None and not isinstance(role["created_at"], (str, datetime)):
+            raise ConfigError(f"roles.{name}.created_at must be a timestamp")
+        idle = role.get("idle_days", 14)
+        if type(idle) is not int or idle < 1:
+            raise ConfigError(f"roles.{name}.idle_days must be a positive integer")
