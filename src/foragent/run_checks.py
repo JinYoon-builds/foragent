@@ -470,6 +470,8 @@ def _verify_contents(attempt: Implementation) -> str:
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "checking")
+    # The guard reads the worktree itself, so it runs before staging can fail.
+    _guard_harness(attempt)
     git.stage_changes()
     if not _prepare_target(attempt):
         raise ExecutorStopped("hash-mismatch")
@@ -477,9 +479,9 @@ def _verify_contents(attempt: Implementation) -> str:
     _progress(n, ctx)
     attempt.checks = []
 
-    # _check repeats this before each measurement (see _implement_and_publish).
-    git.stage_changes()
+    # Retargeting may change the base; _check repeats this before each measurement.
     _guard_harness(attempt)
+    git.stage_changes()
     # Cleaning tracked runner scratch files is not an implementation change.
     if not any(not path.startswith(".foragent/") for path in attempt.paths):
         return "The session made no changes."
@@ -531,6 +533,7 @@ def _verify_contents(attempt: Implementation) -> str:
                 raise ExecutorStopped("timeout", detail)
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
+        _guard_harness(attempt)
         git.stage_changes()
         if not _prepare_target(attempt):
             raise ExecutorStopped("hash-mismatch")
@@ -595,6 +598,8 @@ def _check_review_head(
     if bundle := save_failures(ctx.store.root, n, checks, complete=False):
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.", f"{bundle}\n{link}")
         return "checks-failed"
+    from foragent.harness_guard import before_measurement
+    before_measurement(worktree)  # the review guard decides before staging can fail
     git.stage_changes()
     if git.head_sha() != head or git.has_staged_changes():
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when changed the verified PR contents.", link)

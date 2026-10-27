@@ -6,6 +6,7 @@ from collections.abc import Callable
 import math
 import os
 from pathlib import Path, PurePosixPath
+import stat
 import subprocess
 import tomllib
 from typing import TYPE_CHECKING
@@ -23,6 +24,10 @@ HARNESS_NAMES = frozenset({
 # An empty table still differs from a missing one: pytest selects the file.
 PYPROJECT_TABLES = (("tool", "pytest"), ("project", "entry-points", "pytest11"))
 _UNPARSABLE = object()
+# A side that is not a regular file (directory, symlink, submodule, FIFO,
+# conflict, unreadable): pytest cannot read it as before, so it is a change.
+_NOT_A_FILE = object()
+_REGULAR_MODES = (b"100644", b"100755")
 # Worktree -> check run before any measurement there. Every head measurement
 # goes through run_checks._check, so the guard sits between all of them.
 _GUARDS: dict[Path, Callable[[], None]] = {}
@@ -66,8 +71,10 @@ def _git(git: GitRepo, args: list[str]) -> subprocess.CompletedProcess[bytes]:
         raise GitError(str(exc)) from exc
 
 
-def _pytest_tables(data: bytes | None) -> object:
+def _pytest_tables(data: object) -> object:
     """The pytest tables of one side; an absent file has none, like a pytest-free file."""
+    if data is _NOT_A_FILE:
+        return _UNPARSABLE
     try:
         document = tomllib.loads(data.decode("utf-8")) if data is not None else {}
     except (UnicodeDecodeError, tomllib.TOMLDecodeError):
@@ -79,13 +86,6 @@ def _pytest_tables(data: bytes | None) -> object:
             value = value.get(key) if isinstance(value, dict) else None
         tables.append(None if value is None else _canonical(value))
     return tables
-
-
-def _blob(git: GitRepo, spec: bytes) -> bytes | None:
-    """Exact blob bytes, or None when the path is absent on that side."""
-    if _git(git, ["cat-file", "-e", os.fsdecode(spec)]).returncode != 0:
-        return None
-    return _required(_git(git, ["cat-file", "blob", os.fsdecode(spec)]), f"cat-file {spec!r}")
 
 
 def _required(result: subprocess.CompletedProcess[bytes], what: str) -> bytes:
@@ -143,14 +143,57 @@ def measured_changes(git: GitRepo, base: str) -> set[bytes]:
     return _name_status(committed) | _name_status(staged) | _status_paths(status)
 
 
-def _pyproject_sides(git: GitRepo, raw: bytes) -> list[bytes | None]:
-    """Every head-side version of a pyproject: committed, staged and on disk."""
-    path = git.root / os.fsdecode(raw)
+def _tree_side(git: GitRepo, rev: str, raw: bytes) -> object:
+    """A committed side: regular blob bytes, None when absent, else _NOT_A_FILE."""
+    listing = _required(_git(git, ["--literal-pathspecs", "ls-tree", "-z", rev, "--", os.fsdecode(raw)]),
+                        "ls-tree")
+    entries = [entry for entry in listing.split(b"\0") if entry]
+    if not entries:
+        return None
+    mode, kind, sha = entries[0].split(b"\t", 1)[0].split(b" ")
+    if mode not in _REGULAR_MODES or kind != b"blob":
+        return _NOT_A_FILE  # tree, symlink or submodule
+    return _required(_git(git, ["cat-file", "blob", sha.decode()]), "cat-file")
+
+
+def _index_side(git: GitRepo, raw: bytes) -> object:
+    """The staged side, read from the index without changing it."""
+    listing = _required(_git(git, ["--literal-pathspecs", "ls-files", "-s", "-z", "--", os.fsdecode(raw)]),
+                        "ls-files")
+    entries = [entry.split(b"\t", 1) for entry in listing.split(b"\0") if entry]
+    exact = [info.split(b" ") for info, path in entries if path == raw]
+    if not exact:
+        return _NOT_A_FILE if entries else None  # entries below it: a directory
+    if len(exact) != 1 or exact[0][2] != b"0" or exact[0][0] not in _REGULAR_MODES:
+        return _NOT_A_FILE  # conflict, symlink or submodule
+    return _required(_git(git, ["cat-file", "blob", exact[0][1].decode()]), "cat-file")
+
+
+def _disk_side(path: Path) -> object:
+    """What pytest would read from disk; symlinks are followed as pytest follows them."""
     try:
-        disk: bytes | None = path.read_bytes()
+        # O_NONBLOCK: a FIFO named pyproject.toml must not stall the guard.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
-        disk = None
-    return [_blob(git, b"HEAD:" + raw), _blob(git, b":" + raw), disk]
+        return None  # absent, or a dangling symlink
+    except OSError:
+        return _NOT_A_FILE  # a directory, or unreadable
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return _NOT_A_FILE
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            return stream.read()
+    except OSError:
+        return _NOT_A_FILE
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _pyproject_sides(git: GitRepo, raw: bytes) -> list[object]:
+    """Every head-side version of a pyproject: committed, staged and on disk."""
+    return [_tree_side(git, "HEAD", raw), _index_side(git, raw), _disk_side(git.root / os.fsdecode(raw))]
 
 
 def changed_harness_paths(git: GitRepo, target_ref: str, listed: list[str]) -> list[str]:
@@ -160,7 +203,7 @@ def changed_harness_paths(git: GitRepo, target_ref: str, listed: list[str]) -> l
     for raw in sorted(measured_changes(git, base)):
         name = PurePosixPath(os.fsdecode(raw)).name
         if name == "pyproject.toml":
-            before = _pytest_tables(_blob(git, base.encode() + b":" + raw))
+            before = _pytest_tables(_tree_side(git, base, raw))
             sides = [_pytest_tables(data) for data in _pyproject_sides(git, raw)]
             if before is not _UNPARSABLE and all(side is not _UNPARSABLE and side == before for side in sides):
                 continue

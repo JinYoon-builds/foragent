@@ -292,6 +292,8 @@ def _resolve_conflicts_inner(
         if markers:
             check_failure = f"Conflict markers remain in: {', '.join(markers)}"
             continue
+        from foragent.run_publish import _guard_harness
+        _guard_harness(attempt)  # before staging, which Git may refuse (for example a FIFO)
         git.stage_changes()
         if enabled(ctx, attempt.target_branch):
             commit_exclusions(attempt, title)

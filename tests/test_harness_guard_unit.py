@@ -300,3 +300,75 @@ def test_detection_never_changes_the_index(repo):
     before = git_command(repo, "ls-files", "--stage")
     assert changed_harness_paths(GitRepo(repo), "target", []) == [".foragent/conftest.py"]
     assert git_command(repo, "ls-files", "--stage") == before
+
+
+def _replace_pyproject(repo, kind):
+    import os
+
+    path = repo / "pyproject.toml"
+    path.unlink()
+    if kind == "directory":
+        path.mkdir()
+        (path / "inside.txt").write_text("x\n")
+    elif kind == "symlink-to-directory":
+        os.symlink("tests", path)
+    elif kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "dangling-symlink":
+        os.symlink("missing.toml", path)
+
+
+@pytest.mark.parametrize("staged", [False, True], ids=["on-disk", "staged"])
+@pytest.mark.parametrize("kind", ["directory", "symlink-to-directory", "fifo", "dangling-symlink"])
+def test_pyproject_replaced_by_another_file_type_is_held_not_an_error(repo, kind, staged):
+    if kind == "fifo" and staged:
+        pytest.skip("Git cannot stage a FIFO")
+    _replace_pyproject(repo, kind)
+    if staged:
+        git_command(repo, "add", "-A")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["pyproject.toml"]
+
+
+def test_committed_symlink_pyproject_counts_even_if_its_target_has_equal_tables(repo):
+    import os
+
+    (repo / "real.toml").write_text(PYPROJECT)
+    (repo / "pyproject.toml").unlink()
+    os.symlink("real.toml", repo / "pyproject.toml")
+    commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD").strip())
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["pyproject.toml"]
+
+
+def test_base_side_directory_named_pyproject_is_read_without_error(repo):
+    (repo / "pkg/pyproject.toml").mkdir(parents=True)
+    (repo / "pkg/pyproject.toml/inside.txt").write_text("x\n")
+    start = commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD").strip())
+    git_command(repo, "update-ref", "refs/heads/target", start)
+    (repo / "pkg/pyproject.toml/inside.txt").unlink()
+    (repo / "pkg/pyproject.toml").rmdir()
+    (repo / "pkg/pyproject.toml").write_text('[project]\nname = "p"\n')
+    git_command(repo, "add", "-A")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["pkg/pyproject.toml"]
+
+
+def test_fifo_pyproject_from_the_implementer_is_held_not_a_staging_error(run_case, monkeypatch):
+    """Git cannot stage a FIFO; the guard must decide before any staging runs."""
+    import os
+
+    c = run_case
+    c.history.update({"pyproject.toml": PYPROJECT})
+    run = c.executor.run
+
+    def implement(**kwargs):
+        result = run(**kwargs)
+        path = kwargs["worktree"] / "pyproject.toml"
+        path.unlink()
+        os.mkfifo(path)
+        return result
+
+    monkeypatch.setattr(c.executor, "run", implement)
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert "needs-human" in c.tracker.get_issue(1).labels
+    assert any("pyproject.toml" in comment.body for comment in c.tracker.list_comments(1)
+               if "reason=test-harness-changed" in comment.body)

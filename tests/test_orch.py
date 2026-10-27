@@ -627,3 +627,23 @@ def test_review_only_spec_conflict_stops_with_spec_question_and_keeps_pr_open(re
     assert len(question) == 1 and conflict in question[0]
     events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
     assert [e["verdict"] for e in events if e["kind"] == "review"] == ["SPEC-CONFLICT"]
+
+
+def test_review_done_when_that_leaves_a_fifo_pyproject_is_held_not_a_staging_error(review_case):
+    """The last measurement's leftovers are guarded before the final staging, which Git would refuse."""
+    from runner_support import set_done_when
+
+    c = review_case
+    c.history.update({"pyproject.toml": '[tool.pytest.ini_options]\naddopts = "-q"\n'})
+    c.head = c.history.tip
+    c.tracker.set_pr_head_sha(c.pr, c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", c.head)
+    c.ctx.git.fetch()
+    set_done_when(c, ["rm pyproject.toml && mkfifo pyproject.toml"])
+    c.tracker.edit_body(1, c.store.load_approval(1).body)
+
+    assert runner.review_only(1, c.ctx) == "held"
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
+    assert c.tracker.merged_prs == [] and c.tracker.get_issue(c.pr).state == "open"

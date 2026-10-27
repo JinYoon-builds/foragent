@@ -63,18 +63,28 @@ def _guard_harness(attempt: Implementation) -> None:
         return
     _append(attempt.log, hold_details(paths))
     title = f"{ctx.tracker.get_issue(n).title} (#{n})"
-    if git.has_staged_changes():
-        git.commit(title)
-    _push_branch(attempt)
-    pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))
-    raise ExecutorStopped(_hold_harness_change(n, ctx, paths, f"https://github.com/{ctx.repo}/pull/{pr}"),
-                          hold_details(paths))
+    # Publication is for the human's convenience; a contents problem Git
+    # refuses (for example a FIFO it cannot index) must not replace the hold.
+    try:
+        if git.has_staged_changes():
+            git.commit(title)
+        _push_branch(attempt)
+        pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))
+        link = f"https://github.com/{ctx.repo}/pull/{pr}"
+    except (GitError, AttemptFailure) as exc:
+        link = f"The PR could not be published: {' '.join(str(exc).split())}"
+        _append(attempt.log, link)
+    raise ExecutorStopped(_hold_harness_change(n, ctx, paths, link), hold_details(paths))
 
 
 def _guard_staged(attempt: Implementation) -> None:
-    """Before a head measurement: include files earlier checks generated, then guard."""
-    attempt.git.stage_changes()
+    """Before a head measurement: guard (it reads the worktree itself), then stage.
+
+    Detection never depends on staging, so a file Git refuses to stage cannot
+    preempt the hold; files earlier checks generated are staged afterwards.
+    """
     _guard_harness(attempt)
+    attempt.git.stage_changes()
 
 
 def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
@@ -399,7 +409,12 @@ def _preserve_locked_implementation(
         if git.merge_in_progress():
             # Save the exact partial resolution without declaring its target merged.
             git.quit_merge()
-    git.stage_changes()
+    try:
+        git.stage_changes()
+    except GitError as exc:
+        # Keep the stop's own outcome (for example a harness hold on a FIFO);
+        # what was already staged is still saved.
+        _append(ctx.store.log_path(n), f"WIP staging failed; saving the staged work only: {exc}")
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
     refused = _check_wip_deletions(ctx, git, run)
