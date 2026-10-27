@@ -98,7 +98,7 @@ def record_usage(raw: bytes, now: Callable[[], datetime] = lambda: datetime.now(
 
 
 def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
-    """Entry point for `fa statusline`; stdout is the previous command's bytes only."""
+    """Entry point for `fa statusline`: the previous command's bytes, plus presence in a project."""
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout.buffer
     raw = stdin.read()
@@ -107,16 +107,19 @@ def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
     except OSError as exc:
         # Recording is a side channel; the user's statusline must keep working.
         print(f"fa statusline: could not record rate limits: {exc}", file=sys.stderr)
+    if os.environ.get(NESTED_ENV):
+        return 0  # The outer wrapper prints the user's output and presence once.
     record = load_record() or {}
     previous = record.get("previous_command")
-    if (not isinstance(previous, str) or not previous.strip() or is_wrapper(previous)
-            or os.environ.get(NESTED_ENV)):
-        return 0
-    env = {**os.environ, NESTED_ENV: "1"}
-    result = subprocess.run(previous, shell=True, input=raw, stdout=subprocess.PIPE, env=env, check=False)
-    stdout.write(result.stdout)
+    output, code = b"", 0
+    if isinstance(previous, str) and previous.strip() and not is_wrapper(previous):
+        env = {**os.environ, NESTED_ENV: "1"}
+        result = subprocess.run(previous, shell=True, input=raw, stdout=subprocess.PIPE, env=env, check=False)
+        output, code = result.stdout, (result.returncode if result.returncode >= 0 else 128 - result.returncode)
+    from foragent import presence
+    stdout.write(presence.append(output, presence.statusline_segment(Path.cwd(), datetime.now(UTC))))
     stdout.flush()
-    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+    return code
 
 
 @contextmanager

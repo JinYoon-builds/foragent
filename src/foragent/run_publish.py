@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from foragent import board, cuts, review_perspectives, risks
+from foragent import board, cuts, irreversible_paths, review_perspectives, risks
 from foragent import run_merge_turn as merge_turn
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
@@ -222,8 +222,7 @@ def _final_merge_inputs(
         if any(blobs.get(path) != sha for path, sha in approval.acceptance_blobs.items()):
             return _MergeInputs(stop=invalid_approval)
     paths = sorted(set(git.changed_paths(target_sha)) | set(ctx.tracker.pr_changed_files(pr)))
-    decision = merge_decision(changed_paths=paths, issue_labels=issue.labels, config=ctx.config,
-                              risk_always_human=_risk_always_human(ctx))
+    decision = _merge_decision(n, ctx, git, paths, issue.labels)
     # Bind this status and all verification evidence to the exact head we merge.
     if git.head_sha() != head or ctx.tracker.pr_head_sha(pr) != head:
         return _MergeInputs(stop=lambda: _hold_changed_head(n, ctx, link))
@@ -430,6 +429,13 @@ def _risk_notes(attempt: Implementation) -> str:
     return risks.review_notes(risks.matching(risks.load_at(attempt.git, attempt.base_ref), paths), paths)
 
 
+def _merge_decision(n: int, ctx: RunContext, git: GitRepo, paths: list[str], labels) -> Decision:
+    """Merge policy after first-touch deploy/migration paths join always_human (#785)."""
+    irreversible_paths.register(ctx, n, git, paths)
+    return merge_decision(changed_paths=paths, issue_labels=labels, config=ctx.config,
+                          risk_always_human=_risk_always_human(ctx))
+
+
 def _risk_always_human(ctx: RunContext) -> list[str]:
     """Always-human globs from the risk map on the configured base, not the branch under review."""
     return risks.always_human_globs(ctx.git, f"origin/{ctx.config.base_branch}")
@@ -591,11 +597,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             ctx.tracker.remove_labels(n, [RUNNING])
             return "pr-open"
 
-    if stopped := policy_hold(merge_decision(
-        changed_paths=ctx.tracker.pr_changed_files(pr),
-        issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
-        risk_always_human=_risk_always_human(ctx),
-    )):
+    if stopped := policy_hold(_merge_decision(
+            n, ctx, git, ctx.tracker.pr_changed_files(pr), ctx.tracker.get_issue(n).labels)):
         return stopped
 
     def publish_refresh(target_sha: str) -> str | None:
@@ -611,11 +614,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         verified_base_sha = target_sha
         if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
             return _hold_changed_head(n, ctx, link)
-        decision = merge_decision(
-            changed_paths=git.changed_paths(target_sha),
-            issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
-            risk_always_human=_risk_always_human(ctx),
-        )
+        decision = _merge_decision(n, ctx, git, git.changed_paths(target_sha), ctx.tracker.get_issue(n).labels)
         return policy_hold(decision)
 
     def ci_failed() -> None:
@@ -833,11 +832,9 @@ def _publish_reviewed_in_turn(
             return "pr-open"
         return None
 
-    if stopped := policy_hold(merge_decision(
-        changed_paths=sorted(set(git.changed_paths(base_sha)) | set(ctx.tracker.pr_changed_files(pr.number))),
-        issue_labels=ctx.tracker.get_issue(n).labels, config=ctx.config,
-        risk_always_human=_risk_always_human(ctx),
-    )):
+    if stopped := policy_hold(_merge_decision(
+            n, ctx, git, sorted(set(git.changed_paths(base_sha)) | set(ctx.tracker.pr_changed_files(pr.number))),
+            ctx.tracker.get_issue(n).labels)):
         return stopped
     started = ctx.now().timestamp()
     ci_wait = _CIWait(started)

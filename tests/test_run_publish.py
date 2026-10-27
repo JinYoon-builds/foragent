@@ -130,6 +130,10 @@ def test_parallel_self_merges_cannot_install_an_older_tree_last(run_case, monkey
     monkeypatch.setattr(c.tracker, "merge_pr", merge_into_main)
     monkeypatch.setattr(tool_install, "run_uv", uv)
     monkeypatch.setattr(runner, "after_merge", install_and_verify)
+    # This test pins the merge lock's scope; the FIFO turn (#712) would make B wait before the
+    # lock and hide a lock released too early, so both runs contend for the lock directly.
+    from foragent import run_merge_turn
+    monkeypatch.setattr(run_merge_turn, "holds_turn", lambda store, place: True)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(run_issue, 1, c.ctx)
         try:
@@ -1242,7 +1246,7 @@ def test_batch_pr_merged_before_any_tick_leaves_parent_completion_to_the_gate(ru
     context = _merge_batch_then_tick(c)
     parent = c.tracker.get_issue(99)
     assert parent.state == "closed", "The gate closes the order once every child is done"
-    completion = text("parent_children_done", c.ctx.config.language, count=1)
+    completion = text("order_record_closed", c.ctx.config.language, count=1)
     added = c.tracker.list_comments(99)[len(before):]
     assert [comment.body for comment in added].count(completion) == 1
     tick(context)

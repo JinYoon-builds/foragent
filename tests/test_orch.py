@@ -324,9 +324,12 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
 @pytest.mark.parametrize("change", ["base", "head", "body", "approval", "risk"])
 def test_rechecks_evidence_after_ci(review_case, monkeypatch, change):
     c = review_case
+    polls = []
     def ci(pr):
+        polls.append(pr)
         if change == "base":
-            c.history.update({"moved.txt": "new base"})
+            if len(polls) == 1:
+                c.history.update({"moved.txt": "new base"})
         elif change == "head":
             c.tracker.set_pr_head_sha(pr, "a" * 40)
         elif change == "body":
@@ -337,7 +340,21 @@ def test_rechecks_evidence_after_ci(review_case, monkeypatch, change):
             c.tracker.add_labels(1, ["risk:high"])
         return "pass"
     monkeypatch.setattr(c.tracker, "pr_checks", ci)
+    from foragent import run_review
+    verified = []
+    verify = run_review._verify_review_head
+    monkeypatch.setattr(run_review, "_verify_review_head",
+                        lambda n, ctx, git, parsed, head, link: verified.append(head) or verify(n, ctx, git, parsed, head, link))
     orch.resolve(c.ctx, 1, "pass", "Head-specific review")
+    if change == "base":
+        # Checks ran on the reviewed head and again on the head with the new base merged in.
+        assert len(verified) == 2 and verified[0] != verified[1]
+        # The merge-turn holder merges a moved base into the head and re-verifies it (#712).
+        assert len(c.tracker.merged_prs) == 1
+        assert c.store.log_path(1).read_text().count("re-verifying") == 1
+        # First wait, the refreshed head's wait, and the final read under the merge lock.
+        assert len(polls) == 3, "The refreshed head's CI is checked again before merging"
+        return
     assert_blocked(c, Reason.HASH_MISMATCH if change in {"body", "approval"} else Reason.RISK_HIGH)
 
 
