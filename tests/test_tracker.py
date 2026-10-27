@@ -1664,7 +1664,7 @@ def test_gh_issues_closed_since_is_one_filtered_listing_without_pull_requests():
                       "repos/owner/repo/issues?state=closed&since=2026-10-20T09%3A00%3A00Z&per_page=100"]]
 
 
-def test_observe_closed_issues_records_outside_closes_after_the_first_watermark(tmp_path):
+def test_observe_closed_issues_starts_at_the_last_listing_and_records_unlisted_closes(tmp_path):
     from types import SimpleNamespace
 
     from foragent.config import Config
@@ -1678,15 +1678,20 @@ def test_observe_closed_issues_records_outside_closes_after_the_first_watermark(
     ctx = SimpleNamespace(config=Config(), now=lambda: clock[0],
                           store=StateStore(tmp_path, now=lambda: clock[0]))
     tracker = RecordingTracker(remote, ctx)
-    tracker.refresh_issues()
 
     def states():
         return {row["number"]: row["state"] for row in ctx.store.local_issues()}
 
-    remote.close_issue(1)
-    tracker.observe_closed_issues(observed_at=clock[0])  # The first call only stores the watermark.
-    assert states() == {1: "open", 2: "open"}
-    clock[0] += timedelta(minutes=1)
+    # Without a listing or a watermark there is no span to read yet.
     tracker.observe_closed_issues(observed_at=clock[0])
-    assert states() == {1: "closed", 2: "open"}
+    assert states() == {} and ctx.store.closed_issue_watermark() == clock[0]
+
+    # Upgrading with a cached listing: the first read starts at that listing.
+    (tmp_path / "closed_issues.json").unlink()
+    tracker.refresh_issues()
+    clock[0] += timedelta(minutes=1)
+    remote.close_issue(1)
+    remote.add_issue(3, "Created and closed between listings", "body", state="closed")
+    tracker.observe_closed_issues(observed_at=clock[0])
+    assert states() == {1: "closed", 2: "open", 3: "closed"}
     assert ctx.store.closed_issue_watermark() == clock[0]

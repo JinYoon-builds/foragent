@@ -4,11 +4,6 @@ A parent is an open, unapproved issue with sub-issues. Its own labels say
 nothing about progress, so the gate derives its column from the children on
 each tick that read the issue listing, and closes it once every child closed
 as completed. An approved issue with sub-issues stays ordinary work.
-
-An order record (the plan marker, no lane label) left open without
-sub-issues is closed through the same path. These catch-up closes are paced
-at one order-record close per listing tick, counting parent closes, so a
-backlog of old records does not send a burst of closes and comments.
 """
 
 from collections.abc import Iterable
@@ -21,7 +16,6 @@ from foragent.orch_events import append_event
 from foragent.tracker import Issue
 
 NOT_PLANNED_FLAG = "parent-child-not-planned"
-PLAN_MARKER = "<!-- foragent:plan "
 
 
 def _completed(child: Issue) -> bool:
@@ -59,21 +53,11 @@ def order_parents(rows: list[dict[str, Any]]) -> set[int]:
             and APPROVED not in row.get("labels", ())}
 
 
-def childless_records(rows: list[dict[str, Any]]) -> set[int]:
-    """Open, unapproved order records that the last listing showed without sub-issues."""
-    return {row["number"] for row in rows
-            if row.get("state") == "open" and not row.get("children")
-            and APPROVED not in row.get("labels", ())
-            and PLAN_MARKER in (row.get("body") or "")
-            and not any(label.startswith("lane:") for label in row.get("labels", ()))}
-
-
 def follow_children(ctx, report) -> None:
     """Move each order parent's card to its children's column; close it when all are done."""
     rows = ctx.store.local_issues()
     open_prs = {row["number"] for row in rows if row.get("pr_number") and not row.get("merged")}
     language = ctx.config.language
-    closed = 0
     for number in sorted(order_parents(rows)):
         children = ctx.tracker.sub_issues(number)
         state = parent_state(children, open_prs)
@@ -94,11 +78,4 @@ def follow_children(ctx, report) -> None:
             ctx.tracker.close_issue(number, text("parent_children_done", language, count=len(children)))
             report.actions.append(text("parent_closed_report", language, number=number,
                                        count=len(children)))
-            closed += 1
         board.sync_status(ctx, number, state, parent=True)
-    for number in sorted(childless_records(rows))[:max(0, 1 - closed)]:
-        if ctx.tracker.sub_issues(number):
-            continue  # Children appeared after the listing; the next listing follows them.
-        ctx.tracker.close_issue(number, text("order_record_closed", language))
-        report.actions.append(text("order_record_closed_report", language, number=number))
-        board.sync_status(ctx, number, "Done", parent=True)

@@ -345,17 +345,20 @@ class RecordingTracker:
     def observe_closed_issues(self, *, observed_at):
         """Record issues closed since the stored watermark: one light read per tick.
 
-        Only issues the local record still shows open change, so the board sync
-        moves their cards to Done on this tick instead of the next full listing.
-        The first call only stores the watermark; a full listing covers the past.
+        Without a watermark the read starts at the last full listing, which
+        already showed every earlier close. Each closed issue the local record
+        does not show closed is recorded, including one created and closed
+        between listings, so this tick's board sync moves its card to Done.
         """
         read = getattr(self._tracker, "issues_closed_since", None)
         if read is None:
             return
         store = self._context.store
-        watermark = store.closed_issue_watermark()
-        if watermark is not None:
-            since = (watermark if watermark.tzinfo else watermark.replace(tzinfo=UTC)) - _WATERMARK_MARGIN
+        start = store.closed_issue_watermark()
+        if start is None and (listed := store.issues_observation()["as_of"]) is not None:
+            start = datetime.fromisoformat(listed)
+        if start is not None:
+            since = (start if start.tzinfo else start.replace(tzinfo=UTC)) - _WATERMARK_MARGIN
             try:
                 issues = read(since)
             except TrackerError as exc:
@@ -363,9 +366,9 @@ class RecordingTracker:
                     raise
                 log.warning("Could not read recently closed issues: %s", exc)
                 return  # Keep the watermark; the next tick reads this span again.
-            known_open = {row["number"] for row in store.local_issues() if row.get("state") == "open"}
+            closed = {row["number"] for row in store.local_issues() if row.get("state") == "closed"}
             for issue in issues:
-                if issue.state == "closed" and issue.number in known_open and not issue.is_pull_request:
+                if issue.state == "closed" and issue.number not in closed and not issue.is_pull_request:
                     store.record_issue(issue, self._context.config.lanes)
         store.record_closed_issue_watermark(observed_at)
 
