@@ -30,21 +30,20 @@ def test_cell_helpers_use_replaced_facade_helpers(monkeypatch):
     assert watch._fit([("abc", "bold")], 3) == [("a", "bold"), (" ", "road")]
 
 
-def test_layout_uses_replaced_facade_detail_activity_and_pick(tmp_path, monkeypatch):
+def test_layout_uses_replaced_facade_detail_and_activity(tmp_path, monkeypatch):
     store, tracker, config = StateStore(tmp_path), FakeTracker(), Config()
     tracker.add_issue(1, "Working", labels=["running"])
     store.start_run(1, branch="issue-1", worktree="unused")
     snapshot = watch.collect(cli._status(tracker, store, config), tracker, store, config, BASE_TIME)
     detail = Mock(return_value="facade detail")
     monkeypatch.setattr(watch, "render_detail", detail)
-    monkeypatch.setattr(watch, "_activity", lambda *args: "facade activity")
-    monkeypatch.setattr(watch, "PICK", ("tool",) * 4)
+    # A lane row shows the activity cell when it warns (○ stalled or gone, ? quiet).
+    monkeypatch.setattr(watch, "_activity", lambda *args: "○ facade activity")
 
     frame = watch.render_frame(snapshot, config, tmp_path, selected="main")
 
     assert "facade detail" in frame
     assert "facade activity" in frame
-    assert "tool" in frame
     detail.assert_called_once_with(config, "main", tmp_path, done_count=0)
 
 
@@ -68,7 +67,7 @@ def test_live_run_uses_replaced_facade_frame_and_clock(tmp_path, monkeypatch):
 
     watch.run(lambda: {}, tracker, store, config, tmp_path, now=lambda: BASE_TIME)
 
-    frame.assert_called_once_with(snapshot, config, tmp_path, tick=0, width=79,
-                                  selected=None, now=BASE_TIME, layout={})
+    frame.assert_called_once_with(snapshot, config, tmp_path, tick=0, width=80,
+                                  selected=None, now=BASE_TIME, layout={}, height=24)
     assert screen.addstr.call_args_list[0].args[:3] == (0, 0, "facade live frame")
     assert not (tmp_path / "watch.pid").exists()
