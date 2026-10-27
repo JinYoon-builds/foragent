@@ -266,6 +266,12 @@ def expected_review_rules(acceptance_dir):
         "conflict, not a defect: report it as one line "
         "`SPEC-CONFLICT: <locked test path:line> <what the test requires>; <what the finding wants>` "
         "instead of a finding.\n"
+        "A test that asserts nothing or proves nothing is a weakened check. Judge each new or changed "
+        "test by the break-it rule: Make the code return a wrong value, skip an effect, or do the effect "
+        "twice. If the test still passes, it proves nothing.\n"
+        "Write root-cause and structure findings (why the defect could happen, a better design) as separate "
+        "plain lines `NOTE: <finding>`, beside the findings. NOTE lines are recorded for the orchestrator "
+        "and are never a reason to FAIL.\n"
         "For each finding, say whether it is one instance of a broader defect class "
         "and where else to look in the change."
     )

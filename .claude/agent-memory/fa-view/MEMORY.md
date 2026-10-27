@@ -125,3 +125,5 @@
 - [#172 오케스트레이터 메모 줄](project_orch_panel.md) — 140칸↑ 상자 36칸, 문제 푸는 중 줄 유지+지켜보는 중 추가, inspect 개수 파일은 폴더 있을 때만
 - [#114 주문 완료 구역](project_done_state.md) — done.py·빈 칸 숨김·0 숨김 요약·쉬는 레인 줄바꿈
 - [#167 레인 줄](project_lane_rows.md) — 머리줄·작업자 줄·24줄 예산·KEEP/SIDE, 옛 도로/표 고정 시험 14개 충돌
+- [#168 완료 불꽃](project_finished_fireworks.md) — GAP_AFTER·STAYS, state·calm(), render_frame 고정 인자 함정
+- [#171 준비 줄](project_prep_rows.md) — Snapshot.prep·prep 구역 ORDER 4·고정 시험 함정

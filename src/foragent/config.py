@@ -86,6 +86,7 @@ class Config:
     language: str = "en"
     interview: str = "native"
     ouroboros_version: str | None = None
+    animation: bool = True  # Lane-view fireworks and the big squirrel sprite (#168).
     update_check: bool = True  # The daily release check (#417); FORAGENT_UPDATE_CHECK=off also opts out.
     profile: dict[str, Any] | None = None
     # Whether `fa report propose` may prepare upstream error reports; None means not asked yet (#419).
