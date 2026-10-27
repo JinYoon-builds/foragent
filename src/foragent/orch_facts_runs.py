@@ -231,4 +231,4 @@ def _test_slots(config: Config, running: list[Run], rows: list[dict[str, Any]], 
             "total_wait_seconds": sum(row["test_slot_wait_seconds"] or 0 for row in rows)}
 
 
-# Never copied or opened: plan.json may carry a throughput goal, which facts must not show.
+# plan.json may carry a throughput goal; facts copy only its plan keys (orch_plan.plan_fields) and never show a goal.
