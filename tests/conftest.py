@@ -206,6 +206,18 @@ def isolated_test_slots(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_real_machine_sleep(request, monkeypatch):
+    """The sensor reports no sleep, so the owner's real sleep never credits runs on fake clocks (#415).
+
+    Tests that supply their own sleep facts read the real sensor or patch it themselves.
+    """
+    from foragent import capacity
+
+    if request.module.__name__ not in {"test_machine_sleep", "test_sleep_credit"}:
+        monkeypatch.setattr(capacity, "slept_seconds", lambda since: 0.0)
+
+
+@pytest.fixture(autouse=True)
 def isolated_github_call_counter():
     """A context's gh counter must not leak into later tests' gh calls."""
     from foragent import gh

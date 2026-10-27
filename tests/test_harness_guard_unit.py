@@ -252,3 +252,51 @@ def test_paths_the_runner_never_stages_are_still_measured(repo):
     assert changed_harness_paths(git, "target", []) == [".foragent/conftest.py"]
     # The runner's own index is left exactly as it was.
     assert ".foragent/conftest.py" not in git.changed_paths("target")
+
+
+def test_force_added_ignored_conftest_is_caught(repo):
+    (repo / ".gitignore").write_text("generated/\n")
+    (repo / "generated").mkdir()
+    (repo / "generated/conftest.py").write_text("# generated\n")
+    git_command(repo, "add", ".gitignore")
+    git_command(repo, "add", "-f", "generated/conftest.py")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["generated/conftest.py"]
+
+
+@pytest.mark.parametrize("force_added", [True, False], ids=["staged", "on-disk-only"])
+def test_ignored_pyproject_addition_with_pytest_table_is_caught(repo, force_added):
+    (repo / ".gitignore").write_text("pkg/pyproject.toml\n")
+    (repo / "pkg").mkdir()
+    (repo / "pkg/pyproject.toml").write_text('[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider"\n')
+    git_command(repo, "add", ".gitignore")
+    if force_added:
+        git_command(repo, "add", "-f", "pkg/pyproject.toml")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["pkg/pyproject.toml"]
+
+
+def test_committed_rename_whose_destination_is_conftest_is_caught(repo):
+    (repo / "tests/unit").mkdir()
+    (repo / "tests/unit/helpers.py").write_text("VALUE = 1\n" * 20)
+    start = commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD").strip())
+    git_command(repo, "update-ref", "refs/heads/target", start)
+    (repo / "tests/unit/helpers.py").rename(repo / "tests/unit/conftest.py")
+    commit(repo, "refs/heads/main", parent=start)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["tests/unit/conftest.py"]
+
+
+def test_ignored_environment_directories_are_not_expanded(repo):
+    (repo / ".gitignore").write_text(".venv/\n")
+    (repo / ".venv/lib/site-packages/pkg").mkdir(parents=True)
+    (repo / ".venv/lib/site-packages/pkg/conftest.py").write_text("# third-party\n")
+    (repo / ".venv/lib/site-packages/sitecustomize.py").write_text("# environment\n")
+    git_command(repo, "add", ".gitignore")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+
+
+def test_detection_never_changes_the_index(repo):
+    (repo / ".foragent").mkdir()
+    (repo / ".foragent/conftest.py").write_text("# generated\n")
+    git_command(repo, "add", "-f", ".foragent/conftest.py")
+    before = git_command(repo, "ls-files", "--stage")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == [".foragent/conftest.py"]
+    assert git_command(repo, "ls-files", "--stage") == before

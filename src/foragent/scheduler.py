@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, launchd, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_github, orch_plan, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -91,6 +91,7 @@ def tick(ctx: TickContext) -> TickReport:
                 with step("reap_inactive_runs"):
                     _reap_inactive_runs(ctx, cleanup)
             timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
+            timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
             if skipped := _github_wait(ctx, {}, "github_wait_check"):
                 return keep(TickReport(skipped=skipped, actions=cleanup.actions))
             if not isinstance(ctx.tracker, RecordingTracker):

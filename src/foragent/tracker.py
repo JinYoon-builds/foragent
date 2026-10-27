@@ -1035,6 +1035,19 @@ class GhTracker:
             args.extend(["--comment", comment])
         self._call(args)
 
+    def search_issues(self, query: str) -> Any:
+        """GitHub's issue search response for ``query``: ``items`` (up to 100), ``total_count``
+        and ``incomplete_results``, so a caller can tell a complete "no match" from a partial one.
+
+        GitHub matches titles, bodies and comments; text-match metadata (``text_matches``)
+        shows the matching fragments, including comment fragments a body check cannot see.
+        """
+        data = json.loads(self._call([
+            "api", "-X", "GET", "search/issues", "-H", "Accept: application/vnd.github.text-match+json",
+            "-f", f"q={query}", "-f", "per_page=100",
+        ]))
+        return data  # The caller checks the shape and words any problem for a person.
+
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int:
         output = self._call(
             ["api", "-X", "POST", f"{self._path}/issues", "--input", "-"],
