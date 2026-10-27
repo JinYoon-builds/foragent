@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import cuts
+from foragent import cuts, review_notes
 from foragent.git import GitError
 
 if TYPE_CHECKING:
@@ -111,11 +111,13 @@ def saved_failures_section(root: Path, n: int, failure_text: str = "") -> str:
 
 
 def saved_review_section(root: Path, n: int, failure_text: str = "") -> str:
-    """The latest saved review, whole: every finding reaches the next attempt."""
+    """The latest saved review, whole except its NOTE lines: every finding reaches the next attempt."""
     review = _latest_review(root, n)
     if review is None:
         return ""
     path, text = review
+    # NOTE lines are recorded for the orchestrator; they are never findings to fix.
+    text = review_notes.strip(text).strip()
     lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("VERDICT:")]
     if lines and all(line in failure_text for line in lines):
         return ""  # this attempt's failure text already carries every finding
