@@ -661,15 +661,72 @@ class GitRepo:
                     return None
             raise
 
+    def tree_files(self, ref: str) -> list[str]:
+        """Every file path tracked at ``ref``."""
+        return [path for path in self._call(["ls-tree", "-r", "--name-only", "-z", ref]).split("\0") if path]
+
+    def file_at(self, ref: str, path: str) -> str | None:
+        """A tracked file's text at ``ref``, or None when it is missing or not text."""
+        try:
+            return self._call(["show", f"{ref}:{path}"])
+        except (GitError, UnicodeDecodeError):
+            return None
+
     def blob_shas(self, ref: str, paths: Iterable[str]) -> dict[str, str]:
         return {path: self.blob_sha(ref, path) or "missing" for path in paths}
 
     def remote_slug(self, remote: str = "origin") -> str:
-        url = self._call(["remote", "get-url", remote]).strip()
-        match = re.fullmatch(
-            r"(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)"
-            r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", url,
-        )
-        if match is None:
+        slug = slug_from_url(self._call(["remote", "get-url", remote]))
+        if slug is None:
             raise GitError(f"cannot determine owner/name from remote {remote}; set repo in .foragent.yml")
-        return f"{match[1]}/{match[2]}"
+        return slug
+
+
+def slug_from_url(url: str) -> str | None:
+    """``owner/name`` of a GitHub remote url, else None. The one url-to-slug rule."""
+    match = re.fullmatch(
+        r"(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)"
+        r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", url.strip(),
+    )
+    return None if match is None else f"{match[1]}/{match[2]}"
+
+
+def _common_git_dir(root: Path) -> Path:
+    """The git dir holding ``config``; a linked worktree's ``.git`` file names it via ``commondir``."""
+    dot_git = root / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    line = dot_git.read_text(encoding="utf-8").strip()
+    if not line.startswith("gitdir:"):
+        raise OSError(f"not a git dir file: {dot_git}")
+    gitdir = (root / line.removeprefix("gitdir:").strip()).resolve()
+    commondir = gitdir / "commondir"
+    if commondir.is_file():
+        return (gitdir / commondir.read_text(encoding="utf-8").strip()).resolve()
+    return gitdir
+
+
+def origin_slug_from_files(root: Path, remote: str = "origin") -> str | None:
+    """Like ``GitRepo.remote_slug`` but reads git's config file instead of running git.
+
+    None when the remote is missing, not GitHub, or the files cannot be read.
+    """
+    try:
+        text = (_common_git_dir(root) / "config").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    wanted = f'remote "{remote}"'
+    section = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("["):
+            header = line[1:line.find("]")] if "]" in line else ""
+            name, _, sub = header.partition(" ")
+            section = f"{name.strip().lower()} {sub.strip()}".strip()
+            continue
+        key, sep, value = line.partition("=")
+        if sep and section == wanted and key.strip().lower() == "url":
+            return slug_from_url(value.strip().strip('"'))
+    return None

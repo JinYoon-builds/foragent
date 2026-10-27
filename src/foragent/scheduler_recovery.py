@@ -159,6 +159,7 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
             issue.number, branch=f"foragent/issue-{issue.number}",
             worktree=ctx.store.worktree_path(issue.number),
             lane=scheduler.issue_lane(issue.labels, ctx.config.lanes),
+            implementer=run.implementer if run is not None else None,  # A crash keeps the run's implementer (#107).
         )
         ctx.store.finish_run(issue.number, outcome="crashed", detail=detail)
     report.actions.append(f"#{issue.number} orphaned running label recovered as crashed")
@@ -191,7 +192,12 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
-    sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
+    slept = sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
+    grace = sleep_credit.wake_grace(ctx.store) if slept > sleep_credit.WAKE_THRESHOLD_SECONDS else None
+    if grace is not None:  # Report the stored end, not a second clock reading.
+        report.actions.append(scheduler.text(
+            "sleep_wake", ctx.config.language, hours=int(slept // 3600),
+            minutes=int(slept % 3600 // 60), until=grace[1].astimezone().strftime("%H:%M:%S")))
     for run in ctx.store.active_runs():
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
@@ -230,7 +236,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit."):
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
-            elif run.pid is not None and not waiting and ctx.now() - scheduler.datetime.fromisoformat(
+            elif run.pid is not None and not waiting and not sleep_credit.in_wake_grace(
+                    ctx.store, run, ctx.now()) and ctx.now() - scheduler.datetime.fromisoformat(
                 run.last_progress_at or run.started_at,
             ) - scheduler.timedelta(seconds=run.slept_since_progress) > scheduler.timedelta(
                 minutes=ctx.config.stall_minutes):

@@ -83,8 +83,19 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError(text("perspectives_config_shape", language, seats=", ".join(SEATS)))
     if not isinstance(values["view_glyphs"], str) or values["view_glyphs"] not in {"emoji", "ascii", "auto"}:
         raise ConfigError("view_glyphs must be emoji, ascii, or auto")
+    if type(values["animation"]) is not bool:
+        raise ConfigError("animation must be true or false")
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
+    presence = values["presence"]
+    if not isinstance(presence, dict):
+        raise ConfigError("presence must be a mapping of statusline, session_start and report")
+    from foragent.config import PRESENCE_DEFAULTS
+    for key, value in presence.items():
+        if key not in PRESENCE_DEFAULTS:
+            raise ConfigError(f"unknown presence setting: {key} (use statusline, session_start or report)")
+        if type(value) is not bool:
+            raise ConfigError(f"presence.{key} must be true or false")
     if values["upstream_reports"] is not None and type(values["upstream_reports"]) is not bool:
         from foragent.i18n import text
         language = values["language"] if isinstance(values["language"], str) else "en"
@@ -101,12 +112,14 @@ def _validate(values: dict[str, Any]) -> None:
     for name, lane in lanes.items():
         if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9-]+", name):
             raise ConfigError(f"invalid lanes name: {name}")
-        if not isinstance(lane, dict) or lane.keys() - {"paths", "agent", "skills", "executor", "model", "title", "emoji"}:
+        if not isinstance(lane, dict) or lane.keys() - {"paths", "agent", "skills", "executor", "reviewer", "model", "title", "emoji"}:
             raise ConfigError(f"invalid lanes entry: {name}")
         paths = lane.get("paths", [])
         if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
             raise ConfigError(f"lanes.{name}.paths must be a list of strings")
-        for key in ("agent", "executor", "model", "title", "emoji"):
+        if lane.get("reviewer") is not None and lane["reviewer"] not in _EXECUTORS | {"none"}:
+            raise ConfigError(f"lanes.{name}.reviewer must be codex, claude, none, or null")
+        for key in ("agent", "executor", "reviewer", "model", "title", "emoji"):
             if lane.get(key) is not None and not isinstance(lane[key], str):
                 raise ConfigError(f"lanes.{name}.{key} must be a string or null")
         if lane.get("executor") is not None and lane["executor"] not in _EXECUTORS:
@@ -115,6 +128,15 @@ def _validate(values: dict[str, Any]) -> None:
             not isinstance(skill, str) for skill in lane.get("skills", [])
         ):
             raise ConfigError(f"lanes.{name}.skills must be a list of strings")
+    quota = values["claude_quota"]
+    if not isinstance(quota, dict):
+        raise ConfigError("claude_quota must be a mapping with mode and keep_percent")
+    for key in quota.keys() - {"mode", "keep_percent"}:
+        raise ConfigError(f"claude_quota.{key} is not a known key; use mode or keep_percent")
+    if quota.get("mode") not in ("keep", "burn"):
+        raise ConfigError("claude_quota.mode must be keep or burn")
+    if type(quota.get("keep_percent")) is not int or not 1 <= quota["keep_percent"] <= 100:
+        raise ConfigError("claude_quota.keep_percent must be an integer from 1 to 100")
     tiers = values["tiers"]
     if not isinstance(tiers, dict) or set(tiers) != {"s", "m", "l"}:
         raise ConfigError("tiers must define s, m, and l")
