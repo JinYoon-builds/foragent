@@ -26,7 +26,7 @@ def test_exact_defaults(repo):
         "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "run_hours": "always",
-        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "base_branch": "main",
+        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "tick_failure_alert": 3,
         "repo": None, "board": None, "board_map": None, "language": "en", "codex_goal": False, "review_level": "low",
@@ -381,3 +381,13 @@ def test_committed_config_keeps_local_repo_and_base_and_names_them(tmp_path):
 def test_committed_config_missing_or_invalid_falls_back(tmp_path, content):
     from foragent.config import Config, load_committed_config
     assert load_committed_config(Config(), content, "origin/main:.foragent.yml", tmp_path / "none.yml") == (None, [])
+
+
+@pytest.mark.parametrize("value", [2, 0, "1", True])
+def test_merge_turn_size_is_one_until_merge_groups(repo, value):
+    assert load_config(repo).merge_turn_size == 1
+    (repo / ".foragent.yml").write_text(yaml.safe_dump({"merge_turn_size": 1}), encoding="utf-8")
+    assert load_config(repo).merge_turn_size == 1
+    (repo / ".foragent.yml").write_text(yaml.safe_dump({"merge_turn_size": value}), encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"merge_turn_size must be 1 until merge groups \(#459\)"):
+        load_config(repo)

@@ -73,6 +73,8 @@ def _validate(values: dict[str, Any]) -> None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
+    if type(values["merge_turn_size"]) is not int or values["merge_turn_size"] != 1:
+        raise ConfigError("merge_turn_size must be 1 until merge groups (#459)")
     review_perspectives.validate(values, ConfigError)
     from foragent.order_perspectives import SEATS
     seats = values["perspectives"]

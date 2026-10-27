@@ -184,14 +184,20 @@ def test_reviewed_head_waits_unlocked_and_rechecks_inside_final_lock(run_case, m
     monkeypatch.setattr(case.tracker, "pr_checks", checks)
     monkeypatch.setattr(case.tracker, "merge_pr", merge_pr)
     case.ctx.sleep = sleep
-    expected = {None: "merged", "base": "base-changed", "policy": "held", "approval": "hash-mismatch"}[change]
+    # A moved base is merged in and re-verified on the turn, not a stop (#712).
+    expected = {None: "merged", "base": "merged", "policy": "held", "approval": "hash-mismatch"}[change]
     assert runner.review_only(1, case.ctx, verdict_head=head if verdict else None) == expected
     assert False in guards and True in guards
     record = case.store.get_run(1)
     assert record.last_review_pass_at == accepted_at.isoformat()
     assert record.waited_seconds == 19
-    assert record.review_pass_to_merge_seconds == (51 if change is None else None)
-    assert record.merge_lock_held_seconds == (2 if change is None else None)
+    merged = change in {None, "base"}
+    assert record.review_pass_to_merge_seconds == (51 if merged else None)
+    assert record.merge_lock_held_seconds == (2 if merged else None)
+    if change == "base":
+        log = case.store.log_path(1).read_text()
+        assert log.count("re-verifying") == 1, "The moved base is merged in and re-verified once"
+        assert case.tracker.merged_prs == [2]
 
 
 def test_batch_child_uses_short_lock_and_records_hold_without_reviewer_pass(run_case, monkeypatch):

@@ -117,6 +117,9 @@ def run_case(git_history, tmp_path, monkeypatch):
                 source, destination = branch.split(":", 1)
                 sha = git_command(root, "rev-parse", source)
                 git_command(git_history.origin, "fetch", str(root), f"{sha}:{destination}")
+                # Like GitHub, a push to a PR's head branch moves the PR head (review-only refresh, #712).
+                if destination.startswith("refs/heads/") and (pr := tracker.find_pr(destination[11:])):
+                    tracker.set_pr_head_sha(pr, sha)
             else:
                 git_command(git_history.origin, "fetch", str(root), f"+refs/heads/{branch}:refs/heads/{branch}")
                 pr = tracker.find_pr(branch) or max(tracker.issues) + 1
