@@ -121,3 +121,52 @@ def test_codex_executor_keeps_events_at_a_named_path(tmp_path, monkeypatch):
     executors.CodexExecutor().run(worktree=tmp_path, prompt="p", model=None, timeout_s=1,
                                   log_path=tmp_path / "log", events_path=events)
     assert "thread.started" in events.read_text()
+
+
+def _project(tmp_path, *, agent=False, skill=None, memory=False):
+    root = tmp_path / "project"
+    root.mkdir()
+    if agent:
+        (root / ".claude/agents").mkdir(parents=True)
+        (root / orch_architect.AGENT).write_text("---\nname: fa-architect\n---\n")
+    if skill is not None:
+        path = root / skill
+        path.parent.mkdir(parents=True)
+        path.write_text(f"skill text from {skill}\n")
+    if memory:
+        (root / orch_architect.MEMORY).parent.mkdir(parents=True)
+    return root
+
+
+def test_claude_architect_names_its_agent_only_when_the_project_has_it(tmp_path):
+    store = StateStore(tmp_path / "state")
+    plain = _project(tmp_path)
+    assert "agent" not in orch_architect.session_options(Config(executor="claude"), store, plain)
+    plain.rename(tmp_path / "old")
+    root = _project(tmp_path, agent=True)
+    assert orch_architect.session_options(Config(executor="claude"), store, root)["agent"] == "fa-architect"
+    assert "Follow your fa-architect skill" in orch_architect.build_prompt("why", root, "claude")
+
+
+def test_codex_architect_writes_memory_and_reads_the_project_skill_first(tmp_path):
+    store = StateStore(tmp_path / "state")
+    root = _project(tmp_path, skill=".claude/skills/fa-architect/SKILL.md", memory=True)
+    (root / orch_architect.SKILL).parent.mkdir(parents=True)
+    (root / orch_architect.SKILL).write_text("packaged copy\n")
+    options = orch_architect.session_options(Config(executor="codex"), store, root)
+    assert options["add_dirs"] == (store.root, root / ".claude/agent-memory/fa-architect")
+    prompt = orch_architect.build_prompt("why", root, "codex")
+    assert "skill text from .claude/skills/fa-architect/SKILL.md" in prompt and "packaged copy" not in prompt
+
+
+def test_codex_architect_without_a_skill_keeps_only_the_pointer(tmp_path):
+    root = _project(tmp_path)
+    prompt = orch_architect.build_prompt("why", root, "codex")
+    assert orch_architect.SKILL in prompt and orch_architect.REFACTOR in prompt
+    assert "one proposal per file or concern" not in prompt.casefold()
+
+
+def test_role_skills_contain_no_symlinks_so_skill_install_accepts_them():
+    root = Path(__file__).resolve().parents[1] / "skills"
+    for name in ("fa-architect", "fa-orchestrator"):
+        assert not [path for path in (root / name).rglob("*") if path.is_symlink()], name

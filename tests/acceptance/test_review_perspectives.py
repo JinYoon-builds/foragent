@@ -14,7 +14,7 @@ from test_risk_map import copy_history, entry, offline, risk_case
 from test_skills_autosync import isolated_home
 
 
-NAMES = ("security", "concurrency", "failure", "compatibility", "realism", "docs")
+NAMES = ("security", "concurrency", "failure", "compatibility", "realism", "docs", "performance")
 THEMES = (
     ("spoof", "tamper", "provenance"),
     ("race", "toctou", "stale"),
@@ -22,6 +22,7 @@ THEMES = (
     ("old data", "existing install", "old config"),
     ("real environment", "api", "fake"),
     ("behaviour", "readme", "docs/**", "skills", "same pr"),
+    ("hot path", "repeated", "unbounded"),
 )
 # Project overrides give prompt assertions distinct, known focus texts without
 # importing the missing API during collection or deriving the oracle from it.
@@ -93,7 +94,7 @@ def test_review_perspectives_defaults_have_exact_order_and_required_focus():
 def test_review_perspectives_project_appends_and_overrides_in_place(tmp_path):
     override = {"name": "security", "focus": "PROJECT-SECURITY: verify signed input provenance"}
     path = tmp_path / ".foragent.yml"
-    # Put the addition first in YAML: it must still follow all six defaults.
+    # Put the addition first in YAML: it must still follow all seven defaults.
     path.write_text(yaml.safe_dump({
         "review_perspectives": [PROJECT, override], "review_reviewers": 3,
     }), encoding="utf-8")

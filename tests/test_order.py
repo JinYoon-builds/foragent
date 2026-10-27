@@ -809,6 +809,16 @@ def test_context_all_sections_and_gate_groups(tmp_path):
     assert "npm test" in order.context(tmp_path, config, tracker)["repo"]["test_commands"]
 
 
+def test_context_lane_skills_come_only_from_configuration(tmp_path):
+    # D95: configured skills: [] stays empty even when the agent frontmatter lists a stale skill.
+    (tmp_path / ".claude/agents").mkdir(parents=True)
+    (tmp_path / ".claude/agents/fa-api.md").write_text("---\nname: fa-api\nskills: [stale]\n---\nRules.\n")
+    config = Config(lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": []},
+                           "web": {"paths": ["web/**"], "agent": "fa-api"}})
+    lanes = order.context(tmp_path, config, FakeTracker())["lanes"]
+    assert lanes["api"]["skills"] == [] and lanes["web"]["skills"] == []
+
+
 def test_order_cli_context_and_publish_dry_run(publishing, plan, monkeypatch, capsys):
     root, config, tracker, git, events = publishing
     monkeypatch.setattr(cli, "load_config", lambda root: config)
@@ -1090,7 +1100,9 @@ def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_pa
     (repo / ".claude/agents/fa-api.md").write_text("---\nname: fa-api\nskills: [polish]\n---\nAPI lane rules.\n")
     (repo / ".claude/skills/polish").mkdir(parents=True)
     (repo / ".claude/skills/polish/SKILL.md").write_text("---\nname: polish\ndescription: Polish text\n---\nBody\n")
-    settings = {"paths": ["api/**"], "agent": "fa-api", **({"model": lane_model} if lane_model else {})}
+    # D95: lane skills come from the configuration; the agent frontmatter mirrors it.
+    settings = {"paths": ["api/**"], "agent": "fa-api", "skills": ["polish"],
+                **({"model": lane_model} if lane_model else {})}
     tiers = {"s": {"codex_effort": "medium", "claude_model": "small-model"},
              "m": {"codex_effort": "high", "claude_model": "tier-m-model"},
              "l": {"codex_effort": "xhigh", "claude_model": "large-model"}}
@@ -1238,7 +1250,8 @@ def test_perspectives_rerun_replaces_questions_and_keeps_existing_marks(tmp_path
     from foragent.executors import ExecResult
     from foragent.state import StateStore
 
-    answers = iter(["First\nSecond"] * 6 + ["Only"] * 6)
+    seats = len(order_perspectives.SEATS)
+    answers = iter(["First\nSecond"] * seats + ["Only"] * seats)
 
     class Worker:
         def run(self, **kwargs):
@@ -1253,7 +1266,7 @@ def test_perspectives_rerun_replaces_questions_and_keeps_existing_marks(tmp_path
     order_perspectives.mark(store, ids[0], True)
     order_perspectives.mark(store, ids[1], True)
     again = order_perspectives.run({"id": "p"}, tmp_path, Config(), store)
-    assert again["plan_hash"] == first["plan_hash"] and len(again["questions"]) == 6
+    assert again["plan_hash"] == first["plan_hash"] and len(again["questions"]) == seats
     rows = order_perspectives.stats(store)["perspectives"]
     assert rows["skeptic"] == {"asked": 1, "changed": 1}
     with pytest.raises(order.PlanError):
@@ -1309,6 +1322,7 @@ def test_perspectives_korean_config_yields_korean_questions_end_to_end(tmp_path,
     import shutil
     from foragent import executors
     from foragent.executors import ExecResult
+    from foragent.order_perspectives import SEATS
 
     (tmp_path / ".foragent.yml").write_text(yaml.safe_dump({"repo": "owner/repo", "language": "ko"}))
     (tmp_path / "PLAN.json").write_text(json.dumps({"id": "p", "title": "복구"}), encoding="utf-8")
@@ -1328,11 +1342,12 @@ def test_perspectives_korean_config_yields_korean_questions_end_to_end(tmp_path,
     argv = ["order", "perspectives", str(tmp_path / "PLAN.json"), "--repo-root", str(tmp_path)]
     assert cli.main(argv) == 0
     out = capsys.readouterr().out
-    assert len(prompts) == 6
-    assert out.count("선택한 언어를 유지해야 하나요?") == 6 and "Keep the locale?" not in out
+    assert len(prompts) == len(SEATS)
+    assert out.count("선택한 언어를 유지해야 하나요?") == len(SEATS) and "Keep the locale?" not in out
     labels = {line.split(" (", 1)[0] for line in out.splitlines() if " (" in line}
-    assert labels == {"회의론자", "처음 쓰는 사람", "공격자", "운영자", "6개월 뒤 유지보수자", "사고 기록"}
-    assert "질문 6개" in out
+    assert labels == {"회의론자", "처음 쓰는 사람", "공격자", "운영자", "6개월 뒤 유지보수자", "사고 기록",
+                      "다른 사용자"}
+    assert f"질문 {len(SEATS)}개" in out
     assert cli.main([*argv, "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["language"] == "ko" and {q["language"] for q in payload["questions"]} == {"ko"}

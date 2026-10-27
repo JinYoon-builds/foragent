@@ -77,11 +77,9 @@ def test_note_location_keeps_an_explicit_orca_title_without_a_handle():
     assert orch_inbox.note_location({"FORAGENT_ORCH_TITLE": "t"}) == {"kind": "terminal"}
 
 
-def test_box_width_changes_only_on_screens_of_140_cells_or_more():
-    from foragent.watch_layout import _widths
-
-    # Orchestrator decision 2026-10-27 (Q1=A): 140+ cells get a fixed 36-cell box; narrower keeps today's.
-    assert _widths(99)[:3] == (False, 99, 99)
-    assert _widths(100)[1] == 28 and _widths(139)[1] == 28
-    assert _widths(140)[1] == 36 and _widths(160)[1] == 36
-    assert _widths(160)[3:] == (94, 64), "the work table and events keep their widths"
+def test_box_stands_beside_the_sections_only_on_screens_of_140_cells_or_more():
+    # Orchestrator decision 2026-10-27 (Q1=A): 140+ cells get a fixed 36-cell box; narrower stacks it.
+    assert orch_panel.SIDE == 140
+    assert orch_panel.box_width(99) == 60 and orch_panel.box_width(139) == 60
+    assert orch_panel.box_width(140) == 36 and orch_panel.box_width(160) == 36
+    assert orch_panel.box_width(40) == 40

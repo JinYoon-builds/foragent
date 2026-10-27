@@ -36,9 +36,9 @@ def _run_row(git_history, tmp_path, monkeypatch, *, phase, runner_minutes,
 
 
 @pytest.mark.parametrize("phase,language,phase_minutes,age", [
-    pytest.param("checking", "en", 12, "12 min", id="checking-en"),
-    pytest.param("ci", "en", 5, "5 min", id="ci-en"),
-    pytest.param("checking", "ko", 12, "12분", id="checking-ko"),
+    pytest.param("checking", "en", 12, "30m", id="checking-en"),
+    pytest.param("ci", "en", 5, "30m", id="ci-en"),
+    pytest.param("checking", "ko", 12, "30분", id="checking-ko"),
 ])
 def test_waiting_with_fresh_runner_shows_localized_phase_and_age(
     git_history, tmp_path, monkeypatch, phase, language, phase_minutes, age,
@@ -46,7 +46,8 @@ def test_waiting_with_fresh_runner_shows_localized_phase_and_age(
     row = _run_row(git_history, tmp_path, monkeypatch, phase=phase,
                    runner_minutes=1, language=language, phase_minutes=phase_minutes)
     stalled = MESSAGES[language]["watch_stalled"].partition("{minutes}")[0].strip()
-    missing = [label for label in (text(phase, language), age) if label not in row]
+    # Lane rows show the unified phase word and the worker's total elapsed age.
+    missing = [label for label in (text(f"squirrel_{phase}", language), age) if label not in row]
     assert not missing and stalled not in row, (
         f"Fresh runner in {phase}: missing phase/age {missing!r}; "
         f"stalled={stalled in row}; row={row}"

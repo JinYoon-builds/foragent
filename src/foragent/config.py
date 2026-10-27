@@ -90,6 +90,8 @@ class Config:
     upstream_reports: bool | None = None
     # Order perspective seat -> executor (#414); unnamed seats use the built-in split.
     perspectives: dict[str, str] = field(default_factory=dict)
+    # Lane view glyphs (#167): emoji, ascii, or auto (ascii on dumb/linux terminals or non-UTF-8 locales).
+    view_glyphs: str = "auto"
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
