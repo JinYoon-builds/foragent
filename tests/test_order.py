@@ -809,6 +809,16 @@ def test_context_all_sections_and_gate_groups(tmp_path):
     assert "npm test" in order.context(tmp_path, config, tracker)["repo"]["test_commands"]
 
 
+def test_context_lane_skills_come_only_from_configuration(tmp_path):
+    # D95: configured skills: [] stays empty even when the agent frontmatter lists a stale skill.
+    (tmp_path / ".claude/agents").mkdir(parents=True)
+    (tmp_path / ".claude/agents/fa-api.md").write_text("---\nname: fa-api\nskills: [stale]\n---\nRules.\n")
+    config = Config(lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": []},
+                           "web": {"paths": ["web/**"], "agent": "fa-api"}})
+    lanes = order.context(tmp_path, config, FakeTracker())["lanes"]
+    assert lanes["api"]["skills"] == [] and lanes["web"]["skills"] == []
+
+
 def test_order_cli_context_and_publish_dry_run(publishing, plan, monkeypatch, capsys):
     root, config, tracker, git, events = publishing
     monkeypatch.setattr(cli, "load_config", lambda root: config)
@@ -1090,7 +1100,9 @@ def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_pa
     (repo / ".claude/agents/fa-api.md").write_text("---\nname: fa-api\nskills: [polish]\n---\nAPI lane rules.\n")
     (repo / ".claude/skills/polish").mkdir(parents=True)
     (repo / ".claude/skills/polish/SKILL.md").write_text("---\nname: polish\ndescription: Polish text\n---\nBody\n")
-    settings = {"paths": ["api/**"], "agent": "fa-api", **({"model": lane_model} if lane_model else {})}
+    # D95: lane skills come from the configuration; the agent frontmatter mirrors it.
+    settings = {"paths": ["api/**"], "agent": "fa-api", "skills": ["polish"],
+                **({"model": lane_model} if lane_model else {})}
     tiers = {"s": {"codex_effort": "medium", "claude_model": "small-model"},
              "m": {"codex_effort": "high", "claude_model": "tier-m-model"},
              "l": {"codex_effort": "xhigh", "claude_model": "large-model"}}
