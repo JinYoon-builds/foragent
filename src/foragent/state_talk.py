@@ -113,33 +113,42 @@ class TalkRecordsMixin:
                  if event["kind"] == TALK_CLOSED and event.get("run_started_at") == run.started_at]
         return max(times) if times else None
 
-    def talk_regions(self, run: Run) -> list[tuple[datetime, datetime | None]]:
-        """Each live talk of this run as (start, end): closed at its talk-closed event, superseded at
-        the next live talk-opened event, or still open (None)."""
+    def talk_regions(self, run: Run, finished_at: str | None = None) -> list[tuple[datetime, datetime | None]]:
+        """Each live talk of this run as (start, end), clipped to the run's own lifetime.
+
+        A talk ends at its talk-closed event, at the next live talk-opened event, or stays open
+        (None: up to now). Every boundary is held inside the run: nothing before ``started_at``,
+        and for a finished run nothing after ``finished_at``, whether the later time came from a
+        superseding event, a delayed talk-closed event or a talk opened as the run finished. A
+        finished run without a recorded finish time drops a talk that never ended.
+        """
         events = self.talk_events(run.number)
         closed = {talk_identity(event): event["at"] for event in events if event["kind"] == TALK_CLOSED}
         opened = self.live_events(run)
+        began = _state.datetime.fromisoformat(run.started_at)
+        finish = _state.datetime.fromisoformat(finished_at) if finished_at else None
         regions = []
         for index, event in enumerate(opened):
-            end = closed.get(talk_identity(event)) or (opened[index + 1]["at"] if index + 1 < len(opened) else None)
-            regions.append((_state.datetime.fromisoformat(event["at"]),
-                            _state.datetime.fromisoformat(end) if end else None))
+            stop = closed.get(talk_identity(event)) or (opened[index + 1]["at"] if index + 1 < len(opened) else None)
+            start = max(_state.datetime.fromisoformat(event["at"]), began)
+            end = _state.datetime.fromisoformat(stop) if stop else None
+            if run.status != "running":
+                if finish is None and end is None:
+                    continue
+                end = min(end or finish, finish or end)
+            if end is None or end > start:
+                regions.append((start, end))
         return regions
 
     def _with_talk(self, run: Run | None, finished_at: str | None = None) -> Run | None:
-        """The run with its derived talk; a finished run never talks, and its unclosed talk ends
-        at its finish time (without one recorded, an unclosed talk adds nothing)."""
+        """The run with its derived talk; a finished run never talks, and its talks end by its finish."""
         if run is None:
             return run
-        regions = self.talk_regions(run)
         if run.status == "running":
             current, _ = self.talk_state(run)
             if current is not None:
                 object.__setattr__(run, "_talk_since", current["at"])
-        else:
-            end = _state.datetime.fromisoformat(finished_at) if finished_at else None
-            regions = [(start, stop or end) for start, stop in regions if stop or end]
-        object.__setattr__(run, "_talk_regions", regions)
+        object.__setattr__(run, "_talk_regions", self.talk_regions(run, finished_at))
         return run
 
     def close_talk(self, number: int, event: dict, closed_at: datetime) -> Run | None:

@@ -420,9 +420,10 @@ def test_runner_extends_every_command_timeout_by_the_runs_pause(store, monkeypat
     monkeypatch.setattr(runner.board, "sync_status", lambda *a, **kw: None)
     monkeypatch.setattr(runner, "kick_tick", lambda root: None)
     store.update_run(1, waited_seconds=12)
-    talk_event(store, NOW - timedelta(seconds=30))
-    ctx = runner.RunContext("owner/repo", Path("."), FakeTracker(now=lambda: NOW), store, config(),
-                            SimpleNamespace(remove_worktree=lambda path: None), now=lambda: NOW)
+    talk_event(store, NOW)  # Open since the run began; the run's clock is 30 s later.
+    later = NOW + timedelta(seconds=30)
+    ctx = runner.RunContext("owner/repo", Path("."), FakeTracker(now=lambda: later), store, config(),
+                            SimpleNamespace(remove_worktree=lambda path: None), now=lambda: later)
     monkeypatch.setattr("foragent.run_implementation.lane_config", lambda config, lane: config)
     assert runner.run_issue(1, ctx) == "merged"
     assert seen == [42.0]
@@ -1160,3 +1161,36 @@ def test_the_runner_records_the_live_session_through_its_executor_loop(run_case)
     assert seen == ["live-thread"]
     c.store.finish_run(1, "merged")
     c.tracker.remove_labels(1, ["running"])
+
+
+def _finished_run_pause(tmp_path, *opened, closed=None, finish_after=300):
+    """A run that started at NOW and finished ``finish_after`` seconds later, with given live talks."""
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    events = [talk_event(store, NOW + timedelta(seconds=at), handle=f"term_{at}") for at in opened]
+    if closed is not None:
+        event, at = events[closed[0]], closed[1]
+        append_event(store, NOW + timedelta(seconds=at), 1, "talk-closed", "Talk closed for #1",
+                     run_started_at=event["run_started_at"], executor="codex", handle=event["handle"])
+    clock[0] = NOW + timedelta(seconds=finish_after)
+    store.finish_run(1, "merged")
+    return store.get_run(1).talk_pause_seconds(NOW + timedelta(hours=1))
+
+
+def test_a_talk_superseded_after_the_run_finished_counts_only_up_to_the_finish(tmp_path):
+    # Talk A from 0; the run finishes at 300; a replacement opened at 310 (during a slow launch).
+    assert _finished_run_pause(tmp_path, 0, 310) == 300
+
+
+def test_a_talk_closed_after_the_run_finished_counts_only_up_to_the_finish(tmp_path):
+    assert _finished_run_pause(tmp_path, 0, closed=(0, 400)) == 300
+
+
+def test_a_talk_opened_after_the_run_finished_adds_nothing(tmp_path):
+    assert _finished_run_pause(tmp_path, 100, 350, closed=(0, 150)) == 50
+
+
+def test_a_running_runs_talk_never_counts_before_its_start(store):
+    talk_event(store, NOW - timedelta(seconds=60))  # A clock that ran ahead of the run's start.
+    assert store.get_run(1).talk_pause_seconds(NOW + timedelta(seconds=30)) == 30
