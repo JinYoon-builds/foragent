@@ -317,8 +317,6 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
     assert c.tracker.merged_prs == []
     events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
     assert events[-1]["kind"] == entry
-    if entry == "resolve":  # fa brief --report counts a requeued resolve as a hold returned to ready.
-        assert events[-1]["requeued"] is (failure in {"checks", "ci"})
     assert any(comment.body == "<!-- foragent:orch -->\n" + events[-1]["summary"]
                for comment in c.tracker.list_comments(1))
 

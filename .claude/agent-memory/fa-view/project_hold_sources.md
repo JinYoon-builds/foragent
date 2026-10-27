@@ -1,14 +1,14 @@
 ---
 name: project-hold-sources
-description: Where blocked/needs-human holds and returns to ready are recorded with a time (#756 fa brief --report)
+description: fa brief --report (#756) hold/resolution rule — orch-events.jsonl only, never overwritten snapshots
 metadata:
   type: project
 ---
 
-#756 `brief_report._resolved_holds` pairs every timed hold record with every timed return to ready.
-- 보류 시작: 사건 `escalate`·`retries-exceeded`·`orchestrator-timeout`·`stalled`(두 경로 모두 blocked) + `flags/<n>.json`의 `flagged_at`(`actions.flag`가 blocked 붙일 때마다 씀).
-- ready 복귀: 사건 `retry`·`crash-restart`·`stall-restart`, `resolve`의 `requeued: true`(orch.resolve가 `_retry`를 부를 때 기록), `approvals/<n>.json`의 `approved_at`, gate 머지.
-- 기록 없는 경로(runner SystemExit blocked, GitHub에서 직접 라벨 변경)는 REBUTTAL로 남김.
+#756 `brief_report._resolved_holds` reads holds and their ends only from the append-only `orch-events.jsonl` (spec update 2026-10-27).
+- Hold kinds: escalate, retries-exceeded, stalled, orchestrator-timeout, parked. A hold may be older than the window.
+- Resolving kinds: retry, resolve, unparked, or a gate merge (`presence.gate_merges`, the statusline's source). Only the end must be inside the window (`since < t <= now`); the latest end's say wins, else a default sentence (merge: "merged").
+- A merged issue with a resolved hold appears once, under holds resolved. Report time `<state>/report.json`; missing/broken/future → last 24 h.
 
-**Why:** 리뷰가 종류 목록 누락(stalled, resolve)을 "결함 종류"로 지적함. 사건 종류만 보지 말고 라벨을 붙이는 모든 producer(`grep add_labels(... BLOCKED|NEEDS_HUMAN|READY`)를 대조해야 함.
-**How to apply:** 사건 기록에서 상태 변화를 추론할 때는 그 상태를 쓰는 모든 코드 경로를 먼저 나열하고, 시각 있는 기록이 있는지 확인한다.
+**Why:** Earlier attempts read `flags/*.json` and approval records. Reviewers rejected them twice: flags keep only the latest flag (they lose history), and approvals are saved before prerequisites (they are not proof of ready). Jin's spec then fixed the sources.
+**How to apply:** Rebuild history only from append-only journals. Never read overwritten snapshots (flags, approvals, labels, runs/<n>.json state) to decide *when* something happened. When the spec lists event kinds, use exactly those.

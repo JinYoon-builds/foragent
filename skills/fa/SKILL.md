@@ -21,7 +21,12 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    the big squirrel and a greeting. Show both exactly as printed (the squirrel in a code
    block), then let the greeting lead into the setup interview.
 
-2. **Brief.** Run `fa brief --json` in the project folder for the facts behind the choices.
+   The report makes no GitHub call. When an update is available it ends with the update
+   line from the last daily check; relay it as written.
+
+2. **Brief.** Run `FORAGENT_UPDATE_CHECK=off fa brief --json` in the project folder for the
+   facts behind the choices. The switch keeps `/fa` offline: the report already carries
+   the update line, so this second command must not look up a release.
    - If it prints `"setup": false` (no config in this folder), follow the init flow after
      the greeting: read `skills/fa-init/SKILL.md` (the `fa-init` skill) and do it.
      Stop this skill there.

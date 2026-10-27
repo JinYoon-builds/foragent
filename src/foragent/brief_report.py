@@ -2,7 +2,7 @@
 
 Reads local state only: gate merge records, the orchestrator journal
 (orch-events.jsonl), the question box, the orchestrator note and the issue
-snapshot. The report command is the only writer of the report time
+snapshot (for titles and open needs-human issues). The report command is the only writer of the report time
 (``<state>/report.json``); the first report covers the last 24 hours.
 Notable findings are left out until a recorded source exists.
 """
@@ -16,24 +16,26 @@ from typing import Any
 
 from foragent import orch_inbox, presence, watch_art
 from foragent.i18n import text
+from foragent.labels import NEEDS_HUMAN
+from foragent.update_check import offer_line
 from foragent.state import StateStore
 
 REPORT_FILE = "report.json"
 FIRST_WINDOW = timedelta(hours=24)
-# Every recorded start of a hold (blocked or needs-human): these journal kinds, plus the
-# flags/<n>.json time that actions.flag writes whenever it labels an issue blocked.
-HOLD_KINDS = frozenset({"escalate", "retries-exceeded", "orchestrator-timeout", "stalled"})
-# Every recorded return to ready: these journal kinds, a resolve event that requeued the
-# issue, a new approval (approvals/<n>.json) and a gate merge.
-READY_KINDS = frozenset({"retry", "crash-restart", "stall-restart"})
+# Holds and their ends come from the append-only orch-events.jsonl only (overwritten
+# snapshots lose earlier holds). A merge from the gate's merge records also ends a hold.
+HOLD_KINDS = frozenset({"escalate", "retries-exceeded", "stalled", "orchestrator-timeout", "parked"})
+RESOLVING_KINDS = frozenset({"retry", "resolve", "unparked"})
 
 
-def last_report(store: StateStore) -> datetime | None:
+def last_report(store: StateStore, now: datetime) -> datetime | None:
+    """The previous report time; a missing, broken or future time counts as none."""
     try:
         value = json.loads((store.root / REPORT_FILE).read_text(encoding="utf-8"))["reported_at"]
-        return datetime.fromisoformat(value)
     except (OSError, ValueError, KeyError, TypeError):
         return None
+    at = _time(value)
+    return at if at is not None and at <= now else None
 
 
 def record_report(store: StateStore, now: datetime) -> None:
@@ -67,7 +69,7 @@ def _events(store: StateStore) -> list[dict[str, Any]]:
 
 
 def _merges(store: StateStore) -> dict[int, datetime]:
-    """Each issue's latest gate merge time (an execution's own merge only)."""
+    """Each issue's latest gate merge (record_merge's merged_at), the source the statusline counts."""
     merges: dict[int, datetime] = {}
     for (number, started), value in presence.gate_merges(store).items():
         at, start = _time(value), _time(started)
@@ -76,47 +78,31 @@ def _merges(store: StateStore) -> dict[int, datetime]:
     return merges
 
 
-def _record_time(path, key: str) -> datetime | None:
-    try:
-        return _time(json.loads(path.read_text(encoding="utf-8")).get(key))
-    except (OSError, ValueError, AttributeError):
-        return None
-
-
-def _resolved_holds(store: StateStore, events: list[dict[str, Any]], merges: dict[int, datetime],
+def _resolved_holds(events: list[dict[str, Any]], merges: dict[int, datetime],
                     inside) -> dict[int, tuple[str, str | None]]:
-    """Issues whose hold ended inside the window: how it ended (event, approved, merged) and the event's line."""
-    holds: dict[int, datetime] = {}
+    """Issues with a hold event (of any age) and a later resolving event inside the window.
 
-    def held(number: Any, at: datetime | None) -> None:
-        if isinstance(number, int) and at is not None:
-            holds[number] = min(at, holds.get(number, at))
-
+    The value is the latest resolving event's kind ("merge" for a merge) and its say line,
+    None when it has none (the report then uses a default sentence). Earlier holds are kept: a later hold does not hide them.
+    """
+    first_hold: dict[int, datetime] = {}
     for event in events:
-        if event.get("kind") in HOLD_KINDS:
-            held(event.get("issue"), event["at"])
-    for path in (store.root / "flags").glob("*.json"):
-        if path.stem.isdigit():
-            held(int(path.stem), _record_time(path, "flagged_at"))
-    returns: dict[int, list[tuple[datetime, str, str | None]]] = {}
-    for event in events:
-        if event.get("kind") in READY_KINDS or (event.get("kind") == "resolve" and event.get("requeued") is True):
-            returns.setdefault(event.get("issue"), []).append((event["at"], "event", event.get("say") or event["summary"]))
-    for number in holds:
-        if (approved := _record_time(store.root / "approvals" / f"{number}.json", "approved_at")) is not None:
-            returns.setdefault(number, []).append((approved, "approved", None))
-        if number in merges:
-            returns.setdefault(number, []).append((merges[number], "merged", None))
+        if event.get("kind") in HOLD_KINDS and isinstance(number := event.get("issue"), int):
+            first_hold[number] = min(event["at"], first_hold.get(number, event["at"]))
     resolved = {}
-    for number, start in holds.items():
-        ended = [item for item in returns.get(number, []) if item[0] > start and inside(item[0])]
-        if ended:
-            resolved[number] = max(ended, key=lambda item: item[0])[1:]
+    for number, held in first_hold.items():
+        ends = [(event["at"], event["kind"], event.get("say")) for event in events
+                if event.get("issue") == number and event.get("kind") in RESOLVING_KINDS]
+        if number in merges:
+            ends.append((merges[number], "merge", None))
+        ends = [end for end in ends if end[0] > held and inside(end[0])]
+        if ends:
+            resolved[number] = max(ends, key=lambda end: end[0])[1:]
     return resolved
 
 
 def collect(store: StateStore, now: datetime) -> dict[str, Any]:
-    since = last_report(store) or now - FIRST_WINDOW
+    since = last_report(store, now) or now - FIRST_WINDOW
 
     def inside(at: datetime) -> bool:
         return since < at <= now
@@ -124,16 +110,17 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
     merges = _merges(store)
     titles = {row["number"]: row.get("title") for row in store.local_issues()}
     events = _events(store)
+    holds = _resolved_holds(events, merges, inside)
+    resolved = [{"issue": number, "by": by, "say": say} for number, (by, say) in sorted(holds.items())]
+    # A merged issue whose hold was resolved appears once, under holds resolved.
     merged = [{"issue": number, "title": titles.get(number)}
-              for number, at in sorted(merges.items()) if inside(at)]
-    resolved = [{"issue": number, "via": via, "line": line}
-                for number, (via, line) in sorted(_resolved_holds(store, events, merges, inside).items())]
+              for number, at in sorted(merges.items()) if inside(at) and number not in holds]
     notes = [event for event in events if event.get("kind") == "note"
              and isinstance(event.get("say"), str) and event["say"].strip()]
     note = orch_inbox.read_note(store) or {}
     runs = store.active_runs()
     person = sorted(row["number"] for row in store.local_issues()
-                    if row.get("state") == "open" and presence.PERSON_LABELS & set(row.get("labels") or ()))
+                    if row.get("state") == "open" and NEEDS_HUMAN in (row.get("labels") or ()))
     return {
         "since": since.isoformat(),
         "judgment": notes[-1]["say"] if notes else None,
@@ -158,7 +145,8 @@ def render(report: dict[str, Any], language: str = "en") -> str:
         lines.append(text("brief_report_finished", language))
         lines += [text("brief_report_merged", language, issue=issue(item)) for item in report["merged"]]
         lines += [text("brief_report_resolved", language, issue=f"#{item['issue']}",
-                       line=item["line"] or text(f"brief_report_resolved_{item['via']}", language))
+                       line=item["say"] or text("brief_report_resolved_merged" if item["by"] == "merge"
+                                                 else "brief_report_resolved_default", language))
                   for item in report["resolved"]]
     else:
         lines.append(text("brief_report_nothing_finished", language))
@@ -166,7 +154,7 @@ def render(report: dict[str, Any], language: str = "en") -> str:
     lines.append(f"{now} · {report['now']}" if report["now"] else now)
     if not turns:
         lines.append(text("brief_report_nothing_needed", language))
-        return "\n".join(lines)
+        return "\n".join(lines + _update(report, language))
     lines.append(text("brief_report_your_turn", language))
     recommended = text("brief_report_recommended", language)
     for question in report["questions"]:
@@ -175,7 +163,13 @@ def render(report: dict[str, Any], language: str = "en") -> str:
             for index, option in enumerate(question.get("options") or [], 1))
         lines.append(f"- {question['question']}" + (f" {choices}" if choices else ""))
     lines += [text("brief_report_person_issue", language, issue=issue(item)) for item in report["person_issues"]]
-    return "\n".join(lines)
+    return "\n".join(lines + _update(report, language))
+
+
+def _update(report: dict[str, Any], language: str) -> list[str]:
+    """The cached update offer as the report's last line, when there is one."""
+    offer = report.get("update")
+    return [offer_line(offer, language)] if offer else []
 
 
 def welcome(language: str = "en", *, colour: bool | None = None) -> str:
