@@ -1250,7 +1250,8 @@ def test_perspectives_rerun_replaces_questions_and_keeps_existing_marks(tmp_path
     from foragent.executors import ExecResult
     from foragent.state import StateStore
 
-    answers = iter(["First\nSecond"] * 6 + ["Only"] * 6)
+    seats = len(order_perspectives.SEATS)
+    answers = iter(["First\nSecond"] * seats + ["Only"] * seats)
 
     class Worker:
         def run(self, **kwargs):
@@ -1265,7 +1266,7 @@ def test_perspectives_rerun_replaces_questions_and_keeps_existing_marks(tmp_path
     order_perspectives.mark(store, ids[0], True)
     order_perspectives.mark(store, ids[1], True)
     again = order_perspectives.run({"id": "p"}, tmp_path, Config(), store)
-    assert again["plan_hash"] == first["plan_hash"] and len(again["questions"]) == 6
+    assert again["plan_hash"] == first["plan_hash"] and len(again["questions"]) == seats
     rows = order_perspectives.stats(store)["perspectives"]
     assert rows["skeptic"] == {"asked": 1, "changed": 1}
     with pytest.raises(order.PlanError):
@@ -1321,6 +1322,7 @@ def test_perspectives_korean_config_yields_korean_questions_end_to_end(tmp_path,
     import shutil
     from foragent import executors
     from foragent.executors import ExecResult
+    from foragent.order_perspectives import SEATS
 
     (tmp_path / ".foragent.yml").write_text(yaml.safe_dump({"repo": "owner/repo", "language": "ko"}))
     (tmp_path / "PLAN.json").write_text(json.dumps({"id": "p", "title": "복구"}), encoding="utf-8")
@@ -1340,11 +1342,12 @@ def test_perspectives_korean_config_yields_korean_questions_end_to_end(tmp_path,
     argv = ["order", "perspectives", str(tmp_path / "PLAN.json"), "--repo-root", str(tmp_path)]
     assert cli.main(argv) == 0
     out = capsys.readouterr().out
-    assert len(prompts) == 6
-    assert out.count("선택한 언어를 유지해야 하나요?") == 6 and "Keep the locale?" not in out
+    assert len(prompts) == len(SEATS)
+    assert out.count("선택한 언어를 유지해야 하나요?") == len(SEATS) and "Keep the locale?" not in out
     labels = {line.split(" (", 1)[0] for line in out.splitlines() if " (" in line}
-    assert labels == {"회의론자", "처음 쓰는 사람", "공격자", "운영자", "6개월 뒤 유지보수자", "사고 기록"}
-    assert "질문 6개" in out
+    assert labels == {"회의론자", "처음 쓰는 사람", "공격자", "운영자", "6개월 뒤 유지보수자", "사고 기록",
+                      "다른 사용자"}
+    assert f"질문 {len(SEATS)}개" in out
     assert cli.main([*argv, "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["language"] == "ko" and {q["language"] for q in payload["questions"]} == {"ko"}
