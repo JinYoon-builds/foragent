@@ -368,7 +368,11 @@ def run_issue(n: int, ctx: RunContext) -> str:
         board.sync_status(ctx, n, "Running")
         from foragent.run_implementation import lane_config
 
-        ctx = replace(ctx, config=lane_config(ctx.config, run.lane))
+        from foragent.scheduler_quota import switched_config
+
+        # The implementer the tick stored at start (#107) holds for every attempt of this run.
+        ctx = replace(ctx, config=switched_config(lane_config(ctx.config, run.lane), run.implementer,
+                                                  ctx.store.executor_paused("claude", ctx.now())))
         try:
             outcome = _execute(n, ctx, worktree)
         finally:

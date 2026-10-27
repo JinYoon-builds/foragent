@@ -137,3 +137,22 @@ def acorn(number: int | None, done: bool) -> list[str]:
         foreground + "(" + body + foreground + ")" + reset,
         " " * left + foreground + "v" + reset + " " * (width - left - 1),
     ]
+
+
+def ansi_rows(grid: PixelGrid, palette: Mapping[str, int]) -> list[str]:
+    """half_blocks as xterm-256 ANSI text, one string per cell row, glyphs unchanged.
+
+    A None colour sets no SGR code, so that half shows the terminal's own colour.
+    Each painted cell resets afterwards; trailing transparent cells are dropped.
+    """
+    rows = []
+    for cells in half_blocks(grid, palette):
+        row = ""
+        for glyph, foreground, background in cells:
+            if glyph == " ":
+                row += glyph
+                continue
+            codes = [f"38;5;{foreground}"] * (foreground is not None) + [f"48;5;{background}"] * (background is not None)
+            row += f"\x1b[{';'.join(codes)}m{glyph}\x1b[0m"
+        rows.append(row.rstrip(" "))
+    return rows

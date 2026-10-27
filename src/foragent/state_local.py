@@ -132,6 +132,23 @@ class LocalRecordsMixin:
                                            ensure_ascii=False))
             self._atomic_write(path, "\n".join(lines[-USAGE_HISTORY_LINES:]) + "\n")
 
+    def claude_quota_mode(self) -> str | None:
+        """The local `fa quota mode` override, or None when none is stored or it is unreadable."""
+        try:
+            mode = _state.json.loads((self.root / "claude-quota.json").read_text(encoding="utf-8")).get("mode")
+        except (OSError, ValueError, AttributeError):
+            return None
+        return mode if mode in ("keep", "burn") else None
+
+    def set_claude_quota_mode(self, mode: str | None) -> None:
+        """Store (or with None remove) the local override; only `fa quota mode` writes it."""
+        path = self.root / "claude-quota.json"
+        with self._state_lock():
+            if mode is None:
+                path.unlink(missing_ok=True)
+            else:
+                self._write_json(path, {"mode": mode})
+
     def tidy_state(self) -> dict[str, Any]:
         try:
             return _state.json.loads((self.root / "tidy.json").read_text(encoding="utf-8"))
