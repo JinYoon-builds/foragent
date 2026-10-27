@@ -1,10 +1,16 @@
 from datetime import UTC, datetime, timedelta
+from contextlib import contextmanager
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from foragent import run_merge_turn as turn
 from foragent.config import Config
+from foragent.runner import run_issue
 from foragent.state import StateStore
+from runner_support import run_case  # noqa: F401
 
 
 NOW = datetime(2026, 10, 27, 12, tzinfo=UTC)
@@ -82,3 +88,78 @@ def test_waiting_run_sleeps_until_turn_or_time_budget(tmp_path, monkeypatch):
     assert ctx.store.get_run(2).phase == "merge-lock-wait"
     ctx.store.finish_run(1, outcome="crashed")
     assert turn.await_turn(2, ctx, second, "b") == (False, None)
+
+
+@pytest.mark.parametrize("leave", [False, True])
+def test_implementation_run_merges_without_withdrawing_and_withdraws_when_it_leaves(run_case, monkeypatch, leave):
+    c = run_case
+    lock = c.store.merge_lock
+
+    @contextmanager
+    def hold_on_turn():
+        if leave:  # A policy hold found after joining: the run leaves the ready state unmerged.
+            c.tracker.add_labels(1, ["risk:high"])
+        with lock():
+            yield
+
+    monkeypatch.setattr(c.store, "merge_lock", hold_on_turn)
+    outcome = run_issue(1, c.ctx)
+    events = [row["event"] for row in rows(c.ctx)]
+    if leave:
+        assert outcome == "held"
+        assert events == ["ready", "withdrawn"]
+    else:
+        assert outcome == "merged"
+        assert events == ["ready", "turn"], "A merged run keeps its entry until its run stops"
+
+
+def test_waiting_run_rechecks_ci_on_its_turn_and_withdraws_when_red(run_case, monkeypatch):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_retries=0)
+    ahead_live = queue_behind_live_run(c, monkeypatch)
+    c.tracker.set_pr_failed_logs(2, "Broke while waiting")
+    sleeps = []
+
+    def sleep(seconds):
+        # While run 1 waits, CI on its head turns red and the run ahead finishes.
+        sleeps.append(seconds)
+        c.tracker.set_pr_checks(2, "fail")
+        ahead_live[0] = False
+
+    c.ctx.sleep = sleep
+    assert run_issue(1, c.ctx) == "ci-failed"
+    assert len(sleeps) == 1, "A waiting run does not poll CI; it checks once it holds the turn"
+    assert c.tracker.merged_prs == []
+    own = [row["event"] for row in rows(c.ctx) if row["n"] == 1]
+    assert own == ["ready", "withdrawn"]
+
+
+def test_ci_wait_deadline_starts_when_the_turn_arrives(run_case, monkeypatch):
+    c = run_case
+    ahead_live = queue_behind_live_run(c, monkeypatch)
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if ahead_live[0]:
+            # A long turn wait (past the 1,200 s CI deadline); a rerun is pending afterwards.
+            c.now[0] += timedelta(minutes=25)
+            c.tracker.set_pr_checks(2, "pending")
+            ahead_live[0] = False
+        else:
+            c.now[0] += timedelta(seconds=seconds)
+            c.tracker.set_pr_checks(2, "pass")
+
+    c.ctx.sleep = sleep
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(sleeps) == 2
+    assert c.tracker.merged_prs == [2]
+
+
+def queue_behind_live_run(c, monkeypatch):
+    """Put a live run (#9) ahead in the queue; only its liveness is simulated."""
+    ahead_live = [True]
+    live = turn._live
+    monkeypatch.setattr(turn, "_live", lambda store, key: ahead_live[0] if key[0] == 9 else live(store, key))
+    turn.join(c.ctx, turn.Seat(9, "2026-10-20T08:00:00+00:00", "main"), "a" * 40)
+    return ahead_live
