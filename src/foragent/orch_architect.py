@@ -25,59 +25,57 @@ from foragent.orch_events import append_event
 from foragent.state import StateStore
 
 REFACTOR = "skills/fa-orchestrator/references/refactor.md"
+SKILL = "skills/fa-architect/SKILL.md"
+AGENT = ".claude/agents/fa-architect.md"
+MEMORY = ".claude/agent-memory/fa-architect/MEMORY.md"
 
+# The procedure lives in the fa-architect skill; the prompt keeps the evidence, the why and a pointer.
 PROMPT = """You are the architect for this repository. The orchestrator started you with this evidence:
 
 {why}
 
-Your role is only to propose. You never publish, edit or approve orders, and you do not change code,
-labels or the board. The orchestrator judges each proposal and decides whether it becomes an order.
+Your role is only to propose. You never publish, edit or approve orders. The orchestrator judges each
+proposal and decides whether it becomes an order.
+
+{procedure}
 
 ## Measure first
 
-- Run `fa orch facts` for the hot files (overlap records and waits per file), the co-changed files and
-  line counts. Use `fa orch facts --help` for its options.
-- Run the project's tests with `pytest --durations=25` (for example `fa test --durations=25`) to find
-  the slow tests.
-- Follow the refactoring procedure in {refactor}.
+Run `fa orch facts` for the hot files, and the project's tests with `pytest --durations=25` (for
+example `fa test --durations=25`) for the slow tests.
 
-## Nothing to change is a valid outcome
+"Nothing to change" is a valid and often the best outcome.
 
-"Nothing to change" is a valid and often the best outcome. When the numbers show no clear gain, say so
-in one line and stop without a request.
+Every proposal cites fa orch facts numbers or a real incident, and states its expected measurable
+effect. Deliver each proposal through `fa orch request --from architect --text "<proposal>"` and mark
+each proposal with its decision owner on its first line: `Decision: orchestrator` for an orchestrator
+decision, or `Decision: person` for a person decision (lane boundary changes, anything irreversible,
+scope, or taste), which the orchestrator forwards to the person as a multiple-choice question.
 
-## Each proposal
+## Memory
 
-- One proposal per file or concern.
-- Every proposal cites fa orch facts numbers or a real incident (date and what happened).
-- Every proposal states its expected measurable effect: the number you expect to move, from what to
-  what, and how to measure it again.
-- A split preserves behaviour through a compatibility facade: every module-level name stays importable
-  and existing patches still reach the code. Each split order carries a line-limit acceptance test and
-  reserves the file with `exclusive:` while it runs.
-- Check every proposal against the state-ownership rules:
-  1. One writer per piece of state. Others leave a request for the owner (for example a stop request)
-     and never write it themselves; a fallback writer acts only after the owner is confirmed dead.
-  2. Derive instead of store when the value can be computed from recorded facts (for example sleep
-     credit from sleep and wake points).
-  3. Append instead of overwrite (runs.jsonl style).
-  Flag duplicated state (for example GitHub labels versus the local record) and name the reader that
-  tolerates the lag.
+Record each proposal in {memory} as one bullet with its request id, the date and its expected effect:
+`- <date> <request id>: <one line> - expected: <effect>; measured: pending`. First check the measured
+effect of earlier proposals there with `fa orch scorecard` or `fa orch facts`, and append what you
+measured. Leave the change uncommitted.
 
-## Deliver
-
-Deliver each proposal through `fa orch request --from architect --text "<proposal>"`, one request per
-proposal. Mark each proposal with its decision owner on its first line:
-
-- `Decision: orchestrator` is an orchestrator decision. The orchestrator judges it and decides whether
-  to turn it into an order.
-- `Decision: person` is a person decision: lane boundary changes, anything irreversible or hard to undo,
-  scope, or taste. The orchestrator forwards it to the person as a multiple-choice question with
-  options and its recommendation.
-
-Then write the proposal, its evidence and its expected measurable effect. End with a one-line summary
-of what you proposed, or "Nothing to change.".
+End with a one-line summary of what you proposed, or "Nothing to change.".
 """
+
+CLAUDE_PROCEDURE = ("Follow your fa-architect skill ({skill}; the old link {refactor} points there).")
+POINTER = "Follow the fa-architect skill in {skill} (the old link {refactor} points there)."
+CODEX_PROCEDURE = "Follow the fa-architect skill below (the old link {refactor} points to {skill}).\n\n{text}"
+
+
+def has_agent(root: Path) -> bool:
+    return (root / AGENT).is_file()
+
+
+def _skill_text(root: Path) -> str | None:
+    for path in (root / ".claude/skills/fa-architect/SKILL.md", root / SKILL):
+        if path.is_file():
+            return path.read_text(encoding="utf-8").strip()
+    return None
 
 
 class ArchitectRefused(Exception):
@@ -93,8 +91,17 @@ def log_path(store: StateStore, started_at: str) -> Path:
     return store.root / "logs" / f"architect-{stamp}.log"
 
 
-def build_prompt(why: str) -> str:
-    return PROMPT.format(why=why, refactor=REFACTOR)
+def build_prompt(why: str, root: Path | None = None, executor: str = "claude") -> str:
+    """Claude loads the skill through ``--agent``; Codex gets the skill text when the project has it."""
+    names = {"skill": SKILL, "refactor": REFACTOR}
+    text = _skill_text(root) if root is not None and executor != "claude" else None
+    if text is not None:
+        procedure = CODEX_PROCEDURE.format(text=text, **names)
+    elif root is not None and executor == "claude" and has_agent(root):
+        procedure = CLAUDE_PROCEDURE.format(**names)
+    else:
+        procedure = POINTER.format(**names)
+    return PROMPT.format(why=why, procedure=procedure, memory=MEMORY)
 
 
 def read_record(store: StateStore) -> dict | None:
@@ -183,13 +190,21 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime)
     return text("architect_started", language, pid=process.pid, log=log)
 
 
-def session_options(config: Config, store: StateStore) -> dict:
-    """The size-l tier's model and effort; Codex also gets the state directory as a writable root."""
+def session_options(config: Config, store: StateStore, root: Path | None = None) -> dict:
+    """The size-l tier's model and effort; Claude loads the architect agent when the project has it.
+
+    Codex gets the state directory, and the architect memory directory when present, as writable roots.
+    """
     tier = config.tiers["l"]
     if config.executor == "claude":
-        return {"model": tier.get("claude_model") or config.executor_model}
+        options = {"model": tier.get("claude_model") or config.executor_model}
+        if root is not None and has_agent(root):
+            options["agent"] = "fa-architect"
+        return options
+    memory = (root / MEMORY).parent if root is not None else None
+    extra = (memory,) if memory is not None and memory.is_dir() else ()
     return {"model": config.executor_model, "effort": tier.get("codex_effort"),
-            "add_dirs": (store.root,)}
+            "add_dirs": (store.root, *extra)}
 
 
 def events_path(store: StateStore, started_at: str) -> Path:
@@ -213,12 +228,12 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
     """Run the architect turn in the repository root; append one architect-done event on exit."""
     code, message = 1, ""
     log = log_path(store, started_at)
-    options = session_options(config, store)
+    options = session_options(config, store, root)
     if config.executor != "claude":
         options["events_path"] = events_path(store, started_at)
     try:
         result = executors.executor_for(config.executor).run(
-            worktree=root, prompt=build_prompt(why), timeout_s=config.max_runtime_minutes * 60,
+            worktree=root, prompt=build_prompt(why, root, config.executor), timeout_s=config.max_runtime_minutes * 60,
             log_path=log, **options,
         )
         code = 1 if result.timed_out or result.exit_code is None else result.exit_code
