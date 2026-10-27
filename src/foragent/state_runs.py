@@ -165,12 +165,11 @@ class RunRecordsMixin:
             self._write_json(path, value)
 
     def active_runs(self) -> list[Run]:
-        runs = []
-        for path in sorted((self.root / "runs").glob("*.json"), key=lambda path: int(path.stem)):
-            run = self.get_run(int(path.stem))
-            if run is not None and run.status == "running":
-                runs.append(run)
-        return runs
+        """Running issue runs by number, then running lane dream runs (runs/dream-<lane>.json)."""
+        paths = list((self.root / "runs").glob("*.json"))
+        runs = [*map(self.get_run, sorted(int(path.stem) for path in paths if path.stem.isdigit())),
+                *(self.get_dream(path.stem[6:]) for path in sorted(paths) if path.stem.startswith("dream-"))]
+        return [run for run in runs if run is not None and run.status == "running"]
 
     def pause_lane(self, lane: str, until: datetime) -> None:
         with self._state_lock():

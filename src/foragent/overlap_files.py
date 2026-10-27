@@ -77,8 +77,8 @@ def claims(
     """Active runs' file claims; ``measured=False`` uses only the recorded measurement (read-only)."""
     known, unknown = [], []
     for run in ctx.store.active_runs():
-        if run.number == exclude:
-            continue
+        if run.number == exclude or run.kind != "issue":
+            continue  # A lane's dream claims only its memory directory, never issue files.
         parsed = approved_issue(ctx, run)
         if parsed is None or not parsed.files:
             unknown.append(run)

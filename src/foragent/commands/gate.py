@@ -26,6 +26,9 @@ def add(commands) -> None:
     run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
     run_issue.add_argument("--repo-root", type=cli.Path, required=True)
+    run_dream = actions.add_parser("run-dream", help="Run one lane's memory dream")
+    run_dream.add_argument("lane")
+    run_dream.add_argument("--repo-root", type=cli.Path, required=True)
     done = actions.add_parser("check-done", help="Check Done when for a native Stop hook")
     done.add_argument("--snapshot", type=cli.Path, required=True)
     done.add_argument("--worktree", type=cli.Path, required=True)
@@ -206,6 +209,11 @@ def run(args) -> int:
                 lambda: cli._status(tracker, store, config), tracker, store, config, root,
                 once=args.once, now=lambda: cli.datetime.now(cli.UTC),
             )
+    elif args.action == "run-dream":
+        return cli.orch_dream.run_dream(args.lane, cli.RunContext(
+            repo=repo, repo_root=root, tracker=tracker, store=store,
+            config=config, git=git, now=lambda: cli.datetime.now(cli.UTC),
+        ))
     else:
         if store.get_run(args.number) is None:
             raise cli.ConfigError(f"no run record for issue #{args.number}")

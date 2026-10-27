@@ -193,6 +193,9 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
     sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
     for run in ctx.store.active_runs():
+        if run.kind == "dream":
+            scheduler.orch_dream.recover(ctx, run, report)
+            continue
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
         if cached is not None and any(

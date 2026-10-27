@@ -93,6 +93,8 @@ class Run:
     # One entry per related-unit-test check: changed_file_count, selected_files,
     # file_seconds (JUnit testcase seconds per file), total_seconds and timed_out.
     related_tests: list[dict] = field(default_factory=list)
+    # 'issue' runs implement an issue; a 'dream' run (number 0) tidies one lane's memory (#189).
+    kind: str = "issue"
     # Identity of the work the current phase does (e.g. "baseline:<sha>"), journaled when it ends;
     # work_events maps each finished work identity to its first phase event, across executions.
     phase_work_id: str | None = None

@@ -22,11 +22,18 @@ def add(commands) -> None:
     fixed_skills.add_argument("name")
     fixed_skills.add_argument("ids", nargs="*", help="Skill IDs; omit to clear the lane's fixed skills")
     fixed_skills.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    dreamed = lane_actions.add_parser("dreamed", help="Record that a lane's memory dream is done")
+    dreamed.add_argument("name")
+    dreamed.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
 
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
+    if args.action == "dreamed":
+        config = cli.load_config(root)
+        store = cli.StateStore.for_repo(config.repo or cli.GitRepo(root).remote_slug())
+        return cli.orch_dream.dreamed_command(store, config, args.name)
     if args.action == "skills":
         lane = cli.set_lane_skills(root, args.name, args.ids)
         print(f"Updated lane:{args.name} skills: {', '.join(lane['skills']) or '(none)'}")

@@ -18,7 +18,7 @@ from typing import Any
 
 import yaml
 
-from foragent import __version__, adopt, bench, brief, capacity, design, design_session, gates, gh, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_facts, orch_inbox, orch_queue, orch_tick_outcome, order, star, tidy, update_check, watch, watch_open
+from foragent import __version__, adopt, bench, brief, capacity, design, design_session, gates, gh, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_dream, orch_facts, orch_inbox, orch_queue, orch_tick_outcome, order, star, tidy, update_check, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo

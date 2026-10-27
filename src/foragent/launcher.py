@@ -26,14 +26,15 @@ def spawn_notify(repo_root: Path, store: StateStore) -> None:
         )
 
 
-def spawn_runner(repo_root: Path, store: StateStore) -> Callable[[int], int]:
-    def launch(number: int) -> int:
-        log = store.log_path(number)
+def spawn_runner(repo_root: Path, store: StateStore) -> Callable[..., int]:
+    def launch(number: int | None = None, *, kind: str = "issue", lane: str | None = None) -> int:
+        dream = kind == "dream"
+        log = store.root / "logs" / f"dream-{lane}.log" if dream else store.log_path(number)
         log.parent.mkdir(parents=True, exist_ok=True)
+        action = ["run-dream", str(lane)] if dream else ["run-issue", str(number)]
         with log.open("ab") as stream:
             process = subprocess.Popen(
-                [sys.executable, "-m", "foragent.cli", "gate", "run-issue", str(number),
-                 "--repo-root", str(repo_root)],
+                [sys.executable, "-m", "foragent.cli", "gate", *action, "--repo-root", str(repo_root)],
                 start_new_session=True, stdout=stream, stderr=stream, env=gate_environment(),
             )
             # Capture while Popen still holds the unreaped child. Returning just
@@ -42,7 +43,10 @@ def spawn_runner(repo_root: Path, store: StateStore) -> Callable[[int], int]:
                 identities = observe_tree(roots=(process.pid,))
             except PermissionError:
                 identities = []  # A stop must refuse without birth evidence.
-            store.update_run(number, pid=process.pid, process_identities=identities)
+            if dream:
+                store.update_dream(lane, pid=process.pid, process_identities=identities)
+            else:
+                store.update_run(number, pid=process.pid, process_identities=identities)
         return process.pid
 
     return launch

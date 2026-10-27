@@ -168,3 +168,4 @@
 - #274 재작업(10-27): main이 SKILL.md를 이미 154줄로 넘겨 놓았다. 인수 시험은 대부분 공백을 합친 본문을 읽으므로, 같은 절의 문단을 합치거나 설명을 `references/<topic>.md`로 옮기고 한 줄 링크를 남겨 줄인다(design-handoff.md). 옮기기 전후로 `grep -ln fa-orchestrator tests/acceptance/*.py` 묶음의 실패 집합을 비교한다. tests/test_runner.py는 분할됐고 새 시험은 해당 모듈의 시험 파일(test_run_prompts.py 등)에 둔다; test_runner.py 전체 실행 금지(관련 시험 예산 초과). `run_publish.py` 842줄 상한 초과는 main 기준선 실패.
 - #225: `orch_scorecard.py`는 `fa orch scorecard`(읽기 전용). 버킷은 `(now-t)//24h`(새 끝 포함). pr-open의 merged_at은 `record_merge`가 finish_run 전에 써야 runs.jsonl에 들어간다. 동사 등록은 `_orch_box` + INBOX_ACTIONS.
 - #310: SKILL.md 150줄 상한은 시험이 정규식으로 읽지 않는 설명(watch 세부·주문 카드)을 `references/watch.md`·`order-card.md`로 옮겨 맞췄다. 비교: SKILL을 읽는 인수 16개 파일의 PASSED/FAILED 집합(zsh는 `$(grep -l ...)`로 넘겨야 단어 분리됨).
+- [#189 lane dream](project_189_lane_dream.md) — dream Run records, dream-done event, budget demand, offline-test traps
