@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import threading
 from typing import TYPE_CHECKING
@@ -36,13 +37,18 @@ def poll_executor[T](execute: Callable[[], T], poll: Callable[[], None]) -> T:
 
 
 def _remaining(n: int, ctx: RunContext) -> int:
-    run = ctx.store.get_run(n)
+    run = _with_open_talk(ctx.store.get_run(n), ctx.now())  # An open talk pauses as it happens (D55).
     if run is None:
         raise KeyError(n)
-    now = ctx.now()
-    # An open talk terminal pauses the runtime limit as it happens (D55 addendum).
-    elapsed = (now - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds - run.talk_pause_seconds(now)
+    elapsed = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
     return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
+
+
+def _with_open_talk(run, now: datetime):
+    """The run as if its open talk had already been credited to ``waited_seconds``."""
+    if run is None:
+        return None
+    return replace(run, waited_seconds=run.waited_seconds + run.talk_pause_seconds(now))
 
 
 def paused_seconds(n: int, ctx: RunContext) -> float:

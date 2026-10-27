@@ -68,6 +68,46 @@ def _orca_closed(stdout: str | None) -> bool:
     return isinstance(error, dict) and error.get("code") in ORCA_ABSENT
 
 
+def find_pending(record: dict, cwd: Path) -> tuple[bool | None, str | None]:
+    """A pending record (handle not saved yet): find its terminal by its unique title.
+
+    Returns ``(True, handle)`` when a working listing (Orca's envelope with a terminal
+    list, or tmux on the recorded socket) names the title, else ``(None, None)``. A listing
+    without the title is not proof the terminal closed (it may be incomplete, or the title
+    may have changed), and a pending record has no handle that Orca could call stale, so
+    nothing here ever reports closed; such a talk ends with its run.
+    """
+    executable, title = record.get("executable"), record.get("title")
+    if not isinstance(executable, str) or not isinstance(title, str):
+        return None, None
+    if record.get("kind") == "orca":
+        try:
+            data = _orca_envelope(_call([executable, "terminal", "list", "--json"], cwd).stdout)
+        except (OSError, subprocess.SubprocessError):
+            return None, None
+        result = data.get("result") if data is not None and data.get("ok") is True else None
+        terminals = result.get("terminals") if isinstance(result, dict) else None
+        if not isinstance(terminals, list):
+            return None, None
+        for item in terminals:
+            if isinstance(item, dict) and item.get("title") == title and isinstance(item.get("handle"), str):
+                return True, item["handle"]
+        return None, None
+    socket = record.get("socket") if isinstance(record.get("socket"), str) else None
+    if socket is None:
+        return None, None
+    try:
+        lines = _call([executable, "-S", socket, "list-windows", "-a", "-F", "#{window_id}\t#{window_name}"],
+                      cwd).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    for line in lines:
+        window, _, name = line.partition("\t")
+        if name == title and window:
+            return True, window
+    return None, None
+
+
 def _alive(record: dict, cwd: Path, *, show: bool) -> bool | None:
     """Whether a recorded terminal is open: True, False (closed) or None (could not tell).
 
@@ -78,6 +118,8 @@ def _alive(record: dict, cwd: Path, *, show: bool) -> bool | None:
     and the talk stays open. ``show`` also brings an open terminal forward.
     """
     executable, handle = record.get("executable"), record.get("handle")
+    if isinstance(executable, str) and not isinstance(handle, str) and isinstance(record.get("title"), str):
+        return find_pending(record, cwd)[0]  # Pending: found by title, or nothing can be told.
     if not isinstance(executable, str) or not isinstance(handle, str):
         return None  # A record that names no terminal cannot be probed: no evidence either way.
     if record.get("kind") == "orca":
@@ -129,7 +171,7 @@ def _read_record(store: StateStore, number: int) -> dict | None:
     except (OSError, ValueError) as exc:
         raise RecordUnreadable(str(path)) from exc
     if not (isinstance(record, dict) and isinstance(record.get("executable"), str)
-            and isinstance(record.get("handle"), str)):
+            and (isinstance(record.get("handle"), str) or isinstance(record.get("title"), str))):
         raise RecordUnreadable(str(path))
     return record
 
@@ -161,12 +203,24 @@ def check_talking(store: StateStore, run: Run, root: Path, now: datetime) -> tup
         current = store.get_run(run.number)
         if current is None or current.status != "running" or not current.talking:
             return current or run, False
+        store.anchor_talk_sleep(run.number)  # Sleep credited from now on falls inside this talk.
         try:
             record = _read_record(store, run.number)
         except RecordUnreadable:
             return current, True  # Not knowing the terminal is not knowing it closed.
-        worktree = Path(current.worktree)
-        if record is not None and _alive(record, worktree if worktree.is_dir() else root, show=False) is not False:
+        # begin_talk writes the record with talking in one step, so a talking run without one
+        # never got as far as opening a terminal; that absence is the talk command's own fact.
+        if record is None:
+            return end_talk(store, current, now), False
+        cwd = Path(current.worktree) if Path(current.worktree).is_dir() else root
+        if not isinstance(record.get("handle"), str):
+            found, handle = find_pending(record, cwd)
+            if found:  # The command died before saving the handle; the title found the terminal.
+                store.publish_talk(run.number, current.started_at, "running", {**record, "handle": handle})
+                return current, True
+        else:
+            found = _alive(record, cwd, show=False)
+        if found is not False:
             return current, True  # Open, or the probe could not tell: only a confirmed closure ends a talk.
         return end_talk(store, current, now), False
 

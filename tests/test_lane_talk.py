@@ -724,3 +724,133 @@ def test_tmux_closes_only_on_a_working_reply_on_the_recorded_socket(tmp_path, mo
     assert lane_talk._alive(with_socket, tmp_path, show=False) is False  # Working reply without the window.
     replies[:] = [ok("@1\n")]
     assert lane_talk._alive(no_socket, tmp_path, show=False) is None  # Another server may have answered.
+
+
+def test_machine_sleep_during_a_talk_is_credited_once(tmp_path):
+    from types import SimpleNamespace
+
+    from foragent import run_waits
+
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    run = store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    ctx = SimpleNamespace(store=store, now=lambda: clock[0], config=config(max_runtime_minutes=60))
+    store.begin_talk(1, run.started_at, clock[0])
+    clock[0] += timedelta(minutes=2)
+    # The first tick after the talk began credits 300 s of sleep that ended before the talk.
+    store.update_run(1, slept_seconds=300)
+    store.anchor_talk_sleep(1)
+    clock[0] += timedelta(minutes=8)
+    store.update_run(1, slept_seconds=500)  # A later tick: 200 s of sleep inside the talk.
+    # 600 s of talk count once; only the 200 s of in-talk sleep is left to the sleep credit.
+    assert run_waits.paused_seconds(1, ctx) == 400
+    ended = store.end_talk(1, clock[0])
+    assert ended.waited_seconds == 400 and ended.slept_seconds == 500
+
+
+def test_earlier_sleep_credited_after_a_talk_began_does_not_shorten_it(tmp_path):
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    run = store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    store.begin_talk(1, run.started_at, clock[0])
+    clock[0] += timedelta(minutes=10)
+    store.update_run(1, slept_seconds=300)  # Credited late, but the sleep came before the talk.
+    store.anchor_talk_sleep(1)
+    assert store.end_talk(1, clock[0]).waited_seconds == 600
+
+
+@pytest.mark.parametrize("listed", [True, False])
+def test_a_talk_whose_command_died_before_saving_the_handle_is_found_by_title(store, tmp_path, monkeypatch, listed):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+    pending = {"kind": "orca", "executable": "/bin/orca", "title": "talk #1 deadbeef", "number": 1, "running": True}
+    store.begin_talk(1, store.get_run(1).started_at, NOW, pending)  # Then the command died.
+    terminals_listed = [{"handle": "term_9", "title": "talk #1 deadbeef"}] if listed else [{"handle": "term_2"}]
+    listing = json.dumps({"id": "req-6", "ok": True, "result": {"terminals": terminals_listed}})
+
+    def run(argv, **kwargs):
+        terminals.calls.append(list(argv))
+        if argv[1:3] == ["terminal", "list"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=listing, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(
+            {"id": "req-7", "ok": True, "result": {"terminal": {"handle": "term_9"}}}), stderr="")
+
+    monkeypatch.setattr(lane_talk.subprocess, "run", run)
+    _, still_open = lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW)
+    # A listing without the title is not proof of closure: the talk stays until the run ends.
+    assert still_open and store.get_run(1).talking is True
+    if listed:
+        assert json.loads(lane_talk.talk_path(store, 1).read_text())["handle"] == "term_9"
+        lanes.talk(1, store=store, config=config(), repo_root=tmp_path)  # Re-shown, never doubled.
+        assert terminals.opened() == []
+
+
+def test_pending_talk_with_an_unanswered_listing_stays_open_and_is_not_doubled(store, tmp_path, monkeypatch):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+    pending = {"kind": "orca", "executable": "/bin/orca", "title": "talk #1 deadbeef", "number": 1, "running": True}
+    store.begin_talk(1, store.get_run(1).started_at, NOW, pending)
+    terminals.alive = "timeout"  # Fake listing call below times out too.
+    monkeypatch.setattr(lane_talk.subprocess, "run", lambda argv, **kw: (_ for _ in ()).throw(
+        subprocess.TimeoutExpired(argv, 10)))
+    _, still_open = lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW)
+    assert still_open and store.get_run(1).talking is True
+    line = lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    assert "no second one" in line and terminals.opened() == []
+
+
+def test_an_interrupted_open_keeps_the_pending_record(store, tmp_path, monkeypatch):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+
+    def die(argv):
+        if argv[1:3] == ["terminal", "create"]:
+            raise KeyboardInterrupt  # After Orca may have created the terminal.
+
+    terminals.on_call = die
+    with pytest.raises(KeyboardInterrupt):
+        lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    record = json.loads(lane_talk.talk_path(store, 1).read_text())
+    assert store.get_run(1).talking is True and "handle" not in record and record["title"].startswith("talk #1 ")
+
+
+@pytest.mark.parametrize("failure", [
+    subprocess.CalledProcessError(-9, ["orca"]),
+    subprocess.CalledProcessError(1, ["orca"], output=json.dumps({"ok": False, "error": {"code": "x"}})),
+    subprocess.TimeoutExpired(["orca"], 10),
+])
+def test_a_failed_open_reply_keeps_the_pending_talk(store, tmp_path, monkeypatch, failure):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+
+    def fail(argv):
+        if argv[1:3] == ["terminal", "create"]:
+            raise failure  # The terminal may already exist when the reply fails.
+
+    terminals.on_call = fail
+    with pytest.raises(lane_talk_open.TalkError):
+        lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    record = json.loads(lane_talk.talk_path(store, 1).read_text())
+    assert store.get_run(1).talking is True and "handle" not in record
+
+
+def test_an_opener_that_cannot_start_ends_the_talk(store, tmp_path, monkeypatch):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+
+    def missing(argv):
+        if argv[1:3] == ["terminal", "create"]:
+            raise FileNotFoundError(argv[0])  # Nothing ran, so nothing opened.
+
+    terminals.on_call = missing
+    with pytest.raises(FileNotFoundError):
+        lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    assert store.get_run(1).talking is False and not lane_talk.talk_path(store, 1).exists()
+
+
+def test_tmux_pending_lookup_without_the_title_is_not_a_closure(tmp_path, monkeypatch):
+    monkeypatch.setattr(lane_talk.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, stdout="@1\tother\n", stderr=""))
+    record = {"kind": "tmux", "executable": "/bin/tmux", "socket": "/tmp/sock", "title": "talk #1 deadbeef"}
+    assert lane_talk.find_pending(record, tmp_path) == (None, None)
+    assert lane_talk._alive(record, tmp_path, show=False) is None

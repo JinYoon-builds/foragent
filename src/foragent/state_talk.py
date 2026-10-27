@@ -60,18 +60,32 @@ class TalkRecordsMixin:
             self._write_run(updated)
             return updated
 
-    def begin_talk(self, number: int, started_at: str, now: datetime) -> Run | None:
-        """Mark the run ``started_at`` as talking before its terminal opens; None if it is no longer running."""
+    def begin_talk(self, number: int, started_at: str, now: datetime, record: dict | None = None) -> Run | None:
+        """Mark the run ``started_at`` as talking before its terminal opens; None if it is no longer running.
+
+        ``record`` (the pending terminal: opener, socket and unique title, no handle yet) is
+        written in the same state-lock step, so a talking run always has a record that can
+        find its terminal, even if the command dies right after opening it.
+        """
         with self._state_lock():
             run = self.get_run(number)
             if run is None or run.status != "running" or run.started_at != started_at:
                 return None
             if run.talking:
                 return run
-            updated = _state.replace(run, talking=True, talking_since=now.isoformat(),
+            updated = _state.replace(run, talking=True, talking_since=now.isoformat(), talk_slept_base=None,
                                      **_pause_event(run, now, 0.0, "open", "talk"))
             self._write_run(updated)
+            if record is not None:
+                self._write_json(self.root / "talk" / f"{number}.json", record)
             return updated
+
+    def anchor_talk_sleep(self, number: int) -> None:
+        """At the first tick after a talk began, fix the sleep total later sleep is counted from."""
+        with self._state_lock():
+            run = self.get_run(number)
+            if run is not None and run.status == "running" and run.talking and run.talk_slept_base is None:
+                self._write_run(_state.replace(run, talk_slept_base=run.slept_seconds))
 
     def publish_talk(self, number: int, started_at: str, status: str, record: dict) -> bool:
         """Save a talk terminal record only while the run is still the same run in the same state."""
@@ -102,7 +116,8 @@ def _talk_ended(run: Run, now: datetime, *, restart_stall: bool) -> Run:
         return run
     fields = {"last_progress_at": now.isoformat()} if restart_stall else {}
     since = _state.datetime.fromisoformat(run.pauses_open.get("talk") or run.talking_since or now.isoformat())
-    length = max(0.0, (now - since).total_seconds())
+    # Machine sleep during the talk is the tick's sleep credit already; it counts once.
+    length = max(0.0, (now - since).total_seconds() - run.talk_slept())
     # The talk's whole length, through the shared union accounting.
     return _state.replace(run, talking=False, talking_since=None,
                           **_pause_event(run, now, length, "close", "talk"), **fields)
