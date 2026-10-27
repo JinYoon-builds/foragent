@@ -103,17 +103,20 @@ def test_orch_scorecard_compares_rolling_today_with_daily_medians_and_honors_day
     # rates [.5,.5,.7,.7] -> .6; minutes [5,8,10,10] -> 9; questions -> 0.
     # Only merge rate (.25 < .7), merge time (36 > 10), questions (1 > 0) worsen.
     # These seeds never enter a phase: phase_minutes={} and load=None in both windows.
+    # Compare the metrics this test seeds; later metrics (D96 flow) may be added beside them.
+    today = {key: today[key] for key in METRICS}
+    previous = {key: previous[key] for key in METRICS}
     assert today == {"runs": 4, "merge_rate": 0.25, "median_minutes_to_merge": 36,
                      "github_calls_per_hour": 0, "review_returns": 0, "reverts_after_merge": 0,
                      "spec_questions": 1, "phase_minutes": {}, "load": None}
     assert previous == {"runs": 10, "merge_rate": 0.7, "median_minutes_to_merge": 10,
                         "github_calls_per_hour": 0, "review_returns": 0, "reverts_after_merge": 0,
                         "spec_questions": 0, "phase_minutes": {}, "load": None}
-    assert set(payload["worse"]) == {"merge_rate", "median_minutes_to_merge", "spec_questions"}
+    assert set(payload["worse"]) & METRICS == {"merge_rate", "median_minutes_to_merge", "spec_questions"}
     assert payload["repeated_failures"] == [] and payload["unexplained_failures"] == []
 
     shorter = scorecard(main, capsys, "--days", "5")
-    assert shorter["window"]["today"] == today
+    assert {key: shorter["window"]["today"][key] for key in METRICS} == today
     assert shorter["window"]["previous"]["runs"] == 7
     assert shorter["window"]["previous"]["merge_rate"] == pytest.approx(0.6)
     assert shorter["window"]["previous"]["median_minutes_to_merge"] == 9
