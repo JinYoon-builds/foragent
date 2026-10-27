@@ -44,6 +44,11 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"
+        f"Tests under {acceptance_dir} that this issue lists are locked acceptance tests. If a finding would "
+        "require behaviour a locked acceptance test forbids, or forbid behaviour it requires, it is a spec "
+        "conflict, not a defect: report it as one line "
+        "`SPEC-CONFLICT: <locked test path:line> <what the test requires>; <what the finding wants>` "
+        "instead of a finding.\n"
         + text("review_class_question", language)
     )
 
