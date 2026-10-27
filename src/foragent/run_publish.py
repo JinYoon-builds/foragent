@@ -97,14 +97,16 @@ def _merge_lock(n: int, ctx: RunContext):
                 started = ctx.now()
 
             _credited_wait(n, ctx, acquire)
-            yield hold
+            try:
+                yield hold
+            finally:
+                if started is not None:
+                    # Still under merge.lock: a borrowed member can only finish after this.
+                    for member in hold.members:
+                        ctx.store.update_run(member, merge_lock_held_seconds=(ctx.now() - started).total_seconds())
     finally:
-        if started is not None:
-            seconds = (ctx.now() - started).total_seconds()
-            if hold.record:
-                ctx.store.record_merge_lock(n, seconds)
-            for member in hold.members:
-                ctx.store.update_run(member, merge_lock_held_seconds=seconds)
+        if started is not None and hold.record:
+            ctx.store.record_merge_lock(n, (ctx.now() - started).total_seconds())
 
 
 def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float) -> str:
@@ -498,8 +500,30 @@ def _publish(attempt: Implementation) -> str:
     try:
         return _publish_locked(attempt)
     finally:
-        # A run that stops being ready leaves the merge queue (#459).
-        attempt.ctx.store.dequeue_merge(attempt.n)
+        # A run that stops being ready leaves the merge queue (#459); checks: ci never uses it.
+        if run_merge_group.queue_in_use(attempt.ctx):
+            attempt.ctx.store.dequeue_merge(attempt.n)
+
+
+def _finish_if_group_merged(attempt: Implementation, pr: int, head: str, *, locked: bool) -> bool:
+    """Finish this run when another run's group merged its head; True when it did.
+
+    The leader keeps merge.lock until it has saved this run's group and lock facts,
+    so outside the lock this run first waits for merge.lock and only then finishes:
+    a finished run's record no longer accepts those facts.
+    """
+    n, ctx = attempt.n, attempt.ctx
+    if not run_merge_group.merged_by_group(attempt, pr, head):
+        return False
+    if not locked:
+        _HOLDS[n] = _Hold(record=False)  # The leader recorded this run's merge facts.
+        with _merge_lock(n, ctx):
+            return _finish_if_group_merged(attempt, pr, head, locked=True)
+    _append(ctx.store.log_path(n), f"Merged by another run's merge group: {head}")
+    # A failed closure is queued for retry and reported; the merge itself stands.
+    run_merge_group.finish_merged_self(attempt)
+    _progress(n, ctx)
+    return True
 
 
 def _publish_locked(attempt: Implementation) -> str:
@@ -618,6 +642,10 @@ def _publish_locked(attempt: Implementation) -> str:
     grouping = run_merge_group.grouping_enabled(attempt, initial.kind == "merge")
     group_failed = False
 
+    def merged_by_group(*, locked: bool = False) -> bool:
+        """Checked before any fallible publication step: another group may have merged this head."""
+        return grouping and _finish_if_group_merged(attempt, pr, verified_head_sha, locked=locked)
+
     def publish_refresh(target_sha: str) -> str | None:
         nonlocal pr_ready_at, ci_wait, verified_base_sha
         _check_publication(git, attempt.target_branch, target_sha)
@@ -650,6 +678,8 @@ def _publish_locked(attempt: Implementation) -> str:
     # Result-affecting base merges are bounded by refresh_base's budget and
     # result-neutral ones by the run's time budget, which refresh_base checks.
     while True:
+        if merged_by_group():
+            return "merged"
         _phase(n, ctx, "ci")
         if stopped := _wait_for_ci(n, ctx, git, pr, verified_head_sha, pr_ready_at,
                                   ci_wait, ci_failed, queued_status,
@@ -662,9 +692,12 @@ def _publish_locked(attempt: Implementation) -> str:
         ctx.git.fetch("origin", attempt.target_branch)
         target_sha = git.ref_sha(f"origin/{attempt.target_branch}")
         # Unclaimed ready peers check this moved main jointly instead (#459).
+        if merged_by_group():
+            return "merged"
         regroup = grouping and not group_failed and ctx.store.has_unclaimed_merge_peers(n, attempt.target_branch)
         if target_sha != verified_base_sha and not regroup:
-            ctx.store.dequeue_merge(n)
+            if grouping:
+                ctx.store.dequeue_merge(n)
             target_sha = refresh_base(capture_move(git, target_sha))
             if stopped := publish_refresh(target_sha):
                 return stopped
@@ -684,18 +717,13 @@ def _publish_locked(attempt: Implementation) -> str:
             run_merge_group.enqueue(attempt, pr, verified_head_sha, verified_base_sha, pr_ready_at)
             if not group_failed:
                 group, group_failed = run_merge_group.form(attempt)
+            if merged_by_group():
+                return "merged"
         wait_for_overlap(attempt)
         hold = _HOLDS[n] = _Hold()
         with _merge_lock(n, ctx):
-            if grouping and run_merge_group.merged_by_group(attempt, pr, verified_head_sha):
-                # Another run's group merged this head and recorded its facts.
-                hold.record = False
-                _append(log, f"Merged by another run's merge group: {verified_head_sha}")
-                try:
-                    run_merge_group.finish_merged_self(attempt)
-                except Exception as exc:  # noqa: BLE001 - the merge happened; never redo the work
-                    _append(log, f"Closing the issue after the group merge failed: {exc}")
-                _progress(n, ctx)
+            if merged_by_group(locked=True):
+                hold.record = False  # The leader recorded this run's merge facts.
                 return "merged"
             inputs = _final_merge_inputs(
                 n, ctx, git, pr, attempt.branch, attempt.target_branch,
@@ -738,40 +766,36 @@ def _publish_locked(attempt: Implementation) -> str:
                 if not subject:
                     attempt.pr_title = title
                 # Merging now under the lock: no longer a peer for other leaders.
-                ctx.store.dequeue_merge(n)
-                borrowed: list[dict] = []
-                leader_merged = False
+                if grouping:
+                    ctx.store.dequeue_merge(n)
                 order = group.entries if group is not None else [{"number": n}]
-                try:
-                    # Queue order, including the leader's own position.
-                    for entry in order:
-                        if entry["number"] != n:
-                            if not run_merge_group.merge_member(attempt, members[entry["number"]]):
-                                break  # The rest were checked only together with it.
-                            borrowed.append(entry)
-                            continue
-                        try:
-                            ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
-                        except TrackerError as exc:
-                            if exc.is_rate_limit:
-                                raise
-                            if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
-                                inputs.stop = lambda: _hold_changed_head(n, ctx, link)
-                                break
+
+                def merge_leader() -> bool:
+                    try:
+                        ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
+                    except TrackerError as exc:
+                        if exc.is_rate_limit or ctx.tracker.pr_head_sha(pr) == verified_head_sha:
                             raise
-                        leader_merged = True
-                        ctx.store.record_merge(n, ctx.now())
-                finally:
-                    # Finish every successful merge, even when a later one raised. Local
-                    # facts, reinstall and journal come first; a member whose GitHub
-                    # finalization fails closes its own issue when its run sees the marker.
-                    size = len(borrowed) + leader_merged
-                    hold.members.extend(entry["number"] for entry in borrowed)
-                    run_merge_group.finish_group(
-                        attempt, borrowed, (pr, verified_head_sha) if leader_merged else None,
-                        reinstall=inputs.decision.kind == "merge", raise_errors=False)
+                        inputs.stop = lambda: _hold_changed_head(n, ctx, link)
+                        return False
+                    ctx.store.record_merge(n, ctx.now())
+                    return True
+
+                # Queue order, including the leader's own position; never raises.
+                borrowed, leader_merged, later_error = run_merge_group.merge_in_order(
+                    attempt, order, members, merge_leader)
+                # Finish every merge that happened before reporting any error. Local
+                # facts, reinstall and journal come first; failed closures are queued.
+                hold.members.extend(entry["number"] for entry in borrowed)
+                run_merge_group.finish_group(
+                    attempt, borrowed, (pr, verified_head_sha) if leader_merged else None,
+                    reinstall=inputs.decision.kind == "merge", queue=grouping)
+                if later_error is not None and not leader_merged:
+                    raise later_error
                 if leader_merged:
                     _progress(n, ctx)
+                    if later_error is not None:
+                        _append(log, f"Merge group: a later member failed after this run merged: {later_error}")
                     others = ", ".join(f"#{entry['number']}" for entry in borrowed)
                     try:
                         if attempt.target_branch == attempt.batch_branch:
@@ -800,7 +824,8 @@ def _publish_locked(attempt: Implementation) -> str:
             return inputs.stop()
         if stopped := policy_hold(inputs.decision, inputs.batch_branch):
             return stopped
-        ctx.store.dequeue_merge(n)
+        if grouping:
+            ctx.store.dequeue_merge(n)
         if not continue_merge or (move is None and not inputs.comparison_current):
             queued_status = inputs.status
             continue

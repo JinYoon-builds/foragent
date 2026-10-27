@@ -21,7 +21,8 @@ class MergeQueueMixin:
         return [entry for entry in entries or [] if isinstance(entry, dict) and "number" in entry]
 
     def _save_queue(self, before: list[dict[str, Any]], entries: list[dict[str, Any]]) -> None:
-        if entries != before or not (self.root / QUEUE).exists():
+        # Never create the file just to record that nothing is queued.
+        if entries != before or entries and not (self.root / QUEUE).exists():
             self._write_json(self.root / QUEUE, {"entries": entries})
 
     def _current_execution(self, number: int) -> str | None:
@@ -29,12 +30,18 @@ class MergeQueueMixin:
         run = self.get_run(number)
         return run.started_at if run is not None and run.status == "running" else None
 
+    def merge_entry_current(self, entry: dict[str, Any]) -> bool:
+        """The entry still belongs to its issue's running execution."""
+        return self._current_execution(entry["number"]) == entry.get("started_at")
+
     def _live_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Drop entries of stopped or earlier executions, and claims of such leaders."""
         live = []
         for entry in entries:
             if self._current_execution(entry["number"]) != entry.get("started_at"):
                 continue
+            if entry.get("worktree") and not _state.Path(entry["worktree"]).is_dir():
+                continue  # Its worktree is gone: it can never be merged from this entry.
             claimer = entry.get("claimed_by")
             if claimer is not None and self._current_execution(claimer) != entry.get("claimed_started_at"):
                 entry = {**entry, "claimed_by": None, "claimed_started_at": None}
