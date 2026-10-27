@@ -7,11 +7,12 @@ metadata:
 
 Final design (orchestrator redesign 2026-10-27): `run_implementation.follow_base()` (#483) first calls
 `run_baseline.collect_protected_ids()`. It runs ONE `<baseline command> <acceptance_dir> --ignore=<new base exclusions>
---collect-only ` on a detached checkout of the new base. The plugin is loaded by a helper TEST MODULE
-(`.foragent-collect/test_fa_collect.py`, passed first on the command line) that puts its own directory on sys.path and sets
-`pytest_plugins = ["fa_collected_ids"]`: works with `python -I`, `--noconftest`, `-p no:terminal`, `env PYTHONPATH=…`, any import
-mode and any python_files (explicit files always collect). Rejected: PYTHONPATH injection (`env` overrides, `-I` ignores) and a
-helper conftest (`--noconftest`). The listing path is baked into the plugin source. After collecting,
+--collect-only ` on a detached checkout of the new base. The plugin (orchestrator decision 2026-10-27) is a module with a
+private random name `_foragent_nodeids_<16 hex>` in a temp dir OUTSIDE the checkout, given only to the collection subprocess via
+PYTHONPATH (`_with_python_path()` joins leading and post-`env` assignments, `NAME=<quoted>`) and loaded with `-p <name>`. Rejected
+because they polluted project imports or broke launchers: a helper test module `test_fa_collect` on sys.path (import file
+mismatch with a project file of that name), a helper conftest (`--noconftest`), a fixed module name. Known limit: `python -I`
+ignores PYTHONPATH → the plugin cannot load → #327 stop, nothing dropped. The listing path is baked into the plugin source. After collecting,
 `_validate_baseline_checkout()` runs like after a capture (a conftest that deletes tracked tests → #327). Collection always runs, even when every id is owned. Missing = protected id not in that exact set (rootdir-relative ids are
 converted to repo-relative). Exit 5 or no acceptance dir → empty set. A collection error, another exit, no listing or a
 timeout → #327 stop, but only after #483's capture has run once (locked `test_unusable_new_base_baseline_stops_with_327_outcome`

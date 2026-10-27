@@ -12,6 +12,7 @@ from math import isfinite
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -481,18 +482,47 @@ def pytest_sessionfinish(session, exitstatus):
     with open({listing!r}, "w", encoding="utf-8") as stream:
         json.dump({{"ids": _ids, "errors": _errors, "rootdir": str(session.config.rootpath)}}, stream)
 """
-# Collected first, this helper module puts its own directory on sys.path and
-# registers the plugin with pytest_plugins. It needs no conftest, PYTHONPATH or
-# import mode, so `python -I`, `--noconftest` and `env PYTHONPATH=...` all work;
-# pytest collects an explicitly named file whatever python_files says.
-HELPER_DIR = ".foragent-collect"
-HELPER_MODULE = """\
-import os
-import sys
+def _with_python_path(command: str, directory: str) -> str:
+    """Give only this subprocess ``directory`` on PYTHONPATH, joined with the command's own.
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-pytest_plugins = ["fa_collected_ids"]
-"""
+    Inline assignments win over outer ones, so the directory joins every
+    PYTHONPATH assignment before the command and right after an ``env``
+    launcher; without one it is added in front. Assignments keep NAME=
+    unquoted (a quoted 'NAME=v' is run as a command, exit 127).
+    """
+    words = shlex.split(command)
+
+    def assignment(word: str) -> bool:
+        return re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", word, re.S) is not None
+
+    # Positions of the leading assignments and of those right after each `env`.
+    positions: list[int] = []
+    index = 0
+    while True:
+        while index < len(words) and assignment(words[index]):
+            positions.append(index)
+            index += 1
+        if index < len(words) and Path(words[index]).name == "env":
+            index += 1
+            continue
+        break
+    joined = False
+    for position in positions:
+        name, value = words[position].split("=", 1)
+        if name == "PYTHONPATH":
+            words[position] = "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, value]))
+            joined = True
+    if not joined:
+        words.insert(0, "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, os.environ.get("PYTHONPATH")])))
+        positions = [0, *(position + 1 for position in positions)]
+    rendered = []
+    for position, word in enumerate(words):
+        if position in positions:
+            name, value = word.split("=", 1)
+            rendered.append(f"{name}={shlex.quote(value)}")
+        else:
+            rendered.append(shlex.quote(word))
+    return " ".join(rendered)
 
 
 def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
@@ -508,9 +538,12 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
     timeout raises AttemptFailure. Runs locally with the capture time limit,
     the run budget and a machine test slot.
 
-    The listing plugin comes from a helper module collected first (see
-    HELPER_MODULE). Like a capture, a collection that modified tracked files
-    raises AttemptFailure.
+    The listing plugin is a module with a private random name
+    (``_foragent_nodeids_<hex>``, never a test or project module name) in a
+    temporary directory outside the checkout. Only the collection subprocess
+    gets that directory, through PYTHONPATH, and loads it with ``-p``; nothing
+    is added to the project's tree or import path. Like a capture, a
+    collection that modified tracked files raises AttemptFailure.
     """
     from foragent import runner
 
@@ -530,14 +563,13 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
             remaining = runner._remaining(n, ctx)
             if remaining <= 0:
                 raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before collection")
-            helper = worktree / HELPER_DIR
-            helper.mkdir()
-            (helper / "fa_collected_ids.py").write_text(source, encoding="utf-8")
-            (helper / "test_fa_collect.py").write_text(HELPER_MODULE, encoding="utf-8")
-            # The helper first: the plugin then sees every later collection report.
-            command = (f"{previous.command} {shlex.quote(HELPER_DIR + '/test_fa_collect.py')} "
-                       f"{shlex.quote(acceptance_dir)}"
-                       + "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded) + " --collect-only")
+            plugins = Path(directory) / "plugins"
+            plugins.mkdir()
+            plugin = f"_foragent_nodeids_{secrets.token_hex(8)}"
+            (plugins / f"{plugin}.py").write_text(source, encoding="utf-8")
+            selection = f"{previous.command} {shlex.quote(acceptance_dir)}"
+            selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
+            command = _with_python_path(f"{selection} --collect-only -p {plugin}", str(plugins))
             result = runner._check(command, worktree, log, _baseline_capture_limit(ctx, log, remaining),
                                    progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
             _progress(n, ctx)

@@ -4,7 +4,9 @@ from datetime import timedelta
 import fcntl
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
+import re
 import shlex
 import sys
 import time
@@ -506,11 +508,10 @@ PLAIN = "def test_keep():\n    pass\n\ndef test_other():\n    pass\n"
 
 @pytest.mark.parametrize("launcher", [
     "env PYTHONPATH=src {python} -m pytest",
-    "{python} -I -m pytest",
+    "PYTHONPATH=src {python} -m pytest -p no:terminal",
     "env PYTHONPATH=src {python} -m pytest --noconftest",
-    "{python} -I -m pytest --noconftest -p no:terminal",
     "{python} -m pytest --import-mode=importlib",
-], ids=["env-pythonpath", "isolated", "noconftest", "isolated-noconftest", "importlib"])
+], ids=["env-pythonpath", "inline-pythonpath", "noconftest", "importlib"])
 def test_collection_works_with_every_supported_launcher(tmp_path, monkeypatch, launcher):
     command = launcher.format(python=shlex.quote(sys.executable))
     (owned, missing), _ = _collected(tmp_path, monkeypatch, {"tests/acceptance/test_a.py": PLAIN}, (KEEP, OTHER),
@@ -558,3 +559,40 @@ def test_log_dropped_ids_without_known_failures_does_not_claim_one(tmp_path):
     log = tmp_path / "run.log"
     log_dropped_ids(log, AcceptanceBaseline("pytest", (node,)), (), set(), set(), new, ci=False)
     assert log.read_text() == f"Acceptance baseline dropped protected node id {node}: no longer protected on the new base\n"
+
+
+
+def test_collection_under_isolated_python_stops_and_drops_nothing(tmp_path, monkeypatch):
+    # `python -I` ignores PYTHONPATH, so the plugin cannot load: #327, never a drop.
+    from foragent.run_attempt import AttemptFailure
+
+    command = f"{shlex.quote(sys.executable)} -I -m pytest"
+    with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
+        _collected(tmp_path, monkeypatch, {"tests/acceptance/test_a.py": PLAIN}, (KEEP, OTHER), command=command)
+
+
+def test_collection_plugin_never_collides_with_project_modules(tmp_path, monkeypatch):
+    # The project has its own test_fa_collect.py and a conftest; both import normally.
+    files = {"conftest.py": "ROOT = 1\n",
+             "tests/acceptance/conftest.py": "VALUE = 1\n",
+             "tests/acceptance/test_fa_collect.py": "def test_fa_collect():\n    pass\n",
+             "tests/acceptance/test_a.py": "from conftest import VALUE\n\n" + PLAIN}
+    project_id = "tests/acceptance/test_fa_collect.py::test_fa_collect"
+    (owned, missing), log = _collected(tmp_path, monkeypatch, files, (KEEP, OTHER, project_id))
+    assert (owned, missing) == (set(), set())
+    # The plugin has a private name, outside the checkout, given only through PYTHONPATH.
+    words = shlex.split(log.read_text().split("Done when command:\n")[1].splitlines()[0])
+    plugin = next(words[index + 1] for index, word in enumerate(words)
+                  if word == "-p" and words[index + 1].startswith("_foragent_nodeids_"))
+    assert re.fullmatch(r"_foragent_nodeids_[0-9a-f]{16}", plugin)
+    path = words[0].split("=", 1)[1].split(os.pathsep)[0]
+    assert words[0].startswith("PYTHONPATH=") and (Path(path) / f"{plugin}.py").parent.name == "plugins"
+
+
+def test_with_python_path_joins_inline_and_env_assignments():
+    from foragent.run_baseline import _with_python_path
+
+    assert _with_python_path("A= env 'PYTHONPATH=my src' python -m pytest -o addopts=", "/p d") == (
+        "A='' env PYTHONPATH='/p d:my src' python -m pytest -o addopts=")
+    assert _with_python_path("PYTHONPATH=src python -m pytest", "/p").startswith("PYTHONPATH=/p:src ")
+    assert shlex.split(_with_python_path("python -m pytest", "/p d"))[0].startswith("PYTHONPATH=/p d")
