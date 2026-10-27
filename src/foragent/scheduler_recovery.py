@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler, sleep_credit
 from foragent.scheduler_stop import (
-    _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes,
+    _flag_stop_refused, _restore_stopped, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes,
 )
 from foragent.state import Run
 from foragent.tracker import Issue
@@ -26,14 +26,14 @@ def _kill_executor(ctx: TickContext, number: int) -> None:
 
 
 def _remove_run_worktree(
-    ctx: TickContext, number: int, worktree: Path, report: TickReport, *, outcome: str,
-) -> None:
+    ctx: TickContext, number: int, worktree: Path, report: TickReport, *, outcome: str, why: str = "",
+) -> None:  # `why`: `fa orch stop`'s reason, named in the WIP; its killed tree owns its deletions.
     try:
         if worktree.exists() and outcome != "merged":
             try:
                 scheduler._preserve_failed_implementation(
-                    number, ctx, ctx.git.at(worktree), outcome, approval=ctx.store.load_approval(number),
-                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None,
+                    number, ctx, ctx.git.at(worktree), f"{outcome}: {why}" if why else outcome, approval=ctx.store.load_approval(number),
+                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None, owned_deletions=bool(why),
                 )
             except Exception as exc:
                 detail = f"WIP preservation failed before worktree cleanup: {exc}"
@@ -65,7 +65,7 @@ def _kill_run(
         if stopped == "gone":
             _finish_dead_run(ctx, run, report)
         return False
-    scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome)
+    scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome, why=detail if outcome == "stopped" else "")
     ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
     report.actions.append(f"#{number} runner killed")
     return True
@@ -150,8 +150,8 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
             ctx.tracker.add_labels(issue.number, [scheduler.READY])
         ctx.tracker.remove_labels(issue.number, [scheduler.RUNNING])
         return ctx.tracker.get_issue(issue.number)
-    if run is not None and run.outcome in {"stalled-restart", "stalled"}:
-        scheduler._restore_stalled(ctx, issue.number, run.restarts, report)
+    if run is not None and run.outcome in {"stalled-restart", "stalled", "stopped"}:  # stopped: detail is the why.
+        _restore_stopped(ctx, issue.number, run.detail, report) if run.outcome == "stopped" else scheduler._restore_stalled(ctx, issue.number, run.restarts, report)
         return ctx.tracker.get_issue(issue.number)
     detail = scheduler._crash_detail(ctx, issue.number)
     if run is None or run.outcome != "crashed" or run.detail != detail:

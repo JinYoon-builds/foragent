@@ -312,8 +312,15 @@ def _preserve_failed_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
     approved_ref: str = "HEAD", title: str | None = None, pushed_head: str | None = None,
     tracker_available: bool = True, push_branch: Callable[[], None] | None = None,
+    owned_deletions: bool = False,
 ) -> None:
-    """Save stopped work before cleanup, including after the runner has died."""
+    """Save stopped work before cleanup, including after the runner has died.
+
+    Deletions outside the run's recorded files are left out (#572), unless no
+    other process can be removing files meanwhile: the runner's own save after
+    its executor ended (it passes `push_branch`), or `owned_deletions` (`fa orch
+    stop`'s save of a killed tree under the tick lock).
+    """
     with ctx.store.worktree_lock(n):
         # Recheck only after acquiring the lock: a competing cleanup may have
         # removed the worktree while we waited. A parent repository is no save.
@@ -326,6 +333,7 @@ def _preserve_failed_implementation(
         _preserve_locked_implementation(
             n, ctx, git, reason, approval=approval, approved_ref=approved_ref, title=title,
             pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
+            owned_deletions=owned_deletions or push_branch is not None,
         )
 
 
@@ -354,7 +362,7 @@ def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> lis
 def _preserve_locked_implementation(
     n: int, ctx: FlagContext, git: GitRepo, reason: str, *, approval: Approval | None,
     approved_ref: str, title: str | None, pushed_head: str | None,
-    tracker_available: bool, push_branch: Callable[[], None] | None,
+    tracker_available: bool, push_branch: Callable[[], None] | None, owned_deletions: bool = False,
 ) -> None:
     branch = f"foragent/issue-{n}"
     run = ctx.store.get_run(n)
@@ -368,7 +376,7 @@ def _preserve_locked_implementation(
     git.stage_changes()
     if approval is not None:
         git.restore_staged_paths(approved_ref, approval.acceptance_blobs)
-    refused = _check_wip_deletions(ctx, git, run)
+    refused = [] if owned_deletions else _check_wip_deletions(ctx, git, run)
     if git.has_staged_changes():
         git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
     if refused:
