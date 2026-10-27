@@ -274,20 +274,20 @@ def human(card: dict[str, Any], language: str) -> str:
 
 
 def binding(store: StateStore, config: Config, root, card: dict[str, Any]) -> dict[str, Any]:
-    """Today's binding and the previous day's, from the tick's binding events.
+    """Today's latest binding and the previous day's latest.
 
-    With no event yet, today's comes from fa orch facts' local (read-only) view and the
-    previous day's is unknown (None)."""
+    Each day uses the tick's binding event in force at its end; a day older than every
+    event replays fa orch facts' rule from that day's local records (read-only)."""
     from foragent import orch_binding
 
     now = _time(card["now"])
-    today = orch_binding.at(store, now)
-    if today is not None:
-        return {"today": today, "previous": orch_binding.at(store, now - DAY)}
-    from foragent import orch_facts
 
-    found = orch_facts.collect(store, config, root)["binding"]
-    return {"today": found["kind"] if found else orch_binding.NONE, "previous": None}
+    def at(moment: datetime) -> str:
+        recorded = orch_binding.at(store, moment)
+        return recorded if recorded is not None else flow.binding_at(store, config, root, moment,
+                                                                       current=moment == now)
+
+    return {"today": at(now), "previous": at(now - DAY)}
 
 
 def _days(value: str) -> int:

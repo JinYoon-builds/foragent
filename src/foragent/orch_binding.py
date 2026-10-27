@@ -3,10 +3,11 @@
 Events go to ``<state>/binding-events.jsonl`` (append-only, beside the orch journal) so
 the orchestrator's action log keeps only actions.
 
-The tick is the only writer. It works the constraint out from what it already holds
-(its memory sample, run hours, the local runs and issues), in the order
-``orch_facts_resources._binding`` checks it, without probing processes again. The
-scorecard reads the latest event at or before a moment.
+The tick is the only writer. It runs fa orch facts' own binding functions over what it
+already holds (its memory sample and the local records), without probing processes
+again. The scorecard reads the latest event at or before a moment, and replays facts'
+start loop from that day's records when no event is that old
+(``orch_scorecard_flow.binding_at``).
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import json
 from typing import Any
 
 from foragent import capacity
-from foragent.config import Config, in_run_hours
+from foragent.config import Config
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.state import StateStore
 
@@ -35,35 +36,22 @@ def at(store: StateStore, moment: datetime) -> str | None:
     return latest[1] if latest else None
 
 
-def from_tick(store: StateStore, config: Config, now: datetime, sample: Any, github_wait: bool) -> str:
-    """The tick's view of the one resource holding work now."""
-    running = [run for run in store.active_runs() if run.status == "running"]
-    busy = {run.number for run in running} | set(store.run_starts())
-    waiting = [row for row in store.local_issues() if row.get("state") == "open"
-               and {"approved", "ready"} <= set(row.get("labels") or ())
-               and not set(row.get("labels") or ()) & {"blocked", "needs-human", "running"}
-               and row["number"] not in busy]
-    slot_wait = any(run.phase == "test-slot-wait" for run in running)
-    overlap_wait = any(run.phase == "overlap-wait" for run in running)
-    if not waiting and not slot_wait and not overlap_wait:
-        return NONE
-    pressure, load = (sample[0], float(sample[1])) if sample else ("normal", 0.0)
-    if pressure == "critical" or load >= capacity.OVERLOAD_LOAD:
-        return "machine"
-    if github_wait:
-        return "github"
-    if not in_run_hours(now.astimezone(), config.run_hours):
-        return "run_hours"
-    if slot_wait:
-        return "test_slots"
-    if waiting and not overlap_wait:
-        state = capacity.read_state(store)
-        cap = int(state["parallel"]) if state else capacity.INITIAL_PARALLEL
-        if config.max_parallel is not None:
-            cap = min(cap, config.max_parallel)
-        if len(busy) >= cap:
-            return "cap"
-    return "structure"
+def from_tick(store: StateStore, config: Config, root, now: datetime, sample: Any) -> str:
+    """fa orch facts' own binding (``_resources`` then ``_binding``) over the tick's local records.
+
+    The tick passes its memory sample; sibling runs count as alive (no process probe), as
+    in facts' frozen read when a pid was not probed."""
+    from foragent import machine_budget
+    from foragent.orch_facts_resources import _binding, _resources, _still_running
+    from foragent.orch_facts_runs import _test_slots, _waiting_issues
+
+    running = _still_running(store, store.active_runs())
+    machine = {"sample": tuple(sample) if sample else ("normal", 0.0), "alive": {},
+               "budget": machine_budget.values(), "test_slots": capacity.read_test_slots()}
+    resources = _resources(store, config, root, now, _waiting_issues(store, config, running),
+                           _test_slots(config, running, [], machine), running, machine)
+    found = _binding(resources)
+    return found["kind"] if found else NONE
 
 
 def record(store: StateStore, now: datetime, binding: str) -> bool:
@@ -80,8 +68,7 @@ def record(store: StateStore, now: datetime, binding: str) -> bool:
 
 
 def record_tick(ctx: Any) -> bool:
-    """The tick's one call: its own time, config, memory sample and GitHub wait; no extra probes."""
+    """The tick's one call: its own time, config, checkout and memory sample; no extra probes."""
     now = ctx.now()
-    github_wait = ctx.store.github_wait_until(now) is not None
-    kind = from_tick(ctx.store, ctx.config, now, getattr(ctx, "_budget_sample", None), github_wait)
+    kind = from_tick(ctx.store, ctx.config, ctx.repo_root, now, getattr(ctx, "_budget_sample", None))
     return record(ctx.store, now, kind)

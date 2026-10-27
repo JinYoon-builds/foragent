@@ -4,7 +4,9 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from foragent import orch_binding, orch_inbox, orch_scorecard
+from foragent import orch_scorecard_flow as flow
 from foragent.config import Config
+from foragent.issue import body_hash
 from foragent.state import StateStore
 
 NOW = datetime(2026, 10, 27, 12, tzinfo=UTC)
@@ -33,19 +35,95 @@ def test_record_appends_once_per_change(tmp_path):
     assert not (store.root / "orch-events.jsonl").exists(), "The action journal stays free of binding events"
 
 
+def _waiting(store, number, at=NOW, files="src/a.py"):
+    body = (f"<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- {files}\n## Out of scope\nO\n"
+            "## Done when\n```sh\ntrue\n```\n")
+    store.save_approval(number, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=at.isoformat())
+    store.update_local_issue(number, title="t", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+
+
+def _tick(store, config, tmp_path, sample=("normal", 0.1)):
+    return orch_binding.from_tick(store, config, tmp_path, NOW, sample)
+
+
 def test_from_tick_reads_held_work_without_probes(tmp_path):
     store, config = _store(tmp_path), Config()
-    assert orch_binding.from_tick(store, config, NOW, ("normal", 0.1), False) == "none"
+    assert _tick(store, config, tmp_path) == "none"
     store.start_run(5, branch="foragent/issue-5", worktree=store.worktree_path(5))
     store.update_run(5, phase="test-slot-wait", phase_started_at=NOW.isoformat())
-    assert orch_binding.from_tick(store, config, NOW, ("normal", 0.1), False) == "test_slots"
-    assert orch_binding.from_tick(store, config, NOW, ("normal", 0.1), True) == "github"
-    assert orch_binding.from_tick(store, config, NOW, ("critical", 0.1), False) == "machine"
+    assert _tick(store, config, tmp_path) == "test_slots"
+    # As in fa orch facts, a GitHub wait holds waiting issues; a run waiting in flight is not one.
+    store.pause_github(NOW + timedelta(hours=1))
+    assert _tick(store, config, tmp_path) == "test_slots"
+    _waiting(store, 7)
+    assert _tick(store, config, tmp_path) == "github"
+    assert _tick(store, config, tmp_path, ("critical", 0.1)) == "machine"
+
+
+def test_from_tick_names_quota_for_a_usage_paused_lane_like_facts(tmp_path):
+    store, config = _store(tmp_path), Config()
+    _waiting(store, 7)
+    assert _tick(store, config, tmp_path) == "none", "Facts' start loop would start it"
+    store.pause_executor(config.executor, NOW + timedelta(hours=1))
+    assert _tick(store, config, tmp_path) == "quota"
+
+
+def _budget(tmp_path, monkeypatch, at, parallel):
+    from foragent import capacity
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    capacity.append_budget_history(tmp_path, at, "parallel", 0, parallel, pressure="normal",
+                                   load_per_cpu=0.1, swapins=0)
+
+
+def test_rule_follows_the_start_loop_order(tmp_path, monkeypatch):
+    """Replayed day ends: an occupied slot holds work (cap), a free one meets the lane and file rules."""
+    store, config = _store(tmp_path), Config()
+    _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 1)
+    end = NOW - timedelta(days=1)
+    _waiting(store, 7, at=end - timedelta(hours=1), files="src/a.py")
+    store.clock[0] = end - timedelta(minutes=30)
+    store.start_run(5, branch="foragent/issue-5", worktree=store.worktree_path(5))
+    store.clock[0] = NOW
+    assert flow.binding_at(store, config, tmp_path, end, current=False) == "cap", (
+        "A run still going at the replayed moment holds its slot")
+    store.finish_run(5, outcome="error")
+    assert flow.binding_at(store, config, tmp_path, end, current=False) == "cap", (
+        "A run that finished after the moment held its slot then")
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "none"
+
+
+def test_replay_applies_the_file_rule_against_runs_holding_slots(tmp_path, monkeypatch):
+    store, config = _store(tmp_path), Config(overlap_per_file=1)
+    _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 3)
+    _waiting(store, 5, at=NOW - timedelta(hours=2), files="src/a.py")
+    store.clock[0] = NOW - timedelta(hours=1)
+    store.start_run(5, branch="foragent/issue-5", worktree=store.worktree_path(5))
+    store.update_local_issue(5, labels=["approved", "running"])
+    _waiting(store, 7, at=NOW - timedelta(hours=1), files="src/a.py")
+    store.clock[0] = NOW
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "structure"
+    _waiting(store, 7, at=NOW - timedelta(hours=1), files="src/b.py")
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "none"
+
+
+def test_scorecard_replays_each_days_binding_without_events(tmp_path):
+    store = _store(tmp_path)
+    store.clock[0] = NOW - timedelta(days=1, minutes=10)
+    store.start_run(10, branch="foragent/issue-10", worktree=store.worktree_path(10))
+    store.update_run(10, phase="overlap-wait", phase_started_at=store.clock[0].isoformat())
+    store.clock[0] = NOW - timedelta(days=1)
+    store.finish_run(10, outcome="killed")
+    store.clock[0] = NOW
+    card = orch_scorecard.collect(store, 2)
+    assert orch_scorecard.binding(store, Config(), tmp_path, card) == {"today": "none", "previous": "structure"}
 
 
 def test_record_tick_uses_the_tick_context(tmp_path):
     store = _store(tmp_path)
-    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: NOW, _budget_sample=("normal", 0.1))
+    ctx = SimpleNamespace(store=store, config=Config(), repo_root=tmp_path, now=lambda: NOW,
+                          _budget_sample=("normal", 0.1))
     assert orch_binding.record_tick(ctx) is True and orch_binding.record_tick(ctx) is False
     assert len(_lines(store)) == 1
 
@@ -84,3 +162,23 @@ def test_person_found_appends_one_event_and_rejects_empty_text(tmp_path):
     else:
         raise AssertionError("Empty text must be refused")
     assert len((store.root / "orch-events.jsonl").read_text().splitlines()) == 1
+
+
+def test_replay_claims_committed_measured_files_like_facts(tmp_path, monkeypatch):
+    """A run that committed measured files claims those, not its declared Files, now and in history."""
+    store, config = _store(tmp_path), Config(overlap_per_file=1)
+    _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 3)
+    _waiting(store, 5, at=NOW - timedelta(hours=3), files="src/a.py")
+    store.clock[0] = NOW - timedelta(hours=2)
+    store.start_run(5, branch="foragent/issue-5", worktree=store.worktree_path(5))
+    store.update_run(5, files_committed=True, effective_files=["src/b.py"])
+    store.update_local_issue(5, labels=["approved", "running"])
+    _waiting(store, 7, at=NOW - timedelta(hours=2), files="src/b.py")
+    store.clock[0] = NOW
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "structure"
+    store.finish_run(5, outcome="error")
+    assert flow.binding_at(store, config, tmp_path, NOW - timedelta(hours=1), current=False) == "structure", (
+        "The finished run's history record keeps its measured files")
+    _waiting(store, 7, at=NOW - timedelta(hours=2), files="src/a.py")
+    assert flow.binding_at(store, config, tmp_path, NOW - timedelta(hours=1), current=False) == "none", (
+        "Its declared file is no longer claimed")

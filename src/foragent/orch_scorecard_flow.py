@@ -8,7 +8,9 @@ intervals are clipped to the buckets they overlap. Only local records are read.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import json
 from statistics import median
+from types import SimpleNamespace
 from typing import Any
 
 from foragent import capacity
@@ -81,9 +83,63 @@ def _executions(store: StateStore, now: datetime) -> list[dict[str, Any]]:
     for run in store.active_runs():
         started = _time(run.started_at)
         if run.status == "running" and started and (run.number, started) not in done:
-            rows.append({"number": run.number, "started": started, "finished": None, "merged": False,
-                         "merged_at": None})
+            # A merged runner may still be cleaning up: its merge moment is on the running record.
+            merge = _time(_run_value(store, run.number).get("merged_at"))
+            merge = merge if merge is not None and merge >= started else None
+            rows.append({"number": run.number, "started": started, "finished": None, "merged": merge is not None,
+                         "merged_at": merge, "pid": run.pid})
     return rows
+
+
+def _run_value(store: StateStore, number: int) -> dict[str, Any]:
+    try:
+        value = json.loads((store.root / "runs" / f"{number}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _siblings(store: StateStore) -> list[StateStore]:
+    """Every other repository's store under the same data root (the budgets are machine-wide)."""
+    try:
+        roots = [root for root in store.root.parent.iterdir() if root != store.root and (
+            (root / "runs").is_dir() or (root / "run-starts").is_dir() or (root / "runs.jsonl").is_file())]
+    except OSError:
+        return []
+    return [StateStore(root, now=store._now) for root in sorted(roots)]
+
+
+def _occupancy(store: StateStore, now: datetime, executions: list[dict[str, Any]],
+               phases: list[tuple[int | None, str, Interval]], open_end: datetime | None = None,
+               ) -> tuple[list[tuple[Any, Interval]], list[Interval]]:
+    """Machine-wide run and test-slot holders over time, by fa orch facts' counting rule.
+
+    This store's running records hold a slot through now. Another store's running record
+    holds one while its process may live: with a pid through now (liveness is not probed),
+    without one only for the launch grace. A prepared start holds one for the grace until
+    its run starts. ``open_end`` ends still-open holds (default ``now``); a replay of one
+    moment passes a later time so ``start <= moment < end`` keeps them."""
+    open_end = open_end or now
+    occupied: list[tuple[Any, Interval]] = []
+    testing: list[Interval] = []
+    for index, (source, rows, spans) in enumerate(
+            [(store, executions, phases)] + [(other, _executions(other, now), _phase_intervals(other, now))
+                                            for other in _siblings(store)]):
+        counted = set()
+        for row in rows:
+            end = row["finished"] or open_end
+            if index and row["finished"] is None and row.get("pid") is None:
+                end = min(open_end, row["started"] + capacity.LAUNCH_GRACE)
+            occupied.append(((index, row["number"]), (row["started"], end)))
+            if row["finished"] is not None or not index or row.get("pid") is not None:
+                counted.add(row["number"])
+        for number, prepared in source.run_starts().items():
+            if (at := _time(prepared)) is not None:
+                later = [row["started"] for row in rows if row["number"] == number and row["started"] >= at]
+                occupied.append(((index, number), (at, min([*later, at + capacity.LAUNCH_GRACE, open_end]))))
+        testing += [span for number, phase, span in spans if phase in TEST_PHASES
+                    and (not index or number in counted)]
+    return occupied, testing
 
 
 def _budgets(now: datetime) -> dict[str, list[tuple[datetime, int]]]:
@@ -127,7 +183,8 @@ def _inside(spans: list[Interval], moment: datetime) -> bool:
     return any(start <= moment < end for start, end in spans)
 
 
-def _issue_view(store: StateStore, row: dict[str, Any], lanes: dict) -> dict[str, Any] | None:
+def _issue_view(store: StateStore, row: dict[str, Any], lanes: dict,
+                rows: dict[int, dict[str, Any]] | None = None) -> dict[str, Any] | None:
     """What the idle and lead-time rules need to know about one local issue."""
     events = sorted(((at, item.get("label"), item.get("action"))
                      for item in ((row.get("reads") or {}).get("label_events") or {}).get("value") or []
@@ -136,16 +193,43 @@ def _issue_view(store: StateStore, row: dict[str, Any], lanes: dict) -> dict[str
     approval = store.load_approval(row["number"])
     approved_at = _time(approval.approved_at) if approval else None
     closed = row.get("state") != "open"
-    blockers = [item for item in row.get("blocked_by") or [] if isinstance(item, dict)]
+    # A blocker blocks while open: an open one throughout (None), a merged one until its merge;
+    # a closed one with no recorded close time leaves no evidence that it blocked.
+    blocked_until = []
+    for item in row.get("blocked_by") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("state") != "closed":
+            blocked_until.append(None)
+        elif (merged := _time(((rows or {}).get(item.get("number")) or {}).get("merged_at"))) is not None:
+            blocked_until.append(merged)
+    flag = store.load_flag(row["number"])
     return {"events": events, "approved_at": approved_at, "labels": set(row.get("labels") or ()),
             "open_until": (_time(row.get("merged_at")) if closed else None), "closed": closed,
-            "blocked": any(item.get("state") != "closed" for item in blockers),
+            "blocked_until": blocked_until, "flagged_at": _time(flag.flagged_at) if flag else None,
             "lane": issue_lane(row.get("labels") or (), lanes)}
 
 
+def _issues(store: StateStore, lanes: dict) -> dict[int, dict[str, Any]]:
+    rows = {row["number"]: row for row in store.local_issues()}
+    return {number: view for number, row in rows.items()
+            if (view := _issue_view(store, row, lanes, rows)) is not None}
+
+
 def _labels_at(issue: dict[str, Any], moment: datetime) -> set[str]:
-    if not issue["events"]:  # No label history: the current labels hold from the approval on.
-        return issue["labels"] if issue["approved_at"] and issue["approved_at"] <= moment else set()
+    if not issue["events"]:
+        # No label history: startable from its approval (D96). Current labels are not history:
+        # a hold counts from its recorded flag time, and an approval removed now (no time known)
+        # leaves it unapproved. Its own runs are excluded by their run records.
+        if issue["approved_at"] is None or moment < issue["approved_at"]:
+            return set()
+        labels = {"approved", "ready"}
+        if (held := issue["labels"] & {"blocked", "needs-human"}) and (
+                issue["flagged_at"] is None or moment >= issue["flagged_at"]):
+            labels |= held
+        if not issue["closed"] and "approved" not in issue["labels"]:
+            labels.discard("approved")
+        return labels
     labels: set[str] = set()
     for at, label, action in issue["events"]:
         if at > moment:
@@ -155,7 +239,7 @@ def _labels_at(issue: dict[str, Any], moment: datetime) -> set[str]:
 
 
 def _startable(issue: dict[str, Any], moment: datetime, pauses: dict[str, list[Interval]]) -> bool:
-    if issue["blocked"] or (issue["closed"] and (issue["open_until"] is None or moment >= issue["open_until"])):
+    if any(until is None or moment < until for until in issue["blocked_until"]) or (issue["closed"] and (issue["open_until"] is None or moment >= issue["open_until"])):
         return False
     labels = _labels_at(issue, moment)
     return ({"approved", "ready"} <= labels and not labels & HOLDING
@@ -174,13 +258,7 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
           executions: list[dict[str, Any]], phases: list[tuple[int | None, str, Interval]]) -> list[float]:
     """Wall minutes with a startable approved issue while a run or test slot sat unused."""
     budgets, pauses = _budgets(now), _pauses(store)
-    occupied: list[tuple[int, Interval]] = [(row["number"], (row["started"], row["finished"] or now))
-                                            for row in executions]
-    for number, prepared in store.run_starts().items():  # A prepared start reserves its slot.
-        if (at := _time(prepared)) is not None:
-            later = [row["started"] for row in executions if row["number"] == number and row["started"] >= at]
-            occupied.append((number, (at, min(later, default=now))))
-    testing = [span for _, phase, span in phases if phase in TEST_PHASES]
+    occupied, testing = _occupancy(store, now, executions, phases)
     start = now - days * DAY
     points = {start, now}
     for spans in [[span for _, span in occupied], testing, *pauses.values()]:
@@ -188,12 +266,13 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
     points.update(at for values in budgets.values() for at, _ in values)
     for issue in issues.values():
         points.update(at for at, _, _ in issue["events"])
-        points.update(at for at in (issue["approved_at"], issue["open_until"]) if at is not None)
+        points.update(at for at in (issue["approved_at"], issue["open_until"], issue["flagged_at"],
+                                    *issue["blocked_until"]) if at is not None)
     ordered = sorted(moment for moment in points if start <= moment <= now)
     idle = [0.0] * days
     for low, high in zip(ordered, ordered[1:]):
         moment = low + (high - low) / 2
-        busy = {number for number, (a, b) in occupied if a <= moment < b}
+        busy = {number for (index, number), (a, b) in occupied if not index and a <= moment < b}
         if not any(number not in busy and _startable(issue, moment, pauses) for number, issue in issues.items()):
             continue
         parallel, slots = _value_at(budgets["parallel"], moment), _value_at(budgets["test_slots"], moment)
@@ -206,20 +285,20 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
 
 def daily(store: StateStore, now: datetime, days: int, lanes: dict | None = None) -> list[dict[str, Any]]:
     """Each bucket's flow metrics, today first."""
-    issues = {row["number"]: view for row in store.local_issues()
-              if (view := _issue_view(store, row, lanes or {})) is not None}
+    issues = _issues(store, lanes or {})
     executions, phases = _executions(store, now), _phase_intervals(store, now)
     runtime, wasted = [0.0] * days, [0.0] * days
     leads: list[list[float]] = [[] for _ in range(days)]
     merges = [0] * days
     for row in executions:
-        if row["finished"] is None or row["finished"] > now:
-            continue  # Waste counts ended runtime only.
-        part = _minutes(row["started"], row["finished"], now, days)
-        runtime = [a + b for a, b in zip(runtime, part)]
+        ended = row["finished"] is not None and row["finished"] <= now
+        part = _minutes(row["started"], row["finished"] or now, now, days)
+        runtime = [a + b for a, b in zip(runtime, part)]  # Ongoing runtime is runtime too.
+        if ended and not row["merged"]:
+            wasted = [a + b for a, b in zip(wasted, part)]  # Only runtime that ended without a merge is waste.
         if not row["merged"]:
-            wasted = [a + b for a, b in zip(wasted, part)]
-        elif (bucket := _bucket(row["merged_at"], now, days)) is not None:
+            continue
+        if (bucket := _bucket(row["merged_at"], now, days)) is not None:
             merges[bucket] += 1
             issue = issues.get(row["number"])
             if issue and (approved := _latest_approval(issue, row["merged_at"])) is not None:
@@ -261,3 +340,91 @@ def worse_names(today: dict[str, Any], before: dict[str, Any]) -> list[str]:
     pairs += [(f"wait_minutes_by_cause.{cause}", today["wait_minutes_by_cause"][cause],
                before["wait_minutes_by_cause"][cause]) for cause in CAUSE_ORDER]
     return [name for name, now, then in pairs if now is not None and then is not None and now > then]
+
+
+def binding_at(store: StateStore, config: Any, root, moment: datetime, *, current: bool) -> str:
+    """fa orch facts' binding replayed read-only from the local records in force at ``moment``.
+
+    The start loop is facts' own (_admission): its start order (``_ranked``), lane holds,
+    then the gate's file rule (``admits``: lane serialisation, exclusive reservations,
+    overlap_per_file) against the runs that held slots then; ``_binding`` then names the
+    constraint. A phase that closed exactly at ``moment`` still counts, so a day's end sees
+    the wait that ran up to it. Usage, lane and GitHub pauses keep only their end time, so
+    they count only when ``current`` (moment is now); plan pauses are journaled with times.
+    """
+    from foragent import machine_budget, orch_queue
+    from foragent.config import in_run_hours, lane_executors
+    from foragent.issue import parse_body
+    from foragent.orch_facts_resources import _binding
+    from foragent.overlap_files import Claim, admits, approved_issue, claim, recorded_union
+    from foragent.scheduler_start import _ranked
+    from foragent.state import Run
+
+    ctx = SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: moment)
+    issues = _issues(store, config.lanes)
+    executions, phases = _executions(store, moment), _phase_intervals(store, moment)
+    occupied, _ = _occupancy(store, moment, executions, phases, open_end=moment + 3650 * DAY)
+    holding = [(index, number) for (index, number), (a, b) in occupied if a <= moment < b]
+    busy = {number for index, number in holding if not index}
+    runs = {(run.number, _time(run.started_at)): run for run in [*store.read_history(), *store.active_runs()]}
+    known, unknown = [], []
+    for row in executions:  # This repository's runs holding a slot at the moment claim their Files.
+        run = runs.get((row["number"], row["started"]))
+        end = row["finished"] or moment + DAY
+        if run is None or not row["started"] <= moment < end:
+            continue
+        parsed = approved_issue(ctx, run)
+        if parsed is None or not parsed.files:
+            unknown.append(run)
+        else:
+            known.append(claim(run, parsed))  # facts' claims(): committed measured files first
+    open_phases = {(number, phase) for number, phase, (a, b) in phases if a <= moment <= b}
+    pauses = _pauses(store)
+    lanes: dict[str, list[int]] = {}
+    for number, issue in sorted(issues.items()):
+        if number not in busy and _startable(issue, moment, {}):
+            lanes.setdefault(issue["lane"], []).append(number)
+    ready = {lane: orch_queue.ordered(store, lane, numbers) for lane, numbers in lanes.items()}
+    ranked = _ranked(ctx, ready, claims=list(known))
+    github = current and store.github_wait_until(moment) is not None
+    outside = not in_run_hours(moment.astimezone(), config.run_hours)
+    parallel = _value_at(_budgets(moment)["parallel"], moment)
+    cap = parallel if parallel is not None else capacity.INITIAL_PARALLEL
+    if (ceiling := machine_budget.values()["max_parallel"]) is not None:
+        cap = min(cap, ceiling)
+    free = max(0, cap - len(holding))
+    if config.max_parallel is not None:
+        free = min(free, max(0, config.max_parallel - len(busy)))
+    held: dict[int, str] = {}
+    remaining, union = free, recorded_union(store)
+    for position, (lane, number) in enumerate(ranked):
+        approval = store.load_approval(number)
+        parsed = parse_body(approval.body) if approval is not None else None
+        if github or outside:
+            held[number] = "github" if github else "run_hours"
+        elif remaining <= 0:
+            held.update({later: "cap" for _, later in ranked[position:]})
+            break
+        elif _inside(pauses.get(lane, []), moment) or current and (store.lane_paused(lane, moment) or any(
+                store.executor_paused(name, moment) for name in lane_executors(config, lane))):
+            held[number] = "quota"
+        elif not admits(ctx, lane, parsed, known, unknown, union=union):
+            held[number] = "structure"
+        else:
+            remaining -= 1
+            started = Run(number, "", "", None, moment.isoformat(), moment.isoformat(), lane=lane)
+            if parsed is not None and parsed.files:
+                known.append(Claim(started, parsed, parsed.files))
+            else:
+                unknown.append(started)
+    resources = {
+        "machine": {"overloaded": False, "load_per_cpu": 0.0, "memory_pressure": "normal"},
+        "test_slots": {"queue_length": sum(phase == "test-slot-wait" for _, phase in open_phases),
+                       "admitted": _value_at(_budgets(moment)["test_slots"], moment)},
+        "parallelizable_work": {
+            "waiting_issues": [number for _, number in ranked], "held": {str(n): r for n, r in held.items()},
+            "in_flight": {str(n): "structure" for n, phase in open_phases if phase == "overlap-wait"},
+            "free_run_slots": free, "github_wait_until": moment.isoformat() if github else None},
+    }
+    found = _binding(resources)
+    return found["kind"] if found else "none"
