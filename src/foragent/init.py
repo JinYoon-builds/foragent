@@ -6,10 +6,11 @@ import json
 import logging
 from pathlib import Path
 import subprocess
+import sys
 
 import yaml
 
-from foragent import board, gh, launchd
+from foragent import board, gh, launchd, role_agents
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
@@ -223,6 +224,11 @@ def init_repo(
         contents[WORKFLOW] = workflow_text(config)
     if not (root / "tests/acceptance").exists():
         contents["tests/acceptance/.gitkeep"] = ""
+    role_files, invalid_agents = role_agents.missing_files(root)
+    contents.update(role_files)
+    if invalid_agents:
+        print(f"Warning: kept {', '.join(invalid_agents)} unchanged; its frontmatter needs name, "
+              "memory: project and its role skill.", file=sys.stderr)
 
     created = [path for path in contents if not (root / path).exists()]
     existed = [path for path in contents if (root / path).exists()]
@@ -242,7 +248,7 @@ def init_repo(
     legacy_paths = [LEGACY_PUBLISH_WORKFLOW] if not (root / LEGACY_PUBLISH_WORKFLOW).exists() else []
     pending = list(dict.fromkeys([
         *created, *tracked_removals, *([".foragent.yml"] if added else []),
-        *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *([WORKFLOW] if config.checks == "ci" else [])]),
+        *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root), *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
     if (pending or (board_planned and not config.board)) and git.current_branch() != base_branch:

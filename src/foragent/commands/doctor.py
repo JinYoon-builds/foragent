@@ -19,7 +19,12 @@ def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
     config = cli.load_config(root)
+    from foragent.runner_doctor import lane_skill_drift
+
+    drift = lane_skill_drift(root, config)
+    for line in drift:
+        print(line, flush=True)
     checks = [cli.live_check(root, config, name) for name in [args.executor or config.executor]]
     for check in checks:
         print(check.line(), flush=True)
-    return 0 if all(check.passed for check in checks) else 1
+    return 0 if not drift and all(check.passed for check in checks) else 1

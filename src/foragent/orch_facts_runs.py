@@ -106,6 +106,8 @@ def _row(execution: _Execution, now: datetime) -> dict[str, Any]:
         "declared_file_count": None if run.declared_files is None else len(run.declared_files),
         "changed_file_count": None if run.changed_files is None else len(run.changed_files),
         "overlap_records": [dict(record) for record in run.overlap_records],
+        # Where the acceptance comparison ran and how long it took; null before it was recorded.
+        "comparison": dict(run.comparison) if isinstance(run.comparison, dict) else None,
     }
 
 
