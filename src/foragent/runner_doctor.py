@@ -3,10 +3,13 @@
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
 import time
+
+import yaml
 
 from foragent.config import Config
 from foragent.executors import ExecResult, Executor, executor_for
@@ -17,6 +20,31 @@ from foragent.run_attempt import ExecutorStopped
 from foragent.run_checks import _check
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker
+
+def lane_skill_drift(repo_root: Path, config: Config) -> list[str]:
+    """Lanes whose agent frontmatter skills differ from .foragent.yml, their single source (D95).
+
+    Only reports; ``fa lanes skills`` is the writer that repairs a projection.
+    """
+    problems = []
+    for lane, settings in config.lanes.items():
+        agent = settings.get("agent") or f"fa-{lane}"
+        path = repo_root / ".claude/agents" / f"{agent}.md"
+        if not isinstance(agent, str) or not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        match = re.match(r"\A---[ \t]*\n(.*?)^---[ \t]*(?:\n|$)", text, re.S | re.M)
+        try:
+            metadata = yaml.safe_load(match[1]) if match else None
+        except yaml.YAMLError:
+            metadata = None
+        declared = metadata.get("skills", []) if isinstance(metadata, dict) else None
+        configured = settings.get("skills", [])
+        if declared != configured:
+            problems.append(f"FAIL lane {lane}: skills differ: .foragent.yml={configured!r}, "
+                            f".claude/agents/{agent}.md={declared!r}; run `fa lanes skills {lane} ...` to rewrite both")
+    return problems
+
 
 SMOKE_FILE = "hello.txt"
 SMOKE_CHECK = f'test "$(cat {SMOKE_FILE})" = ok'
