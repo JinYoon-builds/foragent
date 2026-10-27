@@ -13,7 +13,8 @@ directly. Context carries ``tick``, ``width``, ``selected``, ``now`` and
 later entries win). A section draws from ``top`` 0; the compositor moves its
 hits to the rows where it lands. Within a screen ``height``, sections with
 ``KEEP = True`` always stay and the others give way from the bottom up; a section
-with ``YIELD_BEFORE = "<module>"`` gives way just before that sibling; the
+with ``STAYS = True`` stays like KEEP but does not end the lane-row block, and
+moves up into the first ``height - 1`` rows when the KEEP sections push it below; the
 footer then gets ``short=True``. ``rows=True`` says the frame has the lane rows,
 so a section need not list the running issues again.
 

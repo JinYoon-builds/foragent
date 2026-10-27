@@ -5,7 +5,9 @@ play for FIREWORKS_SECONDS, counted in view ticks from the tick that first sees
 this order finished, then the band disappears. It plays once per finished order
 per view process: ``state["fireworks"]`` remembers the first tick per order
 number. Without a state it counts from tick 0. Inside ``calm()`` (fa gate watch
---once prints one still frame) and with ``animation: false`` it never plays. The band needs no strings.
+--once prints one still frame) and with ``animation: false`` it never plays.
+Only terminals narrower than 40 columns or shorter than 16 rows drop it. The
+band needs no strings.
 """
 
 from collections.abc import Iterator
@@ -21,13 +23,14 @@ from foragent.watch_sections.done import finished
 
 ORDER = 22
 GAP_AFTER = False  # The band sits just above the done list's completion sentence.
-# On a short screen the band gives way before the done list and the lane rows.
-YIELD_BEFORE = "done"
+# While it plays the band stays on short screens; other sections give way first.
+STAYS = True
 FIREWORKS_SECONDS = 3
 TICK_SECONDS = 0.3  # The live view's animation step.
 MIN_WIDTH, MIN_HEIGHT = 40, 16
 ROWS = 3
-COLOURS = ("yellow", "green", "claude", "blue")
+# The existing yellow, magenta (claude) and cyan (divider) style keys.
+COLOURS = ("yellow", "claude", "divider")
 # render_frame's arguments are a fixed interface, so the one-shot print says "still" here.
 _CALM: ContextVar[bool] = ContextVar("foragent_watch_calm", default=False)
 
