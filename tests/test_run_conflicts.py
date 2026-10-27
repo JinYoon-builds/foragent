@@ -815,3 +815,24 @@ def test_replay_own_files_come_from_branch_head_not_uncommitted_staged_work(run_
     assert "shared.txt" in c.tracker.list_comments(1)[-1].body
     # The stop keeps the PR's own work rather than the destination tree holding replay markers.
     assert git_command(c.history.origin, "show", "foragent/issue-1:shared.txt") == "child"
+
+
+def test_bug_steps_are_left_out_of_the_conflict_resolution_turn(conflicting_lanes, monkeypatch):
+    c = conflicting_lanes
+    c.tracker.add_labels(1, ["bug"])
+    c.executor.steps.append({"cli.py": "commands = ['help', 'base', 'issue']\n"})
+    implement = c.executor.run
+
+    def run(**kwargs):
+        initial = not c.executor.calls
+        result = implement(**kwargs)
+        if initial:
+            c.move_target()
+        return result
+
+    monkeypatch.setattr(c.executor, "run", run)
+    assert run_issue(1, c.ctx) == "merged"
+    first, conflict = (call["prompt"] for call in c.executor.calls)
+    assert "This issue is a bug. Follow these steps:" in first
+    assert "Resolve the conflict markers" in conflict
+    assert "This issue is a bug. Follow these steps:" not in conflict
