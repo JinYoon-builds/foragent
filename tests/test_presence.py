@@ -81,3 +81,24 @@ def test_a_gate_merge_counts_before_its_run_is_finished_and_only_once(tmp_path):
     assert presence.counts(store, now) == (1, 0, 1)
     store.finish_run(8, outcome="merged")
     assert presence.counts(store, now) == (0, 0, 1)
+
+
+def test_without_a_repo_key_a_non_github_origin_shows_zeros(project):
+    (project / ".foragent.yml").write_text(yaml.safe_dump({"language": "en"}), encoding="utf-8")
+    (project / ".git").mkdir()
+    (project / ".git" / "config").write_text('[remote "origin"]\n\turl = https://gitlab.com/o/n.git\n',
+                                            encoding="utf-8")
+    assert refresh(None) == (0, "🐿 0 lanes working · ✋ 0 · 0 merged today")
+
+
+def test_the_repo_key_wins_over_origin(project, monkeypatch):
+    from foragent import presence
+    from foragent.state import StateStore
+
+    (project / ".git").mkdir()
+    (project / ".git" / "config").write_text('[remote "origin"]\n\turl = git@github.com:o/origin.git\n',
+                                            encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo: seen.append(repo) or cls(project)))
+    presence.statusline_segment(project, statusline.datetime.now(statusline.UTC))
+    assert seen == ["offline/no-state"]
