@@ -65,8 +65,7 @@ def _kill_run(
         if stopped == "gone":
             _finish_dead_run(ctx, run, report)
         return False
-    scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome,
-                                   why=detail if outcome == "stopped" else "")
+    scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome, why=detail if outcome == "stopped" else "")
     ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
     report.actions.append(f"#{number} runner killed")
     return True
@@ -151,11 +150,9 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
             ctx.tracker.add_labels(issue.number, [scheduler.READY])
         ctx.tracker.remove_labels(issue.number, [scheduler.RUNNING])
         return ctx.tracker.get_issue(issue.number)
-    if run is not None and run.outcome in {"stalled-restart", "stalled"}:
-        scheduler._restore_stalled(ctx, issue.number, run.restarts, report)
+    if run is not None and run.outcome in {"stalled-restart", "stalled", "stopped"}:  # stopped: detail is the why.
+        _restore_stopped(ctx, issue.number, run.detail, report) if run.outcome == "stopped" else scheduler._restore_stalled(ctx, issue.number, run.restarts, report)
         return ctx.tracker.get_issue(issue.number)
-    if run is not None and run.outcome == "stopped":  # Its stop command died after the kill; detail is the why.
-        return _restore_stopped(ctx, issue.number, run.detail, report) or ctx.tracker.get_issue(issue.number)
     detail = scheduler._crash_detail(ctx, issue.number)
     if run is None or run.outcome != "crashed" or run.detail != detail:
         ctx.store.start_run(
