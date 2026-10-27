@@ -18,3 +18,4 @@ metadata:
 **Why:** keep these traps findable when the quota feature grows (#186 headroom choice is out of scope here).
 **How to apply:** extend `scheduler_quota.py` rather than scheduler.py/scheduler_start.py.
 - The runner recreates the worktree between attempts; `.foragent/TRY.md` must be rewritten after a retry.
+- CI 2026-10-27 09:15Z: `tests/test_cli.py` app fixture pinned tracker/store to NOW (10-20) but not `cli.datetime`; inspect's 7-day window expired → 2 failures on main too. Fixed by pinning `cli.datetime` in the fixture. Read CI logs with `gh run view <id> --log-failed` after the whole run completes.
