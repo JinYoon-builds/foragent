@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from foragent.git import GitError, GitRepo
+from foragent.git import GitError, GitRepo, origin_slug_from_files, slug_from_url
 
 from conftest import ACCEPTANCE, BASE_TIME, GitHistory, git_command
 
@@ -63,6 +63,52 @@ def test_remote_slug_custom_remote_and_unsupported_url(tmp_path):
     with pytest.raises(GitError, match="set repo"):
         GitRepo(tmp_path, run).remote_slug("upstream")
     assert calls == [["remote", "get-url", "upstream"]]
+
+
+def _git_config(path, body):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config").write_text(body, encoding="utf-8")
+
+
+@pytest.mark.parametrize("url", [
+    "git@github.com:owner/repo.git",
+    "https://github.com/owner/repo",
+    "https://github.com/owner/repo.git",
+    "ssh://git@github.com/owner/repo.git",
+])
+def test_origin_slug_from_files_uses_the_same_rule_as_remote_slug(tmp_path, url):
+    _git_config(tmp_path / ".git", f'[remote "upstream"]\n\turl = git@github.com:other/x.git\n'
+                                   f'[Remote "origin"]\n\tURL = {url}\n')
+    assert origin_slug_from_files(tmp_path) == "owner/repo"
+    assert slug_from_url(url) == "owner/repo"
+
+
+@pytest.mark.parametrize("body", [
+    '[remote "origin"]\n\turl = https://gitlab.com/owner/repo.git\n',
+    '[remote "origin"]\n\turl = /local/origin.git\n',
+    '[remote "upstream"]\n\turl = git@github.com:owner/repo.git\n',
+    '[core]\n\tbare = false\n',
+], ids=["other-host", "local-path", "no-origin", "no-remote"])
+def test_origin_slug_from_files_without_a_github_origin_is_none(tmp_path, body):
+    _git_config(tmp_path / ".git", body)
+    assert origin_slug_from_files(tmp_path) is None
+
+
+def test_origin_slug_from_files_follows_a_relative_worktree_gitdir_and_commondir(tmp_path):
+    common = tmp_path / "main" / ".git"
+    _git_config(common, '[remote "origin"]\n\turl = git@github.com:owner/repo.git\n')
+    (common / "worktrees" / "wt").mkdir(parents=True)
+    (common / "worktrees" / "wt" / "commondir").write_text("../..\n", encoding="utf-8")
+    root = tmp_path / "wt"
+    root.mkdir()
+    (root / ".git").write_text("gitdir: ../main/.git/worktrees/wt\n", encoding="utf-8")
+    assert origin_slug_from_files(root) == "owner/repo"
+
+
+def test_origin_slug_from_files_unreadable_git_is_none(tmp_path):
+    assert origin_slug_from_files(tmp_path) is None
+    (tmp_path / ".git").write_text("not a gitdir line\n", encoding="utf-8")
+    assert origin_slug_from_files(tmp_path) is None
 
 
 @pytest.mark.parametrize("branch", ["main", "trunk", "release/v1"])

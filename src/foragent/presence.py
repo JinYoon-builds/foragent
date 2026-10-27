@@ -64,6 +64,7 @@ def counts(store, now: datetime) -> tuple[int, int, int]:
 def statusline_segment(cwd: Path, now: datetime) -> str | None:
     """The segment for a Foragent project, else None (and when the project config cannot be read)."""
     from foragent.config import load_config
+    from foragent.git import origin_slug_from_files
     from foragent.i18n import text
     from foragent.state import StateStore
 
@@ -74,7 +75,9 @@ def statusline_segment(cwd: Path, now: datetime) -> str | None:
         config = load_config(root)
         if not config.presence["statusline"]:
             return None
-        store = StateStore.for_repo(config.repo) if config.repo else None
+        # Without a repo key, read origin from git's files: the segment runs no child process.
+        repo = config.repo or origin_slug_from_files(root)
+        store = StateStore.for_repo(repo) if repo else None
         # No local state yet (never run here, or no repo set): every count is zero.
         lanes, turns, merged = counts(store, now) if store and store.root.is_dir() else (0, 0, 0)
         return text("presence_statusline", config.language, lanes=lanes, turns=turns, merged=merged)
