@@ -12,7 +12,7 @@ start loop from that day's records when no event is that old
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from typing import Any
 
@@ -73,3 +73,17 @@ def record_tick(ctx: Any) -> bool:
     now = ctx.now()
     kind = from_tick(ctx.store, ctx.config, ctx.repo_root, now, getattr(ctx, "_budget_sample", None))
     return record(ctx.store, now, kind)
+
+
+def scorecard(store: StateStore, config: Config, root, card: dict[str, Any]) -> dict[str, Any]:
+    """Each day's latest binding event, or facts' read-only replay when no event is that old."""
+    from foragent import orch_scorecard_flow as flow
+
+    now = _time(card["now"])
+
+    def latest(moment: datetime) -> str:
+        recorded = at(store, moment)
+        return recorded if recorded is not None else flow.binding_at(store, config, root, moment,
+                                                                       current=moment == now)
+
+    return {"today": latest(now), "previous": latest(now - timedelta(days=1))}

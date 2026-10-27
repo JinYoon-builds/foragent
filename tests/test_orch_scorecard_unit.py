@@ -122,6 +122,37 @@ def test_worst_line_uses_registry_labels_and_raw_phase_names():
     assert orch_scorecard.worst_line(rate, "ko") == "그 전 며칠보다 나빠졌어요: 머지 비율 100.0% -> 50.0%"
 
 
+@pytest.mark.parametrize("records", ["missing", "non-directory", "empty"])
+def test_missing_optional_machine_records_keep_scorecard_consumers_working(store, tmp_path, monkeypatch, records):
+    from foragent import capacity
+    from foragent.config import Config
+
+    machine = tmp_path / "machine"
+    if records == "non-directory":
+        machine.write_text("")
+        machine /= "foragent"
+    elif records == "empty":
+        machine.mkdir()
+        (machine / capacity.HISTORY_FILE).write_text("")
+    monkeypatch.setattr(capacity, "machine_root", lambda: machine)
+    finish(store, 1, at=NOW - timedelta(days=1, hours=1), minutes=10)
+    finish(store, 2, at=NOW - timedelta(hours=1), minutes=30)
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    result = orch_scorecard.collect(store, days=2)
+    today = result["window"]["today"]
+    assert today["idle_minutes"] == 0  # No capacity observation: unknown, never idle.
+    assert today["waste_share"] == 0
+    assert today["lead_time_minutes"] is None  # No approval record.
+    assert today["person_interventions"] == 0
+    assert today["wait_minutes_by_cause"] == dict.fromkeys(("slot", "overlap", "merge", "quota"), 0)
+    assert orch_scorecard.binding(store, Config(), tmp_path, result) == {"today": "none", "previous": "none"}
+    assert orch_scorecard.worst(result) == "median_minutes_to_merge"
+    assert orch_scorecard.worst_line(result, "en") == (
+        "Worse than the days before: minutes to merge 10.0 -> 30.0")
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+
+
 def test_flow_idle_counts_sibling_repositories_on_the_shared_budgets(tmp_path, monkeypatch):
     from foragent import capacity
     from foragent.issue import body_hash

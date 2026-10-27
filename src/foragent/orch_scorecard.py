@@ -17,6 +17,7 @@ from typing import Any
 
 from foragent import orch_scorecard_flow as flow
 from foragent.config import Config
+from foragent.orch_binding import scorecard as binding
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _seconds, _time
 from foragent.state import StateStore
@@ -271,23 +272,6 @@ def human(card: dict[str, Any], language: str) -> str:
         lines.append(text("scorecard_unexplained", language,
                           issues=", ".join(f"#{n}" for n in card["unexplained_failures"])))
     return "\n".join(lines)
-
-
-def binding(store: StateStore, config: Config, root, card: dict[str, Any]) -> dict[str, Any]:
-    """Today's latest binding and the previous day's latest.
-
-    Each day uses the tick's binding event in force at its end; a day older than every
-    event replays fa orch facts' rule from that day's local records (read-only)."""
-    from foragent import orch_binding
-
-    now = _time(card["now"])
-
-    def at(moment: datetime) -> str:
-        recorded = orch_binding.at(store, moment)
-        return recorded if recorded is not None else flow.binding_at(store, config, root, moment,
-                                                                       current=moment == now)
-
-    return {"today": at(now), "previous": at(now - DAY)}
 
 
 def _days(value: str) -> int:

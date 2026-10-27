@@ -27,7 +27,8 @@ def _time(value: Any) -> datetime | None:
 def _jsonl(path) -> list[dict[str, Any]]:
     try:
         text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
+        # A missing journal or a non-directory ancestor both mean no records exist.
         return []
     rows = []
     for line in text.splitlines():
