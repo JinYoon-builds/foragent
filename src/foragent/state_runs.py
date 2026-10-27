@@ -249,6 +249,7 @@ class RunRecordsMixin:
             snapshot = {**self._run_value(finished), "finished_at": self._timestamp()}
             self._atomic_write(history_path, history + _state.json.dumps(snapshot, ensure_ascii=False) + "\n")
             self._write_run(finished, snapshot)
+            self._flush_talk_closes(finished)  # Only after the credit is written.
             return finished
 
     def read_history(self) -> list[Run]:

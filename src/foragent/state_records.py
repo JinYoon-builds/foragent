@@ -100,11 +100,11 @@ class Run:
     # When this instance of the work began; segments split by nested waits share it.
     phase_work_started_at: str | None = None
     work_events: dict[str, str] = field(default_factory=dict)
-    # Open pauses (the talk and each runner wait: test slot, executor backoff, lock), by key,
-    # with their start times; ``pause_mark`` is when their overlap was last counted.
-    # ``waited_seconds`` always holds the union of closed pause time, never a sum (D55 addendum).
-    pauses_open: dict[str, str] = field(default_factory=dict)
-    pause_mark: str | None = None
+    # Runner waits as wall-clock regions: each open wait by key (its region as far as it has
+    # credited), closed ones merged. ``waited_seconds`` changes by exactly the growth of their
+    # union, so concurrent waits count once whatever order they credit in (D55 addendum).
+    pause_regions: dict[str, list[str]] = field(default_factory=dict)
+    pause_closed: list[list[str]] = field(default_factory=list)
     # The recorded session is not the running worker's (a fresh thread is starting, or it was
     # inherited from an earlier run and not resumed yet); nothing may be sent to it.
     session_stale: bool = False
@@ -119,23 +119,36 @@ class Run:
     def talking_since(self) -> str | None:
         return self.__dict__.get("_talk_since")
 
+    def wait_regions(self) -> list[tuple[datetime, datetime]]:
+        """Every runner wait's credited region (closed and open) as wall-clock pairs."""
+        pairs = [*self.pause_closed, *self.pause_regions.values()]
+        return [(start, end) for start, end in ((_at(a), _at(b)) for a, b in pairs) if start and end]
+
     def talk_pause_seconds(self, now: datetime) -> float:
-        """Paused seconds not yet in ``waited_seconds``: the open talk, less pending overlap.
+        """Paused talk time that no runner wait credit already covers, derived up to ``now``.
 
-        Runner waits credit their own time as it passes; the tick credits the talk's whole
-        length when it closes. Time when several pauses are open at once counts once.
+        The talk regions come from the events (closed, superseded or open until ``now``),
+        so this is never lost, never counted twice and never shrinks as time passes: the
+        run's total pause is ``waited_seconds`` plus this, the length of the union.
         """
-        talking = _at(self.talking_since)
-        talk = max(0.0, (now - talking).total_seconds()) if talking is not None else 0.0
-        # May be negative: overlapping runner waits have already credited the shared time twice.
-        return talk - self.pending_overlap(now)
-
-    def pending_overlap(self, now: datetime) -> float:
-        """Seconds counted more than once since ``pause_mark`` while several pauses are open."""
-        mark = _at(self.pause_mark)
-        if mark is None or len(self.pauses_open) < 2:
+        talks = [(start, end or now) for start, end in self.__dict__.get("_talk_regions", ())]
+        if not talks:
             return 0.0
-        return (len(self.pauses_open) - 1) * max(0.0, (now - mark).total_seconds())
+        waits = self.wait_regions()
+        return max(0.0, union_seconds([*waits, *talks]) - union_seconds(waits))
+
+
+def union_seconds(regions) -> float:
+    """Length of the union of ``(start, end)`` datetime pairs."""
+    total, reach = 0.0, None
+    for start, end in sorted((start, end) for start, end in regions if end > start):
+        if reach is None or start > reach:
+            total += (end - start).total_seconds()
+            reach = end
+        elif end > reach:
+            total += (end - reach).total_seconds()
+            reach = end
+    return total
 
 
 def _at(value: str | None) -> datetime | None:

@@ -25,7 +25,6 @@ def check_talking(store: StateStore, run: Run, root: Path, now: datetime) -> tup
         store.close_talk(run.number, event, datetime.fromisoformat(newer_at))
     if current is None:
         return store.get_run(run.number) or run, False
-    store.open_talk_pause(run.number, current, now)
     cwd = Path(run.worktree) if Path(run.worktree).is_dir() else root
     target = probe.resolved(current, cwd)  # A pending title found now serves this probe only.
     if target is None or probe.liveness(target, cwd) != probe.CLOSED:

@@ -233,7 +233,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 report.actions.append(scheduler.text("talk_ended", ctx.config.language, n=run.number))
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
             runtime = ((ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds()
-                       - run.waited_seconds - run.slept_seconds)
+                       - run.waited_seconds - run.slept_seconds - run.talk_pause_seconds(ctx.now()))
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
                 if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit.", unless_talking=True):
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")

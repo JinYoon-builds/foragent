@@ -260,15 +260,11 @@ def test_panel_reviewer_threads_get_the_runs_pause(store):
 def test_queue_uses_the_session_recorded_while_the_terminal_opened(store, tmp_path, monkeypatch):
     session(store, "codex")
     terminals = Terminals(monkeypatch)
-
-    def during(argv):
-        if argv[1:3] == ["terminal", "create"]:  # The runner records the worker's new session now.
-            store.update_run(1, session_id="thread-2", session_executor="codex")
-
-    terminals.on_call = during
-    lanes.talk(1, message="hi", store=store, config=config(), repo_root=tmp_path)
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)  # The log terminal opens.
+    store.update_run(1, session_id="thread-2", session_executor="codex")  # The worker moves on meanwhile.
+    lanes.talk(1, message="hi", store=store, config=config(), repo_root=tmp_path)  # Sent while it is open.
     queue = next(argv for argv in terminals.calls if Path(argv[0]).name == "codex")
-    assert queue[queue.index("--thread") + 1] == "thread-2"
+    assert queue[queue.index("--thread") + 1] == "thread-2" and len(terminals.opened()) == 1
 
 
 def test_a_resume_that_switches_threads_never_lets_talk_send_to_the_old_one(run_case):
@@ -350,7 +346,9 @@ def test_closed_terminal_adds_paused_time_and_restarts_stall_clock(store, tmp_pa
     terminals.alive = False
     later = NOW + timedelta(minutes=9)
     run, still = lane_talk.check_talking(store, store.get_run(1), tmp_path, later)
+    # The tick credits the talk's 9 minutes through the union helper when it closes.
     assert not still and run.talking is False and run.waited_seconds == 9 * 60
+    assert run.talk_pause_seconds(later + timedelta(hours=1)) == 0  # Nothing left to derive.
     (closed,) = events(store, "talk-closed")
     assert closed["handle"] == "term_1" and closed["summary"] == "Talk closed for #1 after 9 min"
     assert run.last_progress_at == run.started_at  # Not moved; the stall clock derives from the event.
@@ -515,7 +513,6 @@ def test_a_talk_overlapping_a_test_slot_wait_is_credited_once(tmp_path, monkeypa
     def slot(slots, waiting):
         waiting()  # Queued for 40 minutes while a person talks for the same 40 minutes.
         talk.append(talk_event(store, clock[0]))
-        store.open_talk_pause(1, talk[0], clock[0])  # The tick sees the talk.
         clock[0] += timedelta(minutes=40)
         if talk_ends_first:
             store.close_talk(1, talk[0], clock[0])
@@ -539,8 +536,8 @@ def test_open_talk_and_open_wait_pause_the_live_budget_once(tmp_path):
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
     store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
     ctx = SimpleNamespace(store=store, now=lambda: clock[0], config=config(max_runtime_minutes=60))
-    store.add_waited(1, 600, wait="open", key="backoff", now=clock[0])  # Credited up front.
-    store.open_talk_pause(1, talk_event(store, clock[0]), clock[0])
+    store.add_waited(1, key="backoff", start=clock[0], end=clock[0] + timedelta(seconds=600))  # Up front.
+    talk_event(store, clock[0])
     clock[0] += timedelta(minutes=10)
     assert run_waits._remaining(1, ctx) == 60 * 60  # Both open for 10 minutes: paused 10, not 20.
 
@@ -561,7 +558,6 @@ def test_two_overlapping_120s_backoffs_inside_a_600s_talk_credit_600s(tmp_path):
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
     store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
     event = talk_event(store)
-    store.open_talk_pause(1, event, clock[0])
     clock[0] += timedelta(seconds=100)
     mono[0] += 100
     depth = []
@@ -576,9 +572,11 @@ def test_two_overlapping_120s_backoffs_inside_a_600s_talk_credit_600s(tmp_path):
 
     ctx = SimpleNamespace(store=store, now=lambda: clock[0], monotonic=lambda: mono[0], sleep=sleep)
     _executor_wait(1, ctx, 120)
-    assert store.get_run(1).pauses_open == {event["at"]: NOW.isoformat()}
+    run = store.get_run(1)
+    assert run.waited_seconds == 120 and run.pause_regions == {} and len(run.pause_closed) == 1
     ended = store.close_talk(1, event, NOW + timedelta(seconds=600))
-    assert ended.waited_seconds == 600 and ended.pauses_open == {} and ended.pause_mark is None
+    later = NOW + timedelta(hours=1)
+    assert ended.waited_seconds + ended.talk_pause_seconds(later) == 600  # The union, counted once.
 
 
 @pytest.mark.parametrize("listing", ["{}", json.dumps({"id": "req-4", "ok": True, "result": {}})])
@@ -758,7 +756,8 @@ FIND_ORCA = [
 ]
 FIND_TMUX = [
     (0, "@1\tother\n@7\tT\n", "@7"),
-    (0, "@7\tT\r\n", "@7"),
+    (0, "@7\r\tT\n", "@7"),  # Only the window-id field loses its trailing \r.
+    (0, "@7\tT\r\n", None),  # The name is compared raw: "T\r" is not "T".
     (0, "@7\tT\tmore\n", None),  # The name after the first tab is "T\tmore".
     (0, "@7\tT\n@8\tT\n", None),
     (0, "@7 T\n", None),  # A line without a tab is malformed.
@@ -823,7 +822,9 @@ def test_a_newer_talk_supersedes_the_older_one_closed_at_its_time(store, tmp_pat
     lane_talk.check_talking(store, run, tmp_path, NOW + timedelta(minutes=5))
     (closed,) = events(store, "talk-closed")
     assert closed["handle"] == older["handle"] and closed["at"] == (NOW + timedelta(minutes=3)).isoformat()
-    assert store.get_run(1).talking is True and store.get_run(1).waited_seconds == 180
+    run = store.get_run(1)
+    assert run.talking is True and run.waited_seconds == 180  # The superseded talk, credited by the tick.
+    assert run.waited_seconds + run.talk_pause_seconds(NOW + timedelta(minutes=5)) == 300
 
 
 def test_stored_talking_and_old_talk_files_are_ignored(store):
@@ -846,3 +847,128 @@ def test_talk_opened_event_carries_its_fields_and_summary(store, tmp_path, monke
     (event,) = events(store, "talk-opened")
     assert event["summary"] == "Talk opened for #1 (codex)" and event["issue"] == 1
     assert set(event) == {"at", "issue", "kind", "summary", "run_started_at", "executor", "socket", "window_id"}
+
+
+def test_an_open_talk_over_an_uncredited_open_wait_still_pauses(tmp_path):
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    store.add_waited(1, key="slot", start=NOW, end=NOW)  # A test-slot queue credited only at its start.
+    talk_event(store)
+    clock[0] = NOW + timedelta(seconds=600)
+    run = store.get_run(1)
+    assert run.waited_seconds + run.talk_pause_seconds(clock[0]) == 600  # Not zero while talking.
+    store.add_waited(1, key="slot", start=NOW, end=clock[0], close=True)  # The queue ends and credits.
+    run = store.get_run(1)
+    assert run.waited_seconds + run.talk_pause_seconds(clock[0]) == 600  # Still once.
+
+
+def test_an_overlap_finished_before_any_tick_counts_once(tmp_path):
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    event = talk_event(store)  # Talk 0-60 s.
+    store.add_waited(1, key="wait", start=NOW + timedelta(seconds=10), end=NOW + timedelta(seconds=20), close=True)
+    store.close_talk(1, event, NOW + timedelta(seconds=60))
+    run = store.get_run(1)
+    assert run.waited_seconds + run.talk_pause_seconds(NOW + timedelta(hours=1)) == 60
+
+
+def test_replacing_a_talk_never_lowers_the_live_pause(store):
+    talk_event(store, NOW, handle="term_old")
+    later = NOW + timedelta(seconds=600)
+    before = store.get_run(1).talk_pause_seconds(later)
+    talk_event(store, later, handle="term_1")  # Superseded before any tick closed the old one.
+    assert before == 600 and store.get_run(1).talk_pause_seconds(later) == 600
+    assert store.get_run(1).talk_pause_seconds(later + timedelta(seconds=60)) == 660
+
+
+def test_a_closing_credit_written_before_its_event_is_not_repeated(tmp_path, monkeypatch):
+    from foragent import orch_events
+
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    event = talk_event(store)
+    original = orch_events._write_line
+    monkeypatch.setattr(orch_events, "_write_line", lambda store, row: (_ for _ in ()).throw(OSError("full")))
+    with pytest.raises(OSError):
+        store.close_talk(1, event, NOW + timedelta(seconds=600))  # The credit is written; the event is not.
+    run = store.get_run(1)
+    assert run.talking is True and run.waited_seconds == 600
+    assert run.waited_seconds + run.talk_pause_seconds(NOW + timedelta(seconds=600)) == 600  # Not twice.
+    monkeypatch.setattr(orch_events, "_write_line", original)
+    store.close_talk(1, event, NOW + timedelta(seconds=600))  # The next tick closes it again.
+    assert store.get_run(1).waited_seconds == 600 and len(events(store, "talk-closed")) == 1
+    clock[0] = NOW + timedelta(hours=1)
+    assert store.finish_run(1, "merged").waited_seconds == 600  # Finishing re-credits nothing.
+
+
+def test_a_second_talk_waits_for_the_first_and_reshows_its_terminal(store, tmp_path, monkeypatch):
+    import threading
+
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+    sending, release, second = threading.Event(), threading.Event(), []
+
+    def slow_queue(argv):
+        if Path(argv[0]).name == "codex" and not sending.is_set():
+            sending.set()
+            assert release.wait(5)
+
+    terminals.on_call = slow_queue
+    first = threading.Thread(target=lambda: lanes.talk(1, message="hi", store=store, config=config(),
+                                                       repo_root=tmp_path))
+    first.start()
+    assert sending.wait(5)
+    other = threading.Thread(target=lambda: second.append(lanes.talk(1, store=store, config=config(),
+                                                                     repo_root=tmp_path)))
+    other.start()
+    other.join(0.5)
+    assert other.is_alive() and terminals.opened() == []  # The send comes first; the second talk waits.
+    release.set()
+    first.join(5)
+    other.join(5)
+    assert len(terminals.opened()) == 1 and "Showed" in second[0]
+    assert len(events(store, "talk-opened")) == 1
+
+
+def test_a_non_string_name_beside_a_matching_title_makes_the_listing_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: f"/bin/{name}")
+    listing = [{"title": "T", "name": 42, "handle": "h"}]
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, json.dumps(listing), ""))
+    assert probe.find_pending({"title": "T"}, tmp_path) is None
+
+
+def test_a_live_log_left_open_after_the_run_is_never_shown_as_its_resume_terminal(store, tmp_path, monkeypatch):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)  # The live log, still open.
+    store.finish_run(1, "blocked")
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    create = terminals.opened()[-1]
+    assert len(terminals.opened()) == 2 and "resume thread-1" in create[create.index("--command") + 1]
+
+
+def test_a_finished_issues_message_opens_a_new_resume_terminal_with_it(store, tmp_path, monkeypatch):
+    session(store, "codex", status="blocked")
+    terminals = Terminals(monkeypatch)
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)  # A resume terminal, still open.
+    lanes.talk(1, message="Why blocked?", store=store, config=config(), repo_root=tmp_path)
+    assert len(terminals.opened()) == 2
+    command = terminals.opened()[-1]
+    assert "resume thread-1 'Why blocked?'" in command[command.index("--command") + 1]
+
+
+def test_the_message_is_sent_before_the_log_opens_and_the_event_follows_the_launch(store, tmp_path, monkeypatch):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+    seen = []
+
+    def watch(argv):
+        if Path(argv[0]).name == "codex":  # No terminal is open, untracked, during the send.
+            seen.append((len(terminals.opened()), len(events(store, "talk-opened"))))
+
+    terminals.on_call = watch
+    lanes.talk(1, message="hi", store=store, config=config(), repo_root=tmp_path)
+    assert seen == [(0, 0)] and len(terminals.opened()) == 1 and store.get_run(1).talking is True

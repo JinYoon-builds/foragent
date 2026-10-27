@@ -132,12 +132,11 @@ def _orca_find(title: str, cwd: Path) -> str | None:
     for entry in entries:
         if not isinstance(entry, dict):
             return None
-        key = "title" if "title" in entry else "name" if "name" in entry else None
-        if key is None:
-            continue
-        if not isinstance(entry[key], str):
+        # Every present title or name must be a string before any entry can match.
+        if any(key in entry and not isinstance(entry[key], str) for key in ("title", "name")):
             return None
-        if entry[key] != title:
+        label = entry["title"] if "title" in entry else entry.get("name")
+        if label != title:  # Matched by title when it has one, else by name; neither: skipped.
             continue
         terminal = entry.get("terminal") if isinstance(entry.get("terminal"), dict) else {}
         handle = next((value for value in (_text(entry.get("handle")), _text(entry.get("id")),
@@ -157,12 +156,12 @@ def _tmux_find(socket: str, title: str, cwd: Path) -> str | None:
         return None
     found = []
     for line in reply.stdout.split("\n"):
-        line = line.rstrip("\r")
         if not line:
             continue
         if "\t" not in line:
-            return None
+            return None  # A non-empty line without a tab is malformed.
         window, name = line.split("\t", 1)
+        window = window.rstrip("\r")  # Only the window-id field is normalised; the name stays raw.
         if not WINDOW_ID.match(window):
             return None
         if name == title:

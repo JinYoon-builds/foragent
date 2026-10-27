@@ -3,9 +3,11 @@
 `fa lanes talk` appends ``talk-opened`` events to the orch events journal and never
 writes the run record. A run's current talk is its latest ``talk-opened`` event (for
 its ``run_started_at``) with no matching ``talk-closed`` event; ``Run.talking`` and
-``talking_since`` are derived from it on every read and never stored. Only the gate
-tick (and ``finish_run``) writes: one ``talk-closed`` event and the paused-time credit,
-through ``add_waited``, the helper every pause credit goes through.
+``talking_since`` are derived from it on every read and never stored. The gate tick
+(and ``finish_run``) closes talks with one ``talk-closed`` event. The talk's paused time
+is derived from the events too (``Run.talk_pause_seconds``): only runner waits credit
+``waited_seconds`` (as wall-clock regions, by their union), and ``finish_run`` folds the
+talk's share in once, in the same write that finishes the run.
 """
 
 from datetime import datetime
@@ -13,7 +15,7 @@ from itertools import pairwise
 import json
 from typing import Any
 
-from foragent.state_records import Run
+from foragent.state_records import Run, union_seconds
 
 TALK_OPENED, TALK_CLOSED = "talk-opened", "talk-closed"
 # A talk-closed event names the talk-opened event it ends by these fields.
@@ -29,14 +31,16 @@ def _minutes(seconds: float) -> str:
 
 
 class TalkRecordsMixin:
-    def add_waited(self, number: int, seconds: float, *, wait: str | None = None,
-                   key: str | None = None, now: datetime | None = None, **fields: Any) -> Run:
+    def add_waited(self, number: int, seconds: float = 0.0, *, key: str | None = None,
+                   start: datetime | None = None, end: datetime | None = None, close: bool = False,
+                   **fields: Any) -> Run:
         """The one helper every pause credit goes through: ``waited_seconds`` stays the union.
 
-        ``seconds`` (negative corrects an advance credit) is the caller's own measure
-        of its pause. ``wait="open"`` / ``"close"`` with a ``key`` marks that pause's span
-        at ``now``. Time when several pauses were open is counted once, so concurrent
-        backoffs, a test-slot queue and a talk add only the length of their union.
+        A plain credit adds ``seconds``. A keyed runner wait sets its wall-clock region to
+        ``start``..``end`` (its own measure: it may grow or, to correct an advance credit,
+        shrink), and ``close`` merges it into the closed regions. ``waited_seconds`` moves by
+        exactly the change in the length of the regions' union, so overlapping waits count
+        once, whichever order they credit in.
         """
         with self._state_lock():
             run = self.get_run(number)
@@ -44,7 +48,17 @@ class TalkRecordsMixin:
                 raise KeyError(number)
             if run.status == "finished":
                 return run
-            updated = _state.replace(run, **_pause_event(run, now, seconds, wait, key), **fields)
+            if key is not None:
+                before = union_seconds(run.wait_regions())
+                regions, closed = dict(run.pause_regions), [list(pair) for pair in run.pause_closed]
+                if start is not None and end is not None:
+                    regions[key] = [start.isoformat(), max(start, end).isoformat()]
+                if close and key in regions:
+                    closed = _merged([*closed, regions.pop(key)])
+                fields.update(pause_regions=regions, pause_closed=closed)
+                probe = _state.replace(run, pause_regions=regions, pause_closed=closed)
+                seconds += union_seconds(probe.wait_regions()) - before
+            updated = _state.replace(run, waited_seconds=run.waited_seconds + seconds, **fields)
             self._write_run(updated)
             return updated
 
@@ -88,78 +102,100 @@ class TalkRecordsMixin:
                  if event["kind"] == TALK_CLOSED and event.get("run_started_at") == run.started_at]
         return max(times) if times else None
 
+    def talk_regions(self, run: Run) -> list[tuple[datetime, datetime | None]]:
+        """Each talk of this run as (start, end): closed at its talk-closed event, superseded at the
+        next talk-opened event, or still open (None)."""
+        events = self.talk_events(run.number)
+        closed = {talk_identity(event): event["at"] for event in events if event["kind"] == TALK_CLOSED}
+        opened = [event for event in events
+                  if event["kind"] == TALK_OPENED and event.get("run_started_at") == run.started_at]
+        regions = []
+        for index, event in enumerate(opened):
+            end = closed.get(talk_identity(event)) or (opened[index + 1]["at"] if index + 1 < len(opened) else None)
+            regions.append((_state.datetime.fromisoformat(event["at"]),
+                            _state.datetime.fromisoformat(end) if end else None))
+        return regions
+
     def _with_talk(self, run: Run | None) -> Run | None:
-        """The run with its derived talk; a finished run never talks."""
+        """The run with its derived talk and talk regions; a finished run never talks."""
         if run is not None and run.status == "running":
             current, _ = self.talk_state(run)
             if current is not None:
                 object.__setattr__(run, "_talk_since", current["at"])
+            object.__setattr__(run, "_talk_regions", self.talk_regions(run))
         return run
 
-    def open_talk_pause(self, number: int, event: dict, now: datetime) -> None:
-        """The tick marks a current talk's pause open in the union, once (keyed by the event's time)."""
-        with self._state_lock():
-            run = self.get_run(number)
-            if run is None or run.status != "running" or event["at"] in run.pauses_open:
-                return
-            at = _state.datetime.fromisoformat(event["at"])
-            mark = _state.datetime.fromisoformat(run.pause_mark) if run.pause_mark else at
-            # The union only moves forward: a talk seen after another pause began opens from there.
-            self._write_run(_state.replace(run, **_pause_event(run, max(at, mark), 0.0,
-                                                               "open", event["at"])))
-
     def close_talk(self, number: int, event: dict, closed_at: datetime) -> Run | None:
-        """The tick closes one talk: one talk-closed event and its paused time credited once."""
+        """The tick closes one talk: its region credited through the union, then one talk-closed event.
+
+        The credit is written first. If the event then fails, the talk still reads as open,
+        the next tick closes it again, and re-crediting the same region adds nothing.
+        """
         with self._state_lock():
             run = self.get_run(number)
-            if run is None or run.status != "running":
+            if run is None or run.status != "running" or self._closed(run, event):
                 return run
-            ended = self._talk_ended(run, event, closed_at)
-            if ended is not run:
-                self._write_run(ended)
-            return ended
+            credited = _credit_region(run, _state.datetime.fromisoformat(event["at"]), closed_at)
+            self._write_run(credited)
+            self._append_closed(run, event, closed_at)
+            return self.get_run(number)
 
-    def _talk_ended(self, run: Run, event: dict, closed_at: datetime) -> Run:
-        """Under the state lock: append talk-closed and credit, unless the talk is already closed."""
+    def _closed(self, run: Run, event: dict) -> bool:
+        return any(other["kind"] == TALK_CLOSED and talk_identity(other) == talk_identity(event)
+                   for other in self.talk_events(run.number))
+
+    def _append_closed(self, run: Run, event: dict, closed_at: datetime) -> None:
+        """Under the state lock: one talk-closed event, unless that talk is already closed."""
         from foragent.orch_events import append_event
 
-        if any(other["kind"] == TALK_CLOSED and talk_identity(other) == talk_identity(event)
-               for other in self.talk_events(run.number)):
-            return run
+        if self._closed(run, event):
+            return
         length = max(0.0, (closed_at - _state.datetime.fromisoformat(event["at"])).total_seconds())
         fields = {name: event[name] for name in IDENTITY if name in event}
         append_event(self, closed_at, run.number, TALK_CLOSED,
                      f"Talk closed for #{run.number} after {_minutes(length)}", locked=True,
                      **{"executor": event.get("executor"), **fields})
-        return _state.replace(run, **_pause_event(run, closed_at, length, "close", event["at"]))
 
     def _finish_talk(self, run: Run) -> Run:
-        """``finish_run`` (under the state lock): an open talk ends with the run, credited once."""
+        """``finish_run`` (under the state lock): every talk region of the run credited once.
+
+        Credit goes into the run write that finishes the run; the closing events are
+        appended only after that write (``_flush_talk_closes``), so an event never exists
+        without its credit. Re-crediting a region another tick already credited adds nothing.
+        """
+        now = self._now()
+        for start, end in self.talk_regions(run):
+            run = _credit_region(run, start, end or now)
         current, superseded = self.talk_state(run)
-        for event, newer_at in superseded:
-            run = self._talk_ended(run, event, _state.datetime.fromisoformat(newer_at))
-        if current is not None:
-            run = self._talk_ended(run, current, self._now())
+        closes = [(event, _state.datetime.fromisoformat(newer_at)) for event, newer_at in superseded]
+        self._talk_closes = [*closes, *([(current, now)] if current is not None else [])]
         return run
 
+    def _flush_talk_closes(self, run: Run) -> None:
+        """After ``finish_run``'s write: the talk-closed events for the talks it credited."""
+        for event, closed_at in getattr(self, "_talk_closes", []):
+            self._append_closed(run, event, closed_at)
+        self._talk_closes = []
 
-def _pause_event(run: Run, now: datetime | None, seconds: float, wait: str | None, key: str | None) -> dict:
-    """Fields after crediting ``seconds`` and opening or closing pause ``key`` at ``now``.
 
-    Before the change, the time since ``pause_mark`` with k pauses open was counted
-    k times by their own credits; (k - 1) times that is taken back, so the total is
-    the union of the pause intervals.
-    """
-    opened = dict(run.pauses_open)
-    waited = run.waited_seconds + seconds
-    if now is None:
-        return {"waited_seconds": waited}
-    waited -= run.pending_overlap(now)
-    if wait == "open" and key is not None:
-        opened.setdefault(key, now.isoformat())
-    elif wait == "close" and key is not None:
-        opened.pop(key, None)
-    return {"waited_seconds": waited, "pauses_open": opened, "pause_mark": now.isoformat() if opened else None}
+def _credit_region(run: Run, start: datetime, end: datetime) -> Run:
+    """The run with one more closed pause region; ``waited_seconds`` grows by the union's growth."""
+    before = union_seconds(run.wait_regions())
+    closed = _merged([*(list(pair) for pair in run.pause_closed), [start.isoformat(), max(start, end).isoformat()]])
+    credited = _state.replace(run, pause_closed=closed)
+    return _state.replace(credited, waited_seconds=run.waited_seconds + union_seconds(credited.wait_regions()) - before)
+
+
+def _merged(pairs: list[list[str]]) -> list[list[str]]:
+    """Closed regions merged where they overlap, so the list stays short."""
+    merged: list[list[str]] = []
+    for start, end in sorted(pairs, key=lambda pair: _state.datetime.fromisoformat(pair[0])):
+        if merged and _state.datetime.fromisoformat(start) <= _state.datetime.fromisoformat(merged[-1][1]):
+            if _state.datetime.fromisoformat(end) > _state.datetime.fromisoformat(merged[-1][1]):
+                merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    return merged
 
 
 import foragent.state as _state

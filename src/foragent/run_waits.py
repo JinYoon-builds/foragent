@@ -70,17 +70,14 @@ def _test_slot(n: int, ctx: RunContext):
     """Hold a machine-wide test slot; credit the queue time as waited, not run time."""
     started = ctx.now()
     waited = False
-    credited = 0.0
     key = f"test-slot-{uuid4().hex}"
     wait = WaitPhase(n, ctx, "test-slot-wait", started)
 
-    def credit(**span) -> datetime:
-        nonlocal credited
+    def credit(close: bool = False) -> datetime:
         now = ctx.now()
-        total = max(0.0, (now - started).total_seconds())
-        # Increments through the union helper, so a talk or another wait open meanwhile counts once.
-        ctx.store.add_waited(n, total - credited, last_progress_at=now.astimezone(UTC).isoformat(), **span)
-        credited = total
+        # Its region through the union helper, so a talk or another wait over the same time counts once.
+        ctx.store.add_waited(n, key=key, start=started, end=now, close=close,
+                             last_progress_at=now.astimezone(UTC).isoformat())
         return now
 
     def waiting() -> None:
@@ -88,7 +85,7 @@ def _test_slot(n: int, ctx: RunContext):
         # Queued time is its own phase, so facts can see the slot queue and its wait.
         wait.open()
         waited = True
-        now = credit(wait="open", key=key, now=ctx.now())
+        now = credit()
         # Tick reads a future waiting_until as alive; refresh it while queued.
         ctx.store.update_run(n, waiting_until=(now + timedelta(seconds=60)).astimezone(UTC).isoformat())
 
@@ -97,7 +94,7 @@ def _test_slot(n: int, ctx: RunContext):
             stack.enter_context(capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting))
         finally:
             if waited:
-                now = credit(wait="close", key=key, now=ctx.now())
+                now = credit(close=True)
                 ctx.store.update_run(n, waiting_until=None)
                 wait.close(now)
         yield
@@ -183,8 +180,9 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
     wait = WaitPhase(n, ctx, "executor-wait", started)
     wait.open()
     key = f"executor-wait-{uuid4().hex}"  # Concurrent reviewers back off under their own keys.
+    # Credited up front as the whole planned region, then corrected to the monotonic elapsed time.
     ctx.store.add_waited(
-        n, seconds, wait="open", key=key, now=started,
+        n, key=key, start=started, end=started + timedelta(seconds=seconds),
         executor_waited_seconds=run.executor_waited_seconds + seconds,
         waiting_until=(started + timedelta(seconds=seconds)).astimezone(UTC).isoformat(),
         last_progress_at=started.astimezone(UTC).isoformat(),
@@ -194,7 +192,7 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
     finally:
         elapsed = max(0, ctx.monotonic() - started_mono)
         ctx.store.add_waited(
-            n, elapsed - seconds, wait="close", key=key, now=ctx.now(),
+            n, key=key, start=started, end=started + timedelta(seconds=elapsed), close=True,
             executor_waited_seconds=run.executor_waited_seconds + elapsed,
             waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
         )
@@ -215,25 +213,23 @@ def _credited_wait(
     wait = WaitPhase(n, ctx, phase)
     if eager:
         wait.open()
-    credited = 0.0
     key = f"lock-wait-{uuid4().hex}"
+    began = ctx.now()
 
-    def credit(**fields):
-        nonlocal credited
-        total = max(0, ctx.monotonic() - started)
-        ctx.store.add_waited(n, total - credited, **fields)
-        credited = total
+    def credit(close: bool = False, **fields):
+        # Its region: from the wall-clock start, as long as the monotonic clock says it has lasted.
+        elapsed = max(0, ctx.monotonic() - started)
+        ctx.store.add_waited(n, key=key, start=began, end=began + timedelta(seconds=elapsed), close=close, **fields)
 
-    def progress(polled: bool = True, **span):
+    def progress(polled: bool = True):
         if polled:
             wait.open()
         now = ctx.now().astimezone(UTC)
-        credit(waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat(), **span)
+        credit(waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat())
 
-    progress(polled=False, wait="open", key=key, now=ctx.now())
+    progress(polled=False)
     try:
         runner.poll_executor(acquire, progress)
     finally:
-        credit(waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
-               wait="close", key=key, now=ctx.now())
+        credit(close=True, waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat())
         wait.close()
