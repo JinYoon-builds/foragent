@@ -10,6 +10,8 @@ def add(commands) -> None:
         "statusline", help="Claude Code statusline: record rate limits, show your statusline")
     statusline_command.add_argument("--uninstall", action="store_true",
                                     help="Put back the statusline you had before Foragent's wrapper")
+    statusline_command.add_argument("--session-start", action="store_true",
+                                    help="Claude Code SessionStart hook: print the since-last-report line")
 
 
 def _uninstall_statusline() -> int:
@@ -29,4 +31,6 @@ def run(args) -> int:
     if args is not None and args.uninstall:
         return facade()._uninstall_statusline()
     from foragent import statusline
+    if args is not None and args.session_start:
+        return statusline.session_start()
     return statusline.run()

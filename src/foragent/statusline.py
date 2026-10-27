@@ -3,6 +3,9 @@
 Account-wide files under $XDG_DATA_HOME/foragent (default ~/.local/share/foragent):
   claude-rate-limits.json  {seen_at: ISO UTC, rate_limits: the input object unchanged}
   statusline-wrapper.json  {enabled: bool, previous_command: str | null}
+
+The install also adds Foragent's SessionStart hook (`fa statusline --session-start`)
+beside the statusline in Claude's user settings; uninstalling or declining removes it.
 """
 
 from collections.abc import Callable, Iterator
@@ -19,6 +22,9 @@ import tempfile
 from typing import Any, BinaryIO
 
 WRAPPER_COMMAND = "fa statusline"
+HOOK_COMMAND = "fa statusline --session-start"
+# Sessions the person starts or resumes; not /clear or compaction inside a session.
+HOOK_MATCHER = "startup|resume"
 # Set while the previous command runs, so a nested wrapper never runs it again.
 NESTED_ENV = "FORAGENT_STATUSLINE_ACTIVE"
 PROMPT = ("Install the Foragent statusline in Claude Code? It records Claude's rate limits "
@@ -63,20 +69,80 @@ def _read_json(path: Path) -> Any:
         return None
 
 
-def is_wrapper(command: str) -> bool:
-    """True when a shell command runs `fa statusline` (any spacing, quoting or path to fa)."""
+def _fa_arguments(command: str) -> list[str] | None:
+    """The arguments a shell command gives fa (any spacing, quoting or path to fa), else None."""
     try:
         words = shlex.split(command)
     except ValueError:
-        return False
+        return None
     while words and "=" in words[0] and not words[0].startswith("="):
         words = words[1:]  # leading VAR=value assignments
     if not words:
-        return False
+        return None
     program = Path(words[0]).name
     if program == "fa":
-        return words[1:] == ["statusline"]
-    return program.startswith("python") and words[1:] == ["-m", "foragent.cli", "statusline"]
+        return words[1:]
+    if program.startswith("python") and words[1:3] == ["-m", "foragent.cli"]:
+        return words[3:]
+    return None
+
+
+def is_wrapper(command: str) -> bool:
+    """True when a shell command runs `fa statusline`."""
+    return _fa_arguments(command) == ["statusline"]
+
+
+def is_session_hook(command: Any) -> bool:
+    """True when a hook command runs `fa statusline --session-start`."""
+    return isinstance(command, str) and _fa_arguments(command) == ["statusline", "--session-start"]
+
+
+def has_hook(settings: dict) -> bool:
+    hooks = settings.get("hooks")
+    groups = hooks.get("SessionStart") if isinstance(hooks, dict) else None
+    return isinstance(groups, list) and any(
+        isinstance(group, dict) and isinstance(group.get("hooks"), list)
+        and any(isinstance(hook, dict) and is_session_hook(hook.get("command")) for hook in group["hooks"])
+        for group in groups)
+
+
+def with_hook(settings: dict) -> dict:
+    """``settings`` with Foragent's SessionStart hook added (unchanged when it is there)."""
+    if has_hook(settings):
+        return settings
+    hooks = settings.get("hooks")
+    hooks = dict(hooks) if isinstance(hooks, dict) else {}
+    groups = hooks.get("SessionStart")
+    groups = list(groups) if isinstance(groups, list) else []
+    groups.append({"matcher": HOOK_MATCHER, "hooks": [{"type": "command", "command": HOOK_COMMAND}]})
+    return {**settings, "hooks": {**hooks, "SessionStart": groups}}
+
+
+def without_hook(settings: dict) -> dict:
+    """``settings`` without Foragent's SessionStart hook; emptied containers go too."""
+    if not has_hook(settings):
+        return settings
+    hooks = dict(settings["hooks"])
+    groups = []
+    for group in hooks["SessionStart"]:
+        if isinstance(group, dict) and isinstance(group.get("hooks"), list):
+            kept = [hook for hook in group["hooks"]
+                    if not (isinstance(hook, dict) and is_session_hook(hook.get("command")))]
+            if len(kept) != len(group["hooks"]):
+                if kept:
+                    groups.append({**group, "hooks": kept})
+                continue
+        groups.append(group)
+    if groups:
+        hooks["SessionStart"] = groups
+    else:
+        del hooks["SessionStart"]
+    result = dict(settings)
+    if hooks:
+        result["hooks"] = hooks
+    else:
+        del result["hooks"]
+    return result
 
 
 def load_record() -> dict | None:
@@ -97,8 +163,44 @@ def record_usage(raw: bytes, now: Callable[[], datetime] = lambda: datetime.now(
     return True
 
 
+def _session_input(raw: bytes) -> dict:
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
+    """Entry point for the SessionStart hook: one JSON object with the summary line, or nothing.
+
+    Claude Code shows a hook's systemMessage to the person; plain stdout would reach only
+    Claude. Outside a Foragent project, or with presence.session_start off, it prints nothing.
+    """
+    from foragent import presence
+
+    stdin = stdin or sys.stdin.buffer
+    stdout = stdout or sys.stdout.buffer
+    payload = _session_input(stdin.read())
+    cwd = payload.get("cwd")
+    session_id = payload.get("session_id")
+    try:
+        message = presence.session_start_message(Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd(),
+                                                 session_id if isinstance(session_id, str) else None,
+                                                 datetime.now(UTC))
+    except Exception:  # A failed summary must never disturb the session that is starting.
+        message = None
+    if message:
+        stdout.write((json.dumps({"systemMessage": message}, ensure_ascii=False) + "\n").encode("utf-8"))
+        stdout.flush()
+    return 0
+
+
 def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
-    """Entry point for `fa statusline`: the previous command's bytes, plus presence in a project."""
+    """Entry point for `fa statusline`: the previous command's bytes, plus presence in a project.
+
+    During a session's first minute the big squirrel shows above that output.
+    """
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout.buffer
     raw = stdin.read()
@@ -117,7 +219,11 @@ def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
         result = subprocess.run(previous, shell=True, input=raw, stdout=subprocess.PIPE, env=env, check=False)
         output, code = result.stdout, (result.returncode if result.returncode >= 0 else 128 - result.returncode)
     from foragent import presence
-    stdout.write(presence.append(output, presence.statusline_segment(Path.cwd(), datetime.now(UTC))))
+    now = datetime.now(UTC)
+    output = presence.append(output, presence.statusline_segment(Path.cwd(), now))
+    session_id = _session_input(raw).get("session_id")
+    art = presence.squirrel(Path.cwd(), session_id if isinstance(session_id, str) else None, now)
+    stdout.write(art.encode("utf-8") + b"\n" + output if art else output)
     stdout.flush()
     return code
 
@@ -149,7 +255,7 @@ def offer_install(ask: Callable[[str], str] = input) -> str:
     next init asks again.
     """
     if load_record() is not None:
-        return "kept"
+        return _sync_hook()
     settings_file = claude_settings_path()
     if not settings_file.parent.is_dir() or _read_settings(settings_file) is None:
         return "skipped"
@@ -164,6 +270,7 @@ def offer_install(ask: Callable[[str], str] = input) -> str:
             return "kept"
         if answer.strip().lower() not in {"y", "yes"}:
             _write_json(record_path(), {"enabled": False, "previous_command": None})
+            _sync_hook_locked()
             return "declined"
         settings = _read_settings(settings_file)
         if settings is None:
@@ -175,6 +282,7 @@ def offer_install(ask: Callable[[str], str] = input) -> str:
         # Record first: a wrapper in settings without its record would hide the user's statusline.
         _write_json(record_path(), {"enabled": True, "previous_command": previous})
         settings["statusLine"] = {**current, "type": "command", "command": WRAPPER_COMMAND}
+        settings = with_hook(settings)
         try:
             _write_json(settings_file.resolve(), settings)
         except OSError:
@@ -182,6 +290,29 @@ def offer_install(ask: Callable[[str], str] = input) -> str:
             record_path().unlink(missing_ok=True)
             raise
     return "installed"
+
+
+def _sync_hook() -> str:
+    with _install_lock():
+        return _sync_hook_locked()
+
+
+def _sync_hook_locked() -> str:
+    """Match the SessionStart hook to the recorded decision: "hooked" when it was added, else "kept".
+
+    Installs from before the hook existed get it at the next init; a declined or
+    uninstalled statusline has none.
+    """
+    record = load_record() or {}
+    settings_file = claude_settings_path()
+    settings = _read_settings(settings_file) if settings_file.parent.is_dir() else None
+    if settings is None:
+        return "kept"
+    wanted = with_hook(settings) if record.get("enabled") else without_hook(settings)
+    if wanted is settings:
+        return "kept"
+    _write_json(settings_file.resolve(), wanted)
+    return "hooked" if record.get("enabled") else "kept"
 
 
 _JSON_SPACE = " \t\r\n"
@@ -296,6 +427,15 @@ def uninstall(language: str = "en") -> tuple[int, str]:
             while (span := _member_span(updated, "statusLine")) is not None:
                 updated = updated[:span[0]] + updated[span[3]:]
             message = text("statusline_removed", language)
+        if (stripped := without_hook(intended)) is not intended:
+            intended = stripped
+            if "hooks" in intended:
+                span = _member_span(updated, "hooks")
+                updated = (updated[:span[1]] + json.dumps(intended["hooks"], ensure_ascii=False)
+                           + updated[span[2]:])
+            else:
+                while (span := _member_span(updated, "hooks")) is not None:
+                    updated = updated[:span[0]] + updated[span[3]:]
         if json.loads(updated) != intended:
             # Never write a file whose effective settings differ from what we report.
             return 1, text("statusline_settings_unreadable", language, path=settings_file,
