@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from foragent import board, review_perspectives, risks
+from foragent import board, cuts, review_perspectives, risks
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError

@@ -150,7 +150,7 @@ def _publish_locked(attempt: Implementation) -> str:
 
     def ci_failed() -> None:
         if attempt.rebuilt:
-            logs = ctx.tracker.pr_failed_logs(pr)
+            logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=run_publish.cuts.issue_dir(ctx.store.root, n))
             run_publish._hold_if_not_started(n, ctx, pr, logs)
             raise run_publish.ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
         run_publish._ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)

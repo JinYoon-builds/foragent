@@ -539,3 +539,34 @@ def test_checks_do_not_write_bytecode_into_the_worktree(tmp_path, with_slot):
     assert result.exit_code == 0, result.output
     assert not list(worktree.rglob("__pycache__"))
     assert ("None" in result.output) is not with_slot
+
+
+def test_related_check_timeout_keeps_earlier_done_when_failures(run_case, monkeypatch):
+    """#420: the related-unit timeout exit saves every failure gathered before it."""
+    from foragent import cuts
+
+    c = run_case
+    c.history.update({
+        "src/sample.py": "VALUE = 1\n",
+        "tests/test_sample.py": "from sample import VALUE\n",
+    })
+    c.ctx.config = replace(c.ctx.config, test_command="pytest -q", max_retries=0)
+    c.executor.steps = [{"feature.txt": "done", "src/sample.py": "VALUE = 2\n"}]
+
+    def check(command, worktree, log, timeout_s, **kwargs):
+        report = next((word.split("=", 1)[1] for word in shlex.split(command) if word.startswith("--junitxml=")), None)
+        if report:
+            ET.ElementTree(ET.Element("testsuite")).write(report, encoding="unicode")
+        if "tests/test_sample.py" in shlex.split(command):
+            c.now[0] += timedelta(seconds=timeout_s)
+            return CheckResult(command, -9, True, "unit output")
+        if command == COMMAND:
+            return CheckResult(command, 1, False, "done-when output")
+        return CheckResult(command, 0, False, "")
+
+    monkeypatch.setattr("foragent.runner._check", check)
+    assert run_issue(1, c.ctx) == "timeout"
+    saved = cuts.failures_path(c.store.root, 1).read_text()
+    assert "done-when output" in saved and "unit output" in saved
+    run = c.store.get_run(1)
+    assert "done-when output" in run.resume_reason and run.resume_whole
