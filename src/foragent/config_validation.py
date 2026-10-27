@@ -193,11 +193,11 @@ def _validate_roles(roles: Any) -> None:
             raise ConfigError(f"roles.{name}.scope must be a list of path globs")
         signals = role.get("signals", [])
         if not isinstance(signals, list) or any(
-            not isinstance(signal, dict) or signal.keys() - {"paths", "kinds"}
-            or not all(_strings(signal.get(key, [])) for key in ("paths", "kinds"))
+            not isinstance(signal, dict) or signal.keys() != {"paths", "kinds"}
+            or not all(_strings(signal[key]) for key in ("paths", "kinds"))
             for signal in signals
         ):
-            raise ConfigError(f"roles.{name}.signals must be a list of {{paths, kinds}} string lists")
+            raise ConfigError(f"roles.{name}.signals must be a list of items with both paths and kinds string lists")
         if role.get("created_at") is not None and not isinstance(role["created_at"], (str, datetime)):
             raise ConfigError(f"roles.{name}.created_at must be a timestamp")
         idle = role.get("idle_days", 14)

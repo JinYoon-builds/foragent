@@ -384,7 +384,7 @@ def test_committed_config_missing_or_invalid_falls_back(tmp_path, content):
 
 
 @pytest.mark.parametrize("roles", [[], {"Bad": {}}, {"x": {"color": "red"}}, {"x": {"skills": "a"}},
-                                   {"x": {"signals": [{"paths": "a"}]}}, {"x": {"idle_days": 0}}])
+                                   {"x": {"signals": [{"paths": "a"}]}}, {"x": {"signals": [{"paths": ["a"]}]}}, {"x": {"idle_days": 0}}])
 def test_invalid_roles_are_rejected(repo, roles):
     (repo / ".foragent.yml").write_text(yaml.safe_dump({"roles": roles}))
     with pytest.raises(ConfigError, match="roles"):
@@ -398,3 +398,19 @@ def test_roles_load_with_defaults_for_optional_fields(repo):
              "signals": [{"paths": ["src/**"], "kinds": []}]}
     (repo / ".foragent.yml").write_text(yaml.safe_dump({"roles": {"security": entry}}))
     assert load_roles(load_config(repo)) == {"security": {**entry, "scope": [], "created_at": None, "idle_days": 14}}
+
+
+def test_edit_roles_touches_only_changed_entries_and_fields():
+    from foragent.roles import edit_roles
+
+    text = ("review: fast  # top\nroles:\n  # about roles\n  orchestrator:\n    agent: fa-orchestrator  # keep\n"
+            "    skills: [fa-orchestrator]  # mine\n    signals: []\n  security:\n    agent: fa-security\n"
+            "    skills: [audit]  # old\n    scope: [src/**]  # owned\n    signals: []\n# tail\n")
+    roles = yaml.safe_load(text)["roles"]
+    changed = edit_roles(text, {**roles, "security": {**roles["security"], "skills": ["deep"]}})
+    assert changed == text.replace("    skills: [audit]  # old\n", "    skills:\n    - deep\n")
+    added = edit_roles(text, {**roles, "docs": {"agent": "fa-docs", "skills": [], "signals": []}})
+    assert added == text.replace("# tail\n", "  docs:\n    agent: fa-docs\n    skills: []\n    signals: []\n# tail\n")
+    removed = edit_roles(text, {"orchestrator": roles["orchestrator"]})
+    assert removed == text.replace(text[text.index("  security:"):text.index("# tail")], "")
+    assert edit_roles(text, roles) == text

@@ -34,8 +34,8 @@ def without_roles(text):
             continue
         inside = False
         kept.append(line)
-    if "roles" in (yaml.safe_load(text) or {}):
-        assert set(roles.DEFAULT_ROLES) <= yaml.safe_load(text)["roles"].keys()
+    # Only for configs init wrote: each must carry every default role.
+    assert set(roles.DEFAULT_ROLES) <= (yaml.safe_load(text) or {}).get("roles", {}).keys()
     return "".join(kept)
 
 
@@ -438,7 +438,7 @@ def test_existing_language_is_never_overwritten_and_missing_values_override_glob
 def test_init_dry_run_reports_missing_keys_without_writing(setup):
     (setup.root / PATHS[0]).write_text("review: fast\n")
     report = setup.init(language="ko", dry_run=True)
-    assert without_roles((setup.root / PATHS[0]).read_text()) == "review: fast\n"
+    assert (setup.root / PATHS[0]).read_text() == "review: fast\n"
     assert report.added_keys == ["language", "checks", "roles"]
     assert "Would add config key: language" in report.summary()
     assert not report.committed and report.commit_planned
@@ -448,7 +448,7 @@ def test_invalid_missing_option_on_existing_config_fails_before_writes(setup):
     (setup.root / PATHS[0]).write_text("review: fast\n")
     with pytest.raises(ConfigError, match="language"):
         setup.init(language="not a tag")
-    assert without_roles((setup.root / PATHS[0]).read_text()) == "review: fast\n"
+    assert (setup.root / PATHS[0]).read_text() == "review: fast\n"
     assert not setup.tracker.labels
 
 
@@ -960,3 +960,84 @@ def test_reinit_keeps_role_entries_and_adds_missing_defaults_from_agent_skills(s
     assert source["docs"]["skills"] == ["fa-docs"] and source["docs"]["scope"] == ["docs/**", "README*"]
     assert agent.read_text().endswith("Body\n")
     assert not setup.init().committed
+
+
+def test_reinit_writes_missing_default_agent_from_its_roles_entry(setup):
+    setup.init()
+    path = setup.root / PATHS[0]
+    source = yaml.safe_load(path.read_text())["roles"]
+    source["architect"]["skills"] = ["project-architect"]
+    path.write_text(path.read_text().replace("    - fa-architect\n", "    - project-architect\n", 1))
+    assert yaml.safe_load(path.read_text())["roles"] == source
+    (setup.root / ".claude/agents/fa-architect.md").unlink()
+    setup.init()
+    agent = (setup.root / ".claude/agents/fa-architect.md").read_text()
+    assert yaml.safe_load(agent.split("---\n")[1])["skills"] == ["project-architect"]
+    assert yaml.safe_load(path.read_text())["roles"] == source
+    assert roles.role_drift(setup.root, load_config(setup.root)) == []
+
+
+def test_role_add_uses_an_installed_skill_copy_and_records_why_without_github(setup, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    setup.init()
+    commits = []
+    monkeypatch.setattr(GitRepo, "commit_paths", lambda self, paths, title: commits.append(paths))
+    monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: None)
+    installed = setup.root / ".claude/skills/house-style"
+    installed.mkdir(parents=True)
+    (installed / "SKILL.md").write_text("---\nname: house-style\ndescription: Installed copy\n---\nBody\n")
+    monkeypatch.setattr(GitRepo, "remote_slug", lambda self: (_ for _ in ()).throw(GitError("local origin")))
+    roles.add_role(setup.root, "style", skills=["house-style"], scope=[], signals=["kinds:hot_overlap_files"],
+                   why="Keep the house style")
+    entry = yaml.safe_load((setup.root / PATHS[0]).read_text())["roles"]["style"]
+    assert entry["skills"] == ["house-style"]
+    assert commits == [[".foragent.yml", ".claude/agents/fa-style.md", ".claude/agent-memory/fa-style/MEMORY.md"]]
+    assert entry["signals"] == [{"paths": [], "kinds": ["hot_overlap_files"]}]
+    events = list((tmp_path / "home").rglob("orch-events.jsonl"))
+    assert len(events) == 1
+    rows = [json.loads(line) for line in events[0].read_text().splitlines()]
+    assert [(row["kind"], row["why"]) for row in rows] == [("role-added", "Keep the house style")]
+    with pytest.raises(Exception, match="unknown skill|not found|no skill"):
+        roles.add_role(setup.root, "other", skills=["missing-skill"], scope=[], signals=[])
+
+
+def test_role_set_keeps_an_empty_body_and_records_why_when_nothing_changes(setup, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    setup.init()
+    commits = []
+    monkeypatch.setattr(GitRepo, "commit_paths", lambda self, paths, title: commits.append(list(paths)))
+    monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: None)
+    monkeypatch.setattr(GitRepo, "remote_slug", lambda self: "owner/repo")
+    agent = setup.root / ".claude/agents/fa-architect.md"
+    agent.write_text("---\nname: fa-architect\nmemory: project\nskills:\n- fa-architect\n---\n")
+    roles.set_role(setup.root, "architect", scope=["src/**"], why="Own the source tree")
+    assert agent.read_text().endswith("\n---\n") and "description: Foragent architect role" in agent.read_text(), (
+        "Regenerate the frontmatter; an empty body stays empty")
+    assert commits == [[".foragent.yml", ".claude/agents/fa-architect.md"]]
+    roles.set_role(setup.root, "architect", scope=["src/**"], why="Same settings, new evidence")
+    assert len(commits) == 1, "Nothing changed, so nothing is committed"
+    events, = (tmp_path / "home").rglob("orch-events.jsonl")
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    assert [(row["kind"], row["why"]) for row in rows] == [
+        ("role-set", "Own the source tree"), ("role-set", "Same settings, new evidence")]
+
+
+def test_role_set_recreates_missing_memory_and_doctor_reports_it(setup, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    setup.init()
+    commits = []
+    monkeypatch.setattr(GitRepo, "commit_paths", lambda self, paths, title: commits.append(list(paths)))
+    monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: None)
+    monkeypatch.setattr(GitRepo, "remote_slug", lambda self: "owner/repo")
+    memory = setup.root / ".claude/agent-memory/fa-docs/MEMORY.md"
+    memory.unlink()
+    memory.parent.rmdir()
+    drift = roles.role_drift(setup.root, load_config(setup.root))
+    assert len(drift) == 1 and "docs" in drift[0] and "memory" in drift[0]
+    roles.set_role(setup.root, "docs", why="Repair the docs memory")
+    assert memory.read_text() == "# fa-docs memory\n\n## Proposals\n\n## Lessons\n"
+    assert commits and commits[-1][-1] == ".claude/agent-memory/fa-docs/MEMORY.md"
+    assert roles.role_drift(setup.root, load_config(setup.root)) == []
+    memory.write_text("")
+    roles.set_role(setup.root, "docs", why="Again")
+    assert memory.read_text() == "" and len(commits) == 1, "An existing memory, even empty, is kept"

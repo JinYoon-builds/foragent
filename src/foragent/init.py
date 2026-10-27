@@ -139,7 +139,7 @@ def _config_text(path: Path, local: dict, added: dict, role_source: dict | None)
     if not added and role_source is None:
         return None
     text = _add_config(path, local, added) if added else path.read_text(encoding="utf-8")
-    return text if role_source is None else roles.replace_block(text, role_source)
+    return text if role_source is None else roles.edit_roles(text, role_source)
 
 
 def _logged_in(tool: str) -> bool:
@@ -242,11 +242,14 @@ def init_repo(
         contents[WORKFLOW] = workflow_text(config)
     if not (root / "tests/acceptance").exists():
         contents["tests/acceptance/.gitkeep"] = ""
-    role_files, invalid_agents = role_agents.missing_files(root)
+    # Default role agents derive their skills from the roles source (#769).
+    role_skills = {entry.get("agent") or f"fa-{name}": entry.get("skills", [])
+                   for name, entry in config.roles.items() if name in roles.DEFAULT_ROLES}
+    role_files, invalid_agents = role_agents.missing_files(root, role_skills)
     contents.update(role_files)
     if invalid_agents:
         print(f"Warning: kept {', '.join(invalid_agents)} unchanged; its frontmatter needs name, "
-              "memory: project and its role skill.", file=sys.stderr)
+              "memory: project and the skills of its roles entry.", file=sys.stderr)
 
     created = [path for path in contents if not (root / path).exists()]
     existed = [path for path in contents if (root / path).exists()]
@@ -266,7 +269,7 @@ def init_repo(
     legacy_paths = [LEGACY_PUBLISH_WORKFLOW] if not (root / LEGACY_PUBLISH_WORKFLOW).exists() else []
     pending = list(dict.fromkeys([
         *created, *tracked_removals, *([".foragent.yml"] if updated_config is not None else []),
-        *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root), *([WORKFLOW] if config.checks == "ci" else [])]),
+        *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root, role_skills), *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
     if (pending or (board_planned and not config.board)) and git.current_branch() != base_branch:

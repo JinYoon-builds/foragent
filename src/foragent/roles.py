@@ -11,11 +11,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 import re
 import shutil
-import sys
 from typing import Any
 
 import yaml
 
+from foragent import role_agents
 from foragent.config import Config, ConfigError, _comments, _last_line, _pair, load_config
 from foragent.config_validation import _validate
 from foragent.git import GitError, GitRepo
@@ -102,41 +102,120 @@ def with_defaults(root: Path, roles: dict[str, Any]) -> dict[str, Any] | None:
     return result
 
 
-def replace_block(text: str, roles: dict[str, Any]) -> str:
-    """Rewrite only the top-level ``roles`` block of a settings text, or append one."""
-    lines = re.findall(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z", text)
+_LINES = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
+
+
+def _dump(value: dict[str, Any], indent: int) -> list[str]:
+    text = yaml.safe_dump(value, sort_keys=False, allow_unicode=True)
+    return [" " * indent + line for line in text.splitlines(keepends=True)]
+
+
+def _span(key: yaml.Node, value: yaml.Node) -> tuple[int, int]:
+    return key.start_mark.line, _last_line(key, value) + 1
+
+
+def _entry_edits(name: str, key: yaml.Node, node: yaml.Node, old: Any, new: Any) -> list:
+    """Line edits that turn one entry from ``old`` into ``new``, touching only changed fields."""
+    if not _block_mapping(node) or not isinstance(old, dict):
+        return [(*_span(key, node), _dump({name: new}, key.start_mark.column))]
+    indent = node.value[0][0].start_mark.column
+    edits = []
+    for field_key, field_value in node.value:
+        field = field_key.value
+        if field not in new:
+            edits.append((*_span(field_key, field_value), []))
+        elif new[field] != old.get(field):
+            edits.append((*_span(field_key, field_value), _dump({field: new[field]}, field_key.start_mark.column)))
+    added = {field: value for field, value in new.items() if field not in old}
+    if added:
+        end = _last_line(*node.value[-1]) + 1
+        edits.append((end, end, _dump(added, indent)))
+    return edits
+
+
+def _block_mapping(node: yaml.Node) -> bool:
+    return isinstance(node, yaml.MappingNode) and not node.flow_style and bool(node.value)
+
+
+def edit_roles(text: str, roles: dict[str, Any]) -> str:
+    """Change the ``roles`` mapping of a settings text to ``roles``, line by line.
+
+    Only the lines of added, removed or changed entries (and, inside a changed entry,
+    its changed fields) are rewritten; every other line and comment keeps its bytes.
+    """
+    lines = _LINES.findall(text)
     try:
         node = yaml.compose(text)
         before = yaml.safe_load(text) or {}
     except yaml.YAMLError as exc:
         raise RoleError(f"cannot read .foragent.yml: {exc}") from exc
-    block = yaml.safe_dump({"roles": roles}, sort_keys=False, allow_unicode=True)
+    if not isinstance(before, dict):
+        raise RoleError(".foragent.yml must contain a mapping")
+    old = before.get("roles") or {}
     pair = _pair(node, "roles")
     if pair is None:
-        prefix = "".join(lines)
-        edited = prefix + ("\n" if prefix and not prefix.endswith("\n") else "") + block
-        kept = lines
+        edits = [(len(lines), len(lines), _dump({"roles": roles}, 0))]
+    elif not _block_mapping(pair[1]) or not isinstance(old, dict) or not roles:
+        edits = [(*_span(*pair), _dump({"roles": roles}, pair[0].start_mark.column))]
     else:
-        start, end = pair[0].start_mark.line, _last_line(*pair) + 1
-        if end < len(lines) or lines[-1].endswith(("\r", "\n")):
-            edited = "".join(lines[:start]) + block + "".join(lines[end:])
-        else:
-            edited = "".join(lines[:start]) + block
-        kept = lines[:start] + lines[end:]
+        entries = {key.value: (key, value) for key, value in pair[1].value if isinstance(key, yaml.ScalarNode)}
+        edits = []
+        for name, (key, value) in entries.items():
+            if name not in roles:
+                edits.append((*_span(key, value), []))
+            elif roles[name] != old.get(name):
+                edits += _entry_edits(name, key, value, old.get(name), roles[name])
+        added = {name: entry for name, entry in roles.items() if name not in entries}
+        if added:
+            end = _last_line(*pair[1].value[-1]) + 1
+            edits.append((end, end, _dump(added, pair[1].value[0][0].start_mark.column)))
+    removed: list[str] = []
+    for begin, end, replacement in sorted(edits, key=lambda edit: (edit[0], edit[1]), reverse=True):
+        if replacement and begin == len(lines) and lines and not lines[-1].endswith(("\r", "\n")):
+            lines[-1] += "\n"
+        removed += lines[begin:end]
+        lines[begin:end] = replacement
+    edited = "".join(lines)
     try:
         written = yaml.safe_load(edited)
     except yaml.YAMLError:
         written = None
-    lost = _comments(kept) - _comments(re.findall(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z", edited))
-    if not isinstance(before, dict) or written != {**before, "roles": roles} or lost:
+    lost = _comments(_LINES.findall(text)) - _comments(_LINES.findall(edited)) - _comments(removed)
+    if written != {**before, "roles": roles} or lost:
         raise RoleError("cannot update roles in .foragent.yml without changing other lines; edit it by hand")
     return edited
 
 
+def _memory_file(root: Path, name: str, memory: str) -> str:
+    """The role's MEMORY.md path; the memory directory must sit inside .claude/agent-memory/."""
+    directory = memory.rstrip("/")
+    if not directory.startswith(".claude/agent-memory/") or (
+            repo_path(root, directory) == repo_path(root, ".claude/agent-memory")):
+        raise RoleError(f"role {name}: memory {memory!r} is outside .claude/agent-memory/")
+    return directory + "/MEMORY.md"
+
+
+def _ensure_memory(root: Path, name: str, entry: dict[str, Any]) -> str:
+    """Create the role's MEMORY.md when missing (an existing one, even empty, is kept); return its path."""
+    relative = _memory_file(root, name, entry.get("memory") or memory_dir(name))
+    memory = repo_path(root, relative)
+    if not memory.exists():
+        memory.parent.mkdir(parents=True, exist_ok=True)
+        agent = entry.get("agent") or f"fa-{name}"
+        memory.write_text(role_agents.MEMORY.get(agent, f"# {agent} memory\n"), encoding="utf-8")
+    return relative
+
+
 def role_drift(root: Path, config: Config) -> list[str]:
-    """Roles whose agent frontmatter skills differ from the roles source. Only reports."""
+    """Roles whose agent file or memory is missing, or whose agent skills differ from the roles source.
+
+    Only reports; ``fa role set`` rewrites the missing or drifted files.
+    """
     problems = []
     for name, entry in load_roles(config).items():
+        memory = entry["memory"].rstrip("/") + "/MEMORY.md"
+        if not repo_path(root, memory).is_file():
+            problems.append(f"FAIL role {name}: memory {memory} is missing; run `fa role set {name}` to create it")
         relative = f".claude/agents/{entry['agent']}.md"
         path = repo_path(root, relative)
         if not path.is_file():
@@ -152,6 +231,7 @@ def role_drift(root: Path, config: Config) -> list[str]:
 
 
 def parse_signals(items: list[str]) -> list[dict[str, list[str]]]:
+    """One signal item per --signal; every item carries both paths and kinds (the unused one empty)."""
     signals = []
     for item in items:
         key, separator, value = item.partition(":")
@@ -183,6 +263,7 @@ class _Edit:
         self.config = load_config(self.root)
         self.git = git or GitRepo(self.root)
         self.manager = manager
+        self.to_install: list[str] = []
         self.path = repo_path(self.root, ".foragent.yml")
         self.text = self.path.read_bytes().decode("utf-8")
         self.roles = deepcopy((yaml.safe_load(self.text) or {}).get("roles") or {})
@@ -191,35 +272,64 @@ class _Edit:
         if self.git.current_branch() != self.config.base_branch:
             raise GitError(f"fa role {verb} must run on the base branch {self.config.base_branch!r}")
 
-    def check_skills(self, skills: list[str]) -> list:
-        if not skills:
-            return []
-        if self.manager is None:
-            from foragent.skills import SkillManager
-            self.manager = SkillManager(self.config)
-        selected = [self.manager.check_install(identity, self.root) for identity in skills]
-        names = [skill.path.name for skill in selected]
+    def check_skills(self, skills: list[str]) -> list[str]:
+        """Installed skill names; each resolves as a repo product skill, a library skill or an installed copy.
+
+        Skills that still need copying are kept in ``self.to_install``, like the lanes code copies them.
+        """
+        from foragent.skills import SkillError, SkillManager
+
+        self.to_install = []
+        names = []
+        for identity in skills:
+            if self.manager is None:
+                self.manager = SkillManager(self.config)
+            try:
+                names.append(self.manager.check_install(identity, self.root).path.name)
+                self.to_install.append(identity)
+            except SkillError:
+                installed = repo_path(self.root, f".claude/skills/{identity}")
+                if installed.is_symlink() or not (installed / "SKILL.md").is_file():
+                    raise
+                names.append(identity)
         if len(set(names)) != len(names):
             raise RoleError("duplicate role skills or conflicting installation names")
         return names
 
-    def save(self, roles: dict[str, Any], skills: list[str]) -> None:
-        edited = replace_block(self.text, roles)
+    def save(self, roles: dict[str, Any]) -> None:
+        edited = edit_roles(self.text, roles)
         _validate({**asdict(self.config), "roles": roles})
-        for identity in skills:
+        for identity in self.to_install:
             self.manager.install(identity, self.root)
         self.path.write_bytes(edited.encode("utf-8"))
 
-    def event(self, kind: str, name: str, why: str | None) -> None:
-        from foragent import orch_events
+    def snapshot(self, paths: list[str]) -> dict[str, bytes | None]:
+        """Bytes of each path before the command writes, None when absent."""
+        return {path: (target.read_bytes() if (target := repo_path(self.root, path)).is_file() else None)
+                for path in paths}
+
+    def publish(self, before: dict[str, bytes | None], title: str) -> list[str]:
+        """Commit the paths this command changed; changing nothing is no error.
+
+        An unchanged setting still gets its orch event, so a commit never gates the event.
+        """
+        paths = [path for path, old in before.items() if self.snapshot([path])[path] != old]
+        if paths:
+            self.git.ensure_tracked([path for path in paths if repo_path(self.root, path).exists()])
+            self.git.commit_paths(paths, title)
+        return paths
+
+    def store(self):
+        """The orchestrator journal's store; a repository without a GitHub origin uses its path as the key."""
         from foragent.state import StateStore
         try:
             repo = self.config.repo or self.git.remote_slug()
-        except GitError as exc:
-            # The role is already written and committed; only its journal line has no home.
-            print(f"Warning: no orch event for role {name}: {exc}", file=sys.stderr)
-            return
-        store = StateStore.for_repo(repo)
+        except GitError:
+            repo = "local" + self.root.as_posix()
+        return StateStore.for_repo(repo)
+
+    def event(self, store, kind: str, name: str, why: str | None) -> None:
+        from foragent import orch_events
         orch_events.append_event(store, datetime.now(UTC), None, kind, f"{name}: {why or ''}", role=name, why=why)
 
 
@@ -239,36 +349,39 @@ def add_role(root: Path, name: str, *, skills: list[str], scope: list[str], sign
     if repo_path(edit.root, agent).exists():
         raise RoleError(f"agent already exists: {agent}")
     edit.check_branch("add")
+    store = edit.store()
     installed = edit.check_skills(skills)
     entry = {"agent": f"fa-{name}", "skills": installed, "memory": memory_dir(name),
              "signals": parse_signals(signals), "scope": list(scope), "created_at": _now()}
     if idle_days is not None:
         entry["idle_days"] = idle_days
-    edit.save({**edit.roles, name: entry}, skills)
+    memory = _memory_file(edit.root, name, entry["memory"])
+    published = [".foragent.yml", agent, memory, *([".gitignore"] if edit.to_install else [])]
+    before = edit.snapshot(published)
+    edit.save({**edit.roles, name: entry})
     destination = repo_path(edit.root, agent)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(_agent_text(name, installed), encoding="utf-8")
-    memory = repo_path(edit.root, memory_dir(name) + "MEMORY.md")
-    memory.parent.mkdir(parents=True, exist_ok=True)
-    if not memory.exists():
-        memory.write_text(f"# fa-{name} memory\n", encoding="utf-8")
-    published = [".foragent.yml", agent, memory_dir(name) + "MEMORY.md", *([".gitignore"] if installed else [])]
-    edit.git.ensure_tracked(published)
-    edit.git.commit_paths(published, f"Foragent role {name}")
-    edit.event("role-added", name, why)
+    _ensure_memory(edit.root, name, entry)
+    edit.publish(before, f"Foragent role {name}")
+    edit.event(store, "role-added", name, why)
     return entry
 
 
 def set_role(root: Path, name: str, *, skills: list[str] | None = None, scope: list[str] | None = None,
              signals: list[str] | None = None, why: str | None = None, idle_days: int | None = None,
              git: GitRepo | None = None, manager=None) -> dict[str, Any]:
-    """Replace the given settings; regenerate only the agent frontmatter, keeping its body."""
+    """Replace the given settings; regenerate only the agent frontmatter, keeping its body.
+
+    A missing agent file or memory is derived again, so set also repairs what doctor reports.
+    """
     edit = _Edit(root, git, manager)
     if name not in edit.roles:
         raise RoleError(f"unknown role: {name}")
     entry = deepcopy(edit.roles[name])
     agent = f".claude/agents/{entry.get('agent') or f'fa-{name}'}.md"
     edit.check_branch("set")
+    store = edit.store()
     installed = edit.check_skills(skills) if skills is not None else None
     if installed is not None:
         entry["skills"] = installed
@@ -278,20 +391,24 @@ def set_role(root: Path, name: str, *, skills: list[str] | None = None, scope: l
         entry["signals"] = parse_signals(signals)
     if idle_days is not None:
         entry["idle_days"] = idle_days
-    header, body = _split_agent(repo_path(edit.root, agent))
+    agent_path = repo_path(edit.root, agent)
+    header, body = _split_agent(agent_path)
     header = {"name": entry.get("agent") or f"fa-{name}", "memory": "project", **(header or {}),
               "description": _description(name), "skills": entry.get("skills", [])}
-    if not body:
+    if not agent_path.exists():
+        # Only a missing agent gets the generated body; an existing one, even empty, keeps its own.
         body = _agent_text(name, header["skills"]).split("---\n", 2)[2]
-    edit.save({**edit.roles, name: entry}, skills or [])
+    memory = _memory_file(edit.root, name, entry.get("memory") or memory_dir(name))
+    published = [".foragent.yml", agent, memory, *([".gitignore"] if edit.to_install else [])]
+    before = edit.snapshot(published)
+    edit.save({**edit.roles, name: entry})
+    _ensure_memory(edit.root, name, entry)
     destination = repo_path(edit.root, agent)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text("---\n" + yaml.safe_dump(header, sort_keys=False, allow_unicode=True) + "---\n" + body,
                            encoding="utf-8")
-    published = [".foragent.yml", agent, *([".gitignore"] if installed else [])]
-    edit.git.ensure_tracked(published)
-    edit.git.commit_paths(published, f"Foragent role {name}")
-    edit.event("role-set", name, why)
+    edit.publish(before, f"Foragent role {name}")
+    edit.event(store, "role-set", name, why)
     return entry
 
 
@@ -304,15 +421,14 @@ def remove_role(root: Path, name: str, *, git: GitRepo | None = None) -> None:
         raise RoleError(f"unknown role: {name}")
     entry = edit.roles[name]
     agent = f".claude/agents/{entry.get('agent') or f'fa-{name}'}.md"
-    memory = (entry.get("memory") or memory_dir(name)).rstrip("/")
+    memory = _memory_file(edit.root, name, entry.get("memory") or memory_dir(name)).removesuffix("/MEMORY.md")
     memory_path = repo_path(edit.root, memory)
-    if not memory.startswith(".claude/agent-memory/") or memory_path == repo_path(edit.root, ".claude/agent-memory"):
-        raise RoleError(f"role {name}: memory {memory!r} is outside .claude/agent-memory/")
     edit.check_branch("remove")
     tracked = [path for path in edit.git._call(["ls-files", "--cached", "-z", "--", agent, memory]).split("\0") if path]
     roles = {key: value for key, value in edit.roles.items() if key != name}
-    edit.save(roles, [])
+    before = edit.snapshot([".foragent.yml", *tracked])
+    edit.save(roles)
     repo_path(edit.root, agent).unlink(missing_ok=True)
     if memory_path.is_dir():
         shutil.rmtree(memory_path)
-    edit.git.commit_paths([".foragent.yml", *tracked], f"Foragent role {name} removed")
+    edit.publish(before, f"Foragent role {name} removed")

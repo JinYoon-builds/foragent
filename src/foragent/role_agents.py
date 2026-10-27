@@ -19,10 +19,13 @@ MEMORY = {"fa-docs": "# fa-docs memory\n\n## Proposals\n\n## Lessons\n"}
 _CHECKOUT_SKILLS = Path(__file__).resolve().parents[2] / "skills"
 
 
-def agent_text(role: str) -> str:
+def agent_text(role: str, skills: list[str] | None = None) -> str:
+    """The agent file; ``skills`` comes from the roles source and defaults to the role's own skill."""
     title = ROLES[role]
+    skills = [role] if skills is None else skills
+    listed = "skills:" + (" []\n" if not skills else "\n" + yaml.safe_dump(skills, allow_unicode=True))
     return (
-        f"---\nname: {role}\ndescription: Foragent {title} role\nmemory: project\nskills:\n- {role}\n---\n"
+        f"---\nname: {role}\ndescription: Foragent {title} role\nmemory: project\n{listed}---\n"
         f"You are this repository's Foragent {title}; follow the {role} skill.\n"
         "Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.\n"
     )
@@ -36,7 +39,7 @@ def skill_source(role: str) -> Path | None:
     return None
 
 
-def _valid_agent(path: Path, role: str) -> bool:
+def _valid_agent(path: Path, role: str, skills: list[str]) -> bool:
     try:
         content = path.read_text(encoding="utf-8")
         match = re.match(r"\A---[ \t]*\n(.*?)^---[ \t]*(?:\n|$)", content, re.S | re.M)
@@ -44,17 +47,23 @@ def _valid_agent(path: Path, role: str) -> bool:
     except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return False
     return (isinstance(header, dict) and header.get("name") == role
-            and header.get("memory") == "project" and header.get("skills") == [role])
+            and header.get("memory") == "project" and header.get("skills") == skills)
 
 
-def _templates(root: Path, *, existing_skills: bool = False) -> dict[str, str]:
+def _skills(role: str, skills: dict[str, list[str]] | None) -> list[str]:
+    return list((skills or {}).get(role, [role]))
+
+
+def _templates(root: Path, *, existing_skills: bool = False,
+               skills: dict[str, list[str]] | None = None) -> dict[str, str]:
     """What init writes for the roles, keyed by repository path.
 
+    ``skills`` maps an agent name to its skills in the roles source (#769).
     An existing skill directory is kept whole, so its files are listed only on request.
     """
     contents: dict[str, str] = {}
     for role in ROLES:
-        contents[f".claude/agents/{role}.md"] = agent_text(role)
+        contents[f".claude/agents/{role}.md"] = agent_text(role, _skills(role, skills))
         contents[f".claude/agent-memory/{role}/MEMORY.md"] = MEMORY.get(role, f"# {role} memory\n")
         skill = f".claude/skills/{role}"
         source = skill_source(role)
@@ -65,19 +74,20 @@ def _templates(root: Path, *, existing_skills: bool = False) -> dict[str, str]:
     return contents
 
 
-def missing_files(root: Path) -> tuple[dict[str, str], list[str]]:
+def missing_files(root: Path, skills: dict[str, list[str]] | None = None) -> tuple[dict[str, str], list[str]]:
     """Files to create (relative path -> text) and agent files left alone with bad frontmatter."""
-    contents = {path: text for path, text in _templates(root).items() if not repo_path(root, path).exists()}
+    contents = {path: text for path, text in _templates(root, skills=skills).items()
+                if not repo_path(root, path).exists()}
     invalid = [f".claude/agents/{role}.md" for role in ROLES
                if repo_path(root, f".claude/agents/{role}.md").exists()
-               and not _valid_agent(repo_path(root, f".claude/agents/{role}.md"), role)]
+               and not _valid_agent(repo_path(root, f".claude/agents/{role}.md"), role, _skills(role, skills))]
     return contents, invalid
 
 
-def setup_paths(root: Path) -> list[str]:
+def setup_paths(root: Path, skills: dict[str, list[str]] | None = None) -> list[str]:
     """Role paths an interrupted init may have left uncommitted: its own, unedited output."""
     owned = []
-    for path, text in _templates(root, existing_skills=True).items():
+    for path, text in _templates(root, existing_skills=True, skills=skills).items():
         target = repo_path(root, path)
         if target.is_file() and not target.is_symlink() and target.read_bytes() == text.encode("utf-8"):
             owned.append(path)
