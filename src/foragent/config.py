@@ -92,6 +92,8 @@ class Config:
     upstream_reports: bool | None = None
     # Order perspective seat -> executor (#414); unnamed seats use the built-in split.
     perspectives: dict[str, str] = field(default_factory=dict)
+    # Claude plan share (#107): keep starts no Claude implementer at keep_percent; burn runs to the limit.
+    claude_quota: dict[str, Any] = field(default_factory=lambda: {"mode": "keep", "keep_percent": 80})
     # Lane view glyphs (#167): emoji, ascii, or auto (ascii on dumb/linux terminals or non-UTF-8 locales).
     view_glyphs: str = "auto"
     # Foragent presence in Claude Code (#754); each part switches off on its own.
@@ -192,6 +194,26 @@ class LaneSettings:
             self._after_colon(skill[0], _flow(skills))
         else:
             self._replace(skill[1], _flow(skills))
+
+    def set_list(self, name: str, values: list[str]) -> None:
+        """Replace one top-level list setting in place, or add it after the last setting."""
+        found = _pair(self.root, name)
+        self.expected[name] = values
+        if found is None and self.root is not None and self.root.flow_style:
+            self._flow_add(self.root, name, values)
+        elif found is None and self.root is not None:
+            self._insert(_last_line(*self.root.value[-1]) + 1, [f"{_flow(name)}: {_flow(values)}{self.newline}"],
+                         before=self.root.value[0][0].start_mark.line)
+        elif found is None:
+            self._insert(len(self.lines), [f"{_flow(name)}: {_flow(values)}{self.newline}"], before=0)
+        elif not _plain_skills(found[1]):
+            raise ConfigError(f"{name} in {self.path} uses a layout fa cannot change; edit it by hand")
+        elif _block(found[1], yaml.SequenceNode):
+            self._replace_items(found[0], found[1], values)
+        elif _empty(found[1]):
+            self._after_colon(found[0], _flow(values))
+        else:
+            self._replace(found[1], _flow(values))
 
     def check(self) -> str:
         """Return the edited text after confirming it reads back as exactly the intended settings."""
@@ -437,6 +459,9 @@ def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
             **previous, **{name: {**(previous[name] if isinstance(previous.get(name), dict) else {}), **tier}
                            if isinstance(tier, dict) else tier for name, tier in tiers.items()},
         }}
+    quota = overrides.get("claude_quota")
+    if isinstance(quota, dict) and isinstance(values["claude_quota"], dict):
+        overrides = {**overrides, "claude_quota": {**values["claude_quota"], **quota}}
     presence = overrides.get("presence")
     if isinstance(presence, dict) and isinstance(values["presence"], dict):
         overrides = {**overrides, "presence": {**values["presence"], **presence}}
@@ -494,6 +519,17 @@ def set_upstream_reports(enabled: bool) -> None:
     _write_global(path, values)
 
 
+def add_always_human(repo_root: Path, glob: str) -> list[str]:
+    """Append one glob to the project's `always_human`, keeping every other line; the key's only writer."""
+    settings = LaneSettings(Path(repo_root) / ".foragent.yml")
+    # The effective list, so a global always_human is kept when the project file starts its own list.
+    current = list(load_config(Path(repo_root)).always_human)
+    if glob not in current:
+        settings.set_list("always_human", [*current, glob])
+        settings.save()
+    return [*current] if glob in current else [*current, glob]
+
+
 def config_key_names(repo_root: Path) -> list[str]:
     """Names of the keys set in the global and repository config files, never their values."""
     names: set[str] = set()
@@ -522,7 +558,8 @@ def resolved_reviewer(config: Config) -> str:
 def lane_executors(config: Config, lane: str) -> set[str]:
     """The implementer and reviewer a lane uses; an unset reviewer follows the lane's implementer."""
     settings = config.lanes.get(lane, {}) if lane != "main" else {}
-    lane_config = replace(config, executor=settings.get("executor") or config.executor)
+    lane_config = replace(config, executor=settings.get("executor") or config.executor,
+                          reviewer=settings.get("reviewer") or config.reviewer)
     return {lane_config.executor, resolved_reviewer(lane_config)}
 
 

@@ -6,16 +6,16 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, orch_plan, orch_queue, overlap_files, scheduler
+from foragent import machine_budget, orch_plan, orch_queue, overlap_files, scheduler, scheduler_quota
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
     machine_lock, machine_runs, next_parallel, read_state, update_test_slots, write_state,
 )
-from foragent.config import lane_executors
 from foragent.issue import parse_body
 from foragent.orch_tick_outcome import step, timed  # noqa: F401
 from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
+from foragent.scheduler_quota import claude_allowed  # noqa: F401  # Re-exported by the facade (#107).
 from foragent.tracker import Issue
 
 if TYPE_CHECKING:
@@ -23,10 +23,14 @@ if TYPE_CHECKING:
 
 
 def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
-    """A lane waits while a live plan pauses it, or it, its implementer or its reviewer is paused for a usage limit."""
-    if ctx.store.lane_paused(lane, now) or orch_plan.lane_paused(ctx.store, lane, now):
+    """A lane waits while a live plan pauses it, or it, its implementer or its reviewer is paused for a usage limit.
+
+    A start switched to Codex (#107) skips a Claude-caused lane pause, leaves it in place,
+    and waits only on its own pair's executor pauses.
+    """
+    if orch_plan.lane_paused(ctx.store, lane, now):
         return True
-    return any(ctx.store.executor_paused(name, now) for name in lane_executors(ctx.config, lane))
+    return scheduler_quota.decide(ctx.store, ctx.config, lane, now).held
 
 
 def _at_plan_width(ctx: TickContext, lane: str) -> bool:
@@ -192,6 +196,10 @@ def _start_ready(
 
         if not eligible(scheduler._local_issue(ctx, number) or issue, lane):
             continue
+        # Chosen once per start; a continued run keeps its stored implementer and waits on its own pair (#107).
+        start = scheduler_quota.decide(ctx.store, ctx.config, lane, ctx.now(), number)
+        if start.held:
+            continue
         if sample[0] == "critical":
             # This issue passed every start check; only critical memory holds it (#497).
             # Running work is left alone, and one row records the held tick.
@@ -220,6 +228,8 @@ def _start_ready(
             ctx.store.start_run(
                 number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number),
                 lane=lane, tier=scheduler.issue_size(issue.labels),
+                # Only a kept implementer: a new switch is chosen, and journaled, when the run really starts.
+                implementer=start.implementer if start.switch is None else None,
             )
             ctx.store.clear_run_start(number)
             scheduler.orch_github.wait_run(ctx, number, until)
@@ -228,8 +238,11 @@ def _start_ready(
             return None
         ctx.store.start_run(
             number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
-            tier=scheduler.issue_size(issue.labels),
+            tier=scheduler.issue_size(issue.labels), implementer=start.implementer,
+            journal=start.switch and scheduler_quota.switch_journal(ctx.store, ctx.now(), number, start.switch),
         )
+        if start.switch is not None:  # Claude is held back: this run implements with Codex (#107).
+            report.actions.append(scheduler_quota.switch_line(number, start.switch, ctx.config.language))
         ctx.store.clear_run_start(number)
         pid = ctx.launcher(number)
         ctx.store.update_run(number, pid=pid)

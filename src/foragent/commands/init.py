@@ -19,6 +19,8 @@ def add(commands) -> None:
     init.add_argument("--no-board", action="store_true")
     init.add_argument("--board-map", help="Existing board columns: Backlog=Todo,Up next=Todo,In progress=Doing,Your turn=Review,Done=Done")
     init.add_argument("--dry-run", action="store_true")
+    init.add_argument("--claude-quota", choices=("keep", "burn"),
+                      help="Default Claude quota mode: keep stops at keep_percent, burn runs to the limit")
     init.add_argument("--statusline", choices=("yes", "no"),
                       help="Answer the Claude statusline question without a prompt")
 
@@ -75,6 +77,8 @@ def run(args) -> int:
         run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
         dry_run=args.dry_run, language=args.language, no_board=args.no_board,
         board_map=args.board_map,
+        # Only an explicit flag reaches setup; without it no claude_quota block is written.
+        **({"claude_quota": args.claude_quota} if args.claude_quota else {}),
     )
     print(report.summary())
     if not args.dry_run:
