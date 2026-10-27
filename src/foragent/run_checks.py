@@ -268,9 +268,12 @@ def has_pull_request_ci(root: Path) -> bool:
     if not workflows.is_dir():
         return False
     for path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
+        from foragent.harness_guard import read_regular
+
+        data = read_regular(path)  # never blocks on a FIFO the measured process left
         try:
-            document = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, yaml.YAMLError):
+            document = yaml.safe_load(data.decode("utf-8")) if data is not None else None
+        except (UnicodeError, yaml.YAMLError):
             continue
         if not isinstance(document, dict):
             continue
@@ -327,8 +330,13 @@ def _related_unit_tests(
     for name, path in tests.items():
         if name in selected:
             continue
+        from foragent.harness_guard import read_regular
+
+        data = read_regular(path)  # never blocks on a FIFO the measured process left
+        if data is None:
+            continue
         try:
-            tree = ast.parse(path.read_bytes(), filename=name)
+            tree = ast.parse(data, filename=name)
         except (SyntaxError, UnicodeError):
             continue
         imports = set()
@@ -507,6 +515,9 @@ def _verify_contents(attempt: Implementation) -> str:
                 previous = ctx.store.get_run(n).comparison or {}
                 ctx.store.update_run(n, comparison={"source": "local", "duration_seconds":
                     previous.get("duration_seconds", 0) + max(0, ctx.monotonic() - started)})
+        # The runner now reads worktree files (test detection, related units,
+        # local_only markers) that the measurements above could have replaced.
+        _guard_harness(attempt)
         test_command = ctx.config.test_command
         if test_command is None:
             test_command = next(iter(runner.detect_test_commands(worktree)), None)

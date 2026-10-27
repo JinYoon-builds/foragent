@@ -876,3 +876,28 @@ def test_conflict_resolution_hold_publishes_the_resolved_merge(conflicting_lanes
     assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
     assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == resolved.strip()
     assert git_command(c.history.origin, "show", "foragent/issue-1:tests/sub/conftest.py") == "# harness"
+
+
+@pytest.mark.parametrize("inherited", [
+    {"tests/sub/conftest.py": "# target harness\n"},
+    {"pyproject.toml": '[tool.pytest.ini_options]\naddopts = "-q"\n'},
+], ids=["conftest", "pyproject-table"])
+def test_conflict_resolution_inherits_target_only_harness_changes(conflicting_lanes, monkeypatch, inherited):
+    """A harness change the target makes in the same move as the conflict is not the PR's."""
+    c = conflicting_lanes
+    c.executor.steps += [{"cli.py": "commands = ['help', 'base', 'issue']\n"}]
+    poll = c.tracker.pr_checks
+
+    def ci(pr):
+        status = poll(pr)
+        if len(c.target_heads) == 1 and c.target_heads[0] == c.history.tip:
+            c.history.update(inherited)
+            c.target_heads.append(c.history.tip)
+        return status
+
+    monkeypatch.setattr(c.tracker, "pr_checks", ci)
+    outcome = run_issue(1, c.ctx)
+    assert outcome == "merged", c.store.log_path(1).read_text()[-2000:]
+    assert c.store.load_flag(1) is None
+    path, content = next(iter(inherited.items()))
+    assert git_command(c.history.origin, "show", f"foragent/issue-1:{path}") == content.strip()

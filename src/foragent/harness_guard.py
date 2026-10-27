@@ -24,8 +24,8 @@ HARNESS_NAMES = frozenset({
 # An empty table still differs from a missing one: pytest selects the file.
 PYPROJECT_TABLES = (("tool", "pytest"), ("project", "entry-points", "pytest11"))
 _UNPARSABLE = object()
-# A side that is not a regular file (directory, symlink, submodule, FIFO,
-# conflict, unreadable): pytest cannot read it as before, so it is a change.
+# An entry that is neither a regular file nor a symlink (directory, submodule,
+# FIFO, unreadable): pytest cannot read it as before, so it is a change.
 _NOT_A_FILE = object()
 _REGULAR_MODES = (b"100644", b"100755")
 # Worktree -> check run before any measurement there. Every head measurement
@@ -144,70 +144,100 @@ def measured_changes(git: GitRepo, base: str) -> set[bytes]:
 
 
 def _tree_side(git: GitRepo, rev: str, raw: bytes) -> object:
-    """A committed side: regular blob bytes, None when absent, else _NOT_A_FILE."""
+    """A committed entry: ("file", bytes), ("symlink", target), None when absent, else _NOT_A_FILE."""
     listing = _required(_git(git, ["--literal-pathspecs", "ls-tree", "-z", rev, "--", os.fsdecode(raw)]),
                         "ls-tree")
     entries = [entry for entry in listing.split(b"\0") if entry]
     if not entries:
         return None
     mode, kind, sha = entries[0].split(b"\t", 1)[0].split(b" ")
-    if mode not in _REGULAR_MODES or kind != b"blob":
-        return _NOT_A_FILE  # tree, symlink or submodule
-    return _required(_git(git, ["cat-file", "blob", sha.decode()]), "cat-file")
-
-
-def _index_side(git: GitRepo, raw: bytes) -> object:
-    """The staged side, read from the index without changing it."""
-    listing = _required(_git(git, ["--literal-pathspecs", "ls-files", "-s", "-z", "--", os.fsdecode(raw)]),
-                        "ls-files")
-    entries = [entry.split(b"\t", 1) for entry in listing.split(b"\0") if entry]
-    exact = [info.split(b" ") for info, path in entries if path == raw]
-    if not exact:
-        return _NOT_A_FILE if entries else None  # entries below it: a directory
-    if len(exact) != 1 or exact[0][2] != b"0" or exact[0][0] not in _REGULAR_MODES:
-        return _NOT_A_FILE  # conflict, symlink or submodule
-    return _required(_git(git, ["cat-file", "blob", exact[0][1].decode()]), "cat-file")
+    if kind != b"blob" or (mode not in _REGULAR_MODES and mode != b"120000"):
+        return _NOT_A_FILE  # tree or submodule
+    content = _required(_git(git, ["cat-file", "blob", sha.decode()]), "cat-file")
+    return ("symlink" if mode == b"120000" else "file", content)
 
 
 def _disk_side(path: Path) -> object:
-    """What pytest would read from disk; symlinks are followed as pytest follows them."""
+    """The entry as the checks find it and as publication stages it, in the same shape as _tree_side."""
     try:
-        # O_NONBLOCK: a FIFO named pyproject.toml must not stall the guard.
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        info = os.lstat(path)
     except FileNotFoundError:
-        return None  # absent, or a dangling symlink
+        return None
     except OSError:
-        return _NOT_A_FILE  # a directory, or unreadable
+        return _NOT_A_FILE
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            return ("symlink", os.fsencode(os.readlink(path)))
+        except OSError:
+            return _NOT_A_FILE
+    if not stat.S_ISREG(info.st_mode):
+        return _NOT_A_FILE  # directory, FIFO, socket or device
+    try:
+        # O_NONBLOCK and O_NOFOLLOW: a path swapped for a FIFO or link after
+        # lstat must not stall the guard or be read through.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return _NOT_A_FILE
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            return _NOT_A_FILE
+        return ("file", stream.read())
+
+
+def read_regular(path: Path) -> bytes | None:
+    """Bytes of a regular file, following symlinks as pytest does; None for anything else.
+
+    The runner reads worktree files the measured process can write. A FIFO in
+    their place must not stall it, so the open never blocks.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return _NOT_A_FILE
+            return None  # a directory, FIFO or device
         with os.fdopen(fd, "rb") as stream:
             fd = -1
             return stream.read()
     except OSError:
-        return _NOT_A_FILE
+        return None
     finally:
         if fd >= 0:
             os.close(fd)
 
 
-def _pyproject_sides(git: GitRepo, raw: bytes) -> list[object]:
-    """Every head-side version of a pyproject: committed, staged and on disk."""
-    return [_tree_side(git, "HEAD", raw), _index_side(git, raw), _disk_side(git.root / os.fsdecode(raw))]
+def _changed(name: str, before: object, after: object) -> bool:
+    """Whether the head side differs from the merge base, as the checks would see it."""
+    if before is _NOT_A_FILE or after is _NOT_A_FILE:
+        return True
+    if before == after:
+        return False
+    if name != "pyproject.toml":
+        return True
+    if (before is not None and before[0] != "file") or (after is not None and after[0] != "file"):
+        return True  # a symlink is not the file pytest's tables are judged in
+    tables = [_pytest_tables(side[1] if side is not None else None) for side in (before, after)]
+    return _UNPARSABLE in tables or tables[0] != tables[1]
 
 
 def changed_harness_paths(git: GitRepo, target_ref: str, listed: list[str]) -> list[str]:
-    """Harness paths the head changes since its merge base with the target."""
+    """Harness paths whose head content differs from the merge base with the target.
+
+    The guard runs before staging, and publication stages the worktree it
+    judged, so the worktree is both what the checks load and what the PR
+    carries. Candidates come from every Git view (measured_changes); each one
+    is judged by its worktree entry against the merge base. Comparing content
+    rather than HEAD means a pending merge's target-only changes, which HEAD
+    does not have yet, are inherited, not introduced.
+    """
     base = git._own_base(target_ref)
     found = []
     for raw in sorted(measured_changes(git, base)):
         name = PurePosixPath(os.fsdecode(raw)).name
-        if name == "pyproject.toml":
-            before = _pytest_tables(_tree_side(git, base, raw))
-            sides = [_pytest_tables(data) for data in _pyproject_sides(git, raw)]
-            if before is not _UNPARSABLE and all(side is not _UNPARSABLE and side == before for side in sides):
-                continue
-        elif name not in HARNESS_NAMES:
+        if name != "pyproject.toml" and name not in HARNESS_NAMES:
+            continue
+        if not _changed(name, _tree_side(git, base, raw), _disk_side(git.root / os.fsdecode(raw))):
             continue
         path = raw.decode("utf-8", "replace")  # Shown in comments; never used to read.
         if not touched([path], listed):

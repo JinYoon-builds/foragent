@@ -104,13 +104,9 @@ def _uses_local_only(root):
     paths = [*(root / "tests").rglob("*.py"), *root.glob("test_*.py"), *root.glob("*_test.py"),
              root / "conftest.py", root / "pytest.ini", root / ".pytest.ini", root / "pyproject.toml",
              root / "setup.cfg", root / "tox.ini", root / "pytest.toml", root / ".pytest.toml"]
-    for path in paths:
-        try:
-            if b"local_only" in path.read_bytes():
-                return True
-        except OSError:
-            continue
-    return False
+    from foragent.harness_guard import read_regular
+
+    return any(b"local_only" in (read_regular(path) or b"") for path in paths)
 
 
 def verify_local_only_units(attempt, command):

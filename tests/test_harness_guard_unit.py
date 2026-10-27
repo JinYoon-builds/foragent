@@ -474,3 +474,128 @@ def test_rate_limit_while_publishing_a_hold_waits_and_holds_again_later(run_case
     monkeypatch.setattr(c.tracker, "create_pr", limited)
     assert runner.run_issue(1, c.ctx) == "limit-wait"
     assert c.store.load_flag(1) is None
+
+
+def _pending_merge(repo, target_files, main_files):
+    """main and target both change cli.py; leave `git merge --no-commit target` pending with a conflict."""
+    import subprocess
+
+    start = git_command(repo, "rev-parse", "HEAD")
+    (repo / "cli.py").write_text("base\n")
+    start = commit(repo, "refs/heads/main", parent=start)
+    for name, content in {"cli.py": "target\n", **target_files}.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(content)
+    commit(repo, "refs/heads/target", parent=start)
+    git_command(repo, "read-tree", "-u", "--reset", start)  # back to the base tree, without checkout
+    for name in target_files:
+        if git_command(repo, "ls-tree", start, "--", name) == "":
+            (repo / name).unlink(missing_ok=True)
+    for name, content in {"cli.py": "main\n", **main_files}.items():
+        (repo / name).write_text(content)
+    commit(repo, "refs/heads/main", parent=start)
+    merged = subprocess.run(["git", "merge", "--no-commit", "--no-ff", "target"], cwd=repo,
+                            capture_output=True, text=True)
+    assert merged.returncode != 0 and "cli.py" in merged.stdout, merged.stdout + merged.stderr
+    assert (repo / ".git/MERGE_HEAD").exists()
+
+
+@pytest.mark.parametrize("target_files", [
+    {"tests/sub/conftest.py": "# target harness\n"},
+    {"tools/pytest.ini": "[pytest]\n"},
+    {"pyproject.toml": PYPROJECT.replace('"-q"', '"-q -p no:cacheprovider"')},
+], ids=["conftest", "pytest-ini", "pyproject-table"])
+def test_pending_merge_inherits_target_only_harness_changes(repo, target_files):
+    _pending_merge(repo, target_files, {"feature.txt": "done\n"})
+    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+
+
+def test_pending_merge_still_catches_the_prs_own_edit_of_an_inherited_harness(repo):
+    _pending_merge(repo, {"tests/sub/conftest.py": "# target harness\n"}, {"feature.txt": "done\n"})
+    (repo / "tests/sub/conftest.py").write_text("# PR edited the inherited harness\n")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["tests/sub/conftest.py"]
+
+
+def test_pending_merge_resolved_pyproject_keeping_target_tables_is_inherited(repo):
+    """main changes the version, target the pytest table; the resolution keeps both."""
+    target = PYPROJECT.replace('"-q"', '"-q -p no:cacheprovider"')
+    _pending_merge(repo, {"pyproject.toml": target}, {"pyproject.toml": PYPROJECT.replace('version = "0"', 'version = "1"')})
+    resolved = target.replace('version = "0"', 'version = "1"')
+    (repo / "pyproject.toml").write_text(resolved)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+
+
+def test_symlinked_pyproject_counts_even_when_its_link_text_parses_as_toml(repo):
+    """pytest reads through the link; the link text itself must never be judged as the tables."""
+    import os
+
+    (repo / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    start = commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD"))
+    git_command(repo, "update-ref", "refs/heads/target", start)
+    (repo / "x=1").write_text('[project]\nname = "x"\n[tool.pytest.ini_options]\naddopts = "-p evil"\n')
+    (repo / "pyproject.toml").unlink()
+    os.symlink("x=1", repo / "pyproject.toml")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["pyproject.toml"]
+
+
+def test_read_regular_never_blocks_and_follows_links_like_pytest(tmp_path):
+    """Run in a child that alarms itself: a blocking open on the FIFO fails the test instead of hanging it."""
+    import os
+    import subprocess
+    import sys
+
+    os.mkfifo(tmp_path / "fifo.py")
+    (tmp_path / "real.py").write_bytes(b"local_only\n")
+    os.symlink("real.py", tmp_path / "link.py")
+    (tmp_path / "dir.py").mkdir()
+    script = (
+        "import signal; signal.alarm(10); "  # a blocked read ends the child; tests cannot send signals
+        "import sys; from pathlib import Path; from foragent.harness_guard import read_regular as r; "
+        "d = Path(sys.argv[1]); "
+        "print([r(d / n) for n in ('fifo.py', 'real.py', 'link.py', 'dir.py', 'missing.py')])"
+    )
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True)
+    assert result.stdout.strip() == "[None, b'local_only\\n', b'local_only\\n', None, None]", result.stderr
+
+
+def test_guard_runs_before_the_runner_reads_worktree_files_after_measurements(run_case, monkeypatch):
+    """A final Done when command leaves a FIFO pyproject; the runner must hold before reading files."""
+    import sys
+    from dataclasses import replace
+
+    from foragent import ci_local, run_implementation
+
+    c = run_case
+    c.history.update({"pyproject.toml": PYPROJECT})
+    c.ctx.config = replace(c.ctx.config, test_command=f"{sys.executable} -m pytest -q -p no:cacheprovider")
+    monkeypatch.setattr(run_implementation, "_capture_acceptance_baseline", lambda *args: None)
+    reads = []
+    monkeypatch.setattr(ci_local, "verify_local_only_units", lambda *args: reads.append(args))
+    set_done_when(c, ["rm pyproject.toml && mkfifo pyproject.toml"])
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert reads == [], "the runner read worktree files before the guard held"
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+
+
+def test_runner_side_reads_skip_fifos_the_measured_process_left(tmp_path):
+    """Non-harness names the guard does not hold on: the runner must still not block reading them."""
+    import os
+    import subprocess
+    import sys
+
+    (tmp_path / "tests").mkdir()
+    os.mkfifo(tmp_path / "tests/test_widget.py")
+    (tmp_path / "tests/test_other.py").write_text("import widget\n")
+    (tmp_path / ".github/workflows").mkdir(parents=True)
+    os.mkfifo(tmp_path / ".github/workflows/ci.yml")
+    (tmp_path / "widget.py").write_text("VALUE = 1\n")
+    script = (
+        "import signal; signal.alarm(10); "  # a blocked read ends the child; tests cannot send signals
+        "import sys; from pathlib import Path; d = Path(sys.argv[1]); "
+        "from foragent.ci_local import _uses_local_only; "
+        "from foragent.run_checks import _related_unit_tests, has_pull_request_ci; "
+        "print(_uses_local_only(d), has_pull_request_ci(d), "
+        "_related_unit_tests(d, ['widget.py'], 'tests/acceptance/', own_only=False))"
+    )
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True)
+    assert result.stdout.strip() == "False False ('tests/test_other.py',)", result.stderr
