@@ -100,14 +100,19 @@ def set_request_status(store: StateStore, request_id: str, status: str, note: st
     return _public(record)
 
 
-def ask(store: StateStore, question: str, options: list[str], recommend: int | None) -> dict[str, Any]:
+def ask(store: StateStore, question: str, options: list[str], recommend: int | None,
+        issues: list[int] = ()) -> dict[str, Any]:
+    """Record an open question; ``issues`` are the issues that wait on its answer."""
     if not question.strip():
         raise InboxError("question must not be empty")
     if recommend is not None and not 1 <= recommend <= len(options):
         raise InboxError("--recommend must name one of the --option values (1-based)")
+    if any(number < 1 for number in issues):
+        raise InboxError("--issue must be a positive issue number")
     record = _create(store, "questions", "q", {
         "question": question, "options": list(options), "recommend": recommend,
         "status": "open", "answer": None,
+        "issues": list(dict.fromkeys(issues)),
     })
     append_event(store, store._now(), None, "ask", f"{record['id']}: {question}")
     return _public(record)
@@ -152,6 +157,11 @@ def route_question(store: StateStore, config: Config, repo: str, record: dict[st
 def questions(store: StateStore, *, include_closed: bool = False) -> list[dict[str, Any]]:
     rows = [_public(row) for row in _records(store, "questions")]
     return rows if include_closed else [row for row in rows if row["status"] == "open"]
+
+
+def waiting_issues(store: StateStore) -> set[int]:
+    """Issue numbers linked to an open question; the board shows them in Your turn."""
+    return {number for row in questions(store) for number in row.get("issues", [])}
 
 
 def answer(store: StateStore, question_id: str, text: str) -> dict[str, Any]:
