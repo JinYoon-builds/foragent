@@ -5,6 +5,7 @@ import json
 import os
 
 from test_heartbeats import heartbeats_offline, heartbeats_write
+from test_stall_visibility import _api_row
 
 
 def view_evidence_case(git_history, tmp_path, monkeypatch):
@@ -46,9 +47,7 @@ def view_evidence_snapshot(case, main, capsys):
 
 
 def view_evidence_worker_row(frame):
-    rows = [line for line in frame.splitlines() if line.startswith("│🧩 Api") and "#1" in line]
-    assert len(rows) == 1, frame
-    return rows[0]
+    return _api_row(frame)
 
 
 def test_view_evidence_orchestrator_claim_follows_heartbeat_age(git_history, tmp_path, monkeypatch, capsys):
@@ -76,7 +75,7 @@ def test_view_evidence_working_and_quiet_use_log_age_rather_than_fresh_state_met
     fresh = render_frame(view_evidence_snapshot(case, main, capsys), case.config, case.root,
                          width=90, now=case.clock[0])
     row = view_evidence_worker_row(fresh)
-    assert "●" in row and "조용해요" not in row and "멈춘 듯" not in row, row
+    assert row.lstrip().startswith(("🐿", "[*]")) and "조용해요" not in row and "멈춘 듯" not in row, row
     # Conversely, fresh state metadata is not evidence of executor output.
     case.store.update_run(1, last_activity_at=case.clock[0].isoformat())
     view_evidence_log(case, minutes=10)
@@ -99,7 +98,8 @@ def test_view_evidence_dead_pid_overrides_fresh_log_and_working_record(
     monkeypatch.setattr("foragent.watch.os.kill", dead)
     frame = render_frame(view_evidence_snapshot(case, main, capsys), case.config, case.root,
                          width=90, now=case.clock[0])
-    assert "작업자가 없어요" in view_evidence_worker_row(frame) and "⚠" in frame
+    row = view_evidence_worker_row(frame)
+    assert "작업자가 없어요" in row and "⚠" in row
 
 
 def test_view_evidence_stale_gate_warns_on_first_line(git_history, tmp_path, monkeypatch, capsys):
