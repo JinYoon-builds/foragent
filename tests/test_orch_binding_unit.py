@@ -182,3 +182,58 @@ def test_replay_claims_committed_measured_files_like_facts(tmp_path, monkeypatch
     _waiting(store, 7, at=NOW - timedelta(hours=2), files="src/a.py")
     assert flow.binding_at(store, config, tmp_path, NOW - timedelta(hours=1), current=False) == "none", (
         "Its declared file is no longer claimed")
+
+
+def _labelled(store, number, at):
+    store.update_local_issue(number, title="t", labels=["approved", "ready"], state="open", blocked_by=[])
+    store.record_read(number, "label_events", [
+        {"label": label, "action": "labeled", "actor": "human", "created_at": at.isoformat()}
+        for label in ("approved", "ready")], baseline=store.read_baseline())
+
+
+def test_replay_candidates_need_an_approval_snapshot_like_facts(tmp_path, monkeypatch):
+    store, config = _store(tmp_path), Config()
+    _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 1)
+    for number in (7, 8):
+        _labelled(store, number, NOW - timedelta(hours=1))
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "none", (
+        "Facts' waiting list skips issues with no approved snapshot")
+    for number, files in ((7, "src/a.py"), (8, "src/b.py")):
+        _waiting(store, number, at=NOW - timedelta(hours=1), files=files)
+        _labelled(store, number, NOW - timedelta(hours=1))
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "cap"
+
+
+def test_replay_candidates_skip_the_blocker_rule_like_facts(tmp_path, monkeypatch):
+    store, config = _store(tmp_path), Config()
+    _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 1)
+    store.start_run(5, branch="foragent/issue-5", worktree=store.worktree_path(5))
+    _waiting(store, 7, at=NOW - timedelta(hours=1))
+    store.update_local_issue(7, blocked_by=[{"number": 99, "state": "open", "repository": None}])
+    assert flow.binding_at(store, config, tmp_path, NOW, current=True) == "cap", (
+        "Facts counts a ready issue with an open blocker as waiting")
+
+
+def test_from_tick_does_not_probe_the_file_system(tmp_path, monkeypatch):
+    """Ranking and the file rule run, but the tick's binding asks the file system nothing."""
+    from foragent import scheduler
+
+    calls = []
+    real = scheduler._filesystem_case_sensitive
+    monkeypatch.setattr(scheduler, "_filesystem_case_sensitive", lambda root: calls.append(root) or real(root))
+    store, config = _store(tmp_path), Config(overlap_per_file=1)
+    _budget(tmp_path, monkeypatch, NOW - timedelta(days=3), 3)
+    _waiting(store, 5, at=NOW - timedelta(hours=2), files="src/a.py")
+    store.start_run(5, branch="foragent/issue-5", worktree=store.worktree_path(5))
+    store.update_local_issue(5, labels=["approved", "running"])
+    _waiting(store, 7, files="src/a.py")
+    _waiting(store, 8, files="src/b.py")
+    assert _tick(store, config, tmp_path) == "structure"
+    assert calls == [], "No file-system probe during the tick's binding"
+    from foragent import orch_facts_resources
+    from foragent.orch_facts_runs import _waiting_issues
+
+    running = store.active_runs()
+    orch_facts_resources._admission(store, config, tmp_path, NOW, _waiting_issues(store, config, running), running,
+                                    machine={"budget": {"max_parallel": None}, "alive": {}})
+    assert calls, "fa orch facts itself still checks the case rule"

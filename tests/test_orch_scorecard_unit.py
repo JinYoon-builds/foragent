@@ -206,3 +206,94 @@ def test_flow_idle_counts_a_merged_blocker_until_its_merge(tmp_path, monkeypatch
                              blocked_by=[{"number": 99, "state": "closed", "repository": None}])
     assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(30), (
         "The blocker was open until its merge 30 minutes ago")
+
+
+def _paused_case(tmp_path, monkeypatch):
+    """Issue 1 approved two hours ago with a free slot ever since; the clock drives plan edits."""
+    from foragent import capacity
+    from foragent.issue import body_hash
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    clock = [NOW - timedelta(hours=2)]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    capacity.append_budget_history(tmp_path, NOW - timedelta(days=1), "parallel", 0, 1,
+                                   pressure="normal", load_per_cpu=0.1, swapins=0)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=clock[0].isoformat())
+    store.update_local_issue(1, title="t", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+    return store, clock
+
+
+def _idle_now(store, clock):
+    clock[0] = NOW
+    return orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"]
+
+
+def test_flow_idle_a_later_pause_of_the_lane_replaces_the_earlier_one(tmp_path, monkeypatch):
+    from foragent import orch_plan
+
+    store, clock = _paused_case(tmp_path, monkeypatch)
+    orch_plan.pause(store, "main", NOW + timedelta(hours=1), "long")  # 10:00 until 13:00
+    clock[0] = NOW - timedelta(minutes=90)
+    orch_plan.pause(store, "main", NOW - timedelta(minutes=20), "shorter")  # 10:30 until 11:40
+    assert _idle_now(store, clock) == pytest.approx(20), "Only 11:40 to 12:00 is unpaused"
+
+
+def test_flow_idle_a_pause_ends_at_the_recorded_plan_expiry_not_when_noticed(tmp_path, monkeypatch):
+    from foragent import orch_plan
+
+    store, clock = _paused_case(tmp_path, monkeypatch)
+    orch_plan.pause(store, "main", NOW + timedelta(hours=1), "long")
+    orch_plan.set_plan(store, {}, NOW + timedelta(minutes=30))
+    clock[0] = NOW - timedelta(minutes=60)
+    orch_plan.set_plan(store, {}, NOW - timedelta(minutes=30))  # The later record replaces the earlier expiry.
+    assert _idle_now(store, clock) == pytest.approx(30), "The plan expired at 11:30 with no tick watching"
+    clock[0] = NOW - timedelta(minutes=10)
+    orch_plan.record_expiry(store, clock[0])  # A tick notices it at 11:50.
+    assert _idle_now(store, clock) == pytest.approx(30), "The noticing time is not the end"
+
+
+def test_flow_a_recorded_merge_counts_even_when_a_later_step_failed(store):
+    store.save_approval(1, body="b", body_sha="s", acceptance_blobs={}, approved_by="human",
+                        approved_at=(NOW - timedelta(hours=2)).isoformat())
+    store.update_local_issue(1, title="t", labels=["approved"], state="closed")
+    finish(store, 1, at=NOW - timedelta(hours=1), minutes=30, outcome="error",
+           merged_at=NOW - timedelta(hours=1, minutes=10))
+    today = orch_scorecard.collect(store, 2)["window"]["today"]
+    assert today["waste_share"] == 0, "Merged work is not wasted because cleanup failed"
+    assert today["merges"] == 1
+    assert today["lead_time_minutes"] == pytest.approx(50), "Approval 10:00 to merge 10:50 keeps its sample"
+
+
+def test_flow_idle_a_current_label_change_never_rewrites_earlier_days(tmp_path, monkeypatch):
+    """Without label events, today's labels apply only from the issue's recorded update time."""
+    from foragent import capacity
+    from foragent.issue import body_hash
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    clock = [NOW - timedelta(days=3)]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    capacity.append_budget_history(tmp_path, clock[0], "parallel", 0, 1, pressure="normal",
+                                   load_per_cpu=0.1, swapins=0)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    store.save_approval(1, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=clock[0].isoformat())
+    store.update_local_issue(1, title="t", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+
+    def idle():
+        clock[0] = NOW
+        window = orch_scorecard.collect(store, 2)["window"]
+        return window["previous"]["idle_minutes"], window["today"]["idle_minutes"]
+
+    assert idle() == (pytest.approx(1440), pytest.approx(1440))
+    clock[0] = NOW - timedelta(hours=1)
+    store.update_local_issue(1, labels=["ready"])  # Approval removed an hour ago.
+    assert idle() == (pytest.approx(1440), pytest.approx(1380)), "Yesterday stays idle"
+    clock[0] = NOW - timedelta(days=3)
+    store.update_local_issue(2, title="t2", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+    store.save_approval(2, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                        approved_by="human", approved_at=clock[0].isoformat())
+    clock[0] = NOW - timedelta(minutes=30)
+    store.update_local_issue(2, labels=["approved", "ready", "blocked"])  # No flag record.
+    assert idle() == (pytest.approx(1440), pytest.approx(1410)), "The hold counts from its update, not all along"

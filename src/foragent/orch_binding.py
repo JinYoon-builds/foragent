@@ -39,8 +39,9 @@ def at(store: StateStore, moment: datetime) -> str | None:
 def from_tick(store: StateStore, config: Config, root, now: datetime, sample: Any) -> str:
     """fa orch facts' own binding (``_resources`` then ``_binding``) over the tick's local records.
 
-    The tick passes its memory sample; sibling runs count as alive (no process probe), as
-    in facts' frozen read when a pid was not probed."""
+    The tick passes its memory sample. Nothing is probed: sibling runs count as alive, as in
+    facts' frozen read when a pid was not probed, and the file system's case rule is unknown
+    (``probe=False``), so paths that differ only in case count as overlapping."""
     from foragent import machine_budget
     from foragent.orch_facts_resources import _binding, _resources, _still_running
     from foragent.orch_facts_runs import _test_slots, _waiting_issues
@@ -49,7 +50,7 @@ def from_tick(store: StateStore, config: Config, root, now: datetime, sample: An
     machine = {"sample": tuple(sample) if sample else ("normal", 0.0), "alive": {},
                "budget": machine_budget.values(), "test_slots": capacity.read_test_slots()}
     resources = _resources(store, config, root, now, _waiting_issues(store, config, running),
-                           _test_slots(config, running, [], machine), running, machine)
+                           _test_slots(config, running, [], machine), running, machine, probe=False)
     found = _binding(resources)
     return found["kind"] if found else NONE
 

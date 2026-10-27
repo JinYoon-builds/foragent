@@ -76,7 +76,8 @@ def _executions(store: StateStore, now: datetime) -> list[dict[str, Any]]:
         finished = _time(finished_at.get(key)) or _time(run.last_progress_at) or started
         merge = _time(merged_at.get(key))
         merge = merge if merge is not None and merge >= started else None
-        merged = run.outcome == "merged" or (run.outcome == "pr-open" and merge is not None)
+        # By effect, not label: a recorded merge is a merge even if a later step failed.
+        merged = run.outcome == "merged" or merge is not None
         rows.append({"number": run.number, "started": started, "finished": finished, "merged": merged,
                      "merged_at": (merge or finished) if merged else None})
     done = {(row["number"], row["started"]) for row in rows}
@@ -162,21 +163,41 @@ def _value_at(values: list[tuple[datetime, int]], moment: datetime) -> int | Non
 
 
 def _pauses(store: StateStore) -> dict[str, list[Interval]]:
-    """Plan pause intervals per lane: from the pause to its until, a resume or a plan expiry."""
-    paused: dict[str, list[list[datetime]]] = {}
+    """Plan pause intervals per lane, replayed from the journal in order.
+
+    Each pause ends at the earliest of its recorded ``until``, the time a later record
+    replaced or cleared it (a new pause of the same lane, a resume), and its plan's
+    recorded ``expires_at``. The latest ``plan-expires`` of a plan replaces earlier ones;
+    ``plan-expired`` carries the value that ended it. The time a tick noticed an expiry is
+    never an end. An edit after the expiry starts a fresh plan with no expiry."""
+    spans: list[dict[str, Any]] = []
+    plan: dict[str, Any] = {"expires": None}  # One record per plan; its pauses share it.
+    open_by_lane: dict[Any, dict[str, Any]] = {}
     for event in _jsonl(store.root / "orch-events.jsonl"):
         at, kind, lane = _time(event.get("at")), event.get("kind"), event.get("lane")
-        if at is None:
+        if at is None or not str(kind).startswith("plan-"):
             continue
+        if kind == "plan-expired":
+            if (ends := _time(event.get("expires_at"))) is not None:
+                plan["expires"] = ends  # The recorded value of the plan that expired.
+            continue
+        if plan["expires"] is not None and at >= plan["expires"]:
+            plan, open_by_lane = {"expires": None}, {}  # This edit replaced an expired plan.
         if kind == "plan-pause" and (until := _time(event.get("until"))) is not None:
-            paused.setdefault(lane, []).append([at, until])
-        elif kind in ("plan-resume", "plan-expired"):
-            for name, spans in paused.items():
-                if kind == "plan-expired" or name == lane:
-                    for span in spans:
-                        if span[0] <= at < span[1]:
-                            span[1] = at
-    return {lane: [(start, end) for start, end in spans] for lane, spans in paused.items()}
+            if (current := open_by_lane.get(lane)) is not None:
+                current["stop"] = at
+            open_by_lane[lane] = {"lane": lane, "start": at, "until": until, "stop": None, "plan": plan}
+            spans.append(open_by_lane[lane])
+        elif kind == "plan-resume" and (current := open_by_lane.pop(lane, None)) is not None:
+            current["stop"] = at
+        elif kind == "plan-expires" and (ends := _time(event.get("expires_at"))) is not None:
+            plan["expires"] = ends
+    paused: dict[str, list[Interval]] = {}
+    for span in spans:
+        end = min(moment for moment in (span["until"], span["stop"], span["plan"]["expires"]) if moment is not None)
+        if span["start"] < end:
+            paused.setdefault(span["lane"], []).append((span["start"], end))
+    return paused
 
 
 def _inside(spans: list[Interval], moment: datetime) -> bool:
@@ -207,6 +228,7 @@ def _issue_view(store: StateStore, row: dict[str, Any], lanes: dict,
     return {"events": events, "approved_at": approved_at, "labels": set(row.get("labels") or ()),
             "open_until": (_time(row.get("merged_at")) if closed else None), "closed": closed,
             "blocked_until": blocked_until, "flagged_at": _time(flag.flagged_at) if flag else None,
+            "updated_at": _time(row.get("updated_at")),
             "lane": issue_lane(row.get("labels") or (), lanes)}
 
 
@@ -218,16 +240,18 @@ def _issues(store: StateStore, lanes: dict) -> dict[int, dict[str, Any]]:
 
 def _labels_at(issue: dict[str, Any], moment: datetime) -> set[str]:
     if not issue["events"]:
-        # No label history: startable from its approval (D96). Current labels are not history:
-        # a hold counts from its recorded flag time, and an approval removed now (no time known)
-        # leaves it unapproved. Its own runs are excluded by their run records.
+        # No label history: startable from its approval (D96). A current label is applied only
+        # from a recorded time: a hold from its flag time, else (like a removed approval) from
+        # the issue's recorded updated_at, which is at or after the change. With no time it is
+        # not applied, so today's labels never rewrite earlier days. Own runs come from run records.
         if issue["approved_at"] is None or moment < issue["approved_at"]:
             return set()
         labels = {"approved", "ready"}
-        if (held := issue["labels"] & {"blocked", "needs-human"}) and (
-                issue["flagged_at"] is None or moment >= issue["flagged_at"]):
+        held = issue["labels"] & {"blocked", "needs-human"}
+        if held and (since := issue["flagged_at"] or issue["updated_at"]) is not None and moment >= since:
             labels |= held
-        if not issue["closed"] and "approved" not in issue["labels"]:
+        if (not issue["closed"] and "approved" not in issue["labels"] and issue["updated_at"] is not None
+                and moment >= issue["updated_at"]):
             labels.discard("approved")
         return labels
     labels: set[str] = set()
@@ -238,8 +262,12 @@ def _labels_at(issue: dict[str, Any], moment: datetime) -> set[str]:
     return labels
 
 
-def _startable(issue: dict[str, Any], moment: datetime, pauses: dict[str, list[Interval]]) -> bool:
-    if any(until is None or moment < until for until in issue["blocked_until"]) or (issue["closed"] and (issue["open_until"] is None or moment >= issue["open_until"])):
+def _startable(issue: dict[str, Any], moment: datetime, pauses: dict[str, list[Interval]], *,
+               blockers: bool = True) -> bool:
+    """Approved, ready and open at ``moment``, not held by a label or a plan pause in ``pauses``.
+
+    ``blockers=False`` skips the open-blocker rule, as facts' waiting list does."""
+    if blockers and any(until is None or moment < until for until in issue["blocked_until"]) or (issue["closed"] and (issue["open_until"] is None or moment >= issue["open_until"])):
         return False
     labels = _labels_at(issue, moment)
     return ({"approved", "ready"} <= labels and not labels & HOLDING
@@ -266,7 +294,7 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
     points.update(at for values in budgets.values() for at, _ in values)
     for issue in issues.values():
         points.update(at for at, _, _ in issue["events"])
-        points.update(at for at in (issue["approved_at"], issue["open_until"], issue["flagged_at"],
+        points.update(at for at in (issue["approved_at"], issue["open_until"], issue["flagged_at"], issue["updated_at"],
                                     *issue["blocked_until"]) if at is not None)
     ordered = sorted(moment for moment in points if start <= moment <= now)
     idle = [0.0] * days
@@ -380,9 +408,12 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
             known.append(claim(run, parsed))  # facts' claims(): committed measured files first
     open_phases = {(number, phase) for number, phase, (a, b) in phases if a <= moment <= b}
     pauses = _pauses(store)
+    # Facts' candidates (_waiting_issues, then startable): an approved snapshot, and no blocker
+    # rule; plan and usage pauses hold them inside the loop below.
+    approvals = {number: approval for number in issues if (approval := store.load_approval(number)) is not None}
     lanes: dict[str, list[int]] = {}
     for number, issue in sorted(issues.items()):
-        if number not in busy and _startable(issue, moment, {}):
+        if number in approvals and number not in busy and _startable(issue, moment, {}, blockers=False):
             lanes.setdefault(issue["lane"], []).append(number)
     ready = {lane: orch_queue.ordered(store, lane, numbers) for lane, numbers in lanes.items()}
     ranked = _ranked(ctx, ready, claims=list(known))
@@ -398,8 +429,7 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     held: dict[int, str] = {}
     remaining, union = free, recorded_union(store)
     for position, (lane, number) in enumerate(ranked):
-        approval = store.load_approval(number)
-        parsed = parse_body(approval.body) if approval is not None else None
+        parsed = parse_body(approvals[number].body)
         if github or outside:
             held[number] = "github" if github else "run_hours"
         elif remaining <= 0:
