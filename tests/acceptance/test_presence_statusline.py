@@ -24,7 +24,7 @@ RAW = b'{"rate_limits":{"five_hour":{"used_percentage":23.5}}}\n'
 
 
 @pytest.fixture
-def presence_case(tmp_path, monkeypatch, isolated_home):
+def presence_case(tmp_path, monkeypatch, isolated_home, request):
     from foragent import cli, state, statusline
     from foragent.orch_inbox import ask
     from foragent.state import StateStore
@@ -43,12 +43,28 @@ def presence_case(tmp_path, monkeypatch, isolated_home):
         config_path.write_text(yaml.safe_dump(values), encoding="utf-8")
 
     configure()
+    # "Today" is the person's local calendar day, not UTC: run in KST, where the
+    # 21:00 UTC merge of the previous UTC day is 06:00 local today.
+    import os
+    import time
+    previous_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Seoul"
+    time.tzset()
+
+    def restore_tz():
+        if previous_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_tz
+        time.tzset()
+
+    request.addfinalizer(restore_tz)
     clock = [NOW]
 
     class Clock(datetime):
         @classmethod
         def now(cls, tz=None):
-            return clock[0].astimezone(tz) if tz else clock[0].replace(tzinfo=None)
+            return clock[0].astimezone(tz) if tz else clock[0].astimezone().replace(tzinfo=None)
 
     for module in (cli, state, statusline):
         monkeypatch.setattr(module, "datetime", Clock)
@@ -125,9 +141,9 @@ def assert_presence(output, *, language="ko", original=USER_OUTPUT):
     segment = suffix.decode("utf-8").rstrip("\r\n")
     assert "\n" not in segment and "\r" not in segment, "Append presence on the user's last line"
     assert len(segment) < 120, "Presence must be one short segment"
-    parts = ((r"레인\s+3\s+일하는 중", r"✋\s*1(?!\d)", r"오늘 머지\s+2(?!\d)")
+    parts = ((r"레인\s+3\s+일하는 중", r"✋\s*1(?!\d)", r"오늘 머지\s+3(?!\d)")
              if language == "ko" else
-             (r"3\s+lanes working", r"✋\s*1(?!\d)", r"2\s+merged today"))
+             (r"3\s+lanes working", r"✋\s*1(?!\d)", r"3\s+merged today"))
     for part in parts:
         assert re.search(part, segment), f"Presence must show the seeded local count: {part}"
     assert output.endswith(b"\n") == original.endswith(b"\n"), "Preserve the user's final-newline convention"
