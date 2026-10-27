@@ -183,6 +183,10 @@ def follow_base(attempt: Implementation) -> None:
         try:
             owned, missing = collect_protected_ids(attempt.n, attempt.ctx, previous, sha)
         except AttemptFailure as exc:
+            # The run stops (#327) and drops nothing. #483 still measures the new
+            # base once; its unusable capture usually stops the run first.
+            capture_acceptance_baseline(attempt.n, attempt.ctx, attempt.git, attempt.target_branch, sha,
+                                        previous.test_command)
             _baseline_unavailable(attempt.n, attempt.ctx, str(exc), exc)
         if not set(previous.node_ids) - owned - missing:
             log_dropped_ids(attempt.log, previous, (), owned, missing, None, False)

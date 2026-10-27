@@ -187,3 +187,25 @@ def test_an_initially_empty_baseline_stays_empty_after_a_sync(git_history, tmp_p
     attempt, calls, _ = following(git_history, monkeypatch, tmp_path, baseline_sha=old, baseline=empty)
     run_implementation.follow_base(attempt)
     assert calls == [] and attempt.baseline is empty and attempt.baseline_sha == git_history.tip
+
+
+def test_a_failed_collection_stops_as_327_and_drops_nothing(git_history, tmp_path, monkeypatch):
+    # A collection error on the new base: #483 still measures once, then the run stops (#123).
+    from foragent import run_baseline
+    from foragent.run_attempt import AttemptFailure
+
+    old = git_history.tip
+    moved_base(git_history)
+    attempt, calls, flags = following(git_history, monkeypatch, tmp_path, baseline_sha=old, baseline=protected())
+    attempt.ctx.store.log_path(1).parent.mkdir(parents=True, exist_ok=True)
+
+    def broken(n, ctx, baseline, sha):
+        raise AttemptFailure("acceptance baseline unavailable: collecting tests/acceptance on new failed")
+
+    monkeypatch.setattr(run_baseline, "collect_protected_ids", broken)
+    with pytest.raises(ExecutorStopped) as stopped:
+        run_implementation.follow_base(attempt)
+    assert stopped.value.outcome == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE.value
+    assert flags == [Reason.ACCEPTANCE_BASELINE_UNAVAILABLE] and len(calls) == 1
+    assert attempt.baseline.node_ids == (PROTECTED,) and attempt.baseline_sha == old
+    assert "dropped" not in (attempt.log.read_text() if attempt.log.exists() else "")

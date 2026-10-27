@@ -404,96 +404,157 @@ def test_log_dropped_ids_in_ci_mode_does_not_claim_a_failure(tmp_path):
     assert log.read_text() == f"Acceptance baseline dropped protected node id {node}: no longer protected on the new base\n"
 
 
-def _collecting(tmp_path, monkeypatch, outcome, files=()):
-    """collect_protected_ids with pytest replaced by ``outcome(selectors) -> exit code``.
-
-    The checkout of the new base holds ``files``.
-    """
+def _collected(tmp_path, monkeypatch, files, node_ids, *, command="", excluded=(),
+               acceptance_dir="tests/acceptance"):
+    """Run the real collection step on a copy of a tiny project standing for the new base."""
+    import shutil
     from types import SimpleNamespace
 
     from foragent import run_baseline, runner
+    from foragent.config import Config
+    from foragent.run_baseline import AcceptanceBaseline, collect_protected_ids
+    from foragent.run_checks import _pytest_command
 
-    monkeypatch.setattr(run_baseline, "_baseline_exclusions", lambda ctx, sha, log: [])
-    monkeypatch.setattr(run_baseline, "_baseline_capture_limit", lambda ctx, log, remaining=None: 900)
+    base = tmp_path / "new base"
+    base.mkdir(parents=True)
+    (base / "pytest.ini").write_text("[pytest]\n")
+    for path, content in files.items():
+        (base / path).parent.mkdir(parents=True, exist_ok=True)
+        (base / path).write_text(content)
+    monkeypatch.setattr(run_baseline, "_baseline_exclusions", lambda ctx, sha, log: list(excluded))
+    monkeypatch.setattr(run_baseline, "_baseline_capture_limit", lambda ctx, log, remaining=None: 120)
     monkeypatch.setattr(run_baseline, "_test_slot", lambda n, ctx: None)
     monkeypatch.setattr(run_baseline, "_progress", lambda n, ctx: None)
     monkeypatch.setattr(runner, "_remaining", lambda n, ctx: 600)
-    commands = []
+    tracked = [path.relative_to(base).as_posix() for path in base.rglob("*") if path.is_file()]
 
-    def check(command, worktree, log, limit, *, progress=None, slot=None):
-        commands.append(command)
-        words = shlex.split(command)
-        return CheckResult(command, outcome(words[words.index("--collect-only") + 1:]), False, "")
+    def at(root):
+        # A clean checkout of "new": status lists tracked files a collection removed.
+        def call(args):
+            return "".join(f" D {name}\n" for name in tracked if not (root / name).exists())
+        return SimpleNamespace(head_sha=lambda: "new", _call=call)
 
-    def checkout(path, sha):
-        for name in files:
-            (path / name).parent.mkdir(parents=True, exist_ok=True)
-            (path / name).write_text("")
-
-    monkeypatch.setattr(runner, "_check", check)
-    git = SimpleNamespace(add_detached_worktree=checkout, remove_worktree=lambda path: None)
-    store = SimpleNamespace(log_path=lambda n: tmp_path / "run.log")
-    return SimpleNamespace(git=git, store=store), commands
-
-
-GONE = "tests/acceptance/test_a.py::test_gone"
-KEPT = "tests/acceptance/test_a.py::test_kept"
-DELETED = "tests/acceptance/test_deleted.py::test_x"
+    git = SimpleNamespace(add_detached_worktree=lambda path, sha: shutil.copytree(base, path),
+                          remove_worktree=lambda path: shutil.rmtree(path), at=at)
+    log = tmp_path / "run.log"
+    ctx = SimpleNamespace(git=git, store=SimpleNamespace(log_path=lambda n: log),
+                          config=Config(acceptance_dir=acceptance_dir))
+    previous = AcceptanceBaseline(_pytest_command(command or f"{shlex.quote(sys.executable)} -m pytest"), node_ids)
+    return collect_protected_ids(1, ctx, previous, "new"), log
 
 
-def test_collect_protected_ids_bisects_only_not_found_selectors(tmp_path, monkeypatch):
-    # A renamed function (its file still collects) and a deleted file both drop as missing.
-    from foragent.run_baseline import AcceptanceBaseline, collect_protected_ids
-
-    def outcome(selectors):
-        return 4 if {GONE, DELETED} & set(selectors) else 0
-
-    ctx, commands = _collecting(tmp_path, monkeypatch, outcome, files=["tests/acceptance/test_a.py"])
-    owned, missing = collect_protected_ids(1, ctx, AcceptanceBaseline("pytest", (GONE, KEPT, DELETED)), "new")
-    assert (owned, missing) == (set(), {GONE, DELETED})
-    assert all("--collect-only" in shlex.split(command) for command in commands)
-    assert not any("--junitxml" in command for command in commands)
+KEEP = "tests/acceptance/test_a.py::test_keep"
+OTHER = "tests/acceptance/test_a.py::test_other"
 
 
-@pytest.mark.parametrize("file_exit", [2, 4, 1], ids=["syntax-error", "usage-error", "other"])
-def test_collect_protected_ids_never_reads_a_failed_collection_as_missing(tmp_path, monkeypatch, file_exit):
-    # A SyntaxError or ImportError under a file::test selector also exits 4; the file alone does not collect.
+def test_collection_drops_a_parametrized_id_whose_selector_still_selects(tmp_path, monkeypatch):
+    # `::test_keep` still selects test_keep[1]; the exact old id is not collected.
+    source = ("import pytest\n\n@pytest.mark.parametrize('v', [1])\ndef test_keep(v):\n    pass\n\n"
+              "def test_other():\n    pass\n")
+    (owned, missing), _ = _collected(tmp_path, monkeypatch, {"tests/acceptance/test_a.py": source}, (KEEP, OTHER))
+    assert (owned, missing) == (set(), {KEEP})
+
+
+def test_collection_lists_exact_ids_whatever_the_terminal_settings(tmp_path, monkeypatch):
+    # -p no:terminal, verbosity_test_cases and an inline PYTHONPATH cannot hide the listing.
+    files = {"pytest.ini": "[pytest]\nverbosity_test_cases = 0\n", "my src/helper.py": "VALUE = 1\n",
+             "tests/acceptance/test_a.py": "from helper import VALUE\n\ndef test_other():\n    pass\n"}
+    command = f"PYTHONPATH='my src' {shlex.quote(sys.executable)} -m pytest -q -p no:terminal"
+    (owned, missing), _ = _collected(tmp_path, monkeypatch, files, (KEEP, OTHER), command=command)
+    assert (owned, missing) == (set(), {KEEP})
+
+
+def test_collection_with_an_import_error_stops_and_drops_nothing(tmp_path, monkeypatch):
     from foragent.run_attempt import AttemptFailure
-    from foragent.run_baseline import AcceptanceBaseline, collect_protected_ids
 
-    def outcome(selectors):
-        return 4 if any("::" in word for word in selectors) else file_exit
-
-    ctx, _ = _collecting(tmp_path, monkeypatch, outcome, files=["tests/acceptance/test_a.py"])
+    files = {"tests/acceptance/test_a.py": "def test_keep():\n    pass\n",
+             "tests/acceptance/test_b.py": "import no_such_module\n\ndef test_b():\n    pass\n"}
     with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
-        collect_protected_ids(1, ctx, AcceptanceBaseline("pytest", (GONE,)), "new")
+        _collected(tmp_path, monkeypatch, files, (KEEP,))
 
 
-@pytest.mark.parametrize("group_exit", [1, 2, 5], ids=["missing-plugin", "collection-error", "no-tests"])
-def test_collect_protected_ids_stops_on_any_other_collection_outcome(tmp_path, monkeypatch, group_exit):
+def test_collection_does_not_stop_for_an_importorskip_module(tmp_path, monkeypatch):
+    # A module skipped at import collects nothing; its ids are simply not collected.
+    files = {"tests/acceptance/test_a.py": "import pytest\n\npytest.importorskip('no_such_module')\n\n"
+                                           "def test_keep():\n    pass\n",
+             "tests/acceptance/test_b.py": "def test_b():\n    pass\n"}
+    (owned, missing), _ = _collected(tmp_path, monkeypatch, files, (KEEP,))
+    assert missing == {KEEP}
+
+
+def test_collection_with_no_tests_or_no_directory_drops_every_id(tmp_path, monkeypatch):
+    (_, missing), _ = _collected(tmp_path / "empty", monkeypatch, {"tests/acceptance/test_a.py": "VALUE = 1\n"},
+                                 (KEEP, OTHER))
+    assert missing == {KEEP, OTHER}
+    (_, missing), log = _collected(tmp_path / "gone", monkeypatch, {"other/readme.txt": ""}, (KEEP,))
+    assert missing == {KEEP} and not log.exists()  # Nothing ran: no acceptance directory.
+
+
+def test_collection_reads_owned_ids_from_the_new_base_exclusions(tmp_path, monkeypatch):
+    files = {"tests/acceptance/test_a.py": "def test_keep():\n    pass\n",
+             "tests/acceptance/test_owned.py": "def test_owned():\n    pass\n"}
+    owned_id = "tests/acceptance/test_owned.py::test_owned"
+    (owned, missing), log = _collected(tmp_path, monkeypatch, files, (KEEP, owned_id),
+                                       excluded=("tests/acceptance/test_owned.py",))
+    assert (owned, missing) == ({owned_id}, set())
+    assert "--ignore=tests/acceptance/test_owned.py" in shlex.split(log.read_text().split("Done when command:\n")[1]
+                                                                   .splitlines()[0])
+
+
+PLAIN = "def test_keep():\n    pass\n\ndef test_other():\n    pass\n"
+
+
+@pytest.mark.parametrize("launcher", [
+    "env PYTHONPATH=src {python} -m pytest",
+    "{python} -I -m pytest",
+    "env PYTHONPATH=src {python} -m pytest --noconftest",
+    "{python} -I -m pytest --noconftest -p no:terminal",
+    "{python} -m pytest --import-mode=importlib",
+], ids=["env-pythonpath", "isolated", "noconftest", "isolated-noconftest", "importlib"])
+def test_collection_works_with_every_supported_launcher(tmp_path, monkeypatch, launcher):
+    command = launcher.format(python=shlex.quote(sys.executable))
+    (owned, missing), _ = _collected(tmp_path, monkeypatch, {"tests/acceptance/test_a.py": PLAIN}, (KEEP, OTHER),
+                                     command=command)
+    assert (owned, missing) == (set(), set())
+
+
+def test_collection_keeps_the_projects_conftest_module(tmp_path, monkeypatch):
+    # Tests that import the project's conftest by name still collect.
+    files = {"tests/acceptance/conftest.py": "VALUE = 1\n",
+             "tests/acceptance/test_a.py": "from conftest import VALUE\n\n" + PLAIN}
+    (owned, missing), _ = _collected(tmp_path, monkeypatch, files, (KEEP, OTHER))
+    assert (owned, missing) == (set(), set())
+
+
+def test_collection_runs_even_when_every_id_is_owned(tmp_path, monkeypatch):
+    # A broken conftest still stops the run though no id needs collecting.
     from foragent.run_attempt import AttemptFailure
-    from foragent.run_baseline import AcceptanceBaseline, collect_protected_ids
 
-    ctx, _ = _collecting(tmp_path, monkeypatch, lambda selectors: group_exit, files=["tests/acceptance/test_a.py"])
+    files = {"tests/acceptance/conftest.py": "def broken(:\n",
+             "tests/acceptance/test_owned.py": "def test_owned():\n    pass\n"}
     with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
-        collect_protected_ids(1, ctx, AcceptanceBaseline("pytest", (KEPT,)), "new")
+        _collected(tmp_path, monkeypatch, files, ("tests/acceptance/test_owned.py::test_owned",),
+                   excluded=("tests/acceptance/test_owned.py",))
 
 
-def test_collect_protected_ids_stops_when_a_deleted_file_meets_a_broken_conftest(tmp_path, monkeypatch):
-    # The file is gone, but the directory left does not collect (a conftest.py SyntaxError exits 4).
+def test_collection_that_changes_tracked_files_stops_like_a_capture(tmp_path, monkeypatch):
+    # A new-base conftest deletes a tracked acceptance test while collecting.
     from foragent.run_attempt import AttemptFailure
-    from foragent.run_baseline import AcceptanceBaseline, collect_protected_ids
 
-    ctx, commands = _collecting(tmp_path, monkeypatch, lambda selectors: 4, files=["tests/acceptance/conftest.py"])
-    with pytest.raises(AttemptFailure, match="acceptance baseline unavailable"):
-        collect_protected_ids(1, ctx, AcceptanceBaseline("pytest", (DELETED,)), "new")
-    # The control collected the nearest directory left, which loads that conftest.py.
-    assert shlex.split(commands[-1])[-1] == "tests/acceptance"
+    files = {"tests/acceptance/conftest.py": "from pathlib import Path\n\n"
+                                             "Path(__file__).with_name('test_b.py').unlink()\n",
+             "tests/acceptance/test_a.py": PLAIN,
+             "tests/acceptance/test_b.py": "def test_b():\n    pass\n"}
+    with pytest.raises(AttemptFailure, match="capture modified tracked files"):
+        _collected(tmp_path, monkeypatch, files, (KEEP, "tests/acceptance/test_b.py::test_b"))
 
 
-def test_collect_protected_ids_drops_a_deleted_file_when_its_directory_collects(tmp_path, monkeypatch):
-    from foragent.run_baseline import AcceptanceBaseline, collect_protected_ids
+def test_log_dropped_ids_without_known_failures_does_not_claim_one(tmp_path):
+    # Collected on the new base, but failing_ids is unknown: the outcome is not evidence.
+    from foragent.run_baseline import AcceptanceBaseline, log_dropped_ids
 
-    ctx, _ = _collecting(tmp_path, monkeypatch, lambda selectors: 4 if DELETED in selectors else 5,
-                         files=["tests/acceptance/conftest.py"])
-    assert collect_protected_ids(1, ctx, AcceptanceBaseline("pytest", (DELETED,)), "new") == (set(), {DELETED})
+    node = "tests/acceptance/test_a.py::test_a"
+    new = AcceptanceBaseline("pytest", (), collected_ids=(node,), failing_ids=None)
+    log = tmp_path / "run.log"
+    log_dropped_ids(log, AcceptanceBaseline("pytest", (node,)), (), set(), set(), new, ci=False)
+    assert log.read_text() == f"Acceptance baseline dropped protected node id {node}: no longer protected on the new base\n"

@@ -458,86 +458,107 @@ def _capture_baseline(
                 ctx.git.remove_worktree(worktree)
 
 
+# Written into a throwaway checkout of the new base. It prints nothing, so the
+# configured command's terminal flags (-q, verbosity_test_cases, -p no:terminal)
+# cannot change the listing; the listing path is part of the source, not the environment.
+COLLECT_PLUGIN = """\
+import json
+
+_ids, _errors = [], 0
+
+
+def pytest_collectreport(report):
+    global _errors
+    if report.failed:  # A collection error; an importorskip skip is not one.
+        _errors += 1
+
+
+def pytest_collection_finish(session):
+    _ids[:] = [item.nodeid for item in session.items]
+
+
+def pytest_sessionfinish(session, exitstatus):
+    with open({listing!r}, "w", encoding="utf-8") as stream:
+        json.dump({{"ids": _ids, "errors": _errors, "rootdir": str(session.config.rootpath)}}, stream)
+"""
+# Collected first, this helper module puts its own directory on sys.path and
+# registers the plugin with pytest_plugins. It needs no conftest, PYTHONPATH or
+# import mode, so `python -I`, `--noconftest` and `env PYTHONPATH=...` all work;
+# pytest collects an explicitly named file whatever python_files says.
+HELPER_DIR = ".foragent-collect"
+HELPER_MODULE = """\
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+pytest_plugins = ["fa_collected_ids"]
+"""
+
+
 def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
                           sha: str) -> tuple[set[str], set[str]]:
-    """(owned, missing) ids of ``previous`` on base ``sha``, by collection only (#123).
+    """(owned, missing) ids of ``previous`` on base ``sha``, from one exact collection (#123).
 
-    Runs locally on a checkout of ``sha`` with the new base's exclusions, the
-    capture time limit, the run budget and a machine test slot. One
-    ``--collect-only`` of all ids usually settles it; pytest exits 4 for a
-    selector it does not find, and only then are the ids halved to find which.
-    Exit 4 is "not found" only when the same command then collects the id's
-    file, or the nearest directory left when the file is gone, cleanly (0 or
-    5): a collection error under a file::test selector or a broken
-    conftest.py also exits 4. Any other exit, a failing file
-    collection or a timeout raises AttemptFailure. No JUnit report is written:
-    the #483 harness counts every JUnit command as a baseline capture.
+    One ``--collect-only`` over the acceptance directory of a checkout of
+    ``sha`` (with its exclusions) lists the exact collected node ids; an id is
+    missing only when it is not in that list. It always runs, also when every
+    id is owned by an open issue, so a broken collection still stops the run.
+    No tests collected (exit 5) or no acceptance directory means nothing is
+    collected. A collection error, another exit, a missing listing or a
+    timeout raises AttemptFailure. Runs locally with the capture time limit,
+    the run budget and a machine test slot.
+
+    The listing plugin comes from a helper module collected first (see
+    HELPER_MODULE). Like a capture, a collection that modified tracked files
+    raises AttemptFailure.
     """
     from foragent import runner
 
     log = ctx.store.log_path(n)
     excluded = _baseline_exclusions(ctx, sha, log)
     owned = {node for node in previous.node_ids if node.split("::", 1)[0] in excluded}
-    selectable = tuple(node for node in previous.node_ids if node not in owned)
-    ignores = "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
-    missing: set[str] = set()
-    if not selectable:
-        return owned, missing
+    selectable = set(previous.node_ids) - owned
+    acceptance_dir = ctx.config.acceptance_dir
     with tempfile.TemporaryDirectory(prefix="foragent-protected-") as directory:
         worktree = Path(directory) / "worktree"
+        listing = Path(directory) / "collected.json"
+        source = COLLECT_PLUGIN.format(listing=str(listing))
         ctx.git.add_detached_worktree(worktree, sha)
         try:
-            def exit_code(selectors: tuple[str, ...]) -> int:
-                remaining = runner._remaining(n, ctx)
-                if remaining <= 0:
-                    raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before collection")
-                result = runner._check(
-                    f"{previous.command} --collect-only {shlex.join(selectors)}{ignores}", worktree, log,
-                    _baseline_capture_limit(ctx, log, remaining), progress=lambda: _progress(n, ctx),
-                    slot=_test_slot(n, ctx))
-                _progress(n, ctx)
-                if result.timed_out:
-                    raise AttemptFailure(f"acceptance baseline unavailable: collecting the protected ids on {sha} "
-                                         "timed out")
-                return result.exit_code
-
-            def failed(selectors: tuple[str, ...], code: int) -> AttemptFailure:
-                return AttemptFailure(f"acceptance baseline unavailable: collecting {' '.join(selectors)} on {sha} "
-                                      f"failed (exit_code={code})")
-
-            files: dict[str, int] = {}
-
-            def find(group: tuple[str, ...]) -> None:
-                code = exit_code(group)
-                if code == 0:
-                    return
-                if code != 4:
-                    raise failed(group, code)
-                if len(group) > 1:
-                    middle = len(group) // 2
-                    find(group[:middle])
-                    find(group[middle:])
-                    return
-                # Exit 4 is also a SyntaxError or ImportError under a file::test
-                # selector, or a conftest.py that fails to load. "Not found"
-                # counts only when the same command then collects cleanly
-                # (0 or 5): the id's file if it is still there (it exits 2 for
-                # its own import error), else the nearest directory still there,
-                # which loads the conftest.py files on the id's path.
-                target = Path(group[0].split("::", 1)[0])
-                while target != Path(".") and not (worktree / target).exists():
-                    target = target.parent
-                key = target.as_posix()
-                if key not in files:
-                    files[key] = exit_code((key,))
-                if files[key] not in (0, 5):
-                    raise failed((key,), files[key])
-                missing.add(group[0])
-
-            find(selectable)
+            if not (worktree / acceptance_dir).is_dir():
+                return owned, selectable
+            remaining = runner._remaining(n, ctx)
+            if remaining <= 0:
+                raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before collection")
+            helper = worktree / HELPER_DIR
+            helper.mkdir()
+            (helper / "fa_collected_ids.py").write_text(source, encoding="utf-8")
+            (helper / "test_fa_collect.py").write_text(HELPER_MODULE, encoding="utf-8")
+            # The helper first: the plugin then sees every later collection report.
+            command = (f"{previous.command} {shlex.quote(HELPER_DIR + '/test_fa_collect.py')} "
+                       f"{shlex.quote(acceptance_dir)}"
+                       + "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded) + " --collect-only")
+            result = runner._check(command, worktree, log, _baseline_capture_limit(ctx, log, remaining),
+                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+            _progress(n, ctx)
+            # Like a capture: a collection that changed tracked files proves nothing.
+            _validate_baseline_checkout(ctx.git.at(worktree), sha)
+            try:
+                found = json.loads(listing.read_text(encoding="utf-8"))
+                ids, errors, rootdir = list(found["ids"]), int(found["errors"]), Path(found["rootdir"])
+            except (OSError, ValueError, KeyError, TypeError):
+                ids, errors, rootdir = None, None, None
+            if result.timed_out or result.exit_code not in (0, 5) or ids is None or errors:
+                raise AttemptFailure(
+                    f"acceptance baseline unavailable: collecting {acceptance_dir} on {sha} failed "
+                    f"(exit_code={result.exit_code}, timed_out={result.timed_out}, "
+                    f"collection_errors={'unknown' if errors is None else errors})")
+            # pytest's node ids are relative to its rootdir; baseline ids to the repository root.
+            prefix = rootdir.resolve().relative_to(worktree.resolve()).as_posix()
+            collected = {node if prefix == "." else f"{prefix}/{node}" for node in ids}
         finally:
             ctx.git.remove_worktree(worktree)
-    return owned, missing
+    return owned, selectable - collected
 
 
 def log_dropped_ids(log: Path, previous: AcceptanceBaseline, protected: tuple[str, ...], owned: set[str],
@@ -552,7 +573,7 @@ def log_dropped_ids(log: Path, previous: AcceptanceBaseline, protected: tuple[st
         elif node in missing:
             reason = "missing on the new base"
         elif (not ci and new is not None and new.collected_ids is not None and node in new.collected_ids
-              and (new.failing_ids is None or node in new.failing_ids)):
+              and new.failing_ids is not None and node in new.failing_ids):
             reason = "failing on the new base"
         else:
             reason = "no longer protected on the new base"
