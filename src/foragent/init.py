@@ -10,7 +10,7 @@ import sys
 
 import yaml
 
-from foragent import board, gh, launchd, role_agents
+from foragent import board, gh, launchd, role_agents, roles
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
@@ -134,6 +134,14 @@ def _add_config(path: Path, local: dict, added: dict) -> str:
     return original.rstrip("\n") + "\n" + yaml.safe_dump(added, sort_keys=False)
 
 
+def _config_text(path: Path, local: dict, added: dict, role_source: dict | None) -> str | None:
+    """The edited settings text, or None when nothing changes; roles are edited by their own writer."""
+    if not added and role_source is None:
+        return None
+    text = _add_config(path, local, added) if added else path.read_text(encoding="utf-8")
+    return text if role_source is None else roles.replace_block(text, role_source)
+
+
 def _logged_in(tool: str) -> bool:
     command = ["codex", "login", "status"] if tool == "codex" else ["claude", "auth", "status"]
     try:
@@ -181,6 +189,7 @@ def init_repo(
     base_branch = DEFAULTS["base_branch"]
     added = {}
     updated_config = None
+    role_source = None
     if config_path.exists():
         config = load_config(root)
         base_branch = config.base_branch
@@ -190,10 +199,18 @@ def init_repo(
         added = {key: value for key, value in explicit.items() if value is not None and key not in local}
         if "checks" not in local:
             added["checks"] = initial_checks(repo, run, command=config.test_command or next(iter(detect_test_commands(root)), None))
+        # Existing role entries are kept; missing defaults are added (#769).
+        role_source = roles.with_defaults(root, local.get("roles") or {})
+        if role_source is not None and "roles" not in local:
+            added["roles"] = role_source
+            role_source = None
+        if role_source is not None:
+            _validate({**asdict(config), **added, "roles": role_source})
+            config = replace(config, roles=role_source)
         if added:
             _validate({**asdict(config), **added})
             config = replace(config, **added)
-            updated_config = _add_config(config_path, local, added)
+        updated_config = _config_text(config_path, local, added, role_source)
     else:
         codex_available = _logged_in("codex")
         claude_available = _logged_in("claude")
@@ -215,10 +232,11 @@ def init_repo(
         values = {key: DEFAULTS[key] if value is None else value for key, value in options.items()}
         values["approvers"] = approvers
         values["checks"] = initial_checks(repo, run, command=next(iter(detect_test_commands(root)), None))
+        values["roles"] = roles.with_defaults(root, {})
         _validate({**DEFAULTS, **values})
         config = Config(**{**DEFAULTS, **values})
         minimal = {key: value for key, value in values.items()
-                   if key in {"review", "approvers", "checks"} or options[key] is not None or value != DEFAULTS[key]}
+                   if key in {"review", "approvers", "checks", "roles"} or options[key] is not None or value != DEFAULTS[key]}
         contents = {".foragent.yml": CONFIG_COMMENT + yaml.safe_dump(minimal, sort_keys=False), **contents}
     if config.checks == "ci":
         contents[WORKFLOW] = workflow_text(config)
@@ -247,7 +265,7 @@ def init_repo(
     # Also recover a deletion left uncommitted by an interrupted setup.
     legacy_paths = [LEGACY_PUBLISH_WORKFLOW] if not (root / LEGACY_PUBLISH_WORKFLOW).exists() else []
     pending = list(dict.fromkeys([
-        *created, *tracked_removals, *([".foragent.yml"] if added else []),
+        *created, *tracked_removals, *([".foragent.yml"] if updated_config is not None else []),
         *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root), *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
@@ -297,7 +315,7 @@ def init_repo(
         if board_changes:
             if config_path.exists():
                 added.update(board_changes)
-                updated_config = _add_config(config_path, local, added)
+                updated_config = _config_text(config_path, local, added, role_source)
             else:
                 contents[".foragent.yml"] += yaml.safe_dump(board_changes, sort_keys=False, allow_unicode=True)
             pending = list(dict.fromkeys([*pending, ".foragent.yml"]))

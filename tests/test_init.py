@@ -11,7 +11,7 @@ import yaml
 from foragent.config import ConfigError, load_config
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
-from foragent import role_agents
+from foragent import role_agents, roles
 from foragent.issue import parse_body
 from foragent.labels import LABELS
 from foragent.tracker import FakeTracker, TrackerError
@@ -23,6 +23,26 @@ PATHS = [".foragent.yml", ".github/ISSUE_TEMPLATE/foragent-task.md", "tests/acce
 # The orchestrator and architect agents, memory and skill copies follow the setup files.
 ROLE_PATHS = list(role_agents.missing_files(Path("/nonexistent-foragent-project"))[0])
 ALL_PATHS = [*PATHS, *ROLE_PATHS]
+def without_roles(text):
+    """Settings text without the roles block init writes (#769); each default role must be in it."""
+    lines, kept, inside = text.splitlines(keepends=True), [], False
+    for line in lines:
+        if line.rstrip("\n") == "roles:":
+            inside = True
+            continue
+        if inside and line.startswith((" ", "-")):
+            continue
+        inside = False
+        kept.append(line)
+    if "roles" in (yaml.safe_load(text) or {}):
+        assert set(roles.DEFAULT_ROLES) <= yaml.safe_load(text)["roles"].keys()
+    return "".join(kept)
+
+
+def config_values(path):
+    return yaml.safe_load(without_roles(path.read_text()))
+
+
 EXPECTED_CONFIG = (
     "# Configuration: Foragent docs/gate.md (section 9), docs/contract.md (section 4).\n"
     "review: batch\napprovers:\n- human\nchecks: local\n"
@@ -153,7 +173,7 @@ def setup(tmp_path, monkeypatch):
 def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     report = setup.init()
     assert report.created == ALL_PATHS and report.existed == []
-    assert (setup.root / PATHS[0]).read_text() == EXPECTED_CONFIG
+    assert without_roles((setup.root / PATHS[0]).read_text()) == EXPECTED_CONFIG
     assert (setup.root / PATHS[1]).read_text() == EXPECTED_TEMPLATE
     assert (setup.root / PATHS[2]).read_bytes() == b""
     body = EXPECTED_TEMPLATE.split("---\n", 2)[2]
@@ -219,7 +239,7 @@ def test_existing_config_does_not_probe_tools_or_change_worker_and_reviewer(setu
 
     monkeypatch.setattr(subprocess, "run", no_probes)
     setup.init()
-    assert (setup.root / PATHS[0]).read_text() == original + "checks: local\n"
+    assert without_roles((setup.root / PATHS[0]).read_text()) == original + "checks: local\n"
 
 
 def test_board_default_is_persisted_and_idempotent(setup):
@@ -243,7 +263,7 @@ def test_init_adds_board_to_existing_config_and_commits_it(setup, existing):
     assert path.read_text().count("board:") == 1
     if existing.startswith("#"):
         assert path.read_text().startswith(existing)
-    assert report.added_keys == ["checks", "board"] and report.committed and report.pushed
+    assert report.added_keys == ["checks", "roles", "board"] and report.committed and report.pushed
 
 
 def test_board_opt_out_and_dry_run_do_not_call_graphql(setup):
@@ -329,7 +349,7 @@ def test_existing_partial_config_and_template_remain_byte_for_byte(setup):
     template.parent.mkdir(parents=True)
     template.write_text("Existing template\n")
     report = setup.init(review="fast", approvers=["new"])
-    assert (setup.root / PATHS[0]).read_text() == config + "checks: local\n"
+    assert without_roles((setup.root / PATHS[0]).read_text()) == config + "checks: local\n"
     assert template.read_text() == "Existing template\n"
     assert report.created == [PATHS[2], *ROLE_PATHS]
     assert ["add", "-f", "--", PATHS[2], *ROLE_PATHS, *PATHS[:2]] in setup.git_calls
@@ -343,7 +363,7 @@ def test_existing_acceptance_directory_gets_no_placeholder(setup):
 
 def test_only_nondefault_keys_and_explicit_approvers_are_written(setup):
     setup.init(review="fast", executor="claude", run_hours="22-08", approvers=["alice", "bob"])
-    assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {
+    assert config_values(setup.root / PATHS[0]) == {
         "review": "fast", "executor": "claude", "approvers": ["alice", "bob"], "run_hours": "22-08",
         "reviewer": "claude", "checks": "local",
     }
@@ -354,7 +374,7 @@ def test_only_nondefault_keys_and_explicit_approvers_are_written(setup):
 @pytest.mark.parametrize("language", ["ko", "en", "ja"])
 def test_init_writes_explicit_language(setup, language):
     setup.init(language=language)
-    assert yaml.safe_load((setup.root / PATHS[0]).read_text())["language"] == language
+    assert config_values(setup.root / PATHS[0])["language"] == language
     assert load_config(setup.root).language == language
 
 
@@ -367,8 +387,8 @@ def test_existing_config_adds_only_missing_explicit_keys(setup, key, value):
     (setup.root / PATHS[0]).write_text(config)
     report = setup.init(**{key: value})
     assert (setup.root / PATHS[0]).read_text().startswith(config)
-    assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {"base_branch": "main", key: value, "checks": "local"}
-    assert report.added_keys == [key, "checks"]
+    assert config_values(setup.root / PATHS[0]) == {"base_branch": "main", key: value, "checks": "local"}
+    assert report.added_keys == [key, "checks", "roles"]
     assert f"Added config key: {key}" in report.summary()
     setup.git_calls.clear()
     report = setup.init(**{key: value})
@@ -392,10 +412,10 @@ def test_init_null_configuration_dry_run_and_multiple_missing_keys(setup):
     path = setup.root / PATHS[0]
     path.write_text("~\n")
     report = setup.init(language="ko", executor="claude", dry_run=True)
-    assert report.added_keys == ["executor", "language", "checks"]
+    assert report.added_keys == ["executor", "language", "checks", "roles"]
     assert path.read_text() == "~\n"
     setup.init(language="ko", executor="claude")
-    assert yaml.safe_load(path.read_text()) == {"executor": "claude", "language": "ko", "checks": "local"}
+    assert config_values(path) == {"executor": "claude", "language": "ko", "checks": "local"}
     assert not setup.init(language="ko", executor="claude").added_keys
 
 
@@ -412,14 +432,14 @@ def test_existing_language_is_never_overwritten_and_missing_values_override_glob
     report = setup.init(language="en", executor="codex")
     assert load_config(setup.root).language == "ko"
     assert load_config(setup.root).executor == "codex"
-    assert report.added_keys == ["executor", "checks"]
+    assert report.added_keys == ["executor", "checks", "roles"]
 
 
 def test_init_dry_run_reports_missing_keys_without_writing(setup):
     (setup.root / PATHS[0]).write_text("review: fast\n")
     report = setup.init(language="ko", dry_run=True)
-    assert (setup.root / PATHS[0]).read_text() == "review: fast\n"
-    assert report.added_keys == ["language", "checks"]
+    assert without_roles((setup.root / PATHS[0]).read_text()) == "review: fast\n"
+    assert report.added_keys == ["language", "checks", "roles"]
     assert "Would add config key: language" in report.summary()
     assert not report.committed and report.commit_planned
 
@@ -428,7 +448,7 @@ def test_invalid_missing_option_on_existing_config_fails_before_writes(setup):
     (setup.root / PATHS[0]).write_text("review: fast\n")
     with pytest.raises(ConfigError, match="language"):
         setup.init(language="not a tag")
-    assert (setup.root / PATHS[0]).read_text() == "review: fast\n"
+    assert without_roles((setup.root / PATHS[0]).read_text()) == "review: fast\n"
     assert not setup.tracker.labels
 
 
@@ -671,7 +691,7 @@ def test_explicit_default_options_override_global_config(setup):
     global_path.parent.mkdir(parents=True)
     global_path.write_text("executor: claude\nrun_hours: 22-08\nreview: careful\napprovers: [global]\n")
     setup.init(executor="codex", run_hours="always", review="batch", approvers=["human"])
-    assert yaml.safe_load((setup.root / PATHS[0]).read_text()) == {
+    assert config_values(setup.root / PATHS[0]) == {
         "executor": "codex", "run_hours": "always", "review": "batch", "approvers": ["human"],
         "checks": "local",
     }
@@ -761,7 +781,9 @@ def test_init_rerun_removes_only_generated_publisher_and_commits_deletion(setup,
         '    steps:\n      - run: python -m foragent.ci_publish\n')
     history = GitHistory(setup.root.parent / 'origin.git', setup.root,
                          git_command(setup.root, 'rev-parse', 'HEAD'))
-    history.update({'.foragent.yml': f'checks: {mode}\ntest_command: python -m pytest\n',
+    # Keep the roles the first init wrote, so only the publisher can change.
+    kept_roles = yaml.safe_dump({'roles': yaml.safe_load((setup.root / '.foragent.yml').read_text())['roles']})
+    history.update({'.foragent.yml': f'checks: {mode}\ntest_command: python -m pytest\n' + kept_roles,
                     WORKFLOW: 'name: customized measurement\n', **({legacy: original} if tracked else {})})
     git_command(setup.root, 'fetch', 'origin')
     git_command(setup.root, 'merge', '--ff-only', 'origin/main')
@@ -863,7 +885,7 @@ def test_missing_checks_in_existing_config_is_selected_without_input_and_kept(
     report = setup.init()
     assert path.read_text().startswith(original)
     assert yaml.safe_load(path.read_text())['checks'] == mode
-    assert report.added_keys == ['checks']
+    assert report.added_keys == ['checks', 'roles']
     assert (setup.root / WORKFLOW).exists() is (mode == 'ci')
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1 and f'checks: {mode}' in lines[0]
@@ -909,7 +931,8 @@ def test_package_data_covers_every_file_of_both_role_skills():
     import tomllib
     root = Path(__file__).resolve().parents[1]
     data_files = tomllib.loads((root / "pyproject.toml").read_text())["tool"]["setuptools"]["data-files"]
-    for role in role_agents.ROLES:
+    # fa-docs ships with the docs-role issue; until then init lists it without copying.
+    for role in [role for role in role_agents.ROLES if role != "fa-docs" or (root / "skills" / role).is_dir()]:
         source = root / "skills" / role
         files = [path.relative_to(root) for path in source.rglob("*") if path.is_file()]
         assert files, f"{role} skill is missing"
@@ -917,3 +940,23 @@ def test_package_data_covers_every_file_of_both_role_skills():
             destination = (Path("share/foragent") / path.parent).as_posix()
             assert any(path.match(pattern) and path.parent == Path(pattern).parent
                        for pattern in data_files.get(destination, [])), f"{path} is not packaged"
+
+
+def test_reinit_keeps_role_entries_and_adds_missing_defaults_from_agent_skills(setup):
+    path = setup.root / PATHS[0]
+    custom = {"agent": "fa-orchestrator", "skills": ["kept-skill"], "memory": ".claude/agent-memory/fa-orchestrator/",
+              "signals": [], "idle_days": 3}
+    path.write_text("# Keep this comment\nreview: fast\nroles:\n  orchestrator: "
+                    + yaml.safe_dump(custom, default_flow_style=True))
+    agent = setup.root / ".claude/agents/fa-architect.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("---\nname: fa-architect\nmemory: project\nskills: [own-architect]\n---\nBody\n")
+    report = setup.init()
+    text = path.read_text()
+    assert text.startswith("# Keep this comment\nreview: fast\n") and report.committed
+    source = yaml.safe_load(text)["roles"]
+    assert source["orchestrator"] == custom
+    assert source["architect"]["skills"] == ["own-architect"] and source["architect"]["created_at"]
+    assert source["docs"]["skills"] == ["fa-docs"] and source["docs"]["scope"] == ["docs/**", "README*"]
+    assert agent.read_text().endswith("Body\n")
+    assert not setup.init().committed

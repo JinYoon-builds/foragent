@@ -1,4 +1,4 @@
-"""The orchestrator and architect role agents that fa init gives every project.
+"""The default role agents (orchestrator, architect, docs) that fa init gives every project.
 
 Projects differ only in memory and project skills: the agent definitions come
 from the template below, and the role skills are copied from the ones Foragent
@@ -14,7 +14,8 @@ import yaml
 from foragent.paths import repo_path
 
 
-ROLES = {"fa-orchestrator": "orchestrator", "fa-architect": "architect"}
+ROLES = {"fa-orchestrator": "orchestrator", "fa-architect": "architect", "fa-docs": "docs"}
+MEMORY = {"fa-docs": "# fa-docs memory\n\n## Proposals\n\n## Lessons\n"}
 _CHECKOUT_SKILLS = Path(__file__).resolve().parents[2] / "skills"
 
 
@@ -54,7 +55,7 @@ def _templates(root: Path, *, existing_skills: bool = False) -> dict[str, str]:
     contents: dict[str, str] = {}
     for role in ROLES:
         contents[f".claude/agents/{role}.md"] = agent_text(role)
-        contents[f".claude/agent-memory/{role}/MEMORY.md"] = f"# {role} memory\n"
+        contents[f".claude/agent-memory/{role}/MEMORY.md"] = MEMORY.get(role, f"# {role} memory\n")
         skill = f".claude/skills/{role}"
         source = skill_source(role)
         if source is not None and (existing_skills or not repo_path(root, skill).exists()):

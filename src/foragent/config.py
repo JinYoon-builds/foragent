@@ -30,6 +30,8 @@ class Config:
     executor_model: str | None = None
     executor_fallback_model: str | None = None
     lanes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Standing roles (#769); written only by foragent.roles.
+    roles: dict[str, dict[str, Any]] = field(default_factory=dict)
     tiers: dict[str, dict[str, Any]] = field(default_factory=lambda: {
         "s": {"codex_effort": "medium", "claude_model": None},
         "m": {"codex_effort": "high", "claude_model": None},

@@ -36,3 +36,4 @@
 - Your turn 덮어쓰기(#694): `board.sync_status` 안에서 열린 이슈가 needs-human·waiting-person 라벨이나 열린 질문(`orch_inbox.waiting_issues`)에 걸리면 Done/closed/merged와 `parent=True`를 빼고 "Needs human"으로 바꾼다. `test_board_parents`의 가짜 store에는 `root`가 없으므로 질문 읽기 실패는 경고만 남기고 계속한다.
 - 다른 이슈가 주인인 상수(예: park 이슈의 `WAITING_PERSON`)는 main에 들어오기 전까지 정의하지 말고 문자열을 직접 쓴다. 지시에 "do not define it here"가 있으면 리뷰가 소유권 위반으로 막는다(#694).
 - [init 역할 에이전트 (#717)](role_agents_init.md) — skill은 data-files로 배포, 커밋 실패 복구는 내용 일치 파일만, test_init ALL_PATHS
+- [roles 원본 (#769)](roles_source.md) — roles.py 단독 writer, init 기본 역할, 새 설정 키면 `uv run fa test`

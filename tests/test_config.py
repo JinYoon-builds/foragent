@@ -29,7 +29,7 @@ def test_exact_defaults(repo):
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "tick_failure_alert": 3,
-        "repo": None, "board": None, "board_map": None, "language": "en", "codex_goal": False, "review_level": "low",
+        "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low",
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
@@ -381,3 +381,20 @@ def test_committed_config_keeps_local_repo_and_base_and_names_them(tmp_path):
 def test_committed_config_missing_or_invalid_falls_back(tmp_path, content):
     from foragent.config import Config, load_committed_config
     assert load_committed_config(Config(), content, "origin/main:.foragent.yml", tmp_path / "none.yml") == (None, [])
+
+
+@pytest.mark.parametrize("roles", [[], {"Bad": {}}, {"x": {"color": "red"}}, {"x": {"skills": "a"}},
+                                   {"x": {"signals": [{"paths": "a"}]}}, {"x": {"idle_days": 0}}])
+def test_invalid_roles_are_rejected(repo, roles):
+    (repo / ".foragent.yml").write_text(yaml.safe_dump({"roles": roles}))
+    with pytest.raises(ConfigError, match="roles"):
+        load_config(repo)
+
+
+def test_roles_load_with_defaults_for_optional_fields(repo):
+    from foragent.roles import load_roles
+
+    entry = {"agent": "fa-security", "skills": ["audit"], "memory": ".claude/agent-memory/fa-security/",
+             "signals": [{"paths": ["src/**"], "kinds": []}]}
+    (repo / ".foragent.yml").write_text(yaml.safe_dump({"roles": {"security": entry}}))
+    assert load_roles(load_config(repo)) == {"security": {**entry, "scope": [], "created_at": None, "idle_days": 14}}
