@@ -16,68 +16,56 @@ from statistics import median
 from typing import Any
 
 from foragent.orch_facts_resources import _jsonl, _time
-from foragent.run_review import SPEC_CONFLICT, parse_code_review, parse_review
+from foragent.run_review import FINDING_LINE, SPEC_CONFLICT, code_review_findings, parse_code_review, parse_review
 from foragent.state import StateStore
 
 UNCLASSIFIED = "unclassified"
 TOP_RUNS = 5
-# The finding pattern parse_code_review uses.
-FINDING = re.compile(r"^(?:[-*]|\d+[.)])?\s*`?\S+?:\d+`?\s+(—|-|--)\s+")
 CLASS_LINE = re.compile(r"^\s+class:\s*(\S+)\s*$")
 
 
-def _line_classes(text: str) -> set[str]:
-    """Classes of the path:line findings in text; a finding without a class line is unclassified."""
+def _class(value: Any) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else UNCLASSIFIED
+
+
+def finding_classes(text: str) -> set[str]:
+    """The classes of every finding in one review's text, whatever its verdict.
+
+    Findings are what the runner's /code-review parser finds: path:line lines (each class
+    is the indented ``class:`` line right under it), else the JSON finding objects (each
+    class is its ``class`` field). A finding without a class is unclassified.
+    """
+    _, findings, _ = code_review_findings(text)
+    if findings and isinstance(findings[0], dict):
+        return {_class(item.get("class")) for item in findings}
     lines = text.splitlines()
     classes = set()
     for index, line in enumerate(lines):
-        if line.strip().startswith(SPEC_CONFLICT) or not FINDING.match(line):
+        if line.strip().startswith(SPEC_CONFLICT) or not FINDING_LINE.match(line):
             continue
-        following = lines[index + 1] if index + 1 < len(lines) else ""
-        match = CLASS_LINE.match(following)
+        match = CLASS_LINE.match(lines[index + 1]) if index + 1 < len(lines) else None
         classes.add(match[1] if match else UNCLASSIFIED)
     return classes
 
 
-def _json_items(text: str) -> list[Any] | None:
-    payload = text.strip()
-    blocks = list(re.finditer(r"^[ \t]*```([^\r\n]*)\r?\n(.*?)^[ \t]*```[ \t]*\r?$", payload, re.M | re.S))
-    json_blocks = [block for block in blocks if block[1].strip() == "json"]
-    if len(blocks) == 1 and blocks[0].span() == (0, len(payload)):
-        payload = blocks[0][2]
-    elif json_blocks:
-        payload = json_blocks[0][2]
-    try:
-        items = json.loads(payload)
-    except ValueError:
-        return None
-    return items if isinstance(items, list) else None
-
-
 def round_classes(text: str, recorded: str | None = None) -> set[str] | None:
-    """The distinct classes of one review: None for an unusable review, empty for PASS.
+    """The distinct classes of one usable review; None for an unusable one.
 
-    ``recorded`` is the reviewer's verdict the runner journaled for this round. It decides: a
-    timed-out reviewer or a failed panel can leave a VERDICT line in the raw text of an UNUSABLE
-    round. A review the journal never recorded (written before review events), or a
-    SPEC-CONFLICT round journaled before the reviewer's own verdict was kept beside it, is
-    judged by parsing the text the same way the runner did.
+    ``recorded`` is the reviewer's verdict the runner journaled for this round. It decides only
+    whether the round counts: a timed-out reviewer or a failed panel can leave a VERDICT line in
+    the raw text of an UNUSABLE round. A review the journal never recorded (written before
+    review events), or a SPEC-CONFLICT round journaled before the reviewer's own verdict was
+    kept beside it, is judged by the runner's parsers. Findings count whatever the verdict;
+    a FAIL with no recognisable finding is one unclassified round.
     """
     if recorded in (None, "SPEC-CONFLICT"):
-        review = parse_review(text)
-        if review.verdict == "UNUSABLE":
-            review = parse_code_review(json.dumps({"result": text}))
-        recorded = review.verdict
-    if recorded == "FAIL":
-        if parse_review(text).verdict == "UNUSABLE" and (items := _json_items(text)) is not None:
-            classes = {item["class"] if isinstance(item, dict) and isinstance(item.get("class"), str)
-                       and item["class"].strip() else UNCLASSIFIED for item in items}
-        else:
-            classes = _line_classes(text)
-        return classes or {UNCLASSIFIED}
-    if recorded == "PASS":
-        return set()
-    return None
+        recorded = parse_review(text).verdict
+        if recorded == "UNUSABLE":
+            recorded = parse_code_review(json.dumps({"result": text})).verdict
+    if recorded not in ("PASS", "FAIL"):
+        return None
+    classes = finding_classes(text)
+    return classes or ({UNCLASSIFIED} if recorded == "FAIL" else set())
 
 
 TOLERANCE = timedelta(seconds=1)

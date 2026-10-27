@@ -48,10 +48,12 @@ def test_journaled_verdict_decides_over_the_text(tmp_path):
     store = _store(tmp_path)
     _review(store, 7, 1, "not a verdict at all\n", START + timedelta(seconds=10), verdict="FAIL")
     _review(store, 7, 2, FINDING, START + timedelta(seconds=20), verdict="FAIL")
-    _review(store, 7, 3, "VERDICT: FAIL\n- src/b.py:1 — Gone.\n", START + timedelta(seconds=30), verdict="PASS")
+    # Recorded PASS still counts its path:line finding: the verdict says only that the round counts.
+    _review(store, 7, 3, "VERDICT: FAIL\n- src/b.py:1 — Gone.\n  class: scope-gap\n",
+            START + timedelta(seconds=30), verdict="PASS")
     summary, row = _attach(store)
     assert row["review_rounds"] == 3
-    assert row["finding_classes"] == {"unclassified": 1, "retry-context": 1}
+    assert row["finding_classes"] == {"unclassified": 1, "retry-context": 1, "scope-gap": 1}
 
 
 CONFLICT = "SPEC-CONFLICT: tests/acceptance/test_x.py:1 — wants the opposite\n"
@@ -96,3 +98,17 @@ def test_json_findings_read_the_class_field():
     assert round_classes(text) == {"stale-base", "unclassified"}
     assert round_classes(text, "UNUSABLE") is None
     assert round_classes("(none)") == set()
+
+
+def test_pass_round_with_path_line_findings_counts_their_classes():
+    text = "VERDICT: PASS\n- src/a.py:3 — Minor, not blocking.\n  class: naming\n- src/b.py:4 — Also minor.\n"
+    assert round_classes(text) == {"naming", "unclassified"}
+    assert round_classes(text, "PASS") == {"naming", "unclassified"}
+    assert round_classes("VERDICT: PASS\n", "PASS") == set()
+
+
+def test_verdict_line_followed_by_claude_json_findings_keeps_class_fields():
+    text = ('VERDICT: FAIL\n```json\n[{"file": "a.py", "line": 3, "summary": "x", "class": "stale-base"},'
+            ' {"file": "b.py", "line": 1, "summary": "y", "class": "retry-context"}]\n```\n')
+    assert round_classes(text) == {"stale-base", "retry-context"}
+    assert round_classes(text, "FAIL") == {"stale-base", "retry-context"}

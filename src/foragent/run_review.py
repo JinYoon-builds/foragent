@@ -68,23 +68,24 @@ def parse_review(message: str) -> ReviewResult:
     return ReviewResult("UNUSABLE", "", ("reviewer gave no verdict",))
 
 
-def parse_code_review(message: str) -> ReviewResult:
-    try:
-        event = json.loads(message)
-    except ValueError:
-        event = None
-    if not isinstance(event, dict) or event.get("is_error") or not isinstance(event.get("result"), str):
-        return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
-    text = event["result"]
+FINDING_LINE = re.compile(r"^(?:[-*]|\d+[.)])?\s*`?\S+?:\d+`?\s+(—|-|--)\s+")
+
+
+def code_review_findings(text: str) -> tuple[str, list[str] | list[dict], str]:
+    """/code-review result text as (verdict, findings, note).
+
+    Findings are the path:line lines when there are any, else the finding objects of the
+    one JSON payload (each keeps every field the reviewer wrote, such as ``class``).
+    """
     lines = [line for line in text.splitlines() if line.strip()]
-    findings = [line for line in lines if re.match(r"^(?:[-*]|\d+[.)])?\s*`?\S+?:\d+`?\s+(—|-|--)\s+", line)]
+    findings = [line for line in lines if FINDING_LINE.match(line)]
     if findings:
-        return ReviewResult("FAIL", "\n".join(findings))
+        return "FAIL", findings, ""
     payload = text.strip()
     blocks = list(re.finditer(r"^[ \t]*```([^\r\n]*)\r?\n(.*?)^[ \t]*```[ \t]*\r?$", payload, re.M | re.S))
     json_blocks = [block for block in blocks if block[1].strip() == "json"]
     if len(json_blocks) > 1:
-        return ReviewResult("UNUSABLE", "", ("/code-review gave multiple findings payloads",))
+        return "UNUSABLE", [], "/code-review gave multiple findings payloads"
     if len(blocks) == 1 and blocks[0].span() == (0, len(payload)):
         payload = blocks[0][2]
     elif json_blocks:
@@ -95,15 +96,29 @@ def parse_code_review(message: str) -> ReviewResult:
         items = None
     if isinstance(items, list):
         if not items:
-            return ReviewResult("PASS", "")
+            return "PASS", [], ""
         if any(not isinstance(item, dict) or not {"file", "line", "summary"}.intersection(item) for item in items):
-            return ReviewResult("UNUSABLE", "", ("/code-review gave invalid findings",))
-        return ReviewResult("FAIL", "\n".join(
-            f"{item.get('file', '?')}:{item.get('line', '?')} — {item.get('summary', '')}" for item in items
-        ))
+            return "UNUSABLE", [], "/code-review gave invalid findings"
+        return "FAIL", items, ""
     if not blocks and lines and lines[0].strip() == "(none)":
-        return ReviewResult("PASS", "")
-    return ReviewResult("UNUSABLE", "", ("/code-review gave no verdict",))
+        return "PASS", [], ""
+    return "UNUSABLE", [], "/code-review gave no verdict"
+
+
+def parse_code_review(message: str) -> ReviewResult:
+    try:
+        event = json.loads(message)
+    except ValueError:
+        event = None
+    if not isinstance(event, dict) or event.get("is_error") or not isinstance(event.get("result"), str):
+        return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
+    verdict, findings, note = code_review_findings(event["result"])
+    if verdict == "UNUSABLE":
+        return ReviewResult("UNUSABLE", "", (note,))
+    return ReviewResult(verdict, "\n".join(
+        item if isinstance(item, str) else f"{item.get('file', '?')}:{item.get('line', '?')} — {item.get('summary', '')}"
+        for item in findings
+    ))
 
 
 @contextmanager
