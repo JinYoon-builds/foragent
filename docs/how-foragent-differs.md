@@ -56,12 +56,17 @@ A lane is an agent that owns one area of the project.
 
 Isolation in git worktrees is standard in this field. What foragent adds on top is area ownership, lanes that learn, and a number of runs at once that follows machine load.
 
-## Next to similar open-source projects (surveyed 2026-10-26)
+Foragent keeps the stock Claude Code and Codex CLI experience. Lanes are standard agent files under `.claude/agents`, skills are standard `SKILL.md` files, lane memory is Claude Code's project memory, and completion checks use Claude Code's own goal loop and hooks. People keep talking to Claude Code as usual; `/fa` is just a skill. Only the gate runs outside. You keep your subscriptions, settings, skills and hooks, and if you remove foragent, what stays behind is ordinary Claude Code configuration.
+
+Other projects use the word "lane" differently. In oh-my-hermes, a lane is a kind of work (for example deep reasoning, visual work or a quick fix), and the kind picks the model. In foragent, a lane owns an area of the code and keeps learning it across issues and days.
+
+## Next to similar open-source projects (surveyed 2026-10-26; oh-my-hermes added 2026-10-27)
 
 | Layer | Examples | Merges without a person by default? |
 |---|---|---|
 | Company-level management | Paperclip | No; completion is a configured review or approval step |
 | Orchestration and verification | Gas Town, OpenAI Symphony, Orchestrator.inc, foragent | Gas Town: yes, through a bisecting merge queue. Symphony: stops at Human Review. Orchestrator.inc: stops at "ready to merge". |
+| Session-level orchestration | oh-my-hermes (on Hermes Agent) | No merge step described; a goal becomes a graph of parallel nodes inside one conversation, and a run counts as verified only when a test, review or CI gate passed |
 | Parallel launchers | Claude Squad, Vibe Kanban, Orca, Conductor | No; a person reviews diffs and merges |
 | Single agents | Claude Code, Codex CLI, OpenCode, Goose, 가재코드 | No; one task per session |
 
