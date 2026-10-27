@@ -24,7 +24,7 @@ from foragent.config import Config
 from foragent.i18n import text
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
-    RECENT, _comparisons, _executions, _failure_reasons, _history, _hot_files, _merges_since_tidy, _row,
+    RECENT, _comparisons, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
     _slowest_files, _test_slots, _waiting_issues,
 )
 from foragent.state import Run, StateStore
@@ -208,6 +208,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "slowest_test_files": _slowest_files(rows),
         "waste": {"seconds": wasted, "runtime_seconds": runtime, "share": wasted / runtime if runtime else None},
         "hot_files": _hot_files(waiting),
+        "file_conflicts": _file_conflicts(rows),
         "failure_reasons": _failure_reasons(rows),
         "merges_since_tidy": _merges_since_tidy(store),
         "resources": resources,
@@ -218,6 +219,10 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
 
 def _s(value: float | None) -> str:
     return "?" if value is None else f"{value:.0f} s"
+
+
+def _n(value: int | None) -> str:
+    return "?" if value is None else str(value)
 
 
 def _pct(value: float | None) -> str:
@@ -254,7 +259,8 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
         runs.append(f"  #{row['issue']} {state}: runtime {_s(row['runtime_seconds'])}, "
                     f"implementing {_s(row['implementing_seconds'])}, checking {_s(row['checking_seconds'])}, "
                     f"slot wait {_s(row['test_slot_wait_seconds'])}, baseline {_s(row['baseline_seconds'])}, "
-                    f"waited {_s(row['waited_seconds'])}")
+                    f"waited {_s(row['waited_seconds'])}, files declared {_n(row['declared_file_count'])} "
+                    f"changed {_n(row['changed_file_count'])}, overlaps {len(row['overlap_records'])}")
     if facts["slowest_test_files"]:
         top = facts["slowest_test_files"][0]
         runs.append(f"  Slowest test file: {top['file']} {_s(top['seconds'])} in {top['runs']} execution(s), "
@@ -280,6 +286,10 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
     hot = list(facts["hot_files"].items())
     hot_lines = [f"Hot files (approved, waiting): {'none' if not hot else len(hot)}"]
     hot_lines += [f"  {path}: {count}" for path, count in hot[:HUMAN_ITEMS]]
+    conflicts = list(facts["file_conflicts"].items())[:HUMAN_ITEMS]
+    hot_lines.append(f"Overlap conflicts (merged, last {facts['window_days']} days): " + ("; ".join(
+        f"{path} {item['conflicted_merges']}/{item['overlapping_merges']} ({_pct(item['conflict_rate'])}), "
+        f"resolution {_s(item['resolution_seconds'])}, redo {item['redo_count']}" for path, item in conflicts) or "none"))
     reasons = list(facts["failure_reasons"].items())
     reason_lines = [f"Failure reasons (last {facts['window_days']} days): {'none' if not reasons else len(reasons)}"]
     reason_lines += [f"  {count}x {text[:100]}" for text, count in reasons[:HUMAN_ITEMS]]
