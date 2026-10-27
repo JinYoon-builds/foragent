@@ -1,6 +1,5 @@
-"""The orchestrator note inside the lanes section's 🧭 box: now, why, next, where and the inbox count.
-
-This module adds no section of its own; the lanes section places these lines in its box.
+"""The orchestrator's 🧭 box below the lane rows: its watch state, note (now, why, next,
+where), the inbox count, the order and the planning requests.
 """
 
 from datetime import datetime, timedelta
@@ -14,13 +13,66 @@ from foragent.state import StateStore
 from foragent.watch_cells import Line
 
 ORDER = 35
+SIDE = 140  # From this width the box stands beside the sections between the rows and it.
+# "Watching" needs an orchestrator heartbeat (written by a running fa orch watch) this fresh (D67).
+ORCH_FRESH_SECONDS = 30
+# The box keeps a label and its value on one line without spreading across the screen.
+BOX_WIDTH = 60
+
+
+def box_width(width: int) -> int:
+    """Beside other sections 36 columns; stacked, up to BOX_WIDTH."""
+    return 36 if width >= SIDE else min(width, BOX_WIDTH)
 # `fa inspect` writes this many-items count; an older one falls back to the status summary.
 COUNT_FILE = "inspect-count.json"
 COUNT_FRESH = timedelta(minutes=10)
 
 
+def _overview(snapshot: Any, language: str, age: float = 0.0, width: int = 26) -> list[Line]:
+    from foragent import watch
+
+    status = snapshot.status
+    t = lambda key, **values: watch.text(key, language, **values)
+    overview: list[Line] = []
+    heartbeat = snapshot.heartbeats.get("orch")
+    fresh = heartbeat is not None and heartbeat + age <= ORCH_FRESH_SECONDS
+    if fresh:
+        # A live watcher is always named (D67 evidence); blocked work keeps its own
+        # unchanged "handling" line after it.
+        overview.append(watch._line(t("watch_monitoring"), "green"))
+        if status["summary"]["blocked"]:
+            overview.append(watch._line(t("watch_handling"), "yellow"))
+    elif heartbeat is not None or status["active_runs"] or any(watch._has_work(row) for row in status["lanes"].values()):
+        # A stale or missing heartbeat while work exists means nobody is watching.
+        overview.append(watch._line(t("watch_orch_off"), "yellow"))
+    # The note and the count for people follow the state line.
+    overview += lines(snapshot.panel, status["summary"]["waiting_human"], language, width, age, fresh)
+    if snapshot.order:
+        # The combined bar and finish time live in the progress section.
+        overview += [watch._line(t("watch_order") + f" #{snapshot.order.number}"),
+                     watch._line(snapshot.order.title)]
+    else:
+        overview.append(watch._line(t("watch_no_order")))
+    if snapshot.requests:
+        count = lambda name: sum(row.get("status") == name for row in snapshot.requests)
+        overview.append(watch._line(t("watch_requests", processing=count("processing"), done=count("done"))))
+    return overview
+
+
 def render(snapshot: Any, config: Config, repo_root: Path, **context: Any) -> list[Line]:
-    return []  # The lanes section draws these lines inside its orchestrator box.
+    from foragent import watch
+
+    language, top = config.language, context.get("top", 0)
+    width = box_width(context["width"])
+    age = max(0.0, (context["now"] - snapshot.captured_at).total_seconds())
+    title = "🧭 " + watch.text("watch_orchestrator", language)
+    if context["width"] >= SIDE:
+        box = watch._panel(_overview(snapshot, language, age, width - 2), width, title)
+    else:
+        # Stacked under the rows, the heading alone sets it apart; borders would cost two rows.
+        box = [watch._line(title, "bold"), *_overview(snapshot, language, age, width)]
+    context.get("hits", []).append((0, top, width, top + len(box), ("orchestrator", None)))
+    return box
 
 
 def write_count(store: StateStore, count: int, now: datetime) -> None:

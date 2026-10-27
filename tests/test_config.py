@@ -35,6 +35,7 @@ def test_exact_defaults(repo):
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
         "interview": "native", "ouroboros_version": None, "profile": None, "update_check": True,
         "upstream_reports": None, "perspectives": {}, "claude_quota": {"mode": "keep", "keep_percent": 80},
+        "view_glyphs": "auto",
         "skill_roles": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,
@@ -65,6 +66,19 @@ def test_tiers_merge_global_and_repository_fields(repo, tmp_path):
 def test_invalid_tiers_are_rejected(repo, value):
     write_settings(repo / ".foragent.yml", {"tiers": value})
     with pytest.raises(ConfigError, match="tiers"):
+        load_config(repo)
+
+
+@pytest.mark.parametrize("value", ["emoji", "ascii", "auto"])
+def test_view_glyphs_accepts_its_three_modes(repo, value):
+    write_settings(repo / ".foragent.yml", {"view_glyphs": value})
+    assert load_config(repo).view_glyphs == value
+
+
+@pytest.mark.parametrize("value", ["unicode", "", None, True, 1])
+def test_view_glyphs_rejects_unknown_values(repo, value):
+    write_settings(repo / ".foragent.yml", {"view_glyphs": value})
+    with pytest.raises(ConfigError, match="view_glyphs"):
         load_config(repo)
 
 

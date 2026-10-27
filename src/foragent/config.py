@@ -92,6 +92,8 @@ class Config:
     perspectives: dict[str, str] = field(default_factory=dict)
     # Claude plan share (#107): keep starts no Claude implementer at keep_percent; burn runs to the limit.
     claude_quota: dict[str, Any] = field(default_factory=lambda: {"mode": "keep", "keep_percent": 80})
+    # Lane view glyphs (#167): emoji, ascii, or auto (ascii on dumb/linux terminals or non-UTF-8 locales).
+    view_glyphs: str = "auto"
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())

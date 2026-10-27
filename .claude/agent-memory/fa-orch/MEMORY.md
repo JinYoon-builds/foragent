@@ -173,3 +173,4 @@
 - [#674 SKILL.md line budget](project_674_skill_space.md) — move untested prose to references/, also catch helper-import readers (question_routing)
 - #310: SKILL.md 150줄 상한은 시험이 정규식으로 읽지 않는 설명(watch 세부·주문 카드)을 `references/watch.md`·`order-card.md`로 옮겨 맞췄다. 비교: SKILL을 읽는 인수 16개 파일의 PASSED/FAILED 집합(zsh는 `$(grep -l ...)`로 넘겨야 단어 분리됨).
 - #693: park/unpark 본체는 `orch_park.py`, CLI는 `commands/_orch_park.py`(orch.py run에서 ctx 만든 뒤 분기). 시간 초과는 `parked_at() > since`면 생략. 인수 시험 1은 라벨 제거만으로 통과하므로 경계는 `tests/test_orch_park_unit.py`가 local_issues를 교체해 확인.
+- [#716 role agents](project_716_role_agents.md) — architect prompt/skill split, --agent launches, pstack test pins refactor.md
