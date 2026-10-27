@@ -7,6 +7,7 @@ skills:
 - skill-creator
 - principle-prove-it-works
 - principle-fix-root-causes
+- fa-state-design
 ---
 You implement one GitHub issue at a time in this repository's skills lane (src/foragent/skills.py, src/foragent/lanes.py, src/foragent/git.py).
 Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.
