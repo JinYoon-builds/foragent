@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+import json
 from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
@@ -97,3 +98,42 @@ def _stop_run_processes(
         _flag_stop_refused(ctx, run, report, exc)
         return "refused"
     return "stopped"
+
+
+def _restore_stopped(ctx: TickContext, number: int, why: str, report: TickReport) -> None:
+    """After `fa orch stop`'s kill: ready again, as a stall restart, with one stop event naming the why.
+
+    The run's WIP was already saved by the kill path. The stop event and the orch
+    audit comment come first, once per run, while `running` still marks the issue
+    for orphan recovery: a later step that fails (a board rate limit) is repeated by
+    the next tick and the record is never lost or written twice. `running` goes
+    last. An open PR flags the issue as _restore_stalled does; a closed, blocked or
+    needs-human issue only loses running. A stop counts toward neither the crash
+    streak nor the stall restart budget.
+    """
+    from foragent.i18n import text
+
+    run = ctx.store.get_run(number)
+    journal = ctx.store.root / "orch-events.jsonl"
+    started = scheduler.datetime.fromisoformat(run.started_at) if run is not None else None
+    if not (journal.exists() and any(
+        event.get("issue") == number and event.get("kind") == "stop"
+        and (started is None or scheduler.datetime.fromisoformat(event["at"]) >= started)
+        for event in map(json.loads, journal.read_text(encoding="utf-8").splitlines())
+    )):
+        ctx.tracker.comment(number, "<!-- foragent:orch -->\n" + text(
+            "orch_stop_done", ctx.config.language, n=number, why=why))
+        scheduler.append_event(ctx.store, ctx.now(), number, "stop",
+                               f"Stopped by fa orch stop; unfinished work kept on foragent/issue-{number}. Why: {why}")
+    issue = ctx.tracker.get_issue(number)
+    if issue.state != "open" or issue.labels & {scheduler.BLOCKED, scheduler.NEEDS_HUMAN}:
+        ctx.tracker.remove_labels(number, [scheduler.RUNNING])
+    elif ctx.tracker.find_pr(f"foragent/issue-{number}") is not None:
+        scheduler.flag(ctx, number, scheduler.Reason.STALLED,
+                       "Runner stopped with an open PR; rerun review or retry implementation.")
+        report.actions.append(f"#{number} flagged stalled with open PR")
+    else:
+        ctx.tracker.add_labels(number, [scheduler.READY])
+        scheduler.board.sync_status(ctx, number, "Ready")
+        ctx.tracker.remove_labels(number, [scheduler.RUNNING])
+        report.actions.append(f"#{number} returned to ready after stop")
