@@ -417,17 +417,27 @@ def test_roles_load_with_defaults_for_optional_fields(repo):
     assert load_roles(load_config(repo)) == {"security": {**entry, "scope": [], "created_at": None, "idle_days": 14}}
 
 
-def test_edit_roles_touches_only_changed_entries_and_fields():
+def test_edit_roles_touches_only_changed_entries_and_fields(capsys):
+    """Bar set 2026-10-27: only the top-level roles block is rewritten; bytes outside it stay identical."""
     from foragent.roles import edit_roles
 
-    text = ("review: fast  # top\nroles:\n  # about roles\n  orchestrator:\n    agent: fa-orchestrator  # keep\n"
-            "    skills: [fa-orchestrator]  # mine\n    signals: []\n  security:\n    agent: fa-security\n"
-            "    skills: [audit]  # old\n    scope: [src/**]  # owned\n    signals: []\n# tail\n")
+    head = "# Settings header\nreview: fast  # top\n\n"
+    tail = "# about lanes\nlanes: {}  # none yet\n# tail\n"
+    block = ("roles:  # owned by fa role\n  # about roles\n  orchestrator:\n    agent: fa-orchestrator  # keep\n"
+             "    skills: [fa-orchestrator]\n    signals: []\n  security: {agent: fa-security, skills: [audit],"
+             " signals: []}\n")
+    text = head + block + tail
     roles = yaml.safe_load(text)["roles"]
-    changed = edit_roles(text, {**roles, "security": {**roles["security"], "skills": ["deep"]}})
-    assert changed == text.replace("    skills: [audit]  # old\n", "    skills:\n    - deep\n")
-    added = edit_roles(text, {**roles, "docs": {"agent": "fa-docs", "skills": [], "signals": []}})
-    assert added == text.replace("# tail\n", "  docs:\n    agent: fa-docs\n    skills: []\n    signals: []\n# tail\n")
-    removed = edit_roles(text, {"orchestrator": roles["orchestrator"]})
-    assert removed == text.replace(text[text.index("  security:"):text.index("# tail")], "")
-    assert edit_roles(text, roles) == text
+    for changed in ({**roles, "security": {**roles["security"], "skills": ["deep"]}},  # set
+                    {**roles, "docs": {"agent": "fa-docs", "skills": [], "signals": []}},  # add
+                    {"orchestrator": roles["orchestrator"]}):  # remove
+        edited = edit_roles(text, changed)
+        assert edited.startswith(head) and edited.endswith(tail), "Every byte outside the roles block is kept"
+        middle = edited[len(head):len(edited) - len(tail)]
+        assert middle == yaml.safe_dump({"roles": changed}, sort_keys=False), "Block-style roles at the same place"
+        assert yaml.safe_load(edited) == {**yaml.safe_load(text), "roles": changed}
+        notice = capsys.readouterr().err
+        assert notice.count("\n") == 1 and "dropped 3 comment" in notice, "One line names the dropped comments"
+    plain = edit_roles("review: fast  # top", {"docs": {"agent": "fa-docs", "skills": [], "signals": []}})
+    assert plain == "review: fast  # top\nroles:\n  docs:\n    agent: fa-docs\n    skills: []\n    signals: []\n"
+    assert capsys.readouterr().err == "", "No notice when no comment was dropped"

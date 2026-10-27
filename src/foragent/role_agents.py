@@ -65,13 +65,28 @@ def _templates(root: Path, *, existing_skills: bool = False,
     for role in ROLES:
         contents[f".claude/agents/{role}.md"] = agent_text(role, _skills(role, skills))
         contents[f".claude/agent-memory/{role}/MEMORY.md"] = MEMORY.get(role, f"# {role} memory\n")
-        skill = f".claude/skills/{role}"
-        source = skill_source(role)
-        if source is not None and (existing_skills or not repo_path(root, skill).exists()):
-            for file in sorted(source.rglob("*")):
-                if file.is_file() and not file.is_symlink():
-                    contents[f"{skill}/{file.relative_to(source).as_posix()}"] = file.read_text(encoding="utf-8")
+        # Copy the skills the roles source lists, not the role's own name (#769).
+        for name in _skills(role, skills):
+            skill = f".claude/skills/{name}"
+            source = _skill_dir(root, name)
+            if source is not None and (existing_skills or not repo_path(root, skill).exists()):
+                for file in sorted(source.rglob("*")):
+                    if file.is_file() and not file.is_symlink():
+                        contents[f"{skill}/{file.relative_to(source).as_posix()}"] = file.read_text(encoding="utf-8")
     return contents
+
+
+def _skill_dir(root: Path, name: str) -> Path | None:
+    """A role skill to copy: the repository's product skill skills/<name> wins, else the shipped one.
+
+    A skill found only in a library or as an installed copy is left to `fa role`, which installs it.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in {".", ".."}:
+        return None
+    product = repo_path(root, f"skills/{name}")
+    if (product / "SKILL.md").is_file() and not product.is_symlink():
+        return product
+    return skill_source(name)
 
 
 def missing_files(root: Path, skills: dict[str, list[str]] | None = None) -> tuple[dict[str, str], list[str]]:

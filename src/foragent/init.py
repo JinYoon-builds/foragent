@@ -135,11 +135,30 @@ def _add_config(path: Path, local: dict, added: dict) -> str:
 
 
 def _config_text(path: Path, local: dict, added: dict, role_source: dict | None) -> str | None:
-    """The edited settings text, or None when nothing changes; roles are edited by their own writer."""
+    """The edited settings text, or None when nothing changes.
+
+    Other keys keep `_add_config`'s behaviour; roles go only through the roles writer, which
+    rewrites the roles block (or appends it) and keeps every other byte, line ends included.
+    """
     if not added and role_source is None:
         return None
-    text = _add_config(path, local, added) if added else path.read_text(encoding="utf-8")
-    return text if role_source is None else roles.edit_roles(text, role_source)
+    # Bytes, not text mode, so CRLF line ends survive.
+    text = _add_config(path, local, added) if added else path.read_bytes().decode("utf-8")
+    if role_source is None:
+        return text
+    try:
+        return roles.edit_roles(text, role_source)
+    except roles.RoleError as exc:
+        # The role agents init creates derive from this source, so init stops before writing anything.
+        raise ConfigError(f"cannot add the default roles to .foragent.yml ({exc}); "
+                          "convert it to block-style YAML and re-run fa init") from exc
+
+
+def _report_keys(added: dict, role_source: dict | None, updated_config: str | None) -> list[str]:
+    """Config keys init adds or fills, for the report; roles is listed when its block was written."""
+    wrote_roles = role_source is not None and updated_config is not None and "roles" in (
+        yaml.safe_load(updated_config) or {})
+    return [*added, *(["roles"] if wrote_roles else [])]
 
 
 def _logged_in(tool: str) -> bool:
@@ -200,10 +219,8 @@ def init_repo(
         if "checks" not in local:
             added["checks"] = initial_checks(repo, run, command=config.test_command or next(iter(detect_test_commands(root)), None))
         # Existing role entries are kept; missing defaults are added (#769).
+        # The roles writer appends a missing block itself, so roles never pass through _add_config.
         role_source = roles.with_defaults(root, local.get("roles") or {})
-        if role_source is not None and "roles" not in local:
-            added["roles"] = role_source
-            role_source = None
         if role_source is not None:
             _validate({**asdict(config), **added, "roles": role_source})
             config = replace(config, roles=role_source)
@@ -280,7 +297,7 @@ def init_repo(
         board_change = board_planned and not config.board
         return InitReport(created, existed, True, push_planned=push_planned or (board_change and not no_push),
                           commit_planned=bool(pending) or board_change, launchd_planned=not no_launchd,
-                          normalized_root=normalized_root, added_keys=list(added), board_planned=board_planned,
+                          normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_planned=board_planned,
                           removed=removed)
 
     # GhTracker counts its own attempts; its default runner must not count them again.
@@ -334,11 +351,11 @@ def init_repo(
     if WORKFLOW in created:
         write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:
-        config_path.write_text(updated_config, encoding="utf-8")
+        config_path.write_bytes(updated_config.encode("utf-8"))
     if pending:
         git.commit_paths(pending, "Set up Foragent")
     if push_planned:
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     return InitReport(created, existed, False, bool(pending), push_planned, label,
-                      normalized_root=normalized_root, added_keys=list(added), board_id=board_id, removed=removed)
+                      normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed)

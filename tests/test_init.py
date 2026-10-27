@@ -263,7 +263,7 @@ def test_init_adds_board_to_existing_config_and_commits_it(setup, existing):
     assert path.read_text().count("board:") == 1
     if existing.startswith("#"):
         assert path.read_text().startswith(existing)
-    assert report.added_keys == ["checks", "roles", "board"] and report.committed and report.pushed
+    assert report.added_keys == ["checks", "board", "roles"] and report.committed and report.pushed
 
 
 def test_board_opt_out_and_dry_run_do_not_call_graphql(setup):
@@ -1121,3 +1121,93 @@ def _role_command_after_hand_deletion(tmp_path, monkeypatch, command, *, staged)
         assert git_command(root, "ls-tree", "-r", "--name-only", "HEAD", "--", *owned[1:]) == "", (
             "Removal leaves no agent or memory file in HEAD")
     assert git_command(root, "show", "HEAD:.foragent.yml").startswith("review: fast  # keep\n")
+
+
+def test_role_commands_keep_every_byte_outside_the_roles_block(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    root = tmp_path / "project"
+    git_command(tmp_path, "init", "-q", "-b", "main", str(root))
+    git_command(root, "remote", "add", "origin", "git@github.com:owner/repo.git")
+    head, tail = "# Team settings\nreview: fast  # agreed 10-27\n\n", "# keep the tail\nlanes: {}  # none\n"
+    orchestrator = {"agent": "fa-orchestrator", "skills": [], "memory": ".claude/agent-memory/fa-orchestrator/",
+                    "signals": []}
+    (root / ".foragent.yml").write_text(head + "roles:  # roles note\n  orchestrator:\n    agent: fa-orchestrator\n"
+                                        "    skills: []\n    memory: .claude/agent-memory/fa-orchestrator/\n"
+                                        "    signals: []\n" + tail)
+    assert yaml.safe_load((root / ".foragent.yml").read_text())["roles"] == {"orchestrator": orchestrator}
+    git_command(root, "add", "-A")
+    base = git_command(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+                       git_command(root, "write-tree"), "-m", "base")
+    git_command(root, "update-ref", "refs/heads/main", base)
+    monkeypatch.setattr(GitRepo, "commit_paths", recording_commit([]))
+    steps = [lambda: roles.add_role(root, "security", skills=[], scope=["src/**"], signals=["paths:src/**"]),
+             lambda: roles.set_role(root, "security", signals=["kinds:hot_overlap_files"]),
+             lambda: roles.remove_role(root, "security")]
+    for step in steps:
+        step()
+        text = (root / ".foragent.yml").read_text()
+        assert text.startswith(head) and text.endswith(tail), "Bytes outside the roles block stay identical"
+        assert text[len(head):len(text) - len(tail)].startswith("roles:\n")
+    assert yaml.safe_load(text)["roles"] == {"orchestrator": orchestrator}
+    assert "dropped 1 comment" in capsys.readouterr().err, "Say once that the block's comment was dropped"
+
+
+@pytest.mark.parametrize("original", [
+    "# keep\r\nreview: fast\r\nchecks: local\r\nroles:\r\n  orchestrator:\r\n    agent: fa-orchestrator\r\n"
+    "    skills: [fa-orchestrator]\r\n    memory: .claude/agent-memory/fa-orchestrator/\r\n    signals: []\r\n"
+    "# tail\r\n",
+    "# keep\nreview: fast\nchecks: local\n\n\n",
+], ids=["crlf-missing-defaults", "trailing-blank-lines-no-roles"])
+def test_init_adds_roles_without_changing_bytes_outside_the_block(setup, original):
+    path = setup.root / PATHS[0]
+    path.write_bytes(original.encode())
+    setup.init()
+    written = path.read_bytes().decode()
+    source = yaml.safe_load(written)["roles"]
+    assert set(roles.DEFAULT_ROLES) <= source.keys()
+    if "roles:" in original:
+        head, tail = original[:original.index("roles:")], original[original.index("# tail"):]
+        assert written.startswith(head) and written.endswith(tail), "Bytes outside the roles block stay identical"
+        assert "\n" not in written.replace("\r\n", ""), "A CRLF file keeps CRLF line ends"
+        assert source["orchestrator"]["skills"] == ["fa-orchestrator"]
+    else:
+        assert written.startswith(original), "Trailing blank lines stay; the roles block is appended after them"
+
+
+def test_init_leaves_a_flow_style_config_unchanged_and_warns(setup, capsys):
+    """The role agents derive from the roles source, so init refuses instead of creating them without it."""
+    path = setup.root / PATHS[0]
+    path.write_bytes(b"{review: fast, checks: local}  # one line\n")
+    with pytest.raises(ConfigError, match="roles"):
+        setup.init()
+    assert path.read_bytes() == b"{review: fast, checks: local}  # one line\n"
+    assert not (setup.root / ".claude/agents").exists(), "No agent without its roles source"
+
+
+def test_init_puts_roles_inside_a_document_with_an_explicit_end(setup):
+    path = setup.root / PATHS[0]
+    path.write_bytes(b"review: fast\nchecks: local\n...\n# after the document\n")
+    setup.init()
+    written = path.read_bytes().decode()
+    assert written.startswith("review: fast\nchecks: local\nroles:\n")
+    assert written.endswith("...\n# after the document\n")
+    assert set(roles.DEFAULT_ROLES) <= yaml.safe_load(written)["roles"].keys()
+
+
+def test_init_copies_the_skills_the_roles_entry_lists(setup):
+    setup.init()
+    path = setup.root / PATHS[0]
+    text = path.read_text()
+    source = yaml.safe_load(text)["roles"]
+    source["architect"]["skills"] = ["audit"]
+    path.write_text(roles.edit_roles(text, source))
+    for relative in (".claude/agents/fa-architect.md", ".claude/skills/fa-architect/SKILL.md"):
+        (setup.root / relative).unlink()
+    product = setup.root / "skills/audit"
+    product.mkdir(parents=True)
+    (product / "SKILL.md").write_text("---\nname: audit\ndescription: Audit\n---\nAudit the code.\n")
+    report = setup.init()
+    assert (setup.root / ".claude/skills/audit/SKILL.md").read_text() == (product / "SKILL.md").read_text()
+    assert ".claude/skills/audit/SKILL.md" in report.created
+    assert not (setup.root / ".claude/skills/fa-architect/SKILL.md").exists(), "Copy the listed skill, not the role's"
+    assert roles.role_drift(setup.root, load_config(setup.root)) == []

@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from typing import Any
 
 import yaml
@@ -45,7 +46,7 @@ def memory_dir(name: str) -> str:
 
 
 def default_entry(name: str, skills: list[str] | None = None) -> dict[str, Any]:
-    signals = {"architect": [{"paths": [], "kinds": list(ARCHITECT_KINDS)}],
+    signals = {"architect": [{"paths": [], "kinds": [kind]} for kind in ARCHITECT_KINDS],
                "docs": [{"paths": list(DOCS_PATHS), "kinds": []}]}.get(name, [])
     entry = {"agent": f"fa-{name}", "skills": [f"fa-{name}"] if skills is None else list(skills),
              "memory": memory_dir(name), "signals": signals}
@@ -106,43 +107,16 @@ def with_defaults(root: Path, roles: dict[str, Any]) -> dict[str, Any] | None:
 _LINES = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
 
 
-def _dump(value: dict[str, Any], indent: int) -> list[str]:
+def _dump(value: dict[str, Any], indent: int, newline: str = "\n") -> list[str]:
     text = yaml.safe_dump(value, sort_keys=False, allow_unicode=True)
-    return [" " * indent + line for line in text.splitlines(keepends=True)]
-
-
-def _span(key: yaml.Node, value: yaml.Node) -> tuple[int, int]:
-    return key.start_mark.line, _last_line(key, value) + 1
-
-
-def _entry_edits(name: str, key: yaml.Node, node: yaml.Node, old: Any, new: Any) -> list:
-    """Line edits that turn one entry from ``old`` into ``new``, touching only changed fields."""
-    if not _block_mapping(node) or not isinstance(old, dict):
-        return [(*_span(key, node), _dump({name: new}, key.start_mark.column))]
-    indent = node.value[0][0].start_mark.column
-    edits = []
-    for field_key, field_value in node.value:
-        field = field_key.value
-        if field not in new:
-            edits.append((*_span(field_key, field_value), []))
-        elif new[field] != old.get(field):
-            edits.append((*_span(field_key, field_value), _dump({field: new[field]}, field_key.start_mark.column)))
-    added = {field: value for field, value in new.items() if field not in old}
-    if added:
-        end = _last_line(*node.value[-1]) + 1
-        edits.append((end, end, _dump(added, indent)))
-    return edits
-
-
-def _block_mapping(node: yaml.Node) -> bool:
-    return isinstance(node, yaml.MappingNode) and not node.flow_style and bool(node.value)
+    return [" " * indent + line + newline for line in text.splitlines()]
 
 
 def edit_roles(text: str, roles: dict[str, Any]) -> str:
-    """Change the ``roles`` mapping of a settings text to ``roles``, line by line.
+    """Rewrite only the top-level ``roles`` block, as block-style YAML at its current position.
 
-    Only the lines of added, removed or changed entries (and, inside a changed entry,
-    its changed fields) are rewritten; every other line and comment keeps its bytes.
+    With no ``roles`` key the block is appended at the end of the file. Every byte outside
+    the block stays identical; comments inside it are dropped, and one line says so.
     """
     lines = _LINES.findall(text)
     try:
@@ -152,38 +126,34 @@ def edit_roles(text: str, roles: dict[str, Any]) -> str:
         raise RoleError(f"cannot read .foragent.yml: {exc}") from exc
     if not isinstance(before, dict):
         raise RoleError(".foragent.yml must contain a mapping")
-    old = before.get("roles") or {}
+    # The file's own line end, so a CRLF file stays CRLF.
+    newline = next((line[len(line.rstrip("\r\n")):] for line in lines if line.endswith(("\r", "\n"))), "\n")
     pair = _pair(node, "roles")
-    if pair is None:
-        edits = [(len(lines), len(lines), _dump({"roles": roles}, 0))]
-    elif not _block_mapping(pair[1]) or not isinstance(old, dict) or not roles:
-        edits = [(*_span(*pair), _dump({"roles": roles}, pair[0].start_mark.column))]
+    ends = [event.start_mark.line for event in yaml.parse(text)
+            if isinstance(event, yaml.events.DocumentEndEvent) and event.explicit]
+    if pair is None and ends:
+        # An explicit document end (`...`): the block goes right before it, inside the document.
+        start = end = ends[0]
+        column = 0
+    elif pair is None:
+        start = end = len(lines)
+        if lines and not lines[-1].endswith(("\r", "\n")):
+            lines[-1] += newline
+        column = 0
     else:
-        entries = {key.value: (key, value) for key, value in pair[1].value if isinstance(key, yaml.ScalarNode)}
-        edits = []
-        for name, (key, value) in entries.items():
-            if name not in roles:
-                edits.append((*_span(key, value), []))
-            elif roles[name] != old.get(name):
-                edits += _entry_edits(name, key, value, old.get(name), roles[name])
-        added = {name: entry for name, entry in roles.items() if name not in entries}
-        if added:
-            end = _last_line(*pair[1].value[-1]) + 1
-            edits.append((end, end, _dump(added, pair[1].value[0][0].start_mark.column)))
-    removed: list[str] = []
-    for begin, end, replacement in sorted(edits, key=lambda edit: (edit[0], edit[1]), reverse=True):
-        if replacement and begin == len(lines) and lines and not lines[-1].endswith(("\r", "\n")):
-            lines[-1] += "\n"
-        removed += lines[begin:end]
-        lines[begin:end] = replacement
+        start, end, column = pair[0].start_mark.line, _last_line(*pair) + 1, pair[0].start_mark.column
+    dropped = sum(_comments(lines[start:end]).values())
+    lines[start:end] = _dump({"roles": roles}, column, newline)
     edited = "".join(lines)
     try:
         written = yaml.safe_load(edited)
     except yaml.YAMLError:
         written = None
-    lost = _comments(_LINES.findall(text)) - _comments(_LINES.findall(edited)) - _comments(removed)
-    if written != {**before, "roles": roles} or lost:
-        raise RoleError("cannot update roles in .foragent.yml without changing other lines; edit it by hand")
+    if written != {**before, "roles": roles}:
+        raise RoleError("cannot rewrite the roles block of .foragent.yml; edit it by hand")
+    if dropped:
+        print(f"Note: rewrote the roles block of .foragent.yml and dropped {dropped} comment(s) inside it.",
+              file=sys.stderr)
     return edited
 
 
