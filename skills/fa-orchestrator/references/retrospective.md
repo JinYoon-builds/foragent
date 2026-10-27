@@ -29,3 +29,26 @@ the call stays the orchestrator's judgment (Jin, 2026-10-27):
 - approved work concentrated in one lane while other lanes are idle.
 
 Until `fa orch architect` is available, hand code-design causes on as an order.
+
+## Reading the scorecard
+
+The retrospective reads `fa orch scorecard` beside `fa orch facts` and `fa orch log`. A metric worse
+than on recent days is a question to answer from the logs, not a target to hit.
+
+- **The same failure reason on two or more issues** (for example two lanes stopped by the same tool
+  error, test-slot wait, missing path or quota stop) is an environment problem: the issues are not
+  wrong, the place they run is. Find the root cause in the run logs (`log_path`, read beyond the tail),
+  then file one fix issue for it as a new order through `fa-order`, in the lane that owns the files.
+- **The same defect class twice on one issue** is the hold rule: redesign or split that issue.
+
+## Never buy speed with safeguards
+
+Locked acceptance tests, cross review and the merge conditions are what make a fast scorecard mean
+anything. Do not weaken, skip or relax any of them to recover a metric. If one of them looks like the
+cause of the slowdown, ask the person first, with choices and a recommendation, and wait for the answer.
+
+## Review notes
+
+Reviewers write root-cause and structure findings as `NOTE:` lines. They never reject the work; the
+runner records each one once per issue as a `review-note` event in `orch-events.jsonl`. Read them in
+the retrospective and the tidy cycle as evidence for structural work.
