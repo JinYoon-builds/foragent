@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler, sleep_credit
 from foragent.scheduler_stop import (
-    _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes,
+    _flag_stop_refused, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes, runner_alive,
 )
 from foragent.state import Run
 from foragent.tracker import Issue
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from foragent.scheduler import TickContext, TickReport
 
 
-def _kill_executor(ctx: TickContext, number: int) -> None:
+def _kill_executor(ctx: TickContext, number: int | str) -> None:
     # Re-read after stopping the runner: it may have spawned or reaped an executor.
     run = ctx.store.get_run(number)
     if run.executor_pgid is not None:
@@ -26,10 +26,10 @@ def _kill_executor(ctx: TickContext, number: int) -> None:
 
 
 def _remove_run_worktree(
-    ctx: TickContext, number: int, worktree: Path, report: TickReport, *, outcome: str,
+    ctx: TickContext, number: int | str, worktree: Path, report: TickReport, *, outcome: str,
 ) -> None:
     try:
-        if worktree.exists() and outcome != "merged":
+        if worktree.exists() and outcome != "merged" and isinstance(number, int):
             try:
                 scheduler._preserve_failed_implementation(
                     number, ctx, ctx.git.at(worktree), outcome, approval=ctx.store.load_approval(number),
@@ -45,7 +45,7 @@ def _remove_run_worktree(
 
 
 def _kill_run(
-    ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
+    ctx: TickContext, number: int | str, report: TickReport, *, outcome: str = "killed",
     count_stall: bool = False, detail: str = "",
 ) -> bool:
     run = ctx.store.get_run(number)
@@ -159,6 +159,7 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
             issue.number, branch=f"foragent/issue-{issue.number}",
             worktree=ctx.store.worktree_path(issue.number),
             lane=scheduler.issue_lane(issue.labels, ctx.config.lanes),
+            implementer=run.implementer if run is not None else None,  # A crash keeps the run's implementer (#107).
         )
         ctx.store.finish_run(issue.number, outcome="crashed", detail=detail)
     report.actions.append(f"#{issue.number} orphaned running label recovered as crashed")
@@ -198,34 +199,27 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             "sleep_wake", ctx.config.language, hours=int(slept // 3600),
             minutes=int(slept % 3600 // 60), until=grace[1].astimezone().strftime("%H:%M:%S")))
     for run in ctx.store.active_runs():
-        if run.kind == "dream":
-            scheduler.orch_dream.recover(ctx, run, report)
-            continue
+        issue = run.kind == "issue"  # Dreams share this path by record key; only issues touch labels.
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
         if cached is not None and any(
             item["pid"] == run.pid and item["start_time"] == cached.start_time
             for item in run.process_identities
         ):
-            run = ctx.store.update_run(run.number, routine=True, observe=True)
+            run = ctx.store.update_run(run.key, routine=True, observe=True)
             dead = False  # Routine positive liveness needs no further enumeration.
         else:
             # Keep witnessed descendants across subsequent reparenting or runner death.
-            run = ctx.store.update_run(run.number, observe=True)
-            identities = {item["pid"]: item["start_time"] for item in run.process_identities}
+            run = ctx.store.update_run(run.key, observe=True)
             if run.pid is None:
                 dead = (
                     ctx.now() - scheduler.datetime.fromisoformat(run.started_at) >= scheduler.LAUNCH_GRACE
-                    and not ctx.runner_process_exists(run.number)
+                    and not (issue and ctx.runner_process_exists(run.number))
                 )
-            elif run.pid in identities and not any(
-                row.pid == run.pid and row.start_time == identities[run.pid] for row in processes.list_processes()
-            ):
-                dead = True  # Never probe a replacement as if it were the recorded runner.
             else:
-                dead = not _pid_exists(run.pid)
+                dead = not runner_alive(run)
         # The runner may have finished while another run or its process was checked.
-        run = ctx.store.get_run(run.number)
+        run = ctx.store.get_run(run.key)
         if run is None or run.status != "running":
             continue
         if not dead:
@@ -235,7 +229,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             runtime = ((ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds()
                        - run.waited_seconds - run.slept_seconds)
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
-                if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit."):
+                if scheduler._kill_run(ctx, run.key, report, outcome="killed" if issue else "error",
+                                       detail="Runner exceeded its runtime limit.") and issue:
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
             elif run.pid is not None and not waiting and not sleep_credit.in_wake_grace(
@@ -244,9 +239,9 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             ) - scheduler.timedelta(seconds=run.slept_since_progress) > scheduler.timedelta(
                 minutes=ctx.config.stall_minutes):
                 restarts = run.restarts + 1
-                outcome = "stalled-restart" if restarts <= 1 else "stalled"
-                if scheduler._kill_run(ctx, run.number, report, outcome=outcome, count_stall=True,
-                          detail="Runner stopped making progress past the stall limit."):
+                outcome = ("stalled-restart" if restarts <= 1 else "stalled") if issue else "error"
+                if scheduler._kill_run(ctx, run.key, report, outcome=outcome, count_stall=True,
+                          detail="Runner stopped making progress past the stall limit.") and issue:
                     scheduler._restore_stalled(ctx, run.number, restarts, report)
             continue
         # Clean up a crashed group or finish an interrupted stall termination.
@@ -259,12 +254,12 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
 
 
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
-    outcome = run.outcome or "crashed"
+    outcome = (run.outcome or "crashed") if run.kind == "issue" else "error"  # A dead dream: error, no labels.
     if run.executor_pgid is not None:
-        ctx.store.update_run(run.number, executor_pgid=None)
-    scheduler._remove_run_worktree(ctx, run.number, scheduler.Path(run.worktree), report, outcome=outcome)
+        ctx.store.update_run(run.key, executor_pgid=None)
+    scheduler._remove_run_worktree(ctx, run.key, scheduler.Path(run.worktree), report, outcome=outcome)
     detail = scheduler._crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
-    finished = ctx.store.finish_run(run.number, outcome=outcome, detail=detail)
+    finished = ctx.store.finish_run(run.key, outcome=outcome, detail=detail)
     if finished.outcome in {"stalled-restart", "stalled"}:
         scheduler._restore_stalled(ctx, run.number, finished.restarts, report)
     elif finished.outcome == "crashed":

@@ -90,31 +90,13 @@ class StateBase:
             self._write_json(self.root / "runs" / f"dream-{lane}.json", _state.asdict(run))
             return run
 
-    def update_dream(self, lane: str, **fields: Any) -> "Run | None":
-        """Save metadata of a running dream; a finished or missing record stays as it is.
-
-        ``process_identities`` adds to the recorded ones under the lock: the launcher, the
-        worker and its executor callback each know part of the tree, and none may drop another's.
-        """
-        with self._state_lock():
-            run = self.get_dream(lane)
-            if run is None or run.status == "finished":
-                return run
-            if "process_identities" in fields:
-                known = {(item["pid"], item["start_time"]): item
-                         for item in (*run.process_identities, *fields["process_identities"])}
-                fields["process_identities"] = list(known.values())
-            updated = _state.replace(run, **fields)
-            self._write_run(updated)
-            return updated
-
     def finish_dream(self, lane: str, outcome: str, detail: str = "") -> "Run | None":
         with self._state_lock():
             run = self.get_dream(lane)
             if run is None or run.status == "finished":
                 return run
             finished = _state.replace(run, status="finished", outcome=outcome,
-                                      detail=" ".join(detail.split())[:500])
+                                      detail=" ".join(detail.split())[:500] or f"Run finished with outcome {outcome}.")
             self._write_run(finished, {**self._run_value(finished), "finished_at": self._timestamp()})
             return finished
 

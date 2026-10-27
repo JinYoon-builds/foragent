@@ -12,7 +12,9 @@ import subprocess
 import tempfile
 from typing import TYPE_CHECKING, Any
 
-from foragent.orch_dream import _runs_since, last_dream_at, log_path, media_root, memory_path, record_done, worktree_path
+from foragent.orch_dream import (
+    _runs_since, last_dream_at, last_published, log_path, media_root, memory_path, record_done, worktree_path,
+)
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -141,17 +143,29 @@ def _dream_worktree(ctx: RunContext, lane: str, worktree: Path):
     branch, base = f"foragent/dream-{lane}", f"origin/{ctx.config.base_branch}"
     remote = f"refs/remotes/origin/{branch}"
     try:
-        ctx.git._call(["rev-parse", "--verify", "--quiet", remote])
+        pushed = ctx.git._call(["rev-parse", "--verify", "--quiet", remote]).strip() or None
     except Exception:
-        remote = None
-    ctx.git.add_worktree(worktree, branch, remote or base)
+        pushed = None
+    ctx.git.add_worktree(worktree, branch, remote if pushed else base)
     git = ctx.git.at(worktree)
-    if remote is not None:
+    if pushed:
         try:
             git._call([*GIT_IDENTITY, "merge", "--no-edit", base])
         except Exception:
             git._call(["merge", "--abort"])
-    return git
+    return git, pushed
+
+
+def _unpublished(store, git, lane: str, pushed: str | None, base: str, directory: str) -> bool:
+    """Whether the dream branch holds pushed memory no completed dream published as a PR.
+
+    A dream whose push succeeded but whose PR creation failed ended as error, so the
+    branch head differs from the last ``published`` head of a completed dream. A branch
+    whose PR merged has no memory difference from the base left. Local facts only.
+    """
+    if pushed is None or pushed == last_published(store, lane):
+        return False
+    return bool(git._call(["diff", "--name-only", base, "HEAD", "--", directory]).strip())
 
 
 def _publish(ctx: RunContext, git, lane: str, memory: str, count: int) -> int:
@@ -187,7 +201,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
     """The dream worker; it owns runs/dream-<lane>.json while its process lives."""
     from foragent import usage_events
     from foragent.executors import classify_result
-    from foragent.processes import observe_tree, track_process_group
+    from foragent.processes import track_process_group
     from foragent.run_implementation import lane_config
 
     store, config = ctx.store, ctx.config
@@ -195,16 +209,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
     if run is None or run.status != "running":
         print(f"foragent: no running dream record for lane {lane}")
         return 1
-
-    def own(identities: list[dict]) -> None:
-        store.update_dream(lane, process_identities=identities)  # Added to the record under its lock.
-
-    if run.pid is None:
-        store.update_dream(lane, pid=os.getpid())
-        try:
-            own(observe_tree(roots=(os.getpid(),)))
-        except OSError:
-            pass  # Without birth evidence a stop refuses; the tick waits for the process to end.
+    key = run.key  # Records are written exactly as an issue run's (update_run by key).
     worktree = worktree_path(store, lane)
     log = log_path(store, lane)
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -212,7 +217,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
     try:
         if worktree.exists():
             ctx.git.remove_worktree(worktree)
-        git = _dream_worktree(ctx, lane, worktree)
+        git, pushed = _dream_worktree(ctx, lane, worktree)
         created = True
         memory = memory_path(config, lane)
         memory_file = worktree / memory
@@ -240,11 +245,12 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             current = log.stat().st_size if log.exists() else 0
             if current > size:
                 stamp = ctx.now().astimezone(UTC).isoformat()
-                store.update_dream(lane, last_progress_at=stamp, last_activity_at=stamp)
+                store.update_run(key, last_progress_at=stamp, last_activity_at=stamp)
             size = current
 
         def execute():
-            with track_process_group(lambda pgid: store.update_dream(lane, executor_pgid=pgid), tree_callback=own):
+            with track_process_group(lambda pgid: store.update_run(key, executor_pgid=pgid),
+                                     tree_callback=lambda identities: store.update_run(key, process_identities=identities)):
                 return executor.run(worktree=worktree, prompt=text, model=model,
                                     timeout_s=config.max_runtime_minutes * 60, log_path=log, **options)
 
@@ -261,13 +267,18 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             with log.open("a", encoding="utf-8") as stream:
                 stream.write(f"foragent: media {publish_media(proposal, target, bundle.get(target))}\n")
         directory = str(Path(memory).parent)
-        count, pr = 0, None
-        if _files(memory_dir) != before_files:  # commit_paths stages with `git add -f`, ignored files too.
+        count, pr, published = 0, None, None
+        changed = _files(memory_dir) != before_files  # commit_paths stages with `git add -f`, ignored files too.
+        if changed:
             after = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
             count = _changed_lines(before, after)
             git.commit_paths([directory], f"Lane {lane} memory: {ctx.now().astimezone().date().isoformat()}")
+        if changed or _unpublished(store, git, lane, pushed, f"origin/{config.base_branch}", directory):
+            # Completed only once the PR exists after the push; a failure here ends the dream as error.
             pr = _publish(ctx, git, lane, memory, count)
-        record_done(store, lane, count, config.language, ctx.now(), covered_until=covered_until, pr=pr)
+            published = git._call(["rev-parse", "HEAD"]).strip()
+        record_done(store, lane, count, config.language, ctx.now(), covered_until=covered_until, pr=pr,
+                    published=published)
         store.finish_dream(lane, "dreamed", f"{count} memory lines tidied.")
         return 0
     except Exception as exc:

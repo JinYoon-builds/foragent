@@ -28,7 +28,7 @@ from foragent.scheduler_start import (
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _apply_budgets, _github_pause, _github_wait, _has_slot,
     _machine_budget, _reopen_view, _reserve_slot, _start_ready, append_budget_history, append_memory_hold,
     decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel, prebuild_acceptance_baseline,
-    read_state, start_baseline_thread, step, timed, update_test_slots, write_state,
+    read_state, start_baseline_thread, step, timed, update_test_slots, write_state, claude_allowed,
 )
 from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models

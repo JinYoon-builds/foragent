@@ -1,21 +1,31 @@
-"""Boundary tests for lane dreams (#189): process ownership, admission, inputs and publication."""
+"""Boundary tests for lane dreams (#189): shared run recovery, admission, inputs and publication.
+
+Process tests use fake process tables only: no real process is listed or signaled.
+"""
 
 from datetime import UTC, datetime, timedelta
 import json
-import os
 from types import SimpleNamespace
 
 import pytest
 
-from foragent import orch_dream, orch_dream_stop, orch_dream_worker, processes
+from foragent import orch_dream, orch_dream_worker, processes, scheduler
 from foragent.config import Config
 from foragent.state import StateStore
 
 NOW = datetime(2026, 10, 27, 12, tzinfo=UTC)
+KEY = "dream-orch"
 
 
 def row(pid, start=1.0, argv=None, uid=None):
     return SimpleNamespace(pid=pid, start_time=start, argv=argv, ppid=1, pgid=pid, sid=pid, uid=uid)
+
+
+class NoIssues:
+    """A dream never touches issue labels, comments or PRs during recovery."""
+
+    def __getattr__(self, name):
+        pytest.fail(f"dream recovery called the tracker: {name}")
 
 
 @pytest.fixture
@@ -24,135 +34,212 @@ def world(tmp_path, monkeypatch):
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
     config = Config(repo="o/r", lanes={"orch": {"paths": ["orch/**"]}}, stall_minutes=10, max_runtime_minutes=60)
     killed, removed = [], []
+    table = [processes.ProcessTable([])]
 
     def kill(pid):
-        assert processes._recorded_tree.get() is not None, "a stop needs recorded ownership"
+        """Like kill_process_group: only recorded identities that still match are stopped."""
+        recorded = processes._recorded_tree.get()
+        assert recorded is not None, "a stop needs recorded ownership"
         killed.append(pid)
-        current = table[0]  # The signal works: the stopped process leaves the table.
-        table[0] = processes.ProcessTable([item for item in current if item.pid != pid],
-                                          current.unreadable, current.unreadable_uids)
+        owned = {(item["pid"], item["start_time"]) for item in recorded}
+        table[0] = processes.ProcessTable([item for item in table[0] if (item.pid, item.start_time) not in owned])
 
-    ctx = SimpleNamespace(store=store, config=config, now=lambda: clock[0], kill_runner=kill,
-                          repo_root=(tmp_path / "repo").resolve(),
-                          git=SimpleNamespace(remove_worktree=removed.append))
-    table = [processes.ProcessTable([])]
+    ctx = SimpleNamespace(store=store, config=config, now=lambda: clock[0], kill_runner=kill, tracker=NoIssues(),
+                          repo_root=(tmp_path / "repo").resolve(), git=SimpleNamespace(remove_worktree=removed.append),
+                          runner_process_exists=lambda number: pytest.fail("issue runner discovery for a dream"))
     monkeypatch.setattr(processes, "list_processes", lambda: table[0])
+    for name in ("observe_tree", "observe_routine_tree"):  # Recorded identities stay as recorded.
+        monkeypatch.setattr(processes, name, lambda identities=(), roots=(), **kw: [dict(i) for i in identities])
+    monkeypatch.setattr("foragent.sleep_credit.credit", lambda store, now: 0)
     alive = {}
-    monkeypatch.setattr("foragent.scheduler_stop._pid_exists", lambda pid: alive.get(pid, False))
+    # Like os.kill(pid, 0): a listed pid exists, unless a test says otherwise.
+    monkeypatch.setattr("foragent.scheduler_stop._pid_exists",
+                        lambda pid: alive.get(pid, any(item.pid == pid for item in table[0])))
     return SimpleNamespace(store=store, config=config, ctx=ctx, clock=clock, killed=killed,
                            removed=removed, table=table, alive=alive)
 
 
-def dreaming(world, *, pid=4100, identities=True, executor=None):
+def dreaming(world, *, pid=4100, start=1.0, executor=None, extra=()):
     world.store.start_dream("orch", worktree=world.store.root / "worktrees/dream-orch")
-    fields = {"pid": pid, "executor_pgid": executor}
-    if identities:
-        fields["process_identities"] = [{"pid": pid, "start_time": 1.0}]
-    world.store.update_dream("orch", **fields)
+    identities = ([{"pid": pid, "start_time": start}] if start is not None and pid is not None else []) + list(extra)
+    world.store.update_run(KEY, pid=pid, executor_pgid=executor, process_identities=identities)
     return world.store.get_dream("orch")
 
 
-def test_unreadable_worker_is_unknown_not_dead(world):
-    run = dreaming(world)
-    world.table[0] = processes.ProcessTable([], unreadable=[4100])
-    assert orch_dream_stop.dream_liveness(run) is None
+def recover(world):
     report = SimpleNamespace(actions=[])
-    orch_dream.recover(world.ctx, run, report)
-    assert world.store.get_dream("orch").status == "running" and world.removed == []
+    scheduler._recover_runs(world.ctx, report)
+    return report
+
+
+def merged_run(world, number=3):
+    world.store.start_run(number, branch="b", worktree="w", lane="orch")
+    world.store.finish_run(number, outcome="merged")
+
+
+def due(world):
+    return orch_dream.dream_due(world.store, world.config, SimpleNamespace(list_open_issues=lambda: []),
+                                world.clock[0])
+
+
+def test_reused_worker_pid_finishes_the_dream_as_error_and_the_lane_is_due(world):
+    merged_run(world)
+    dreaming(world)  # Worker 4100 recorded with start time 1.0.
+    world.table[0] = processes.ProcessTable([row(4100, start=9.0)])  # Same pid, another process.
+    world.alive[4100] = True  # os.kill(4100, 0) succeeds for the reused pid.
+    recover(world)
+    finished = world.store.get_dream("orch")
+    assert finished.status == "finished" and finished.outcome == "error"
+    assert world.table[0][0].pid == 4100, "the unrelated process that reused the pid is not stopped"
+    assert world.removed and due(world) == ["orch"]
+    history = (world.store.root / "runs.jsonl").read_text().splitlines()
+    assert [json.loads(line).get("kind", "issue") for line in history] == ["issue"], "dreams stay out of runs.jsonl"
+
+
+def test_stalled_dream_is_stopped_through_its_recorded_identity_and_ends_as_error(world):
+    dreaming(world)
+    world.table[0] = processes.ProcessTable([row(4100)])
+    world.clock[0] += timedelta(minutes=11)
+    recover(world)
+    finished = world.store.get_dream("orch")
+    assert world.killed == [4100] and world.table[0] == ()
+    assert finished.outcome == "error" and "stall" in finished.detail
+
+
+def test_dream_over_its_runtime_limit_is_stopped(world):
+    dreaming(world)
+    world.table[0] = processes.ProcessTable([row(4100)])
+    world.clock[0] += timedelta(minutes=world.config.max_runtime_minutes + 11)
+    world.store.update_run(KEY, last_progress_at=world.clock[0].isoformat())  # Progressing, but too long.
+    recover(world)
+    finished = world.store.get_dream("orch")
+    assert world.killed == [4100] and finished.outcome == "error" and "runtime" in finished.detail
+
+
+def test_recovery_decides_from_a_fresh_record_read(world, monkeypatch):
+    dreaming(world)
+    world.clock[0] += timedelta(minutes=11)  # The snapshot from active_runs() looks stalled.
+
+    def listing():  # The worker records progress while the tick checks its process.
+        world.store.update_run(KEY, last_progress_at=world.clock[0].isoformat())
+        return processes.ProcessTable([row(4100)])
+
+    monkeypatch.setattr(processes, "list_processes", listing)
+    world.alive[4100] = True
+    recover(world)
+    assert world.killed == [] and world.store.get_dream("orch").status == "running"
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test_null_start_time_means_alive_while_the_pid_exists(world, exists):
+    dreaming(world, start=None)
+    world.alive[4100] = exists
+    recover(world)
+    run = world.store.get_dream("orch")
+    assert (run.status, run.outcome) == (("running", None) if exists else ("finished", "error"))
+
+
+def test_dead_worker_stops_its_surviving_executor_before_finishing(world):
+    dreaming(world, executor=4200, extra=[{"pid": 4200, "start_time": 2.0}])
+    world.table[0] = processes.ProcessTable([row(4200, start=2.0)])  # The worker is gone; its executor lives.
+    recover(world)
+    assert world.table[0] == () and world.killed
+    assert world.store.get_dream("orch").outcome == "error"
+
+
+def test_failed_launch_without_a_pid_ends_as_error_after_the_grace(world):
+    from foragent import scheduler
+
+    dreaming(world, pid=None, start=None)
+    recover(world)
+    assert world.store.get_dream("orch").status == "running", "within the launch grace"
+    world.clock[0] += scheduler.LAUNCH_GRACE + timedelta(seconds=1)
+    recover(world)
+    assert world.store.get_dream("orch").outcome == "error" and world.killed == []
 
 
 def test_manual_completion_refuses_only_a_confirmed_live_worker(world):
     run = dreaming(world)
-    world.table[0] = processes.ProcessTable([row(4100)])  # Confirmed alive: same pid and start time.
+    world.table[0] = processes.ProcessTable([row(4100)])  # Same pid and start time: alive.
     assert orch_dream.dreamed_command(world.store, world.config, "orch") == 2
     assert orch_dream.last_dream_at(world.store, "orch") is None
-    world.table[0] = processes.ProcessTable([], unreadable=[4100])  # Unknown: event only.
+    world.table[0] = processes.ProcessTable([row(4100, start=9.0)])  # Reused pid: not alive.
+    world.alive[4100] = True
     assert orch_dream.dreamed_command(world.store, world.config, "orch") == 0
     assert orch_dream.last_dream_at(world.store, "orch") is not None
-    assert world.store.get_dream("orch") == run, "the record belongs to the worker and the tick"
+    assert world.store.get_dream("orch") == run, "the command never writes the dream record"
 
 
-@pytest.mark.parametrize("table", [
-    processes.ProcessTable([row(4500, argv=None)]),  # Our own process whose argv cannot be read.
-    processes.ProcessTable([], unreadable=[4500]),  # An unreadable process of unknown owner.
-], ids=["unreadable-argv", "unreadable-process"])
-def test_pidless_dream_is_not_finished_while_a_worker_might_be_unreadable(world, table):
-    from foragent import scheduler
-
-    dreaming(world, pid=None, identities=False)
-    world.table[0] = table
-    world.clock[0] += scheduler.LAUNCH_GRACE + timedelta(seconds=1)
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), SimpleNamespace(actions=[]))
-    assert world.store.get_dream("orch").status == "running" and world.removed == []
+def unpublished_git(diff):
+    return SimpleNamespace(_call=lambda args: diff if args[:1] == ["diff"] else "")
 
 
-def test_pidless_dream_with_every_process_read_and_no_worker_is_finished(world):
-    from foragent import scheduler
-
-    dreaming(world, pid=None, identities=False)
-    other = os.getuid() + 1
-    world.table[0] = processes.ProcessTable([row(4500, argv=("python", "other"), uid=os.getuid())],
-                                            unreadable=[4600], unreadable_uids={4600: other})
-    world.clock[0] += scheduler.LAUNCH_GRACE + timedelta(seconds=1)
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), SimpleNamespace(actions=[]))
-    assert world.store.get_dream("orch").outcome == "error" and world.removed
-
-
-def test_refused_stop_with_an_unreadable_recorded_process_keeps_the_record(world):
-    dreaming(world, identities=False)
-    world.table[0] = processes.ProcessTable([], unreadable=[4100])
-    world.ctx.kill_runner = processes.kill_process_group  # No recorded identity: the stop raises.
-    run = world.store.get_dream("orch")
-    assert orch_dream_stop._stop(world.ctx, run, SimpleNamespace(actions=[])) is False
+def test_pushed_branch_without_a_published_pr_is_unpublished(world):
+    directory = ".claude/agent-memory/orch"
+    assert orch_dream_worker._unpublished(world.store, unpublished_git("MEMORY.md\n"), "orch", "s1", "origin/main", directory)
+    orch_dream.record_done(world.store, "orch", 1, "en", pr=5, published="s1")
+    assert not orch_dream_worker._unpublished(world.store, unpublished_git("MEMORY.md\n"), "orch", "s1",
+                                              "origin/main", directory)
+    assert orch_dream_worker._unpublished(world.store, unpublished_git("MEMORY.md\n"), "orch", "s2",
+                                          "origin/main", directory)
+    assert not orch_dream_worker._unpublished(world.store, unpublished_git(""), "orch", "s2", "origin/main", directory)
+    assert not orch_dream_worker._unpublished(world.store, unpublished_git("x\n"), "orch", None, "origin/main", directory)
 
 
-def test_stalled_dream_stops_worker_and_executor_with_recorded_ownership(world):
-    dreaming(world, executor=4200)
-    world.table[0] = processes.ProcessTable([row(4100)])
-    world.clock[0] += timedelta(minutes=11)
-    report = SimpleNamespace(actions=[])
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), report)
-    assert world.killed == [4100, 4200]
-    finished = world.store.get_dream("orch")
-    assert finished.status == "finished" and finished.outcome == "error" and "stall" in finished.detail
-
-
-def test_dead_worker_stops_surviving_executor_before_finishing(world):
-    dreaming(world, executor=4200)
-    report = SimpleNamespace(actions=[])
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), report)
-    assert world.killed == [4100, 4200], "the surviving executor tree is stopped first"
-    assert world.store.get_dream("orch").outcome == "error"
-
-
-def test_refused_stop_of_surviving_executor_keeps_the_record(world, monkeypatch):
-    dreaming(world, identities=False, executor=4200)
-    world.alive[4200] = True  # The executor group survives; no recorded identity authorizes a stop.
-    world.ctx.kill_runner = processes.kill_process_group
-    report = SimpleNamespace(actions=[])
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), report)
-    assert world.store.get_dream("orch").status == "running"
-    assert any("stop refused" in action for action in report.actions)
-
-
-def test_worker_records_executor_tree_for_later_stops(world, tmp_path, monkeypatch):
-    seen = []
-
+def worker_world(world, executor_edit, publish):
     class Executor:
         def run(self, **kwargs):
-            processes._process_tree_callback.get()([{"pid": 4300, "start_time": 2.0}])
-            seen.append(world.store.get_dream("orch").process_identities)
-            raise RuntimeError("stop here")
+            executor_edit(kwargs["worktree"])
+            from foragent.executors import ExecResult
+            return ExecResult(0, False, "done", kwargs["log_path"])
 
-    dreaming(world)
-    world.ctx.git = SimpleNamespace(remove_worktree=lambda path: None, add_worktree=lambda *a: None,
-                                    at=lambda path: None)
+    def add_worktree(path, branch, ref):
+        path.mkdir(parents=True)
+
+    def remove_worktree(path):
+        import shutil
+        shutil.rmtree(path, ignore_errors=True)
+
+    calls = {"commits": [], "published": []}
+    head = "pushed-sha"
+    git = SimpleNamespace(
+        _call=lambda args: head if args[:1] == ["rev-parse"] else ("MEMORY.md\n" if args[:1] == ["diff"] else ""),
+        commit_paths=lambda paths, title: calls["commits"].append(paths))
+    world.ctx.git = SimpleNamespace(_call=lambda args: head if args[:1] == ["rev-parse"] else "",
+                                    add_worktree=add_worktree, remove_worktree=remove_worktree, at=lambda path: git)
     world.ctx.executor_factory = lambda name: Executor()
     world.ctx.poll_hook = lambda execute, poll: execute()
+    world.ctx.tracker = None
+
+    def fake_publish(ctx, git, lane, memory, count):
+        calls["published"].append(count)
+        return publish()
+
+    return calls, fake_publish
+
+
+def test_push_without_a_pr_ends_as_error_and_the_next_dream_opens_the_pr(world, monkeypatch):
+    def failing():
+        raise RuntimeError("PR creation failed after the push")
+
+    def edit(worktree):
+        path = worktree / ".claude/agent-memory/orch/MEMORY.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("a lesson\n")
+
+    calls, publish = worker_world(world, edit, failing)
+    monkeypatch.setattr(orch_dream_worker, "_publish", publish)
+    dreaming(world, pid=None, start=None)
     with pytest.raises(RuntimeError):
         orch_dream_worker.run_dream("orch", world.ctx)
-    assert {"pid": 4300, "start_time": 2.0} in seen[0]
-    assert {"pid": 4100, "start_time": 1.0} in seen[0]
+    assert world.store.get_dream("orch").outcome == "error" and orch_dream.last_dream_at(world.store, "orch") is None
+    calls, publish = worker_world(world, lambda worktree: None, lambda: 8)  # No new edit this time.
+    monkeypatch.setattr(orch_dream_worker, "_publish", publish)
+    dreaming(world, pid=None, start=None)
+    assert orch_dream_worker.run_dream("orch", world.ctx) == 0
+    assert calls["published"] == [0] and calls["commits"] == []
+    saved = json.loads((world.store.root / "orch-events.jsonl").read_text().splitlines()[-1])
+    assert saved["pr"] == 8 and saved["published"] == "pushed-sha"
 
 
 def test_start_rechecks_a_lane_whose_issue_started_this_tick(world, monkeypatch):
@@ -224,14 +311,6 @@ def test_dream_done_event_names_the_pr_and_reference(world):
     assert event["say"] == "orch 레인이 꿈을 꿨어요 — 기억 3개 정리"
 
 
-def test_identity_updates_add_to_the_record_instead_of_replacing_it(world):
-    dreaming(world)
-    world.store.update_dream("orch", process_identities=[{"pid": 4300, "start_time": 2.0}])  # Worker's executor.
-    world.store.update_dream("orch", pid=4100, process_identities=[{"pid": 4100, "start_time": 1.0}])  # Launcher.
-    assert world.store.get_dream("orch").process_identities == [
-        {"pid": 4100, "start_time": 1.0}, {"pid": 4300, "start_time": 2.0}]
-
-
 def test_start_rechecks_quota_exhausted_after_the_candidates(world, monkeypatch):
     from foragent import scheduler
 
@@ -255,7 +334,7 @@ def test_second_dream_starts_from_the_dream_branch_with_the_base_merged(tmp_path
             calls.append(args)
             if args[:3] == ["rev-parse", "--verify", "--quiet"] and not exists:
                 raise GitError("missing")
-            return ""
+            return "abc123\n" if args[:1] == ["rev-parse"] else ""
 
         repo = SimpleNamespace(_call=call, add_worktree=lambda path, branch, ref: calls.append(("add", branch, ref)),
                                at=lambda path: repo)
@@ -264,7 +343,8 @@ def test_second_dream_starts_from_the_dream_branch_with_the_base_merged(tmp_path
     for exists, start in ((False, "origin/main"), (True, "refs/remotes/origin/foragent/dream-orch")):
         repo, calls = fake(exists)
         ctx = SimpleNamespace(git=repo, config=Config(repo="o/r", lanes={"orch": {"paths": ["orch/**"]}}))
-        orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w")
+        _, pushed = orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w")
+        assert pushed == ("abc123" if exists else None)
         assert ("add", "foragent/dream-orch", start) in calls
         merged = [args for args in calls if isinstance(args, list) and "merge" in args]
         assert merged == ([[*orch_dream_worker.GIT_IDENTITY, "merge", "--no-edit", "origin/main"]] if exists else [])
@@ -309,18 +389,6 @@ def test_new_memory_file_in_an_ignored_directory_is_published_and_counted(world,
     assert not worktree.exists()
 
 
-def test_stop_reported_by_the_killer_is_not_trusted_while_an_unrecorded_worker_lives(world):
-    dreaming(world, identities=False, executor=4200)
-    world.store.update_dream("orch", process_identities=[{"pid": 4200, "start_time": 2.0}])
-    world.table[0] = processes.ProcessTable([row(4200, start=2.0)])
-    world.alive[4100] = True  # The worker has no birth evidence, so the recorded tree misses it.
-    world.clock[0] += timedelta(minutes=11)
-    report = SimpleNamespace(actions=[])
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), report)
-    assert world.store.get_dream("orch").status == "running" and world.removed == []
-    assert any("still running after the stop" in action for action in report.actions)
-
-
 def committed_lanes(world):
     from foragent.scheduler_config import record_tick_config
 
@@ -362,128 +430,3 @@ def test_active_dreams_are_no_issue_rows_or_issue_logs(world):
             if isinstance(state, list) for item in state]
     assert not any(isinstance(item, dict) and item.get("number") == 0 for item in rows)
     assert collected["summary"]["working"] == 1
-
-
-def test_reused_worker_pid_finishes_the_dream_as_error_and_the_lane_is_due(world):
-    world.store.start_run(3, branch="b", worktree="w", lane="orch")
-    world.store.finish_run(3, outcome="merged")
-    dreaming(world)  # Worker 4100 recorded with start time 1.0.
-    world.table[0] = processes.ProcessTable([row(4100, start=9.0)])  # Same pid, another process.
-    world.alive[4100] = True  # os.kill(4100, 0) succeeds for the reused pid.
-    sent = []
-
-    def kill(pid):  # The recorded identity no longer matches, so nothing is signaled.
-        assert processes._recorded_tree.get() is not None
-        sent.append(pid)
-
-    world.ctx.kill_runner = kill
-    assert orch_dream_stop.dream_liveness(world.store.get_dream("orch")) is False
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), SimpleNamespace(actions=[]))
-    finished = world.store.get_dream("orch")
-    assert finished.status == "finished" and finished.outcome == "error"
-    assert world.removed, "the dead dream's worktree is removed"
-    assert orch_dream.dream_due(world.store, world.config, SimpleNamespace(list_open_issues=lambda: []),
-                                world.clock[0]) == ["orch"]
-    assert orch_dream.dreamed_command(world.store, world.config, "orch") == 0
-
-
-def test_reused_executor_group_is_not_the_dreams(world):
-    dreaming(world, executor=4200)
-    world.store.update_dream("orch", process_identities=[{"pid": 4200, "start_time": 2.0}])
-    reused = [row(4200, start=7.0), SimpleNamespace(pid=4201, start_time=7.5, argv=(), ppid=4200, pgid=4200,
-                                                     sid=4200, uid=None)]
-    world.table[0] = processes.ProcessTable(reused)
-    world.alive.update({4200: True, 4201: True})
-    assert orch_dream_stop._remaining(world.store.get_dream("orch")) is False
-    world.table[0] = processes.ProcessTable([reused[1]])  # The replacement leader exited; its child is not ours.
-    assert orch_dream_stop._remaining(world.store.get_dream("orch")) is False
-    world.store.update_dream("orch", process_identities=[{"pid": 4201, "start_time": 2.5}])
-    world.table[0] = processes.ProcessTable([SimpleNamespace(pid=4201, start_time=2.5, argv=(), ppid=1, pgid=4200,
-                                                             sid=4200, uid=None)])
-    assert orch_dream_stop._remaining(world.store.get_dream("orch")) is True, "a recorded member is ours"
-
-
-def test_null_start_time_means_alive_while_the_pid_exists(world):
-    run = dreaming(world, identities=False)
-    world.alive[4100] = True
-    assert orch_dream_stop.dream_liveness(run) is True
-    assert orch_dream.dreamed_command(world.store, world.config, "orch") == 2
-    world.alive[4100] = False
-    assert orch_dream_stop.dream_liveness(run) is False
-
-
-def worker_argv(root, lane="orch"):
-    return ("python", "-m", "foragent.cli", "gate", "run-dream", lane, "--repo-root", str(root))
-
-
-def test_another_repositorys_worker_of_the_same_lane_is_not_ours(world, tmp_path):
-    from foragent import scheduler
-
-    dreaming(world, pid=None, identities=False)  # The launch failed before any pid was recorded.
-    other = (tmp_path / "other-repo").resolve()
-    world.table[0] = processes.ProcessTable([row(4700, argv=worker_argv(other), uid=os.getuid())])
-    world.clock[0] += scheduler.LAUNCH_GRACE + timedelta(seconds=1)
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), SimpleNamespace(actions=[]))
-    finished = world.store.get_dream("orch")
-    assert finished.status == "finished" and finished.outcome == "error" and world.killed == []
-
-
-def born(world):
-    return datetime.fromisoformat(world.store.get_dream("orch").started_at).timestamp() + 0.5
-
-
-def test_own_pidless_worker_is_adopted_and_stopped_at_its_runtime_limit(world):
-    dreaming(world, pid=None, identities=False)
-    world.table[0] = processes.ProcessTable([row(4800, start=born(world), argv=worker_argv(world.ctx.repo_root),
-                                                 uid=os.getuid())])
-    world.clock[0] += timedelta(minutes=world.config.max_runtime_minutes + 11)
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), SimpleNamespace(actions=[]))
-    assert world.killed == [4800], "this repository's worker is stopped through its recorded identity"
-    finished = world.store.get_dream("orch")
-    assert finished.outcome == "error" and "runtime" in finished.detail
-
-
-def test_own_pidless_worker_within_its_limits_keeps_the_dream_running(world):
-    dreaming(world, pid=None, identities=False)
-    world.table[0] = processes.ProcessTable([row(4800, start=born(world), argv=worker_argv(world.ctx.repo_root),
-                                                 uid=os.getuid())])
-    world.clock[0] += timedelta(minutes=2)
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), SimpleNamespace(actions=[]))
-    run = world.store.get_dream("orch")
-    assert run.status == "running" and run.pid == 4800 and world.killed == []
-
-
-def test_text_containing_the_worker_command_is_no_worker(world):
-    from foragent import scheduler
-
-    dreaming(world, pid=None, identities=False)
-    root = world.ctx.repo_root
-    search = ("rg", f"gate run-dream orch --repo-root {root}")  # A search for the command, not the worker.
-    world.table[0] = processes.ProcessTable([row(4900, start=born(world), argv=search, uid=os.getuid())])
-    world.clock[0] += scheduler.LAUNCH_GRACE + timedelta(seconds=1)
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), SimpleNamespace(actions=[]))
-    assert world.killed == [] and world.store.get_dream("orch").outcome == "error"
-
-
-@pytest.mark.parametrize("change", ["not-session-leader", "born-before-the-record", "born-after-the-grace",
-                                    "other-user"])
-def test_listed_worker_without_birth_proof_is_never_stopped(world, change):
-    from foragent import scheduler
-
-    dreaming(world, pid=None, identities=False)
-    worker = row(4800, start=born(world), argv=worker_argv(world.ctx.repo_root), uid=os.getuid())
-    if change == "not-session-leader":
-        worker.sid = 1
-    elif change == "born-before-the-record":
-        worker.start_time -= 30
-    elif change == "born-after-the-grace":
-        worker.start_time += scheduler.LAUNCH_GRACE.total_seconds() + 5
-    else:
-        worker.uid = None  # Possibly ours (life evidence), but not proven ours.
-    world.table[0] = processes.ProcessTable([worker])
-    world.clock[0] += timedelta(minutes=world.config.max_runtime_minutes + 11)
-    report = SimpleNamespace(actions=[])
-    orch_dream.recover(world.ctx, world.store.get_dream("orch"), report)
-    run = world.store.get_dream("orch")
-    assert world.killed == [] and run.status == "running" and run.pid is None
-    assert any("not verified" in action for action in report.actions)

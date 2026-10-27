@@ -43,10 +43,7 @@ def spawn_runner(repo_root: Path, store: StateStore) -> Callable[..., int]:
                 identities = observe_tree(roots=(process.pid,))
             except PermissionError:
                 identities = []  # A stop must refuse without birth evidence.
-            if dream:
-                store.update_dream(lane, pid=process.pid, process_identities=identities)
-            else:
-                store.update_run(number, pid=process.pid, process_identities=identities)
+            store.update_run(f"dream-{lane}" if dream else number, pid=process.pid, process_identities=identities)
         return process.pid
 
     return launch

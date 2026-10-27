@@ -215,6 +215,9 @@ def run(args) -> int:
                 once=args.once, now=lambda: cli.datetime.now(cli.UTC),
             )
     elif args.action == "run-dream":
+        if (dream := store.get_dream(args.lane)) is None or dream.status != "running":
+            raise cli.ConfigError(f"no running dream record for lane {args.lane}")
+        store.update_run(dream.key, pid=cli.os.getpid(), process_identities=cli.observe_tree(roots=(cli.os.getpid(),)))
         return cli.orch_dream.run_dream(args.lane, cli.RunContext(
             repo=repo, repo_root=root, tracker=tracker, store=store,
             config=config, git=git, now=lambda: cli.datetime.now(cli.UTC),
