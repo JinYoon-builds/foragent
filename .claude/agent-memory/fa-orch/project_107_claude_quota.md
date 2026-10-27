@@ -5,8 +5,9 @@ metadata:
   type: project
 ---
 
-- `scheduler_quota.py` holds `claude_allowed`/`claude_percent`/`switch_reason`/`switched_config`/`lane_start`/`record_switch`. `scheduler.py` re-exports `claude_allowed` in one line (facade limit 250; it was 249).
+- `scheduler_quota.py` holds `claude_allowed`/`claude_percent`/`switch_reason`/`switched_config`/`lane_start`/`record_switch`. `scheduler.py` re-exports `claude_allowed` through its `scheduler_start` import list (facade is 250/250 after main's plan merge).
 - Window expiry uses `store._now()` (the injected clock), not real time: the acceptance fixture's five_hour reset (2026-10-22) is already past in real time.
+- Orchestrator answer (2026-10-27): Claude hard-limit pause switches in keep AND burn; reason `Claude paused at its limit until <t>`. `_lane_held` skips a lane pause only when switched and `claude_caused` (Claude paused + lane pair has Claude), leaving the pause file unchanged. Switched runs never write lane pauses (`note_limit`/`hold_lane` get lane=None). Lane `reviewer` key is supported in validation, `lane_config`, `lane_executors`.
 - `_lane_held` checks the switched executor pair, so "Codex paused too → lane waits" and `orch facts` follow it.
 - Tick writes `Run.implementer` once via `start_run(implementer=...)`; runner applies `switched_config(lane_config(...), run.implementer, claude paused)`. Restarts decide afresh.
 - `state_runs.py` is at 298/300 lines: add params on existing lines.
@@ -15,3 +16,4 @@ metadata:
 
 **Why:** keep these traps findable when the quota feature grows (#186 headroom choice is out of scope here).
 **How to apply:** extend `scheduler_quota.py` rather than scheduler.py/scheduler_start.py.
+- The runner recreates the worktree between attempts; `.foragent/TRY.md` must be rewritten after a retry.

@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, orch_queue, overlap_files, scheduler, scheduler_quota
+from foragent import machine_budget, orch_plan, orch_queue, overlap_files, scheduler, scheduler_quota
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
@@ -16,6 +16,7 @@ from foragent.config import resolved_reviewer
 from foragent.issue import parse_body
 from foragent.orch_tick_outcome import step, timed  # noqa: F401
 from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
+from foragent.scheduler_quota import claude_allowed  # noqa: F401  # Re-exported by the facade (#107).
 from foragent.tracker import Issue
 
 if TYPE_CHECKING:
@@ -23,13 +24,23 @@ if TYPE_CHECKING:
 
 
 def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
-    """A lane waits while it, its implementer or its reviewer is paused for a usage limit."""
+    """A lane waits while a live plan pauses it, or it, its implementer or its reviewer is paused for a usage limit.
+
+    A start switched to Codex (#107) skips a Claude-caused lane pause, leaves it in place,
+    and waits only on its own pair's executor pauses.
+    """
+    if orch_plan.lane_paused(ctx.store, lane, now):
+        return True
     config, reason = scheduler_quota.lane_start(ctx.store, ctx.config, lane, now)
-    # Lane pauses mirror a limit of the lane's configured pair; a keep-mode switch
-    # starts another pair, so only that pair's executor pauses hold it (#107).
-    if reason is None and ctx.store.lane_paused(lane, now):
+    if ctx.store.lane_paused(lane, now) and not (reason and scheduler_quota.claude_caused(ctx.store, ctx.config, lane, now)):
         return True
     return any(ctx.store.executor_paused(name, now) for name in {config.executor, resolved_reviewer(config)})
+
+
+def _at_plan_width(ctx: TickContext, lane: str) -> bool:
+    """A live plan width caps the lane's running runs; without one the lane has no fixed cap."""
+    width = orch_plan.width(ctx.store, lane, ctx.now())
+    return width is not None and sum(run.lane == lane for run in ctx.store.active_runs()) >= width
 
 
 def _apply_budgets(
@@ -167,6 +178,8 @@ def _start_ready(
         if not scheduler._has_slot(ctx, budget):
             break
         if held.setdefault(lane, _lane_held(ctx, lane, ctx.now())):
+            continue
+        if _at_plan_width(ctx, lane):
             continue
         local = scheduler._local_issue(ctx, number)
         if local is not None and not eligible(local, lane):

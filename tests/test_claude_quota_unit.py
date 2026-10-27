@@ -164,19 +164,35 @@ def test_init_without_flag_writes_no_block_and_with_flag_keeps_other_keys(setup)
     assert yaml.safe_load(path.read_text())["claude_quota"] == {"keep_percent": 70, "mode": "burn"}
 
 
-def test_claude_hard_limit_lane_pause_does_not_hold_a_switched_start(ctx):
+@pytest.mark.parametrize("mode", ["keep", "burn"])
+def test_claude_hard_limit_lane_pause_does_not_hold_a_switched_start(ctx, mode):
     from foragent import usage_recheck
 
-    ctx.config = replace(ctx.config, executor="claude")
+    ctx.config = replace(ctx.config, executor="claude", claude_quota={"mode": mode, "keep_percent": 80})
     ctx.start_runs = True
     usage(ctx.store, 100.0)
     until = NOW + timedelta(hours=1)
     usage_recheck.note_limit(ctx.store, "claude", until, [{"name": "five_hour", "exhausted": True}], NOW, lane="main")
-    assert ctx.store.lane_paused("main", NOW)
+    pauses = (ctx.store.root / "lane-pauses.json").read_bytes()
     approve(ctx, 1)
-    tick(ctx)
+    report = tick(ctx)
     run = ctx.store.get_run(1)
     assert run is not None and run.implementer == "codex"
+    reason = f"Claude paused at its limit until {until.isoformat()}"
+    assert [event["reason"] for event in events(ctx.store) if event["kind"] == "executor-switch"] == [reason]
+    assert any(reason in action for action in report.actions)
+    # The tick leaves the Claude-caused lane pause in place.
+    assert (ctx.store.root / "lane-pauses.json").read_bytes() == pauses
+
+
+def test_lane_pause_not_caused_by_claude_still_holds_a_switched_start(ctx):
+    ctx.config = replace(ctx.config, executor="claude")
+    ctx.start_runs = True
+    usage(ctx.store, 90.0)
+    ctx.store.pause_lane("main", NOW + timedelta(hours=1))
+    approve(ctx, 1)
+    tick(ctx)
+    assert ctx.store.get_run(1) is None
 
 
 def test_unswitched_lane_still_waits_on_its_lane_pause(ctx):

@@ -53,8 +53,16 @@ def claude_allowed(store: StateStore, config: Config, now: datetime | None = Non
 
 
 def switch_reason(store: StateStore, config: Config, now: datetime) -> str | None:
-    """Why a new run on this lane-adjusted ``config`` starts with Codex instead of Claude, or None."""
-    if config.executor != "claude" or claude_allowed(store, config, now):
+    """Why a new run on this lane-adjusted ``config`` starts with Codex instead of Claude, or None.
+
+    Claude paused at its hard limit switches in keep and burn mode alike; keep mode
+    also switches once a current Claude window reaches keep_percent.
+    """
+    if config.executor != "claude":
+        return None
+    if (until := store.executor_pause_until("claude", now)) is not None:
+        return f"Claude paused at its limit until {until.isoformat()}"
+    if claude_allowed(store, config, now):
         return None
     percent = claude_percent(store, now)
     return f"Claude keep share {percent:g}% >= {config.claude_quota['keep_percent']}%"
@@ -76,6 +84,13 @@ def switched_config(config: Config, implementer: str | None, claude_paused: bool
         config, executor=implementer, executor_model=None, executor_fallback_model=None, reviewer=reviewer,
         reviewer_model=config.reviewer_model if reviewer == previous else None,
     )
+
+
+def claude_caused(store: StateStore, config: Config, lane: str, now: datetime) -> bool:
+    """A lane pause is Claude's when Claude is paused and the lane's configured pair includes Claude."""
+    from foragent.config import lane_executors
+
+    return store.executor_paused("claude", now) and "claude" in lane_executors(config, lane)
 
 
 def lane_start(store: StateStore, config: Config, lane: str, now: datetime) -> tuple[Config, str | None]:

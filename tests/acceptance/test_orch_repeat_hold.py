@@ -37,3 +37,13 @@ def test_a_daily_retrospective_finds_lost_run_time_and_repeated_failures():
     # Fix what is within the orchestrator's authority, tell the person one line,
     # and ask only for product decisions with choices and a recommendation.
     assert "one line to the person" in text
+
+
+def test_every_retrospective_asks_whether_the_architect_is_needed():
+    text = normalized()
+    assert "does this need the architect" in text
+    # The four signals the answer is read from (fa orch facts and the log).
+    for signal in ("overlap waits", "hot files", "two writers", "check-then-act", "line limit", "idle"):
+        assert signal in text, signal
+    assert "fa orch architect --why" in text
+    assert "record why not" in text

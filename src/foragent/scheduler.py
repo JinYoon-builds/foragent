@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, launchd, orch_github, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_github, orch_plan, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -27,7 +27,7 @@ from foragent.scheduler_start import (
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _apply_budgets, _github_pause, _github_wait, _has_slot,
     _machine_budget, _reopen_view, _reserve_slot, _start_ready, append_budget_history, append_memory_hold,
     decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel, prebuild_acceptance_baseline,
-    read_state, start_baseline_thread, step, timed, update_test_slots, write_state,
+    read_state, start_baseline_thread, step, timed, update_test_slots, write_state, claude_allowed,
 )
 from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
@@ -74,7 +74,6 @@ from foragent.scheduler_checks import (  # noqa: E402
     _reconcile_batches,
 )
 from foragent.scheduler_config import fetch_base  # noqa: E402
-from foragent.scheduler_quota import claude_allowed  # noqa: E402,F401
 from foragent.scheduler_lanes import (  # noqa: E402
     _can_start_in_lane, _file_patterns_overlap, _filesystem_case_sensitive,
 )
@@ -92,6 +91,7 @@ def tick(ctx: TickContext) -> TickReport:
                 with step("reap_inactive_runs"):
                     _reap_inactive_runs(ctx, cleanup)
             timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
+            timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
             if skipped := _github_wait(ctx, {}, "github_wait_check"):
                 return keep(TickReport(skipped=skipped, actions=cleanup.actions))
             if not isinstance(ctx.tracker, RecordingTracker):
