@@ -12,3 +12,5 @@ metadata:
 
 **Why:** the next sleep/stall issue should extend these, not add a new ledger file.
 **How to apply:** tests `tests/acceptance/test_wake_grace.py`, `test_machine_sleep.py`, `tests/test_sleep_credit.py` (all fast, ~5 s).
+- Unit tests that reuse acceptance helpers (`sleep_case`, `tick_case`) need `monkeypatch.syspath_prepend(tests/acceptance)`; the directory is on the path only when an acceptance module is collected. The wake-line test in `tests/test_sleep_credit.py` does this.
+- Break-it is done by `sed` mutation plus `git show HEAD:<file> > <file>` to restore. Copying to /tmp and `git checkout` are both blocked here.

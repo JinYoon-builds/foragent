@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime, timedelta
 import json
+from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -177,3 +179,18 @@ def test_activity_ends_grace_only_for_its_run_and_a_short_sleep_does_not_restart
     assert sleep_credit.in_wake_grace(case.store, case.store.get_run(2), case.facts.now())
     case.facts.awake(sleep_credit.WAKE_GRACE_SECONDS)
     assert not sleep_credit.in_wake_grace(case.store, case.store.get_run(2), case.facts.now())
+
+
+def test_the_tick_report_shows_one_wake_line_only_after_a_long_sleep(git_history, tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parent / "acceptance"))
+    from test_machine_sleep import sleep_case, tick_case
+
+    monkeypatch.setattr(time, "sleep", lambda seconds: pytest.fail("No real sleep"))
+    machine = sleep_case(git_history, tmp_path, monkeypatch, max_runtime_minutes=2000)
+    machine.facts.advance(2 * 3600 + 5 * 60, asleep=True)
+    lines = [line for line in tick_case(machine).actions if line.startswith("Machine slept")]
+    until = (machine.clock[0] + timedelta(seconds=sleep_credit.WAKE_GRACE_SECONDS)).astimezone()
+    assert lines == [f"Machine slept 2 h 5 min; stall checks wait until {until:%H:%M} "
+                     "or until a run shows activity."]
+    machine.facts.advance(60, asleep=True)
+    assert not [line for line in tick_case(machine).actions if line.startswith("Machine slept")]
