@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime, timedelta
 import json
+from pathlib import Path
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -150,3 +152,55 @@ def test_sensor_clock_baselines_are_pruned_by_age_only(tmp_path, monkeypatch):
     wall[0] += 2 * 3600
     capacity.slept_seconds(Clock.now())
     assert len(json.loads(path.read_text())) == 2, "Only the one older than 48 h is dropped"
+
+
+def test_only_sleep_above_a_minute_starts_wake_grace(case):
+    case.tick()
+    case.facts.sleep(60)
+    case.tick()
+    assert sleep_credit.wake_grace(case.store) is None
+    case.facts.sleep(61)
+    case.tick()
+    wake, until = sleep_credit.wake_grace(case.store)
+    assert wake == case.facts.now() and until == wake + timedelta(seconds=sleep_credit.WAKE_GRACE_SECONDS)
+
+
+def test_activity_ends_grace_only_for_its_run_and_a_short_sleep_does_not_restart_it(case, tmp_path):
+    case.store.start_run(2, branch="b", worktree=tmp_path / "w2")
+    case.tick()
+    case.facts.sleep(NIGHT)
+    case.tick()
+    assert all(sleep_credit.in_wake_grace(case.store, case.store.get_run(n), case.facts.now()) for n in (1, 2))
+    case.facts.awake(30)
+    case.store.update_run(1, last_activity_at=case.facts.now().isoformat())
+    case.facts.sleep(30)
+    case.tick()
+    assert not sleep_credit.in_wake_grace(case.store, case.store.get_run(1), case.facts.now())
+    assert sleep_credit.in_wake_grace(case.store, case.store.get_run(2), case.facts.now())
+    case.facts.awake(sleep_credit.WAKE_GRACE_SECONDS)
+    assert not sleep_credit.in_wake_grace(case.store, case.store.get_run(2), case.facts.now())
+
+
+def test_the_tick_report_shows_one_wake_line_only_after_a_long_sleep(git_history, tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parent / "acceptance"))
+    from test_machine_sleep import sleep_case, tick_case
+
+    monkeypatch.setattr(time, "sleep", lambda seconds: pytest.fail("No real sleep"))
+    machine = sleep_case(git_history, tmp_path, monkeypatch, max_runtime_minutes=2000)
+    credit = sleep_credit.credit
+
+    def slow_credit(store, now):  # The tick's clock moves on while credit() runs.
+        increment = credit(store, now)
+        machine.clock[0] += timedelta(seconds=2)
+        return increment
+
+    monkeypatch.setattr(sleep_credit, "credit", slow_credit)
+    machine.clock[0] = machine.clock[0].replace(second=0) + timedelta(minutes=1, seconds=-1)
+    machine.facts.advance(2 * 3600 + 5 * 60, asleep=True)
+    lines = [line for line in tick_case(machine).actions if line.startswith("Machine slept")]
+    until = sleep_credit.wake_grace(machine.store)[1].astimezone()
+    assert until.second == 59, "The stored end sits just before a minute boundary"
+    assert lines == [f"Machine slept 2 h 5 min; stall checks wait until {until:%H:%M:%S} "
+                     "or until a run shows activity."], "Report the stored grace end exactly"
+    machine.facts.advance(60, asleep=True)
+    assert not [line for line in tick_case(machine).actions if line.startswith("Machine slept")]

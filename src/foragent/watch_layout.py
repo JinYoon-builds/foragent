@@ -114,11 +114,15 @@ SCREEN_ROWS = 24
 def _frame(
     snapshot: Snapshot, config: Config, repo_root: Path, *, tick: int, width: int,
     selected: str | None, now: datetime, layout: dict[str, Any] | None = None, height: int | None = SCREEN_ROWS,
+    state: dict[str, Any] | None = None,
 ) -> list[Line]:
     """Stack the sections by ORDER with one blank line between non-empty ones.
 
     Within ``height`` rows, sections marked KEEP (header, lane rows, details and
-    footer) always stay; the others give way from the bottom up.
+    footer) always stay; the others give way from the bottom up. A section
+    marked STAYS (the fireworks band while it plays) stays too and is moved up into
+    the first screen when the KEEP sections push it below. ``state`` is the live view's
+    memory across frames (None for a stateless frame).
     """
     from foragent import watch
 
@@ -128,7 +132,8 @@ def _frame(
         # Each section draws once from row 0; its click areas move with it below.
         own: list[tuple[int, int, int, int, Any]] = []
         lines = section.render(snapshot, config, repo_root, tick=tick, width=width, selected=selected,
-                               now=now, layout=layout, top=0, hits=own, rows=True)
+                               now=now, layout=layout, top=0, hits=own, rows=True, height=height,
+                               state=state)
         rendered.append((section, list(lines), own))
     # From its SIDE width on, a section (the orchestrator box) stands to the right
     # of the sections between the lane rows and itself.
@@ -137,14 +142,19 @@ def _frame(
     rows_end = max((index for index, (section, _, _) in enumerate(rendered)
                     if getattr(section, "KEEP", False) and (side is None or index < side)), default=-1)
 
+    stays: list[tuple[int, int]] = []  # Row spans of the STAYS sections in the last assembly.
+
     def assemble() -> tuple[list[Line], list[tuple[int, int, int, int, Any]]]:
         hits: list[tuple[int, int, int, int, Any]] = []
         frame: list[Line] = []
+        stays.clear()
         mark = None  # Where the sections beside the SIDE section begin.
+        joined = False  # The previous section asked the next one to follow it directly.
         for index, (section, lines, own) in enumerate(rendered):
             if not lines:
                 continue
-            gap = bool(frame) and getattr(section, "GAP", True)
+            gap = bool(frame) and getattr(section, "GAP", True) and not joined
+            joined = not getattr(section, "GAP_AFTER", True)
             if wide and index == side and mark is not None and mark < len(frame):
                 left_width = width - max(watch._cells("".join(value for value, _ in line)) for line in lines) - 2
                 left = frame[mark:]
@@ -158,14 +168,17 @@ def _frame(
                 mark = top
             frame += [[]] * gap + lines
             hits += [(x0, y0 + top, x1, y1 + top, target) for x0, y0, x1, y1, target in own]
+            if getattr(section, "STAYS", False):
+                stays.append((top, top + len(lines)))
         return frame, hits
 
     frame, hits = assemble()
     if height is not None and len(frame) > height:
         # Lane rows win: the other sections give way from the bottom up.
-        for index in reversed(range(len(rendered))):
+        order = reversed(range(len(rendered)))
+        for index in order:
             section, lines, _ = rendered[index]
-            if lines and not getattr(section, "KEEP", False):
+            if lines and not (getattr(section, "KEEP", False) or getattr(section, "STAYS", False)):
                 rendered[index] = (section, [], [])
                 if len(assemble()[0]) <= height:
                     break
@@ -175,8 +188,19 @@ def _frame(
                 own = []
                 rendered[index] = (section, list(section.render(
                     snapshot, config, repo_root, tick=tick, width=width, selected=selected, now=now,
-                    layout=layout, top=0, hits=own, rows=True, short=True)), own)
+                    layout=layout, top=0, hits=own, rows=True, height=height, state=state, short=True)), own)
         frame, hits = assemble()
+    if height is not None:
+        # The live view shows the first height - 1 rows above the footer. A STAYS
+        # section pushed below them by the KEEP sections moves up to just above the
+        # footer, so it is on screen when the view opens; the rows it passes move down.
+        for start, end in stays:
+            size, target = end - start, height - 1 - (end - start)
+            if end <= height - 1 or target < 0:
+                continue
+            frame[target:end] = frame[start:end] + frame[target:start]
+            hits = [(x0, y0 + size, x1, y1 + size, item) if target <= y0 < start else (x0, y0, x1, y1, item)
+                    for x0, y0, x1, y1, item in hits]
     if layout is not None:
         layout["hits"] = hits
     return [watch._fit(list(line), width) for line in frame]
@@ -193,4 +217,5 @@ def render_frame(
     return "\n".join("".join(value for value, style in line).rstrip() for line in watch._frame(
         snapshot, config, repo_root, tick=tick, width=max(1, width), selected=selected,
         now=now or snapshot.captured_at, **({} if layout is None else {"layout": layout}),
+        **({} if state is None else {"state": state}),
     ))

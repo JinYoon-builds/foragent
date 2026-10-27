@@ -19,6 +19,7 @@ class ConfigError(ValueError):
 
 
 SKILL_ROLES = {"style", "review", "tool", "domain"}
+PRESENCE_DEFAULTS = {"statusline": True, "session_start": True, "report": True}
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class Config:
     language: str = "en"
     interview: str = "native"
     ouroboros_version: str | None = None
+    animation: bool = True  # Lane-view fireworks and the big squirrel sprite (#168).
     update_check: bool = True  # The daily release check (#417); FORAGENT_UPDATE_CHECK=off also opts out.
     profile: dict[str, Any] | None = None
     # Whether `fa report propose` may prepare upstream error reports; None means not asked yet (#419).
@@ -92,6 +94,8 @@ class Config:
     perspectives: dict[str, str] = field(default_factory=dict)
     # Lane view glyphs (#167): emoji, ascii, or auto (ascii on dumb/linux terminals or non-UTF-8 locales).
     view_glyphs: str = "auto"
+    # Foragent presence in Claude Code (#754); each part switches off on its own.
+    presence: dict[str, bool] = field(default_factory=lambda: dict(PRESENCE_DEFAULTS))
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
@@ -188,6 +192,26 @@ class LaneSettings:
             self._after_colon(skill[0], _flow(skills))
         else:
             self._replace(skill[1], _flow(skills))
+
+    def set_list(self, name: str, values: list[str]) -> None:
+        """Replace one top-level list setting in place, or add it after the last setting."""
+        found = _pair(self.root, name)
+        self.expected[name] = values
+        if found is None and self.root is not None and self.root.flow_style:
+            self._flow_add(self.root, name, values)
+        elif found is None and self.root is not None:
+            self._insert(_last_line(*self.root.value[-1]) + 1, [f"{_flow(name)}: {_flow(values)}{self.newline}"],
+                         before=self.root.value[0][0].start_mark.line)
+        elif found is None:
+            self._insert(len(self.lines), [f"{_flow(name)}: {_flow(values)}{self.newline}"], before=0)
+        elif not _plain_skills(found[1]):
+            raise ConfigError(f"{name} in {self.path} uses a layout fa cannot change; edit it by hand")
+        elif _block(found[1], yaml.SequenceNode):
+            self._replace_items(found[0], found[1], values)
+        elif _empty(found[1]):
+            self._after_colon(found[0], _flow(values))
+        else:
+            self._replace(found[1], _flow(values))
 
     def check(self) -> str:
         """Return the edited text after confirming it reads back as exactly the intended settings."""
@@ -433,6 +457,9 @@ def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
             **previous, **{name: {**(previous[name] if isinstance(previous.get(name), dict) else {}), **tier}
                            if isinstance(tier, dict) else tier for name, tier in tiers.items()},
         }}
+    presence = overrides.get("presence")
+    if isinstance(presence, dict) and isinstance(values["presence"], dict):
+        overrides = {**overrides, "presence": {**values["presence"], **presence}}
     values.update(overrides)
 
 
@@ -485,6 +512,17 @@ def set_upstream_reports(enabled: bool) -> None:
     values = _read_yaml(path) if path.exists() else {}
     values["upstream_reports"] = enabled
     _write_global(path, values)
+
+
+def add_always_human(repo_root: Path, glob: str) -> list[str]:
+    """Append one glob to the project's `always_human`, keeping every other line; the key's only writer."""
+    settings = LaneSettings(Path(repo_root) / ".foragent.yml")
+    # The effective list, so a global always_human is kept when the project file starts its own list.
+    current = list(load_config(Path(repo_root)).always_human)
+    if glob not in current:
+        settings.set_list("always_human", [*current, glob])
+        settings.save()
+    return [*current] if glob in current else [*current, glob]
 
 
 def config_key_names(repo_root: Path) -> list[str]:
