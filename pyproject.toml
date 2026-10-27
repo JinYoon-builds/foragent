@@ -22,6 +22,15 @@ fa = "foragent.cli:main"
 requires = ["setuptools>=81"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.data-files]
+# The role skills fa init copies into each project (role_agents.py finds them).
+"share/foragent/skills/fa-orchestrator" = ["skills/fa-orchestrator/*.md"]
+"share/foragent/skills/fa-orchestrator/references" = ["skills/fa-orchestrator/references/*.md"]
+"share/foragent/skills/fa-architect" = ["skills/fa-architect/*.md"]
+
 [tool.uv]
 cache-keys = [{ file = "pyproject.toml" }, { file = "setup.py" }, { git = { commit = true } }]
 
