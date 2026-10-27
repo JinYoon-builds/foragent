@@ -1194,3 +1194,17 @@ def test_a_talk_opened_after_the_run_finished_adds_nothing(tmp_path):
 def test_a_running_runs_talk_never_counts_before_its_start(store):
     talk_event(store, NOW - timedelta(seconds=60))  # A clock that ran ahead of the run's start.
     assert store.get_run(1).talk_pause_seconds(NOW + timedelta(seconds=30)) == 30
+
+
+def test_the_ticks_talk_step_keeps_an_open_talk_and_reports_a_closed_one(store, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)
+    ctx = SimpleNamespace(store=store, repo_root=tmp_path, now=lambda: NOW, config=config())
+    report = SimpleNamespace(actions=[])
+    assert lane_talk.tick_talk(ctx, store.get_run(1), report) is True and report.actions == []
+    terminals.alive = False
+    assert lane_talk.tick_talk(ctx, store.get_run(1), report) is False
+    assert report.actions == ["#1 talk terminal closed; stall clock restarted"]

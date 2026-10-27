@@ -38,6 +38,14 @@ def check_talking(store: StateStore, run: Run, root: Path, now: datetime) -> tup
     return store.get_run(run.number) or run, False
 
 
+def tick_talk(ctx, run: Run, report) -> bool:
+    """The tick's talk step for a talking run; True while it stays open (or unknown)."""
+    _, still_open = check_talking(ctx.store, run, ctx.repo_root, ctx.now())
+    if not still_open:
+        report.actions.append(text("talk_ended", ctx.config.language, n=run.number))
+    return still_open
+
+
 def talking_now(store: StateStore, number: int) -> bool:
     """Read again right before a stop for time: an open (or just opened) talk pauses it."""
     run = store.get_run(number)

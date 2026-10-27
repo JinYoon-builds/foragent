@@ -192,7 +192,12 @@ def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickR
 
 
 def _recover_runs(ctx: TickContext, report: TickReport) -> None:
-    sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
+    slept = sleep_credit.credit(ctx.store, ctx.now())  # The full tick alone credits machine sleep (#415).
+    grace = sleep_credit.wake_grace(ctx.store) if slept > sleep_credit.WAKE_THRESHOLD_SECONDS else None
+    if grace is not None:  # Report the stored end, not a second clock reading.
+        report.actions.append(scheduler.text(
+            "sleep_wake", ctx.config.language, hours=int(slept // 3600),
+            minutes=int(slept % 3600 // 60), until=grace[1].astimezone().strftime("%H:%M:%S")))
     for run in ctx.store.active_runs():
         snapshot = processes.current_snapshot()
         cached = snapshot.rows.get(run.pid) if snapshot is not None and snapshot.available else None
@@ -224,11 +229,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         if not dead:
             if _stop_already_refused(ctx, run):
                 continue
-            if run.talking:  # A person is watching or talking; the first closed-terminal tick ends it.
-                run, still_open = scheduler.lane_talk.check_talking(ctx.store, run, ctx.repo_root, ctx.now())
-                if still_open:
-                    continue
-                report.actions.append(scheduler.text("talk_ended", ctx.config.language, n=run.number))
+            if run.talking and scheduler.lane_talk.tick_talk(ctx, run, report):
+                continue  # A person is watching or talking; only a confirmed closure ends it.
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
             runtime = ((ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds()
                        - run.waited_seconds - run.slept_seconds - run.talk_pause_seconds(ctx.now()))
@@ -236,7 +238,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit.", unless_talking=True):
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
-            elif run.pid is not None and not waiting and ctx.now() - scheduler.lane_talk.stall_since(
+            elif run.pid is not None and not waiting and not sleep_credit.in_wake_grace(
+                    ctx.store, run, ctx.now()) and ctx.now() - scheduler.lane_talk.stall_since(
                 ctx.store, run,  # The later of the last progress and the latest talk closing (D95).
             ) - scheduler.timedelta(seconds=run.slept_since_progress) > scheduler.timedelta(
                 minutes=ctx.config.stall_minutes):
