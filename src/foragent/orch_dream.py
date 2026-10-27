@@ -188,8 +188,11 @@ def record_done(store: StateStore, lane: str, count: int, language: str, at: dat
 
 
 def run_dream(lane: str, ctx: RunContext) -> int:
+    """The worker runs with the configuration the tick admitted it with, not the checkout's."""
     from foragent.orch_dream_worker import run_dream
+    from foragent.scheduler_config import tick_config
 
+    ctx.config = tick_config(ctx.store, ctx.config)
     return run_dream(lane, ctx)
 
 
@@ -236,6 +239,9 @@ def recover(ctx: TickContext, run, report: TickReport) -> None:
 
 def dreamed_command(store: StateStore, config: Config, lane: str) -> int:
     """`fa lanes dreamed <lane>`: append a completed-dream event; never write the dream record."""
+    from foragent.scheduler_config import tick_config
+
+    config = tick_config(store, config)  # The lanes the gate dreams with, from its committed config.
     if lane not in config.lanes:
         print(f"foragent: lane {lane} is not configured", flush=True)
         return 2

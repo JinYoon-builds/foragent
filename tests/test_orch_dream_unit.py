@@ -28,6 +28,9 @@ def world(tmp_path, monkeypatch):
     def kill(pid):
         assert processes._recorded_tree.get() is not None, "a stop needs recorded ownership"
         killed.append(pid)
+        current = table[0]  # The signal works: the stopped process leaves the table.
+        table[0] = processes.ProcessTable([item for item in current if item.pid != pid],
+                                          current.unreadable, current.unreadable_uids)
 
     ctx = SimpleNamespace(store=store, config=config, now=lambda: clock[0], kill_runner=kill,
                           git=SimpleNamespace(remove_worktree=removed.append))
@@ -303,3 +306,58 @@ def test_new_memory_file_in_an_ignored_directory_is_published_and_counted(world,
     saved = json.loads((world.store.root / "orch-events.jsonl").read_text().splitlines()[-1])
     assert saved["memories"] == 2 and saved["pr"] == 7
     assert not worktree.exists()
+
+
+def test_stop_reported_by_the_killer_is_not_trusted_while_an_unrecorded_worker_lives(world):
+    dreaming(world, identities=False, executor=4200)
+    world.store.update_dream("orch", process_identities=[{"pid": 4200, "start_time": 2.0}])
+    world.table[0] = processes.ProcessTable([row(4200, start=2.0)])
+    world.alive[4100] = True  # The worker has no birth evidence, so the recorded tree misses it.
+    world.clock[0] += timedelta(minutes=11)
+    report = SimpleNamespace(actions=[])
+    orch_dream.recover(world.ctx, world.store.get_dream("orch"), report)
+    assert world.store.get_dream("orch").status == "running" and world.removed == []
+    assert any("still running after the stop" in action for action in report.actions)
+
+
+def committed_lanes(world):
+    from foragent.scheduler_config import record_tick_config
+
+    content = ("repo: o/r\nlanes:\n  orch:\n    paths: ['orch/**']\n    agent: fa-new\n    executor: codex\n"
+               "  docs:\n    paths: ['docs/**']\n")
+    record_tick_config(world.store, "origin/main:.foragent.yml", content)
+    return Config(repo="o/r", executor="claude", lanes={"orch": {"paths": ["orch/**"], "agent": "fa-old"}})
+
+
+def test_worker_runs_with_the_config_the_tick_admitted_it_with(world, monkeypatch):
+    checkout = committed_lanes(world)
+    seen = []
+    monkeypatch.setattr(orch_dream_worker, "run_dream", lambda lane, ctx: seen.append(ctx.config) or 0)
+    ctx = SimpleNamespace(store=world.store, config=checkout)
+    assert orch_dream.run_dream("orch", ctx) == 0
+    from foragent.run_implementation import lane_config
+
+    assert orch_dream.memory_dir(seen[0], "orch") == "fa-new"
+    assert lane_config(seen[0], "orch").executor == "codex"
+
+
+def test_manual_completion_accepts_a_lane_configured_in_the_committed_config(world):
+    checkout = committed_lanes(world)
+    assert "docs" not in checkout.lanes
+    assert orch_dream.dreamed_command(world.store, checkout, "docs") == 0
+    assert orch_dream.last_dream_at(world.store, "docs") is not None
+
+
+def test_active_dreams_are_no_issue_rows_or_issue_logs(world):
+    from foragent import status
+
+    for lane in ("orch", "view"):
+        world.store.start_dream(lane, worktree=world.store.root / f"worktrees/dream-{lane}")
+    world.store.start_run(5, branch="b", worktree="w", lane="orch")
+    config = Config(repo="o/r", lanes={name: {"paths": [f"{name}/**"]} for name in ("orch", "view")})
+    collected = status.collect(world.store, config, world.clock[0])
+    assert [run["number"] for run in collected["active_runs"]] == [5]
+    rows = [item for row in collected["lanes"].values() for state in row.values()
+            if isinstance(state, list) for item in state]
+    assert not any(isinstance(item, dict) and item.get("number") == 0 for item in rows)
+    assert collected["summary"]["working"] == 1

@@ -81,21 +81,27 @@ def _recorded_unreadable(run) -> bool:
 
 
 def _stop(ctx: TickContext, run, report: TickReport) -> bool:
-    """Stop the dream's recorded tree (worker and executor); False when the stop is refused."""
+    """Stop the dream's recorded tree (worker and executor); True only once all of it is confirmed gone.
+
+    A stop that raises nothing is not proof: a worker pid without birth evidence is not
+    in the recorded tree, so the killer may stop the executor and leave the worker alive.
+    """
     from foragent import processes
     from foragent.scheduler_stop import _run_processes_exist
 
+    refusal = None
     try:
         with processes.recorded_tree(run.process_identities):
             for pid in (run.pid, run.executor_pgid):
                 if pid is not None:
                     ctx.kill_runner(pid)
-        return True
     except (ValueError, PermissionError, TimeoutError) as exc:
-        try:
-            if not _recorded_unreadable(run) and not _run_processes_exist(run):
-                return True  # Nothing of the dream is left to stop, confirmed by a full read.
-        except PermissionError:
-            pass  # An unreadable table cannot prove death.
-        report.actions.append(f"lane {run.lane} dream stop refused: {' '.join(str(exc).split())[:200]}")
-        return False
+        refusal = exc
+    try:
+        if not _recorded_unreadable(run) and not _run_processes_exist(run):
+            return True  # Nothing of the dream is left, confirmed by a full read.
+    except PermissionError:
+        pass  # An unreadable table cannot prove death.
+    reason = f"stop refused: {refusal}" if refusal is not None else "still running after the stop"
+    report.actions.append(f"lane {run.lane} dream {' '.join(reason.split())[:200]}")
+    return False
