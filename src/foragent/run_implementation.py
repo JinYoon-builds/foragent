@@ -23,7 +23,7 @@ from foragent.run_previous import (
     consume_hint, pending_hint, previous_attempt_summary, record_stop_point, saved_feedback_section,
 )
 from foragent.run_parent import parent_context
-from foragent.run_prompts import build_prompt, build_resume_prompt
+from foragent.run_prompts import bug_fix_steps, build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
 from foragent.run_overlap import wait_for_overlap
 from foragent.run_waits import _phase, _timeout
@@ -308,6 +308,8 @@ def _implement(
     test_command = ctx.config.test_command
     if test_command is None:
         test_command = next(iter(runner.detect_test_commands(worktree)), None)
+    # Bug-fix steps reach implementation turns (first, retries, resumes), not conflict resolution.
+    procedure = bug_fix_steps(attempt.issue.labels, worktree) if merge_conflicts is None else None
     fixed = lane_skill_names(ctx.config, run.lane, worktree, lane_notes(ctx.config, run.lane, worktree)[0])
     prompt = build_prompt(
         n, attempt.parsed, ctx.config.acceptance_dir, failure_context, ctx.config.language,
@@ -326,6 +328,7 @@ def _implement(
                           if failure_context or reviewer_text is not None or saved_feedback else ""),
         review_feedback=review_feedback,
         retry_default=retry_default,
+        procedure=procedure,
     )
     offset = log.stat().st_size if log.exists() else 0
     result = None
@@ -339,6 +342,7 @@ def _implement(
                 reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
                 review_feedback=review_feedback, retry_default=retry_default,
                 moved_files=moved_files, parent_context=attempt.approval.parent_context or "",
+                procedure=procedure,
             ) + (f"\n\n{saved_feedback}" if saved_feedback else "") + setup.memory_notice,
             model=model, timeout_s=remaining, log_path=log, **attempt.options,
         )

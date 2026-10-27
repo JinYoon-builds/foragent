@@ -38,7 +38,9 @@ def _remaining(n: int, ctx: RunContext) -> int:
     run = ctx.store.get_run(n)
     if run is None:
         raise KeyError(n)
-    elapsed = (ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds() - run.waited_seconds
+    # The gate tick credits machine sleep to the run record; the runner never reads the sensor.
+    elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
+               - run.waited_seconds - run.slept_seconds)
     return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
 
 
