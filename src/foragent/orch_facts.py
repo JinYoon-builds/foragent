@@ -18,7 +18,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from foragent import capacity, machine_budget
+from foragent import capacity, machine_budget, orch_plan
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
@@ -40,7 +40,6 @@ def _current_runs(store: StateStore) -> list[Run]:
     return runs
 
 
-NOT_READ = {"plan.json"}
 FREEZE_ATTEMPTS = 3
 
 
@@ -54,6 +53,16 @@ def _lock_shared(stack: ExitStack, path: Path) -> bool:
     fcntl.flock(descriptor, fcntl.LOCK_SH)
     stack.callback(fcntl.flock, descriptor, fcntl.LOCK_UN)
     return True
+
+
+def _copy_plan(source: Path, target: Path) -> None:
+    """Copy only the plan keys (lane queues and the rest the tick reads); never a goal field."""
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(orch_plan.plan_fields(data)), encoding="utf-8")
 
 
 def _copy(source: Path, target: Path) -> None:
@@ -103,8 +112,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
             names = [*source.glob("*.json"), *source.glob("*.jsonl")] if source == store.root else [
                 source / "runs.jsonl"]
             for path in names:
-                if path.name not in NOT_READ:
-                    _copy(path, target / path.name)
+                (_copy_plan if path.name == "plan.json" else _copy)(path, target / path.name)
             for directory in ("runs", "run-starts", *(("approvals",) if source == store.root else ())):
                 for path in (source / directory).glob("*.json"):
                     _copy(path, target / directory / path.name)
