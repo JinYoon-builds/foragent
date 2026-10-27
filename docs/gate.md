@@ -131,7 +131,7 @@ review_level: low       # Claude /code-review: low | medium | high | xhigh | max
 review_scope: claude-local  # claude-local | pr-body
 review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 7개(security·concurrency·failure·compatibility·realism·docs·performance)와 이름이 같으면 그 focus를 바꿈
 review_reviewers: 1      # 1 이상 정수; 1이면 리뷰어 하나가 모든 관점을 체크리스트로 받음
-perspectives: {}         # fa order perspectives 자리별 실행기 {skeptic|first_time_user|attacker|operator|maintainer|incidents: codex|claude}; 없으면 attacker·maintainer는 codex, 나머지는 claude
+perspectives: {}         # fa order perspectives 자리별 실행기 {skeptic|first_time_user|attacker|operator|maintainer|incidents|other_users: codex|claude}; 없으면 attacker·maintainer는 codex, 나머지는 claude
 review_max: 2            # 리뷰 FAIL 허용 수; 초과하면 PR을 열고 risk-high로 보류
 approvers: [JinYoon-builds]   # v1 승인 라벨을 붙일 수 있는 사람 (D14)
 acceptance_dir: tests/acceptance/   # order가 구현 전에 쓰고 잠그는 인수 시험 (D11)
