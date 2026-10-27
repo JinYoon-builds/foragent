@@ -80,6 +80,8 @@ class Config:
     max_runtime_minutes: int = 90
     max_retries: int = 2
     conflict_retries: int = 2
+    # Merge-queue entries the FIFO turn holder takes at once (#712); only 1 until merge groups (#459).
+    merge_turn_size: int = 1
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None

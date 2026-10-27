@@ -1260,7 +1260,8 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
     case.ctx.sleep = unlocked_sleep
     outcome = runner.review_only(1, case.ctx, repair_ci=False) if reviewed else runner.run_issue(1, case.ctx)
 
-    if change == 'producer' or (change == 'base' and not reviewed):
+    # Both paths refresh a moved base on their merge turn (#712).
+    if change in {'producer', 'base'}:
         assert outcome == 'merged'
         assert len(locks) == 2
         assert len(heads) == (2 if change == 'base' else 1)
@@ -1268,8 +1269,6 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
         assert outcome != 'merged' and not case.tracker.merged_prs
     if change in {'producer', 'regression', 'missing'}:
         assert reads[:3] == [False, True, False], 'Changed evidence must be checked again outside the lock'
-    if change == 'base' and reviewed:
-        assert outcome == 'base-changed'
     if change == 'head':
         assert outcome == 'held'
     assert git_command(case.history.origin, 'rev-parse', 'main') == case.history.tip

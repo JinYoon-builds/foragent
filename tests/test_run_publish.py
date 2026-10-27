@@ -130,6 +130,10 @@ def test_parallel_self_merges_cannot_install_an_older_tree_last(run_case, monkey
     monkeypatch.setattr(c.tracker, "merge_pr", merge_into_main)
     monkeypatch.setattr(tool_install, "run_uv", uv)
     monkeypatch.setattr(runner, "after_merge", install_and_verify)
+    # This test pins the merge lock's scope; the FIFO turn (#712) would make B wait before the
+    # lock and hide a lock released too early, so both runs contend for the lock directly.
+    from foragent import run_merge_turn
+    monkeypatch.setattr(run_merge_turn, "holds_turn", lambda store, place: True)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(run_issue, 1, c.ctx)
         try:
