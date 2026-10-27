@@ -37,6 +37,7 @@ def test_exact_defaults(repo):
         "upstream_reports": None, "perspectives": {}, "claude_quota": {"mode": "keep", "keep_percent": 80},
         "view_glyphs": "auto",
         "presence": {"statusline": True, "session_start": True, "report": True},
+        "executors": [{"name": "codex", "quota": "subscription"}],  # Derived from executor (#786).
         "skill_roles": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,
@@ -271,7 +272,8 @@ def test_all_valid_overrides(repo):
         "review_scope": "pr-body",
     }
     write_settings(repo / ".foragent.yml", settings)
-    assert asdict(load_config(repo)) == DEFAULTS | settings
+    derived = [{"name": "claude", "quota": "subscription", "keep_percent": 80}, {"name": "codex", "quota": "subscription"}]
+    assert asdict(load_config(repo)) == DEFAULTS | settings | {"executors": derived}
 
 
 def test_language_uses_global_default_and_repo_override(repo, tmp_path):

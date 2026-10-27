@@ -85,7 +85,22 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, **kwargs) -> Exec
         poll()
         # Executors report plan usage in their own output; keep the latest numbers.
         usage.update(usage_events.record_from_log(ctx.store, log, offset, ctx.now()))
+        _record_spend(n, ctx, log, offset)
         _progress(n, ctx)
+
+
+def _record_spend(n: int, ctx: RunContext, log: Path, offset: int) -> None:
+    """Money spent by this session, from the Claude result line (#786); nothing without a cost field."""
+    from foragent.scheduler_quota import record_cost
+
+    try:
+        with log.open("rb") as stream:
+            stream.seek(offset)
+            lines = stream.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    run = ctx.store.get_run(n)
+    record_cost(ctx.store, ctx.config, run.started_at if run is not None else None, lines)
 
 
 def _limit_wait(n: int, ctx: RunContext, detail: str) -> None:

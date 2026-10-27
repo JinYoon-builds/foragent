@@ -59,11 +59,12 @@ def _validate(values: dict[str, Any]) -> None:
     for path, review in paths.items():
         if not isinstance(path, str) or not isinstance(review, str) or review not in _REVIEW_LEVELS:
             raise ConfigError(f"invalid review_paths entry: {path}")
+    listed = _validate_executors(values.get("executors"))
     for key in ("executor", "reviewer"):
         value = values[key]
         if key == "reviewer" and value is None:
             continue
-        allowed = _EXECUTORS | {"none"} if key == "reviewer" else _EXECUTORS
+        allowed = _EXECUTORS | {"none"} if key == "reviewer" else _EXECUTORS | listed
         if not isinstance(value, str) or value not in allowed:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
@@ -122,8 +123,8 @@ def _validate(values: dict[str, Any]) -> None:
         for key in ("agent", "executor", "reviewer", "model", "title", "emoji"):
             if lane.get(key) is not None and not isinstance(lane[key], str):
                 raise ConfigError(f"lanes.{name}.{key} must be a string or null")
-        if lane.get("executor") is not None and lane["executor"] not in _EXECUTORS:
-            raise ConfigError(f"lanes.{name}.executor must be codex, claude, or null")
+        if lane.get("executor") is not None and lane["executor"] not in _EXECUTORS | listed:
+            raise ConfigError(f"lanes.{name}.executor must be codex, claude, an executors name, or null")
         if not isinstance(lane.get("skills", []), list) or any(
             not isinstance(skill, str) for skill in lane.get("skills", [])
         ):
@@ -181,3 +182,44 @@ def _validate(values: dict[str, Any]) -> None:
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
+
+
+QUOTAS = ("subscription", "api", "unlimited")
+# Executors whose runs report a cost (Claude's total_cost_usd); only these can spend through an api quota.
+COST_REPORTING = frozenset({"claude", "codex"})
+
+
+def _validate_executors(entries: Any) -> set[str]:
+    """Check an explicit ordered executors list (#786); return its names."""
+    from foragent.config import ConfigError, DerivedExecutors
+
+    if entries is None or isinstance(entries, DerivedExecutors):
+        return set()
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError("executors must be a nonempty list of {name, quota} entries")
+    names: list[str] = []
+    for index, entry in enumerate(entries):
+        where = f"executors[{index}]"
+        if not isinstance(entry, dict) or entry.keys() - {"name", "quota", "keep_percent", "spend_cap"}:
+            raise ConfigError(f"{where} must be a mapping of name, quota, keep_percent and spend_cap")
+        name = entry.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise ConfigError(f"{where}.name must be a nonempty executor name")
+        if name in names:
+            raise ConfigError(f"executors lists {name} twice")
+        names.append(name)
+        quota = entry.get("quota")
+        if not isinstance(quota, str) or quota not in QUOTAS:
+            raise ConfigError(f"{where}.quota must be subscription, api or unlimited")
+        keep = entry.get("keep_percent")
+        if keep is not None and (quota != "subscription" or type(keep) is not int or not 1 <= keep <= 100):
+            raise ConfigError(f"{where}.keep_percent must be an integer from 1 to 100 on a subscription executor")
+        cap = entry.get("spend_cap")
+        if cap is not None and (quota == "unlimited" or isinstance(cap, bool)
+                                or not isinstance(cap, (int, float)) or not cap > 0):
+            raise ConfigError(f"{where}.spend_cap must be a number above 0 on a subscription or api executor")
+        if quota == "api" and cap is None:
+            raise ConfigError(f"{where}.spend_cap is required for an api executor; spending needs a daily cap")
+        if quota == "api" and name not in COST_REPORTING:
+            raise ConfigError(f"{where}.quota api needs an executor that reports cost (claude or codex)")
+    return set(names)
