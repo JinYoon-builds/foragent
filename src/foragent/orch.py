@@ -123,8 +123,8 @@ def _text(value: str, name: str) -> str:
 
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
-           say: str | None = None) -> dict:
-    event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
+           say: str | None = None, **fields) -> dict:
+    event = append_event(ctx.store, ctx.now(), n, kind, summary, say, **fields)
     if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
         return event
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
@@ -210,9 +210,11 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str, say: str | None = 
     RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
         n, f"<!-- foragent:orch-verdict pr={pr} head={head} verdict={verdict} -->\n{note}")
     outcome = "interrupted"
+    requeued = False  # Whether this resolve returned the issue to ready (fa brief --report reads it).
     try:
         if verdict == "fail":
             _retry(ctx, n, note)
+            requeued = True
             outcome = "queued implementation retry"
         else:
             outcome = review_only(n, ctx, verdict_head=head, repair_ci=False)
@@ -221,10 +223,11 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str, say: str | None = 
             if outcome in {"checks-failed", "ci-failed"}:
                 # The failing commands themselves reach the next implementer from the saved bundle.
                 _retry(ctx, n, f"{note}\n\nVerification: {outcome}\nSee {ctx.store.log_path(n)}")
+                requeued = True
                 outcome += "; queued implementation retry"
     finally:
         summary = f"#{n}: resolved review {verdict} for {head}; {outcome}; {note}"
-        _event(ctx, n, "resolve", summary, say=say)
+        _event(ctx, n, "resolve", summary, say=say, requeued=requeued)
         kick_tick(ctx.repo_root)
     return summary
 
