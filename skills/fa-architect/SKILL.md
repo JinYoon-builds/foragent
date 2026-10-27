@@ -86,3 +86,12 @@ before-and-after output, and what shipped and what was reverted.
 
 Your project memory is `.claude/agent-memory/fa-architect/MEMORY.md`; only your session writes it.
 Record your proposals there as the session prompt says, appending lines instead of rewriting them.
+
+## References
+
+Optional background; the procedure above is unchanged.
+
+- [ADR consequences](references/adr-consequences.md): one way to describe what a change makes
+  easier, harder and when to revisit it.
+- [Tech-debt scoring](references/tech-debt-scoring.md): the common (Impact + Risk) × (6 − Effort)
+  priority score.
