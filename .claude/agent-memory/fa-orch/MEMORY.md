@@ -186,3 +186,4 @@
 - #785: `irreversible_paths.register(ctx,n,git,paths)`는 run_publish `_merge_decision()` 한 곳에서 호출. 실제 Git은 `tree_files`/`file_at`로 HEAD와 `origin/<base>` 트리를 읽고(PR이 경로를 지워도 잡힘), 가짜는 디스크로 대체. 공지 확인·쓰기·이벤트는 state lock 하나 안. `add_always_human`은 전역 포함 유효 목록에 덧붙임. 시험에서 git commit은 conftest가 막으니 `write-tree` 트리를 쓴다.
 - 시간 폭탄(2026-10-27): `tests/test_cli.py` 가짜 tracker·store는 고정 `NOW`(10-20)인데 inspect 명령 시계는 `cli.datetime.now`(실제)라 7일 창을 벗어나 CI가 깨졌다. fixture 전체 고정은 실제 시계를 기대하는 mark-seen 시험을 깨므로 해당 시험에만 `FixedClock`을 쓴다. 고정 시각 fixture를 쓰는 CI 실패는 먼저 main 소스로 재현해 본다.
 - 모듈 줄 수: `tests/acceptance/test_cli_split.py`가 `src/foragent/*.py`와 `commands/`에 300줄 상한을 건다(run_*.py는 test_runner_split의 600). orch_facts.py는 상한 근처라 새 기능은 helper 모듈(`orch_facts_reviews.human_lines`)에 둔다.
+- #814: `run_logged(env=...)`는 부모 환경에 변수를 더한다. Claude 세션 공통 환경은 `executors.CLAUDE_SESSION_ENV`(백그라운드 작업 끔). 실제 전달은 PATH 앞의 가짜 `claude` 스크립트로 시험한다.
