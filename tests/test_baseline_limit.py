@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import timedelta
 import json
+import os
 from pathlib import Path
 import shlex
 from types import SimpleNamespace
@@ -256,7 +257,9 @@ def test_baseline_timeout_does_not_cache_success_or_duration(capture_case, api):
     else:
         c.capture(api)
         assert "acceptance baseline unavailable" in c.log.read_text()
-    assert not list(c.cache.glob("*.json"))
+    # Only a timed-out record (runner path) may remain: never a success, never a limit source.
+    assert all(json.loads(path.read_text())["timed_out"] is True for path in c.cache.glob("*.json"))
+    assert len(list(c.cache.glob("*.json"))) == (api == "runner")
     c.timed_out, c.exit_code = False, 0
     c.capture(api)
     assert c.calls == [900, 900]
@@ -280,4 +283,107 @@ def test_baseline_timeout_still_refuses_merge_without_protection(run_case, monke
     assert c.executor.calls == []
     assert c.tracker.created_prs == c.tracker.merged_prs == []
     assert c.store.load_flag(1).reason == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
-    assert not list((c.store.root.parent / "baselines").glob("*.json"))
+    assert [json.loads(path.read_text())["timed_out"]
+            for path in (c.store.root.parent / "baselines").glob("*.json")] == [True]
+
+
+def tag(path, **fields):
+    saved = json.loads(path.read_text())
+    saved.update(fields)
+    for name in [name for name, value in fields.items() if value is None]:
+        del saved[name]
+    path.write_text(json.dumps(saved))
+
+
+@pytest.mark.parametrize("api", ["prebuild", "runner"])
+def test_baseline_capture_limit_skips_timed_out_history(capture_case, api):
+    c = capture_case
+    seed_history(c, 736, name="older")
+    tag(seed_history(c, 2000, name="newer-timeout", age=timedelta(hours=1)), timed_out=True)
+    c.capture(api)
+    assert c.calls == [1472]
+
+
+@pytest.mark.parametrize(("repository", "slug", "expected"), [
+    (None, "owner/repo", 1472),         # No path: the slug decides.
+    (None, "owner/other", 900),
+    ("/other/checkout", "owner/repo", 900),  # A path names another checkout, whatever its slug.
+])
+def test_baseline_capture_limit_reads_repo_slug_only_without_a_path(capture_case, repository, slug, expected):
+    c = capture_case
+    c.ctx.config = replace(c.ctx.config, repo="owner/repo")
+    tag(seed_history(c, 736), repository=repository, repo=slug)
+    c.capture("runner")
+    assert c.calls == [expected]
+
+
+@pytest.mark.parametrize("api", ["prebuild", "runner"])
+def test_cache_hit_never_reuses_a_timed_out_entry(capture_case, api):
+    c = capture_case
+    build = run_baseline._baseline_build(c.ctx, "pytest", "main", c.ctx.store.log_path(1))
+    tag(seed_history(c, 900, name=build.key, age=timedelta()), timed_out=True, node_ids=[], failing_ids=[])
+    c.capture(api)
+    assert len(c.calls) == 1, "A timed-out entry was reused as a baseline"
+    saved = json.loads((c.cache / f"{build.key}.json").read_text())
+    assert saved["timed_out"] is False and saved["node_ids"] == [NODE]
+
+
+@pytest.mark.parametrize("slug", [None, "owner/repo"])
+def test_saved_baseline_records_repository_tags_and_outcome(capture_case, slug):
+    c = capture_case
+    c.ctx.config = replace(c.ctx.config, repo=slug)
+    c.capture("runner")
+    saved = json.loads(next(c.cache.glob("*.json")).read_text())
+    assert saved["repository"] == str(c.ctx.repo_root.resolve())
+    assert saved["base_sha"] == "base" and saved["exit_code"] == 0 and saved["timed_out"] is False
+    assert saved.get("repo") == slug and ("repo" in saved) is (slug is not None)
+
+
+@pytest.mark.parametrize("api", ["prebuild", "runner"])
+def test_baseline_capture_limit_estimates_path_tagged_entry_from_its_xml(capture_case, api):
+    c = capture_case
+    seed_xml_history(c, 736, repository=str(c.ctx.repo_root.resolve()))
+    c.capture(api)
+    assert c.calls == [1472]
+
+
+def test_runner_timeout_records_partial_history_but_prebuild_does_not(capture_case):
+    c = capture_case
+    c.timed_out, c.exit_code = True, None
+    with pytest.raises(AttemptFailure):
+        c.capture("runner")
+    saved = [json.loads(path.read_text()) for path in c.cache.glob("*.json")]
+    assert len(saved) == 1 and saved[0]["timed_out"] is True and saved[0]["duration_seconds"] == 736
+    assert saved[0]["node_ids"] == saved[0]["collected_ids"] == [NODE] and saved[0]["failing_ids"] == []
+    for path in c.cache.glob("*.json"):
+        path.unlink()
+    c.capture("prebuild")  # The background builder logs its failure instead of raising.
+    assert not list(c.cache.glob("*.json"))
+
+
+def test_timeout_never_replaces_a_finished_capture(capture_case):
+    c = capture_case
+    build = run_baseline._baseline_build(c.ctx, "pytest", "main", c.ctx.store.log_path(1))
+    path = seed_history(c, 100, name=build.key, age=timedelta(hours=7))  # Expired, so a capture runs.
+    c.timed_out, c.exit_code = True, None
+    with pytest.raises(AttemptFailure):
+        c.capture("runner")
+    assert json.loads(path.read_text())["duration_seconds"] == 100 and "timed_out" not in json.loads(path.read_text())
+
+
+def test_detached_builder_keeps_the_repo_slug(capture_case, monkeypatch, tmp_path):
+    from foragent import run_baseline_process
+
+    c = capture_case
+    c.ctx.config = replace(c.ctx.config, repo="owner/repo")
+    launched = []
+    monkeypatch.setattr(run_baseline.subprocess, "Popen", lambda argv, **kwargs: launched.append(argv))
+    build = run_baseline._baseline_build(c.ctx, "pytest", "main", c.ctx.store.log_path(1))
+    c.cache.mkdir(exist_ok=True)
+    lock = StateStore(c.cache).lock_acceptance_baseline(build.key)
+    run_baseline.start_baseline_process(c.ctx, build, lock)
+    request = json.loads(launched[0][3])
+    built = []
+    monkeypatch.setattr(run_baseline, "_build_baseline", lambda context, *args: built.append(context))
+    run_baseline_process.main(["x", json.dumps({**request, "repo_root": str(tmp_path)}), str(os.open(os.devnull, os.O_RDONLY))])
+    assert built[0].config.repo == "owner/repo"

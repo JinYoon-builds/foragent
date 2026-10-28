@@ -515,30 +515,45 @@ def test_not_a_git_worktree_fails_before_auth(tmp_path, monkeypatch):
 @pytest.mark.parametrize("remote", [None, "git@gitlab.com:owner/repo.git", "https://github.com.evil/owner/repo"])
 def test_origin_must_be_github(setup, remote):
     setup.remote = remote
-    with pytest.raises(GitError, match="origin remote on github.com"):
+    with pytest.raises(GitError, match="origin remote on github.com") as raised:
         setup.init()
     assert not (setup.root / PATHS[0]).exists() and setup.gh_calls == []
+    if remote is not None:
+        assert "git remote set-url origin https://github.com/<owner>/<repo>.git" in str(raised.value)
+        assert "git remote add origin" not in str(raised.value)
 
 
 def test_missing_origin_has_clear_error(setup):
     setup.remote = None
     git_command(setup.root, "remote", "remove", "origin")
-    with pytest.raises(GitError, match="origin remote on github.com"):
+    with pytest.raises(GitError, match="origin remote on github.com") as raised:
         setup.init()
+    assert "git remote add origin https://github.com/<owner>/<repo>.git" in str(raised.value)
+    assert "set-url" not in str(raised.value)
 
 
-@pytest.mark.parametrize("error", [
-    subprocess.CalledProcessError(1, ["gh", "auth", "status"], stderr="not logged in"),
-    FileNotFoundError("gh not installed"),
+def test_preflight_fix_follows_requested_language(setup):
+    setup.remote = None
+    git_command(setup.root, "remote", "remove", "origin")
+    with pytest.raises(GitError, match="origin 원격을 추가하세요") as raised:
+        setup.init(language="ko")
+    assert "git remote add origin https://github.com/<owner>/<repo>.git" in str(raised.value)
+
+
+@pytest.mark.parametrize("error,fix,other", [
+    (subprocess.CalledProcessError(1, ["gh", "auth", "status"], stderr="not logged in"),
+     "gh auth login", "brew install gh"),
+    (FileNotFoundError("gh not installed"), "brew install gh", "gh auth login"),
 ])
-def test_auth_precondition_error_changes_nothing(setup, error):
+def test_auth_precondition_error_changes_nothing(setup, error, fix, other):
     def fail(*args, **kwargs):
         raise error
 
     setup.run_gh = fail
-    with pytest.raises(TrackerError, match="gh auth status failed"):
+    with pytest.raises(TrackerError, match="gh auth status failed") as raised:
         setup.init()
     assert not (setup.root / PATHS[0]).exists() and setup.tracker.labels == {}
+    assert fix in str(raised.value) and other not in str(raised.value)
 
 
 def test_empty_authenticated_login_fails(setup):
