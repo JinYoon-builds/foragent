@@ -70,7 +70,9 @@ def test_a_lane_with_workers_shows_only_their_rows(tmp_path):
     tracker, store, config, clock = workers_case(tmp_path, {1: 0, 2: 1})
     tracker.add_issue(9, "Waiting task", labels=["approved", "ready", "lane:orch"])
     text = frame(tracker, store, config, clock)
-    assert "#9" not in text, text
+    # Folded, the lane adds only its next waiting issue under the workers (#170).
+    waiting = rows_with(text, "#9")
+    assert len(waiting) == 1 and waiting[0].startswith("⏳"), text
     first, second = rows_with(text, "orch 1"), rows_with(text, "orch 2")
     assert len(first) == len(second) == 1 and "#1" in first[0] and "#2" in second[0], text
     assert not any(row.startswith("│") for row in text.splitlines()), "no work table"
