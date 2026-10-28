@@ -589,7 +589,7 @@ def test_remote_conflicted_wip_is_rechecked_without_local_state(conflicting_lane
     monkeypatch.setattr(c.executor, "run", execute)
     assert run_issue(1, c.ctx) == "merged"
     assert len(c.executor.calls) == 5
-    assert "충돌 마커가 남음: cli.py:1" in c.executor.calls[-1]["prompt"]
+    assert "Conflict marker left: cli.py:1" in c.executor.calls[-1]["prompt"]
     assert git_command(c.history.origin, "show", f"{branch}:cli.py") == resolved.strip()
 
 

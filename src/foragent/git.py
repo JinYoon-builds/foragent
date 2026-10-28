@@ -50,9 +50,12 @@ class GitError(RuntimeError):
 class PublicationError(GitError):
     """The proposed Git contents contain unresolved conflict markers."""
 
-    def __init__(self, markers: list[tuple[str, int]]):
+    def __init__(self, markers: list[tuple[str, int]], language: str = "en"):
+        from foragent.i18n import text
+
         self.markers = markers
-        super().__init__("\n".join(f"충돌 마커가 남음: {path}:{line}" for path, line in markers))
+        super().__init__("\n".join(text("conflict_marker_left", language, location=f"{path}:{line}")
+                                   for path, line in markers))
 
 
 @dataclass(frozen=True)
@@ -504,7 +507,16 @@ class GitRepo:
         """Validate staged PR contents in this branch's own changed files."""
         markers = self.conflict_marker_lines(self.changed_paths(base_ref))
         if markers:
-            raise PublicationError(markers)
+            raise PublicationError(markers, self._language())
+
+    def _language(self) -> str:
+        """Project language for diagnostics; English when the config cannot be read."""
+        from foragent.config import load_config
+
+        try:
+            return load_config(self.root).language
+        except Exception:
+            return "en"
 
     def has_staged_changes(self) -> bool:
         return self.staged_tree_sha() != self._call(["rev-parse", "HEAD^{tree}"]).strip()

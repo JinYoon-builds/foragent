@@ -118,6 +118,20 @@ def ask(store: StateStore, question: str, options: list[str], recommend: int | N
     return _public(record)
 
 
+def ask_once(store: StateStore, key: str, question: str, options: list[str], recommend: int) -> dict[str, Any] | None:
+    """Record an open question unless one with this ``key`` was ever recorded; None when it was."""
+    with store._state_lock():
+        if any(row.get("key") == key for row in _records(store, "questions")):
+            return None
+        seq = max((int(row.get("seq", 0)) for row in _records(store, "questions")), default=0) + 1
+        record = {"id": f"q{seq}", "seq": seq, "key": key, "question": question, "options": list(options),
+                  "recommend": recommend, "status": "open", "answer": None, "issues": [],
+                  "created_at": store._timestamp(), "updated_at": store._timestamp()}
+        store._write_json(_folder(store, "questions") / f"{record['id']}.json", record)
+    append_event(store, store._now(), None, "ask", f"{record['id']}: {question}")
+    return _public(record)
+
+
 def plan_heartbeat_path(store: StateStore) -> Path:
     return store.root / "plan-heartbeat.json"
 

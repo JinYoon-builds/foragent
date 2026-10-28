@@ -133,7 +133,9 @@ def test_unusable_baseline_stops_before_publish_without_retry(run_case, monkeypa
     assert "acceptance baseline unavailable" in c.store.get_run(1).detail
     assert parse_reason(c.tracker.list_comments(1)[-1].body) == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
     assert c.store.read_history()[-1].outcome == "acceptance-baseline-unavailable"
-    assert not list((c.store.root.parent / "baselines").glob("*.json"))
+    # A timeout is kept as history (timed_out: true, never reused); other failures leave nothing.
+    saved = [json.loads(path.read_text()) for path in (c.store.root.parent / "baselines").glob("*.json")]
+    assert [entry["timed_out"] for entry in saved] == ([True] if unusable.endswith("timeout") else [])
 
 
 def test_baseline_uses_a_prebuilt_cache_before_implementation(run_case, monkeypatch):
