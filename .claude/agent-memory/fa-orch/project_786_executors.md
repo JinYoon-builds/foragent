@@ -15,3 +15,4 @@ metadata:
 - Review attempt 2: admission must sit inside `_available_executor.execute()` (every launch: failed-resume relaunch, retries, reviewers), not the loop head. Reviewer choice keeps only `can_review` names, else `none`. `executors: null` is a ConfigError; `run_base_move._repo_config` must call `_apply_executors` too (third config-loading path).
 - Break-it pitfall: a mutation guarded by `hold is not None and f()` never calls f on the first launch; mutate on a launch property (e.g. `"resume_session_id" in kwargs`) instead.
 - Review attempt 3: every hold path (implementer, reviewer, lane) must ask credits when a hard limit is the cause; continuations use blocked(keep=False).
+- Review 4: one reviewer helper `choose_reviewer()`; only claude<->codex fallbacks switch reviewer, other fallbacks keep configured. Merge with #769 roles: keep both validators in config_validation.

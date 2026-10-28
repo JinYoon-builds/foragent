@@ -298,7 +298,7 @@ def test_flow_a_recorded_merge_counts_even_when_a_later_step_failed(store):
 
 
 def test_flow_idle_a_current_label_change_never_rewrites_earlier_days(tmp_path, monkeypatch):
-    """Without label events, today's labels apply only from the issue's recorded update time."""
+    """Without label events, a current hold applies only from the issue's recorded update time."""
     from foragent import capacity
     from foragent.issue import body_hash
 
@@ -320,7 +320,8 @@ def test_flow_idle_a_current_label_change_never_rewrites_earlier_days(tmp_path, 
     assert idle() == (pytest.approx(1440), pytest.approx(1440))
     clock[0] = NOW - timedelta(hours=1)
     store.update_local_issue(1, labels=["ready"])  # Approval removed an hour ago.
-    assert idle() == (pytest.approx(1440), pytest.approx(1380)), "Yesterday stays idle"
+    # #827: a removed approval with no label history and no run is never startable in the window.
+    assert idle() == (pytest.approx(0), pytest.approx(0)), "A removed approval is not idle work"
     clock[0] = NOW - timedelta(days=3)
     store.update_local_issue(2, title="t2", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
     store.save_approval(2, body=body, body_sha=body_hash(body), acceptance_blobs={},
@@ -344,3 +345,18 @@ def test_flow_idle_reads_the_parallel_state_file_from_its_changed_at(tmp_path, m
     capacity.write_state(store, 1, NOW - timedelta(hours=1))
     assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(60), (
         "The budget file is a record from its changed_at")
+
+
+def test_flow_removed_approval_rule_spares_running_and_closed_issues():
+    """#827: only an open, not running issue without a current approved label is never startable."""
+    from foragent.orch_scorecard_flow import _labels_at
+
+    approved, updated = NOW - timedelta(days=1), NOW - timedelta(minutes=10)
+    issue = {"events": [], "approved_at": approved, "labels": {"ready"}, "closed": False,
+             "flagged_at": None, "updated_at": updated, "running": False}
+    before = NOW - timedelta(hours=1)
+    assert _labels_at(issue, before) == set()
+    assert _labels_at({**issue, "running": True}, before) == {"approved", "ready"}
+    assert _labels_at({**issue, "running": True}, NOW) == {"ready"}
+    assert _labels_at({**issue, "closed": True}, before) == {"approved", "ready"}
+    assert _labels_at({**issue, "labels": {"approved"}}, NOW) == {"approved", "ready"}

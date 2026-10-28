@@ -222,5 +222,9 @@ def _issue_view(store: StateStore, row: dict[str, Any], lanes: dict,
 
 def _issues(store: StateStore, lanes: dict) -> dict[int, dict[str, Any]]:
     rows = {row["number"]: row for row in store.local_issues()}
-    return {number: view for number, row in rows.items()
-            if (view := _issue_view(store, row, lanes, rows)) is not None}
+    running = {run.number for run in store.active_runs() if run.status == "running"}
+    views = {number: view for number, row in rows.items()
+             if (view := _issue_view(store, row, lanes, rows)) is not None}
+    for number, view in views.items():
+        view["running"] = number in running  # An active run record, for the removed-approval rule.
+    return views

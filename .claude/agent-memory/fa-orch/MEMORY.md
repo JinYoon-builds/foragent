@@ -179,6 +179,7 @@
 - #421 리뷰: 리뷰 원문은 UNUSABLE이어도 VERDICT 줄이 남는다(시간 초과·패널 실패 "Reviewer 1:\nVERDICT: ..."). 판정은 `orch-events.jsonl`의 kind=review(issue·round·verdict)를 쓰고, 파일 저장 직후 기록되므로 mtime 이후 첫 이벤트를 고른다(같은 round의 앞선 orchestrator PASS 제외). 기록 없는 옛 파일만 원문 파싱.
 - #421 2차 리뷰: review 이벤트 중 `source: orchestrator`는 파일 없이 다음 round 번호를 쓰므로 파일 짝짓기에서 뺀다. SPEC-CONFLICT 기록은 리뷰어 판정을 잃었으므로 runner `_journal_review`에 `review_verdict` 필드를 더했다(기존 시험은 verdict만 봄). 옛 SPEC-CONFLICT는 원문 판정.
 - [#449 overlap facts](project_449_overlap_facts.md) — file_conflicts in orch_facts_runs, 30-line human cap, zsh array for test lists
+- [#712 merge turn](project_712_merge_turn.md) — FIFO merge-queue.jsonl reader rules, join after green CI, turn record before merge_pr
 - #421 3차: 지적 추출은 `run_review.code_review_findings()`(parse_code_review에서 꺼낸 공용 함수, JSON 객체를 그대로 반환)를 쓴다. 판정은 라운드를 셀지만 정하고 PASS의 path:line 지적도 센다. 형식 판별을 facts에서 다시 구현하지 않는다.
 - [#650 wake grace](project_650_wake_grace.md) — wake-grace.json beside sleep baseline, per-run activity ends it, sleep_wake line
 - [#226 review NOTE lines](project_226_review_notes.md) — review_notes.py, break-it rule, SKILL.md 150-line pitfalls

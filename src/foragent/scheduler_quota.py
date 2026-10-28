@@ -161,32 +161,39 @@ def can_review(config: Config, name: str) -> bool:
     return name in ("claude", "codex") and entry_for(config, name).get("quota") != "unlimited"
 
 
+def choose_reviewer(config: Config, executor: str, claude_paused: bool,
+                    available: Callable[[str], bool]) -> str:
+    """The reviewer of a run of lane-adjusted ``config`` on ``executor``; the one place it is chosen.
+
+    A run on its own executor keeps the configured reviewer, which moves from Claude to Codex
+    while Claude is paused at its hard limit. A run that falls back to an executor other than
+    Claude or Codex, or from one, keeps that reviewer too. Only a fallback between Claude and
+    Codex never waits for a reviewer: the executor it fell back from reviews when it is free,
+    else the configured reviewer when free and not the run's executor, else the run's own
+    executor. Unlimited and unknown executors never review; with no candidate left: ``none``.
+    """
+    previous = resolved_reviewer(config)
+    source = config.executor
+    if previous == "none":
+        return "none"
+    if executor != source and {source, executor} <= {"claude", "codex"}:
+        chain = [source, *([previous] if previous != executor else []), executor]
+        return next((name for name in chain if can_review(config, name) and
+                     (name == executor or available(name))), "none")
+    kept = "codex" if claude_paused and previous == "claude" else previous
+    return next((name for name in (kept, executor) if can_review(config, name)), "none")
+
+
 def switched_config(config: Config, implementer: str | None, claude_paused: bool = False,
                     available: Callable[[str], bool] | None = None) -> Config:
-    """A lane-adjusted config with the run's stored implementer and its reviewer.
+    """A lane-adjusted config with the run's stored implementer and its reviewer (``choose_reviewer``).
 
-    ``implementer`` None keeps the lane's executor; that run keeps its configured reviewer,
-    with a Claude reviewer moving to Codex while Claude is paused at its hard limit, and
-    the run's own executor reviewing when the configured one can never review.
-    A fallback run never waits for a reviewer: the executor it fell back from reviews when
-    available, else the configured reviewer when available and not the run's executor,
-    else the run's own executor. Unlimited and unknown executors never review: when no
-    candidate can, the reviewer is ``none``. ``available`` says which executors can run now.
+    ``implementer`` None keeps the lane's executor; ``available`` says which executors can run now.
     """
     available = available or (lambda name: not (claude_paused and name == "claude"))
     previous = resolved_reviewer(config)
     executor = implementer if implementer is not None else config.executor
-    if previous == "none":
-        chain, free = [], False
-    elif executor != config.executor:
-        chain, free = [config.executor, *([previous] if previous != executor else []), executor], True
-    else:
-        chain, free = ["codex" if claude_paused and previous == "claude" else previous, executor], False
-    # Only an executor that can review is chosen; with none left, the run is not reviewed.
-    eligible = [name for name in chain if can_review(config, name)]
-    reviewer = next((name for name in eligible if not free or name == executor or available(name)),
-                    None if free else (eligible[0] if eligible else None))
-    reviewer = "none" if reviewer is None else reviewer
+    reviewer = choose_reviewer(config, executor, claude_paused, available)
     if executor == config.executor and reviewer == previous:
         return config
     same = executor == config.executor

@@ -91,3 +91,44 @@ checks: ci  # 2026-10-26 Jin: CI mode on after #493/#506 (evidence = the measure
 max_runtime_minutes: 360  # 2026-10-25 Jin (D89): interim until the #435 watchdog; progressing runs were cut at 90 min. stall_minutes (30, no progress) still ends silent runs
 # Raised from 2 on 2026-10-26: 1 conflict (598 s, no redo) in 107 overlap records; earlier 33 conflict events took 189 s median, while cap waits held 5 ready issues for hours.
 overlap_per_file: 3
+roles:
+  orchestrator:
+    agent: fa-orchestrator
+    skills:
+    - fa-orchestrator
+    memory: .claude/agent-memory/fa-orchestrator/
+    signals: []
+    created_at: '2026-10-27T07:58:05+00:00'
+  architect:
+    agent: fa-architect
+    skills:
+    - fa-architect
+    memory: .claude/agent-memory/fa-architect/
+    signals:
+    - paths: []
+      kinds:
+      - repeated_design_holds
+    - paths: []
+      kinds:
+      - hot_overlap_files
+    - paths: []
+      kinds:
+      - files_over_limit
+    - paths: []
+      kinds:
+      - idle_lanes_with_backlog
+    created_at: '2026-10-27T07:58:05+00:00'
+  docs:
+    agent: fa-docs
+    skills:
+    - fa-docs
+    memory: .claude/agent-memory/fa-docs/
+    signals:
+    - paths:
+      - docs/**
+      - README*
+      kinds: []
+    scope:
+    - docs/**
+    - README*
+    created_at: '2026-10-27T07:58:05+00:00'

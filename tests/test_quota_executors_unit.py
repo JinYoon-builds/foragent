@@ -95,12 +95,19 @@ def test_switch_event_and_line_use_the_real_names(tmp_path):
 
 
 @pytest.mark.parametrize("executor,implementer,reviewer,paused,expected", [
-    ("claude", "codex", None, (), "claude"),           # the source reviews when it is free
-    ("codex", "local", None, (), "codex"),             # also on an executor other than claude or codex
-    ("codex", "local", None, ("codex",), "claude"),    # source paused: the configured reviewer
-    ("claude", "codex", None, ("claude",), "codex"),   # configured is the run's executor: it reviews itself
-    ("codex", "claude", "codex", ("codex",), "claude"),
+    # [codex, local]: a fallback to another executor keeps the configured reviewer.
+    ("codex", "local", None, (), "claude"),
+    ("codex", "local", None, ("codex",), "claude"),
+    ("codex", "local", "codex", ("codex",), "codex"),
+    ("local", "codex", "claude", (), "claude"),           # from another executor: kept too
+    # [claude, codex]: the executor it fell back from reviews when free, else the run's own.
+    ("claude", "codex", None, (), "claude"),
+    ("claude", "codex", None, ("claude",), "codex"),
     ("claude", "codex", "none", (), "none"),
+    # [codex, claude]: the same rule reversed.
+    ("codex", "claude", None, (), "codex"),
+    ("codex", "claude", None, ("codex",), "claude"),
+    ("codex", "claude", "codex", ("codex",), "claude"),
 ])
 def test_fallback_reviewer(executor, implementer, reviewer, paused, expected):
     config = Config(executor=executor, reviewer=reviewer)
@@ -126,9 +133,10 @@ def test_no_eligible_reviewer_means_no_review(tmp_path, lane, paused):
 
 
 def test_fallback_reviewer_is_none_when_no_eligible_reviewer_is_free():
-    config = Config(executor="claude", reviewer="codex", executors=[entry("claude"), entry("local", "unlimited")])
+    config = Config(executor="claude", reviewer="codex",
+                    executors=[entry("claude"), entry("codex", "unlimited"), entry("local", "unlimited")])
     switched = switched_config(config, "local", available=lambda name: name not in ("claude", "codex"))
-    assert switched.reviewer == "none", "a fallback never waits for a reviewer"
+    assert switched.reviewer == "none", "the kept reviewer is unlimited and local cannot review"
 
 
 def test_base_move_check_applies_the_executors_file_rules(monkeypatch):
@@ -293,3 +301,12 @@ def test_continued_run_is_not_held_by_keep_percent(tmp_path, outcome):
     assert (start.held, start.config.executor) == (False, "codex"), "a continuation keeps Codex over its keep share"
     store.pause_executor("codex", NOW + timedelta(hours=1))
     assert decide(store, config, "main", NOW, 1).held, "a hard limit still holds the continuation"
+
+
+def test_fallback_to_another_executor_keeps_the_configured_reviewer_in_decide(tmp_path):
+    config = load(tmp_path, {"reviewer": "claude", "executors": [entry("codex", keep_percent=50),
+                                                                 entry("local", "unlimited")]})
+    store = store_at(tmp_path)
+    store.record_usage("codex", [{"name": "5h", "used_percent": 60, "resets_at": None}])
+    start = decide(store, config, "main", NOW)
+    assert (start.config.executor, start.config.reviewer, start.held) == ("local", "claude", False)

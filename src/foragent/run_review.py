@@ -597,4 +597,6 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     return _publish_reviewed_head(
         n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
         comparison_attempt=comparison_attempt,
+        # On its merge turn a moved base is merged in and this head's checks run again (#712).
+        reverify=lambda new_head: _verify_review_head(n, ctx, git, parsed, new_head, link),
     )

@@ -1,0 +1,249 @@
+"""Standing roles: one ``roles:`` source in .foragent.yml and the files derived from it (D95).
+
+A role is an agent file, its skills, project memory and the signals that call it.
+Only this module writes ``roles``; the agent file and memory directory are written
+in the same command, and ``fa doctor`` reports a projection that drifted.
+"""
+
+from copy import deepcopy
+from datetime import UTC, datetime
+from pathlib import Path
+import re
+import sys
+from typing import Any
+
+import yaml
+
+from foragent import role_agents
+from foragent.config import Config, ConfigError, _comments, _last_line, _pair
+from foragent.paths import repo_path
+
+
+DEFAULT_ROLES = ("orchestrator", "architect", "docs")
+# Names of state files a role session record (<name>.json) would collide with.
+STATE_NAMES = frozenset({"plan", "session", "usage", "tidy", "issues", "capacity"})
+IDLE_DAYS = 14
+ARCHITECT_KINDS = ["repeated_design_holds", "hot_overlap_files", "files_over_limit", "idle_lanes_with_backlog"]
+DOCS_PATHS = ["docs/**", "README*"]
+SIGNAL_KEYS = ("paths", "kinds")
+
+
+class RoleError(ConfigError):
+    """A role cannot be added, changed or removed as requested."""
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def memory_dir(name: str) -> str:
+    return f".claude/agent-memory/fa-{name}/"
+
+
+def default_entry(name: str, skills: list[str] | None = None) -> dict[str, Any]:
+    signals = {"architect": [{"paths": [], "kinds": [kind]} for kind in ARCHITECT_KINDS],
+               "docs": [{"paths": list(DOCS_PATHS), "kinds": []}]}.get(name, [])
+    entry = {"agent": f"fa-{name}", "skills": [f"fa-{name}"] if skills is None else list(skills),
+             "memory": memory_dir(name), "signals": signals}
+    if name == "docs":
+        entry["scope"] = list(DOCS_PATHS)
+    entry["created_at"] = _now()
+    return entry
+
+
+def load_roles(config: Config) -> dict[str, dict[str, Any]]:
+    """Every configured role with its optional fields filled in.
+
+    With no roles key (a config from before roles), the three default entries are derived,
+    not stored (D95): re-init leaves the file as is, and the first fa role command writes them.
+    """
+    stored = config.roles or {name: {**default_entry(name), "created_at": None} for name in DEFAULT_ROLES}
+    roles = {}
+    for name, entry in stored.items():
+        scope = entry.get("scope", [])
+        roles[name] = {
+            "agent": entry.get("agent") or f"fa-{name}",
+            "skills": list(entry.get("skills", [])),
+            "memory": entry.get("memory") or memory_dir(name),
+            "signals": deepcopy(entry.get("signals", [])),
+            "scope": [scope] if isinstance(scope, str) else list(scope),
+            "created_at": entry.get("created_at"),
+            "idle_days": entry.get("idle_days", IDLE_DAYS),
+        }
+    return roles
+
+
+def _split_agent(path: Path) -> tuple[dict | None, bytes, str]:
+    """Agent frontmatter (None when absent or invalid), the exact body bytes after it, and its line end.
+
+    Bytes, so a CRLF body is not normalized: fa role set changes only the frontmatter.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None, b"", "\n"
+    match = re.match(rb"\A---[ \t]*(\r?\n)(.*?)^---[ \t]*(?:\r?\n|\Z)", data, re.S | re.M)
+    header = None
+    if match:
+        try:
+            header = yaml.safe_load(match[2].decode("utf-8"))
+        except (UnicodeDecodeError, yaml.YAMLError):
+            header = None
+    return ((header if isinstance(header, dict) else None), data[match.end():] if match else data,
+            match[1].decode() if match else "\n")
+
+
+def with_defaults(root: Path, roles: dict[str, Any]) -> dict[str, Any] | None:
+    """``roles`` plus any missing default role, or None when nothing is missing.
+
+    A missing entry takes its skills from an existing agent file, which the person owns.
+    """
+    missing = [name for name in DEFAULT_ROLES if name not in roles]
+    if not missing:
+        return None
+    result = deepcopy(roles)
+    for name in missing:
+        header, _, _ = _split_agent(repo_path(root, f".claude/agents/fa-{name}.md"))
+        skills = header.get("skills") if header else None
+        valid = isinstance(skills, list) and all(isinstance(skill, str) for skill in skills)
+        result[name] = default_entry(name, skills if valid else None)
+    return result
+
+
+_LINES = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
+
+
+def _dump(value: dict[str, Any], indent: int, newline: str = "\n") -> list[str]:
+    text = yaml.safe_dump(value, sort_keys=False, allow_unicode=True)
+    return [" " * indent + line + newline for line in text.splitlines()]
+
+
+def edit_roles(text: str, roles: dict[str, Any]) -> str:
+    """Rewrite only the top-level ``roles`` block, as block-style YAML at its current position.
+
+    With no ``roles`` key the block is appended at the end of the file. Every byte outside
+    the block stays identical; comments inside it are dropped. Pure: the writer reports
+    dropped comments once with ``report_dropped_comments``.
+    """
+    lines = _LINES.findall(text)
+    try:
+        node = yaml.compose(text)
+        before = yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise RoleError(f"cannot read .foragent.yml: {exc}") from exc
+    if not isinstance(before, dict):
+        raise RoleError(".foragent.yml must contain a mapping")
+    # The file's own line end, so a CRLF file stays CRLF.
+    newline = next((line[len(line.rstrip("\r\n")):] for line in lines if line.endswith(("\r", "\n"))), "\n")
+    pair = _pair(node, "roles")
+    ends = [event.start_mark.line for event in yaml.parse(text)
+            if isinstance(event, yaml.events.DocumentEndEvent) and event.explicit]
+    if pair is None and ends:
+        # An explicit document end (`...`): the block goes right before it, inside the document.
+        start = end = ends[0]
+        column = 0
+    elif pair is None:
+        start = end = len(lines)
+        if lines and not lines[-1].endswith(("\r", "\n")):
+            lines[-1] += newline
+        column = 0
+    else:
+        start, end, column = pair[0].start_mark.line, _last_line(*pair) + 1, pair[0].start_mark.column
+    lines[start:end] = _dump({"roles": roles}, column, newline)
+    edited = "".join(lines)
+    try:
+        written = yaml.safe_load(edited)
+    except yaml.YAMLError:
+        written = None
+    if written != {**before, "roles": roles}:
+        raise RoleError("cannot rewrite the roles block of .foragent.yml; edit it by hand")
+    return edited
+
+
+def report_dropped_comments(original: str) -> None:
+    """Say once, from the code that writes the file, how many comments the roles block rewrite dropped."""
+    try:
+        pair = _pair(yaml.compose(original), "roles")
+    except yaml.YAMLError:
+        return
+    if pair is None:
+        return
+    lines = _LINES.findall(original)
+    dropped = sum(_comments(lines[pair[0].start_mark.line:_last_line(*pair) + 1]).values())
+    if dropped:
+        print(f"Note: rewrote the roles block of .foragent.yml and dropped {dropped} comment(s) inside it.",
+              file=sys.stderr)
+
+
+def _memory_file(root: Path, name: str, memory: str) -> str:
+    """The role's MEMORY.md path; the memory directory must sit inside .claude/agent-memory/."""
+    directory = memory.rstrip("/")
+    if not directory.startswith(".claude/agent-memory/") or (
+            repo_path(root, directory) == repo_path(root, ".claude/agent-memory")):
+        raise RoleError(f"role {name}: memory {memory!r} is outside .claude/agent-memory/")
+    return directory + "/MEMORY.md"
+
+
+def _ensure_memory(root: Path, name: str, entry: dict[str, Any]) -> str:
+    """Create the role's MEMORY.md when missing (an existing one, even empty, is kept); return its path."""
+    relative = _memory_file(root, name, entry.get("memory") or memory_dir(name))
+    memory = repo_path(root, relative)
+    if not memory.exists():
+        memory.parent.mkdir(parents=True, exist_ok=True)
+        agent = entry.get("agent") or f"fa-{name}"
+        memory.write_text(role_agents.MEMORY.get(agent, f"# {agent} memory\n"), encoding="utf-8")
+    return relative
+
+
+def role_drift(root: Path, config: Config) -> list[str]:
+    """Stored roles whose agent file or memory is missing, or whose agent skills differ from the roles source.
+
+    Only reports; ``fa role set`` rewrites the missing or drifted files. Derived defaults (no roles
+    key yet) have no stored entry to drift from, so they are not checked.
+    """
+    problems = []
+    for name, entry in load_roles(config).items() if config.roles else ():
+        memory = entry["memory"].rstrip("/") + "/MEMORY.md"
+        if not repo_path(root, memory).is_file():
+            problems.append(f"FAIL role {name}: memory {memory} is missing; run `fa role set {name}` to create it")
+        relative = f".claude/agents/{entry['agent']}.md"
+        path = repo_path(root, relative)
+        if not path.is_file():
+            problems.append(f"FAIL role {name}: agent file {relative} is missing; "
+                            f"run `fa role set {name} --skill ...` to rewrite it")
+            continue
+        header, _, _ = _split_agent(path)
+        declared = header.get("skills") if header else None
+        if declared != entry["skills"]:
+            problems.append(f"FAIL role {name}: skills differ: .foragent.yml={entry['skills']!r}, "
+                            f"{relative}={declared!r}; run `fa role set {name} --skill ...` to rewrite both")
+    return problems
+
+
+def parse_signals(items: list[str]) -> list[dict[str, list[str]]]:
+    """One signal item per --signal; every item carries both paths and kinds (the unused one empty)."""
+    signals = []
+    for item in items:
+        key, separator, value = item.partition(":")
+        if not separator or key not in SIGNAL_KEYS or not value.strip():
+            raise RoleError(f"invalid --signal {item!r}: use paths:<glob> or kinds:<fact kind>")
+        signals.append({"paths": [value.strip()] if key == "paths" else [],
+                        "kinds": [value.strip()] if key == "kinds" else []})
+    return signals
+
+
+def _description(name: str) -> str:
+    return f"Foragent {name} role"
+
+
+def _agent_text(name: str, skills: list[str]) -> str:
+    header = yaml.safe_dump({"name": f"fa-{name}", "description": _description(name), "memory": "project",
+                             "skills": skills}, sort_keys=False, allow_unicode=True)
+    return (f"---\n{header}---\n"
+            f"You are this repository's Foragent {name}; follow your role skills.\n"
+            "Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.\n"
+            "Propose changes to the orchestrator; never message a person directly.\n")
+
+
+# The role verbs live in roles_commands; their names stay importable here.
+from foragent.roles_commands import add_role, remove_role, set_role  # noqa: F401
