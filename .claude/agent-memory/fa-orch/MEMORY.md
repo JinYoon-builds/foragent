@@ -202,3 +202,4 @@
 - [#129 blocked push](project_129_blocked_push.md) — orch_push hook after spawn, _push_ready flag, notify-blocked.json re-arm
 - #846: Windows 조기 종료는 `cli.py`의 foragent import 앞 `try: import fcntl`에서 한 줄 출력 후 `SystemExit(1)`. 콘솔 대상은 바꾸지 않는다.
 - #772 재시도: "baseline regression"을 재현할 수 없을 때 runs/issue-N/*check*.log에는 실패 상세가 없다. 시험 중 값 확인은 capsys를 우회하는 `os.write(2, ...)`와 `-s`로 하고, 브랜치가 origin/main을 포함하는지 `git log HEAD..origin/main`으로 먼저 본다.
+- "Acceptance baseline regression (previously passing tests)"는 GitHub `foragent-acceptance` CI(리눅스) 비교 결과다. 상세는 `gh run list --branch foragent/issue-N --workflow foragent-acceptance` 뒤 `gh run view <id> --log`의 "Compare acceptance passing sets" 단계에 있다. #772에서 facts 반복 읽기 시험은 실시간 `os.getloadavg()` 값 차이로 간헐 실패했다(main 원인).
