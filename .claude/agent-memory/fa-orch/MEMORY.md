@@ -199,5 +199,6 @@
 - #770 리뷰: 아키텍트도 roles 원본에서 agent·skills·memory를 읽어야 한다(`_entry(config, role)`를 모든 역할에 적용). 고정 상수 `SKILL`·`AGENT`·`MEMORY`·`has_agent`는 지웠고 `_procedure()`가 두 프롬프트의 스킬 안내를 공유한다. 회귀 시험 `test_architect_session_reads_agent_skills_and_memory_from_the_roles_source`.
 - #770: `tests/acceptance/test_cli_split.py`가 `src/foragent/*.py`·`commands/**` 모두 300줄(cli.py 150줄) 상한을 건다. 역할 지시문은 `orch_role_prompt.py`로 분리했고 `orch_architect`가 `build_prompt`·`REFACTOR` 등을 재노출한다. 모듈을 키울 때 먼저 `wc -l`로 확인한다.
 - #772: 역할 신호는 `orch_roles.py`(roles·role-decision), kinds는 `orch_facts_kinds.py`. roles는 kinds 신호가 있을 때만 `orch_facts.collect`를 모듈 속성으로 부른다(인수 시험이 교체·Popen 금지). SKILL.md 끝 줄바꿈 없음: `wc -l` 149가 splitlines 150이다.
+- [#129 blocked push](project_129_blocked_push.md) — orch_push hook after spawn, _push_ready flag, notify-blocked.json re-arm
 - #846: Windows 조기 종료는 `cli.py`의 foragent import 앞 `try: import fcntl`에서 한 줄 출력 후 `SystemExit(1)`. 콘솔 대상은 바꾸지 않는다.
 - #772 재시도: "baseline regression"을 재현할 수 없을 때 runs/issue-N/*check*.log에는 실패 상세가 없다. 시험 중 값 확인은 capsys를 우회하는 `os.write(2, ...)`와 `-s`로 하고, 브랜치가 origin/main을 포함하는지 `git log HEAD..origin/main`으로 먼저 본다.
