@@ -24,7 +24,7 @@ from foragent.order_files import issue_body, validate_paths
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
-from foragent.tracker import LabelSpec, Tracker
+from foragent.tracker import LabelSpec, Tracker, pr_issue_number
 
 
 class PlanError(ValueError):
@@ -157,6 +157,18 @@ def detect_test_commands(root: Path) -> list[str]:
     return commands
 
 
+PR_HISTORY = 30
+
+
+def _pull_requests(tracker: Tracker) -> list[dict]:
+    """Open PRs and the latest merged ones, so planning sees what was done and by whom (#848)."""
+    merged = sorted(tracker.list_prs(state="merged"), key=lambda pr: (pr.merged_at or "", pr.number))[-PR_HISTORY:]
+    return [{"number": pr.number, "title": pr.title, "head": pr.head, "state": state,
+             "merged_at": pr.merged_at, "foragent": pr_issue_number(pr.head) is not None}
+            for state, prs in (("open", tracker.list_prs(state="open")), ("merged", merged[::-1]))
+            for pr in prs]
+
+
 def context(root: Path, config: Config, tracker: Tracker) -> dict:
     issues = sorted(tracker.list_open_issues(), key=lambda issue: issue.number)
     feedback, decisions = [], []
@@ -216,6 +228,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),
                          "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
                          "state_group": state_group(issue, tracker)} for issue in issues],
+        "pull_requests": _pull_requests(tracker),
         "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
                                  "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
     }

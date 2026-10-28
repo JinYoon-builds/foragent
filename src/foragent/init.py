@@ -87,6 +87,8 @@ class InitReport:
     board_id: str | None = None
     board_planned: bool = False
     removed: list[str] = field(default_factory=list)
+    # The tracker setup used; fa init reuses it to look up starter-order facts.
+    tracker: object = field(default=None, repr=False, compare=False)
 
     def summary(self) -> str:
         lines = ["Foragent setup plan:" if self.dry_run else "Foragent setup:"]
@@ -394,4 +396,5 @@ def init_repo(
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     return InitReport(created, existed, False, bool(pending), push_planned, label,
-                      normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed)
+                      normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
+                      tracker=tracker)
