@@ -16,7 +16,7 @@ from typing import Any
 from foragent import capacity
 from foragent.state import Run, StateStore
 
-FILE = "resource-sample.json"
+PREFIX = "resource-sample-"  # One file per repository: resource-sample-<store>.json
 FIELDS = ("at", "cpu_busy", "load_average_per_cpu", "memory_pressure", *capacity.DISK_RATES.values(),
           "test_slot_queue")
 
@@ -56,8 +56,18 @@ def slot_queue(store: StateStore, now: datetime) -> int:
     return count
 
 
+def path_for(store: StateStore) -> Path:
+    """This repository's own sample file: its gate is the file's only writer (D95)."""
+    return capacity.machine_root() / f"{PREFIX}{store.root.name}.json"
+
+
 def record(store: StateStore, sample: tuple[str, float], at: datetime) -> None:
-    """Replace the machine's latest sample with this tick's readings (no new sensor read)."""
+    """Replace this repository's sample with this tick's readings (no new sensor read).
+
+    ``at`` is when the readings were taken, before the sensors were read. Each gate
+    writes only its own file, so a tick delayed after measuring cannot replace another
+    repository's newer sample; readers take the newest ``at`` across files (latest()).
+    """
     load = getattr(sample, "load_average_per_cpu", None)
     row = {
         "at": at.isoformat(), "cpu_busy": getattr(sample, "cpu_busy", None),
@@ -65,15 +75,21 @@ def record(store: StateStore, sample: tuple[str, float], at: datetime) -> None:
         **(getattr(sample, "disk_rates", None) or dict.fromkeys(capacity.DISK_RATES.values())),
         "test_slot_queue": slot_queue(store, at),
     }
-    root = capacity.machine_root()
+    target = path_for(store)
     try:
-        with capacity._flock(root / capacity.SENSOR_LOCK):
-            descriptor, temporary = tempfile.mkstemp(dir=root, prefix=f".{FILE}.")
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(row, stream)
-            os.replace(temporary, root / FILE)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(row, stream)
+        os.replace(temporary, target)
     except OSError:
         pass  # A missed sample leaves the previous one, whose age facts report.
+
+
+def latest(directory: Path) -> dict[str, Any] | None:
+    """The newest valid sample by its measured ``at`` among the per-repository files in ``directory``."""
+    rows = [row for path in sorted(directory.glob(f"{PREFIX}*.json")) if (row := read(path)) is not None]
+    return max(rows, key=lambda row: datetime.fromisoformat(row["at"]), default=None)
 
 
 def read(path: Path) -> dict[str, Any] | None:

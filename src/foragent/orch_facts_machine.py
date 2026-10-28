@@ -15,6 +15,7 @@ from foragent.state import Run, StateStore
 
 
 SLOT_STORES = "slot-stores"
+SAMPLES = "resource-samples"
 
 
 def freeze_slot_store(store: StateStore, source: Path, into: Path, copy: Callable[[Path, Path], None]) -> None:
@@ -25,9 +26,10 @@ def freeze_slot_store(store: StateStore, source: Path, into: Path, copy: Callabl
 
 
 def freeze_sample(into: Path, copy: Callable[[Path, Path], None]) -> tuple[dict[str, Any] | None, tuple[str, float]]:
-    """The gate's last recorded sample and its (pressure, load); without one, today's read-only live reading."""
-    copy(capacity.machine_root() / resource_sample.FILE, into / resource_sample.FILE)
-    stored = resource_sample.read(into / resource_sample.FILE)
+    """The newest gate sample on the machine and its (pressure, load); without one, today's live reading."""
+    for path in capacity.machine_root().glob(f"{resource_sample.PREFIX}*.json"):
+        copy(path, into / SAMPLES / path.name)
+    stored = resource_sample.latest(into / SAMPLES)
     if stored is None:
         with capacity.observing():
             return None, capacity.machine_load()

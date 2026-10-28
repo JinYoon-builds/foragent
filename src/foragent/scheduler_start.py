@@ -49,9 +49,10 @@ def _apply_budgets(
     """
     if (sample := getattr(ctx, "_budget_sample", None)) is not None:
         return sample  # Already applied in this tick.
+    measured_at = ctx.now()  # Before the sensors: a later publication keeps the measured time (D93).
     sample, machine = scheduler.machine_load(), machine_budget.values()
     ctx._budget_sample = sample
-    resource_sample.record(ctx.store, sample, ctx.now())  # The tick's one sample, kept for facts (D93).
+    resource_sample.record(ctx.store, sample, measured_at)
     scheduler.update_test_slots(
         machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
         swapins=getattr(sample, "swapins", None),
