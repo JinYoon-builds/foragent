@@ -1,7 +1,7 @@
 """Patches at the original watch module must reach extracted implementations."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 from conftest import BASE_TIME
 from foragent import cli, watch
@@ -68,6 +68,7 @@ def test_live_run_uses_replaced_facade_frame_and_clock(tmp_path, monkeypatch):
     watch.run(lambda: {}, tracker, store, config, tmp_path, now=lambda: BASE_TIME)
 
     frame.assert_called_once_with(snapshot, config, tmp_path, tick=0, width=80,
-                                  selected=None, now=BASE_TIME, layout={}, height=24, state={})
+                                  selected=None, now=BASE_TIME, layout={}, height=24, state=ANY,
+                                  scrolls=True)
     assert screen.addstr.call_args_list[0].args[:3] == (0, 0, "facade live frame")
     assert not (tmp_path / "watch.pid").exists()

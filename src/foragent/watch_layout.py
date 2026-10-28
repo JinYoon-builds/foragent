@@ -114,7 +114,7 @@ SCREEN_ROWS = 24
 def _frame(
     snapshot: Snapshot, config: Config, repo_root: Path, *, tick: int, width: int,
     selected: str | None, now: datetime, layout: dict[str, Any] | None = None, height: int | None = SCREEN_ROWS,
-    state: dict[str, Any] | None = None,
+    state: dict[str, Any] | None = None, scrolls: bool = False,
 ) -> list[Line]:
     """Stack the sections by ORDER with one blank line between non-empty ones.
 
@@ -122,7 +122,8 @@ def _frame(
     footer) always stay; the others give way from the bottom up. A section
     marked STAYS (the fireworks band while it plays) stays too and is moved up into
     the first screen when the KEEP sections push it below. ``state`` is the live view's
-    memory across frames (None for a stateless frame).
+    memory across frames (None for a stateless frame). ``scrolls`` (the live view)
+    keeps every section, since the screen scrolls the whole frame; STAYS still moves.
     """
     from foragent import watch
 
@@ -173,7 +174,16 @@ def _frame(
         return frame, hits
 
     frame, hits = assemble()
-    if height is not None and len(frame) > height:
+    if height is not None and len(frame) > height and not scrolls:
+        # A folded lane's last finished row and toggle give way first.
+        for index, (section, lines, own) in enumerate(rendered):
+            if getattr(section, "TIGHT", False):
+                own = []
+                rendered[index] = (section, list(section.render(
+                    snapshot, config, repo_root, tick=tick, width=width, selected=selected, now=now,
+                    layout=layout, top=0, hits=own, rows=True, height=height, state=state, tight=True)), own)
+        frame, hits = assemble()
+    if height is not None and len(frame) > height and not scrolls:
         # Lane rows win: the other sections give way from the bottom up.
         order = reversed(range(len(rendered)))
         for index in order:
@@ -203,19 +213,55 @@ def _frame(
                     for x0, y0, x1, y1, item in hits]
     if layout is not None:
         layout["hits"] = hits
+    if state is not None:
+        # Scrolling and the keyboard highlight read the frame's size and issue rows.
+        state["length"] = len(frame)
+        state["rows"] = sorted({(y0, target[1]) for x0, y0, x1, y1, target in hits
+                                if isinstance(target, tuple) and target[0] == "acorn" and x1 > x0})
     return [watch._fit(list(line), width) for line in frame]
+
+
+def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width: int, language: str) -> list[Line]:
+    """The rows a screen of ``height`` shows.
+
+    A frame that fits is shown whole. A taller one shows ``height - 1`` rows from
+    ``state['scroll']`` (kept within the last full screen) and, in place of the key
+    help, a position line with the text-selection hint.
+    """
+    from foragent import watch
+
+    state = {} if state is None else state
+    state["height"] = height
+    state["length"] = len(frame)
+    if len(frame) <= height:
+        state["scroll"] = 0
+        return frame
+    rows = max(1, height - 1)
+    top = state["scroll"] = max(0, min(state.get("scroll", 0), watch.scroll_limit(state)))
+    position = watch.text("acorns_position", language, first=top + 1, last=min(len(frame), top + rows),
+                          total=len(frame))
+    footer = watch._fit(watch._line(f"{position} · {watch.text('acorns_select', language)}", "dim"), width)
+    return frame[top:top + rows] + [footer]
 
 
 def render_frame(
     snapshot: Snapshot, config: Config, repo_root: Path, *, tick: int = 0, width: int = 120,
     selected: str | None = None, now: datetime | None = None,
-    state: dict[str, Any] | None = None, layout: dict[str, Any] | None = None,
+    state: dict[str, Any] | None = None, layout: dict[str, Any] | None = None, height: int | None = None,
 ) -> str:
-    """A single plain-text frame, sharing the live view's layout and data."""
+    """A single plain-text frame, sharing the live view's layout and data.
+
+    With ``height``, only the rows a screen that tall shows: the frame scrolled to
+    ``state['scroll']`` with a position line when it is taller than the screen.
+    Hit boxes keep their whole-frame rows.
+    """
     from foragent import watch
 
-    return "\n".join("".join(value for value, style in line).rstrip() for line in watch._frame(
+    frame = watch._frame(
         snapshot, config, repo_root, tick=tick, width=max(1, width), selected=selected,
         now=now or snapshot.captured_at, **({} if layout is None else {"layout": layout}),
         **({} if state is None else {"state": state}),
-    ))
+    )
+    if height is not None:
+        frame = watch._window(frame, state, max(1, height), max(1, width), config.language)
+    return "\n".join("".join(value for value, style in line).rstrip() for line in frame)

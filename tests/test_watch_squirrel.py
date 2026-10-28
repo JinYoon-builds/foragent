@@ -95,7 +95,7 @@ def test_rows_win_and_sections_give_way_from_the_bottom_on_a_short_screen(tmp_pa
     short = watch.render_frame(busy_snapshot(18), config, tmp_path, width=100).splitlines()
     assert len(tall) > 24 >= len(short)
     assert sum(line.startswith("🐿") or line.startswith("[*]") for line in short) == 18
-    assert short[-1] == "q: quit · s · m · j/k"
+    assert short[-1] == "j/k move · Enter open · f fold · a all · o orchestrator · x close · q quit"
     assert "handled" not in "\n".join(short), "the events log below the rows gives way first"
 
 

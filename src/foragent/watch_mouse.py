@@ -1,8 +1,11 @@
-"""Mouse targets in the lane view.
+"""Mouse targets, keys and scrolling in the lane view.
 
 render_frame fills a caller-owned layout with hit boxes; coordinates are
-zero-based screen cells. Runtime dependencies resolve through foragent.watch
-to preserve its patch points.
+zero-based screen cells. Handlers change a caller-owned state: ``issue`` is the
+open box's number (or None), ``scroll`` the zero-based first visible frame row,
+``unfolded`` the lanes showing all their rows. Each frame records ``length``,
+``rows`` (issue rows as (y, number)) and, on a screen, ``height``. Runtime
+dependencies resolve through foragent.watch to preserve its patch points.
 """
 
 from typing import Any
@@ -20,16 +23,124 @@ def hit_test(layout: dict[str, Any], x: int, y: int) -> Any:
     return None
 
 
+def scroll_limit(state: dict[str, Any]) -> int:
+    """The last scroll offset: the last full screen, else (before any screen) the last row."""
+    length, height = state.get("length", 0), state.get("height")
+    if height:
+        return max(0, length - max(1, height - 1)) if length > height else 0
+    return max(0, length - 1)
+
+
+def scroll(state: dict[str, Any], rows: int) -> None:
+    state["scroll"] = max(0, min(state.get("scroll", 0) + rows, scroll_limit(state)))
+
+
+def highlighted(state: dict[str, Any]) -> int | None:
+    """The top visible issue row's number, else the first issue row below it on screen."""
+    top = state.get("scroll", 0)
+    height = state.get("height")
+    bottom = top + max(1, height - 1) if height and state.get("length", 0) > height else None
+    for y, number in sorted(state.get("rows", ())):
+        if y >= top and (bottom is None or y < bottom):
+            return number
+    return None
+
+
+def _open(state: dict[str, Any], number: int | None, store: StateStore) -> None:
+    """Open (or, with None, close) the issue box; the box reads the records through store."""
+    state["issue"] = number
+    if number is not None:
+        state["store"] = store
+
+
 def handle_mouse(
     button: str, x: int, y: int, layout: dict[str, Any], store: StateStore, config: Config,
     *, state: dict[str, Any] | None = None,
 ) -> None:
-    """Act on a click. The big squirrel switches to the orchestrator's recorded terminal."""
+    """Act on one mouse event. Wheel steps only scroll; a left click acts on its target."""
     from foragent import watch
 
-    if button != "left" or watch.hit_test(layout, x, y) != ("orchestrator", None):
+    state = {} if state is None else state
+    if button in ("wheel-down", "wheel-up"):
+        watch.scroll(state, 1 if button == "wheel-down" else -1)
         return
-    watch.switch_to_orchestrator(store)
+    if button != "left":
+        return
+    target = watch.hit_test(layout, x, y)
+    if target == ("orchestrator", None):
+        watch.switch_to_orchestrator(store)
+    elif isinstance(target, tuple) and target[0] == "acorn":
+        # The same issue closes its box; another issue switches the box to it.
+        _open(state, None if state.get("issue") == target[1] else target[1], store)
+    elif isinstance(target, tuple) and target[0] == "more":
+        toggle_lane(state, target[1])
+
+
+def toggle_lane(state: dict[str, Any], slug: str) -> None:
+    unfolded = set(state.get("unfolded", ()))
+    unfolded ^= {slug}
+    state["unfolded"] = unfolded
+
+
+def handle_key(key: str, store: StateStore, config: Config, *, state: dict[str, Any] | None = None) -> bool:
+    """Act on one key name; True asks the view to quit.
+
+    j/k (and the arrows) move one row, Enter opens the highlighted row's box, f folds
+    its lane, a unfolds every lane when any is folded (else folds all), o switches to
+    the orchestrator, x or Esc closes the box (Esc quits when none is open). While a
+    box is open, Enter, f and a do nothing.
+    """
+    from foragent import watch
+
+    state = {} if state is None else state
+    is_open = state.get("issue") is not None
+    if key in ("q", "Q"):
+        return True
+    if key == "esc":
+        if not is_open:
+            return True
+        state["issue"] = None
+    elif key == "x":
+        state["issue"] = None
+    elif key in ("j", "down"):
+        watch.scroll(state, 1)
+    elif key in ("k", "up"):
+        watch.scroll(state, -1)
+    elif key in ("pagedown", "pageup"):
+        step = max(1, (state.get("height") or 3) - 2)
+        watch.scroll(state, step if key == "pagedown" else -step)
+    elif key == "o":
+        watch.switch_to_orchestrator(store)
+    elif is_open:
+        pass
+    elif key == "a":
+        lanes = set(config.lanes) | set(state.get("lanes", ()))
+        unfolded = set(state.get("unfolded", ()))
+        state["unfolded"] = set() if lanes <= unfolded else lanes | unfolded
+    elif key in ("enter", "f"):
+        number = watch.highlighted(state)
+        if number is None:
+            return False
+        if key == "enter":
+            _open(state, number, store)
+        elif (slug := state.get("issue_lanes", {}).get(number)) is not None:
+            watch.toggle_lane(state, slug)
+    return False
+
+
+def osc8(url: str, text: str) -> str:
+    """Text that a terminal shows as a link to url (OSC 8)."""
+    return f"\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\"
+
+
+def terminal_setup_sequences() -> list[str]:
+    """Written before curses starts: the alternate screen, so the view leaves no scrollback."""
+    return ["\x1b[?1049h"]
+
+
+def terminal_restore_sequences() -> list[str]:
+    """Written when the view ends or re-executes: back to the main screen."""
+    return ["\x1b[?1049l"]
 
 
 def switch_to_orchestrator(store: StateStore) -> bool:

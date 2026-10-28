@@ -6,9 +6,14 @@ Runtime dependencies resolve through foragent.watch to preserve its patch points
 from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
+import re
 
 from foragent.config import Config
 from foragent.watch_data import Snapshot
+
+
+# A visible issue number, linked to its GitHub page after each refresh.
+ISSUE_NUMBER = re.compile(r"(?<![\w#])#(\d+)(?!\w)")
 
 
 def color_pairs(colors: int) -> list[tuple[int, int]]:
@@ -37,7 +42,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
 
     import curses
 
-    styles = {"bold": curses.A_BOLD, "edge": curses.A_BOLD}
+    styles = {"bold": curses.A_BOLD, "edge": curses.A_BOLD, "dim": curses.A_DIM}
     if curses.has_colors():
         curses.start_color()
         curses.use_default_colors()
@@ -53,23 +58,35 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
         curses.curs_set(0)
     except curses.error:
         pass
+    try:
+        curses.set_escdelay(25)  # Esc closes a box at once instead of waiting for a sequence.
+    except (curses.error, AttributeError):
+        pass
     screen.keypad(True)
+    wheel = getattr(curses, "BUTTON4_PRESSED", 0), getattr(curses, "BUTTON5_PRESSED", 0)
+    click = curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
     if store is not None:
         try:
-            curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            curses.mouseinterval(0)  # Presses arrive at once; a wheel step is never a click.
         except curses.error:
             pass  # A terminal without mouse support keeps the keyboard view.
     screen.timeout(300)
     selected = None
     show_detail = False
-    offset = 0
     digits = ""
     error = ""
     animation_started = watch.time.monotonic()
     next_refresh = animation_started + 5
     pending = None
     started_build = watch._installed_build()
-    view_state: dict = {}  # Memory across frames, such as when each order's fireworks began.
+    # Memory across frames: fireworks start times, folds, scroll and the open issue box.
+    view_state: dict = {}
+    if store is not None:
+        view_state["store"] = store
+    keys = {curses.KEY_DOWN: "down", curses.KEY_UP: "up", curses.KEY_NPAGE: "pagedown",
+            curses.KEY_PPAGE: "pageup", 27: "esc", **{ord(key): key for key in "jkfaoxqQ"}}
+    last_painted = None
     with ExitStack() as cleanup:
         worker = cleanup.enter_context(watch.ThreadPoolExecutor(max_workers=1))
         while True:
@@ -96,54 +113,84 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             layout: dict = {}
             try:
                 # The terminal's own width, so the 60- and 100-column rules hold as in a plain frame.
+                # The live view keeps every section and scrolls the whole frame.
                 frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(1, width), selected=selected,
                                      now=now(), **({} if store is None else {"layout": layout}), height=height,
-                                     state=view_state)
+                                     state=view_state, scrolls=True)
             except ImportError:
                 # A reinstall can briefly leave modules missing; restart on the installed code.
                 return _restart(cleanup)
-            # Keep keyboard help on screen even when there are more lanes than rows.
-            body, footer = frame[:-1], frame[-1]
-            if error:
-                footer = watch._fit(watch._line(error, "yellow"), max(1, width))
             if show_detail:
-                offset = len(body)
+                view_state["scroll"] = len(frame)  # Jump to the lane details at the end.
                 show_detail = False
-            offset = max(0, min(offset, len(body) - max(1, height - 1)))
-            visible = body[offset:offset + max(0, height - 1)]
+            visible = watch._window(frame, view_state, max(1, height), max(1, width), config.language)
+            # A frame that fits keeps its key help on the bottom row.
+            if len(frame) <= height and visible:
+                visible = visible[:-1] + [[]] * (height - len(visible)) + visible[-1:]
+            if error:
+                visible = visible[:-1] + [watch._fit(watch._line(error, "yellow"), max(1, width))]
+            top = view_state.get("scroll", 0)
+            mark = watch.highlighted(view_state) if view_state.get("issue") is None else None
+            marked = {y - top for y, number in view_state.get("rows", ()) if number == mark}
             screen.erase()
-            for y, line in [*enumerate(visible), (height - 1, footer)]:
+            links: list[str] = []
+            for y, line in enumerate(visible[:max(1, height)]):
                 x = 0
                 # _frame already cut every line to the width; it is painted as it is.
                 for value, style in line:
+                    attribute = styles.get(style, 0) | (curses.A_REVERSE if y in marked else 0)
                     try:
-                        screen.addstr(y, x, value, styles.get(style, 0))
+                        screen.addstr(y, x, value, attribute)
                     except curses.error:
                         # Writing the bottom-right cell reports an error after drawing it;
                         # a resize between measuring and painting does too.
                         pass
+                    for found in ISSUE_NUMBER.finditer(value):
+                        url = watch.issue_url(config, int(found[1]))
+                        if url is not None:
+                            look = ("\x1b[2m" if style == "dim" else "") + ("\x1b[7m" if y in marked else "")
+                            links.append(f"\x1b[{y + 1};{x + watch._cells(value[:found.start()]) + 1}H{look}"
+                                         + watch.osc8(url, found[0]) + ("\x1b[0m" if look else ""))
                     x += watch._cells(value)
             screen.refresh()
+            # Curses cannot write OSC 8: each visible #n is written again as a link in place,
+            # whenever curses may have repainted it.
+            painted = (links, [[value for value, _ in line] for line in visible], sorted(marked))
+            if links and painted != last_painted:
+                watch.sys.stdout.write("".join(links))
+                watch.sys.stdout.flush()
+            last_painted = painted
             key = screen.getch()
             slugs = list(snapshot.status["lanes"])
-            if key in (ord("q"), ord("Q"), 27):
-                return
             if key == curses.KEY_MOUSE and store is not None:
                 try:
                     _, x, y, _, buttons = curses.getmouse()
                 except curses.error:
                     continue
-                if y < height - 1 and buttons & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
-                    watch.handle_mouse("left", x, offset + y, layout, store, config)
+                if buttons & wheel[0]:
+                    watch.handle_mouse("wheel-up", x, top + y, layout, store, config, state=view_state)
+                elif buttons & wheel[1]:
+                    watch.handle_mouse("wheel-down", x, top + y, layout, store, config, state=view_state)
+                elif buttons & click and y < len(visible) - (len(frame) > height):
+                    watch.handle_mouse("left", x, top + y, layout, store, config, state=view_state)
                 continue
-            if key in (curses.KEY_DOWN, curses.KEY_NPAGE):
-                offset += 1 if key == curses.KEY_DOWN else max(1, height - 2)
-            elif key in (curses.KEY_UP, curses.KEY_PPAGE):
-                offset -= 1 if key == curses.KEY_UP else max(1, height - 2)
-            elif key in range(ord("0"), ord("9") + 1):
+            if key in range(ord("0"), ord("9") + 1):
                 digits = (digits + chr(key))[-len(str(len(slugs))):]
                 if len(slugs) > 9:
                     continue
+            elif key in (10, 13, curses.KEY_ENTER) and not digits:
+                if store is not None:
+                    watch.handle_key("enter", store, config, state=view_state)
+                continue
+            elif key in keys:
+                if keys[key] in ("q", "Q") or (keys[key] == "esc" and view_state.get("issue") is None):
+                    return
+                if store is not None:
+                    watch.handle_key(keys[key], store, config, state=view_state)
+                elif keys[key] in ("down", "up", "j", "k", "pagedown", "pageup"):
+                    step = 1 if keys[key] in ("down", "up", "j", "k") else max(1, height - 2)
+                    watch.scroll(view_state, -step if keys[key] in ("up", "k", "pageup") else step)
+                continue
             elif key not in (10, 13, curses.KEY_ENTER):
                 continue
             if digits:
@@ -154,4 +201,4 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     selected = None if selected == slug else slug
                     show_detail = selected is not None
                     if selected is None:
-                        offset = 0
+                        view_state["scroll"] = 0
