@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 import json
 import logging
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -87,6 +88,7 @@ class InitReport:
     board_id: str | None = None
     board_planned: bool = False
     removed: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     # The tracker setup used; fa init reuses it to look up starter-order facts.
     tracker: object = field(default=None, repr=False, compare=False)
 
@@ -111,6 +113,7 @@ class InitReport:
             lines.append("Would install launchd job.")
         elif self.launchd_label:
             lines.append(f"launchd installed: {self.launchd_label}")
+        lines.extend(self.notes)
         return "\n".join(lines)
 
 
@@ -181,6 +184,22 @@ def _logged_in(tool: str) -> bool:
     return isinstance(status, dict) and status.get("loggedIn") is True
 
 
+def _claude_installed() -> bool:
+    try:
+        result = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _claude_by_env() -> str | None:
+    """How an installed, logged-out Claude Code still runs (#889): ``oauth`` (a token, subscription)
+    before ``api`` (ANTHROPIC_API_KEY, billed); None otherwise. The key itself is never read."""
+    kind = ("oauth" if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            else "api" if os.environ.get("ANTHROPIC_API_KEY") else None)
+    return kind if kind is not None and _claude_installed() else None
+
+
 def _preflight_language(root: Path, language: str | None) -> str:
     """Language for errors raised before setup: the flag, else the existing config, else English."""
     if language is not None:
@@ -232,6 +251,7 @@ def init_repo(
     added = {}
     updated_config = None
     role_source = None
+    notes: list[str] = []
     if config_path.exists():
         config = load_config(root)
         base_branch = config.base_branch
@@ -260,6 +280,8 @@ def init_repo(
     else:
         codex_available = _logged_in("codex")
         claude_available = _logged_in("claude")
+        claude_env = None if claude_available else _claude_by_env()
+        claude_available = claude_available or claude_env is not None
         if not codex_available and not claude_available:
             raise ConfigError("No logged-in coding tool found; log in to Claude Code or Codex and retry.")
         if executor is None and not codex_available:
@@ -288,6 +310,8 @@ def init_repo(
             _validate({**asdict(config), "claude_quota": {**config.claude_quota, "mode": claude_quota}})
             config = replace(config, claude_quota={**config.claude_quota, "mode": claude_quota})
         contents = {".foragent.yml": CONFIG_COMMENT + yaml.safe_dump(minimal, sort_keys=False), **contents}
+        if claude_env == "api":  # The key makes Claude available; spending stays the person's choice.
+            notes.append(text("init_api_key_hint", config.language))
     if config.checks == "ci":
         contents[WORKFLOW] = workflow_text(config)
     if not (root / "tests/acceptance").exists():
@@ -331,7 +355,7 @@ def init_repo(
         return InitReport(created, existed, True, push_planned=push_planned or (board_change and not no_push),
                           commit_planned=bool(pending) or board_change, launchd_planned=not no_launchd,
                           normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_planned=board_planned,
-                          removed=removed)
+                          removed=removed, notes=notes)
 
     # GhTracker counts its own attempts; its default runner must not count them again.
     tracker = tracker or GhTracker(repo, run=gh_run)
@@ -397,4 +421,4 @@ def init_repo(
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     return InitReport(created, existed, False, bool(pending), push_planned, label,
                       normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
-                      tracker=tracker)
+                      notes=notes, tracker=tracker)
