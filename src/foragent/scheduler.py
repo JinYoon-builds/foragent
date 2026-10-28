@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, launchd, orch_github, orch_plan, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_github, orch_plan, orch_push, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -80,7 +80,6 @@ from foragent.scheduler_lanes import (  # noqa: E402
 
 
 def tick(ctx: TickContext) -> TickReport:
-    ctx._push_ready = False  # Set once this tick gets past its GitHub refresh and wait check (#129).
     with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep:
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
@@ -103,7 +102,6 @@ def tick(ctx: TickContext) -> TickReport:
             except TrackerError as exc:
                 if not exc.is_rate_limit:
                     raise
-                ctx._push_ready = False  # A tick that fails after the wait check sends no push.
                 return keep(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions))
             # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
             if request := timed("tidy_check", tidy.post_if_due, ctx.store):
@@ -128,9 +126,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             recorder.refresh_issues(observed_at=started)
             board.refresh_cards(ctx, recorder)
         ctx.tracker.flush_outbox()
-    if skipped := _github_wait(ctx, {}, "github_wait_after_refresh"):
+    if skipped := orch_push.refresh_waited(ctx, _github_wait(ctx, {}, "github_wait_after_refresh")):  # #129
         return TickReport(skipped=skipped)
-    ctx._push_ready = True
     snapshot = current_snapshot()
     processes_available = snapshot is None or snapshot.available
     # Unknown liveness defers routine recovery while the queue keeps moving.

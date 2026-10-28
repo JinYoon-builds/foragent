@@ -206,6 +206,7 @@ def deciding(ctx, acquired: bool = True):
     that did not get the lock touches nothing; the tick holding it decides.
     """
     kept = []
+    ctx._push_ready = False  # #129: set by orch_push.refresh_waited once this tick passes its wait check.
 
     def keep(report):
         kept.append(report)

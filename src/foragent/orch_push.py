@@ -62,6 +62,16 @@ def _journal(store: StateStore) -> list[dict]:
     return events
 
 
+def refresh_waited(ctx, skipped: str | None) -> str | None:
+    """Mark the tick ready to push when its post-refresh GitHub wait check passed; return ``skipped``.
+
+    ``orch_spawn.deciding`` clears the mark when the tick starts and a rate limit
+    later in the tick clears it again, so only a completing tick pushes.
+    """
+    ctx._push_ready = skipped is None
+    return skipped
+
+
 def tick_line(issues: list[int], outage: bool, language: str) -> str | None:
     """The gate report's line for what this tick pushed, or None when nothing went out."""
     items = [f"#{n}" for n in issues] + ([text("push_blocked_tick_orch_off", language)] if outage else [])

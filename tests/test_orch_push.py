@@ -193,7 +193,6 @@ def _spawning(case, monkeypatch, tmp_path, *, send_raises=False, record_raises=F
         def broken(*args, **kwargs):
             raise OSError("disk full")
         monkeypatch.setattr(orch_spawn, "_record_session", broken)
-    case.ctx._push_ready = True
     repo = tmp_path / "repo"
     repo.mkdir()
     case.ctx.repo_root = repo
@@ -207,6 +206,7 @@ def test_spawn_suppresses_pushes_even_when_its_bookkeeping_fails(case, monkeypat
     label(case, 4, "blocked")
     launches = _spawning(case, monkeypatch, tmp_path, **{failure: True})
     with orch_spawn.deciding(case.ctx) as keep:
+        orch_push.refresh_waited(case.ctx, None)  # A completing tick.
         report = keep(SimpleNamespace(actions=[]))
     assert len(launches) == 1
     assert len(case.pushes) == 1  # Only the spawn push was tried.
@@ -240,8 +240,8 @@ def _deciding_report(case, monkeypatch):
     monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")
     monkeypatch.setattr(orch_binding, "record_tick", lambda ctx: None)
     monkeypatch.setattr(orch_stale_files, "report", lambda ctx: None)
-    case.ctx._push_ready = True
     with orch_spawn.deciding(case.ctx) as keep:
+        orch_push.refresh_waited(case.ctx, None)  # A completing tick.
         return keep(SimpleNamespace(actions=[]))
 
 
@@ -263,3 +263,38 @@ def test_failed_push_report_line_follows_the_project_language(case, monkeypatch)
     monkeypatch.setattr(orch_push, "after_tick", broken)
     case.ctx.config = replace(case.ctx.config, language="ko")
     assert _deciding_report(case, monkeypatch).actions == ["막힌 일 알림을 보내지 못했어요: disk full"]
+
+
+@pytest.mark.parametrize("rate_limited", [False, True])
+def test_only_a_tick_past_its_wait_check_without_a_rate_limit_pushes(case, monkeypatch, rate_limited):
+    from foragent import orch_binding, orch_spawn, orch_stale_files, scheduler, scheduler_start
+
+    monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")
+    monkeypatch.setattr(orch_binding, "record_tick", lambda ctx: None)
+    monkeypatch.setattr(orch_stale_files, "report", lambda ctx: None)
+    monkeypatch.setattr(scheduler.orch_github, "pause", lambda ctx, exc: NOW)
+    monkeypatch.setattr(scheduler, "_apply_budgets", lambda ctx, ready: None)
+    label(case, 4, "blocked")
+    case.ctx._push_ready = True  # A previous tick's mark must not leak into this one.
+    with orch_spawn.deciding(case.ctx) as keep:
+        keep(SimpleNamespace(actions=[]))
+    assert case.pushes == []
+    with orch_spawn.deciding(case.ctx) as keep:
+        assert orch_push.refresh_waited(case.ctx, None) is None
+        if rate_limited:
+            scheduler_start._github_pause(case.ctx, OSError("rate limit"))
+        keep(SimpleNamespace(actions=[]))
+    assert len(case.pushes) == (0 if rate_limited else 1)
+
+
+def test_a_waiting_tick_does_not_push(case, monkeypatch):
+    from foragent import orch_binding, orch_spawn, orch_stale_files
+
+    monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")
+    monkeypatch.setattr(orch_binding, "record_tick", lambda ctx: None)
+    monkeypatch.setattr(orch_stale_files, "report", lambda ctx: None)
+    label(case, 4, "blocked")
+    with orch_spawn.deciding(case.ctx) as keep:
+        assert orch_push.refresh_waited(case.ctx, "GitHub rate limit until later") == "GitHub rate limit until later"
+        keep(SimpleNamespace(actions=[]))
+    assert case.pushes == []

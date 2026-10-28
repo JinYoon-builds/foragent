@@ -274,6 +274,7 @@ def _github_wait(ctx: TickContext, ready: dict[str, list[int]], name: str) -> st
 
 def _github_pause(ctx: TickContext, exc: Exception) -> str:
     """Record a GitHub rate limit as one timed step and apply this tick's budgets."""
+    ctx._push_ready = False  # #129: a tick that hits a rate limit after its wait check sends no push.
     with step("github_pause"):
         until = scheduler.orch_github.pause(ctx, exc)
         scheduler._apply_budgets(ctx, {})
