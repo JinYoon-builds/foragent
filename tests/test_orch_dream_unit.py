@@ -490,3 +490,30 @@ def test_progress_recorded_after_the_stall_check_voids_the_kill(world, monkeypat
     monkeypatch.setattr("foragent.sleep_credit.in_wake_grace", wake_grace)
     recover(world)
     assert world.killed == [] and world.store.get_dream("orch").status == "running"
+
+
+def started(world, launcher, monkeypatch):
+    from foragent import scheduler
+
+    monkeypatch.setattr(scheduler, "_has_slot", lambda ctx, budget: True)
+    monkeypatch.setattr(orch_dream, "dream_due", lambda *args: ["orch"])
+    world.ctx.launcher = launcher
+    orch_dream.start(world.ctx, ["orch"], 2, SimpleNamespace(actions=[]))
+    return world.store.get_dream("orch")
+
+
+def test_launcher_without_a_process_is_a_failed_start_and_the_lane_stays_due(world, monkeypatch):
+    merged_run(world)
+    run = started(world, lambda **kwargs: None, monkeypatch)
+    assert (run.status, run.outcome) == ("finished", "error")
+    assert world.store.active_runs() == [] and orch_dream.last_dream_at(world.store, "orch") is None
+
+
+def test_in_process_worker_that_finished_is_left_alone(world, monkeypatch):
+    def worker(**kwargs):  # Runs synchronously and completes before the launcher returns.
+        orch_dream.record_done(world.store, "orch", 0, "en")
+        world.store.finish_run(KEY, "dreamed", "0 memory lines tidied.")
+
+    run = started(world, worker, monkeypatch)
+    assert (run.status, run.outcome) == ("finished", "dreamed")
+    assert orch_dream.last_dream_at(world.store, "orch") is not None

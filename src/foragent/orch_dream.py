@@ -176,7 +176,15 @@ def start(ctx: TickContext, lanes: list[str], budget: int, report: TickReport) -
     pid = ctx.launcher(kind="dream", lane=lane)
     if pid is not None:  # As for an issue run: the record's pid, with its observed birth identity.
         ctx.store.update_run(f"dream-{lane}", pid=pid)
-    report.actions.append(f"lane {lane} started dreaming (pid={pid})")
+        report.actions.append(f"lane {lane} started dreaming (pid={pid})")
+        return
+    run = ctx.store.get_dream(lane)  # A fresh read: an in-process worker may already have finished it.
+    if run is not None and run.status == "running":
+        # No process and an unfinished record: a failed start; the lane stays due.
+        ctx.store.finish_run(run.key, "error", "The launcher started no dream process.")
+        report.actions.append(f"lane {lane} dream start failed: no process")
+    else:
+        report.actions.append(f"lane {lane} dreamed in process")
 
 
 def worktree_path(store: StateStore, lane: str) -> Path:

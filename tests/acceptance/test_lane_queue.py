@@ -36,7 +36,9 @@ def queue_case(git_history, tmp_path, monkeypatch, isolated_home):
     case.tick_ctx = tick_context(case)
     case.launched = []
 
-    def launch(number):
+    def launch(number=None, *, kind="issue", lane=None):
+        if kind != "issue":  # #189: lanes may dream; this test counts issue starts only.
+            return None
         case.launched.append(number)
         return os.getpid()  # A second tick must see a live runner, not recover a crash.
 
