@@ -168,7 +168,7 @@ def test_live_session_without_heartbeat_is_not_off(case, monkeypatch):
     assert case.pushes == []
 
 
-def _spawning(case, monkeypatch, tmp_path, *, send_raises=False, record_raises=False):
+def _spawning(case, monkeypatch, tmp_path, *, send_raises=False, record_raises=False, launch_fails=False):
     """A tick context whose spawn decision opens an orchestrator (no heartbeat, approved work)."""
     import shutil
     import subprocess
@@ -182,8 +182,13 @@ def _spawning(case, monkeypatch, tmp_path, *, send_raises=False, record_raises=F
     monkeypatch.delenv("FORAGENT_ORCH_SPAWN", raising=False)
     monkeypatch.delenv("ORCA_TERMINAL_HANDLE", raising=False)
     monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.setattr(subprocess, "run", lambda argv, *a, **k: launches.append(argv)
-                        or subprocess.CompletedProcess(argv, 0))
+    def run(argv, *args, **kwargs):
+        launches.append(argv)
+        if launch_fails:
+            raise subprocess.TimeoutExpired(argv, 10)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(shutil, "which", lambda name: f"/offline/bin/{name}" if name == "claude" else None)
     monkeypatch.setattr(orch_binding, "record_tick", lambda ctx: None)
     monkeypatch.setattr(orch_stale_files, "report", lambda ctx: None)
@@ -298,3 +303,51 @@ def test_a_waiting_tick_does_not_push(case, monkeypatch):
         assert orch_push.refresh_waited(case.ctx, "GitHub rate limit until later") == "GitHub rate limit until later"
         keep(SimpleNamespace(actions=[]))
     assert case.pushes == []
+
+
+@pytest.mark.parametrize("launch_fails", [False, True])
+def test_spawned_comes_from_the_launch_outcome_in_the_spawn_record(case, monkeypatch, tmp_path, launch_fails):
+    from foragent import orch_spawn
+
+    label(case, 4, "blocked")
+    launches = _spawning(case, monkeypatch, tmp_path, launch_fails=launch_fails)
+    seen = []
+    real = orch_push.after_tick
+    monkeypatch.setattr(orch_push, "after_tick", lambda ctx, spawned: seen.append(spawned) or real(ctx, spawned))
+    with orch_spawn.deciding(case.ctx) as keep:
+        orch_push.refresh_waited(case.ctx, None)  # A completing tick.
+        keep(SimpleNamespace(actions=[]))
+    record = json.loads((case.store.root / "orch-spawn.json").read_text())
+    assert len(launches) == 1 and record["launched"] is (not launch_fails)
+    assert seen == [not launch_fails]
+    # A failed or timed-out launch is not a spawn, so the blocked push goes out in the same tick.
+    assert [("#4" in push["line"]) for push in case.pushes] == ([True] if launch_fails else [False])
+
+
+def test_an_unchanged_launched_record_from_an_earlier_tick_is_not_this_ticks_spawn(case, monkeypatch, tmp_path):
+    from foragent import orch_spawn
+
+    label(case, 4, "blocked")
+    _spawning(case, monkeypatch, tmp_path)
+    (case.store.root / "orch-spawn.json").write_text(json.dumps(
+        {"spawned_at": NOW.isoformat(), "screen": "background", "launched": True}))  # Spacing holds this tick.
+    with orch_spawn.deciding(case.ctx) as keep:
+        orch_push.refresh_waited(case.ctx, None)
+        keep(SimpleNamespace(actions=[]))
+    assert len(case.pushes) == 1 and "#4" in case.pushes[0]["line"]
+
+
+def test_the_error_exit_of_a_tick_never_runs_the_push_step(case, monkeypatch):
+    from foragent import orch_binding, orch_spawn, orch_stale_files
+
+    monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")
+    monkeypatch.setattr(orch_binding, "record_tick", lambda ctx: None)
+    monkeypatch.setattr(orch_stale_files, "report", lambda ctx: None)
+    calls = []
+    monkeypatch.setattr(orch_push, "after_tick", lambda ctx, spawned: calls.append(spawned) or ([], False))
+    label(case, 4, "blocked")
+    with pytest.raises(RuntimeError):
+        with orch_spawn.deciding(case.ctx):
+            orch_push.refresh_waited(case.ctx, None)
+            raise RuntimeError("board sync failed")
+    assert calls == [] and case.pushes == []
