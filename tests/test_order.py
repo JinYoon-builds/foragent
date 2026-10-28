@@ -789,7 +789,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "pull_requests", "specs", "repo"}
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
     assert result["feedback"] == [{"number": 1, "title": "Feedback", "body": "Fix it\n\nAbout #8.", "about": 8}]
@@ -1363,3 +1363,17 @@ def test_perspectives_prompt_names_the_configured_language(tmp_path):
     assert "Write every question in Korean" in order_perspectives.prompt("skeptic", {}, tmp_path, "ko-KR")
     assert "Write every question in English" in order_perspectives.prompt("skeptic", {}, tmp_path)
     assert "'fr'" in order_perspectives.prompt("skeptic", {}, tmp_path, "fr")
+
+
+def test_context_supplies_open_and_merged_pr_history(tmp_path):
+    tracker = FakeTracker()
+    human = tracker.create_pr(head="human/readme", base="main", title="Human docs", body="")
+    tracker.merge_pr(human, expected_head_sha=tracker.pr_head_sha(human))
+    ours = tracker.create_pr(head="foragent/issue-7", base="main", title="Lane work", body="Closes #7")
+    tracker.merge_pr(ours, expected_head_sha=tracker.pr_head_sha(ours))
+    pending = tracker.create_pr(head="human/wip", base="main", title="Open work", body="")
+    prs = order.context(tmp_path, Config(), tracker)["pull_requests"]
+    assert [(pr["number"], pr["state"], pr["foragent"]) for pr in prs] == [
+        (pending, "open", False), (ours, "merged", True), (human, "merged", False)]
+    assert [pr["title"] for pr in prs] == ["Open work", "Lane work", "Human docs"]
+    assert all(pr["merged_at"] for pr in prs[1:]) and prs[0]["merged_at"] is None

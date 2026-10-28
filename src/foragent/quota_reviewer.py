@@ -14,8 +14,11 @@ if TYPE_CHECKING:
 
 
 def can_review(config: Config, name: str) -> bool:
-    """Unlimited and unknown executors never review."""
-    return name in ("claude", "codex") and scheduler_quota.entry_for(config, name).get("quota") != "unlimited"
+    """Unlimited, unknown and uncapped api executors (Claude on an API key, #889) never review."""
+    entry = scheduler_quota.entry_for(config, name)
+    quota = entry.get("quota")
+    return name in ("claude", "codex") and quota != "unlimited" and not (
+        quota == "api" and entry.get("spend_cap") is None)
 
 
 def choose_reviewer(config: Config, executor: str, claude_paused: bool,
