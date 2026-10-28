@@ -184,15 +184,21 @@ def start(ctx: TickContext, lanes: list[str], budget: int, report: TickReport) -
                 scheduler.orch_github.pause(ctx, exc)  # Only the tick records the shared GitHub pause.
             report.actions.append(f"lane {lane} dream not started: {' '.join(str(exc).split())[:200]}")
             return
-        if open_pr is None:
-            break
-        report.actions.append(f"lane {lane} dream PR #{open_pr} is open; the lane does not dream")
+        if open_pr is not None:
+            report.actions.append(f"lane {lane} dream PR #{open_pr} is open; the lane does not dream")
+            continue
+        # Slot and start conditions again under the machine lock, which is the only lock held: the
+        # record is written as an issue start's reservation is, never waiting on the state lock here.
+        # A lane no longer admissible (its issue started this tick) gives way to the next due lane.
+        with scheduler.machine_lock(ctx.store):
+            if not scheduler._has_slot(ctx, budget):
+                return
+            if lane not in _admissible(ctx, [lane]):
+                continue
+            ctx.store.start_dream(lane, worktree=worktree_path(ctx.store, lane), under_machine_lock=True)
+        break
     else:
         return
-    with scheduler.machine_lock(ctx.store):  # Slot and start conditions again, under the lock.
-        if not scheduler._has_slot(ctx, budget) or lane not in _admissible(ctx, [lane]):
-            return
-        ctx.store.start_dream(lane, worktree=worktree_path(ctx.store, lane))
     pid = ctx.launcher(kind="dream", lane=lane)
     if pid is not None:  # As for an issue run: the record's pid, with its observed birth identity.
         ctx.store.update_run(f"dream-{lane}", pid=pid)

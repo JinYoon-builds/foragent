@@ -754,3 +754,71 @@ def test_recovery_with_an_unreadable_process_table_neither_finishes_nor_kills(wo
     recover(world)
     run = world.store.get_dream("orch")
     assert run.status == "running" and world.removed == []
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["completed", "failed"])
+def test_worker_finishes_its_record_only_after_removing_its_worktree(world, fails):
+    seen = []
+
+    def edit(worktree):
+        if fails:
+            raise RuntimeError("executor crashed")
+
+    calls, publish = worker_world(world, edit, lambda: 1)
+    removing = world.ctx.git.remove_worktree
+
+    def remove(path):
+        seen.append(world.store.get_dream("orch").status)
+        removing(path)
+
+    world.ctx.git.remove_worktree = remove
+    dreaming(world, pid=None, start=None)
+    if fails:
+        with pytest.raises(RuntimeError):
+            orch_dream_worker.run_dream("orch", world.ctx)
+    else:
+        assert orch_dream_worker.run_dream("orch", world.ctx) == 0
+    assert seen and seen[-1] == "running", "the record still says running while the worker cleans up"
+    assert world.store.get_dream("orch").outcome == ("error" if fails else "dreamed")
+
+
+def test_dream_start_holds_one_lock_at_a_time(world, monkeypatch):
+    from foragent import scheduler as facade
+
+    held = []
+
+    @contextmanager
+    def machine(store):
+        held.append("machine")
+        yield
+        held.remove("machine")
+
+    original = world.store._state_lock
+
+    def state():
+        assert "machine" not in held, "the state lock must never be awaited under the machine lock"
+        return original()
+
+    monkeypatch.setattr(facade, "_has_slot", lambda ctx, budget: True)
+    monkeypatch.setattr(facade, "machine_lock", machine)
+    monkeypatch.setattr(orch_dream, "dream_due", lambda *args: ["orch"])
+    monkeypatch.setattr(world.store, "_state_lock", state)
+    world.ctx.tracker = SimpleNamespace(find_pr=lambda branch: None)
+    world.ctx.launcher = lambda **kwargs: 5100
+    orch_dream.start(world.ctx, ["orch"], 2, SimpleNamespace(actions=[]))
+    run = world.store.get_dream("orch")
+    assert run.status == "running" and run.pid == 5100
+
+
+def test_a_candidate_whose_issue_started_this_tick_gives_way_to_the_next_due_lane(world, monkeypatch):
+    from foragent import scheduler as facade
+
+    looked = []
+    monkeypatch.setattr(facade, "_has_slot", lambda ctx, budget: True)
+    monkeypatch.setattr(orch_dream, "dream_due", lambda *args: ["view"])  # orch's ready issue started meanwhile.
+    world.ctx.config = Config(repo="o/r", lanes={name: {"paths": [f"{name}/**"]} for name in ("orch", "view")})
+    world.ctx.tracker = SimpleNamespace(find_pr=lambda branch: looked.append(branch))
+    world.ctx.launcher = lambda **kwargs: 5200
+    orch_dream.start(world.ctx, ["orch", "view"], 2, SimpleNamespace(actions=[]))
+    assert world.store.get_dream("orch") is None and world.store.get_dream("view").status == "running"
+    assert looked == ["foragent/dream-orch", "foragent/dream-view"], "one lookup per lane"

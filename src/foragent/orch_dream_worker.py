@@ -147,6 +147,9 @@ def run_dream(lane: str, ctx: RunContext) -> int:
     log = log_path(store, lane)
     log.parent.mkdir(parents=True, exist_ok=True)
     created = False
+    # The record is finished last, after the worktree cleanup: once it says finished, this worker
+    # touches nothing a later dream of the lane could own (D95).
+    final = ("error", "Dream worker ended before finishing.")
     try:
         if worktree.exists():
             ctx.git.remove_worktree(worktree)
@@ -193,7 +196,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             usage_events.record_from_log(store, log, offset, ctx.now())
         if classify_result(result) != "normal" or result.timed_out or result.exit_code not in {None, 0}:
             outcome = "limit-wait" if classify_result(result) == "limit" else "error"
-            store.finish_dream(lane, outcome, f"Dream executor ended without finishing (exit {result.exit_code}).")
+            final = (outcome, f"Dream executor ended without finishing (exit {result.exit_code}).")
             return 1
         proposal = worktree / ".foragent" / f"media-{lane}.md"
         if proposal.is_file():
@@ -208,14 +211,15 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             # Completed only once the PR exists after the push; a failure here ends the dream as error.
             pr = _publish(ctx, git, lane, memory, count)
         record_done(store, lane, count, config.language, ctx.now(), covered_until=covered_until, pr=pr)
-        store.finish_dream(lane, "dreamed", f"{count} memory lines tidied.")
+        final = ("dreamed", f"{count} memory lines tidied.")
         return 0
     except Exception as exc:
-        store.finish_dream(lane, "error", f"Dream failed: {exc}")
+        final = ("error", f"Dream failed: {exc}")
         raise
     finally:
         if created:
             try:
                 ctx.git.remove_worktree(worktree)
             except Exception:
-                pass  # The next dream removes a left-over worktree before it starts.
+                pass  # A left-over worktree is removed by the next dream before it starts.
+        store.finish_dream(lane, *final)

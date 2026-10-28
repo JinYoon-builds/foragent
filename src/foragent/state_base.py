@@ -86,15 +86,24 @@ class StateBase:
         paths = sorted((self.root / "runs").glob("dream-*.json"))
         return [run for path in paths if (run := self.get_dream(path.stem[6:])) is not None]
 
-    def start_dream(self, lane: str, *, worktree: str | Path) -> "Run":
-        with self._state_lock():
-            timestamp = self._timestamp()
-            # A fresh record, as start_run's for an issue: no earlier birth identity may judge this
-            # dream's worker. The lane does not dream while an earlier dream still owns processes.
-            run = _state.Run(0, f"foragent/dream-{lane}", str(worktree), None, timestamp, timestamp,
-                             lane=lane, tier="s", last_activity_at=timestamp, kind="dream")
-            self._write_json(self.root / "runs" / f"dream-{lane}.json", _state.asdict(run))
-            return run
+    def start_dream(self, lane: str, *, worktree: str | Path, under_machine_lock: bool = False) -> "Run":
+        """Write a fresh dream record.
+
+        ``under_machine_lock``: as prepare_run_start's reservation, the tick writes it while
+        holding the machine lock alone (one lock at a time, the order `fa orch facts` relies on).
+        A new dream record has no other writer then: the tick lock admits one tick, and an
+        earlier worker of the lane finished its record as its last act.
+        """
+        if not under_machine_lock:
+            with self._state_lock():
+                return self.start_dream(lane, worktree=worktree, under_machine_lock=True)
+        # A fresh record, as start_run's for an issue: no earlier birth identity may judge this
+        # dream's worker. The lane does not dream while an earlier dream still owns processes.
+        timestamp = self._timestamp()
+        run = _state.Run(0, f"foragent/dream-{lane}", str(worktree), None, timestamp, timestamp,
+                         lane=lane, tier="s", last_activity_at=timestamp, kind="dream")
+        self._write_json(self.root / "runs" / f"dream-{lane}.json", _state.asdict(run))
+        return run
 
     def finish_dream(self, lane: str, outcome: str, detail: str = "") -> "Run | None":
         with self._state_lock():
