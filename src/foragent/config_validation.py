@@ -59,11 +59,12 @@ def _validate(values: dict[str, Any]) -> None:
     for path, review in paths.items():
         if not isinstance(path, str) or not isinstance(review, str) or review not in _REVIEW_LEVELS:
             raise ConfigError(f"invalid review_paths entry: {path}")
+    listed = _validate_executors(values.get("executor_list"))
     for key in ("executor", "reviewer"):
         value = values[key]
         if key == "reviewer" and value is None:
             continue
-        allowed = _EXECUTORS | {"none"} if key == "reviewer" else _EXECUTORS
+        allowed = _EXECUTORS | {"none"} if key == "reviewer" else _EXECUTORS | listed
         if not isinstance(value, str) or value not in allowed:
             raise ConfigError(f"{key} must be codex or claude" + (" or none" if key == "reviewer" else ""))
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
@@ -124,8 +125,8 @@ def _validate(values: dict[str, Any]) -> None:
         for key in ("agent", "executor", "reviewer", "model", "title", "emoji"):
             if lane.get(key) is not None and not isinstance(lane[key], str):
                 raise ConfigError(f"lanes.{name}.{key} must be a string or null")
-        if lane.get("executor") is not None and lane["executor"] not in _EXECUTORS:
-            raise ConfigError(f"lanes.{name}.executor must be codex, claude, or null")
+        if lane.get("executor") is not None and lane["executor"] not in _EXECUTORS | listed:
+            raise ConfigError(f"lanes.{name}.executor must be codex, claude, an executors name, or null")
         if not isinstance(lane.get("skills", []), list) or any(
             not isinstance(skill, str) for skill in lane.get("skills", [])
         ):
@@ -184,6 +185,43 @@ def _validate(values: dict[str, Any]) -> None:
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
+
+QUOTAS = ("subscription", "api", "unlimited")
+
+
+def _validate_executors(entries: Any) -> set[str]:
+    """Check an explicit ordered executors list (#786); return its names."""
+    from foragent.config import ConfigError
+
+    if entries is None:  # Not set; `executors: null` is refused where the file is read.
+        return set()
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError("executors must be a nonempty list of {name, quota} entries")
+    names: list[str] = []
+    for index, entry in enumerate(entries):
+        where = f"executors[{index}]"
+        if not isinstance(entry, dict) or entry.keys() - {"name", "quota", "keep_percent", "spend_cap"}:
+            raise ConfigError(f"{where} must be a mapping of name, quota, keep_percent and spend_cap")
+        name = entry.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise ConfigError(f"{where}.name must be a nonempty executor name")
+        if name in names:
+            raise ConfigError(f"executors lists {name} twice")
+        names.append(name)
+        quota = entry.get("quota")
+        if not isinstance(quota, str) or quota not in QUOTAS:
+            raise ConfigError(f"{where}.quota must be subscription, api or unlimited")
+        # A written key must hold a valid value: `keep_percent: null` is not the same as leaving it out.
+        keep = entry.get("keep_percent")
+        if "keep_percent" in entry and (quota != "subscription" or type(keep) is not int or not 1 <= keep <= 100):
+            raise ConfigError(f"{where}.keep_percent must be an integer from 1 to 100 on a subscription executor")
+        cap = entry.get("spend_cap")
+        if "spend_cap" in entry and (quota == "unlimited" or isinstance(cap, bool)
+                                     or not isinstance(cap, (int, float)) or not cap > 0):
+            raise ConfigError(f"{where}.spend_cap must be a number above 0 on a subscription or api executor")
+        if quota == "api" and "spend_cap" not in entry:
+            raise ConfigError(f"{where}.spend_cap is required for an api executor; spending needs a daily cap")
+    return set(names)
 
 
 def _strings(value: Any) -> bool:

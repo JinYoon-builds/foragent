@@ -775,7 +775,7 @@ def test_review_returns_conflicted_pr_to_implementer_even_with_pass_verdict(run_
     c.executor.steps = [{"notes.txt": "resolved\n"}]
     assert review_only(1, c.ctx, verdict_head=head if resolved else None) == "merged"
     assert len(c.executor.calls) == 1
-    assert "충돌 마커가 남음: notes.txt:1" in c.executor.calls[0]["prompt"]
+    assert "Conflict marker left: notes.txt:1" in c.executor.calls[0]["prompt"]
     assert c.tracker.merged_prs == [pr]
     assert git_command(c.history.origin, "show", "foragent/issue-1:notes.txt") == "resolved"
     journal = c.store.root / "orch-events.jsonl"
