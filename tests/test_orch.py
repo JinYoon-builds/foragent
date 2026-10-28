@@ -631,6 +631,10 @@ def assert_review_harness_hold(c, monkeypatch, entry, path):
     assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
     assert any(path in comment.body for comment in c.tracker.list_comments(1)
                if "reason=test-harness-changed" in comment.body)
+    # A held PR is left as it is: only the flag and comment, no push and no new PR.
+    assert len(c.tracker.created_prs) == 1
+    assert not any("push" in args or "commit" in args for _, args in c.operations)
+    assert git_command(c.history.origin, "rev-parse", "refs/heads/foragent/issue-1") == c.head
 
 
 def test_review_only_spec_conflict_stops_with_spec_question_and_keeps_pr_open(review_case):

@@ -5,7 +5,7 @@ import pytest
 from conftest import git_command
 from foragent import runner
 from foragent.git import GitRepo
-from foragent.harness_guard import changed_harness_paths, guard_measurements
+from foragent.harness_guard import HARNESS_NAMES, changed_harness_paths, guard_measurements
 from foragent.reasons import Reason
 from runner_support import run_case, set_done_when  # noqa: F401
 
@@ -674,3 +674,183 @@ def test_pytest_free_pyproject_is_regular_when_git_ignores_the_execute_bit(repo,
     assert changed_harness_paths(GitRepo(repo), "target", []) == []
     (repo / "lib/pyproject.toml").write_text(plain + '[tool.pytest.ini_options]\naddopts = "-q"\n')
     assert changed_harness_paths(GitRepo(repo), "target", []) == ["lib/pyproject.toml"]
+
+
+def _git_bytes(repo, *args, stdin=b""):
+    import subprocess
+
+    return subprocess.run(["git", *args], cwd=repo, input=stdin, capture_output=True, check=True).stdout
+
+
+def _base_with_entries(repo, entries):
+    """Commit raw (mode, path bytes, blob content or sha) index entries as the merge base, then delete
+    them in HEAD; no worktree file is needed, so any path bytes work on any filesystem."""
+    lines = b""
+    for mode, path, content in entries:
+        sha = content if mode == b"160000" else _git_bytes(repo, "hash-object", "-w", "--stdin", stdin=content).strip()
+        lines += mode + b" " + sha + b"\t" + path + b"\0"
+    _git_bytes(repo, "update-index", "-z", "--index-info", stdin=lines)
+    tree = _git_bytes(repo, "write-tree").strip().decode()
+    parent = git_command(repo, "rev-parse", "HEAD")
+    base = git_command(repo, "commit-tree", tree, "-p", parent, "-m", "base")
+    git_command(repo, "update-ref", "refs/heads/target", base)
+    removal = b"".join(b"0 " + b"0" * 40 + b"\t" + path + b"\0" for _, path, _ in entries)
+    _git_bytes(repo, "update-index", "-z", "--index-info", stdin=removal)
+    head = git_command(repo, "commit-tree", _git_bytes(repo, "write-tree").strip().decode(), "-p", base, "-m", "delete")
+    git_command(repo, "update-ref", "refs/heads/main", head)
+
+
+@pytest.mark.parametrize("name", sorted(HARNESS_NAMES | {"pyproject.toml"}))
+@pytest.mark.parametrize("files", [[], ["caf�/{name}"], ["**/{name}"], ["*/*"], ["**"]],
+                         ids=["unlisted", "replacement-char-entry", "glob", "star-star", "everything"])
+def test_non_utf8_harness_path_always_holds_and_is_c_quoted(repo, name, files):
+    """b"caf\\xff/<name>" must never match a Files entry through replacement decoding."""
+    raw = b"caf\xff/" + name.encode()
+    _base_with_entries(repo, [(b"100644", raw, b"# harness\n")])
+    held = changed_harness_paths(GitRepo(repo), "target", [entry.format(name=name) for entry in files])
+    assert held == [f'"caf\\377/{name}"']
+    # The same C-quoted form Git itself prints for that path.
+    quoted = _git_bytes(repo, "-c", "core.quotePath=true", "ls-tree", "--name-only", "-r", "target").decode()
+    assert held[0] in quoted.splitlines()
+
+
+def test_files_entries_match_raw_bytes_exactly(repo):
+    """An NFD path is not listed by an NFC entry that decodes to the same text."""
+    import unicodedata
+
+    nfd = unicodedata.normalize("NFD", "café/conftest.py").encode()
+    nfc = unicodedata.normalize("NFC", "café/conftest.py")
+    assert nfd != nfc.encode()
+    _base_with_entries(repo, [(b"100644", nfd, b"# harness\n")])
+    git = GitRepo(repo)
+    assert changed_harness_paths(git, "target", [nfc]) == [nfd.decode()]
+    assert changed_harness_paths(git, "target", [nfd.decode()]) == []  # exact bytes: listed
+    assert changed_harness_paths(git, "target", ["caf*/conftest.py"]) == []  # byte glob
+
+
+@pytest.mark.parametrize("mode", [b"120000", b"160000"], ids=["symlink", "submodule"])
+@pytest.mark.parametrize("name", ["tests/conftest.py", "pyproject.toml"])
+def test_symlink_or_submodule_on_the_base_side_always_holds_even_listed(repo, mode, name):
+    content = b"a" * 40 if mode == b"160000" else b"elsewhere.py"
+    _base_with_entries(repo, [(mode, name.encode(), content)])
+    for files in ([], [name], ["**"]):
+        assert changed_harness_paths(GitRepo(repo), "target", files) == [name]
+
+
+@pytest.mark.parametrize("head", ["regular-to-symlink", "symlink-retargeted"])
+def test_symlink_on_the_head_side_always_holds_even_listed(repo, head):
+    import os
+
+    conftest = repo / "tests/conftest.py"
+    if head == "symlink-retargeted":
+        conftest.unlink()
+        os.symlink("a.py", conftest)
+        base = commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD"))
+        git_command(repo, "update-ref", "refs/heads/target", base)
+        conftest.unlink()
+        os.symlink("b.py", conftest)
+    else:
+        conftest.unlink()
+        os.symlink("elsewhere.py", conftest)
+    assert changed_harness_paths(GitRepo(repo), "target", ["tests/conftest.py"]) == ["tests/conftest.py"]
+
+
+def test_listed_regular_harness_file_may_change_content_and_mode(repo):
+    conftest = repo / "tests/conftest.py"
+    conftest.write_text("# listed change\n")
+    conftest.chmod(0o755)
+    git = GitRepo(repo)
+    assert changed_harness_paths(git, "target", ["tests/conftest.py"]) == []
+    assert changed_harness_paths(git, "target", []) == ["tests/conftest.py"]
+
+
+def test_unparsable_pyproject_always_holds_even_listed(repo):
+    (repo / "pyproject.toml").write_text("[broken\n")
+    assert changed_harness_paths(GitRepo(repo), "target", ["pyproject.toml"]) == ["pyproject.toml"]
+
+
+def test_unreadable_base_blob_always_holds_even_listed(repo):
+    missing = b"1" * 40
+    tree = _git_bytes(repo, "mktree", "--missing", stdin=b"100644 blob " + missing + b"\tconftest.py\n").strip().decode()
+    base = git_command(repo, "commit-tree", tree, "-m", "base with a missing blob")
+    git_command(repo, "update-ref", "refs/heads/target", base)
+    git_command(repo, "update-ref", "refs/heads/main",
+                git_command(repo, "commit-tree", _git_bytes(repo, "write-tree").strip().decode(), "-p", base, "-m", "head"))
+    # The head's other files are listed additions; only the unreadable blob cannot be compared.
+    files = ["conftest.py", "pyproject.toml", "tests/conftest.py"]
+    assert changed_harness_paths(GitRepo(repo), "target", files) == ["conftest.py"]
+
+
+def test_flag_needs_human_blocks_and_hands_over_with_one_marked_comment(tmp_path):
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from foragent.actions import flag
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker
+
+    now = datetime(2026, 10, 29, tzinfo=UTC)
+    tracker = FakeTracker(now=lambda: now)
+    tracker.add_issue(1, "Issue", "body", labels=["running", "ready"])
+    ctx = SimpleNamespace(store=StateStore(tmp_path / "state", now=lambda: now), tracker=tracker,
+                          now=lambda: now, config=Config(), repo="owner/repo")
+    flag(ctx, 1, Reason.TEST_HARNESS_CHANGED, "Held", "details", needs_human=True)
+    assert {"blocked", "needs-human"} <= tracker.get_issue(1).labels
+    assert not tracker.get_issue(1).labels & {"running", "ready"}
+    assert ctx.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    comments = tracker.list_comments(1)
+    assert len(comments) == 1
+    assert comments[0].body.startswith("<!-- foragent:needs-human reason=test-harness-changed -->")
+    flag(ctx, 1, Reason.TIMEOUT, "Plain", None)
+    assert tracker.list_comments(1)[-1].body.startswith("<!-- foragent:blocked reason=timeout -->")
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["staged", "committed"])
+def test_recorded_symlink_with_identical_bytes_holds_when_checked_out_as_a_file(repo, committed):
+    """core.symlinks false: Git records 120000 while the worktree keeps a regular file with the same bytes."""
+    git_command(repo, "config", "core.symlinks", "false")
+    sha = git_command(repo, "rev-parse", "HEAD:tests/conftest.py")
+    git_command(repo, "update-index", "--cacheinfo", f"120000,{sha},tests/conftest.py")
+    if committed:
+        tree = git_command(repo, "write-tree")
+        git_command(repo, "update-ref", "refs/heads/main",
+                    git_command(repo, "commit-tree", tree, "-p", "HEAD", "-m", "symlink mode"))
+    assert (repo / "tests/conftest.py").read_text() == "# base\n"  # the worktree still shows a file
+    for files in ([], ["tests/conftest.py"]):
+        assert changed_harness_paths(GitRepo(repo), "target", files) == ["tests/conftest.py"]
+
+
+def test_skip_worktree_entry_is_judged_by_what_the_index_publishes(repo):
+    """Staging never refreshes a skip-worktree entry from disk; its index content is what a commit carries."""
+    sha = _git_bytes(repo, "hash-object", "-w", "--stdin", stdin=b"# changed only in the index\n").strip().decode()
+    git_command(repo, "update-index", "--cacheinfo", f"100644,{sha},tests/conftest.py")
+    git_command(repo, "update-index", "--skip-worktree", "tests/conftest.py")
+    assert (repo / "tests/conftest.py").read_text() == "# base\n"
+    git = GitRepo(repo)
+    assert changed_harness_paths(git, "target", []) == ["tests/conftest.py"]
+    assert changed_harness_paths(git, "target", ["tests/conftest.py"]) == []  # listed regular change
+
+
+@pytest.mark.parametrize("entry", ["/tests/conftest.py", "./tests/conftest.py", "tests//conftest.py",
+                                   "tests/./conftest.py", "tests/conftest.py/"])
+def test_files_entries_are_not_normalized(repo, entry):
+    """Only equal bytes (or a byte glob) list a path; a differently spelled entry authorizes nothing."""
+    (repo / "tests/conftest.py").write_text("# changed\n")
+    git = GitRepo(repo)
+    assert changed_harness_paths(git, "target", [entry]) == ["tests/conftest.py"]
+    assert changed_harness_paths(git, "target", ["tests/conftest.py"]) == []
+
+
+def test_symlink_recorded_only_in_head_holds_when_the_index_dropped_it(repo):
+    """The runner unstages .foragent/ (rm --cached); HEAD still records the PR head's symlink there."""
+    git_command(repo, "config", "core.symlinks", "false")
+    sha = _git_bytes(repo, "hash-object", "-w", "--stdin", stdin=b"../tests/conftest.py").strip().decode()
+    git_command(repo, "update-index", "--add", "--cacheinfo", f"120000,{sha},.foragent/conftest.py")
+    tree = git_command(repo, "write-tree")
+    git_command(repo, "update-ref", "refs/heads/main",
+                git_command(repo, "commit-tree", tree, "-p", "HEAD", "-m", "head symlink"))
+    git_command(repo, "rm", "-q", "--cached", ".foragent/conftest.py")
+    (repo / ".foragent").mkdir()
+    (repo / ".foragent/conftest.py").write_text("../tests/conftest.py")  # core.symlinks false checkout
+    assert changed_harness_paths(GitRepo(repo), "target", [".foragent/conftest.py"]) == [".foragent/conftest.py"]

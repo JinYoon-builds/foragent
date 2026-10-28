@@ -18,7 +18,7 @@ from foragent.git import GitError, GitRepo, PublicationError
 from foragent.harness_guard import changed_harness_paths, hold_details
 from foragent.i18n import text
 from foragent.issue import ParsedIssue, body_hash
-from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
+from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
 from foragent.orch_events import append_event
 from foragent.overlap_files import any_overlap
 from foragent.policy import Decision, merge_decision, review_mode_for, touched
@@ -49,8 +49,7 @@ def _hold_changed_head(n: int, ctx: RunContext, link: str) -> str:
 def _hold_harness_change(n: int, ctx: RunContext, paths: list[str], link: str) -> str:
     """Hold a PR whose test harness changed outside ## Files; no head evidence is trusted."""
     flag(ctx, n, Reason.TEST_HARNESS_CHANGED, "PR changes the test harness outside ## Files",
-         f"{hold_details(paths)}\n\n{link}")
-    ctx.tracker.add_labels(n, [NEEDS_HUMAN])
+         f"{hold_details(paths)}\n\n{link}", needs_human=True)
     return "held"
 
 
