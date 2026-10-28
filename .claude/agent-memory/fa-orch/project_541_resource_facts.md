@@ -1,0 +1,13 @@
+---
+name: project-541-resource-facts
+description: #541 D93 machine resource sample per tick and fa orch facts resources object — where it is written/read, test fixture pitfalls
+metadata:
+  type: project
+---
+
+- The gate writes `resource_sample.FILE` (`resource-sample.json`, latest row only) in `capacity.machine_root()` from `scheduler_start._apply_budgets()` (cached once per tick). Disk baselines live in the sensor file (`memory-sample.json`, key `disk`) and are read inside `machine_load()` under SENSOR_LOCK; observing mode reads no disk.
+- `orch_facts._freeze` copies the sample; when present it replaces the live `machine_load()` read (raw `load_average_per_cpu`). New facts code is in `orch_facts_machine.py` because `orch_facts_resources.py` was already ~300 lines and `scheduler.py` sits exactly at its 250-line cap.
+- Acceptance fixture pitfall: the test store is under XDG_STATE_HOME, not machine_root, so the queue counter must add the tick's own store to the stores found under machine_root.
+- `GhTracker.rate_limit_reset` sets `rate_limit_remaining`; `orch_github.pause` saves it outside the reset try-block so a write error never discards a valid reset time.
+- 27 failures in facts_baseline_trend/test_slots/cli_split/tick_github_budget/union_merge_overlap were identical on the base source (other issues' unimplemented tests). Load base with `git archive HEAD src | tar -x -C .foragent/base` and `PYTHONPATH=.foragent/base/src` (keeps files inside the repo; the goal forbids writing outside it).
+- Review lessons: call `psutil.disk_io_counters(nowrap=False)`. The default nowrap=True caches values in the process and hides counter resets. Machine-wide test-slot discovery has one helper, `resource_sample.machine_stores()`, which the gate sample, `_freeze` (copies to `slot-stores/`) and the binding live path all use. Run-budget discovery (`store.root.parent`) stays as it is on purpose.

@@ -19,8 +19,9 @@ import shutil
 import tempfile
 from typing import Any
 
-from foragent import capacity, machine_budget, orch_facts_reviews, orch_plan
+from foragent import capacity, machine_budget, orch_facts_reviews, orch_plan, resource_sample
 from foragent.config import Config
+from foragent import orch_facts_machine
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
     RECENT, _comparisons, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
@@ -76,6 +77,7 @@ def _copy(source: Path, target: Path) -> None:
 
 
 GLOBAL_CONFIG = "global-config.yml"
+SLOT_STORES = "slot-stores"
 
 
 def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tuple[StateStore, dict[str, Any]] | None:
@@ -94,7 +96,8 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
                 (path / "runs").is_dir() or (path / "run-starts").is_dir())}
         except OSError:
             found = set()
-        return sorted(found | {store.root})
+        # Stores under the machine root are read for the machine-wide test-slot queue.
+        return sorted(found | {store.root} | set(resource_sample.machine_stores(store)))
 
     def lock_set(stores: list[Path]) -> list[Path]:
         return [*(path / "state.lock" for path in stores), parent / capacity.LOCK_FILE,
@@ -109,6 +112,12 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
         if discover() != stores:
             return None
         for source in stores:
+            if source != store.root and source.parent == capacity.machine_root():
+                # Every machine-root store but this one, exactly as the gate's sample counts them.
+                for path in (source / "runs").glob("*.json"):
+                    _copy(path, into / SLOT_STORES / source.name / "runs" / path.name)
+            if source != store.root and source.parent != parent:
+                continue
             target = into / "data" / source.name
             names = [*source.glob("*.json"), *source.glob("*.jsonl")] if source == store.root else [
                 source / "runs.jsonl"]
@@ -130,8 +139,14 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
         _copy(Path.home() / ".config/foragent/config.yml", into / GLOBAL_CONFIG)
         if checkout is not None:
             _copy(checkout / ".foragent.yml", into / "checkout" / ".foragent.yml")
-        with capacity.observing():
-            sample = capacity.machine_load()
+        # The gate's last recorded sample; without one, today's read-only live reading.
+        _copy(capacity.machine_root() / resource_sample.FILE, into / resource_sample.FILE)
+        stored = resource_sample.read(into / resource_sample.FILE)
+        if stored is None:
+            with capacity.observing():
+                sample = capacity.machine_load()
+        else:
+            sample = (stored["memory_pressure"], float(stored["load_average_per_cpu"]))
         # Sibling processes are probed now, while their records cannot change.
         alive = {}
         for path in (into / "data").glob("*/runs/*.json"):
@@ -144,7 +159,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
             if record.get("status") == "running" and type(record.get("pid")) is int:
                 alive[record["pid"]] = _probe(record["pid"])
         machine = {"test_slots": capacity.read_test_slots(), "budget": machine_budget.values(), "sample": sample,
-                   "now": store._now(), "alive": alive}
+                   "stored": stored, "slot_stores": into / SLOT_STORES, "now": store._now(), "alive": alive}
         # A lock file created meanwhile (a first write under it) means the read was not covered.
         if discover() != stores or [path.exists() for path in lock_set(stores)] != held:
             return None
@@ -251,6 +266,7 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
         f"Test slots: current {slots['current']} (admitted {resources['test_slots']['admitted']}), queue {slots['queue_length']}, "
         f"waited {_s(slots['total_wait_seconds'])}",
         f"  Machine: load {machine['load_per_cpu']:.2f} per CPU, memory {machine['memory_pressure']}",
+        "  " + orch_facts_machine.human_line(resources, language),
         f"  Parallel: {work['free_run_slots']} free (machine {work['machine_runs']}/{work['machine_cap']}"
         + (f", project {work['project_runs']}/{work['project_cap']}" if work["project_cap"] is not None else "")
         + "); held: " + (", ".join(f"#{n} {reason}" for n, reason in work["held"].items()) or "none"),

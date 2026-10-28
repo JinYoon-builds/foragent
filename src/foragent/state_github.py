@@ -1,4 +1,4 @@
-"""Local per-UTC-hour count of gh calls, kept for the last 30 days."""
+"""Local GitHub records: per-UTC-hour gh call counts (30 days) and the last remaining-request reading."""
 
 from datetime import datetime
 from typing import Any
@@ -23,6 +23,11 @@ class GithubCallsMixin:
             if since is None or hour >= since:
                 rows.append({"hour": hour.isoformat(), "calls": calls})
         return rows
+
+    def record_github_remaining(self, remaining: int, seen_at: datetime) -> None:
+        """Replace the last known count of core GitHub requests left, with when it was read."""
+        self._write_json(self.root / "github-rate-limit.json",
+                         {"remaining": remaining, "seen_at": seen_at.isoformat()})
 
     def _github_call_counts(self) -> dict[str, int]:
         try:
