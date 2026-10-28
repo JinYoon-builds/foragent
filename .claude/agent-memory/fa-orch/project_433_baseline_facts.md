@@ -14,3 +14,4 @@ metadata:
 - The detached builder (`run_baseline_process.main`) rebuilds Config from the request: any new `ctx.config` read on the `_build_baseline` path must be added to `start_baseline_process`'s request.
 - Companion-XML duration estimates apply to every entry without `duration_seconds`, path-tagged or not (old runner behaviour).
 - zsh pitfall: `fa test $T` with a space-separated list passes one argument; use `${=T}`. An empty FAILED-ID diff may just mean pytest found no file.
+- Optional measurements (companion XML time) must fail to "unknown", never drop the entry; reviewers flag any try-block that wraps both validity and estimation.

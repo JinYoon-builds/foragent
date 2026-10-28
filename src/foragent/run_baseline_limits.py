@@ -47,6 +47,14 @@ def _junit_total(report: Path) -> float | None:
     return sum(float(suite.attrib["time"]) for suite in suites)
 
 
+def _estimate(report: Path) -> float | None:
+    """The JUnit total time, or None when the report cannot give one; the entry itself stays valid."""
+    try:
+        return _duration(_junit_total(report))
+    except (OSError, ValueError, TypeError, KeyError, ET.ParseError):
+        return None
+
+
 def _duration(value) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value < 0:
         return None
@@ -69,7 +77,8 @@ def read_entries(cache_root: Path, repo_root: Path, repo: str | None, now: datet
                 duration = _duration(saved["duration_seconds"])
             elif path.with_suffix(".xml").is_file():
                 # An older producer (tagged or not): the runner's estimate from the JUnit total time.
-                duration, estimated = _duration(_junit_total(path.with_suffix(".xml"))), True
+                duration = _estimate(path.with_suffix(".xml"))
+                estimated = duration is not None
             else:
                 duration = None
             entries.append(CacheEntry(path.stem, saved, created_at, duration, estimated,

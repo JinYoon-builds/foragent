@@ -67,3 +67,24 @@ def test_human_line_in_korean_names_duration_share_and_warning(tmp_path):
     assert orch_facts_baselines.human_line(collect(tmp_path / "c"), "en") == (
         "Baseline capture: latest 3000 s, 83% of the 3600 s limit; near the limit")
     assert "no measured capture yet" in orch_facts_baselines.human_line(collect(tmp_path / "d"), "en")
+
+
+import pytest
+
+
+@pytest.mark.parametrize("report", [
+    '<testsuite name="no-time"/>', '<testsuite time="soon"/>', "<testsuite", "<other/>",
+], ids=["missing-time", "non-numeric-time", "malformed", "wrong-root"])
+def test_legacy_entry_with_unusable_xml_stays_listed_with_unknown_duration(tmp_path, report):
+    path = seed(tmp_path / "b", "legacy", age=timedelta(minutes=1), repository=None)
+    path.with_suffix(".xml").write_text(report)
+    measured = seed(tmp_path / "b", "measured", age=timedelta(minutes=2), duration=50)
+    facts = collect(tmp_path / "b")
+    assert [(row["key"], row["duration_seconds"], row["duration_estimated"]) for row in facts["baseline_builds"]] == [
+        ("legacy", None, False), ("measured", 50, False)]
+    assert facts["baseline_trend"]["latest_duration_seconds"] == 50
+
+
+def test_entry_with_malformed_node_ids_is_listed_with_zero_tests(tmp_path):
+    seed(tmp_path / "b", "odd", age=timedelta(minutes=1), duration=40, node_ids=7)
+    assert [(row["key"], row["test_count"]) for row in collect(tmp_path / "b")["baseline_builds"]] == [("odd", 0)]

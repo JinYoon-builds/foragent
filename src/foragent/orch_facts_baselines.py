@@ -22,7 +22,8 @@ def collect(cache_root: Path, repo_root: Path, repo: str | None, now: datetime, 
     for entry in entries:
         if entry.created_at < now - window:
             continue
-        count = len(entry.saved.get("node_ids") or ())
+        ids = entry.saved.get("node_ids")
+        count = len(ids) if isinstance(ids, list) else 0  # A malformed list still leaves the build listed.
         # A successful zero-test capture measured nothing.
         duration = entry.duration_seconds if entry.timed_out or count else None
         rows.append({
