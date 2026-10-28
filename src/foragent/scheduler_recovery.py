@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler, sleep_credit
 from foragent.scheduler_stop import (
-    DECISION_FIELDS, _flag_stop_refused, _restore_stopped, _pid_exists, _run_processes_exist,
+    DECISION_FIELDS, LIVENESS_FIELDS, _flag_stop_refused, _stop_unconfirmed, _restore_stopped, _pid_exists, _run_processes_exist,
     _stop_already_refused, _stop_run_processes, runner_alive,
 )
 from foragent.state import Run
@@ -23,7 +23,8 @@ def _kill_executor(ctx: TickContext, number: int | str) -> None:
     if run.executor_pgid is not None:
         with processes.recorded_tree(run.process_identities):
             ctx.kill_runner(run.executor_pgid)
-        ctx.store.update_run(number, executor_pgid=None)
+        if not _stop_unconfirmed(run):  # A surviving executor stays recorded, so the next tick still sees it.
+            ctx.store.update_run(number, executor_pgid=None)
 
 
 def _remove_run_worktree(
@@ -221,9 +222,10 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 )
             else:
                 dead = runner_alive(run, _pid_exists) is False  # Only confirmed death; unknown waits.
-        # The runner may have finished while another run or its process was checked.
-        run = ctx.store.get_run(run.key)
-        if run is None or run.status != "running":
+        # The runner may have finished, or registered and progressed, while its process was checked.
+        decided, run = run, ctx.store.get_run(run.key)
+        if run is None or run.status != "running" or dead and any(
+                getattr(run, name) != getattr(decided, name) for name in LIVENESS_FIELDS):
             continue
         if not dead:
             if _stop_already_refused(ctx, run):
@@ -272,9 +274,9 @@ def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
 
 
 def _reap_inactive_runs(ctx: TickContext, report: TickReport) -> None:
-    """Only recorded ownership authorizes cleanup, including closed issues."""
-    for run in ctx.store.read_history():
-        current = ctx.store.get_run(run.number)
+    """Only recorded ownership authorizes cleanup, including closed issues and finished dreams."""
+    for run in [*ctx.store.read_history(), *ctx.store.dream_runs()]:  # Dreams stay out of runs.jsonl.
+        current = ctx.store.get_run(run.key)
         if current is not None and current.status == "running":
             continue
         if not run.process_identities:
@@ -294,5 +296,5 @@ def _reap_inactive_runs(ctx: TickContext, report: TickReport) -> None:
             continue
         if count:
             summary = f"Reaped {count} owned processes from inactive run."
-            scheduler.append_event(ctx.store, ctx.now(), run.number, "orphans-reaped", summary)
-            report.actions.append(f"#{run.number} {summary}")
+            scheduler.append_event(ctx.store, ctx.now(), run.number if run.kind == "issue" else None, "orphans-reaped", summary)
+            report.actions.append(f"#{run.key} {summary}")

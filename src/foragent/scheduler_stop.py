@@ -77,6 +77,8 @@ def _pid_exists(pid: int) -> bool:
 
 # The fields a runtime or stall decision reads; a change after the check voids it (_kill_run).
 DECISION_FIELDS = ("last_progress_at", "waiting_until", "waited_seconds", "slept_seconds", "slept_since_progress")
+# The fields a dead decision reads: a worker that registered or progressed meanwhile is not dead.
+LIVENESS_FIELDS = ("pid", "process_identities", "executor_pgid", "last_progress_at")
 
 
 def runner_alive(run: Run, exists=None) -> bool | None:
@@ -111,13 +113,17 @@ def _run_processes_exist(run: Run) -> bool:
 def _stop_unconfirmed(run: Run) -> bool:
     """Whether a stop that raised nothing may still have left the run's processes alive.
 
-    kill_process_group waits until every readable recorded identity is gone, so only a
-    recorded pid the listing cannot read stays unconfirmed. A runner recorded without a
-    birth identity is trusted to the injected killer, as the locked stop tests require.
+    kill_process_group waits until every readable recorded identity is gone, so a recorded
+    pid the listing cannot read stays unconfirmed. A dream's worker or executor recorded
+    without a birth identity (a null start time) is alive while its pid exists (D95), and
+    the recorded tree does not reach it. An issue runner without one is trusted to the
+    injected killer, as the locked stop tests require.
     """
     identities = {item["pid"] for item in run.process_identities}
     unreadable = getattr(processes.list_processes(), "unreadable", frozenset())
-    return bool(unreadable & {run.pid, run.executor_pgid, *identities})
+    roots = {pid for pid in (run.pid, run.executor_pgid) if pid is not None}
+    return bool(unreadable & {*roots, *identities}) or (
+        run.kind != "issue" and any(pid not in identities and _pid_exists(pid) for pid in roots))
 
 
 def _stop_run_processes(

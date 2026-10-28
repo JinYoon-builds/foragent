@@ -216,7 +216,7 @@ def worker_world(world, executor_edit, publish):
     world.ctx.poll_hook = lambda execute, poll: execute()
     world.ctx.tracker = None
 
-    def fake_publish(ctx, git, lane, memory, count):
+    def fake_publish(ctx, git, lane, memory, count, **kwargs):
         calls["published"].append(count)
         return publish()
 
@@ -348,7 +348,8 @@ def test_second_dream_starts_from_the_dream_branch_with_the_base_merged(tmp_path
     for exists, start in ((False, "origin/main"), (True, "refs/remotes/origin/foragent/dream-orch")):
         repo, calls = fake(exists)
         ctx = SimpleNamespace(git=repo, config=Config(repo="o/r", lanes={"orch": {"paths": ["orch/**"]}}))
-        _, pushed = orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w")
+        _, pushed, replaced = orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w")
+        assert replaced is False
         assert pushed == ("abc123" if exists else None)
         assert ("add", "foragent/dream-orch", start) in calls
         merged = [args for args in calls if isinstance(args, list) and "merge" in args]
@@ -382,7 +383,7 @@ def test_new_memory_file_in_an_ignored_directory_is_published_and_counted(world,
     world.ctx.poll_hook = lambda execute, poll: execute()
     world.ctx.tracker = None
     original = orch_dream_worker._publish
-    orch_dream_worker._publish = lambda ctx, git, lane, memory, count: published.append(count) or 7
+    orch_dream_worker._publish = lambda ctx, git, lane, memory, count, **kw: published.append(count) or 7
     try:
         dreaming(world)
         assert orch_dream_worker.run_dream("orch", world.ctx) == 0
@@ -517,3 +518,124 @@ def test_in_process_worker_that_finished_is_left_alone(world, monkeypatch):
     run = started(world, worker, monkeypatch)
     assert (run.status, run.outcome) == ("finished", "dreamed")
     assert orch_dream.last_dream_at(world.store, "orch") is not None
+
+
+def conflicting_repo(calls):
+    from foragent.git import GitError
+
+    def call(args):
+        calls.append(args)
+        if "merge" in args and "--abort" not in args:
+            raise GitError("CONFLICT (add/add): MEMORY.md")  # The squash-merged PR, then a base edit.
+        return "abc123\n" if args[:1] == ["rev-parse"] else ""
+
+    repo = SimpleNamespace(_call=call, at=lambda path: repo,
+                           add_worktree=lambda path, branch, ref: calls.append(("add", branch, ref)),
+                           remove_worktree=lambda path: calls.append(("remove", path)))
+    return repo
+
+
+@pytest.mark.parametrize("published", [True, False], ids=["published-head", "unpublished-head"])
+def test_conflicting_dream_branch_is_replaced_only_when_its_head_was_published(world, tmp_path, published):
+    if published:
+        orch_dream.record_done(world.store, "orch", 1, "en", pr=5, published="abc123")
+    calls = []
+    ctx = SimpleNamespace(git=conflicting_repo(calls), store=world.store,
+                          config=Config(repo="o/r", lanes={"orch": {"paths": ["orch/**"]}}))
+    _, pushed, replaced = orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w")
+    adds = [item for item in calls if isinstance(item, tuple) and item[0] == "add"]
+    assert (pushed, replaced) == ("abc123", published)
+    if published:  # Stale: read the base's current memory.
+        assert adds[-1] == ("add", "foragent/dream-orch", "origin/main") and ("remove", tmp_path / "w") in calls
+    else:  # Pending publication: keep the pushed memory so its PR is still opened.
+        assert adds == [("add", "foragent/dream-orch", "refs/remotes/origin/foragent/dream-orch")]
+
+
+def test_replacing_a_stale_open_pr_branch_pushes_with_a_lease_and_no_merge(world):
+    calls = []
+    git = SimpleNamespace(
+        fetch=lambda remote, ref: calls.append(("fetch", ref)),
+        _call=lambda args: calls.append(("git", args)) or "abc123\n",
+        push=lambda branch, lease=None: calls.append(("push", branch, lease)),
+    )
+    world.ctx.tracker = SimpleNamespace(find_pr=lambda branch: 9, update_pr=lambda pr, **kwargs: None)
+    orch_dream_worker._publish(world.ctx, git, "orch", ".claude/agent-memory/orch/MEMORY.md", 1, replace=True)
+    assert not [args for kind, *rest in calls if kind == "git" for args in rest if "merge" in args]
+    assert ("push", "foragent/dream-orch", "abc123") in calls
+
+
+def test_leftover_processes_of_a_finished_dream_are_reaped(world, monkeypatch):
+    dreaming(world, extra=[{"pid": 4300, "start_time": 3.0}])
+    world.store.finish_run(KEY, "dreamed", "0 memory lines tidied.")
+    world.table[0] = processes.ProcessTable([row(4300, start=3.0)])  # The executor's child survived.
+    reaped = []
+
+    def kill_group(pid):
+        reaped.extend(item["pid"] for item in processes._recorded_tree.get())
+        world.table[0] = processes.ProcessTable([])
+        return 1
+
+    monkeypatch.setattr(processes, "kill_process_group", kill_group)
+    report = SimpleNamespace(actions=[])
+    scheduler._reap_inactive_runs(world.ctx, report)
+    assert 4300 in reaped and any("Reaped 1" in action for action in report.actions)
+
+
+def test_a_new_dream_record_keeps_the_previous_dreams_owned_processes(world):
+    dreaming(world, extra=[{"pid": 4300, "start_time": 3.0}])
+    world.store.finish_run(KEY, "error", "Dream process died.")
+    run = world.store.start_dream("orch", worktree="w")
+    assert {"pid": 4300, "start_time": 3.0} in run.process_identities and run.pid is None
+
+
+def test_finishing_a_dream_observes_its_tree_like_an_issue_run(world, monkeypatch):
+    dreaming(world)
+    child = {"pid": 4400, "start_time": 4.0}
+    monkeypatch.setattr(processes, "observe_tree",
+                        lambda identities=(), roots=(), **kw: [*map(dict, identities), child])
+    finished = world.store.finish_run(KEY, "dreamed", "done")
+    assert child in finished.process_identities
+
+
+def test_stop_of_a_dream_worker_without_a_birth_identity_is_confirmed_by_its_pid(world):
+    dreaming(world, start=None, executor=4200, extra=[{"pid": 4200, "start_time": 2.0}])
+    world.table[0] = processes.ProcessTable([row(4200, start=2.0)])
+    world.alive[4100] = True  # The worker lives; only the recorded executor tree can be stopped.
+    world.clock[0] += timedelta(minutes=11)
+    report = recover(world)
+    assert world.table[0] == (), "the executor was stopped"
+    assert world.store.get_dream("orch").status == "running" and world.removed == []
+    assert any("cannot be confirmed" in action for action in report.actions)
+
+
+def test_worker_that_registers_after_the_dead_check_is_not_finished(world, monkeypatch):
+    from foragent import scheduler as facade
+
+    dreaming(world, pid=None, start=None)
+    world.clock[0] += facade.LAUNCH_GRACE + timedelta(seconds=1)  # Looks like a failed launch.
+    original = world.store.get_run
+    reads = []
+
+    def late(key):  # The delayed worker registers between the dead check and the reread.
+        reads.append(key)
+        if key == KEY and len(reads) == 2:  # update_run's own read, then the reread after the dead check.
+            monkeypatch.setattr(world.store, "get_run", original)
+            world.store.update_run(KEY, pid=4100, process_identities=[{"pid": 4100, "start_time": 1.0}],
+                                   last_progress_at=world.clock[0].isoformat())
+        return original(key)
+
+    monkeypatch.setattr(world.store, "get_run", late)
+    world.table[0] = processes.ProcessTable([row(4100)])
+    recover(world)
+    run = original(KEY)
+    assert run.status == "running" and run.pid == 4100 and world.removed == []
+
+
+def test_surviving_executor_without_a_birth_identity_stays_recorded(world):
+    dreaming(world, executor=4200)  # The worker has a birth identity; the executor has none.
+    world.table[0] = processes.ProcessTable([row(4100)])
+    world.alive[4200] = True
+    world.clock[0] += timedelta(minutes=11)
+    recover(world)
+    run = world.store.get_dream("orch")
+    assert run.status == "running" and run.executor_pgid == 4200, "the next tick must still see the executor"

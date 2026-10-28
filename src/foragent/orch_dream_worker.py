@@ -136,9 +136,9 @@ def _changed_lines(before: str, after: str) -> int:
 def _dream_worktree(ctx: RunContext, lane: str, worktree: Path):
     """Start from the lane's dream branch when the clone has one, so an unmerged PR's memory is read.
 
-    The base is merged in; a branch whose PR was squash-merged merges cleanly (the same
-    edits are on both sides). On a conflict the dream reads the branch as it is, and
-    the orchestrator sees the PR conflict with the base. Only local refs are read.
+    The base is merged in. On a conflict a published head is stale (e.g. a squash-merged PR, then
+    a base edit): the dream restarts from the base and replaces the branch (``replaced``); an
+    unpublished head is kept for publication recovery. Local refs and journal only.
     """
     branch, base = f"foragent/dream-{lane}", f"origin/{ctx.config.base_branch}"
     remote = f"refs/remotes/origin/{branch}"
@@ -153,26 +153,33 @@ def _dream_worktree(ctx: RunContext, lane: str, worktree: Path):
             git._call([*GIT_IDENTITY, "merge", "--no-edit", base])
         except Exception:
             git._call(["merge", "--abort"])
-    return git, pushed
+            if pushed != last_published(ctx.store, lane):
+                # Pushed memory no completed dream published: keep it, so its PR is still opened.
+                return git, pushed, False
+            ctx.git.remove_worktree(worktree)
+            ctx.git.add_worktree(worktree, branch, base)
+            return ctx.git.at(worktree), pushed, True
+    return git, pushed, False
 
 
 def _unpublished(store, git, lane: str, pushed: str | None, base: str, directory: str) -> bool:
-    """Whether the dream branch holds pushed memory no completed dream published as a PR.
+    """Whether the branch holds pushed memory no completed dream published as a PR.
 
-    A dream whose push succeeded but whose PR creation failed ended as error, so the
-    branch head differs from the last ``published`` head of a completed dream. A branch
-    whose PR merged has no memory difference from the base left. Local facts only.
+    A push whose PR creation failed leaves a head unlike the last ``published`` one; a
+    merged PR's branch has no memory difference from the base. Local facts only.
     """
     if pushed is None or pushed == last_published(store, lane):
         return False
     return bool(git._call(["diff", "--name-only", base, "HEAD", "--", directory]).strip())
 
 
-def _publish(ctx: RunContext, git, lane: str, memory: str, count: int) -> int:
+def _publish(ctx: RunContext, git, lane: str, memory: str, count: int, *, replace: bool = False) -> int:
     """Push the committed memory edit and open or update the lane's dream PR.
 
     An open dream PR keeps its earlier, unmerged edits: this dream's commit is merged
     onto that branch and pushed with a lease on the head it merged, never forced over it.
+    A stale branch (``replace``: it conflicted with the base) is replaced by this dream,
+    which started from the base, still with a lease on the head it saw.
     """
     branch, base = f"foragent/dream-{lane}", ctx.config.base_branch
     title = f"Lane {lane} memory: {ctx.now().astimezone().date().isoformat()}"
@@ -182,11 +189,12 @@ def _publish(ctx: RunContext, git, lane: str, memory: str, count: int) -> int:
     else:
         git.fetch("origin", branch)
         head = git._call(["rev-parse", f"refs/remotes/origin/{branch}"]).strip()
-        try:
-            git._call([*GIT_IDENTITY, "merge", "--no-edit", "-m", title, f"refs/remotes/origin/{branch}"])
-        except Exception:
-            git._call(["merge", "--abort"])
-            raise
+        if not replace:
+            try:
+                git._call([*GIT_IDENTITY, "merge", "--no-edit", "-m", title, f"refs/remotes/origin/{branch}"])
+            except Exception:
+                git._call(["merge", "--abort"])
+                raise
         git.push(branch, lease=head)
     body = (f"The {lane} lane's dream tidied `{memory}` ({count} lines added or removed).\n\n"
             "Only the lane's memory directory changes. The orchestrator merges it when CI passes "
@@ -217,7 +225,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
     try:
         if worktree.exists():
             ctx.git.remove_worktree(worktree)
-        git, pushed = _dream_worktree(ctx, lane, worktree)
+        git, pushed, replaced = _dream_worktree(ctx, lane, worktree)
         created = True
         memory = memory_path(config, lane)
         memory_file = worktree / memory
@@ -275,7 +283,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             git.commit_paths([directory], f"Lane {lane} memory: {ctx.now().astimezone().date().isoformat()}")
         if changed or _unpublished(store, git, lane, pushed, f"origin/{config.base_branch}", directory):
             # Completed only once the PR exists after the push; a failure here ends the dream as error.
-            pr = _publish(ctx, git, lane, memory, count)
+            pr = _publish(ctx, git, lane, memory, count, replace=replaced)
             published = git._call(["rev-parse", "HEAD"]).strip()
         record_done(store, lane, count, config.language, ctx.now(), covered_until=covered_until, pr=pr,
                     published=published)

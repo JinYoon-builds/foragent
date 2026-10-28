@@ -81,12 +81,21 @@ class StateBase:
             return None
         return _state.load_record(_state.Run, _state.json.loads(value))
 
+    def dream_runs(self) -> list["Run"]:
+        """Every lane's dream record, running or finished (runs/dream-<lane>.json)."""
+        paths = sorted((self.root / "runs").glob("dream-*.json"))
+        return [run for path in paths if (run := self.get_dream(path.stem[6:])) is not None]
+
     def start_dream(self, lane: str, *, worktree: str | Path) -> "Run":
         with self._state_lock():
             timestamp = self._timestamp()
+            # A fresh record that keeps the earlier dream's recorded processes: leftovers the
+            # tick has not reaped yet stay owned (reaped once this dream finishes).
+            previous = self.get_dream(lane)
+            owned = previous.process_identities if previous is not None else []
             run = _state.Run(0, f"foragent/dream-{lane}", str(worktree), None, timestamp, timestamp,
-                             lane=lane, tier="s", last_activity_at=timestamp, kind="dream")
-            # A fresh record: nothing of an earlier dream of this lane is carried over.
+                             lane=lane, tier="s", last_activity_at=timestamp, kind="dream",
+                             process_identities=list(owned))
             self._write_json(self.root / "runs" / f"dream-{lane}.json", _state.asdict(run))
             return run
 
@@ -95,8 +104,12 @@ class StateBase:
             run = self.get_dream(lane)
             if run is None or run.status == "finished":
                 return run
+            from foragent.processes import observe_tree
+
+            # As finish_run: observe the recorded tree once more, so its descendants stay owned.
             finished = _state.replace(run, status="finished", outcome=outcome,
-                                      detail=" ".join(detail.split())[:500] or f"Run finished with outcome {outcome}.")
+                                      detail=" ".join(detail.split())[:500] or f"Run finished with outcome {outcome}.",
+                                      process_identities=observe_tree(run.process_identities))
             self._write_run(finished, {**self._run_value(finished), "finished_at": self._timestamp()})
             return finished
 
