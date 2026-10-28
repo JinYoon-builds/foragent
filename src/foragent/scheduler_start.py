@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, orch_plan, orch_queue, overlap_files, scheduler, scheduler_quota
+from foragent import machine_budget, orch_plan, orch_queue, overlap_files, resource_sample, scheduler, scheduler_quota
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
@@ -49,8 +49,10 @@ def _apply_budgets(
     """
     if (sample := getattr(ctx, "_budget_sample", None)) is not None:
         return sample  # Already applied in this tick.
+    measured_at = ctx.now()  # Before the sensors: a later publication keeps the measured time (D93).
     sample, machine = scheduler.machine_load(), machine_budget.values()
     ctx._budget_sample = sample
+    resource_sample.record(ctx.store, sample, measured_at)
     scheduler.update_test_slots(
         machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
         swapins=getattr(sample, "swapins", None),
