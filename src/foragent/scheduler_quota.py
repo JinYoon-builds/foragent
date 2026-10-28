@@ -166,11 +166,12 @@ def choose_reviewer(config: Config, executor: str, claude_paused: bool,
     """The reviewer of a run of lane-adjusted ``config`` on ``executor``; the one place it is chosen.
 
     A run on its own executor keeps the configured reviewer, which moves from Claude to Codex
-    while Claude is paused at its hard limit. A run that falls back to an executor other than
-    Claude or Codex, or from one, keeps that reviewer too. Only a fallback between Claude and
-    Codex never waits for a reviewer: the executor it fell back from reviews when it is free,
-    else the configured reviewer when free and not the run's executor, else the run's own
-    executor. Unlimited and unknown executors never review; with no candidate left: ``none``.
+    while Claude is paused at its hard limit. A fallback never waits for a reviewer. One between
+    Claude and Codex is reviewed by the executor it fell back from when that is free, else by
+    the configured reviewer when free and not the run's executor, else by the run's own
+    executor. Any other fallback keeps the configured reviewer when it is free, else the run's
+    own executor reviews. Unlimited and unknown executors never review; with no candidate
+    left: ``none``.
     """
     previous = resolved_reviewer(config)
     source = config.executor
@@ -179,6 +180,10 @@ def choose_reviewer(config: Config, executor: str, claude_paused: bool,
     if executor != source and {source, executor} <= {"claude", "codex"}:
         chain = [source, *([previous] if previous != executor else []), executor]
         return next((name for name in chain if can_review(config, name) and
+                     (name == executor or available(name))), "none")
+    if executor != source:
+        # Any other fallback keeps the configured reviewer while it is free; it never waits for it.
+        return next((name for name in (previous, executor) if can_review(config, name) and
                      (name == executor or available(name))), "none")
     kept = "codex" if claude_paused and previous == "claude" else previous
     return next((name for name in (kept, executor) if can_review(config, name)), "none")

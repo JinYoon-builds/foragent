@@ -14,6 +14,8 @@ from foragent.scheduler_quota import (
 )
 from foragent.state import StateStore
 
+from test_scheduler import approve as sched_approve, ctx  # noqa: F401
+
 NOW = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
 
 
@@ -36,6 +38,10 @@ def store_at(tmp_path):
 @pytest.mark.parametrize("data,key", [
     ({"executors": []}, "executors"),
     ({"executors": None}, "executors"),
+    ({"executors": [entry("local", "unlimited", keep_percent=None)]}, "keep_percent"),
+    ({"executors": [entry("local", "unlimited", spend_cap=None)]}, "spend_cap"),
+    ({"executors": [entry("claude", keep_percent=None)]}, "keep_percent"),
+    ({"executors": [entry("claude", "api", spend_cap=None)]}, "spend_cap"),
     ({"executors": [entry("claude"), entry("claude")]}, "twice"),
     ({"executors": [entry("local", "unlimited", keep_percent=50)]}, "keep_percent"),
     ({"executors": [entry("local", "unlimited", spend_cap=5)]}, "spend_cap"),
@@ -98,7 +104,9 @@ def test_switch_event_and_line_use_the_real_names(tmp_path):
     # [codex, local]: a fallback to another executor keeps the configured reviewer.
     ("codex", "local", None, (), "claude"),
     ("codex", "local", None, ("codex",), "claude"),
-    ("codex", "local", "codex", ("codex",), "codex"),
+    ("codex", "local", "codex", ("codex",), "none"),       # a paused reviewer is skipped; local cannot review
+    ("local", "claude", "codex", ("codex",), "claude"),    # [local, claude]: the run's own executor reviews
+    ("local", "claude", "codex", (), "codex"),             # a free configured reviewer is kept
     ("local", "codex", "claude", (), "claude"),           # from another executor: kept too
     # [claude, codex]: the executor it fell back from reviews when free, else the run's own.
     ("claude", "codex", None, (), "claude"),
@@ -310,3 +318,74 @@ def test_fallback_to_another_executor_keeps_the_configured_reviewer_in_decide(tm
     store.record_usage("codex", [{"name": "5h", "used_percent": 60, "resets_at": None}])
     start = decide(store, config, "main", NOW)
     assert (start.config.executor, start.config.reviewer, start.held) == ("local", "claude", False)
+
+
+
+def test_crashed_run_over_keep_percent_resumes_through_the_tick(ctx):
+    """The lane-wide answer (Claude paused, Codex over keep) must not hold a continued Codex run."""
+    from foragent.scheduler import tick
+    from foragent.scheduler_start import _lane_held
+
+    now = ctx.now()
+    ctx.config = replace(ctx.config, executor="claude", reviewer="none",
+                         executors=[entry("claude"), entry("codex", keep_percent=50)])
+    ctx.start_runs = True
+    sched_approve(ctx, 1)
+    ctx.store.pause_executor("claude", now + timedelta(hours=1))
+    tick(ctx)
+    assert ctx.store.get_run(1).implementer == "codex"
+    ctx.store.finish_run(1, "crashed")
+    ctx.process_table.exit(7001)
+    ctx.tracker.remove_labels(1, ["running"])
+    ctx.tracker.add_labels(1, ["ready"])
+    ctx.store.record_usage("codex", [{"name": "5h", "used_percent": 60, "resets_at": None}])
+    assert _lane_held(ctx, "main", now), "a fresh start in this lane waits"
+    assert not _lane_held(ctx, "main", now, 1), "the continued run does not"
+    tick(ctx)
+    run = ctx.store.get_run(1)
+    assert run.status == "running" and run.implementer == "codex"
+
+
+def spy_decide(monkeypatch):
+    from foragent import scheduler_quota
+
+    numbers, real = [], scheduler_quota.decide
+    monkeypatch.setattr(scheduler_quota, "decide", lambda store, config, lane, now, number=None:
+                        numbers.append(number) or real(store, config, lane, now, number))
+    return numbers
+
+
+def test_machine_budget_counts_waiting_issues_by_their_own_quota_decision(ctx, monkeypatch):
+    from foragent.scheduler_start import _machine_budget
+
+    numbers = spy_decide(monkeypatch)
+    _machine_budget(ctx, {"main": [1, 2]}, ("normal", 0.0))
+    assert numbers == [1, 2]
+
+
+def test_facts_replay_uses_each_issues_own_quota_decision(tmp_path, monkeypatch):
+    from foragent import orch_facts_resources
+    from foragent.orch_facts_runs import _waiting_issues
+    from test_orch_binding_unit import NOW as BINDING_NOW, _store, _waiting
+
+    store = _store(tmp_path)
+    _waiting(store, 7, files="src/a.py")
+    numbers = spy_decide(monkeypatch)
+    config = Config()
+    orch_facts_resources._admission(store, config, tmp_path, BINDING_NOW, _waiting_issues(store, config, []), [],
+                                    machine={"budget": {"max_parallel": None}, "alive": {}})
+    assert numbers == [7]
+
+
+def test_fallback_from_another_executor_never_waits_for_a_paused_reviewer(tmp_path):
+    from foragent.run_implementation import lane_config
+    from foragent.scheduler_quota import run_config
+
+    config = load(tmp_path, {"reviewer": "codex", "executors": [entry("local", "unlimited"), entry("claude")]})
+    store = store_at(tmp_path)
+    for name in ("local", "codex"):
+        store.pause_executor(name, NOW + timedelta(hours=1))
+    start = decide(store, config, "main", NOW)
+    assert (start.config.executor, start.config.reviewer, start.held) == ("claude", "claude", False)
+    runner_config = run_config(store, lane_config(config, "main"), start.implementer, NOW)
+    assert runner_config.reviewer == "claude", "the runner reviews with the same free executor"

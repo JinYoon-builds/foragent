@@ -212,14 +212,15 @@ def _validate_executors(entries: Any) -> set[str]:
         quota = entry.get("quota")
         if not isinstance(quota, str) or quota not in QUOTAS:
             raise ConfigError(f"{where}.quota must be subscription, api or unlimited")
+        # A written key must hold a valid value: `keep_percent: null` is not the same as leaving it out.
         keep = entry.get("keep_percent")
-        if keep is not None and (quota != "subscription" or type(keep) is not int or not 1 <= keep <= 100):
+        if "keep_percent" in entry and (quota != "subscription" or type(keep) is not int or not 1 <= keep <= 100):
             raise ConfigError(f"{where}.keep_percent must be an integer from 1 to 100 on a subscription executor")
         cap = entry.get("spend_cap")
-        if cap is not None and (quota == "unlimited" or isinstance(cap, bool)
-                                or not isinstance(cap, (int, float)) or not cap > 0):
+        if "spend_cap" in entry and (quota == "unlimited" or isinstance(cap, bool)
+                                     or not isinstance(cap, (int, float)) or not cap > 0):
             raise ConfigError(f"{where}.spend_cap must be a number above 0 on a subscription or api executor")
-        if quota == "api" and cap is None:
+        if quota == "api" and "spend_cap" not in entry:
             raise ConfigError(f"{where}.spend_cap is required for an api executor; spending needs a daily cap")
     return set(names)
 

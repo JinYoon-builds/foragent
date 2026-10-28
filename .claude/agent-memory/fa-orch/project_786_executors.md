@@ -16,3 +16,5 @@ metadata:
 - Break-it pitfall: a mutation guarded by `hold is not None and f()` never calls f on the first launch; mutate on a launch property (e.g. `"resume_session_id" in kwargs`) instead.
 - Review attempt 3: every hold path (implementer, reviewer, lane) must ask credits when a hard limit is the cause; continuations use blocked(keep=False).
 - Review 4: one reviewer helper `choose_reviewer()`; only claude<->codex fallbacks switch reviewer, other fallbacks keep configured. Merge with #769 roles: keep both validators in config_validation.
+- Review 5: `_lane_held(ctx, lane, now, number)` at all 3 callers (start loop, _machine_budget, facts _admission); written null keep_percent/spend_cap is a ConfigError.
+- Review 6: every fallback branch of choose_reviewer must check availability (non claude<->codex: configured if free, else own, else none).
