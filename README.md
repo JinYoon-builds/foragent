@@ -2,6 +2,61 @@
 
 > Your agent forages for the next task.
 
+Stock Claude Code is already good at finishing one task. Foragent automates the part **between tasks**: when one task ends, it runs the done-when commands, sends the change to an adversarial review, merges it when it passes, and picks up the next issue by itself. You decide what to build and approve it once.
+
+```
+task ends → done-when commands → adversarial review → merge → next issue
+```
+
+<!-- GIF placeholder: lane view and statusline recording, coming soon (Jin records it). -->
+**GIF placeholder:** a recording of the lane view and the statusline is coming soon.
+
+Foragent built itself: 208 merged PRs in 10 days (counted from `git log` on 2026-10-29).
+
+[한국어 README](#한국어)
+
+## Install
+
+```sh
+uv tool install git+https://github.com/JinYoon-builds/foragent
+fa init
+```
+
+Foragent needs Python 3.12 or newer. You do not have to install it first: if no suitable Python is on your machine, uv fetches one automatically and installs the `fa` command with it. Run `fa init` inside the project folder you want Foragent to work on.
+
+Then open Claude Code in the project and type `/fa`. It sets up the project the first time, and later it briefs you and takes your next order.
+
+## Lanes
+
+A lane is an agent that owns one area of your code, for example `src/foragent/order.py` and its tests. Issues are split by lane, so each lane works in its own area.
+
+- **Own an area.** Each lane has its own paths. An issue goes to the lane that owns the files it changes, so two lanes do not edit the same files.
+- **Learn.** Each lane keeps its own memory of patterns, pitfalls and commands in that area. Lessons from one issue help the next issue in the same lane.
+- **Work in parallel.** Lanes run at the same time, each in its own git worktree. The gate merges the results one by one.
+
+## Runs on stock Claude Code
+
+Foragent does not replace Claude Code. It uses what stock Claude Code already has:
+
+- **Lanes are `.claude/agents`.** Each lane is a plain agent file, `.claude/agents/fa-<lane>.md`.
+- **Skills are `SKILL.md`.** `/fa`, `/fa-order` and `/fa-inspect` are ordinary skills with a `SKILL.md` file.
+- **Memory is project memory.** Each lane writes its lessons to Claude Code project memory in the repository.
+- **Only the gate runs outside.** `fa gate` is a background program with no LLM of its own. It runs outside Claude Code and starts Claude Code sessions for the work.
+
+Codex CLI is optional. If it is installed, Foragent can use it to implement issues or to cross-review Claude's work.
+
+## Known limits, contributions welcome
+
+These limits are known. Each item names the file where a change would start.
+
+- **Codex-only setups are not supported yet.** Foragent runs on Claude Code; Codex CLI is optional. Running with Codex CLI and without Claude Code is not supported at launch. Start at `config.resolved_reviewer` (the default reviewer) and `orch_spawn` (`src/foragent/orch_spawn.py`, which starts the orchestrator with `claude`).
+- **The background gate is macOS only.** It runs as a launchd service. A Linux service (for example systemd) is not written yet. Start at `src/foragent/launchd.py`.
+- **Native Windows is not supported yet.** WSL will follow the Linux gate when it exists. Start at `src/foragent/launchd.py`.
+- **Terminal switching works only in Orca.** Foragent opens the lane view beside your session in tmux, WezTerm, kitty, iTerm2 or Terminal, but only Orca lets it switch back to the terminal it opened before. Other terminals open a new split instead. Start at `src/foragent/watch_open.py`.
+- **Update checks always use the main repository.** A fork still checks `JinYoon-builds/foragent` for updates and installs from it. Start at `src/foragent/update_check.py`.
+
+## 한국어
+
 한 작업을 끝까지 하는 것은 이제 순정 Claude Code·Codex도 잘한다. Foragent는 **작업과 작업 사이**를 자동화한다.
 
 ```
@@ -10,7 +65,7 @@
 
 사람은 무엇을 만들지 결정하고 승인만 한다. "다 했어? → 리뷰해 → 다음 거"를 손으로 반복하지 않는다.
 
-## 명령
+### 명령
 
 | 단계 | 어디서 | 하는 일 | 사람이 하는 일 |
 |---|---|---|---|
@@ -29,7 +84,7 @@ ID 없이 `fa lanes skills <lane>`을 실행하면 목록을 비운다. `style` 
 변경은 작업 트리에 남으므로 확인한 뒤 커밋한다.
 `.foragent.yml` 수정은 커밋해서 기본 브랜치에 푸시해야 gate tick에 반영된다.
 
-## 문서
+### 문서
 
 - [docs/decisions.md](docs/decisions.md) — 확정된 결정과 이유
 - [docs/status.md](docs/status.md) — 무엇이 설계됐고 무엇이 남았나
