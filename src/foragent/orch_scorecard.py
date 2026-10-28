@@ -15,8 +15,9 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_scorecard_flow as flow
+from foragent import orch_roles, orch_scorecard_flow as flow
 from foragent.config import Config
+from foragent.roles import load_roles
 from foragent.orch_binding import scorecard as binding
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _seconds, _time
@@ -137,8 +138,12 @@ def _worse(today: dict[str, Any], previous: dict[str, Any]) -> list[str]:
             if now is not None and before is not None and (now - before) * direction > 0]
 
 
-def collect(store: StateStore, days: int = 7, lanes: dict | None = None) -> dict[str, Any]:
-    """The card; ``lanes`` (the config's lanes) places issues in lanes for plan pauses."""
+def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
+            roles: list[str] | None = None) -> dict[str, Any]:
+    """The card; ``lanes`` (the config's lanes) places issues in lanes for plan pauses.
+
+    ``roles`` (the role names) adds each role's calls and accepted proposals to both windows.
+    """
     now = store._now()
     runs, events = _runs(store, now, days), _events(store, now, days)
     calls = [0] * days
@@ -161,6 +166,12 @@ def collect(store: StateStore, days: int = 7, lanes: dict | None = None) -> dict
     previous.update(flow.previous(flows[1:]))
     previous["merges"] = _half_up(previous["merges"]) if previous["merges"] is not None else None
     order = [*_day([], [], 0), "phase_minutes", "load", "merges", *flow.NAMES]
+    if roles is not None:
+        role_days = orch_roles.counts(roles, events, days)
+        today["roles"] = role_days[0]
+        previous["roles"] = {name: {key: _half_up(median([day[name][key] for day in role_days[1:]]))
+                                    for key in ("calls", "accepted_proposals")} for name in roles}
+        order.append("roles")
     today, previous = {name: today[name] for name in order}, {name: previous[name] for name in order}
     repeated, unexplained = _failures([run for index, run in runs if index == 0])
     return {"now": now.isoformat(), "days": days, "window": {"today": today, "previous": previous},
@@ -257,6 +268,10 @@ def human(card: dict[str, Any], language: str) -> str:
              _flow_line("scorecard_flow_previous", previous, language)]
     if "binding" in card:
         lines.append(_binding_line(card["binding"], language))
+    for name, counts in today.get("roles", {}).items():
+        before = previous["roles"][name]
+        lines.append(f"Role {name}: calls {counts['calls']} (before {before['calls']}), accepted proposals "
+                     f"{counts['accepted_proposals']} (before {before['accepted_proposals']})")
     for name in card["worse"]:
         before, now = _pair(card, name)
         lines.append(text("scorecard_worse", language, metric=name, before=_shown(name, before),
@@ -294,6 +309,6 @@ def add_parser(orch_actions) -> None:
 
 
 def command(args, store: StateStore, config: Config) -> None:
-    card = collect(store, args.days, config.lanes)
+    card = collect(store, args.days, config.lanes, list(load_roles(config)))
     card["binding"] = binding(store, config, args.repo_root, card)
     print(json.dumps(card, ensure_ascii=False) if args.json else human(card, config.language))
