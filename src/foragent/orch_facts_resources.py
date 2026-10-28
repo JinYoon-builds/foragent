@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from foragent import capacity, orch_queue
+from foragent import capacity, orch_facts_machine, orch_queue
 from foragent.config import Config, in_run_hours, lane_executors
 from foragent.processes import read_process_identity
 from foragent.state import Run, StateStore
@@ -191,14 +191,13 @@ def _admission(
         # The tick skips the whole start loop before any cap, quota or file check.
         held.update({number: hold_all for _, number in ranked})
         ranked = []
-    lane_holds: dict[str, bool] = {}
     for index, (lane, number) in enumerate(ranked):
         item = items[number]
         if remaining <= 0:
             # No slot ends the loop: nothing after this point is checked.
             held.update({later: "cap" for _, later in ranked[index:]})
             break
-        if lane_holds.setdefault(lane, _lane_held(ctx, lane, now)):
+        if _lane_held(ctx, lane, now, number):  # The issue's own quota decision, as the tick makes it.
             held[number] = "quota"
         elif not admits(ctx, lane, item.parsed, known, unknown, union=union):
             held[number] = "structure"
@@ -251,9 +250,9 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
             name in needed and not value["paused"] and (value["remaining_share"] or 0) > 0)
     waiting_now = bool(held) or slots["queue_length"] > 0
     return {
-        "machine": {"load_per_cpu": load, "memory_pressure": pressure, "memory_headroom": memory_headroom,
-                    "headroom": headroom, "overloaded": overloaded,
-                    "idle_while_waiting": headroom and waiting_now},
+        "machine": {**orch_facts_machine.sample(machine, now), "load_per_cpu": load, "memory_pressure": pressure,
+                    "memory_headroom": memory_headroom, "headroom": headroom, "overloaded": overloaded,
+                    "idle_while_waiting": headroom and waiting_now}, **orch_facts_machine.local(store, config, now, running, machine),
         "quota": quota,
         # `admitted` is what `hold_test_slot` grants now, including machine.yml's default ceiling.
         "test_slots": {**slots, "admitted": capacity.effective_test_slots(
