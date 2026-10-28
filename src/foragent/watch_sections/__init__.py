@@ -10,12 +10,14 @@ blank line, and ``GAP_AFTER = False`` to have the next section follow it
 directly. Context carries ``tick``, ``width``, ``selected``, ``now`` and
 ``layout`` from the frame API, ``height`` (None when unbounded) and ``state``
 (the live view's memory across frames, None for a stateless frame), plus ``top`` and ``hits`` (clickable rectangles,
-later entries win). A section draws from ``top`` 0; the compositor moves its
+later entries win), and ``marks`` (issue rows as (row, number, lane or None); only rows with
+a lane can be folded). A section draws from ``top`` 0; the compositor moves its
 hits to the rows where it lands. Within a screen ``height``, sections with
 ``KEEP = True`` always stay and the others give way from the bottom up; a section
 with ``STAYS = True`` stays like KEEP but does not end the lane-row block, and
 moves up into the first ``height - 1`` rows when the KEEP sections push it below; the
-footer then gets ``short=True``. ``rows=True`` says the frame has the lane rows,
+footer then gets ``short=True``. Before that, a section with ``TIGHT = True`` (the lane
+rows) is drawn again with ``tight=True`` and may leave out rows it can spare. ``rows=True`` says the frame has the lane rows,
 so a section need not list the running issues again.
 
 Shared helpers live in ``foragent.watch_layout``; this package holds sections only.
