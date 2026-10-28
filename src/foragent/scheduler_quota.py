@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
+import os
 from typing import TYPE_CHECKING, NamedTuple
 
 from foragent.config import Config, resolved_reviewer
@@ -97,23 +98,36 @@ class Switch:
 MEASURED = frozenset({"claude"})
 
 
+def api_key_billing() -> bool:
+    """Whether Claude runs started by this process bill the API (#889): derived from the
+    gate's own environment, never stored. An OAuth token keeps Claude on its subscription."""
+    return bool(os.environ.get("ANTHROPIC_API_KEY")) and not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+
+
+def billed(entry: dict) -> dict:
+    """``entry`` as it bills now: under an API key Claude is api, capped only by its own spend_cap."""
+    if entry["name"] == "claude" and api_key_billing():
+        return {**entry, "quota": "api"}
+    return entry
+
+
 def fallback_order(config: Config) -> list[dict]:
     """The lane-adjusted executor first, then the configured order, wrapping around (#786).
 
     A lane executor missing from the list uses only that executor, as before the list existed.
     """
-    entries = [dict(entry) for entry in config.executors]
+    entries = [billed(dict(entry)) for entry in config.executors]
     names = [entry["name"] for entry in entries]
     if config.executor not in names:
-        return [{"name": config.executor, "quota": "subscription"}]
+        return [billed({"name": config.executor, "quota": "subscription"})]
     index = names.index(config.executor)
     return entries[index:] + entries[:index]
 
 
 def entry_for(config: Config, name: str) -> dict:
-    """``name``'s executors entry; an unlisted executor counts as a plain subscription."""
-    return next((dict(entry) for entry in config.executors if entry["name"] == name),
-                {"name": name, "quota": "subscription"})
+    """``name``'s executors entry as it bills now; an unlisted executor counts as a plain subscription."""
+    return billed(next((dict(entry) for entry in config.executors if entry["name"] == name),
+                       {"name": name, "quota": "subscription"}))
 
 
 def blocked(entry: dict, store: StateStore, now: datetime, usage: dict, mode: str,
@@ -127,6 +141,10 @@ def blocked(entry: dict, store: StateStore, now: datetime, usage: dict, mode: st
     if quota == "api" and name not in MEASURED:  # A cap that is never measured cannot hold spending back.
         return Switch(f"{label(name)} reports no cost, so its api spend cannot be measured against spend_cap",
                       "switch_reason_unmeasured", {"name": label(name)}, name), False
+    if quota == "api" and cap is None:  # Only an API key makes this (#889): no spend without a cap.
+        return Switch(f"{label(name)} bills the API through ANTHROPIC_API_KEY and has no spend_cap; "
+                      "set a spend_cap in its executors entry to allow it",
+                      "switch_reason_uncapped", {"name": label(name)}, name), False
     spent = store.spend_today(name, now) if cap is not None else 0.0
     if cap is not None and spent >= cap:
         return Switch(f"{label(name)} spent {spent:g} of its daily cap {cap:g}", "switch_reason_cap",
@@ -191,7 +209,7 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
     order = fallback_order(adjusted)
     kept = kept_implementer(store, number) if number is not None else None
     if kept is not None:
-        order = [next((entry for entry in order if entry["name"] == kept), {"name": kept, "quota": "subscription"})]
+        order = [next((entry for entry in order if entry["name"] == kept), entry_for(adjusted, kept))]  # Billed as listed ones.
     switch, chosen, asks = None, None, []
     for entry in order:
         # A continued run (crashed, stalled-restart, limit-wait) keeps its implementer: only a hard
