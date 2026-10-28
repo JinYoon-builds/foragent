@@ -23,12 +23,19 @@ def hit_test(layout: dict[str, Any], x: int, y: int) -> Any:
     return None
 
 
+# A screen shorter than this is treated as no height: F as it is, no position line, no scrolling.
+MIN_SCREEN = 3
+
+
 def scroll_limit(state: dict[str, Any]) -> int:
-    """The last scroll offset: len(F) - (height - 1), else (before any screen) the last row."""
+    """The last scroll offset: len(F) - (height - 1); 0 under MIN_SCREEN rows; before any
+    screen was drawn, the last row of the last frame."""
     length, height = state.get("length", 0), state.get("height")
-    if height:
-        return max(0, length - max(1, height - 1)) if length > height else 0
-    return max(0, length - 1)
+    if height is None:
+        return max(0, length - 1)
+    if height < MIN_SCREEN or length <= height:
+        return 0
+    return length - (height - 1)
 
 
 def scroll(state: dict[str, Any], rows: int) -> None:
@@ -42,7 +49,8 @@ def highlighted_row(state: dict[str, Any]) -> int | None:
     """
     issues = dict(state.get("rows", ()))
     top, height = state.get("scroll", 0), state.get("height")
-    bottom = top + max(1, height - 1) if height and state.get("length", 0) > height else None
+    windowed = height is not None and height >= MIN_SCREEN and state.get("length", 0) > height
+    bottom = top + height - 1 if windowed else None
     return next((y for y in sorted(issues) if y >= top and (bottom is None or y < bottom)), None)
 
 
@@ -54,17 +62,20 @@ def highlighted(state: dict[str, Any]) -> int | None:
     return None if y is None else dict(state.get("rows", ()))[y]
 
 
-def _open(state: dict[str, Any], number: int | None, store: StateStore | None) -> None:
+def _open(state: dict[str, Any], number: int | None, store: StateStore | None, row: int | None = None) -> None:
     """Open, switch or (with None) close the issue box; the box reads the records through store.
 
     The box starts at its top; closing it brings the rows back where they were scrolled.
+    ``row`` is the F row it was opened from: the box names that row's lane, if any.
     """
     was_open = state.get("issue") is not None
     if number is not None:
         if not was_open:
             state["rows_scroll"] = state.get("scroll", 0)
             state["scroll"] = 0
+        # The box names the lane of the row it was opened from (none for a completion row).
         state["issue"], state["store"] = number, store
+        state["issue_lane"] = state.get("row_lanes", {}).get(row)
     elif was_open:
         state["issue"] = None
         state["scroll"] = state.pop("rows_scroll", 0)
@@ -88,7 +99,8 @@ def handle_mouse(
         watch.switch_to_orchestrator(store)
     elif isinstance(target, tuple) and target[0] == "acorn":
         # The same issue closes its box; another issue switches the box to it.
-        _open(state, None if state.get("issue") == target[1] else target[1], store)
+        row = y + layout.get("offset", 0)
+        _open(state, None if state.get("issue") == target[1] else target[1], store, row)
     elif isinstance(target, tuple) and target[0] == "more":
         toggle_lane(state, target[1])
 
@@ -135,12 +147,14 @@ def handle_key(key: str, store: StateStore, config: Config, *, state: dict[str, 
         unfolded = set(state.get("unfolded", ()))
         state["unfolded"] = set() if lanes <= unfolded else lanes | unfolded
     elif key in ("enter", "f"):
-        number = watch.highlighted(state)
-        if number is None:
+        # The highlighted row itself, not its issue number, decides: a completion row of an
+        # issue that also shows as a lane row is still not foldable.
+        row = watch.highlighted_row(state)
+        if row is None:
             return False
         if key == "enter":
-            _open(state, number, store)
-        elif (slug := state.get("issue_lanes", {}).get(number)) is not None:
+            _open(state, dict(state.get("rows", ()))[row], store, row)
+        elif (slug := state.get("row_lanes", {}).get(row)) is not None:
             watch.toggle_lane(state, slug)
     return False
 

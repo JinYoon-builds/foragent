@@ -26,3 +26,7 @@ metadata:
 공백 보완(2026-10-29): `watch._wrap`·`_line`은 `_clean`으로 연속 공백을 하나로 합친다. 원문을 보여 주는 이슈 상자는 `acorns._verbatim_wrap`(문자를 바꾸지 않고 마지막 공백 뒤나 폭에서 끊음, 이어 붙이면 원문)과 `[(piece, "")]`로 직접 Line을 만든다. `parse_body`의 goal은 `.strip()`되어 첫 줄 들여쓰기가 사라지므로 본문에서 "## Goal" 뒤 위치를 찾아 되살린다. 탭은 그 텍스트 자체 열 기준으로 펼친 뒤 "  "를 붙이고, C 범주 제어 문자는 뺀다. 레인 줄 제목 칸의 `_clean`은 한 줄 요약이라 REBUTTAL.
 
 링크 캐시 보완(2026-10-29): OSC 8 링크를 "글자가 같으면 안 씀"으로 캐시했더니, 창 크기 변경 뒤 curses가 같은 글자를 지우고 다시 그려 링크가 사라졌다(리뷰가 PTY로 확인). curses는 크기 변경·자체 clear 때 같은 글자도 다시 그리므로 캐시를 지우고 refresh마다 쓴다. PTY 재현: TIOCSWINSZ로 크기를 바꾸고 SIGWINCH를 보낸 뒤 출력에서 `\x1b[2J` 이후에 링크가 있는지 본다.
+
+상호작용 데이터 보완(2026-10-29, "두 번째 보류 뒤 기준"): 구역이 state에 직접 쓰면(issue_lanes 등) 24줄 trimming이 그 구역을 다시 그리거나 뺄 때 낡은 값이 남는다. 이제 구역은 `marks`(줄, 번호, 레인 또는 None)를 hits처럼 내고, `_frame`이 마지막 조립의 marks로 한 번만 state["rows"]·["issue_lanes"]·["lanes"]를 만든다(STAYS 이동도 marks를 옮김). 완료 목록 줄은 레인 None(f 안 됨, Enter·클릭은 됨). 상자 레인 힌트는 열 때 `state["issue_lane"]`에 저장. 3줄 미만 화면은 높이 없음(`MIN_SCREEN`): F 그대로, 위치 줄 없음, scroll 0. F가 맞으면 실시간 화면은 base처럼 키 도움말을 맨 아래 줄에, 오류는 그 줄을 대신. break-it 함정: tight 뒤에도 frame이 크면 나중 assemble이 marks를 덮어 낡은 marks 변형이 안 잡힌다 — tight만으로 24줄에 맞는 경우(blocked, queued=(), done=(1,2))를 시험에 넣는다.
+
+줄 정체성 보완(2026-10-29): 같은 이슈가 펼친 레인 줄과 완료 목록 줄에 동시에 보이면, 번호로 찾는 `issue_lanes`가 완료 줄에서도 레인을 돌려줘 f가 접혔다. 이제 `state["row_lanes"]`({F 줄: 레인})로 줄마다 저장하고 f·Enter는 `highlighted_row`의 줄로, 클릭은 `y + layout["offset"]`(높이 렌더가 기록한 scroll, 높이 없는 렌더는 0)로 F 줄을 찾는다. 번호 기준이 맞는 곳(같은 이슈 다시 클릭하면 상자 닫힘, OSC 링크 URL)은 그대로.

@@ -128,7 +128,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         return []
     width = context["width"]
     lines: list[Line] = []
-    for text in watch.issue_box(number, store, config, state.get("issue_lanes", {}).get(number)):
+    for text in watch.issue_box(number, store, config, state.get("issue_lane")):
         # Never _wrap: it joins runs of spaces, which would change a Done-when command.
         lines += [[(piece, "")] for piece in _verbatim_wrap(text, width - 2)]
     hits = context.get("hits")

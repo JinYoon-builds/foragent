@@ -124,14 +124,20 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 view_state["scroll"] = len(frame)  # Jump to the lane details at the end.
                 show_detail = False
             # The same slice as render_frame with this height; hit boxes move to screen rows.
-            visible = watch._window(frame, view_state, max(1, height), max(1, width), config.language,
+            # Under 3 rows this is F itself, painted from the top and cut to the screen below.
+            visible = watch._window(frame, view_state, height, max(1, width), config.language,
                                     layout if store is not None else None)
             top = view_state.get("scroll", 0)
-            if error:
+            alert = [watch._fit(watch._line(error, "yellow"), max(1, width))] if error else []
+            if height >= watch.MIN_SCREEN and len(frame) <= height and visible:
+                # F fits: painted as today, its last row (the key help) on the bottom row,
+                # where a refresh error takes its place.
+                body = visible[:-1]
+                visible = body + [[]] * (height - 1 - len(body)) + (alert or visible[-1:])
+            elif alert:
                 # A refresh error takes the bottom row (in place of the position line).
-                bottom = max(1, height) - 1
-                visible = visible[:bottom] + [[]] * (bottom - len(visible[:bottom])) + [
-                    watch._fit(watch._line(error, "yellow"), max(1, width))]
+                bottom = max(0, height - 1)
+                visible = visible[:bottom] + [[]] * (bottom - len(visible[:bottom])) + alert
             # One highlighted row, by its position: the first issue row on screen.
             mark = watch.highlighted_row(view_state) if view_state.get("issue") is None else None
             marked = set() if mark is None else {mark - top}

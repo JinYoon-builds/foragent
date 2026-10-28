@@ -127,30 +127,38 @@ def _frame(
     from foragent import watch
 
     sections = _sections()
-    rendered: list[tuple[ModuleType, list[Line], list[tuple[int, int, int, int, Any]]]] = []
-    for section in sections:
-        # Each section draws once from row 0; its click areas move with it below.
-        own: list[tuple[int, int, int, int, Any]] = []
+    Hit = tuple[int, int, int, int, Any]
+    Mark = tuple[int, int, str | None]  # (row, issue number, its lane; None when not foldable)
+    rendered: list[tuple[ModuleType, list[Line], list[Hit], list[Mark]]] = []
+
+    def draw(section: ModuleType, **extra: Any) -> tuple[ModuleType, list[Line], list[Hit], list[Mark]]:
+        # A section draws from row 0; its click areas and issue rows move with it below.
+        own: list[Hit] = []
+        marks: list[Mark] = []
         lines = section.render(snapshot, config, repo_root, tick=tick, width=width, selected=selected,
-                               now=now, layout=layout, top=0, hits=own, rows=True, height=height,
-                               state=state)
-        rendered.append((section, list(lines), own))
+                               now=now, layout=layout, top=0, hits=own, marks=marks, rows=True,
+                               height=height, state=state, **extra)
+        return section, list(lines), own, marks
+
+    for section in sections:
+        rendered.append(draw(section))
     # From its SIDE width on, a section (the orchestrator box) stands to the right
     # of the sections between the lane rows and itself.
-    side = next((index for index, (section, _, _) in enumerate(rendered) if getattr(section, "SIDE", None)), None)
+    side = next((index for index, (section, *_) in enumerate(rendered) if getattr(section, "SIDE", None)), None)
     wide = side is not None and width >= rendered[side][0].SIDE
-    rows_end = max((index for index, (section, _, _) in enumerate(rendered)
+    rows_end = max((index for index, (section, *_) in enumerate(rendered)
                     if getattr(section, "KEEP", False) and (side is None or index < side)), default=-1)
 
     stays: list[tuple[int, int]] = []  # Row spans of the STAYS sections in the last assembly.
 
-    def assemble() -> tuple[list[Line], list[tuple[int, int, int, int, Any]]]:
-        hits: list[tuple[int, int, int, int, Any]] = []
+    def assemble() -> tuple[list[Line], list[Hit], list[Mark]]:
+        hits: list[Hit] = []
+        marks: list[Mark] = []
         frame: list[Line] = []
         stays.clear()
         mark = None  # Where the sections beside the SIDE section begin.
         joined = False  # The previous section asked the next one to follow it directly.
-        for index, (section, lines, own) in enumerate(rendered):
+        for index, (section, lines, own, rows) in enumerate(rendered):
             if not lines:
                 continue
             gap = bool(frame) and getattr(section, "GAP", True) and not joined
@@ -162,43 +170,39 @@ def _frame(
                 frame += watch._beside(left, lines, left_width)
                 hits += [(x0 + left_width + 2, y0 + mark, x1 + left_width + 2, y1 + mark, target)
                          for x0, y0, x1, y1, target in own]
+                marks += [(y + mark, number, lane) for y, number, lane in rows]
                 continue
             top = len(frame) + gap
             if wide and mark is None and rows_end < index < side:
                 mark = top
             frame += [[]] * gap + lines
             hits += [(x0, y0 + top, x1, y1 + top, target) for x0, y0, x1, y1, target in own]
+            marks += [(y + top, number, lane) for y, number, lane in rows]
             if getattr(section, "STAYS", False):
                 stays.append((top, top + len(lines)))
-        return frame, hits
+        return frame, hits, marks
 
-    frame, hits = assemble()
+    frame, hits, marks = assemble()
     if height is not None and len(frame) > height:
         # A folded lane's last finished row and toggle give way first.
-        for index, (section, lines, own) in enumerate(rendered):
+        for index, (section, *_) in enumerate(rendered):
             if getattr(section, "TIGHT", False):
-                own = []
-                rendered[index] = (section, list(section.render(
-                    snapshot, config, repo_root, tick=tick, width=width, selected=selected, now=now,
-                    layout=layout, top=0, hits=own, rows=True, height=height, state=state, tight=True)), own)
-        frame, hits = assemble()
+                rendered[index] = draw(section, tight=True)
+        frame, hits, marks = assemble()
     if height is not None and len(frame) > height:
         # Lane rows win: the other sections give way from the bottom up.
         order = reversed(range(len(rendered)))
         for index in order:
-            section, lines, _ = rendered[index]
+            section, lines, *_ = rendered[index]
             if lines and not (getattr(section, "KEEP", False) or getattr(section, "STAYS", False)):
-                rendered[index] = (section, [], [])
+                rendered[index] = (section, [], [], [])
                 if len(assemble()[0]) <= height:
                     break
         # The footer becomes one short line of the key letters.
-        for index, (section, lines, own) in enumerate(rendered):
+        for index, (section, *_) in enumerate(rendered):
             if section.__name__.endswith(".help"):
-                own = []
-                rendered[index] = (section, list(section.render(
-                    snapshot, config, repo_root, tick=tick, width=width, selected=selected, now=now,
-                    layout=layout, top=0, hits=own, rows=True, height=height, state=state, short=True)), own)
-        frame, hits = assemble()
+                rendered[index] = draw(section, short=True)
+        frame, hits, marks = assemble()
     if height is not None:
         # The live view shows the first height - 1 rows above the footer. A STAYS
         # section pushed below them by the KEEP sections moves up to just above the
@@ -210,13 +214,21 @@ def _frame(
             frame[target:end] = frame[start:end] + frame[target:start]
             hits = [(x0, y0 + size, x1, y1 + size, item) if target <= y0 < start else (x0, y0, x1, y1, item)
                     for x0, y0, x1, y1, item in hits]
+            marks = [(y + size, number, lane) if target <= y < start else (y, number, lane)
+                     for y, number, lane in marks]
     if layout is not None:
         layout["hits"] = hits
+        layout["offset"] = 0  # Hits are in F rows; a height render shifts them (``_window``).
     if state is not None:
-        # Scrolling and the keyboard highlight read the frame's size and issue rows.
+        # Interaction data comes once from the final rows, never from a section draw that a
+        # later trim replaced: the frame's size, its issue rows for the highlight, and the
+        # lane of each foldable row (completion rows have none, so f does nothing there).
         state["length"] = len(frame)
-        state["rows"] = sorted({(y0, target[1]) for x0, y0, x1, y1, target in hits
-                                if isinstance(target, tuple) and target[0] == "acorn" and x1 > x0})
+        state["rows"] = sorted({(y, number) for y, number, _ in marks})
+        # Lanes belong to rows, not issue numbers: the same issue can show as a lane row
+        # (foldable) and again as a completion row (not foldable).
+        state["row_lanes"] = {y: lane for y, _, lane in marks if lane is not None}
+        state["lanes"] = list(snapshot.status.get("lanes", {}))
     return [watch._fit(list(line), width) for line in frame]
 
 
@@ -226,7 +238,8 @@ def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width:
 
     ``frame`` is F, the heightless 24-row-trimmed frame (its footer row is an ordinary
     row). When F fits, it is returned as it is. When it is taller, the screen shows
-    F[scroll : scroll + height - 1] and a position line with N = len(F). ``scroll``
+    F[scroll : scroll + height - 1] and a position line with N = len(F); under
+    MIN_SCREEN (3) rows it is F as it is, as with no height. ``scroll``
     stays within 0..len(F) - (height - 1), and ``layout['hits']`` moves to screen rows,
     clipped to the visible rows.
     """
@@ -234,12 +247,14 @@ def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width:
 
     state = {} if state is None else state
     state.update(height=height, length=len(frame))
-    if len(frame) <= height:
+    if height < watch.MIN_SCREEN or len(frame) <= height:
+        # F fits, or the screen is too short to scroll (under 3 rows counts as no height).
         state["scroll"] = 0
         return frame
-    rows = max(1, height - 1)
+    rows = height - 1
     top = state["scroll"] = max(0, min(state.get("scroll", 0), watch.scroll_limit(state)))
     if layout is not None:
+        layout["offset"] = top  # Screen row + offset = F row.
         layout["hits"] = [(x0, max(0, y0 - top), x1, min(rows, y1 - top), target)
                           for x0, y0, x1, y1, target in layout.get("hits", [])
                           if max(0, y0 - top) < min(rows, y1 - top)]
@@ -268,5 +283,5 @@ def render_frame(
         **({} if state is None else {"state": state}),
     )
     if height is not None:
-        frame = watch._window(frame, state, max(1, height), max(1, width), config.language, layout)
+        frame = watch._window(frame, state, height, max(1, width), config.language, layout)
     return "\n".join("".join(value for value, style in line).rstrip() for line in frame)

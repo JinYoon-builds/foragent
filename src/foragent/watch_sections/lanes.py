@@ -292,9 +292,6 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     glyphs = GLYPHS[glyph_mode(config)]
     unfolded = set(state.get("unfolded", ())) if state is not None else set()
     rows = _rows(snapshot, config, glyphs, context["now"], unfolded, bool(context.get("tight")))
-    if state is not None:
-        state["lanes"] = list(snapshot.status["lanes"])
-        state["issue_lanes"] = {row["issue"]: row["slug"] for row in rows if "issue" in row}
     if not rows:
         return []
     cells = [row for row in rows if "toggle" not in row]
@@ -318,7 +315,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         if over > 0:
             widths[key] = max(min(widths[key], least), widths[key] - over)
     shown = [key for key in columns if widths[key]]
-    hits = context.get("hits")
+    hits, marks = context.get("hits"), context.get("marks")
     lines: list[Line] = []
     for row in rows:
         if "toggle" in row:
@@ -332,6 +329,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             # The whole row, from its #issue to its acorns, opens the issue's box.
             target = (0, len(lines) - 1, min(width, watch._cells("".join(v for v, _ in lines[-1]).rstrip())),
                       len(lines), ("acorn", row["issue"]))
+            if marks is not None:
+                marks.append((len(lines) - 1, row["issue"], row["slug"]))  # A lane row folds its lane.
         else:
             values = [row["glyph"], row["lane"]] + ([row["rest"]] if row["rest"] else [])
             sizes = [glyph_width, max(lane_width, watch._cells(row["lane"]))] + (
