@@ -265,78 +265,43 @@ def test_unreadable_reference_keeps_record_open_and_rate_limit_propagates(monkey
         board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
 
 
-def test_reference_reads_stop_at_the_tick_allowance_and_resume_next_tick(monkeypatch, tmp_path):
+def test_every_unlisted_reference_is_read_fresh_in_one_tick_without_a_cap(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
     from foragent import board_parents
 
-    cap = board_parents.MAX_REFERENCE_READS
-    first = list(range(100, 100 + cap - 1))
-    rows = [_record(1, edited=first), _record(2, edited=[200, 201]), _record(3, edited=[300])]
-    remote = {n: child(n, state="closed") for n in [*first, 200, 201, 300]}
-    ctx, out = _record_ctx(monkeypatch, rows, remote, root=tmp_path)
+    edited = list(range(100, 125))
+    rows = [_record(1, edited=edited), _record(2, edited=[100])]
+    ctx, out = _record_ctx(monkeypatch, rows, {n: child(n, state="closed") for n in edited}, root=tmp_path)
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert len(out.reads) == cap, "One tick reads at most the allowance"
-    assert [n for n, _ in out.closed] == [1], "Records past the allowance wait for the next tick"
-    rows[0]["state"] = "closed"
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.reads[cap:] == [201, 300], "The next tick reads only what is still unconfirmed"
-    assert [n for n, _ in out.closed] == [1, 2, 3]
+    assert out.reads == [*edited, 100], "Each record reads its unlisted references fresh"
+    assert out.closed == [(1, text("order_record_closed", "en", count=25)),
+                          (2, text("order_record_closed", "en", count=1))]
+    assert list(tmp_path.iterdir()) == [], "Nothing about references is stored between ticks"
 
 
-def test_record_with_more_unlisted_issues_than_one_tick_reads_closes_next_tick(monkeypatch, tmp_path):
+def test_reference_read_closed_earlier_is_read_again_on_every_tick(monkeypatch):
     from types import SimpleNamespace
 
     from foragent import board_parents
+    from foragent.tracker import TrackerError
 
-    cap = board_parents.MAX_REFERENCE_READS
-    edited = list(range(100, 100 + cap + 1))
-    rows = [_record(1, edited=edited)]
-    ctx, out = _record_ctx(monkeypatch, rows, {n: child(n, state="closed") for n in edited},
-                           root=tmp_path)
+    rows = [_record(1, edited=[4, 5, 6])]
+    remote = {4: Issue(4, "", "", frozenset(), "open", is_pull_request=True),
+              5: child(5, state="closed"), 6: child(6)}
+    ctx, out = _record_ctx(monkeypatch, rows, remote)
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.closed == [] and len(out.reads) == cap
+    assert out.reads == [4, 5, 6] and out.closed == []
+    remote[5], remote[6] = child(5), child(6, state="closed")  # #5 reopened; #6 closed.
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.closed == [(1, text("order_record_closed", "en", count=cap + 1))]
-    assert sorted(out.reads) == edited, "Every reference is read exactly once"
-
-
-def test_confirmed_reads_expire_and_open_work_clears_them(monkeypatch, tmp_path):
-    from datetime import UTC, datetime, timedelta
-    from types import SimpleNamespace
-
-    from foragent import board_parents
-
-    cap = board_parents.MAX_REFERENCE_READS
-    edited = list(range(100, 100 + cap + 1))
-    remote = {n: child(n, state="closed") for n in edited}
-    now = [datetime(2026, 1, 1, tzinfo=UTC)]
-    rows = [_record(1, edited=edited)]
-    ctx, out = _record_ctx(monkeypatch, rows, remote, root=tmp_path, clock=lambda: now[0])
+    assert out.reads[3:] == [4, 5] and out.closed == [], "A reopened reference keeps the record open"
+    remote[5] = TrackerError("Not Found")
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    now[0] += board_parents.CONFIRMED_FOR + timedelta(seconds=1)
+    assert out.reads[5:] == [4, 5] and out.closed == [], "An unreadable reference keeps the record open"
+    remote[5] = child(5, state="closed")
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.closed == [] and out.reads[cap:] == edited[:cap], "Expired reads are read again"
-
-    rows.append(_row(edited[-1], "open"))  # The one unread reference shows up open in the listing.
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    rows.pop()
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.closed == [] and out.reads[2 * cap:] == edited[:cap], (
-        "Open work clears earlier closed reads, so they are read again"
-    )
-
-
-def test_reference_shared_by_records_is_read_once_per_tick(monkeypatch):
-    from types import SimpleNamespace
-
-    from foragent import board_parents
-
-    rows = [_record(1, edited=[5]), _record(2, {"a": 5})]
-    ctx, out = _record_ctx(monkeypatch, rows, {5: child(5, state="closed")})
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.reads == [5]
-    assert [n for n, _ in out.closed] == [1, 2]
+    assert out.reads[7:] == [4, 5, 6]
+    assert out.closed == [(1, text("order_record_closed", "en", count=2))], "The pull request is ignored"
 
 
 def test_unparseable_marker_is_skipped_quietly_even_with_completed_children(monkeypatch):
@@ -407,100 +372,3 @@ def test_known_pull_request_reference_spends_no_read(monkeypatch):
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
     assert out.reads == [], "A pull request the listing already shows is ignored without a read"
     assert out.closed == [(1, text("order_record_closed", "en", count=1))]
-
-
-def test_record_with_more_unlisted_pull_requests_than_one_tick_allows_still_closes(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-
-    from foragent import board_parents
-
-    cap = board_parents.MAX_REFERENCE_READS
-    prs = list(range(100, 100 + cap + 1))
-    rows = [_record(1, edited=[*prs, 500])]
-    remote = {n: Issue(n, "", "", frozenset(), "open", is_pull_request=True) for n in prs}
-    remote[500] = child(500, state="closed")
-    ctx, out = _record_ctx(monkeypatch, rows, remote, root=tmp_path)
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.closed == [] and out.reads == prs[:cap]
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.reads[cap:] == [prs[-1], 500], "Pull requests read on an earlier tick are not read again"
-    assert out.closed == [(1, text("order_record_closed", "en", count=1))]
-
-    ctx, out = _record_ctx(monkeypatch, rows, remote, root=tmp_path)
-    rows[0]["state"] = "open"
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.reads == [], "A new tick context reads the remembered reads from the state folder"
-
-
-def test_unreadable_references_do_not_starve_later_records(monkeypatch):
-    from datetime import UTC, datetime, timedelta
-    from types import SimpleNamespace
-
-    from foragent import board_parents
-    from foragent.tracker import TrackerError
-
-    cap = board_parents.MAX_REFERENCE_READS
-    rows = [_record(n, edited=[1000 + n]) for n in range(1, cap + 1)] + [_record(cap + 1, edited=[2000])]
-    remote = {1000 + n: TrackerError("Not Found") for n in range(1, cap + 1)}
-    remote[2000] = child(2000, state="closed")
-    now = [datetime(2026, 1, 1, tzinfo=UTC)]
-    ctx, out = _record_ctx(monkeypatch, rows, remote, clock=lambda: now[0])
-    for _ in range(cap + 1):
-        board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-        assert len(out.reads) <= cap * (_ + 1)
-        now[0] += timedelta(seconds=board_parents.ROTATION_SECONDS)
-    assert {n for n, _ in out.closed} == {cap + 1}, (
-        "Records that cannot be read must not take the whole allowance on every tick"
-    )
-
-
-def test_closed_read_is_confirmed_again_in_the_closing_tick(monkeypatch, tmp_path):
-    import json as _json
-    from types import SimpleNamespace
-
-    from foragent import board_parents
-    from foragent.tracker import TrackerError
-
-    rows = [_record(1, edited=[4, 5, 6])]
-    remote = {4: Issue(4, "", "", frozenset(), "open", is_pull_request=True),
-              5: child(5, state="closed"), 6: child(6)}
-    ctx, out = _record_ctx(monkeypatch, rows, remote, root=tmp_path)
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.reads == [4, 5, 6] and out.closed == []
-    remote[5] = TrackerError("Not Found")  # Unreadable now, after an earlier read saw it closed.
-    remote[6] = child(6, state="closed")
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.reads[3:] == [5] and out.closed == [], "An unreadable reference keeps the record open"
-    remote[5] = child(5, state="closed")
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.reads[4:] == [5, 6], "The pull request read earlier is not read again"
-    assert out.closed == [(1, text("order_record_closed", "en", count=2))]
-
-    path = tmp_path / board_parents.REFERENCE_READS_FILE
-    assert _json.loads(path.read_text())["prs"] == [4]
-    rows[0]["state"] = "closed"
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert _json.loads(path.read_text()) == {"prs": [], "confirmed": {}}, (
-        "Reads for records that are no longer open are dropped"
-    )
-
-
-def test_an_unfinished_sub_issue_clears_earlier_closed_reads(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-
-    from foragent import board_parents
-
-    cap = board_parents.MAX_REFERENCE_READS
-    edited = list(range(100, 100 + cap + 1))
-    rows = [_record(1, edited=edited, children=[2])]
-    subs = {1: [child(2, state="closed", reason="completed")]}
-    ctx, out = _record_ctx(monkeypatch, rows, {n: child(n, state="closed") for n in edited},
-                           children=subs, root=tmp_path)
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    subs[1] = [child(2)]  # Reopened sub-issue: the record has open work again.
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    subs[1] = [child(2, state="closed", reason="completed")]
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.closed == [] and out.reads[cap:] == edited[:cap], (
-        "Closed reads taken before the sub-issue reopened no longer count"
-    )

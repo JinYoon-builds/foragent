@@ -43,11 +43,9 @@ def test_unlisted_reference_read_closed_earlier_is_read_again_before_closing(par
     assert [entry for entry in case.tracker.closures if entry[0] == 40] == [(40, "completed")]
 
 
-def test_record_with_more_unlisted_closed_references_than_one_tick_reads_closes(parent_case):  # noqa: F811
-    from foragent import board_parents
-
+def test_record_with_many_unlisted_closed_references_closes_in_one_tick(parent_case):  # noqa: F811
     case = parent_case
-    edited = list(range(100, 100 + board_parents.MAX_REFERENCE_READS + 1))
+    edited = list(range(100, 125))
     for number in edited:
         add_work(case, number, closed=True)
     add_record(case, 40, edited=edited)
@@ -64,7 +62,5 @@ def test_record_with_more_unlisted_closed_references_than_one_tick_reads_closes(
 
     case.tracker.get_issue = get_issue
     gate_tick(case)
-    assert case.tracker.get_issue(40).state == "open"
-    tick_again(case)
-    assert case.tracker.get_issue(40).state == "closed", "Reads carry over listing refreshes"
+    assert case.tracker.get_issue(40).state == "closed", "Every unlisted reference is read in the same tick"
     assert sorted(reads) == edited, "Each unlisted reference is read exactly once"
