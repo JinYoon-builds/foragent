@@ -697,3 +697,19 @@ def test_publication_markers_skip_deleted_files_and_symlinks(git_history):
     git = GitRepo(root)
     assert git.conflict_marker_lines(git.changed_paths("HEAD")) == []
     assert git.conflict_marker_lines([]) == []
+
+
+@pytest.mark.parametrize("config", [None, "language: [unclosed\n", "language: ko\n"])
+def test_publication_conflict_language_falls_back_to_english_silently(tmp_path, monkeypatch, capsys, config):
+    from foragent.git import PublicationError
+
+    if config is not None:
+        (tmp_path / ".foragent.yml").write_text(config, encoding="utf-8")
+    git = GitRepo(tmp_path)
+    monkeypatch.setattr(git, "changed_paths", lambda base: ["a.py"])
+    monkeypatch.setattr(git, "conflict_marker_lines", lambda paths: [("a.py", 3)])
+    with pytest.raises(PublicationError) as raised:
+        git.check_publication("base")
+    expected = "충돌 마커가 남음: a.py:3" if config == "language: ko\n" else "Conflict marker left: a.py:3"
+    assert str(raised.value) == expected
+    assert capsys.readouterr() == ("", "")

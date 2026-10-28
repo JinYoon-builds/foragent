@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from foragent import capacity, orch_queue
+from foragent import capacity, orch_facts_machine, orch_queue
 from foragent.config import Config, in_run_hours, lane_executors
 from foragent.processes import read_process_identity
 from foragent.state import Run, StateStore
@@ -250,9 +250,9 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
             name in needed and not value["paused"] and (value["remaining_share"] or 0) > 0)
     waiting_now = bool(held) or slots["queue_length"] > 0
     return {
-        "machine": {"load_per_cpu": load, "memory_pressure": pressure, "memory_headroom": memory_headroom,
-                    "headroom": headroom, "overloaded": overloaded,
-                    "idle_while_waiting": headroom and waiting_now},
+        "machine": {**orch_facts_machine.sample(machine, now), "load_per_cpu": load, "memory_pressure": pressure,
+                    "memory_headroom": memory_headroom, "headroom": headroom, "overloaded": overloaded,
+                    "idle_while_waiting": headroom and waiting_now}, **orch_facts_machine.local(store, config, now, running, machine),
         "quota": quota,
         # `admitted` is what `hold_test_slot` grants now, including machine.yml's default ceiling.
         "test_slots": {**slots, "admitted": capacity.effective_test_slots(
