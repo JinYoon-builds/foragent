@@ -115,6 +115,30 @@ class LocalRecordsMixin:
         except FileNotFoundError:
             return {}
 
+    def record_spend(self, executor: str, amount: float) -> None:
+        """Append one charge in the executor's account currency; ``spend.jsonl`` is append-only (#786)."""
+        line = _state.json.dumps({"at": self._timestamp(), "executor": executor, "amount": float(amount)})
+        with self._state_lock(), (self.root / "spend.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+
+    def spend_today(self, executor: str, now: Any = None) -> float:
+        """The executor's charges on the UTC day of ``now``, as providers count usage."""
+        day = (now or self._now()).astimezone(_state.UTC).date()
+        try:
+            lines = (self.root / "spend.jsonl").read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return 0.0
+        total = 0.0
+        for line in lines:
+            try:
+                row = _state.json.loads(line)
+                if (row["executor"] == executor
+                        and _state.datetime.fromisoformat(row["at"]).astimezone(_state.UTC).date() == day):
+                    total += float(row["amount"])
+            except (ValueError, KeyError, TypeError):
+                continue  # A torn last line is not a charge.
+        return total
+
     def record_usage(self, executor: str, windows: list[dict[str, Any]]) -> None:
         """Keep the latest usage per executor and append it to a bounded observation history."""
         with self._state_lock():

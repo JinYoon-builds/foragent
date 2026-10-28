@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, orch_plan, orch_queue, overlap_files, scheduler, scheduler_quota
+from foragent import machine_budget, orch_plan, orch_queue, overlap_files, resource_sample, scheduler, scheduler_quota
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
@@ -22,9 +22,11 @@ if TYPE_CHECKING:
     from foragent.scheduler import TickContext, TickReport
 
 
-def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
-    """A lane waits while a live plan pauses it, or it, its implementer or its reviewer is paused for a usage limit.
+def _lane_held(ctx: TickContext, lane: str, now: datetime, number: int | None = None) -> bool:
+    """A start waits while a live plan pauses its lane, or quota admission holds it.
 
+    ``number`` makes the quota decision the issue's own (#786): a continued run keeps its
+    implementer and skips keep_percent, so a lane-wide answer must not hold it back.
     A start switched to Codex (#107) skips a Claude-caused lane pause, leaves it in place,
     and waits only on its own pair's executor pauses.
     """
@@ -32,7 +34,7 @@ def _lane_held(ctx: TickContext, lane: str, now: datetime) -> bool:
         return True
     if (dream := ctx.store.get_dream(lane)) is not None and dream.status == "running":
         return True  # While a lane dreams, no new issue of that lane starts.
-    return scheduler_quota.decide(ctx.store, ctx.config, lane, now).held
+    return scheduler_quota.decide(ctx.store, ctx.config, lane, now, number).held
 
 
 def _at_plan_width(ctx: TickContext, lane: str) -> bool:
@@ -51,8 +53,10 @@ def _apply_budgets(
     """
     if (sample := getattr(ctx, "_budget_sample", None)) is not None:
         return sample  # Already applied in this tick.
+    measured_at = ctx.now()  # Before the sensors: a later publication keeps the measured time (D93).
     sample, machine = scheduler.machine_load(), machine_budget.values()
     ctx._budget_sample = sample
+    resource_sample.record(ctx.store, sample, measured_at)
     scheduler.update_test_slots(
         machine["test_slots"], ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
         swapins=getattr(sample, "swapins", None),
@@ -70,7 +74,8 @@ def _machine_budget(
     """Update the machine-wide AIMD value once per tick and return this tick's machine budget."""
     now = ctx.now()
     # Every ready issue in an unpaused lane may start; the file-overlap check runs at start time.
-    waiting = sum(len(numbers) for lane, numbers in ready.items() if not _lane_held(ctx, lane, now))
+    waiting = sum(1 for lane, numbers in ready.items() for number in numbers
+                  if not _lane_held(ctx, lane, now, number))
     waiting += getattr(ctx, "_dream_demand", 0)  # A due dream asks for one worker too.
     sample = sample if sample is not None else scheduler.machine_load()
     pressure, load = sample
@@ -174,11 +179,10 @@ def _start_ready(
     sample = sample if sample is not None else scheduler.machine_load()
     budget = scheduler._machine_budget(ctx, ready, sample)
     started = False
-    held: dict[str, bool] = {}
     for lane, number in _ranked(ctx, ready):
         if not scheduler._has_slot(ctx, budget):
             break
-        if held.setdefault(lane, _lane_held(ctx, lane, ctx.now())):
+        if _lane_held(ctx, lane, ctx.now(), number):
             continue
         if _at_plan_width(ctx, lane):
             continue

@@ -70,6 +70,12 @@ def offline_only(monkeypatch, isolated_home):
     monkeypatch.setattr(executors.CodexExecutor, "run", forbidden)
     monkeypatch.setattr(executors.ClaudeExecutor, "run", forbidden)
     monkeypatch.setattr(notify, "send", forbidden)
+    try:  # #129's tick push step is its own feature; these tests pin other tick work.
+        from foragent import orch_push
+    except ImportError:
+        orch_push = None
+    if orch_push is not None and hasattr(orch_push, "after_tick"):
+        monkeypatch.setattr(orch_push, "after_tick", lambda *args, **kwargs: ([], False))
     yield
     assert calls == [], "All GitHub operations must stay at the injected offline boundary"
 

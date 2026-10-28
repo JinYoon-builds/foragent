@@ -81,17 +81,27 @@ DECISION_FIELDS = ("last_progress_at", "waiting_until", "waited_seconds", "slept
 LIVENESS_FIELDS = ("pid", "process_identities", "executor_pgid", "last_progress_at")
 
 
+def _listing():
+    """The process table, or None when it cannot be read (no evidence either way)."""
+    try:
+        return processes.list_processes()
+    except OSError:  # PermissionError included.
+        return None
+
+
 def runner_alive(run: Run, exists=None) -> bool | None:
     """The one liveness rule for a recorded runner (issue or dream) with a pid.
 
     It is alive when its pid exists with the recorded start time; a reused pid (another
     start time) is dead. With no recorded start time (no birth identity), it is alive
-    while the pid exists. A pid the listing could not read is unknown (None), never dead.
+    while the pid exists. A pid the listing could not read, or a table that cannot be read at
+    all, is unknown (None), never dead and never an error.
     ``exists`` is the caller's signal-0 probe (recovery passes its own, patchable one).
     """
     identities = {item["pid"]: item["start_time"] for item in run.process_identities}
     if run.pid in identities:
-        table = processes.list_processes()
+        if (table := _listing()) is None:
+            return None
         if run.pid in getattr(table, "unreadable", frozenset()):
             return None  # Unknown liveness is not confirmed death (D95).
         if not any(row.pid == run.pid and row.start_time == identities[run.pid] for row in table):
@@ -100,8 +110,9 @@ def runner_alive(run: Run, exists=None) -> bool | None:
 
 
 def _run_processes_exist(run: Run) -> bool:
-    """Whether any recorded process may remain; an unreadable recorded pid counts (unknown is not gone)."""
-    rows = processes.list_processes()
+    """Whether any recorded process may remain; an unreadable pid or table counts (unknown is not gone)."""
+    if (rows := _listing()) is None:
+        return True
     identities = {item["pid"]: item["start_time"] for item in run.process_identities}
     unreadable = getattr(rows, "unreadable", frozenset())
     return (any(_pid_exists(pid) for pid in (run.pid, run.executor_pgid) if pid is not None)
@@ -133,7 +144,9 @@ def _stop_unconfirmed(run: Run) -> bool:
     injected killer, as the locked stop tests require.
     """
     identities = {item["pid"] for item in run.process_identities}
-    unreadable = getattr(processes.list_processes(), "unreadable", frozenset())
+    if (table := _listing()) is None:
+        return True  # No table: nothing about the stop is confirmed.
+    unreadable = getattr(table, "unreadable", frozenset())
     roots = {pid for pid in (run.pid, run.executor_pgid) if pid is not None}
     return bool(unreadable & {*roots, *identities}) or (
         run.kind != "issue" and any(pid not in identities and _pid_exists(pid) for pid in roots))

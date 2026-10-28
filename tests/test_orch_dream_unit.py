@@ -727,3 +727,30 @@ def test_a_configured_main_lane_waits_on_its_own_executors_pause(world, monkeypa
     monkeypatch.setattr(orch_dream, "dream_due", lambda *args: ["main", "orch"])
     world.store.pause_executor("codex", world.clock[0] + timedelta(hours=1))
     assert orch_dream._admissible(world.ctx) == ["orch"], "main waits on codex; orch's claude is free"
+
+
+def unreadable_table(monkeypatch):
+    def refuse():
+        raise PermissionError("Process table unavailable; ownership cannot be verified")
+
+    monkeypatch.setattr(processes, "list_processes", refuse)
+
+
+def test_manual_completion_with_an_unreadable_process_table_records_the_event(world, monkeypatch):
+    run = dreaming(world)
+    world.alive[4100] = True
+    unreadable_table(monkeypatch)
+    assert orch_dream.dreamed_command(world.store, world.config, "orch") == 0
+    assert orch_dream.last_dream_at(world.store, "orch") is not None
+    assert world.store.get_dream("orch") == run
+
+
+@pytest.mark.parametrize("minutes", [0, 11], ids=["fresh", "past-the-stall-limit"])
+def test_recovery_with_an_unreadable_process_table_neither_finishes_nor_kills(world, monkeypatch, minutes):
+    dreaming(world)
+    world.alive[4100] = True
+    world.clock[0] += timedelta(minutes=minutes)
+    unreadable_table(monkeypatch)
+    recover(world)
+    run = world.store.get_dream("orch")
+    assert run.status == "running" and world.removed == []
