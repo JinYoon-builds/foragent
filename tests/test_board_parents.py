@@ -142,3 +142,100 @@ def test_batch_parent_completes_when_its_children_are_done(monkeypatch, batch_ro
     assert closed == [(9, text("order_record_closed", "en", count=1))]
     assert synced == [(9, "Done")]
 
+
+
+def _record_ctx(monkeypatch, rows, remote, children=None):
+    """An offline tick context whose local listing is ``rows`` and GitHub is ``remote``."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from foragent import board, board_parents
+
+    flags, out = {}, SimpleNamespace(events=[], closed=[], synced=[], reads=[])
+
+    def get_issue(n):
+        out.reads.append(n)
+        return remote[n]
+
+    store = SimpleNamespace(
+        local_issues=lambda: rows, load_flag=lambda n: flags.get(n),
+        save_flag=lambda n, reason, flagged_at: flags.__setitem__(n, SimpleNamespace(reason=reason)),
+    )
+    tracker = SimpleNamespace(sub_issues=lambda n: (children or {}).get(n, []), get_issue=get_issue,
+                              close_issue=lambda n, comment: out.closed.append((n, comment)))
+    ctx = SimpleNamespace(store=store, tracker=tracker, config=SimpleNamespace(language="en"),
+                          now=lambda: datetime(2026, 1, 1, tzinfo=UTC))
+    monkeypatch.setattr(board_parents, "append_event", lambda *args: out.events.append(args))
+    monkeypatch.setattr(board, "sync_status",
+                        lambda ctx, n, state, parent=False: out.synced.append((n, state, parent)))
+    return ctx, out
+
+
+def _record(number, mapping=None, edited=(), labels=(), children=()):
+    acceptance = {str(n): {"tests/acceptance/test_x.py": "0" * 40} for n in edited}
+    body = (f"Order.\n\n<!-- foragent:plan id=r-{number} map={json.dumps(mapping or {})} "
+            f"acceptance={json.dumps(acceptance)} -->")
+    return {"number": number, "state": "open", "labels": list(labels), "body": body,
+            "children": list(children)}
+
+
+def _row(number, state):
+    return {"number": number, "state": state, "labels": [], "body": "", "title": ""}
+
+
+def test_plan_references_reads_map_values_and_edited_issues():
+    from foragent.board_parents import plan_references
+
+    assert plan_references(_record(1, {"a": 2, "b": 3}, edited=[3, 4])["body"]) == {2, 3, 4}
+    assert plan_references("no marker") == set()
+
+
+def test_record_counts_distinct_references_and_reads_reasons_only_when_all_closed(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, {"a": 2, "b": 3}, edited=[3], children=[2]), _row(2, "closed"), _row(3, "closed")]
+    ctx, out = _record_ctx(monkeypatch, rows, {3: child(3, state="closed", reason="completed")},
+                           children={1: [child(2, state="closed", reason="completed")]})
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.closed == [(1, text("order_record_closed", "en", count=2))]
+    assert out.reads == [3], "The sub-issue already carries its reason; only the other reference is read"
+    assert out.synced == [(1, "Done", True)]
+
+    rows[2] = _row(3, "open")
+    ctx, out = _record_ctx(monkeypatch, rows, {}, children={1: [child(2, state="closed", reason="completed")]})
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.closed == [] and out.reads == [], "Open referenced work keeps the record open without reads"
+
+
+def test_record_reads_missing_reference_and_flags_not_planned(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, {"a": 2}, edited=[3]), _row(2, "closed")]
+    remote = {2: child(2, state="closed", reason="completed"), 3: child(3, state="closed", reason="not_planned")}
+    ctx, out = _record_ctx(monkeypatch, rows, remote)
+    report = SimpleNamespace(actions=[])
+    board_parents.follow_children(ctx, report)
+    assert sorted(out.reads) == [2, 3], "A reference missing from the listing is read from GitHub"
+    assert out.closed == [], "A not_planned reference keeps the record open"
+    assert [event[3] for event in out.events] == [board_parents.NOT_PLANNED_FLAG]
+    assert report.actions == [text("parent_child_not_planned", "en", number=1, children="#3")]
+    assert out.synced == [], "A record without sub-issues keeps today's board column"
+
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert len(out.events) == 1, "The flag is raised once"
+
+
+def test_record_with_a_lane_label_or_approval_is_not_closed_by_references(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    for labels in (["lane:main"], ["approved"]):
+        rows = [_record(1, {"a": 2}, labels=labels), _row(2, "closed")]
+        ctx, out = _record_ctx(monkeypatch, rows, {2: child(2, state="closed", reason="completed")})
+        board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+        assert out.closed == [] and out.reads == []
