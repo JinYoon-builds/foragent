@@ -58,3 +58,4 @@
 - #773: 문서 순서 시험(`text.find`로 첫 등장 위치 비교)은 제목에 든 낱말도 센다. 예: 제목 "before a new role"이 "lane memory"보다 먼저 나와 실패했다. 제목에는 검사 구절을 쓰지 않는다. `fa role add` 플래그는 `--scope --signal paths:<glob> --skill --why`(test_role_source.py).
 - #849: README의 자체 제작 수치는 `git log --first-parent --oneline | grep -cE '\(#[0-9]+\)$'`(PR 수)와 첫·마지막 커밋 날짜(포함 일수)로 센다. `watch_open`에서 Orca만 되는 것은 기록된 터미널로 돌아가기(`terminal show`)이고, 분할은 tmux·WezTerm·kitty·iTerm·Terminal도 된다.
 - #848: `fa init` 마지막 질문(Starter order)은 `commands/init.py::_offer_starter`, 자격 판정은 `starter.eligible`(열린 approved 이슈·`pr_issue_number` 병합 PR), 트래커는 `InitReport.tracker`(compare=False). 시험 가짜 report는 SimpleNamespace라 `getattr`로 읽는다. init에 질문을 더하면 잠긴 `test_statusline_wrapper.py` 4개가 질문 수 때문에 깨진다 → QUESTION.md.
+- #848 2차: `input()`을 `forbidden`으로 막고 init을 돌리는 잠긴 시험도 있다(`test_irreversible_paths.py`, `test_quota_executors.py`). init 질문을 더할 때는 `grep -l builtins.input tests -r | xargs grep -l '"init"'`로 전부 찾아 돌린다.
