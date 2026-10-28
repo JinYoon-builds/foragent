@@ -24,8 +24,9 @@ from test_init import setup
 from test_skills_autosync import cli_exit, isolated_home
 
 def _skip_upstream(answer):
-    """#419 asks once about upstream reports; these tests count only statusline questions."""
-    return lambda prompt="": "n" if "upstream report" in prompt.lower() else answer(prompt)
+    """#419 asks about upstream reports and #848 offers a starter order; these tests count only statusline questions."""
+    return lambda prompt="": ("n" if "upstream report" in prompt.lower() or "starter order" in prompt.lower()
+                              else answer(prompt))
 
 
 
