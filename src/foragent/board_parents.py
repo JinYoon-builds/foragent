@@ -8,14 +8,18 @@ as completed. An approved issue with sub-issues stays ordinary work.
 An order record (plan marker, no lane label) also owns every issue its plan
 marker references: the map values and the issues in its acceptance (edit)
 map. Edit-only records and records older than native sub-issue edges have no
-sub-issues, so the close waits for those references as well (#837). Only the
-close reads them; the board column still comes from sub-issues alone.
+sub-issues, so the close waits for those references as well (#837). A closed
+reference counts as done whatever its reason; native sub-issues keep the
+not_planned handling. Until a record closes, its card keeps today's handling.
 """
 
 import json
 import logging
+import os
 import re
+import tempfile
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 from foragent import board
@@ -27,6 +31,10 @@ from foragent.tracker import Issue, TrackerError
 log = logging.getLogger(__name__)
 
 NOT_PLANNED_FLAG = "parent-child-not-planned"
+REFERENCE_PRS_FILE = "order_reference_prs.json"  # Written only here: numbers that read as pull requests.
+ROTATION_SECONDS = 300  # One step of the record rotation: the listing refresh interval.
+MAX_REFERENCE_READS = 20  # Extra get_issue reads one tick may spend on order-record references.
+_MARKER_START = "<!-- foragent:plan "
 _PLAN_MARKER = re.compile(r"<!-- foragent:plan id=\S+ map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
 
 
@@ -65,56 +73,119 @@ def order_parents(rows: list[dict[str, Any]]) -> set[int]:
             and APPROVED not in row.get("labels", ())}
 
 
-def plan_references(body: str) -> set[int]:
-    """Issues a plan marker names: its map values and its acceptance (edit) map keys."""
-    marker = _PLAN_MARKER.search(body or "")
-    if marker is None:
+def plan_references(body: str) -> set[int] | None:
+    """Issues a plan marker names: its map values and its acceptance (edit) map keys.
+
+    None when the body has a plan marker that does not parse; a marker with
+    any invalid entry is unparseable as a whole, so no reference is dropped.
+    """
+    if _MARKER_START not in (body or ""):
         return set()
+    marker = _PLAN_MARKER.search(body)
+    if marker is None:
+        return None
     try:
         mapping = json.loads(marker[1])
         acceptance = json.loads(marker[2]) if marker[2] else {}
     except ValueError:
-        return set()
-    numbers = set()
-    if isinstance(mapping, dict):
-        numbers |= {n for n in mapping.values() if type(n) is int and n > 0}
-    if isinstance(acceptance, dict):
-        numbers |= {int(key) for key in acceptance if isinstance(key, str) and key.isdecimal() and int(key) > 0}
-    return numbers
+        return None
+    if (not isinstance(mapping, dict) or not isinstance(acceptance, dict)
+            or any(type(n) is not int or n <= 0 for n in mapping.values())
+            or any(not isinstance(key, str) or not key.isdecimal() or int(key) <= 0 for key in acceptance)):
+        return None
+    return set(mapping.values()) | {int(key) for key in acceptance}
 
 
-def order_records(rows: list[dict[str, Any]]) -> dict[int, set[int]]:
-    """Open, unapproved order records (plan marker, no lane label) and the issues they reference."""
-    records = {}
+def order_records(rows: list[dict[str, Any]]) -> tuple[dict[int, set[int]], set[int]]:
+    """Open order records (plan marker, no lane label) with their references, and those whose marker does not parse.
+
+    An approved issue is ordinary work even with a plan marker, as with sub-issues.
+    A record may reference itself; it is open, so that keeps it open.
+    """
+    records, unparseable = {}, set()
     for row in rows:
         labels = row.get("labels", ())
         if (row.get("state") != "open" or APPROVED in labels
-                or any(label.startswith("lane:") for label in labels)):
+                or any(label.startswith("lane:") for label in labels)
+                or _MARKER_START not in (body := row.get("body") or "")):
             continue
-        if references := plan_references(row.get("body", "")) - {row["number"]}:
-            records[row["number"]] = references
-    return records
-
-
-def _referenced_work(ctx, references: set[int], known: dict[int, Issue],
-                     rows: dict[int, dict[str, Any]]) -> list[Issue] | None:
-    """The referenced issues besides the sub-issues, or None while any of them is open.
-
-    The local listing gives open/closed; a closed issue's reason needs a read, so
-    reads happen only once nothing is open. An issue missing locally is read.
-    """
-    found, closed = [], []
-    for number in sorted(references - known.keys()):
-        row = rows.get(number)
-        if row is None:
-            found.append(ctx.tracker.get_issue(number))
-        elif row.get("state") == "open":
-            return None
+        references = plan_references(body)
+        if references is None:
+            unparseable.add(row["number"])
         else:
-            closed.append(number)
-    if any(issue.state == "open" for issue in [*known.values(), *found]):
-        return None
-    return found + [ctx.tracker.get_issue(number) for number in closed]
+            records[row["number"]] = references
+    return records, unparseable
+
+
+def _reference_prs(store) -> set[int]:
+    """Referenced numbers an earlier tick read as pull requests; the tracker does not record them."""
+    root = getattr(store, "root", None)
+    if root is None:
+        return set()
+    try:
+        saved = json.loads((Path(root) / REFERENCE_PRS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {n for n in saved.get("prs", ()) if type(n) is int} if isinstance(saved, dict) else set()
+
+
+def _remember_reference_prs(store, numbers: set[int]) -> None:
+    """Add pull request numbers; a number that is a pull request stays one, so the file only grows."""
+    root = getattr(store, "root", None)
+    if root is None or not numbers:
+        return
+    path = Path(root) / REFERENCE_PRS_FILE
+    content = json.dumps({"prs": sorted(_reference_prs(store) | numbers)}) + "\n"
+    try:
+        fd, temporary = tempfile.mkstemp(dir=root, prefix=f".{REFERENCE_PRS_FILE}.")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(temporary, path)
+    except OSError as exc:
+        log.warning("Could not remember referenced pull requests: %s", exc)
+
+
+def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]],
+                       known_prs: set[int], reads: dict[str, Any]) -> set[int] | None:
+    """The referenced issues once every one is closed, or None while any is open or unknown.
+
+    A closed reference counts as done whatever its close reason. The local
+    listing answers first; an issue missing from it is read once per tick,
+    within the tick's read allowance. The tick's tracker records each read
+    issue locally, so a record with more missing references than one tick
+    allows still advances on each tick. A pull request number is ignored.
+    """
+    closed, missing = set(), []
+    for number in sorted(references):
+        row = rows.get(number)
+        if number in known_prs:
+            continue
+        if row is None:
+            missing.append(number)
+        elif row.get("state") != "closed":
+            return None  # Open work keeps the record open without spending reads.
+        else:
+            closed.add(number)
+    for number in missing:
+        if number not in reads["issues"]:
+            if reads["left"] <= 0:
+                return None  # The rest is read on later ticks.
+            reads["left"] -= 1
+            try:
+                reads["issues"][number] = ctx.tracker.get_issue(number)
+            except TrackerError as exc:
+                if exc.is_rate_limit:
+                    raise
+                log.warning("Could not read #%s, which an order record references: %s", number, exc)
+                reads["issues"][number] = None
+        issue = reads["issues"][number]
+        if issue is None or not issue.is_pull_request and issue.state != "closed":
+            return None  # Unreadable or open work keeps the record open.
+        if issue.is_pull_request:
+            reads["prs"].add(number)
+        else:
+            closed.add(number)
+    return closed
 
 
 def follow_children(ctx, report) -> None:
@@ -122,39 +193,49 @@ def follow_children(ctx, report) -> None:
     rows = ctx.store.local_issues()
     by_number = {row["number"]: row for row in rows}
     open_prs = {row["number"] for row in rows if row.get("pr_number") and not row.get("merged")}
-    records = order_records(rows)
+    known_prs = {row["pr_number"] for row in rows if row.get("pr_number")} | _reference_prs(ctx.store)
+    parents = order_parents(rows)
+    records, unparseable = order_records(rows)
+    reads = {"left": MAX_REFERENCE_READS, "issues": {}, "prs": set()}
     language = ctx.config.language
-    for number in sorted(order_parents(rows) | records.keys()):
-        children = ctx.tracker.sub_issues(number) if by_number[number].get("children") else []
-        state = parent_state(children, open_prs)
-        work = children
-        if references := records.get(number, set()) - {child.number for child in children}:
-            try:
-                extra = _referenced_work(ctx, references, {c.number: c for c in children}, by_number)
-            except TrackerError as exc:
-                if exc.is_rate_limit:
-                    raise
-                log.warning("Could not read the issues order record #%s references: %s", number, exc)
-                extra = None
-            # Open (or unreadable) referenced work keeps the record open.
-            work = children + extra if extra is not None else None
-        if state is None and not work:
-            continue
-        cancelled = [child.number for child in work or children
-                     if child.state == "closed" and not _completed(child)]
-        if cancelled:
-            previous = ctx.store.load_flag(number)
-            if previous is None or previous.reason != NOT_PLANNED_FLAG:
-                at = ctx.now()
-                ctx.store.save_flag(number, NOT_PLANNED_FLAG, flagged_at=at.isoformat())
-                summary = text("parent_child_not_planned", language, number=number,
-                               children=", ".join(f"#{child}" for child in cancelled))
-                append_event(ctx.store, at, number, NOT_PLANNED_FLAG, summary)
-                report.actions.append(summary)
-        if work and all(_completed(issue) for issue in work):
-            ctx.tracker.close_issue(number, text("order_record_closed", language, count=len(work)))
-            report.actions.append(text("parent_closed_report", language, number=number,
-                                       count=len(work)))
-            state = "Done"
-        if state is not None:
-            board.sync_status(ctx, number, state, parent=True)
+    order = sorted(parents | records.keys())
+    if order:  # Rotate each tick so the read allowance does not always go to the same records.
+        start = int(ctx.now().timestamp() // ROTATION_SECONDS) % len(order)
+        order = order[start:] + order[:start]
+    try:
+        for number in order:
+            children = ctx.tracker.sub_issues(number) if by_number[number].get("children") else []
+            # Until a record closes, only an order parent's sub-issues move its card (today's handling).
+            state = parent_state(children, open_prs) if number in parents else None
+            cancelled = [child.number for child in children
+                         if child.state == "closed" and not _completed(child)]
+            if cancelled and number in parents:
+                previous = ctx.store.load_flag(number)
+                if previous is None or previous.reason != NOT_PLANNED_FLAG:
+                    at = ctx.now()
+                    ctx.store.save_flag(number, NOT_PLANNED_FLAG, flagged_at=at.isoformat())
+                    summary = text("parent_child_not_planned", language, number=number,
+                                   children=", ".join(f"#{child}" for child in cancelled))
+                    append_event(ctx.store, at, number, NOT_PLANNED_FLAG, summary)
+                    report.actions.append(summary)
+            work = {child.number for child in children}
+            if number in records:
+                done = None
+                if all(_completed(child) for child in children):
+                    # Sub-issues already carry their state; read only the other references.
+                    done = _closed_references(ctx, records[number] - work, by_number, known_prs, reads)
+                closes = done is not None and bool(work | done)
+                work |= done or set()
+            elif number in unparseable:
+                closes = False  # Its work is unknown: skip the close quietly; the card keeps today's column.
+            else:
+                closes = state == "Done"
+            if closes:
+                ctx.tracker.close_issue(number, text("order_record_closed", language, count=len(work)))
+                report.actions.append(text("parent_closed_report", language, number=number,
+                                           count=len(work)))
+                state = "Done"
+            if state is not None:
+                board.sync_status(ctx, number, state, parent=True)
+    finally:
+        _remember_reference_prs(ctx.store, reads["prs"])

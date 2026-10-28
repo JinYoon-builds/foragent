@@ -120,6 +120,7 @@ def test_work_state_writes_skip_an_open_order_parent_card(monkeypatch):
 ])
 def test_batch_parent_completes_when_its_children_are_done(monkeypatch, batch_rows):
     """Batch finalization continues for a closed parent, so completion never waits for it."""
+    from datetime import UTC, datetime
     from types import SimpleNamespace
 
     from foragent import board, board_parents
@@ -135,7 +136,8 @@ def test_batch_parent_completes_when_its_children_are_done(monkeypatch, batch_ro
     tracker = SimpleNamespace(sub_issues=lambda n: [child(2, state="closed", reason="completed")],
                               close_issue=lambda n, comment: closed.append((n, comment)))
     ctx = SimpleNamespace(store=SimpleNamespace(local_issues=lambda: rows), tracker=tracker,
-                          config=SimpleNamespace(language="en"))
+                          config=SimpleNamespace(language="en"),
+                          now=lambda: datetime(2026, 1, 1, tzinfo=UTC))
     monkeypatch.setattr(board, "sync_status", lambda ctx, n, state, parent=False: synced.append((n, state)))
     report = SimpleNamespace(actions=[])
     board_parents.follow_children(ctx, report)
@@ -144,8 +146,11 @@ def test_batch_parent_completes_when_its_children_are_done(monkeypatch, batch_ro
 
 
 
-def _record_ctx(monkeypatch, rows, remote, children=None):
-    """An offline tick context whose local listing is ``rows`` and GitHub is ``remote``."""
+def _record_ctx(monkeypatch, rows, remote, children=None, records_reads=False, root=None, clock=None):
+    """An offline tick context whose local listing is ``rows`` and GitHub is ``remote``.
+
+    With ``records_reads`` a read issue joins the listing, as the tick's RecordingTracker does.
+    """
     from datetime import UTC, datetime
     from types import SimpleNamespace
 
@@ -155,16 +160,21 @@ def _record_ctx(monkeypatch, rows, remote, children=None):
 
     def get_issue(n):
         out.reads.append(n)
-        return remote[n]
+        issue = remote[n]
+        if isinstance(issue, Exception):
+            raise issue
+        if records_reads and not issue.is_pull_request:
+            rows.append(_row(n, issue.state))
+        return issue
 
     store = SimpleNamespace(
-        local_issues=lambda: rows, load_flag=lambda n: flags.get(n),
+        root=root, local_issues=lambda: rows, load_flag=lambda n: flags.get(n),
         save_flag=lambda n, reason, flagged_at: flags.__setitem__(n, SimpleNamespace(reason=reason)),
     )
     tracker = SimpleNamespace(sub_issues=lambda n: (children or {}).get(n, []), get_issue=get_issue,
                               close_issue=lambda n, comment: out.closed.append((n, comment)))
     ctx = SimpleNamespace(store=store, tracker=tracker, config=SimpleNamespace(language="en"),
-                          now=lambda: datetime(2026, 1, 1, tzinfo=UTC))
+                          now=clock or (lambda: datetime(2026, 1, 1, tzinfo=UTC)))
     monkeypatch.setattr(board_parents, "append_event", lambda *args: out.events.append(args))
     monkeypatch.setattr(board, "sync_status",
                         lambda ctx, n, state, parent=False: out.synced.append((n, state, parent)))
@@ -190,41 +200,163 @@ def test_plan_references_reads_map_values_and_edited_issues():
     assert plan_references("no marker") == set()
 
 
-def test_record_counts_distinct_references_and_reads_reasons_only_when_all_closed(monkeypatch):
+def test_record_counts_distinct_references_and_reads_no_close_reasons(monkeypatch):
     from types import SimpleNamespace
 
     from foragent import board_parents
 
-    rows = [_record(1, {"a": 2, "b": 3}, edited=[3], children=[2]), _row(2, "closed"), _row(3, "closed")]
-    ctx, out = _record_ctx(monkeypatch, rows, {3: child(3, state="closed", reason="completed")},
-                           children={1: [child(2, state="closed", reason="completed")]})
+    rows = [_record(1, {"a": 2, "b": 3}, edited=[3, 4], children=[2]), _row(2, "closed"),
+            _row(3, "closed"), _row(4, "closed")]
+    ctx, out = _record_ctx(monkeypatch, rows, {}, children={1: [child(2, state="closed", reason="completed")]})
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.closed == [(1, text("order_record_closed", "en", count=2))]
-    assert out.reads == [3], "The sub-issue already carries its reason; only the other reference is read"
-    assert out.synced == [(1, "Done", True)]
+    assert out.closed == [(1, text("order_record_closed", "en", count=3))], "Count distinct issues once"
+    assert out.reads == [], "Closed references in the listing count as done without reading a reason"
+    assert out.synced == [(1, "Done", True)], "A record it closes moves to Done"
 
     rows[2] = _row(3, "open")
     ctx, out = _record_ctx(monkeypatch, rows, {}, children={1: [child(2, state="closed", reason="completed")]})
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
     assert out.closed == [] and out.reads == [], "Open referenced work keeps the record open without reads"
+    assert out.synced == [(1, "Done", True)], "An open parent keeps today's column from its sub-issues"
 
 
-def test_record_reads_missing_reference_and_flags_not_planned(monkeypatch):
+def test_record_reads_missing_references_and_ignores_pull_requests(monkeypatch):
     from types import SimpleNamespace
 
     from foragent import board_parents
 
-    rows = [_record(1, {"a": 2}, edited=[3]), _row(2, "closed")]
-    remote = {2: child(2, state="closed", reason="completed"), 3: child(3, state="closed", reason="not_planned")}
+    pr = Issue(3, "", "", frozenset(), "open", is_pull_request=True)
+    rows = [_record(1, {"a": 2}, edited=[3, 4]), _row(2, "closed")]
+    remote = {3: pr, 4: child(4, state="closed", reason="not_planned")}
     ctx, out = _record_ctx(monkeypatch, rows, remote)
     report = SimpleNamespace(actions=[])
     board_parents.follow_children(ctx, report)
-    assert sorted(out.reads) == [2, 3], "A reference missing from the listing is read from GitHub"
-    assert out.closed == [], "A not_planned reference keeps the record open"
-    assert [event[3] for event in out.events] == [board_parents.NOT_PLANNED_FLAG]
-    assert report.actions == [text("parent_child_not_planned", "en", number=1, children="#3")]
-    assert out.synced == [], "A record without sub-issues keeps today's board column"
+    assert out.reads == [3, 4], "References missing from the listing are read once each"
+    assert out.closed == [(1, text("order_record_closed", "en", count=2))], (
+        "A pull request is ignored and a closed reference is done whatever its reason"
+    )
+    assert out.events == [], "Only native sub-issues raise the not_planned flag"
 
+    remote[4] = child(4)
+    ctx, out = _record_ctx(monkeypatch, rows, remote)
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.closed == [] and out.synced == [], "An open missing reference keeps the record and its card"
+
+
+def test_unreadable_reference_keeps_record_open_and_rate_limit_propagates(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+    from foragent.tracker import TrackerError
+
+    rows = [_record(1, edited=[2])]
+    ctx, out = _record_ctx(monkeypatch, rows, {})
+
+    def fail(n):
+        raise TrackerError("gone")
+
+    ctx.tracker.get_issue = fail
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.closed == []
+
+    def limited(n):
+        raise TrackerError("API rate limit exceeded")
+
+    ctx.tracker.get_issue = limited
+    with pytest.raises(TrackerError):
+        board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+
+
+def test_reference_reads_stop_at_the_tick_allowance_and_resume_next_tick(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    cap = board_parents.MAX_REFERENCE_READS
+    first = list(range(100, 100 + cap - 1))
+    rows = [_record(1, edited=first), _record(2, edited=[200, 201]), _record(3, edited=[300])]
+    remote = {n: child(n, state="closed") for n in [*first, 200, 201, 300]}
+    ctx, out = _record_ctx(monkeypatch, rows, remote, records_reads=True)
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert len(out.reads) == cap, "One tick reads at most the allowance"
+    assert [n for n, _ in out.closed] == [1], "Records past the allowance wait for the next tick"
+    rows[0]["state"] = "closed"
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.reads[cap:] == [201, 300], "The next tick reads only what is still missing"
+    assert [n for n, _ in out.closed] == [1, 2, 3]
+
+
+def test_record_with_more_missing_references_than_one_tick_allows_still_closes(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    cap = board_parents.MAX_REFERENCE_READS
+    edited = list(range(100, 100 + cap + 1))
+    rows = [_record(1, edited=edited)]
+    ctx, out = _record_ctx(monkeypatch, rows, {n: child(n, state="closed") for n in edited},
+                           records_reads=True)
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.closed == [] and len(out.reads) == cap
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.closed == [(1, text("order_record_closed", "en", count=cap + 1))]
+    assert sorted(out.reads) == edited, "Every reference is read exactly once"
+
+
+def test_reference_shared_by_records_is_read_once_per_tick(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, edited=[5]), _record(2, {"a": 5})]
+    ctx, out = _record_ctx(monkeypatch, rows, {5: child(5, state="closed")})
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.reads == [5]
+    assert [n for n, _ in out.closed] == [1, 2]
+
+
+def test_unparseable_marker_is_skipped_quietly_even_with_completed_children(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    for body in ("Order.\n\n<!-- foragent:plan id=r-1 map={broken -->",
+                 'Order.\n\n<!-- foragent:plan id=r-1 map={"a": "x"} acceptance={} -->'):
+        rows = [{**_record(1, children=[2]), "body": body}, _row(2, "closed")]
+        ctx, out = _record_ctx(monkeypatch, rows, {},
+                               children={1: [child(2, state="closed", reason="completed")]})
+        report = SimpleNamespace(actions=[])
+        board_parents.follow_children(ctx, report)
+        assert out.closed == [] and out.reads == [] and report.actions == []
+        assert out.synced == [(1, "Done", True)], "An open parent keeps today's column"
+    assert board_parents.plan_references(rows[0]["body"]) is None
+
+
+def test_record_referencing_itself_stays_open(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, {"a": 1, "b": 2}, children=[2]), _row(2, "closed")]
+    ctx, out = _record_ctx(monkeypatch, rows, {},
+                           children={1: [child(2, state="closed", reason="completed")]})
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.closed == [], "The record itself is open work it references"
+    assert board_parents.plan_references(rows[0]["body"]) == {1, 2}
+
+
+def test_not_planned_sub_issue_flags_even_while_a_reference_is_open(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, {"a": 2}, edited=[3], children=[2]), _row(2, "closed"), _row(3, "open")]
+    ctx, out = _record_ctx(monkeypatch, rows, {},
+                           children={1: [child(2, state="closed", reason="not_planned")]})
+    report = SimpleNamespace(actions=[])
+    board_parents.follow_children(ctx, report)
+    assert report.actions == [text("parent_child_not_planned", "en", number=1, children="#2")]
+    assert out.closed == []
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
     assert len(out.events) == 1, "The flag is raised once"
 
@@ -239,3 +371,60 @@ def test_record_with_a_lane_label_or_approval_is_not_closed_by_references(monkey
         ctx, out = _record_ctx(monkeypatch, rows, {2: child(2, state="closed", reason="completed")})
         board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
         assert out.closed == [] and out.reads == []
+
+
+def test_known_pull_request_reference_spends_no_read(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, {"a": 2, "b": 7}), {**_row(2, "closed"), "pr_number": 7, "merged": True}]
+    ctx, out = _record_ctx(monkeypatch, rows, {})
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.reads == [], "A pull request the listing already shows is ignored without a read"
+    assert out.closed == [(1, text("order_record_closed", "en", count=1))]
+
+
+def test_record_with_more_unlisted_pull_requests_than_one_tick_allows_still_closes(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    cap = board_parents.MAX_REFERENCE_READS
+    prs = list(range(100, 100 + cap + 1))
+    rows = [_record(1, edited=[*prs, 500])]
+    remote = {n: Issue(n, "", "", frozenset(), "open", is_pull_request=True) for n in prs}
+    remote[500] = child(500, state="closed")
+    ctx, out = _record_ctx(monkeypatch, rows, remote, records_reads=True, root=tmp_path)
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.closed == [] and out.reads == prs[:cap]
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.reads[cap:] == [prs[-1], 500], "Pull requests read on an earlier tick are not read again"
+    assert out.closed == [(1, text("order_record_closed", "en", count=1))]
+
+    ctx, out = _record_ctx(monkeypatch, rows, remote, root=tmp_path)
+    rows[0]["state"] = "open"
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.reads == [], "A new tick context reads the remembered pull requests from the state folder"
+
+
+def test_unreadable_references_do_not_starve_later_records(monkeypatch):
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+    from foragent.tracker import TrackerError
+
+    cap = board_parents.MAX_REFERENCE_READS
+    rows = [_record(n, edited=[1000 + n]) for n in range(1, cap + 1)] + [_record(cap + 1, edited=[2000])]
+    remote = {1000 + n: TrackerError("Not Found") for n in range(1, cap + 1)}
+    remote[2000] = child(2000, state="closed")
+    now = [datetime(2026, 1, 1, tzinfo=UTC)]
+    ctx, out = _record_ctx(monkeypatch, rows, remote, clock=lambda: now[0])
+    for _ in range(cap + 1):
+        board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+        assert len(out.reads) <= cap * (_ + 1)
+        now[0] += timedelta(seconds=board_parents.ROTATION_SECONDS)
+    assert {n for n, _ in out.closed} == {cap + 1}, (
+        "Records that cannot be read must not take the whole allowance on every tick"
+    )
