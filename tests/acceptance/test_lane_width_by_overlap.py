@@ -20,7 +20,9 @@ def _wide_lane(context, budget):
     write_state(context.store, budget, context.now())
     starts = []
 
-    def launch(number):
+    def launch(number=None, *, kind="issue", lane=None):
+        if kind != "issue":  # #189: lanes may dream; this test counts issue starts only.
+            return None
         starts.append(number)
         return 7000 + number  # ctx records these in its fake live process table.
 
