@@ -1,10 +1,12 @@
-"""The architect: one worker session the orchestrator starts with `fa orch architect --why`.
+"""Standing-role sessions the orchestrator starts with `fa orch role <name> --why`.
 
-Only that command starts it; no tick, merge or schedule does. The command is the
-only writer of ``<state>/architect.json`` (pid, process start time, started_at,
-why) and of the ``architect-call`` event. The session itself, started as the
-hidden ``fa gate run-architect``, is the only writer of its ``architect-done``
-event. Proposals reach the orchestrator through ``fa orch request``.
+`fa orch architect --why` is the architect instance of the same command. Only that
+command starts a role session; no tick, merge or schedule does. The command is the
+only writer of ``<state>/<name>.json`` (pid, process start time, started_at, why)
+and of the ``<name>-call`` event. The session itself, started as the hidden
+``fa gate run-architect --role <name>``, is the only writer of its ``<name>-done``
+event. Roles never message a person: proposals reach the orchestrator through
+``fa orch request``. Roles are read from ``foragent.roles.load_roles`` (D95).
 """
 
 from contextlib import contextmanager
@@ -22,14 +24,12 @@ from foragent.config import Config
 from foragent.i18n import text
 from foragent.launcher import gate_environment
 from foragent.orch_events import append_event
+from foragent.roles import load_roles
 from foragent.state import StateStore
 
 REFACTOR = "skills/fa-orchestrator/references/refactor.md"
-SKILL = "skills/fa-architect/SKILL.md"
-AGENT = ".claude/agents/fa-architect.md"
-MEMORY = ".claude/agent-memory/fa-architect/MEMORY.md"
 
-# The procedure lives in the fa-architect skill; the prompt keeps the evidence, the why and a pointer.
+# The procedure lives in the architect's skills; the prompt keeps the evidence, the why and a pointer.
 PROMPT = """You are the architect for this repository. The orchestrator started you with this evidence:
 
 {why}
@@ -62,51 +62,95 @@ measured. Leave the change uncommitted.
 End with a one-line summary of what you proposed, or "Nothing to change.".
 """
 
-CLAUDE_PROCEDURE = ("Follow your fa-architect skill ({skill}; the old link {refactor} points there).")
-POINTER = "Follow the fa-architect skill in {skill} (the old link {refactor} points there)."
-CODEX_PROCEDURE = "Follow the fa-architect skill below (the old link {refactor} points to {skill}).\n\n{text}"
+ARCHITECT = "architect"
+
+# Every other role: the evidence, the role's skills and memory, and the one way out (the orchestrator).
+ROLE_PROMPT = """You are the {role} role for this repository. The orchestrator started you with this evidence:
+
+{why}
+
+Your role is only to propose. You never publish, edit or approve orders, and you never message a
+person. The orchestrator judges each proposal and decides whether it becomes an order.
+
+{procedure}
+
+Deliver each proposal through `fa orch request --from {role} --text "<proposal>"`. "Nothing to change"
+is a valid outcome.
+
+## Memory
+
+Your project memory is {memory}. Read {memory_file} first and record each proposal there as one
+bullet with its request id and the date. Leave the change uncommitted.
+
+End with a one-line summary of what you proposed, or "Nothing to change.".
+"""
 
 
-def has_agent(root: Path) -> bool:
-    return (root / AGENT).is_file()
+class ArchitectRefused(Exception):
+    """The role session did not start; the message is for a person."""
 
 
-def _skill_text(root: Path) -> str | None:
-    for path in (root / ".claude/skills/fa-architect/SKILL.md", root / SKILL):
+def record_path(store: StateStore, role: str = ARCHITECT) -> Path:
+    return store.root / f"{role}.json"
+
+
+def log_path(store: StateStore, started_at: str, role: str = ARCHITECT) -> Path:
+    stamp = datetime.fromisoformat(started_at).astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return store.root / "logs" / f"{role}-{stamp}.log"
+
+
+def _entry(config: Config, role: str) -> dict | None:
+    """The role's agent, skills and memory, read only from the roles source (D95)."""
+    return load_roles(config).get(role)
+
+
+def _memory_file(entry: dict) -> str:
+    return entry["memory"].rstrip("/") + "/MEMORY.md"
+
+
+def _has_agent(root: Path | None, entry: dict) -> bool:
+    return root is not None and (root / ".claude/agents" / f"{entry['agent']}.md").is_file()
+
+
+def _skill_text(root: Path, skill: str) -> str | None:
+    """The installed copy first, then the project's own skills directory."""
+    for path in (root / ".claude/skills" / skill / "SKILL.md", root / "skills" / skill / "SKILL.md"):
         if path.is_file():
             return path.read_text(encoding="utf-8").strip()
     return None
 
 
-class ArchitectRefused(Exception):
-    """The architect did not start; the message is for a person."""
+def _procedure(entry: dict, root: Path | None, executor: str, note: str) -> str:
+    """Claude loads the skills through the agent; Codex gets their text; otherwise a pointer to them."""
+    skills = entry["skills"]
+    if not skills:
+        return f"Your role has no skills configured ({note})." if note else ""
+    names = ", ".join(skills)
+    paths = ", ".join(f"skills/{skill}/SKILL.md" for skill in skills)
+    detail = f"{paths}; {note}" if note else paths
+    texts = [text for skill in skills
+             if root is not None and executor != "claude" and (text := _skill_text(root, skill))]
+    if texts:
+        return f"Follow the {names} skill below ({detail}).\n\n" + "\n\n".join(texts)
+    if executor == "claude" and _has_agent(root, entry):
+        return f"Follow your {names} skill ({detail})."
+    return f"Follow the {names} skill in {detail}."
 
 
-def record_path(store: StateStore) -> Path:
-    return store.root / "architect.json"
+def build_prompt(why: str, root: Path | None = None, executor: str = "claude",
+                 role: str = ARCHITECT, entry: dict | None = None) -> str:
+    """The prompt for ``role``; ``entry`` defaults to the derived roles source of a bare config."""
+    entry = entry if entry is not None else _entry(Config(), role)
+    if role == ARCHITECT:
+        procedure = _procedure(entry, root, executor, f"the old link {REFACTOR} points there")
+        return PROMPT.format(why=why, procedure=procedure, memory=_memory_file(entry))
+    return ROLE_PROMPT.format(role=role, why=why, procedure=_procedure(entry, root, executor, ""),
+                              memory=entry["memory"], memory_file=_memory_file(entry))
 
 
-def log_path(store: StateStore, started_at: str) -> Path:
-    stamp = datetime.fromisoformat(started_at).astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    return store.root / "logs" / f"architect-{stamp}.log"
-
-
-def build_prompt(why: str, root: Path | None = None, executor: str = "claude") -> str:
-    """Claude loads the skill through ``--agent``; Codex gets the skill text when the project has it."""
-    names = {"skill": SKILL, "refactor": REFACTOR}
-    text = _skill_text(root) if root is not None and executor != "claude" else None
-    if text is not None:
-        procedure = CODEX_PROCEDURE.format(text=text, **names)
-    elif root is not None and executor == "claude" and has_agent(root):
-        procedure = CLAUDE_PROCEDURE.format(**names)
-    else:
-        procedure = POINTER.format(**names)
-    return PROMPT.format(why=why, procedure=procedure, memory=MEMORY)
-
-
-def read_record(store: StateStore) -> dict | None:
+def read_record(store: StateStore, role: str = ARCHITECT) -> dict | None:
     try:
-        record = json.loads(record_path(store).read_text(encoding="utf-8"))
+        record = json.loads(record_path(store, role).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return None
     return record if isinstance(record, dict) else None
@@ -146,10 +190,10 @@ def _start_time(pid: int) -> float | None:
 
 
 @contextmanager
-def _call_lock(store: StateStore) -> Iterator[None]:
+def _call_lock(store: StateStore, role: str = ARCHITECT) -> Iterator[None]:
     """Two calls at once cannot both see no live session and both launch."""
     store.root.mkdir(parents=True, exist_ok=True)
-    with (store.root / "architect.lock").open("a") as stream:
+    with (store.root / f"{role}.lock").open("a") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         try:
             yield
@@ -157,90 +201,107 @@ def _call_lock(store: StateStore) -> Iterator[None]:
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def call(root: Path, store: StateStore, config: Config, why: str, now: datetime) -> str:
-    """Start one architect session and return the line for the caller; refuse with ArchitectRefused."""
+def _say(key: str, role: str, language: str, **values) -> str:
+    """The architect keeps its own wording; every other role shares the role_* strings."""
+    if role == ARCHITECT:
+        return text(f"architect_{key}", language, **values)
+    return text(f"role_{key}", language, role=role, **values)
+
+
+def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
+         role: str = ARCHITECT) -> str:
+    """Start one session of ``role`` and return the line for the caller; refuse with ArchitectRefused."""
     language = config.language
+    if _entry(config, role) is None:
+        raise ArchitectRefused(text("role_unknown", language, role=role,
+                                    roles=", ".join(load_roles(config)) or "-"))
     why = why.strip()
     if not why:
-        raise ArchitectRefused(text("architect_why_required", language))
+        raise ArchitectRefused(_say("why_required", role, language))
     until = store.executor_pause_until(config.executor, now)
     if until is not None:
-        raise ArchitectRefused(text("architect_paused", language, executor=config.executor,
+        raise ArchitectRefused(_say("paused", role, language, executor=config.executor,
                                     until=until.isoformat()))
-    with _call_lock(store):
-        record = read_record(store)
+    with _call_lock(store, role):
+        record = read_record(store, role)
         if session_alive(record):
-            raise ArchitectRefused(text("architect_running", language, pid=record["pid"],
+            raise ArchitectRefused(_say("running", role, language, pid=record["pid"],
                                         started_at=record.get("started_at", "?")))
         started_at = now.astimezone(UTC).isoformat()
-        log = log_path(store, started_at)
+        log = log_path(store, started_at, role)
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("ab") as stream:
             process = subprocess.Popen(
                 [sys.executable, "-m", "foragent.cli", "gate", "run-architect",
-                 "--repo-root", str(root), "--started-at", started_at, "--why", why],
+                 "--repo-root", str(root), "--started-at", started_at, "--why", why, "--role", role],
                 cwd=root, stdin=subprocess.DEVNULL, start_new_session=True,
                 stdout=stream, stderr=stream, env=gate_environment(),
             )
-        store._write_json(record_path(store), {
+        store._write_json(record_path(store, role), {
             "pid": process.pid, "start_time": _start_time(process.pid),
             "started_at": started_at, "why": why,
         })
-    append_event(store, now, None, "architect-call", why, why=why, pid=process.pid, log=str(log))
-    return text("architect_started", language, pid=process.pid, log=log)
+    append_event(store, now, None, f"{role}-call", why, why=why, pid=process.pid, log=str(log))
+    return _say("started", role, language, pid=process.pid, log=log)
 
 
-def session_options(config: Config, store: StateStore, root: Path | None = None) -> dict:
-    """The size-l tier's model and effort; Claude loads the architect agent when the project has it.
+def session_options(config: Config, store: StateStore, root: Path | None = None,
+                    role: str = ARCHITECT, entry: dict | None = None) -> dict:
+    """The size-l tier's model and effort; Claude loads the role's agent when the project has it.
 
-    Codex gets the state directory, and the architect memory directory when present, as writable roots.
+    Codex gets the state directory, and the role's memory directory when present, as writable roots.
     """
     tier = config.tiers["l"]
+    entry = entry if entry is not None else _entry(config, role)
     if config.executor == "claude":
         options = {"model": tier.get("claude_model") or config.executor_model}
-        if root is not None and has_agent(root):
-            options["agent"] = "fa-architect"
+        if _has_agent(root, entry):
+            options["agent"] = entry["agent"]
         return options
-    memory = (root / MEMORY).parent if root is not None else None
+    memory = root / entry["memory"] if root is not None else None
     extra = (memory,) if memory is not None and memory.is_dir() else ()
     return {"model": config.executor_model, "effort": tier.get("codex_effort"),
             "add_dirs": (store.root, *extra)}
 
 
-def events_path(store: StateStore, started_at: str) -> Path:
+def events_path(store: StateStore, started_at: str, role: str = ARCHITECT) -> Path:
     """The session's JSON events beside its log, as Claude keeps its ``.stdout``."""
-    return log_path(store, started_at).with_suffix(".stdout")
+    return log_path(store, started_at, role).with_suffix(".stdout")
 
 
 MESSAGE_LIMIT = 4000
 
 
-def _keep_message(log: Path, message: str) -> str:
+def _keep_message(log: Path, message: str, role: str = ARCHITECT) -> str:
     """Append the session's final answer to its log; return the tail for the event."""
     message = message.strip()
     with log.open("a", encoding="utf-8") as stream:
-        stream.write(f"\n--- architect final message ---\n{message or '(empty)'}\n")
+        stream.write(f"\n--- {role} final message ---\n{message or '(empty)'}\n")
     return message[-MESSAGE_LIMIT:]
 
 
 def run_session(root: Path, store: StateStore, config: Config, why: str, started_at: str,
-                now) -> int:
-    """Run the architect turn in the repository root; append one architect-done event on exit."""
+                now, role: str = ARCHITECT) -> int:
+    """Run the role's turn in the repository root; append one ``<role>-done`` event on exit."""
     code, message = 1, ""
-    log = log_path(store, started_at)
-    options = session_options(config, store, root)
-    if config.executor != "claude":
-        options["events_path"] = events_path(store, started_at)
+    log = log_path(store, started_at, role)
     try:
+        entry = _entry(config, role)
+        if entry is None:
+            raise ArchitectRefused(text("role_unknown", config.language, role=role,
+                                        roles=", ".join(load_roles(config)) or "-"))
+        options = session_options(config, store, root, role, entry)
+        if config.executor != "claude":
+            options["events_path"] = events_path(store, started_at, role)
         result = executors.executor_for(config.executor).run(
-            worktree=root, prompt=build_prompt(why, root, config.executor), timeout_s=config.max_runtime_minutes * 60,
-            log_path=log, **options,
+            worktree=root, prompt=build_prompt(why, root, config.executor, role, entry),
+            timeout_s=config.max_runtime_minutes * 60, log_path=log, **options,
         )
         code = 1 if result.timed_out or result.exit_code is None else result.exit_code
-        message = _keep_message(log, result.full_message or result.last_message or "")
+        message = _keep_message(log, result.full_message or result.last_message or "", role)
     finally:
         first = message.splitlines()[0][:200] if message else ""
-        append_event(store, now(), None, "architect-done",
+        append_event(store, now(), None, f"{role}-done",
                      f"exit code {code}" + (f": {first}" if first else ""),
                      started_at=started_at, exit_code=code, message=message)
     return code
