@@ -633,3 +633,44 @@ def test_mode_is_ignored_where_git_ignores_it(repo):
     assert changed_harness_paths(GitRepo(repo), "target", []) == []
     (repo / "tests/conftest.py").write_text("# changed content still counts\n")
     assert changed_harness_paths(GitRepo(repo), "target", []) == ["tests/conftest.py"]
+
+
+def _without_file_mode(repo, files=None):
+    """core.fileMode false, with the given files committed at mode 100644 as the merge base."""
+    git_command(repo, "config", "core.fileMode", "false")
+    for name, content in (files or {}).items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).write_text(content)
+    base = commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD"))
+    git_command(repo, "update-ref", "refs/heads/target", base)
+    return base
+
+
+@pytest.mark.parametrize("committed", [True, False], ids=["committed", "staged"])
+@pytest.mark.parametrize("name", ["tests/conftest.py", "tools/pytest.ini", "setup.cfg", "pkg/sitecustomize.py"])
+def test_recorded_mode_change_counts_when_git_ignores_the_execute_bit(repo, name, committed):
+    """`git update-index --chmod=+x` records 100755 even with core.fileMode false; that is published."""
+    base = _without_file_mode(repo, {name: "# harness\n"})
+    git_command(repo, "update-index", "--chmod=+x", "--", name)
+    if committed:
+        tree = git_command(repo, "write-tree")
+        git_command(repo, "update-ref", "refs/heads/main",
+                    git_command(repo, "commit-tree", tree, "-p", base, "-m", "chmod"))
+    assert git_command(repo, "ls-files", "-s", "--", name).startswith("100755")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == [name]
+
+
+@pytest.mark.parametrize("change", ["add", "rename"])
+def test_pytest_free_pyproject_is_regular_when_git_ignores_the_execute_bit(repo, change):
+    plain = '[project]\nname = "pkg"\nversion = "0"\n'
+    _without_file_mode(repo, {"pkg/pyproject.toml": plain} if change == "rename" else None)
+    if change == "add":
+        (repo / "lib").mkdir()
+        (repo / "lib/pyproject.toml").write_text(plain)
+    else:
+        (repo / "lib").mkdir()
+        (repo / "pkg/pyproject.toml").rename(repo / "lib/pyproject.toml")
+    git_command(repo, "add", "-A")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+    (repo / "lib/pyproject.toml").write_text(plain + '[tool.pytest.ini_options]\naddopts = "-q"\n')
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["lib/pyproject.toml"]

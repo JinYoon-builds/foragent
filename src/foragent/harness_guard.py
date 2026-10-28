@@ -64,11 +64,8 @@ def _canonical(value: object) -> object:
 
 
 def _git(git: GitRepo, args: list[str]) -> subprocess.CompletedProcess[bytes]:
-    """Run Git without decoding, so paths and file bytes are never replaced."""
-    try:
-        return subprocess.run(["git", *args], cwd=git.root, capture_output=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise GitError(str(exc)) from exc
+    """Raw Git output through the repository object, never a process of our own."""
+    return git.run_bytes(args)
 
 
 def _pytest_tables(data: object) -> object:
@@ -156,11 +153,12 @@ def _tree_side(git: GitRepo, rev: str, raw: bytes) -> object:
     return (mode, _required(_git(git, ["cat-file", "blob", sha.decode()]), "cat-file"))
 
 
-def _disk_side(path: Path, file_mode: bool = True) -> object:
+def _disk_side(path: Path, recorded_mode: bytes | None = None) -> object:
     """The entry as the checks find it and as publication stages it, in the same shape as _tree_side.
 
     The execute bit gives the Git mode as `git add` records it. With
-    core.fileMode false Git ignores that bit, so the mode is None (unknown).
+    core.fileMode false Git ignores that bit and stages the mode it already
+    records, which the caller passes as recorded_mode.
     """
     try:
         info = os.lstat(path)
@@ -185,7 +183,7 @@ def _disk_side(path: Path, file_mode: bool = True) -> object:
         mode = os.fstat(stream.fileno()).st_mode
         if not stat.S_ISREG(mode):
             return _NOT_A_FILE
-        git_mode = (b"100755" if mode & stat.S_IXUSR else b"100644") if file_mode else None
+        git_mode = recorded_mode or (b"100755" if mode & stat.S_IXUSR else b"100644")
         return (git_mode, stream.read())
 
 
@@ -216,8 +214,6 @@ def _changed(name: str, before: object, after: object) -> bool:
     """Whether the head side differs from the merge base, as the checks would see it."""
     if before is _NOT_A_FILE or after is _NOT_A_FILE:
         return True
-    if before is not None and after is not None and after[0] is None and before[0] in _REGULAR_MODES:
-        after = (before[0], after[1])  # core.fileMode false: Git keeps the recorded mode
     if before == after:
         return False  # same Git mode and content
     if name != "pyproject.toml":
@@ -227,6 +223,23 @@ def _changed(name: str, before: object, after: object) -> bool:
     # Only the pytest tables count for pyproject.toml; a mode-only change does not.
     tables = [_pytest_tables(side[1] if side is not None else None) for side in (before, after)]
     return _UNPARSABLE in tables or tables[0] != tables[1]
+
+
+def _recorded_mode(git: GitRepo, raw: bytes) -> bytes:
+    """The regular-file mode Git stages for a path when core.fileMode is false.
+
+    Git keeps the mode it already records, staged or committed (including a
+    `git update-index --chmod` change), and gives a new file 100644.
+    """
+    listing = _required(_git(git, ["--literal-pathspecs", "ls-files", "-s", "-z", "--", os.fsdecode(raw)]),
+                        "ls-files")
+    for entry in filter(None, listing.split(b"\0")):
+        info, path = entry.split(b"\t", 1)
+        mode, _sha, stage = info.split(b" ")
+        if path == raw and stage in (b"0", b"2") and mode in _REGULAR_MODES:
+            return mode  # the staged entry, or "ours" during a conflicted merge
+    head = _tree_side(git, "HEAD", raw)
+    return head[0] if isinstance(head, tuple) and head[0] in _REGULAR_MODES else b"100644"
 
 
 def changed_harness_paths(git: GitRepo, target_ref: str, listed: list[str]) -> list[str]:
@@ -239,14 +252,25 @@ def changed_harness_paths(git: GitRepo, target_ref: str, listed: list[str]) -> l
     rather than HEAD means a pending merge's target-only changes, which HEAD
     does not have yet, are inherited, not introduced.
     """
-    base = git._own_base(target_ref)
+    # Every repository object reports its changed paths. One that can run Git
+    # adds the views changed_paths omits (unstaged, untracked, ignored and
+    # runner-excluded paths), read as raw bytes.
+    candidates = {os.fsencode(path) for path in git.changed_paths(target_ref)}
+    can_run_git = callable(getattr(git, "run_bytes", None))
+    base = git._own_base(target_ref) if can_run_git else None
+    if can_run_git:
+        candidates |= measured_changes(git, base)
+    harness = sorted(raw for raw in candidates
+                     if PurePosixPath(os.fsdecode(raw)).name in HARNESS_NAMES | {"pyproject.toml"})
+    if not harness:
+        return []
+    base = base or git._own_base(target_ref)
     file_mode = _git(git, ["config", "--bool", "core.fileMode"]).stdout.strip() != b"false"
     found = []
-    for raw in sorted(measured_changes(git, base)):
+    for raw in harness:
         name = PurePosixPath(os.fsdecode(raw)).name
-        if name != "pyproject.toml" and name not in HARNESS_NAMES:
-            continue
-        if not _changed(name, _tree_side(git, base, raw), _disk_side(git.root / os.fsdecode(raw), file_mode)):
+        recorded = None if file_mode else _recorded_mode(git, raw)
+        if not _changed(name, _tree_side(git, base, raw), _disk_side(git.root / os.fsdecode(raw), recorded)):
             continue
         path = raw.decode("utf-8", "replace")  # Shown in comments; never used to read.
         if not touched([path], listed):

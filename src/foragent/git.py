@@ -79,6 +79,13 @@ class GitRepo:
             timeout=timeout, errors="replace",
         ).stdout
 
+    def run_bytes(self, args: list[str]) -> subprocess.CompletedProcess[bytes]:
+        """Run Git without decoding or raising, so paths and file bytes are never replaced."""
+        try:
+            return subprocess.run(["git", *args], cwd=self.root, capture_output=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise GitError(str(exc)) from exc
+
     def _call(self, args: list[str]) -> str:
         try:
             return self._run(args)
