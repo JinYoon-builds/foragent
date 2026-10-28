@@ -1,63 +1,66 @@
 # Order lane 기억
 
-- 설정 필드를 추가할 때 `Config`에 기본값을 넣으면 `DEFAULTS = asdict(Config())`와 알 수 없는 키 검사에 반영된다. 타입·허용값 검증은 `config._validate`에 둔다. 로컬·전역 설정은 같은 검증을 사용한다.
-- 설정 기본값과 주문 응답의 전체 항목을 검사하는 테스트가 있다. 필드 추가 시 `tests/test_config.py::test_exact_defaults`, `tests/test_order.py::test_context_all_sections_and_gate_groups`도 갱신한다.
-- 인터뷰 설치 정보는 현재 `Path.home() / ".claude/plugins/installed_plugins.json"`에서 읽는다. `plugins`의 `ouroboros@`로 시작하는 키에서 첫 항목 버전을 사용한다. 파일·구조가 손상됐으면 미설치로 처리한다. 버전 고정은 문자열 완전 일치이며 `None`만 고정 없음이다.
-- 외부 계정 없이 주문 컨텍스트를 검증하려면 `order.context(root, config, FakeTracker())`를 사용한다. 설치 파일 테스트는 임시 HOME으로 격리한다.
-- 검증: `uv run pytest -q tests/acceptance/test_interview_engine.py tests/test_order.py tests/test_config.py`. 인수 테스트는 수정하지 않는다.
-- 주문 스킬의 인터뷰 분기는 설정 요청값이 아니라 `fa order context --json`의 `interview.engine`을 따른다. `interview.reason`은 native 전환 설명에 활용하며, seed도 실패하면 기존 답변을 유지한 채 AskUserQuestion으로 이어간다. seed는 3단계 되짚기와 4단계 분할의 확정 맥락이다.
-- 스킬 문서 변경 검증: `uv run pytest -q tests/acceptance/test_fa_order_skill.py`. 이 테스트는 문서를 직접 읽으며 외부 계정이 필요 없다.
-- #109: 인터뷰 기본값은 `native`. Ouroboros 폴백 테스트는 `Config(interview="ouroboros")`를 명시해야 한다. `profile`은 매핑 또는 `None`이며 주문 컨텍스트 최상위에 그대로 나온다.
-- `fa profile set --kind ... --stage ... --priority ...`은 Git/GitHub 초기화 전에 처리한다. 저장은 `config.set_profile`에서 로컬 YAML만 갱신해 전역 설정을 복사하지 않고 `date.today().isoformat()`을 기록한다.
-- 제한 환경에서 기본 uv 캐시를 쓸 수 없으면 `UV_CACHE_DIR`를 `/tmp`로 지정한다. 네트워크도 막혔으면 기존 `wheels-v6`, `simple-v21` 및 필요한 패키지의 `archive-v0` 디렉터리를 임시 캐시에 복사하고 `UV_OFFLINE=true uv run pytest`로 실행할 수 있다.
-- #110: `validate_plan`은 신규 `issues`와 기존 이슈 `edits`의 `out_of_scope`에 `_text`의 기본 비어 있지 않은 문자열 검증을 적용한다. `publish`는 dry-run 분기 및 외부 작업 전에 이를 호출한다. 정상 발행 테스트 데이터에도 제외 범위를 명시해야 한다. 검증: `uv run pytest tests/acceptance/test_publish_out_of_scope.py`; 신규·수정 및 일반·dry-run 거절 회귀 테스트는 `tests/test_order.py -k empty_out_of_scope`.
-- #144: `issues`와 `edits`의 선택 `files`는 예상 변경 경로/glob 목록이다. `_strings`와 `repo_path`로 검증하며 오류에 해당 `files` 필드명을 포함한다. 실제 파일 생성·glob 확장 없이 `## Files`의 일반 Markdown 목록으로 보존한다. 본문 파서는 `src/foragent/issue.py`, 주문 JSON 스키마 도움말은 `src/foragent/cli.py`에 있으므로 본문 필드를 추가할 때 함께 갱신한다.
-- 기존 주문의 자식을 `edits`로 수정하는 테스트는 새 주문 `id`를 써야 한다. 같은 주문의 자식과 `edits`가 겹치면 발행이 거절된다. #144 검증: `uv run pytest tests/acceptance/test_issue_files.py`; 일반 회귀 검사는 `uv run pytest tests/test_order.py tests/test_issue.py`.
-- #159: `fa order progress <step>`은 GitHub 초기화 전에 처리하며, 설정의 `repo`가 있으면 Git 없이 동작한다. 뷰 열기는 `/fa-order`가 `start` 직후 `fa gate watch --open`으로 수행한다. progress 자체는 로컬 기록과 JSON 출력만 한다.
-- 준비 사실은 `StateStore.order_progress()`로 다른 프로세스에서도 읽는다(`order-progress.json`). `update_order_progress`는 읽기·수정을 같은 잠금 안에서 수행하고 원자적으로 저장한다. chunk당 다섯 칸(goal/out_of_scope/done_when/lane/skills), 질문은 미완성, 재입력은 중복 집계하지 않으며 `end`는 준비 기록만 지운다. 검증: `uv run pytest tests/acceptance/test_order_progress.py tests/test_order.py tests/test_state.py`.
-- #161: `issues[].interactive`는 선택 boolean이며 생략하면 false다. 신규 및 동일 주문 재발행에서 `interactive` 라벨을 동기화하며, 값 변경 시 기존 approved/ready를 해제한다. edits는 기존 라벨을 유지하고 미리보기에 표시한다. 라벨 정의는 발행 시 필요하면 tracker.ensure_labels로 준비한다. 스키마 도움말은 src/foragent/cli.py도 갱신한다.
-- #161: D72에 따라 /fa-order는 대화가 많이 필요한 일을 맥락으로 판단해 표시하고, 시각 디자인은 /fa-design-session을 제안한다. 세션 시작과 talk-state는 이 주문 기능의 범위 밖이다. 검증: uv run pytest tests/acceptance/test_interactive_flag.py tests/test_order.py.
-- #111: native 인터뷰의 기준은 `docs/decisions.md` D58과 보강 2다. 문서 장부는 출처·날짜와 함께 한 번 확인하고, 명시적 변경은 재승인 없이 반영한다. 불명확한 충돌만 Change / Keep / Exception this once로 한 번 묻고 영구 변경은 대체 결정 기록을 남긴다.
-- #111: `new_lanes[].skills`와 `fa lanes skills`에는 사람이 고른 고정 스타일만 둔다. 도구·검토·분야 스킬은 승인된 목록에서 레인 에이전트가 이슈마다 선택한다. `fa skills add URL --json`으로 미리 보고 모든 스킬의 역할을 확인한 뒤 `--approve --role SKILL=ROLE`로 등록한다.
-- #111 스킬 재작성 때 `files`, `interactive`, 시작 직후 뷰 열기와 progress 전체 단계를 유지한다. 빠른 검증: `uv run pytest tests/acceptance/test_fa_order_interview.py tests/acceptance/test_fa_order_skill.py tests/acceptance/test_order_progress.py tests/acceptance/test_issue_files.py tests/acceptance/test_interactive_flag.py`.
-- #237: `fa order preread`는 이슈별 프롬프트의 sha256으로 결과를 저장소 안 `.foragent/preread.json`(자체 `.gitignore` `*`)에 둔다. 시험이 HOME을 격리하지 않아 `StateStore.for_repo`에 쓰면 저장소 밖이 바뀐다. 관문은 `order.require_clean_preread`이며 `tests/test_order.py`는 autouse로 끈다. 실행기 `read_only=True`는 codex `-s read-only`, claude `--permission-mode plan`.
-- #237: 전체 `fa test tests/`는 10분 제한을 넘는다. 관련 파일만 골라 돌린다. 승인 발행을 쓰는 잠긴 인수 시험(`test_publish_own_paths.py`, `test_view_open_triggers.py`)은 preread 관문과 충돌해 QUESTION.md로 넘겼다.
-- #259: 발행 Git 단계는 `order._publish_files`에 있고 `git.publish_lock()`(git common dir의 flock) 안에서 `git.update_base(branch)`(fetch 후 ff-only)를 먼저 한다. 덕 타입 가짜 Git(`tests/test_order.py::PublishingGit`)에 메서드를 추가해야 한다. 검증: `fa test tests/acceptance/test_publish_own_paths.py`. `test_listing_sanity`·`test_order_preread`는 미구현 기능이라 원래 실패한다.
-- 2026-10-24 D81/#307 이후 러너는 Done when, 인수 기준선, 수정한 파일의 자체 시험만 돌린다. 재시도 때 작업 트리가 다시 만들어지면 `.foragent/TRY.md`도 사라지므로 다시 쓴다.
-- #237 리뷰: preread와 승인 관문은 `order.preread_target`을 함께 쓴다. edits도 대상이며(key `#N`, 트래커에서 제목·레인), 해시에는 실행기·모델(레인 설정 우선, 러너와 동일)과 blocked_by·interactive·new_lanes가 든 프롬프트가 들어간다.
-- 레인 브랜치가 main보다 뒤처지면 main에 새로 생긴 인수 파일이 diff에서 "삭제"로 보여 리뷰가 거절한다. `git restore --source=origin/main --worktree -- <파일>`로 가져오고 `git hash-object`로 같은지 확인한다. 모르는 점은 스킬이 스스로 답하지 않고 사용자에게 묻는다(#237 제외 범위).
-- #237 3차: preread 증거 키에는 계획 전체(정렬한 JSON)가 들어가 어떤 이슈의 변경도 이전 결과를 무효로 한다. `--approve-numbers`에 아직 매핑되지 않은 번호가 있으면 이번에 만들 자식 전부에 깨끗한 preread를 요구한다.
-- 재시도를 시작할 때마다 `git fetch origin && git diff --name-only HEAD...origin/main`을 먼저 본다. 나온 파일이 내 변경과 겹치지 않으면 zsh에서 `files=(${(f)"$(...)"})`로 나눈 뒤 `git restore --source=origin/main --worktree -- $files`로 가져온다(#237에서 두 번 "인수 시험 삭제"로 거절됨).
-- 위 동기화 뒤 main에서 새로 생긴 파일은 `git add -N`(내용 없이 추적 표시)으로 표시한다. 그래야 `git diff origin/main`이 내 파일만 보여 리뷰가 "삭제"로 오해하지 않는다. main에서 지워진 파일은 `git cat-file -e origin/main:<파일>`로 가려 지운다.
-- #237 4차: preread는 `run_implementation.lane_config` + `implementer_setup(config, lane, tier, worktree)`를 구현과 함께 쓴다(첫 시도 tier = 이슈 크기). 필드를 따로 흉내 내면 리뷰마다 어긋남이 새로 나온다. 비교 시험은 `tests/test_order.py::test_preread_setup_matches_the_implementation_setup`.
-- 병합 중(MERGE_HEAD 있음)에 main이 또 움직였으면 `git diff --name-only MERGE_HEAD origin/main`만 가져온다. `git checkout --theirs`는 권한이 막히므로 `git restore --source=origin/main --worktree`를 쓴다.
-- #237 5차: 이번 주문이 만드는 레인(`new_lanes` 중 설정에 아직 없는 것)의 이슈는 preread와 승인 모두 거절한다. 레인 에이전트·스킬은 `add_lane`이 설치하므로 미리 흉내 내지 않는다. 순서: `--approve` 없이 발행 → preread → `--approve`로 재발행.
-- #119: 사람은 `/fa`만 친다(`skills/fa/SKILL.md`가 `fa brief --json` → 라우팅). 다른 스킬의 다음 단계 안내는 `/fa`로 쓴다(인수 정규식이 run/type/use/tell the user the next step 줄의 `/fa-init|order|inspect`를 막음). `test_fa_init_skill` 등 스킬 문서 시험 12개는 원래 실패한다. 기준선 비교 임시 파일도 저장소 밖(/tmp)에 쓰지 않는다.
-- #119 2차: `.foragent/acceptance-exclusions.json`은 러너(`ci_mode.stage_exclusions`)가 기준 커밋 실패 시험으로 만들어 강제 추가한다. 리뷰가 "내 시험 제외"로 지적하면 REBUTTAL로 답한다. 사람이 보는 새 문구는 스킬에 박지 말고 `src/foragent/messages/*.py`에 두고 CLI JSON으로 넘긴다(예: `brief.next_step`).
-- #119 3차: 리뷰는 정규식에 안 걸리는 `/fa-design-session` 제안도 "사람에게 /fa만" 위반으로 본다. 사람에게는 "디자인 인터뷰"라고 말하고 스킬 파일 경로를 따라가게 쓴다. 단 `test_fa_init_skill.py::test_brownfield_steps_are_present_in_order`는 fa-init에서 `fa adopt ci` 뒤에 `/fa-order` 문자열이 있어야 한다.
-- #419: `fa init`에 질문을 더하면 잠긴 `tests/acceptance/test_ci_mode.py`(input 호출 시 실패)와 `test_cli_split.py`(stdout 정확 비교)가 깨진다. `test_statusline_wrapper.py`(질문 수를 셈)와 `tests/test_cli.py`(`cli.load_config` 호출 기록)도 같은 종류다. 새 init 질문은 이 넷을 먼저 돌려 본다. ci_mode는 main에서 'n'으로 답하게 고쳤고, statusline_wrapper는 2차 QUESTION.md로 넘겼다.
-- #419: `fa init`은 `checks`가 없으면 `gh repo view`로 공개 여부를 묻는다. pytest 명령이 없을 때는 이제 묻지 않는다(`ci_workflow.initial_checks`). 전역 설정 쓰기는 `config._write_global`, 동의 키는 `upstream_reports`(None=안 물음).
-- #419 리뷰: traceback은 자유 글이다. 패키지 프레임은 `resolve()` 뒤 실제 패키지 안 파일 + 함수 정의 확인, 예외 종류는 traceback 구조 줄로만 읽는다: 마지막 `Traceback` 블록의 들여쓴 `File "...", line N, in f` 줄과 그 뒤 column 0의 첫 줄. 소스 줄은 해석하지 않는다(`if` 머리줄, 여러 줄 호출의 한 줄이 나옴, 4차 리뷰). 한 줄로 편 event는 같은 이슈의 flag/run.detail 원본을 찾아 같은 규칙으로 읽고, 없으면 후보가 하나일 때만 받는다. 보고서 본문과 argparse help도 등록부와 저장소 언어를 따른다(리뷰가 "기존 help는 영어" 반박을 받아들이지 않음). parser의 언어는 `foragent.config.load_config`로 직접 읽는다(`cli.load_config` 호출 기록 시험 때문).
-- #419 5차: traceback에서 보고하는 값은 검증한 값 그대로여야 한다(일부만 검증하고 전체를 쓰지 않기). 함수는 점 없는 식별자 하나 + 파일에 정의, 줄 번호는 파일 줄 수 안일 때만, 정규식은 토큰 전체(`\S+`)를 잡는다.
-- #133: `fa orch ensure`(commands/orch.py `_ensure`)는 env off·살아 있음·승인 일 없음·세션 살아 있음을 먼저 가려 한 줄 이유를 찍고, 아니면 `orch_spawn.ensure_orchestrator(..., spacing=False)`를 부른다. 시험이 spawn 함수를 신원으로 바꿔치기하므로 반드시 모듈 속성(`orch_spawn.ensure_orchestrator`)으로 호출한다. `test_orchestrator_scorecard_skill.py` 3개는 미구현(`fa orch scorecard`)이라 원래 실패한다.
-- #133 리뷰: 게이트 spawn 경로(`ensure_orchestrator` 기본값)는 범위 밖이라 한 글자도 바꾸지 않는다. 명시 호출(`spacing=False`)은 `_ensure_explicit`로 분리해 잠금 안 재검사·기록 변화·잠금 busy(`_explicit_lock`, LOCK_NB)로 동시 spawn을 막고 이유를 `why` 목록으로 돌려준다. argparse `help=`도 메시지 등록부를 쓴다.
-- #133 3차: `tests/acceptance/test_scheduler_split.py`는 BASE_MODULES 밖 모듈(예: `orch_spawn.py`)도 300줄로 제한한다. 오케스트레이터 힌트가 "네 diff 탓 아님"이라 해도 실패 메시지의 모듈 이름을 먼저 본다. 명시 spawn은 `src/foragent/orch_ensure.py`로 분리했다. `test_orch_plan.py`(`fa orch pause`)는 main에도 없는 미구현 기능이다.
-- #414: `fa order perspectives`는 `src/foragent/order_perspectives.py`(CLI는 `commands/order.py`). 원장은 작업 트리가 아니라 `store.root/perspectives/<plan_hash>.json`(시험이 작업 트리 불변 검사). 시험이 `executors.executor_for`와 `shutil.which`를 모듈 속성으로 바꾸므로 `from ... import`로 묶지 말 것. 질문 id는 `hash[:12]-seat-번호`(재실행 시 같은 id여야 stats가 맞음).
-- #414 2차: 리뷰는 사람에게 보이는 오류 문자열(실패 사유, PlanError, ConfigError 포함)도 messages 목록과 설정 언어를 요구한다. 함수에 `language`를 넘기고, 설정 검증 오류는 `values["language"]`를 쓴다. 에이전트 프롬프트는 영어로 두고 REBUTTAL에 적는다.
-- #414 3차: 새 argparse 도움말도 지역화 대상이다. 파서 생성 중 `load_config`를 부르면 `tests/test_cli.py::test_init_view_uses_normalized_root_and_skips_dry_run`의 가짜 load_config 기록이 깨진다. 도움말 언어는 `config._read_yaml(cwd/.foragent.yml)`의 language만 읽는다.
-- #414 4차: 설정 언어는 에이전트가 만드는 사람용 글(질문)에도 전달해야 한다. 프롬프트에 "Write every question in <언어>"를 넣고, 질문·원장·JSON에 `language`를 기록하고, 출력의 자리 이름도 메시지 목록에서 가져온다.
-- #419 6차: 잠긴 `test_board_projects.py`와 `test_view_open_triggers.py`는 HOME을 격리하지 않고 실제 `fa init`을 돌린다. init에서 답 없이 전역 설정에 쓰면 이 기계의 `~/.config/foragent/config.yml`이 바뀌고, 설치된 옛 `fa`가 새 키를 몰라 `fa test`까지 깨진다. 전역 설정을 쓰는 코드를 바꾸면 시험 뒤 `grep <키> ~/.config/foragent/config.yml`로 확인한다. 한국어 메시지는 해요체(`니다` 금지, `test_voice.py`).
-- #419 7차: upstream 중복 판정은 GitHub 검색처럼 덧글도 본다(`search_issues`가 text-match 헤더와 per_page=100을 요청, 제목·본문·`text_matches` 조각에서 서명 확인). 인수 시험 가짜 gh는 search/issues와 create/comment만 받으므로 `list_comments` 같은 추가 호출은 쓸 수 없다. 새 설정 검증 오류도 등록부 + `values["language"]`로 낸다.
-- #419 8차: 실제 실패 traceback은 flag 이유가 아니라 이슈 로그(`store.log_path(N)`, runner가 `traceback.format_exc()`를 덧붙임)와 `tick-failure.log`(gate tick, 요청 event 글에 경로가 들어감)에 있다. 인수 시험은 flag 이유에 traceback을 넣어 이를 가린다. 로그에는 사용자 시험 traceback도 섞이므로 검증된 Foragent 프레임이 있는 마지막 블록만 쓴다.
-- #419 9차: 2026-10-27 #655 이후 모든 시험이 conftest에서 HOME/XDG를 격리한다. 시험 파일마다 HOME 격리 fixture를 따로 둘 필요가 없다. 리뷰가 다른 이슈의 파일을 지적하면 `git diff origin/main -- <파일>`이 비어 있는지 확인하고 REBUTTAL로 답한다.
-- `tests/acceptance/test_cli_split.py::test_cli_split_modules_meet_line_limits`: `src/foragent/*.py`와 `commands/*.py`는 300줄 한도다. 모듈을 키우면 이 시험을 돌리고, 넘으면 도우미 모듈로 나눈다(#419: `upstream_traceback.py`).
-- #419 10차: 보낼 글은 ID가 내용의 해시여야 한다(`load`가 다시 계산해 확인). GitHub 검색은 `incomplete_results`/`total_count`를 보고, 일치가 없는데 결과가 불완전하면 새 이슈를 열지 않는다. help 언어는 하위 parser의 `parse_known_args`를 감싸 `--repo-root`를 먼저 읽고 정한다.
-- #419 11차: 명령의 모든 실패는 자기 명령 안에서 등록부 키로 바꾼다(`ReportError(key, **values)`). `cli.main`의 공통 처리로 새면 영어 원문이 나온다. 공유 모듈(tracker 등)에 새 영어 오류 문구를 넣지 말고 호출한 쪽에서 판단한다. 기반 도구 원문은 `{error}`로만 덧붙인다. 내 파일이 main에서도 바뀌면 `git merge-file`로 3방향 병합한다.
-- #227: `fa brief`의 점수표 한 줄은 `orch_scorecard.worst_line(collect(store))`(지표 이름표는 `messages/orch_scorecard.py`의 `scorecard_label_*`, 없는 단계는 `scorecard_label_phase`). 검증: `fa test tests/acceptance/test_fa_briefing_scorecard.py tests/test_brief.py tests/test_orch_scorecard_unit.py`.
-- #745: 관점 자리를 더할 때 고칠 곳: `order_perspectives.SEATS`·`DEFAULT_EXECUTORS`·`SEAT_FOCUS`, `messages/order_perspectives.py`의 `perspectives_seat_<자리>`, fa-order 5b 자리 목록, `docs/gate.md`의 perspectives 설정 줄, `tests/test_order.py`의 perspectives 단위 시험(자리 수는 `len(SEATS)`로, 한국어 이름표 집합). 단위 시험은 CI가 잡으니 `fa test tests/test_order.py`를 꼭 돌린다. 잠긴 시험의 자리 수 숫자 박기는 spec-question으로 넘기면 main에서 고쳐 줘요(2026-10-27).
-- #773: 문서 순서 시험(`text.find`로 첫 등장 위치 비교)은 제목에 든 낱말도 센다. 예: 제목 "before a new role"이 "lane memory"보다 먼저 나와 실패했다. 제목에는 검사 구절을 쓰지 않는다. `fa role add` 플래그는 `--scope --signal paths:<glob> --skill --why`(test_role_source.py).
-- #849: README의 자체 제작 수치는 `git log --first-parent --oneline | grep -cE '\(#[0-9]+\)$'`(PR 수)와 첫·마지막 커밋 날짜(포함 일수)로 센다. `watch_open`에서 Orca만 되는 것은 기록된 터미널로 돌아가기(`terminal show`)이고, 분할은 tmux·WezTerm·kitty·iTerm·Terminal도 된다.
-- #848: `fa init` 마지막 질문(Starter order)은 `commands/init.py::_offer_starter`, 자격 판정은 `starter.eligible`(열린 approved 이슈·`pr_issue_number` 병합 PR), 트래커는 `InitReport.tracker`(compare=False). 시험 가짜 report는 SimpleNamespace라 `getattr`로 읽는다. init에 질문을 더하면 잠긴 `test_statusline_wrapper.py` 4개가 질문 수 때문에 깨진다 → QUESTION.md.
-- #848 2차: `input()`을 `forbidden`으로 막고 init을 돌리는 잠긴 시험도 있다(`test_irreversible_paths.py`, `test_quota_executors.py`). init 질문을 더할 때는 `grep -l builtins.input tests -r | xargs grep -l '"init"'`로 전부 찾아 돌린다.
-- #848 3차: 사실을 판정 boolean으로만 줄이면 리뷰가 "맥락 누락"으로 거절한다. 에이전트가 고를 일이면 원자료를 `fa order context`에 넣는다(`pull_requests`: 열린 PR + 최근 병합 30개, `foragent` 표시). 맥락 키를 더하면 `docs/impl/p8a-order-tools.md` 목록과 `test_context_all_sections_and_gate_groups`도 고친다.
-- #850: 출시 초안은 `docs/launch/{geeknews,x,threads,hn}.{ko,en}.md`, 첫 줄 `# draft, not posted`. 수치·한계는 README에서만 가져온다. X 글은 한글 2자·URL 23자 가중치로 280 이하인지 센다. 한국어 초안도 해요체.
+## 설정
+- 설정 필드를 추가할 때 `Config`에 기본값을 넣으면 `DEFAULTS = asdict(Config())`와 알 수 없는 키 검사에 반영된다. 타입·허용값 검증은 `config._validate`에 둔다. 로컬·전역 설정은 같은 검증을 사용한다. 함께 고칠 시험: `tests/test_config.py::test_exact_defaults`, `tests/test_order.py::test_context_all_sections_and_gate_groups`.
+- 인터뷰 기본값은 `native`(#109). Ouroboros 폴백 시험은 `Config(interview="ouroboros")`를 명시한다. 설치 정보는 `Path.home() / ".claude/plugins/installed_plugins.json"`의 `ouroboros@` 키 첫 항목 버전이다. 손상되면 미설치, 버전 고정은 문자열 완전 일치, `None`만 고정 없음.
+- `profile`은 매핑 또는 `None`이며 주문 컨텍스트 최상위에 그대로 나온다. `fa profile set --kind ... --stage ... --priority ...`은 Git/GitHub 초기화 전에 처리하고 `config.set_profile`이 로컬 YAML만 갱신하며 `date.today().isoformat()`을 기록한다.
+- 전역 설정 쓰기는 `config._write_global`. upstream 동의 키는 `upstream_reports`(None=안 물음).
+
+## 주문 컨텍스트·발행
+- 외부 계정 없이 검증하려면 `order.context(root, config, FakeTracker())`를 쓴다. 맥락 키를 더하면 `docs/impl/p8a-order-tools.md` 목록과 `test_context_all_sections_and_gate_groups`도 고친다.
+- 사실을 판정 boolean으로만 줄이면 리뷰가 "맥락 누락"으로 거절한다. 에이전트가 고를 일이면 원자료를 `fa order context`에 넣는다(#848 `pull_requests`: 열린 PR + 최근 병합 30개, `foragent` 표시).
+- 주문 스킬의 인터뷰 분기는 `fa order context --json`의 `interview.engine`을 따른다. `interview.reason`은 native 전환 설명에 쓰고, seed도 실패하면 기존 답변을 유지한 채 AskUserQuestion으로 이어간다. seed는 3단계 되짚기와 4단계 분할의 확정 맥락이다.
+- `validate_plan`은 `issues`와 `edits`의 `out_of_scope`에 비어 있지 않은 문자열 검증(`_text`)을 하고, `publish`는 dry-run·외부 작업 전에 이를 부른다. 정상 발행 시험 데이터에도 제외 범위를 넣는다(#110).
+- 선택 `files`는 예상 변경 경로/glob 목록이다. `_strings`와 `repo_path`로 검증하고 `## Files` Markdown 목록으로 보존한다(#144). `interactive`는 선택 boolean(기본 false), 신규·재발행 때 라벨을 동기화하고 값이 바뀌면 approved/ready를 해제한다. edits는 기존 라벨을 유지한다(#161). 본문 필드를 더하면 파서 `src/foragent/issue.py`와 스키마 도움말 `src/foragent/cli.py`를 함께 고친다.
+- 기존 주문의 자식을 `edits`로 고치는 시험은 새 주문 `id`를 쓴다. 같은 주문의 자식과 `edits`가 겹치면 발행이 거절된다.
+- 발행 Git 단계는 `order._publish_files`, `git.publish_lock()` 안에서 `git.update_base(branch)`(fetch 후 ff-only)를 먼저 한다. 가짜 Git(`tests/test_order.py::PublishingGit`)에 메서드를 추가해야 한다(#259).
+- `fa order progress <step>`은 GitHub 초기화 전에 처리하며 로컬 기록과 JSON 출력만 한다. 뷰 열기는 `/fa-order`가 `start` 직후 `fa gate watch --open`으로 한다. 준비 사실은 `StateStore.order_progress()`(`order-progress.json`), `update_order_progress`는 같은 잠금 안에서 읽기·수정하고 원자적으로 저장한다. chunk당 다섯 칸(goal/out_of_scope/done_when/lane/skills), `end`는 준비 기록만 지운다(#159).
+
+## preread (#237)
+- `fa order preread` 결과는 저장소 안 `.foragent/preread.json`(자체 `.gitignore` `*`)에 둔다. 관문은 `order.require_clean_preread`이며 `tests/test_order.py`는 autouse로 끈다. 실행기 `read_only=True`는 codex `-s read-only`, claude `--permission-mode plan`.
+- preread와 승인 관문은 `order.preread_target`을 함께 쓴다. edits도 대상이다(key `#N`). 증거 키에는 계획 전체(정렬한 JSON)가 들어가 어떤 이슈가 바뀌어도 이전 결과가 무효다. `--approve-numbers`에 아직 매핑 안 된 번호가 있으면 이번에 만들 자식 전부에 깨끗한 preread를 요구한다.
+- preread는 `run_implementation.lane_config` + `implementer_setup(config, lane, tier, worktree)`를 구현과 함께 쓴다(첫 시도 tier = 이슈 크기). 필드를 따로 흉내 내면 리뷰마다 어긋남이 새로 나온다. 비교 시험: `test_preread_setup_matches_the_implementation_setup`.
+- 이번 주문이 만드는 레인(`new_lanes` 중 설정에 없는 것)의 이슈는 preread와 승인 모두 거절한다. 순서: `--approve` 없이 발행 → preread → `--approve`로 재발행. 모르는 점은 스킬이 스스로 답하지 않고 사용자에게 묻는다.
+
+## 관점 (`fa order perspectives`, #414·#745)
+- 코드는 `src/foragent/order_perspectives.py`(CLI `commands/order.py`). 원장은 `store.root/perspectives/<plan_hash>.json`(시험이 작업 트리 불변 검사). 시험이 `executors.executor_for`와 `shutil.which`를 모듈 속성으로 바꾸므로 `from ... import`로 묶지 않는다. 질문 id는 `hash[:12]-seat-번호`.
+- 자리를 더할 때 고칠 곳: `SEATS`·`DEFAULT_EXECUTORS`·`SEAT_FOCUS`, `messages/order_perspectives.py`의 `perspectives_seat_<자리>`, fa-order 5b 자리 목록, `docs/gate.md` perspectives 줄, `tests/test_order.py` 단위 시험(자리 수는 `len(SEATS)`). 단위 시험은 CI가 잡으니 `fa test tests/test_order.py`를 꼭 돌린다.
+
+## 사람용 글·언어 (리뷰가 매번 잡는 종류)
+- 사람이 보는 모든 문자열은 `src/foragent/messages/*.py` 등록부와 설정 언어를 따른다: 실패 사유, PlanError·ConfigError(설정 검증은 `values["language"]`), argparse `help=`, 보고서 본문, 출력의 자리 이름. "기존 help는 영어" 반박은 받아들여지지 않는다. 스킬에 새 문구를 박지 말고 CLI JSON으로 넘긴다(예: `brief.next_step`).
+- 에이전트가 만드는 사람용 글(질문 등)에도 언어를 넘긴다: 프롬프트에 "Write every question in <언어>", 결과에 `language` 기록. 에이전트 프롬프트 자체는 영어로 두고 REBUTTAL에 적는다.
+- 명령의 실패는 자기 명령 안에서 등록부 키로 바꾼다(`ReportError(key, **values)`). `cli.main` 공통 처리로 새면 영어가 나온다. 공유 모듈(tracker 등)에 새 영어 오류를 넣지 말고, 기반 도구 원문은 `{error}`로만 덧붙인다.
+- 파서 생성 중 `cli.load_config`를 부르면 `tests/test_cli.py`의 가짜 load_config 기록이 깨진다. 도움말 언어는 `config._read_yaml(cwd/.foragent.yml)` 또는 `foragent.config.load_config`로 직접 읽고, 하위 parser의 `parse_known_args`를 감싸 `--repo-root`를 먼저 읽는다.
+- 한국어 메시지·초안은 해요체(`니다` 금지, `test_voice.py`).
+
+## `fa init`에 질문 더하기
+- init 질문을 더하면 질문 수를 세거나 `input()`을 금지하는 잠긴 시험이 깨진다(`test_ci_mode.py`, `test_statusline_wrapper.py`, `test_irreversible_paths.py`, `test_quota_executors.py`, `test_board_status_groups.py`, stdout 정확 비교 `test_cli_split.py`, `tests/test_cli.py`). 먼저 `grep -rl builtins.input tests | xargs grep -l '"init"'`로 전부 찾아 돌리고, 깨지는 잠긴 시험은 한 번에 모아 spec-question으로 넘긴다(#419·#848에서 세 번씩 나눠 물었다).
+- Starter order 질문은 `commands/init.py::_offer_starter`, 자격은 `starter.eligible`, 트래커는 `InitReport.tracker`(compare=False). 시험 가짜 report는 SimpleNamespace라 `getattr`로 읽는다(#848). `checks`가 없으면 `gh repo view`로 공개 여부를 묻고, pytest 명령이 없으면 묻지 않는다(`ci_workflow.initial_checks`).
+
+## upstream report (#419)
+- traceback은 구조 줄로만 읽는다: 마지막 `Traceback` 블록의 들여쓴 `File "...", line N, in f` 줄과 그 뒤 column 0 첫 줄. 소스 줄은 해석하지 않는다. 패키지 프레임은 `resolve()` 뒤 실제 패키지 안 파일 + 함수 정의 확인, 함수는 점 없는 식별자, 줄 번호는 파일 줄 수 안, 정규식은 토큰 전체(`\S+`). 보고하는 값은 검증한 값 그대로 쓴다.
+- 실제 traceback은 flag 이유가 아니라 이슈 로그(`store.log_path(N)`)와 `tick-failure.log`에 있다. 로그에는 사용자 시험 traceback도 섞이므로 검증된 Foragent 프레임이 있는 마지막 블록만 쓴다. 한 줄로 편 event는 같은 이슈의 flag/run.detail 원본을 찾아 같은 규칙으로 읽고, 없으면 후보가 하나일 때만 받는다.
+- 중복 판정은 덧글도 본다(`search_issues`가 text-match 헤더·per_page=100, 제목·본문·`text_matches`에서 서명 확인). `incomplete_results`인데 일치가 없으면 새 이슈를 열지 않는다. 가짜 gh는 search/issues와 create/comment만 받는다. 보낼 글의 ID는 내용 해시여야 한다(`load`가 재계산).
+
+## 기타 기능 위치
+- `/fa`가 유일한 사람 입구다(`skills/fa/SKILL.md`가 `fa brief --json` → 라우팅). 다른 스킬의 다음 단계 안내도 `/fa`로 쓰고, `/fa-design-session`도 사람에게는 "디자인 인터뷰"라고 말한다. 예외: `test_fa_init_skill.py::test_brownfield_steps_are_present_in_order`는 fa-init에서 `fa adopt ci` 뒤에 `/fa-order` 문자열을 요구한다(#119).
+- `fa orch ensure`는 `commands/orch.py::_ensure`가 이유를 먼저 가리고 명시 spawn은 `src/foragent/orch_ensure.py`(잠금 busy `_explicit_lock`, `why` 목록). 시험이 spawn 함수를 바꿔치기하므로 모듈 속성(`orch_spawn.ensure_orchestrator`)으로 부른다. 게이트 spawn 경로(기본값)는 범위 밖이면 건드리지 않는다(#133).
+- `fa brief` 점수표 한 줄은 `orch_scorecard.worst_line(collect(store))`, 이름표는 `messages/orch_scorecard.py`의 `scorecard_label_*`(#227).
+- `fa role add` 플래그는 `--scope --signal paths:<glob> --skill --why`(test_role_source.py). 문서 순서 시험(`text.find`)은 제목 낱말도 세므로 제목에 검사 구절을 쓰지 않는다(#773).
+- README 자체 제작 수치는 `git log --first-parent --oneline | grep -cE '\(#[0-9]+\)$'`와 첫·마지막 커밋 날짜(포함 일수)로 센다(#849). 출시 초안은 `docs/launch/{geeknews,x,threads,hn}.{ko,en}.md`, 첫 줄 `# draft, not posted`, 수치는 README에서만, X 글은 한글 2자·URL 23자 가중치로 280 이하(#850).
+- `/fa-order`의 `new_lanes[].skills`·`fa lanes skills`에는 사람이 고른 고정 스타일만 둔다. 도구·검토·분야 스킬은 레인 에이전트가 이슈마다 고른다. `fa skills add URL --json`으로 미리 보고 `--approve --role SKILL=ROLE`로 등록한다. native 인터뷰 기준은 `docs/decisions.md` D58과 보강 2(#111). 대화가 많은 일은 D72대로 표시하고 시각 디자인은 디자인 세션을 제안한다(#161).
+- 스킬을 다시 쓸 때 `files`, `interactive`, 시작 직후 뷰 열기, progress 전체 단계를 유지한다(#111).
+
+## 시험·검증
+- 러너는 Done when, 인수 기준선, 수정한 파일의 자체 시험만 돌린다(D81). 전체 `fa test tests/`는 10분 제한을 넘으니 관련 파일만 돌린다. 인수 시험은 고치지 않는다.
+- 빠른 검증 묶음: `uv run pytest -q tests/test_order.py tests/test_config.py tests/acceptance/test_fa_order_skill.py tests/acceptance/test_fa_order_interview.py tests/acceptance/test_order_progress.py tests/acceptance/test_issue_files.py tests/acceptance/test_interactive_flag.py tests/acceptance/test_publish_own_paths.py`.
+- 모든 시험은 conftest가 HOME/XDG/Git 설정을 격리한다(#655, 2026-10-27). 시험마다 HOME fixture를 따로 둘 필요가 없다.
+- `src/foragent/*.py`와 `commands/*.py`는 300줄 한도다(`test_cli_split.py`, BASE_MODULES 밖도 `test_scheduler_split.py`). 모듈을 키우면 두 시험을 돌리고 넘으면 도우미 모듈로 나눈다(`upstream_traceback.py`, `orch_ensure.py`). 힌트가 "네 diff 탓 아님"이라 해도 실패 메시지의 모듈 이름을 먼저 본다.
+- `.foragent/acceptance-exclusions.json`은 러너(`ci_mode.stage_exclusions`)가 기준 커밋 실패 시험으로 만든다. 리뷰가 "내 시험 제외"로 지적하면 REBUTTAL로 답한다. 리뷰가 다른 이슈의 파일을 지적하면 `git diff origin/main -- <파일>`이 비었는지 보고 REBUTTAL로 답한다.
+- 재시도 때 작업 트리가 다시 만들어지면 `.foragent/TRY.md`도 다시 쓴다. 기준선 비교 임시 파일도 저장소 밖(/tmp)에 쓰지 않는다.
+- 잠긴 시험의 숫자·질문 수가 새 요구와 부딪히면 spec-question으로 넘긴다. main에서 고쳐 준다(#237·#419·#745·#848).
+- uv 캐시를 못 쓰면 `UV_CACHE_DIR=/tmp/...`. 네트워크도 막혔으면 기존 `wheels-v6`, `simple-v21`, 필요한 `archive-v0`를 임시 캐시에 복사하고 `UV_OFFLINE=true uv run pytest`.
+
+## main 따라가기 (리뷰가 "인수 시험 삭제"로 거절하지 않게)
+- 재시도를 시작할 때마다 `git fetch origin && git diff --name-only HEAD...origin/main`을 본다. 내 변경과 겹치지 않는 파일은 zsh `files=(${(f)"$(...)"})`로 나눠 `git restore --source=origin/main --worktree -- $files`로 가져온다. main에서 새로 생긴 파일은 `git add -N`, 지워진 파일은 `git cat-file -e origin/main:<파일>`로 가려 지운다. `git hash-object`로 같은지 확인한다.
+- 병합 중(MERGE_HEAD 있음)에 main이 또 움직였으면 `git diff --name-only MERGE_HEAD origin/main`만 가져온다. `git checkout --theirs`는 권한이 막히므로 `git restore --source=origin/main --worktree`를 쓴다. 내 파일이 main에서도 바뀌면 `git merge-file`로 3방향 병합한다.
