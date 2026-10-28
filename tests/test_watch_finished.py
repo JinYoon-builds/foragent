@@ -213,7 +213,8 @@ def test_live_terminal_paints_the_band_on_a_short_screen_with_many_lanes(tmp_pat
 
     snapshot, config = snapshot_for(lanes=8)
     screen = Mock()
-    screen.getmaxyx.return_value = (16, 100)
+    # F keeps the band within its fixed 24 rows (#170); a 24-row terminal shows it at once.
+    screen.getmaxyx.return_value = (24, 100)
     screen.getch.return_value = ord("q")
     monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
     monkeypatch.setattr(watch, "_installed_build", lambda: "unknown")
@@ -223,5 +224,5 @@ def test_live_terminal_paints_the_band_on_a_short_screen_with_many_lanes(tmp_pat
     watch_terminal._terminal(screen, lambda: snapshot, snapshot, config, tmp_path, lambda: BASE_TIME,
                              StateStore(tmp_path))
     painted = [call.args for call in screen.addstr.call_args_list]
-    assert all(y < 16 for y, *_ in painted)
+    assert all(y < 24 for y, *_ in painted)
     assert {value for y, x, value, *_ in painted} & {"*", "+"}, "fireworks are painted on the screen"
