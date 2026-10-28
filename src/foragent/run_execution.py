@@ -79,6 +79,10 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, *, spender: str |
     try:
         result = ctx.poll_hook(execute, poll)
         result.usage = usage  # filled in ``finally`` once the log is complete
+        if spender is not None:  # Money this session spent, from the executor's own result (#786).
+            from foragent.quota_spend import record_cost
+
+            record_cost(ctx.store, spender, result.cost_usd)
         if log.exists():
             result.log_tail = cuts.read_tail(log, offset, 4000, "executor", cuts.issue_dir(ctx.store.root, n))
         return result
@@ -86,22 +90,7 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, *, spender: str |
         poll()
         # Executors report plan usage in their own output; keep the latest numbers.
         usage.update(usage_events.record_from_log(ctx.store, log, offset, ctx.now()))
-        if spender is not None:
-            _record_spend(ctx, spender, log, offset)
         _progress(n, ctx)
-
-
-def _record_spend(ctx: RunContext, name: str, log: Path, offset: int) -> None:
-    """Money spent by one session, from the Claude result line (#786); nothing without a cost field."""
-    from foragent.scheduler_quota import record_cost
-
-    try:
-        with log.open("rb") as stream:
-            stream.seek(offset)
-            lines = stream.read().decode("utf-8", errors="replace").splitlines()
-    except OSError:
-        return
-    record_cost(ctx.store, name, lines)
 
 
 def _session_hold(ctx: RunContext, name: str, lane: str | None) -> str | None:

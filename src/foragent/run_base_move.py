@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from foragent import labels
-from foragent.config import DEFAULTS, IGNORED_KEYS, Config, _apply_executors, _overlay, _validate
+from foragent.config import DEFAULTS, FILE_KEYS, IGNORED_KEYS, Config, _apply_executors, _overlay, _validate
 from foragent.git import GitError
 from foragent.issue import acceptance_paths, parse_body
 
@@ -122,7 +122,7 @@ def _repo_config(git: GitRepo, sha: str) -> dict[str, Any] | None:
         # Any failure to load is unparsable, and unparsable is result-affecting.
         return None
     value = {} if value is None else value
-    if not isinstance(value, dict) or any(key not in DEFAULTS and key not in IGNORED_KEYS for key in value):
+    if not isinstance(value, dict) or any(key not in DEFAULTS and key not in IGNORED_KEYS and key not in FILE_KEYS for key in value):
         return None
     if "max_parallel" in value and value["max_parallel"] is None:
         return None

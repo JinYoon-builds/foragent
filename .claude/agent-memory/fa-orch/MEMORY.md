@@ -192,4 +192,4 @@
 - 모듈 줄 수: `tests/acceptance/test_cli_split.py`가 `src/foragent/*.py`와 `commands/`에 300줄 상한을 건다(run_*.py는 test_runner_split의 600). orch_facts.py는 상한 근처라 새 기능은 helper 모듈(`orch_facts_reviews.human_lines`)에 둔다.
 - #779 CI 재시도: 선택적 JSONL 기록의 부재는 FileNotFoundError뿐 아니라 상위 경로가 파일인 NotADirectoryError도 포함한다. 공용 `_jsonl`에서 둘만 처리해 brief·scorecard·binding replay를 함께 복구하고 다른 I/O 오류는 유지한다. 회귀·break-it 근거는 project_779_scorecard_flow.md.
 - #814: `run_logged(env=...)`는 부모 환경에 변수를 더한다. Claude 세션 공통 환경은 `executors.CLAUDE_SESSION_ENV`(백그라운드 작업 끔). 실제 전달은 PATH 앞의 가짜 `claude` 스크립트로 시험한다.
-- [#786 ordered executors](project_786_executors.md) — DerivedExecutors re-derive, fallback order, spend.jsonl, credits key, codex api held
+- [#786 ordered executors](project_786_executors.md) — executor_list + executors property, fallback order, spend.jsonl, credits key, codex api held

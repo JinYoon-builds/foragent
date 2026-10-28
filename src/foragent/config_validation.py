@@ -59,7 +59,7 @@ def _validate(values: dict[str, Any]) -> None:
     for path, review in paths.items():
         if not isinstance(path, str) or not isinstance(review, str) or review not in _REVIEW_LEVELS:
             raise ConfigError(f"invalid review_paths entry: {path}")
-    listed = _validate_executors(values.get("executors"))
+    listed = _validate_executors(values.get("executor_list"))
     for key in ("executor", "reviewer"):
         value = values[key]
         if key == "reviewer" and value is None:
@@ -191,11 +191,10 @@ QUOTAS = ("subscription", "api", "unlimited")
 
 def _validate_executors(entries: Any) -> set[str]:
     """Check an explicit ordered executors list (#786); return its names."""
-    from foragent.config import ConfigError, DerivedExecutors
+    from foragent.config import ConfigError
 
-    if isinstance(entries, DerivedExecutors):
+    if entries is None:  # Not set; `executors: null` is refused where the file is read.
         return set()
-    # The default is always a derived list, so None here is an explicit `executors: null`.
     if not isinstance(entries, list) or not entries:
         raise ConfigError("executors must be a nonempty list of {name, quota} entries")
     names: list[str] = []

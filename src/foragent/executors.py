@@ -22,6 +22,8 @@ class ExecResult:
     session_id: str | None = None
     num_turns: int | None = None
     usage: dict | None = None
+    # What the session cost, as the executor reported it (Claude's total_cost_usd); None when unreported.
+    cost_usd: float | None = None
 
 
 def classify_result(result: ExecResult) -> str:
@@ -197,6 +199,21 @@ def claude_review_command(level: str, model: str | None = None, *, pr: int | Non
     return args + (["--model", model] if model is not None else [])
 
 
+def claude_cost(result: dict) -> float | None:
+    """Claude's reported ``total_cost_usd`` from a result event or review document (#786)."""
+    value = result.get("total_cost_usd") if isinstance(result, dict) else None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def claude_document(path: Path) -> dict:
+    """A review run's single JSON document; {} when it is not one."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def claude_stream_result(path: Path) -> dict:
     """Read the last result event, without loading the session transcript."""
     result = {}
@@ -280,9 +297,12 @@ class ClaudeExecutor:
         turns = result.get("num_turns")
         error_kind = _structured_error_kind(output_path, "claude", document=review_level is not None)
         session_id = stream_session_id(output_path, "claude") if review_level is None else None
+        # The cost comes from the same output the adapter reads: the stream's result event,
+        # or a review's one JSON document, which carries no `type`.
+        cost = claude_cost(result if review_level is None else claude_document(output_path))
         return ExecResult(code, timed_out, message, log_path, message,
                           error_kind=error_kind, session_id=session_id,
-                          num_turns=turns if type(turns) is int else None)
+                          num_turns=turns if type(turns) is int else None, cost_usd=cost)
 
 
 def executor_for(name: str) -> Executor:

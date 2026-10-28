@@ -7,7 +7,7 @@ import json
 import pytest
 import yaml
 
-from foragent.config import Config, ConfigError, load_config
+from foragent.config import Config, ConfigError, executors_explicit, load_config
 from foragent.orch_inbox import questions
 from foragent.scheduler_quota import (
     Switch, credits, decide, record_cost, switch_journal, switch_line, switched_config,
@@ -142,7 +142,7 @@ def test_no_eligible_reviewer_means_no_review(tmp_path, lane, paused):
 
 def test_fallback_reviewer_is_none_when_no_eligible_reviewer_is_free():
     config = Config(executor="claude", reviewer="codex",
-                    executors=[entry("claude"), entry("codex", "unlimited"), entry("local", "unlimited")])
+                    executor_list=[entry("claude"), entry("codex", "unlimited"), entry("local", "unlimited")])
     switched = switched_config(config, "local", available=lambda name: name not in ("claude", "codex"))
     assert switched.reviewer == "none", "the kept reviewer is unlimited and local cannot review"
 
@@ -214,16 +214,68 @@ def test_credits_question_is_once_per_executor_and_only_when_it_holds(tmp_path):
     assert asked[0]["options"][0] == "재설정까지 기다리기(추천)"
 
 
-def result_line(cost):
-    return json.dumps({"type": "result", "total_cost_usd": cost})
-
-
 def test_record_cost_sums_result_lines_and_needs_a_cost_field(tmp_path):
     store = store_at(tmp_path)
-    assert record_cost(store, "claude", ["noise", result_line(1.5), result_line(0.5)]) == 2.0
-    assert record_cost(store, "claude", [json.dumps({"type": "result"})]) is None
+    assert record_cost(store, "claude", 1.5) == 1.5 and record_cost(store, "claude", 0.5) == 0.5
+    assert record_cost(store, "claude", None) is None, "no reported cost records nothing"
     assert store.spend_today("claude", NOW) == 2.0
     assert store.spend_today("claude", NOW + timedelta(days=1)) == 0.0
+
+
+def claude_output(monkeypatch, text):
+    class Process:
+        pid, returncode = 54321, 0
+
+        def __init__(self, args, **kwargs):
+            import io
+
+            self.stdin = io.BytesIO()
+            kwargs["stdout"].write(text.encode())
+
+        def wait(self, **kwargs):
+            return self.returncode
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr("foragent.processes.subprocess.Popen", Process)
+
+
+@pytest.mark.parametrize("review_level,text,cost", [
+    # A review run prints one JSON document without `type`, here pretty-printed over several lines.
+    ("high", json.dumps({"result": "ok", "is_error": False, "total_cost_usd": 1.0}, indent=2), 1.0),
+    ("high", json.dumps({"result": "ok", "is_error": False}), None),
+    # An implementation run streams events; the result event carries the cost.
+    (None, "\n".join(json.dumps(event) for event in (
+        {"type": "system", "subtype": "init", "session_id": "s"},
+        {"type": "assistant", "total_cost_usd": 9},
+        {"type": "result", "result": "done", "num_turns": 2, "total_cost_usd": 0.25})) + "\n", 0.25),
+])
+def test_claude_adapter_reports_the_cost_of_every_output_form(tmp_path, monkeypatch, review_level, text, cost):
+    from foragent.executors import ClaudeExecutor
+
+    claude_output(monkeypatch, text)
+    result = ClaudeExecutor().run(worktree=tmp_path, prompt="p", model=None, timeout_s=12,
+                                  log_path=tmp_path / "run.log", review_level=review_level)
+    assert result.cost_usd == cost
+
+
+def test_paid_review_reaches_the_cap_and_blocks_the_next_launch(tmp_path, monkeypatch):
+    """The reproduced case: a $1 api review under a $1 cap must be charged and stop the next launch."""
+    from foragent import run_execution
+    from foragent.executors import ClaudeExecutor
+
+    ctx = runner_ctx(tmp_path, load(tmp_path, {"reviewer": "claude",
+                                               "executors": [entry("codex"), entry("claude", "api", spend_cap=1)]}))
+    ctx.poll_hook = lambda execute, poll: execute()
+    monkeypatch.setattr(run_execution, "_progress", lambda n, context: None)
+    claude_output(monkeypatch, json.dumps({"result": "ok", "is_error": False, "total_cost_usd": 1.0}))
+    result = run_execution._run_executor(1, ctx, ClaudeExecutor(), spender="claude", worktree=tmp_path,
+                                         prompt="p", model=None, timeout_s=12, log_path=tmp_path / "review.log",
+                                         review_level="high")
+    assert result.cost_usd == 1.0 and ctx.store.spend_today("claude", NOW) == 1.0
+    assert "daily cap" in run_execution._session_hold(ctx, "claude", "main")
+
 
 
 def test_credits_is_decided_when_the_session_launches(tmp_path):
@@ -328,7 +380,7 @@ def test_crashed_run_over_keep_percent_resumes_through_the_tick(ctx):
 
     now = ctx.now()
     ctx.config = replace(ctx.config, executor="claude", reviewer="none",
-                         executors=[entry("claude"), entry("codex", keep_percent=50)])
+                         executor_list=[entry("claude"), entry("codex", keep_percent=50)])
     ctx.start_runs = True
     sched_approve(ctx, 1)
     ctx.store.pause_executor("claude", now + timedelta(hours=1))
@@ -346,35 +398,42 @@ def test_crashed_run_over_keep_percent_resumes_through_the_tick(ctx):
     assert run.status == "running" and run.implementer == "codex"
 
 
-def spy_decide(monkeypatch):
-    from foragent import scheduler_quota
+def continued_codex_runs(store, numbers, now):
+    """Claude paused and Codex over its keep share: fresh starts wait, continued Codex runs may go."""
+    for number in numbers:
+        store.start_run(number, branch=f"b{number}", worktree=store.worktree_path(number), implementer="codex")
+        store.finish_run(number, "crashed")
+    store.pause_executor("claude", now + timedelta(hours=1))
+    store.record_usage("codex", [{"name": "5h", "used_percent": 60, "resets_at": None}])
+    return [entry("claude"), entry("codex", keep_percent=50)]
 
-    numbers, real = [], scheduler_quota.decide
-    monkeypatch.setattr(scheduler_quota, "decide", lambda store, config, lane, now, number=None:
-                        numbers.append(number) or real(store, config, lane, now, number))
-    return numbers
 
-
-def test_machine_budget_counts_waiting_issues_by_their_own_quota_decision(ctx, monkeypatch):
+def test_machine_budget_counts_waiting_issues_by_their_own_quota_decision(ctx):
+    from foragent import scheduler
     from foragent.scheduler_start import _machine_budget
 
-    numbers = spy_decide(monkeypatch)
-    _machine_budget(ctx, {"main": [1, 2]}, ("normal", 0.0))
-    assert numbers == [1, 2]
+    now = ctx.now()
+    ctx.config = replace(ctx.config, executor="claude", reviewer="none",
+                         executor_list=continued_codex_runs(ctx.store, [1, 2], now))
+    scheduler.write_state(ctx.store, 6, now)
+    # Issues 1 and 2 continue on Codex; 3 is a fresh start that waits. The budget is their demand.
+    assert _machine_budget(ctx, {"main": [1, 2, 3]}, ("normal", 0.0)) == 2
 
 
-def test_facts_replay_uses_each_issues_own_quota_decision(tmp_path, monkeypatch):
+def test_facts_replay_uses_each_issues_own_quota_decision(tmp_path):
     from foragent import orch_facts_resources
     from foragent.orch_facts_runs import _waiting_issues
     from test_orch_binding_unit import NOW as BINDING_NOW, _store, _waiting
 
     store = _store(tmp_path)
     _waiting(store, 7, files="src/a.py")
-    numbers = spy_decide(monkeypatch)
-    config = Config()
-    orch_facts_resources._admission(store, config, tmp_path, BINDING_NOW, _waiting_issues(store, config, []), [],
-                                    machine={"budget": {"max_parallel": None}, "alive": {}})
-    assert numbers == [7]
+    _waiting(store, 8, files="src/b.py")
+    config = Config(executor="claude", reviewer="none",
+                    executor_list=continued_codex_runs(store, [7], BINDING_NOW))
+    facts = orch_facts_resources._admission(store, config, tmp_path, BINDING_NOW,
+                                            _waiting_issues(store, config, []), [],
+                                            machine={"budget": {"max_parallel": None}, "alive": {}})
+    assert facts["held"] == {"8": "quota"}, "only the fresh start waits on quota; #7 continues"
 
 
 def test_fallback_from_another_executor_never_waits_for_a_paused_reviewer(tmp_path):
@@ -389,3 +448,38 @@ def test_fallback_from_another_executor_never_waits_for_a_paused_reviewer(tmp_pa
     assert (start.config.executor, start.config.reviewer, start.held) == ("claude", "claude", False)
     runner_config = run_config(store, lane_config(config, "main"), start.implementer, NOW)
     assert runner_config.reviewer == "claude", "the runner reviews with the same free executor"
+
+
+def test_written_out_config_round_trips(tmp_path):
+    from dataclasses import asdict
+
+    for data in ({"executor": "claude", "claude_quota": {"mode": "keep", "keep_percent": 70}}, {}):
+        config = load(tmp_path, data)
+        values = {key: value for key, value in asdict(config).items() if key != "max_parallel" or value is not None}
+        assert values["executor_list"] is None, "only an explicit list is stored"
+        again = load(tmp_path, yaml.safe_load(yaml.safe_dump(values)))
+        assert again == config and not executors_explicit(again)
+    lone = load(tmp_path, {"executors": [entry("codex", "subscription")]})
+    assert executors_explicit(lone) and lone.executors == [entry("codex", "subscription")]
+    again = load(tmp_path, {"executor_list": [entry("codex", "subscription")]})
+    assert again.executors == lone.executors, "the written-back key means the same list"
+
+
+@pytest.mark.parametrize("data", [
+    {"executors": [entry("codex"), entry("claude")], "claude_quota": {"mode": "keep"}},
+    # Even the exact legacy list beside claude_quota is the same-file conflict.
+    {"executor": "claude", "claude_quota": {"mode": "keep", "keep_percent": 80},
+     "executors": [entry("claude", keep_percent=80), entry("codex")]},
+    {"executor_list": [entry("codex")], "claude_quota": {"mode": "keep"}},
+])
+def test_executors_and_claude_quota_in_one_file_is_always_an_error(tmp_path, data):
+    with pytest.raises(ConfigError, match="not both"):
+        load(tmp_path, data)
+
+
+def test_written_back_key_follows_the_same_file_rules(tmp_path):
+    with pytest.raises(ConfigError, match="only once"):
+        load(tmp_path, {"executors": [entry("codex")], "executor_list": [entry("codex")]})
+    with pytest.raises(ConfigError, match="only in the repository"):
+        load(tmp_path, {}, {"executor_list": [entry("codex")]})
+    assert not executors_explicit(load(tmp_path, {}, {"executor_list": None}))

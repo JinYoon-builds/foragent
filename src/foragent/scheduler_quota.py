@@ -156,65 +156,6 @@ def credits(store: StateStore, config: Config, name: str, now: datetime) -> bool
     return entry.get("quota") == "api" or store.executor_paused(name, now)
 
 
-def can_review(config: Config, name: str) -> bool:
-    """Unlimited and unknown executors never review."""
-    return name in ("claude", "codex") and entry_for(config, name).get("quota") != "unlimited"
-
-
-def choose_reviewer(config: Config, executor: str, claude_paused: bool,
-                    available: Callable[[str], bool]) -> str:
-    """The reviewer of a run of lane-adjusted ``config`` on ``executor``; the one place it is chosen.
-
-    A run on its own executor keeps the configured reviewer, which moves from Claude to Codex
-    while Claude is paused at its hard limit. A fallback never waits for a reviewer. One between
-    Claude and Codex is reviewed by the executor it fell back from when that is free, else by
-    the configured reviewer when free and not the run's executor, else by the run's own
-    executor. Any other fallback keeps the configured reviewer when it is free, else the run's
-    own executor reviews. Unlimited and unknown executors never review; with no candidate
-    left: ``none``.
-    """
-    previous = resolved_reviewer(config)
-    source = config.executor
-    if previous == "none":
-        return "none"
-    if executor != source and {source, executor} <= {"claude", "codex"}:
-        chain = [source, *([previous] if previous != executor else []), executor]
-        return next((name for name in chain if can_review(config, name) and
-                     (name == executor or available(name))), "none")
-    if executor != source:
-        # Any other fallback keeps the configured reviewer while it is free; it never waits for it.
-        return next((name for name in (previous, executor) if can_review(config, name) and
-                     (name == executor or available(name))), "none")
-    kept = "codex" if claude_paused and previous == "claude" else previous
-    return next((name for name in (kept, executor) if can_review(config, name)), "none")
-
-
-def switched_config(config: Config, implementer: str | None, claude_paused: bool = False,
-                    available: Callable[[str], bool] | None = None) -> Config:
-    """A lane-adjusted config with the run's stored implementer and its reviewer (``choose_reviewer``).
-
-    ``implementer`` None keeps the lane's executor; ``available`` says which executors can run now.
-    """
-    available = available or (lambda name: not (claude_paused and name == "claude"))
-    previous = resolved_reviewer(config)
-    executor = implementer if implementer is not None else config.executor
-    reviewer = choose_reviewer(config, executor, claude_paused, available)
-    if executor == config.executor and reviewer == previous:
-        return config
-    same = executor == config.executor
-    return replace(
-        config, executor=executor, executor_model=config.executor_model if same else None,
-        executor_fallback_model=config.executor_fallback_model if same else None, reviewer=reviewer,
-        reviewer_model=config.reviewer_model if reviewer == previous else None,
-    )
-
-
-def run_config(store: StateStore, config: Config, implementer: str | None, now: datetime) -> Config:
-    """The runner's config for a lane-adjusted ``config``, choosing the reviewer as ``decide`` does."""
-    return switched_config(config, implementer, store.executor_paused("claude", now),
-                           lambda name: blocked(entry_for(config, name), store, now, {}, "keep", keep=False)[0] is None)
-
-
 # A new run record after one of these continues the same run (as ``restarts`` counts it).
 CONTINUED_OUTCOMES = frozenset({"stalled-restart", "crashed", "limit-wait"})
 
@@ -323,19 +264,6 @@ def switch_line(number: int, switch: Switch, language: str) -> str:
                 target=label(switch.target), reason=reason)
 
 
-def record_cost(store: StateStore, name: str, lines: list[str]) -> float | None:
-    """Record a money session's Claude result ``total_cost_usd`` against ``name``; nothing without one."""
-    import json
-
-    cost = None
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        value = event.get("total_cost_usd") if isinstance(event, dict) and event.get("type") == "result" else None
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            cost = (cost or 0.0) + float(value)
-    if cost is not None:
-        store.record_spend(name, cost)
-    return cost
+# Split out to stay under the module line limit; re-exported so callers keep their imports.
+from foragent.quota_reviewer import can_review, choose_reviewer, run_config, switched_config  # noqa: E402,F401
+from foragent.quota_spend import record_cost  # noqa: E402,F401
