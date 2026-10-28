@@ -74,7 +74,7 @@ class IssueRefreshMixin:
             # which recorded run it ended.
             history = self.read_history()
             starts: dict[int, set[str]] = {}
-            for run in [*history, *self.active_runs()]:
+            for run in [*history, *(run for run in self.active_runs() if run.kind == "issue")]:
                 starts.setdefault(run.number, set()).add(run.started_at)
             pr_facts: dict[str, dict[str, Any]] = {}
             for pr in prs:

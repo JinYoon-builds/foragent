@@ -76,7 +76,7 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
         "stale": observation["error"] is not None,
         "error": observation["error"],
         "failed_at": observation["failed_at"],
-        "active_runs": [asdict(run) for run in store.active_runs()],
+        "active_runs": [asdict(run) for run in store.active_runs() if run.kind == "issue"],  # Dreams hold no issue.
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
 
@@ -165,7 +165,7 @@ def collect_lanes(
     # Runs recorded locally are working even when the snapshot predates them or is missing.
     seen = {issue.number for issue in issues}
     for run in store.active_runs():
-        if run.number in seen:
+        if run.kind != "issue" or run.number in seen:  # A lane's dream is no issue row.
             continue
         summary["working"] += 1
         show(lane_row(run.lane), "working", run.number, (titles or {}).get(run.number), run, [])
