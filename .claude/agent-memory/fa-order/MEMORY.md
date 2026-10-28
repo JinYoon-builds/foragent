@@ -59,3 +59,4 @@
 - #849: README의 자체 제작 수치는 `git log --first-parent --oneline | grep -cE '\(#[0-9]+\)$'`(PR 수)와 첫·마지막 커밋 날짜(포함 일수)로 센다. `watch_open`에서 Orca만 되는 것은 기록된 터미널로 돌아가기(`terminal show`)이고, 분할은 tmux·WezTerm·kitty·iTerm·Terminal도 된다.
 - #848: `fa init` 마지막 질문(Starter order)은 `commands/init.py::_offer_starter`, 자격 판정은 `starter.eligible`(열린 approved 이슈·`pr_issue_number` 병합 PR), 트래커는 `InitReport.tracker`(compare=False). 시험 가짜 report는 SimpleNamespace라 `getattr`로 읽는다. init에 질문을 더하면 잠긴 `test_statusline_wrapper.py` 4개가 질문 수 때문에 깨진다 → QUESTION.md.
 - #848 2차: `input()`을 `forbidden`으로 막고 init을 돌리는 잠긴 시험도 있다(`test_irreversible_paths.py`, `test_quota_executors.py`). init 질문을 더할 때는 `grep -l builtins.input tests -r | xargs grep -l '"init"'`로 전부 찾아 돌린다.
+- #848 3차: 사실을 판정 boolean으로만 줄이면 리뷰가 "맥락 누락"으로 거절한다. 에이전트가 고를 일이면 원자료를 `fa order context`에 넣는다(`pull_requests`: 열린 PR + 최근 병합 30개, `foragent` 표시). 맥락 키를 더하면 `docs/impl/p8a-order-tools.md` 목록과 `test_context_all_sections_and_gate_groups`도 고친다.
