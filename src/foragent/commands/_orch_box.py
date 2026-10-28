@@ -29,7 +29,9 @@ def _add_inbox(orch_actions) -> None:
     answer.add_argument("id")
     answer.add_argument("--text", required=True)
     note = orch_actions.add_parser("note", help="Record what the orchestrator does now, why, next and where")
-    note.add_argument("--now", required=True)
+    note.add_argument("--now")
+    note.add_argument("--person-found", dest="person_found",
+                      help="Record one problem the person found before the retrospective")
     note.add_argument("--why")
     note.add_argument("--next", dest="next_step")
     note.add_argument("--where-title", "--orca-title", dest="where_title", help="Orca tab title, e.g. orch: <project>")
@@ -144,9 +146,13 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         record = box.set_request_status(store, args.id, args.status, args.note)
         print(f"Request {record['id']}: {record['status']}.")
     elif args.action == "note":
-        where = box.note_location(dict(cli.os.environ), args.where_title, args.tmux_pane)
-        record = box.write_note(store, args.now, args.why, args.next_step, where)
-        print(f"Note saved at {record['at']} ({where['kind']}).")
+        if args.person_found is not None:
+            event = box.person_found(store, args.person_found)
+            print(f"Person-found event recorded at {event['at']}.")
+        if args.now is not None or args.person_found is None:
+            where = box.note_location(dict(cli.os.environ), args.where_title, args.tmux_pane)
+            record = box.write_note(store, args.now or "", args.why, args.next_step, where)
+            print(f"Note saved at {record['at']} ({where['kind']}).")
     elif args.action == "ask":
         record = box.ask(store, args.question, args.option, args.recommend, args.issues)
         pushed = box.route_question(store, config, repo, record)

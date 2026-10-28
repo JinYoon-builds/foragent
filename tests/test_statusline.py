@@ -250,3 +250,87 @@ def test_uninstall_restore_with_duplicates_activates_the_previous_command():
     code, message = statusline.uninstall()
     assert code == 0, message
     assert json.loads(statusline.claude_settings_path().read_text())["statusLine"]["command"] == "echo hi"
+
+
+OTHER_HOOK = {"matcher": "startup", "hooks": [{"type": "command", "command": "echo mine"}]}
+
+
+def _settings():
+    return json.loads(statusline.claude_settings_path().read_text(encoding="utf-8"))
+
+
+def _hook_commands(settings):
+    return [hook["command"] for group in settings.get("hooks", {}).get("SessionStart", [])
+            for hook in group["hooks"]]
+
+
+def test_install_adds_the_session_hook_once_beside_other_hooks(tmp_path):
+    (tmp_path / "claude").mkdir()
+    statusline.claude_settings_path().write_text(json.dumps({"hooks": {"SessionStart": [OTHER_HOOK]}}))
+    assert statusline.offer_install(lambda prompt: "y") == "installed"
+    assert _hook_commands(_settings()) == ["echo mine", statusline.HOOK_COMMAND]
+    assert statusline.offer_install(lambda prompt: pytest.fail("must not ask")) == "kept"
+    assert _hook_commands(_settings()) == ["echo mine", statusline.HOOK_COMMAND]
+
+
+def test_earlier_install_gets_the_hook_at_the_next_offer(tmp_path):
+    _installed('{"statusLine": {"type": "command", "command": "fa statusline"}}', None)
+    assert statusline.offer_install(lambda prompt: pytest.fail("must not ask")) == "hooked"
+    assert _hook_commands(_settings()) == [statusline.HOOK_COMMAND]
+    assert statusline.offer_install(lambda prompt: pytest.fail("must not ask")) == "kept"
+
+
+def test_decline_removes_a_leftover_session_hook_only(tmp_path):
+    (tmp_path / "claude").mkdir()
+    settings = statusline.with_hook({"hooks": {"SessionStart": [OTHER_HOOK]}, "theme": "dark"})
+    statusline.claude_settings_path().write_text(json.dumps(settings))
+    assert statusline.offer_install(lambda prompt: "n") == "declined"
+    assert _settings() == {"hooks": {"SessionStart": [OTHER_HOOK]}, "theme": "dark"}
+
+
+@pytest.mark.parametrize("other, after", [
+    (True, {"theme": "dark", "hooks": {"SessionStart": [OTHER_HOOK]}}),
+    (False, {"theme": "dark"}),
+], ids=["keeps-other-hooks", "drops-empty-hooks"])
+def test_uninstall_removes_the_session_hook(other, after):
+    settings = statusline.with_hook({"theme": "dark", "hooks": {"SessionStart": [OTHER_HOOK]}} if other
+                                    else {"theme": "dark"})
+    settings["statusLine"] = {"type": "command", "command": "fa statusline"}
+    _installed(json.dumps(settings), None)
+    code, message = statusline.uninstall()
+    assert code == 0, message
+    assert _settings() == after
+
+
+def test_uninstall_removes_the_hook_after_the_user_changed_statusline():
+    settings = statusline.with_hook({"statusLine": {"type": "command", "command": "echo mine"},
+                                     "hooks": {"SessionStart": [OTHER_HOOK]}})
+    _installed(json.dumps(settings), "echo old")
+    code, message = statusline.uninstall()
+    assert code == 0 and "user changed" in message and "session-start hook" in message
+    assert _settings() == {"statusLine": {"type": "command", "command": "echo mine"},
+                           "hooks": {"SessionStart": [OTHER_HOOK]}}
+    # The record stays as it was, and the next init must not bring the hook back.
+    assert statusline.load_record()["enabled"] is True
+    assert statusline.offer_install(lambda prompt: pytest.fail("must not ask")) == "kept"
+    assert _hook_commands(_settings()) == ["echo mine"]
+
+
+@pytest.mark.parametrize("record", [None, {"enabled": False, "previous_command": None}],
+                         ids=["no-record", "record-off"])
+def test_uninstall_without_an_installed_wrapper_still_removes_the_hook(record):
+    statusline.claude_settings_path().parent.mkdir(parents=True, exist_ok=True)
+    statusline.claude_settings_path().write_text(json.dumps(statusline.with_hook({"theme": "dark"})))
+    if record is not None:
+        statusline._write_json(statusline.record_path(), record)
+    code, message = statusline.uninstall()
+    assert code == 0 and "not installed" in message and "session-start hook" in message
+    assert _settings() == {"theme": "dark"}
+    assert statusline.load_record() == record
+    def snapshot():
+        path = statusline.claude_settings_path()
+        return path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns
+
+    unchanged = snapshot()
+    assert statusline.uninstall()[0] == 0
+    assert snapshot() == unchanged, "Nothing left to remove: settings must not be rewritten"

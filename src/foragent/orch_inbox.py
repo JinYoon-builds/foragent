@@ -208,5 +208,12 @@ def write_note(store: StateStore, now: str, why: str | None, next_step: str | No
     return record
 
 
+def person_found(store: StateStore, text: str) -> dict[str, Any]:
+    """Append one ``person-found`` event: a problem the person found before the retrospective."""
+    if not text.strip():
+        raise InboxError("--person-found must not be empty")
+    return append_event(store, store._now(), None, "person-found", text)
+
+
 def read_note(store: StateStore) -> dict[str, Any] | None:
     return store.orch_note()

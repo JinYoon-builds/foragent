@@ -31,6 +31,8 @@ class Config:
     executor_model: str | None = None
     executor_fallback_model: str | None = None
     lanes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Standing roles (#769); written only by foragent.roles.
+    roles: dict[str, dict[str, Any]] = field(default_factory=dict)
     tiers: dict[str, dict[str, Any]] = field(default_factory=lambda: {
         "s": {"codex_effort": "medium", "claude_model": None},
         "m": {"codex_effort": "high", "claude_model": None},
@@ -78,6 +80,8 @@ class Config:
     max_runtime_minutes: int = 90
     max_retries: int = 2
     conflict_retries: int = 2
+    # Merge-queue entries the FIFO turn holder takes at once (#712); only 1 until merge groups (#459).
+    merge_turn_size: int = 1
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None
