@@ -8,6 +8,7 @@ One JSON document the skill reads before interviewing:
 - `feedback`: open issues labelled `feedback` (number, title, body, about).
 - `decisions`: open `needs-human` issues with reason `spec-question` or `no-machine-check`: number, title, current body, the gate question (comment details), the latest `<!-- foragent:decision -->` answer if any.
 - `open_issues`: number, title, labels, lane, size, state group (from `fa gate status` logic).
+- `pull_requests`: open PRs, then the 30 latest merged PRs newest first: number, title, head, state, merged_at, `foragent` (head is `foragent/issue-N` or `foragent/batch-N`).
 - `specs`: paths and first heading of `docs/specs/*.md`.
 - `repo`: top-level tree (depth 2, ignore .git/.venv/node_modules), detected languages/test commands (pyproject → `uv run pytest`, package.json scripts.test → `npm test`/`pnpm test`, go.mod → `go test ./...`), whether `.github/workflows` exists.
 
