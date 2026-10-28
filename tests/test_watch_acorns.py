@@ -132,9 +132,13 @@ def test_window_shows_position_line_only_when_taller_than_the_screen(tmp_path):
     state = {"unfolded": {"work"}, "scroll": 999}
     full = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, state=state)).splitlines()
     shown = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)).splitlines()
-    assert state["scroll"] == len(full) - 11
-    assert shown[:-1] == full[-11:]
-    assert shown[-1].startswith(f"{len(full) - 10}–{len(full)}/{len(full)}줄")
+    # The key help (the frame's last row) is not content: the last screen ends on the row
+    # above it, and the position line stands in its place.
+    assert full[-1].startswith("j/k 이동")
+    assert state["scroll"] == len(full) - 1 - 11
+    assert shown[:-1] == full[-12:-1]
+    assert shown[-1].startswith(f"{len(full) - 11}–{len(full) - 1}/{len(full)}줄")
+    assert not any(line.startswith("j/k 이동") for line in shown), "never both footers"
     small = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, height=200, state={}))
     assert "줄 ·" not in small and "Option" not in small
 
@@ -251,21 +255,28 @@ def test_queued_rows_do_not_take_the_lanes_phase(tmp_path):
     assert lines and all(line.endswith("○○○○○") for line in lines), lines
 
 
-def test_toggle_lines_are_controls_drawn_only_with_view_state(tmp_path):
-    # A finished order is no exception: its idle lane can still unfold by mouse.
+def test_a_frame_draws_the_same_rows_with_or_without_view_state(tmp_path):
+    """Class: content must not depend on whether a caller passed view state."""
+    snapshot, config = lane_case()
+    printed = watch.render_frame(snapshot, config, tmp_path, width=100)
+    live = watch.render_frame(snapshot, config, tmp_path, width=100, state={})
+    assert printed == live
+    assert numbers(printed) == [2, 3, 4] and "▸ 3개 더" in printed
+    assert len(printed.splitlines()) <= 24
+
+
+def test_a_finished_order_folds_no_idle_lane_with_or_without_state(tmp_path):
+    # Orchestrator decision and tests/acceptance/test_view_done_state.py:65: no ▸ once the order is done.
     snapshot, config = lane_case(running=False, queued=(), done=tuple(range(1, 13)))
     snapshot = replace(snapshot, total=snapshot.completed)
-    layout = {}
-    live = "\n".join("".join(value for value, _ in line) for line in watch._frame(
-        snapshot, config, tmp_path, tick=0, width=100, selected=None, now=snapshot.captured_at,
-        height=None, state={}, layout=layout))
-    assert "▸ 12개 더" in live
-    assert ("more", "work") in {target for *_, target in layout["hits"]}
-    printed = watch.render_frame(snapshot, config, tmp_path, width=100)
-    assert "▸" not in printed and "▾" not in printed, "a printed frame has nothing to click"
-    running, _ = lane_case()
-    assert "▸" not in watch.render_frame(running, config, tmp_path, width=100)
-    assert numbers(watch.render_frame(running, config, tmp_path, width=100)) == [3, 4], "nor a last finished row"
+    for state in (None, {}):
+        frame = whole(snapshot, config, tmp_path, state)
+        assert "▸" not in frame and "▾" not in frame and numbers(frame) == []
+    unfolded = whole(snapshot, config, tmp_path, {"unfolded": {"work"}})
+    assert numbers(unfolded) == list(range(1, 13)) and "▾ 접기" in unfolded
+    # While work remains, the same idle lane offers ▸ for its finished rows.
+    open_order = replace(snapshot, total=snapshot.completed + 1)
+    assert "▸ 12개 더" in whole(open_order, config, tmp_path, None)
 
 
 def test_issue_box_shares_the_rows_state_and_lane(tmp_path):
@@ -291,7 +302,7 @@ def test_completed_order_merges_stay_reachable_by_click_and_keys(tmp_path):
     folded = "\n".join("".join(value for value, _ in line) for line in watch._frame(
         snapshot, config, tmp_path, tick=0, width=100, selected=None, now=snapshot.captured_at,
         height=None, state=state, layout=layout))
-    assert "▸ 2개 더" in folded
+    assert "▸" not in folded, "a finished order folds nothing; its list is the way in"
     clicks = {target for *_, target in layout["hits"]}
     assert {("acorn", 1), ("acorn", 2)} <= clicks, "each merge the order lists opens its box"
     x0, y0, *_ = next(hit for hit in layout["hits"] if hit[4] == ("acorn", 2))
@@ -377,3 +388,80 @@ def test_footers_list_the_new_keys_from_their_own_feature_file(tmp_path):
     assert "acorns_keys" in acorns.MESSAGES["en"]
     assert all("j/k move" not in value for module in (squirrel, shared)
                for table in module.MESSAGES.values() for value in table.values())
+
+
+def test_the_key_help_never_scrolls_into_the_window(tmp_path):
+    """Class: the footer is not scrollable content (window, limit and live paint)."""
+    snapshot, config = lane_case(queued=tuple(range(4, 40)))
+    state = {"unfolded": {"work"}}
+    full = watch._frame(snapshot, config, tmp_path, tick=0, width=100, selected=None,
+                        now=snapshot.captured_at, state=state)
+    footer = len(full) - 1
+    for scroll in range(0, len(full) + 5):
+        state["scroll"] = scroll
+        lines = watch._window(full, state, 15, 100, "ko")
+        assert footer not in state["shown"], scroll
+        assert sum("담당 보기" in "".join(value for value, _ in line) for line in lines) == 0
+    assert state["scroll"] == watch.scroll_limit(state) == footer - 14
+    watch.scroll(state, 1)
+    assert state["scroll"] == footer - 14, "j past the last content row does nothing"
+
+
+def live_paint(tmp_path, monkeypatch, snapshot, config, *, height, unfolded=None):
+    import curses
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from foragent import watch_terminal
+
+    screen = Mock()
+    screen.getmaxyx.return_value = (height, 100)
+    screen.getch.return_value = ord("q")
+    monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
+    monkeypatch.setattr(watch, "_installed_build", lambda: "unknown")
+    monkeypatch.setattr(curses, "has_colors", lambda: False)
+    monkeypatch.setattr(curses, "curs_set", lambda *args: None)
+    monkeypatch.setattr(curses, "mousemask", lambda *args: None, raising=False)
+    monkeypatch.setattr(curses, "mouseinterval", lambda *args: None, raising=False)
+    monkeypatch.setattr(watch.sys, "stdout", __import__("io").StringIO())
+    if unfolded:
+        real = watch._frame
+        monkeypatch.setattr(watch, "_frame", lambda *a, state, **k: real(
+            *a, state=state.setdefault("unfolded", set()).update(unfolded) or state, **k))
+    watch_terminal._terminal(screen, lambda: snapshot, snapshot, config, tmp_path,
+                             lambda: snapshot.captured_at, StateStore(tmp_path))
+    rows: dict[int, str] = {}
+    reverse = set()
+    for call in screen.addstr.call_args_list:
+        y, x, value, attribute = call.args
+        rows[y] = rows.get(y, "") + value
+        if attribute & curses.A_REVERSE:
+            reverse.add(y)
+    return rows, reverse
+
+
+def test_live_view_pins_key_help_or_position_line_to_the_bottom_row(tmp_path, monkeypatch):
+    snapshot, config = lane_case(queued=tuple(range(4, 40)))
+    rows, _ = live_paint(tmp_path, monkeypatch, snapshot, config, height=15, unfolded={"work"})
+    assert "줄 · Option" in rows[14] and not any("담당 보기" in text for text in rows.values())
+    short, _ = lane_case()
+    rows, _ = live_paint(tmp_path, monkeypatch, short, config, height=60)
+    assert "담당 보기" in rows[59] and sum("담당 보기" in text for text in rows.values()) == 1
+
+
+def test_only_the_first_visible_issue_row_is_highlighted(tmp_path, monkeypatch):
+    """Class: selection by row position, not issue identity (repeats and wrapped rows)."""
+    snapshot, config = lane_case(running=False, queued=(), done=(1, 2))
+    snapshot = replace(snapshot, total=snapshot.completed)
+    # Unfolded, #1 and #2 show as lane rows and again in the finished order's list.
+    rows, reverse = live_paint(tmp_path, monkeypatch, snapshot, config, height=60, unfolded={"work"})
+    assert sum("#1 " in text or text.rstrip().endswith("#1") for text in rows.values()) >= 2
+    assert len(reverse) == 1 and "#1" in rows[min(reverse)] and rows[min(reverse)].startswith("💤")
+    # A long title wraps the list item onto two lines; still one highlighted row.
+    issue = replace(snapshot.done["work"][0], title="Done " + "word " * 40)
+    wrapped = replace(snapshot, done={"work": [issue, snapshot.done["work"][1]]})
+    state = {}
+    watch._frame(wrapped, config, tmp_path, tick=0, width=100, selected=None, now=wrapped.captured_at, state=state)
+    assert [number for _, number in state["rows"]].count(1) >= 2, "the item wraps onto two issue rows"
+    rows, reverse = live_paint(tmp_path, monkeypatch, wrapped, config, height=60, unfolded={"work"})
+    assert len(reverse) == 1 and rows[min(reverse)].startswith("💤")

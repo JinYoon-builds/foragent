@@ -209,11 +209,16 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
     for a person count as running) and every waiting issue. Folded, it keeps the
     last finished, the running rows and the next waiting issue; an idle lane folds
     to its one summary row. ``tight`` (a short plain frame) leaves out a folded
-    lane's last finished row and toggle, so the frame keeps today's rows; a printed
-    frame without view state (nothing can fold it) is always tight. No order-level
-    rule changes folding.
+    lane's last finished row and toggle, so the frame keeps today's rows; a frame with
+    or without view state draws the same rows. Lanes fold only while the order's work
+    remains: a finished order lists its merges (clickable) in its own section, so its
+    folded idle lanes show no ▸ line (orchestrator decision; tests/acceptance/
+    test_view_done_state.py:65). ``a``, or ``f`` on a listed merge, still unfolds them.
     """
     from foragent import watch
+    from foragent.watch_sections import done
+
+    order_done = done.finished(snapshot)
 
     status, language = snapshot.status, config.language
     clones = _clones(status)
@@ -260,7 +265,7 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
                      else len(snapshot.done.get(slug, [])))
             rest = "✓ " + watch.text("done_state_lane_done", language, count=count) if count else ""
             rows.append({"glyph": glyphs["idle"], "lane": name, "rest": rest})
-            hideable = len(finished)
+            hideable = 0 if order_done and not is_open else len(finished)
             if is_open:
                 rows += [_finished_row(snapshot, config, issue, name, glyphs) for issue in finished]
         else:
@@ -291,9 +296,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     width = context["width"]
     glyphs = GLYPHS[glyph_mode(config)]
     unfolded = set(state.get("unfolded", ())) if state is not None else set()
-    # Only a view with state can fold or unfold, so a stateless frame leaves out the
-    # folding extras: the last finished row and the toggle.
-    rows = _rows(snapshot, config, glyphs, context["now"], unfolded, bool(context.get("tight")) or state is None)
+    rows = _rows(snapshot, config, glyphs, context["now"], unfolded, bool(context.get("tight")))
     if state is not None:
         state["lanes"] = list(snapshot.status["lanes"])
         state["issue_lanes"] = {row["issue"]: row["slug"] for row in rows if "issue" in row}

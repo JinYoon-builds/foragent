@@ -124,15 +124,15 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             if show_detail:
                 view_state["scroll"] = len(frame)  # Jump to the lane details at the end.
                 show_detail = False
-            visible = watch._window(frame, view_state, max(1, height), max(1, width), config.language)
-            # A frame that fits keeps its key help on the bottom row.
-            if len(frame) <= height and visible:
-                visible = visible[:-1] + [[]] * (height - len(visible)) + visible[-1:]
+            # A frame that fits keeps its key help on the bottom row; a taller one scrolls.
+            visible = watch._window(frame, view_state, max(1, height), max(1, width), config.language, pad=True)
+            shown = view_state["shown"]
             if error:
                 visible = visible[:-1] + [watch._fit(watch._line(error, "yellow"), max(1, width))]
-            top = view_state.get("scroll", 0)
-            mark = watch.highlighted(view_state) if view_state.get("issue") is None else None
-            marked = {y - top for y, number in view_state.get("rows", ()) if number == mark}
+                shown = shown[:-1] + [None]
+            # One highlighted row, by its position on screen.
+            mark = watch.highlighted_row(view_state) if view_state.get("issue") is None else None
+            marked = {y for y, row in enumerate(shown) if row is not None and row == mark}
             screen.erase()
             links: list[str] = []
             for y, line in enumerate(visible[:max(1, height)]):
@@ -170,12 +170,15 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     _, x, y, _, buttons = curses.getmouse()
                 except curses.error:
                     continue
+                # Screen rows map to the frame rows they show; blank padding and the
+                # position line show none.
+                row = shown[y] if 0 <= y < len(shown) else None
                 if buttons & wheel[0]:
-                    watch.handle_mouse("wheel-up", x, top + y, layout, store, config, state=view_state)
+                    watch.handle_mouse("wheel-up", x, row or 0, layout, store, config, state=view_state)
                 elif buttons & wheel[1]:
-                    watch.handle_mouse("wheel-down", x, top + y, layout, store, config, state=view_state)
-                elif buttons & click and y < len(visible) - (len(frame) > height):
-                    watch.handle_mouse("left", x, top + y, layout, store, config, state=view_state)
+                    watch.handle_mouse("wheel-down", x, row or 0, layout, store, config, state=view_state)
+                elif buttons & click and row is not None:
+                    watch.handle_mouse("left", x, row, layout, store, config, state=view_state)
                 continue
             if key in range(ord("0"), ord("9") + 1):
                 digits = (digits + chr(key))[-len(str(len(slugs))):]

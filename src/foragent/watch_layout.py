@@ -216,32 +216,45 @@ def _frame(
     if state is not None:
         # Scrolling and the keyboard highlight read the frame's size and issue rows.
         state["length"] = len(frame)
+        state.pop("shown", None)  # Which rows a screen shows is known again once it is windowed.
         state["rows"] = sorted({(y0, target[1]) for x0, y0, x1, y1, target in hits
                                 if isinstance(target, tuple) and target[0] == "acorn" and x1 > x0})
     return [watch._fit(list(line), width) for line in frame]
 
 
-def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width: int, language: str) -> list[Line]:
+def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width: int, language: str,
+            *, pad: bool = False) -> list[Line]:
     """The rows a screen of ``height`` shows.
 
-    A frame that fits is shown whole. A taller one shows ``height - 1`` rows from
-    ``state['scroll']`` (kept within the last full screen) and, in place of the key
-    help, a position line with the text-selection hint.
+    The key help (rows styled ``help.FOOTER``) is not scrollable content. A frame that
+    fits is shown whole (``pad`` puts blank rows above the key help so it sits on the
+    bottom row). A taller one shows ``height - 1`` content rows from ``state['scroll']``
+    (kept within the last full screen of content) and, in place of the key help, a
+    position line with the text-selection hint; its total is the frame's length.
+    ``state['shown']`` records the frame row behind each screen row (None for none).
     """
     from foragent import watch
+    from foragent.watch_sections.help import FOOTER
 
     state = {} if state is None else state
-    state["height"] = height
-    state["length"] = len(frame)
+    footer = {index for index, line in enumerate(frame) if any(style == FOOTER for _, style in line)}
+    content = [index for index in range(len(frame)) if index not in footer]
+    state.update(height=height, length=len(frame), content=len(content))
     if len(frame) <= height:
         state["scroll"] = 0
-        return frame
+        shown: list[int | None] = list(range(len(frame)))
+        if pad and footer:
+            first = min(footer)
+            shown = shown[:first] + [None] * (height - len(frame)) + shown[first:]
+        state["shown"] = shown
+        return [frame[index] if index is not None else [] for index in shown]
     rows = max(1, height - 1)
     top = state["scroll"] = max(0, min(state.get("scroll", 0), watch.scroll_limit(state)))
-    position = watch.text("acorns_position", language, first=top + 1, last=min(len(frame), top + rows),
-                          total=len(frame))
-    footer = watch._fit(watch._line(f"{position} · {watch.text('acorns_select', language)}", "dim"), width)
-    return frame[top:top + rows] + [footer]
+    picked = content[top:top + rows]
+    state["shown"] = [*picked, None]
+    position = watch.text("acorns_position", language, first=top + 1, last=top + len(picked), total=len(frame))
+    line = watch._fit(watch._line(f"{position} · {watch.text('acorns_select', language)}", "dim"), width)
+    return [frame[index] for index in picked] + [line]
 
 
 def render_frame(

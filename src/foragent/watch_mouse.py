@@ -24,10 +24,14 @@ def hit_test(layout: dict[str, Any], x: int, y: int) -> Any:
 
 
 def scroll_limit(state: dict[str, Any]) -> int:
-    """The last scroll offset: the last full screen, else (before any screen) the last row."""
+    """The last scroll offset: the last full screen of content, else (before any screen) the last row.
+
+    ``content`` counts the frame's rows without the key help, which never scrolls.
+    """
     length, height = state.get("length", 0), state.get("height")
     if height:
-        return max(0, length - max(1, height - 1)) if length > height else 0
+        content = state.get("content", length)
+        return max(0, content - max(1, height - 1)) if length > height else 0
     return max(0, length - 1)
 
 
@@ -35,15 +39,25 @@ def scroll(state: dict[str, Any], rows: int) -> None:
     state["scroll"] = max(0, min(state.get("scroll", 0) + rows, scroll_limit(state)))
 
 
-def highlighted(state: dict[str, Any]) -> int | None:
-    """The top visible issue row's number, else the first issue row below it on screen."""
-    top = state.get("scroll", 0)
-    height = state.get("height")
+def highlighted_row(state: dict[str, Any]) -> int | None:
+    """The frame row of the highlight: the top visible issue row, else the first issue row
+    below it on screen. One row, chosen by position: the same issue shown again further
+    down (or a wrapped second line) is not highlighted too.
+    """
+    issues = dict(state.get("rows", ()))
+    if "shown" in state:
+        return next((y for y in state["shown"] if y is not None and y in issues), None)
+    top, height = state.get("scroll", 0), state.get("height")
     bottom = top + max(1, height - 1) if height and state.get("length", 0) > height else None
-    for y, number in sorted(state.get("rows", ())):
-        if y >= top and (bottom is None or y < bottom):
-            return number
-    return None
+    return next((y for y in sorted(issues) if y >= top and (bottom is None or y < bottom)), None)
+
+
+def highlighted(state: dict[str, Any]) -> int | None:
+    """The issue number on the highlighted row."""
+    from foragent import watch
+
+    y = watch.highlighted_row(state)
+    return None if y is None else dict(state.get("rows", ()))[y]
 
 
 def _open(state: dict[str, Any], number: int | None, store: StateStore) -> None:
