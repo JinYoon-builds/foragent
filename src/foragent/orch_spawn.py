@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from types import SimpleNamespace
 
-from foragent import notify, orch_binding, orch_stale_files, processes, watch_open
+from foragent import notify, orch_binding, orch_push, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
@@ -159,25 +159,39 @@ def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, n
                                     stderr=subprocess.DEVNULL, check=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return None
-        _record_session(store, now, screen, getattr(result, "pid", None))
+        # The session is open from here on: later bookkeeping failures must not hide it,
+        # or the tick would treat this as no spawn and push beside it (#129).
+        try:
+            _record_session(store, now, screen, getattr(result, "pid", None))
+        except Exception:  # noqa: BLE001 - the PID record is optional evidence
+            pass
     language = config.language
-    notify.send(config, text("orch_spawn_title", language),
-                text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
+    try:
+        notify.send(config, text("orch_spawn_title", language),
+                    text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
+    except Exception:  # noqa: BLE001 - the session opened even when its push fails
+        pass
     return screen
 
 
 def on_tick(ctx, report):
     """Open an orchestrator when needed and note it in ``report``; never raise. Returns ``report``."""
+    _spawn(ctx, report)
+    return report
+
+
+def _spawn(ctx, report) -> str | None:
+    """``on_tick``'s decision; returns the screen used, or None."""
     language = "en"
     try:
         language = ctx.config.language
         screen = ensure_orchestrator(ctx.repo_root, ctx.store, ctx.config, now=ctx.now())
     except Exception as exc:  # noqa: BLE001 - the optional spawn must not stop the tick
         report.actions.append(text("orch_spawn_failed", language, error=" ".join(str(exc).split())[:200]))
-        return report
+        return None
     if screen:
         report.actions.append(text("orch_spawn_tick", language, screen=screen))
-    return report
+    return screen
 
 
 @contextmanager
@@ -216,5 +230,16 @@ def deciding(ctx, acquired: bool = True):
     # Stale Files are facts for the orchestrator, so they are read before its spawn decision.
     with step("stale_files"):
         orch_stale_files.report(ctx)
+    report = kept[-1] if kept else SimpleNamespace(actions=[])
     with step("orchestrator_spawn"):
-        on_tick(ctx, kept[-1] if kept else SimpleNamespace(actions=[]))
+        screen = _spawn(ctx, report)
+    # #129: only a tick past its GitHub refresh and wait check pushes, after the spawn decision.
+    if getattr(ctx, "_push_ready", False):
+        with step("blocked_push"):
+            language = ctx.config.language
+            try:
+                if line := orch_push.tick_line(*orch_push.after_tick(ctx, spawned=bool(screen)), language):
+                    report.actions.append(line)
+            except Exception as exc:  # noqa: BLE001 - the push must not fail a finished tick
+                report.actions.append(text("push_blocked_failed", language,
+                                           error=" ".join(str(exc).split())[:200]))
