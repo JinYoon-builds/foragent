@@ -5,10 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from datetime import datetime
 from hashlib import sha256
 import json
-from math import isfinite
 import os
 from pathlib import Path
 import re
@@ -25,8 +23,8 @@ import xml.etree.ElementTree as ET
 
 from foragent import cuts
 from foragent.git import GitError
-from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
+from foragent.run_baseline_limits import load_reusable, record_timeout, repository_limit
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
 from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot, phase_identity, restore_phase
 from foragent.state import StateStore
@@ -90,6 +88,8 @@ def _build_baseline(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> Non
                     command, root, log, _baseline_capture_limit(ctx, log),
                     slot=capacity.hold_test_slot(ctx.config.test_slots)),
                 prepare=lambda: None, wait=lambda acquire: acquire(), build=build, lock=lock,
+                # Locked test_baseline_prebuild (unusable "timeout") forbids caching a timed-out prebuild.
+                record_timeouts=False,
             )
         except Exception as exc:
             # No failure marker is cached: a later tick can reserve the key again.
@@ -108,7 +108,7 @@ def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str])
 
     request = {
         "repo_root": str(ctx.repo_root.resolve()), "store_root": str(ctx.store.root.resolve()),
-        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots,
+        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots, "repo": ctx.config.repo,
         "machine_root": str(capacity.machine_root().resolve()),
         "build": asdict(build),
     }
@@ -137,14 +137,14 @@ def prebuild_acceptance_baseline(ctx: RunContext, target_ref: str, launch: Calla
     log = ctx.store.root / "baseline-build.log"
     build = _baseline_build(ctx, test_command, target_ref, log)
     cache = StateStore(ctx.store.root.parent / "baselines", now=ctx.now)
-    if cache.load_acceptance_baseline(build.key) is not None:
+    if load_reusable(cache, build.key) is not None:
         return
     lock = cache.lock_acceptance_baseline(build.key, blocking=False)
     if lock is None:
         return
     try:
         # A producer may have published between our initial read and reservation.
-        if cache.load_acceptance_baseline(build.key) is not None:
+        if load_reusable(cache, build.key) is not None:
             lock.close()
             return
         append_event(ctx.store, ctx.now(), None, "baseline-build",
@@ -212,7 +212,7 @@ def _premerge_baseline(ctx: RunContext, test_command: str, base_sha: str,
     cache, key = _baseline_cache(ctx, test_command, base_sha, excluded)
     scope = sha256(json.dumps(_baseline_identity(ctx, test_command, base_sha), sort_keys=True).encode()).hexdigest()
     for candidate in [cache.root / f"{key}.json", *sorted(cache.root.glob("*.json"))]:
-        saved = cache.load_acceptance_baseline(candidate.stem)
+        saved = load_reusable(cache, candidate.stem)
         if saved is None or not {"collected_ids", "failing_ids", "excluded"} <= saved.keys():
             continue
         if candidate.stem != key and saved.get("scope") != scope:
@@ -232,38 +232,8 @@ def _saved_baseline(command: str, saved: dict) -> AcceptanceBaseline:
 
 def _baseline_capture_limit(ctx: RunContext, log: Path, remaining: int | None = None) -> int:
     """Use this repository's latest successful capture, even after its cache expires."""
-    latest = None
-    for path in (ctx.store.root.parent / "baselines").glob("*.json"):
-        try:
-            saved = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(saved, dict):
-                continue
-            report = path.with_suffix(".xml")
-            if "repository" in saved:
-                if saved["repository"] != str(ctx.repo_root.resolve()):
-                    continue
-            elif not report.is_file():
-                # Legacy entries lack repository tags; accept companion reports in this shared cache.
-                continue
-            if "duration_seconds" in saved:
-                duration = saved["duration_seconds"]
-            else:
-                junit = ET.parse(report).getroot()
-                suites = [junit] if junit.tag == "testsuite" else junit.findall("testsuite")
-                if junit.tag not in {"testsuite", "testsuites"} or not suites:
-                    continue
-                duration = sum(float(suite.attrib["time"]) for suite in suites)
-            created_at = datetime.fromisoformat(saved["created_at"])
-            if (isinstance(duration, bool) or not isinstance(duration, (int, float))
-                    or not isfinite(duration) or duration < 0 or created_at.tzinfo is None
-                    or created_at > ctx.now()):
-                continue
-            if latest is None or created_at > latest[0]:
-                latest = created_at, duration
-        except (OSError, ValueError, TypeError, KeyError, ET.ParseError):
-            continue
-    limit = 900 if latest is None else int(min(3600, max(900, 2 * latest[1])))
-    reason = "default: no successful capture history" if latest is None else f"last successful capture={latest[1]:g}s"
+    limit, latest = repository_limit(ctx.store.root.parent / "baselines", ctx.repo_root, ctx.config.repo, ctx.now())
+    reason = "default: no successful capture history" if latest is None else f"last successful capture={latest:g}s"
     if remaining is not None:
         limit = min(limit, remaining)
         reason += f", run remaining={remaining}s"
@@ -312,7 +282,7 @@ def _capture_baseline(
     ctx: RunContext, test_command: str | None, target_ref: str, *, log: Path, report: Path,
     check: Callable[[str, Path], CheckResult], prepare: Callable[[], None],
     wait: Callable[[Callable[[], object]], None], required_ids: frozenset[str] | None = None,
-    build: BaselineBuild | None = None, lock: IO[str] | None = None,
+    build: BaselineBuild | None = None, lock: IO[str] | None = None, record_timeouts: bool = True,
 ) -> AcceptanceBaseline | None:
     """Share capture, safety validation and cache identity across runner and premerge."""
     command = _pytest_command(test_command) if test_command else None
@@ -326,16 +296,20 @@ def _capture_baseline(
     cached_ids = cache.root / f"{key}.json"
 
     def save_baseline(node_ids: tuple[str, ...], collected_ids: tuple[str, ...],
-                      failing_ids: tuple[str, ...], duration_seconds: float | None = None) -> None:
+                      failing_ids: tuple[str, ...], duration_seconds: float | None = None,
+                      exit_code: int | None = None, timed_out: bool = False) -> None:
         saved = {
             "node_ids": node_ids, "collected_ids": collected_ids, "failing_ids": failing_ids,
-            "excluded": excluded,
-            "scope": build.scope,
-            "created_at": ctx.now().isoformat(),
+            "excluded": excluded, "scope": build.scope, "created_at": ctx.now().isoformat(),
+            # Tags for `fa orch facts` and the capture limit; the slug is omitted when unknown.
+            **({"repo": ctx.config.repo} if ctx.config.repo else {}),
+            "repository": str(ctx.repo_root.resolve()), "base_sha": base_sha, "exit_code": exit_code,
+            "timed_out": timed_out, **({} if duration_seconds is None else {"duration_seconds": duration_seconds}),
         }
-        if duration_seconds is not None:
-            saved.update(repository=str(ctx.repo_root.resolve()), duration_seconds=duration_seconds)
-        cache._atomic_write(cached_ids, json.dumps(saved) + "\n")
+        if timed_out:
+            record_timeout(cache, cached_ids, saved)  # Partial ids; never reused (load_reusable).
+        else:
+            cache._atomic_write(cached_ids, json.dumps(saved) + "\n")
 
     prepare()
     if lock is None:
@@ -350,7 +324,7 @@ def _capture_baseline(
     else:
         ownership = nullcontext(lock)
     with ownership:
-        saved = cache.load_acceptance_baseline(key)
+        saved = load_reusable(cache, key)
         if saved is not None and (required_ids is None or
                                   {"collected_ids", "failing_ids", "excluded"} <= saved.keys()):
             _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
@@ -394,7 +368,7 @@ def _capture_baseline(
                 # Read this execution's collection count from the full log: a long
                 # traceback can push it out of CheckResult's bounded output tail.
                 collected = None
-                cacheable = False
+                cacheable, collected_ids = False, ()
                 try:
                     with log.open(encoding="utf-8", errors="replace") as stream:
                         stream.seek(offset)
@@ -447,7 +421,9 @@ def _capture_baseline(
                     else:
                         report.unlink(missing_ok=True)
                 if cacheable:
-                    save_baseline(node_ids, collected_ids, failing_ids, duration_seconds)
+                    save_baseline(node_ids, collected_ids, failing_ids, duration_seconds, result.exit_code)
+                elif result.timed_out and record_timeouts:
+                    save_baseline(node_ids, collected_ids, (), duration_seconds, result.exit_code, timed_out=True)
                 _append(log, f"Acceptance baseline count={len(node_ids)}, exit_code={result.exit_code}, timed_out={result.timed_out}")
                 if not cacheable:
                     raise AttemptFailure(
@@ -613,18 +589,6 @@ def log_dropped_ids(log: Path, previous: AcceptanceBaseline, protected: tuple[st
 
 
 if __name__ == "__main__":
-    from datetime import UTC, datetime
-    from types import SimpleNamespace
-    from foragent.config import Config
-    from foragent.git import GitRepo
-    from foragent import capacity
+    from foragent.run_baseline_process import main
 
-    request = json.loads(sys.argv[1])
-    capacity.machine_root = lambda: Path(request["machine_root"])
-    root = Path(request["repo_root"])
-    context = SimpleNamespace(
-        repo_root=root, store=StateStore(Path(request["store_root"])), git=GitRepo(root),
-        config=Config(acceptance_dir=request["acceptance_dir"], test_slots=request["test_slots"]),
-        now=lambda: datetime.now(UTC),
-    )
-    _build_baseline(context, load_record(BaselineBuild, request["build"]), os.fdopen(int(sys.argv[2]), "a"))
+    main(sys.argv)
