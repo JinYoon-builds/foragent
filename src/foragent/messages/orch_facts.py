@@ -1,4 +1,4 @@
-"""Review-round and resource lines for `fa orch facts`."""
+"""Review-round, resource and baseline-capture lines for `fa orch facts`."""
 
 MESSAGES = {
     "en": {
@@ -14,6 +14,9 @@ MESSAGES = {
         "facts_resources_unknown": "unknown",
         "facts_resources_ok": "ok",
         "facts_resources_limited": "limited until {until}",
+        "facts_baseline": "Baseline capture: latest {duration} s, {share}% of the {limit} s limit",
+        "facts_baseline_near": "; near the limit",
+        "facts_baseline_none": "Baseline capture: no measured capture yet (limit {limit} s)",
     },
     "ko": {
         "facts_review_rounds": ("머지된 실행의 리뷰 라운드 (최근 {days}일): 중앙값 {median}; "
@@ -28,5 +31,8 @@ MESSAGES = {
         "facts_resources_unknown": "모름",
         "facts_resources_ok": "정상",
         "facts_resources_limited": "{until}까지 한도",
+        "facts_baseline": "기준선 캡처: 최근 {duration} s, 한도 {limit} s의 {share}%",
+        "facts_baseline_near": "; 한도에 가까움",
+        "facts_baseline_none": "기준선 캡처: 아직 측정된 캡처 없음 (한도 {limit} s)",
     },
 }

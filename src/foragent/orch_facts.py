@@ -19,7 +19,7 @@ import shutil
 import tempfile
 from typing import Any
 
-from foragent import capacity, machine_budget, orch_facts_machine, orch_facts_reviews, orch_plan, resource_sample
+from foragent import capacity, machine_budget, orch_facts_baselines, orch_facts_machine, orch_facts_reviews, orch_plan, resource_sample
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
@@ -181,7 +181,12 @@ def collect(store: StateStore, config: Config, root, *, checkout: bool = False) 
                     config = load_config(Path(directory) / "checkout", global_path=global_path)
                 except (ConfigError, OSError, ValueError, TypeError):
                     pass  # The checkout file vanished or broke meanwhile: keep the command's config.
-            return _collect(snapshot, tick_config(snapshot, config, global_path), root, machine)
+            config = tick_config(snapshot, config, global_path)
+            facts = _collect(snapshot, config, root, machine)
+            # The machine-wide baseline cache, read in place as of the same moment.
+            facts.update(orch_facts_baselines.collect(store.root.parent / "baselines", root, config.repo,
+                                                      machine["now"], RECENT))
+            return facts
     raise AssertionError("unreachable")
 
 
@@ -277,7 +282,8 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
     reasons = list(facts["failure_reasons"].items())
     reason_lines = [f"Failure reasons (last {facts['window_days']} days): {'none' if not reasons else len(reasons)}"]
     reason_lines += [f"  {count}x {text[:100]}" for text, count in reasons[:HUMAN_ITEMS]]
-    blocks = [runs + ["  " + line for line in orch_facts_reviews.human_lines(facts, language, HUMAN_ITEMS)], capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}"]]
+    blocks = [runs + ["  " + line for line in orch_facts_reviews.human_lines(facts, language, HUMAN_ITEMS)], capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}",
+                                    orch_facts_baselines.human_line(facts, language)]]
     return "\n\n".join("\n".join(block) for block in blocks)
 
 
