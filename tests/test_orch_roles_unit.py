@@ -96,7 +96,31 @@ def test_scorecard_previous_window_holds_the_median_per_role_day(store):
 
     for days in (1, 1, 2, 2, 3):
         append_event(store, NOW - timedelta(days=days, hours=1), None, "docs-call", "call")
-    card = orch_scorecard.collect(store, days=4, roles=["docs"])
-    assert card["window"]["today"]["roles"] == {"docs": {"calls": 0, "accepted_proposals": 0}}
+    append_event(store, NOW - timedelta(hours=1), None, "role-proposal", "decision", role="docs", accepted=True)
+    append_event(store, NOW - timedelta(hours=2), None, "role-proposal", "decision", role="docs", accepted=False)
+    config = SimpleNamespace(roles={"docs": {"agent": "fa-docs"}})
+    card = orch_roles.scorecard(store, config, orch_scorecard.collect(store, days=4))
+    assert card["window"]["today"]["roles"] == {"docs": {"calls": 0, "accepted_proposals": 1}}
     assert card["window"]["previous"]["roles"] == {"docs": {"calls": 2, "accepted_proposals": 0}}
-    assert "roles" not in orch_scorecard.collect(store, days=4)["window"]["today"]
+    assert orch_scorecard.human(card, "en").count("Role docs: calls 0 (before 2)") == 1
+
+
+def test_repeating_a_role_decision_counts_once_and_the_latest_one_wins(store, tmp_path):
+    config = SimpleNamespace(roles={"security": {"agent": "fa-security", "created_at": NOW.isoformat()}})
+    requests = [orch_inbox.add_request(store, "gate", f"proposal {n}", {"role": "security"}) for n in range(3)]
+    for step in range(3):
+        store.clock[0] = NOW - timedelta(minutes=10 - step)
+        orch_roles.decide(store, requests[0]["id"], "rejected", None)
+    store.clock[0] = NOW
+    rows = orch_roles.collect(store, config, tmp_path)["roles"]
+    assert rows["security"]["removal_proposed"] is False, "One proposal rejected three times is one rejection"
+    for request in requests[1:]:
+        orch_roles.decide(store, request["id"], "rejected", None)
+    assert orch_roles.collect(store, config, tmp_path)["roles"]["security"]["removal_proposed"] is True
+    store.clock[0] = NOW + timedelta(minutes=1)
+    orch_roles.decide(store, requests[0]["id"], "accepted", None)
+    orch_roles.decide(store, requests[0]["id"], "accepted", None)
+    assert orch_roles.collect(store, config, tmp_path)["roles"]["security"]["removal_proposed"] is False, (
+        "A corrected decision replaces the earlier one")
+    card = orch_roles.scorecard(store, config, orch_scorecard.collect(store, days=2))
+    assert card["window"]["today"]["roles"]["security"]["accepted_proposals"] == 1

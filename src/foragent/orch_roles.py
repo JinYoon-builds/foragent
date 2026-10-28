@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from foragent import orch_events, orch_facts, orch_inbox
@@ -36,6 +37,24 @@ def _events(store: StateStore, now: datetime) -> list[tuple[datetime, dict[str, 
     return sorted(rows, key=lambda row: row[0])
 
 
+def decisions(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One decision per (role, request id), oldest first: a repeated or corrected decision replaces the earlier one.
+
+    The journal is append-only, so `fa orch role-decision` run again for one request adds an event;
+    only the latest one (by time, then journal order) counts. A decision without a request id stands alone.
+    """
+    latest: dict[Any, tuple[tuple, dict[str, Any]]] = {}
+    for index, event in enumerate(events):
+        if event.get("kind") != "role-proposal" or type(event.get("accepted")) is not bool:
+            continue
+        request = event.get("request_id")
+        key = (event.get("role"), request if request is not None else ("line", index))
+        order = (_time(event.get("at")), index)
+        if key not in latest or order >= latest[key][0]:
+            latest[key] = (order, event)
+    return [event for _, event in sorted(latest.values(), key=lambda item: item[0])]
+
+
 def _recent_merged_files(store: StateStore, now: datetime) -> set[str]:
     """Files changed by merged executions that finished in the last 24 hours."""
     finished = store.finish_times()
@@ -56,10 +75,8 @@ def _removal_proposed(name: str, entry: dict[str, Any], events, now: datetime) -
     if name in DEFAULT_ROLES:
         return False
     calls = [at for at, event in events if event.get("kind") == call_kind(name)]
-    decisions = [event.get("accepted") for _, event in events
-                 if event.get("kind") == "role-proposal" and event.get("role") == name
-                 and type(event.get("accepted")) is bool]
-    if len(decisions) >= REJECTED_IN_A_ROW and not any(decisions[-REJECTED_IN_A_ROW:]):
+    decided = [event["accepted"] for event in decisions([event for _, event in events]) if event.get("role") == name]
+    if len(decided) >= REJECTED_IN_A_ROW and not any(decided[-REJECTED_IN_A_ROW:]):
         return True
     # Idle since the last call; with no call, since creation; with neither, from now.
     since = calls[-1] if calls else (_time(entry.get("created_at")) or now)
@@ -85,17 +102,37 @@ def collect(store: StateStore, config: Config, root: Path) -> dict[str, Any]:
     return {"at": now.isoformat(), "roles": rows}
 
 
-def counts(names: list[str], events: list[tuple[int, dict[str, Any]]], days: int) -> list[dict]:
-    """Per day bucket, each role's calls and accepted proposals from (bucket, event) pairs."""
+def scorecard(store: StateStore, config: Config, card: dict[str, Any]) -> dict[str, Any]:
+    """Add each role's calls and accepted proposals to both scorecard windows.
+
+    Today is the first 24-hour bucket; the window before holds the per-day median, rounded half up.
+    """
+    from foragent import orch_scorecard
+
+    names, days = list(load_roles(config)), card["days"]
     daily = [{name: {"calls": 0, "accepted_proposals": 0} for name in names} for _ in range(days)]
-    for bucket, event in events:
+    pairs = orch_scorecard._events(store, store._now(), days)
+    # Each call event is one launched session; a decision counts once per request (see decisions).
+    counted = {id(event) for event in decisions([event for _, event in pairs])}
+    for bucket, event in pairs:
         kind, role = event.get("kind"), event.get("role")
         for name in names:
             if kind == call_kind(name):
                 daily[bucket][name]["calls"] += 1
-            elif kind == "role-proposal" and role == name and event.get("accepted") is True:
+            elif role == name and id(event) in counted and event["accepted"]:
                 daily[bucket][name]["accepted_proposals"] += 1
-    return daily
+    card["window"]["today"]["roles"] = daily[0]
+    card["window"]["previous"]["roles"] = {
+        name: {key: orch_scorecard._half_up(median([day[name][key] for day in daily[1:]]))
+               for key in ("calls", "accepted_proposals")} for name in names}
+    return card
+
+
+def scorecard_lines(today: dict[str, Any], previous: dict[str, Any]) -> list[str]:
+    """One line per role for people: calls and accepted proposals today and the days before."""
+    return [f"Role {name}: calls {counts['calls']} (before {previous['roles'][name]['calls']}), accepted "
+            f"proposals {counts['accepted_proposals']} (before {previous['roles'][name]['accepted_proposals']})"
+            for name, counts in today.get("roles", {}).items()]
 
 
 def human(payload: dict[str, Any]) -> str:
