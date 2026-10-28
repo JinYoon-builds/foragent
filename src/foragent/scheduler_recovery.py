@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -154,6 +155,10 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         _restore_stopped(ctx, issue.number, run.detail, report) if run.outcome == "stopped" else scheduler._restore_stalled(ctx, issue.number, run.restarts, report)
         return ctx.tracker.get_issue(issue.number)
     detail = scheduler._crash_detail(ctx, issue.number)
+    if run is None and not _reconciled(ctx, issue.number, detail):
+        # The journal is the event's only record, so a failed write leaves nothing to skip it.
+        scheduler.append_event(ctx.store, ctx.now(), issue.number, "reconciled",
+                               scheduler.text("reconciled", ctx.config.language), detail=detail)
     if run is None or run.outcome != "crashed" or run.detail != detail:
         ctx.store.start_run(
             issue.number, branch=f"foragent/issue-{issue.number}",
@@ -165,6 +170,22 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
     report.actions.append(f"#{issue.number} orphaned running label recovered as crashed")
     scheduler._restore_after_crash(ctx, issue, report)
     return ctx.tracker.get_issue(issue.number)
+
+
+def _reconciled(ctx: TickContext, number: int, detail: str) -> bool:
+    """Whether this running-label generation's repair is already in the journal."""
+    journal = ctx.store.root / "orch-events.jsonl"
+    if not journal.exists():
+        return False
+    for line in journal.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(event, dict) and event.get("issue") == number
+                and event.get("kind") == "reconciled" and event.get("detail") == detail):
+            return True
+    return False
 
 
 def _restore_stalled(ctx: TickContext, number: int, restarts: int, report: TickReport) -> None:

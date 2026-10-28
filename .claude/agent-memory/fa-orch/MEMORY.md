@@ -200,3 +200,4 @@
 - #770: `tests/acceptance/test_cli_split.py`가 `src/foragent/*.py`·`commands/**` 모두 300줄(cli.py 150줄) 상한을 건다. 역할 지시문은 `orch_role_prompt.py`로 분리했고 `orch_architect`가 `build_prompt`·`REFACTOR` 등을 재노출한다. 모듈을 키울 때 먼저 `wc -l`로 확인한다.
 - [#129 blocked push](project_129_blocked_push.md) — orch_push hook after spawn, _push_ready flag, notify-blocked.json re-arm
 - #846: Windows 조기 종료는 `cli.py`의 foragent import 앞 `try: import fcntl`에서 한 줄 출력 후 `SystemExit(1)`. 콘솔 대상은 바꾸지 않는다.
+- #130: 기록 없는 running 라벨 복구의 `reconciled` 이벤트는 대체 crashed 기록보다 먼저 쓰고, 중복은 journal의 (issue, detail=라벨 세대)로 판단한다. 기록을 가드로 쓰면 이벤트 실패가 영구 유실된다(리뷰 지적). 시험 `tests/acceptance/test_reconcile.py`, `tests/test_reconcile_unit.py`(sys.path에 acceptance 추가 필요).
