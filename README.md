@@ -10,6 +10,15 @@
 
 사람은 무엇을 만들지 결정하고 승인만 한다. "다 했어? → 리뷰해 → 다음 거"를 손으로 반복하지 않는다.
 
+## Install
+
+```sh
+uv tool install git+https://github.com/JinYoon-builds/foragent
+fa init
+```
+
+Foragent needs Python 3.12 or newer. You do not have to install it first: if no suitable Python is on your machine, uv fetches one automatically and installs the `fa` command with it. Run `fa init` inside the project folder you want Foragent to work on.
+
 ## 명령
 
 | 단계 | 어디서 | 하는 일 | 사람이 하는 일 |
