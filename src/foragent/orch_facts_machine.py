@@ -2,14 +2,36 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 import json
+from pathlib import Path
 from typing import Any
 
 from foragent import capacity, resource_sample
 from foragent.config import Config, lane_executors
 from foragent.i18n import text
 from foragent.state import Run, StateStore
+
+
+SLOT_STORES = "slot-stores"
+
+
+def freeze_slot_store(store: StateStore, source: Path, into: Path, copy: Callable[[Path, Path], None]) -> None:
+    """Copy a machine-root store's run records for the test-slot queue, as the gate's sample counts them."""
+    if source != store.root and source.parent == capacity.machine_root():
+        for path in (source / "runs").glob("*.json"):
+            copy(path, into / SLOT_STORES / source.name / "runs" / path.name)
+
+
+def freeze_sample(into: Path, copy: Callable[[Path, Path], None]) -> tuple[dict[str, Any] | None, tuple[str, float]]:
+    """The gate's last recorded sample and its (pressure, load); without one, today's read-only live reading."""
+    copy(capacity.machine_root() / resource_sample.FILE, into / resource_sample.FILE)
+    stored = resource_sample.read(into / resource_sample.FILE)
+    if stored is None:
+        with capacity.observing():
+            return None, capacity.machine_load()
+    return stored, (stored["memory_pressure"], float(stored["load_average_per_cpu"]))
 
 
 def sample(machine: dict[str, Any], now: datetime) -> dict[str, Any]:

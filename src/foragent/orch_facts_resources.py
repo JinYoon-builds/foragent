@@ -253,8 +253,7 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
     return {
         "machine": {**orch_facts_machine.sample(machine, now), "load_per_cpu": load, "memory_pressure": pressure,
                     "memory_headroom": memory_headroom, "headroom": headroom, "overloaded": overloaded,
-                    "idle_while_waiting": headroom and waiting_now},
-        **orch_facts_machine.local(store, config, now, running, machine),
+                    "idle_while_waiting": headroom and waiting_now}, **orch_facts_machine.local(store, config, now, running, machine),
         "quota": quota,
         # `admitted` is what `hold_test_slot` grants now, including machine.yml's default ceiling.
         "test_slots": {**slots, "admitted": capacity.effective_test_slots(

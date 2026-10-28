@@ -19,9 +19,8 @@ import shutil
 import tempfile
 from typing import Any
 
-from foragent import capacity, machine_budget, orch_facts_reviews, orch_plan, resource_sample
+from foragent import capacity, machine_budget, orch_facts_machine, orch_facts_reviews, orch_plan, resource_sample
 from foragent.config import Config
-from foragent import orch_facts_machine
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
     RECENT, _comparisons, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
@@ -77,7 +76,6 @@ def _copy(source: Path, target: Path) -> None:
 
 
 GLOBAL_CONFIG = "global-config.yml"
-SLOT_STORES = "slot-stores"
 
 
 def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tuple[StateStore, dict[str, Any]] | None:
@@ -112,10 +110,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
         if discover() != stores:
             return None
         for source in stores:
-            if source != store.root and source.parent == capacity.machine_root():
-                # Every machine-root store but this one, exactly as the gate's sample counts them.
-                for path in (source / "runs").glob("*.json"):
-                    _copy(path, into / SLOT_STORES / source.name / "runs" / path.name)
+            orch_facts_machine.freeze_slot_store(store, source, into, _copy)
             if source != store.root and source.parent != parent:
                 continue
             target = into / "data" / source.name
@@ -139,14 +134,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
         _copy(Path.home() / ".config/foragent/config.yml", into / GLOBAL_CONFIG)
         if checkout is not None:
             _copy(checkout / ".foragent.yml", into / "checkout" / ".foragent.yml")
-        # The gate's last recorded sample; without one, today's read-only live reading.
-        _copy(capacity.machine_root() / resource_sample.FILE, into / resource_sample.FILE)
-        stored = resource_sample.read(into / resource_sample.FILE)
-        if stored is None:
-            with capacity.observing():
-                sample = capacity.machine_load()
-        else:
-            sample = (stored["memory_pressure"], float(stored["load_average_per_cpu"]))
+        stored, sample = orch_facts_machine.freeze_sample(into, _copy)
         # Sibling processes are probed now, while their records cannot change.
         alive = {}
         for path in (into / "data").glob("*/runs/*.json"):
@@ -159,7 +147,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
             if record.get("status") == "running" and type(record.get("pid")) is int:
                 alive[record["pid"]] = _probe(record["pid"])
         machine = {"test_slots": capacity.read_test_slots(), "budget": machine_budget.values(), "sample": sample,
-                   "stored": stored, "slot_stores": into / SLOT_STORES, "now": store._now(), "alive": alive}
+                   "stored": stored, "slot_stores": into / orch_facts_machine.SLOT_STORES, "now": store._now(), "alive": alive}
         # A lock file created meanwhile (a first write under it) means the read was not covered.
         if discover() != stores or [path.exists() for path in lock_set(stores)] != held:
             return None
