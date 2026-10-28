@@ -172,7 +172,8 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
     acorns = "".join(glyphs["done" if index in done else "left"] for index in range(len(ACORNS)))
     return {"glyph": glyphs[kind], "lane": name, "number": f"#{number}", "issue": number, "title": watch._clean(title or ""),
             "words": watch.text(words, language), "activity": activity,
-            "elapsed": elapsed_text(elapsed, language), "acorns": acorns,
+            # Without a recorded time (a queued issue, a row with no run) the cell says so.
+            "elapsed": elapsed_text(elapsed, language) or "—", "acorns": acorns,
             "style": "yellow" if activity or kind == "person" else ""}
 
 
@@ -200,15 +201,6 @@ def last_finished(snapshot: Snapshot, issues: list[Any]) -> Any:
     return max(timed, key=lambda issue: aware(snapshot.merged_at[issue.number]))
 
 
-def _listed(snapshot: Snapshot) -> set[int]:
-    """Merged issues the finished order's own section already lists by number."""
-    from foragent.watch_sections import done
-
-    if not done.finished(snapshot):
-        return set()
-    return {issue.number for issue, _ in done._newest_first(snapshot)[:done.SHOWN]}
-
-
 def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datetime,
           unfolded: frozenset[str] | set[str] = frozenset(), tight: bool = False) -> list[dict[str, Any]]:
     """Every lane's rows in lane order, then its fold toggle when rows are hidden.
@@ -217,12 +209,11 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
     for a person count as running) and every waiting issue. Folded, it keeps the
     last finished, the running rows and the next waiting issue; an idle lane folds
     to its one summary row. ``tight`` (a short plain frame) leaves out a folded
-    lane's last finished row and toggle, so the frame keeps today's rows. A finished
-    order's section already lists its merges, so they are not hidden rows.
+    lane's last finished row and toggle, so the frame keeps today's rows; a printed
+    frame without view state (nothing can fold it) is always tight. No order-level
+    rule changes folding.
     """
     from foragent import watch
-
-    listed = _listed(snapshot)
 
     status, language = snapshot.status, config.language
     clones = _clones(status)
@@ -243,9 +234,22 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
                 title = titles.get(number) or snapshot.titles.get(number) or (row.get("title") if own else "") or ""
                 label = f"{name} {position}" if len(workers) > 1 else name
                 active.append(_issue_row(snapshot, config, row, label, number, run, state, phase, title, glyphs, now))
-        elif row.get("issue") is not None and row["state"] in {"working", "waiting-human", "blocked"}:
-            active.append(_issue_row(snapshot, config, row, name, row["issue"], None, row["state"], row.get("phase"),
-                                     row.get("title") or snapshot.titles.get(row["issue"]) or "", glyphs, now))
+        # Blocked and waiting-for-a-person issues without a run count as running too:
+        # every one the status lists ("held"), then the lane's own issue for older snapshots.
+        held = [dict(item) for item in row.get("held", [])]
+        if row.get("issue") is not None and row["state"] in {"working", "waiting-human", "blocked"} and not workers:
+            held.append({"number": row["issue"], "title": row.get("title"), "state": row["state"],
+                         "phase": row.get("phase")})
+        shown = {run["number"] for run in workers}
+        for item in held:
+            number = item["number"]
+            if number in shown:
+                continue
+            shown.add(number)
+            # A working issue whose run has stopped keeps the phase that run recorded.
+            phase = item.get("phase") or (snapshot.run_phases.get(number) if item["state"] == "working" else None)
+            active.append(_issue_row(snapshot, config, row, name, number, None, item["state"], phase,
+                                     item.get("title") or snapshot.titles.get(number) or "", glyphs, now))
         shown = {item["issue"] for item in active}
         queued = [item for item in row.get("queued", []) if item["number"] not in shown]
         finished = [issue for issue in snapshot.done.get(slug, []) if issue.number not in shown]
@@ -256,7 +260,7 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
                      else len(snapshot.done.get(slug, [])))
             rest = "✓ " + watch.text("done_state_lane_done", language, count=count) if count else ""
             rows.append({"glyph": glyphs["idle"], "lane": name, "rest": rest})
-            hideable = len([issue for issue in finished if issue.number not in listed])
+            hideable = len(finished)
             if is_open:
                 rows += [_finished_row(snapshot, config, issue, name, glyphs) for issue in finished]
         else:
@@ -266,8 +270,9 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
                 rows.append(_finished_row(snapshot, config, issue, name, glyphs))
             rows += active
             for item in queued if is_open else queued[:1]:
-                waiting = _issue_row(snapshot, config, row, name, item["number"], None, "queued",
-                                     row.get("phase"), item.get("title") or "", glyphs, now)
+                # A queued issue has no run: neither the lane's phase nor its acorns are its own.
+                waiting = _issue_row(snapshot, config, row, name, item["number"], None, "queued", None,
+                                     item.get("title") or snapshot.titles.get(item["number"]) or "", glyphs, now)
                 rows.append({**waiting, "style": "dim"})
         found += [{**item, "slug": slug} for item in rows]
         if hideable and (is_open or not tight):
@@ -286,7 +291,9 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     width = context["width"]
     glyphs = GLYPHS[glyph_mode(config)]
     unfolded = set(state.get("unfolded", ())) if state is not None else set()
-    rows = _rows(snapshot, config, glyphs, context["now"], unfolded, bool(context.get("tight")))
+    # Only a view with state can fold or unfold, so a stateless frame leaves out the
+    # folding extras: the last finished row and the toggle.
+    rows = _rows(snapshot, config, glyphs, context["now"], unfolded, bool(context.get("tight")) or state is None)
     if state is not None:
         state["lanes"] = list(snapshot.status["lanes"])
         state["issue_lanes"] = {row["issue"]: row["slug"] for row in rows if "issue" in row}

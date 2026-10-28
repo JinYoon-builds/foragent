@@ -67,9 +67,17 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     language, width = config.language, context["width"]
     lines = _wrapped(watch.text("done_state_heading", language), width, "green")
     items = _newest_first(snapshot)
+    hits, state = context.get("hits"), context.get("state")
     for issue, slug in items[:SHOWN]:
         lane = watch.lane_display(config, slug, language)
+        top = len(lines)
         lines += _item(issue.number, watch._clean(issue.title), lane, language, width)
+        # Each merge opens its issue box, as a lane row does (#170); f folds its lane.
+        if hits is not None:
+            hits += [(0, y, max(1, watch._cells("".join(v for v, _ in lines[y]).rstrip())), y + 1,
+                      ("acorn", issue.number)) for y in range(top, len(lines))]
+        if state is not None:
+            state.setdefault("issue_lanes", {}).setdefault(issue.number, slug)
     if len(items) > SHOWN:
         lines += _wrapped(watch.text("done_state_more", language, count=len(items) - SHOWN), width)
     return lines

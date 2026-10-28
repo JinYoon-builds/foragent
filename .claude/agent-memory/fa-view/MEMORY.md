@@ -129,4 +129,4 @@
 - [#171 준비 줄](project_prep_rows.md) — Snapshot.prep·prep 구역 ORDER 4·고정 시험 함정
 - [#756 보류·해제는 사건 기록만](project_hold_sources.md) — orch-events.jsonl의 다섯 보류·세 해제 종류+머지, flags·승인 스냅숏 금지
 - [#756 /fa는 GitHub 호출 없음](project_fa_offline.md) — --report는 캐시 안내만, 스킬 2단계는 FORAGENT_UPDATE_CHECK=off, 반박 반복되면 재설계
-- [#170 도토리 클릭·접기·스크롤](project_acorn_interact.md) — state 키, TIGHT 24줄 처리, done_state·sections·d76 고정 시험 충돌 해법
+- [#170 도토리 클릭·접기·스크롤](project_acorn_interact.md) — state 키, TIGHT 24줄, held 나열·상자 상태/레인 규칙, 끝난 주문은 안 접음

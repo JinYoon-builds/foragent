@@ -253,7 +253,8 @@ def render_frame(
 
     With ``height``, only the rows a screen that tall shows: the frame scrolled to
     ``state['scroll']`` with a position line when it is taller than the screen.
-    Hit boxes keep their whole-frame rows.
+    The frame is always the heightless, 24-row-trimmed one, so the position total
+    is that frame's length whatever the height. Hit boxes keep their whole-frame rows.
     """
     from foragent import watch
 

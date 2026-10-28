@@ -210,3 +210,170 @@ def test_osc8_and_screen_sequences():
     assert watch.osc8("u", "#1") == "\x1b]8;;u\x1b\\#1\x1b]8;;\x1b\\"
     assert watch.terminal_setup_sequences() == ["\x1b[?1049h"]
     assert watch.terminal_restore_sequences() == ["\x1b[?1049l"]
+
+
+def test_held_issues_beside_a_worker_each_get_a_row(tmp_path):
+    snapshot, config = lane_case(queued=(4,), done=())
+    row = snapshot.status["lanes"]["work"]
+    row["held"] = [{"number": 7, "title": "Blocked one", "state": "blocked"},
+                   {"number": 8, "title": "Needs you", "state": "waiting-human"}]
+    for state in ({}, {"unfolded": {"work"}}):
+        lines = [line for line in plain_frame(whole(snapshot, config, tmp_path, state)).splitlines()
+                 if line.startswith(("🐿", "⏳", "✋"))]
+        assert [int(re.search(r"#(\d+)", line)[1]) for line in lines] == [3, 7, 8, 4]
+        assert lines[1].startswith("⏳") and "오케스트레이터 기다리는 중" in lines[1]
+        assert lines[2].startswith("✋") and "사람 기다리는 중" in lines[2]
+
+
+def test_status_lists_every_held_issue_of_a_lane(tmp_path):
+    from foragent.config import Config
+    from foragent.status import collect_lanes
+    from foragent.tracker import Issue
+
+    store, config = StateStore(tmp_path), Config(lanes={"work": {}})
+    issues = [Issue(n, f"T{n}", "", frozenset(labels), "open") for n, labels in (
+        (1, {"approved", "lane:work", "blocked"}), (2, {"approved", "lane:work", "needs-human"}),
+        (3, {"approved", "lane:work", "ready"}))]
+    groups = {"needs-human": [{"number": 2, "title": "T2"}], "ready": [{"number": 3, "title": "T3"}],
+              "running": [], "pr-open": [], "approved-waiting": [{"number": 1, "title": "T1"}],
+              "unapproved": []}
+    lanes, _ = collect_lanes(issues, groups, {}, store, config, running_snapshot()[0].captured_at)
+    assert [(item["number"], item["state"]) for item in lanes["work"]["held"]] == [
+        (1, "blocked"), (2, "waiting-human")]
+    assert [item["number"] for item in lanes["work"]["queued"]] == [3]
+
+
+def test_queued_rows_do_not_take_the_lanes_phase(tmp_path):
+    snapshot, config = lane_case(running=False, queued=(4, 5), done=())
+    snapshot.status["lanes"]["work"]["phase"] = "merging"
+    lines = [line for line in plain_frame(whole(snapshot, config, tmp_path, {})).splitlines()
+             if line.startswith("⏳")]
+    assert lines and all(line.endswith("○○○○○") for line in lines), lines
+
+
+def test_toggle_lines_are_controls_drawn_only_with_view_state(tmp_path):
+    # A finished order is no exception: its idle lane can still unfold by mouse.
+    snapshot, config = lane_case(running=False, queued=(), done=tuple(range(1, 13)))
+    snapshot = replace(snapshot, total=snapshot.completed)
+    layout = {}
+    live = "\n".join("".join(value for value, _ in line) for line in watch._frame(
+        snapshot, config, tmp_path, tick=0, width=100, selected=None, now=snapshot.captured_at,
+        height=None, state={}, layout=layout))
+    assert "▸ 12개 더" in live
+    assert ("more", "work") in {target for *_, target in layout["hits"]}
+    printed = watch.render_frame(snapshot, config, tmp_path, width=100)
+    assert "▸" not in printed and "▾" not in printed, "a printed frame has nothing to click"
+    running, _ = lane_case()
+    assert "▸" not in watch.render_frame(running, config, tmp_path, width=100)
+    assert numbers(watch.render_frame(running, config, tmp_path, width=100)) == [3, 4], "nor a last finished row"
+
+
+def test_issue_box_shares_the_rows_state_and_lane(tmp_path):
+    store = StateStore(tmp_path)
+    config = replace(lane_case()[1], language="ko", repo=None,
+                     lanes={"work": {"title": "work"}, "docs": {"title": "docs"}})
+    tracker = FakeTracker()
+    tracker.add_issue(5, "Has PR", "", labels=["approved", "lane:work"])
+    tracker.add_issue(6, "Moved", "", labels=["approved", "running", "lane:work"])
+    for number in (5, 6):
+        store.record_issue(tracker.get_issue(number), config.lanes)
+    store.update_local_issue(5, pr_number=50)
+    store.start_run(6, branch="b", worktree="w", lane="docs")
+    assert "사람 기다리는 중" in "\n".join(watch.issue_box(5, store, config)), "an open PR waits for a person"
+    assert "레인: docs" in watch.issue_box(6, store, config), "the run's lane, as in the rows"
+    assert "레인: work" in watch.issue_box(6, store, config, "work"), "the row's own lane wins"
+
+
+def test_completed_order_merges_stay_reachable_by_click_and_keys(tmp_path):
+    snapshot, config = lane_case(running=False, queued=(), done=(1, 2))
+    snapshot = replace(snapshot, total=snapshot.completed)
+    store, state, layout = StateStore(tmp_path), {}, {}
+    folded = "\n".join("".join(value for value, _ in line) for line in watch._frame(
+        snapshot, config, tmp_path, tick=0, width=100, selected=None, now=snapshot.captured_at,
+        height=None, state=state, layout=layout))
+    assert "▸ 2개 더" in folded
+    clicks = {target for *_, target in layout["hits"]}
+    assert {("acorn", 1), ("acorn", 2)} <= clicks, "each merge the order lists opens its box"
+    x0, y0, *_ = next(hit for hit in layout["hits"] if hit[4] == ("acorn", 2))
+    watch.handle_mouse("left", x0, y0, layout, store, config, state=state)
+    assert state["issue"] == 2
+    watch.handle_key("x", store, config, state=state)
+    watch.handle_key("a", store, config, state=state)
+    opened = whole(snapshot, config, tmp_path, state)
+    assert numbers(opened) == [1, 2] and "▾ 접기" in opened
+    watch.handle_key("a", store, config, state=state)
+    assert numbers(whole(snapshot, config, tmp_path, state)) == []
+
+
+def test_missing_times_show_a_dash_on_every_row_kind(tmp_path):
+    snapshot, config = lane_case(queued=(4,), done=())
+    row = snapshot.status["lanes"]["work"]
+    row.update(elapsed_seconds=None)
+    row["held"] = [{"number": 7, "title": "Blocked one", "state": "blocked"}]
+    lines = [line for line in plain_frame(whole(snapshot, config, tmp_path, {})).splitlines()
+             if line.startswith(("🐿", "⏳"))]
+    assert len(lines) == 3
+    assert all(re.search(r"— +○○○○○$", line) for line in lines), lines
+
+
+def test_a_stopped_run_keeps_its_phase_in_row_and_box(tmp_path):
+    snapshot, config = lane_case(running=False, queued=(), done=())
+    row = snapshot.status["lanes"]["work"]
+    row["held"] = [{"number": 9, "title": "Stopped", "state": "working"}]
+    snapshot = replace(snapshot, run_phases={9: "reviewing"})
+    assert "리뷰 받는 중" in [line for line in whole(snapshot, config, tmp_path, {}).splitlines() if "#9" in line][0]
+
+    store = StateStore(tmp_path / "state")
+    config = replace(config, language="ko", repo=None)
+    tracker = FakeTracker()
+    tracker.add_issue(9, "Stopped", "", labels=["approved", "running", "lane:work"])
+    tracker.add_issue(10, "Reopened", "", labels=["approved", "ready", "lane:work"])
+    for number in (9, 10):
+        store.record_issue(tracker.get_issue(number), config.lanes)
+    store.start_run(9, branch="b9", worktree="w9", lane="work")
+    store.update_run(9, phase="reviewing")
+    store.finish_run(9, outcome="failed", detail="stopped")
+    assert "지금: 리뷰 받는 중" in watch.issue_box(9, store, config)
+    store.start_run(10, branch="b10", worktree="w10", lane="work")
+    store.finish_run(10, outcome="merged")
+    assert "지금: 차례 기다리는 중" in watch.issue_box(10, store, config), "a reopened issue is not done"
+
+
+def test_links_restore_the_cursor_curses_expects(tmp_path, monkeypatch):
+    import curses
+    from io import StringIO
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from foragent import watch_terminal
+
+    snapshot, config = lane_case()
+    screen = Mock()
+    screen.getmaxyx.return_value = (40, 100)
+    screen.getch.return_value = ord("q")
+    output = StringIO()
+    monkeypatch.setattr(watch.sys, "stdout", output)
+    monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
+    monkeypatch.setattr(watch, "_installed_build", lambda: "unknown")
+    monkeypatch.setattr(curses, "has_colors", lambda: False)
+    monkeypatch.setattr(curses, "curs_set", lambda *args: None)
+    monkeypatch.setattr(curses, "mousemask", lambda *args: None, raising=False)
+    monkeypatch.setattr(curses, "mouseinterval", lambda *args: None, raising=False)
+    watch_terminal._terminal(screen, lambda: snapshot, snapshot, config, tmp_path,
+                             lambda: snapshot.captured_at, StateStore(tmp_path))
+    written = output.getvalue()
+    assert "\x1b]8;;https://github.com/owner/repo/issues/3" in written
+    # Every cursor move for a link sits between one save and its restore.
+    assert written.startswith("\x1b7") and written.endswith("\x1b8")
+    assert written.count("\x1b7") == written.count("\x1b8") == 1
+
+
+def test_footers_list_the_new_keys_from_their_own_feature_file(tmp_path):
+    from foragent.messages import acorns, squirrel, watch as shared
+
+    snapshot, config = lane_case()
+    assert watch.render_frame(snapshot, config, tmp_path, width=200).splitlines()[-1] == (
+        "1–1: 담당 보기 · j/k 이동 · Enter 열기 · f 접기 · a 모두 · o 오케스트레이터 · x 닫기 · q 끝내기")
+    assert "acorns_keys" in acorns.MESSAGES["en"]
+    assert all("j/k move" not in value for module in (squirrel, shared)
+               for table in module.MESSAGES.values() for value in table.values())

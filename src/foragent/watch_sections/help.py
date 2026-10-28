@@ -17,7 +17,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
 
     if context.get("short"):
         # Sections gave way to the lane rows: one short line of the key letters.
-        return [watch._line(watch.text("squirrel_footer", config.language))]
+        return [watch._line(watch.text("acorns_keys", config.language))]
     count = len(snapshot.status["lanes"])
-    key = "watch_help_many" if count > 9 else "watch_help"
+    # The lane-row keys (#170) live with their feature in messages/acorns.py.
+    key = "acorns_help_many" if count > 9 else "acorns_help"
     return [watch._line(watch.text(key, config.language, count=count))]

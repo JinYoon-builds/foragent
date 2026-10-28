@@ -14,7 +14,7 @@ MESSAGES = {
         "squirrel_minutes": "{minutes}m",
         "squirrel_hours": "{hours}h {minutes}m",
         "squirrel_header": "today ✓{done} · working {working} · waiting {waiting} · queued {queued}",
-        "squirrel_footer": "j/k move · Enter open · f fold · a all · o orchestrator · x close · q quit",
+        "squirrel_footer": "q: quit · s · m · j/k",
     },
     "ko": {
         "squirrel_code": "코드 쓰는 중",
@@ -29,6 +29,6 @@ MESSAGES = {
         "squirrel_minutes": "{minutes}분",
         "squirrel_hours": "{hours}시간 {minutes}분",
         "squirrel_header": "오늘 ✓{done} · 일하는 중 {working} · 기다리는 일 {waiting} · 차례 {queued}",
-        "squirrel_footer": "j/k 이동 · Enter 열기 · f 접기 · a 모두 · o 오케스트레이터 · x 닫기 · q 끝내기",
+        "squirrel_footer": "q: 종료 · s · m · j/k",
     },
 }

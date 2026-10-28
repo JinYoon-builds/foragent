@@ -13,6 +13,7 @@ from foragent.watch_data import Snapshot
 
 
 # A visible issue number, linked to its GitHub page after each refresh.
+SAVE_CURSOR, RESTORE_CURSOR = "\x1b7", "\x1b8"
 ISSUE_NUMBER = re.compile(r"(?<![\w#])#(\d+)(?!\w)")
 
 
@@ -157,7 +158,9 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             # whenever curses may have repainted it.
             painted = (links, [[value for value, _ in line] for line in visible], sorted(marked))
             if links and painted != last_painted:
-                watch.sys.stdout.write("".join(links))
+                # Save and restore the cursor and attributes (DECSC/DECRC) around the links,
+                # so curses' next refresh starts from the position it believes it left.
+                watch.sys.stdout.write(SAVE_CURSOR + "".join(links) + RESTORE_CURSOR)
                 watch.sys.stdout.flush()
             last_painted = painted
             key = screen.getch()

@@ -123,7 +123,8 @@ def test_calm_frame_keeps_the_layout_of_a_view_without_the_band(monkeypatch):
     sections = watch_layout._sections
     monkeypatch.setattr(watch_layout, "_sections",
                         lambda: [section for section in sections() if section is not finished])
-    assert calm == watch._frame(snapshot, config, ".", tick=20, width=160, selected=None, now=BASE_TIME)
+    # Both are views with state, so both draw the lane fold controls (#170).
+    assert calm == watch._frame(snapshot, config, ".", tick=20, width=160, selected=None, now=BASE_TIME, state={})
 
 
 def test_once_prints_the_calm_frame(tmp_path, monkeypatch, capsys):
