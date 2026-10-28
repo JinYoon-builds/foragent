@@ -872,7 +872,10 @@ class GhTracker:
             raise TrackerError(str(exc)) from exc
 
     def rate_limit_reset(self) -> datetime | None:
+        """Also keeps the core requests remaining from the same response in ``rate_limit_remaining``."""
         data = json.loads(self._call(["api", "rate_limit"]))
+        remaining = (data.get("resources", {}).get("core") or {}).get("remaining")
+        self.rate_limit_remaining = remaining if type(remaining) is int and remaining >= 0 else None
         resets = [
             datetime.fromtimestamp(window["reset"], UTC)
             for window in data.get("resources", {}).values()
