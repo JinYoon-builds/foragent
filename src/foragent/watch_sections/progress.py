@@ -83,7 +83,7 @@ def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
     rows = {row["number"]: row for row in store.local_issues()}
     history = store.read_history()
     starts: dict[int, list[datetime]] = {}
-    for run in [*history, *store.active_runs()]:
+    for run in [*history, *(run for run in store.active_runs() if run.kind == "issue")]:
         if (at := _time(run.started_at)) is not None:
             starts.setdefault(run.number, []).append(at)
     latest: dict[int, tuple[datetime, str, datetime | None]] = {}  # number -> (merged, size, started)
