@@ -19,7 +19,7 @@ import shutil
 import subprocess
 from types import SimpleNamespace
 
-from foragent import notify, orch_binding, orch_stale_files, processes, watch_open
+from foragent import notify, orch_binding, orch_push, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
@@ -90,8 +90,38 @@ def _record_session(store: StateStore, now: datetime, screen: str, pid) -> None:
         row = None
     if row is None:
         return
-    store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen,
+    store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen, "launched": True,
                                             "pid": pid, "start_time": row.start_time})
+
+
+def record_launch(store: StateStore, now: datetime, screen: str, result) -> None:
+    """After the launch command returns, add its outcome to the spawn record.
+
+    ``result`` is the finished process, or None when the command failed or timed
+    out (``launched: false``). The PID and start time are optional evidence, so a
+    failure to read them never hides a launch that happened.
+    """
+    store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen,
+                                            "launched": result is not None})
+    if result is not None:
+        try:
+            _record_session(store, now, screen, getattr(result, "pid", None))
+        except Exception:  # noqa: BLE001 - the identity is optional evidence
+            pass
+
+
+def _read_record(store: StateStore) -> dict | None:
+    try:
+        record = json.loads(_record_path(store).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def launched_since(store: StateStore, before: dict | None) -> bool:
+    """Whether the spawn record changed since ``before`` to a launch that ran (#129)."""
+    after = _read_record(store)
+    return after is not None and after != before and after.get("launched") is True
 
 
 def _approved_work(store: StateStore) -> bool:
@@ -158,11 +188,15 @@ def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, n
             result = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, check=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
+            record_launch(store, now, screen, None)
             return None
-        _record_session(store, now, screen, getattr(result, "pid", None))
+        record_launch(store, now, screen, result)
     language = config.language
-    notify.send(config, text("orch_spawn_title", language),
-                text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
+    try:
+        notify.send(config, text("orch_spawn_title", language),
+                    text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
+    except Exception:  # noqa: BLE001 - the session opened even when its push fails
+        pass
     return screen
 
 
@@ -192,6 +226,7 @@ def deciding(ctx, acquired: bool = True):
     that did not get the lock touches nothing; the tick holding it decides.
     """
     kept = []
+    ctx._push_ready = False  # #129: set by orch_push.refresh_waited once this tick passes its wait check.
 
     def keep(report):
         kept.append(report)
@@ -216,5 +251,18 @@ def deciding(ctx, acquired: bool = True):
     # Stale Files are facts for the orchestrator, so they are read before its spawn decision.
     with step("stale_files"):
         orch_stale_files.report(ctx)
+    report = kept[-1] if kept else SimpleNamespace(actions=[])
+    before = _read_record(ctx.store)
     with step("orchestrator_spawn"):
-        on_tick(ctx, kept[-1] if kept else SimpleNamespace(actions=[]))
+        on_tick(ctx, report)
+    # #129: only a tick past its GitHub refresh and wait check pushes, after the spawn decision.
+    if getattr(ctx, "_push_ready", False):
+        with step("blocked_push"):
+            language = ctx.config.language
+            spawned = launched_since(ctx.store, before)  # This tick's spawn, as the record says.
+            try:
+                if line := orch_push.tick_line(*orch_push.after_tick(ctx, spawned), language):
+                    report.actions.append(line)
+            except Exception as exc:  # noqa: BLE001 - the push must not fail a finished tick
+                report.actions.append(text("push_blocked_failed", language,
+                                           error=" ".join(str(exc).split())[:200]))

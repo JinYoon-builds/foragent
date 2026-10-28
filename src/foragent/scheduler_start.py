@@ -32,6 +32,8 @@ def _lane_held(ctx: TickContext, lane: str, now: datetime, number: int | None = 
     """
     if orch_plan.lane_paused(ctx.store, lane, now):
         return True
+    if (dream := ctx.store.get_dream(lane)) is not None and dream.status == "running":
+        return True  # While a lane dreams, no new issue of that lane starts.
     return scheduler_quota.decide(ctx.store, ctx.config, lane, now, number).held
 
 
@@ -74,6 +76,7 @@ def _machine_budget(
     # Every ready issue in an unpaused lane may start; the file-overlap check runs at start time.
     waiting = sum(1 for lane, numbers in ready.items() for number in numbers
                   if not _lane_held(ctx, lane, now, number))
+    waiting += getattr(ctx, "_dream_demand", 0)  # A due dream asks for one worker too.
     sample = sample if sample is not None else scheduler.machine_load()
     pressure, load = sample
     machine = machine_budget.values()  # The shared value follows machine.yml only.
@@ -91,7 +94,8 @@ def _machine_budget(
                 load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
                 cpu_busy=getattr(sample, "cpu_busy", None),
             )
-            return max(1, min(ceiling, scheduler.machine_runs(ctx.store, now) + waiting))
+            ctx._tick_budget = max(1, min(ceiling, scheduler.machine_runs(ctx.store, now) + waiting))
+            return ctx._tick_budget
         changed_at = scheduler.datetime.fromisoformat(state["changed_at"]) if state else now
         demand = scheduler.machine_runs(ctx.store, now) + waiting
         # Work only caps growth: the shared value never drops below itself for lack
@@ -114,7 +118,8 @@ def _machine_budget(
             load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
             cpu_busy=getattr(sample, "cpu_busy", None),
         )
-    return max(1, min(value, demand))
+    ctx._tick_budget = max(1, min(value, demand))
+    return ctx._tick_budget
 
 
 def _has_slot(ctx: TickContext, budget: int) -> bool:
@@ -278,6 +283,7 @@ def _github_wait(ctx: TickContext, ready: dict[str, list[int]], name: str) -> st
 
 def _github_pause(ctx: TickContext, exc: Exception) -> str:
     """Record a GitHub rate limit as one timed step and apply this tick's budgets."""
+    ctx._push_ready = False  # #129: a tick that hits a rate limit after its wait check sends no push.
     with step("github_pause"):
         until = scheduler.orch_github.pause(ctx, exc)
         scheduler._apply_budgets(ctx, {})

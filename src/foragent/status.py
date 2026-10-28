@@ -76,7 +76,7 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
         "stale": observation["error"] is not None,
         "error": observation["error"],
         "failed_at": observation["failed_at"],
-        "active_runs": [asdict(run) for run in store.active_runs()],
+        "active_runs": [asdict(run) for run in store.active_runs() if run.kind == "issue"],  # Dreams hold no issue.
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
 
@@ -127,7 +127,7 @@ def collect_lanes(
             "slug": slug, "lane_display": lane_display(config, slug, config.language),
             "state": "idle", "issue": None, "title": None, "phase": None,
             "elapsed_seconds": None, "last_activity_seconds": None, "waiting_for": [],
-            RUNNING: [], READY: [], "queued": [],
+            RUNNING: [], READY: [], "queued": [], "held": [],
         })
 
     def show(row: dict[str, Any], state: str, number: int, title: str | None, run, waiting_for) -> None:
@@ -157,12 +157,15 @@ def collect_lanes(
         summary[state.replace("-", "_")] += 1
         if state == "queued":
             row["queued"].append(item)
+        elif state in {"blocked", "waiting-human"} and not active:
+            # Every held issue, not only the lane's most urgent one, has a lane row.
+            row["held"].append({**item, "state": state})
         show(row, state, issue.number, issue.title, run if active else None,
              waiting.get(issue.number, []) if state == "queued" else [])
     # Runs recorded locally are working even when the snapshot predates them or is missing.
     seen = {issue.number for issue in issues}
     for run in store.active_runs():
-        if run.number in seen:
+        if run.kind != "issue" or run.number in seen:  # A lane's dream is no issue row.
             continue
         summary["working"] += 1
         show(lane_row(run.lane), "working", run.number, (titles or {}).get(run.number), run, [])

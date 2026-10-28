@@ -133,7 +133,7 @@ def test_gate_path_is_unchanged_by_the_explicit_call(tmp_path, monkeypatch):
     assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW) == "background"
     assert len(calls) == 1
     assert json.loads((store.root / "orch-spawn.json").read_text()) == {
-        "spawned_at": NOW.isoformat(), "screen": "background"}
+        "spawned_at": NOW.isoformat(), "screen": "background", "launched": True}
 
 
 def test_missing_claude_opens_nothing_and_keeps_no_record(tmp_path, monkeypatch):

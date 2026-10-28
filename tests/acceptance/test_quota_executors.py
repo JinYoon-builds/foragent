@@ -124,7 +124,7 @@ def _offline_init(root, store, monkeypatch):
     ))
     monkeypatch.setattr(cli, "_open_lane_view", lambda root: None)
     assert cli.main(["init", "--repo-root", str(root), "--no-push", "--no-launchd", "--no-board",
-                     "--statusline", "no"]) == 0, "Offline fa init must succeed without quota questions"
+                     "--statusline", "no", "--starter", "no"]) == 0, "Offline fa init must succeed without quota questions"
     assert questions(store, include_closed=True) == [], "Init must not ask about future quota or credits"
 
 
