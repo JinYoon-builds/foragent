@@ -23,6 +23,8 @@ def add(commands) -> None:
                       help="Default Claude quota mode: keep stops at keep_percent, burn runs to the limit")
     init.add_argument("--statusline", choices=("yes", "no"),
                       help="Answer the Claude statusline question without a prompt")
+    init.add_argument("--starter", choices=("yes", "no"),
+                      help="Answer the starter order offer without a prompt")
 
 
 def _offer_statusline(answer: str | None) -> None:
@@ -77,6 +79,27 @@ def _offer_upstream_reports(root) -> None:
     print(cli.text("upstream_reports_on" if enabled else "upstream_reports_off", language))
 
 
+def _offer_starter(root, tracker, answer: str | None) -> None:
+    """Offer one tiny first order when the project has no Foragent work; store nothing."""
+    from foragent import starter
+    from foragent.config import load_config
+
+    cli = facade()
+    try:
+        language = load_config(root).language
+        if tracker is None or not starter.eligible(tracker):
+            return
+    except Exception:  # No readable config or tracker facts: skip the offer quietly.
+        return
+    if answer is None:
+        try:
+            answer = input(cli.text("starter_question", language))
+        except (EOFError, OSError):
+            return
+    if answer.strip().lower() in {"y", "yes"}:
+        print(cli.text("starter_next_step", language, example=cli.text("starter_example", language)))
+
+
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
@@ -92,5 +115,6 @@ def run(args) -> int:
     if not args.dry_run:
         cli._offer_statusline(args.statusline)
         _offer_upstream_reports(report.normalized_root or root)
+        _offer_starter(report.normalized_root or root, getattr(report, "tracker", None), args.starter)
         cli._open_lane_view(report.normalized_root or root)
     return 0
