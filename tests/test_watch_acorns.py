@@ -128,17 +128,15 @@ def test_scroll_before_any_screen_is_bounded_by_the_last_frame(tmp_path):
 
 
 def test_window_shows_position_line_only_when_taller_than_the_screen(tmp_path):
+    """One slice rule: F[scroll : scroll + h - 1] plus the position line, N = len(F)."""
     snapshot, config = lane_case(queued=tuple(range(4, 40)))
     state = {"unfolded": {"work"}, "scroll": 999}
     full = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, state=state)).splitlines()
     shown = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)).splitlines()
-    # The key help (the frame's last row) is not content: the last screen ends on the row
-    # above it, and the position line stands in its place.
+    assert state["scroll"] == len(full) - 11
+    assert shown[:-1] == full[-11:], "F's own footer row is an ordinary row and scrolls with it"
     assert full[-1].startswith("j/k 이동")
-    assert state["scroll"] == len(full) - 1 - 11
-    assert shown[:-1] == full[-12:-1]
-    assert shown[-1].startswith(f"{len(full) - 11}–{len(full) - 1}/{len(full)}줄")
-    assert not any(line.startswith("j/k 이동") for line in shown), "never both footers"
+    assert shown[-1].startswith(f"{len(full) - 10}–{len(full)}/{len(full)}줄")
     small = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, height=200, state={}))
     assert "줄 ·" not in small and "Option" not in small
 
@@ -265,18 +263,15 @@ def test_a_frame_draws_the_same_rows_with_or_without_view_state(tmp_path):
     assert len(printed.splitlines()) <= 24
 
 
-def test_a_finished_order_folds_no_idle_lane_with_or_without_state(tmp_path):
-    # Orchestrator decision and tests/acceptance/test_view_done_state.py:65: no ▸ once the order is done.
+def test_a_finished_orders_idle_lane_still_offers_its_finished_rows(tmp_path):
+    """No order-level exception: a folded idle lane with finished rows shows its toggle."""
     snapshot, config = lane_case(running=False, queued=(), done=tuple(range(1, 13)))
     snapshot = replace(snapshot, total=snapshot.completed)
     for state in (None, {}):
         frame = whole(snapshot, config, tmp_path, state)
-        assert "▸" not in frame and "▾" not in frame and numbers(frame) == []
+        assert "▸ 12개 더" in frame and numbers(frame) == []
     unfolded = whole(snapshot, config, tmp_path, {"unfolded": {"work"}})
     assert numbers(unfolded) == list(range(1, 13)) and "▾ 접기" in unfolded
-    # While work remains, the same idle lane offers ▸ for its finished rows.
-    open_order = replace(snapshot, total=snapshot.completed + 1)
-    assert "▸ 12개 더" in whole(open_order, config, tmp_path, None)
 
 
 def test_issue_box_shares_the_rows_state_and_lane(tmp_path):
@@ -302,7 +297,7 @@ def test_completed_order_merges_stay_reachable_by_click_and_keys(tmp_path):
     folded = "\n".join("".join(value for value, _ in line) for line in watch._frame(
         snapshot, config, tmp_path, tick=0, width=100, selected=None, now=snapshot.captured_at,
         height=None, state=state, layout=layout))
-    assert "▸" not in folded, "a finished order folds nothing; its list is the way in"
+    assert "▸ 2개 더" in folded
     clicks = {target for *_, target in layout["hits"]}
     assert {("acorn", 1), ("acorn", 2)} <= clicks, "each merge the order lists opens its box"
     x0, y0, *_ = next(hit for hit in layout["hits"] if hit[4] == ("acorn", 2))
@@ -390,21 +385,19 @@ def test_footers_list_the_new_keys_from_their_own_feature_file(tmp_path):
                for table in module.MESSAGES.values() for value in table.values())
 
 
-def test_the_key_help_never_scrolls_into_the_window(tmp_path):
-    """Class: the footer is not scrollable content (window, limit and live paint)."""
+def test_hits_use_screen_rows_after_a_height_render(tmp_path):
     snapshot, config = lane_case(queued=tuple(range(4, 40)))
-    state = {"unfolded": {"work"}}
-    full = watch._frame(snapshot, config, tmp_path, tick=0, width=100, selected=None,
-                        now=snapshot.captured_at, state=state)
-    footer = len(full) - 1
-    for scroll in range(0, len(full) + 5):
-        state["scroll"] = scroll
-        lines = watch._window(full, state, 15, 100, "ko")
-        assert footer not in state["shown"], scroll
-        assert sum("담당 보기" in "".join(value for value, _ in line) for line in lines) == 0
-    assert state["scroll"] == watch.scroll_limit(state) == footer - 14
-    watch.scroll(state, 1)
-    assert state["scroll"] == footer - 14, "j past the last content row does nothing"
+    state, whole_layout, layout = {"unfolded": {"work"}}, {}, {}
+    watch.render_frame(snapshot, config, tmp_path, width=100, state=state, layout=whole_layout)
+    state["scroll"] = 5
+    watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state, layout=layout)
+    expected = [(x0, y0 - 5, x1, y1 - 5, target) for x0, y0, x1, y1, target in whole_layout["hits"]
+                if 5 <= y0 and y1 - 5 <= 11]
+    assert layout["hits"] == expected and expected
+    assert all(0 <= y0 < y1 <= 11 for _, y0, _, y1, _ in layout["hits"]), "clipped to the h-1 visible rows"
+    x, y = next((x0, y0) for x0, y0, _, _, target in layout["hits"] if target == ("acorn", 6))
+    watch.handle_mouse("left", x, y, layout, StateStore(tmp_path), config, state=state)
+    assert state["issue"] == 6, "a screen-row click opens the issue shown on that row"
 
 
 def live_paint(tmp_path, monkeypatch, snapshot, config, *, height, unfolded=None):
@@ -440,13 +433,17 @@ def live_paint(tmp_path, monkeypatch, snapshot, config, *, height, unfolded=None
     return rows, reverse
 
 
-def test_live_view_pins_key_help_or_position_line_to_the_bottom_row(tmp_path, monkeypatch):
+def test_live_view_paints_exactly_render_frames_slice(tmp_path, monkeypatch):
     snapshot, config = lane_case(queued=tuple(range(4, 40)))
     rows, _ = live_paint(tmp_path, monkeypatch, snapshot, config, height=15, unfolded={"work"})
-    assert "줄 · Option" in rows[14] and not any("담당 보기" in text for text in rows.values())
-    short, _ = lane_case()
-    rows, _ = live_paint(tmp_path, monkeypatch, short, config, height=60)
-    assert "담당 보기" in rows[59] and sum("담당 보기" in text for text in rows.values()) == 1
+    expected = watch.render_frame(snapshot, config, tmp_path, width=100, height=15,
+                                  state={"unfolded": {"work"}}).splitlines()
+    assert [rows.get(y, "").rstrip() for y in range(15)] == expected
+    tall, _ = live_paint(tmp_path, monkeypatch, snapshot, config, height=60, unfolded={"work"})
+    frame = watch.render_frame(snapshot, config, tmp_path, width=100, state={"unfolded": {"work"}}).splitlines()
+    assert len(frame) < 60 and [tall.get(y, "").rstrip() for y in range(len(frame))] == frame, (
+        "a tall screen paints F itself: the same 24-row trimming, no extra sections")
+    assert not any(text.strip() for y, text in tall.items() if y >= len(frame))
 
 
 def test_only_the_first_visible_issue_row_is_highlighted(tmp_path, monkeypatch):
@@ -465,3 +462,103 @@ def test_only_the_first_visible_issue_row_is_highlighted(tmp_path, monkeypatch):
     assert [number for _, number in state["rows"]].count(1) >= 2, "the item wraps onto two issue rows"
     rows, reverse = live_paint(tmp_path, monkeypatch, wrapped, config, height=60, unfolded={"work"})
     assert len(reverse) == 1 and rows[min(reverse)].startswith("💤")
+
+
+def test_closing_the_box_keeps_the_rows_scroll(tmp_path):
+    snapshot, config = lane_case(queued=tuple(range(4, 40)))
+    store, state = StateStore(tmp_path), {"unfolded": {"work"}}
+    watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
+    for _ in range(7):
+        watch.handle_key("j", store, config, state=state)
+    assert state["scroll"] == 7
+    watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
+    watch.handle_key("enter", store, config, state=state)
+    opened = state["issue"]
+    assert opened is not None and state["scroll"] == 0, "the box opens at its top"
+    watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)
+    for key in ("x", "x"):
+        watch.handle_key(key, store, config, state=state)
+        assert state["issue"] is None and state["scroll"] == 7, "x closes once, then does nothing"
+    watch.handle_mouse("left", 0, 0, {"hits": [(0, 0, 9, 1, ("acorn", 9))]}, store, config, state=state)
+    watch.handle_mouse("left", 0, 0, {"hits": [(0, 0, 9, 1, ("acorn", 9))]}, store, config, state=state)
+    assert state["issue"] is None and state["scroll"] == 7, "a click that opens then closes keeps it too"
+
+
+VERBATIM_BODY = (
+    "## Goal\n    indented  first line\nsecond   line\n"
+    "## Done when\n```sh\nprintf 'a  b'\ncat <<'EOF'\n    kept  indent\n\tTabbed\nEOF\n```\n"
+)
+
+
+def box_case(tmp_path, body=VERBATIM_BODY):
+    store = StateStore(tmp_path / "state")
+    config = replace(lane_case()[1], language="en", repo=None)
+    tracker = FakeTracker()
+    tracker.add_issue(5, "Two  spaces  title", body, labels=["approved", "lane:work"])
+    store.record_issue(tracker.get_issue(5), config.lanes)
+    return store, config
+
+
+def test_issue_box_keeps_whitespace_of_goal_title_and_commands(tmp_path):
+    """Class: whitespace corruption of text shown verbatim from the local record."""
+    store, config = box_case(tmp_path)
+    lines = watch.issue_box(5, store, config)
+    for expected in ("#5 Two  spaces  title", "      indented  first line", "  second   line",
+                     "  printf 'a  b'", "      kept  indent", "          Tabbed"):
+        assert expected in lines, (expected, lines)
+    state = {"issue": 5, "store": store}
+    frame = watch.render_frame(lane_case()[0], config, tmp_path, width=100, state=state)
+    assert "│  printf 'a  b'" in frame and "│      kept  indent" in frame and "│      indented  first line" in frame
+
+
+def test_a_wrapped_box_line_joins_back_to_the_exact_text(tmp_path):
+    from foragent.watch_sections.acorns import _verbatim_wrap
+
+    line = "  run --flag  'two  spaces'  다람쥐도토리 " + "x" * 30
+    for width in (2, 7, 12, 20):
+        pieces = _verbatim_wrap(line, width)
+        assert "".join(pieces) == line
+        assert all(watch._cells(piece) <= width for piece in pieces)
+    store, config = box_case(tmp_path, "## Done when\n```sh\n" + line + "\n```\n")
+    frame = watch.render_frame(lane_case()[0], config, tmp_path, width=24, state={"issue": 5, "store": store})
+    inside = [row[1:-1] for row in frame.splitlines() if row.startswith("│")]
+    assert "".join(inside).find("  " + line) >= 0, "the wrapped rows hold every character in order"
+
+
+def test_issue_box_drops_terminal_controls_but_not_spaces(tmp_path):
+    store, config = box_case(tmp_path, "## Done when\n```sh\necho  \x1b[31mred\x07\n```\n")
+    assert "  echo  [31mred" in watch.issue_box(5, store, config)
+
+
+@pytest.mark.parametrize("sizes, first_key", [
+    (((40, 100), (45, 100)), "resize"),  # curses clears and repaints the same text after a resize
+    (((40, 100), (40, 100)), "timeout"),  # or repaints it on its own; the links must come back each time
+])
+def test_links_are_written_after_every_refresh_even_when_text_is_unchanged(tmp_path, monkeypatch, sizes, first_key):
+    """Class: repaint-cache invalidation. No cache, so no repaint can lose the links."""
+    import curses
+    from io import StringIO
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from foragent import watch_terminal
+
+    snapshot, config = lane_case()
+    screen = Mock()
+    screen.getmaxyx.side_effect = list(sizes)
+    screen.getch.side_effect = [curses.KEY_RESIZE if first_key == "resize" else -1, ord("q")]
+    output = StringIO()
+    monkeypatch.setattr(watch.sys, "stdout", output)
+    monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
+    monkeypatch.setattr(watch, "_installed_build", lambda: "unknown")
+    monkeypatch.setattr(curses, "has_colors", lambda: False)
+    monkeypatch.setattr(curses, "curs_set", lambda *args: None)
+    monkeypatch.setattr(curses, "mousemask", lambda *args: None, raising=False)
+    monkeypatch.setattr(curses, "mouseinterval", lambda *args: None, raising=False)
+    watch_terminal._terminal(screen, lambda: snapshot, snapshot, config, tmp_path,
+                             lambda: snapshot.captured_at, StateStore(tmp_path))
+    written = output.getvalue()
+    link = "\x1b]8;;https://github.com/owner/repo/issues/3\x1b\\#3"
+    assert screen.refresh.call_count == 2
+    assert written.count("\x1b7") == written.count("\x1b8") == 2
+    assert written.count(link) == 2, "each refresh writes the link again"

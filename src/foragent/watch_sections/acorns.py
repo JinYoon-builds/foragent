@@ -57,7 +57,7 @@ def issue_box(number: int, store: StateStore, config: Config, lane: str | None =
 
     language = config.language
     row = next((item for item in store.local_issues() if item.get("number") == number), {})
-    lines = [f"#{number} {watch._clean(row.get('title') or '')}".rstrip()]
+    lines = [f"#{number} {row.get('title') or ''}".rstrip()]
     if (url := issue_url(config, number)) is not None:
         lines.append(url)
     if lane is None:
@@ -69,13 +69,53 @@ def issue_box(number: int, store: StateStore, config: Config, lane: str | None =
     if lane:
         lines.append(f"{watch.text('acorns_lane', language)}: {watch.lane_display(config, lane, language)}")
     lines.append(f"{watch.text('acorns_phase', language)}: {phase_word(store, config, number, row)}")
-    parsed = parse_body(row.get("body") or "")
+    body = (row.get("body") or "").replace("\r\n", "\n")
+    parsed = parse_body(body)
     if parsed.goal:
-        lines += ["", watch.text("acorns_goal", language)] + ["  " + line for line in parsed.goal.splitlines()]
+        # parse_body strips the Goal; its first line keeps the indentation it had in the body.
+        start = body.find(parsed.goal, max(0, body.find("## Goal")))
+        indent = start
+        while indent > 0 and body[indent - 1] in " \t":
+            indent -= 1
+        goal = body[indent:start] + parsed.goal if start >= 0 else parsed.goal
+        lines += ["", watch.text("acorns_goal", language)] + ["  " + _printable(line) for line in goal.splitlines()]
     if parsed.done_when_commands:
         lines += ["", watch.text("acorns_done_when", language)] + [
-            "  " + line for command in parsed.done_when_commands for line in command.splitlines()]
-    return lines
+            "  " + _printable(line) for command in parsed.done_when_commands for line in command.splitlines()]
+    # Shown verbatim: every space stays; tabs become the spaces a terminal would show (in
+    # the text's own columns), and other control characters, which could steer the
+    # terminal, are dropped.
+    return [_printable(line) for line in lines]
+
+
+def _printable(text: str) -> str:
+    from foragent import watch
+
+    return "".join(char for char in text.expandtabs(8)
+                   if not watch.unicodedata.category(char).startswith("C"))
+
+
+def _verbatim_wrap(text: str, width: int) -> list[str]:
+    """Break a line to ``width`` cells without changing a character.
+
+    A piece ends after its last space when there is one, else at the width; joining
+    the pieces gives the line back exactly (indentation and repeated spaces included).
+    """
+    from foragent import watch
+
+    width, pieces = max(1, width), []
+    while watch._cells(text) > width:
+        cut, cells = 0, 0
+        while cut < len(text) and cells + watch._cells(text[cut]) <= width:
+            cells += watch._cells(text[cut])
+            cut += 1
+        cut = max(1, cut)
+        space = text.rfind(" ", 0, cut)
+        if space >= 0 and text[:space].strip():
+            cut = space + 1
+        pieces.append(text[:cut])
+        text = text[cut:]
+    return pieces + [text]
 
 
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
@@ -89,7 +129,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     width = context["width"]
     lines: list[Line] = []
     for text in watch.issue_box(number, store, config, state.get("issue_lanes", {}).get(number)):
-        lines += watch._wrap(text, width - 2) if text else [[]]
+        # Never _wrap: it joins runs of spaces, which would change a Done-when command.
+        lines += [[(piece, "")] for piece in _verbatim_wrap(text, width - 2)]
     hits = context.get("hits")
     if hits is not None:
         # Clicking the number again closes the box.

@@ -24,14 +24,10 @@ def hit_test(layout: dict[str, Any], x: int, y: int) -> Any:
 
 
 def scroll_limit(state: dict[str, Any]) -> int:
-    """The last scroll offset: the last full screen of content, else (before any screen) the last row.
-
-    ``content`` counts the frame's rows without the key help, which never scrolls.
-    """
+    """The last scroll offset: len(F) - (height - 1), else (before any screen) the last row."""
     length, height = state.get("length", 0), state.get("height")
     if height:
-        content = state.get("content", length)
-        return max(0, content - max(1, height - 1)) if length > height else 0
+        return max(0, length - max(1, height - 1)) if length > height else 0
     return max(0, length - 1)
 
 
@@ -45,8 +41,6 @@ def highlighted_row(state: dict[str, Any]) -> int | None:
     down (or a wrapped second line) is not highlighted too.
     """
     issues = dict(state.get("rows", ()))
-    if "shown" in state:
-        return next((y for y in state["shown"] if y is not None and y in issues), None)
     top, height = state.get("scroll", 0), state.get("height")
     bottom = top + max(1, height - 1) if height and state.get("length", 0) > height else None
     return next((y for y in sorted(issues) if y >= top and (bottom is None or y < bottom)), None)
@@ -60,11 +54,20 @@ def highlighted(state: dict[str, Any]) -> int | None:
     return None if y is None else dict(state.get("rows", ()))[y]
 
 
-def _open(state: dict[str, Any], number: int | None, store: StateStore) -> None:
-    """Open (or, with None, close) the issue box; the box reads the records through store."""
-    state["issue"] = number
+def _open(state: dict[str, Any], number: int | None, store: StateStore | None) -> None:
+    """Open, switch or (with None) close the issue box; the box reads the records through store.
+
+    The box starts at its top; closing it brings the rows back where they were scrolled.
+    """
+    was_open = state.get("issue") is not None
     if number is not None:
-        state["store"] = store
+        if not was_open:
+            state["rows_scroll"] = state.get("scroll", 0)
+            state["scroll"] = 0
+        state["issue"], state["store"] = number, store
+    elif was_open:
+        state["issue"] = None
+        state["scroll"] = state.pop("rows_scroll", 0)
 
 
 def handle_mouse(
@@ -113,9 +116,9 @@ def handle_key(key: str, store: StateStore, config: Config, *, state: dict[str, 
     if key == "esc":
         if not is_open:
             return True
-        state["issue"] = None
+        _open(state, None, store)
     elif key == "x":
-        state["issue"] = None
+        _open(state, None, store)
     elif key in ("j", "down"):
         watch.scroll(state, 1)
     elif key in ("k", "up"):

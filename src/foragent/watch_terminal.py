@@ -87,7 +87,6 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
         view_state["store"] = store
     keys = {curses.KEY_DOWN: "down", curses.KEY_UP: "up", curses.KEY_NPAGE: "pagedown",
             curses.KEY_PPAGE: "pageup", 27: "esc", **{ord(key): key for key in "jkfaoxqQ"}}
-    last_painted = None
     with ExitStack() as cleanup:
         worker = cleanup.enter_context(watch.ThreadPoolExecutor(max_workers=1))
         while True:
@@ -114,25 +113,28 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             layout: dict = {}
             try:
                 # The terminal's own width, so the 60- and 100-column rules hold as in a plain frame.
-                # The live view keeps every section and scrolls the whole frame.
+                # F is built as render_frame builds it (the fixed 24-row trimming, also on a
+                # tall terminal); the screen then shows render_frame's slice of it.
                 frame = watch._frame(snapshot, config, repo_root, tick=tick, width=max(1, width), selected=selected,
-                                     now=now(), **({} if store is None else {"layout": layout}), height=height,
-                                     state=view_state, scrolls=True)
+                                     now=now(), **({} if store is None else {"layout": layout}), state=view_state)
             except ImportError:
                 # A reinstall can briefly leave modules missing; restart on the installed code.
                 return _restart(cleanup)
             if show_detail:
                 view_state["scroll"] = len(frame)  # Jump to the lane details at the end.
                 show_detail = False
-            # A frame that fits keeps its key help on the bottom row; a taller one scrolls.
-            visible = watch._window(frame, view_state, max(1, height), max(1, width), config.language, pad=True)
-            shown = view_state["shown"]
+            # The same slice as render_frame with this height; hit boxes move to screen rows.
+            visible = watch._window(frame, view_state, max(1, height), max(1, width), config.language,
+                                    layout if store is not None else None)
+            top = view_state.get("scroll", 0)
             if error:
-                visible = visible[:-1] + [watch._fit(watch._line(error, "yellow"), max(1, width))]
-                shown = shown[:-1] + [None]
-            # One highlighted row, by its position on screen.
+                # A refresh error takes the bottom row (in place of the position line).
+                bottom = max(1, height) - 1
+                visible = visible[:bottom] + [[]] * (bottom - len(visible[:bottom])) + [
+                    watch._fit(watch._line(error, "yellow"), max(1, width))]
+            # One highlighted row, by its position: the first issue row on screen.
             mark = watch.highlighted_row(view_state) if view_state.get("issue") is None else None
-            marked = {y for y, row in enumerate(shown) if row is not None and row == mark}
+            marked = set() if mark is None else {mark - top}
             screen.erase()
             links: list[str] = []
             for y, line in enumerate(visible[:max(1, height)]):
@@ -154,15 +156,14 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                                          + watch.osc8(url, found[0]) + ("\x1b[0m" if look else ""))
                     x += watch._cells(value)
             screen.refresh()
-            # Curses cannot write OSC 8: each visible #n is written again as a link in place,
-            # whenever curses may have repainted it.
-            painted = (links, [[value for value, _ in line] for line in visible], sorted(marked))
-            if links and painted != last_painted:
+            # Curses cannot write OSC 8, so every visible #n is written again as a link after
+            # each refresh. No "unchanged" shortcut: curses also repaints unchanged text (after
+            # a resize, or when it clears the screen itself), and that drops the links.
+            if links:
                 # Save and restore the cursor and attributes (DECSC/DECRC) around the links,
                 # so curses' next refresh starts from the position it believes it left.
                 watch.sys.stdout.write(SAVE_CURSOR + "".join(links) + RESTORE_CURSOR)
                 watch.sys.stdout.flush()
-            last_painted = painted
             key = screen.getch()
             slugs = list(snapshot.status["lanes"])
             if key == curses.KEY_MOUSE and store is not None:
@@ -170,15 +171,13 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     _, x, y, _, buttons = curses.getmouse()
                 except curses.error:
                     continue
-                # Screen rows map to the frame rows they show; blank padding and the
-                # position line show none.
-                row = shown[y] if 0 <= y < len(shown) else None
+                # The hit boxes are in screen rows already: clicks pass through unchanged.
                 if buttons & wheel[0]:
-                    watch.handle_mouse("wheel-up", x, row or 0, layout, store, config, state=view_state)
+                    watch.handle_mouse("wheel-up", x, y, layout, store, config, state=view_state)
                 elif buttons & wheel[1]:
-                    watch.handle_mouse("wheel-down", x, row or 0, layout, store, config, state=view_state)
-                elif buttons & click and row is not None:
-                    watch.handle_mouse("left", x, row, layout, store, config, state=view_state)
+                    watch.handle_mouse("wheel-down", x, y, layout, store, config, state=view_state)
+                elif buttons & click:
+                    watch.handle_mouse("left", x, y, layout, store, config, state=view_state)
                 continue
             if key in range(ord("0"), ord("9") + 1):
                 digits = (digits + chr(key))[-len(str(len(slugs))):]
