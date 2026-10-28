@@ -19,6 +19,7 @@ import os
 import re
 import tempfile
 from collections.abc import Iterable
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,8 @@ from foragent.tracker import Issue, TrackerError
 log = logging.getLogger(__name__)
 
 NOT_PLANNED_FLAG = "parent-child-not-planned"
-REFERENCE_PRS_FILE = "order_reference_prs.json"  # Written only here: numbers that read as pull requests.
+REFERENCE_READS_FILE = "order_reference_reads.json"  # Written only here: reads of unlisted references.
+CONFIRMED_FOR = timedelta(hours=1)  # How long a closed read of an unlisted reference counts.
 ROTATION_SECONDS = 300  # One step of the record rotation: the listing refresh interval.
 MAX_REFERENCE_READS = 20  # Extra get_issue reads one tick may spend on order-record references.
 _MARKER_START = "<!-- foragent:plan "
@@ -117,59 +119,96 @@ def order_records(rows: list[dict[str, Any]]) -> tuple[dict[int, set[int]], set[
     return records, unparseable
 
 
-def _reference_prs(store) -> set[int]:
-    """Referenced numbers an earlier tick read as pull requests; the tracker does not record them."""
+def _parse_time(value: str) -> datetime | None:
+    """A saved read time; one without a time zone is not trusted."""
+    try:
+        at = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return at if at.tzinfo is not None else None
+
+
+def _saved_reads(store) -> dict[str, Any]:
+    """What earlier ticks read about references the listing does not show.
+
+    ``prs``: numbers that read as pull requests (a pull request stays one).
+    ``confirmed``: per record, unlisted references read as closed and when.
+    """
+    saved: Any = {}
+    if (root := getattr(store, "root", None)) is not None:
+        try:
+            saved = json.loads((Path(root) / REFERENCE_READS_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
+    confirmed = saved.get("confirmed") if isinstance(saved.get("confirmed"), dict) else {}
+    return {
+        "prs": {n for n in saved.get("prs", ()) if type(n) is int},
+        "confirmed": {int(record): {int(n): at for n, at in numbers.items()
+                                    if n.isdecimal() and isinstance(at, str)}
+                      for record, numbers in confirmed.items()
+                      if record.isdecimal() and isinstance(numbers, dict)},
+    }
+
+
+def _save_reads(store, saved: dict[str, Any], records: dict[int, set[int]]) -> None:
+    """Keep what open records still reference; write only when it changed."""
     root = getattr(store, "root", None)
     if root is None:
-        return set()
-    try:
-        saved = json.loads((Path(root) / REFERENCE_PRS_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return set()
-    return {n for n in saved.get("prs", ()) if type(n) is int} if isinstance(saved, dict) else set()
-
-
-def _remember_reference_prs(store, numbers: set[int]) -> None:
-    """Add pull request numbers; a number that is a pull request stays one, so the file only grows."""
-    root = getattr(store, "root", None)
-    if root is None or not numbers:
         return
-    path = Path(root) / REFERENCE_PRS_FILE
-    content = json.dumps({"prs": sorted(_reference_prs(store) | numbers)}) + "\n"
+    referenced = set().union(*records.values())
+    value = {"prs": sorted(saved["prs"] & referenced),
+             "confirmed": {str(record): {str(n): at for n, at in sorted(numbers.items())}
+                           for record, numbers in sorted(saved["confirmed"].items())
+                           if record in records and numbers}}
+    before = _saved_reads(store)
+    if value == {"prs": sorted(before["prs"]),
+                 "confirmed": {str(r): {str(n): at for n, at in sorted(ns.items())}
+                               for r, ns in sorted(before["confirmed"].items())}}:
+        return
     try:
-        fd, temporary = tempfile.mkstemp(dir=root, prefix=f".{REFERENCE_PRS_FILE}.")
+        fd, temporary = tempfile.mkstemp(dir=root, prefix=f".{REFERENCE_READS_FILE}.")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.replace(temporary, path)
+            handle.write(json.dumps(value) + "\n")
+        os.replace(temporary, Path(root) / REFERENCE_READS_FILE)
     except OSError as exc:
-        log.warning("Could not remember referenced pull requests: %s", exc)
+        log.warning("Could not remember order record reference reads: %s", exc)
 
 
 def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]],
-                       known_prs: set[int], reads: dict[str, Any]) -> set[int] | None:
+                       known_prs: set[int], reads: dict[str, Any],
+                       confirmed: dict[int, str]) -> set[int] | None:
     """The referenced issues once every one is closed, or None while any is open or unknown.
 
-    A closed reference counts as done whatever its close reason. The local
-    listing answers first; an issue missing from it is read once per tick,
-    within the tick's read allowance. The tick's tracker records each read
-    issue locally, so a record with more missing references than one tick
-    allows still advances on each tick. A pull request number is ignored.
+    A closed reference counts as done whatever its close reason. The listing
+    answers first; an unlisted issue is read within the tick's allowance. A
+    record with more unlisted issues than one tick may read keeps its closed
+    reads in ``confirmed`` and continues on later ticks. Those reads count only
+    while nothing of the record was seen open or unreadable since, and only for
+    an hour: an open or unreadable reference clears them, so a close never
+    rests on a read taken while other work was still open. A pull request
+    number is ignored.
     """
+    now = ctx.now()
     closed, missing = set(), []
     for number in sorted(references):
         row = rows.get(number)
         if number in known_prs:
             continue
-        if row is None:
+        if row is None and number in confirmed:
+            closed.add(number)
+        elif row is None:
             missing.append(number)
         elif row.get("state") != "closed":
+            confirmed.clear()
             return None  # Open work keeps the record open without spending reads.
         else:
             closed.add(number)
     for number in missing:
         if number not in reads["issues"]:
             if reads["left"] <= 0:
-                return None  # The rest is read on later ticks.
+                return None  # The rest is read on later ticks; the closed reads so far are kept.
             reads["left"] -= 1
             try:
                 reads["issues"][number] = ctx.tracker.get_issue(number)
@@ -180,11 +219,13 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
                 reads["issues"][number] = None
         issue = reads["issues"][number]
         if issue is None or not issue.is_pull_request and issue.state != "closed":
+            confirmed.clear()
             return None  # Unreadable or open work keeps the record open.
         if issue.is_pull_request:
             reads["prs"].add(number)
         else:
             closed.add(number)
+            confirmed[number] = now.isoformat()
     return closed
 
 
@@ -193,10 +234,15 @@ def follow_children(ctx, report) -> None:
     rows = ctx.store.local_issues()
     by_number = {row["number"]: row for row in rows}
     open_prs = {row["number"] for row in rows if row.get("pr_number") and not row.get("merged")}
-    known_prs = {row["pr_number"] for row in rows if row.get("pr_number")} | _reference_prs(ctx.store)
+    listed_prs = {row["pr_number"] for row in rows if row.get("pr_number")}
+    saved = _saved_reads(ctx.store)
+    oldest = ctx.now() - CONFIRMED_FOR
+    for record in list(saved["confirmed"]):
+        saved["confirmed"][record] = {n: at for n, at in saved["confirmed"][record].items()
+                                      if (read_at := _parse_time(at)) is not None and oldest <= read_at}
     parents = order_parents(rows)
     records, unparseable = order_records(rows)
-    reads = {"left": MAX_REFERENCE_READS, "issues": {}, "prs": set()}
+    reads = {"left": MAX_REFERENCE_READS, "issues": {}, "prs": saved["prs"]}
     language = ctx.config.language
     order = sorted(parents | records.keys())
     if order:  # Rotate each tick so the read allowance does not always go to the same records.
@@ -221,9 +267,13 @@ def follow_children(ctx, report) -> None:
             work = {child.number for child in children}
             if number in records:
                 done = None
+                confirmed = saved["confirmed"].setdefault(number, {})
                 if all(_completed(child) for child in children):
                     # Sub-issues already carry their state; read only the other references.
-                    done = _closed_references(ctx, records[number] - work, by_number, known_prs, reads)
+                    done = _closed_references(ctx, records[number] - work, by_number,
+                                              listed_prs | reads["prs"], reads, confirmed)
+                else:
+                    confirmed.clear()  # Open work: earlier closed reads no longer count.
                 closes = done is not None and bool(work | done)
                 work |= done or set()
             elif number in unparseable:
@@ -238,4 +288,4 @@ def follow_children(ctx, report) -> None:
             if state is not None:
                 board.sync_status(ctx, number, state, parent=True)
     finally:
-        _remember_reference_prs(ctx.store, reads["prs"])
+        _save_reads(ctx.store, saved, records)
