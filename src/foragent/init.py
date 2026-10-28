@@ -14,6 +14,7 @@ from foragent import board, gh, launchd, role_agents, roles
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
+from foragent.i18n import text
 from foragent.labels import LABELS
 from foragent.order import detect_test_commands
 from foragent.tracker import GhTracker, Tracker, TrackerError
@@ -178,6 +179,16 @@ def _logged_in(tool: str) -> bool:
     return isinstance(status, dict) and status.get("loggedIn") is True
 
 
+def _preflight_language(root: Path, language: str | None) -> str:
+    """Language for errors raised before setup: the flag, else the existing config, else English."""
+    if language is not None:
+        return language
+    try:
+        return load_config(root).language if (root / ".foragent.yml").exists() else "en"
+    except (ConfigError, OSError):
+        return "en"
+
+
 def init_repo(
     repo_root: Path, *, approvers: list[str] | None = None, review: str | None = None,
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
@@ -196,12 +207,22 @@ def init_repo(
     if normalized_root is not None:
         root = top_level
         git = git.at(root)
+    preflight_language = _preflight_language(root, language)
     try:
         repo = git.remote_slug()
     except GitError as exc:
-        raise GitError(f"init requires an origin remote on github.com: {exc}") from exc
+        # A failed `git remote get-url` (non-zero exit) means no origin; a readable url that
+        # the remote parser rejects means origin is not GitHub.
+        key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
+        raise GitError(text(key, preflight_language, error=exc)) from exc
     run = gh_run or _run_gh
-    _gh_call(run, ["auth", "status"])
+    try:
+        run(["auth", "status"], input=None)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # OSError: gh cannot be started (not installed); non-zero exit: not logged in.
+        message = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+        key = "init_gh_logged_out" if isinstance(exc, subprocess.CalledProcessError) else "init_gh_missing"
+        raise TrackerError(text(key, preflight_language, error=(message or str(exc)).strip())) from exc
 
     config_path = root / ".foragent.yml"
     contents = {".github/ISSUE_TEMPLATE/foragent-task.md": ISSUE_TEMPLATE}
