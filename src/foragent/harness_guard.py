@@ -144,7 +144,7 @@ def measured_changes(git: GitRepo, base: str) -> set[bytes]:
 
 
 def _tree_side(git: GitRepo, rev: str, raw: bytes) -> object:
-    """A committed entry: ("file", bytes), ("symlink", target), None when absent, else _NOT_A_FILE."""
+    """A committed entry: (Git mode, bytes) for a file or symlink, None when absent, else _NOT_A_FILE."""
     listing = _required(_git(git, ["--literal-pathspecs", "ls-tree", "-z", rev, "--", os.fsdecode(raw)]),
                         "ls-tree")
     entries = [entry for entry in listing.split(b"\0") if entry]
@@ -153,12 +153,15 @@ def _tree_side(git: GitRepo, rev: str, raw: bytes) -> object:
     mode, kind, sha = entries[0].split(b"\t", 1)[0].split(b" ")
     if kind != b"blob" or (mode not in _REGULAR_MODES and mode != b"120000"):
         return _NOT_A_FILE  # tree or submodule
-    content = _required(_git(git, ["cat-file", "blob", sha.decode()]), "cat-file")
-    return ("symlink" if mode == b"120000" else "file", content)
+    return (mode, _required(_git(git, ["cat-file", "blob", sha.decode()]), "cat-file"))
 
 
-def _disk_side(path: Path) -> object:
-    """The entry as the checks find it and as publication stages it, in the same shape as _tree_side."""
+def _disk_side(path: Path, file_mode: bool = True) -> object:
+    """The entry as the checks find it and as publication stages it, in the same shape as _tree_side.
+
+    The execute bit gives the Git mode as `git add` records it. With
+    core.fileMode false Git ignores that bit, so the mode is None (unknown).
+    """
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -167,7 +170,7 @@ def _disk_side(path: Path) -> object:
         return _NOT_A_FILE
     if stat.S_ISLNK(info.st_mode):
         try:
-            return ("symlink", os.fsencode(os.readlink(path)))
+            return (b"120000", os.fsencode(os.readlink(path)))
         except OSError:
             return _NOT_A_FILE
     if not stat.S_ISREG(info.st_mode):
@@ -179,9 +182,11 @@ def _disk_side(path: Path) -> object:
     except OSError:
         return _NOT_A_FILE
     with os.fdopen(fd, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+        mode = os.fstat(stream.fileno()).st_mode
+        if not stat.S_ISREG(mode):
             return _NOT_A_FILE
-        return ("file", stream.read())
+        git_mode = (b"100755" if mode & stat.S_IXUSR else b"100644") if file_mode else None
+        return (git_mode, stream.read())
 
 
 def read_regular(path: Path) -> bytes | None:
@@ -211,12 +216,15 @@ def _changed(name: str, before: object, after: object) -> bool:
     """Whether the head side differs from the merge base, as the checks would see it."""
     if before is _NOT_A_FILE or after is _NOT_A_FILE:
         return True
+    if before is not None and after is not None and after[0] is None and before[0] in _REGULAR_MODES:
+        after = (before[0], after[1])  # core.fileMode false: Git keeps the recorded mode
     if before == after:
-        return False
+        return False  # same Git mode and content
     if name != "pyproject.toml":
-        return True
-    if (before is not None and before[0] != "file") or (after is not None and after[0] != "file"):
+        return True  # content or mode changed, including 100644 <-> 100755
+    if any(side is not None and side[0] not in _REGULAR_MODES for side in (before, after)):
         return True  # a symlink is not the file pytest's tables are judged in
+    # Only the pytest tables count for pyproject.toml; a mode-only change does not.
     tables = [_pytest_tables(side[1] if side is not None else None) for side in (before, after)]
     return _UNPARSABLE in tables or tables[0] != tables[1]
 
@@ -232,12 +240,13 @@ def changed_harness_paths(git: GitRepo, target_ref: str, listed: list[str]) -> l
     does not have yet, are inherited, not introduced.
     """
     base = git._own_base(target_ref)
+    file_mode = _git(git, ["config", "--bool", "core.fileMode"]).stdout.strip() != b"false"
     found = []
     for raw in sorted(measured_changes(git, base)):
         name = PurePosixPath(os.fsdecode(raw)).name
         if name != "pyproject.toml" and name not in HARNESS_NAMES:
             continue
-        if not _changed(name, _tree_side(git, base, raw), _disk_side(git.root / os.fsdecode(raw))):
+        if not _changed(name, _tree_side(git, base, raw), _disk_side(git.root / os.fsdecode(raw), file_mode)):
             continue
         path = raw.decode("utf-8", "replace")  # Shown in comments; never used to read.
         if not touched([path], listed):

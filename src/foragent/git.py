@@ -537,6 +537,10 @@ class GitRepo:
         force = "-f" if lease is None else f"--force-with-lease=refs/heads/{branch}:{lease}"
         self._call(["push", force, "origin", branch])
 
+    def push_head(self, branch: str, *, lease: str) -> None:
+        """Push a detached HEAD to ``branch`` only while the remote still has ``lease``."""
+        self._call(["push", f"--force-with-lease=refs/heads/{branch}:{lease}", "origin", f"HEAD:refs/heads/{branch}"])
+
     def check_worktree(self) -> None:
         try:
             inside = self._call(["rev-parse", "--is-inside-work-tree"]).strip()

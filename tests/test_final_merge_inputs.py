@@ -206,8 +206,6 @@ def test_each_changed_merge_input_is_rejected_after_queuing(queued_publish, monk
             git_command(case.store.worktree_path(1), "add", "--", "feature.txt")
 
     case.change = change
-    if case.reviewed and changed == "acceptance-base":
-        outcome = "base-changed"
     if case.reviewed and changed == "publication":
         outcome = "ci-failed"
     assert case.publish() == outcome
@@ -243,10 +241,10 @@ def test_base_sha_change_during_lock_wait_requeues_before_merge(queued_publish, 
 
     monkeypatch.setattr(run_publish, "_check_publication", observe)
     case.change = change
-    assert case.publish() == ("base-changed" if case.reviewed else "merged")
-    assert case.merge_acquisitions == ([] if case.reviewed else [2])
-    if not case.reviewed:
-        assert (1, False) in checks, "The moved base must be verified after releasing the first lock"
+    # The merge-turn holder refreshes a moved base on both paths, including review-only (#712).
+    assert case.publish() == "merged"
+    assert case.merge_acquisitions == [2]
+    assert (1, False) in checks, "The moved base must be verified after releasing the first lock"
 
 
 def test_base_rewind_during_lock_wait_also_requires_requeuing(run_case, monkeypatch):

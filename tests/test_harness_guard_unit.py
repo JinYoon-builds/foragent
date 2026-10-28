@@ -599,3 +599,37 @@ def test_runner_side_reads_skip_fifos_the_measured_process_left(tmp_path):
     )
     result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True)
     assert result.stdout.strip() == "False False ('tests/test_other.py',)", result.stderr
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["worktree", "committed"])
+@pytest.mark.parametrize("start,end", [(0o644, 0o755), (0o755, 0o644)], ids=["100644-to-100755", "100755-to-100644"])
+def test_unlisted_conftest_mode_change_is_held(repo, committed, start, end):
+    conftest = repo / "tests/conftest.py"
+    conftest.chmod(start)
+    base = commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD"))
+    git_command(repo, "update-ref", "refs/heads/target", base)
+    conftest.chmod(end)  # content unchanged; only the Git mode differs
+    if committed:
+        commit(repo, "refs/heads/main", parent=base)
+    git = GitRepo(repo)
+    assert changed_harness_paths(git, "target", []) == ["tests/conftest.py"]
+    assert changed_harness_paths(git, "target", ["tests/conftest.py"]) == []  # a listed path proceeds
+
+
+def test_mode_only_pyproject_change_is_not_a_pytest_table_change(repo):
+    (repo / "pyproject.toml").chmod(0o755)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+
+
+def test_mode_is_ignored_where_git_ignores_it(repo):
+    """With core.fileMode false, Git neither records nor publishes the execute bit."""
+    git_command(repo, "config", "core.fileMode", "false")
+    # A committed edit makes the path a candidate; the worktree restores the
+    # content with the execute bit set, which Git will not publish.
+    (repo / "tests/conftest.py").write_text("# edited\n")
+    commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD"))
+    (repo / "tests/conftest.py").write_text("# base\n")
+    (repo / "tests/conftest.py").chmod(0o755)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+    (repo / "tests/conftest.py").write_text("# changed content still counts\n")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["tests/conftest.py"]

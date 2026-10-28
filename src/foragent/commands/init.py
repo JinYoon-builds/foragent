@@ -38,6 +38,14 @@ def _offer_statusline(answer: str | None) -> None:
         print("Claude statusline: not installed; Foragent will not ask again.")
     elif outcome == "unanswered":
         print("Claude statusline: not asked (no terminal); rerun with --statusline yes|no.")
+    elif outcome == "hooked":
+        # Installed before the session-start summary existed: added quietly, said in one line.
+        cli = facade()
+        try:
+            language = cli.load_config(cli.Path.cwd()).language
+        except Exception:  # Outside a readable Foragent config, speak English.
+            language = "en"
+        print(cli.text("statusline_hook_added", language))
 
 
 def _offer_upstream_reports(root) -> None:

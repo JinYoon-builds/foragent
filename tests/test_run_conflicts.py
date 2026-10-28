@@ -757,20 +757,23 @@ def test_fresh_base_done_when_failure_returns_to_implementer(run_case, monkeypat
 
 
 def test_moving_base_times_out_after_three_merges(run_case, monkeypatch):
+    """The merge-turn rule (#712): no merge-count cap, only the run's time budget stops it."""
     c = run_case
     moves = []
 
     def ci(pr):
         moves.append(pr)
+        c.now[0] += timedelta(minutes=20)
         c.history.update({f"parallel-{len(moves)}.txt": "fresh"})
         return "pass"
 
     monkeypatch.setattr(c.tracker, "pr_checks", ci)
     assert run_issue(1, c.ctx) == "timeout"
-    assert len(moves) == 4
-    assert len([args for _, args in c.operations if "--no-edit" in args]) == 3
+    # Every result-affecting move is merged and re-verified once, past the old cap of three.
+    assert len(moves) == 5
+    assert len([args for _, args in c.operations if "--no-edit" in args]) == len(moves)
     assert c.store.load_flag(1).reason == Reason.TIMEOUT
-    assert "base kept moving" in c.tracker.list_comments(1)[-1].body
+    assert not any("base kept moving" in comment.body for comment in c.tracker.list_comments(1))
     assert c.tracker.merged_prs == []
 
 
