@@ -191,14 +191,13 @@ def _admission(
         # The tick skips the whole start loop before any cap, quota or file check.
         held.update({number: hold_all for _, number in ranked})
         ranked = []
-    lane_holds: dict[str, bool] = {}
     for index, (lane, number) in enumerate(ranked):
         item = items[number]
         if remaining <= 0:
             # No slot ends the loop: nothing after this point is checked.
             held.update({later: "cap" for _, later in ranked[index:]})
             break
-        if lane_holds.setdefault(lane, _lane_held(ctx, lane, now)):
+        if _lane_held(ctx, lane, now, number):  # The issue's own quota decision, as the tick makes it.
             held[number] = "quota"
         elif not admits(ctx, lane, item.parsed, known, unknown, union=union):
             held[number] = "structure"
