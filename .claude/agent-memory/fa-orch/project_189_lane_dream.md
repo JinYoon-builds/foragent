@@ -31,3 +31,4 @@ metadata:
 - 리뷰 반영(재설계 뒤 10차): 프로세스 표 읽기 실패(OSError, PermissionError 포함)는 증거 없음이다. `scheduler_stop._listing()`이 None을 돌려주고, `runner_alive`는 None(모름), `_run_processes_exist`·`_stop_unconfirmed`는 "남아 있음/확인 안 됨"을 답한다. 2026-10-29 main 병합: `_lane_held(ctx, lane, now, number)`에 이슈 번호가 생겼고, 대기 수는 이슈마다 센다. 꿈 검사와 `_dream_demand`는 그 위에 둔다.
 - 리뷰 반영(재설계 뒤 11차): `fa orch facts`는 모든 state lock을 잡은 뒤 machine lock을 잡고, writer는 lock을 하나씩만 잡는다는 규칙에 기댄다. 그래서 꿈 시작은 machine lock 하나만 잡고 `start_dream(..., under_machine_lock=True)`로 기록을 쓴다(issue의 prepare_run_start와 같은 방식). 작업자는 작업 공간을 지운 뒤 마지막 일로 `finish_dream`을 부른다(finally에서). 이렇게 하면 끝난 기록에는 아직 움직이는 작업자가 없다.
 - 리뷰 반영(재설계 뒤 12차): 꿈 시작은 lock 안 재확인에서 빠진 레인(그 tick에 이슈가 시작됨)을 건너뛰고 다음 대상 레인을 시도한다. 빈 자리가 없을 때만 멈춘다.
+- 2026-10-29 main 병합(scheduler.py import 충돌): main의 `orch_push`와 이 브랜치의 `orch_dream`을 모두 import한다. scheduler.py는 정확히 250줄(제한)이다.

@@ -100,9 +100,10 @@ def ensure_explicit(repo_root: Path, store: StateStore, config: Config, now: dat
             result = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, check=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
+            orch_spawn.record_launch(store, now, screen, None)
             why.append("failed")
             return None
-        orch_spawn._record_session(store, now, screen, getattr(result, "pid", None))
+        orch_spawn.record_launch(store, now, screen, result)
     language = config.language
     notify.send(config, text("orch_spawn_title", language),
                 text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))

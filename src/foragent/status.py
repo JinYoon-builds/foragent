@@ -127,7 +127,7 @@ def collect_lanes(
             "slug": slug, "lane_display": lane_display(config, slug, config.language),
             "state": "idle", "issue": None, "title": None, "phase": None,
             "elapsed_seconds": None, "last_activity_seconds": None, "waiting_for": [],
-            RUNNING: [], READY: [], "queued": [],
+            RUNNING: [], READY: [], "queued": [], "held": [],
         })
 
     def show(row: dict[str, Any], state: str, number: int, title: str | None, run, waiting_for) -> None:
@@ -157,6 +157,9 @@ def collect_lanes(
         summary[state.replace("-", "_")] += 1
         if state == "queued":
             row["queued"].append(item)
+        elif state in {"blocked", "waiting-human"} and not active:
+            # Every held issue, not only the lane's most urgent one, has a lane row.
+            row["held"].append({**item, "state": state})
         show(row, state, issue.number, issue.title, run if active else None,
              waiting.get(issue.number, []) if state == "queued" else [])
     # Runs recorded locally are working even when the snapshot predates them or is missing.

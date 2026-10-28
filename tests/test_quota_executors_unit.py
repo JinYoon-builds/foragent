@@ -483,3 +483,58 @@ def test_written_back_key_follows_the_same_file_rules(tmp_path):
     with pytest.raises(ConfigError, match="only in the repository"):
         load(tmp_path, {}, {"executor_list": [entry("codex")]})
     assert not executors_explicit(load(tmp_path, {}, {"executor_list": None}))
+
+
+@pytest.fixture
+def api_key(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+
+def test_api_key_claude_without_a_cap_falls_back_along_the_derived_list(tmp_path, api_key):
+    config = load(tmp_path, {"executor": "claude", "reviewer": "none"})
+    start = decide(store_at(tmp_path), config, "main", NOW)
+    assert (start.held, start.implementer) == (False, "codex")
+    assert start.switch.key == "switch_reason_uncapped"
+    assert config.executors[0]["quota"] == "subscription", "the derived list itself is unchanged"
+
+
+def test_api_key_claude_alone_waits_and_says_to_set_a_spend_cap(tmp_path, api_key):
+    config = load(tmp_path, {"executor": "claude", "reviewer": "none", "executors": [entry("claude")]})
+    start = decide(store_at(tmp_path), config, "main", NOW)
+    assert start.held and "spend_cap" in start.reason
+    assert switch_line(1, Switch(start.reason, "switch_reason_uncapped", {}), "ko")
+
+
+def test_oauth_token_keeps_claude_a_subscription(tmp_path, api_key, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "offline-token")
+    config = load(tmp_path, {"executor": "claude", "reviewer": "none"})
+    start = decide(store_at(tmp_path), config, "main", NOW)
+    assert (start.held, start.implementer) == (False, None)
+
+
+def test_api_key_counts_any_quota_with_a_spend_cap_as_api(tmp_path, api_key):
+    config = load(tmp_path, {"executor": "claude", "reviewer": "none",
+                             "executors": [entry("claude", spend_cap=3)]})
+    store = store_at(tmp_path)
+    assert credits(store, config, "claude", NOW), "an API-key run spends under its cap"
+    assert decide(store, config, "main", NOW).implementer is None
+    store.record_spend("claude", 3)
+    assert decide(store_at(tmp_path), config, "main", NOW).held
+
+
+def test_uncapped_api_key_claude_reviewer_falls_back_to_the_runs_executor(tmp_path, api_key):
+    config = load(tmp_path, {"executor": "codex", "reviewer": "claude",
+                             "executors": [entry("codex"), entry("claude")]})
+    start = decide(store_at(tmp_path), config, "main", NOW)
+    assert (start.held, start.config.executor, start.config.reviewer) == (False, "codex", "codex")
+
+
+@pytest.mark.parametrize("executors", [[entry("codex")], [entry("codex"), entry("claude")]])
+def test_continued_api_key_claude_run_waits_for_a_spend_cap(tmp_path, api_key, executors):
+    config = load(tmp_path, {"executor": "codex", "reviewer": "none", "executors": executors})
+    store = store_at(tmp_path)
+    store.start_run(1, branch="b", worktree=tmp_path / "w", implementer="claude")
+    store.finish_run(1, "crashed")
+    start = decide(store, config, "main", NOW, 1)
+    assert start.held and "spend_cap" in start.reason, "a kept Claude implementer bills the API too"

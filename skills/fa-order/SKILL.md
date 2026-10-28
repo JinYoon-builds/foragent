@@ -63,6 +63,11 @@ Run `fa order context --json` and read it fully. Then read the repository yourse
   acceptance test), split, merge duplicates, close (with reason, original kept) or leave
   (not finished by code). Apply only what the user approves; never delete.
 - Never ask what the code, docs, specs or earlier decisions already answer.
+- A **starter order** (the person says `starter: ...` after `fa init`) is one tiny task
+  a lane can finish in about 10 minutes, to show the flow to a merged PR. Their example is
+  a suggestion: pick what fits this project from `repo`, `open_issues` and
+  `pull_requests` (open and recently merged; `foragent` marks Foragent branches), so it
+  neither repeats nor collides with existing work. It goes through the same approval.
 
 ### Current words win
 The person's current words take precedence over old documents and the ledger.

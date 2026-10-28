@@ -18,6 +18,7 @@ from foragent.watch_layout import _clones
 ORDER = 5
 GAP = False  # The rows follow the one-line header directly.
 KEEP = True  # Lane rows win when the screen is short.
+TIGHT = True  # On a short plain frame, folded lanes first drop their extra rows.
 
 GLYPHS = {
     "emoji": {"code": "🐿", "check": "🔍", "person": "✋", "wait": "⏳", "idle": "💤", "done": "🌰", "left": "○"},
@@ -169,14 +170,49 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
     events = snapshot.phases.get(number, []) if _time(started) is not None else []
     done = finished_acorns(phase, events, started, waiting_from)
     acorns = "".join(glyphs["done" if index in done else "left"] for index in range(len(ACORNS)))
-    return {"glyph": glyphs[kind], "lane": name, "number": f"#{number}", "title": watch._clean(title or ""),
+    return {"glyph": glyphs[kind], "lane": name, "number": f"#{number}", "issue": number, "title": watch._clean(title or ""),
             "words": watch.text(words, language), "activity": activity,
-            "elapsed": elapsed_text(elapsed, language), "acorns": acorns,
+            # Without a recorded time (a queued issue, a row with no run) the cell says so.
+            "elapsed": elapsed_text(elapsed, language) or "—", "acorns": acorns,
             "style": "yellow" if activity or kind == "person" else ""}
 
 
-def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datetime) -> list[dict[str, Any]]:
-    """Every lane's rows in lane order: its workers, else its waiting or next queued issue, else idle."""
+def _finished_row(snapshot: Snapshot, config: Config, issue: Any, name: str,
+                  glyphs: dict[str, str]) -> dict[str, Any]:
+    """A merged issue: its latest run's start to its merge, every acorn earned."""
+    from foragent import watch
+
+    started, merged = _time(snapshot.run_starts.get(issue.number)), snapshot.merged_at.get(issue.number)
+    elapsed = "—"
+    if started is not None and merged is not None:
+        aware = lambda moment: moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+        elapsed = elapsed_text(max(0.0, (aware(merged) - aware(started)).total_seconds()), config.language) or "—"
+    return {"glyph": glyphs["idle"], "lane": name, "number": f"#{issue.number}", "issue": issue.number,
+            "title": watch._clean(issue.title or ""), "words": watch.text("acorns_done", config.language),
+            "activity": "", "elapsed": elapsed, "acorns": glyphs["done"] * len(ACORNS), "style": "dim"}
+
+
+def last_finished(snapshot: Snapshot, issues: list[Any]) -> Any:
+    """The latest merge by merged_at; without any merge time, the done list's last entry."""
+    timed = [issue for issue in issues if snapshot.merged_at.get(issue.number) is not None]
+    if not timed:
+        return issues[-1] if issues else None
+    aware = lambda moment: moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+    return max(timed, key=lambda issue: aware(snapshot.merged_at[issue.number]))
+
+
+def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datetime,
+          unfolded: frozenset[str] | set[str] = frozenset(), tight: bool = False) -> list[dict[str, Any]]:
+    """Every lane's rows in lane order, then its fold toggle when rows are hidden.
+
+    Unfolded, a lane lists its finished issues, its workers (blocked and waiting
+    for a person count as running) and every waiting issue. Folded, it keeps the
+    last finished, the running rows and the next waiting issue; an idle lane folds
+    to its one summary row. ``tight`` (a short plain frame) leaves out a folded
+    lane's last finished row and toggle, so the frame keeps today's rows; a frame with
+    or without view state draws the same rows. The toggle shows whenever a lane has
+    hidden rows, whether or not the order is finished.
+    """
     from foragent import watch
 
     status, language = snapshot.status, config.language
@@ -184,8 +220,10 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
     found: list[dict[str, Any]] = []
     for row in status["lanes"].values():
         slug, name = row["slug"], row["lane_display"]
+        is_open = slug in unfolded
         workers = clones.get(slug, [])
         titles = {item["number"]: item.get("title") for item in row.get("running", []) + row.get("queued", [])}
+        active: list[dict[str, Any]] = []
         if workers:
             for position, run in enumerate(workers, 1):
                 number = run["number"]
@@ -195,35 +233,72 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
                 # Status lists only some workers; the local issue records name every one.
                 title = titles.get(number) or snapshot.titles.get(number) or (row.get("title") if own else "") or ""
                 label = f"{name} {position}" if len(workers) > 1 else name
-                found.append(_issue_row(snapshot, config, row, label, number, run, state, phase, title, glyphs, now))
-        elif row.get("issue") is not None and row["state"] in {"working", "waiting-human", "blocked"}:
-            found.append(_issue_row(snapshot, config, row, name, row["issue"], None, row["state"], row.get("phase"),
-                                    row.get("title") or snapshot.titles.get(row["issue"]) or "", glyphs, now))
-        elif row.get("queued"):
-            item = row["queued"][0]
-            found.append(_issue_row(snapshot, config, row, name, item["number"], None, "queued",
-                                    row.get("phase"), item.get("title") or "", glyphs, now))
-        else:
+                active.append(_issue_row(snapshot, config, row, label, number, run, state, phase, title, glyphs, now))
+        # Blocked and waiting-for-a-person issues without a run count as running too:
+        # every one the status lists ("held"), then the lane's own issue for older snapshots.
+        held = [dict(item) for item in row.get("held", [])]
+        if row.get("issue") is not None and row["state"] in {"working", "waiting-human", "blocked"} and not workers:
+            held.append({"number": row["issue"], "title": row.get("title"), "state": row["state"],
+                         "phase": row.get("phase")})
+        shown = {run["number"] for run in workers}
+        for item in held:
+            number = item["number"]
+            if number in shown:
+                continue
+            shown.add(number)
+            # A working issue whose run has stopped keeps the phase that run recorded.
+            phase = item.get("phase") or (snapshot.run_phases.get(number) if item["state"] == "working" else None)
+            active.append(_issue_row(snapshot, config, row, name, number, None, item["state"], phase,
+                                     item.get("title") or snapshot.titles.get(number) or "", glyphs, now))
+        shown = {item["issue"] for item in active}
+        queued = [item for item in row.get("queued", []) if item["number"] not in shown]
+        finished = [issue for issue in snapshot.done.get(slug, []) if issue.number not in shown]
+        rows: list[dict[str, Any]] = []
+        if not active and not queued:
             # Today's merges in this lane; a snapshot built without them keeps the order's done list.
             count = (snapshot.today_done.get(slug, 0) if snapshot.today_done is not None
                      else len(snapshot.done.get(slug, [])))
             rest = "✓ " + watch.text("done_state_lane_done", language, count=count) if count else ""
-            found.append({"glyph": glyphs["idle"], "lane": name, "rest": rest})
+            rows.append({"glyph": glyphs["idle"], "lane": name, "rest": rest})
+            hideable = len(finished)
+            if is_open:
+                rows += [_finished_row(snapshot, config, issue, name, glyphs) for issue in finished]
+        else:
+            hideable = max(0, len(finished) - 1) + max(0, len(queued) - 1)
+            last = last_finished(snapshot, finished)
+            for issue in finished if is_open else [last] if last is not None and not tight else []:
+                rows.append(_finished_row(snapshot, config, issue, name, glyphs))
+            rows += active
+            for item in queued if is_open else queued[:1]:
+                # A queued issue has no run: neither the lane's phase nor its acorns are its own.
+                waiting = _issue_row(snapshot, config, row, name, item["number"], None, "queued", None,
+                                     item.get("title") or snapshot.titles.get(item["number"]) or "", glyphs, now)
+                rows.append({**waiting, "style": "dim"})
+        found += [{**item, "slug": slug} for item in rows]
+        if hideable and (is_open or not tight):
+            words = (watch.text("acorns_fold", language) if is_open
+                     else watch.text("acorns_more", language, count=hideable))
+            found.append({"toggle": slug, "text": words})
     return found
 
 
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
     from foragent import watch
 
+    state = context.get("state")
+    if state is not None and state.get("issue") is not None:
+        return []  # The open issue box (watch_sections/acorns) stands in for the rows.
     width = context["width"]
     glyphs = GLYPHS[glyph_mode(config)]
-    rows = _rows(snapshot, config, glyphs, context["now"])
+    unfolded = set(state.get("unfolded", ())) if state is not None else set()
+    rows = _rows(snapshot, config, glyphs, context["now"], unfolded, bool(context.get("tight")))
     if not rows:
         return []
-    size = lambda key: max((watch._cells(row.get(key, "")) for row in rows if "number" in row), default=0)
+    cells = [row for row in rows if "toggle" not in row]
+    size = lambda key: max((watch._cells(row.get(key, "")) for row in cells if "number" in row), default=0)
     glyph_width = max(watch._cells(value) for value in glyphs.values())
     # Worker lanes share one column; an idle row keeps its whole name.
-    lane_width = min(max(10, width // 4), max(watch._cells(row["lane"]) for row in rows))
+    lane_width = min(max(10, width // 4), max(watch._cells(row["lane"]) for row in cells))
     columns = ["glyph", "lane", "number", "title", "words", "activity", "elapsed", "acorns"]
     widths = {"glyph": glyph_width, "lane": lane_width, **{key: size(key) for key in columns[2:]}}
     if width < 60:
@@ -240,13 +315,28 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         if over > 0:
             widths[key] = max(min(widths[key], least), widths[key] - over)
     shown = [key for key in columns if widths[key]]
+    hits, marks = context.get("hits"), context.get("marks")
     lines: list[Line] = []
     for row in rows:
-        if "number" in row:
+        if "toggle" in row:
+            # The toggle sits under the lane's rows, in the lane column.
+            text = watch._clean(row["text"])
+            lines.append(watch._fit(watch._line(" " * (glyph_width + 1) + text, "dim"), width))
+            target = (glyph_width + 1, len(lines) - 1, min(width, glyph_width + 1 + watch._cells(text)),
+                      len(lines), ("more", row["toggle"]))
+        elif "number" in row:
             lines += watch._columns([row[key] for key in shown], [widths[key] for key in shown], row["style"])
+            # The whole row, from its #issue to its acorns, opens the issue's box.
+            target = (0, len(lines) - 1, min(width, watch._cells("".join(v for v, _ in lines[-1]).rstrip())),
+                      len(lines), ("acorn", row["issue"]))
+            if marks is not None:
+                marks.append((len(lines) - 1, row["issue"], row["slug"]))  # A lane row folds its lane.
         else:
             values = [row["glyph"], row["lane"]] + ([row["rest"]] if row["rest"] else [])
             sizes = [glyph_width, max(lane_width, watch._cells(row["lane"]))] + (
                 [watch._cells(row["rest"])] if row["rest"] else [])
             lines += watch._columns(values, sizes)
+            continue
+        if hits is not None:
+            hits.append(target)
     return lines
