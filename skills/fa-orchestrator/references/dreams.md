@@ -12,5 +12,5 @@ titled `Lane <lane> memory: <date>`. Its `dream-done` event in `fa orch log` nam
   `fa orch merge PR --approved-by "$(gh api user --jq .login)"`, your own gh login.
 - A dream PR whose diff touches anything else is not a memory edit: do not merge it; close it with
   a one-line reason.
-- The dream records its own completion (`fa lanes dreamed <lane>` does the same by hand), so the
-  lane can dream again before its PR merges; the next dream adds onto the open PR's branch.
+- While a lane's dream PR is open, the lane does not dream; merge or close the PR to let it dream
+  again. Every dream starts from the base: a dream PR you close is not carried into the next one.

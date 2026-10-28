@@ -12,8 +12,8 @@ import subprocess
 import tempfile
 from typing import TYPE_CHECKING, Any
 
-from foragent.orch_dream import _runs_since, last_dream_at, log_path, media_root, memory_path, record_done, worktree_path
-from foragent.orch_dream_publish import GIT_IDENTITY, _dream_worktree, _publish, _unpublished  # noqa: F401
+from foragent.orch_dream import _runs_since, dream_config, last_dream_at, log_path, media_root, memory_path, record_done, worktree_path
+from foragent.orch_dream_publish import _dream_worktree, _publish  # noqa: F401
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -136,7 +136,6 @@ def run_dream(lane: str, ctx: RunContext) -> int:
     from foragent import usage_events
     from foragent.executors import classify_result
     from foragent.processes import track_process_group
-    from foragent.run_implementation import lane_config
 
     store, config = ctx.store, ctx.config
     run = store.get_dream(lane)
@@ -153,16 +152,16 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             ctx.git.remove_worktree(worktree)
         created = True  # Cleaned up in finally even when the branch cannot be prepared.
         memory = memory_path(config, lane)
-        git, pushed, replaced = _dream_worktree(ctx, lane, worktree, str(Path(memory).parent))
+        git = _dream_worktree(ctx, lane, worktree)
         memory_file = worktree / memory
         before = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
         memory_dir = worktree / Path(memory).parent
         before_files = _files(memory_dir)
-        lane_settings = lane_config(config, lane)
+        lane_settings = dream_config(config, lane)
         tier = config.tiers["s"]
         options: dict[str, Any] = {}
         if lane_settings.executor == "claude":
-            model = (config.lanes.get(lane) or {}).get("model") or tier.get("claude_model") or lane_settings.executor_model
+            model = (config.lanes.get(lane) or {}).get("model") or tier.get("claude_model") or config.executor_model
         else:
             model = lane_settings.executor_model
             options["effort"] = tier.get("codex_effort")
@@ -201,18 +200,14 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             with log.open("a", encoding="utf-8") as stream:
                 stream.write(f"foragent: media {publish_media(proposal, target, bundle.get(target))}\n")
         directory = str(Path(memory).parent)
-        count, pr, published = 0, None, None
-        changed = _files(memory_dir) != before_files  # commit_paths stages with `git add -f`, ignored files too.
-        if changed:
+        count, pr = 0, None
+        if _files(memory_dir) != before_files:  # commit_paths stages with `git add -f`, ignored files too.
             after = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
             count = _changed_lines(before, after)
             git.commit_paths([directory], f"Lane {lane} memory: {ctx.now().astimezone().date().isoformat()}")
-        if changed or _unpublished(store, git, lane, pushed, f"origin/{config.base_branch}", directory):
             # Completed only once the PR exists after the push; a failure here ends the dream as error.
-            pr = _publish(ctx, git, lane, memory, count, replace=replaced, start=pushed)
-            published = git._call(["rev-parse", "HEAD"]).strip()
-        record_done(store, lane, count, config.language, ctx.now(), covered_until=covered_until, pr=pr,
-                    published=published)
+            pr = _publish(ctx, git, lane, memory, count)
+        record_done(store, lane, count, config.language, ctx.now(), covered_until=covered_until, pr=pr)
         store.finish_dream(lane, "dreamed", f"{count} memory lines tidied.")
         return 0
     except Exception as exc:

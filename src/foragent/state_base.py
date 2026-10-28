@@ -89,13 +89,10 @@ class StateBase:
     def start_dream(self, lane: str, *, worktree: str | Path) -> "Run":
         with self._state_lock():
             timestamp = self._timestamp()
-            # A fresh record that keeps the earlier dream's recorded processes: leftovers the
-            # tick has not reaped yet stay owned (reaped once this dream finishes).
-            previous = self.get_dream(lane)
-            owned = previous.process_identities if previous is not None else []
+            # A fresh record, as start_run's for an issue: no earlier birth identity may judge this
+            # dream's worker. The lane does not dream while an earlier dream still owns processes.
             run = _state.Run(0, f"foragent/dream-{lane}", str(worktree), None, timestamp, timestamp,
-                             lane=lane, tier="s", last_activity_at=timestamp, kind="dream",
-                             process_identities=list(owned))
+                             lane=lane, tier="s", last_activity_at=timestamp, kind="dream")
             self._write_json(self.root / "runs" / f"dream-{lane}.json", _state.asdict(run))
             return run
 
