@@ -341,7 +341,7 @@ def test_init_asks_nothing_and_defers_registration_until_a_touching_merge(tmp_pa
     monkeypatch.setattr(cli, "_open_lane_view", lambda root: None)
     before = (case.root / ".foragent.yml").read_bytes()
     assert cli.main(["init", "--repo-root", str(case.root), "--no-push", "--no-launchd", "--no-board",
-                     "--statusline", "no"]) == 0, "Offline fa init must succeed without irreversible-path questions"
+                     "--statusline", "no", "--starter", "no"]) == 0, "Offline fa init must succeed without irreversible-path questions"
     assert questions(case.store, include_closed=True) == [], "Init must not ask about future irreversible choices"
     assert (case.root / ".foragent.yml").read_bytes() == before, "Init must defer path registration until a touching merge"
     assert _events(case.store) == [], "Init must not announce a merge policy that has not been needed"
