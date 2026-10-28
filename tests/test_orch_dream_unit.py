@@ -348,7 +348,7 @@ def test_second_dream_starts_from_the_dream_branch_with_the_base_merged(tmp_path
     for exists, start in ((False, "origin/main"), (True, "refs/remotes/origin/foragent/dream-orch")):
         repo, calls = fake(exists)
         ctx = SimpleNamespace(git=repo, config=Config(repo="o/r", lanes={"orch": {"paths": ["orch/**"]}}))
-        _, pushed, replaced = orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w")
+        _, pushed, replaced = orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w", ".claude/agent-memory/orch")
         assert replaced is False
         assert pushed == ("abc123" if exists else None)
         assert ("add", "foragent/dream-orch", start) in calls
@@ -520,35 +520,62 @@ def test_in_process_worker_that_finished_is_left_alone(world, monkeypatch):
     assert orch_dream.last_dream_at(world.store, "orch") is not None
 
 
-def conflicting_repo(calls):
-    from foragent.git import GitError
-
-    def call(args):
-        calls.append(args)
-        if "merge" in args and "--abort" not in args:
-            raise GitError("CONFLICT (add/add): MEMORY.md")  # The squash-merged PR, then a base edit.
-        return "abc123\n" if args[:1] == ["rev-parse"] else ""
-
-    repo = SimpleNamespace(_call=call, at=lambda path: repo,
-                           add_worktree=lambda path, branch, ref: calls.append(("add", branch, ref)),
-                           remove_worktree=lambda path: calls.append(("remove", path)))
-    return repo
+MEMORY = ".claude/agent-memory/orch/MEMORY.md"
 
 
-@pytest.mark.parametrize("published", [True, False], ids=["published-head", "unpublished-head"])
-def test_conflicting_dream_branch_is_replaced_only_when_its_head_was_published(world, tmp_path, published):
-    if published:
-        orch_dream.record_done(world.store, "orch", 1, "en", pr=5, published="abc123")
-    calls = []
-    ctx = SimpleNamespace(git=conflicting_repo(calls), store=world.store,
-                          config=Config(repo="o/r", lanes={"orch": {"paths": ["orch/**"]}}))
-    _, pushed, replaced = orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w")
-    adds = [item for item in calls if isinstance(item, tuple) and item[0] == "add"]
-    assert (pushed, replaced) == ("abc123", published)
-    if published:  # Stale: read the base's current memory.
-        assert adds[-1] == ("add", "foragent/dream-orch", "origin/main") and ("remove", tmp_path / "w") in calls
-    else:  # Pending publication: keep the pushed memory so its PR is still opened.
-        assert adds == [("add", "foragent/dream-orch", "refs/remotes/origin/foragent/dream-orch")]
+def dream_branch(git_history, files):
+    """Import foragent/dream-orch into the origin, branched from main's current tip."""
+    from conftest import git_command
+
+    stream = ["commit refs/heads/foragent/dream-orch\n",
+              "committer Offline Tests <tests@example.com> 1792483200 +0000\n", "data 5\nDream\n",
+              f"from {git_history.tip}\n"]
+    for path, content in files.items():
+        stream.append(f"M 100644 inline {path}\ndata {len(content.encode())}\n{content}\n")
+    git_command(git_history.origin, "fast-import", "--quiet", input="".join(stream) + "\ndone\n")
+    return git_command(git_history.origin, "rev-parse", "refs/heads/foragent/dream-orch")
+
+
+def real_ctx(world, git_history):
+    from conftest import git_command
+    from foragent.git import GitRepo
+
+    git_command(git_history.clone, "fetch", "origin")
+    return SimpleNamespace(git=GitRepo(git_history.clone), store=world.store,
+                           config=Config(repo="o/r", lanes={"orch": {"paths": ["orch/**"]}}))
+
+
+def test_open_dream_pr_conflicting_with_the_base_keeps_its_unmerged_lesson(world, tmp_path, git_history):
+    from conftest import git_command
+
+    head = dream_branch(git_history, {MEMORY: "first lesson\n"})  # The open PR's unmerged lesson.
+    git_history.update({MEMORY: "base lesson\n"})  # The base adds its own MEMORY.md: add/add conflict.
+    ctx = real_ctx(world, git_history)
+    with pytest.raises(RuntimeError, match="unmerged memory"):
+        orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w", ".claude/agent-memory/orch")
+    assert git_command(git_history.origin, "rev-parse", "refs/heads/foragent/dream-orch") == head
+    assert git_command(git_history.origin, "show", f"foragent/dream-orch:{MEMORY}") == "first lesson"
+    assert (tmp_path / "w" / MEMORY).read_text() == "first lesson\n", "the merge was aborted, nothing reset"
+
+
+def test_squash_merged_dream_branch_conflicting_with_the_base_restarts_from_the_base(world, tmp_path, git_history):
+    dream_branch(git_history, {MEMORY: "first lesson\n"})
+    git_history.update({MEMORY: "first lesson\n"}, message="Squash-merged dream PR")
+    git_history.update({MEMORY: "first lesson\nbase edit\n"})
+    ctx = real_ctx(world, git_history)
+    _, pushed, replaced = orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w", ".claude/agent-memory/orch")
+    assert pushed and replaced
+    assert (tmp_path / "w" / MEMORY).read_text() == "first lesson\nbase edit\n", "the dream reads current memory"
+
+
+def test_open_dream_pr_with_a_clean_base_merge_keeps_its_lesson(world, tmp_path, git_history):
+    dream_branch(git_history, {MEMORY: "first lesson\n"})
+    git_history.update({"README.md": "unrelated base change\n"})
+    ctx = real_ctx(world, git_history)
+    _, _, replaced = orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w", ".claude/agent-memory/orch")
+    assert not replaced
+    assert (tmp_path / "w" / MEMORY).read_text() == "first lesson\n"
+    assert (tmp_path / "w" / "README.md").read_text() == "unrelated base change\n"
 
 
 def test_replacing_a_stale_open_pr_branch_pushes_with_a_lease_and_no_merge(world):
@@ -559,9 +586,11 @@ def test_replacing_a_stale_open_pr_branch_pushes_with_a_lease_and_no_merge(world
         push=lambda branch, lease=None: calls.append(("push", branch, lease)),
     )
     world.ctx.tracker = SimpleNamespace(find_pr=lambda branch: 9, update_pr=lambda pr, **kwargs: None)
-    orch_dream_worker._publish(world.ctx, git, "orch", ".claude/agent-memory/orch/MEMORY.md", 1, replace=True)
+    orch_dream_worker._publish(world.ctx, git, "orch", ".claude/agent-memory/orch/MEMORY.md", 1, replace=True,
+                               start="seen-at-start")
     assert not [args for kind, *rest in calls if kind == "git" for args in rest if "merge" in args]
-    assert ("push", "foragent/dream-orch", "abc123") in calls
+    # Leased on the head seen at the start, not on "abc123" fetched later (its memory was never read).
+    assert ("push", "foragent/dream-orch", "seen-at-start") in calls
 
 
 def test_leftover_processes_of_a_finished_dream_are_reaped(world, monkeypatch):
@@ -639,3 +668,70 @@ def test_surviving_executor_without_a_birth_identity_stays_recorded(world):
     recover(world)
     run = world.store.get_dream("orch")
     assert run.status == "running" and run.executor_pgid == 4200, "the next tick must still see the executor"
+
+
+def test_publishing_without_an_open_pr_never_pushes_over_a_newer_branch_head(world):
+    world.ctx.tracker = SimpleNamespace(find_pr=lambda branch: None, create_pr=lambda **kwargs: 3)
+
+    def publish(remote, start):
+        pushes = []
+        listing = f"{remote}\trefs/heads/foragent/dream-orch\n" if remote else ""
+        git = SimpleNamespace(push=lambda branch, lease=None: pushes.append(lease),
+                              _call=lambda args: listing if args[:1] == ["ls-remote"] else "")
+        orch_dream_worker._publish(world.ctx, git, "orch", MEMORY, 1, start=start)
+        return pushes
+
+    assert publish(None, "deleted-head") == [""], "a branch deleted remotely is created again, not leased on its old head"
+    assert publish(None, None) == [""]
+    assert publish("seen-head", "seen-head") == ["seen-head"]
+    with pytest.raises(RuntimeError, match="moved"):
+        publish("newer-head", "seen-head")
+
+
+def test_worker_registering_during_the_executor_stop_keeps_its_record_and_worktree(world):
+    from foragent import scheduler as facade
+
+    dreaming(world, pid=None, start=None, executor=4200, extra=[{"pid": 4200, "start_time": 2.0}])
+    world.table[0] = processes.ProcessTable([row(4200, start=2.0)])
+    world.clock[0] += facade.LAUNCH_GRACE + timedelta(seconds=1)  # Looks like a failed launch.
+    stop = world.ctx.kill_runner
+
+    def kill_and_register(pid):  # The delayed worker registers while its executor is stopped.
+        stop(pid)
+        world.store.update_run(KEY, pid=4100, process_identities=[{"pid": 4100, "start_time": 1.0}],
+                               last_progress_at=world.clock[0].isoformat())
+
+    world.ctx.kill_runner = kill_and_register
+    recover(world)
+    run = world.store.get_dream("orch")
+    assert run.status == "running" and run.pid == 4100 and world.removed == []
+
+
+def test_progress_recorded_during_a_stall_stop_leaves_the_record_for_the_next_tick(world):
+    dreaming(world)
+    world.table[0] = processes.ProcessTable([row(4100)])
+    world.clock[0] += timedelta(minutes=11)
+    stop = world.ctx.kill_runner
+
+    def kill_while_progressing(pid):
+        world.store.update_run(KEY, last_progress_at=world.clock[0].isoformat())
+        stop(pid)
+
+    world.ctx.kill_runner = kill_while_progressing
+    recover(world)
+    run = world.store.get_dream("orch")
+    assert run.status == "running" and world.removed == [] and run.restarts == 0
+
+
+
+def test_open_dream_pr_reverting_a_base_edit_is_not_mistaken_for_merged(world, tmp_path, git_history):
+    from conftest import git_command
+
+    git_history.update({MEMORY: "lesson A\n"})
+    git_history.update({MEMORY: "lesson B\n"})
+    head = dream_branch(git_history, {MEMORY: "lesson A\n"})  # The open PR corrects B back to A.
+    git_history.update({MEMORY: "lesson C\n"})  # Conflicts with the correction.
+    ctx = real_ctx(world, git_history)
+    with pytest.raises(RuntimeError, match="unmerged memory"):
+        orch_dream_worker._dream_worktree(ctx, "orch", tmp_path / "w", ".claude/agent-memory/orch")
+    assert git_command(git_history.origin, "rev-parse", "refs/heads/foragent/dream-orch") == head

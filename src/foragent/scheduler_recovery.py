@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from foragent import processes, scheduler, sleep_credit
 from foragent.scheduler_stop import (
     DECISION_FIELDS, LIVENESS_FIELDS, _flag_stop_refused, _stop_unconfirmed, _restore_stopped, _pid_exists, _run_processes_exist,
-    _stop_already_refused, _stop_run_processes, runner_alive,
+    _stop_already_refused, _stop_run_processes, registered_since, runner_alive,
 )
 from foragent.state import Run
 from foragent.tracker import Issue
@@ -18,8 +18,7 @@ if TYPE_CHECKING:
 
 
 def _kill_executor(ctx: TickContext, number: int | str) -> None:
-    # Re-read after stopping the runner: it may have spawned or reaped an executor.
-    run = ctx.store.get_run(number)
+    run = ctx.store.get_run(number)  # Re-read after stopping the runner: it may have spawned or reaped an executor.
     if run.executor_pgid is not None:
         with processes.recorded_tree(run.process_identities):
             ctx.kill_runner(run.executor_pgid)
@@ -63,7 +62,7 @@ def _kill_run(
         if count_stall:
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         raise
-    if stopped != "stopped":
+    if stopped != "stopped" or registered_since(ctx, run):  # A fresh read decides the last transition.
         if count_stall:
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         if stopped == "gone":
@@ -249,8 +248,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                           detail="Runner stopped making progress past the stall limit.") and issue:
                     scheduler._restore_stalled(ctx, run.number, restarts, report)
             continue
-        # Clean up a crashed group or finish an interrupted stall termination.
-        # A recorded completion does not need another signal.
+        # Clean up a crashed group or finish an interrupted stall; a recorded completion needs no signal.
         stopped = _stop_run_processes(
             ctx, run, report, stop_runner=run.outcome in {None, "crashed", "stalled-restart", "stalled"},
         )
@@ -259,6 +257,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
 
 
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
+    if registered_since(ctx, run):  # The runner registered or progressed during the stop.
+        return
     outcome = (run.outcome or "crashed") if run.kind == "issue" else "error"  # A dead dream: error, no labels.
     if run.executor_pgid is not None:
         ctx.store.update_run(run.key, executor_pgid=None)

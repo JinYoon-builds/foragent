@@ -110,6 +110,19 @@ def _run_processes_exist(run: Run) -> bool:
                    or identities.get(row.pid) == row.start_time for row in rows))
 
 
+def _registration(run: Run) -> tuple:
+    starts = {item["pid"]: item["start_time"] for item in run.process_identities}
+    return run.pid, starts.get(run.pid), run.last_progress_at
+
+
+def registered_since(ctx: TickContext, run: Run) -> bool:
+    """Whether a decision taken from ``run`` is stale: the record finished, or its runner
+    registered (pid, birth identity) or progressed since. The caller then leaves it for the
+    next tick instead of removing the worktree or finishing the record (D95)."""
+    fresh = ctx.store.get_run(run.key)
+    return fresh is None or fresh.status != "running" or _registration(fresh) != _registration(run)
+
+
 def _stop_unconfirmed(run: Run) -> bool:
     """Whether a stop that raised nothing may still have left the run's processes alive.
 
