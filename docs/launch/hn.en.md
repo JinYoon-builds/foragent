@@ -12,11 +12,11 @@ Foragent automates that loop:
 
     task ends → done-when commands → adversarial review → merge → next issue
 
-You describe what to build in `/fa-order`. It interviews you, splits the work into GitHub issues with executable acceptance tests, and asks for one approval. After that, `fa gate` (a background program with no LLM of its own) runs each issue: it starts a Claude Code session, runs the done-when commands, sends the diff to an adversarial review, opens the PR, merges it when it passes, and moves on.
+You describe what to build in `/fa-order`. It interviews you, splits the work into GitHub issues with executable acceptance tests, and asks for one approval. After that, `fa gate` (a background program with no LLM of its own) runs each issue: it starts a coding session (Codex CLI when it is logged in, else Claude Code), runs the done-when commands, sends the diff to an adversarial review by the other tool, opens the PR, merges it when it passes, and moves on.
 
 Work is split into lanes. A lane is an agent that owns one area of the code. Each lane has its own paths, its own memory of patterns and pitfalls in that area, and its own git worktree, so lanes run in parallel without editing the same files.
 
-It runs on stock Claude Code: lanes are `.claude/agents` files, skills are `SKILL.md`, memory is project memory. Codex CLI is optional, for implementation or cross-review.
+It runs on stock Claude Code: lanes are `.claude/agents` files, skills are `SKILL.md`, memory is project memory. Codex CLI is optional: when it is logged in, it implements and Claude Code reviews; without it, Claude Code implements and a separate Claude Code session reviews.
 
 Foragent built itself: 208 merged PRs in 10 days, counted from `git log` on 2026-10-29.
 
