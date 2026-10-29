@@ -220,7 +220,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "merges_since_tidy": _merges_since_tidy(store),
         "resources": resources,
         "binding": _binding(resources),
-        **reviews, "kinds": orch_facts_kinds.collect(store, config, root, now, rows, running, waiting),
+        **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting),
     }
 
 
