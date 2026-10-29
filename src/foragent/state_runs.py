@@ -22,8 +22,13 @@ class RunRecordsMixin:
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
         lane: str = "main", tier: str = "m", implementer: str | None = None, journal: Any = None,
     ) -> Run:
-        """Create a run; pid attests self or a newly spawned, unreaped child."""
-        with self._state_lock():
+        """Create a run; pid attests self or a newly spawned, unreaped child.
+
+        The issue's worktree lock is held while creating it, so log pruning
+        (which takes the same lock) never deletes a starting run's logs.
+        Callers must not already hold it (it is not reentrant).
+        """
+        with self.worktree_lock(number), self._state_lock():
             timestamp = self._timestamp()
             approval = self.load_approval(number)
             previous = self.get_run(number)

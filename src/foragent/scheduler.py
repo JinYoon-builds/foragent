@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_spawn, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -83,30 +83,28 @@ def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep:
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
-        timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
-        timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
-        with tick_processes(ctx.store) as snapshot:
-            cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
-            if snapshot.available:
-                with step("reap_inactive_runs"):
-                    _reap_inactive_runs(ctx, cleanup)
-            timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
-            timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
-            if skipped := _github_wait(ctx, {}, "github_wait_check"):
-                return keep(TickReport(skipped=skipped, actions=cleanup.actions))
-            if not isinstance(ctx.tracker, RecordingTracker):
-                ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-            try:
-                report = _tick_locked(ctx)
-                report.actions[:0] = cleanup.actions
-            except TrackerError as exc:
-                if not exc.is_rate_limit:
-                    raise
-                return keep(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions))
-            # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
-            if request := timed("tidy_check", tidy.post_if_due, ctx.store):
-                report.actions.append(f"Tidy due; inbox request {request['id']}")
-            return keep(report)
+        with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
+            timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
+            timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
+            with tick_processes(ctx.store) as snapshot:
+                cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
+                if snapshot.available:
+                    with step("reap_inactive_runs"):
+                        _reap_inactive_runs(ctx, cleanup)
+                timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
+                timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
+                if skipped := _github_wait(ctx, {}, "github_wait_check"):
+                    return keep(done(TickReport(skipped=skipped, actions=cleanup.actions)))
+                if not isinstance(ctx.tracker, RecordingTracker):
+                    ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
+                try:
+                    report = _tick_locked(ctx)
+                    report.actions[:0] = cleanup.actions
+                except TrackerError as exc:
+                    if not exc.is_rate_limit:
+                        raise
+                    return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
+                return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 
 
 def _tick_locked(ctx: TickContext) -> TickReport:

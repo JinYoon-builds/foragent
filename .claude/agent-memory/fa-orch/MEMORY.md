@@ -202,3 +202,5 @@
 - [#129 blocked push](project_129_blocked_push.md) — orch_push hook after spawn, _push_ready flag, notify-blocked.json re-arm
 - #846: Windows 조기 종료는 `cli.py`의 foragent import 앞 `try: import fcntl`에서 한 줄 출력 후 `SystemExit(1)`. 콘솔 대상은 바꾸지 않는다.
 - #130: 기록 없는 running 라벨의 `reconciled` 이벤트는 `scheduler_reconcile.orphan_crash_detail()`이 대체 crashed 기록보다 먼저 쓰고, 중복은 `orch_events.has_event(..., detail=라벨 세대)`로 판단한다. main의 scheduler_recovery.py(300)·scheduler.py(250)가 이미 상한이라 기존 줄을 바꿔 순증 0줄로 맞췄다. run_publish·run_review·capacity의 상한 초과는 main에서 이미 실패.
+- #131: 로그 보존은 `state_logs.py` 믹스인(prune_logs·trim_journals), tick 끝 정리는 `scheduler_housekeeping.after_tick` context manager(`done(report, finished=)`)로 모든 반환 경로를 덮어 scheduler.py 250줄 상한을 지킨다. `start_run`이 worktree_lock(n)을 잡으므로 그 잠금을 쥔 채 start_run을 부르면 교착된다.
+- #131 리뷰: 삭제 결정은 잠금 전에 읽은 기록·mtime·크기를 쓰면 안 된다(stale history). worktree 잠금 안에서 그 이슈의 runs.jsonl 최신 기록·파일·크기를 다시 읽고, 정렬에 쓴 기록과 다르면 건너뛴다. 잠금 중엔 기록 생성이 막히고 종료는 running 기록이 필요해 잠금 안 판독이 확정값이다.
