@@ -1,38 +1,51 @@
 # skills 레인 현재 메모
 
-- `GitRepo.fetch()`는 공유 clone의 참조 갱신 경합(`incorrect old value provided`)만 짧게 기다려 최대 3회 시도한다. `_call()` 전체에 재시도를 넣으면 다른 Git 작업까지 바뀌므로 fetch 안에서 처리한다. 재시도 중 다른 오류가 나오면 즉시 원문으로 전달한다. #134 검증: `uv run pytest tests/acceptance/test_fetch_race.py`, 회귀: `uv run pytest tests/test_git.py -k fetch`.
+## 스킬 설치와 작업공간 복사
+- 라이브러리 스킬 설치 기본값은 로컬 복사다(D37). `.gitignore`에는 `/.claude/skills/<이름>/` 규칙만 한 번 덧붙이고 기존 내용은 바이트 그대로 둔다. `.claude/skills/` 전체를 빼면 사용자 스킬도 빠지므로 개별 경로를 쓴다.
+- 라이선스 차단과 `THIRD_PARTY_NOTICES.md` 생성은 `install(..., commit=True)` / `fa skills install --commit`에서만 한다. 로컬 설치는 불명확·비공개 라이선스도 경고 후 허용하고 Git 조회가 필요 없다.
+- `lane_files()`는 레인 설정·에이전트 정의·`.gitignore`만 반환한다. `order.publish()` 중단 복구도 이 함수를 쓰므로 스킬 파일을 넣으면 강제 추적·커밋된다.
+- runner는 작업공간을 만들거나 다시 만들 때(대상 브랜치 변경·패치 충돌 복구 포함) 스킬을 복사한다. 순서는 저장소 `skills/<이름>/` 제품 스킬 → `.claude/skills` 로컬 설치본 → `available_only=True` 캐시다. 기존 작업공간의 스킬은 보존한다.
+- 복사한 경로만 `GitRepo.local_skill_paths`에 등록한다. 자동 스테이징에서 빼고, 실행기가 강제로 스테이징한 복사본도 커밋 전에 인덱스에서 지운다. 사용자 스킬은 계속 커밋된다.
 
-- 라이브러리 스킬 설치 기본값은 로컬 복사다. `.gitignore`에는 `/.claude/skills/<이름>/` 규칙만 한 번 추가하며, 기존 내용은 바이트 그대로 보존한다. 전체 `.claude/skills/`를 제외하면 사용자 스킬도 빠지므로 개별 경로를 쓴다.
-- `SkillManager.install(..., commit=True)` / `fa skills install --commit`에서만 기존 오픈소스 라이선스 차단과 `THIRD_PARTY_NOTICES.md` 생성을 적용한다. 로컬 설치는 불명확하거나 비공개인 라이선스도 경고 후 허용하며 Git 조회가 필요 없다.
-- `lane_files()`는 레인 설정·에이전트 정의·`.gitignore`만 반환한다. `order.publish()`의 중단 복구도 이 함수를 쓰므로 라이브러리 스킬 파일을 반환하면 강제 추적·커밋된다.
-- runner는 작업공간 생성 직후 로컬 설치본 → 사용 가능한 라이브러리 캐시 순서로 복사한다. 기존 작업공간의 스킬은 보존한다. 대상 브랜치 변경·패치 충돌 복구로 작업공간을 다시 만들 때도 복사가 필요하다.
-- 복사한 경로만 `GitRepo.local_skill_paths`에 등록한다. 자동 스테이징에서 제외하고 실행기가 강제로 스테이징한 복사본도 커밋 전에 인덱스에서 제거한다. 사용자 스킬은 계속 커밋할 수 있다.
-- 검증 명령: `uv run pytest -q tests/acceptance/test_skills_local.py`. 관련 회귀: `tests/test_skills_lanes.py`, `tests/test_git.py`, `tests/test_runner.py`, `tests/test_cli.py`, `tests/test_order.py`. acceptance 파일은 수정하지 않는다.
-- 제한 환경에서 기본 uv 캐시에 쓰기가 막히면 `/private/tmp`의 작업 전용 캐시에 필요한 캐시를 복사한 뒤 `UV_CACHE_DIR=/private/tmp/fa-issue-39-uv-cache uv run --offline ...`로 검증할 수 있다.
-- `review_scope` 기본값은 `claude-local`이다. `pr-body`는 각 리뷰 전에 검증한 변경을 커밋·푸시하고 같은 PR을 갱신한 뒤 Claude에 `review_pr`를 전달한다. CLI 명령은 `/code-review <PR 번호> <review_level>`이며 임시 `CLAUDE.local.md`를 만들지 않는다.
-- PR 본문은 초기 생성·재리뷰·최종 공개 모두 같은 렌더러를 쓴다. `pr-body`에서는 범위 규칙과 판정만 본문에, 각 라운드 지적·메모는 PR 댓글에 기록한다. 기본 모드는 이전처럼 본문에 리뷰 이력을 남긴다.
-- 리뷰 모드 검증: `uv run pytest -q tests/acceptance/test_skills_review_scope.py`. 회귀: `tests/test_config.py tests/test_executors.py tests/test_runner.py tests/test_git.py`. `tests/test_runner.py -k pr_body_reviews`는 매 라운드의 로컬 HEAD·원격 브랜치·PR HEAD 일치와 재시도 댓글 보존을 확인한다.
-- `SkillManager.skills()`는 등록된 라이브러리가 디스크에 없으면 복제하고 조회를 계속한다. catalog·install·레인 검증이 이 경로를 공유한다. 기존 디렉터리는 갱신하지 않으며, runner의 `available_only=True` 캐시 조회는 누락 라이브러리를 건너뛰어 오프라인 동작을 보존한다. 복제 실패는 라이브러리 이름을 포함한 `SkillError`로 전달한다.
-- 자동 복제 검증: `uv run pytest tests/acceptance/test_skills_autosync.py`. `tests/test_skills_lanes.py`의 자동 복제 회귀는 로컬 bare 저장소로 복제 1회·기존 캐시 미갱신·레인 설치를 함께 확인한다.
-- `fa skills add SOURCE [--json]`는 임시 복제본만 읽고 정리한다. `--approve --role SKILL=style|review|tool|domain`으로 모든 스킬의 역할을 명시해야 전역 `skill_libraries`·`skill_roles`를 함께 저장한다. 실제 캐시는 이후 catalog/install의 기존 자동 복제가 만든다.
-- `skills/<이름>`과 `.<도구>/skills/<이름>`은 같은 `<라이브러리 접두사>:<이름>`으로 묶는다. 공용 사본을 먼저 선택하고 `copies`에는 모든 상대 경로를 남긴다. `engineering/skills/<이름>` 같은 직무별 기존 ID는 유지한다. 완전한 ID 선택은 이름 별칭보다 우선한다.
-- 카탈로그의 `role`은 미확정이면 `null`이다. `runs_scripts`는 파일 경로만 확인하며 모든 도구 사본을 합산한다. 스크립트를 읽어 평가하거나 실행하지 않는다.
-- 등록 회귀는 `tests/test_skill_registration.py`에 둔다. pytest 기본 수집 방식에서는 acceptance 파일과 같은 `test_skills_add.py` 이름을 쓰면 import 충돌이 난다. #101 검증은 `UV_CACHE_DIR=/private/tmp/fa-issue-101-uv-cache uv run pytest tests/acceptance/test_skills_add.py`다.
-- `fa lanes skills <lane> [ids]`는 기존 레인의 고정 목록을 교체하며 ID 생략은 비우기다. 설정의 `agent`가 가리키는 파일의 본문·다른 필드는 보존하고, 설치본은 제거하지 않는다. 변경은 작업 트리에 남긴다.
-- 레인 생성·고정 스킬 변경은 `_check_skills()`로 설치 전에 모든 ID와 설치 디렉터리 중복·`style` 최대 하나를 확인한다. 역할은 별칭 문자열 대신 해석된 `Skill.role`로 판정한다. 검증 실패 시 레인 파일과 설치 디렉터리를 바꾸지 않아야 한다.
-- #102 검증: `uv run pytest tests/acceptance/test_lane_fixed_skills.py`; 회귀는 `tests/test_skills_lanes.py`의 `fixed_lane` 사례(사용자 지정 에이전트·설정 보존, 목록 비우기, 잘못된 요청의 무변경, 생성 시 style 제한)다.
-- 레인 에이전트는 삭제되거나 처음부터 없을 수 있다. `set_lane_skills()`는 설치 전에 `read_text()`의 `OSError`를 경로가 포함된 `LaneError`로 변환한다. 누락·미생성·디렉터리 경로의 CLI 오류와 프로젝트 파일 무변경을 함께 검증한다.
-- 설정 `_overlay()`는 `tiers`만 깊게 병합하며 `lanes`는 전역 → 로컬 순으로 목록 전체를 교체한다. 로컬 `lanes`가 있으면 `config.lanes`에 전역 전용 레인이 섞이지 않는다. 목록을 처음 로컬에 저장할 때는 상속한 다른 레인을 보존해야 한다. 전역·로컬 혼합 회귀는 `test_set_lane_skills_does_not_copy_overridden_global_lanes`다.
-- `SkillManager._scan()`은 (유효 스킬, 건너뜀 `{path, error}`)를 돌려준다. 깨진 SKILL.md는 catalog·install에서 조용히 빠지고, `add`는 `skipped`로 알린다. 유효 스킬 0개+건너뜀 있음일 때만 모든 경로를 담아 실패한다. #232 검증: `fa test tests/acceptance/test_skills_add_partial_pack.py`. `fa test`는 슬롯 대기로 10분을 넘길 수 있으니 백그라운드로 돌린다.
-- [.foragent.yml 줄 단위 편집](settings_roundtrip.md) — lanes add/skills는 compose 위치로 줄만 고치고 다시 읽어 확인; ruamel 왕복은 거절됨 (#233)
-- [게이트 슬롯 환경 변수](gate_slot_env.md) — FORAGENT_TEST_SLOT=held가 시험에 새면 capacity 슬롯 시험이 게이트에서만 실패
-- 오케스트레이터 시간 초과(`scheduler_checks._escalate_overdue_blocker`) 시계는 최신 blocked 댓글과 그 이슈의 최신 `store.finish_times()`(키 `(번호, started_at)`) 중 늦은 쪽부터 센다(#642). 시험에서 종료 시각을 바꾸려면 같은 state 경로로 `now`가 다른 `StateStore`를 새로 만들어 `finish_run`한다.
-- 모든 시험의 HOME·XDG·GIT_CONFIG_GLOBAL 격리는 conftest의 `pytest_runtest_setup`(tryfirst) 훅이 한다(#655). 같은 범위 autouse fixture는 선언 순서대로 준비되지 않으므로 fixture로 하면 다른 fixture가 시작 HOME을 본다. 복원은 `pytest_runtest_teardown` hookwrapper의 yield 뒤. 확인은 `pytest_fixture_setup`에서 HOME을 기록하는 `-p` 임시 플러그인으로 한다(`--setup-plan`엔 훅이 안 보임). `REAL_HOME`은 시작 HOME, gates 가드는 `temporary_home`도 "격리 안 함"으로 본다. 넓은 acceptance 묶음은 미구현 주문 시험이 원래 실패하므로 회귀 판단은 단위 시험이나 변경 전후 비교로 한다.
-- `src/foragent/commands/*.py`(밑줄 도우미 포함)의 최상위 import는 `facade`·`repo_store`만 허용된다(`tests/test_cli_commands.py::test_command_modules_import_nothing_that_cli_already_binds`). 다른 모듈 이름을 다시 내보내려면 함수 안 import나 모듈 `__getattr__`를 쓴다. 명령 파일을 쪼갤 땐 이 단위 시험을 꼭 같이 돌린다(#662 CI 실패).
-- 레인 스킬의 원본은 `.foragent.yml` 하나다(D95, #725). `lane_skill_names()`는 에이전트 frontmatter를 대체로 읽지 않는다. `order.context()`도 같은 원칙이다(#725 재시도: 대체 읽기를 남겨 반려됨). 레인 스킬 읽는 곳을 고칠 땐 `grep -rn '"skills"\|\.claude/agents' src/foragent`로 모든 읽는 곳을 함께 점검한다. 시험 fixture가 frontmatter에만 스킬을 두면 실패하니 lane 설정에 `skills`를 넣는다(`tests/test_order.py` preread 사례). `fa doctor --live`는 `runner_doctor.lane_skill_drift()`로 어긋난 레인 이름을 알리고 1을 반환한다. 고치지는 않는다.
-- 저장소 `skills/<이름>/`의 제품 스킬은 이름으로 라이브러리보다 먼저 해석된다. `check_install`은 `_repo_skill()`를 먼저 보고, `copy_lane_skills`는 skills/ → `.claude/skills` 로컬 설치본 → 캐시 순서로 찾는다. 완전한 라이브러리 ID는 계속 라이브러리 사본을 고른다. 반입한 스킬의 LICENSE에는 `SPDX-License-Identifier: MIT`를 첫 줄에 둔다. 머리말을 덧붙이면 표준 MIT 판별이 깨지기 때문이다.
-- 라이브러리 캐시는 `~/.local/share/foragent/libraries/<이름>`이다. knowledge-work-plugins의 루트 LICENSE 끝에는 라이선스와 무관한 글이 붙어 있으니, 반입할 때 "limitations under the License."까지만 복사한다(#727). `fa lanes skills`에 제품 스킬을 넣으면 `.claude/skills/<이름>/`로 복사하고 `.gitignore`에 줄을 추가한다.
-- 목표 조건에 "저장소 밖 파일 무변경"이 있으면, 새 작업 트리의 첫 `uv run`이 `~/.cache/uv`에 editable 빌드(`archive-v0/<id>`, `sdists-v9/editable/<hash>`)를 남긴다. `.pth`가 이 작업 트리 `src`를 가리키는 두 항목만 지우면 된다. `.venv`는 따로 복사돼 있어 다시 빌드하지 않는다(#727). 전후 비교는 `find -newer 표식 파일`로 한다.
-- 라이브러리 스킬 탐색은 `_skill_files()`의 os.walk로 `**/skills/<이름>/SKILL.md`를 찾는다(#730). 숨김 폴더·node_modules는 건너뛰되 자식이 `skills`인 숨김 도구 폴더는 들어간다. 사본 묶음 키는 skills 앞 경로(마지막 숨김 폴더 하나 제외)+이름, ID는 옛 규칙(`이름` 또는 `첫폴더/이름`)이고 충돌할 때만 대표 사본 폴더 경로. 라이선스는 `_license(..., nearest=True)`로 가장 가까운 LICENSE·덧붙인 글 허용, repo 제품 스킬은 옛 규칙. 실제 캐시 확인은 `SkillManager().skills(available_only=True)`로 한다(복제 없음). 탐색은 옛 glob처럼 디렉터리 심볼릭 링크를 따라가고 자기 조상 실경로로 돌아가는 링크만 끊는다. nearest 모드에선 앞부분 표준 본문이 SPDX보다 먼저 판정한다(덧붙인 SPDX가 뒤집지 못함).
-- 레인에 스킬을 붙일 땐 `uv run fa lanes skills <레인> <기존 목록…> <새 ID>`로 한다(#726). 이 명령은 `.foragent.yml`·에이전트 frontmatter와 함께 `.gitignore`에 `/.claude/skills/<이름>/`도 덧붙이고 `.claude/skills/`에 로컬 사본을 만든다. Files 목록에 `.gitignore`가 없어도 이 변경은 레인 코드의 정상 결과다. 실행 전 `SkillManager(load_config(root)).skills(available_only=True)`로 라이브러리 캐시가 있는지 확인하면 홈 디렉터리로의 복제를 피할 수 있다. LICENSE 없는 제품 스킬은 "installing locally only" 경고가 나오지만 붙이기는 성공한다.
-- `PublicationError` 문구는 `messages/conflicts.py`의 `conflict_marker_left`로 렌더한다(#845). 언어는 `GitRepo._language()`가 오류를 낼 때 `load_config(root)`로 읽고, 실패하면 조용히 `en`이다. runner 시험 fixture는 언어가 없어 영어 문구를 본다. `fa test`에 맞는 파일이 없는 glob을 넘기면 zsh가 인자 없이 실행해 전체 묶음이 돌아간다. 파일 이름은 먼저 `ls`로 확인한다.
+## 라이브러리·카탈로그
+- 캐시는 `~/.local/share/foragent/libraries/<이름>`이다. `SkillManager.skills()`는 등록됐는데 디스크에 없는 라이브러리를 복제한다(D58). 기존 디렉터리는 갱신하지 않는다. `available_only=True`는 누락 라이브러리를 건너뛰어 복제 없이 오프라인으로 돈다. 실제 캐시 확인은 이것으로 한다. 복제 실패는 라이브러리 이름이 든 `SkillError`다.
+- `_skill_files()`는 os.walk로 `**/skills/<이름>/SKILL.md`를 찾는다(#730). 숨김 폴더·node_modules는 건너뛰되 자식이 `skills`인 숨김 도구 폴더는 들어간다. 옛 glob처럼 디렉터리 심볼릭 링크를 따라가고, 자기 조상 실경로로 돌아가는 링크만 끊는다.
+- 도구별 사본(`skills/<이름>`, `.<도구>/skills/<이름>`)은 skills 앞 경로(마지막 숨김 폴더 제외)+이름으로 묶는다. 공용 사본을 대표로 고르고 `copies`에 모든 상대 경로를 남긴다. ID는 옛 규칙(`이름` 또는 `첫폴더/이름`, 예: `engineering/skills/<이름>`)이고 충돌할 때만 대표 사본 폴더 경로를 쓴다. 완전한 ID는 이름 별칭보다 우선한다.
+- 라이선스: 라이브러리는 `_license(..., nearest=True)`로 가장 가까운 LICENSE를 보고 덧붙인 글을 허용한다. 앞부분 표준 본문이 SPDX보다 먼저 판정한다(덧붙인 SPDX가 뒤집지 못함, #730 리뷰). 저장소 제품 스킬은 옛 규칙이다.
+- 저장소 `skills/<이름>/` 제품 스킬은 이름으로 라이브러리보다 먼저 해석된다(`check_install`이 `_repo_skill()`을 먼저 봄). 완전한 라이브러리 ID는 계속 라이브러리 사본을 고른다.
+- 스킬을 반입할 때 LICENSE 첫 줄에 `SPDX-License-Identifier: MIT`를 둔다. 머리말을 덧붙이면 표준 MIT 판별이 깨진다. knowledge-work-plugins 루트 LICENSE는 "limitations under the License."까지만 복사한다. 그 뒤는 무관한 글이다(#727).
+- 카탈로그 `role`은 미확정이면 `null`이다. `runs_scripts`는 파일 경로만 보고 모든 사본을 합산한다. 스크립트를 읽거나 실행하지 않는다.
+- `_scan()`은 (유효 스킬, 건너뜀 `{path, error}`)를 돌려준다. 깨진 SKILL.md는 catalog·install에서 조용히 빠지고 `add`는 `skipped`로 알린다. 유효 0개+건너뜀 있음일 때만 모든 경로를 담아 실패한다(#232).
+- `fa skills add SOURCE [--json]`은 임시 복제본만 읽고 지운다. `--approve --role SKILL=style|review|tool|domain`으로 모든 스킬의 역할을 줘야 전역 `skill_libraries`·`skill_roles`를 저장한다. 실제 캐시는 이후 자동 복제가 만든다.
+
+## 레인 스킬
+- 레인 스킬의 원본은 `.foragent.yml` 하나다(D95, #725). `lane_skill_names()`와 `order.context()` 모두 에이전트 frontmatter를 대체로 읽지 않는다. #725는 읽는 곳 하나에 대체 읽기를 남겨 반려됐다. 고칠 땐 `grep -rn '"skills"\|\.claude/agents' src/foragent`로 모든 읽는 곳을 함께 본다. 시험 fixture도 lane 설정에 `skills`를 넣어야 한다. `fa doctor --live`는 `runner_doctor.lane_skill_drift()`로 어긋난 레인만 알리고 1을 반환한다.
+- `fa lanes skills <레인> [ids]`는 고정 목록을 통째로 교체한다. ID 생략은 비우기다. 붙일 땐 기존 목록을 모두 다시 적는다. 이 명령은 `.foragent.yml`·에이전트 frontmatter·`.gitignore` 줄·`.claude/skills/` 로컬 사본을 함께 만든다. Files 목록에 `.gitignore`가 없어도 정상 결과다. 에이전트 본문·다른 필드는 보존하고 설치본은 지우지 않는다. 실행 전 `SkillManager(load_config(root)).skills(available_only=True)`로 캐시를 확인하면 홈으로의 복제를 피한다. LICENSE 없는 제품 스킬은 "installing locally only" 경고 뒤 성공한다.
+- 레인 생성·스킬 변경은 `_check_skills()`가 설치 전에 모든 ID·설치 디렉터리 중복·`style` 최대 하나를 확인한다. 역할은 해석된 `Skill.role`로 판정한다. 실패하면 레인 파일과 설치 디렉터리가 그대로여야 한다.
+- 레인 에이전트 파일은 없을 수 있다. `set_lane_skills()`는 설치 전에 `read_text()`의 `OSError`를 경로가 든 `LaneError`로 바꾼다(#102 리뷰).
+- 설정 `_overlay()`는 `tiers`만 깊게 병합하고 `lanes`는 전역 → 로컬 순으로 목록 전체를 교체한다. 처음 로컬에 저장할 때 상속한 다른 레인은 보존하되 전역 전용 레인을 복사하지 않는다(회귀: `test_set_lane_skills_does_not_copy_overridden_global_lanes`).
+- [.foragent.yml 줄 단위 편집](settings_roundtrip.md) — lanes add/skills는 compose 위치로 줄만 고치고 다시 읽어 확인한다. 드문 YAML 형태는 쫓지 말고 거부한다. ruamel 왕복은 거절됨(#233).
+
+## 리뷰·게이트
+- `review_scope` 기본값은 `claude-local`이다(D39). `pr-body`는 리뷰마다 검증한 변경을 커밋·푸시해 같은 PR을 갱신하고 `/code-review <PR 번호> <review_level>`을 부른다. 임시 `CLAUDE.local.md`는 만들지 않는다. PR 본문은 생성·재리뷰·공개 모두 같은 렌더러다. `pr-body`는 범위 규칙과 판정만 본문에, 라운드 지적은 PR 댓글에 둔다.
+- 기본 리뷰 관점은 `review_perspectives.py`의 `DEFAULT_PERSPECTIVES` 끝에 붙인다(#628 docs, #729 performance). focus 문구는 이슈 그대로 쓴다. 회귀: `test_review_perspectives_unit`, `test_config`, `test_orch_reviewers`, `test_review_conflict_paths`.
+- 리뷰어는 브랜치를 최신 main과 비교한다. main이 앞서가면 "시험 삭제"로 보인다. merge-base 비교로 확인하고 REBUTTAL에 쓴다(#233).
+- 리뷰 지적이 "broader class"를 말하면 같은 종류를 전부 찾는다. #725·#730은 지적 하나만 고쳤다면 다시 반려됐을 사례다.
+- `PublicationError` 문구는 `messages/conflicts.py`의 `conflict_marker_left`로 렌더한다(#845). 언어는 오류 때 `GitRepo._language()`가 `load_config(root)`로 읽고 실패하면 `en`이다. runner fixture는 영어 문구를 본다.
+- 오케스트레이터 시간 초과(`scheduler_checks._escalate_overdue_blocker`)는 최신 blocked 댓글과 `store.finish_times()`(키 `(번호, started_at)`)의 최신 값 중 늦은 쪽부터 센다(#642). 종료 시각을 바꾸려면 같은 state 경로로 `now`가 다른 `StateStore`를 만들어 `finish_run`한다.
+
+## 시험 환경
+- HOME·XDG·GIT_CONFIG_GLOBAL 격리는 conftest의 `pytest_runtest_setup`(tryfirst) 훅이 한다(#655). autouse fixture로는 순서가 보장되지 않는다. 복원은 `pytest_runtest_teardown` hookwrapper의 yield 뒤다. 확인은 `pytest_fixture_setup`에서 HOME을 기록하는 `-p` 임시 플러그인으로 한다(`--setup-plan`에는 훅이 안 보임).
+- [게이트 슬롯 환경 변수](gate_slot_env.md) — FORAGENT_TEST_SLOT=held가 시험에 새면 capacity 슬롯 시험이 게이트에서만 실패한다.
+- `src/foragent/commands/*.py`의 최상위 import는 `facade`·`repo_store`만 허용된다(`tests/test_cli_commands.py::test_command_modules_import_nothing_that_cli_already_binds`). 다른 이름은 함수 안 import나 모듈 `__getattr__`로 낸다. 명령 파일을 쪼갤 땐 이 시험을 같이 돌린다(#662 CI 실패).
+- 넓은 acceptance 묶음에는 미구현 주문의 시험이 원래 실패한다(#100 재시도 소진 때도 capacity_aimd·quota_mode 등이 섞였음). 회귀 판단은 단위 시험이나 변경 전후 비교로 한다.
+- `fa test`는 슬롯 대기로 10분을 넘길 수 있으니 백그라운드로 돌린다. 맞는 파일이 없는 glob을 넘기면 zsh가 인자 없이 실행해 전체 묶음이 돈다. 파일 이름은 먼저 `ls`로 확인한다.
+- 등록 회귀는 `tests/test_skill_registration.py`에 둔다. acceptance와 같은 파일 이름(`test_skills_add.py`)을 쓰면 pytest import 충돌이 난다. acceptance 파일은 고치지 않는다.
+- uv 캐시: 기본 캐시에 쓰기가 막히면 `/private/tmp`에 작업 전용 캐시를 복사해 `UV_CACHE_DIR=... uv run --offline ...`으로 돌린다. "저장소 밖 무변경" 조건이 있으면 첫 `uv run`이 `~/.cache/uv`에 남긴 editable 빌드(`archive-v0/<id>`, `sdists-v9/editable/<hash>`) 중 `.pth`가 이 작업 트리 `src`를 가리키는 두 항목만 지운다. 전후 비교는 `find -newer 표식 파일`로 한다(#727).
+
+## 검증 명령
+- 로컬 설치 `tests/acceptance/test_skills_local.py` · 리뷰 모드 `test_skills_review_scope.py`(회귀 `tests/test_runner.py -k pr_body_reviews`) · 자동 복제 `test_skills_autosync.py` · 등록 `test_skills_add.py` · 부분 팩 `test_skills_add_partial_pack.py` · 고정 스킬 `test_lane_fixed_skills.py` · fetch 경합 `test_fetch_race.py` · 문서 역할 `test_docs_role.py`.
+- 단위 회귀: `tests/test_skills_lanes.py`(`fixed_lane`, `settings_document`, 자동 복제는 로컬 bare 저장소 사용), `tests/test_git.py -k fetch`, `tests/test_runner.py`, `tests/test_cli.py`, `tests/test_order.py`, `tests/test_config.py`, `tests/test_executors.py`.
+
+## Git
+- `GitRepo.fetch()`는 공유 clone의 참조 경합(`incorrect old value provided`)만 짧게 기다려 최대 3회 시도한다(#134). `_call()` 전체에 재시도를 넣지 않는다. 다른 오류는 즉시 원문으로 낸다.
