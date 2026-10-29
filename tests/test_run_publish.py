@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import timedelta
 import threading
+import time
 from pathlib import Path
 import shutil
 
@@ -1057,7 +1058,19 @@ def test_fresh_base_new_workflow_gets_ci_registration_grace(run_case, monkeypatc
 
 def test_parallel_lanes_implement_while_merge_phase_serializes_and_rechecks(run_case, monkeypatch):
     c = run_case
-    c.ctx.config = replace(c.ctx.config, max_retries=0, lanes={"ui": {}, "api": {}})
+    # The fake sleep advances the shared clock with no real delay, so issue 2's
+    # merge-queue wait would spin 30 fake seconds per loop for as long as issue 1
+    # really works, and a slow machine exhausts its budget. This test is about
+    # serialization, not the time budget: pace each fake sleep with a short real
+    # pause and give the run a long budget (about 144 s of real waiting).
+    c.ctx.config = replace(c.ctx.config, max_retries=0, lanes={"ui": {}, "api": {}}, max_runtime_minutes=24 * 60)
+    advance = c.ctx.sleep
+
+    def paced_sleep(seconds):
+        time.sleep(0.05)
+        advance(seconds)
+
+    c.ctx.sleep = paced_sleep
     set_done_when(c, ["test ! -f a || test ! -f b"])
     approval = c.store.load_approval(1)
     c.tracker.add_issue(2, "Other lane", approval.body, labels=["approved", "running"])

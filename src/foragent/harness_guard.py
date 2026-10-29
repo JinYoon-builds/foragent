@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from fnmatch import fnmatchcase
-from functools import lru_cache
 import math
 import os
 from pathlib import Path
@@ -51,17 +50,41 @@ def before_measurement(root: Path) -> None:
         guard()
 
 
-def _canonical(value: object) -> object:
-    """TOML values compared by type and exact value, so 0 differs from false and nan equals nan."""
-    if isinstance(value, dict):
-        return ("table", tuple(sorted((key, _canonical(item)) for key, item in value.items())))
-    if isinstance(value, list):
-        return ("array", tuple(_canonical(item) for item in value))
-    if isinstance(value, float):
-        return ("float", "nan" if math.isnan(value) else value.hex())
-    if hasattr(value, "isoformat"):
-        return (type(value).__name__, value.isoformat())
-    return (type(value).__name__, value)
+_END = object()
+
+
+def _canonical(value: object) -> tuple:
+    """TOML values compared by type and exact value, so 0 differs from false and nan equals nan.
+
+    The result is a flat token sequence built with an explicit stack, so neither
+    building nor comparing it recurses, however deeply the document nests.
+    TOML values are never tuples, so a tuple on the stack marks a table key.
+    """
+    tokens: list[tuple] = []
+    stack: list[object] = [value]
+    while stack:
+        item = stack.pop()
+        if item is _END:
+            tokens.append(("end",))
+        elif isinstance(item, tuple):
+            tokens.append(item)  # ("key", name)
+        elif isinstance(item, dict):
+            tokens.append(("table", len(item)))
+            stack.append(_END)
+            for key in sorted(item, reverse=True):
+                stack.append(item[key])
+                stack.append(("key", key))
+        elif isinstance(item, list):
+            tokens.append(("array", len(item)))
+            stack.append(_END)
+            stack.extend(reversed(item))
+        elif isinstance(item, float):
+            tokens.append(("float", "nan" if math.isnan(item) else item.hex()))
+        elif hasattr(item, "isoformat"):
+            tokens.append((type(item).__name__, item.isoformat()))
+        else:
+            tokens.append((type(item).__name__, item))
+    return tuple(tokens)
 
 
 def _git(git: GitRepo, args: list[str]) -> subprocess.CompletedProcess[bytes]:
@@ -79,7 +102,7 @@ def _pytest_tables(data: object) -> object:
         return _UNPARSABLE
     try:
         document = tomllib.loads(data.decode("utf-8")) if data is not None else {}
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+    except Exception:  # undecodable, invalid, or too deeply nested to parse (RecursionError)
         return _UNPARSABLE
     tables = []
     for keys in PYPROJECT_TABLES:
@@ -257,20 +280,21 @@ def listed(path: bytes, files: list[str]) -> bool:
     within a component, ** spans components, a literal entry needs equal bytes.
     """
     parts = _parts(path)
-    for entry in files:
-        globs = _parts(entry.encode("utf-8"))
+    return any(_glob_matches(parts, _parts(entry.encode("utf-8"))) for entry in files)
 
-        @lru_cache(None)
-        def match(i: int, j: int) -> bool:
-            if j == len(globs):
-                return i == len(parts)
-            if globs[j] == b"**":
-                return match(i, j + 1) or (i < len(parts) and match(i + 1, j))
-            return i < len(parts) and fnmatchcase(parts[i], globs[j]) and match(i + 1, j + 1)
 
-        if match(0, 0):
-            return True
-    return False
+def _glob_matches(parts: tuple[bytes, ...], globs: tuple[bytes, ...]) -> bool:
+    # Iterative: the set of path positions reachable after each glob component,
+    # so a path with thousands of components cannot exhaust the recursion limit.
+    positions = {0}
+    for glob in globs:
+        if glob == b"**":
+            positions = set(range(min(positions), len(parts) + 1))
+        else:
+            positions = {i + 1 for i in positions if i < len(parts) and fnmatchcase(parts[i], glob)}
+        if not positions:
+            return False
+    return len(parts) in positions
 
 
 def display_path(raw: bytes) -> str:
@@ -356,25 +380,34 @@ def changed_harness_paths(git: GitRepo, target_ref: str, files: list[str]) -> li
     file_mode = _git(git, ["config", "--bool", "core.fileMode"]).stdout.strip() != b"false"
     found = []
     for raw in harness:
-        name = raw.rsplit(b"/", 1)[-1]
-        before = _tree_side(git, base, raw)
-        path = git.root / os.fsdecode(raw)
-        afters = ([_disk_side(path)] if file_mode
-                  else [_disk_side(path, mode) for mode in _recorded_modes(git, raw)])
-        # Git's recorded entries the worktree cannot show: index entries of another
-        # type or not refreshed from disk, and HEAD's entry type.
-        afters += _index_entries(git, raw)
-        verdicts = {_verdict(name, before, after) for after in afters}
-        head = _tree_side(git, "HEAD", raw)
-        if head is _NOT_A_FILE or (head is not None and head[0] not in _REGULAR_MODES):
-            verdicts.add(_ALWAYS)  # a symlink or submodule recorded in HEAD
         try:
-            raw.decode("utf-8")
-        except UnicodeDecodeError:
-            verdicts.add(_ALWAYS)  # Files entries are UTF-8; such a path cannot be listed exactly
-        if _ALWAYS in verdicts or (_CHANGE in verdicts and not listed(raw, files)):
+            held = _judge(git, base, raw, files, file_mode)
+        except Exception:  # anything that stops an exact comparison holds (fail closed)
+            held = True
+        if held:
             found.append(display_path(raw))
     return found
+
+
+def _judge(git: GitRepo, base: str, raw: bytes, files: list[str], file_mode: bool) -> bool:
+    """Whether one harness candidate holds the PR."""
+    name = raw.rsplit(b"/", 1)[-1]
+    before = _tree_side(git, base, raw)
+    path = git.root / os.fsdecode(raw)
+    afters = ([_disk_side(path)] if file_mode
+              else [_disk_side(path, mode) for mode in _recorded_modes(git, raw)])
+    # Git's recorded entries the worktree cannot show: index entries of another
+    # type or not refreshed from disk, and HEAD's entry type.
+    afters += _index_entries(git, raw)
+    verdicts = {_verdict(name, before, after) for after in afters}
+    head = _tree_side(git, "HEAD", raw)
+    if head is _NOT_A_FILE or (head is not None and head[0] not in _REGULAR_MODES):
+        verdicts.add(_ALWAYS)  # a symlink or submodule recorded in HEAD
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        verdicts.add(_ALWAYS)  # Files entries are UTF-8; such a path cannot be listed exactly
+    return _ALWAYS in verdicts or (_CHANGE in verdicts and not listed(raw, files))
 
 
 def hold_details(paths: list[str]) -> str:

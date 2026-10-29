@@ -854,3 +854,54 @@ def test_symlink_recorded_only_in_head_holds_when_the_index_dropped_it(repo):
     (repo / ".foragent").mkdir()
     (repo / ".foragent/conftest.py").write_text("../tests/conftest.py")  # core.symlinks false checkout
     assert changed_harness_paths(GitRepo(repo), "target", [".foragent/conftest.py"]) == [".foragent/conftest.py"]
+
+
+@pytest.mark.parametrize("files", [[], ["pyproject.toml"]], ids=["unlisted", "listed"])
+def test_deeply_nested_pyproject_arrays_hold_instead_of_erroring(repo, files):
+    (repo / "pyproject.toml").write_text("[tool.pytest]\nx = " + "[" * 2000 + "]" * 2000 + "\n")
+    assert changed_harness_paths(GitRepo(repo), "target", files) == ["pyproject.toml"]
+
+
+def test_deeply_nested_pyproject_tables_are_compared_without_recursion(repo):
+    header = "[tool.pytest" + "".join(f".k{i}" for i in range(2000)) + "]\nx = 1\n"
+    (repo / "pyproject.toml").write_text(PYPROJECT + header)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["pyproject.toml"]
+
+
+def test_canonical_form_of_a_deep_value_is_flat_and_comparable():
+    from foragent.harness_guard import _canonical
+
+    deep = value = {}
+    for _ in range(5000):
+        value["k"] = [{}]
+        value = value["k"][0]
+    assert _canonical(deep) == _canonical(deep)
+    assert _canonical({"a": 0}) != _canonical({"a": False}) != _canonical({"a": [0]})
+
+
+def test_files_glob_matching_handles_thousands_of_path_components():
+    from foragent.harness_guard import listed
+
+    path = b"a/" * 3000 + b"conftest.py"
+    assert listed(path, ["**/conftest.py"])
+    assert not listed(path, ["a/*/conftest.py"])
+    assert listed(b"a/b/conftest.py", ["a/**/conftest.py"]) and listed(b"a/conftest.py", ["a/**/conftest.py"])
+
+
+def test_any_failure_while_judging_a_harness_path_holds_it(repo, monkeypatch):
+    from foragent import harness_guard
+
+    (repo / "tests/conftest.py").write_text("# changed\n")
+
+    def broken(*args):
+        raise RuntimeError("cannot compare")
+
+    monkeypatch.setattr(harness_guard, "_tree_side", broken)
+    assert changed_harness_paths(GitRepo(repo), "target", ["tests/conftest.py"]) == ["tests/conftest.py"]
+
+
+def test_too_deep_to_parse_is_unparsable_not_an_exception():
+    from foragent.harness_guard import _UNPARSABLE, _pytest_tables
+
+    deep = ("[tool.pytest]\nx = " + "[" * 2000 + "]" * 2000 + "\n").encode()
+    assert _pytest_tables(deep) is _UNPARSABLE
