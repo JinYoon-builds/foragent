@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import processes, scheduler, sleep_credit
+from foragent import processes, scheduler, scheduler_reconcile, sleep_credit
 from foragent.scheduler_stop import (
     DECISION_FIELDS, LIVENESS_FIELDS, _flag_stop_refused, _stop_unconfirmed, _restore_stopped, _pid_exists, _run_processes_exist,
     _stop_already_refused, _stop_run_processes, registered_since, runner_alive,
@@ -156,7 +156,7 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
     if run is not None and run.outcome in {"stalled-restart", "stalled", "stopped"}:  # stopped: detail is the why.
         _restore_stopped(ctx, issue.number, run.detail, report) if run.outcome == "stopped" else scheduler._restore_stalled(ctx, issue.number, run.restarts, report)
         return ctx.tracker.get_issue(issue.number)
-    detail = scheduler._crash_detail(ctx, issue.number)
+    detail = scheduler_reconcile.orphan_crash_detail(ctx, issue.number, run)
     if run is None or run.outcome != "crashed" or run.detail != detail:
         ctx.store.start_run(
             issue.number, branch=f"foragent/issue-{issue.number}",
