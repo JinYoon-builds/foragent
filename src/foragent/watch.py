@@ -31,11 +31,15 @@ from foragent.tracker import Issue, Tracker
 from foragent.watch_cells import Line, Span, _beside, _cells, _clean, _columns, _fit, _line, _panel, _wrap
 from foragent.watch_data import Snapshot, collect, recent_events
 from foragent.watch_art import ORCHESTRATOR, PALETTE, half_blocks
-from foragent.watch_layout import PICK, _activity, _frame, _has_work, render_frame
+from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, render_frame
+from foragent.watch_sections.acorns import issue_box, issue_url
 from foragent.watch_sections.detail import render_detail
 from foragent.watch_sections.finished import FIREWORKS_SECONDS, calm
 from foragent.watch_sections.stage import _stage
-from foragent.watch_mouse import handle_mouse, hit_test, switch_to_orchestrator
+from foragent.watch_mouse import (
+    MIN_SCREEN, handle_key, handle_mouse, highlighted, highlighted_row, hit_test, osc8, scroll, scroll_limit, switch_to_orchestrator,
+    terminal_restore_sequences, terminal_setup_sequences, toggle_lane,
+)
 from foragent.watch_open import LOCK_FD_ENV, exclusive, registered
 from foragent.watch_terminal import _terminal, color_pairs
 
@@ -56,6 +60,11 @@ def should_reload(started: str, current: str) -> bool:
     """Only a change between two known builds warrants replacing the view."""
     return bool(started and current and started != "unknown" and current != "unknown"
                 and started != current)
+
+
+def _write(sequences: list[str]) -> None:
+    sys.stdout.write("".join(sequences))
+    sys.stdout.flush()
 
 
 def run(
@@ -82,12 +91,17 @@ def run(
             snapshot = refresh()
             import curses
 
+            # The alternate screen keeps the view out of the terminal's scrollback.
+            _write(terminal_setup_sequences())
             try:
                 reload_requested = curses.wrapper(_terminal, refresh, snapshot, config, repo_root, now, store)
             except KeyboardInterrupt:
                 pass
             except curses.error as exc:
                 raise ConfigError(str(exc)) from exc
+            finally:
+                # Leave the alternate screen on exit and before a re-exec alike.
+                _write(terminal_restore_sequences())
         if not reload_requested:
             return
         # Curses and PID registration unwind before exec; the inherited lock leaves no gap.

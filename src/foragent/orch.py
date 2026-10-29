@@ -28,8 +28,8 @@ from foragent.processes import claude_session, run_logged
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
-from foragent.run_checks import CheckResult, history_gaps, trusts_ci
-from foragent.watchdog import SilenceWatchdog
+from foragent.run_checks import CheckResult, trusts_ci
+from foragent.watchdog import SilenceWatchdog, history_gaps
 from foragent.run_previous import retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only

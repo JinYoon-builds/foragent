@@ -131,3 +131,19 @@ def recorded_gaps(cache_root: Path, repository: Path) -> tuple[float, ...]:
         except (OSError, ValueError, TypeError, KeyError):
             continue
     return () if latest is None else latest[1]
+
+
+def history_gaps(ctx) -> tuple[float, ...]:
+    """This repository's recorded result gaps; every check site sizes its silence window from them."""
+    return recorded_gaps(ctx.store.root.parent / "baselines", ctx.repo_root)
+
+
+def safety_net(ctx) -> float:
+    from foragent.config import safety_net_seconds
+
+    return safety_net_seconds(ctx.config)
+
+
+def silence_args(ctx) -> dict:
+    """The watchdog inputs a check site passes to ``run_checks._check``."""
+    return {"history_gaps": history_gaps(ctx), "safety_net": safety_net(ctx)}

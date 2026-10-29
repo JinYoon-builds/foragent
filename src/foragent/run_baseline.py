@@ -5,10 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from datetime import datetime
 from hashlib import sha256
 import json
-from math import isfinite
 import os
 from pathlib import Path
 import re
@@ -24,12 +22,13 @@ from typing import IO, TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
 from foragent import cuts
+from foragent import run_baseline_plugins as resume
+from foragent.run_baseline_plugins import COLLECT_PLUGIN, _with_python_path  # noqa: F401  (re-exported)
 from foragent.git import GitError
-from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
-from foragent.run_checks import (
-    CheckResult, _append, _passing_acceptance_ids, _pytest_command, history_gaps, junit_node_id, safety_net,
-)
+from foragent.run_baseline_limits import load_reusable, record_timeout, repository_limit
+from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
+from foragent.watchdog import history_gaps, safety_net
 from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot, phase_identity, restore_phase
 from foragent.state import StateStore
 
@@ -101,6 +100,8 @@ def _build_baseline(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> Non
                     slot=capacity.hold_test_slot(ctx.config.test_slots),
                     history_gaps=history_gaps(ctx), safety_net=safety_net(ctx)),
                 prepare=lambda: None, wait=lambda acquire: acquire(), build=build, lock=lock,
+                # Locked test_baseline_prebuild (unusable "timeout") forbids caching a timed-out prebuild.
+                record_timeouts=False,
             )
         except Exception as exc:
             # No failure marker is cached: a later tick can reserve the key again.
@@ -119,7 +120,7 @@ def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str])
 
     request = {
         "repo_root": str(ctx.repo_root.resolve()), "store_root": str(ctx.store.root.resolve()),
-        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots,
+        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots, "repo": ctx.config.repo,
         "machine_root": str(capacity.machine_root().resolve()),
         "build": asdict(build),
     }
@@ -148,14 +149,14 @@ def prebuild_acceptance_baseline(ctx: RunContext, target_ref: str, launch: Calla
     log = ctx.store.root / "baseline-build.log"
     build = _baseline_build(ctx, test_command, target_ref, log)
     cache = StateStore(ctx.store.root.parent / "baselines", now=ctx.now)
-    if cache.load_acceptance_baseline(build.key) is not None:
+    if load_reusable(cache, build.key) is not None:
         return
     lock = cache.lock_acceptance_baseline(build.key, blocking=False)
     if lock is None:
         return
     try:
         # A producer may have published between our initial read and reservation.
-        if cache.load_acceptance_baseline(build.key) is not None:
+        if load_reusable(cache, build.key) is not None:
             lock.close()
             return
         append_event(ctx.store, ctx.now(), None, "baseline-build",
@@ -223,7 +224,7 @@ def _premerge_baseline(ctx: RunContext, test_command: str, base_sha: str,
     cache, key = _baseline_cache(ctx, test_command, base_sha, excluded)
     scope = sha256(json.dumps(_baseline_identity(ctx, test_command, base_sha), sort_keys=True).encode()).hexdigest()
     for candidate in [cache.root / f"{key}.json", *sorted(cache.root.glob("*.json"))]:
-        saved = cache.load_acceptance_baseline(candidate.stem)
+        saved = load_reusable(cache, candidate.stem)
         if saved is None or not {"collected_ids", "failing_ids", "excluded"} <= saved.keys():
             continue
         if candidate.stem != key and saved.get("scope") != scope:
@@ -243,38 +244,8 @@ def _saved_baseline(command: str, saved: dict) -> AcceptanceBaseline:
 
 def _baseline_capture_limit(ctx: RunContext, log: Path, remaining: int | None = None) -> int:
     """Use this repository's latest successful capture, even after its cache expires."""
-    latest = None
-    for path in (ctx.store.root.parent / "baselines").glob("*.json"):
-        try:
-            saved = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(saved, dict):
-                continue
-            report = path.with_suffix(".xml")
-            if "repository" in saved:
-                if saved["repository"] != str(ctx.repo_root.resolve()):
-                    continue
-            elif not report.is_file():
-                # Legacy entries lack repository tags; accept companion reports in this shared cache.
-                continue
-            if "duration_seconds" in saved:
-                duration = saved["duration_seconds"]
-            else:
-                junit = ET.parse(report).getroot()
-                suites = [junit] if junit.tag == "testsuite" else junit.findall("testsuite")
-                if junit.tag not in {"testsuite", "testsuites"} or not suites:
-                    continue
-                duration = sum(float(suite.attrib["time"]) for suite in suites)
-            created_at = datetime.fromisoformat(saved["created_at"])
-            if (isinstance(duration, bool) or not isinstance(duration, (int, float))
-                    or not isfinite(duration) or duration < 0 or created_at.tzinfo is None
-                    or created_at > ctx.now()):
-                continue
-            if latest is None or created_at > latest[0]:
-                latest = created_at, duration
-        except (OSError, ValueError, TypeError, KeyError, ET.ParseError):
-            continue
-    limit = 900 if latest is None else int(min(3600, max(900, 2 * latest[1])))
-    reason = "default: no successful capture history" if latest is None else f"last successful capture={latest[1]:g}s"
+    limit, latest = repository_limit(ctx.store.root.parent / "baselines", ctx.repo_root, ctx.config.repo, ctx.now())
+    reason = "default: no successful capture history" if latest is None else f"last successful capture={latest:g}s"
     if remaining is not None:
         limit = min(limit, remaining)
         reason += f", run remaining={remaining}s"
@@ -326,7 +297,7 @@ def _capture_baseline(
     ctx: RunContext, test_command: str | None, target_ref: str, *, log: Path, report: Path,
     check: Callable[[str, Path], CheckResult], prepare: Callable[[], None],
     wait: Callable[[Callable[[], object]], None], required_ids: frozenset[str] | None = None,
-    build: BaselineBuild | None = None, lock: IO[str] | None = None,
+    build: BaselineBuild | None = None, lock: IO[str] | None = None, record_timeouts: bool = True,
 ) -> AcceptanceBaseline | None:
     """Share capture, safety validation and cache identity across runner and premerge."""
     command = _pytest_command(test_command) if test_command else None
@@ -341,19 +312,23 @@ def _capture_baseline(
 
     def save_baseline(node_ids: tuple[str, ...], collected_ids: tuple[str, ...],
                       failing_ids: tuple[str, ...], duration_seconds: float | None = None,
+                      exit_code: int | None = None, timed_out: bool = False,
                       result_gaps: tuple[float, ...] = ()) -> None:
         saved = {
             "node_ids": node_ids, "collected_ids": collected_ids, "failing_ids": failing_ids,
-            "excluded": excluded,
-            "scope": build.scope,
-            "created_at": ctx.now().isoformat(),
+            "excluded": excluded, "scope": build.scope, "created_at": ctx.now().isoformat(),
+            # Tags for `fa orch facts` and the capture limit; the slug is omitted when unknown.
+            **({"repo": ctx.config.repo} if ctx.config.repo else {}),
+            "repository": str(ctx.repo_root.resolve()), "base_sha": base_sha, "exit_code": exit_code,
+            "timed_out": timed_out, **({} if duration_seconds is None else {"duration_seconds": duration_seconds}),
         }
-        if duration_seconds is not None:
-            saved.update(repository=str(ctx.repo_root.resolve()), duration_seconds=duration_seconds)
-            if result_gaps:
-                # The silence window of later checks comes from these measured gaps (#435).
-                saved["result_gaps_seconds"] = list(result_gaps)
-        cache._atomic_write(cached_ids, json.dumps(saved) + "\n")
+        if result_gaps:
+            # The silence window of later checks comes from these measured gaps (#435).
+            saved["result_gaps_seconds"] = list(result_gaps)
+        if timed_out:
+            record_timeout(cache, cached_ids, saved)  # Partial ids; never reused (load_reusable).
+        else:
+            cache._atomic_write(cached_ids, json.dumps(saved) + "\n")
 
     prepare()
     if lock is None:
@@ -368,7 +343,7 @@ def _capture_baseline(
     else:
         ownership = nullcontext(lock)
     with ownership:
-        saved = cache.load_acceptance_baseline(key)
+        saved = load_reusable(cache, key)
         if saved is not None and (required_ids is None or
                                   {"collected_ids", "failing_ids", "excluded"} <= saved.keys()):
             _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
@@ -401,20 +376,13 @@ def _capture_baseline(
                 selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)}"
                 selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
                 # A capture stopped by silence kept the passes it reported; resume after them (#435).
-                retained = _retained_passes(cache, key)
+                retained = resume.retained_passes(cache, key)
                 selection += "".join(f" {shlex.quote('--deselect=' + node)}" for node in retained)
                 baseline_command = (
                     f"{selection} "
                     f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(capture_report))}"
                 )
-                # JUnit is written at session end and the terminal may print only dots, so a
-                # plugin records each pass as it finishes; a silenced capture keeps them (#435).
-                passes = Path(directory) / "passes.jsonl"
-                plugins = Path(directory) / "plugins"
-                plugins.mkdir()
-                plugin = f"_foragent_passes_{secrets.token_hex(8)}"
-                (plugins / f"{plugin}.py").write_text(RESULTS_PLUGIN.format(listing=str(passes)), encoding="utf-8")
-                baseline_command = _with_python_path(f"{baseline_command} -p {plugin}", str(plugins))
+                baseline_command, passes = resume.with_results_plugin(baseline_command, Path(directory))
                 offset = log.stat().st_size if log.exists() else 0
                 started = monotonic()
                 result = check(baseline_command, worktree)
@@ -423,7 +391,7 @@ def _capture_baseline(
                 # Read this execution's collection count from the full log: a long
                 # traceback can push it out of CheckResult's bounded output tail.
                 collected = None
-                cacheable = False
+                cacheable, collected_ids = False, ()
                 try:
                     with log.open(encoding="utf-8", errors="replace") as stream:
                         stream.seek(offset)
@@ -477,14 +445,16 @@ def _capture_baseline(
                     else:
                         report.unlink(missing_ok=True)
                 if result.timed_out and not cacheable:
-                    _retain_passes(cache, key, retained | _reported_passes(capture_report, log, offset)
-                                   | _plugin_passes(passes, worktree), log)
+                    resume.stopped_capture(cache, key, retained, capture_report, log, offset, passes, worktree)
                 if cacheable and retained:
                     node_ids = tuple(sorted(set(node_ids) | retained))
                     collected_ids = tuple(sorted(set(collected_ids) | retained))
                 if cacheable:
-                    save_baseline(node_ids, collected_ids, failing_ids, duration_seconds, result.result_gaps)
-                    _retained_path(cache, key).unlink(missing_ok=True)
+                    save_baseline(node_ids, collected_ids, failing_ids, duration_seconds, result.exit_code,
+                                  result_gaps=result.result_gaps)
+                    resume.retained_path(cache, key).unlink(missing_ok=True)
+                elif result.timed_out and record_timeouts:
+                    save_baseline(node_ids, collected_ids, (), duration_seconds, result.exit_code, timed_out=True)
                 _append(log, f"Acceptance baseline count={len(node_ids)}, exit_code={result.exit_code}, timed_out={result.timed_out}")
                 if not cacheable:
                     raise AttemptFailure(
@@ -494,156 +464,6 @@ def _capture_baseline(
                 return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded), base_sha)
             finally:
                 ctx.git.remove_worktree(worktree)
-
-
-def _retained_path(cache: StateStore, key: str) -> Path:
-    # Not *.json: a partial capture is never a baseline or capture history.
-    return cache.root / f"{key}.partial"
-
-
-def _retained_passes(cache: StateStore, key: str) -> set[str]:
-    try:
-        saved = json.loads(_retained_path(cache, key).read_text(encoding="utf-8"))
-        return {node for node in saved["node_ids"] if isinstance(node, str)}
-    except (OSError, ValueError, TypeError, KeyError):
-        return set()
-
-
-def _retain_passes(cache: StateStore, key: str, passes: set[str], log: Path) -> None:
-    if passes:
-        cache._atomic_write(_retained_path(cache, key), json.dumps({"node_ids": sorted(passes)}) + "\n")
-        _append(log, f"Acceptance baseline kept {len(passes)} reported passes for the next capture")
-
-
-def _reported_passes(report: Path, log: Path, offset: int) -> set[str]:
-    """Passes a stopped capture already reported: its partial JUnit report and streamed results."""
-    passed = set()
-    parser = ET.XMLPullParser(events=("end",))
-    try:
-        parser.feed(report.read_bytes())
-        for _, element in parser.read_events():
-            if (element.tag == "testcase" and (node := junit_node_id(element)) is not None
-                    and not any(element.find(tag) is not None for tag in ("failure", "error", "skipped"))):
-                passed.add(node)
-    except (OSError, ET.ParseError):
-        pass
-    try:
-        with log.open(encoding="utf-8", errors="replace") as stream:
-            stream.seek(offset)
-            for line in stream:
-                # Verbose lines; a parameterized id can contain spaces.
-                if match := re.match(r"(\S.*?::.+?) PASSED(?:\s|$)", line):
-                    passed.add(match[1])
-    except OSError:
-        pass
-    return passed
-
-
-RESULTS_PLUGIN = """\
-import json
-
-_passed, _root = {{}}, None
-
-
-def pytest_configure(config):
-    global _root
-    _root = str(config.rootpath)
-
-
-def pytest_runtest_logreport(report):
-    if report.failed or (report.skipped and report.when == "call"):
-        _passed[report.nodeid] = False
-    elif report.when == "call" and report.passed:
-        _passed.setdefault(report.nodeid, True)
-    if report.when == "teardown" and _passed.pop(report.nodeid, False):
-        with open({listing!r}, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({{"nodeid": report.nodeid, "rootdir": _root}}) + "\\n")
-"""
-
-
-def _plugin_passes(listing: Path, worktree: Path) -> set[str]:
-    """Repository-relative ids the capture's plugin recorded as passed (setup, call and teardown)."""
-    passed = set()
-    try:
-        lines = listing.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return passed
-    for line in lines:
-        try:
-            record = json.loads(line)
-            prefix = Path(record["rootdir"]).resolve().relative_to(worktree.resolve()).as_posix()
-            nodeid = record["nodeid"]
-        except (ValueError, KeyError, TypeError):
-            continue  # A line cut by the stop, or a root outside the checkout.
-        if isinstance(nodeid, str):
-            passed.add(nodeid if prefix == "." else f"{prefix}/{nodeid}")
-    return passed
-
-
-# Written into a throwaway checkout of the new base. It prints nothing, so the
-# configured command's terminal flags (-q, verbosity_test_cases, -p no:terminal)
-# cannot change the listing; the listing path is part of the source, not the environment.
-COLLECT_PLUGIN = """\
-import json
-
-_ids, _errors = [], 0
-
-
-def pytest_collectreport(report):
-    global _errors
-    if report.failed:  # A collection error; an importorskip skip is not one.
-        _errors += 1
-
-
-def pytest_collection_finish(session):
-    _ids[:] = [item.nodeid for item in session.items]
-
-
-def pytest_sessionfinish(session, exitstatus):
-    with open({listing!r}, "w", encoding="utf-8") as stream:
-        json.dump({{"ids": _ids, "errors": _errors, "rootdir": str(session.config.rootpath)}}, stream)
-"""
-def _with_python_path(command: str, directory: str) -> str:
-    """Give only this subprocess ``directory`` on PYTHONPATH, joined with the command's own.
-
-    Inline assignments win over outer ones, so the directory joins every
-    PYTHONPATH assignment before the command and right after an ``env``
-    launcher; without one it is added in front. Assignments keep NAME=
-    unquoted (a quoted 'NAME=v' is run as a command, exit 127).
-    """
-    words = shlex.split(command)
-
-    def assignment(word: str) -> bool:
-        return re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", word, re.S) is not None
-
-    # Positions of the leading assignments and of those right after each `env`.
-    positions: list[int] = []
-    index = 0
-    while True:
-        while index < len(words) and assignment(words[index]):
-            positions.append(index)
-            index += 1
-        if index < len(words) and Path(words[index]).name == "env":
-            index += 1
-            continue
-        break
-    joined = False
-    for position in positions:
-        name, value = words[position].split("=", 1)
-        if name == "PYTHONPATH":
-            words[position] = "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, value]))
-            joined = True
-    if not joined:
-        words.insert(0, "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, os.environ.get("PYTHONPATH")])))
-        positions = [0, *(position + 1 for position in positions)]
-    rendered = []
-    for position, word in enumerate(words):
-        if position in positions:
-            name, value = word.split("=", 1)
-            rendered.append(f"{name}={shlex.quote(value)}")
-        else:
-            rendered.append(shlex.quote(word))
-    return " ".join(rendered)
 
 
 def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
@@ -734,18 +554,6 @@ def log_dropped_ids(log: Path, previous: AcceptanceBaseline, protected: tuple[st
 
 
 if __name__ == "__main__":
-    from datetime import UTC, datetime
-    from types import SimpleNamespace
-    from foragent.config import Config
-    from foragent.git import GitRepo
-    from foragent import capacity
+    from foragent.run_baseline_process import main
 
-    request = json.loads(sys.argv[1])
-    capacity.machine_root = lambda: Path(request["machine_root"])
-    root = Path(request["repo_root"])
-    context = SimpleNamespace(
-        repo_root=root, store=StateStore(Path(request["store_root"])), git=GitRepo(root),
-        config=Config(acceptance_dir=request["acceptance_dir"], test_slots=request["test_slots"]),
-        now=lambda: datetime.now(UTC),
-    )
-    _build_baseline(context, load_record(BaselineBuild, request["build"]), os.fdopen(int(sys.argv[2]), "a"))
+    main(sys.argv)

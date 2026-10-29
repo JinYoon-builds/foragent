@@ -551,6 +551,26 @@ def recorded_tree(identities):
 _quiescent: ContextVar[bool] = ContextVar("quiescent_tree", default=False)
 
 
+def in_quiescent_stop() -> bool:
+    """Inside a stop of a silent tree, with the tick's readable snapshot (#435)."""
+    snapshot = current_snapshot()
+    return _quiescent.get() and snapshot is not None and snapshot.available
+
+
+def targeted_table(pids) -> ProcessTable:
+    """Current identities of ``pids`` by one targeted read each; an unreadable pid is unknown."""
+    rows, unreadable = [], set()
+    for pid in sorted(pids):
+        try:
+            row = read_process_identity(pid)
+        except (OSError, psutil.Error):
+            unreadable.add(pid)
+            continue
+        if row is not None:
+            rows.append(row)
+    return ProcessTable(rows, unreadable)
+
+
 def read_children(pid: int) -> tuple[ProcessIdentity, ...]:
     """Verified identities of ``pid``'s current children, without listing our process table."""
     try:

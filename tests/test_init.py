@@ -10,6 +10,7 @@ import yaml
 
 from foragent.config import ConfigError, load_config
 from foragent.git import GitError, GitRepo
+from foragent.i18n import text
 from foragent.init import init_repo
 from foragent import role_agents, roles
 from foragent.issue import parse_body
@@ -154,6 +155,8 @@ class Setup:
 def setup(tmp_path, monkeypatch):
     # Isolate global config reads as well as all writes from the real home.
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):  # A real key would change detection.
+        monkeypatch.delenv(name, raising=False)
     run = subprocess.run
 
     def offline_tools(argv, *args, **kwargs):
@@ -227,6 +230,51 @@ def test_successful_exit_without_claude_login_is_not_authenticated(setup, monkey
     with pytest.raises(ConfigError, match="No logged-in coding tool"):
         setup.init()
     assert not (setup.root / PATHS[0]).exists() and not setup.tracker.labels
+
+
+def logged_out_claude(monkeypatch, installed=True):
+    run = subprocess.run
+
+    def probe(argv, *args, **kwargs):
+        if argv == ["codex", "login", "status"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="Not logged in")
+        if argv == ["claude", "auth", "status"]:
+            return subprocess.CompletedProcess(argv, 1, stdout='{"loggedIn": false}', stderr="")
+        if argv == ["claude", "--version"]:
+            if not installed:
+                raise FileNotFoundError("claude")
+            return subprocess.CompletedProcess(argv, 0, stdout="2.0.0 (Claude Code)\n", stderr="")
+        return run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", probe)
+
+
+@pytest.mark.parametrize("token,hinted", [(None, True), ("offline-token", False)])
+def test_logged_out_claude_on_an_api_key_or_token_is_available(setup, monkeypatch, token, hinted):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    if token:
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", token)
+    logged_out_claude(monkeypatch)
+    summary = setup.init(language="ko").summary()
+    config = load_config(setup.root)
+    assert config.executor == config.reviewer == "claude"
+    saved = (setup.root / PATHS[0]).read_text()
+    assert "offline" not in saved and "spend_cap" not in saved
+    hints = [line for line in summary.splitlines() if "spend_cap" in line]
+    assert hints == ([text("init_api_key_hint", "ko")] if hinted else [])
+    assert "spend_cap" not in setup.init().summary(), "re-init does not probe tools or repeat the hint"
+
+
+def test_api_key_without_installed_claude_is_not_available(setup, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    logged_out_claude(monkeypatch, installed=False)
+    with pytest.raises(ConfigError, match="No logged-in coding tool"):
+        setup.init()
+
+
+def test_logged_in_claude_with_an_api_key_prints_no_hint(setup, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    assert "spend_cap" not in setup.init().summary()
 
 
 def test_existing_config_does_not_probe_tools_or_change_worker_and_reviewer(setup, monkeypatch):
@@ -515,30 +563,45 @@ def test_not_a_git_worktree_fails_before_auth(tmp_path, monkeypatch):
 @pytest.mark.parametrize("remote", [None, "git@gitlab.com:owner/repo.git", "https://github.com.evil/owner/repo"])
 def test_origin_must_be_github(setup, remote):
     setup.remote = remote
-    with pytest.raises(GitError, match="origin remote on github.com"):
+    with pytest.raises(GitError, match="origin remote on github.com") as raised:
         setup.init()
     assert not (setup.root / PATHS[0]).exists() and setup.gh_calls == []
+    if remote is not None:
+        assert "git remote set-url origin https://github.com/<owner>/<repo>.git" in str(raised.value)
+        assert "git remote add origin" not in str(raised.value)
 
 
 def test_missing_origin_has_clear_error(setup):
     setup.remote = None
     git_command(setup.root, "remote", "remove", "origin")
-    with pytest.raises(GitError, match="origin remote on github.com"):
+    with pytest.raises(GitError, match="origin remote on github.com") as raised:
         setup.init()
+    assert "git remote add origin https://github.com/<owner>/<repo>.git" in str(raised.value)
+    assert "set-url" not in str(raised.value)
 
 
-@pytest.mark.parametrize("error", [
-    subprocess.CalledProcessError(1, ["gh", "auth", "status"], stderr="not logged in"),
-    FileNotFoundError("gh not installed"),
+def test_preflight_fix_follows_requested_language(setup):
+    setup.remote = None
+    git_command(setup.root, "remote", "remove", "origin")
+    with pytest.raises(GitError, match="origin 원격을 추가하세요") as raised:
+        setup.init(language="ko")
+    assert "git remote add origin https://github.com/<owner>/<repo>.git" in str(raised.value)
+
+
+@pytest.mark.parametrize("error,fix,other", [
+    (subprocess.CalledProcessError(1, ["gh", "auth", "status"], stderr="not logged in"),
+     "gh auth login", "brew install gh"),
+    (FileNotFoundError("gh not installed"), "brew install gh", "gh auth login"),
 ])
-def test_auth_precondition_error_changes_nothing(setup, error):
+def test_auth_precondition_error_changes_nothing(setup, error, fix, other):
     def fail(*args, **kwargs):
         raise error
 
     setup.run_gh = fail
-    with pytest.raises(TrackerError, match="gh auth status failed"):
+    with pytest.raises(TrackerError, match="gh auth status failed") as raised:
         setup.init()
     assert not (setup.root / PATHS[0]).exists() and setup.tracker.labels == {}
+    assert fix in str(raised.value) and other not in str(raised.value)
 
 
 def test_empty_authenticated_login_fails(setup):

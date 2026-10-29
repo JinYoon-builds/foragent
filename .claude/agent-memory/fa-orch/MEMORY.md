@@ -173,6 +173,7 @@
 - #225: `orch_scorecard.py`는 `fa orch scorecard`(읽기 전용). 버킷은 `(now-t)//24h`(새 끝 포함). pr-open의 merged_at은 `record_merge`가 finish_run 전에 써야 runs.jsonl에 들어간다. 동사 등록은 `_orch_box` + INBOX_ACTIONS.
 - [#674 SKILL.md line budget](project_674_skill_space.md) — move untested prose to references/, also catch helper-import readers (question_routing)
 - #310: SKILL.md 150줄 상한은 시험이 정규식으로 읽지 않는 설명(watch 세부·주문 카드)을 `references/watch.md`·`order-card.md`로 옮겨 맞췄다. 비교: SKILL을 읽는 인수 16개 파일의 PASSED/FAILED 집합(zsh는 `$(grep -l ...)`로 넘겨야 단어 분리됨).
+- [#189 lane dream](project_189_lane_dream.md) — dream Run records, dream-done event, budget demand, offline-test traps
 - #693: park/unpark 본체는 `orch_park.py`, CLI는 `commands/_orch_park.py`(orch.py run에서 ctx 만든 뒤 분기). 시간 초과는 `parked_at() > since`면 생략. 인수 시험 1은 라벨 제거만으로 통과하므로 경계는 `tests/test_orch_park_unit.py`가 local_issues를 교체해 확인.
 - [#716 role agents](project_716_role_agents.md) — architect prompt/skill split, --agent launches, pstack test pins refactor.md
 - #421: 리뷰 라운드·지적 종류는 `orch_facts_reviews.attach()`. `_freeze`가 `runs/issue-*/review-*.txt`를 `shutil.copy2`로 mtime 보존 복사(실행 귀속 기준). human은 test_orch_facts가 5블록을 강제해 Runs 블록 안에 줄을 넣는다.
@@ -192,7 +193,17 @@
 - 모듈 줄 수: `tests/acceptance/test_cli_split.py`가 `src/foragent/*.py`와 `commands/`에 300줄 상한을 건다(run_*.py는 test_runner_split의 600). orch_facts.py는 상한 근처라 새 기능은 helper 모듈(`orch_facts_reviews.human_lines`)에 둔다.
 - #779 CI 재시도: 선택적 JSONL 기록의 부재는 FileNotFoundError뿐 아니라 상위 경로가 파일인 NotADirectoryError도 포함한다. 공용 `_jsonl`에서 둘만 처리해 brief·scorecard·binding replay를 함께 복구하고 다른 I/O 오류는 유지한다. 회귀·break-it 근거는 project_779_scorecard_flow.md.
 - #814: `run_logged(env=...)`는 부모 환경에 변수를 더한다. Claude 세션 공통 환경은 `executors.CLAUDE_SESSION_ENV`(백그라운드 작업 끔). 실제 전달은 PATH 앞의 가짜 `claude` 스크립트로 시험한다.
+- [#786 ordered executors](project_786_executors.md) — executor_list + executors property, fallback order, spend.jsonl, credits key, codex api held
+- [#541 resource facts](project_541_resource_facts.md) — tick sample file, facts resources, base-compare inside repo
+- [#433 baseline facts](project_433_baseline_facts.md) — shared limit module, membership rule, timeout-JSON vs locked prebuild test, zsh `${=T}`
 - #770: `fa orch role <name> --why`는 `orch_architect.call/run_session(..., role=)`로 일반화했다. 기록 `<name>.json`·잠금 `<name>.lock`·이벤트 `<name>-call/-done`·로그 `logs/<name>-*.log`. 숨은 동사는 `run-architect --role`(기본 architect)을 재사용한다. architect는 기존 PROMPT·문구를 유지하고, 다른 역할은 `ROLE_PROMPT`·`role_*` 문구와 `load_roles(config)` 항목(agent·skills·memory)을 쓴다. Done when의 `-k`는 두 파일 모두에 적용되어 4개만 돈다.
 - #770 리뷰: 아키텍트도 roles 원본에서 agent·skills·memory를 읽어야 한다(`_entry(config, role)`를 모든 역할에 적용). 고정 상수 `SKILL`·`AGENT`·`MEMORY`·`has_agent`는 지웠고 `_procedure()`가 두 프롬프트의 스킬 안내를 공유한다. 회귀 시험 `test_architect_session_reads_agent_skills_and_memory_from_the_roles_source`.
 - #770: `tests/acceptance/test_cli_split.py`가 `src/foragent/*.py`·`commands/**` 모두 300줄(cli.py 150줄) 상한을 건다. 역할 지시문은 `orch_role_prompt.py`로 분리했고 `orch_architect`가 `build_prompt`·`REFACTOR` 등을 재노출한다. 모듈을 키울 때 먼저 `wc -l`로 확인한다.
 - [#435 silence watchdog](project_435_silence_watchdog.md) — watchdog wiring, quiescent snapshot reuse, older fixed-limit tests in QUESTION
+- #772: 역할 신호는 `orch_roles.py`(roles·role-decision), kinds는 `orch_facts_kinds.py`. roles는 kinds 신호가 있을 때만 `orch_facts.collect`를 모듈 속성으로 부른다(인수 시험이 교체·Popen 금지). SKILL.md 끝 줄바꿈 없음: `wc -l` 149가 splitlines 150이다.
+- [#129 blocked push](project_129_blocked_push.md) — orch_push hook after spawn, _push_ready flag, notify-blocked.json re-arm
+- #846: Windows 조기 종료는 `cli.py`의 foragent import 앞 `try: import fcntl`에서 한 줄 출력 후 `SystemExit(1)`. 콘솔 대상은 바꾸지 않는다.
+- #772 재시도: "baseline regression"을 재현할 수 없을 때 runs/issue-N/*check*.log에는 실패 상세가 없다. 시험 중 값 확인은 capsys를 우회하는 `os.write(2, ...)`와 `-s`로 하고, 브랜치가 origin/main을 포함하는지 `git log HEAD..origin/main`으로 먼저 본다.
+- "Acceptance baseline regression (previously passing tests)"는 GitHub `foragent-acceptance` CI(리눅스) 비교 결과다. 상세는 `gh run list --branch foragent/issue-N --workflow foragent-acceptance` 뒤 `gh run view <id> --log`의 "Compare acceptance passing sets" 단계에 있다. #772에서 facts 반복 읽기 시험은 실시간 `os.getloadavg()` 값 차이로 간헐 실패했다(main 원인).
+- #130: 기록 없는 running 라벨의 `reconciled` 이벤트는 `scheduler_reconcile.orphan_crash_detail()`이 대체 crashed 기록보다 먼저 쓰고, 중복은 `orch_events.has_event(..., detail=라벨 세대)`로 판단한다. main의 scheduler_recovery.py(300)·scheduler.py(250)가 이미 상한이라 기존 줄을 바꿔 순증 0줄로 맞췄다. run_publish·run_review·capacity의 상한 초과는 main에서 이미 실패.
+- #158: 오케 스킬 150줄 한도(splitlines 기준, wc보다 1 많음)는 라우팅 표에 한 줄 행을 더하고 세부는 references/settings.md로 맞췄다. zsh는 `$files` 변수를 단어로 나누지 않으니 `fa test`에는 `$(... | tr '\n' ' ')`를 직접 넘긴다.

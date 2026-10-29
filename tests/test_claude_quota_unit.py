@@ -293,14 +293,13 @@ def test_tick_restart_of_kept_codex_run_waits_while_codex_is_paused(ctx):
 
 
 def test_switch_event_is_written_with_the_run_record(ctx):
-    from foragent.scheduler_quota import Snapshot, Switch, switch_journal
+    from foragent.scheduler_quota import Switch, switch_journal
 
     switch = Switch("Claude keep share 90% >= 80%", "switch_reason_keep", {"percent": "90", "keep": 80})
     ctx.store.start_run(1, branch="b", worktree="w", implementer="codex",
                         journal=switch_journal(ctx.store, NOW, 1, switch))
     [event] = [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
     assert event["reason"] == switch.reason and ctx.store.get_run(1).implementer == "codex"
-    assert Snapshot(None, 90.0, "keep").claude_paused is False
 
 
 def test_github_limit_during_start_stores_no_unjournaled_switch_then_next_start_records_it(ctx, monkeypatch):

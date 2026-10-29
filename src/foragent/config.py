@@ -105,11 +105,39 @@ class Config:
     view_glyphs: str = "auto"
     # Foragent presence in Claude Code (#754); each part switches off on its own.
     presence: dict[str, bool] = field(default_factory=lambda: dict(PRESENCE_DEFAULTS))
+    # Ordered executors (#786) exactly as the repository `executors` key wrote them; None when
+    # the key is absent. Only this explicit list is stored; `executors` derives the rest.
+    executor_list: list[dict[str, Any]] | None = None
+
+    @property
+    def executors(self) -> list[dict[str, Any]]:
+        """The ordered executors; the order is the fallback order. Without a repository list,
+        the legacy one derived from executor and claude_quota."""
+        if self.executor_list is not None:
+            return self.executor_list
+        return derived_executors(self.executor, self.claude_quota)
+
+
+def derived_executors(executor: Any, claude_quota: Any) -> list[dict[str, Any]]:
+    """[claude (subscription, keep_percent), codex (subscription)] for claude, else [executor]."""
+    if executor == "claude":
+        keep = claude_quota.get("keep_percent") if isinstance(claude_quota, dict) else None
+        return [{"name": "claude", "quota": "subscription", "keep_percent": keep},
+                {"name": "codex", "quota": "subscription"}]
+    return [{"name": executor, "quota": "subscription"}]
+
+
+def executors_explicit(config: Config) -> bool:
+    """Whether the repository config sets its own executors list."""
+    return config.executor_list is not None
+
 
 
 DEFAULTS: dict[str, Any] = asdict(Config())
 # Retired floors (#497): still accepted in YAML, dropped before Config is built.
 IGNORED_KEYS = frozenset({"test_slots_floor", "parallel_floor"})
+# Keys a settings file may hold that Config stores under another name (#786: executors -> executor_list).
+FILE_KEYS = frozenset({"executors"})
 _REVIEW_LEVELS = {"fast", "batch", "careful"}
 _EXECUTORS = {"codex", "claude"}
 
@@ -391,7 +419,7 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"configuration must be a mapping: {path}")
     for key in value:
-        if key not in DEFAULTS and key not in IGNORED_KEYS:
+        if key not in DEFAULTS and key not in IGNORED_KEYS and key not in FILE_KEYS:
             raise ConfigError(f"unknown configuration key: {key}")
     if "max_parallel" in value and value["max_parallel"] is None:
         raise ConfigError("max_parallel must be a positive integer; omit it to have no ceiling")
@@ -425,11 +453,49 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
     if global_path is None:
         global_path = Path.home() / ".config/foragent/config.yml"
     values = deepcopy(DEFAULTS)
-    if global_path.exists():
-        _overlay(values, _read_yaml(global_path))
-    _overlay(values, _read_yaml(local_path))
+    global_values = _read_yaml(global_path) if global_path.exists() else {}
+    _overlay(values, global_values)
+    local = _read_yaml(local_path)
+    _overlay(values, local)
+    _apply_executors(values, global_values, local)
     _validate(values)
     return Config(**values)
+
+
+def _file_executors(source: dict[str, Any]) -> tuple[bool, Any]:
+    """Whether a settings file sets the executors list, and the list.
+
+    ``executors`` is the key people write. ``executor_list`` is how asdict(config) writes the
+    same setting back: null there means not set, a list means the same as ``executors``.
+    """
+    if "executors" in source and source.get("executor_list") is not None:
+        raise ConfigError("set executors only once; executor_list is the written-back form of executors")
+    if "executors" in source:
+        if source["executors"] is None:
+            raise ConfigError("executors must be a nonempty list of {name, quota} entries")
+        return True, source["executors"]
+    listed = source.get("executor_list")
+    return listed is not None, listed
+
+
+def _apply_executors(values: dict[str, Any], global_values: dict[str, Any], local: dict[str, Any]) -> None:
+    """The repository executors list sets the default executor; only the repository may set it."""
+    values.pop("executors", None)  # _overlay copied the file key; Config stores executor_list.
+    if _file_executors(global_values)[0]:
+        raise ConfigError("executors may be set only in the repository .foragent.yml, not the global config")
+    values["executor_list"] = None
+    present, entries = _file_executors(local)
+    if not present:
+        return
+    if "claude_quota" in local:
+        raise ConfigError("set either executors or claude_quota in .foragent.yml, not both")
+    values["executor_list"] = entries
+    if not isinstance(entries, list) or not entries or not isinstance(entries[0], dict):
+        return  # _validate names the shape error.
+    first = entries[0].get("name")
+    if "executor" in local and local["executor"] != first:
+        raise ConfigError(f"executor must be absent or equal to the first executors entry ({first})")
+    values["executor"] = first
 
 
 # Built from the local checkout once per command; origin's copy cannot move them.
@@ -452,9 +518,10 @@ def load_committed_config(local: Config, content: str | None, source: str,
     try:
         committed = _parse_yaml(content, source)
         values = deepcopy(DEFAULTS)
-        if global_path.exists():
-            _overlay(values, _read_yaml(global_path))
+        global_values = _read_yaml(global_path) if global_path.exists() else {}
+        _overlay(values, global_values)
         _overlay(values, committed)
+        _apply_executors(values, global_values, committed)
         # A language change is not a conflict worth a warning; repo and base_branch are.
         ignored = [key for key in ("repo", "base_branch") if key in committed and values[key] != getattr(local, key)]
         values.update({key: getattr(local, key) for key in LOCAL_ONLY_KEYS})
@@ -487,8 +554,9 @@ def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
 def load_global_config(global_path: Path | None = None) -> Config:
     path = global_path or Path.home() / ".config/foragent/config.yml"
     values = deepcopy(DEFAULTS)
-    if path.exists():
-        _overlay(values, _read_yaml(path))
+    global_values = _read_yaml(path) if path.exists() else {}
+    _overlay(values, global_values)
+    _apply_executors(values, global_values, {})
     _validate(values)
     return Config(**values)
 

@@ -1,5 +1,7 @@
-"""Claude plan share (#107): keep mode starts new runs with Codex once Claude passes keep_percent;
-Claude paused at its hard limit moves every Claude role of a new run to Codex in either mode.
+"""Executor admission (#107, #786): a start takes the first executor in the configured order
+that can run. keep_percent moves on at a share, a hard limit moves on unless a spend_cap
+allows credits, and an api executor stops at its daily spend_cap. ``fa quota mode burn``
+turns off Claude's keep_percent only.
 
 `fa quota mode` is the only writer of ``<state>/claude-quota.json``; the tick only reads it.
 The tick writes a run's ``implementer`` once, when it starts the run.
@@ -10,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
+import os
 from typing import TYPE_CHECKING, NamedTuple
 
 from foragent.config import Config, resolved_reviewer
@@ -19,18 +22,30 @@ if TYPE_CHECKING:
 
 
 def quota_mode(store: StateStore, config: Config) -> tuple[str, str]:
-    """The effective mode and its source: ``local`` (fa quota mode) or ``config``."""
+    """The effective mode and its source: ``local`` (fa quota mode) or ``config``.
+
+    A repository executors list ignores claude_quota; there keep_percent alone decides.
+    """
+    from foragent.config import executors_explicit
+
     local = store.claude_quota_mode()
-    return (local, "local") if local is not None else (config.claude_quota["mode"], "config")
+    if local is not None:
+        return local, "local"
+    return ("keep" if executors_explicit(config) else config.claude_quota["mode"]), "config"
 
 
-def claude_percent(store: StateStore, now: datetime | None = None) -> float | None:
-    """The highest Claude window whose reset is still ahead; None when none is known."""
-    now = now or store._now()
+def _usage(store: StateStore) -> dict:
     try:
-        windows = store.usage().get("claude", {}).get("windows", [])
+        usage = store.usage()
     except (OSError, ValueError, AttributeError):
-        return None
+        return {}
+    return usage if isinstance(usage, dict) else {}
+
+
+def _percent(usage: dict, name: str, now: datetime) -> float | None:
+    """The highest window of ``name`` whose reset is still ahead; None when none is known."""
+    record = usage.get(name)
+    windows = record.get("windows", []) if isinstance(record, dict) else []
     found = []
     for window in windows if isinstance(windows, list) else ():
         if not isinstance(window, dict):
@@ -47,6 +62,11 @@ def claude_percent(store: StateStore, now: datetime | None = None) -> float | No
     return max(found, default=None)
 
 
+def claude_percent(store: StateStore, now: datetime | None = None) -> float | None:
+    """The highest Claude window whose reset is still ahead; None when none is known."""
+    return _percent(_usage(store), "claude", now or store._now())
+
+
 def claude_allowed(store: StateStore, config: Config, now: datetime | None = None) -> bool:
     """False in keep mode while a current Claude window is at or above keep_percent."""
     if quota_mode(store, config)[0] == "burn":
@@ -55,9 +75,13 @@ def claude_allowed(store: StateStore, config: Config, now: datetime | None = Non
     return percent is None or percent < config.claude_quota["keep_percent"]
 
 
+def label(name: str) -> str:
+    return {"claude": "Claude", "codex": "Codex"}.get(name, name)
+
+
 @dataclass(frozen=True)
 class Switch:
-    """Why one start uses Codex instead of Claude.
+    """Why one start uses ``target`` instead of ``source``.
 
     ``reason`` is the fixed English machine reason kept in the event; ``key`` and
     ``values`` render it for a person through the messages registry.
@@ -66,67 +90,88 @@ class Switch:
     reason: str
     key: str
     values: dict
+    source: str = "claude"
+    target: str = "codex"
 
 
-@dataclass(frozen=True)
-class Snapshot:
-    """Claude's pause, share and mode, each read once for one start decision."""
-
-    claude_until: datetime | None
-    percent: float | None
-    mode: str
-
-    @classmethod
-    def read(cls, store: StateStore, config: Config, now: datetime) -> Snapshot:
-        return cls(store.executor_pause_until("claude", now), claude_percent(store, now), quota_mode(store, config)[0])
-
-    @property
-    def claude_paused(self) -> bool:
-        return self.claude_until is not None
-
-    def paused(self, store: StateStore, name: str, now: datetime) -> bool:
-        return self.claude_paused if name == "claude" else store.executor_paused(name, now)
+# Only these executors' runs report a cost, so only they can spend through an api quota.
+MEASURED = frozenset({"claude"})
 
 
-def switch_for(config: Config, snap: Snapshot) -> Switch | None:
-    """The switch a start on this lane-adjusted ``config`` takes, from one snapshot.
+def api_key_billing() -> bool:
+    """Whether Claude runs started by this process bill the API (#889): derived from the
+    gate's own environment, never stored. An OAuth token keeps Claude on its subscription."""
+    return bool(os.environ.get("ANTHROPIC_API_KEY")) and not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
 
-    Claude paused at its hard limit switches in keep and burn mode alike; keep mode
-    also switches once a current Claude window reaches keep_percent.
+
+def billed(entry: dict) -> dict:
+    """``entry`` as it bills now: under an API key Claude is api, capped only by its own spend_cap."""
+    if entry["name"] == "claude" and api_key_billing():
+        return {**entry, "quota": "api"}
+    return entry
+
+
+def fallback_order(config: Config) -> list[dict]:
+    """The lane-adjusted executor first, then the configured order, wrapping around (#786).
+
+    A lane executor missing from the list uses only that executor, as before the list existed.
     """
-    if config.executor != "claude":
-        return None
-    if snap.claude_until is not None:
-        until = snap.claude_until.isoformat()
-        return Switch(f"Claude paused at its limit until {until}", "switch_reason_limit", {"until": until})
-    keep = config.claude_quota["keep_percent"]
-    if snap.mode == "burn" or snap.percent is None or snap.percent < keep:
-        return None
-    percent = f"{snap.percent:g}"
-    return Switch(f"Claude keep share {percent}% >= {keep}%", "switch_reason_keep", {"percent": percent, "keep": keep})
+    entries = [billed(dict(entry)) for entry in config.executors]
+    names = [entry["name"] for entry in entries]
+    if config.executor not in names:
+        return [billed({"name": config.executor, "quota": "subscription"})]
+    index = names.index(config.executor)
+    return entries[index:] + entries[:index]
 
 
-def switched_config(config: Config, implementer: str | None, claude_paused: bool = False) -> Config:
-    """A lane-adjusted config with the run's stored implementer and Claude's hard-limit fallback.
+def entry_for(config: Config, name: str) -> dict:
+    """``name``'s executors entry as it bills now; an unlisted executor counts as a plain subscription."""
+    return billed(next((dict(entry) for entry in config.executors if entry["name"] == name),
+                       {"name": name, "quota": "subscription"}))
 
-    ``implementer`` None keeps the lane's executor. A switched run's reviewer is Claude
-    (cross-model) unless it is pinned to ``none``. While Claude is paused at its hard
-    limit, every role Claude would fill moves to Codex: the implementer through the
-    stored choice, the reviewer here, whichever executor the lane configures.
+
+def blocked(entry: dict, store: StateStore, now: datetime, usage: dict, mode: str,
+            keep: bool = True) -> tuple[Switch | None, bool]:
+    """Why ``entry`` cannot run now (None when it can), and whether a hard limit without a cap holds it.
+
+    A reached daily spend_cap counts as a pause until the next UTC day, whatever else is paused.
+    ``keep=False`` skips keep_percent, which only moves implementers.
     """
-    previous = resolved_reviewer(config)
-    executor = implementer if implementer is not None else config.executor
-    reviewer = previous if executor == config.executor else ("none" if previous == "none" else "claude")
-    if claude_paused and reviewer == "claude":
-        reviewer = "codex"
-    if executor == config.executor and reviewer == previous:
-        return config
-    same = executor == config.executor
-    return replace(
-        config, executor=executor, executor_model=config.executor_model if same else None,
-        executor_fallback_model=config.executor_fallback_model if same else None, reviewer=reviewer,
-        reviewer_model=config.reviewer_model if reviewer == previous else None,
-    )
+    name, quota, cap = entry["name"], entry.get("quota", "subscription"), entry.get("spend_cap")
+    if quota == "api" and name not in MEASURED:  # A cap that is never measured cannot hold spending back.
+        return Switch(f"{label(name)} reports no cost, so its api spend cannot be measured against spend_cap",
+                      "switch_reason_unmeasured", {"name": label(name)}, name), False
+    if quota == "api" and cap is None:  # Only an API key makes this (#889): no spend without a cap.
+        return Switch(f"{label(name)} bills the API through ANTHROPIC_API_KEY and has no spend_cap; "
+                      "set a spend_cap in its executors entry to allow it",
+                      "switch_reason_uncapped", {"name": label(name)}, name), False
+    spent = store.spend_today(name, now) if cap is not None else 0.0
+    if cap is not None and spent >= cap:
+        return Switch(f"{label(name)} spent {spent:g} of its daily cap {cap:g}", "switch_reason_cap",
+                      {"name": label(name), "spent": f"{spent:g}", "cap": f"{cap:g}"}, name), False
+    until = store.executor_pause_until(name, now)
+    if until is not None and not (quota == "subscription" and cap is not None):
+        # Past a subscription limit only credits under a cap run; others wait for the reset.
+        return Switch(f"{label(name)} paused at its limit until {until.isoformat()}", "switch_reason_limit",
+                      {"name": label(name), "until": until.isoformat()}, name), quota == "subscription"
+    if until is not None or quota != "subscription" or not keep:
+        return None, False
+    percent = _percent(usage, name, now)
+    share = None if name == "claude" and mode == "burn" else entry.get("keep_percent")
+    if share is None or percent is None or percent < share:
+        return None, False
+    shown = f"{percent:g}"
+    return Switch(f"{label(name)} keep share {shown}% >= {share}%", "switch_reason_keep",
+                  {"name": label(name), "percent": shown, "keep": share}, name), False
+
+
+def credits(store: StateStore, config: Config, name: str, now: datetime) -> bool:
+    """Whether a session of ``name`` launched now spends money: an api executor, or
+    credits past a subscription hard-limit pause under a spend_cap."""
+    entry = entry_for(config, name)
+    if entry.get("spend_cap") is None:
+        return False
+    return entry.get("quota") == "api" or store.executor_paused(name, now)
 
 
 # A new run record after one of these continues the same run (as ``restarts`` counts it).
@@ -146,28 +191,67 @@ class Start(NamedTuple):
     implementer: str | None
     switch: Switch | None
     held: bool
+    reason: str | None = None  # Why the start waits, in the executor-wait words; None when it starts.
 
 
 def decide(store: StateStore, config: Config, lane: str, now: datetime, number: int | None = None) -> Start:
-    """Decide a gate start from one snapshot; ``number`` lets a continued run keep its implementer."""
+    """Decide a gate start from one usage read; ``number`` lets a continued run keep its implementer.
+
+    The first executor in the lane's fallback order that can run implements. When none can,
+    the start waits with the first executor's reason, and each subscription executor whose
+    hard limit (without a spend_cap) holds it records one credits question, once ever.
+    """
+    from foragent.config import lane_executors
     from foragent.run_implementation import lane_config
 
-    snap = Snapshot.read(store, config, now)
     adjusted = lane_config(config, lane)
+    usage, mode = _usage(store), quota_mode(store, config)[0]
+    order = fallback_order(adjusted)
     kept = kept_implementer(store, number) if number is not None else None
-    switch = None if kept is not None else switch_for(adjusted, snap)
-    implementer = kept if kept is not None else ("codex" if switch is not None else None)
-    run_config = switched_config(adjusted, implementer, snap.claude_paused)
-    held = any(snap.paused(store, name, now) for name in {run_config.executor, resolved_reviewer(run_config)})
-    if not held and store.lane_paused(lane, now):
-        # A lane pause mirrors a limit of the lane's configured pair. A Claude-caused one does
-        # not hold the start: every Claude role of this run already moved to Codex, which is free.
-        # The pause itself stays in place.
-        from foragent.config import lane_executors
+    if kept is not None:
+        order = [next((entry for entry in order if entry["name"] == kept), entry_for(adjusted, kept))]  # Billed as listed ones.
+    switch, chosen, asks = None, None, []
+    for entry in order:
+        # A continued run (crashed, stalled-restart, limit-wait) keeps its implementer: only a hard
+        # limit, cap or unmeasured spend holds it, never keep_percent, as #107 continuations did.
+        why, ask = blocked(entry, store, now, usage, mode, keep=kept is None)
+        if why is None:
+            chosen = entry["name"]
+            break
+        switch = switch or why
+        if ask:
+            asks.append(entry["name"])
+    if chosen is None:
+        for name in asks:
+            _ask_credits(store, config, name)
+        return Start(adjusted, kept, None, True, switch.reason)
+    implementer = kept if kept is not None else (None if chosen == adjusted.executor else chosen)
+    switch = replace(switch, target=chosen) if kept is None and implementer is not None else None
+    chosen_config = run_config(store, adjusted, implementer, now)
+    reason = None
+    reviewer = resolved_reviewer(chosen_config)
+    if chosen_config.executor == adjusted.executor and reviewer != "none":
+        # Today's rule: a run on its own executor waits for its reviewer; a fallback never does.
+        why, ask = blocked(entry_for(adjusted, reviewer), store, now, usage, mode, keep=False)
+        reason = why and why.reason
+        if ask:  # The reviewer's hard limit holds this start: its one credits question.
+            _ask_credits(store, config, reviewer)
+    if reason is None and store.lane_paused(lane, now) and not any(
+            store.executor_paused(name, now) for name in lane_executors(config, lane)):
+        # A lane pause mirrors a limit of the lane's configured pair. One caused by an executor
+        # this run no longer needs does not hold it; the pause itself stays in place.
+        reason = f"lane {lane} is paused"
+    return Start(chosen_config, implementer, switch, reason is not None, reason)
 
-        claude_caused = snap.claude_paused and "claude" in lane_executors(config, lane)
-        held = not (claude_caused and "claude" not in {run_config.executor, resolved_reviewer(run_config)})
-    return Start(run_config, implementer, switch, held)
+
+def _ask_credits(store: StateStore, config: Config, name: str) -> None:
+    """The one credits question for ``name``; the person's answer only records their choice."""
+    from foragent.i18n import text
+    from foragent.orch_inbox import ask_once
+
+    language = config.language
+    ask_once(store, f"credits:{name}", text("credits_question", language, name=label(name)),
+             [text("credits_wait", language), text("credits_allow", language)], 1)
 
 
 def run_start(store: StateStore, config: Config, lane: str, number: int,
@@ -185,12 +269,19 @@ def switch_journal(store: StateStore, now: datetime, number: int, switch: Switch
     from foragent.orch_events import append_event
 
     return lambda: append_event(store, now, number, "executor-switch",
-                                f"#{number} implementer claude -> codex: {switch.reason}", locked=True,
-                                **{"from": "claude", "to": "codex", "reason": switch.reason})
+                                f"#{number} implementer {switch.source} -> {switch.target}: {switch.reason}",
+                                locked=True, **{"from": switch.source, "to": switch.target, "reason": switch.reason})
 
 
 def switch_line(number: int, switch: Switch, language: str) -> str:
     """The tick report line for a switch, in the repository's language."""
     from foragent.i18n import text
 
-    return text("executor_switch", language, number=number, reason=text(switch.key, language, **switch.values))
+    reason = text(switch.key, language, **{"name": label(switch.source), **switch.values})
+    return text("executor_switch", language, number=number, source=label(switch.source),
+                target=label(switch.target), reason=reason)
+
+
+# Split out to stay under the module line limit; re-exported so callers keep their imports.
+from foragent.quota_reviewer import can_review, choose_reviewer, run_config, switched_config  # noqa: E402,F401
+from foragent.quota_spend import record_cost  # noqa: E402,F401

@@ -30,6 +30,8 @@ class StateLocksMixin:
         """Read a complete, unexpired baseline; old passing-only entries remain usable."""
         try:
             saved = _state.json.loads((self.root / f"{key}.json").read_text(encoding="utf-8"))
+            if isinstance(saved, dict) and saved.get("timed_out") is True:
+                return None  # A timed-out capture's history (#433) is incomplete, not a baseline (#435).
             age = self._now() - _state.datetime.fromisoformat(saved["created_at"])
             if not _state.timedelta() <= age < _state.timedelta(hours=6):
                 return None

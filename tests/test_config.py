@@ -38,6 +38,7 @@ def test_exact_defaults(repo):
         "upstream_reports": None, "perspectives": {}, "claude_quota": {"mode": "keep", "keep_percent": 80},
         "view_glyphs": "auto",
         "presence": {"statusline": True, "session_start": True, "report": True},
+        "executor_list": None,  # No repository executors list (#786).
         "skill_roles": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 import json
 import logging
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from foragent import board, gh, launchd, role_agents, roles
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
+from foragent.i18n import text
 from foragent.labels import LABELS
 from foragent.order import detect_test_commands
 from foragent.tracker import GhTracker, Tracker, TrackerError
@@ -86,6 +88,9 @@ class InitReport:
     board_id: str | None = None
     board_planned: bool = False
     removed: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    # The tracker setup used; fa init reuses it to look up starter-order facts.
+    tracker: object = field(default=None, repr=False, compare=False)
 
     def summary(self) -> str:
         lines = ["Foragent setup plan:" if self.dry_run else "Foragent setup:"]
@@ -108,6 +113,7 @@ class InitReport:
             lines.append("Would install launchd job.")
         elif self.launchd_label:
             lines.append(f"launchd installed: {self.launchd_label}")
+        lines.extend(self.notes)
         return "\n".join(lines)
 
 
@@ -178,6 +184,32 @@ def _logged_in(tool: str) -> bool:
     return isinstance(status, dict) and status.get("loggedIn") is True
 
 
+def _claude_installed() -> bool:
+    try:
+        result = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _claude_by_env() -> str | None:
+    """How an installed, logged-out Claude Code still runs (#889): ``oauth`` (a token, subscription)
+    before ``api`` (ANTHROPIC_API_KEY, billed); None otherwise. The key itself is never read."""
+    kind = ("oauth" if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            else "api" if os.environ.get("ANTHROPIC_API_KEY") else None)
+    return kind if kind is not None and _claude_installed() else None
+
+
+def _preflight_language(root: Path, language: str | None) -> str:
+    """Language for errors raised before setup: the flag, else the existing config, else English."""
+    if language is not None:
+        return language
+    try:
+        return load_config(root).language if (root / ".foragent.yml").exists() else "en"
+    except (ConfigError, OSError):
+        return "en"
+
+
 def init_repo(
     repo_root: Path, *, approvers: list[str] | None = None, review: str | None = None,
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
@@ -196,12 +228,22 @@ def init_repo(
     if normalized_root is not None:
         root = top_level
         git = git.at(root)
+    preflight_language = _preflight_language(root, language)
     try:
         repo = git.remote_slug()
     except GitError as exc:
-        raise GitError(f"init requires an origin remote on github.com: {exc}") from exc
+        # A failed `git remote get-url` (non-zero exit) means no origin; a readable url that
+        # the remote parser rejects means origin is not GitHub.
+        key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
+        raise GitError(text(key, preflight_language, error=exc)) from exc
     run = gh_run or _run_gh
-    _gh_call(run, ["auth", "status"])
+    try:
+        run(["auth", "status"], input=None)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # OSError: gh cannot be started (not installed); non-zero exit: not logged in.
+        message = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+        key = "init_gh_logged_out" if isinstance(exc, subprocess.CalledProcessError) else "init_gh_missing"
+        raise TrackerError(text(key, preflight_language, error=(message or str(exc)).strip())) from exc
 
     config_path = root / ".foragent.yml"
     contents = {".github/ISSUE_TEMPLATE/foragent-task.md": ISSUE_TEMPLATE}
@@ -209,6 +251,7 @@ def init_repo(
     added = {}
     updated_config = None
     role_source = None
+    notes: list[str] = []
     if config_path.exists():
         config = load_config(root)
         base_branch = config.base_branch
@@ -237,6 +280,8 @@ def init_repo(
     else:
         codex_available = _logged_in("codex")
         claude_available = _logged_in("claude")
+        claude_env = None if claude_available else _claude_by_env()
+        claude_available = claude_available or claude_env is not None
         if not codex_available and not claude_available:
             raise ConfigError("No logged-in coding tool found; log in to Claude Code or Codex and retry.")
         if executor is None and not codex_available:
@@ -265,6 +310,8 @@ def init_repo(
             _validate({**asdict(config), "claude_quota": {**config.claude_quota, "mode": claude_quota}})
             config = replace(config, claude_quota={**config.claude_quota, "mode": claude_quota})
         contents = {".foragent.yml": CONFIG_COMMENT + yaml.safe_dump(minimal, sort_keys=False), **contents}
+        if claude_env == "api":  # The key makes Claude available; spending stays the person's choice.
+            notes.append(text("init_api_key_hint", config.language))
     if config.checks == "ci":
         contents[WORKFLOW] = workflow_text(config)
     if not (root / "tests/acceptance").exists():
@@ -308,7 +355,7 @@ def init_repo(
         return InitReport(created, existed, True, push_planned=push_planned or (board_change and not no_push),
                           commit_planned=bool(pending) or board_change, launchd_planned=not no_launchd,
                           normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_planned=board_planned,
-                          removed=removed)
+                          removed=removed, notes=notes)
 
     # GhTracker counts its own attempts; its default runner must not count them again.
     tracker = tracker or GhTracker(repo, run=gh_run)
@@ -373,4 +420,5 @@ def init_repo(
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     return InitReport(created, existed, False, bool(pending), push_planned, label,
-                      normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed)
+                      normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
+                      notes=notes, tracker=tracker)

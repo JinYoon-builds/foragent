@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from foragent import processes, run_baseline, scheduler  # noqa: F401  (scheduler first, as production imports it)
+from foragent import processes, run_baseline, run_baseline_plugins, scheduler  # noqa: F401  (scheduler first, as production imports it)
 from foragent import scheduler_recovery, scheduler_silence
 from foragent.config import Config
 from foragent.run_waits import _remaining
@@ -108,12 +108,12 @@ def test_results_plugin_records_passes_without_verbose_output(tmp_path):
     )
     plugins, listing = tmp_path / "plugins", tmp_path / "passes.jsonl"
     plugins.mkdir()
-    (plugins / "_foragent_passes_test.py").write_text(run_baseline.RESULTS_PLUGIN.format(listing=str(listing)))
+    (plugins / "_foragent_passes_test.py").write_text(run_baseline_plugins.RESULTS_PLUGIN.format(listing=str(listing)))
     command = run_baseline._with_python_path(
         f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider tests -p _foragent_passes_test",
         str(plugins))
     subprocess.run(["/bin/sh", "-c", command], cwd=project, capture_output=True, check=False)
-    assert run_baseline._plugin_passes(listing, project) == {
+    assert run_baseline_plugins._plugin_passes(listing, project) == {
         "tests/test_a.py::test_pass", "tests/test_a.py::test_param[a b]",
     }
 
@@ -122,7 +122,7 @@ def test_streamed_verbose_line_keeps_ids_with_spaces(tmp_path):
     log = tmp_path / "log"
     log.write_text("tests/test_a.py::test_param[a b] PASSED            [ 50%]\n"
                    "tests/test_a.py::test_other FAILED\n")
-    assert run_baseline._reported_passes(tmp_path / "missing.xml", log, 0) == {"tests/test_a.py::test_param[a b]"}
+    assert run_baseline_plugins._reported_passes(tmp_path / "missing.xml", log, 0) == {"tests/test_a.py::test_param[a b]"}
 
 
 # Fixed deadline: max_runtime_minutes never bounds a run's own budget.
@@ -147,7 +147,7 @@ def test_watchdog_stop_restarts_even_after_an_earlier_stall(monkeypatch, decisio
     monkeypatch.setattr(scheduler_silence, "_log", lambda *args: calls.append(("log", args[3])))
     fact = SilenceWatchdog().observe(now=0, output_bytes=0, progress_events=0, snapshot=(), identities=())
     fact = replace(fact, stop=True, decision=decision)
-    run = SimpleNamespace(number=7, restarts=1)
+    run = SimpleNamespace(number=7, key=7, kind="issue", restarts=1)
     assert scheduler_silence.stop(object(), run, SimpleNamespace(actions=[]), fact, past_limit=False, wake_grace=False)
     kill = calls[0][1]
     assert kill["outcome"] == "stalled-restart" and kill["count_restart"] is False
@@ -158,12 +158,16 @@ def test_watchdog_stop_restarts_even_after_an_earlier_stall(monkeypatch, decisio
 def test_interrupted_watchdog_stop_finishes_as_restart(monkeypatch):
     restored = []
     finished = SimpleNamespace(outcome="stalled-restart", restarts=3)
-    store = SimpleNamespace(finish_run=lambda *args, **kwargs: finished, update_run=lambda *a, **k: None)
+    run = SimpleNamespace(number=7, key=7, kind="issue", lane=None, status="running", pid=None,
+                          process_identities=[], last_progress_at=None, outcome="stalled-restart",
+                          executor_pgid=None, worktree="/w", detail="")
+    store = SimpleNamespace(finish_run=lambda *args, **kwargs: finished, update_run=lambda *a, **k: None,
+                            get_run=lambda key: run)
     ctx = SimpleNamespace(store=store)
     monkeypatch.setattr(scheduler_recovery.scheduler, "_remove_run_worktree", lambda *args, **kwargs: None)
     monkeypatch.setattr(scheduler_recovery.scheduler, "_restore_stalled",
                         lambda ctx, number, restarts, report: restored.append(restarts))
-    run = SimpleNamespace(number=7, outcome="stalled-restart", executor_pgid=None, worktree="/w", detail="")
+
     scheduler_recovery._finish_dead_run(ctx, run, SimpleNamespace(actions=[]))
     assert restored == [1]
 
@@ -208,3 +212,26 @@ def test_waiting_loops_keep_the_configured_runtime_bound():
     assert _remaining(1, ctx) > 24 * 3600, "Only waiting is bounded; progressing work is not"
     ctx.config = Config()
     assert _wait_remaining(1, ctx) == _remaining(1, ctx)
+
+
+# A dream run shares the stop path by record key: it ends as error and touches no labels.
+@pytest.mark.parametrize("decision", ["safety-net", "silent"])
+def test_watchdog_stop_of_a_dream_ends_as_error_without_labels(monkeypatch, decision):
+    calls = []
+    monkeypatch.setattr(scheduler_recovery.scheduler, "_kill_run",
+                        lambda ctx, key, report, **kwargs: calls.append(("kill", key, kwargs)) or True)
+    monkeypatch.setattr(scheduler_recovery.scheduler, "_restore_stalled",
+                        lambda *args: calls.append(("restore",)))
+    monkeypatch.setattr(scheduler_recovery.scheduler, "append_event",
+                        lambda store, at, number, kind, summary, **facts: calls.append(("event", number, kind)))
+    fact = SilenceWatchdog().observe(now=0, output_bytes=0, progress_events=0, snapshot=(), identities=())
+    fact = replace(fact, stop=True, decision=decision)
+    run = SimpleNamespace(number=0, key="dream-orch", kind="dream", lane="orch", restarts=0)
+    ctx = SimpleNamespace(store=None, now=lambda: datetime(2026, 10, 29, tzinfo=UTC))
+    assert scheduler_silence.stop(ctx, run, SimpleNamespace(actions=[]), fact, past_limit=False, wake_grace=False)
+    kill = calls[0]
+    assert kill[1] == "dream-orch" and kill[2]["outcome"] == "error" and kill[2]["count_stall"] is False
+    assert kill[2]["decided"] is run
+    assert ("restore",) not in calls
+    assert [call for call in calls if call[0] == "event"] == [
+        ("event", None, "safety-net" if decision == "safety-net" else "silence-stop")]
