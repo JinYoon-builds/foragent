@@ -119,58 +119,6 @@ def _required(result: subprocess.CompletedProcess[bytes], what: str) -> bytes:
     return result.stdout
 
 
-def _name_status(output: bytes) -> set[bytes]:
-    """Every path in `--name-status -z` output; renames and copies give both paths."""
-    tokens = output.split(b"\0")
-    paths: set[bytes] = set()
-    i = 0
-    while i < len(tokens) and tokens[i]:
-        count = 2 if tokens[i][:1] in (b"R", b"C") else 1
-        paths.update(tokens[i + 1:i + 1 + count])
-        i += 1 + count
-    return paths
-
-
-def _status_paths(output: bytes) -> set[bytes]:
-    """Every path in `status --porcelain=v2 -z`: changed, renamed (both), unmerged, untracked, ignored."""
-    tokens = output.split(b"\0")
-    paths: set[bytes] = set()
-    i = 0
-    while i < len(tokens):
-        record = tokens[i]
-        i += 1
-        if record[:2] in (b"? ", b"! "):
-            paths.add(record[2:])
-        elif record[:2] == b"1 ":
-            paths.add(record.split(b" ", 8)[8])
-        elif record[:2] == b"2 ":
-            paths.add(record.split(b" ", 9)[9])
-            paths.add(tokens[i])  # the rename's original path
-            i += 1
-        elif record[:2] == b"u ":
-            paths.add(record.split(b" ", 10)[10])
-    return paths
-
-
-def measured_changes(git: GitRepo, base: str) -> set[bytes]:
-    """Paths the head publishes or the checks can load, read without touching any index.
-
-    Committed: the tree diff between the merge base and HEAD. Uncommitted: the
-    staged diff against HEAD (which also shows paths the runner unstaged, such
-    as .foragent/) and every worktree entry Git reports, including force-added,
-    untracked and pattern-ignored files. Ignored directories count as one entry,
-    so environments such as .venv/ do not expand into their contents.
-    """
-    # --no-renames lists a rename as its deletion and addition (both paths)
-    # without reading blobs, so an unreadable blob is judged, not an error.
-    committed = _required(_git(git, ["diff", "--name-status", "-z", "--no-renames", base, "HEAD"]), "diff")
-    staged = _required(_git(git, ["diff", "--cached", "--name-status", "-z", "--no-renames", "HEAD"]),
-                       "diff --cached")
-    status = _required(_git(git, ["status", "--porcelain=v2", "-z", "--untracked-files=all",
-                                  "--ignored=matching", "--no-renames"]), "status")
-    return _name_status(committed) | _name_status(staged) | _status_paths(status)
-
-
 def _tree_side(git: GitRepo, rev: str, raw: bytes) -> object:
     """A committed entry: (Git mode, bytes) for a file or symlink, None when absent, else _NOT_A_FILE."""
     listing = _required(_git(git, ["--literal-pathspecs", "ls-tree", "-z", rev, "--", os.fsdecode(raw)]),
@@ -327,16 +275,79 @@ def _recorded_modes(git: GitRepo, raw: bytes) -> list[bytes]:
     return modes
 
 
-def _index_entries(git: GitRepo, raw: bytes) -> list[object]:
-    """Index entries at a path that the worktree cannot show, read without changing the index.
+# Directories the walk and the tree listings leave out, by exact name bytes at
+# any depth: Git's own data, runner scratch, virtualenvs and tool caches.
+SKIP_DIRS = frozenset({b".git", b".venv", b"venv", b".uv-cache", b".tox", b"node_modules", b".foragent",
+                       b"__pycache__"})
+_TRACKED_NAMES = _HARNESS_NAMES_RAW | {b"pyproject.toml"}
 
-    Staging replaces a normal regular entry with the worktree file, so the
-    worktree side already stands for it. Two kinds of recorded entry are not
-    replaced and are judged here: a non-regular type (a symlink checked out as
-    a regular file under core.symlinks false, a submodule, a directory), and
-    an entry Git does not refresh from disk (skip-worktree or assume-unchanged).
+
+def _harness_prefix(raw: bytes) -> bytes | None:
+    """The harness-named entry a listed path is, or lies under, unless a skipped directory comes first.
+
+    Git lists files, not directories, so pkg/conftest.py/inside.txt stands for
+    a directory named pkg/conftest.py: that entry is the candidate.
     """
-    listing = _required(_git(git, ["--literal-pathspecs", "ls-files", "-v", "-s", "-z", "--", os.fsdecode(raw)]),
+    parts = raw.split(b"/")
+    for i, part in enumerate(parts):
+        if part in SKIP_DIRS:
+            return None
+        if part in _TRACKED_NAMES:
+            return b"/".join(parts[:i + 1])
+    return None
+
+
+def _walk(root: Path) -> tuple[set[bytes], set[bytes]]:
+    """Every harness-named entry under root, and the places the walk could not read.
+
+    The walk enters ignored and untracked directories alike, never follows a
+    symlinked directory, and does not descend into a harness-named entry:
+    whatever its type, that entry is itself a candidate.
+    """
+    found: set[bytes] = set()
+    unreadable: set[bytes] = set()
+    top = os.fsencode(root)
+    stack = [b""]
+    while stack:
+        rel = stack.pop()
+        try:
+            with os.scandir(os.path.join(top, rel) if rel else top) as entries:
+                for entry in entries:
+                    name = entry.name
+                    path = rel + b"/" + name if rel else name
+                    if name in SKIP_DIRS:
+                        continue
+                    if name in _TRACKED_NAMES:
+                        found.add(path)
+                        continue
+                    try:
+                        # lstat, unlike is_dir(), raises for an entry that vanished.
+                        is_dir = stat.S_ISDIR(entry.stat(follow_symlinks=False).st_mode)
+                    except OSError:
+                        unreadable.add(path)
+                        continue
+                    if is_dir:
+                        stack.append(path)
+        except OSError:
+            unreadable.add(rel or b".")  # an unreadable or vanished directory or entry
+    return found, unreadable
+
+
+def _listed_paths(git: GitRepo, args: list[str]) -> set[bytes]:
+    output = _required(_git(git, args), " ".join(args[:2]))
+    return {prefix for path in output.split(b"\0") if path and (prefix := _harness_prefix(path)) is not None}
+
+
+def _index_entries(git: GitRepo, raw: bytes) -> list[object]:
+    """What the index records at a path, read without changing it.
+
+    Stage 0 is what a commit publishes; it can differ from the worktree (a
+    clean filter, skip-worktree or assume-unchanged, a symlink checked out as a
+    regular file under core.symlinks false), so its mode and raw blob are
+    judged too. During a conflict the worktree holds the resolution, so the
+    conflict stages count only for their type.
+    """
+    listing = _required(_git(git, ["--literal-pathspecs", "ls-files", "-s", "-z", "--", os.fsdecode(raw)]),
                         "ls-files")
     sides: list[object] = []
     for entry in filter(None, listing.split(b"\0")):
@@ -344,65 +355,76 @@ def _index_entries(git: GitRepo, raw: bytes) -> list[object]:
         if path != raw:
             sides.append(_NOT_A_FILE)  # entries below the path: Git records a directory there
             continue
-        tag, mode, sha, _stage = info.split(b" ")
+        mode, sha, stage = info.split(b" ")
         if mode not in _REGULAR_MODES and mode != b"120000":
             sides.append(_NOT_A_FILE)  # submodule
-        elif mode == b"120000" or tag != b"H":
+        elif stage == b"0" or mode == b"120000":
             blob = _git(git, ["cat-file", "blob", sha.decode()])
             sides.append((mode, blob.stdout) if blob.returncode == 0 else _NOT_A_FILE)
     return sides
 
 
+def _merge_base(git: GitRepo, target_ref: str, *heads: str) -> str:
+    result = _git(git, ["merge-base", target_ref, *heads])
+    if result.returncode == 1:
+        return target_ref  # unrelated histories have no merge base
+    return _required(result, "merge-base").strip().decode()
+
+
 def changed_harness_paths(git: GitRepo, target_ref: str, files: list[str]) -> list[str]:
-    """Harness paths whose head entry differs from the merge base with the target, for display.
+    """Harness paths that hold the PR, for display.
 
-    The guard runs before staging, and publication stages the worktree it
-    judged, so the worktree is both what the checks load and what the PR
-    carries. Candidates come from every Git view as raw path bytes, never
-    decoded; each one is judged by its worktree entry (Git mode and content)
-    against the merge base, so a pending merge's target-only changes are
-    inherited, not introduced. A harness path that is not valid UTF-8, or
-    that cannot be compared exactly, holds even when ## Files lists it.
+    Candidates do not come from asking Git what changed. They are every
+    harness-named entry the file-system walk finds (ignored and untracked
+    directories included) plus every harness-named path in the base tree,
+    the HEAD tree and the index. Each is judged by raw bytes and Git mode:
+    the worktree entry and the index's stage 0 against the merge base of HEAD
+    (and a pending MERGE_HEAD) with the target, and the committed HEAD blob
+    against HEAD's own merge base with the target. Blobs come from git
+    cat-file, which applies no clean or smudge filter. A harness path that is
+    not valid UTF-8, or that cannot be compared exactly, holds even when
+    ## Files lists it; so does a directory the walk could not read.
     """
-    can_run_git = callable(getattr(git, "run_bytes", None))
-    if can_run_git:
-        base = git._own_base(target_ref)
-        candidates = measured_changes(git, base)
-    else:
-        # A repository object that cannot run Git (a fixture) reports only its
-        # changed paths; they are judged the same way, as bytes.
-        base, candidates = None, {path.encode("utf-8") for path in git.changed_paths(target_ref)}
-    harness = sorted(raw for raw in candidates
-                     if raw.rsplit(b"/", 1)[-1] in _HARNESS_NAMES_RAW | {b"pyproject.toml"})
-    if not harness:
-        return []
-    base = base or git._own_base(target_ref)
+    found_on_disk, unreadable = _walk(git.root)
+    if not callable(getattr(git, "run_bytes", None)):
+        # A repository object that cannot run Git (a fixture): its changed
+        # paths and the walk are the candidates; judging them needs Git, so
+        # any candidate holds.
+        listed_changes = {_harness_prefix(path.encode("utf-8")) for path in git.changed_paths(target_ref)}
+        return [display_path(raw) for raw in sorted((listed_changes - {None}) | found_on_disk | unreadable)]
+    base = git._own_base(target_ref)
+    head_base = _merge_base(git, target_ref, "HEAD")
+    candidates = (found_on_disk
+                  | _listed_paths(git, ["ls-tree", "-r", "-z", "--full-tree", "--name-only", base])
+                  | _listed_paths(git, ["ls-tree", "-r", "-z", "--full-tree", "--name-only", "HEAD"])
+                  | _listed_paths(git, ["ls-files", "-z"]))
     file_mode = _git(git, ["config", "--bool", "core.fileMode"]).stdout.strip() != b"false"
-    found = []
-    for raw in harness:
+    held = set(unreadable)
+    for raw in candidates:
         try:
-            held = _judge(git, base, raw, files, file_mode)
+            if _judge(git, base, head_base, raw, files, file_mode, raw in found_on_disk):
+                held.add(raw)
         except Exception:  # anything that stops an exact comparison holds (fail closed)
-            held = True
-        if held:
-            found.append(display_path(raw))
-    return found
+            held.add(raw)
+    return [display_path(raw) for raw in sorted(held)]
 
 
-def _judge(git: GitRepo, base: str, raw: bytes, files: list[str], file_mode: bool) -> bool:
-    """Whether one harness candidate holds the PR."""
+def _judge(git: GitRepo, base: str, head_base: str, raw: bytes, files: list[str], file_mode: bool,
+           walked: bool) -> bool:
+    """Whether one harness candidate holds the PR; walked means the walk saw it on disk."""
     name = raw.rsplit(b"/", 1)[-1]
     before = _tree_side(git, base, raw)
     path = git.root / os.fsdecode(raw)
     afters = ([_disk_side(path)] if file_mode
               else [_disk_side(path, mode) for mode in _recorded_modes(git, raw)])
-    # Git's recorded entries the worktree cannot show: index entries of another
-    # type or not refreshed from disk, and HEAD's entry type.
+    if walked and None in afters:
+        return True  # the walk saw it, then it vanished: it cannot be compared (fail closed)
     afters += _index_entries(git, raw)
     verdicts = {_verdict(name, before, after) for after in afters}
-    head = _tree_side(git, "HEAD", raw)
-    if head is _NOT_A_FILE or (head is not None and head[0] not in _REGULAR_MODES):
-        verdicts.add(_ALWAYS)  # a symlink or submodule recorded in HEAD
+    # The committed HEAD blob, against HEAD's own merge base: a pending
+    # merge's target-only changes are not in HEAD yet and are not the PR's.
+    head_before = before if head_base == base else _tree_side(git, head_base, raw)
+    verdicts.add(_verdict(name, head_before, _tree_side(git, "HEAD", raw)))
     try:
         raw.decode("utf-8")
     except UnicodeDecodeError:

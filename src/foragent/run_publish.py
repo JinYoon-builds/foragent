@@ -84,14 +84,13 @@ def _guard_harness(attempt: Implementation) -> None:
     raise ExecutorStopped(_hold_harness_change(n, ctx, paths, link), hold_details(paths))
 
 
-def _guard_staged(attempt: Implementation) -> None:
-    """Before a head measurement: guard (it reads the worktree itself), then stage.
+def _guard_before_measurement(attempt: Implementation) -> None:
+    """The last step before a head measurement: nothing runs between it and the check.
 
-    Detection never depends on staging, so a file Git refuses to stage cannot
-    preempt the hold; files earlier checks generated are staged afterwards.
+    Detection reads the worktree itself and never stages. Staging runs Git
+    filters, which can write files, so it never follows the guard here.
     """
     _guard_harness(attempt)
-    attempt.git.stage_changes()
 
 
 def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:

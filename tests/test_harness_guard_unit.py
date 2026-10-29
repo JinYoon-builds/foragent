@@ -242,16 +242,18 @@ def test_guard_compares_with_the_current_target_not_the_pinned_start(repo, monke
 
 
 def test_paths_the_runner_never_stages_are_still_measured(repo):
-    """stage_changes drops .foragent/ from the index; checks still load it from disk."""
-    (repo / ".foragent").mkdir()
-    (repo / ".foragent/conftest.py").write_text("# generated\n")
+    """stage_changes leaves the lane's injected skills out of the index; checks still load them from disk."""
+    skill = repo / ".claude/skills/demo"
+    skill.mkdir(parents=True)
+    (skill / "conftest.py").write_text("# generated\n")
     (repo / "feature.txt").write_text("done\n")
     git = GitRepo(repo)
+    git.local_skill_paths.add(".claude/skills/demo")
     git.stage_changes()
-    assert ".foragent/conftest.py" not in git.changed_paths("target")
-    assert changed_harness_paths(git, "target", []) == [".foragent/conftest.py"]
+    assert ".claude/skills/demo/conftest.py" not in git.changed_paths("target")
+    assert changed_harness_paths(git, "target", []) == [".claude/skills/demo/conftest.py"]
     # The runner's own index is left exactly as it was.
-    assert ".foragent/conftest.py" not in git.changed_paths("target")
+    assert ".claude/skills/demo/conftest.py" not in git.changed_paths("target")
 
 
 def test_force_added_ignored_conftest_is_caught(repo):
@@ -294,11 +296,11 @@ def test_ignored_environment_directories_are_not_expanded(repo):
 
 
 def test_detection_never_changes_the_index(repo):
-    (repo / ".foragent").mkdir()
-    (repo / ".foragent/conftest.py").write_text("# generated\n")
-    git_command(repo, "add", "-f", ".foragent/conftest.py")
+    (repo / "generated").mkdir()
+    (repo / "generated/conftest.py").write_text("# generated\n")
+    git_command(repo, "add", "-f", "generated/conftest.py")
     before = git_command(repo, "ls-files", "--stage")
-    assert changed_harness_paths(GitRepo(repo), "target", []) == [".foragent/conftest.py"]
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["generated/conftest.py"]
     assert git_command(repo, "ls-files", "--stage") == before
 
 
@@ -624,13 +626,15 @@ def test_mode_only_pyproject_change_is_not_a_pytest_table_change(repo):
 def test_mode_is_ignored_where_git_ignores_it(repo):
     """With core.fileMode false, Git neither records nor publishes the execute bit."""
     git_command(repo, "config", "core.fileMode", "false")
-    # A committed edit makes the path a candidate; the worktree restores the
-    # content with the execute bit set, which Git will not publish.
+    # Every harness file is a candidate now; the execute bit alone changes nothing Git publishes.
+    (repo / "tests/conftest.py").chmod(0o755)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+    # A committed edit holds even when the worktree shows the base content: HEAD is compared too.
     (repo / "tests/conftest.py").write_text("# edited\n")
     commit(repo, "refs/heads/main", parent=git_command(repo, "rev-parse", "HEAD"))
     (repo / "tests/conftest.py").write_text("# base\n")
-    (repo / "tests/conftest.py").chmod(0o755)
-    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["tests/conftest.py"]
+    (repo / "tests/conftest.py").chmod(0o644)
     (repo / "tests/conftest.py").write_text("# changed content still counts\n")
     assert changed_harness_paths(GitRepo(repo), "target", []) == ["tests/conftest.py"]
 
@@ -843,17 +847,18 @@ def test_files_entries_are_not_normalized(repo, entry):
 
 
 def test_symlink_recorded_only_in_head_holds_when_the_index_dropped_it(repo):
-    """The runner unstages .foragent/ (rm --cached); HEAD still records the PR head's symlink there."""
+    """The runner unstages local skill paths (rm --cached); HEAD still records the PR head's symlink there."""
     git_command(repo, "config", "core.symlinks", "false")
     sha = _git_bytes(repo, "hash-object", "-w", "--stdin", stdin=b"../tests/conftest.py").strip().decode()
-    git_command(repo, "update-index", "--add", "--cacheinfo", f"120000,{sha},.foragent/conftest.py")
+    git_command(repo, "update-index", "--add", "--cacheinfo", f"120000,{sha},.claude/skills/demo/conftest.py")
     tree = git_command(repo, "write-tree")
     git_command(repo, "update-ref", "refs/heads/main",
                 git_command(repo, "commit-tree", tree, "-p", "HEAD", "-m", "head symlink"))
-    git_command(repo, "rm", "-q", "--cached", ".foragent/conftest.py")
-    (repo / ".foragent").mkdir()
-    (repo / ".foragent/conftest.py").write_text("../tests/conftest.py")  # core.symlinks false checkout
-    assert changed_harness_paths(GitRepo(repo), "target", [".foragent/conftest.py"]) == [".foragent/conftest.py"]
+    git_command(repo, "rm", "-q", "--cached", ".claude/skills/demo/conftest.py")
+    (repo / ".claude/skills/demo").mkdir(parents=True)
+    (repo / ".claude/skills/demo/conftest.py").write_text("../tests/conftest.py")  # core.symlinks false checkout
+    assert changed_harness_paths(GitRepo(repo), "target", [".claude/skills/demo/conftest.py"]) == [
+        ".claude/skills/demo/conftest.py"]
 
 
 @pytest.mark.parametrize("files", [[], ["pyproject.toml"]], ids=["unlisted", "listed"])
@@ -897,7 +902,8 @@ def test_any_failure_while_judging_a_harness_path_holds_it(repo, monkeypatch):
         raise RuntimeError("cannot compare")
 
     monkeypatch.setattr(harness_guard, "_tree_side", broken)
-    assert changed_harness_paths(GitRepo(repo), "target", ["tests/conftest.py"]) == ["tests/conftest.py"]
+    # Every harness file is judged, so every one that cannot be compared holds.
+    assert changed_harness_paths(GitRepo(repo), "target", ["tests/conftest.py"]) == ["pyproject.toml", "tests/conftest.py"]
 
 
 def test_too_deep_to_parse_is_unparsable_not_an_exception():
@@ -905,3 +911,229 @@ def test_too_deep_to_parse_is_unparsable_not_an_exception():
 
     deep = ("[tool.pytest]\nx = " + "[" * 2000 + "]" * 2000 + "\n").encode()
     assert _pytest_tables(deep) is _UNPARSABLE
+
+
+@pytest.mark.parametrize("name,content", [(name, "# harness\n") for name in sorted(HARNESS_NAMES)]
+                         + [("pyproject.toml", '[tool.pytest.ini_options]\naddopts = "-q"\n')])
+def test_harness_files_in_ignored_untracked_directories_hold(repo, name, content):
+    """pytest loads generated/conftest.py although Git lists the ignored directory only as a whole."""
+    (repo / ".gitignore").write_text("generated/\n")
+    (repo / "generated/deeper").mkdir(parents=True)
+    (repo / "generated/deeper" / name).write_text(content)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == [f"generated/deeper/{name}"]
+
+
+@pytest.mark.parametrize("committed", [False, True], ids=["staged", "committed"])
+def test_clean_filter_output_is_judged_as_raw_blobs(repo, committed):
+    """The worktree equals the base, but a clean filter publishes different conftest.py bytes."""
+    git_command(repo, "config", "filter.rewrite.clean", "sed s/base/rewritten/")
+    (repo / ".git/info/attributes").write_text("tests/conftest.py filter=rewrite\n")
+    git_command(repo, "add", "--renormalize", "tests/conftest.py")
+    assert _git_bytes(repo, "cat-file", "-p", ":tests/conftest.py") == b"# rewritten\n"
+    if committed:
+        commit_tree = git_command(repo, "commit-tree", git_command(repo, "write-tree"), "-p", "HEAD", "-m", "filtered")
+        git_command(repo, "update-ref", "refs/heads/main", commit_tree)
+    assert (repo / "tests/conftest.py").read_text() == "# base\n"
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["tests/conftest.py"]
+
+
+@pytest.mark.parametrize("path", ["node_modules/pkg/conftest.py", "src/.tox/conftest.py", "a/b/__pycache__/conftest.py",
+                                  ".venv/lib/sitecustomize.py", "venv/conftest.py", ".uv-cache/x/pytest.ini",
+                                  ".foragent/conftest.py"])
+def test_skipped_directories_are_ignored_at_any_depth_on_disk_and_in_trees(repo, path):
+    # On disk only.
+    (repo / path).parent.mkdir(parents=True, exist_ok=True)
+    (repo / path).write_text("# ignored\n")
+    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+    # Deleted from the trees: no deletion hold under a skipped directory either.
+    (repo / path).unlink()
+    _base_with_entries(repo, [(b"100644", path.encode(), b"# tracked\n")])
+    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+
+
+def test_symlinked_directories_are_not_followed(repo):
+    import os
+
+    os.symlink("tests", repo / "linked")  # linked/conftest.py exists only through the link
+    assert changed_harness_paths(GitRepo(repo), "target", []) == []
+
+
+def test_harness_named_directory_holds_and_is_not_entered(repo):
+    (repo / "pkg/conftest.py").mkdir(parents=True)
+    (repo / "pkg/conftest.py/conftest.py").write_text("# inside\n")
+    assert changed_harness_paths(GitRepo(repo), "target", ["pkg/conftest.py"]) == ["pkg/conftest.py"]
+
+
+def test_unreadable_directory_holds(repo):
+    locked = repo / "locked"
+    locked.mkdir()
+    locked.chmod(0)
+    try:
+        assert changed_harness_paths(GitRepo(repo), "target", []) == ["locked"]
+    finally:
+        locked.chmod(0o755)
+
+
+def test_entry_vanishing_during_the_walk_holds(repo, monkeypatch):
+    import os
+
+    from foragent import harness_guard
+
+    (repo / "gone").mkdir()
+    real = os.scandir
+
+    def vanishing(path):
+        if os.fsencode(path).endswith(b"/gone"):
+            raise FileNotFoundError(path)
+        return real(path)
+
+    monkeypatch.setattr(harness_guard.os, "scandir", vanishing)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["gone"]
+
+
+def test_deleted_harness_file_holds(repo):
+    (repo / "tests/conftest.py").unlink()
+    git = GitRepo(repo)
+    assert changed_harness_paths(git, "target", []) == ["tests/conftest.py"]
+    assert changed_harness_paths(git, "target", ["tests/conftest.py"]) == []
+
+
+def test_repository_object_without_git_still_walks_the_file_system(tmp_path):
+    from types import SimpleNamespace
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg/conftest.py").write_text("# found by the walk\n")
+    fake = SimpleNamespace(root=tmp_path, changed_paths=lambda ref: ["src/app.py"])
+    assert changed_harness_paths(fake, "main", []) == ["pkg/conftest.py"]
+    (tmp_path / "pkg/conftest.py").unlink()
+    assert changed_harness_paths(fake, "main", []) == []
+
+
+def test_committed_head_blob_is_compared_even_when_index_and_disk_show_the_base(repo):
+    edited = _git_bytes(repo, "hash-object", "-w", "--stdin", stdin=b"# committed only\n").strip().decode()
+    listing = git_command(repo, "ls-tree", "HEAD")
+    tests_sha = _git_bytes(repo, "mktree", stdin=f"100644 blob {edited}\tconftest.py\n".encode()).strip().decode()
+    lines = [line for line in listing.splitlines() if not line.endswith("\ttests")]
+    tree = _git_bytes(repo, "mktree", stdin=("\n".join(lines + [f"040000 tree {tests_sha}\ttests"]) + "\n").encode())
+    head = git_command(repo, "commit-tree", tree.strip().decode(), "-p", "HEAD", "-m", "edit in HEAD only")
+    git_command(repo, "update-ref", "refs/heads/main", head)
+    assert git_command(repo, "show", ":tests/conftest.py") == "# base"
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["tests/conftest.py"]
+
+
+def test_harness_named_directory_tracked_only_in_the_base_holds_when_deleted(repo):
+    """Recursive ls-tree lists pkg/conftest.py/inside.txt, never the directory pkg/conftest.py itself."""
+    _base_with_entries(repo, [(b"100644", b"pkg/conftest.py/inside.txt", b"x\n")])
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["pkg/conftest.py"]
+
+
+@pytest.mark.parametrize("where", ["head", "index"])
+def test_harness_named_directory_recorded_only_in_head_or_index_holds(repo, where):
+    sha = _git_bytes(repo, "hash-object", "-w", "--stdin", stdin=b"x\n").strip().decode()
+    git_command(repo, "update-index", "--add", "--cacheinfo", f"100644,{sha},pkg/conftest.py/inside.txt")
+    if where == "head":
+        head = git_command(repo, "commit-tree", git_command(repo, "write-tree"), "-p", "HEAD", "-m", "dir")
+        git_command(repo, "update-ref", "refs/heads/main", head)
+        git_command(repo, "rm", "-q", "--cached", "pkg/conftest.py/inside.txt")
+    assert not (repo / "pkg").exists()
+    assert changed_harness_paths(GitRepo(repo), "target", ["pkg/conftest.py"]) == ["pkg/conftest.py"]
+
+
+def test_listed_paths_stop_at_a_skipped_directory_but_not_after_a_harness_name(repo):
+    _base_with_entries(repo, [(b"100644", b"node_modules/conftest.py/x", b"x\n"),
+                              (b"100644", b"conftest.py/.venv/x", b"x\n")])
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["conftest.py"]
+
+
+def test_harness_file_vanishing_after_the_walk_holds(repo, monkeypatch):
+    """A new untracked conftest.py the walk saw, gone before it is read, is not 'absent like the base'."""
+    from foragent import harness_guard
+
+    (repo / "pkg").mkdir()
+    (repo / "pkg/conftest.py").write_text("# fleeting\n")
+    walk = harness_guard._walk
+
+    def walk_then_vanish(root):
+        result = walk(root)
+        (repo / "pkg/conftest.py").unlink()
+        return result
+
+    monkeypatch.setattr(harness_guard, "_walk", walk_then_vanish)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["pkg/conftest.py"]
+
+
+def test_directory_vanishing_between_listing_and_lstat_holds(repo, monkeypatch):
+    """is_dir() would quietly answer False for a vanished entry; the walk must notice it."""
+    import os
+
+    from foragent import harness_guard
+
+    (repo / "gone").mkdir()
+    real = os.scandir
+
+    class Listing:
+        def __init__(self, path):
+            self.entries = list(real(path))
+            if any(entry.name == b"gone" for entry in self.entries):
+                (repo / "gone").rmdir()
+
+        def __enter__(self):
+            return iter(self.entries)
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(harness_guard.os, "scandir", Listing)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["gone"]
+
+
+def test_entry_whose_type_cannot_be_read_holds(repo, monkeypatch):
+    """Without a cached type, DirEntry.is_dir() returns False for a vanished entry; lstat raises instead."""
+    import os
+
+    from foragent import harness_guard
+
+    real = os.scandir
+
+    class Vanished:
+        name = b"vanished"
+        path = os.path.join(os.fsencode(repo), b"vanished")
+
+        def is_dir(self, follow_symlinks=True):
+            return False
+
+        def stat(self, follow_symlinks=True):
+            raise FileNotFoundError(self.path)
+
+    class Listing:
+        def __init__(self, path):
+            self.entries = list(real(path))
+            if os.fsencode(path) == os.fsencode(repo):
+                self.entries.append(Vanished())
+
+        def __enter__(self):
+            return iter(self.entries)
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(harness_guard.os, "scandir", Listing)
+    assert changed_harness_paths(GitRepo(repo), "target", []) == ["vanished"]
+
+
+# Only once a measured command has changed feature.txt (to contain "more") does staging write the harness.
+FILTER_MAKES_HARNESS = ("sh -c 'input=$(cat); case \"$input\" in *more*) mkdir -p gen; "
+                        "echo \"# made by a filter\" > gen/conftest.py;; esac; printf \"%s\\n\" \"$input\"'")
+MEASURED = 'if test -f gen/conftest.py; then echo MEASURED_""WITH_HARNESS; fi'
+
+
+def test_no_git_filter_runs_between_the_guard_and_a_measurement(run_case):
+    """Staging runs clean filters; one that writes conftest.py must not run after the guard."""
+    c = run_case
+    git_command(c.history.clone, "config", "filter.mk.clean", FILTER_MAKES_HARNESS)
+    (c.history.clone / ".git/info").mkdir(exist_ok=True)
+    (c.history.clone / ".git/info/attributes").write_text("feature.txt filter=mk\n")
+    set_done_when(c, ["echo more >> feature.txt", MEASURED])
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert "MEASURED_WITH_HARNESS" not in c.store.log_path(1).read_text()
+    assert "gen/conftest.py" in _held_comment(c)

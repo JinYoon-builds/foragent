@@ -572,11 +572,11 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return "base-changed"
 
     def guard() -> None:
-        # Between every measurement of this head (Done when, comparison, CI evidence).
-        # Detection reads the worktree itself, so it runs before staging can fail.
+        # The last step before every measurement of this head (Done when, comparison,
+        # CI evidence). Detection reads the worktree itself and never stages: staging
+        # runs Git filters, which can write files after the guard.
         if harness := changed_harness_paths(git, base_ref, parsed.files):
             raise ExecutorStopped(_hold_harness_change(n, ctx, harness, link), hold_details(harness))
-        git.stage_changes()
 
     stop_guarding = guard_measurements(git.root, guard)
     try:

@@ -606,8 +606,8 @@ def test_review_entries_hold_unlisted_harness_change_before_measuring_head(revie
 
 @pytest.mark.parametrize("entry", ["review-only", "resolve"])
 def test_review_hold_sees_head_paths_the_runner_index_omits(review_case, monkeypatch, entry):
-    """The review worktree's staging drops .foragent/; the measured head still has it."""
-    assert_review_harness_hold(review_case, monkeypatch, entry, ".foragent/conftest.py")
+    """Paths the runner's staging can drop (local skill paths) are still judged from the PR head."""
+    assert_review_harness_hold(review_case, monkeypatch, entry, ".claude/skills/demo/conftest.py")
 
 
 def assert_review_harness_hold(c, monkeypatch, entry, path):
@@ -689,3 +689,19 @@ def test_review_fifo_between_done_when_commands_is_held_before_staging(review_ca
     assert runner.review_only(1, c.ctx) == "held"
     assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
     assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
+
+
+def test_review_guard_runs_no_git_filter_before_a_measurement(review_case):
+    """The review guard must not stage: a clean filter could write conftest.py after it."""
+    from runner_support import set_done_when
+
+    c = review_case
+    git_command(c.history.clone, "config", "filter.mk.clean",
+                "sh -c 'mkdir -p gen && echo \"# made by a filter\" > gen/conftest.py; cat'")
+    (c.history.clone / ".git/info").mkdir(exist_ok=True)
+    (c.history.clone / ".git/info/attributes").write_text("feature.txt filter=mk\n")
+    set_done_when(c, ["echo more >> feature.txt",
+                      'if test -f gen/conftest.py; then echo MEASURED_""WITH_HARNESS; fi'])
+    c.tracker.edit_body(1, c.store.load_approval(1).body)
+    runner.review_only(1, c.ctx)
+    assert "MEASURED_WITH_HARNESS" not in c.store.log_path(1).read_text()
