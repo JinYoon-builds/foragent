@@ -1,215 +1,113 @@
 # orch 레인 현재 메모
 
-- #210: GitHub 한도 대기는 레인별 실행기 대기와 달리 `<state>/github-pause.json`에 프로젝트 공통 재설정 시각을 저장한다. state lock 안에서 더 늦은 시각을 보존하고, `tick()`은 fetch·복구·GitHub 조회보다 먼저 이 기록을 확인한다. 실행 기록은 기존 `limit-wait`와 `waiting_until`을 함께 써서 재시작 때 attempts·restarts·tier를 유지한다.
-- #210: `TrackerError.is_rate_limit`는 API 한도 진단과 HTTP 429를 읽으며, 단순 HTTP 403 권한 오류는 한도 오류로 보지 않는다. `reset_at`의 X-RateLimit-Reset을 우선하고, 없으면 `GhTracker.rate_limit_reset()`이 주입된 `_run`으로 `gh api rate_limit`를 한 번 호출한다. 소진된 자원의 가장 늦은 reset을 쓰며, 조회 실패·비정상 응답·지난 시각은 1분 뒤 재시도로 남겨 차단하지 않는다.
-- #210: runner의 merge·close 재확인, batch 지연 처리, board 상태 갱신에서 한도 오류를 삼키거나 추가 GitHub 호출로 덮지 않게 전달한다. review-only 종료와 orch 감사는 대기 중 로컬 기록만 남긴다. 한도 오류로 남은 running 라벨과 프로세스 시작 전의 부분 라벨 변경은 다음 tick에서 crash·stall 예산을 쓰지 않고 복원한다.
-- #210 검증: `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run pytest tests/acceptance/test_github_limit_wait.py` 5개와 저장된 D53 기준선 268개가 통과했다. tracker·state·scheduler·runner·orch·board와 새 경계 시험 및 지정 인수를 묶은 824개가 통과했고, 이후 추가한 시작 전 한도 시험을 포함한 scheduler 경계 4개도 통과했다. 나머지 관련 25개 파일에서는 770개 통과·inspect 프로세스 종료 권한 오류 1개 실패였다. 변경 전 HEAD를 `/private/tmp/fa-210-base-2yqtqp4t/src`에서 로딩하여 동일한 `processes.py:33`의 `os.killpg(..., SIGTERM)` 권한 오류를 재현했다. 기준선도 통과·실패가 섞였으며 로그는 `/private/tmp/fa-issue-210-related.log`, `/private/tmp/fa-issue-210-process-base-3.log`다. `.foragent/REBUTTAL.md`에 범위 근거를 남겼고 인수 시험·Git 인덱스는 수정하지 않았다.
+## 먼저 볼 함정 (여러 이슈에서 반복)
 
-- #92: gate의 `_tick_locked()`는 모든 레인의 시작·PID 저장을 마친 뒤 실제 시작이 있으면 `watch_open.open_view(repo_root, store, config.language)`를 tick당 한 번 호출한다. 기존 opener가 Orca 재사용·Terminal 대체·살아 있는 `watch.pid`와 `FORAGENT_VIEW=off` 억제를 맡는다. gate 호출 경계에서도 `Exception`을 처리해 예상 밖 opener 오류가 시작 결과를 잃게 하지 않으며, 오류는 기존 번역 문구로 정규화한 한 줄을 `report.actions`에 추가한다.
-- #92 시험: `tests/conftest.py`의 자동 fixture가 `FORAGENT_VIEW=off`로 실제 창을 막는다. `_call` 실패 주입은 opt-out을 해제해 opener 내부의 예상 오류 처리를 확인하고, `open_view` 자체의 예외 주입은 gate의 반환 결과·다중 레인 PID·시작 메시지·다음 tick 보존을 확인한다. 지정 인수 시험은 `tests/acceptance/test_gate_open_view.py` 4개, 경계 시험은 `tests/test_scheduler.py -k 'view_opens_once or view_opener'` 6개다. 레인 시작 순서는 `lane_order()`로 main이 마지막이므로 보존 시험에서는 메시지 집합을 비교한다.
-- #92 최종 검증: 지정 인수 시험 4개와 scheduler·watch_open 회귀 188개 통과. `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run pytest`는 2,093개 통과, 범위 밖 foreground 자동 열기 8개 실패(401.26초). 변경 전 HEAD의 src를 `/private/tmp/fa-92-review-base.er7BTu/src`로 추출해 같은 8개 실패를 재현했고, `foragent.scheduler.__file__`로 기준선 소스 로딩과 실패 ID 집합의 일치도 확인했다. 전체 로그는 `/private/tmp/fa-issue-92-review-full.log`, 기준선 로그는 `/private/tmp/fa-issue-92-review-base-foreground.log`이며 `.foragent/REBUTTAL.md`에 범위 근거를 남겼다. 인수 시험·Git 인덱스는 수정하지 않았다.
+- 잠긴 인수 시험과 Goal·리뷰가 부딪히는 일이 가장 흔한 막힘이다(#221·#365·#459·#533·#561·#603·#224·#287·#154·#107·#716·#779·#786·#433·#129·#189·#435·#413). 둘 다 만족하는 구현이 없음을 확인하면 시험을 고치지 말고 바로 QUESTION(선택지+추천, main 소스로 재현한 실패 ID 첨부)을 낸다. 리뷰어도 `SPEC-CONFLICT:` 줄로 같은 정지를 낸다(#673, `run_review.spec_conflicts()`).
+- 리뷰 지적의 "Broader class … also inspect …"는 그 한 줄이 아니라 같은 종류 전부를 고치라는 뜻이다. 한 자리만 고치면 다음 라운드에 이웃 사례가 나와 3라운드 보류가 된다(#123·#370·#415·#466·#154·#189·#333·#420).
+- 같은 영역에서 보류가 두 번이면 지적 자리를 고치지 말고 상태마다 쓰는 쪽을 하나로 다시 정한다(D95, 제품 스킬 `fa-state-design`). 사례: #370 정지는 tick 잠금 아래 얇은 stall-kill 호출 하나로 끝났고, #415 수면은 tick의 `sleep_credit.credit()` 하나만 기록하게 해서 끝났고, #154 대화 생존은 공유 함수 하나가 open·closed·unknown을 돌려주고 구조화된 증거가 있을 때만 closed로 본다.
+- 리뷰가 반복해 잡은 결함 종류: 모름을 없음·성공으로 보기(프로세스 표 PermissionError, 읽지 못한 plist, 빈 tmux 응답), 검사 뒤 변경(check/use 경쟁, 잠금 밖에서 읽은 기록으로 삭제 — 잠금 안에서 다시 읽는다), 잃는 변환(UTF-8 대체 문자, `strip()`된 경로, `--ignored=matching`이 접는 디렉터리, Git 모드 비트), 재시작 뒤 같은 식별자 재사용(#238 시도 번호, #413 상속된 `FORAGENT_SESSION_ID`, #154 옛 세션 ID), 메시지가 CLI 옵션으로 읽힘(#154: 사용자 문구는 `--` 뒤에 둔다), 감시기 정지 결과를 소비자마다 다르게 처리(#435: 모든 `run_related_check` 호출자가 같은 stalled-restart 규칙을 따라야 한다; 런타임 초과 뒤 일시 오류는 진행 없음의 증거가 아니다), 가드 뒤의 변형(#466: staging·clean filter 같은 변경 작업 뒤, 리뷰 전에 다시 검사).
+- 줄 수 상한: `test_scheduler_split`이 `scheduler.py` 250줄·분할 모듈 300줄, `test_cli_split`이 `src/foragent/*.py`·`commands/**` 300줄(`cli.py` 150), `test_runner_split`이 run_*.py 600줄을 건다. main 자체가 상한에 붙어 있거나 넘는 일이 잦아(scheduler.py 249, scheduler_recovery.py 300) 한 줄만 더해도 "Acceptance baseline regression"이 난다(#318·#129·#130·#786). 편집 전에 `wc -l`로 재고, 기존 줄을 접어 순증 0으로 맞추거나 helper 모듈로 뺀다. tick 끝 작업은 `scheduler_housekeeping.after_tick`·`orch_spawn.deciding()` 같은 래퍼에 넣는다. 바꾼 파일마다 `tests/acceptance/test_*split*.py`를 전부 돌린다.
+- `skills/fa-orchestrator/SKILL.md`는 `test_orch_skill`이 splitlines 150줄 이하를 강제한다(끝 줄바꿈이 없어 `wc -l`은 149). 16개쯤의 인수 파일이 본문을 정규식으로 읽는다(단어 순서·백틱까지). 늘릴 땐 시험이 안 읽는 설명을 `references/<topic>.md`로 옮기고 한 줄 링크를 남긴다. 옮기기 전후로 `grep -ln fa-orchestrator tests/acceptance/*.py` 묶음과 helper import로 읽는 시험(question_routing)의 PASSED/FAILED 집합을 비교한다.
+- "base kept moving" 타임아웃과 "Too big for one session"은 핫 파일(run_publish·scheduler·runner)을 넓게 건드린 이슈에서 반복됐다(#154·#370·#421·#560·#107·#123). 크기 l 이슈는 검증 단위로 쪼개고, 병합 충돌은 main이 옮긴 함수를 분할 모듈로 옮겨 적는다.
+- 리뷰는 새 base와 비교하므로 브랜치 뒤에 base에 생긴 파일을 "삭제"로, 옮긴 파일을 "이동"으로 지적할 수 있다. `git ls-tree origin/main`·`git log HEAD..origin/main`으로 확인하고 오탐이면 커밋 SHA를 REBUTTAL에 남긴다.
+- 2026-10-28~29: `invalid literal for int() with base 10: 'dream-adopt'`로 gate 실행이 error가 됐다(#466·#772·#435). 실행 기록 키가 언제나 이슈 번호라고 가정하지 않는다(꿈 기록 `dream-*`, [[project-189-lane-dream]]).
 
-- #93(D57 재설치): `orch.merge()`의 성공 이벤트 뒤에서만 `orch_reinstall.after_merge()`를 호출한다. 병합 후 base를 다시 fetch해 SHA를 고정하고 detached 임시 작업공간의 `[project].name == "foragent"`일 때만 `uv tool install --force --reinstall <path>`를 실행한다. 사용자 checkout이나 PR head를 설치 소스로 쓰지 않는다.
-- #93: `uv tool dir`의 `foragent/lib/python*/site-packages/foragent`를 재귀적으로 비교한다. 설치 누락·남은 파일·중첩 데이터·`_build.py`도 검사하고 Python 캐시만 제외한다. `setup.py`가 빌드 중 소스의 `_build.py`를 생성하므로 설치 후 소스와 비교한다. 실제 uv의 격리 설치에서도 소스·설치본 41개 파일이 일치했다.
-- #93: 설치·검증·fetch·작업공간 오류는 병합을 되돌리지 않고 `reinstall failed: <reason>` 한 줄과 로컬 `reinstall-failed` 이벤트로 남긴다. 생성에 성공한 작업공간만 `finally`에서 Git 등록을 제거한다. 별도 경계 시험은 고정 인수 파일과 모듈명이 겹치지 않는 `tests/test_orch_reinstall_unit.py`에 있다.
-- #93 환경: 오프라인 `uv tool install --reinstall`은 잠금 파일 기반 `uv run`과 달리 의존성의 simple 메타데이터도 필요하다. 임시 캐시에 wheel이 있어도 PyYAML 탐색이 실패하면 기본 캐시의 `simple-v21/pypi/pyyaml.rkyv`를 쓰기 가능한 캐시에 복사한다. 시험용 `UV_TOOL_DIR`·`UV_TOOL_BIN_DIR`를 임시 경로로 지정하면 실제 사용자 설치를 건드리지 않고 실제 uv 빌드와 설치를 확인할 수 있다.
-- #93 최종 검증: `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run pytest tests/acceptance/test_orch_reinstall.py` 5개와 추가 경계 시험 12개 통과. 같은 캐시로 실행한 전체 `uv run pytest`는 2,061개 통과, 화면 자동 열기 19개 실패(447.92초). 변경 전 HEAD의 src를 `/private/tmp/fa-93-base.rLj9PV/src`에 추출해 동일한 19개 실패를 확인했다. 전체 로그는 `/private/tmp/fa-issue-93-full.log`, 기준선 재현 로그는 `/private/tmp/fa-issue-93-base-view.log`다. 고정 인수 파일·Git 인덱스는 수정하지 않았다.
+## 시험과 검증 방법
 
-- #84(D54 1·2): 죽은 runner PID도 `_recover_runs()`에서 `ctx.kill_runner(pid)`로 그룹을 정리한 뒤 작업공간을 제거한다. PID가 없으면 종료 호출을 생략한다. 종료 실패는 활성 실행과 작업공간을 보존하고 전파한다.
-- #84: `orch_events.append_event()`가 state lock 안에서 기존 `at/issue/kind/summary` JSONL 형식을 공유한다. orch 동사는 기존 감사 댓글을 계속 쓰고, gate의 복구 기록은 로컬 journal에 남긴다. 기록은 `_restore_after_crash()`·`_restore_stalled()`의 실제 전환 결과에서 추가한다.
-- #84 리뷰: `crash-restart`는 ready 복귀에만 사용한다. 열린 PR이나 연속 crash로 차단하면 기존 이유 코드와 같은 `retries-exceeded`, stall 차단은 `stalled`다. 요약뿐 아니라 kind도 실제 결과와 일치시킨다.
-- #84 리뷰: `kill_process_group()`은 사라진 그룹의 `ProcessLookupError`를 이미 정상 반환으로 처리한다(`processes.py:15–18`, 이후 확인에도 동일). `test_crash_recovery_with_default_killer_tolerates_missing_group`는 기본 종료 함수를 써서 실제 임시 Git 작업공간 제거와 ready 복귀까지 확인한다. 권한 오류는 그룹이 사라졌다는 증거가 아니므로 삼키지 않는다.
-- #84 재리뷰: 죽은 실행의 그룹 종료는 crash 또는 미완료 stall 종료에 한정한다. 완료 결과(`merged`·`blocked`·`killed`·`limit-wait`)가 있으면 추가 신호 없이 작업공간과 실행 기록을 정리한다. POSIX §4.17상 그룹이 남아 있으면 그 ID를 PID로 재사용할 수 없지만, 그룹 소멸 뒤 검사와 신호 사이의 재사용 경쟁까지 기존 숫자 PID 인터페이스가 보장하지는 않는다. 범위 밖인 원자적 소유권 확인 체계는 `.foragent/REBUTTAL.md`에 근거를 남겼다.
+- 회귀 판단은 변경 전 소스와 비교한다: 이슈 커밋 이전 SHA를 `git archive`로 풀고 `PYTHONPATH=<archive>/src`로 같은 시험을 돌린 뒤 `foragent.scheduler.__file__`로 실제 로딩을 확인하고 실패 ID 집합을 비교한다. 같은 ID면 REBUTTAL에 근거를 남긴다.
+- "Acceptance baseline regression (previously passing tests)"는 GitHub `foragent-acceptance` CI(리눅스) 비교다. 상세는 `gh run list --branch foragent/issue-N --workflow foragent-acceptance` → `gh run view <id> --log`의 "Compare acceptance passing sets". runs/issue-N/*check*.log에는 상세가 없다. 실시간 `os.getloadavg()`·실제 시계를 읽는 시험은 간헐 실패한다(#772 facts, test_cli의 고정 `NOW`와 `cli.datetime.now` — 해당 시험에만 `FixedClock`).
+- `tests/conftest.py`는 시험 중 `git commit`/`checkout`을 막는다. 이력은 `git_history.update()`(fast-import), `commit-tree`·`write-tree` 같은 plumbing과 bare `origin`으로 만든다. 실제 창(`FORAGENT_VIEW=off`), 오케 생성, 실제 HOME·XDG_STATE_HOME, 실제 codex app-server, 실제 수면도 conftest가 막는다.
+- 이 환경에서 `git checkout <file>`·`--theirs`는 권한 거부된다. `git show HEAD:<path> > <path>`로 되돌리고, 충돌은 표식을 직접 편집한다.
+- zsh는 `$files`를 단어로 나누지 않는다. `${=files}` 또는 `$(... | tr '\n' ' ')`로 pytest·`fa test`에 넘긴다.
+- 긴 묶음: `tests/acceptance/test_ci_mode.py`는 부하 중 ~30분이라 Stop hook의 check-done이 "Check timed out"을 낸다. `fa test`를 백그라운드로 따로 돌린다. `tests/test_runner.py` 전체는 돌리지 않는다(관련 시험 예산 초과); 새 시험은 분할된 모듈의 시험 파일에 둔다.
+- 인수 파일과 같은 모듈명의 단위 시험 파일을 만들지 않는다(기본 import 모드에서 충돌). 경계 시험은 `tests/test_<topic>_unit.py`.
+- 새 Config 키는 `tests/test_config.py::test_exact_defaults`도 고친다. 설정 로더는 모르는 키를 거부하므로(config.py) 새 최상위 키는 IGNORED_KEYS에도 넣는다.
+- 작업공간이 재생성되면(대상 전환·한도 실패 뒤 재시도) `.foragent/TRY.md`·`REBUTTAL.md`와 미커밋 변경이 사라진다. 다시 쓴다.
+- 시험 안 값 확인은 capsys를 우회하는 `os.write(2, ...)`와 `-s`.
+- `os.killpg` EPERM으로 `test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands[True]` 등 프로세스 종료 시험이 간헐 실패한다(변경 전 소스에서도 재현). 실제 기계에서 kill 재현은 하지 않는다.
+- 기본 uv 캐시에 쓸 수 없으면 `UV_CACHE_DIR=<쓰기 가능한 캐시> uv run --offline pytest`. 오프라인 빌드에 setuptools·PyYAML이 없으면 기본 캐시의 `wheels-v6`·`simple-v21/*.rkyv`·참조하는 `archive-v0/<id>`까지 복사한다.
+- `run_case`로 한 시험에서 여러 번 시작하면 주입 시계를 전진시킨다(실행 이력은 `(이슈, started_at)`으로 중복 제거).
 
-- #84 최종 검증: 지정 인수 시험 12개와 스케줄러 회귀 167개(완료 결과가 있는 실행의 신호 생략 4개 포함) 통과. 전체 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest`는 2,021개 통과, 별도 D54 3·4의 `stall-visibility` 3개만 실패(381.49초). HEAD의 src를 `/private/tmp/fa-84-final-base.deywzV/src`에 추출해 같은 3개 실패를 재현했다. 전체 로그는 `/private/tmp/fa-issue-84-final-full.log`다. 인수 시험과 Git 인덱스는 수정하지 않았다.
+## 구조 규칙
 
-- #80(D53): `_implement_and_publish()` 시작 시 설정 명령 또는 실제 작업공간에서 감지한 첫 명령으로 기준선을 한 번 캡처한다. pytest만 지원하며, 대상 ref의 별도 detached 작업공간을 버려 시험이 만든 파일이 구현 작업공간에 섞이지 않게 한다. CI 재리뷰에서 구현으로 돌아오는 경로도 PR head가 아니라 target ref에서 기준선을 잡는다.
-- #80: JUnit은 `<state>/runs/issue-N-acceptance-baseline.xml`에 저장한다. `junit_family=legacy`의 file·classname·name으로 클래스·매개변수를 포함한 정확한 ID를 만들고, 실패·오류·건너뜀(같은 ID의 teardown 오류 포함)을 뺀다. 저장소 루트와 빈 JUnit 접두어를 지정해야 사용자 지정 pytest root·접두어가 실행 가능한 ID를 바꾸지 않는다.
-- #80: 기준선 검사는 기존 `verify()` 안에서 Done when과 함께 실행한다. 매 시도·대상 갱신·충돌 해결 뒤에도 같은 통과 ID만 검사하고 실패는 기존 시도 예산을 쓴다. 0개면 pytest를 빈 선택으로 호출하지 않는다(전체 시험이 다시 실행됨). 구현 프롬프트의 전체 시험 명령은 기준선과 별도로 매 시도 재감지하는 기존 동작을 유지한다.
-- #80: 기준선 건너뜀 기록도 구현자 실행 전에 로그를 만든다. 로그 활동 시험의 가짜 실행기는 실제 `run_logged()`처럼 append해야 한다. `write_text()`로 덮어쓰면 새 출력이 짧아졌을 때 기존 크기 증가 기반 활동 감지가 동작하지 않아 시험 의도와 달라진다.
-- #80 검증: 지정 acceptance-baseline·ci-feedback·conflict-budget·orch-verbs 인수 시험 16개, 새 기준선 경계 시험 8개와 로그 활동 시험 2개가 통과했다. 최종 전체 명령 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest`는 인수 시험을 포함한 2,011개 전부 통과했다. 고정 인수 시험과 Git 인덱스는 수정하지 않았다.
+- 분할 facade(scheduler·runner·run_publish·state): 분할 모듈은 모듈 수준 `from foragent import scheduler`로 원래 전역 이름을 호출 시점에 `scheduler.X`로 조회해 facade 패치가 닿게 한다. facade는 원래 import를 전부 남기고 재노출은 하단에 둔다(클래스 정의 시점에 쓰는 이름은 상단). [[project-196-state-split]] [[project-560-run-publish-split]]
+- `commands/*.py`는 `facade`·`repo_store`만 import한다(test_cli_commands). argparse·gh는 `cli.argparse`·`cli.gh`로 쓴다. GitHub 없이 처리하는 동사는 `INBOX_ACTIONS`에 넣어 Git·GhTracker 준비 전에 분기한다.
+- 저장 dataclass는 `records.load_record(cls, data)`로만 적재하고(인수 AST 검사가 `X(**m)`을 막음), 다시 쓸 때는 `StateStore._write_record()`/`records.write_back()`으로 모르는 필드를 보존한다. Run 파일은 `_write_run()` 하나로만 쓴다(#386).
+- `_state_lock`은 재진입 불가다. 잠금 안의 기록은 `orch_events.write_event`, 밖은 `append_event`. `start_run`이 `worktree_lock(n)`을 잡으므로 그 잠금을 쥔 채 부르면 교착된다. `hold_tick_lock()`만 같은 스레드의 중첩 `tick_lock()`을 재진입시킨다.
+- 요청을 끝내는 동사는 `orch_inbox.set_request_status(..., check=fn)`로 확인과 완료를 state lock 안에서 한 번에 한다(동시 답 경쟁).
+- 선택적 JSONL 기록의 부재는 FileNotFoundError와 NotADirectoryError 둘 다다. 공용 `_jsonl`에서 이 둘만 처리한다.
+- 공통 실행 루프로 넘길 땐 기존 `GitRepo` 인스턴스를 넘긴다(`local_skill_paths`가 인스턴스에 있음). 작업공간 재생성 직후 `_inject_lane_skills()`를 부른다.
+- `update_run`은 `observe=True` 또는 pid·process_identities·executor_pgid가 있을 때만 프로세스 표를 읽는다(#547).
+- `run_logged(env=...)`는 부모 환경에 더한다. Claude 세션 공통 환경은 `executors.CLAUDE_SESSION_ENV`(#814).
+- 게이트 자식 환경은 `launcher.gate_environment()`. launcher·kick·launchd 단위 시험은 Popen 인자 집합을 정확히 비교한다.
 
-- #64: 구현 프롬프트의 전체 시험 명령은 `config.test_command`를 우선하고, 없으면 실제 작업공간에서 `order.detect_test_commands()`의 첫 명령을 사용한다. CI 로그는 `GhTracker.pr_failed_logs()`가 PR head SHA의 Actions 실행을 페이지 끝까지 읽고 실행별 마지막 4,000자를 가져온다. `.workflow_runs`를 `--jq`로 배열로 꺼내야 기존 `_items()`로 읽을 수 있다.
-- #64: 일반 구현과 재리뷰의 CI 실패는 `_ci_failure()`에서 예산을 한 번만 소비하고 `_implement_and_publish()`의 공통 검증·리뷰·게시 경로로 돌아간다. CI 로그 여러 개를 다시 전체 4,000자로 자르지 않는다. 재리뷰의 detached 작업공간은 같은 위치에서 이슈 브랜치에 연결하고, 새 head는 새 리뷰를 받아야 한다. `_next_review_round()`로 이전 원문 파일을 보존한다.
-- 공통 실행 루프를 추출할 때 기존 `GitRepo` 인스턴스도 넘긴다. 로컬 스킬 제외 경로인 `local_skill_paths`는 인스턴스에 있으므로 `ctx.git.at(worktree)`를 다시 만들면 제외 정보가 사라진다. 스킬 복사를 두 번 호출해도 두 번째 호출은 이미 존재하는 파일을 로컬 주입 대상으로 기록하지 않으므로 처음 인스턴스의 기록을 보존해야 한다.
-- #64 이전 orch-verbs 인수 시험의 `resolve pass` + CI 실패 항목은 `max_retries=3`에 구현자 응답을 하나만 준비하여 새 재시도 흐름과 맞지 않는다. 고정 시험은 수정하지 않으며 `.foragent/REBUTTAL.md`에 근거를 남겼다. 지정 시험은 `tests/acceptance/test_ci_feedback.py`이고 새 경계 시험은 기존 `tests/test_runner.py`, `tests/test_tracker.py`, `tests/test_orch.py`에 추가한다.
-- #64 검증: 지정 ci-feedback 인수 시험 4개와 전체 CI 명령(`UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest -q --ignore=tests/acceptance`) 1,859개 통과. 전체 시험 수집 뒤 추가한 최신 base 병합 후 CI 재시도 시험도 별도로 1개 통과했다. ci-feedback·orch-verbs·review-handoff·merge 인수 시험을 함께 실행하면 위의 이전 orch-verbs 항목 1개만 실패하고 나머지 22개는 통과한다. 인수 시험 파일과 Git 인덱스는 수정하지 않았다.
+## 영역별 메모
 
-- gate·runner의 차단 처리는 `src/foragent/actions.py`의 `flag()`를 공유한다. 이 함수는 `blocked` 라벨과 `<!-- foragent:blocked reason=... -->` 댓글을 남기며, 기존 이유 코드·상세 출력·승인 무효화 기록을 유지한다.
-- `format_comment()`의 기본은 기존 사람 확인 댓글과 호환되도록 `needs-human`이다. gate·runner에서는 `label="blocked"`를 명시한다. `parse_reason()`은 두 표식을 모두 읽는다.
-- `scheduler.tick()`의 타임아웃은 로컬 flag 기록이 아니라 GitHub에서 가장 최근의 blocked 댓글 시각을 기준으로 한다. 알 수 없는 새 이유 코드도 유효한 blocked 표식이면 시계 기준이 된다. `orchestrator_timeout_minutes` 기본값은 30이며 양의 정수만 허용한다.
-- 재시작·중단 복구와 실행 직전 검사에도 `blocked`를 포함해야 대기 이슈가 다시 실행되지 않는다. 기존 hash-mismatch의 유효한 재승인 경로는 두 대기 라벨을 해제한 뒤 스냅샷을 갱신한다.
-- inspect는 이슈 목록 외에 열린 PR도 따로 수집한다. blocked 이슈의 PR이 이 우회 경로로 사람 검토 목록에 나오지 않도록 함께 확인한다.
-- #28 인수 시험: `uv run pytest -q tests/acceptance/test_orch_blocked.py`. acceptance 파일은 수정하지 않는다. 임시 Git 이력과 가짜 실행기로 네트워크 없이 검증한다.
-- #28 검증 결과: scheduler·runner·config·reasons·inspect 및 지정 인수 시험 781개, `tests/test_orch_blocked.py`의 경계 시험 10개 통과. 경계 시험은 Git 없이 가짜 tracker와 주입 시계로 실행한다.
-- 이 환경에서 기본 uv 캐시에 쓰기 제한이 있으면, 패키지가 준비된 임시 캐시로 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline pytest ...`를 실행할 수 있다.
-- 판정 불가 리뷰는 리뷰어만 다시 호출하지 않고 구현 시도를 하나 소비한다. `build_prompt(..., reviewer_text=...)`가 `A reviewer said (verbatim):` 뒤에 원문 전체를 넣는다. 일반 검사 실패의 4,000자 꼬리 제한을 이 경로에 적용하면 안 된다.
-- 반박은 `.foragent/REBUTTAL.md`에서 읽어 PR의 `## Rebuttals`와 다음 리뷰에 전달한다. Claude는 임시 `CLAUDE.local.md`, Codex는 리뷰 프롬프트를 쓴다. `GitRepo.stage_changes()`는 실행기가 직접 스테이징한 `.foragent` 파일도 인덱스에서 제거하므로 기존 경로를 공유한다.
-- batch/fast 대상 전환은 worktree를 다시 만들기 때문에 `TRY.md`와 `REBUTTAL.md`를 함께 보존해야 한다. PR에는 각 세션의 서로 다른 반박 내용을 보존한다.
-- `review-dispute`는 반박이 있는 상태로 진행한 리뷰 두 회에서 연속으로 같은 지적이 나왔을 때의 기술 차단이다. 공백·대소문자·목록 기호를 정규화한다. 비정형 원문은 하나의 지적으로 비교하여 공통 서문만으로 분쟁을 만들지 않는다.
-- #29 인수 시험: `uv run pytest -q tests/acceptance/test_orch_review_handoff.py`. `tests/test_orch_blocked.py`와 `tests/acceptance/test_orch_blocked.py`는 모듈명이 같아 기본 pytest 모드로 함께 수집하면 충돌하므로 별도로 실행한다.
-- 로컬 스킬 기능과 병합할 때 `recreate_worktree()` 안에서 작업공간 생성 직후 `_inject_lane_skills(ctx, n, git)`를 호출한다. 대상 브랜치 전환과 패치 충돌 복구 모두 이 함수를 쓰므로 `TRY.md`·`REBUTTAL.md` 보존과 스킬 복원·커밋 제외 경로를 함께 유지할 수 있다.
-- #30의 `runner.review_only(n, ctx, verdict_head=...)`는 기존 PR의 정확한 head를 detached worktree에서 검증한다. `verdict_head`가 없으면 리뷰어를 부르고, 있으면 그 head의 오케스트레이터 판정만 대신 쓴다. Done when·승인 스냅샷·CI·기존 경로별 병합 정책은 계속 적용하며 head·base·이슈 변경을 병합 직전에 재확인한다.
-- 재리뷰의 열린 이슈는 어떤 종료 경로에서도 `blocked` 또는 `ready`를 남겨야 한다. `resolve pass` 뒤 Done when·CI 실패는 PR을 닫고 근거를 힌트로 남겨 `ready`로 돌린다. 나머지 실패는 이유가 있는 `blocked`로 남긴다. SystemExit와 작업공간 정리 실패도 공통 종료 경로를 거친다.
-- 열린 PR이 있는 runner가 죽거나 멈추면 scheduler에서 `ready`로만 복구해서는 안 된다. 기존 PR 검사가 바로 `ready`를 지워 상태가 사라진다. crash·stall 복구에서 PR 존재를 확인하고 각각 `retries-exceeded`·`stalled`로 차단한다.
-- 힌트는 `<state>/hints/<n>.txt`를 다음 구현 프롬프트에 한 번 넣고 소비한다. `build_prompt(orchestrator_hint=...)`에서 native `/goal` 감싸기 전에 넣어 Claude·Codex의 `/goal` 명령이 맨 앞에 남도록 한다.
-- 힌트 소비는 프롬프트 작성이 아니라 `_available_executor()`가 일반 실행 결과를 반환한 뒤에 한다. limit 대기·transient 소진·transient 중 런타임 소진·실행 파일 누락·예외·SystemExit에서는 파일을 보존해야 다음 실행이 같은 힌트를 받는다. `classify_result(result)`로 이미 있는 실행기 가용성 구분을 재사용한다.
-- `orch-verbs` 명세는 조회를 포함한 모든 동사의 이력을 요구한다. `list`는 journal과 조회된 이슈 댓글, `log`는 이슈 번호 없는 journal을 남긴다. 조회의 `foragent:orch` 댓글은 blocked 근거·시각을 갱신하지 않는다.
-- `run_case`로 한 시험에서 실행을 여러 번 시작할 때 주입 시계를 한 번 이상 전진시킨다. 실행 이력은 `(이슈 번호, started_at)`으로 중복을 제거하므로 같은 시각에 시작하면 서로 다른 실행이 합쳐진다.
-- #30 통합 검증: `uv run pytest -q tests/acceptance/test_orch_verbs.py` 7개 통과. 전체 CI 명령 `uv run pytest -q --ignore=tests/acceptance`은 1,754개 통과, 아래 샌드박스 권한 제한으로 1개 실패이며 `tests/test_orch.py`의 71개 회귀 시험도 이 실행에 포함된다. 인수 시험 파일과 이름이 겹치는 새 시험 파일은 만들지 않는다.
-- `foragent/batch-27`과 `cli.py` 충돌 시 `orch`와 `notify`의 import 및 명령 등록을 모두 보존한다. `fa orch --help`와 `fa notify --help`로 양쪽 명령을 확인하고, 알림·상태 표시가 통합된 전체 CI 시험을 실행한다. 충돌 해결은 작업 트리에 남기고 스테이징·병합 커밋은 runner에 맡긴다.
-- #30 검증 당시 샌드박스에서는 `tests/test_inspect_runtime.py::test_prepare_timeout_uses_60_seconds_and_kills_child_group`가 종료 후 `src/foragent/processes.py:16`의 `os.killpg(pid, signal.SIGTERM)`에서 `PermissionError: [Errno 1] Operation not permitted`로 실패했다. 단독 실행에서도 재현됐으며 두 파일은 해당 병합에서 바뀌지 않았다. uv 임시 캐시 설정과 별개의 실행 권한 제한이었다.
-- #31의 `orch.premerge(ctx, pr)`는 정확한 PR head를 detached 임시 작업공간에서 검사한다. `test_command`가 없으면 `order.detect_test_commands()`를 공유하여 Python·Node·Go의 전체 시험을 모두 실행한다. 명령을 찾지 못하면 `.foragent.yml` 설정을 안내하고 중단한다.
-- 사전 검사에서 시험이 만든 파일이 충돌 판정에 섞이지 않도록 같은 head의 작업공간을 다시 만든 뒤 `git merge --no-commit --no-ff`로 시험 병합한다. 충돌 없는 Git 오류는 성공으로 취급하지 않는다. 시험 출력은 `<state>/runs/premerge-pr-<n>.log`에 남기며, 예외·중단 때도 작업공간을 정리한다.
-- `orch.merge()`는 사전 검사를 새로 실행하고 PR head·base와 CI를 다시 확인한 뒤 승인 댓글을 단다. 기존 `tracker.merge_pr(expected_head_sha=...)`가 `--match-head-commit`을 제공한다. 병합 이벤트는 이슈 번호 없는 journal에 PR 번호·SHA·승인자를 담으며, 사전 검사에는 GitHub 댓글이나 이벤트를 남기지 않는다.
-- #31 인수 시험: `uv run pytest -q tests/acceptance/test_orch_merge.py` 9개 통과. 추가 경계 시험은 기존 인수 파일명과 겹치지 않는 `tests/test_orch_premerge.py`에 둔다. orch·config·order 관련 회귀 시험 362개 통과.
-- #31 초기 구현 검증의 전체 CI 명령 `uv run pytest -q --ignore=tests/acceptance`은 1,815개 전부 통과했다. merge·verbs·review-handoff 인수 시험도 함께 19개 통과했다. #30에서 기록한 프로세스 권한 실패는 이 실행에서는 발생하지 않았다.
-- #31 생성 실패 보완: `add_detached_worktree()` 성공 뒤에만 해당 작업공간의 `try/finally` 정리 범위에 들어간다. 시험용·시험 병합용 작업공간의 수명을 나누면 최초 생성이나 재생성 실패 뒤 `remove_worktree()`가 원래 Git 오류를 가리지 않는다. 실패 후 디렉터리만 남아도 Git 작업공간 등록은 없을 수 있으므로 디렉터리 존재만으로 정리 여부를 판단하지 않는다.
-- 보완 검증: 최초 생성·재생성 실패를 `premerge`·`merge`로 교차한 회귀 4개를 추가했다. 실제 Git의 `not a working tree` 오류로 기존 실패를 재현한 뒤 원래 예외 보존·임시 공간 정리·GitHub 변경 없음이 통과함을 확인했다. `tests/test_orch_premerge.py tests/test_orch.py tests/test_config.py tests/test_order.py tests/acceptance/test_orch_merge.py` 총 375개(지정 인수 시험 9개 포함) 통과. 기본 uv 캐시 쓰기 제한으로 앞서 기록한 임시 캐시와 `--offline`을 사용했다.
-- #32의 `orch.watch(ctx, interval=5, follow=False)`는 최초 상태와 변화만 내보내는 generator다. CLI는 JSON 한 줄을 즉시 flush하고 기본은 한 번 출력 후 종료, `--follow`는 Ctrl-C까지 계속한다. 대기는 `time.sleep`을 사용하므로 주입 시험은 이 함수를 교체한다.
-- 감시 서명은 정렬한 `blocked`·`needs_human`·`merged` 이슈 번호와 `queue_empty`만 포함한다. 제목·시각·로그는 제외한다. 병합은 GitHub의 `foragent/issue-N`·`foragent/batch-N` PR로 확인하며, 승인/ready/running 열린 이슈 또는 활성 run이 있으면 큐가 비지 않았다. 상태 비교와 원자 저장은 기존 state lock과 `<state>/orch-watch.json`을 쓴다. 감시 자체는 댓글·알림·orch-events를 쓰지 않는다.
-- `skills/fa-orchestrator/SKILL.md`는 150줄 이하 영어 스킬이다. 기술 문제의 두 차례 처리 뒤 escalate, 사람 결정·알림, 5종 대화 분류, order publish를 통한 승인과 AskUserQuestion 이후 orch merge 경계를 함께 유지한다. `fa-inspect`의 수동 라벨/머지 안내는 이 세션의 승인 경로로 가져오지 않는다.
-- #32 인수 시험: `uv run pytest -q tests/acceptance/test_orch_skill.py`. 추가 경계 시험은 모듈명이 겹치지 않는 `tests/test_orch_watcher.py`, CLI 연속 출력·간격 검증은 `tests/test_cli.py -k orch_watch`에 있다.
-- #32 검증: orch-skill·orch-verbs·orch-review-handoff·orch-blocked 인수 시험 16개, orch watcher·orch·cli·notify·status 회귀 시험 161개 통과. 스킬 quick_validate와 `git diff --check`도 통과했다.
-- #31·#32 통합 시 CLI의 `watch`·`premerge`·`merge` 등록을 모두 보존한다. `orch.py`도 감시용 `Iterator`·`math`·`time`·`APPROVED`와 사전 검사용 `dataclass`·`Path`·`TemporaryDirectory`·`GitError`·시험 실행 함수를 함께 가져와야 한다. 기능 본문은 자동 병합되어도 목록·import 충돌에서 한쪽을 택하면 다른 기능이 사라진다.
-- 베이스의 setuptools 빌드 전환 뒤 임시 uv 캐시에 `setuptools>=81`이 없어 오프라인 빌드가 실패할 수 있다. 기본 캐시의 `wheels-v6/pypi/setuptools`·`simple-v21/pypi/setuptools.rkyv`와 wheel이 참조하는 `archive-v0/<id>`를 쓰기 가능한 캐시로 복사하면 기존 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run --offline ...`을 그대로 쓸 수 있다. wheel 디렉터리만 복사하면 archive 참조가 풀리지 않는다.
-- #31 충돌 해결 후 검증: 지정 orch-merge 인수 시험 9개, orch-skill·orch-verbs·orch-review-handoff·orch-blocked 인수 시험 16개, 전체 CI 시험(`uv run --offline pytest -q --ignore=tests/acceptance`) 1,841개가 모두 통과했다. `orch`·`watch`·`premerge`·`merge`·`notify` 도움말과 충돌 표시 제거도 확인했다. 인수 시험 파일과 Git 인덱스는 수정하지 않고 해결본을 작업 트리에 남겼다.
+- 차단: gate·runner는 `actions.flag()`를 공유한다(`blocked` 라벨 + `<!-- foragent:blocked reason=... -->`). `format_comment()` 기본은 `needs-human`, `parse_reason()`은 둘 다 읽는다. tick 타임아웃은 GitHub의 최근 blocked 댓글 시각 기준. 복구·실행 직전 검사에 `blocked`를 포함한다.
+- 복구: 열린 PR이 있는 runner가 죽거나 멈추면 ready로 돌리지 말고 `retries-exceeded`·`stalled`로 막는다. 첫 stall은 `_kill_run`이 신호 전에 `stalled-restart`를 기록하고 다음 tick이 ready로 돌린다(#305). 그룹 종료는 crash·미완료 stall에만 하고, 완료 결과가 있으면 신호 없이 정리한다. `ProcessLookupError`만 그룹 소멸로 보고 권한 오류는 삼키지 않는다(#84).
+- 기록 없는 running 라벨의 `reconciled` 이벤트는 `scheduler_reconcile.orphan_crash_detail()`이 먼저 쓰고 중복은 `orch_events.has_event(..., detail=라벨 세대)`로 판단한다(#130).
+- GitHub 한도: `<state>/github-pause.json`에 프로젝트 공통 재설정 시각(늦은 쪽 보존), `tick()`이 가장 먼저 확인한다. `TrackerError.is_rate_limit`는 HTTP 429·한도 진단만(단순 403 제외). 한도 오류를 삼키거나 추가 GitHub 호출로 덮지 않는다(#210).
+- 실행기 한도: `executor-pauses.json`, `_available_executor()`가 매 실행 직전 확인. 사용량 파싱은 `usage_events`(`name/used_percent/resets_at`만 저장). 한도 뒤 재시작 시험은 시계를 `limit_wait_minutes` 뒤로 옮긴다. [[project-107-claude-quota]] [[project-318-usage-recheck]] [[project-786-executors]] [[project-186-executor-choice]]
+- 힌트 `<state>/hints/<n>.txt`는 `/goal` 감싸기 전에 넣고, 실행기가 일반 결과를 돌려준 뒤에만 소비한다(limit·transient·예외에서는 보존).
+- 리뷰: 판정 불가 리뷰는 구현 시도를 하나 쓰고 원문 전체를 `A reviewer said (verbatim):` 뒤에 넣는다(4,000자 꼬리 제한 금지). 반박은 `.foragent/REBUTTAL.md` → PR `## Rebuttals`·다음 리뷰. 규칙 문구를 바꾸면 `tests/runner_support.expected_review_rules`도 바꾼다. 리뷰 관점 체크리스트는 `review_perspectives.with_checklist()`. [[project-533-review-panel]] [[project-226-review-notes]]
+- 리뷰 facts(#421): 판정은 `orch-events.jsonl`의 kind=review(파일 mtime 이후 첫 이벤트, `source: orchestrator` 제외)로 읽고, 지적 추출은 공용 `run_review.code_review_findings()`를 쓴다(facts에서 형식 판별을 다시 구현하지 않음). PASS의 path:line도 센다. NOTE 줄은 `review_notes.strip()`·`note_text()`로 뺀다.
+- 기준선(D53): 대상 ref의 별도 detached 작업공간에서 캡처, JUnit `junit_family=legacy`로 정확한 ID, 0개면 pytest를 빈 선택으로 부르지 않는다(전체가 돈다). 검증 순서는 Done when → 기준선 통과 ID → 관련 단위 시험(`_related_unit_tests()`, AST import). [[project-123-baseline-survivors]] [[project-483-baseline-follows-base]] [[project-433-baseline-facts]]
+- premerge·merge(#31·#152): 정확한 PR head를 detached 작업공간에서, base를 `merge --no-commit`한 결과로 시험한다. `add_detached_worktree()` 성공 뒤에만 정리 범위에 넣는다(디렉터리 존재로 판단 금지). 병합 뒤 재설치는 `orch_reinstall.after_merge()`가 병합된 base SHA의 임시 작업공간에서 한다(#93·#103).
+- gh 호출 계수는 `foragent/gh.py` 모듈 기록기, 단계 시간은 `state_phases.close_phase`(#224·#333). GhTracker 재시도는 주입 `sleep`을 쓴다.
+- CI 제외 목록은 커밋 trailer로 전달되고 main은 `.foragent/acceptance-exclusions.json`을 추적하지 않는다. 병합 충돌(UD)이면 지운다. 제외 목록에 시험을 더하면 "CI 약화"로 거절된다(#127·#370·#318). [[project-567-ci-exclusions-drift]]
+- 감시: `orch.watch()`는 읽기 예외를 `{"unknown": true}`로 내고 `orch-watch.json`은 건드리지 않는다(별도 `orch-watch-unknown.json`). 서명은 blocked·needs_human·merged 번호와 queue_empty만(#32·#217).
+- 하트비트: `orch-heartbeat.json`·`gate-heartbeat.json`, tick lock 직후 기록, 30초 이하면 alive(#127). tick 결과는 `tick-outcome.json`을 tick 잠금 안에서 쓴다(#387).
+- 레인 대기열 `lane-queues.json`은 `_start_ready()` 직전 ready만 재정렬한다(#235). 계획은 [[project-287-plan]], 교차 레인 순위는 [[project-603-cross-lane]].
+- stale Files 보고(#604): 승인 시점 base는 `rev-list -1 --first-parent --until=<ts>`로 찾는다. `ls-tree -z` split 뒤 빈 이름을 뺀다. scheduler에 git 호출을 더하면 test_cli의 엄격한 가짜 git이 깨지므로 대상이 있을 때만 읽는다.
+- 로그 보존(#131): `state_logs.py` 믹스인, 묶음 나이는 finished_at, 없으면 묶음의 가장 새 파일 mtime. 보존 일수는 `settings.read_machine()`의 log_retention_days(기본 7). 삭제 결정은 worktree 잠금 안에서 다시 읽은 값으로 한다.
+- 역할 호출(#770·#772·#794): `fa orch role <name> --why`는 `orch_architect.call/run_session(role=)`, 아키텍트도 roles 원본에서 agent·skills·memory를 읽는다. 신호는 `orch_roles.observe`/`signal_met`, 요청 상태는 레코드와 `role-signal-*` 이벤트에서 유도한다.
+- `fa doctor --live`(#248): 실행기 어댑터를 직접 부르면 "runner 경로 우회"로 거절된다. 임시 StateStore·`FakeTracker`로 RunContext를 만들어 `_prepare_implementation`+`_implement`를 그대로 돈다. clone을 쓰고 worktree를 쓰지 않는다.
+- 되돌릴 수 없는 경로(#785): `irreversible_paths.register()`는 `_merge_decision()` 한 곳, HEAD와 `origin/<base>` 트리를 읽는다.
+- Windows 조기 종료(#846): `cli.py`의 foragent import 앞 `try: import fcntl`.
 
-- #103: fast 자동 병합은 `runner._implement_and_publish()`와 `_review_only()` 두 경로가 있다. `merge_pr()` 성공 직후 `orch_reinstall.after_merge(ctx, pr, base)`를 공유하며, batch 자식 병합은 호출하지 않는다. 일반 경로는 최종 `decision.kind == "merge"`, 재리뷰는 `review_mode_for(paths, config) == "fast"`로 판별한다.
-- #103: `orch_reinstall`의 `RunContext`는 타입 참조뿐이므로 `TYPE_CHECKING` 아래로 옮겨 runner에서 공통 함수를 import할 때 순환 참조를 없앤다. 재설치 방식·대상 프로젝트 판별·설치본 전체 비교·실패 기록은 기존 구현을 그대로 쓴다.
-- #103 시험: 고정 인수 `tests/acceptance/test_gate_merge_reinstall.py` 3개 통과. `tests/test_orch.py -k 'post_merge_reinstall or does_not_reinstall'` 3개가 review-only·resolve의 병합 뒤 호출과 병합 실패 시 호출 생략을 확인한다. `review_only()`는 TrackerError를 전파하지 않고 error 결과와 blocked 기록으로 바꾸므로 경계 시험도 이 공개 동작을 확인한다.
-- #103 회귀 보정: 기존 CI 복구 시험의 worktree 개수는 `store.worktree_path(n)`에 해당하는 구현 공간만 센다. 기준선 생략 시험은 구현자 호출 시점에 detached 공간이 없음을 확인한다. 자동 병합 뒤 재설치 공간은 두 시험의 검증 대상과 수명이 다르다. 관련 회귀 실행은 489개 통과했고, 실행 도중 수정한 기준선 생략 2개도 별도로 통과했다. 지정 인수·새 경계·CI 복구·기준선 생략 최종 묶음은 14개 모두 통과했다(`/private/tmp/fa-issue-103-final-targeted.log`).
-- #103 최종 전체 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run pytest`: 2,146개 통과·95개 실패(1,784.96초). 인수 실패 90개의 ID 집합은 변경 전 HEAD 소스를 `/private/tmp/fa-103-base.UtJpO6/src`에서 로딩해 재현한 집합과 정확히 일치한다. 나머지 5개는 전체 실행 도중 수정한 이전 시험 코드이며 최종 14개 묶음에서 모두 통과했다. 전체 로그 `/private/tmp/fa-issue-103-full.log`, 기준선 ID `/private/tmp/fa-issue-103-base-failed-ids.txt`; `.foragent/REBUTTAL.md`에 근거를 남겼다. 고정 인수 시험·Git 인덱스는 수정하지 않았다.
+## 이슈별 상세 파일
 
-- #195: `runner.verify()`는 Done when → 고정 D53 통과 ID → 관련 단위 시험 순으로 실행한다. 관련 시험도 기존 `checks`에 넣어 실패·타임아웃·시험이 바꾼 파일의 재검증과 구현 재시도 예산을 공유한다. D50 CI 재시도·CI 설정·D53 발견과 검증은 유지한다.
-- #195: `_related_unit_tests()`는 실제 변경 경로에서 수정·추가되어 현재 존재하는 시험 파일과 변경 Python 모듈을 직접 import하는 `tests/**/test_*.py`·`*_test.py`를 고른다. AST로 주석·문자열을 제외하고 별칭·함수 안 import·`from package import module`을 읽는다. 삭제한 모듈도 경로로 판별하며, 삭제한 시험과 설정된 인수 디렉터리는 제외한다. `src/`·flat 배치와 패키지 `__init__.py`를 지원한다.
-- #195: 관련 시험 실행은 기존 `_pytest_command()`로 pytest 선택 옵션을 걷어 낸 뒤 경로를 `shlex.join()`해 전달한다. 빈 선택으로 pytest를 호출하면 전체 시험이 실행되므로 생략한다. pytest 명령을 찾지 못하면 관련 단위 시험 생략을 로그에 남긴다. 전체 시험 명령은 구현 프롬프트에 선택 사항으로 남기며 전체 시험은 PR의 CI가 맡는다.
-- #195 검증: 지정 `tests/acceptance/test_fast_checks.py` 5개와 `tests/test_runner.py -k 'related_unit or implementation_prompt_full_suite or baseline_'` 16개 통과. 전체 `UV_CACHE_DIR=/private/tmp/fa-issue-4-uv-cache uv run pytest`는 2,351개 통과·257개 실패(3,345.93초), runner 402개는 전부 통과했다. HEAD 소스를 `/private/tmp/fa-195-base-e0eavpzb/src`에서 로딩해 257개 실패 ID를 모두 재현했으며 집합이 정확히 일치한다. 256개는 다른 이슈의 인수 시험, 1개는 `tests/test_scheduler.py::test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands[True]`의 간헐적인 `os.killpg(..., SIGKILL)` 권한 오류다. 전체 로그 `/private/tmp/fa-issue-195-full.log`, 비교 `/private/tmp/fa-issue-195-failure-comparison.json`; `.foragent/REBUTTAL.md`에 근거를 남겼다. 인수 시험·CI·Git 인덱스는 수정하지 않았다.
-
-- [#106 machine AIMD budget](project_106_capacity.md) — capacity.py, data-root state, per-repo ceiling, grace window, lock scope
-- [#243 machine-wide test slots](project_243_test_slots.md) — Path.home() data root, flock slots, waited credit, conftest isolation
-
-- #217: `orch.watch()`는 읽기 예외를 `{"unknown": true, "error": str}`로 내고 `orch-watch.json`은 건드리지 않는다. 회복 강제 출력은 프로세스를 넘어 유지돼야 하므로 별도 `<state>/orch-watch-unknown.json` 표식을 쓴다(인수 시험이 orch-watch.json의 바이트 동일성을 검사). follow는 같은 오류를 반복 출력하지 않고, CLI는 one-shot에서 unknown이면 1을 반환한다. 시험: `tests/acceptance/test_watch_never_silent.py` 3개, `tests/test_orch_watcher.py` 4개.
-- #217 재시도: runner의 관련 시험 묶음에서 `test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands[True]`가 `os.killpg` EPERM으로 간헐 실패한다. 변경 전 소스에서도 3회 중 2회 재현되므로 REBUTTAL로 처리했다. 기준선을 잡을 때는 runner가 이미 커밋했을 수 있으니 HEAD가 아니라 이슈 커밋 이전 SHA를 `git archive`해야 한다.
-
-- #152: `orch._premerge()`는 head 작업공간 하나에서 base를 `merge --no-commit`한 결과를 시험한다(충돌 시 abort 후 head만). pytest 명령(`_pytest_command`로 판별)에는 legacy JUnit 옵션을 덧붙여 실패 ID를 모으고, 실패가 있을 때만 base 작업공간에서 같은 명령을 다시 돌려 `broken`/`failing_on_base`를 나눈다. JUnit 없음·세션 오류·비 pytest 명령은 종료 코드로 판정한다. 노드 ID는 runner의 공용 `junit_node_id()`를 쓴다. 두 번째 작업공간은 base 비교 때만 생기므로 생성 실패 경계 시험은 실패 JUnit을 쓰는 가짜 `pytest`로 그 경로에 도달시킨다.
-
-- #201(D76 요청함): `orch_inbox.py`가 `<state>/inbox/requests|questions/<id>.json`에 한 건씩 저장한다(id `r1`·`q1`, state lock 안 순번). CLI는 Git·GhTracker 준비 전 `INBOX_ACTIONS`로 먼저 분기해 GitHub 호출이 없다. 인수 시험은 실패한 명령 뒤 state 아래 모든 `*.json` 바이트 동일성을 보므로 검증은 쓰기 전에 끝낸다. 경계 시험 `tests/test_orch_inbox_unit.py`. 스킬 정규식 관련 인수 시험 28개는 변경 전후 동일하게 실패(다른 이슈 미구현). 이전 시도가 GitHub 403 한도로 PR 생성에 실패하면 작업공간이 재생성되어 미커밋 변경은 사라진다.
-
-- #202: `orch_inbox`에 `plan-heartbeat.json`(120초 이내면 alive)과 `route_question()`을 두고, CLI `ask`가 기획 세션이 없을 때만 `notify.send`를 호출한다(모듈 속성 호출이라 시험의 send 교체가 먹힌다). `fa brief`는 #113 전이라 `brief.py`에 `questions_open`만 있는 최소 판으로 만들었다; #113이 같은 payload를 확장한다. `tests/acceptance/test_orch_ask_rule.py` 3개는 HEAD 스킬에서도 실패하는 다른 이슈 범위다.
-
-- #274(D79): pstack 절차서 4개는 `skills/fa-orchestrator/references/`. SKILL.md는 150줄 상한(test_orch_skill)이라 새 규칙을 넣을 땐 기존 문단을 다시 줄바꿈해 맞춘다. Foragent는 skills를 패키지 데이터로 싣지 않으므로 runner의 `BUG_FIX_STEPS`(bug 라벨용) 본문은 `run_prompts.py`에 두고(#320에서 runner.py가 run_*.py로 분할됨; runner.py 500줄·새 모듈 600줄 상한은 test_runner_split, 프롬프트 호출부는 `run_implementation._implement`), 작업공간에 참조 파일이 있을 때만 경로를 덧붙인다. 같은 스킬 인수 묶음의 fa_entry·orch_ask_rule·fa_order_break_it 9개는 변경 전에도 실패. `tests/test_runner.py` 전체는 약 34분.
-- #224(재설계): gh 호출 계수는 `foragent/gh.py`의 모듈 기록기(store, now)가 맡는다. `RecordingTracker.__init__`가 `gh.set_recorder(context.store, context.now)`를 설정하고, `GhTracker._call`이 시도마다 `gh.count_call()`, 다른 모듈(init·ci_workflow·update_check·star)은 `gh.run()`을 쓴다. init은 GhTracker에 자기 실행기를 넘기지 않아 이중 계수를 피한다. conftest가 시험마다 `gh.clear_recorder()`. 단계 기록은 `state_runs.update_run`(phase 변경)·`finish_run`이 잠금 안에서 `orch_events.write_event`로 쓴다(_state_lock은 재진입 불가). 리뷰 기록은 `run_review._journal_review`. GhTracker 빈 목록 재시도는 주입 가능한 `sleep`을 쓴다(local_cli가 전역 time.sleep을 막음). 인수 시험의 단계 시간 검사가 #437의 병합 잠금 뒤 CI 재확인(pr_checks 2회)과 충돌해 QUESTION으로 남겼고, 시험 쪽(첫 읽기만 시간 소비)을 고치는 것으로 답을 받았다. `commands/gate.py`도 저장소를 연 직후 기록기를 설정한다(status·watch·run 경로). WIP 커밋이 병합 결과를 일반 커밋으로 담으면 다음 병합에서 main이 바꾼 모든 파일이 충돌한다: 내 실제 변경은 `git diff <그때 main> <WIP>`로 구하고, 충돌 구간은 표식 편집으로 새 main 쪽을 고른 뒤 차이가 내 변경과 같은지 비교한다(checkout --theirs는 권한 거부). 이후 main(#333)이 `state_phases.close_phase`로 같은 단계 기록을 먼저 넣어서, 내 `_journal_phase`를 지우고 그 함수에 `next_step`(요약 `<phase> -> <next>`)·정수 초·부하 null을 더했다. 시험 슬롯 대기는 main 설계(슬롯 요청 시점부터)를 따른다. 명령 모듈(`commands/*.py`)은 `facade`만 import하므로 `gh`는 cli.py에 묶고 `cli.gh`로 쓴다. 모듈 300줄 제한(test_cli_split)도 지켜야 해 계수기는 `state_github.py` 혼합 클래스로 뺐다.
-- #235: 레인 대기열은 `orch_queue.py`가 `<state>/lane-queues.json`에 저장한다. `_tick_locked()`가 `_start_ready()` 직전에 `orch_queue.ordered()`로 ready 목록만 재정렬하므로 blocked·blocked_by·닫힌 이슈는 기존 검사로 걸러지고 대기열 자리는 유지된다. CLI `fa orch queue <lane> [N...] [--clear] [--json]`은 `INBOX_ACTIONS`에 넣어 GitHub 호출 없이 처리한다. 인수 시험 7개·경계 `tests/test_orch_queue.py` 통과.
-- #156(D71 질문 규칙): `skills/fa-orchestrator/SKILL.md`는 `test_orch_skill.py`가 150줄 이하를 강제하며 9개 인수 파일이 이 스킬을 정규식으로 읽는다. 문구를 늘릴 땐 인라인 코드를 쪼개지 않는 줄바꿈(백틱 구간을 한 토큰으로)으로 문단을 다시 맞춘다. 정규식은 단어 순서까지 본다(`(own|wrote).{0,120}tests?` → "you own or wrote a test"). 변경 전후로 9개 파일의 PASSED/FAILED 집합을 비교해 회귀를 확인한다. 이 환경에서 `git checkout <file>`은 권한 거부되므로 `git show HEAD:<path> > <path>`로 되돌린다.
-
-- [#196 state split](project_196_state_split.md) — state_* mixin layout, `_state.X` call-time lookup, merging main hunks
-- #105: `foragent/usage.py`의 `read_usage(log, now, offset)`가 이벤트 모양으로 실행기를 판별한다(`rate_limit_event`→claude, `rate_limits`→codex; Executor 객체에는 이름이 없다). `_run_executor()`가 호출별 offset 이후를 읽어 `ExecResult.usage`에 담고 `StateStore.record_usage()`로 `<state>/usage.json`에 실행기별 최신본을 저장한다. limit 대기는 그 호출의 `config.executor` 스냅샷에서 exhausted 창(100% 또는 claude `rejected`의 rateLimitType)의 가장 늦은 reset까지, 없으면 `limit_wait_minutes`. 시험 `tests/acceptance/test_usage_read.py` 10개, `tests/test_usage.py`. 리뷰 반영: 한도는 레인뿐 아니라 `StateStore.pause_executor()`(`executor-pauses.json`)로 실행기를 멈추고, scheduler `_lane_held()`가 레인의 구현자·리뷰어(`resolved_reviewer`) 중 하나라도 멈췄으면 시작하지 않는다. 리뷰어 한도는 소진 창을 읽었을 때만 limit-wait로 멈추고, 못 읽으면 기존 단위 시험이 정한 transient 재시도를 유지한다. 재설정을 모르는 소진 창이 있으면 `limit_reset(..., fallback)`이 알려진 시각과 `limit_wait_minutes` 중 늦은 쪽을 쓴다.
-- #157(tidy): `tidy.py`가 due를 계산한다(병합 수는 `read_history()`의 merged 총수 − `tidy.json`의 `merged_at_tidy`; idle-quota는 merges>0·활성 실행 없음·`store.usage()`에 소진 안 된 창). `--json`은 정확히 4키(due/reason/merges_since/last_tidy_at)만 낸다(인수 시험이 dict 동일성 비교). 요청은 `tick()` 끝(실행 시작 뒤)에서 `post_if_due()`가 기간 키(last_tidy_at 또는 "start")를 요청 레코드의 `tidy_period`에 담아 inbox에 `from: gate`로 한 번 넣는다. 별도 claim 파일을 먼저 쓰면 inbox 쓰기 실패 시 그 기간이 영구히 막히므로(리뷰 지적) inbox 레코드 자체를 유일한 증거로 쓰고, 검사-생성 경쟁은 tick_lock이 막는다. 사용량은 `run_execution._run_executor()` finally에서 `usage_events.record_from_log()`로 로그의 claude `rate_limit_event`·codex `token_count`를 형식별로 읽는다(#105가 이 모양을 확장). 스킬 150줄 제한은 백틱을 토큰으로 묶은 100자 재정렬과 문구 축약으로 맞췄고, 스킬을 읽는 10개 인수 파일의 PASSED/FAILED 집합이 변경 전과 같음을 확인했다.
-- #197: scheduler.py는 facade(226줄)와 `scheduler_approval/recovery/checks/lanes/start.py`로 나눴다. 분할 모듈은 모듈 수준 `from foragent import scheduler`(순환 import 허용, 호출 시점 조회)로 서로·`has_machine_check`·`machine_load`·`next_parallel`·`_check_prerequisites`·`_machine_budget`·`_filesystem_case_sensitive` 등을 `scheduler.X(`로 불러 facade 패치가 닿게 한다. 재노출 import는 facade 하단에 둔다. 인수 `test_scheduler_split.py` 4개와 scheduler 관련 단위 1,150개 통과(32분).
-- #197 리뷰: "모든 옛 이름 patchable"은 함수뿐 아니라 원래 scheduler의 모든 모듈 수준 이름(import한 `Counter`·`asdict`·`machine_runs`·상수 포함)을 뜻한다. facade에 원래 import를 전부 남기고, 분할 모듈 함수 본문의 모든 원래 전역 이름을 AST로 찾아 `scheduler.X`로 바꿨다(타입 주석은 `TYPE_CHECKING`). 기준 HEAD의 원본에서 전역 집합을 뽑아 `hasattr` 누락 0과 직접 참조 0을 확인한다.
-- #197 병합: 인수 `split_modules()`는 facade가 정적으로 import한 모듈 중 고정 BASE_MODULES에 없는 것을 모두 300줄 제한으로 잰다. 이후에 생긴 `capacity.py`(#342 뒤 419줄)·`run_baseline.py`(#357 뒤 374줄)가 걸렸으므로 그 이름들을 `scheduler_start.py`에서 import하고 facade는 거기서 재노출한다(같은 객체). 병합에서 main이 옮긴 함수를 고치면 충돌 블록은 내 쪽(빈 쪽)을 택하고 main diff를 분할 모듈에 `scheduler.X`로 옮긴다.
-- #197 병합: `TickContext`의 기본값(`start_baseline_thread`)처럼 클래스 정의 시점에 쓰는 재노출 이름은 facade 상단 import 블록에서 가져와야 한다. 분할 모듈은 `scheduler`를 호출 시점에만 읽으므로 일찍 import해도 안전하다. 작업공간 재생성 때 `.foragent/`가 지워지므로 REBUTTAL·TRY를 다시 쓴다.
-- [#376 neutral base moves](project_376_base_move.md) — docs/pending-locked moves skip re-verify; checks set PYTHONDONTWRITEBYTECODE; plumbing-only git in tests
-
-- #305: 첫 stall은 scheduler `_kill_run`이 신호 전에 run outcome을 `stalled-restart`로 기록한다. runner `run_issue`의 SystemExit 처리기는 이 기록을 보면 라벨을 건드리지 않고 다음 tick의 `_recover_orphan`→`_restore_stalled`가 ready로 돌린다(예전엔 무조건 blocked를 붙여 재시작을 막음). 인수 `tests/acceptance/test_first_stall_restarts.py` 3개, 단위 `test_runner_stop_leaves_first_stall_labels_to_the_tick`.
-- #386: 저장 상태 dataclass는 `foragent.records.load_record(cls, data)`로만 적재한다(모르는 필드 무시, 빠진 필드 기본값). 인수 AST 검사가 Config 외 모든 `X(**m)`(위치 인자 없음) 호출을 막으므로 새 기록 적재도 이 함수를 쓴다. Run·InspectState 다시 쓰기는 `StateStore._write_record()`/`unknown_fields()`로 파일의 모르는 필드를 보존한다.
-- #386 리뷰: "다시 쓸 때 보존"은 load→save 왕복 전부에 적용된다. `save_approval`·`save_flag`(`_write_mapping`), 점검 재준비(`inspect_runtime._prepared_write_back`, 같은 명령 문자열의 저장 기록을 순서대로 하나씩 짝짓기 — dict로 짝지으면 반복 명령이 마지막 기록으로 뭉개진다), 위치 인자로 만드는 바깥 `Prepared` 적재까지 리뷰가 잡았다. 인수 시험이 안 보는 쓰기 경로도 `records.write_back()`으로 훑는다.
-
-- #387: `orch_tick_outcome.py`가 `<state>/tick-outcome.json`(at·status·consecutive_failures, 실패 시 error_type·500자 error_message·log_path, 열린 알림 id `alert_request`)과 덮어쓰는 `tick-failure.log`를 쓴다. CLI `gate tick`이 `tick()`을 try로 감싸 실패를 기록한 뒤 다시 raise하고, `scheduler.BUSY_TICK`(잠금 중 생략)이면 기록을 건드리지 않는다. 설정 `tick_failure_alert` 기본 3. scheduler.py facade는 `test_scheduler_split`의 250줄 제한에 걸려 있어(변경 전 249줄) 한 줄 추가도 빈 줄 없이 기존 상수 옆에 둔다. `tests/test_config.py::test_exact_defaults`는 새 설정 키마다 갱신해야 한다. 리뷰 지적 2회: 결과 기록은 tick 잠금 안에서 해야 순서가 지켜진다(전용 잠금만으로는 늦게 시작한 성공 tick이 먼저 기록됨). `StateStore.hold_tick_lock()`은 같은 스레드의 중첩 `tick_lock()`을 재진입시키고, CLI는 `orch_tick_outcome.run_recorded()`로 tick과 기록을 함께 감싼다. 일반 `tick_lock()` 중첩은 여전히 False여야 한다(test_state·test_scheduler·test_kick이 같은 스레드의 busy 동작에 의존).
-- #386 마무리: Run 파일 쓰기는 `StateStore._write_run()` 하나로만 한다(`_run_value()`가 디스크의 모르는 필드 위에 dataclass 값을 덮음). start_run·update_run·finish_run 모두 이 경로이며, finish_run은 같은 병합 값을 runs.jsonl과 스냅샷에 쓴다(히스토리 먼저). limit-wait 재개 보존 시험은 `tests/test_records.py`.
-
-- #248: (runner.py는 이제 facade지만 인수 시험이 호출 스택에 `foragent.runner`를 요구하므로 `live_check`는 runner.py 본문에 둔다.) `fa doctor --live [--executor] [--repo-root]`는 `runner.live_check()`가 `git clone --no-hardlinks`로 임시 복제본을 만들고 origin을 지운 뒤 `build_prompt`·`goal_condition`(모듈 전역 조회, 시험이 교체함)·`executor_for().run()`을 그대로 쓴다. worktree 대신 clone을 써야 사용자 저장소의 worktree 목록·ref가 바뀌지 않는다. 판정은 exit≠0 → `num_turns==0` → `_check(test "$(cat hello.txt)" = ok)` 순이며 출력은 한 줄이다. Codex 턴 수는 `executors.codex_turns()`가 thread.started 이후 turn.completed를 센다(시작 전이면 None).
-- #248 검증: 지정 인수 7개, executors·runner·cli·worker_sessions·orch_skill 관련 671개 통과(1,017초). 전체 시험은 1시간 가까이 걸려 실행하지 않았다.
-- #248 재시도: 리뷰는 새 base와 비교하므로 브랜치 생성 뒤 base에 추가된 인수 파일을 "삭제"로 지적한다. 실제 삭제가 아니면 커밋 SHA를 근거로 REBUTTAL에 남긴다. `tests/conftest.py`는 시험 중 `git commit`을 막으므로 커밋이 필요한 저장소는 `git_history.update()`(fast-import)와 bare `origin`을 쓴다. CodexExecutor는 `-o` 파일이 비면 `codex_error_text()`로 error·turn.failed 원문을 last_message에 넣는다.
-- #248 병합: main의 `skills/fa-orchestrator/SKILL.md`는 이미 150줄 한도에 딱 맞고 폭 100으로 촘촘히 정렬돼 있어 재정렬로는 줄이 줄지 않는다. 새 규칙은 짧게 끝나는 기존 문단의 마지막 줄 여백에 한 문장으로 붙인다(예: 병합 문단 끝 "Switch executors only after `fa doctor --live --executor NAME` prints PASS.").
-- #248 재리뷰: doctor가 실행기 어댑터를 직접 부르면 "runner 경로 우회"로 거절된다. 지금은 임시 `StateStore`·승인 스냅샷·`start_run`·`FakeTracker`(src/foragent/tracker.py, GitHub 없음)로 `RunContext`를 만들고 `_prepare_implementation(..., capture_baseline=False)`+`_implement()`를 그대로 돌린다. 결과 인용은 `executor_factory`에 실제 어댑터를 감싼 기록용 래퍼를 넣어 얻는다. `board=None`, `transient_max_wait_minutes=0`으로 보드 갱신과 대기를 끈다. `tests/acceptance/test_orch_stop.py` 20개 실패는 main 소스에서도 같은 ID로 실패한다(다른 주문 stop-safely).
-- [#365 machine.yml budgets](project_365_machine_yml.md) — single source for shared budget files, whole-file fallback to repo values
-- [#108 orch --say](project_108_say.md) — person line by #N: summary format, view helper outside watch_sections, zsh word-split
-- [#368 ci-not-started](project_368_ci_not_started.md) — CIEvidence.not_started from jobs/annotations; held without worker round
-- #105 병합(2026-10-25): main의 #157이 `usage_events.py`와 `StateStore.record_usage(executor, windows)`·`usage()`를 먼저 넣었다. 중복 `usage.py`를 지우고 파서·`limit_reset`을 `usage_events`로 합쳤다. 저장 형식은 `test_tidy.py`가 정확히 비교하므로 `name/used_percent/resets_at`만 저장하고 `exhausted`는 `record_from_log()` 반환값에만 둔다. 시작 판단은 `scheduler_start.py`(`_lane_held`)로 옮겨졌다. 리뷰어 한도도 사용량 판독 여부와 무관하게 실행기를 멈춘다(오케스트레이터 지시). `test_fa_brief.py` 실패는 #113 미구현 범위다.
-- #105 리뷰: 실행기 멈춤은 시작 때만이 아니라 `_available_executor()`가 매 실행 직전 `store.executor_pause_until()`로 확인하고 `_limit_wait()`로 limit-wait 처리한다. 한도 뒤 곧바로 재시작하는 시험은 시계를 `limit_wait_minutes` 뒤로 옮겨야 한다(`test_worker_sessions.py`). `test_executor_choice.py` 6개는 main에서도 실패하는 quota 범위다.
-- [#104 skill catalog](project_104_skill_catalog.md) — Available skills prompt section, Skills used in Run/PR, claude plain VERDICT fallback
-- [#123 baseline survivors](project_123_baseline_survivors.md) — one exact collect-only listing in follow_base; never infer ids from probe exits
-- [#420 whole picture](project_420_whole_picture.md) — cuts.py notice, WholeFailure, parent_context snapshot, moved_by on base merges
-- [#379 risk map](project_379_risk_map.md) — base-ref map read, review/tier/always_human hooks, commands/*.py import rule
-- [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order, conftest opt-out
-- [#497 memory critical line](project_497_memory_critical.md) — raw kernel level, critical holds starts only, floors in IGNORED_KEYS
-- [#450 PR title from issue](project_450_pr_title.md) — retitle before merge; locked fakes lack subject so GhTracker reads live title
-- #547: `update_run`은 `observe=True` 또는 `pid`·`process_identities`·`executor_pgid`가 있을 때만 프로세스 표를 읽는다. 메타데이터만 바꾸는 갱신에 기대 후손을 관찰하던 단위 시험은 `observe=True`를 명시해 의도를 유지한다.
-- [#483 baseline follows base](project_483_baseline_follows_base.md) — re-capture baseline on result-affecting base move; detect test command at new base
-- [#514 neutral config/locked moves](project_514_neutral_more.md) — config key rules; Done when included #483 test → applied #483 WIP diff
-- #127: `StateStore.write_heartbeat(side, at)`/`heartbeats()`(state.py)가 `<state>/orch-heartbeat.json`·`gate-heartbeat.json`을 덮어쓴다. watch는 매 읽기 전, gate는 `tick()`에서 tick lock을 얻은 직후 쓴다(busy tick은 ctx에 store만 있는 `test_kick` 시험 때문에 쓰지 않음). `fa orch alive`는 `INBOX_ACTIONS`에 넣어 GitHub 없이 처리, 30초 이하면 alive. 인수 `tests/acceptance/test_heartbeats.py` 4개.
-- #521 이후 CI 제외 목록은 커밋 trailer로 전달되고 main은 `.foragent/acceptance-exclusions.json`을 추적하지 않는다. 병합 충돌(UD)이면 파일을 지운다.
-- [#416 retry fixes](project_416_retry_fixes.md) — retry marker, stop file path, majority-only rebuild, contradicting locked tests
-- [#318 usage recheck](project_318_usage_recheck.md) — free quota re-read in tick, note_limit baseline, conftest stubs real codex app-server
-- #532: 리뷰 관점 체크리스트는 `review_perspectives.with_checklist()`로 위험 지도 메모 뒤에 붙인다(run_review 2곳·run_publish 1곳). 새 Config 키는 `tests/test_config.py::test_exact_defaults`도 고쳐야 한다.
-- #547: `update_run`은 `observe=True` 또는 `pid`·`process_identities`·`executor_pgid`가 있을 때만 프로세스 표를 읽는다. 메타데이터만 바꾸는 갱신에 기대 후손을 관찰하던 단위 시험은 `observe=True`를 명시해 의도를 유지한다.
-- #551: tick의 origin 설정 읽기는 `TickContext.committed_config`(gate만 True)로 켠다. 기본 False라 Config를 직접 주는 단위 시험은 영향 없음. test_cli의 FakeGit은 `blob_sha`·`_call(cat-file)`로 로컬 파일을 커밋본처럼 흉내 낸다. `fa test`는 .foragent.yml 있는 곳에서만 돈다: 기준선은 worktree에서 `PYTHONPATH=<archive>/src`로.
-- [#533 review panel](project_533_review_panel.md) — _panel_review threads+merge, orch_reviewers state override, limit re-raise
-- `test_scheduler_split.py`가 facade `scheduler.py`를 250줄로 제한한다. scheduler에 줄을 더하면 같은 수만큼 줄이거나 분할 모듈로 옮긴다. 바꾼 파일마다 `tests/acceptance/test_*split*.py` 전부를 돌려 확인한다.
-- #561: `tests/acceptance/test_ci_mode.py`(54개)는 부하 중 ~30분 걸려 Stop hook의 check-done이 "Check timed out"을 낸다. 실패가 아니므로 `fa test`를 timeout 7200000 백그라운드로 따로 돌려 확인한다.
-- [#564 tick step times](project_564_step_times.md) — step/timed contextvar, scheduler.py 250-line cap via scheduler_start re-export
-- [#567 CI exclusions drift](project_567_ci_exclusions_drift.md) — subset rule, keep payload/scope excluded equal, slow test_ci_mode under load
-- `test_scheduler_split.py`가 facade `scheduler.py`를 250줄로 제한한다. scheduler에 줄을 더하면 같은 수만큼 줄이거나 분할 모듈로 옮긴다. 바꾼 파일마다 `tests/acceptance/test_*split*.py` 전부를 돌려 확인한다.
-- [#128 orch spawn](project_128_orch_spawn.md) — gate opens orchestrator; conftest opt-out; scheduler.py 250-line cap
-- [#333 orch facts](project_333_facts.md) — read-only facts view, capacity.observing(), related-check junit flag form
-- [#590 orch liveness](project_590_orch_liveness.md) — heartbeat session, /fa-orchestrator scan, nearest Claude literally; conftest hides real ancestors
-- #591: `orch_reinstall._uv()`가 uv 설치의 디렉터리 경쟁 오류만 3회까지 재시도(`sleep` 모듈 속성)하며 update_check도 이 함수를 공유한다. 게이트 자식 환경은 `launcher.gate_environment()`; launcher·kick·launchd 단위 시험은 Popen 인자 집합을 정확히 비교한다.
-- #591 리뷰: 패키지 안 `sys.dont_write_bytecode`는 `__init__.pyc`가 먼저 써져 늦다. 틱이 `launchd.refresh_from_tick()`로 예전 plist를 따로 떨어진 갱신 프로세스(틱 잠금 대기→`update_check._restart`)로 다시 올린다. scheduler 파사드는 250줄 제한. 게이트 작업은 파일 이름이 아니라 `installed_jobs()`의 `--repo-root`로 찾고(옛 이름·개명 plist 포함), 읽지 못한 plist는 최신으로 보지 않는다. plist는 bootout→수정→bootstrap 안에서만 바꾸고, `launchctl print` 실패는 없음(113)과 모름을 나눈다.
-- [#560 run_publish split](project_560_run_publish_split.md) — facade + 6 modules, bottom import, run_publish.X lookup, porting main hunks
-- [#415 sleep ledger](project_415_sleep.md) — slept_seconds sensor, machine ledger, conftest stub for real sleep
-- #604: `orch_stale_files.report()`가 board_sync 뒤 tick마다 승인 스냅샷의 Files를 `rev-list -1 --first-parent --until=<unix ts>`(포함; first-parent 없으면 나중에 병합된 토픽 커밋이 기준이 됨)로 찾은 승인 시점 base 트리와 현재 트리로 비교, `stale-files.json`(이슈→보고한 SHA 목록, 닫힌 이슈도 지우지 않음)으로 SHA당 한 번만 기록. 시험의 conftest 가드가 git commit/checkout을 막으니 commit-tree 등 plumbing으로 이력을 만든다. scheduler.py facade는 `test_scheduler_split`이 250줄 상한을 강제하므로 줄을 더하면 기존 `with step` 블록을 `timed(...)` 한 줄로 접는다.
-- #604 리뷰: 잠금을 잡은 tick의 모든 종료(GitHub 대기·한도 예외 포함)에서 돌아야 하는 로컬 사실 검사는 `orch_spawn.deciding()` 래퍼에 넣는다(scheduler 본문의 중간 호출은 이른 반환에 건너뛰어짐). `ls-tree -z` 출력은 split 뒤 빈 이름을 빼야 `**`가 빈 트리에 일치하지 않는다. scheduler에 git 호출을 더하면 test_cli의 엄격한 가짜 git이 깨지므로 대상이 있을 때만 git을 읽는다.
-- [#603 cross-lane start](project_603_cross_lane.md) — _ranked sort key, global-queue.json; no main-last key; ranking applies in one lane too
-- #604: `orch_stale_files.report()`가 board_sync 뒤 tick마다 승인 스냅샷의 Files를 `rev-list -1 --first-parent --until=<unix ts>`(포함; first-parent 없으면 나중에 병합된 토픽 커밋이 기준이 됨)로 찾은 승인 시점 base 트리와 현재 트리로 비교, `stale-files.json`(이슈→보고한 SHA 목록, 닫힌 이슈도 지우지 않음)으로 SHA당 한 번만 기록. 시험의 conftest 가드가 git commit/checkout을 막으니 commit-tree 등 plumbing으로 이력을 만든다. scheduler.py facade는 `test_scheduler_split`이 250줄 상한을 강제하므로 줄을 더하면 기존 `with step` 블록을 `timed(...)` 한 줄로 접는다.
-- #604 리뷰: 잠금을 잡은 tick의 모든 종료(GitHub 대기·한도 예외 포함)에서 돌아야 하는 로컬 사실 검사는 `orch_spawn.deciding()` 래퍼에 넣는다(scheduler 본문의 중간 호출은 이른 반환에 건너뛰어짐). `ls-tree -z` 출력은 split 뒤 빈 이름을 빼야 `**`가 빈 트리에 일치하지 않는다. scheduler에 git 호출을 더하면 test_cli의 엄격한 가짜 git이 깨지므로 대상이 있을 때만 git을 읽는다.
-- [#366 installed gates](project_366_installed_gates.md) — gates.py discovery, remote fallback for state root, conftest real-HOME isolation
-- [#370 orch stop](project_370_orch_stop.md) — option A: thin stall-kill caller under tick lock; why D95 ownership design was dropped
-- [#287 lane plan](project_287_plan.md) — plan.json, non-reentrant state lock, CLI stderr exits, stall vs 1h clock in locked test
-- #673: 리뷰 결과의 `SPEC-CONFLICT:` 줄은 `run_review.spec_conflicts()`가 모으고(panel은 모든 구성원 raw + merge raw), `_finish_review()`가 journal verdict `SPEC-CONFLICT`로 기록한다. `_stop_on_spec_conflict()`가 `_review_implementation`·`_review_only`에서 flag(spec-question) 후 `ExecutorStopped("spec-question")`; 브랜치 push는 `_execute` finally의 보존 경로가 맡는다. 규칙 문구는 `review_scope_rules`에 있어 `tests/runner_support.expected_review_rules`도 같이 바꾼다. 경계 시험 `tests/test_review_conflict_paths.py`. panel은 구성원 충돌을 사용량 한도 재발생보다 먼저 읽고 merge 호출을 건너뛴다. `with_review_scope`는 옛 PR 본문에 빠진 규칙 줄을 모두 채운다.
-- #274 재작업(10-27): main이 SKILL.md를 이미 154줄로 넘겨 놓았다. 인수 시험은 대부분 공백을 합친 본문을 읽으므로, 같은 절의 문단을 합치거나 설명을 `references/<topic>.md`로 옮기고 한 줄 링크를 남겨 줄인다(design-handoff.md). 옮기기 전후로 `grep -ln fa-orchestrator tests/acceptance/*.py` 묶음의 실패 집합을 비교한다. tests/test_runner.py는 분할됐고 새 시험은 해당 모듈의 시험 파일(test_run_prompts.py 등)에 둔다; test_runner.py 전체 실행 금지(관련 시험 예산 초과). `run_publish.py` 842줄 상한 초과는 main 기준선 실패.
-- [#107 Claude quota keep/burn](project_107_claude_quota.md) — scheduler_quota.py, store clock for expiry, line-limit traps
-- #334: `fa orch architect`는 `orch_architect.py`+`commands/_orch_architect.py`(set_defaults handler, orch·gate run()이 먼저 분기). commands/*.py 본문 import는 facade·repo_store만 허용(test_cli_commands) → argparse는 `cli.argparse`. refactor.md는 pstack 시험 정규식(백틱 단독 `architect` 금지)도 지킨다.
-- #225: `orch_scorecard.py`는 `fa orch scorecard`(읽기 전용). 버킷은 `(now-t)//24h`(새 끝 포함). pr-open의 merged_at은 `record_merge`가 finish_run 전에 써야 runs.jsonl에 들어간다. 동사 등록은 `_orch_box` + INBOX_ACTIONS.
-- [#674 SKILL.md line budget](project_674_skill_space.md) — move untested prose to references/, also catch helper-import readers (question_routing)
-- #310: SKILL.md 150줄 상한은 시험이 정규식으로 읽지 않는 설명(watch 세부·주문 카드)을 `references/watch.md`·`order-card.md`로 옮겨 맞췄다. 비교: SKILL을 읽는 인수 16개 파일의 PASSED/FAILED 집합(zsh는 `$(grep -l ...)`로 넘겨야 단어 분리됨).
-- [#189 lane dream](project_189_lane_dream.md) — dream Run records, dream-done event, budget demand, offline-test traps
-- #693: park/unpark 본체는 `orch_park.py`, CLI는 `commands/_orch_park.py`(orch.py run에서 ctx 만든 뒤 분기). 시간 초과는 `parked_at() > since`면 생략. 인수 시험 1은 라벨 제거만으로 통과하므로 경계는 `tests/test_orch_park_unit.py`가 local_issues를 교체해 확인.
-- [#716 role agents](project_716_role_agents.md) — architect prompt/skill split, --agent launches, pstack test pins refactor.md
-- #421: 리뷰 라운드·지적 종류는 `orch_facts_reviews.attach()`. `_freeze`가 `runs/issue-*/review-*.txt`를 `shutil.copy2`로 mtime 보존 복사(실행 귀속 기준). human은 test_orch_facts가 5블록을 강제해 Runs 블록 안에 줄을 넣는다.
-- #421 리뷰: 리뷰 원문은 UNUSABLE이어도 VERDICT 줄이 남는다(시간 초과·패널 실패 "Reviewer 1:\nVERDICT: ..."). 판정은 `orch-events.jsonl`의 kind=review(issue·round·verdict)를 쓰고, 파일 저장 직후 기록되므로 mtime 이후 첫 이벤트를 고른다(같은 round의 앞선 orchestrator PASS 제외). 기록 없는 옛 파일만 원문 파싱.
-- #421 2차 리뷰: review 이벤트 중 `source: orchestrator`는 파일 없이 다음 round 번호를 쓰므로 파일 짝짓기에서 뺀다. SPEC-CONFLICT 기록은 리뷰어 판정을 잃었으므로 runner `_journal_review`에 `review_verdict` 필드를 더했다(기존 시험은 verdict만 봄). 옛 SPEC-CONFLICT는 원문 판정.
-- [#449 overlap facts](project_449_overlap_facts.md) — file_conflicts in orch_facts_runs, 30-line human cap, zsh array for test lists
-- [#712 merge turn](project_712_merge_turn.md) — FIFO merge-queue.jsonl reader rules, join after green CI, turn record before merge_pr
-- #421 3차: 지적 추출은 `run_review.code_review_findings()`(parse_code_review에서 꺼낸 공용 함수, JSON 객체를 그대로 반환)를 쓴다. 판정은 라운드를 셀지만 정하고 PASS의 path:line 지적도 센다. 형식 판별을 facts에서 다시 구현하지 않는다.
-- [#650 wake grace](project_650_wake_grace.md) — wake-grace.json beside sleep baseline, per-run activity ends it, sleep_wake line
-- [#226 review NOTE lines](project_226_review_notes.md) — review_notes.py, break-it rule, SKILL.md 150-line pitfalls
-- #445: facts 실행 행의 `comparison`은 `Run.comparison`(#442가 `update_run(comparison=...)`로 저장)을 `_row()`에서 그대로 복사, 없으면 null. zsh에서 `$files` 목록은 `${=files}`로 나눠야 pytest에 넘어간다. facts 관련 시험 287개 중 74개는 변경 전에도 같은 ID로 실패(다른 이슈 범위).
-- [#779 scorecard flow](project_779_scorecard_flow.md) — flow module, binding-events.jsonl (not orch journal), scheduler.py at 250 limit, SKILL.md no trailing newline
-- #421 main 동기화: main(#226)이 `review_notes.strip()`으로 NOTE 줄을 지적에서 뺀다. 공용 `code_review_findings()` 첫 줄에서 strip하고, facts의 class 줄 탐색도 `note_text()`로 NOTE를 건너뛴다. `NOTE:src/a.py:3 — x`(콜론 뒤 공백 없음)은 FINDING_LINE에 걸리므로 시험에 쓴다.
-- 상태 설계(D95)는 제품 스킬 `fa-state-design`(쓰는 곳 하나·저장 대신 계산·덮어쓰기 대신 덧붙이기)에 일반 규칙으로 있다. 이 저장소 사례: #370 정지는 실행기 혼자 맡는 얇은 호출로 끝났고(정지 경로가 둘이면 매번 새 경합), #415 수면 시간은 tick의 `sleep_credit.credit()` 하나만 기록해 끝났다([[project-415-sleep-ledger]]), #154 대화 생존 판정은 공유 함수 하나가 open·closed·unknown을 돌려주고 구조화된 증거가 있을 때만 closed로 본다. 같은 영역에서 보류가 두 번이면 지적 자리를 고치지 말고 각 상태의 쓰는 곳을 다시 정한다.
-- #785: `irreversible_paths.register(ctx,n,git,paths)`는 run_publish `_merge_decision()` 한 곳에서 호출. 실제 Git은 `tree_files`/`file_at`로 HEAD와 `origin/<base>` 트리를 읽고(PR이 경로를 지워도 잡힘), 가짜는 디스크로 대체. 공지 확인·쓰기·이벤트는 state lock 하나 안. `add_always_human`은 전역 포함 유효 목록에 덧붙임. 시험에서 git commit은 conftest가 막으니 `write-tree` 트리를 쓴다.
-- 시간 폭탄(2026-10-27): `tests/test_cli.py` 가짜 tracker·store는 고정 `NOW`(10-20)인데 inspect 명령 시계는 `cli.datetime.now`(실제)라 7일 창을 벗어나 CI가 깨졌다. fixture 전체 고정은 실제 시계를 기대하는 mark-seen 시험을 깨므로 해당 시험에만 `FixedClock`을 쓴다. 고정 시각 fixture를 쓰는 CI 실패는 먼저 main 소스로 재현해 본다.
-- 모듈 줄 수: `tests/acceptance/test_cli_split.py`가 `src/foragent/*.py`와 `commands/`에 300줄 상한을 건다(run_*.py는 test_runner_split의 600). orch_facts.py는 상한 근처라 새 기능은 helper 모듈(`orch_facts_reviews.human_lines`)에 둔다.
-- #779 CI 재시도: 선택적 JSONL 기록의 부재는 FileNotFoundError뿐 아니라 상위 경로가 파일인 NotADirectoryError도 포함한다. 공용 `_jsonl`에서 둘만 처리해 brief·scorecard·binding replay를 함께 복구하고 다른 I/O 오류는 유지한다. 회귀·break-it 근거는 project_779_scorecard_flow.md.
-- #814: `run_logged(env=...)`는 부모 환경에 변수를 더한다. Claude 세션 공통 환경은 `executors.CLAUDE_SESSION_ENV`(백그라운드 작업 끔). 실제 전달은 PATH 앞의 가짜 `claude` 스크립트로 시험한다.
-- [#786 ordered executors](project_786_executors.md) — executor_list + executors property, fallback order, spend.jsonl, credits key, codex api held
-- [#541 resource facts](project_541_resource_facts.md) — tick sample file, facts resources, base-compare inside repo
-- [#433 baseline facts](project_433_baseline_facts.md) — shared limit module, membership rule, timeout-JSON vs locked prebuild test, zsh `${=T}`
-- #770: `fa orch role <name> --why`는 `orch_architect.call/run_session(..., role=)`로 일반화했다. 기록 `<name>.json`·잠금 `<name>.lock`·이벤트 `<name>-call/-done`·로그 `logs/<name>-*.log`. 숨은 동사는 `run-architect --role`(기본 architect)을 재사용한다. architect는 기존 PROMPT·문구를 유지하고, 다른 역할은 `ROLE_PROMPT`·`role_*` 문구와 `load_roles(config)` 항목(agent·skills·memory)을 쓴다. Done when의 `-k`는 두 파일 모두에 적용되어 4개만 돈다.
-- #770 리뷰: 아키텍트도 roles 원본에서 agent·skills·memory를 읽어야 한다(`_entry(config, role)`를 모든 역할에 적용). 고정 상수 `SKILL`·`AGENT`·`MEMORY`·`has_agent`는 지웠고 `_procedure()`가 두 프롬프트의 스킬 안내를 공유한다. 회귀 시험 `test_architect_session_reads_agent_skills_and_memory_from_the_roles_source`.
-- #770: `tests/acceptance/test_cli_split.py`가 `src/foragent/*.py`·`commands/**` 모두 300줄(cli.py 150줄) 상한을 건다. 역할 지시문은 `orch_role_prompt.py`로 분리했고 `orch_architect`가 `build_prompt`·`REFACTOR` 등을 재노출한다. 모듈을 키울 때 먼저 `wc -l`로 확인한다.
-- #772: 역할 신호는 `orch_roles.py`(roles·role-decision), kinds는 `orch_facts_kinds.py`. roles는 kinds 신호가 있을 때만 `orch_facts.collect`를 모듈 속성으로 부른다(인수 시험이 교체·Popen 금지). SKILL.md 끝 줄바꿈 없음: `wc -l` 149가 splitlines 150이다.
-- [#129 blocked push](project_129_blocked_push.md) — orch_push hook after spawn, _push_ready flag, notify-blocked.json re-arm
-- #846: Windows 조기 종료는 `cli.py`의 foragent import 앞 `try: import fcntl`에서 한 줄 출력 후 `SystemExit(1)`. 콘솔 대상은 바꾸지 않는다.
-- [#186 executor choice](project_186_executor_choice.md) — headroom modules, stored pair, open regressions to check vs base
-- #772 재시도: "baseline regression"을 재현할 수 없을 때 runs/issue-N/*check*.log에는 실패 상세가 없다. 시험 중 값 확인은 capsys를 우회하는 `os.write(2, ...)`와 `-s`로 하고, 브랜치가 origin/main을 포함하는지 `git log HEAD..origin/main`으로 먼저 본다.
-- "Acceptance baseline regression (previously passing tests)"는 GitHub `foragent-acceptance` CI(리눅스) 비교 결과다. 상세는 `gh run list --branch foragent/issue-N --workflow foragent-acceptance` 뒤 `gh run view <id> --log`의 "Compare acceptance passing sets" 단계에 있다. #772에서 facts 반복 읽기 시험은 실시간 `os.getloadavg()` 값 차이로 간헐 실패했다(main 원인).
-- #130: 기록 없는 running 라벨의 `reconciled` 이벤트는 `scheduler_reconcile.orphan_crash_detail()`이 대체 crashed 기록보다 먼저 쓰고, 중복은 `orch_events.has_event(..., detail=라벨 세대)`로 판단한다. main의 scheduler_recovery.py(300)·scheduler.py(250)가 이미 상한이라 기존 줄을 바꿔 순증 0줄로 맞췄다. run_publish·run_review·capacity의 상한 초과는 main에서 이미 실패.
-- #131: 로그 보존은 `state_logs.py` 믹스인(prune_logs·trim_journals), tick 끝 정리는 `scheduler_housekeeping.after_tick` context manager(`done(report, finished=)`)로 모든 반환 경로를 덮어 scheduler.py 250줄 상한을 지킨다. `start_run`이 worktree_lock(n)을 잡으므로 그 잠금을 쥔 채 start_run을 부르면 교착된다.
-- #131 리뷰: 삭제 결정은 잠금 전에 읽은 기록·mtime·크기를 쓰면 안 된다(stale history). worktree 잠금 안에서 그 이슈의 runs.jsonl 최신 기록·파일·크기를 다시 읽고, 정렬에 쓴 기록과 다르면 건너뛴다. 잠금 중엔 기록 생성이 막히고 종료는 running 기록이 필요해 잠금 안 판독이 확정값이다.
-- #794: `orch_role_raise.raise_due`가 `orch_roles.observe`/`signal_met`(#772의 `_met`을 공개)로 신호를 재고, 요청 레코드(from gate·role·signal·created_at)와 `role-signal-clear`/`role-signal-answer` 이벤트에서 상태를 유도한다. scheduler.py는 250줄 상한(test_scheduler_split)이라 tick 호출은 한 줄, step·예외 기록은 `orch_role_raise.tick`에 있다. SKILL.md는 splitlines 기준 150줄이라 마지막 줄 줄바꿈이 없는 걸 주의(wc -l보다 1 많음). 설정 로더는 모르는 키를 거부한다(config.py:420). 명세가 'config.py 변경 없음'이라 해도 새 최상위 키는 IGNORED_KEYS에 넣지 않으면 쓸 수 없으므로, 그 한 단어 변경을 REBUTTAL 근거와 함께 남겼다. 리뷰는 같은 종류의 다른 사례까지 찾으라고 하므로 한 tick 안의 배치 쓰기는 로컬 상태(last·clears)를 바로 갱신하고, 관찰 값(kind 숫자)은 렌더링 전에 버리지 않는다.
-- #158: 오케 스킬 150줄 한도(splitlines 기준, wc보다 1 많음)는 라우팅 표에 한 줄 행을 더하고 세부는 references/settings.md로 맞췄다. zsh는 `$files` 변수를 단어로 나누지 않으니 `fa test`에는 `$(... | tr '\n' ' ')`를 직접 넘긴다.
-- #794 재시도: 요청을 끝내는 동사는 `orch_inbox.set_request_status(..., check=fn)`으로 상태 확인과 완료 표시를 state lock 안에서 한 번에 한다(동시 답 경쟁). 스코어카드 역할 행은 설정 역할만이 아니라 열린 신호·창 안 신호가 있는 역할도 넣는다. 동시성 시험은 `_file_lock`이 호출마다 새 fd로 flock하므로 스레드 두 개로 재현된다. 작업공간 재생성 때 `.foragent/TRY.md`·`REBUTTAL.md`는 사라지므로 다시 써야 한다. "파일 이동" 안내는 오탐일 수 있으니 `git ls-tree origin/main`으로 확인한다.
-- #131 재시도: Goal(2026-10-29)이 묶음 나이를 finished_at, 없으면 묶음의 가장 새 파일 mtime으로 정했다(기간·크기 규칙 공통 `_group_age`). 병합 보존 일수는 `settings.read_machine()`의 log_retention_days(기본 7, conftest가 XDG_STATE_HOME 격리). main의 `orch_role_raise.tick`은 정상 종료 경로의 `done(..., finished=True)` 직전에 둔다.
+- [#104 skill catalog](project_104_skill_catalog.md) — Available skills prompt section, Skills used in Run/PR
+- [#106 machine AIMD budget](project_106_capacity.md) — capacity.py, data-root state, per-repo ceiling, grace window
+- [#107 Claude quota keep/burn](project_107_claude_quota.md) — scheduler_quota.py, store clock for expiry
+- [#108 orch --say](project_108_say.md) — person line format, view helper outside watch_sections
+- [#123 baseline survivors](project_123_baseline_survivors.md) — one exact collect-only listing; never infer ids from probe exits
+- [#128 orch spawn](project_128_orch_spawn.md) — gate opens orchestrator; conftest opt-out
+- [#129 blocked push](project_129_blocked_push.md) — orch_push hook after spawn, notify-blocked.json re-arm
+- [#186 executor choice](project_186_executor_choice.md) — headroom modules, stored pair
+- [#189 lane dream](project_189_lane_dream.md) — dream Run records, dream-done event, budget demand
+- [#196 state split](project_196_state_split.md) — state_* mixin layout, `_state.X` call-time lookup
+- [#226 review NOTE lines](project_226_review_notes.md) — review_notes.py, break-it rule
+- [#243 machine-wide test slots](project_243_test_slots.md) — flock slots, waited credit, conftest isolation
+- [#287 lane plan](project_287_plan.md) — plan.json, non-reentrant state lock, stall vs 1h clock
+- [#318 usage recheck](project_318_usage_recheck.md) — free quota re-read in tick, note_limit baseline
+- [#333 orch facts](project_333_facts.md) — read-only facts view, capacity.observing()
+- [#365 machine.yml budgets](project_365_machine_yml.md) — single source for shared budget files
+- [#366 installed gates](project_366_installed_gates.md) — gates.py discovery, conftest real-HOME isolation
+- [#368 ci-not-started](project_368_ci_not_started.md) — CIEvidence.not_started from jobs/annotations
+- [#370 orch stop](project_370_orch_stop.md) — thin stall-kill caller under tick lock
+- [#376 neutral base moves](project_376_base_move.md) — docs/pending-locked moves skip re-verify
+- [#379 risk map](project_379_risk_map.md) — base-ref map read, review/tier/always_human hooks
+- [#415 sleep ledger](project_415_sleep.md) — slept_seconds sensor, machine ledger
+- [#416 retry fixes](project_416_retry_fixes.md) — retry marker, stop file path, majority-only rebuild
+- [#417 update check](project_417_update_check.md) — daily release cache, fa update lock order
+- [#420 whole picture](project_420_whole_picture.md) — cuts.py notice, WholeFailure, moved_by on base merges
+- [#433 baseline facts](project_433_baseline_facts.md) — shared limit module, membership rule
+- [#449 overlap facts](project_449_overlap_facts.md) — file_conflicts in orch_facts_runs, 30-line human cap
+- [#450 PR title from issue](project_450_pr_title.md) — retitle before merge
+- [#483 baseline follows base](project_483_baseline_follows_base.md) — re-capture baseline on result-affecting base move
+- [#497 memory critical line](project_497_memory_critical.md) — critical holds starts only
+- [#514 neutral config/locked moves](project_514_neutral_more.md) — config key rules
+- [#533 review panel](project_533_review_panel.md) — _panel_review threads+merge, limit re-raise
+- [#541 resource facts](project_541_resource_facts.md) — tick sample file, facts resources
+- [#560 run_publish split](project_560_run_publish_split.md) — facade + 6 modules, porting main hunks
+- [#564 tick step times](project_564_step_times.md) — step/timed contextvar
+- [#567 CI exclusions drift](project_567_ci_exclusions_drift.md) — subset rule, slow test_ci_mode under load
+- [#590 orch liveness](project_590_orch_liveness.md) — heartbeat session, nearest Claude literally
+- [#603 cross-lane start](project_603_cross_lane.md) — _ranked sort key, global-queue.json
+- [#650 wake grace](project_650_wake_grace.md) — wake-grace.json, per-run activity ends it
+- [#674 SKILL.md line budget](project_674_skill_space.md) — move untested prose to references/
+- [#712 merge turn](project_712_merge_turn.md) — FIFO merge-queue.jsonl, turn record before merge_pr
+- [#716 role agents](project_716_role_agents.md) — architect prompt/skill split, pstack test pins refactor.md
+- [#779 scorecard flow](project_779_scorecard_flow.md) — flow module, binding-events.jsonl
+- [#786 ordered executors](project_786_executors.md) — executor_list, fallback order, spend.jsonl
