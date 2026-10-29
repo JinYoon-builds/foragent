@@ -105,6 +105,9 @@ class Config:
     # Ordered executors (#786) exactly as the repository `executors` key wrote them; None when
     # the key is absent. Only this explicit list is stored; `executors` derives the rest.
     executor_list: list[dict[str, Any]] | None = None
+    # Whether a person wrote an executor order (#186): a repository executors list, or claude_quota in
+    # any config file. Derived at load time; without it, Claude and Codex go by quota headroom.
+    order_written: bool = False
 
     @property
     def executors(self) -> list[dict[str, Any]]:
@@ -474,6 +477,11 @@ def _apply_executors(values: dict[str, Any], global_values: dict[str, Any], loca
         raise ConfigError("executors may be set only in the repository .foragent.yml, not the global config")
     values["executor_list"] = None
     present, entries = _file_executors(local)
+    # Per file: a config written back with asdict carries order_written itself, which speaks for
+    # that file only; otherwise claude_quota written there is an order. A repository list always is.
+    values["order_written"] = present or any(
+        source["order_written"] if isinstance(source.get("order_written"), bool) else "claude_quota" in source
+        for source in (local, global_values))
     if not present:
         return
     if "claude_quota" in local:
