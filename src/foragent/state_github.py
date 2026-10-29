@@ -1,4 +1,4 @@
-"""Local per-UTC-hour count of gh calls, kept for the last 30 days."""
+"""Local GitHub records: per-UTC-hour gh call counts (30 days) and the last remaining-request reading."""
 
 from datetime import datetime
 from typing import Any
@@ -23,6 +23,21 @@ class GithubCallsMixin:
             if since is None or hour >= since:
                 rows.append({"hour": hour.isoformat(), "calls": calls})
         return rows
+
+    def record_github_remaining(self, remaining: int, seen_at: datetime) -> None:
+        """Keep the newest known count of core GitHub requests left, with when it was read.
+
+        Runners and the gate may probe at once: a reading older than the stored one is dropped.
+        """
+        path = self.root / "github-rate-limit.json"
+        with self._state_lock():
+            try:
+                newer = _state.datetime.fromisoformat(
+                    _state.json.loads(path.read_text(encoding="utf-8"))["seen_at"]) <= seen_at
+            except (FileNotFoundError, ValueError, TypeError, KeyError):
+                newer = True  # No readable earlier reading to keep.
+            if newer:
+                self._write_json(path, {"remaining": remaining, "seen_at": seen_at.isoformat()})
 
     def _github_call_counts(self) -> dict[str, int]:
         try:

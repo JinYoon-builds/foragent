@@ -31,11 +31,16 @@ from foragent.tracker import Issue, Tracker
 from foragent.watch_cells import Line, Span, _beside, _cells, _clean, _columns, _fit, _line, _panel, _wrap
 from foragent.watch_data import Snapshot, collect, recent_events
 from foragent.watch_art import ORCHESTRATOR, PALETTE, half_blocks
-from foragent.watch_layout import PICK, _activity, _frame, _has_work, render_frame
+from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, render_frame
+from foragent.watch_sections.acorns import issue_box, issue_url
 from foragent.watch_sections.detail import render_detail
 from foragent.watch_sections.finished import FIREWORKS_SECONDS, calm
+from foragent.watch_sections.settings import settings_view
 from foragent.watch_sections.stage import _stage
-from foragent.watch_mouse import handle_mouse, hit_test, switch_to_orchestrator
+from foragent.watch_mouse import (
+    MIN_SCREEN, handle_key, handle_mouse, highlighted, highlighted_row, hit_test, osc8, scroll, scroll_limit, switch_to_orchestrator,
+    terminal_restore_sequences, terminal_setup_sequences, toggle_lane,
+)
 from foragent.watch_open import LOCK_FD_ENV, exclusive, registered
 from foragent.watch_terminal import _terminal, color_pairs
 
@@ -58,6 +63,25 @@ def should_reload(started: str, current: str) -> bool:
                 and started != current)
 
 
+class _Refresh:
+    """One snapshot read with the view's current configuration.
+
+    The settings window (#173) saves and reloads the configuration; setting ``config``
+    makes the next refresh read the usage meter (mode, budget) and lanes with it.
+    """
+
+    def __init__(self, read: Callable[[Config], Snapshot], config: Config) -> None:
+        self.read, self.config = read, config
+
+    def __call__(self) -> Snapshot:
+        return self.read(self.config)
+
+
+def _write(sequences: list[str]) -> None:
+    sys.stdout.write("".join(sequences))
+    sys.stdout.flush()
+
+
 def run(
     status: Callable[[], dict[str, Any]], tracker: Tracker, store: StateStore,
     config: Config, repo_root: Path, *, once: bool = False,
@@ -67,7 +91,7 @@ def run(
         raise ConfigError(text("watch_terminal", config.language))
     argv = sys.argv.copy()
     reload_requested = False
-    refresh = lambda: collect(status(), tracker, store, config, now())
+    refresh = _Refresh(lambda current: collect(status(), tracker, store, current, now()), config)
     if once:
         # A single printed frame is the calm finished scene, never fireworks.
         with calm():
@@ -82,12 +106,17 @@ def run(
             snapshot = refresh()
             import curses
 
+            # The alternate screen keeps the view out of the terminal's scrollback.
+            _write(terminal_setup_sequences())
             try:
                 reload_requested = curses.wrapper(_terminal, refresh, snapshot, config, repo_root, now, store)
             except KeyboardInterrupt:
                 pass
             except curses.error as exc:
                 raise ConfigError(str(exc)) from exc
+            finally:
+                # Leave the alternate screen on exit and before a re-exec alike.
+                _write(terminal_restore_sequences())
         if not reload_requested:
             return
         # Curses and PID registration unwind before exec; the inherited lock leaves no gap.

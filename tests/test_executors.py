@@ -534,3 +534,25 @@ def test_codex_turns_counts_completed_turns_only_after_thread_start(tmp_path):
     assert codex_turns(events) == 2
     events.write_text(json.dumps({"type": "error", "message": "boom"}) + "\n")
     assert codex_turns(events) is None
+
+
+@pytest.mark.parametrize("options", ({}, {"review_level": "high"}), ids=("session", "review"))
+def test_claude_child_sees_background_tasks_disabled_and_keeps_parent_environment(tmp_path, monkeypatch, options):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "claude"
+    fake.write_text(
+        "#!/bin/sh\ncat >/dev/null\n"
+        "printf '%s|%s\\n' \"$CLAUDE_CODE_DISABLE_BACKGROUND_TASKS\" \"$FA_PARENT_MARK\" > \"$FA_ENV_OUT\"\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FA_PARENT_MARK", "kept")
+    monkeypatch.setenv("FA_ENV_OUT", str(tmp_path / "env.txt"))
+    monkeypatch.delenv("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", raising=False)
+
+    ClaudeExecutor().run(worktree=tmp_path, prompt="implement", model=None,
+                         timeout_s=30, log_path=tmp_path / "run.log", **options)
+
+    assert (tmp_path / "env.txt").read_text() == "1|kept\n"
+    assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in os.environ

@@ -11,13 +11,14 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, launchd, orch_github, orch_plan, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_spawn, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
+from foragent.orch_dream import DREAM_EVERY_MERGES, dream_due  # noqa: F401
 from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import current_snapshot, kill_process_group, runner_commands_exist
@@ -27,7 +28,7 @@ from foragent.scheduler_start import (
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _apply_budgets, _github_pause, _github_wait, _has_slot,
     _machine_budget, _reopen_view, _reserve_slot, _start_ready, append_budget_history, append_memory_hold,
     decrease_allowed, machine_load, machine_lock, machine_runs, next_parallel, prebuild_acceptance_baseline,
-    read_state, start_baseline_thread, step, timed, update_test_slots, write_state,
+    read_state, start_baseline_thread, step, timed, update_test_slots, write_state, claude_allowed, choose_executor,
 )
 from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
@@ -45,7 +46,7 @@ class TickContext:
     config: Config
     git: GitRepo
     now: Callable[[], datetime]
-    launcher: Callable[[int], int | None]
+    launcher: Callable[..., int | None]  # (number) for an issue; (kind="dream", lane=...) for a dream.
     start_runs: bool = True
     runner_process_exists: Callable[[int], bool] = runner_process_exists
     kill_runner: Callable[[int], None] = kill_process_group
@@ -62,8 +63,7 @@ class TickReport:
     actions: list[str] = field(default_factory=list)
 
 
-# Preserve the original facade bindings for callers and monkeypatches.
-# Split modules call each other through this module, so patches here reach them.
+# Facade bindings for callers and monkeypatches; split modules call each other through here.
 from foragent.scheduler_approval import _check_integrity, _invalidate_approval, _latest_approval, _snapshot  # noqa: E402
 from foragent.scheduler_recovery import (  # noqa: E402
     _crash_detail, _kill_executor, _kill_run, _local_issue, _recover_orphan, _recover_runs, _remove_run_worktree,
@@ -83,30 +83,29 @@ def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep:
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
-        timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
-        timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
-        with tick_processes(ctx.store) as snapshot:
-            cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
-            if snapshot.available:
-                with step("reap_inactive_runs"):
-                    _reap_inactive_runs(ctx, cleanup)
-            timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
-            timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
-            if skipped := _github_wait(ctx, {}, "github_wait_check"):
-                return keep(TickReport(skipped=skipped, actions=cleanup.actions))
-            if not isinstance(ctx.tracker, RecordingTracker):
-                ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-            try:
-                report = _tick_locked(ctx)
-                report.actions[:0] = cleanup.actions
-            except TrackerError as exc:
-                if not exc.is_rate_limit:
-                    raise
-                return keep(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions))
-            # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
-            if request := timed("tidy_check", tidy.post_if_due, ctx.store):
-                report.actions.append(f"Tidy due; inbox request {request['id']}")
-            return keep(report)
+        with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
+            timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
+            timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
+            with tick_processes(ctx.store) as snapshot:
+                cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
+                if snapshot.available:
+                    with step("reap_inactive_runs"):
+                        _reap_inactive_runs(ctx, cleanup)
+                timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
+                timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
+                if skipped := _github_wait(ctx, {}, "github_wait_check"):
+                    return keep(done(TickReport(skipped=skipped, actions=cleanup.actions)))
+                if not isinstance(ctx.tracker, RecordingTracker):
+                    ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
+                try:
+                    report = _tick_locked(ctx)
+                    report.actions[:0] = cleanup.actions
+                except TrackerError as exc:
+                    if not exc.is_rate_limit:
+                        raise
+                    return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
+                orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language)  # Met role signals (#794).
+                return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 
 
 def _tick_locked(ctx: TickContext) -> TickReport:
@@ -115,9 +114,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     timed("fetch_base", fetch_base, ctx)  # Also applies origin's committed .foragent.yml for fa gate tick.
     base_ref = f"origin/{ctx.config.base_branch}"
     with step("github_refresh"):
-        # A listing taken this tick can confirm remembered per-issue reads.
-        # A periodic tick starts within process start-up jitter of its nominal 300 s
-        # cadence, and its refresh is stamped with its start; it is the next refresh tick.
+        # A listing taken this tick can confirm remembered per-issue reads. A periodic tick starts within
+        # start-up jitter of its nominal 300 s cadence; stamped with its start, it is the next refresh tick.
         listing_current = (ctx.store.issues_refresh_due(started + TICK_JITTER)
                            or bool(ctx.store.github_outbox()))
         if listing_current:
@@ -126,7 +124,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             recorder.refresh_issues(observed_at=started)
             board.refresh_cards(ctx, recorder)
         ctx.tracker.flush_outbox()
-    if skipped := _github_wait(ctx, {}, "github_wait_after_refresh"):
+    if skipped := orch_push.refresh_waited(ctx, _github_wait(ctx, {}, "github_wait_after_refresh")):  # #129
         return TickReport(skipped=skipped)
     snapshot = current_snapshot()
     processes_available = snapshot is None or snapshot.available
@@ -235,16 +233,17 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         timed("machine_budget", _machine_budget, ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
+    dreams = timed("dream_check", orch_dream.startable, ctx, sample)  # Worker demand like a ready issue.
     if not ready:
-        timed("machine_budget", _machine_budget, ctx, ready, sample)
+        orch_dream.start(ctx, dreams, timed("machine_budget", _machine_budget, ctx, ready, sample), report)
         _reopen_view(ctx, report)
         return report
 
-    with step("start_ready"):
-        # A lane's local queue picks the order; startability was already checked above.
+    with step("start_ready"):  # A lane's local queue picks the order; startability was checked above.
         ready = {lane: orch_queue.ordered(ctx.store, lane, numbers) for lane, numbers in ready.items()}
         started = _start_ready(ctx, ready, lane_for, base_ref, report, sample)
     if started is None:
         return report
+    orch_dream.start(ctx, dreams, ctx._tick_budget, report)  # Only a slot the ready issues left free.
     _reopen_view(ctx, report)
     return report

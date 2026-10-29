@@ -77,25 +77,33 @@ def claims(
     """Active runs' file claims; ``measured=False`` uses only the recorded measurement (read-only)."""
     known, unknown = [], []
     for run in ctx.store.active_runs():
-        if run.number == exclude:
-            continue
+        if run.number == exclude or run.kind != "issue":
+            continue  # A lane's dream claims only its memory directory, never issue files.
         parsed = approved_issue(ctx, run)
         if parsed is None or not parsed.files:
             unknown.append(run)
             continue
         if measured:
             run = measure(ctx, run, parsed)
-        files = ([escape(path) for path in run.effective_files]
-                 if run.files_committed and run.effective_files is not None else parsed.files)
-        known.append(Claim(run, parsed, files))
+        known.append(claim(run, parsed))
     return known, unknown
+
+
+def claim(run: Run, parsed: ParsedIssue) -> Claim:
+    """A run's file claim: its committed measured files once recorded, else its approved Files."""
+    files = ([escape(path) for path in run.effective_files]
+             if run.files_committed and run.effective_files is not None else parsed.files)
+    return Claim(run, parsed, files)
 
 
 def intersects(ctx, *patterns: str) -> bool:
     from foragent import scheduler
 
-    sensitive = scheduler._filesystem_case_sensitive(ctx.repo_root)
-    return sensitive is None or scheduler._file_patterns_overlap(*patterns, case_sensitive=sensitive)
+    # A caller that must not probe passes its answer (None: unknown) as ``ctx.case_sensitive``.
+    sensitive = (ctx.case_sensitive if hasattr(ctx, "case_sensitive")
+                 else scheduler._filesystem_case_sensitive(ctx.repo_root))
+    # Unknown never makes two different paths overlap: compare them case-sensitively (D96).
+    return scheduler._file_patterns_overlap(*patterns, case_sensitive=sensitive is not False)
 
 
 def any_overlap(ctx, left: list[str], right: list[str]) -> bool:

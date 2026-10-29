@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from foragent import labels
-from foragent.config import DEFAULTS, IGNORED_KEYS, Config, _overlay, _validate
+from foragent.config import DEFAULTS, FILE_KEYS, IGNORED_KEYS, Config, _apply_executors, _overlay, _validate
 from foragent.git import GitError
 from foragent.issue import acceptance_paths, parse_body
 
@@ -122,13 +122,14 @@ def _repo_config(git: GitRepo, sha: str) -> dict[str, Any] | None:
         # Any failure to load is unparsable, and unparsable is result-affecting.
         return None
     value = {} if value is None else value
-    if not isinstance(value, dict) or any(key not in DEFAULTS and key not in IGNORED_KEYS for key in value):
+    if not isinstance(value, dict) or any(key not in DEFAULTS and key not in IGNORED_KEYS and key not in FILE_KEYS for key in value):
         return None
     if "max_parallel" in value and value["max_parallel"] is None:
         return None
     values = deepcopy(DEFAULTS)
     try:
         _overlay(values, value)
+        _apply_executors(values, {}, value)  # The same file rules as load_config (#786).
         _validate(values)
         Config(**values)
     except Exception:  # noqa: BLE001 - odd shapes or cyclic values can fail anywhere in validation

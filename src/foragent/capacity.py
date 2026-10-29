@@ -183,7 +183,39 @@ class LoadSample(tuple[str, float]):
         sample.swapins = swapins
         sample.load_average_per_cpu = load_average_per_cpu
         sample.cpu_busy = cpu_busy
+        sample.disk_rates = dict.fromkeys(DISK_RATES.values())
         return sample
+
+
+# Cumulative psutil disk counters and the per-second rate each one becomes.
+DISK_RATES = {"read_bytes": "read_bytes_per_s", "write_bytes": "write_bytes_per_s",
+              "read_count": "read_ops_per_s", "write_count": "write_ops_per_s"}
+
+
+def _disk_rates(sensor: dict[str, Any]) -> dict[str, float | None]:
+    """Disk I/O rates since the saved counters; rebases ``sensor`` on the current ones.
+
+    The first reading, a counter reset (e.g. reboot) and an unreadable counter are unknown (None).
+    """
+    rates: dict[str, float | None] = dict.fromkeys(DISK_RATES.values())
+    try:
+        # nowrap=False: raw kernel counters, so a reset shows as a decrease instead of being
+        # added onto the values psutil cached earlier in this process.
+        counters = psutil.disk_io_counters(nowrap=False)
+    except (OSError, RuntimeError, AttributeError, NotImplementedError, psutil.Error):
+        counters = None
+    if counters is None:
+        sensor.pop("disk", None)
+        return rates
+    current = {key: getattr(counters, key) for key in DISK_RATES}
+    current["at"] = time.time()
+    previous = sensor.get("disk")
+    if isinstance(previous, dict) and all(type(previous.get(key)) in (int, float) for key in current):
+        elapsed = current["at"] - previous["at"]
+        if elapsed > 0 and all(current[key] >= previous[key] for key in DISK_RATES):
+            rates = {name: (current[key] - previous[key]) / elapsed for key, name in DISK_RATES.items()}
+    sensor["disk"] = current
+    return rates
 
 
 def load_per_cpu() -> float:
@@ -286,11 +318,14 @@ def machine_load() -> LoadSample:
         # A reset (e.g. reboot) establishes a new baseline without negative activity.
         swapins = max(0, total - previous) if total is not None and previous is not None else None
         sensor["swapins_total"] = total
+        disk = _disk_rates(sensor)
         (root / SENSOR_FILE).write_text(json.dumps(sensor), encoding="utf-8")
     # Swap-ins are recorded as a fact; they never reclassify the kernel level.
     raw_load, busy = load_per_cpu(), cpu_busy()
     load = min(raw_load, busy / 0.6) if busy is not None else raw_load
-    return LoadSample(pressure, load, swapins, load_average_per_cpu=raw_load, cpu_busy=busy)
+    sample = LoadSample(pressure, load, swapins, load_average_per_cpu=raw_load, cpu_busy=busy)
+    sample.disk_rates = disk
+    return sample
 
 
 def _within_grace(timestamp: str | None, now: datetime) -> bool:

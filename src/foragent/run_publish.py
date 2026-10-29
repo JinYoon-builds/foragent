@@ -11,6 +11,7 @@ import tempfile
 from typing import TYPE_CHECKING
 
 from foragent import board, cuts, irreversible_paths, review_perspectives, risks
+from foragent import run_merge_turn as merge_turn
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
@@ -46,15 +47,17 @@ from foragent.run_publish_ci import (  # noqa: E402
     _CIWait, _ci_failure, _ci_status, _hold_changed_head, _hold_if_not_started, _wait_for_ci,
 )
 from foragent.run_publish_merge import (  # noqa: E402
-    _MergeInputs, _batch_pr, _check_publication, _final_merge_inputs, _merge_lock, _policy_allows,
-    retitle_for_merge,
-)
-from foragent.run_publish_pr import (  # noqa: E402
-    _merge_decision, _open_or_update_pr, _push_branch, _render_pr_body, _risk_always_human, _risk_notes,
-    _skills_line, _update_open_pr,
+    _MergeInputs, _batch_pr, _check_publication, _final_merge_inputs, _merge_lock, _policy_allows, retitle_for_merge,
 )
 from foragent.run_publish_preserve import (  # noqa: E402
     _check_wip_deletions, _preserve_failed_implementation, _preserve_locked_implementation,
 )
-from foragent.run_publish_flow import _publish, _publish_locked  # noqa: E402
-from foragent.run_publish_reviewed import _publish_reviewed_head  # noqa: E402
+from foragent.run_publish_pr import (  # noqa: E402
+    _merge_decision, _open_or_update_pr, _push_branch, _render_pr_body, _risk_always_human, _risk_notes, _skills_line, _update_open_pr,
+)
+from foragent.run_publish_flow import (  # noqa: E402
+    _publish, _publish_in_turn, _publish_locked,
+)
+from foragent.run_publish_reviewed import (  # noqa: E402
+    _publish_reviewed_head, _publish_reviewed_in_turn,
+)

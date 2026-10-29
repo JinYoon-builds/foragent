@@ -130,6 +130,10 @@ def test_parallel_self_merges_cannot_install_an_older_tree_last(run_case, monkey
     monkeypatch.setattr(c.tracker, "merge_pr", merge_into_main)
     monkeypatch.setattr(tool_install, "run_uv", uv)
     monkeypatch.setattr(runner, "after_merge", install_and_verify)
+    # This test pins the merge lock's scope; the FIFO turn (#712) would make B wait before the
+    # lock and hide a lock released too early, so both runs contend for the lock directly.
+    from foragent import run_merge_turn
+    monkeypatch.setattr(run_merge_turn, "holds_turn", lambda store, place: True)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(run_issue, 1, c.ctx)
         try:
@@ -936,7 +940,7 @@ def test_publication_returns_conflict_marker_locations_before_opening_pr(run_cas
     assert run_issue(1, c.ctx) == ("merged" if repair else "retries-exceeded")
     assert len(c.executor.calls) == 2
     for line in (2, 4, 6):
-        assert f"충돌 마커가 남음: notes.txt:{line}" in c.executor.calls[-1]["prompt"]
+        assert f"Conflict marker left: notes.txt:{line}" in c.executor.calls[-1]["prompt"]
     assert len(reviews) == int(repair)
     assert len(c.tracker.created_prs) == int(repair)
     assert len(c.tracker.merged_prs) == int(repair)
@@ -994,7 +998,7 @@ def test_batch_publication_failure_is_deferred_until_aggregate_contents_are_repa
     assert run_issue(1, c.ctx) == "merged"
     assert c.tracker.get_issue(1).state == "closed" and c.store.load_flag(1) is None
     assert len(c.tracker.created_prs) == 1
-    assert "Batch PR finalization deferred to tick: 충돌 마커가 남음: notes.txt:1" in c.store.log_path(1).read_text()
+    assert "Batch PR finalization deferred to tick: Conflict marker left: notes.txt:1" in c.store.log_path(1).read_text()
     context = TickContext(
         repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
         config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda number: None, start_runs=False,
@@ -1029,7 +1033,7 @@ def test_publication_rechecks_marker_locations_after_ci_before_merge(run_case, m
     monkeypatch.setattr(c.tracker, "pr_checks", ci)
     assert run_issue(1, c.ctx) == "merged"
     assert len(c.executor.calls) == 2
-    assert "충돌 마커가 남음: notes.txt:1" in c.executor.calls[-1]["prompt"]
+    assert "Conflict marker left: notes.txt:1" in c.executor.calls[-1]["prompt"]
     assert len(c.tracker.merged_prs) == 1
     assert git_command(c.history.origin, "show", "foragent/issue-1:notes.txt") == "resolved"
 

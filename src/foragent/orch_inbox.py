@@ -85,11 +85,15 @@ def requests(store: StateStore, *, pending: bool = False) -> list[dict[str, Any]
     return [row for row in rows if row["status"] != "done"] if pending else rows
 
 
-def set_request_status(store: StateStore, request_id: str, status: str, note: str | None = None) -> dict[str, Any]:
+def set_request_status(store: StateStore, request_id: str, status: str, note: str | None = None,
+                       check=None) -> dict[str, Any]:
+    """Set one request's status; ``check(record)`` runs inside the same state lock and may raise InboxError."""
     if status not in REQUEST_STATUSES:
         raise InboxError(f"status must be one of: {', '.join(REQUEST_STATUSES)}")
 
     def change(record: dict[str, Any]) -> None:
+        if check is not None:
+            check(record)
         record["status"] = status
         record.setdefault("notes", []).append(
             {"at": store._timestamp(), "status": status, "note": note or ""})
@@ -114,6 +118,20 @@ def ask(store: StateStore, question: str, options: list[str], recommend: int | N
         "status": "open", "answer": None,
         "issues": list(dict.fromkeys(issues)),
     })
+    append_event(store, store._now(), None, "ask", f"{record['id']}: {question}")
+    return _public(record)
+
+
+def ask_once(store: StateStore, key: str, question: str, options: list[str], recommend: int) -> dict[str, Any] | None:
+    """Record an open question unless one with this ``key`` was ever recorded; None when it was."""
+    with store._state_lock():
+        if any(row.get("key") == key for row in _records(store, "questions")):
+            return None
+        seq = max((int(row.get("seq", 0)) for row in _records(store, "questions")), default=0) + 1
+        record = {"id": f"q{seq}", "seq": seq, "key": key, "question": question, "options": list(options),
+                  "recommend": recommend, "status": "open", "answer": None, "issues": [],
+                  "created_at": store._timestamp(), "updated_at": store._timestamp()}
+        store._write_json(_folder(store, "questions") / f"{record['id']}.json", record)
     append_event(store, store._now(), None, "ask", f"{record['id']}: {question}")
     return _public(record)
 
@@ -206,6 +224,13 @@ def write_note(store: StateStore, now: str, why: str | None, next_step: str | No
     store.root.mkdir(parents=True, exist_ok=True)
     store._write_json(note_path(store), record)
     return record
+
+
+def person_found(store: StateStore, text: str) -> dict[str, Any]:
+    """Append one ``person-found`` event: a problem the person found before the retrospective."""
+    if not text.strip():
+        raise InboxError("--person-found must not be empty")
+    return append_event(store, store._now(), None, "person-found", text)
 
 
 def read_note(store: StateStore) -> dict[str, Any] | None:

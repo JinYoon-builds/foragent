@@ -17,7 +17,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import orch_events, orch_reviewers, review_notes, review_perspectives, risks
+from foragent import orch_events, orch_reviewers, quota_reviewer, review_notes, review_perspectives, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -159,6 +159,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
             path.chmod(mode)
 
 
+@quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
     from foragent import runner
@@ -187,8 +188,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
         before = git.review_state()
         try:
             result = _available_executor(
-                n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
-                reviewer=True,
+                n, ctx, ctx.executor_factory(reviewer), worktree=git.root, reviewer=True,
                 prompt="" if reviewer == "claude" else build_review_prompt(
                     parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
                     full_text_dir=cuts.issue_dir(ctx.store.root, n),
@@ -597,4 +597,6 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     return _publish_reviewed_head(
         n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
         comparison_attempt=comparison_attempt,
+        # On its merge turn a moved base is merged in and this head's checks run again (#712).
+        reverify=lambda new_head: _verify_review_head(n, ctx, git, parsed, new_head, link),
     )

@@ -93,9 +93,22 @@ class Run:
     # One entry per related-unit-test check: changed_file_count, selected_files,
     # file_seconds (JUnit testcase seconds per file), total_seconds and timed_out.
     related_tests: list[dict] = field(default_factory=list)
+    # 'issue' runs implement an issue; a 'dream' run (number 0) tidies one lane's memory (#189).
+    kind: str = "issue"
+
+    @property
+    def key(self) -> int | str:
+        """The record's name in runs/: the issue number, or dream-<lane> for a dream run."""
+        return f"dream-{self.lane}" if self.kind == "dream" else self.number
     # Identity of the work the current phase does (e.g. "baseline:<sha>"), journaled when it ends;
     # work_events maps each finished work identity to its first phase event, across executions.
     phase_work_id: str | None = None
     # When this instance of the work began; segments split by nested waits share it.
     phase_work_started_at: str | None = None
     work_events: dict[str, str] = field(default_factory=dict)
+    # Only records from before #186: the implementer chosen at start; None meant the lane's executor.
+    implementer: str | None = None
+    # The concrete pair the tick chose at start (#186); the runner reads it and never chooses again.
+    # A reviewer None means no review.
+    executor: str | None = None
+    reviewer: str | None = None

@@ -1,4 +1,4 @@
-"""PR contents, pushes and failed-work preservation."""
+"""PR contents, pushes and merge policy inputs."""
 
 from __future__ import annotations
 

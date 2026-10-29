@@ -20,10 +20,11 @@ class RunRecordsMixin:
 
     def start_run(
         self, number: int, *, branch: str, worktree: str | Path, pid: int | None = None,
-        lane: str = "main", tier: str = "m",
+        lane: str = "main", tier: str = "m", implementer: str | None = None, journal: Any = None,
+        executor: str | None = None, reviewer: str | None = None,
     ) -> Run:
         """Create a run; pid attests self or a newly spawned, unreaped child."""
-        with self._state_lock():
+        with self.worktree_lock(number), self._state_lock():  # Log pruning takes it too; callers must not hold it.
             timestamp = self._timestamp()
             approval = self.load_approval(number)
             previous = self.get_run(number)
@@ -38,10 +39,9 @@ class RunRecordsMixin:
                 session = {
                     "session_id": previous.session_id, "session_executor": previous.session_executor,
                     "session_ids": previous.session_ids, "session_body": previous.session_body,
-                    "merge_conflicts": previous.merge_conflicts,
+                    "merge_conflicts": previous.merge_conflicts, "work_events": previous.work_events,
                     "resume_whole": previous.resume_whole, "moved_files": previous.moved_files,
                     "local_skill_paths": previous.local_skill_paths,
-                    "work_events": previous.work_events,
                     "resume_reason": reason + (
                         "\nThe runner recreated the worktree from its target branch; "
                         "earlier uncommitted changes are no longer present."
@@ -54,9 +54,12 @@ class RunRecordsMixin:
                       restarts=restarts, lane=lane, tier=previous.tier if resumed else tier,
                       attempt_tiers=previous.attempt_tiers if resumed else {},
                       approval_body_sha=approval.body_sha if approval is not None else None,
-                      last_activity_at=timestamp, process_identities=identities, **session)
+                      last_activity_at=timestamp, process_identities=identities, implementer=implementer,
+                      executor=executor, reviewer=reviewer, **session)
             self._merge_lock_seconds.pop((number, timestamp), None)
             self._write_run(run)
+            if journal is not None:  # The audit event of this record (#107), under the same lock.
+                journal()
             return run
 
     def prepare_run_start(self, number: int) -> None:
@@ -165,12 +168,10 @@ class RunRecordsMixin:
             self._write_json(path, value)
 
     def active_runs(self) -> list[Run]:
-        runs = []
-        for path in sorted((self.root / "runs").glob("*.json"), key=lambda path: int(path.stem)):
-            run = self.get_run(int(path.stem))
-            if run is not None and run.status == "running":
-                runs.append(run)
-        return runs
+        paths = list((self.root / "runs").glob("*.json"))  # Issues by number, then dream-<lane> records.
+        runs = [*map(self.get_run, sorted(int(path.stem) for path in paths if path.stem.isdigit())),
+                *(self.get_dream(path.stem[6:]) for path in sorted(paths) if path.stem.startswith("dream-"))]
+        return [run for run in runs if run is not None and run.status == "running"]
 
     def pause_lane(self, lane: str, until: datetime) -> None:
         with self._state_lock():
@@ -200,12 +201,7 @@ class RunRecordsMixin:
 
     def executor_pause_until(self, executor: str, now: datetime) -> datetime | None:
         """When a usage-limit pause of ``executor`` ends, or None when it is not paused."""
-        try:
-            pauses = _state.json.loads((self.root / "executor-pauses.json").read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None
-        until = _state.datetime.fromisoformat(pauses[executor]) if executor in pauses else None
-        return until if until is not None and now < until else None
+        return self.executor_pauses(now).get(executor)
 
     def executor_paused(self, executor: str, now: datetime) -> bool:
         return self.executor_pause_until(executor, now) is not None
@@ -225,7 +221,9 @@ class RunRecordsMixin:
         until = _state.datetime.fromisoformat(_state.json.loads(value)["until"])
         return until if now < until else None
 
-    def finish_run(self, number: int, outcome: str, detail: str = "") -> Run:
+    def finish_run(self, number: int | str, outcome: str, detail: str = "") -> Run:
+        if isinstance(number, str):  # A dream record (dream-<lane>) never enters runs.jsonl.
+            return self.finish_dream(number[6:], outcome, detail)
         with self._state_lock():
             run = self.get_run(number)
             if run is None:
@@ -293,6 +291,5 @@ class RunRecordsMixin:
         prune_process_identities(self, inactive_only=inactive_only)
 
 
-# Bound last: foragent.state imports this module, and lookups happen at call time
-# so names patched on the facade reach this implementation.
+# Bound last: foragent.state imports this module; call-time lookups reach facade patches.
 import foragent.state as _state

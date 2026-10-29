@@ -1,7 +1,7 @@
 ---
 name: fa-architect
-description: Foragent architect role
 memory: project
+description: Foragent architect role
 skills:
 - fa-architect
 ---

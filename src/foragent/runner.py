@@ -145,6 +145,7 @@ class RunContext:
     sleep: Callable[[float], None] = time.sleep
     poll_hook: Callable[[Callable[[], ExecResult], Callable[[], None]], ExecResult] = poll_executor
     monotonic: Callable[[], float] = time.monotonic
+    lane_executor: str | None = None  # The lane's configured executor, before the run's pair (#186).
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self)
@@ -368,7 +369,12 @@ def run_issue(n: int, ctx: RunContext) -> str:
         board.sync_status(ctx, n, "Running")
         from foragent.run_implementation import lane_config
 
-        ctx = replace(ctx, config=lane_config(ctx.config, run.lane))
+        from foragent.quota_reviewer import stored_config
+
+        # The pair the tick stored at start (#186) holds for every attempt of this run.
+        lane_settings = lane_config(ctx.config, run.lane)
+        ctx = replace(ctx, config=stored_config(ctx.store, lane_settings, run, ctx.now()),
+                      lane_executor=lane_settings.executor)
         try:
             outcome = _execute(n, ctx, worktree)
         finally:

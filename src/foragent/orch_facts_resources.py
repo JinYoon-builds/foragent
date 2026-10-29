@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from foragent import capacity, orch_queue
+from foragent import capacity, orch_facts_machine, orch_queue
 from foragent.config import Config, in_run_hours, lane_executors
 from foragent.processes import read_process_identity
 from foragent.state import Run, StateStore
@@ -27,7 +27,8 @@ def _time(value: Any) -> datetime | None:
 def _jsonl(path) -> list[dict[str, Any]]:
     try:
         text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
+        # A missing journal or a non-directory ancestor both mean no records exist.
         return []
     rows = []
     for line in text.splitlines():
@@ -143,7 +144,7 @@ def _machine_runs(store: StateStore, now: datetime, running: list[Run], alive: d
 
 def _admission(
     store: StateStore, config: Config, root, now: datetime, waiting: list[_Waiting], running: list[Run],
-    hold_all: str | None = None, machine: dict[str, Any] | None = None,
+    hold_all: str | None = None, machine: dict[str, Any] | None = None, *, probe: bool = True,
 ) -> dict[str, Any]:
     """Replay the gate's start loop read-only: machine budget, project ceiling, lane holds, file rule.
 
@@ -154,6 +155,8 @@ def _admission(
     from foragent.scheduler_start import _lane_held
 
     ctx = SimpleNamespace(store=store, config=config, repo_root=root)
+    if not probe:
+        ctx.case_sensitive = None  # Unknown: intersects() then compares paths case-sensitively.
     state = capacity.read_state(store)
     machine_cap = int(state["parallel"]) if state else capacity.INITIAL_PARALLEL
     if (ceiling := machine["budget"]["max_parallel"]) is not None:
@@ -188,14 +191,13 @@ def _admission(
         # The tick skips the whole start loop before any cap, quota or file check.
         held.update({number: hold_all for _, number in ranked})
         ranked = []
-    lane_holds: dict[str, bool] = {}
     for index, (lane, number) in enumerate(ranked):
         item = items[number]
         if remaining <= 0:
             # No slot ends the loop: nothing after this point is checked.
             held.update({later: "cap" for _, later in ranked[index:]})
             break
-        if lane_holds.setdefault(lane, _lane_held(ctx, lane, now)):
+        if _lane_held(ctx, lane, now, number):  # The issue's own quota decision, as the tick makes it.
             held[number] = "quota"
         elif not admits(ctx, lane, item.parsed, known, unknown, union=union):
             held[number] = "structure"
@@ -217,7 +219,7 @@ def _admission(
 
 
 def _resources(store: StateStore, config: Config, root, now: datetime, waiting, slots, running,
-               machine: dict[str, Any]) -> dict[str, Any]:
+               machine: dict[str, Any], *, probe: bool = True) -> dict[str, Any]:
     sample = machine["sample"]
     pressure, load = sample[0], float(sample[1])
     # The gate's rules: only critical memory holds starts and test slots (#497); load at or over
@@ -231,7 +233,7 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
     hold_all = ("github" if github_until is not None
                 else "run_hours" if not in_run_hours(now.astimezone(), config.run_hours)
                 else "machine" if not memory_headroom else None)
-    work = _admission(store, config, root, now, waiting, running, hold_all, machine)
+    work = _admission(store, config, root, now, waiting, running, hold_all, machine, probe=probe)
     work["github_wait_until"] = github_until.isoformat() if github_until is not None else None
     # Running work held in flight: a run waiting for files other runs hold.
     work["in_flight"] = {str(run.number): "structure" for run in sorted(running, key=lambda run: run.number)
@@ -248,9 +250,9 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
             name in needed and not value["paused"] and (value["remaining_share"] or 0) > 0)
     waiting_now = bool(held) or slots["queue_length"] > 0
     return {
-        "machine": {"load_per_cpu": load, "memory_pressure": pressure, "memory_headroom": memory_headroom,
-                    "headroom": headroom, "overloaded": overloaded,
-                    "idle_while_waiting": headroom and waiting_now},
+        "machine": {**orch_facts_machine.sample(machine, now), "load_per_cpu": load, "memory_pressure": pressure,
+                    "memory_headroom": memory_headroom, "headroom": headroom, "overloaded": overloaded,
+                    "idle_while_waiting": headroom and waiting_now}, **orch_facts_machine.local(store, config, now, running, machine),
         "quota": quota,
         # `admitted` is what `hold_test_slot` grants now, including machine.yml's default ceiling.
         "test_slots": {**slots, "admitted": capacity.effective_test_slots(

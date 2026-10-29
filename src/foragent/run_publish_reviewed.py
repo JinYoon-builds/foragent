@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from foragent import run_merge_turn as merge_turn
     from foragent.git import GitRepo
     from foragent.policy import Decision
     from foragent.runner import RunContext
@@ -15,8 +16,33 @@ if TYPE_CHECKING:
 def _publish_reviewed_head(
     n: int, ctx: RunContext, git: GitRepo, pr, head: str, base_ref: str, base_sha: str,
     approval: Approval, approved: Callable[[], bool], batch_branch: str | None, parent: int | None,
-    *, comparison_attempt=None,
+    *, comparison_attempt=None, reverify: Callable[[str], str | None] | None = None,
 ) -> str:
+    # The review-only merge takes the same FIFO turn as an implementation run (#712).
+    place = run_publish.merge_turn.seat(ctx, n, pr.base)
+    outcome = None
+    try:
+        outcome = run_publish._publish_reviewed_in_turn(
+            n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
+            place, comparison_attempt=comparison_attempt, reverify=reverify,
+        )
+        return outcome
+    finally:
+        if outcome != "merged":
+            run_publish.merge_turn.withdraw(ctx, place)
+
+
+def _publish_reviewed_in_turn(
+    n: int, ctx: RunContext, git: GitRepo, pr, head: str, base_ref: str, base_sha: str,
+    approval: Approval, approved: Callable[[], bool], batch_branch: str | None, parent: int | None,
+    place: merge_turn.Seat, *, comparison_attempt=None, reverify: Callable[[str], str | None] | None = None,
+) -> str:
+    """Merge a reviewed head on its turn; ``reverify`` re-runs its checks after a base merge.
+
+    A moved base is merged into the reviewed head, re-verified once per move and
+    pushed (as the implementation path does after its review); without
+    ``reverify`` or on a conflict it stops as base-changed.
+    """
     from foragent import runner
 
     worktree = git.root
@@ -31,16 +57,48 @@ def _publish_reviewed_head(
             return run_publish._hold_changed_head(n, ctx, link)
         current = next((item for item in ctx.tracker.list_prs("open", pr.head)
                         if item.number == pr.number), None)
-        ctx.git.fetch("origin", pr.base)
-        if current is None or current.base != pr.base or ctx.git.ref_sha(base_ref) != base_sha:
-            run_publish.flag(ctx, n, run_publish.Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
-            return "base-changed"
+        # A moved target SHA is no stop here: the turn holder refreshes it (#712).
+        if current is None or current.base != pr.base:
+            return base_changed()
         if not run_publish._acceptance_matches(n, ctx, git, approval):
             return "hash-mismatch"
         return None
 
+    def base_changed() -> str:
+        run_publish.flag(ctx, n, run_publish.Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
+        return "base-changed"
+
     if stopped := unchanged():
         return stopped
+
+    def refresh(target_sha: str) -> str | None:
+        """Merge the moved base into the reviewed head, re-verify and push it."""
+        nonlocal head, base_sha, started, ci_wait, queued_status
+        if runner._remaining(n, ctx) <= 0:
+            return run_publish._timeout(n, ctx)
+        if reverify is None:
+            return base_changed()
+        run_publish._append(log, f"{run_publish.REVERIFY}: {target_sha}")
+        try:
+            git.merge_base(target_sha)
+        except run_publish.GitError:
+            if not git.conflict_paths():
+                raise
+            git.quit_merge()
+            return base_changed()
+        new_head = git.head_sha()
+        if stopped := reverify(new_head):
+            return stopped
+        run_publish._check_publication(git, pr.base, target_sha)
+        git.push_head(pr.head, lease=head)
+        ctx.tracker.comment(pr.number, f"base merged before merge: {target_sha}")
+        run_publish._append(log, f"Pushed verified HEAD: {new_head}")
+        head, base_sha = new_head, target_sha
+        started = ctx.now().timestamp()
+        ci_wait, queued_status = run_publish._CIWait(started), None
+        if ctx.tracker.pr_head_sha(pr.number) != head:
+            return run_publish._hold_changed_head(n, ctx, link)
+        return None
 
     def policy_hold(decision: Decision, current_batch: str | None = batch_branch) -> str | None:
         if decision.kind == "hold":
@@ -65,6 +123,18 @@ def _publish_reviewed_head(
             comparison_mode=comparison_attempt is not None,
         ):
             return stopped
+        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, head)
+        if stopped:
+            return stopped
+        if waited:
+            # CI is checked again, with a fresh deadline, once the turn arrives.
+            ci_wait, queued_status = run_publish._CIWait(ctx.now().timestamp()), None
+            continue
+        ctx.git.fetch("origin", pr.base)
+        if (target_sha := ctx.git.ref_sha(base_ref)) != base_sha:
+            if stopped := refresh(target_sha):
+                return stopped
+            continue
         comparison = None
         if comparison_attempt is not None:
             comparison = run_publish.require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
@@ -72,15 +142,18 @@ def _publish_reviewed_head(
                                                         deadline=ci_wait.deadline)
             if stopped := unchanged():
                 return stopped
+        failed_merge = None
         with run_publish._merge_lock(n, ctx):
             inputs = run_publish._final_merge_inputs(
-                n, ctx, git, pr.number, pr.head, pr.base, head, approval, started, base_sha=base_sha,
+                n, ctx, git, pr.number, pr.head, pr.base, head, approval, started,
                 approved_body_sha=approval.body_sha,
                 comparison=comparison,
             )
             continue_merge = (inputs.stop is None and run_publish._policy_allows(inputs.decision, pr.base, inputs.batch_branch)
                               and inputs.status in {"pass", "none"} and inputs.comparison_current)
-            if continue_merge:
+            # A base that moved during lock acquisition is refreshed unlocked, like the implementation path.
+            moved = continue_merge and inputs.base_sha != base_sha
+            if continue_merge and not moved:
                 run_publish._check_publication(git, pr.base, inputs.base_sha)
                 title = f"{ctx.tracker.get_issue(n).title} (#{n})"
                 subject = run_publish.retitle_for_merge(
@@ -88,15 +161,17 @@ def _publish_reviewed_head(
                     body=lambda: pr.body, note=lambda line: run_publish._append(log, line),
                 )
                 pr = run_publish.replace(pr, title=title)
+                run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
                 try:
                     ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
                 except run_publish.TrackerError as exc:
+                    run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "failed")
                     if exc.is_rate_limit:
                         raise
                     if ctx.tracker.pr_head_sha(pr.number) != head:
                         inputs.stop = lambda: run_publish._hold_changed_head(n, ctx, link)
                     else:
-                        raise
+                        failed_merge = exc
                 else:
                     ctx.store.record_merge(n, ctx.now())
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":
@@ -120,10 +195,19 @@ def _publish_reviewed_head(
                                 raise
                             run_publish._append(log, f"Batch PR finalization deferred to tick: {exc}")
                     return "merged"
+        if failed_merge is not None:
+            # Re-enter at the FIFO tail for a later turn instead of ending the run (#712).
+            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge)
+            queued_status = None
+            continue
         if inputs.stop is not None:
             return inputs.stop()
         if stopped := policy_hold(inputs.decision, inputs.batch_branch):
             return stopped
+        if moved:
+            if stopped := refresh(inputs.base_sha):
+                return stopped
+            continue
         queued_status = inputs.status
 
 
