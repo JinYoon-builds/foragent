@@ -24,7 +24,7 @@ class RunRecordsMixin:
         executor: str | None = None, reviewer: str | None = None,
     ) -> Run:
         """Create a run; pid attests self or a newly spawned, unreaped child."""
-        with self._state_lock():
+        with self.worktree_lock(number), self._state_lock():  # Log pruning takes it too; callers must not hold it.
             timestamp = self._timestamp()
             approval = self.load_approval(number)
             previous = self.get_run(number)
