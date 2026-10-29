@@ -95,7 +95,10 @@ def test_rows_win_and_sections_give_way_from_the_bottom_on_a_short_screen(tmp_pa
     short = watch.render_frame(busy_snapshot(18), config, tmp_path, width=100).splitlines()
     assert len(tall) > 24 >= len(short)
     assert sum(line.startswith("🐿") or line.startswith("[*]") for line in short) == 18
-    assert short[-1] == "j/k move · Enter open · f fold · a all · o orchestrator · x close · q quit"
+    # On a short screen the key letters stay, directly above the usage line (#115),
+    # which ends with the quit key.
+    assert short[-2] == "j/k move · Enter open · f fold · a all · o orchestrator · m keep/burn · x close"
+    assert short[-1] == "Claude — · Codex — · running 0/2 · keep 80% · q quit"
     assert "handled" not in "\n".join(short), "the events log below the rows gives way first"
 
 

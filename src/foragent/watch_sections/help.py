@@ -7,7 +7,7 @@ from foragent.config import Config
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
-ORDER = 60
+ORDER = 80  # After the other gates (70), directly above the usage line (90, #115).
 GAP = False  # The help line sits directly under the section above it.
 KEEP = True  # The footer stays when the screen is short.
 
@@ -16,7 +16,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     from foragent import watch
 
     if context.get("short"):
-        # Sections gave way to the lane rows: one short line of the key letters.
+        # Sections gave way to the lane rows: one short line of the key letters. The quit
+        # key ends the usage line below (#115).
         return [watch._line(watch.text("acorns_keys", config.language))]
     count = len(snapshot.status["lanes"])
     # The lane-row keys (#170) live with their feature in messages/acorns.py.

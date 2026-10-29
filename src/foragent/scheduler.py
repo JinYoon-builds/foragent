@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_spawn, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_spawn, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -104,6 +104,7 @@ def tick(ctx: TickContext) -> TickReport:
                     if not exc.is_rate_limit:
                         raise
                     return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
+                orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language)  # Met role signals (#794).
                 return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 
 

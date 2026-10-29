@@ -63,6 +63,29 @@ class Snapshot:
     today_done: dict[str, int] | None = None
     # Order preparation facts from ``fa order progress`` (StateStore.order_progress); None when none.
     prep: dict[str, Any] | None = None
+    # The usage line's facts, read once per refresh (``meter``): usage.json, the machine's
+    # running runs and budget, the effective Claude mode and memory pressure. Empty when not collected.
+    meter: dict[str, Any] = field(default_factory=dict)
+
+
+def meter(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
+    """One read of what the usage line shows; an unreadable record reads as missing."""
+    from foragent import capacity, scheduler_quota
+
+    found: dict[str, Any] = {"mode": scheduler_quota.quota_mode(store, config)[0],
+                             "memory": capacity.memory_pressure()}
+    try:
+        usage = store.usage()
+    except (OSError, ValueError):
+        usage = {}
+    found["usage"] = usage if isinstance(usage, dict) else {}
+    state = capacity.read_state(store)
+    found["budget"] = config.max_parallel or (int(state["parallel"]) if state else capacity.INITIAL_PARALLEL)
+    try:
+        found["running"] = capacity.machine_runs(store, now)
+    except OSError:
+        pass  # No machine state folder yet: the line counts this repository's active runs.
+    return found
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -230,4 +253,5 @@ def collect(
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
                           worker_states, eta_range, basis, today, merged_at, orch_panel.collect(store, now),
                           phases, say, titles=titles, run_starts=run_starts, run_phases=run_phases,
-                          today_done=today_done, prep=prep)
+                          today_done=today_done, prep=prep,
+                          meter=meter(store, config, now))

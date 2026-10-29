@@ -57,20 +57,68 @@ def test_active_runs_and_runs_without_a_finish_are_kept_by_age(tmp_path):
     assert all(path.is_file() for path in kept)
 
 
+def drop_finished_at(store, number):
+    """Make issue ``number``'s history look like a record written before finish times were saved."""
+    history = store.root / "runs.jsonl"
+    values = [json.loads(line) for line in history.read_text().splitlines()]
+    for value in values:
+        if value["number"] == number:
+            del value["finished_at"]
+    history.write_text("".join(json.dumps(value) + "\n" for value in values))
+
+
 def test_newest_finished_run_decides_and_mtime_is_the_fallback_age(tmp_path):
     store, clock = make(tmp_path)
     run(store, clock, 1, days=40, outcome="blocked")
     run(store, clock, 1, days=3, outcome="merged")
     young = write(store, "issue-1.log", days=40)
-    history = store.root / "runs.jsonl"
-    run(store, clock, 2, days=0, outcome="merged")
-    lines = history.read_text().splitlines()
-    value = json.loads(lines[-1])
-    del value["finished_at"]  # A record written before finish times were saved.
-    history.write_text("\n".join([*lines[:-1], json.dumps(value)]) + "\n")
-    old, fresh = write(store, "issue-2.log", days=8), write(store, "issue-2.stdout", days=6)
-    assert store.prune_logs(NOW) == [old]
-    assert young.is_file() and fresh.is_file()
+    for number in (2, 3):
+        run(store, clock, number, days=0, outcome="merged")
+        drop_finished_at(store, number)
+    # The group's age is its newest file mtime: 6 days keeps the whole group, 8 days deletes it.
+    kept = [write(store, "issue-2.log", days=8), write(store, "issue-2.stdout", days=6)]
+    old = [write(store, "issue-3.log", days=9), write(store, "issue-3.stdout", days=8)]
+    assert store.prune_logs(NOW) == old
+    assert young.is_file() and all(path.is_file() for path in kept)
+
+
+def test_size_rule_orders_groups_by_last_activity_without_a_finish_time(tmp_path, monkeypatch):
+    """Goal (2026-10-29): without finished_at a group's age is its newest file mtime.
+
+    Each fallback kind gets one older-looking .log whose group was written to
+    yesterday; the group whose newest file is oldest goes first.
+    """
+    monkeypatch.setattr(state, "LOG_LIMIT_BYTES", 160)
+    store, clock = make(tmp_path)
+    no_finish = [write(store, "issue-1.log", days=20, size=40), write(store, "issue-1.stdout", days=1, size=40)]
+    orphans = [write(store, "issue-2-review-1-1.log", days=20, size=20),
+               write(store, "issue-2.stdout", days=1, size=20)]
+    run(store, clock, 3, days=0, outcome="blocked")
+    drop_finished_at(store, 3)
+    missing = [write(store, "issue-3.log", days=20, size=20), write(store, "issue-3.stdout", days=1, size=20)]
+    oldest = write(store, "issue-4.log", days=10, size=40)
+    assert store.prune_logs(NOW) == [oldest]
+    assert all(path.is_file() for path in [*no_finish, *orphans, *missing])
+    monkeypatch.setattr(state, "LOG_LIMIT_BYTES", 50)
+    stamp = (NOW - timedelta(days=2)).timestamp()
+    os.utime(no_finish[1], (stamp, stamp))
+    assert store.prune_logs(NOW) == no_finish + orphans  # Oldest last activity first, each group whole.
+
+
+def test_merged_retention_follows_log_retention_days(tmp_path, monkeypatch):
+    from foragent import settings
+
+    store, clock = make(tmp_path)
+    run(store, clock, 1, days=8)
+    run(store, clock, 2, days=3)
+    paths = [write(store, "issue-1.log"), write(store, "issue-2.log")]
+    monkeypatch.setattr(settings, "read_machine", lambda: {"log_retention_days": 10})
+    assert store.prune_logs(NOW) == []
+    monkeypatch.setattr(settings, "read_machine", lambda: {"log_retention_days": 2})
+    assert store.prune_logs(NOW) == paths
+    run(store, clock, 5, days=29, outcome="failed")
+    failed = write(store, "issue-5.log")
+    assert store.prune_logs(NOW) == [] and failed.is_file(), "Other outcomes keep 30 days"
 
 
 def test_size_rule_deletes_oldest_whole_issues_never_active_ones(tmp_path, monkeypatch):

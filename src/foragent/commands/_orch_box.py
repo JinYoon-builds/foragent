@@ -63,6 +63,9 @@ def _add_inbox(orch_actions) -> None:
     from foragent import orch_roles
 
     orch_roles.add_parser(orch_actions)
+    from foragent import orch_role_raise
+
+    orch_role_raise.add_parser(orch_actions)
     reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")
     reviewers.add_argument("issue", type=int)
     reviewers.add_argument("count", type=int, nargs="?", help="Reviewer count (1 or more); wins over review_reviewers")
@@ -132,6 +135,10 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         from foragent import orch_roles
 
         return orch_roles.command(args, store, config)
+    if args.action == "signal-answer":
+        from foragent import orch_role_raise
+
+        return orch_role_raise.command(args, store)
     if args.action == "ensure":
         _ensure(args, store, config)
         return

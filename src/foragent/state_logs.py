@@ -11,7 +11,8 @@ from pathlib import Path
 import re
 
 # Days a finished run's logs stay, by its newest run's outcome; any non-merged outcome keeps 30.
-MERGED_RETENTION = timedelta(days=7)
+# Merged runs keep `fa settings` log_retention_days (#160), 7 by default.
+MERGED_RETENTION_DAYS = 7
 OTHER_RETENTION = timedelta(days=30)
 JOURNAL_RETENTION = timedelta(days=30)
 JOURNALS = ("orch-events.jsonl", "gate-events.jsonl")
@@ -62,11 +63,14 @@ class LogRetentionMixin:
     def prune_logs(self, now: datetime) -> list[Path]:
         """Delete expired issue logs, then the oldest above the size cap; return every deleted path.
 
-        Retention follows each issue's newest finished run in runs.jsonl: merged
-        keeps 7 days, any other outcome 30, measured from its ``finished_at``
-        (else each file's mtime). Issues with an active run are never touched;
-        issues without a finished run are kept by age but may go by size.
-        Files under logs/ that are not issue files count toward the cap only.
+        An issue's files form one group, kept or deleted together. Retention
+        follows its newest finished run in runs.jsonl: merged keeps
+        ``log_retention_days`` (7 by default), any other outcome 30. The group's
+        age is that run's ``finished_at``, else its newest file mtime (its last
+        activity), so a group still being written is never the oldest. Issues
+        with an active run are never touched; issues without a finished run are
+        kept by age but may go by size. Files under logs/ that are not issue
+        files count toward the cap only.
         """
         self.trim_journals(now)
         logs = self.root / "logs"
@@ -77,20 +81,23 @@ class LogRetentionMixin:
             if path.is_file() and (match := _ISSUE_FILE.match(path.name)):
                 groups.setdefault(int(match[1]), []).append(path)
         newest = self._newest_finished_runs()
+        merged_keep = timedelta(days=self._merged_retention_days())
+
+        def expired(run: dict, paths: list[Path]) -> list[Path]:
+            keep = merged_keep if run.get("outcome") == "merged" else OTHER_RETENTION
+            return paths if paths and now - self._group_age(run, paths) > keep else []
+
         deleted: list[Path] = []
         for number in sorted(groups):
             if (run := newest.get(number)) is not None:
-                deleted += [path for path, _ in self._delete_issue_files(
-                    number, run, lambda fresh, paths: [path for path in paths if self._expired(fresh, path, now)])]
+                deleted += [path for path, _ in self._delete_issue_files(number, run, expired)]
         limit = _state.LOG_LIMIT_BYTES
         total = self.logs_total()
         if total <= limit:
             return deleted
 
         def age(number: int) -> tuple[datetime, int]:
-            finished = _parse_time((newest.get(number) or {}).get("finished_at"))
-            paths = [path for path in groups[number] if path.exists()]
-            return finished or max(self._mtime(path) for path in paths), number
+            return self._group_age(newest.get(number), [path for path in groups[number] if path.exists()]), number
 
         for number in sorted((n for n in groups if any(path.exists() for path in groups[n])), key=age):
             if total <= limit:
@@ -101,9 +108,15 @@ class LogRetentionMixin:
         return deleted
 
     @classmethod
-    def _expired(cls, run: dict, path: Path, now: datetime) -> bool:
-        keep = MERGED_RETENTION if run.get("outcome") == "merged" else OTHER_RETENTION
-        return now - (_parse_time(run.get("finished_at")) or cls._mtime(path)) > keep
+    def _group_age(cls, run: dict | None, paths: list[Path]) -> datetime:
+        """The run's finished_at, else the group's newest file mtime (its last activity)."""
+        return _parse_time((run or {}).get("finished_at")) or max(cls._mtime(path) for path in paths)
+
+    @staticmethod
+    def _merged_retention_days() -> int:
+        from foragent import settings
+
+        return settings.read_machine().get("log_retention_days", MERGED_RETENTION_DAYS)
 
     def logs_total(self) -> int:
         """Bytes of every file under <state>/logs/."""
