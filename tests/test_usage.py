@@ -124,7 +124,9 @@ def test_executor_pause_holds_every_lane_that_uses_it(tmp_path):
     store.pause_executor("codex", NOW + timedelta(minutes=1))  # never shortened
     later = NOW + timedelta(minutes=30)
     # main and api implement with codex; ui implements with claude and reviews with codex.
-    assert _lane_held(ctx, "main", later) and _lane_held(ctx, "api", later) and _lane_held(ctx, "ui", later)
+    assert _lane_held(ctx, "main", later) and _lane_held(ctx, "api", later)
+    # #186 rule 5: ui uses Codex only as its reviewer, so its review moves to Claude and it starts.
+    assert not _lane_held(ctx, "ui", later)
     assert not _lane_held(ctx, "main", NOW + timedelta(hours=1))
     store.pause_executor("claude", NOW + timedelta(hours=2))
     # Claude's roles move to Codex while Codex is free (#107): main reviews and ui implements with Codex.

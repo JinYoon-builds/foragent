@@ -35,6 +35,7 @@ from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, r
 from foragent.watch_sections.acorns import issue_box, issue_url
 from foragent.watch_sections.detail import render_detail
 from foragent.watch_sections.finished import FIREWORKS_SECONDS, calm
+from foragent.watch_sections.settings import settings_view
 from foragent.watch_sections.stage import _stage
 from foragent.watch_mouse import (
     MIN_SCREEN, handle_key, handle_mouse, highlighted, highlighted_row, hit_test, osc8, scroll, scroll_limit, switch_to_orchestrator,
@@ -62,6 +63,20 @@ def should_reload(started: str, current: str) -> bool:
                 and started != current)
 
 
+class _Refresh:
+    """One snapshot read with the view's current configuration.
+
+    The settings window (#173) saves and reloads the configuration; setting ``config``
+    makes the next refresh read the usage meter (mode, budget) and lanes with it.
+    """
+
+    def __init__(self, read: Callable[[Config], Snapshot], config: Config) -> None:
+        self.read, self.config = read, config
+
+    def __call__(self) -> Snapshot:
+        return self.read(self.config)
+
+
 def _write(sequences: list[str]) -> None:
     sys.stdout.write("".join(sequences))
     sys.stdout.flush()
@@ -76,7 +91,7 @@ def run(
         raise ConfigError(text("watch_terminal", config.language))
     argv = sys.argv.copy()
     reload_requested = False
-    refresh = lambda: collect(status(), tracker, store, config, now())
+    refresh = _Refresh(lambda current: collect(status(), tracker, store, current, now()), config)
     if once:
         # A single printed frame is the calm finished scene, never fireworks.
         with calm():

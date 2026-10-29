@@ -18,7 +18,7 @@ def add(commands) -> None:
     actions = command.add_subparsers(dest="action", required=True)
     listing = actions.add_parser("list", help=say("settings_list_help"))
     getting = actions.add_parser("get", help=say("settings_get_help"))
-    getting.add_argument("key")
+    getting.add_argument("key", nargs="?")
     setting = actions.add_parser("set", help=say("settings_set_help"))
     setting.add_argument("key")
     setting.add_argument("value", nargs="?")
@@ -29,7 +29,7 @@ def add(commands) -> None:
 
 
 def run(args) -> int:
-    from foragent import settings, settings_write
+    from foragent import settings
 
     cli = facade()
     root = args.repo_root.resolve()
@@ -45,10 +45,24 @@ def run(args) -> int:
                 print("  ".join((entry["scope"], entry["key"], settings.plain(entry["value"]),
                                  entry["description"])))
         return 0
+    if args.action == "get" and args.key is None:
+        values = settings.effective(root, _store(root), language)
+        if args.json:
+            print(cli.json.dumps(values, ensure_ascii=False))
+        else:
+            for entry in settings.SETTINGS:
+                value = values
+                for part in entry.key.split("."):
+                    value = value[part]
+                print(f"{entry.key} {settings.plain(value)}")
+        return 0
     if args.action == "get":
         entry = settings.get_item(root, args.key, language)
     else:
-        entry = settings_write.set_value(root, args.key, args.value, unset=args.unset, language=language)
+        from foragent import config as config_module
+
+        # The settings window saves through the same function.
+        entry = config_module.set_setting(root, args.key, args.value, unset=args.unset, language=language)
     if args.json:
         print(cli.json.dumps(entry, ensure_ascii=False))
     elif args.action == "get":
@@ -56,3 +70,13 @@ def run(args) -> int:
     else:
         print("  ".join((entry["scope"], entry["key"], settings.plain(entry["value"]))))
     return 0
+
+
+def _store(root):
+    """The repository's state store, which holds fa quota mode's override; None without one."""
+    cli = facade()
+    try:
+        config = cli.load_config(root)
+        return cli.StateStore.for_repo(config.repo or cli.GitRepo(root).remote_slug())
+    except (cli.ConfigError, cli.GitError, OSError):
+        return None  # Without a repository slug only the files apply.
