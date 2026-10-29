@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 from foragent import cuts, watchdog
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import _passing_acceptance_ids, _pytest_command, junit_node_id
-from foragent.run_waits import _phase, _progress, _test_slot, in_phase, phase_identity, restore_phase
+from foragent.run_waits import _phase, _progress, _test_slot, after_check, in_phase, phase_identity, restore_phase
 
 
 def report_ids(report, result, measurement):
@@ -172,6 +172,8 @@ def fallback_comparison(attempt, base_sha):
         attempt.baseline = baseline
         raise AttemptFailure("Acceptance comparison modified tracked files; reverify with the local baseline.",
                              attempt.target_branch)
+    if result is not None:
+        after_check(n, ctx, [result])  # A check stopped at the safety net restarts the run (#435).
     if result is not None and (result.exit_code != 0 or result.timed_out):
         raise AttemptFailure(f"Acceptance baseline regression:\n{result.command}\n{result.output}", attempt.target_branch)
     ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})

@@ -571,29 +571,15 @@ def targeted_table(pids) -> ProcessTable:
     return ProcessTable(rows, unreadable)
 
 
-def read_children(pid: int) -> tuple[ProcessIdentity, ...]:
-    """Verified identities of ``pid``'s current children, without listing our process table."""
-    try:
-        children = psutil.Process(pid).children()
-    except psutil.NoSuchProcess:
-        return ()
-    except psutil.AccessDenied as exc:
-        raise PermissionError(f"Children of {pid} cannot be read") from exc
-    found = []
-    for child in children:
-        row = read_process_identity(child.pid)
-        if row is not None and row.ppid == pid:
-            found.append(row)
-    return tuple(found)
-
-
 def _observe_quiescent(identities, rows) -> list[dict]:
-    """A stop of a silent tree: the tick snapshot plus targeted reads of each live member's children.
+    """A stop of a silent tree: the tick snapshot's tree, each parent rechecked by a targeted read.
 
-    The snapshot supplies the recorded tree; a child forked after it is found by reading
-    each verified live member's children, so no further whole-table listing is needed (#435).
+    No further whole-table listing: the tree proved silent for the whole window, so the
+    snapshot taken at this tick is its current shape. A protected process (init, our own
+    lineage, group or session) is never a root, and a parent must be the same lifetime
+    before and after its children are taken, so a reused PID adopts nothing (#435).
     """
-    known = {item["pid"]: item["start_time"] for item in observe_routine_tree(identities)}
+    known = {item["pid"]: item["start_time"] for item in identities}
     lineage, group, session = _protected(rows)
 
     def safe(row) -> bool:  # The rule observe_tree applies to every root and child.
@@ -607,18 +593,13 @@ def _observe_quiescent(identities, rows) -> list[dict]:
     frontier = list(known)
     while frontier:
         pid = frontier.pop()
-        # A protected process (init, our own lineage, group or session) is never a traversal
-        # root, even when recorded: its children are not the run's.
         if (parent := verified(pid)) is None:
             continue
-        children = read_children(pid)
-        # The parent must still be the same lifetime after its children were read: a PID
-        # reused in between would adopt the replacement's children.
+        children = [row for row in rows.values() if row.ppid == pid and row.pid not in known
+                    and row.start_time >= parent.start_time and safe(row)]
         if verified(pid) is None:
             continue
         for child in children:
-            if child.pid in known or child.start_time < parent.start_time or not safe(child):
-                continue
             known[child.pid] = child.start_time
             frontier.append(child.pid)
     return [{"pid": pid, "start_time": start} for pid, start in known.items()]
@@ -755,15 +736,20 @@ def _past_budget():
     return SilenceWatchdog(safety_net=math.inf, window_seconds=math.inf, runtime_limit=0)
 
 
-def _watch(process, watchdog, output, log, forward, identities) -> bool:
-    """Wait for ``process`` under the silence watchdog; True when it decided to stop."""
+def _watch(process, watchdog, output, log, forward, identities, channels=()) -> bool:
+    """Wait for ``process`` under the silence watchdog; True when it decided to stop.
+
+    Output is every channel the process writes: its private stdout file and ``channels``
+    (a separate stderr file, or the log that receives its stderr directly).
+    """
     def observe():
         forward()
         try:
             snapshot = list_processes()
         except OSError:
             snapshot = None  # CPU unknown this poll: the watchdog never reads that as silence.
-        return watchdog.observe(now=time.monotonic(), output_bytes=os.fstat(output.fileno()).st_size,
+        written = sum(os.fstat(stream.fileno()).st_size for stream in (output, *channels))
+        return watchdog.observe(now=time.monotonic(), output_bytes=written,
                                 progress_events=0, snapshot=snapshot, identities=identities())
 
     observe()
@@ -911,6 +897,8 @@ def run_logged(
         follower = threading.Thread(target=follow_stdout, daemon=True) if capture_stdout else None
         if follower is not None:
             follower.start()
+        # Where the process's stderr lands when it is not in the private stdout file.
+        stderr_channels = (errors,) if errors is not None else (log,) if capture_stdout else ()
         try:
             if on_process_group is not None:
                 on_process_group(process.pid)  # start_new_session makes PID == PGID.
@@ -919,7 +907,8 @@ def run_logged(
             if watchdog is not None:
                 # With a follower thread (captured stdout) it alone forwards; two writers would duplicate.
                 timed_out = _watch(process, watchdog, output, log,
-                                   forward_stdout if follower is None else (lambda: None), lambda: identities)
+                                   forward_stdout if follower is None else (lambda: None), lambda: identities,
+                                   channels=stderr_channels)
                 if timed_out:
                     stop_children()
                     process.wait()
@@ -929,7 +918,8 @@ def run_logged(
                 except subprocess.TimeoutExpired:
                     timed_out = not quiet_timeout or _watch(
                         process, _past_budget(), output, log,
-                        forward_stdout if follower is None else (lambda: None), lambda: identities)
+                        forward_stdout if follower is None else (lambda: None), lambda: identities,
+                        channels=stderr_channels)
                     if timed_out:
                         stop_children()
                         process.wait()

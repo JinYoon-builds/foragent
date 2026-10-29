@@ -826,7 +826,8 @@ def test_running_overtime_backstop_kills_alive_runner(ctx, monkeypatch, seconds,
     actions = []
     ctx.kill_runner = record_stop(ctx, actions.append)
     ctx.now = lambda: NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 10, seconds=seconds)
-    ctx.store.update_run(1, last_progress_at=ctx.now().isoformat())
+    # Progress 20 minutes ago: no stall yet, but past the limit with no growing fact it is killed (#435).
+    ctx.store.update_run(1, last_progress_at=(NOW + timedelta(minutes=ctx.config.max_runtime_minutes - 10)).isoformat())
     tick(ctx)
     assert actions == ([5432] if killed else [])
     if killed:
@@ -846,7 +847,8 @@ def test_runtime_backstop_outbox_survives_uncollected_old_comment_after_reset(ct
     assert all(comment["id"] != old_comment for comment in ctx.store.local_issues()[0]["comments"])
 
     ctx.now = lambda: NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 11)
-    ctx.store.update_run(1, last_progress_at=ctx.now().isoformat())
+    # Progress 20 minutes ago: no stall yet, but past the limit with no growing fact it is killed (#435).
+    ctx.store.update_run(1, last_progress_at=(NOW + timedelta(minutes=ctx.config.max_runtime_minutes - 10)).isoformat())
     until = ctx.now() + timedelta(minutes=1)
     add_labels = remote.add_labels
     attempts, killed, launches = [], [], []

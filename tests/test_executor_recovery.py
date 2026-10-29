@@ -81,7 +81,7 @@ def test_runner_persists_and_clears_real_executor_group(recovery, monkeypatch, f
     monkeypatch.setattr(f"foragent.executors.{executor}_command", lambda *args: ["offline-executor"])
     if timeout:
         # Past its budget a session ends only once quiet (#435): this one is quiet, so it is stopped.
-        monkeypatch.setattr("foragent.processes._watch", lambda *args: True)
+        monkeypatch.setattr("foragent.processes._watch", lambda *args, **kwargs: True)
     runner_ctx = SimpleNamespace(store=ctx.store, now=ctx.now, poll_hook=lambda execute, poll: execute())
     result = _run_executor(
         1, runner_ctx, executor_for(executor), worktree=ctx.store.worktree_path(1),

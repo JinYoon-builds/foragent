@@ -177,8 +177,8 @@ def test_interrupted_watchdog_stop_finishes_as_restart(monkeypatch):
     assert restored == [1]
 
 
-# Stale tree: a silent tree's stop still ends a child forked after the snapshot.
-def test_quiescent_stop_ends_a_child_forked_after_the_snapshot(fake_process_table, monkeypatch, tmp_path):
+# A silent tree's stop ends its whole snapshot tree with that one listing (#435).
+def test_quiescent_stop_ends_the_snapshot_tree_with_one_listing(fake_process_table, monkeypatch, tmp_path):
     table = fake_process_table
     root = table.add(42000, cwd=tmp_path, start_time=10)
     child = table.add(42001, ppid=root.pid, cwd=tmp_path, start_time=11)
@@ -193,16 +193,15 @@ def test_quiescent_stop_ends_a_child_forked_after_the_snapshot(fake_process_tabl
             return None
 
     monkeypatch.setattr(processes, "read_process_identity", read)
-    monkeypatch.setattr(processes, "read_children", lambda pid: tuple(
-        row for number, row in table.rows.items() if number in table.live and row.ppid == pid))
+    # A grandchild the snapshot witnessed but nobody recorded yet: the silent stop ends it too.
+    grandchild = table.add(45000, ppid=child.pid, cwd=tmp_path, start_time=50)
     recorded = [{"pid": row.pid, "start_time": row.start_time} for row in (root, child)]
     with processes.process_snapshot():
-        late = table.add(45000, ppid=child.pid, cwd=tmp_path, start_time=50)
         with processes.quiescent_tree(), processes.recorded_tree(recorded):
             processes.kill_process_group(root.pid)
-    assert late.pid not in table.live
+    assert grandchild.pid not in table.live
     assert not {root.pid, child.pid} & table.live
-    assert len(listings) == 1, "The silent stop reuses the tick snapshot with targeted reads"
+    assert len(listings) == 1, "The silent stop reuses the tick snapshot with targeted reads, no other scan"
 
 
 # Out of scope (CI polling, merge turns): waiting loops keep max_runtime_minutes as their bound.
@@ -252,8 +251,6 @@ def _quiescent_case(table, monkeypatch, tmp_path):
             return None
 
     monkeypatch.setattr(processes, "read_process_identity", read)
-    monkeypatch.setattr(processes, "read_children", lambda pid: tuple(
-        row for number, row in table.rows.items() if number in table.live and row.ppid == pid))
     return read
 
 
@@ -270,24 +267,26 @@ def test_quiescent_stop_never_traverses_from_a_protected_process(fake_process_ta
     assert unrelated.pid not in {item["pid"] for item in found}
 
 
-# Unverified parent: a PID reused between the identity read and the child read adopts nothing.
+# Unverified parent: a PID reused between the two parent reads adopts nothing.
 def test_quiescent_stop_ignores_children_of_a_reused_parent_pid(fake_process_table, monkeypatch, tmp_path):
     table = fake_process_table
     read = _quiescent_case(table, monkeypatch, tmp_path)
     root = table.add(42000, cwd=tmp_path, start_time=10)
+    table.add(47000, ppid=root.pid, cwd=tmp_path, start_time=95)
+    reads = []
 
-    def reused_children(pid):
-        if pid == root.pid and table.rows[pid].start_time == 10:
+    def reused(pid):
+        reads.append(pid)
+        if pid == root.pid and reads.count(pid) == 2:  # The PID is reused right after the first read.
             table.exit(root.pid)
-            table.add(root.pid, cwd=tmp_path, start_time=90)  # Reused after the identity read.
-            table.add(47000, ppid=root.pid, cwd=tmp_path, start_time=95)
-        return tuple(row for number, row in table.rows.items() if number in table.live and row.ppid == pid)
+            table.add(root.pid, cwd=tmp_path, start_time=90)
+        return read(pid)
 
-    monkeypatch.setattr(processes, "read_children", reused_children)
-    with processes.process_snapshot(), processes.quiescent_tree():
-        found = processes.observe_tree([{"pid": root.pid, "start_time": 10}])
+    with processes.process_snapshot():
+        monkeypatch.setattr(processes, "read_process_identity", reused)
+        with processes.quiescent_tree():
+            found = processes.observe_tree([{"pid": root.pid, "start_time": 10}])
     assert 47000 not in {item["pid"] for item in found}
-    assert read(root.pid).start_time == 90
 
 
 # Unknown as known: a recorded pid the table could not read is unknown CPU, never silence.
@@ -421,7 +420,7 @@ def test_executor_session_reaching_its_budget_is_watched_not_killed(monkeypatch,
         def poll(self):
             return 0 if len(waits) > 1 else None
 
-    def watch(process, watchdog, *args):
+    def watch(process, watchdog, *args, **kwargs):
         watched.append(watchdog.runtime_limit)
         process.wait(timeout=5)
         return False  # It finished while growing.
@@ -432,3 +431,99 @@ def test_executor_session_reaching_its_budget_is_watched_not_killed(monkeypatch,
                                   log_path=tmp_path / "review.log", review_level="high")
     assert waits[0] == 12 and watched == [0]
     assert not result.timed_out
+
+
+# Inexact selection: --deselect matches prefixes, so a retained id that prefixes another stays selected.
+def test_resume_deselects_only_ids_that_prefix_no_other_collected_id(tmp_path):
+    from foragent.state import StateStore
+
+    cache = StateStore(tmp_path / "baselines")
+    cache.root.mkdir(parents=True)
+    retained = {"tests/a.py::test_work", "tests/a.py::test_other"}
+    run_baseline_plugins._retain_passes(cache, "k", retained, tmp_path / "log",
+                                        {"tests/a.py::test_work", "tests/a.py::test_work_more", "tests/a.py::test_other"})
+    assert run_baseline_plugins.retained_passes(cache, "k") == retained
+    assert run_baseline_plugins.deselectable(cache, "k", retained) == {"tests/a.py::test_other"}
+
+
+def test_results_plugin_records_the_whole_collection_including_deselected_ids(tmp_path):
+    project = tmp_path / "project"
+    (project / "tests").mkdir(parents=True)
+    (project / "pytest.ini").write_text("[pytest]\n")
+    (project / "tests" / "test_a.py").write_text("def test_work(): pass\ndef test_work_more(): pass\n")
+    plugins, listing = tmp_path / "plugins", tmp_path / "passes.jsonl"
+    plugins.mkdir()
+    (plugins / "_foragent_passes_test.py").write_text(run_baseline_plugins.RESULTS_PLUGIN.format(listing=str(listing)))
+    command = run_baseline._with_python_path(
+        f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider tests "
+        "--deselect=tests/test_a.py::test_work_more -p _foragent_passes_test", str(plugins))
+    subprocess.run(["/bin/sh", "-c", command], cwd=project, capture_output=True, check=False)
+    passed, collected = run_baseline_plugins._plugin_records(listing, project)
+    assert passed == {"tests/test_a.py::test_work"}
+    assert collected == {"tests/test_a.py::test_work", "tests/test_a.py::test_work_more"}
+
+
+# Missing measurement read as silence: a first sample judges by the last measured activity.
+@pytest.mark.parametrize("last_activity,grew", [(1000.0, True), (0.0, False)])
+def test_first_sample_judges_growth_by_its_last_measured_activity(last_activity, grew):
+    watch = SilenceWatchdog(started=0.0)
+    watch.last_activity_at = watch.last_output_at = last_activity  # Progress recorded just now, or long ago.
+    assert watch.observe(now=1010, output_bytes=0, progress_events=0, snapshot=(), identities=()).grew is grew
+
+
+# Omitted output channel: a session writing only to stderr is still producing output.
+def test_session_writing_only_stderr_is_not_quiet(monkeypatch, tmp_path):
+    clock = [0.0]
+    monkeypatch.setattr(processes, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(processes, "list_processes", lambda: (Row(10, 1.0, 0.0),))
+    writes = [float(t) for t in range(5, 1000, 5)]
+    with (tmp_path / "out").open("w+b") as output, (tmp_path / "err").open("w+b") as errors, \
+            (tmp_path / "log").open("ab") as log:
+        stopped = processes._watch(Process(clock, errors, writes, 1000), processes._past_budget(), output, log,
+                                   lambda: None, lambda: RECORDED, channels=(errors,))
+    assert stopped is False and clock[0] == 1000
+
+
+# Stop reason lost in result handling: a safety-net stop restarts the run, a silent one stays a failure.
+def test_check_result_carries_why_the_watchdog_stopped_it(monkeypatch, tmp_path):
+    from foragent import run_checks, runner
+
+    def run_logged(argv, *, watchdog, log_path, **kwargs):
+        log_path.write_text("")
+        watchdog.observe(now=0, output_bytes=0, progress_events=0, snapshot=(), identities=())
+        watchdog.observe(now=watchdog.safety_net, output_bytes=1, progress_events=0, snapshot=(), identities=())
+        return -15, True, ""
+
+    monkeypatch.setattr(runner, "run_logged", run_logged)
+    result = run_checks._check("pytest", tmp_path, tmp_path / "log", 900, safety_net=100)
+    assert result.timed_out and result.stop == "safety-net"
+
+
+@pytest.mark.parametrize("stop,restarted", [("safety-net", True), ("silent", False), (None, False)])
+def test_after_check_restarts_only_at_the_safety_net(monkeypatch, stop, restarted):
+    from foragent import run_checks, run_waits
+
+    calls = []
+    monkeypatch.setattr(run_waits, "_progress", lambda n, ctx: None)
+    monkeypatch.setattr(run_checks, "save_failures", lambda *args, **kwargs: calls.append("saved"))
+    monkeypatch.setattr(run_waits, "watchdog_restart", lambda n, ctx, detail: calls.append("restart"))
+    ctx = SimpleNamespace(store=SimpleNamespace(root=Path("state")))
+    run_waits.after_check(1, ctx, [run_checks.CheckResult("pytest", -15, stop is not None, "", stop=stop)])
+    assert calls == (["saved", "restart"] if restarted else [])
+
+
+# Dropped metadata: the premerge suite keeps the gaps the watchdog measured.
+def test_premerge_suite_keeps_the_measured_result_gaps(monkeypatch, tmp_path):
+    from contextlib import nullcontext
+
+    from foragent import orch
+
+    def run_logged(argv, *, watchdog, **kwargs):
+        for now, written in ((0, 0), (30, 1), (90, 2)):
+            watchdog.observe(now=now, output_bytes=written, progress_events=0, snapshot=(), identities=())
+        return 0, False, ""
+
+    monkeypatch.setattr(orch, "run_logged", run_logged)
+    ctx = SimpleNamespace(store=SimpleNamespace(root=tmp_path / "state"), repo_root=tmp_path, config=Config())
+    result = orch._suite_process(ctx, 5, "pytest", tmp_path, tmp_path / "pre.log", "head", nullcontext())
+    assert result.result_gaps == (30, 60)

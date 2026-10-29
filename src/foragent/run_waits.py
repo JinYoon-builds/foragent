@@ -103,6 +103,20 @@ def watchdog_restart(n: int, ctx: RunContext, detail: str):
     raise ExecutorStopped("stalled-restart", detail)
 
 
+def after_check(n: int, ctx: RunContext, checks: list) -> None:
+    """Progress after a check; one the watchdog stopped at the safety net restarts the run (#435).
+
+    A silent check stays a failing result for the implementer; the safety net always means
+    the run ends resumably, keeping its WIP and every failure gathered so far.
+    """
+    _progress(n, ctx)
+    if checks and getattr(checks[-1], "stop", None) == "safety-net":
+        from foragent.run_checks import save_failures
+
+        save_failures(ctx.store.root, n, checks, complete=False)
+        watchdog_restart(n, ctx, f"A check reached the safety net: {checks[-1].command}")
+
+
 def _phase_log(ctx: RunContext, n: int, detail: str) -> None:
     from foragent.run_checks import _append
 

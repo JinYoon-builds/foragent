@@ -295,14 +295,16 @@ def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
+    watch = SilenceWatchdog(history_gaps=history_gaps(ctx), safety_net=safety_net_seconds(ctx.config))
     with slot:
         # Like every check: it ends on silence or the safety net, never at a fixed time (#435).
         code, timed_out, output = run_logged(
             ["/bin/sh", "-c", command], cwd=worktree,
-            timeout_s=safety_net_seconds(ctx.config), log_path=log_path, env=capacity.HELD_ENV,
-            watchdog=SilenceWatchdog(history_gaps=history_gaps(ctx), safety_net=safety_net_seconds(ctx.config)),
+            timeout_s=safety_net_seconds(ctx.config), log_path=log_path, env=capacity.HELD_ENV, watchdog=watch,
         )
-    return CheckResult(command, code, timed_out, output)
+    # The measured gaps reach the capture history a premerge baseline saves (#435).
+    stop = watch.last.decision if timed_out and watch.last is not None and watch.last.stop else None
+    return CheckResult(command, code, timed_out, output, result_gaps=watch.result_gaps, stop=stop)
 
 
 def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Path,

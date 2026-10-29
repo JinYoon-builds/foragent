@@ -27,7 +27,7 @@ from foragent.reasons import Reason
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout, in_phase, watchdog_restart
+from foragent.run_waits import _phase, _progress, _test_slot, _timeout, after_check, in_phase, watchdog_restart
 from foragent.state import Approval
 
 if TYPE_CHECKING:
@@ -44,6 +44,7 @@ class CheckResult:
     # Elapsed command time (excluding any test-slot queue) when a clock was supplied.
     seconds: float | None = None
     result_gaps: tuple[float, ...] = ()
+    stop: str | None = None  # Why the watchdog stopped it ("silent", "safety-net"), when it did (#435).
 
 
 def _append(log: Path, text: str) -> None:
@@ -61,7 +62,6 @@ def _check(
     history_gaps: tuple[float, ...] = (), safety_net: float = watchdog.SAFETY_NET_SECONDS,
 ) -> CheckResult:
     """Run one check; a cut output tail links its full copy under ``full_text_dir`` (the issue's folder).
-
     The shared watchdog ends it on silence or the safety net, never at ``timeout_s`` (#435)."""
     from foragent import runner
 
@@ -96,7 +96,8 @@ def _check(
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
     tail = cuts.read_tail(log, offset, 4000, "check", full_text_dir)
     _append(log, f"\nCheck exit_code={code}, timed_out={timed_out}\nOutput tail:\n{tail}")
-    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None, watch.result_gaps)
+    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None, watch.result_gaps,
+                       watch.last.decision if timed_out and watch.last is not None and watch.last.stop else None)
 
 
 def _pytest_command(command: str) -> str | None:
@@ -347,8 +348,7 @@ def _related_unit_tests(
     return tuple(sorted(selected))
 
 
-def check_done(snapshot: Path, worktree: Path, acceptance_dir: str, *, history_root: Path | None = None,
-               safety_net_seconds: int | None = None) -> int:
+def check_done(snapshot: Path, worktree: Path, acceptance_dir: str, *, history_root: Path | None = None, safety_net_seconds: int | None = None) -> int:
     """Stop hook: re-use independent checks, allowing at most eight blocked stops."""
     from foragent import runner
 
@@ -491,7 +491,7 @@ def _verify_contents(attempt: Implementation) -> str:
         for command in attempt.parsed.done_when_commands:
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                                  slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n), **watchdog.silence_args(ctx)))
-            _progress(n, ctx)
+            after_check(n, ctx, attempt.checks)
         if attempt.baseline and attempt.baseline.node_ids:
             started = ctx.monotonic()
             command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
@@ -500,7 +500,7 @@ def _verify_contents(attempt: Implementation) -> str:
             attempt.checks.append(result)
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
-            _progress(n, ctx)
+            after_check(n, ctx, attempt.checks)
             if not enabled(ctx, attempt.target_branch):
                 previous = ctx.store.get_run(n).comparison or {}
                 ctx.store.update_run(n, comparison={"source": "local", "duration_seconds":

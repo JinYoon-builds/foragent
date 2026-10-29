@@ -378,7 +378,8 @@ def _capture_baseline(
                 selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
                 # A capture stopped by silence kept the passes it reported; resume after them (#435).
                 retained = resume.retained_passes(cache, key)
-                selection += "".join(f" {shlex.quote('--deselect=' + node)}" for node in retained)
+                selection += "".join(f" {shlex.quote('--deselect=' + node)}"
+                                     for node in sorted(resume.deselectable(cache, key, retained)))
                 baseline_command = (
                     f"{selection} "
                     f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(capture_report))}"

@@ -47,7 +47,8 @@ def observe(ctx: TickContext, run: Run) -> Decision:
     except (OSError, ValueError, AttributeError):
         pass
     if run.last_progress_at and watch.last_activity_at is not None and watch.output_bytes is None:
-        # The first observation starts silence at the run's last recorded progress.
+        # The first observation starts silence at the run's last recorded progress, a fact on
+        # the tick's own clock, not at a missing earlier sample (a file time is another clock).
         progressed = scheduler.datetime.fromisoformat(run.last_progress_at).timestamp()
         watch.last_output_at = watch.last_activity_at = max(watch.last_activity_at, progressed)
     watch.started = started  # Credited waits and machine sleep move the safety net, as the old limit.

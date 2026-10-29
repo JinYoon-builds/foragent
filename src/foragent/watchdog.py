@@ -66,6 +66,7 @@ class SilenceWatchdog:
         self.progress_events: int | None = None
         self.cpu: dict[str, float] = {}
         self.result_times: list[float] = []
+        self.last: Decision | None = None  # The latest decision, read by whoever ran the check.
 
     @property
     def result_gaps(self) -> tuple[float, ...]:
@@ -102,6 +103,10 @@ class SilenceWatchdog:
         grew = output_grew or cpu_delta > 0
         if grew:
             self.last_activity_at = now
+        # A first sample has nothing to compare with: its last measured activity decides
+        # whether it is still growing, never the missing earlier sample.
+        if first and now - self.last_activity_at < RUNTIME_QUIET_SECONDS:
+            grew = True
         self.output_bytes, self.progress_events = output_bytes, progress_events
         self.cpu = {**self.cpu, **cpu}
         if now - self.started >= self.safety_net:
@@ -113,8 +118,9 @@ class SilenceWatchdog:
             decision = "runtime-limit"
         else:
             decision = "running"
-        return Decision(decision != "running", decision, now - self.last_output_at, cpu_delta,
-                        self.window_seconds, self.window_source, grew, cpu_known)
+        self.last = Decision(decision != "running", decision, now - self.last_output_at, cpu_delta,
+                             self.window_seconds, self.window_source, grew, cpu_known)
+        return self.last
 
     def state(self) -> dict:
         return {"started": self.started, "last_output_at": self.last_output_at,

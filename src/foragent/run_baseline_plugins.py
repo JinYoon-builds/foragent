@@ -35,8 +35,21 @@ def with_results_plugin(command: str, directory: Path) -> tuple[str, Path]:
 
 def stopped_capture(cache: StateStore, key: str, retained: set[str], report: Path, log: Path, offset: int,
                     passes: Path, worktree: Path) -> None:
-    """Keep every pass the stopped capture reported, beside those an earlier one kept."""
-    _retain_passes(cache, key, retained | _reported_passes(report, log, offset) | _plugin_passes(passes, worktree), log)
+    """Keep every pass the stopped capture reported, beside those an earlier one kept, and its collection."""
+    reported, collected = _plugin_records(passes, worktree)
+    _retain_passes(cache, key, retained | _reported_passes(report, log, offset) | reported, log,
+                   collected or _retained(cache, key).get("collected"))
+
+
+def deselectable(cache: StateStore, key: str, retained: set[str]) -> set[str]:
+    """Retained ids safe to pass to ``--deselect``, which matches node-id prefixes.
+
+    An id that prefixes another collected id (test_work and test_work_more) would also
+    drop that one, so it runs again instead. Without a recorded collection, the
+    retained ids themselves are the only ones known.
+    """
+    pool = set(_retained(cache, key).get("collected") or ()) | retained
+    return {node for node in retained if not any(other != node and other.startswith(node) for other in pool)}
 
 
 def retained_path(cache: StateStore, key: str) -> Path:
@@ -44,17 +57,23 @@ def retained_path(cache: StateStore, key: str) -> Path:
     return cache.root / f"{key}.partial"
 
 
-def retained_passes(cache: StateStore, key: str) -> set[str]:
+def _retained(cache: StateStore, key: str) -> dict:
     try:
         saved = json.loads(retained_path(cache, key).read_text(encoding="utf-8"))
-        return {node for node in saved["node_ids"] if isinstance(node, str)}
-    except (OSError, ValueError, TypeError, KeyError):
-        return set()
+        return saved if isinstance(saved, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
-def _retain_passes(cache: StateStore, key: str, passes: set[str], log: Path) -> None:
+def retained_passes(cache: StateStore, key: str) -> set[str]:
+    nodes = _retained(cache, key).get("node_ids")
+    return {node for node in nodes if isinstance(node, str)} if isinstance(nodes, list) else set()
+
+
+def _retain_passes(cache: StateStore, key: str, passes: set[str], log: Path, collected=None) -> None:
     if passes:
-        cache._atomic_write(retained_path(cache, key), json.dumps({"node_ids": sorted(passes)}) + "\n")
+        value = {"node_ids": sorted(passes), **({"collected": sorted(collected)} if collected else {})}
+        cache._atomic_write(retained_path(cache, key), json.dumps(value) + "\n")
         _append(log, f"Acceptance baseline kept {len(passes)} reported passes for the next capture")
 
 
@@ -93,34 +112,58 @@ def pytest_configure(config):
     _root = str(config.rootpath)
 
 
+def _record(value):
+    with open({listing!r}, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({{**value, "rootdir": _root}}) + "\\n")
+
+
+def pytest_deselected(items):
+    _record({{"collected": [item.nodeid for item in items]}})
+
+
+def pytest_collection_finish(session):
+    _record({{"collected": [item.nodeid for item in session.items]}})
+
+
 def pytest_runtest_logreport(report):
     if report.failed or (report.skipped and report.when == "call"):
         _passed[report.nodeid] = False
     elif report.when == "call" and report.passed:
         _passed.setdefault(report.nodeid, True)
     if report.when == "teardown" and _passed.pop(report.nodeid, False):
-        with open({listing!r}, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps({{"nodeid": report.nodeid, "rootdir": _root}}) + "\\n")
+        _record({{"nodeid": report.nodeid}})
 """
 
 
-def _plugin_passes(listing: Path, worktree: Path) -> set[str]:
-    """Repository-relative ids the capture's plugin recorded as passed (setup, call and teardown)."""
-    passed = set()
+def _plugin_records(listing: Path, worktree: Path) -> tuple[set[str], set[str]]:
+    """Repository-relative (passed, collected) ids the capture's plugin recorded.
+
+    A pass needs setup, call and teardown to pass; collected ids include deselected ones.
+    """
+    passed, collected = set(), set()
     try:
         lines = listing.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return passed
+        return passed, collected
     for line in lines:
         try:
             record = json.loads(line)
             prefix = Path(record["rootdir"]).resolve().relative_to(worktree.resolve()).as_posix()
-            nodeid = record["nodeid"]
         except (ValueError, KeyError, TypeError):
             continue  # A line cut by the stop, or a root outside the checkout.
-        if isinstance(nodeid, str):
-            passed.add(nodeid if prefix == "." else f"{prefix}/{nodeid}")
-    return passed
+
+        def name(nodeid: str) -> str:
+            return nodeid if prefix == "." else f"{prefix}/{nodeid}"
+
+        if isinstance(record.get("nodeid"), str):
+            passed.add(name(record["nodeid"]))
+        if isinstance(record.get("collected"), list):
+            collected |= {name(nodeid) for nodeid in record["collected"] if isinstance(nodeid, str)}
+    return passed, collected
+
+
+def _plugin_passes(listing: Path, worktree: Path) -> set[str]:
+    return _plugin_records(listing, worktree)[0]
 
 
 # Written into a throwaway checkout of the new base. It prints nothing, so the
