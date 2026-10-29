@@ -1,8 +1,10 @@
 """The dreaming lane's row (#190): 💭 <lane> dreaming · ✓ N done, in place of its 💤 row.
 
-This module only holds the helper ``lanes.py`` calls. Every module in this package
-is discovered as a section, so it keeps an ORDER and a ``render`` that draws nothing.
-The view trusts the dream record in the snapshot: the tick owns its liveness.
+This module holds the helper the lane rows (watch_sections/lanes) call. Every module
+in this package is discovered as a section, so it keeps an ORDER and a ``render``
+that draws nothing; ``GAP = False`` keeps it from adding a blank line, so the dream
+adds no screen row. The view trusts the dream record in the snapshot: the tick owns
+its liveness.
 """
 
 from pathlib import Path
@@ -13,6 +15,7 @@ from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
 ORDER = 7
+GAP = False  # It draws nothing; it must not cost a blank row.
 
 GLYPHS = {"emoji": "💭", "ascii": "[~]"}
 
