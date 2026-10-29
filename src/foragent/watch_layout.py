@@ -158,15 +158,11 @@ def _frame(
         stays.clear()
         mark = None  # Where the sections beside the SIDE section begin.
         joined = False  # The previous section asked the next one to follow it directly.
-        apart: tuple[str, ...] = ()  # Sections that keep their blank line even so (APART).
         for index, (section, lines, own, rows) in enumerate(rendered):
             if not lines:
                 continue
-            kept = section.__name__.rsplit(".", 1)[-1] in apart
-            # APART keeps the blank line even for a GAP = False section or after GAP_AFTER = False.
-            gap = bool(frame) and (kept or (getattr(section, "GAP", True) and not joined))
+            gap = bool(frame) and getattr(section, "GAP", True) and not joined
             joined = not getattr(section, "GAP_AFTER", True)
-            apart = getattr(section, "APART", ())
             if wide and index == side and mark is not None and mark < len(frame):
                 left_width = width - max(watch._cells("".join(value for value, _ in line)) for line in lines) - 2
                 left = frame[mark:]
@@ -202,9 +198,9 @@ def _frame(
                 rendered[index] = (section, [], [], [])
                 if len(assemble()[0]) <= height:
                     break
-        # The footer becomes one short line of the key letters (sections marked SHORT).
+        # The footer becomes one short line of the key letters.
         for index, (section, *_) in enumerate(rendered):
-            if getattr(section, "SHORT", False):
+            if section.__name__.endswith(".help"):
                 rendered[index] = draw(section, short=True)
         frame, hits, marks = assemble()
     if height is not None:

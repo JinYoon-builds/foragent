@@ -188,13 +188,14 @@ def test_a_narrow_frame_wraps_the_footer_between_items_instead_of_losing_its_end
     assert len(text) > 2, "the line wrapped rather than being clipped"
 
 
-def test_usage_line_sits_under_help_and_above_the_separate_other_gates(tmp_path):
+def test_usage_line_is_last_even_below_the_other_gates(tmp_path):
     snap = snapshot()
     snap.status["installed_gates"] = [{"repo": "o/other", "last_tick": None, "stale": False,
                                        "running_runs": 0, "current": False}]
     rows = render_frame(snap, config(), tmp_path, width=200, now=NOW).splitlines()
-    assert "x close" in rows[-4] and rows[-3].startswith("Claude —") and rows[-3].endswith("q quit")
-    assert rows[-2] == "" and "o/other" in rows[-1], "the other gates keep their own section"
+    # The other gates keep the blank line before them; the footer follows them directly.
+    assert rows[-4] == "" and "o/other" in rows[-3]
+    assert rows[-2].endswith("x close") and rows[-1].startswith("Claude —") and rows[-1].endswith("q quit")
     plain = render_frame(snapshot(), config(), tmp_path, width=200, now=NOW).splitlines()
     assert plain[-2].endswith("x close") and plain[-1].endswith("q quit"), "directly under the help line"
 

@@ -1,7 +1,7 @@
 """The usage line: plan usage per executor, memory, concurrency and the Claude mode (#115).
 
-It is the frame's last line, directly under the help line, and ends with the quit key;
-only the other gates' own section (when any) comes after it.
+It is always the frame's last line, directly under the help line, and ends with the quit
+key. The other gates' section (when any) stands above the help line.
 With every lane idle and quota left, one invite line stands above it. Both stay on a
 short screen, and both wrap between items instead of losing their end to the frame width.
 """
@@ -14,10 +14,9 @@ from foragent.config import Config
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
-ORDER = 65  # Directly under the help line (60).
+ORDER = 90  # After the help line (80): always the frame's last line.
 GAP = False  # Directly under the help line.
-GAP_AFTER = False  # A section after it follows directly, so the line costs one row...
-APART = ("gates",)  # ...except the other gates, which keep their own section below it.
+GAP_AFTER = False  # A section after it follows directly, so the line costs one row.
 KEEP = True  # The usage line stays when the screen is short.
 
 EXECUTORS = (("claude", "Claude"), ("codex", "Codex"))

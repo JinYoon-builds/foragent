@@ -16,11 +16,9 @@ hits to the rows where it lands. Within a screen ``height``, sections with
 ``KEEP = True`` always stay and the others give way from the bottom up; a section
 with ``STAYS = True`` stays like KEEP but does not end the lane-row block, and
 moves up into the first ``height - 1`` rows when the KEEP sections push it below; the
-sections with ``SHORT = True`` (the footer) are then drawn again with ``short=True``. Before that, a section with ``TIGHT = True`` (the lane
+footer then gets ``short=True``. Before that, a section with ``TIGHT = True`` (the lane
 rows) is drawn again with ``tight=True`` and may leave out rows it can spare. ``rows=True`` says the frame has the lane rows,
-so a section need not list the running issues again. With ``GAP_AFTER = False``
-the next section follows directly. ``APART`` names the sections that keep one blank line
-after this one even so, also when they set ``GAP = False``.
+so a section need not list the running issues again.
 
 Shared helpers live in ``foragent.watch_layout``; this package holds sections only.
 """

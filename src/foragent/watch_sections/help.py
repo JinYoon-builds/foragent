@@ -7,10 +7,9 @@ from foragent.config import Config
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
-ORDER = 60  # Directly above the usage line (65, #115).
+ORDER = 80  # After the other gates (70), directly above the usage line (90, #115).
 GAP = False  # The help line sits directly under the section above it.
 KEEP = True  # The footer stays when the screen is short.
-SHORT = True  # On a short screen it is drawn again with short=True.
 
 
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
