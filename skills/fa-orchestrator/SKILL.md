@@ -98,9 +98,9 @@ interventions; also the binding constraint, where run time was lost and which fa
 logs, then file a fix issue as a new order through `fa-order`. The same defect class twice on one issue follows the hold rule above. Fix causes
 within your authority (skill rule, issue edit or split, queue) and give one line to the person. Never weaken locked tests, cross review or merge
 conditions to recover a metric: ask the person first with choices and a recommendation, and wait for the answer. Every retrospective answers
-"does this need the architect?" in one `fa orch note` line from the facts and log: overlap waits repeating on the same hot files; repeat holds
-of a design defect class (two writers, check-then-act); files over their line limit; approved work in one lane while others are idle. If any
-holds, call `fa orch architect --why "<signal and numbers>"`, or record why not; no fixed threshold ([why](references/retrospective.md)).
+"does this need the architect?" in one `fa orch note` line from the facts and log: overlap waits repeating on the same hot files; repeat holds of a design defect class (two writers, check-then-act);
+files over their line limit; approved work in one lane while others are idle. If any holds, call `fa orch architect --why "<signal and numbers>"`, or record why not; no fixed threshold
+([why](references/retrospective.md)). Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why`); record proposals: `fa orch role-decision <id> accepted|rejected`.
 
 ## Human decisions, notification and merge
 
@@ -126,6 +126,7 @@ Classify each message using its context; a message may contain several kinds.
 | New work or change | Accumulate an order draft with the existing scope and decisions. When clear enough to split, propose the single card below. |
 | Change to a running issue | Propose an edit to that issue; ask whether to stop the running work or wait. A changed body needs explicit re-approval through order publication. |
 | Thought | Record it in the project's decision notes only; it creates no issues or approval. |
+| Setting change | Run `fa settings set KEY VALUE` for a key `fa settings list` shows ("turn off automatic merge" means `review batch`), with no extra confirmation, and report the change to the person in one line; for a team-scope key say it applies to the whole team, then commit and push `.foragent.yml` from a temporary worktree of the default branch. Unknown key or rejected value: one line with the valid choices. Details: [settings](references/settings.md). |
 
 Keep one order draft in `docs/specs/`; split it with the `fa-order` skill. When clear, propose one
 card with new issues by lane, dependencies and Done when checks. AskUserQuestion: [add] (recommended)
@@ -146,5 +147,4 @@ the last tidy, or `idle-quota` when no lane runs and quota is left) and puts one
 with the evidence numbers in `fa orch inbox` per due period; it never orders tidy work. Judge whether
 to call the architect (`fa orch architect --why "<numbers>"`), which reads widely, ranks and proposes
 refactors ([checklist](references/tidy.md)). Propose the tidy order with `fa orch ask`; after the user
-approves, publish it via `fa order publish`, each issue in the lane that owns its files; Done when:
-all existing tests still pass, behaviour unchanged. Then `fa tidy done`.
+approves, publish it via `fa order publish`, each issue in the lane that owns its files; Done when: all existing tests still pass, behaviour unchanged. Then `fa tidy done`.

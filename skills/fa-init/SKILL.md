@@ -12,15 +12,21 @@ description: Set up a project folder for Foragent.
    `gh repo create <owner>/<folder> --private|--public --source . --push` using
    the selected owner, folder name, and visibility flag.
 
-2. Ask only for review mode and executor, using AskUserQuestion (or the available
-   question tool), with recommendations first:
+2. At first use, ask only two questions: merge (review) mode, then Claude quota
+   mode. Use AskUserQuestion (or the available question tool), recommendation first:
    - batch (recommended): group completed work for human review.
    - fast: merge passing work automatically unless a human review rule applies.
    - careful: require human review of each task before merging.
-   - Executor: codex (recommended), or claude.
+   On a re-run, skip a question whose key is already set in its own scope file
+   ([settings](references/settings.md)). Leave the executor to the config default.
 
-3. Run `fa init --review <mode> --executor <executor>` in the project folder and
-   show its summary. New boards get five Status columns: 🗂 Backlog, 🌰 Up next,
+3. Run `fa init --review <mode>` in the project folder (no `--executor`, never
+   `--claude-quota`), so the answer lands in init's own commit, and show its
+   summary. Only if Claude is available (`claude auth status` logged in, or
+   `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` set), then ask the quota mode:
+   keep (recommended: leave part of Claude's limit for you) or burn (use all of
+   it), and save it with `fa settings set claude_quota.mode <mode>`. Both can be
+   changed later with `fa settings set review <mode>` and `fa settings set claude_quota.mode <mode>`. New boards get five Status columns: 🗂 Backlog, 🌰 Up next,
    🐿 In progress, ✋ Your turn, 📦 Done. A blocked card stays in 🐿 In progress;
    its `blocked` label is the ⚠. If init stops because an existing team
    board needs a mapping, show its column names and ask once which column each
