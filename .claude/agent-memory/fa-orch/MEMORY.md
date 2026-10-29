@@ -204,3 +204,4 @@
 - #846: Windows 조기 종료는 `cli.py`의 foragent import 앞 `try: import fcntl`에서 한 줄 출력 후 `SystemExit(1)`. 콘솔 대상은 바꾸지 않는다.
 - #772 재시도: "baseline regression"을 재현할 수 없을 때 runs/issue-N/*check*.log에는 실패 상세가 없다. 시험 중 값 확인은 capsys를 우회하는 `os.write(2, ...)`와 `-s`로 하고, 브랜치가 origin/main을 포함하는지 `git log HEAD..origin/main`으로 먼저 본다.
 - "Acceptance baseline regression (previously passing tests)"는 GitHub `foragent-acceptance` CI(리눅스) 비교 결과다. 상세는 `gh run list --branch foragent/issue-N --workflow foragent-acceptance` 뒤 `gh run view <id> --log`의 "Compare acceptance passing sets" 단계에 있다. #772에서 facts 반복 읽기 시험은 실시간 `os.getloadavg()` 값 차이로 간헐 실패했다(main 원인).
+- #130: 기록 없는 running 라벨의 `reconciled` 이벤트는 `scheduler_reconcile.orphan_crash_detail()`이 대체 crashed 기록보다 먼저 쓰고, 중복은 `orch_events.has_event(..., detail=라벨 세대)`로 판단한다. main의 scheduler_recovery.py(300)·scheduler.py(250)가 이미 상한이라 기존 줄을 바꿔 순증 0줄로 맞췄다. run_publish·run_review·capacity의 상한 초과는 main에서 이미 실패.
