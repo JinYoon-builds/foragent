@@ -227,8 +227,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 getattr(run, name) != getattr(decided, name) for name in LIVENESS_FIELDS):
             continue
         if not dead:
-            if _stop_already_refused(ctx, run) or run.talking and scheduler.lane_talk.tick_talk(ctx, run, report):
-                continue  # A refused stop, or a person watching or talking: only a confirmed closure ends a talk.
+            if run.talking and scheduler.lane_talk.tick_talk(ctx, run, report) or _stop_already_refused(ctx, run):
+                continue  # The talk is probed first, even past a refused stop; only a confirmed closure ends it.
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
             runtime = ((ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds()
                        - run.waited_seconds - run.slept_seconds - run.talk_pause_seconds(ctx.now()))

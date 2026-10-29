@@ -1232,3 +1232,85 @@ def test_the_ticks_timed_stops_go_through_the_talk_guard(limit, git_history, tmp
                         or original(ctx, number, report, stop, mark))
     tick(ctx)
     assert guarded == [1] and ctx.store.get_run(1).status == "finished"
+
+
+@pytest.mark.parametrize("worker,default,expect", [
+    ("claude", "codex", "hint"),  # A Claude worker under a Codex lane default.
+    ("codex", "claude", "queue"),  # A Codex worker under a Claude lane default.
+])
+def test_talk_reaches_the_worker_the_run_recorded_not_the_lane_default(
+    store, tmp_path, monkeypatch, worker, default, expect,
+):
+    session(store, worker)
+    store.update_run(1, executor=worker)  # The pair the tick chose at start (#186).
+    terminals = Terminals(monkeypatch)
+    lanes.talk(1, message="Keep labels.", store=store, config=config(executor=default), repo_root=tmp_path)
+    queued = [argv for argv in terminals.calls if Path(argv[0]).name == "codex"]
+    hint = store.root / "hints/1.txt"
+    if expect == "queue":
+        assert len(queued) == 1 and queued[0][queued[0].index("--thread") + 1] == "thread-1" and not hint.exists()
+    else:
+        assert queued == [] and hint.read_text() == "Keep labels."
+
+
+def test_trimming_the_journal_keeps_an_active_runs_talk_events(tmp_path):
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    talk_event(store)
+    append_event(store, NOW, 1, "note", "An old unrelated line")
+    store.start_run(2, branch="foragent/issue-2", worktree=store.worktree_path(2))
+    append_event(store, NOW, 2, "talk-opened", "Talk opened for #2 (codex)",
+                 run_started_at=store.get_run(2).started_at, executor="codex", handle="term_2")
+    store.finish_run(2, "merged")
+    clock[0] = NOW + timedelta(days=40)
+    store.trim_journals(clock[0])
+    kinds = [(row["issue"], row["kind"]) for row in map(json.loads, (store.root / "orch-events.jsonl").read_text().splitlines())]
+    assert kinds == [(1, "talk-opened")]  # The finished run's talk and the unrelated line went.
+    run = store.get_run(1)
+    assert run.talking is True and run.talk_pause_seconds(clock[0]) == 40 * 24 * 3600
+
+
+def test_a_refused_stop_does_not_stop_the_tick_from_closing_a_talk(git_history, tmp_path, monkeypatch,
+                                                                    fake_process_table):
+    import test_scheduler as sched
+
+    from foragent.reasons import Reason
+    from foragent.scheduler import tick
+
+    ctx = sched.ctx.__wrapped__(git_history, tmp_path, monkeypatch, fake_process_table)
+    sched.approve(ctx)
+    tick(ctx)
+    sched.mark_running(ctx)
+    talk_event(ctx.store, sched.NOW)
+    ctx.store.save_flag(1, Reason.STOP_REFUSED, flagged_at=(sched.NOW + timedelta(minutes=1)).isoformat())
+    monkeypatch.setattr(probe, "liveness", lambda event, cwd: probe.CLOSED)  # The terminal is gone.
+    ctx.now = lambda: sched.NOW + timedelta(minutes=5)
+    tick(ctx)
+    assert ctx.store.get_run(1).talking is False and len(events(ctx.store, "talk-closed")) == 1
+
+
+
+def test_a_reused_tmux_window_id_is_a_new_talk_not_an_already_closed_one(store, tmp_path, monkeypatch, socket):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch, opener="tmux", socket=socket)
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)  # Window @7.
+    terminals.alive = False
+    lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW + timedelta(minutes=2))  # Closed.
+    terminals.alive = True
+    talk_event(store, NOW + timedelta(minutes=5), socket=str(socket), window_id="@7")  # tmux reuses @7.
+    run = store.get_run(1)
+    assert run.talking is True and run.talking_since == (NOW + timedelta(minutes=5)).isoformat()
+    assert run.talk_pause_seconds(NOW + timedelta(minutes=9)) == 2 * 60 + 4 * 60
+    lanes.talk(1, store=store, config=config(), repo_root=tmp_path)  # Re-shown, not a duplicate.
+    assert len(terminals.opened()) == 1
+
+
+def test_closing_a_superseded_talk_never_closes_the_newer_one_with_the_same_id(store, tmp_path, monkeypatch, socket):
+    Terminals(monkeypatch, opener="tmux", socket=socket)
+    talk_event(store, NOW, socket=str(socket), window_id="@7")
+    talk_event(store, NOW + timedelta(minutes=3), socket=str(socket), window_id="@7")
+    lane_talk.check_talking(store, store.get_run(1), tmp_path, NOW + timedelta(minutes=4))  # Closes the older.
+    run = store.get_run(1)
+    assert len(events(store, "talk-closed")) == 1 and run.talking is True
+    assert run.talking_since == (NOW + timedelta(minutes=3)).isoformat()

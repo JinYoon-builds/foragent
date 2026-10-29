@@ -85,26 +85,37 @@ class TalkRecordsMixin:
             self._talk_cache = cached
         return list(cached[1].get(number, []))
 
-    def live_events(self, run: Run) -> list[dict]:
-        """This run's live talk-opened events, in order; one without a mode is live."""
-        return [event for event in self.talk_events(run.number)
-                if event["kind"] == TALK_OPENED and event.get("run_started_at") == run.started_at
-                and event.get("mode", "live") == "live"]
-
     def resume_events(self, run: Run) -> list[dict]:
         """This run's resume-terminal events, in order (never part of its talk state or pause)."""
         return [event for event in self.talk_events(run.number)
                 if event["kind"] == TALK_OPENED and event.get("run_started_at") == run.started_at
                 and event.get("mode") == "resume"]
 
+    def live_talks(self, run: Run) -> list[tuple[dict, str | None]]:
+        """This run's live talks in journal order, each with the time its own talk-closed event ends it.
+
+        A talk-closed event names a terminal (handle, socket, window id or title), and tmux reuses
+        window ids, so it closes the oldest earlier live talk of the run with that identity that is
+        still open: never a later talk that happens to reuse the identity, and never one twice.
+        """
+        talks: list[list] = []
+        for event in self.talk_events(run.number):
+            if event.get("run_started_at") != run.started_at:
+                continue
+            if event["kind"] == TALK_OPENED and event.get("mode", "live") == "live":
+                talks.append([event, None])
+            elif event["kind"] == TALK_CLOSED:
+                match = next((talk for talk in talks
+                              if talk[1] is None and talk_identity(talk[0]) == talk_identity(event)), None)
+                if match is not None:
+                    match[1] = event["at"]
+        return [(event, closed_at) for event, closed_at in talks]
+
     def talk_state(self, run: Run) -> tuple[dict | None, list[tuple[dict, str]]]:
         """``(current talk-opened event or None, [(superseded open event, its closing time)])``."""
-        events = self.talk_events(run.number)
-        closed = {talk_identity(event) for event in events if event["kind"] == TALK_CLOSED}
-        opened = self.live_events(run)
-        superseded = [(event, newer["at"]) for event, newer in pairwise(opened)
-                      if talk_identity(event) not in closed]
-        current = opened[-1] if opened and talk_identity(opened[-1]) not in closed else None
+        talks = self.live_talks(run)
+        superseded = [(event, newer["at"]) for (event, closed_at), (newer, _) in pairwise(talks) if closed_at is None]
+        current = talks[-1][0] if talks and talks[-1][1] is None else None
         return current, superseded
 
     def talk_closed_at(self, run: Run) -> str | None:
@@ -122,14 +133,12 @@ class TalkRecordsMixin:
         superseding event, a delayed talk-closed event or a talk opened as the run finished. A
         finished run without a recorded finish time drops a talk that never ended.
         """
-        events = self.talk_events(run.number)
-        closed = {talk_identity(event): event["at"] for event in events if event["kind"] == TALK_CLOSED}
-        opened = self.live_events(run)
+        talks = self.live_talks(run)
         began = _state.datetime.fromisoformat(run.started_at)
         finish = _state.datetime.fromisoformat(finished_at) if finished_at else None
         regions = []
-        for index, event in enumerate(opened):
-            stop = closed.get(talk_identity(event)) or (opened[index + 1]["at"] if index + 1 < len(opened) else None)
+        for index, (event, closed_at) in enumerate(talks):
+            stop = closed_at or (talks[index + 1][0]["at"] if index + 1 < len(talks) else None)
             start = max(_state.datetime.fromisoformat(event["at"]), began)
             end = _state.datetime.fromisoformat(stop) if stop else None
             if run.status != "running":
@@ -161,8 +170,9 @@ class TalkRecordsMixin:
             return self.get_run(number)
 
     def _closed(self, run: Run, event: dict) -> bool:
-        return any(other["kind"] == TALK_CLOSED and talk_identity(other) == talk_identity(event)
-                   for other in self.talk_events(run.number))
+        """Whether this very talk-opened event (not another reusing its terminal id) is closed."""
+        return any(talk is event or (talk["at"] == event["at"] and talk_identity(talk) == talk_identity(event))
+                   for talk, closed_at in self.live_talks(run) if closed_at is not None)
 
     def _append_closed(self, run: Run, event: dict, closed_at: datetime) -> None:
         """Under the state lock: one talk-closed event, unless that talk is already closed."""

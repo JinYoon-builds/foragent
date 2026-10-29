@@ -46,7 +46,13 @@ class TalkError(LaneError):
         self.stdout = stdout
 
 
-def _lane_executor(run: Run, config: Config) -> str:
+def _worker_executor(run: Run, config: Config) -> str:
+    """The executor this run's worker actually uses: the pair the tick recorded at start (#186),
+    else an older record's implementer, else (records from before both) the lane's configured one."""
+    if run.executor:
+        return run.executor
+    if run.implementer:
+        return run.implementer
     settings = config.lanes.get(run.lane, {}) if run.lane != "main" else {}
     return settings.get("executor") or config.executor
 
@@ -54,14 +60,14 @@ def _lane_executor(run: Run, config: Config) -> str:
 def _session(run: Run, config: Config) -> tuple[str, str | None]:
     """The executor to talk to and its session, or None when no usable session is recorded.
 
-    A running issue talks to its lane's implementer; a session recorded for
-    another executor (an earlier run's) is not that worker's. A finished run
-    resumes the session it recorded.
+    A running issue talks to the worker its run record names; a session recorded for
+    another executor (an earlier run's) is not that worker's. A finished run resumes
+    the session it recorded, with the executor that recorded it.
     """
     if run.status != "running":
-        executor = run.session_executor or _lane_executor(run, config)
+        executor = run.session_executor or _worker_executor(run, config)
         return executor, run.session_id
-    executor = _lane_executor(run, config)
+    executor = _worker_executor(run, config)
     # A stale session (a fresh thread is starting, or inherited and not resumed) is not the worker's.
     usable = run.session_id if run.session_executor in (None, executor) and not run.session_stale else None
     return executor, usable
