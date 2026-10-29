@@ -121,6 +121,8 @@ def collect_lanes(
     summary = dict(working=0, blocked=0, waiting_human=0, queued=0)
     priority = {"working": 0, "waiting-human": 1, "blocked": 2, "queued": 3, "idle": 4}
     grouped = {item["number"]: (group, item) for group, items in groups.items() for item in items}
+    # A lane dreams while its dream record runs; the tick owns that record's liveness.
+    dreaming = {run.lane for run in store.dream_runs() if run.status == "running"}
 
     def lane_row(slug: str) -> dict[str, Any]:
         return lanes.setdefault(slug, {
@@ -128,6 +130,7 @@ def collect_lanes(
             "state": "idle", "issue": None, "title": None, "phase": None,
             "elapsed_seconds": None, "last_activity_seconds": None, "waiting_for": [],
             RUNNING: [], READY: [], "queued": [], "held": [],
+            "dreaming": slug in dreaming,
         })
 
     def show(row: dict[str, Any], state: str, number: int, title: str | None, run, waiting_for) -> None:
