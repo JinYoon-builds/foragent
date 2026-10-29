@@ -55,7 +55,7 @@ from foragent.run_prompts import (
 from foragent.run_waits import (
     poll_executor,
     _remaining,
-    _runtime_left,
+    _budget_left,
     _timeout,
     _test_slot,
     _progress,
@@ -146,6 +146,7 @@ class RunContext:
     sleep: Callable[[float], None] = time.sleep
     poll_hook: Callable[[Callable[[], ExecResult], Callable[[], None]], ExecResult] = poll_executor
     monotonic: Callable[[], float] = time.monotonic
+    lane_executor: str | None = None  # The lane's configured executor, before the run's pair (#186).
     # A probe's own hard deadline (fa doctor); runs have none but the safety net (#435).
     deadline_seconds: int | None = None
 
@@ -214,7 +215,7 @@ def _implement_and_publish(
             attempt.reviewer_text = None
             run = ctx.store.get_run(n)
             if not attempt.failure and ctx.config.reviewer != "none":
-                if _remaining(n, ctx) <= 0:
+                if _budget_left(n, ctx) <= 0:
                     outcome = _timeout(n, ctx)
                     return outcome
                 _review_implementation(attempt)
@@ -371,10 +372,12 @@ def run_issue(n: int, ctx: RunContext) -> str:
         board.sync_status(ctx, n, "Running")
         from foragent.run_implementation import lane_config
 
-        from foragent.scheduler_quota import run_config
+        from foragent.quota_reviewer import stored_config
 
-        # The implementer the tick stored at start (#107) holds for every attempt of this run.
-        ctx = replace(ctx, config=run_config(ctx.store, lane_config(ctx.config, run.lane), run.implementer, ctx.now()))
+        # The pair the tick stored at start (#186) holds for every attempt of this run.
+        lane_settings = lane_config(ctx.config, run.lane)
+        ctx = replace(ctx, config=stored_config(ctx.store, lane_settings, run, ctx.now()),
+                      lane_executor=lane_settings.executor)
         try:
             outcome = _execute(n, ctx, worktree)
         finally:

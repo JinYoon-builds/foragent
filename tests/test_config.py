@@ -39,6 +39,7 @@ def test_exact_defaults(repo):
         "view_glyphs": "auto",
         "presence": {"statusline": True, "session_start": True, "report": True},
         "executor_list": None,  # No repository executors list (#786).
+        "order_written": False,  # No executor order written: headroom chooses (#186).
         "skill_roles": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,
@@ -366,6 +367,10 @@ def test_lane_validation(repo, settings):
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_parallel_and_wait_settings_are_positive(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
+    if key == "max_parallel" and value is None:
+        # null is the default (no ceiling), as when the key is left out (a dump of Config writes it).
+        assert load_config(repo).max_parallel is None
+        return
     with pytest.raises(ConfigError, match=key):
         load_config(repo)
 

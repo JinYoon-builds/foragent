@@ -35,41 +35,42 @@ def poll_executor[T](execute: Callable[[], T], poll: Callable[[], None]) -> T:
         watcher.join()
 
 
-def _remaining(n: int, ctx: RunContext) -> int:
+def _elapsed(n: int, ctx: RunContext) -> float:
     run = ctx.store.get_run(n)
     if run is None:
         raise KeyError(n)
     # The gate tick credits machine sleep to the run record; the runner never reads the sensor.
-    elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
-               - run.waited_seconds - run.slept_seconds)
-    deadline = getattr(ctx, "deadline_seconds", None)  # Optional: only a probe (fa doctor) sets one.
-    if deadline is None:
-        # Past the safety net by a margin: the gate's tick ends the run first, keeping its WIP
-        # for the next run; this budget only bounds a runner whose gate stopped ticking.
-        deadline = safety_net_seconds(ctx.config) + RUNNER_MARGIN_SECONDS
-    return max(0, int(deadline - elapsed))
+    return ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
+            - run.waited_seconds - run.slept_seconds)
 
 
-RUNNER_MARGIN_SECONDS = 10 * 60
-
-
-def _runtime_left(n: int, ctx: RunContext) -> int:
+def _remaining(n: int, ctx: RunContext) -> int:
     """What is left of ``max_runtime_minutes`` (credited waits excluded).
 
-    Waiting loops (CI polling, merge turns) keep it as their bound, as before #435;
-    changing those belongs to a later issue. An executor session gets it as ``timeout_s``,
-    which run_logged's ``quiet_timeout`` applies only once the session is also quiet.
+    Waiting loops (CI polling, merge turns) keep it as their bound, as before #435. An
+    executor session gets it as ``timeout_s``, which run_logged's ``quiet_timeout`` applies
+    only once the session is also quiet; a check gets it only as its logged limit.
+    """
+    deadline = getattr(ctx, "deadline_seconds", None)  # Optional: only a probe (fa doctor) sets one.
+    limit = ctx.config.max_runtime_minutes * 60 if deadline is None else deadline
+    return max(0, int(limit - _elapsed(n, ctx)))
+
+
+def _budget_left(n: int, ctx: RunContext) -> int:
+    """The run's own bound at step boundaries (#435): the safety net plus a margin.
+
+    The gate's tick reaches the safety net first and ends the run resumably, keeping its
+    WIP; this bound only stops a runner whose gate stopped ticking. A probe's deadline wins.
     """
     from foragent import runner
 
-    remaining = runner._remaining(n, ctx)  # The runner's seam, so callers' budgets agree.
-    if getattr(ctx, "deadline_seconds", None) is not None:
-        return remaining
-    limit = ctx.config.max_runtime_minutes
-    run = ctx.store.get_run(n)
-    elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
-               - run.waited_seconds - run.slept_seconds)
-    return max(0, min(int(limit * 60 - elapsed), remaining))
+    deadline = getattr(ctx, "deadline_seconds", None)
+    if deadline is not None:
+        return runner._remaining(n, ctx)
+    return max(0, int(safety_net_seconds(ctx.config) + RUNNER_MARGIN_SECONDS - _elapsed(n, ctx)))
+
+
+RUNNER_MARGIN_SECONDS = 10 * 60
 
 
 def past_runtime_limit(n: int, ctx: RunContext) -> bool:

@@ -108,6 +108,9 @@ class Config:
     # Ordered executors (#786) exactly as the repository `executors` key wrote them; None when
     # the key is absent. Only this explicit list is stored; `executors` derives the rest.
     executor_list: list[dict[str, Any]] | None = None
+    # Whether a person wrote an executor order (#186): a repository executors list, or claude_quota in
+    # any config file. Derived at load time; without it, Claude and Codex go by quota headroom.
+    order_written: bool = False
 
     @property
     def executors(self) -> list[dict[str, Any]]:
@@ -423,7 +426,8 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
         if key not in DEFAULTS and key not in IGNORED_KEYS and key not in FILE_KEYS:
             raise ConfigError(f"unknown configuration key: {key}")
     if "max_parallel" in value and value["max_parallel"] is None:
-        raise ConfigError("max_parallel must be a positive integer; omit it to have no ceiling")
+        # null is the default (no ceiling), as when the key is left out; a dump of Config writes it.
+        value = {key: item for key, item in value.items() if key != "max_parallel"}
     return value
 
 
@@ -458,9 +462,16 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
     _overlay(values, global_values)
     local = _read_yaml(local_path)
     _overlay(values, local)
+    _personal_glyphs(values, global_values)
     _apply_executors(values, global_values, local)
     _validate(values)
     return Config(**values)
+
+
+def _personal_glyphs(values: dict[str, Any], global_values: dict[str, Any]) -> None:
+    """A repository's view_glyphs auto makes no choice, so a person's own emoji or ascii applies (#173)."""
+    if values.get("view_glyphs") == "auto" and global_values.get("view_glyphs") in ("emoji", "ascii"):
+        values["view_glyphs"] = global_values["view_glyphs"]
 
 
 def _file_executors(source: dict[str, Any]) -> tuple[bool, Any]:
@@ -486,6 +497,11 @@ def _apply_executors(values: dict[str, Any], global_values: dict[str, Any], loca
         raise ConfigError("executors may be set only in the repository .foragent.yml, not the global config")
     values["executor_list"] = None
     present, entries = _file_executors(local)
+    # Per file: a config written back with asdict carries order_written itself, which speaks for
+    # that file only; otherwise claude_quota written there is an order. A repository list always is.
+    values["order_written"] = present or any(
+        source["order_written"] if isinstance(source.get("order_written"), bool) else "claude_quota" in source
+        for source in (local, global_values))
     if not present:
         return
     if "claude_quota" in local:
@@ -522,6 +538,7 @@ def load_committed_config(local: Config, content: str | None, source: str,
         global_values = _read_yaml(global_path) if global_path.exists() else {}
         _overlay(values, global_values)
         _overlay(values, committed)
+        _personal_glyphs(values, global_values)
         _apply_executors(values, global_values, committed)
         # A language change is not a conflict worth a warning; repo and base_branch are.
         ignored = [key for key in ("repo", "base_branch") if key in committed and values[key] != getattr(local, key)]
@@ -634,6 +651,17 @@ def set_profile(repo_root: Path, *, kind: str, stage: str, priority: str) -> dic
     local["profile"] = profile
     path.write_text(yaml.safe_dump(local, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return profile
+
+
+def set_setting(repo_root: Path, key: str, raw: str | None, *, unset: bool = False,
+                language: str = "en") -> dict[str, Any]:
+    """Change one `fa settings` setting in the file its scope owns.
+
+    The one writer that `fa settings set` and the lane view's settings window share.
+    """
+    from foragent import settings_write
+
+    return settings_write.set_value(repo_root, key, raw, unset=unset, language=language)
 
 
 def resolved_reviewer(config: Config) -> str:

@@ -35,7 +35,7 @@ def test_keep_mode_starts_claude_lane_with_codex_and_records_why(ctx):
     approve(ctx, 1)
     report = tick(ctx)
     run = ctx.store.get_run(1)
-    assert run.implementer == "codex" and run.pid == 7001
+    assert (run.executor, run.reviewer) == ("codex", "claude") and run.pid == 7001
     [event] = [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
     assert (event["issue"], event["from"], event["to"]) == (1, "claude", "codex")
     assert event["reason"] == "Claude keep share 81% >= 80%"
@@ -53,7 +53,7 @@ def test_no_switch_in_burn_mode_for_codex_lanes_or_below_keep(ctx, executor, ove
         ctx.store.set_claude_quota_mode(override)
     approve(ctx, 1)
     tick(ctx)
-    assert ctx.store.get_run(1).implementer is None
+    assert ctx.store.get_run(1).executor == executor
     assert not [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
 
 
@@ -73,7 +73,7 @@ def test_lane_pin_is_switched_too(ctx):
     usage(ctx.store, 95.0)
     approve(ctx, 1, labels=["lane:ui"])
     tick(ctx)
-    assert ctx.store.get_run(1).implementer == "codex"
+    assert ctx.store.get_run(1).executor == "codex"
 
 
 def test_expired_windows_and_unreadable_usage_are_ignored(tmp_path):
@@ -93,7 +93,7 @@ def test_expired_windows_and_unreadable_usage_are_ignored(tmp_path):
 ])
 def test_switched_config_reviews_cross_model_where_possible(reviewer, paused, expected):
     config = Config(executor="claude", executor_model="opus", reviewer=reviewer)
-    switched = switched_config(config, "codex", paused)
+    switched = switched_config(config, "codex", lambda name: paused and name == "claude")
     assert (switched.executor, switched.executor_model, switched.reviewer) == ("codex", None, expected)
     assert switched_config(config, None) is config and switched_config(config, "claude") is config
 
@@ -177,7 +177,7 @@ def test_claude_hard_limit_lane_pause_does_not_hold_a_switched_start(ctx, mode):
     approve(ctx, 1)
     report = tick(ctx)
     run = ctx.store.get_run(1)
-    assert run is not None and run.implementer == "codex"
+    assert run is not None and run.executor == "codex"
     reason = f"Claude paused at its limit until {until.isoformat()}"
     assert [event["reason"] for event in events(ctx.store) if event["kind"] == "executor-switch"] == [reason]
     assert any(reason in action for action in report.actions)
@@ -226,7 +226,7 @@ def test_lane_pinned_reviewer_reaches_the_switched_run(pin, paused, expected):
     config = Config(executor="codex", lanes={"ui": {"executor": "claude", "reviewer": pin}})
     adjusted = lane_config(config, "ui")
     assert adjusted.reviewer == pin
-    assert switched_config(adjusted, "codex", paused).reviewer == expected
+    assert switched_config(adjusted, "codex", lambda name: paused and name == "claude").reviewer == expected
     if pin in ("claude", "none"):
         assert lane_executors(config, "ui") == {"claude", pin}
 
@@ -272,7 +272,7 @@ def test_tick_restart_after_limit_wait_keeps_codex_without_a_new_switch(ctx):
     usage(ctx.store, 5.0)  # Claude's share has reset.
     tick(ctx)
     run = ctx.store.get_run(1)
-    assert run.status == "running" and run.implementer == "codex"
+    assert run.status == "running" and run.executor == "codex"
     assert len([event for event in events(ctx.store) if event["kind"] == "executor-switch"]) == 1
 
 
@@ -288,8 +288,30 @@ def test_tick_restart_of_kept_codex_run_waits_while_codex_is_paused(ctx):
     ctx.tracker.add_labels(1, ["ready"])
     usage(ctx.store, 5.0)
     ctx.store.pause_executor("codex", NOW + timedelta(hours=1))
+    ctx.store.pause_executor("claude", NOW + timedelta(hours=1))  # #186: with Claude free it would hand over.
     tick(ctx)
     assert ctx.store.get_run(1).outcome == "limit-wait"
+
+
+def test_tick_restart_of_kept_codex_run_hands_over_when_codex_is_paused(ctx):
+    """#186: a kept executor at a hard limit (here a pause, no usage window) is released with a limit switch."""
+    ctx.config = replace(ctx.config, executor="claude")
+    ctx.start_runs = True
+    usage(ctx.store, 81.0)
+    approve(ctx, 1)
+    tick(ctx)
+    ctx.store.finish_run(1, "limit-wait")
+    ctx.process_table.exit(7001)
+    ctx.tracker.remove_labels(1, ["running"])
+    ctx.tracker.add_labels(1, ["ready"])
+    usage(ctx.store, 5.0)
+    ctx.store.pause_executor("codex", NOW + timedelta(hours=1))
+    tick(ctx)
+    run = ctx.store.get_run(1)
+    assert run.status == "running" and run.executor == "claude"
+    switches = [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
+    assert [(event["from"], event["to"]) for event in switches] == [("claude", "codex"), ("codex", "claude")]
+    assert switches[-1]["reason"].startswith("Codex paused at its limit")
 
 
 def test_switch_event_is_written_with_the_run_record(ctx):
@@ -321,11 +343,12 @@ def test_github_limit_during_start_stores_no_unjournaled_switch_then_next_start_
     monkeypatch.setattr(board, "sync_status", limited)
     tick(ctx)
     run = ctx.store.get_run(1)
-    assert run.outcome == "limit-wait" and run.implementer is None
-    assert not [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
+    # #186: the rate-limit path stores the chosen pair and journals its switch as any start does.
+    assert run.outcome == "limit-wait" and run.executor == "codex"
+    assert len([event for event in events(ctx.store) if event["kind"] == "executor-switch"]) == 1
     from foragent.scheduler_quota import run_start
 
-    assert run_start(ctx.store, ctx.config, "main", 1, NOW)[2] is not None, "the next start still switches"
+    assert run_start(ctx.store, ctx.config, "main", 1, NOW)[2] is None, "the continued start keeps Codex"
 
 
 def test_usage_changing_between_reads_cannot_break_the_decision(ctx, monkeypatch):
@@ -372,9 +395,9 @@ def test_claude_hard_limit_moves_every_claude_role_to_free_codex(ctx, mode, exec
     approve(ctx, 1)
     tick(ctx)
     run = ctx.store.get_run(1)
-    assert run is not None and run.status == "running" and run.implementer == implementer
-    config = switched_config(lane_config(ctx.config, "main"), run.implementer, ctx.store.executor_paused("claude", NOW))
-    assert (config.executor, config.reviewer) == ("codex", "codex")
+    assert run is not None and run.status == "running"
+    assert (run.executor, run.reviewer) == ("codex", "codex"), "the stored pair moves both roles"
+    assert lane_config(ctx.config, "main").executor == (implementer and executor or "codex")
     assert (ctx.store.root / "lane-pauses.json").read_bytes() == pauses, "the Claude pause stays in place"
     switches = [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
     assert len(switches) == (0 if implementer is None else 1)
@@ -408,3 +431,27 @@ def test_runner_moves_claude_review_to_codex_while_claude_is_paused(monkeypatch,
     monkeypatch.setattr(runner, "observe_tree", lambda roots: [])
     runner.run_issue(1, context)
     assert (seen[0].executor, seen[0].reviewer, seen[0].reviewer_model) == ("codex", "codex", None)
+
+
+def test_queued_github_limit_during_start_stores_the_pair_and_its_switch(ctx, monkeypatch):
+    """#186: a label write the RecordingTracker only queued (no raise) still stores the pair and its switch."""
+    from foragent import board
+
+    ctx.config = replace(ctx.config, executor="claude")
+    ctx.start_runs = True
+    usage(ctx.store, 85.0)
+    approve(ctx, 1)
+    until = NOW + timedelta(minutes=5)
+
+    def queued(context, issue, status, **kwargs):
+        if status == "Running":  # The outbox queued the write and noted the GitHub pause.
+            (ctx.store.root / "github-pause.json").write_text(json.dumps({"until": until.isoformat()}))
+
+    monkeypatch.setattr(board, "sync_status", queued)
+    report = tick(ctx)
+    run = ctx.store.get_run(1)
+    assert report.skipped == f"GitHub rate limit until {until.isoformat()}"
+    assert (run.outcome, run.executor, run.reviewer) == ("limit-wait", "codex", "claude")
+    [event] = [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
+    assert (event["from"], event["to"]) == ("claude", "codex")
+    assert not ctx.store.run_start_pending(1), "the reservation is released like the raising path"

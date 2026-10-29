@@ -37,6 +37,28 @@ def _restart(cleanup: ExitStack) -> bool:
     return True
 
 
+def window_key(key: int, names: dict[int, str], prompting: bool, not_keys: tuple[int, ...]) -> str | None:
+    """The settings window's name for one getch value, or None to ignore it.
+
+    During the team y/n prompt a key outside the map (Space, a letter, F1) still answers:
+    it counts as n. No key (a timeout), a resize or a mouse event is not a key.
+    """
+    name = names.get(key)
+    if name is None and prompting and key not in not_keys:
+        return "other"
+    return name
+
+
+def _reload(config: Config, repo_root: Path) -> Config:
+    """The configuration as just saved, so rows, glyphs and the last line change at once."""
+    from foragent.config import ConfigError, load_config
+
+    try:
+        return load_config(repo_root)
+    except (ConfigError, OSError):
+        return config
+
+
 def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, config: Config, repo_root: Path, now,
               store=None):
     from foragent import watch
@@ -86,7 +108,11 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     if store is not None:
         view_state["store"] = store
     keys = {curses.KEY_DOWN: "down", curses.KEY_UP: "up", curses.KEY_NPAGE: "pagedown",
-            curses.KEY_PPAGE: "pageup", 27: "esc", **{ord(key): key for key in "jkfaomxqQ"}}
+            curses.KEY_PPAGE: "pageup", 27: "esc", **{ord(key): key for key in "jkfaomxqQs"}}
+    # The settings window's own keys (#173): there digits switch tabs instead of picking a lane.
+    window_keys = {**keys, 10: "enter", 13: "enter", curses.KEY_ENTER: "enter", 9: "tab",
+                   getattr(curses, "KEY_BTAB", 353): "btab", curses.KEY_LEFT: "left",
+                   curses.KEY_RIGHT: "right", **{ord(key): key for key in "yYnN123"}}
     with ExitStack() as cleanup:
         worker = cleanup.enter_context(watch.ThreadPoolExecutor(max_workers=1))
         while True:
@@ -110,6 +136,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                         return _restart(cleanup)
             tick = int((watch.time.monotonic() - animation_started) / 0.3)
             height, width = screen.getmaxyx()
+            view_state["height"] = height  # The settings window fits itself to this screen.
             layout: dict = {}
             try:
                 # The terminal's own width, so the 60- and 100-column rules hold as in a plain frame.
@@ -172,6 +199,20 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 watch.sys.stdout.flush()
             key = screen.getch()
             slugs = list(snapshot.status["lanes"])
+            if view_state.get("settings"):
+                # The window is keyboard-only and takes every key but q.
+                name = window_key(key, window_keys, view_state.get("settings_prompt") is not None,
+                                  (-1, curses.KEY_RESIZE, curses.KEY_MOUSE))
+                if name in ("q", "Q"):
+                    return
+                if name is not None:
+                    watch.handle_key(name, store, config, state=view_state, repo_root=repo_root)
+                if view_state.pop("config_changed", False):
+                    config = _reload(config, repo_root)
+                    if hasattr(refresh, "config"):
+                        refresh.config = config  # Later snapshots read the saved settings too.
+                    next_refresh = watch.time.monotonic()  # And the next one starts now.
+                continue
             if key == curses.KEY_MOUSE and store is not None:
                 try:
                     _, x, y, _, buttons = curses.getmouse()
@@ -196,8 +237,8 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             elif key in keys:
                 if keys[key] in ("q", "Q") or (keys[key] == "esc" and view_state.get("issue") is None):
                     return
-                if store is not None:
-                    watch.handle_key(keys[key], store, config, state=view_state)
+                if store is not None or keys[key] == "s":
+                    watch.handle_key(keys[key], store, config, state=view_state, repo_root=repo_root)
                 elif keys[key] in ("down", "up", "j", "k", "pagedown", "pageup"):
                     step = 1 if keys[key] in ("down", "up", "j", "k") else max(1, height - 2)
                     watch.scroll(view_state, -step if keys[key] in ("up", "k", "pageup") else step)

@@ -17,7 +17,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import orch_events, orch_reviewers, review_notes, review_perspectives, risks
+from foragent import orch_events, orch_reviewers, quota_reviewer, review_notes, review_perspectives, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -159,6 +159,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
             path.chmod(mode)
 
 
+@quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
     from foragent import runner
@@ -187,14 +188,13 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
         before = git.review_state()
         try:
             result = _available_executor(
-                n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
-                reviewer=True,
+                n, ctx, ctx.executor_factory(reviewer), worktree=git.root, reviewer=True,
                 prompt="" if reviewer == "claude" else build_review_prompt(
                     parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
                     full_text_dir=cuts.issue_dir(ctx.store.root, n),
                     risk_notes=risk_notes,
                 ),
-                **settings, timeout_s=runner._runtime_left(n, ctx),
+                **settings, timeout_s=runner._remaining(n, ctx),
                 log_path=ctx.store.log_path(n), on_result=notes_of(n, ctx, reviewer, round_number), **options,
             )
             message = result.full_message if result.full_message is not None else result.last_message
@@ -289,7 +289,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     def call(prompt: str, log_path: Path = log) -> ExecResult:
         # The panel decides the round's outcome from every call, so no call blocks the issue itself.
         return _available_executor(n, ctx, executor, worktree=git.root, reviewer=True, prompt=prompt,
-                                   **settings, timeout_s=runner._runtime_left(n, ctx), log_path=log_path,
+                                   **settings, timeout_s=runner._remaining(n, ctx), log_path=log_path,
                                    flag_exhaustion=False, on_result=record)
 
     def failure(label: str, error: BaseException) -> str:
@@ -573,7 +573,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     _check_publication(git, pr.base)
 
     if verdict_head is None and ctx.config.reviewer != "none":
-        if runner._remaining(n, ctx) <= 0:
+        if runner._budget_left(n, ctx) <= 0:
             return _timeout(n, ctx)
         if ctx.config.review_scope == "pr-body":
             # Native PR review reads only the PR body: refresh the risk notes for this head and base.
@@ -586,7 +586,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
                          pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
         _stop_on_spec_conflict(n, ctx, review)
-        if review.timed_out or runner._remaining(n, ctx) <= 0:
+        if review.timed_out or runner._budget_left(n, ctx) <= 0:
             return _timeout(n, ctx)
         if review.verdict != "PASS":
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)

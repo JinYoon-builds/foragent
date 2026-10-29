@@ -78,6 +78,16 @@ class ExecutorStopped(Exception):
         self.outcome = outcome
 
 
+class ReviewerLimited(ExecutorStopped):
+    """A stored reviewer reached a hard limit before its session launched (#186).
+
+    The review runs again with the run's own executor (``quota_reviewer.moving_review``); it never waits.
+    """
+
+    def __init__(self, name: str):
+        super().__init__("limit-wait", f"{name} reached its limit before the review launched")
+
+
 @dataclass
 class Implementation:
     """The former closure state, retained across checks, reviews and merge retries."""

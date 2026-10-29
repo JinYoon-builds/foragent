@@ -426,7 +426,7 @@ def test_missing_pr_remains_visible_with_or_without_run_record(review_case, prev
 def test_rerun_early_verification_failures_remain_blocked(review_case, monkeypatch, failure):
     c = review_case
     if failure == "runtime":
-        monkeypatch.setattr(runner, "_remaining", lambda *args: 0)
+        monkeypatch.setattr(runner, "_budget_left", lambda *args: 0)  # The run's own bound at a step (#435).
         reason = Reason.TIMEOUT
     elif failure == "head-before-review":
         c.tracker.set_pr_head_sha(c.pr, "f" * 40)

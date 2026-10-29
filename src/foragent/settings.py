@@ -1,4 +1,4 @@
-"""`fa settings`: eleven settings in three scopes, each read from and written to its own file (#160).
+"""`fa settings`: thirteen settings in three scopes, each read from and written to its own file (#160).
 
 - team: the repository's ``.foragent.yml``
 - me: the user config, ``~/.config/foragent/config.yml``
@@ -46,10 +46,12 @@ SETTINGS = (
     Setting("always_human", "team", [], kind="list"),
     Setting("executor", "team", "codex", ("claude", "codex")),
     Setting("reviewer", "team", None, ("claude", "codex", "none")),
+    Setting("runner_unit_tests", "team", "auto", ("auto", "ci", "all")),
     Setting("claude_quota.mode", "me", "keep", ("keep", "burn")),
     Setting("notify", "me", None, NOTIFY_FIXED, kind="notify"),
     Setting("animation", "me", True, (True, False), kind="bool"),
     Setting("language", "me", "en", ("en", "ko")),
+    Setting("view_glyphs", "me", "auto", ("auto", "emoji", "ascii")),
     Setting("max_parallel", "machine", None, kind="positive"),
     Setting("memory_pressure_limit", "machine", "critical", PRESSURE_LEVELS),
     Setting("log_retention_days", "machine", 7, kind="range", low=1, high=365),
@@ -208,3 +210,41 @@ def plain(value: Any) -> str:
     if isinstance(value, list):
         return ",".join(str(part) for part in value) or "-"
     return str(value)
+
+
+def raw(value: Any) -> str:
+    """The command-line text that `fa settings set` parses back into value."""
+    return plain(value) if isinstance(value, bool) else str(value)
+
+
+def effective_value(setting: Setting, config: Any, store: Any = None) -> Any:
+    """What applies now: the loaded configuration (team over me), the machine file and,
+    for the Claude quota mode, the repository's local override (fa quota mode)."""
+    if setting.key == "claude_quota.mode":
+        if store is not None:
+            from foragent import scheduler_quota
+
+            return scheduler_quota.quota_mode(store, config)[0]
+        return config.claude_quota.get("mode", setting.default)
+    if setting.scope == "machine":
+        return read_machine().get(setting.key, getattr(config, setting.key, setting.default))
+    return deepcopy(getattr(config, setting.key, setting.default))
+
+
+def effective(root: Path, store: Any = None, language: str = "en") -> dict[str, Any]:
+    """Every setting, nested by its dotted key (claude_quota.mode under claude_quota).
+
+    Team, me and machine values come from each scope's own file; the repository's local
+    override (fa quota mode) decides the Claude quota mode when it is set.
+    """
+    result: dict[str, Any] = {}
+    for setting in SETTINGS:
+        value = _file_value(setting, root, language)
+        if setting.key == "claude_quota.mode" and store is not None:
+            value = store.claude_quota_mode() or value
+        *parents, name = setting.key.split(".")
+        target = result
+        for parent in parents:
+            target = target.setdefault(parent, {})
+        target[name] = value
+    return result

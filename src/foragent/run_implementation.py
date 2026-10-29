@@ -287,7 +287,7 @@ def _implement(
     wait_for_overlap(attempt)
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")
-    remaining = runner._remaining(n, ctx)
+    remaining = runner._budget_left(n, ctx)
     # The step just finished was stopped (a check the watchdog found silent, or a review
     # session that timed out): past max_runtime_minutes, the run ends here (#435).
     stopped = (any(check.timed_out for check in attempt.checks)
@@ -372,7 +372,7 @@ def _implement(
     rebuttal = _read_rebuttals(worktree)
     if rebuttal.strip() and rebuttal not in attempt.rebuttals:
         attempt.rebuttals.append(rebuttal)
-    if result.timed_out or runner._remaining(n, ctx) <= 0:
+    if result.timed_out or runner._budget_left(n, ctx) <= 0:
         raise ExecutorStopped(_timeout(n, ctx))
     question = worktree / ".foragent/QUESTION.md"
     if question.exists():

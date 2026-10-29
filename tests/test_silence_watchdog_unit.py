@@ -14,7 +14,7 @@ import pytest
 from foragent import processes, run_baseline, run_baseline_plugins, scheduler  # noqa: F401  (scheduler first, as production imports it)
 from foragent import scheduler_recovery, scheduler_silence
 from foragent.config import Config
-from foragent.run_waits import _remaining
+from foragent.run_waits import _budget_left, _remaining
 from foragent.watchdog import SilenceWatchdog
 from process_fakes import fake_process_table  # noqa: F401
 
@@ -131,9 +131,10 @@ def test_runner_budget_ignores_max_runtime_and_outlasts_the_gate_safety_net():
     run = SimpleNamespace(started_at=started.isoformat(), waited_seconds=0, slept_seconds=0)
     ctx = SimpleNamespace(store=SimpleNamespace(get_run=lambda n: run), now=lambda: started,
                           config=Config(max_runtime_minutes=2), deadline_seconds=None)
-    assert _remaining(1, ctx) > 24 * 3600, "The gate's resumable safety-net stop must come first"
-    ctx.deadline_seconds = 120  # A probe (fa doctor) keeps its own deadline.
-    assert _remaining(1, ctx) == 120
+    assert _budget_left(1, ctx) > 24 * 3600, "The gate's resumable safety-net stop must come first"
+    assert _remaining(1, ctx) == 120, "A session's budget is still max_runtime_minutes, applied only once quiet"
+    ctx.deadline_seconds = 60  # A probe (fa doctor) keeps its own deadline.
+    assert _budget_left(1, ctx) == _remaining(1, ctx) == 60
 
 
 # Restart policy: silence and safety-net stops always restart, whatever the count.
@@ -206,16 +207,14 @@ def test_quiescent_stop_ends_a_child_forked_after_the_snapshot(fake_process_tabl
 
 # Out of scope (CI polling, merge turns): waiting loops keep max_runtime_minutes as their bound.
 def test_waiting_loops_keep_the_configured_runtime_bound():
-    from foragent.run_waits import _runtime_left
-
     started = datetime(2026, 10, 29, tzinfo=UTC)
     run = SimpleNamespace(started_at=started.isoformat(), waited_seconds=0, slept_seconds=0)
     ctx = SimpleNamespace(store=SimpleNamespace(get_run=lambda n: run), now=lambda: started,
                           config=Config(max_runtime_minutes=2), deadline_seconds=None)
-    assert _runtime_left(1, ctx) == 120
-    assert _remaining(1, ctx) > 24 * 3600, "Only waiting is bounded; progressing work is not"
+    assert _remaining(1, ctx) == 120
+    assert _budget_left(1, ctx) > 24 * 3600, "Only waiting is bounded; step boundaries use the safety net"
     ctx.config = Config()  # The default 90 minutes still bound waiting, not the safety net.
-    assert _runtime_left(1, ctx) == 90 * 60
+    assert _remaining(1, ctx) == 90 * 60
 
 
 # A dream run shares the stop path by record key: it ends as error and touches no labels.

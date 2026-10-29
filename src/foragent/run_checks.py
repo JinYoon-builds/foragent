@@ -517,7 +517,7 @@ def _verify_contents(attempt: Implementation) -> str:
             if local_units is not None:
                 attempt.checks.append(local_units)
         if unit_tests and unit_command:
-            limit = max(900, runner._remaining(n, ctx))
+            limit = max(900, runner._remaining(n, ctx))  # Logged only: the watchdog ends the check (#435).
             result = run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths), limit)
             attempt.checks.append(result)
             if result.timed_out:
@@ -576,7 +576,7 @@ def _check_review_head(
     # Done when on the PR head is checking time, as in an implementation's verification.
     with in_phase(n, ctx, "checking"):
         for command in parsed.done_when_commands:
-            if runner._remaining(n, ctx) <= 0:
+            if runner._budget_left(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
             check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)),
@@ -584,7 +584,7 @@ def _check_review_head(
                                   full_text_dir=cuts.issue_dir(ctx.store.root, n), **watchdog.silence_args(ctx))
             checks.append(check)
             _progress(n, ctx)
-            if check.timed_out or runner._remaining(n, ctx) <= 0:
+            if check.timed_out or runner._budget_left(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 if check.timed_out:  # Stopped by the watchdog: restart, as the gate's silence stop does.
                     watchdog_restart(n, ctx, f"Done when on the PR head was stopped by the watchdog: {command}")

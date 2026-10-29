@@ -260,7 +260,7 @@ def _capture_acceptance_baseline(
     from foragent import runner
 
     def check(command: str, worktree: Path) -> CheckResult:
-        remaining = runner._remaining(n, ctx)
+        remaining = runner._budget_left(n, ctx)
         if remaining <= 0:
             raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before capture")
         # A capture (not a cache hit) is work on this base; a second capture of it repeats it.
@@ -271,7 +271,7 @@ def _capture_acceptance_baseline(
         except GitError:
             pass  # Without the base identity the capture is still measured, only not linked.
         result = runner._check(command, worktree, ctx.store.log_path(n),
-                               _baseline_capture_limit(ctx, ctx.store.log_path(n), remaining),
+                               _baseline_capture_limit(ctx, ctx.store.log_path(n), runner._remaining(n, ctx)),
                                progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
                                full_text_dir=cuts.issue_dir(ctx.store.root, n),
                                history_gaps=history_gaps(ctx), safety_net=safety_net(ctx))
@@ -502,7 +502,7 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
         try:
             if not (worktree / acceptance_dir).is_dir():
                 return owned, selectable
-            remaining = runner._remaining(n, ctx)
+            remaining = runner._budget_left(n, ctx)
             if remaining <= 0:
                 raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before collection")
             plugins = Path(directory) / "plugins"
@@ -512,7 +512,7 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
             selection = f"{previous.command} {shlex.quote(acceptance_dir)}"
             selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
             command = _with_python_path(f"{selection} --collect-only -p {plugin}", str(plugins))
-            result = runner._check(command, worktree, log, _baseline_capture_limit(ctx, log, remaining),
+            result = runner._check(command, worktree, log, _baseline_capture_limit(ctx, log, runner._remaining(n, ctx)),
                                    progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
                                    history_gaps=history_gaps(ctx), safety_net=safety_net(ctx))
             _progress(n, ctx)

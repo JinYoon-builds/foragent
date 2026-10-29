@@ -8,8 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from foragent.config import Config
-
 from foragent import capacity, run_waits, sleep_credit
 from foragent.state import StateStore
 
@@ -122,10 +120,8 @@ def test_remaining_runtime_reads_the_run_record_not_the_sensor(case, monkeypatch
     case.facts.sleep(NIGHT)
     case.tick()
     monkeypatch.setattr(capacity, "slept_seconds", lambda since: pytest.fail("The runner never reads the sensor"))
-    ctx = SimpleNamespace(now=case.facts.now, store=case.store, config=Config())
-    # 30 awake minutes ran; the night's sleep is credited from the run record, not the sensor.
-    budget = 24 * 3600 + run_waits.RUNNER_MARGIN_SECONDS  # The safety net plus the runner margin (#435).
-    assert run_waits._remaining(1, ctx) == budget - 30 * 60
+    ctx = SimpleNamespace(now=case.facts.now, store=case.store, config=SimpleNamespace(max_runtime_minutes=90))
+    assert run_waits._remaining(1, ctx) == 60 * 60
 
 
 def test_a_run_record_without_the_fields_reads_as_zero(case):

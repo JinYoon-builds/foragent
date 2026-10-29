@@ -12,14 +12,15 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board, cuts, usage_events, usage_recheck
+from foragent import board, cuts, quota_reviewer, usage_events, usage_recheck
 from foragent.actions import flag
 from foragent.config import resolved_reviewer, safety_net_seconds
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
 from foragent.labels import READY, RUNNING
 from foragent.processes import track_process_group
 from foragent.reasons import Reason
-from foragent.run_attempt import ExecutorStopped
+from foragent.quota_view import QuotaView
+from foragent.run_attempt import ExecutorStopped, ReviewerLimited
 from foragent.run_waits import _executor_wait, _progress, past_runtime_limit
 
 if TYPE_CHECKING:
@@ -95,20 +96,29 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, *, spender: str |
         _progress(n, ctx)
 
 
-def _session_hold(ctx: RunContext, name: str, lane: str | None) -> str | None:
-    """Why a session of ``name`` may not launch now; the same quota rules ``decide`` applies."""
+def _session_hold(ctx: RunContext, name: str, lane: str | None, view: QuotaView) -> str | None:
+    """Why a session of ``name`` may not launch now; the same quota rules ``decide`` applies.
+
+    ``view`` is the launch's one quota snapshot (#186): the hold, the reviewer move and the
+    credits question all read it, so a limit written meanwhile cannot split their answers.
+    """
     from foragent.scheduler_quota import blocked, entry_for
 
-    now = ctx.now()
-    entry = entry_for(ctx.config, name)
-    why = blocked(entry, ctx.store, now, {}, "keep", keep=False)[0]
-    if why is not None and why.key != "switch_reason_limit":  # A plain pause keeps today's words below.
+    why = blocked(entry_for(ctx.config, name), view, view.now, view.usage(), "keep", keep=False)[0]
+    if why is None:  # Free, or past a subscription limit on credits under its spend_cap.
+        return None
+    if why.key != "switch_reason_limit":  # A plain pause keeps today's words below.
         return why.reason + "."
-    if entry.get("quota") == "subscription" and entry.get("spend_cap") is not None:
-        return None  # Credits under the cap run past the executor pause; a lane pause mirrors it.
-    if (until := usage_recheck.hold_lane(ctx.store, name, lane, now)) is not None:
-        return f"{name} is paused for a usage limit until {until.isoformat()}."
-    return None
+    if view.executor_paused(name):  # The lane mirrors its pair's executor pause (#105).
+        usage_recheck.hold_lane(ctx.store, name, lane, view.now)
+    return f"{name} is paused for a usage limit until {why.values['until']}."
+
+
+def lane_default(ctx: RunContext, run) -> bool:
+    """Whether ``run`` runs on its lane's configured executor; only then does a limit pause the lane."""
+    if getattr(run, "executor", None) is None:  # A record from before #186.
+        return run.implementer is None
+    return run.executor == (ctx.lane_executor or ctx.config.executor)
 
 
 def _limit_wait(n: int, ctx: RunContext, detail: str) -> None:
@@ -142,13 +152,15 @@ def _available_executor(
         # Every launch, including a fresh start after a failed resume and each retry, is admitted
         # here: another run may have paused this executor, or this run reached its spend_cap (#786).
         # A keep-mode switched run (#107) never pauses its lane: the lane's own pair may be free.
-        current = ctx.store.get_run(n)
-        if (hold := _session_hold(ctx, name, current.lane if current.implementer is None else None)) is not None:
+        current, view = ctx.store.get_run(n), QuotaView(ctx.store, ctx.now())
+        if reviewer and quota_reviewer.reviewer_limited(n, ctx, name, view):
+            raise ReviewerLimited(name)  # Before _limit_wait: the review moves to the worker (#186).
+        if (hold := _session_hold(ctx, name, current.lane if lane_default(ctx, current) else None, view)) is not None:
             _limit_wait(n, ctx, hold)
         log = kwargs["log_path"]
         offset = log.stat().st_size if log.exists() else 0
         try:
-            spender = name if credits(ctx.store, ctx.config, name, ctx.now()) else None
+            spender = name if credits(view, ctx.config, name, view.now) else None
             result = _run_executor(n, ctx, executor, spender=spender, **kwargs)
             if on_result is not None:
                 on_result(result)
@@ -174,7 +186,7 @@ def _available_executor(
         run = ctx.store.get_run(n)
         if not reviewer and run.fallback_model is not None:
             kwargs["model"] = run.fallback_model
-        kwargs["timeout_s"] = runner._runtime_left(n, ctx)  # The session budget; it ends only once quiet past it (#435).
+        kwargs["timeout_s"] = runner._remaining(n, ctx)  # The session budget; it ends only once quiet past it (#435).
         session_id = (run.session_id if session_body is not None and resume_prompt is not None and not reviewer
                       and run.session_executor == ctx.config.executor else None)
         kwargs["prompt"] = resume_prompt if session_id is not None else full_prompt
@@ -199,7 +211,7 @@ def _available_executor(
             session_id = None
             kwargs.pop("resume_session_id")
             kwargs["prompt"] = full_prompt
-            kwargs["timeout_s"] = runner._runtime_left(n, ctx)  # The session budget; it ends only once quiet past it (#435).
+            kwargs["timeout_s"] = runner._remaining(n, ctx)  # The session budget; it ends only once quiet past it (#435).
             result = execute()
         kind = classify_result(result)
         if not reviewer and result.num_turns == 0 and not result.timed_out and kind == "normal":
@@ -225,7 +237,7 @@ def _available_executor(
             return result
         # A transient failure did no work: past max_runtime_minutes it ends the run, as a
         # silent step does at an attempt boundary (#435); otherwise only the budget ends it.
-        if kind == "transient" and (runner._remaining(n, ctx) <= 0 or past_runtime_limit(n, ctx)):
+        if kind == "transient" and (runner._budget_left(n, ctx) <= 0 or past_runtime_limit(n, ctx)):
             return replace(result, timed_out=True)
         if kind == "limit":
             now = ctx.now()
@@ -233,7 +245,7 @@ def _available_executor(
             until = usage_events.limit_reset(windows, now, now + timedelta(minutes=ctx.config.limit_wait_minutes))
             # One write pauses the executor and lane and notes the levels; the gate may end it early.
             usage_recheck.note_limit(ctx.store, name, until, windows, now,
-                                     lane=run.lane if run.implementer is None else None)
+                                     lane=run.lane if lane_default(ctx, run) else None)
             _limit_wait(n, ctx, result.last_message or result.log_tail or "Executor usage limit reached.")
         if kind == "transient" and not reviewer:
             run = ctx.store.update_run(n, transient_errors=run.transient_errors + 1)

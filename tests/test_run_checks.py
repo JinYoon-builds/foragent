@@ -298,9 +298,7 @@ def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkey
 
     monkeypatch.setattr("foragent.runner._check", check)
     assert run_issue(1, c.ctx) == ("stalled-restart" if timed_out else "merged")
-    # The run budget is the safety net plus the runner margin (#435), less the run time and credited waits.
-    remaining = RUNNER_BUDGET - 3600 + 600
-    assert [limit for _, limit in calls] == [900, 900, remaining - 240, remaining - 360, remaining - 480]
+    assert [limit for _, limit in calls] == [900, 900, 2160, 2040, 1920]
     assert '--collect-only' in calls[-3][0]
     assert '-m local_only' in calls[-2][0]
     assert "tests/test_new.py" in shlex.split(calls[-1][0])
@@ -328,7 +326,7 @@ def test_related_check_timeout_preserves_implementation_before_cleanup(run_case,
             ET.ElementTree(ET.Element("testsuite")).write(report, encoding="unicode")
         timed_out = "tests/test_sample.py" in shlex.split(command)
         if timed_out:
-            assert timeout_s == RUNNER_BUDGET - 70 * 60
+            assert timeout_s == 1200
             c.now[0] += timedelta(seconds=timeout_s)
         return CheckResult(command, -9 if timed_out else 0, timed_out, "")
 
@@ -388,7 +386,7 @@ def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_cas
         if kind == slow_check and not observed:
             assert timeout_s >= (stall_minutes + 1) * 60
             if kind == "related":
-                assert timeout_s == runner._remaining(1, c.ctx)
+                assert timeout_s == 3600
             for _ in range(stall_minutes + 1):
                 c.now[0] += timedelta(minutes=1)
                 if polls:
