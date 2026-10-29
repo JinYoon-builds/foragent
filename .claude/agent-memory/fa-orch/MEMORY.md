@@ -202,3 +202,4 @@
 - [#129 blocked push](project_129_blocked_push.md) — orch_push hook after spawn, _push_ready flag, notify-blocked.json re-arm
 - #846: Windows 조기 종료는 `cli.py`의 foragent import 앞 `try: import fcntl`에서 한 줄 출력 후 `SystemExit(1)`. 콘솔 대상은 바꾸지 않는다.
 - #130: 기록 없는 running 라벨의 `reconciled` 이벤트는 `scheduler_reconcile.orphan_crash_detail()`이 대체 crashed 기록보다 먼저 쓰고, 중복은 `orch_events.has_event(..., detail=라벨 세대)`로 판단한다. main의 scheduler_recovery.py(300)·scheduler.py(250)가 이미 상한이라 기존 줄을 바꿔 순증 0줄로 맞췄다. run_publish·run_review·capacity의 상한 초과는 main에서 이미 실패.
+- #158: 오케 스킬 150줄 한도(splitlines 기준, wc보다 1 많음)는 라우팅 표에 한 줄 행을 더하고 세부는 references/settings.md로 맞췄다. zsh는 `$files` 변수를 단어로 나누지 않으니 `fa test`에는 `$(... | tr '\n' ' ')`를 직접 넘긴다.
