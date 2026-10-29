@@ -701,7 +701,44 @@ def test_review_guard_runs_no_git_filter_before_a_measurement(review_case):
     (c.history.clone / ".git/info").mkdir(exist_ok=True)
     (c.history.clone / ".git/info/attributes").write_text("feature.txt filter=mk\n")
     set_done_when(c, ["echo more >> feature.txt",
-                      'if test -f gen/conftest.py; then echo MEASURED_""WITH_HARNESS; fi'])
+                      'echo RAN_""SECOND; if test -f gen/conftest.py; then echo MEASURED_""WITH_HARNESS; fi'])
     c.tracker.edit_body(1, c.store.load_approval(1).body)
     runner.review_only(1, c.ctx)
-    assert "MEASURED_WITH_HARNESS" not in c.store.log_path(1).read_text()
+    log = c.store.log_path(1).read_text()
+    assert "RAN_SECOND" in log, "the second measurement must actually run"
+    assert "MEASURED_WITH_HARNESS" not in log
+
+
+def test_review_final_staging_cannot_hide_a_filter_written_harness(review_case):
+    """A clean filter that returns feature.txt's own bytes but writes gen/conftest.py, run by the final staging."""
+    from runner_support import set_done_when
+
+    c = review_case
+    git_command(c.history.clone, "config", "filter.mk.clean",
+                "sh -c 'mkdir -p gen && echo \"# made by a filter\" > gen/conftest.py; cat'")
+    (c.history.clone / ".git/info").mkdir(exist_ok=True)
+    (c.history.clone / ".git/info/attributes").write_text("feature.txt filter=mk\n")
+    # Rewrite feature.txt with the same bytes, so staging re-cleans it and finds no change.
+    set_done_when(c, ['cp feature.txt f.tmp && mv f.tmp feature.txt && echo RAN_""DONE_WHEN'])
+    c.tracker.edit_body(1, c.store.load_approval(1).body)
+    assert runner.review_only(1, c.ctx) == "held"
+    assert "RAN_DONE_WHEN" in c.store.log_path(1).read_text()
+    assert c.tracker.merged_prs == []
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
+
+
+def test_review_harness_written_after_the_last_measurement_is_held_before_merging(review_case, monkeypatch):
+    c = review_case
+    checks = c.tracker.pr_checks
+
+    def ci_writes_harness(pr):
+        worktree = c.store.worktree_path(1)
+        (worktree / "gen").mkdir(exist_ok=True)
+        (worktree / "gen/conftest.py").write_text("# appeared after the checks\n")
+        return checks(pr)
+
+    monkeypatch.setattr(c.tracker, "pr_checks", ci_writes_harness)
+    assert runner.review_only(1, c.ctx) == "held"
+    assert c.tracker.merged_prs == []
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED

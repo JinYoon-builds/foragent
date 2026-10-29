@@ -386,18 +386,37 @@ def changed_harness_paths(git: GitRepo, target_ref: str, files: list[str]) -> li
     ## Files lists it; so does a directory the walk could not read.
     """
     found_on_disk, unreadable = _walk(git.root)
+    failures: list[str] = []
+
+    def enumerate_or_hold(what: str, read: Callable[[], set[bytes]]) -> set[bytes]:
+        # A source of candidates that cannot be read is no proof that nothing
+        # changed: it holds, named in the comment (fail closed).
+        try:
+            return read()
+        except Exception as exc:
+            failures.append(f"({what} could not be read: {' '.join(str(exc).split())[:200]})")
+            return set()
+
     if not callable(getattr(git, "run_bytes", None)):
         # A repository object that cannot run Git (a fixture): its changed
         # paths and the walk are the candidates; judging them needs Git, so
         # any candidate holds.
-        listed_changes = {_harness_prefix(path.encode("utf-8")) for path in git.changed_paths(target_ref)}
-        return [display_path(raw) for raw in sorted((listed_changes - {None}) | found_on_disk | unreadable)]
-    base = git._own_base(target_ref)
-    head_base = _merge_base(git, target_ref, "HEAD")
+        listed_changes = enumerate_or_hold("changed paths", lambda: {
+            prefix for path in git.changed_paths(target_ref)
+            if (prefix := _harness_prefix(path.encode("utf-8"))) is not None})
+        return failures + [display_path(raw) for raw in sorted(listed_changes | found_on_disk | unreadable)]
+    bases: list[str] = []
+    enumerate_or_hold("the merge base", lambda: bases.extend(
+        [git._own_base(target_ref), _merge_base(git, target_ref, "HEAD")]) or set())
+    if len(bases) != 2:
+        return failures + [display_path(raw) for raw in sorted(found_on_disk | unreadable)]
+    base, head_base = bases
     candidates = (found_on_disk
-                  | _listed_paths(git, ["ls-tree", "-r", "-z", "--full-tree", "--name-only", base])
-                  | _listed_paths(git, ["ls-tree", "-r", "-z", "--full-tree", "--name-only", "HEAD"])
-                  | _listed_paths(git, ["ls-files", "-z"]))
+                  | enumerate_or_hold("the base tree", lambda: _listed_paths(
+                      git, ["ls-tree", "-r", "-z", "--full-tree", "--name-only", base]))
+                  | enumerate_or_hold("the HEAD tree", lambda: _listed_paths(
+                      git, ["ls-tree", "-r", "-z", "--full-tree", "--name-only", "HEAD"]))
+                  | enumerate_or_hold("the index", lambda: _listed_paths(git, ["ls-files", "-z"])))
     file_mode = _git(git, ["config", "--bool", "core.fileMode"]).stdout.strip() != b"false"
     held = set(unreadable)
     for raw in candidates:
@@ -406,7 +425,7 @@ def changed_harness_paths(git: GitRepo, target_ref: str, files: list[str]) -> li
                 held.add(raw)
         except Exception:  # anything that stops an exact comparison holds (fail closed)
             held.add(raw)
-    return [display_path(raw) for raw in sorted(held)]
+    return failures + [display_path(raw) for raw in sorted(held)]
 
 
 def _judge(git: GitRepo, base: str, head_base: str, raw: bytes, files: list[str], file_mode: bool,

@@ -15,7 +15,7 @@ from foragent import run_merge_turn as merge_turn
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError
-from foragent.harness_guard import changed_harness_paths, hold_details
+from foragent.harness_guard import before_measurement, changed_harness_paths, hold_details
 from foragent.i18n import text
 from foragent.issue import ParsedIssue, body_hash
 from foragent.labels import APPROVED, BLOCKED, READY, RUNNING
@@ -741,6 +741,9 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 )
                 if not subject:
                     attempt.pr_title = title
+                # Last step before the merge consumes the evidence: base merges and
+                # staging run Git filters, which can write harness files.
+                before_measurement(git.root)
                 merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
                 try:
                     ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
@@ -946,6 +949,7 @@ def _publish_reviewed_in_turn(
                     body=lambda: pr.body, note=lambda line: _append(log, line),
                 )
                 pr = replace(pr, title=title)
+                before_measurement(git.root)  # last step before the merge consumes the evidence
                 merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
                 try:
                     ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)

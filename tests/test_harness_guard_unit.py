@@ -4,7 +4,7 @@ import pytest
 
 from conftest import git_command
 from foragent import runner
-from foragent.git import GitRepo
+from foragent.git import GitError, GitRepo
 from foragent.harness_guard import HARNESS_NAMES, changed_harness_paths, guard_measurements
 from foragent.reasons import Reason
 from runner_support import run_case, set_done_when  # noqa: F401
@@ -1124,7 +1124,8 @@ def test_entry_whose_type_cannot_be_read_holds(repo, monkeypatch):
 # Only once a measured command has changed feature.txt (to contain "more") does staging write the harness.
 FILTER_MAKES_HARNESS = ("sh -c 'input=$(cat); case \"$input\" in *more*) mkdir -p gen; "
                         "echo \"# made by a filter\" > gen/conftest.py;; esac; printf \"%s\\n\" \"$input\"'")
-MEASURED = 'if test -f gen/conftest.py; then echo MEASURED_""WITH_HARNESS; fi'
+# Always prints RAN_SECOND (proving the measurement ran); adds the harness marker if conftest.py exists.
+MEASURED = 'echo RAN_""SECOND; if test -f gen/conftest.py; then echo MEASURED_""WITH_HARNESS; fi'
 
 
 def test_no_git_filter_runs_between_the_guard_and_a_measurement(run_case):
@@ -1135,5 +1136,77 @@ def test_no_git_filter_runs_between_the_guard_and_a_measurement(run_case):
     (c.history.clone / ".git/info/attributes").write_text("feature.txt filter=mk\n")
     set_done_when(c, ["echo more >> feature.txt", MEASURED])
     assert runner.run_issue(1, c.ctx) == "held"
-    assert "MEASURED_WITH_HARNESS" not in c.store.log_path(1).read_text()
+    log = c.store.log_path(1).read_text()
+    assert "RAN_SECOND" in log, "the second measurement must actually run"
+    assert "MEASURED_WITH_HARNESS" not in log
     assert "gen/conftest.py" in _held_comment(c)
+
+
+
+def test_harness_written_after_the_last_measurement_is_held_before_merging(run_case, monkeypatch):
+    """Evidence is consumed at merge time; a file written meanwhile (here during the CI wait) must hold."""
+    c = run_case
+    checks = c.tracker.pr_checks
+
+    def ci_writes_harness(pr):
+        worktree = c.store.worktree_path(1)
+        (worktree / "gen").mkdir(exist_ok=True)
+        (worktree / "gen/conftest.py").write_text("# appeared after the checks\n")
+        return checks(pr)
+
+    monkeypatch.setattr(c.tracker, "pr_checks", ci_writes_harness)
+    assert runner.run_issue(1, c.ctx) == "held"
+    assert c.tracker.merged_prs == []
+    assert "gen/conftest.py" in _held_comment(c)
+
+
+def _commit_with_missing_tree(repo, parent=None):
+    """A commit whose tree names conftest.py as a tree object that does not exist."""
+    missing = "2" * 40
+    entries = git_command(repo, "ls-tree", "HEAD").splitlines() + [f"040000 tree {missing}\tconftest.py"]
+    tree = _git_bytes(repo, "mktree", "--missing", stdin=("\n".join(entries) + "\n").encode()).strip().decode()
+    return git_command(repo, "commit-tree", tree, *(["-p", parent] if parent else []), "-m", "missing tree")
+
+
+def test_base_tree_that_cannot_be_listed_holds(repo):
+    base = _commit_with_missing_tree(repo)
+    git_command(repo, "update-ref", "refs/heads/target", base)
+    git_command(repo, "update-ref", "refs/heads/main",
+                git_command(repo, "commit-tree", git_command(repo, "write-tree"), "-p", base, "-m", "head"))
+    held = changed_harness_paths(GitRepo(repo), "target", ["**"])
+    assert held and held[0].startswith("(the base tree could not be read:")
+
+
+def test_head_tree_that_cannot_be_listed_holds(repo):
+    git_command(repo, "update-ref", "refs/heads/main", _commit_with_missing_tree(repo, parent="HEAD"))
+    held = changed_harness_paths(GitRepo(repo), "target", ["**"])
+    assert held and held[0].startswith("(the HEAD tree could not be read:")
+
+
+@pytest.mark.parametrize("source,message", [
+    ("_listed_paths", "(the index could not be read:"),
+    ("_merge_base", "(the merge base could not be read:"),
+])
+def test_other_candidate_sources_that_fail_hold(repo, monkeypatch, source, message):
+    from foragent import harness_guard
+
+    real = getattr(harness_guard, source)
+
+    def failing(git, args, *rest):
+        if source == "_merge_base" or args[:1] == ["ls-files"]:
+            raise GitError("cannot read")
+        return real(git, args, *rest)
+
+    monkeypatch.setattr(harness_guard, source, failing)
+    held = changed_harness_paths(GitRepo(repo), "target", ["**"])
+    assert held and held[0] == f"{message} cannot read)"
+
+
+def test_fallback_changed_paths_that_fail_hold(tmp_path):
+    from types import SimpleNamespace
+
+    def failing(ref):
+        raise RuntimeError("no listing")
+
+    fake = SimpleNamespace(root=tmp_path, changed_paths=failing)
+    assert changed_harness_paths(fake, "main", []) == ["(changed paths could not be read: no listing)"]
