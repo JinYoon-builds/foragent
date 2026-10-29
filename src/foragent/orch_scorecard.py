@@ -15,7 +15,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_scorecard_flow as flow
+from foragent import orch_roles, orch_scorecard_flow as flow
 from foragent.config import Config
 from foragent.orch_binding import scorecard as binding
 from foragent.i18n import text
@@ -257,6 +257,7 @@ def human(card: dict[str, Any], language: str) -> str:
              _flow_line("scorecard_flow_previous", previous, language)]
     if "binding" in card:
         lines.append(_binding_line(card["binding"], language))
+    lines += orch_roles.scorecard_lines(today, previous, language)
     for name in card["worse"]:
         before, now = _pair(card, name)
         lines.append(text("scorecard_worse", language, metric=name, before=_shown(name, before),
@@ -294,6 +295,6 @@ def add_parser(orch_actions) -> None:
 
 
 def command(args, store: StateStore, config: Config) -> None:
-    card = collect(store, args.days, config.lanes)
+    card = orch_roles.scorecard(store, config, collect(store, args.days, config.lanes))
     card["binding"] = binding(store, config, args.repo_root, card)
     print(json.dumps(card, ensure_ascii=False) if args.json else human(card, config.language))

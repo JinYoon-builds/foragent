@@ -85,11 +85,15 @@ def requests(store: StateStore, *, pending: bool = False) -> list[dict[str, Any]
     return [row for row in rows if row["status"] != "done"] if pending else rows
 
 
-def set_request_status(store: StateStore, request_id: str, status: str, note: str | None = None) -> dict[str, Any]:
+def set_request_status(store: StateStore, request_id: str, status: str, note: str | None = None,
+                       check=None) -> dict[str, Any]:
+    """Set one request's status; ``check(record)`` runs inside the same state lock and may raise InboxError."""
     if status not in REQUEST_STATUSES:
         raise InboxError(f"status must be one of: {', '.join(REQUEST_STATUSES)}")
 
     def change(record: dict[str, Any]) -> None:
+        if check is not None:
+            check(record)
         record["status"] = status
         record.setdefault("notes", []).append(
             {"at": store._timestamp(), "status": status, "note": note or ""})

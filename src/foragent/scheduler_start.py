@@ -122,6 +122,14 @@ def _machine_budget(
     return ctx._tick_budget
 
 
+def _memory_holds(pressure: str) -> bool:
+    """Whether memory pressure has reached `fa settings`' memory_pressure_limit (default critical)."""
+    from foragent import settings
+
+    limit = settings.read_machine().get("memory_pressure_limit", "critical")
+    return pressure == "critical" or (limit == "warn" and pressure == "warn")
+
+
 def _has_slot(ctx: TickContext, budget: int) -> bool:
     """Machine-wide runs stay under the shared budget; this project's under its ceiling."""
     if scheduler.machine_runs(ctx.store, ctx.now()) >= budget:
@@ -209,8 +217,8 @@ def _start_ready(
         start = scheduler_quota.decide(ctx.store, ctx.config, lane, ctx.now(), number)
         if start.held:
             continue
-        if sample[0] == "critical":
-            # This issue passed every start check; only critical memory holds it (#497).
+        if _memory_holds(sample[0]):
+            # This issue passed every start check; only memory at the machine's limit holds it (#497, #160).
             # Running work is left alone, and one row records the held tick.
             scheduler.append_memory_hold(
                 ctx.store.root.parent, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],

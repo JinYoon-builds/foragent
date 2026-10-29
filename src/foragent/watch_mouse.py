@@ -8,6 +8,7 @@ open box's number (or None), ``scroll`` the zero-based first visible frame row,
 dependencies resolve through foragent.watch to preserve its patch points.
 """
 
+from datetime import UTC, datetime
 from typing import Any
 
 from foragent import orch_inbox
@@ -116,8 +117,8 @@ def handle_key(key: str, store: StateStore, config: Config, *, state: dict[str, 
 
     j/k (and the arrows) move one row, Enter opens the highlighted row's box, f folds
     its lane, a unfolds every lane when any is folded (else folds all), o switches to
-    the orchestrator, x or Esc closes the box (Esc quits when none is open). While a
-    box is open, Enter, f and a do nothing.
+    the orchestrator, m flips the Claude quota mode (keep/burn), x or Esc closes the box (Esc quits when none is open). While a
+    box is open, Enter, f, a and m do nothing.
     """
     from foragent import watch
 
@@ -142,6 +143,13 @@ def handle_key(key: str, store: StateStore, config: Config, *, state: dict[str, 
         watch.switch_to_orchestrator(store)
     elif is_open:
         pass
+    elif key == "m":
+        # The same flip as `fa quota mode`: from the effective mode to the other one.
+        from foragent import scheduler_quota
+
+        mode = "burn" if scheduler_quota.quota_mode(store, config)[0] == "keep" else "keep"
+        store.set_claude_quota_mode(mode)
+        state["quota_mode"] = (mode, datetime.now(UTC))  # The usage line shows it before the next refresh.
     elif key == "a":
         lanes = set(config.lanes) | set(state.get("lanes", ()))
         unfolded = set(state.get("unfolded", ()))
