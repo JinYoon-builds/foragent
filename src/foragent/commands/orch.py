@@ -7,7 +7,7 @@ ORDER = 120
 ALIVE_SECONDS = 30
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive",
                  "reviewers", "ensure", "facts", "scorecard", "roles", "role-decision", "signal-answer", "pause", "resume",
-                 "plan"}
+                 "plan", "refresh-due", "handoff", "refresh"}
 
 
 def add(commands) -> None:
