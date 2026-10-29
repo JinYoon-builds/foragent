@@ -82,6 +82,14 @@ class StateLocksMixin:
         return _file_lock(self.root / "runs" / f"issue-{number}.worktree.lock")
 
     @contextmanager
+    def try_worktree_lock(self, number: int) -> Iterator[bool]:
+        """Take an issue's worktree lock without waiting; yield whether it was taken."""
+        path = self.root / "runs" / f"issue-{number}.worktree.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._try_tick_lock(path) as acquired:
+            yield acquired
+
+    @contextmanager
     def merge_lock(self) -> Iterator[None]:
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / "merge.lock").open("a", encoding="utf-8") as stream:

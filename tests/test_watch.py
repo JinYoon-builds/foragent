@@ -203,7 +203,13 @@ def test_unicode_layout_fits_resized_terminal_and_preserves_event_summary(tmp_pa
     result.events = [{"summary": "긴 사건 기록도 잘리지 않고 마지막 내용까지 보여야 합니다 끝", "at": NOW.isoformat()}]
     output = watch.render_frame(result, config, tmp_path, width=width)
     assert all(watch._cells(line) <= width for line in output.splitlines())
-    assert "합니다 끝 ✓" in output
+    if width > 40:
+        assert "합니다 끝 ✓" in output
+    else:
+        # At 40 columns the usage line (#115, KEEP) wraps instead of losing its end, and
+        # the event log gives way from the bottom up; it is never left half shown.
+        assert "긴 사건" not in output and output.endswith("q 끝내기")
+        assert "Claude —" in output and "동시 " in output and "keep 80%" in output
 
 
 @pytest.mark.parametrize("lane_count,keys", [(1, "11q"), (12, "12\n12\nq")])

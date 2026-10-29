@@ -257,7 +257,7 @@ def human(card: dict[str, Any], language: str) -> str:
              _flow_line("scorecard_flow_previous", previous, language)]
     if "binding" in card:
         lines.append(_binding_line(card["binding"], language))
-    lines += orch_roles.scorecard_lines(today, previous)
+    lines += orch_roles.scorecard_lines(today, previous, language)
     for name in card["worse"]:
         before, now = _pair(card, name)
         lines.append(text("scorecard_worse", language, metric=name, before=_shown(name, before),
