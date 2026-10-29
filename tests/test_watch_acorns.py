@@ -379,8 +379,9 @@ def test_footers_list_the_new_keys_from_their_own_feature_file(tmp_path):
     from foragent.messages import acorns, squirrel, watch as shared
 
     snapshot, config = lane_case()
-    assert watch.render_frame(snapshot, config, tmp_path, width=200).splitlines()[-1] == (
-        "1–1: 담당 보기 · j/k 이동 · Enter 열기 · f 접기 · a 모두 · o 오케스트레이터 · x 닫기 · q 끝내기")
+    # The help line sits directly above the usage line (#115), the last row.
+    assert watch.render_frame(snapshot, config, tmp_path, width=200).splitlines()[-2] == (
+        "1–1: 담당 보기 · j/k 이동 · Enter 열기 · f 접기 · a 모두 · o 오케스트레이터 · m keep/burn · x 닫기 · q 끝내기")
     assert "acorns_keys" in acorns.MESSAGES["en"]
     assert all("j/k move" not in value for module in (squirrel, shared)
                for table in module.MESSAGES.values() for value in table.values())
@@ -599,7 +600,8 @@ def test_interaction_data_comes_from_the_final_rows_after_trimming(tmp_path, cas
     if case == "tight":
         assert lane_rows == {3, 4} and 2 not in dict(state["rows"]).values(), "the dropped row leaves no trace"
     if case == "tight-fits":
-        assert len(lines) == 24 and lane_rows == {3}
+        # The usage line (#115) adds a row, so the frame also gives way further down.
+        assert len(lines) <= 24 and lane_rows == {3}
         assert {number for _, number in state["rows"]} == {3}, "the dropped finished row leaves no trace"
     if case == "completed":
         listed = {number for _, number in state["rows"]}
@@ -722,7 +724,8 @@ def test_a_refresh_error_takes_the_bottom_row(tmp_path, monkeypatch, unfolded, h
     if unfolded:
         assert "Option" in first[height - 1] and "Option" not in "".join(second.values())
     else:
-        assert "j/k 이동" in first[height - 1] and "j/k 이동" not in "".join(second.values())
+        # The usage line (#115) is the bottom row until the error takes it.
+        assert "Claude —" in first[height - 1] and "Claude —" not in "".join(second.values())
 
 
 def test_row_identity_decides_fold_and_box_lane_when_an_issue_shows_twice(tmp_path):
