@@ -52,6 +52,9 @@ class Run:
     executor_waited_seconds: float = 0
     tier: str = "m"
     attempt_tiers: dict[str, str] = field(default_factory=dict)
+    # The attempt_tiers key of the implementation turn started but not yet answered (#238);
+    # a limit-wait resume continues it at its stored tier. Written only by the runner.
+    open_turn: str | None = None
     phase: str | None = None
     phase_started_at: str | None = None
     last_activity_at: str | None = None

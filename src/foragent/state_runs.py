@@ -53,6 +53,7 @@ class RunRecordsMixin:
             run = _state.Run(number, branch, str(worktree), pid, timestamp, timestamp, attempts=attempts,
                       restarts=restarts, lane=lane, tier=previous.tier if resumed else tier,
                       attempt_tiers=previous.attempt_tiers if resumed else {},
+                      open_turn=previous.open_turn if resumed else None,
                       approval_body_sha=approval.body_sha if approval is not None else None,
                       last_activity_at=timestamp, process_identities=identities, implementer=implementer,
                       executor=executor, reviewer=reviewer, **session)

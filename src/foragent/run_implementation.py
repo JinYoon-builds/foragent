@@ -11,6 +11,7 @@ from foragent import cuts
 from foragent.actions import flag
 from foragent.executors import ExecResult, classify_result
 from foragent.issue import parse_body
+from foragent import quota_headroom, scheduler_quota
 from foragent.labels import attempt_tier, issue_size
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation, WholeFailure
@@ -60,18 +61,100 @@ class ImplementerSetup:
     memory_notice: str = ""
 
 
+def tier_model_effort(config: Config, lane: str, tier: str) -> tuple[str | None, str | None]:
+    """The run's executor's model and effort at ``tier`` (#238); None means the executor default.
+
+    A lane model wins while the run is on the lane's executor (``lane_config`` made it the
+    executor_model; another executor's pair has none). Then the tier's ``<executor>_model``:
+    a name wins, an explicit empty string means the executor default, None falls back to
+    executor_model. An executor without tier keys (``has_tier_keys``) gets no model or effort.
+    """
+    name, settings = config.executor, config.tiers[tier]
+    if not has_tier_keys(config, name):
+        return None, None
+    lane_model = (config.lanes.get(lane, {}) if lane != "main" else {}).get("model")
+    tier_model = settings.get(f"{name}_model")
+    if lane_model and config.executor_model == lane_model:
+        model = lane_model
+    elif tier_model is not None:
+        model = tier_model or None
+    else:
+        model = config.executor_model
+    return model, settings.get(f"{name}_effort")
+
+
+_TIERS = ("s", "m", "l")
+
+
+def has_tier_keys(config: Config, name: str) -> bool:
+    """Codex and Claude always have tier keys; another executor only when a tier names it."""
+    return name in ("codex", "claude") or any(
+        isinstance(tier, dict) and (f"{name}_model" in tier or f"{name}_effort" in tier)
+        for tier in config.tiers.values())
+
+
+def ample_quota(ctx: RunContext) -> bool:
+    """Whether the run's executor has at least tiers_headroom_ample of its plan left (#238).
+
+    The run's executor (the pair the tick stored, else the lane's) owns the quota, never the
+    reviewer. Without current usage, or when it is not billed by subscription, it is not ample.
+    """
+    config, name = ctx.config, ctx.config.executor
+    if not has_tier_keys(config, name) or scheduler_quota.entry_for(config, name).get("quota") != "subscription":
+        return False
+    mode = scheduler_quota.quota_mode(ctx.store, config)[0]
+    left = quota_headroom.usable(scheduler_quota._usage(ctx.store), name, ctx.now(),
+                                 quota_headroom.cap(config, name, mode))
+    return left is not None and left >= config.tiers_headroom_ample
+
+
+def turn_key(run, conflict: bool) -> str:
+    """The attempt_tiers key of the next implementation turn, from the stored record alone.
+
+    An implementation turn is its attempt number. A conflict-resolution turn does not advance
+    attempts: it is ``<attempt>c<k>``, the open one when a resumed run left it unanswered,
+    else one past the attempt's last recorded conflict turn, so a restart never reuses one.
+    """
+    if not conflict:
+        return str(run.attempts)
+    prefix = f"{run.attempts}c"
+    if run.open_turn is not None and run.open_turn.startswith(prefix):
+        return run.open_turn
+    done = [int(name[len(prefix):]) for name in run.attempt_tiers
+            if name.startswith(prefix) and name[len(prefix):].isdigit()]
+    return f"{prefix}{max(done, default=0) + 1}"
+
+
+def choose_tier(ctx: RunContext, run, size: str, key: str | None = None, *, final: bool = False) -> str:
+    """The tier of the implementation turn recorded under ``key`` in attempt_tiers (default: the attempt).
+
+    l with ample quota, else the size; one tier up per earlier turn (failed attempts, CI repairs
+    and conflict-resolution turns alike); l on the last allowed turn or a ``final`` one (a
+    rebuild); never below an earlier turn. The open turn of a resumed run keeps its stored tier. An executor
+    without tier keys stays at the size.
+    """
+    if not has_tier_keys(ctx.config, ctx.config.executor):
+        return size
+    key = str(run.attempts) if key is None else key
+    stored = run.attempt_tiers.get(key)
+    if key == run.open_turn and stored in _TIERS:
+        return stored
+    earlier = [value for name, value in run.attempt_tiers.items() if name != key]
+    turn = max(run.attempts, len(earlier) + 1)
+    tier = attempt_tier("l" if ample_quota(ctx) else size, turn)
+    if final or turn >= ctx.config.max_retries + 1:
+        tier = "l"
+    floor = max((_TIERS.index(value) for value in earlier if value in _TIERS), default=0)
+    return _TIERS[max(_TIERS.index(tier), floor)]
+
+
 def implementer_setup(
     config: Config, lane: str, tier: str, worktree: Path, full_text_dir: Path | None = None,
 ) -> ImplementerSetup:
     """Choose executor, model, lane agent, lane instructions and skills from a lane-adjusted config."""
     native_claude = config.executor == "claude"
-    settings = config.tiers[tier]
-    model = config.executor_model
-    options: dict[str, Any] = {}
-    if native_claude:
-        model = (config.lanes.get(lane, {}) if lane != "main" else {}).get("model") or settings["claude_model"] or model
-    else:
-        options["effort"] = settings["codex_effort"]
+    model, effort = tier_model_effort(config, lane, tier)
+    options: dict[str, Any] = {} if effort is None else {"effort": effort}
     agent, notes = lane_notes(config, lane, worktree, full_text_dir)
     missing: list[str] = []
     if native_claude:
@@ -289,12 +372,15 @@ def _implement(
     if remaining <= 0:
         raise ExecutorStopped(_timeout(n, ctx))
     run = ctx.store.get_run(n)
-    tier = attempt_tier(attempt.size, run.attempts)
-    ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, str(run.attempts): tier})
+    # A conflict-resolution turn does not advance attempts; it is a failed turn of its own (#238).
+    key = turn_key(run, merge_conflicts is not None)
+    tier = choose_tier(ctx, run, attempt.size, key, final=attempt.rebuilt)
+    ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, key: tier}, open_turn=key)
     full_text_dir = cuts.issue_dir(ctx.store.root, n)
     setup = implementer_setup(ctx.config, run.lane, tier, worktree, full_text_dir)
     model, notes = setup.model, setup.notes
-    attempt.options.update(setup.options)
+    # Effort and agent belong to this turn's tier; a tier without effort means the executor default.
+    options = {**attempt.options, **setup.options}
     attempt.missing_skills.extend(name for name in setup.missing_skills if name not in attempt.missing_skills)
     retry_default, hint = pending_hint(ctx.store.root, n)
     failure_context = str(failure) or run.resume_reason
@@ -347,7 +433,7 @@ def _implement(
                 moved_files=moved_files, parent_context=attempt.approval.parent_context or "",
                 procedure=procedure,
             ) + (f"\n\n{saved_feedback}" if saved_feedback else "") + setup.memory_notice,
-            model=model, timeout_s=remaining, log_path=log, **attempt.options,
+            model=model, timeout_s=remaining, log_path=log, **options,
         )
     finally:
         # Every way a turn ends (result, limit wait, launch failure, interruption) leaves its stop point.
@@ -360,6 +446,8 @@ def _implement(
     # only once the implementer returns an ordinary execution result.
     if (retry_default or hint is not None) and classify_result(result) == "normal":
         consume_hint(ctx.store.root, n)
+    if classify_result(result) == "normal":
+        ctx.store.update_run(n, open_turn=None)  # answered: the next turn is a new one
     if moved_files and classify_result(result) == "normal":
         ctx.store.update_run(n, moved_files=[])  # named once, after delivery
     _record_skills_used(n, ctx, result)

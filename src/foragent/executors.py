@@ -178,6 +178,7 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
 def claude_command(
     model: str | None = None, settings_path: Path | None = None, agent: str | None = None,
     *, resume_session_id: str | None = None, read_only: bool = False, prompt: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     if resume_session_id is not None and (prompt is None or not prompt.strip()):
         raise ValueError("Session resume requires a non-empty prompt")
@@ -190,6 +191,8 @@ def claude_command(
         args += ["--agent", agent]
     if resume_session_id is not None:
         args += ["--resume", resume_session_id]
+    if effort is not None:
+        args += ["--effort", effort]
     return args + (["--model", model] if model is not None else [])
 
 
@@ -265,10 +268,12 @@ class ClaudeExecutor:
         settings_path: Path | None = None, review_level: str | None = None,
         agent: str | None = None, review_pr: int | None = None,
         resume_session_id: str | None = None,
-        goal: str | None = None, read_only: bool = False,
+        goal: str | None = None, read_only: bool = False, effort: str | None = None,
     ) -> ExecResult:
         output_path = log_path.with_suffix(".stdout")
         options = {}
+        if effort is not None:
+            options["effort"] = effort
         if read_only:
             options["read_only"] = True
         if agent is not None:
