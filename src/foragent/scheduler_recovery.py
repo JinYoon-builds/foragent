@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import processes, scheduler, sleep_credit
+from foragent import processes, scheduler, scheduler_silence, sleep_credit
 from foragent.scheduler_stop import (
     _flag_stop_refused, _restore_stopped, _pid_exists, _run_processes_exist, _stop_already_refused, _stop_run_processes,
 )
@@ -27,13 +27,15 @@ def _kill_executor(ctx: TickContext, number: int) -> None:
 
 def _remove_run_worktree(
     ctx: TickContext, number: int, worktree: Path, report: TickReport, *, outcome: str, why: str = "",
+    owned_deletions: bool = False,
 ) -> None:  # `why`: `fa orch stop`'s reason, named in the WIP; its killed tree owns its deletions.
     try:
         if worktree.exists() and outcome != "merged":
             try:
                 scheduler._preserve_failed_implementation(
                     number, ctx, ctx.git.at(worktree), f"{outcome}: {why}" if why else outcome, approval=ctx.store.load_approval(number),
-                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None, owned_deletions=bool(why),
+                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None,
+                    owned_deletions=bool(why) or owned_deletions,
                 )
             except Exception as exc:
                 detail = f"WIP preservation failed before worktree cleanup: {exc}"
@@ -46,13 +48,14 @@ def _remove_run_worktree(
 
 def _kill_run(
     ctx: TickContext, number: int, report: TickReport, *, outcome: str = "killed",
-    count_stall: bool = False, detail: str = "",
+    count_stall: bool = False, detail: str = "", owned_deletions: bool = False, count_restart: bool = True,
 ) -> bool:
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
         return False
     if count_stall:
-        ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
+        # The outcome is recorded first so an interrupted stop still finishes as this outcome.
+        ctx.store.update_run(number, restarts=run.restarts + int(count_restart), outcome=outcome)
     try:
         stopped = _stop_run_processes(ctx, run, report)
     except Exception:
@@ -65,7 +68,8 @@ def _kill_run(
         if stopped == "gone":
             _finish_dead_run(ctx, run, report)
         return False
-    scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome, why=detail if outcome == "stopped" else "")
+    scheduler._remove_run_worktree(ctx, number, scheduler.Path(run.worktree), report, outcome=outcome, why=detail if outcome == "stopped" else "",
+                                     owned_deletions=owned_deletions)
     ctx.store.finish_run(number, outcome=outcome, detail=detail or "Runner stopped by the scheduler.")
     report.actions.append(f"#{number} runner killed")
     return True
@@ -232,10 +236,12 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
             runtime = ((ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds()
                        - run.waited_seconds - run.slept_seconds)
-            if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
-                if scheduler._kill_run(ctx, run.number, report, detail="Runner exceeded its runtime limit."):
-                    scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
-                    report.actions.append(f"#{run.number} flagged timeout")
+            limit = ctx.config.max_runtime_minutes
+            if run.pid is not None and not waiting and scheduler_silence.stop(
+                    ctx, run, report, scheduler_silence.observe(ctx, run),
+                    past_limit=limit is not None and runtime > (limit + 10) * 60,
+                    wake_grace=sleep_credit.in_wake_grace(ctx.store, run, ctx.now())):
+                pass  # The shared watchdog stopped it: silence, the safety net or a silent run past its limit.
             elif run.pid is not None and not waiting and not sleep_credit.in_wake_grace(
                     ctx.store, run, ctx.now()) and ctx.now() - scheduler.datetime.fromisoformat(
                 run.last_progress_at or run.started_at,
@@ -264,11 +270,22 @@ def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
     detail = scheduler._crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
     finished = ctx.store.finish_run(run.number, outcome=outcome, detail=detail)
     if finished.outcome in {"stalled-restart", "stalled"}:
-        scheduler._restore_stalled(ctx, run.number, finished.restarts, report)
+        # The recorded outcome decides: a silence or safety-net stop is stalled-restart
+        # without spending the stall budget, whatever the restart count is (#435).
+        restarts = 1 if finished.outcome == "stalled-restart" else finished.restarts
+        scheduler._restore_stalled(ctx, run.number, restarts, report)
     elif finished.outcome == "crashed":
         report.actions.append(f"#{run.number} runner crashed")
         issue = ctx.tracker.get_issue(run.number)
         scheduler._restore_after_crash(ctx, issue, report)
+
+
+def _alive(item: dict) -> bool:
+    try:
+        row = processes.read_process_identity(item["pid"])
+    except OSError:
+        return True  # An unreadable identity cannot prove death.
+    return row is not None and row.start_time == item["start_time"]
 
 
 def _reap_inactive_runs(ctx: TickContext, report: TickReport) -> None:
@@ -281,6 +298,8 @@ def _reap_inactive_runs(ctx: TickContext, report: TickReport) -> None:
             continue
         if _stop_already_refused(ctx, run):
             continue
+        if not any(_alive(item) for item in run.process_identities):
+            continue  # No recorded member lives, so none can have a child to reap.
         try:
             with processes.recorded_tree(run.process_identities):
                 count = processes.kill_process_group(run.pid or run.executor_pgid or run.process_identities[0]["pid"])

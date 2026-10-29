@@ -123,7 +123,7 @@ def _wait_for_ci(
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     wait.infrastructure = ""
     while True:
-        if runner._remaining(n, ctx) <= 0:
+        if runner._wait_remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
         if status is None:
             status = _ci_status(ctx, pr, git.root, ready_at)
@@ -147,7 +147,7 @@ def _wait_for_ci(
                 return None
             flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
             return "timeout"
-        ctx.sleep(min(30, remaining, runner._remaining(n, ctx)))
+        ctx.sleep(min(30, remaining, runner._wait_remaining(n, ctx)))
         wait.polls += 1
         status = None
 
@@ -301,10 +301,9 @@ def retitle_for_merge(
 
 
 def _check_publication(git: GitRepo, target_branch: str, base_sha: str | None = None) -> None:
-    if base_sha is None:
-        base_sha = git.ref_sha(f"origin/{target_branch}")
     try:
-        git.check_publication(base_sha)
+        # Without a frozen base the ref itself is the base: check_publication resolves it.
+        git.check_publication(base_sha or f"origin/{target_branch}")
     except PublicationError as exc:
         raise AttemptFailure(str(exc), target_branch) from exc
 

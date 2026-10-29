@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from foragent.run_waits import RUNNER_MARGIN_SECONDS
+
 from foragent.reasons import Reason, parse_reason
 from foragent.runner import run_issue
 
@@ -47,7 +49,7 @@ def test_remaining_budget_model_and_progress_are_passed_through(run_case):
     c.ctx.config = replace(c.ctx.config, executor_model="chosen")
     c.now[0] += timedelta(minutes=2)
     assert run_issue(1, c.ctx) == "merged"
-    assert c.executor.calls[0]["timeout_s"] == (90 - 2) * 60
+    assert c.executor.calls[0]["timeout_s"] == 24 * 3600 + RUNNER_MARGIN_SECONDS - 2 * 60  # The safety net plus the runner margin (#435)
     assert c.executor.calls[0]["model"] == "chosen"
     assert c.store.get_run(1).last_progress_at == c.now[0].isoformat()
 

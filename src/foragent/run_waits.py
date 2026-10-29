@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from foragent import capacity, orch_github
 from foragent.actions import flag
+from foragent.config import safety_net_seconds
 from foragent.reasons import Reason
 from foragent.tracker import TrackerError
 
@@ -41,7 +42,48 @@ def _remaining(n: int, ctx: RunContext) -> int:
     # The gate tick credits machine sleep to the run record; the runner never reads the sensor.
     elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
                - run.waited_seconds - run.slept_seconds)
-    return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
+    deadline = getattr(ctx, "deadline_seconds", None)  # Optional: only a probe (fa doctor) sets one.
+    if deadline is None:
+        # Past the safety net by a margin: the gate's tick ends the run first, keeping its WIP
+        # for the next run; this budget only bounds a runner whose gate stopped ticking.
+        deadline = safety_net_seconds(ctx.config) + RUNNER_MARGIN_SECONDS
+    return max(0, int(deadline - elapsed))
+
+
+RUNNER_MARGIN_SECONDS = 10 * 60
+
+
+def _wait_remaining(n: int, ctx: RunContext) -> int:
+    """The budget of waiting loops (CI polling, merge turns): waiting is not progress.
+
+    These loops keep their earlier bound, ``max_runtime_minutes`` when set; changing
+    CI polling and turn caps belongs to a later issue (#435 out of scope).
+    """
+    from foragent import runner
+
+    remaining = runner._remaining(n, ctx)  # The runner's seam, so callers' budgets agree.
+    limit = ctx.config.max_runtime_minutes
+    if limit is None or getattr(ctx, "deadline_seconds", None) is not None:
+        return remaining
+    run = ctx.store.get_run(n)
+    elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
+               - run.waited_seconds - run.slept_seconds)
+    return max(0, min(int(limit * 60 - elapsed), remaining))
+
+
+def past_runtime_limit(n: int, ctx: RunContext) -> bool:
+    """Past ``max_runtime_minutes`` (when set): a limit only on work that is also silent (#435).
+
+    Callers stop at a step boundary only when the step just finished was itself
+    stopped by silence; progressing work runs on to the safety net.
+    """
+    limit = ctx.config.max_runtime_minutes
+    if limit is None:
+        return False
+    run = ctx.store.get_run(n)
+    elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
+               - run.waited_seconds - run.slept_seconds)
+    return elapsed >= limit * 60  # Like the old budget: reaching the limit is past it.
 
 
 def _timeout(n: int, ctx: RunContext) -> str:

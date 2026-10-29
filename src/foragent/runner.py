@@ -55,6 +55,7 @@ from foragent.run_prompts import (
 from foragent.run_waits import (
     poll_executor,
     _remaining,
+    _wait_remaining,
     _timeout,
     _test_slot,
     _progress,
@@ -145,6 +146,8 @@ class RunContext:
     sleep: Callable[[float], None] = time.sleep
     poll_hook: Callable[[Callable[[], ExecResult], Callable[[], None]], ExecResult] = poll_executor
     monotonic: Callable[[], float] = time.monotonic
+    # A probe's own hard deadline (fa doctor); runs have none but the safety net (#435).
+    deadline_seconds: int | None = None
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self)

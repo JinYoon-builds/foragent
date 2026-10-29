@@ -18,9 +18,9 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import capacity, cuts
+from foragent import capacity, cuts, watchdog
 from foragent.actions import flag, invalidate_approval
-from foragent.config import Config
+from foragent.config import Config, safety_net_seconds
 from foragent.git import GitRepo
 from foragent.issue import ParsedIssue, has_machine_check, parse_body
 from foragent.reasons import Reason
@@ -43,6 +43,16 @@ class CheckResult:
     output: str
     # Elapsed command time (excluding any test-slot queue) when a clock was supplied.
     seconds: float | None = None
+    result_gaps: tuple[float, ...] = ()
+
+
+def history_gaps(ctx: RunContext) -> tuple[float, ...]:
+    """This repository's recorded result gaps; every check site sizes its silence window from them."""
+    return watchdog.recorded_gaps(ctx.store.root.parent / "baselines", ctx.repo_root)
+
+
+def safety_net(ctx: RunContext) -> float:
+    return safety_net_seconds(ctx.config)
 
 
 def _append(log: Path, text: str) -> None:
@@ -57,8 +67,14 @@ def _check(
     slot: AbstractContextManager | None = None,
     clock: Callable[[], float] | None = None,
     full_text_dir: Path | None = None,
+    history_gaps: tuple[float, ...] = (), safety_net: float = watchdog.SAFETY_NET_SECONDS,
 ) -> CheckResult:
-    """Run one check; a cut output tail links its full copy under ``full_text_dir`` (the issue's folder)."""
+    """Run one check; a cut output tail links its full copy under ``full_text_dir`` (the issue's folder).
+
+    The shared silence watchdog decides when the check ends (#435): ``timeout_s`` no longer
+    stops a check whose output or process-tree CPU still grows. ``timed_out`` reports a
+    silence or safety-net stop; ``result_gaps`` are this run's measured gaps between results.
+    """
     from foragent import runner
 
     _append(log, f"\nDone when command:\n{command}")
@@ -69,12 +85,13 @@ def _check(
     environment = {"PYTHONDONTWRITEBYTECODE": "1"}
 
     elapsed: list[float] = []
+    watch = watchdog.SilenceWatchdog(history_gaps=history_gaps, safety_net=safety_net)
 
     def timed(env):
         started = clock() if clock is not None else None
         try:
             return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
-                                     env=env)
+                                     env=env, watchdog=watch)
         finally:
             if started is not None:
                 elapsed.append(max(0.0, clock() - started))
@@ -91,7 +108,7 @@ def _check(
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
     tail = cuts.read_tail(log, offset, 4000, "check", full_text_dir)
     _append(log, f"\nCheck exit_code={code}, timed_out={timed_out}\nOutput tail:\n{tail}")
-    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None)
+    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None, watch.result_gaps)
 
 
 def _pytest_command(command: str) -> str | None:
@@ -254,7 +271,8 @@ def run_related_check(
     junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
     result = runner._check(f"{unit_command} {junit} {shlex.join(unit_tests)}", worktree, ctx.store.log_path(n), limit,
                            progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
-                           full_text_dir=cuts.issue_dir(ctx.store.root, n))
+                           full_text_dir=cuts.issue_dir(ctx.store.root, n),
+                           history_gaps=history_gaps(ctx), safety_net=safety_net(ctx))
     _record_related_check(n, ctx, changed, unit_tests, report, result)
     _progress(n, ctx)
     return result
@@ -484,13 +502,15 @@ def _verify_contents(attempt: Implementation) -> str:
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
-                                 slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n)))
+                                 slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n),
+                                 history_gaps=history_gaps(ctx), safety_net=safety_net(ctx)))
             _progress(n, ctx)
         if attempt.baseline and attempt.baseline.node_ids:
             started = ctx.monotonic()
             command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
             result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
-                            slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n))
+                            slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n),
+                            history_gaps=history_gaps(ctx), safety_net=safety_net(ctx))
             attempt.checks.append(result)
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
@@ -520,7 +540,8 @@ def _verify_contents(attempt: Implementation) -> str:
                 save_failures(ctx.store.root, n, attempt.checks, complete=False)
                 bundle = WholeFailure(cuts.failures_path(ctx.store.root, n).read_text(encoding="utf-8"))
                 ctx.store.update_run(n, resume_reason=bundle, resume_whole=True)
-                detail = f"Related unit tests timed out after {limit} s ({len(unit_tests)} selected tests)."
+                detail = (f"Related unit tests went silent and were stopped by the watchdog "
+                          f"({len(unit_tests)} selected tests).")
                 flag(ctx, n, Reason.TIMEOUT, detail, bundle)
                 raise ExecutorStopped("timeout", detail)
         elif unit_tests:
@@ -577,7 +598,8 @@ def _check_review_head(
                 return _timeout(n, ctx)
             check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)),
                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
-                                  full_text_dir=cuts.issue_dir(ctx.store.root, n))
+                                  full_text_dir=cuts.issue_dir(ctx.store.root, n),
+                                  history_gaps=history_gaps(ctx), safety_net=safety_net(ctx))
             checks.append(check)
             _progress(n, ctx)
             if check.timed_out or runner._remaining(n, ctx) <= 0:

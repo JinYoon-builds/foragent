@@ -23,11 +23,13 @@ from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
+from foragent.config import safety_net_seconds
 from foragent.processes import claude_session, run_logged
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
-from foragent.run_checks import CheckResult, trusts_ci
+from foragent.run_checks import CheckResult, history_gaps, trusts_ci
+from foragent.watchdog import SilenceWatchdog
 from foragent.run_previous import retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
@@ -294,9 +296,11 @@ def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
     with slot:
+        # Like every check: it ends on silence or the safety net, never at a fixed time (#435).
         code, timed_out, output = run_logged(
             ["/bin/sh", "-c", command], cwd=worktree,
-            timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path, env=capacity.HELD_ENV,
+            timeout_s=safety_net_seconds(ctx.config), log_path=log_path, env=capacity.HELD_ENV,
+            watchdog=SilenceWatchdog(history_gaps=history_gaps(ctx), safety_net=safety_net_seconds(ctx.config)),
         )
     return CheckResult(command, code, timed_out, output)
 

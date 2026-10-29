@@ -1082,7 +1082,7 @@ def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
                               size=size, options={}, missing_skills=[], native_claude=ctx.config.executor == "claude",
                               parsed=parse_body(body), baseline=None, executor=None,
                               approval=store.load_approval(1), review_feedback=False,
-                              issue=SimpleNamespace(labels=set()))
+                              issue=SimpleNamespace(labels=set()), checks=[])
     monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
     monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
     with pytest.raises(Stop):

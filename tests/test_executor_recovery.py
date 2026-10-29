@@ -28,7 +28,10 @@ def recovery(tmp_path):
     tracker.add_issue(1, "Recover executor", labels=["running"])
     return TickContext(
         repo="owner/repo", repo_root=tmp_path, tracker=tracker, store=store,
-        config=Config(), git=SimpleNamespace(remove_worktree=lambda path: path.rmdir()),
+        # The stall and configured runtime-limit paths (#435 keeps both); a day-long
+        # silence window keeps the watchdog from ending these runs first.
+        config=Config(max_runtime_minutes=90, silence_minutes=24 * 60),
+        git=SimpleNamespace(remove_worktree=lambda path: path.rmdir()),
         now=lambda: now, launcher=lambda number: None, start_runs=False,
     )
 

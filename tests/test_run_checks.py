@@ -16,6 +16,11 @@ from foragent.runner import CheckResult, run_issue
 from conftest import ACCEPTANCE, git_command
 from runner_support import COMMAND, batch_setup, run_case, seed_batch, set_done_when
 
+from foragent.run_waits import RUNNER_MARGIN_SECONDS
+
+# A run's own budget: the safety net plus the margin that lets the gate stop it first (#435).
+RUNNER_BUDGET = 24 * 3600 + RUNNER_MARGIN_SECONDS
+
 
 def test_generated_source_is_rechecked_and_committed_instead_of_old_index(run_case):
     c = run_case
@@ -293,14 +298,16 @@ def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkey
 
     monkeypatch.setattr("foragent.runner._check", check)
     assert run_issue(1, c.ctx) == ("timeout" if timed_out else "merged")
-    assert [limit for _, limit in calls] == [900, 900, 2160, 2040, 1920]
+    # The run budget is the safety net plus the runner margin (#435), less the run time and credited waits.
+    remaining = RUNNER_BUDGET - 3600 + 600
+    assert [limit for _, limit in calls] == [900, 900, remaining - 240, remaining - 360, remaining - 480]
     assert '--collect-only' in calls[-3][0]
     assert '-m local_only' in calls[-2][0]
     assert "tests/test_new.py" in shlex.split(calls[-1][0])
     assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
     if timed_out:
         assert c.store.load_flag(1).reason == Reason.TIMEOUT
-        assert c.store.get_run(1).detail == "Related unit tests timed out after 1920 s (1 selected tests)."
+        assert c.store.get_run(1).detail == "Related unit tests went silent and were stopped by the watchdog (1 selected tests)."
         assert c.tracker.created_prs == []
 
 
@@ -321,7 +328,7 @@ def test_related_check_timeout_preserves_implementation_before_cleanup(run_case,
             ET.ElementTree(ET.Element("testsuite")).write(report, encoding="unicode")
         timed_out = "tests/test_sample.py" in shlex.split(command)
         if timed_out:
-            assert timeout_s == 1200
+            assert timeout_s == RUNNER_BUDGET - 70 * 60
             c.now[0] += timedelta(seconds=timeout_s)
         return CheckResult(command, -9 if timed_out else 0, timed_out, "")
 
@@ -332,12 +339,13 @@ def test_related_check_timeout_preserves_implementation_before_cleanup(run_case,
     assert git_command(c.history.origin, "show", "foragent/issue-1:src/sample.py") == "VALUE = 2"
     assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
     assert c.store.load_flag(1).reason == Reason.TIMEOUT
-    assert c.store.get_run(1).detail == "Related unit tests timed out after 1200 s (1 selected tests)."
+    assert c.store.get_run(1).detail == "Related unit tests went silent and were stopped by the watchdog (1 selected tests)."
     assert c.tracker.created_prs == c.tracker.merged_prs == []
 
 
 @pytest.mark.parametrize("slow_check", ["baseline", "done-when", "related"])
 def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_case, monkeypatch, slow_check):
+    from foragent import runner
     from foragent.scheduler import TickContext, TickReport, _recover_runs
 
     c = run_case
@@ -380,7 +388,7 @@ def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_cas
         if kind == slow_check and not observed:
             assert timeout_s >= (stall_minutes + 1) * 60
             if kind == "related":
-                assert timeout_s == 3600
+                assert timeout_s == runner._remaining(1, c.ctx)
             for _ in range(stall_minutes + 1):
                 c.now[0] += timedelta(minutes=1)
                 if polls:
@@ -432,7 +440,7 @@ def test_retry_gets_remaining_budget_after_checks_spend_time(run_case, monkeypat
 
     monkeypatch.setattr("foragent.runner._check", check)
     assert run_issue(1, c.ctx) == "merged"
-    assert [call["timeout_s"] for call in c.executor.calls] == [90 * 60, 88 * 60]
+    assert [call["timeout_s"] for call in c.executor.calls] == [RUNNER_BUDGET, RUNNER_BUDGET - 2 * 60]
 
 
 def test_batch_acceptance_binding_still_uses_approval_snapshot(run_case):

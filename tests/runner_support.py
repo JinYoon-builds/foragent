@@ -131,7 +131,8 @@ def run_case(git_history, tmp_path, monkeypatch):
 
     context = RunContext(
         repo="owner/repo", repo_root=git_history.clone, tracker=tracker, store=store,
-        config=Config(review="fast", max_retries=1, reviewer="none"), git=GitRepo(git_history.clone, git_run),
+        # These cases check the configured runtime budget (#435 made it optional).
+        config=Config(review="fast", max_retries=1, reviewer="none", max_runtime_minutes=90), git=GitRepo(git_history.clone, git_run),
         now=lambda: now[0], executor_factory=lambda name: executor,
         sleep=lambda seconds: now.__setitem__(0, now[0] + timedelta(seconds=seconds)),
         monotonic=lambda: (now[0] - BASE_TIME).total_seconds(),
@@ -251,7 +252,7 @@ def review_context(git_history, tmp_path):
     store.start_run(1, branch="foragent/issue-1", worktree=git.root)
     return RunContext(
         repo="owner/repo", repo_root=git.root, tracker=FakeTracker(), store=store,
-        config=Config(), git=git, now=lambda: now,
+        config=Config(max_runtime_minutes=90), git=git, now=lambda: now,
         poll_hook=lambda execute, poll: execute(),
     )
 

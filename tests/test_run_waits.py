@@ -13,6 +13,11 @@ from foragent.tracker import TrackerError
 from conftest import BASE_TIME
 from runner_support import conflicting_lanes, run_case, scripted_results
 
+from foragent.run_waits import RUNNER_MARGIN_SECONDS
+
+# A run's own budget: the safety net plus the margin that lets the gate stop it first (#435).
+RUNNER_BUDGET = 24 * 3600 + RUNNER_MARGIN_SECONDS
+
 
 @pytest.mark.parametrize("operation", ["get_issue", "pr_checks", "merge_pr", "board"])
 def test_github_limit_from_runner_stages_waits_without_followup_calls(run_case, monkeypatch, operation):
@@ -68,7 +73,7 @@ def test_runner_launched_during_persisted_github_wait_stays_offline(run_case, mo
 def test_session_timeout_and_exhausted_budget(run_case, expired):
     c = run_case
     if expired:
-        c.now[0] += timedelta(minutes=c.ctx.config.max_runtime_minutes)
+        c.now[0] += timedelta(seconds=RUNNER_BUDGET)  # The safety net plus the runner margin (#435).
     else:
         c.executor.timed_out = True
     assert run_issue(1, c.ctx) == "timeout"
@@ -141,7 +146,7 @@ def test_merge_lock_wait_does_not_consume_conflict_executor_backoff_budget(confl
     assert run.attempts == 1 and run.executor_waited_seconds == 120 * (2 if prior_backoff else 1)
     assert len(lock_waits) == 2  # Discover the conflict, then queue the verified resolution.
     assert run.waited_seconds == len(lock_waits) * 31 * 60 + run.executor_waited_seconds
-    assert [call["timeout_s"] for call in c.executor.calls] == [60] * (4 if prior_backoff else 3)
+    assert [call["timeout_s"] for call in c.executor.calls] == [RUNNER_BUDGET] * (4 if prior_backoff else 3)
     assert c.store.load_flag(1) is None
 
 
@@ -159,7 +164,7 @@ def test_backoff_oversleep_preserves_runtime_for_next_executor(run_case, monkeyp
     c.ctx.sleep = oversleep
     assert run_issue(1, c.ctx) == "merged"
     assert waits == [120]
-    assert [call["timeout_s"] for call in c.executor.calls] == [60, 60]
+    assert [call["timeout_s"] for call in c.executor.calls] == [RUNNER_BUDGET, RUNNER_BUDGET]
     assert c.store.get_run(1).waited_seconds == 300
     assert c.store.get_run(1).executor_waited_seconds == 300
 

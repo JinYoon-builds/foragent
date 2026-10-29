@@ -77,7 +77,10 @@ class Config:
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
     tick_failure_alert: int = 3
-    max_runtime_minutes: int = 90
+    # None: no fixed runtime limit; the silence watchdog and safety net end runs (#435).
+    max_runtime_minutes: int | None = None
+    silence_minutes: int = 10
+    safety_net_hours: int = 24
     max_retries: int = 2
     conflict_retries: int = 2
     # Merge-queue entries the FIFO turn holder takes at once (#712); only 1 until merge groups (#459).
@@ -404,6 +407,15 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
         raise ValueError("run_hours must be 'always' or HH-HH (00-23)")
     start, end = run_hours.split("-")
     return int(start), int(end)
+
+
+def safety_net_seconds(config: Config) -> int:
+    """The only fixed bound on work (#435); silence ends it long before.
+
+    ``max_runtime_minutes`` is not a bound here: the gate applies it only to a run
+    that is also silent, so progressing work is never cut at that time.
+    """
+    return config.safety_net_hours * 3600
 
 
 def load_config(repo_root: Path, global_path: Path | None = None) -> Config:

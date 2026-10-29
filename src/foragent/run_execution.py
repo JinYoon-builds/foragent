@@ -14,13 +14,13 @@ from typing import TYPE_CHECKING
 
 from foragent import board, cuts, usage_events, usage_recheck
 from foragent.actions import flag
-from foragent.config import resolved_reviewer
+from foragent.config import resolved_reviewer, safety_net_seconds
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
 from foragent.labels import READY, RUNNING
 from foragent.processes import track_process_group
 from foragent.reasons import Reason
 from foragent.run_attempt import ExecutorStopped
-from foragent.run_waits import _executor_wait, _progress
+from foragent.run_waits import _executor_wait, _progress, past_runtime_limit
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
@@ -47,7 +47,7 @@ def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
             "Bash(git merge:*)",
         ]},
         "hooks": {"Stop": [{"hooks": [{"type": "command", "command": command,
-                                      "timeout": max(900, ctx.config.max_runtime_minutes * 60)}]}]},
+                                      "timeout": max(900, safety_net_seconds(ctx.config))}]}]},
     }
     path = directory / "claude-settings.json"
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -197,7 +197,9 @@ def _available_executor(
                 resume_prompt = (resume_prompt or "") + "\n\n" + reason
         if kind == "normal":
             return result
-        if kind == "transient" and runner._remaining(n, ctx) <= 0:
+        # A transient failure did no work: past max_runtime_minutes it ends the run, as a
+        # silent step does at an attempt boundary (#435); otherwise only the budget ends it.
+        if kind == "transient" and (runner._remaining(n, ctx) <= 0 or past_runtime_limit(n, ctx)):
             return replace(result, timed_out=True)
         if kind == "limit":
             now = ctx.now()

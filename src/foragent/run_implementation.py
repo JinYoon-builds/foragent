@@ -26,7 +26,7 @@ from foragent.run_parent import parent_context
 from foragent.run_prompts import bug_fix_steps, build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
 from foragent.run_overlap import wait_for_overlap
-from foragent.run_waits import _phase, _timeout
+from foragent.run_waits import _phase, _timeout, past_runtime_limit
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -167,7 +167,7 @@ def follow_base(attempt: Implementation) -> None:
     protected set was captured with: the branch may have changed the files
     test-command detection reads.
     """
-    if attempt.baseline_sha is None:
+    if getattr(attempt, "baseline_sha", None) is None:  # Partial attempts carry no base to follow.
         return
     sha = attempt.git.ref_sha(attempt.start_ref)
     if sha == attempt.baseline_sha:
@@ -286,7 +286,11 @@ def _implement(
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")
     remaining = runner._remaining(n, ctx)
-    if remaining <= 0:
+    # The step just finished was stopped (a check the watchdog found silent, or a review
+    # session that timed out): past max_runtime_minutes, the run ends here (#435).
+    stopped = (any(check.timed_out for check in attempt.checks)
+               or bool(getattr(attempt, "reviews", None)) and attempt.reviews[-1].timed_out)
+    if remaining <= 0 or (stopped and past_runtime_limit(n, ctx)):
         raise ExecutorStopped(_timeout(n, ctx))
     run = ctx.store.get_run(n)
     tier = attempt_tier(attempt.size, run.attempts)

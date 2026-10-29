@@ -7,6 +7,8 @@ import sys
 
 import pytest
 
+from foragent.run_waits import RUNNER_MARGIN_SECONDS
+
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.runner import run_issue
@@ -124,7 +126,7 @@ def test_claude_native_goal_settings_and_independent_retry(run_case, acceptance_
                                  "Bash(git commit:*)", "Bash(git push:*)",
                                  "Bash(git checkout:*)", "Bash(git switch:*)", "Bash(git merge:*)"]},
         "hooks": {"Stop": [{"hooks": [{"type": "command", "command": expected_command,
-                                      "timeout": c.ctx.config.max_runtime_minutes * 60}]}]},
+                                      "timeout": c.ctx.config.safety_net_hours * 3600}]}]},
     }
     assert not settings_path.is_relative_to(c.store.worktree_path(1))
     assert (settings_path.parent / "stop-block-count").read_text() == "0"
@@ -196,7 +198,8 @@ def test_transients_preserve_attempt_and_budget_and_fallback_persists(run_case, 
     assert run_issue(1, c.ctx) == "merged"
     assert waits == [120, 240]
     assert [call["model"] for call in c.executor.calls] == ["primary", "primary", "fallback", "fallback"]
-    assert [call["timeout_s"] for call in c.executor.calls] == [60] * 4
+    # Backoff waits are credited: every call gets the whole budget, the safety net plus the margin (#435).
+    assert [call["timeout_s"] for call in c.executor.calls] == [24 * 3600 + RUNNER_MARGIN_SECONDS] * 4
     assert c.executor.calls[0]["prompt"] == c.executor.calls[1]["prompt"] == c.executor.calls[2]["prompt"]
     run = c.store.get_run(1)
     assert run.attempts == 2 and run.waited_seconds == 360

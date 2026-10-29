@@ -125,7 +125,8 @@ def test_unusable_baseline_stops_before_publish_without_retry(run_case, monkeypa
 
     monkeypatch.setattr("foragent.runner._check", check)
     assert run_issue(1, c.ctx) == "acceptance-baseline-unavailable"
-    assert captures == [60]
+    # The logged capture limit; the run budget no longer shortens it (#435): silence ends a capture.
+    assert captures == [900]
     assert c.now[0] == BASE_TIME + timedelta(hours=1, seconds=20)
     assert c.executor.calls == []
     assert c.tracker.created_prs == c.tracker.merged_prs == []
@@ -165,7 +166,8 @@ def test_baseline_uses_a_prebuilt_cache_before_implementation(run_case, monkeypa
 def test_baseline_budget_exhausted_before_capture_stops_with_unavailable_reason(run_case, monkeypatch):
     c = run_case
     c.history.update({"tests/acceptance/test_keep.py": "def test_keep():\n    assert True\n"})
-    c.ctx.config = replace(c.ctx.config, test_command="pytest", max_runtime_minutes=1)
+    c.ctx.config = replace(c.ctx.config, test_command="pytest")
+    c.ctx.deadline_seconds = 60  # The run's own budget (max_runtime_minutes no longer bounds a run, #435).
     c.now[0] += timedelta(minutes=1)
     monkeypatch.setattr("foragent.runner._check", lambda *args, **kwargs: pytest.fail("no capture budget remains"))
 

@@ -69,6 +69,8 @@ class ProcessIdentity:
     start_time: float
     argv: tuple[str, ...] | None = ()
     uid: int | None = None
+    # Cumulative user + system CPU seconds, including reaped children (#435); not identity.
+    cpu_time: float | None = field(default=None, compare=False)
 
 
 class ProcessTable(tuple):
@@ -279,8 +281,14 @@ def list_processes() -> tuple[ProcessIdentity, ...]:
                 if not _caused_by_permission_error(exc):
                     raise
                 argv = None
+            try:
+                times = process.cpu_times()
+                cpu_time = times.user + times.system + getattr(times, "children_user", 0.0) + getattr(
+                    times, "children_system", 0.0)
+            except (psutil.Error, OSError, AttributeError):
+                cpu_time = None  # Identity is still readable; the watchdog sees no CPU fact.
             row = ProcessIdentity(process.pid, process.ppid(), os.getpgid(process.pid),
-                                  os.getsid(process.pid), start, argv, uid)
+                                  os.getsid(process.pid), start, argv, uid, cpu_time)
             if psutil.Process(process.pid).create_time() == start and process.status() != psutil.STATUS_ZOMBIE:
                 rows.append(row)
         except (psutil.NoSuchProcess, ProcessLookupError):
@@ -476,6 +484,8 @@ def observe_tree(
     """
     if not identities and not roots:
         return []
+    if _quiescent.get() and not roots and (snapshot := current_snapshot()) is not None and snapshot.available:
+        return _observe_quiescent(identities, snapshot.rows)
     rows, confirmed = shared_routine_rows(
         not_before=time.monotonic() if not_before is None else not_before,
     ) if shared else _scan_tree_rows()
@@ -538,6 +548,59 @@ def recorded_tree(identities):
         _recorded_tree.reset(token)
 
 
+_quiescent: ContextVar[bool] = ContextVar("quiescent_tree", default=False)
+
+
+def read_children(pid: int) -> tuple[ProcessIdentity, ...]:
+    """Verified identities of ``pid``'s current children, without listing our process table."""
+    try:
+        children = psutil.Process(pid).children()
+    except psutil.NoSuchProcess:
+        return ()
+    except psutil.AccessDenied as exc:
+        raise PermissionError(f"Children of {pid} cannot be read") from exc
+    found = []
+    for child in children:
+        row = read_process_identity(child.pid)
+        if row is not None and row.ppid == pid:
+            found.append(row)
+    return tuple(found)
+
+
+def _observe_quiescent(identities, rows) -> list[dict]:
+    """A stop of a silent tree: the tick snapshot plus targeted reads of each live member's children.
+
+    The snapshot supplies the recorded tree; a child forked after it is found by reading
+    each verified live member's children, so no further whole-table listing is needed (#435).
+    """
+    known = {item["pid"]: item["start_time"] for item in observe_routine_tree(identities)}
+    lineage, group, session = _protected(rows)
+    frontier = list(known)
+    while frontier:
+        pid = frontier.pop()
+        parent = read_process_identity(pid)
+        if parent is None or parent.start_time != known[pid]:
+            continue  # Gone or reused: a replacement's children are not ours.
+        for child in read_children(pid):
+            if (child.pid in known or child.start_time < parent.start_time or child.pid <= 1
+                    or child.pid in lineage or child.pgid in lineage or child.sid in lineage
+                    or child.pgid == group or child.sid == session):
+                continue
+            known[child.pid] = child.start_time
+            frontier.append(child.pid)
+    return [{"pid": pid, "start_time": start} for pid, start in known.items()]
+
+
+@contextmanager
+def quiescent_tree():
+    """Mark a stop of a tree whose output and CPU were silent for the whole window."""
+    token = _quiescent.set(True)
+    try:
+        yield
+    finally:
+        _quiescent.reset(token)
+
+
 def kill_process_group(pid: int) -> int:
     """Stop a recorded tree by individual identities, never a numeric group.
 
@@ -550,14 +613,29 @@ def kill_process_group(pid: int) -> int:
     recorded = _recorded_tree.get()
     if not recorded:
         raise ValueError(f"No recorded process identity for {pid}")
+    # A tree the watchdog proved silent forked nothing since the tick's snapshot:
+    # that snapshot supplies it, and each target gets a targeted recheck (#435).
+    # Any other stop lists afresh, so a child forked after the snapshot ends too.
+    snapshot = current_snapshot() if _quiescent.get() else None
+    tick_rows = snapshot.rows if snapshot is not None and snapshot.available else None
     identities = observe_tree(recorded)
     if not identities:
         return 0
     signaled = set()
 
+    def listing():
+        if tick_rows is None:
+            rows = {row.pid: row for row in list_processes()}
+            return rows, _protected(rows)
+        rows = {}
+        for item in identities:
+            row = read_process_identity(item["pid"])
+            if row is not None:
+                rows[item["pid"]] = row
+        return rows, _protected(tick_rows)
+
     def current():
-        rows = {row.pid: row for row in list_processes()}
-        lineage, group, session = _protected(rows)
+        rows, (lineage, group, session) = listing()
         return {item["pid"]: rows[item["pid"]] for item in identities
                 if item["pid"] in rows and rows[item["pid"]].start_time == item["start_time"]
                 and item["pid"] > 1 and item["pid"] not in lineage
@@ -634,13 +712,48 @@ def _child_environment(cwd: Path) -> dict[str, str]:
     return env
 
 
+WATCH_POLL_SECONDS = 5
+
+
+def _watch(process, watchdog, output, log, forward, identities) -> bool:
+    """Wait for ``process`` under the silence watchdog; True when it decided to stop."""
+    def observe():
+        forward()
+        try:
+            snapshot = list_processes()
+        except OSError:
+            snapshot = None  # CPU unknown this poll: the watchdog never reads that as silence.
+        return watchdog.observe(now=time.monotonic(), output_bytes=os.fstat(output.fileno()).st_size,
+                                progress_events=0, snapshot=snapshot, identities=identities())
+
+    observe()
+    while True:
+        try:
+            process.wait(timeout=WATCH_POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            observe()  # The final sample: results written since the last poll are results too.
+            return False
+        decision = observe()
+        if decision.stop:
+            log.write((json.dumps(decision.facts()) + "\n").encode())
+            log.flush()
+            return True
+
+
 def run_logged(
     argv: list[str], *, cwd: Path, timeout_s: int, log_path: Path,
     prompt: str | None = None, capture_stdout: bool = False,
     stdout_path: Path | None = None, terminate_children: bool = False,
-    stderr_path: Path | None = None, env: dict[str, str] | None = None,
+    stderr_path: Path | None = None, env: dict[str, str] | None = None, watchdog=None,
 ) -> tuple[int | None, bool, str]:
-    """Append output without buffering an unbounded session in memory; env adds variables."""
+    """Append output without buffering an unbounded session in memory; env adds variables.
+
+    With a ``watchdog`` (foragent.watchdog.SilenceWatchdog), ``timeout_s`` is not a limit:
+    the command ends only when the watchdog reports silence or its safety net. Its own
+    output then goes through a private file, so other writers of the log are not output.
+    """
     on_process_group = _process_group_callback.get()
     on_process_tree = _process_tree_callback.get()
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -649,7 +762,7 @@ def run_logged(
     ) as output, (stderr_path.open("ab") if stderr_path is not None else nullcontext()) as errors:
         process = subprocess.Popen(
             argv, cwd=cwd, stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
-            stdout=output if capture_stdout else log,
+            stdout=output if capture_stdout or watchdog is not None else log,
             stderr=errors if errors is not None else log if capture_stdout else subprocess.STDOUT,
             # Closing stdin during cancellation must not wait for a buffered
             # writer's lock while a descendant keeps the pipe open.
@@ -760,12 +873,18 @@ def run_logged(
                 on_process_group(process.pid)  # start_new_session makes PID == PGID.
             if on_process_tree is not None:
                 on_process_tree(identities)
-            try:
-                process.wait(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                stop_children()
-                process.wait()
+            if watchdog is not None:
+                timed_out = _watch(process, watchdog, output, log, forward_stdout, lambda: identities)
+                if timed_out:
+                    stop_children()
+                    process.wait()
+            else:
+                try:
+                    process.wait(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    stop_children()
+                    process.wait()
             if observation_errors:
                 raise observation_errors[0]
         finally:
@@ -801,6 +920,7 @@ def run_logged(
                 if follower is not None:
                     stop_forwarding.set()
                     follower.join()
+                if follower is not None or watchdog is not None:
                     forward_stdout()
         if not prompt_cancelled:
             for exc in prompt_errors:

@@ -106,6 +106,18 @@ def no_real_signals(monkeypatch):
     ))
 
 
+    def read_children(pid):
+        # A targeted read, like the real seam: the fake table's rows without a listing call.
+        table = getattr(processes.list_processes, "__self__", None)
+        rows = getattr(table, "rows", None)
+        if not isinstance(rows, dict):
+            return ()
+        live = table.live
+        return tuple(row for child, row in rows.items() if child in live and row.ppid == pid)
+
+    monkeypatch.setattr(processes, "read_children", read_children)
+
+
 from process_fakes import fake_process_table  # noqa: E402, F401
 
 
