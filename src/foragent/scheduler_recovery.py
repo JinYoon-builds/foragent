@@ -47,7 +47,7 @@ def _remove_run_worktree(
 
 def _kill_run(
     ctx: TickContext, number: int | str, report: TickReport, *, outcome: str = "killed",
-    count_stall: bool = False, detail: str = "", decided: Run | None = None, owned_deletions: bool = False, count_restart: bool = True,
+    count_stall: bool = False, detail: str = "", decided: Run | None = None, owned_deletions: bool = False, count_restart: bool = True, on_stopped=None,
 ) -> bool:
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
@@ -57,7 +57,7 @@ def _kill_run(
     if count_stall:
         ctx.store.update_run(number, restarts=run.restarts + int(count_restart), outcome=outcome)
     try:
-        stopped = _stop_run_processes(ctx, run, report)
+        stopped = _stop_run_processes(ctx, run, report, on_stopped=on_stopped)
     except Exception:
         if count_stall:
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)

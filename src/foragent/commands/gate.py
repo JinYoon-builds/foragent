@@ -36,6 +36,8 @@ def add(commands) -> None:
     done.add_argument("--snapshot", type=cli.Path, required=True)
     done.add_argument("--worktree", type=cli.Path, required=True)
     done.add_argument("--acceptance-dir", required=True)
+    done.add_argument("--history-root", type=cli.Path, help="Repository whose result gaps size the silence window")
+    done.add_argument("--safety-net-seconds", type=int)
     for name in ("install", "uninstall", "launchd-status"):
         command = actions.add_parser(name)
         command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
@@ -175,7 +177,10 @@ def run(args) -> int:
         return handler(args)
     cli = facade()
     if args.action == "check-done":
-        return cli.check_done(args.snapshot.resolve(), args.worktree.resolve(), args.acceptance_dir)
+        # The hook's silence inputs (#435) are passed only when its command carries them.
+        silence = {name: value for name, value in (("history_root", args.history_root),
+                                                   ("safety_net_seconds", args.safety_net_seconds)) if value is not None}
+        return cli.check_done(args.snapshot.resolve(), args.worktree.resolve(), args.acceptance_dir, **silence)
     root = args.repo_root.resolve()
     if args.action in LAUNCHD_ACTIONS:
         return _launchd(args, root)

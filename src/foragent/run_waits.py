@@ -51,20 +51,22 @@ def _remaining(n: int, ctx: RunContext) -> int:
 
 
 RUNNER_MARGIN_SECONDS = 10 * 60
+# The run budget waiting loops had before #435 made max_runtime_minutes optional.
+WAIT_DEFAULT_MINUTES = 90
 
 
 def _wait_remaining(n: int, ctx: RunContext) -> int:
     """The budget of waiting loops (CI polling, merge turns): waiting is not progress.
 
-    These loops keep their earlier bound, ``max_runtime_minutes`` when set; changing
-    CI polling and turn caps belongs to a later issue (#435 out of scope).
+    These loops keep the bound they had before #435: ``max_runtime_minutes`` when set,
+    else its earlier default. Changing CI polling and turn caps belongs to a later issue.
     """
     from foragent import runner
 
     remaining = runner._remaining(n, ctx)  # The runner's seam, so callers' budgets agree.
-    limit = ctx.config.max_runtime_minutes
-    if limit is None or getattr(ctx, "deadline_seconds", None) is not None:
+    if getattr(ctx, "deadline_seconds", None) is not None:
         return remaining
+    limit = ctx.config.max_runtime_minutes or WAIT_DEFAULT_MINUTES
     run = ctx.store.get_run(n)
     elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
                - run.waited_seconds - run.slept_seconds)
@@ -84,6 +86,29 @@ def past_runtime_limit(n: int, ctx: RunContext) -> bool:
     elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
                - run.waited_seconds - run.slept_seconds)
     return elapsed >= limit * 60  # Like the old budget: reaching the limit is past it.
+
+
+def watchdog_restart(n: int, ctx: RunContext, detail: str):
+    """A check the watchdog stopped ends the run as stalled-restart, back to ready (#435).
+
+    The same rule as the gate's silence stop: the kept WIP and gathered failures reach
+    the next run (with an open PR, the issue is flagged stalled instead). Raises.
+    """
+    from types import SimpleNamespace
+
+    from foragent import scheduler
+    from foragent.run_attempt import ExecutorStopped
+
+    _phase_log(ctx, n, detail)
+    ctx.store.update_run(n, outcome="stalled-restart")
+    scheduler._restore_stalled(ctx, n, 1, SimpleNamespace(actions=[]))
+    raise ExecutorStopped("stalled-restart", detail)
+
+
+def _phase_log(ctx: RunContext, n: int, detail: str) -> None:
+    from foragent.run_checks import _append
+
+    _append(ctx.store.log_path(n), detail)
 
 
 def _timeout(n: int, ctx: RunContext) -> str:

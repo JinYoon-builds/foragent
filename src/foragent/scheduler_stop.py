@@ -168,9 +168,14 @@ def _stop_unconfirmed(run: Run) -> bool:
 
 
 def _stop_run_processes(
-    ctx: TickContext, run: Run, report: TickReport, *, stop_runner: bool = True,
+    ctx: TickContext, run: Run, report: TickReport, *, stop_runner: bool = True, on_stopped=None,
 ) -> str:
-    """A refused stop belongs to this run, never to the whole gate tick."""
+    """A refused stop belongs to this run, never to the whole gate tick.
+
+    ``on_stopped`` runs once this stop has ended the run's processes, before any later
+    check of the record: a runner that finishes its record meanwhile cannot hide the stop.
+    """
+    stopped = on_stopped or (lambda: None)
     try:
         if _stop_already_refused(ctx, run):
             return "refused" if _run_processes_exist(run) else "gone"
@@ -183,11 +188,13 @@ def _stop_run_processes(
     except (ValueError, PermissionError, TimeoutError) as exc:
         try:
             if not _run_processes_exist(ctx.store.get_run(run.key) or run):
+                stopped()  # The stop raised, but the processes it targeted are gone.
                 return "gone"
         except PermissionError:
             pass  # An unreadable table cannot prove death.
         _flag_stop_refused(ctx, run, report, exc)
         return "refused"
+    stopped()
     return "stopped"
 
 

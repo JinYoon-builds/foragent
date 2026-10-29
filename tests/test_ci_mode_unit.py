@@ -109,7 +109,10 @@ def test_unfinished_measurement_polls_within_existing_ci_budget(tmp_path, monkey
     ctx = SimpleNamespace(
         repo=repo, repo_root=tmp_path, config=config, now=lambda: clock[0], sleep=sleep,
         tracker=GhTracker(repo, github),
-        store=SimpleNamespace(update_run=lambda n, **kwargs: updates.append(kwargs)),
+        store=SimpleNamespace(update_run=lambda n, **kwargs: updates.append(kwargs),
+                              # The run record the waiting budget reads (#435).
+                              get_run=lambda n: SimpleNamespace(started_at=BASE_TIME.isoformat(),
+                                                                waited_seconds=0, slept_seconds=0)),
     )
     attempt = SimpleNamespace(
         n=1, ctx=ctx, target_branch='main', log=tmp_path / 'log',
@@ -580,7 +583,10 @@ def test_ci_head_without_exclusions_and_reports_holds_or_falls_back(tmp_path, mo
     ctx = SimpleNamespace(
         repo='owner/repo', repo_root=tmp_path, config=config, now=lambda: clock[0], sleep=sleep,
         tracker=SimpleNamespace(pr_default_branch=lambda: 'main', pr_acceptance_reports=lambda pr: reads.append(pr) or []),
-        store=SimpleNamespace(update_run=lambda n, **kwargs: updates.append(kwargs)),
+        store=SimpleNamespace(update_run=lambda n, **kwargs: updates.append(kwargs),
+                              # The run record the waiting budget reads (#435).
+                              get_run=lambda n: SimpleNamespace(started_at=BASE_TIME.isoformat(),
+                                                                waited_seconds=0, slept_seconds=0)),
     )
     attempt = SimpleNamespace(
         n=1, ctx=ctx, worktree=tmp_path, target_branch='main', log=tmp_path / 'log',

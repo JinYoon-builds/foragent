@@ -140,8 +140,12 @@ def test_runner_budget_ignores_max_runtime_and_outlasts_the_gate_safety_net():
 @pytest.mark.parametrize("decision", ["safety-net", "silent"])
 def test_watchdog_stop_restarts_even_after_an_earlier_stall(monkeypatch, decision):
     calls = []
-    monkeypatch.setattr(scheduler_recovery.scheduler, "_kill_run",
-                        lambda *args, **kwargs: calls.append(("kill", kwargs)) or True)
+    def kill(*args, **kwargs):
+        calls.append(("kill", kwargs))
+        kwargs["on_stopped"]()  # The processes ended.
+        return True
+
+    monkeypatch.setattr(scheduler_recovery.scheduler, "_kill_run", kill)
     monkeypatch.setattr(scheduler_recovery.scheduler, "_restore_stalled",
                         lambda ctx, number, restarts, report: calls.append(("restore", restarts)))
     monkeypatch.setattr(scheduler_silence, "_log", lambda *args: calls.append(("log", args[3])))
@@ -210,16 +214,20 @@ def test_waiting_loops_keep_the_configured_runtime_bound():
                           config=Config(max_runtime_minutes=2), deadline_seconds=None)
     assert _wait_remaining(1, ctx) == 120
     assert _remaining(1, ctx) > 24 * 3600, "Only waiting is bounded; progressing work is not"
-    ctx.config = Config()
-    assert _wait_remaining(1, ctx) == _remaining(1, ctx)
+    ctx.config = Config()  # Unset: the waiting bound before #435, not the safety net.
+    assert _wait_remaining(1, ctx) == 90 * 60
 
 
 # A dream run shares the stop path by record key: it ends as error and touches no labels.
 @pytest.mark.parametrize("decision", ["safety-net", "silent"])
 def test_watchdog_stop_of_a_dream_ends_as_error_without_labels(monkeypatch, decision):
     calls = []
-    monkeypatch.setattr(scheduler_recovery.scheduler, "_kill_run",
-                        lambda ctx, key, report, **kwargs: calls.append(("kill", key, kwargs)) or True)
+    def kill(ctx, key, report, **kwargs):
+        calls.append(("kill", key, kwargs))
+        kwargs["on_stopped"]()
+        return True
+
+    monkeypatch.setattr(scheduler_recovery.scheduler, "_kill_run", kill)
     monkeypatch.setattr(scheduler_recovery.scheduler, "_restore_stalled",
                         lambda *args: calls.append(("restore",)))
     monkeypatch.setattr(scheduler_recovery.scheduler, "append_event",
@@ -235,3 +243,145 @@ def test_watchdog_stop_of_a_dream_ends_as_error_without_labels(monkeypatch, deci
     assert ("restore",) not in calls
     assert [call for call in calls if call[0] == "event"] == [
         ("event", None, "safety-net" if decision == "safety-net" else "silence-stop")]
+
+
+def _quiescent_case(table, monkeypatch, tmp_path):
+    def read(pid):
+        try:
+            return table.process(pid)
+        except ProcessLookupError:
+            return None
+
+    monkeypatch.setattr(processes, "read_process_identity", read)
+    monkeypatch.setattr(processes, "read_children", lambda pid: tuple(
+        row for number, row in table.rows.items() if number in table.live and row.ppid == pid))
+    return read
+
+
+# Unsafe traversal root: a recorded protected process never adopts its children.
+@pytest.mark.parametrize("protected", ["init", "parent"])
+def test_quiescent_stop_never_traverses_from_a_protected_process(fake_process_table, monkeypatch, tmp_path, protected):
+    table = fake_process_table
+    _quiescent_case(table, monkeypatch, tmp_path)
+    pid = 1 if protected == "init" else table.parent_pid
+    unrelated = table.add(46000, ppid=pid, cwd=tmp_path, start_time=50)
+    recorded = [{"pid": pid, "start_time": table.rows[pid].start_time}]
+    with processes.process_snapshot(), processes.quiescent_tree():
+        found = processes.observe_tree(recorded)
+    assert unrelated.pid not in {item["pid"] for item in found}
+
+
+# Unverified parent: a PID reused between the identity read and the child read adopts nothing.
+def test_quiescent_stop_ignores_children_of_a_reused_parent_pid(fake_process_table, monkeypatch, tmp_path):
+    table = fake_process_table
+    read = _quiescent_case(table, monkeypatch, tmp_path)
+    root = table.add(42000, cwd=tmp_path, start_time=10)
+
+    def reused_children(pid):
+        if pid == root.pid and table.rows[pid].start_time == 10:
+            table.exit(root.pid)
+            table.add(root.pid, cwd=tmp_path, start_time=90)  # Reused after the identity read.
+            table.add(47000, ppid=root.pid, cwd=tmp_path, start_time=95)
+        return tuple(row for number, row in table.rows.items() if number in table.live and row.ppid == pid)
+
+    monkeypatch.setattr(processes, "read_children", reused_children)
+    with processes.process_snapshot(), processes.quiescent_tree():
+        found = processes.observe_tree([{"pid": root.pid, "start_time": 10}])
+    assert 47000 not in {item["pid"] for item in found}
+    assert read(root.pid).start_time == 90
+
+
+# Unknown as known: a recorded pid the table could not read is unknown CPU, never silence.
+def test_unreadable_recorded_child_is_unknown_cpu():
+    table = processes.ProcessTable([Row(10, 1.0, 0.0)], unreadable={11})
+    identities = [*RECORDED, {"pid": 11, "start_time": 2.0}]
+    watch = SilenceWatchdog()
+    watch.observe(now=0, output_bytes=0, progress_events=0, snapshot=table, identities=identities)
+    late = watch.observe(now=600, output_bytes=0, progress_events=0, snapshot=table, identities=identities)
+    assert not late.cpu_known and not late.stop
+
+
+# Run-ending check stopped by the watchdog: restart, not timeout/blocked.
+def test_pr_head_check_stopped_by_the_watchdog_restarts(monkeypatch, tmp_path):
+    from foragent import run_checks, runner
+    from foragent.issue import ParsedIssue
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    store.start_run(3, branch="b", worktree=tmp_path / "w")
+    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: datetime.now(UTC),
+                          repo_root=tmp_path, deadline_seconds=None)
+    monkeypatch.setattr(runner, "_check", lambda command, *a, **k: run_checks.CheckResult(command, -15, True, ""))
+    restarts = []
+
+    def restart(n, ctx, detail):
+        restarts.append(detail)
+        raise ExecutorStopped("stalled-restart", detail)
+
+    monkeypatch.setattr(run_checks, "watchdog_restart", restart)
+    monkeypatch.setattr(run_checks, "_timeout", lambda n, ctx: pytest.fail("A watchdog stop is not a timeout"))
+    with pytest.raises(ExecutorStopped, match="watchdog"):
+        run_checks._check_review_head(3, ctx, SimpleNamespace(root=tmp_path), ParsedIssue(None, "", "", ["true"], []),
+                                      "head", "", [])
+    assert len(restarts) == 1
+
+
+# Check site without history: the Stop hook sizes its window from the run's history.
+def test_stop_hook_checks_use_the_repository_history_and_safety_net(tmp_path):
+    from foragent import watchdog
+
+    state = tmp_path / "data" / "owner__repo"
+    snapshot = state / "approvals" / "1.json"
+    cache = tmp_path / "data" / "baselines"
+    cache.mkdir(parents=True)
+    (cache / "a.json").write_text(json.dumps({
+        "repository": str(tmp_path.resolve()), "created_at": "2026-10-28T00:00:00+00:00",
+        "result_gaps_seconds": [120, 720]}))
+    assert watchdog.hook_args(snapshot, tmp_path, 3600) == {"history_gaps": (120, 720), "safety_net": 3600}
+    assert watchdog.hook_args(snapshot, None, None) == {"history_gaps": (), "safety_net": watchdog.SAFETY_NET_SECONDS}
+
+
+# Setting lost at a process boundary: the detached builder keeps the configured safety net.
+def test_detached_baseline_builder_keeps_the_configured_safety_net(monkeypatch, tmp_path):
+    from foragent import run_baseline_process
+
+    seen = []
+    monkeypatch.setattr(run_baseline, "_build_baseline", lambda context, build, lock: seen.append(context.config))
+    monkeypatch.setattr(run_baseline_process, "load_record", lambda cls, value: value)
+    monkeypatch.setattr(run_baseline_process.os, "fdopen", lambda fd, mode: None)
+    request = {"repo_root": str(tmp_path), "store_root": str(tmp_path / "state"), "acceptance_dir": "tests/acceptance/",
+               "test_slots": 1, "machine_root": str(tmp_path / "machine"), "safety_net_hours": 1, "build": {}}
+    run_baseline_process.main(["x", json.dumps(request), "9"])
+    assert seen[0].safety_net_hours == 1
+
+
+# Decision record lost to a race: the stop happened, so its facts are journaled.
+def test_watchdog_decision_is_journaled_when_the_runner_finishes_during_the_stop(monkeypatch):
+    events = []
+
+    def kill(ctx, key, report, **kwargs):
+        kwargs["on_stopped"]()  # The processes ended, then the runner's own finish won the record.
+        return False
+
+    monkeypatch.setattr(scheduler_recovery.scheduler, "_kill_run", kill)
+    monkeypatch.setattr(scheduler_recovery.scheduler, "append_event",
+                        lambda store, at, number, kind, summary, **facts: events.append((kind, facts["decision"])))
+    fact = SilenceWatchdog().observe(now=0, output_bytes=0, progress_events=0, snapshot=(), identities=())
+    run = SimpleNamespace(number=7, key=7, kind="issue", restarts=0)
+    ctx = SimpleNamespace(store=None, now=lambda: datetime(2026, 10, 29, tzinfo=UTC))
+    scheduler_silence.stop(ctx, run, SimpleNamespace(actions=[]), replace(fact, stop=True, decision="silent"),
+                           past_limit=False, wake_grace=False)
+    assert events == [("silence-stop", "silent")]
+
+
+def test_gate_check_done_passes_the_hook_silence_inputs_only_when_given(monkeypatch, tmp_path):
+    from foragent import cli
+
+    calls = []
+    monkeypatch.setattr(cli, "check_done", lambda *args, **kwargs: calls.append(kwargs) or 0)
+    base = ["gate", "check-done", "--snapshot", str(tmp_path / "s.json"), "--worktree", str(tmp_path),
+            "--acceptance-dir", "tests/acceptance/"]
+    assert cli.main([*base, "--history-root", str(tmp_path), "--safety-net-seconds", "60"]) == 0
+    assert cli.main(base) == 0
+    assert calls == [{"history_root": tmp_path, "safety_net_seconds": 60}, {}]

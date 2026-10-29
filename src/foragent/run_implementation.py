@@ -13,7 +13,7 @@ from foragent.executors import ExecResult, classify_result
 from foragent.issue import parse_body
 from foragent.labels import attempt_tier, issue_size
 from foragent.reasons import Reason
-from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation, WholeFailure
+from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation, SilentCapture, WholeFailure
 from foragent.run_baseline import _capture_acceptance_baseline
 from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
@@ -26,7 +26,7 @@ from foragent.run_parent import parent_context
 from foragent.run_prompts import bug_fix_steps, build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
 from foragent.run_overlap import wait_for_overlap
-from foragent.run_waits import _phase, _timeout, past_runtime_limit
+from foragent.run_waits import _phase, _timeout, past_runtime_limit, watchdog_restart
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -147,6 +147,8 @@ def capture_acceptance_baseline(
 
 def _baseline_unavailable(n: int, ctx: RunContext, detail: str, cause: Exception | None = None) -> None:
     """The #327 stop: no merge without a usable protected set."""
+    if isinstance(cause, SilentCapture):  # Stopped by the watchdog: resume the kept passes (#435).
+        watchdog_restart(n, ctx, detail)
     _append(ctx.store.log_path(n), detail)
     reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
     flag(ctx, n, reason, "acceptance baseline unavailable", detail)

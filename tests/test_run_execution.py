@@ -119,6 +119,7 @@ def test_claude_native_goal_settings_and_independent_retry(run_case, acceptance_
         sys.executable, "-m", "foragent.cli", "gate", "check-done",
         "--snapshot", str(c.store.root / "approvals/1.json"),
         "--worktree", str(c.store.worktree_path(1)), "--acceptance-dir", acceptance_dir,
+        "--history-root", str(c.ctx.repo_root.resolve()), "--safety-net-seconds", str(24 * 3600),
     ])
     path = Path(acceptance_dir).as_posix().rstrip("/") + "/"
     assert settings == {

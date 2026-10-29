@@ -39,6 +39,8 @@ def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
     command = shlex.join([
         sys.executable, "-m", "foragent.cli", "gate", "check-done", "--snapshot", str(snapshot),
         "--worktree", str(worktree.resolve()), "--acceptance-dir", ctx.config.acceptance_dir,
+        # The hook's checks use the run's silence history and safety net, as the runner's do (#435).
+        "--history-root", str(ctx.repo_root.resolve()), "--safety-net-seconds", str(safety_net_seconds(ctx.config)),
     ])
     settings = {
         "permissions": {"deny": [

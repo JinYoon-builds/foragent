@@ -297,7 +297,7 @@ def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkey
         return CheckResult(command, -9 if killed else 0, killed, "")
 
     monkeypatch.setattr("foragent.runner._check", check)
-    assert run_issue(1, c.ctx) == ("timeout" if timed_out else "merged")
+    assert run_issue(1, c.ctx) == ("stalled-restart" if timed_out else "merged")
     # The run budget is the safety net plus the runner margin (#435), less the run time and credited waits.
     remaining = RUNNER_BUDGET - 3600 + 600
     assert [limit for _, limit in calls] == [900, 900, remaining - 240, remaining - 360, remaining - 480]
@@ -305,9 +305,9 @@ def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkey
     assert '-m local_only' in calls[-2][0]
     assert "tests/test_new.py" in shlex.split(calls[-1][0])
     assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
-    if timed_out:
-        assert c.store.load_flag(1).reason == Reason.TIMEOUT
-        assert c.store.get_run(1).detail == "Related unit tests went silent and were stopped by the watchdog (1 selected tests)."
+    if timed_out:  # A watchdog stop restarts the run back to ready (#435).
+        assert c.store.load_flag(1) is None and "ready" in c.tracker.get_issue(1).labels
+        assert c.store.get_run(1).detail == "Related unit tests were stopped by the watchdog (1 selected tests)."
         assert c.tracker.created_prs == []
 
 
@@ -333,13 +333,13 @@ def test_related_check_timeout_preserves_implementation_before_cleanup(run_case,
         return CheckResult(command, -9 if timed_out else 0, timed_out, "")
 
     monkeypatch.setattr("foragent.runner._check", check)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "stalled-restart"
     assert not c.store.worktree_path(1).exists()
     assert git_command(c.history.clone, "show", "foragent/issue-1:src/sample.py") == "VALUE = 2"
     assert git_command(c.history.origin, "show", "foragent/issue-1:src/sample.py") == "VALUE = 2"
     assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
-    assert c.store.load_flag(1).reason == Reason.TIMEOUT
-    assert c.store.get_run(1).detail == "Related unit tests went silent and were stopped by the watchdog (1 selected tests)."
+    assert c.store.load_flag(1) is None and "ready" in c.tracker.get_issue(1).labels
+    assert c.store.get_run(1).detail == "Related unit tests were stopped by the watchdog (1 selected tests)."
     assert c.tracker.created_prs == c.tracker.merged_prs == []
 
 
@@ -573,7 +573,7 @@ def test_related_check_timeout_keeps_earlier_done_when_failures(run_case, monkey
         return CheckResult(command, 0, False, "")
 
     monkeypatch.setattr("foragent.runner._check", check)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "stalled-restart"
     saved = cuts.failures_path(c.store.root, 1).read_text()
     assert "done-when output" in saved and "unit output" in saved
     run = c.store.get_run(1)

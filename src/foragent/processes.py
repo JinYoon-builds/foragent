@@ -595,16 +595,29 @@ def _observe_quiescent(identities, rows) -> list[dict]:
     """
     known = {item["pid"]: item["start_time"] for item in observe_routine_tree(identities)}
     lineage, group, session = _protected(rows)
+
+    def safe(row) -> bool:  # The rule observe_tree applies to every root and child.
+        return (row.pid > 1 and row.pid not in lineage and row.pgid not in lineage
+                and row.sid not in lineage and row.pgid != group and row.sid != session)
+
+    def verified(pid: int):
+        row = read_process_identity(pid)
+        return row if row is not None and row.start_time == known[pid] and safe(row) else None
+
     frontier = list(known)
     while frontier:
         pid = frontier.pop()
-        parent = read_process_identity(pid)
-        if parent is None or parent.start_time != known[pid]:
-            continue  # Gone or reused: a replacement's children are not ours.
-        for child in read_children(pid):
-            if (child.pid in known or child.start_time < parent.start_time or child.pid <= 1
-                    or child.pid in lineage or child.pgid in lineage or child.sid in lineage
-                    or child.pgid == group or child.sid == session):
+        # A protected process (init, our own lineage, group or session) is never a traversal
+        # root, even when recorded: its children are not the run's.
+        if (parent := verified(pid)) is None:
+            continue
+        children = read_children(pid)
+        # The parent must still be the same lifetime after its children were read: a PID
+        # reused in between would adopt the replacement's children.
+        if verified(pid) is None:
+            continue
+        for child in children:
+            if child.pid in known or child.start_time < parent.start_time or not safe(child):
                 continue
             known[child.pid] = child.start_time
             frontier.append(child.pid)

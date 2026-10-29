@@ -52,7 +52,8 @@ def observe(ctx: TickContext, run: Run) -> Decision:
         watch.last_output_at = watch.last_activity_at = max(watch.last_activity_at, progressed)
     watch.started = started  # Credited waits and machine sleep move the safety net, as the old limit.
     snapshot = processes.current_snapshot()
-    rows = snapshot.rows.values() if snapshot is not None and snapshot.available else None
+    # The whole snapshot: its rows and the pids it could not read (unknown, never silence).
+    rows = snapshot if snapshot is not None and snapshot.available else None
     log = _output_log(ctx, run)
     progress = run.last_progress_at
     decision = watch.observe(
@@ -81,8 +82,8 @@ def stop(ctx: TickContext, run: Run, report: TickReport, decision: Decision,
          past_limit: bool, wake_grace: bool) -> bool:
     """Stop the run when the watchdog says so; True when this handled the run.
 
-    Each decision is journaled with its facts once its stop succeeded: a refused
-    stop is reported as stop-refused, and the next tick decides again. A dream run
+    Each decision is journaled with its facts once its stop ended the processes: a
+    refused stop is reported as stop-refused, and the next tick decides again. A dream run
     ends as error and touches no labels, as every other gate stop of a dream does.
     """
     issue = run.kind == "issue"
@@ -94,9 +95,9 @@ def stop(ctx: TickContext, run: Run, report: TickReport, decision: Decision,
         if decision.decision == "running":
             decision = replace(decision, stop=True, decision="runtime-limit")
         if scheduler._kill_run(ctx, run.key, report, outcome="killed" if issue else "error",
-                               detail="Runner exceeded its runtime limit.", decided=run):
-            _log(ctx, run, decision, "runtime-limit",
-                 "Run passed max_runtime_minutes with no growing output, CPU or progress.")
+                               detail="Runner exceeded its runtime limit.", decided=run,
+                               on_stopped=lambda: _log(ctx, run, decision, "runtime-limit",
+                                                       "Run passed max_runtime_minutes with no growing output, CPU or progress.")):
             if issue:
                 scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                 report.actions.append(f"#{run.number} flagged timeout")
@@ -117,9 +118,10 @@ def _stalled(ctx: TickContext, run: Run, report: TickReport, decision: Decision,
     """
     issue = run.kind == "issue"
     # The tick killed the whole tree under its lock, as `fa orch stop` does: its deletions are the run's.
+    # The decision is journaled once the stop ended the processes, even if the runner
+    # finished its record meanwhile and _kill_run leaves the rest to the next tick.
     if scheduler._kill_run(ctx, run.key, report, outcome="stalled-restart" if issue else "error",
                            count_stall=issue, count_restart=False, detail=detail, decided=run,
-                           owned_deletions=True):
-        _log(ctx, run, decision, kind, detail)
+                           owned_deletions=True, on_stopped=lambda: _log(ctx, run, decision, kind, detail)):
         if issue:
             scheduler._restore_stalled(ctx, run.number, 1, report)

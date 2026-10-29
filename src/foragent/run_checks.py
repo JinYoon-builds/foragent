@@ -27,7 +27,7 @@ from foragent.reasons import Reason
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout, in_phase
+from foragent.run_waits import _phase, _progress, _test_slot, _timeout, in_phase, watchdog_restart
 from foragent.state import Approval
 
 if TYPE_CHECKING:
@@ -347,7 +347,8 @@ def _related_unit_tests(
     return tuple(sorted(selected))
 
 
-def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
+def check_done(snapshot: Path, worktree: Path, acceptance_dir: str, *, history_root: Path | None = None,
+               safety_net_seconds: int | None = None) -> int:
     """Stop hook: re-use independent checks, allowing at most eight blocked stops."""
     from foragent import runner
 
@@ -378,7 +379,7 @@ def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
             raise ValueError("Done when has no machine check")
         # Every failing command is reported, each with its own limited tail and cut notice.
         for command in parsed.done_when_commands:
-            result = runner._check(command, worktree, directory / "check-done.log", 900)
+            result = runner._check(command, worktree, directory / "check-done.log", 900, **watchdog.hook_args(snapshot, history_root, safety_net_seconds))
             if result.exit_code != 0 or result.timed_out:
                 failures.append(result)
         if failures:
@@ -525,9 +526,7 @@ def _verify_contents(attempt: Implementation) -> str:
                 save_failures(ctx.store.root, n, attempt.checks, complete=False)
                 bundle = WholeFailure(cuts.failures_path(ctx.store.root, n).read_text(encoding="utf-8"))
                 ctx.store.update_run(n, resume_reason=bundle, resume_whole=True)
-                detail = f"Related unit tests went silent and were stopped by the watchdog ({len(unit_tests)} selected tests)."
-                flag(ctx, n, Reason.TIMEOUT, detail, bundle)
-                raise ExecutorStopped("timeout", detail)
+                watchdog_restart(n, ctx, f"Related unit tests were stopped by the watchdog ({len(unit_tests)} selected tests).")
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
         git.stage_changes()
@@ -587,6 +586,8 @@ def _check_review_head(
             _progress(n, ctx)
             if check.timed_out or runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
+                if check.timed_out:  # Stopped by the watchdog: restart, as the gate's silence stop does.
+                    watchdog_restart(n, ctx, f"Done when on the PR head was stopped by the watchdog: {command}")
                 return _timeout(n, ctx)
     # PR-head checks rerun only Done when: other saved failures (baseline, units) are not re-verified here.
     if bundle := save_failures(ctx.store.root, n, checks, complete=False):

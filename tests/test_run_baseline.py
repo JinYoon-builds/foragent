@@ -124,16 +124,21 @@ def test_unusable_baseline_stops_before_publish_without_retry(run_case, monkeypa
         return CheckResult(command, code, timed_out, "")
 
     monkeypatch.setattr("foragent.runner._check", check)
-    assert run_issue(1, c.ctx) == "acceptance-baseline-unavailable"
+    stopped = unusable.endswith("timeout")  # The watchdog stopped the capture: the run restarts (#435).
+    assert run_issue(1, c.ctx) == ("stalled-restart" if stopped else "acceptance-baseline-unavailable")
     # The logged capture limit; the run budget no longer shortens it (#435): silence ends a capture.
     assert captures == [900]
     assert c.now[0] == BASE_TIME + timedelta(hours=1, seconds=20)
     assert c.executor.calls == []
     assert c.tracker.created_prs == c.tracker.merged_prs == []
-    assert c.store.load_flag(1).reason == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
     assert "acceptance baseline unavailable" in c.store.get_run(1).detail
-    assert parse_reason(c.tracker.list_comments(1)[-1].body) == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
-    assert c.store.read_history()[-1].outcome == "acceptance-baseline-unavailable"
+    if stopped:
+        assert c.store.load_flag(1) is None and "ready" in c.tracker.get_issue(1).labels
+        assert c.store.read_history()[-1].outcome == "stalled-restart"
+    else:
+        assert c.store.load_flag(1).reason == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+        assert parse_reason(c.tracker.list_comments(1)[-1].body) == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+        assert c.store.read_history()[-1].outcome == "acceptance-baseline-unavailable"
     # A timeout is kept as history (timed_out: true, never reused); other failures leave nothing.
     saved = [json.loads(path.read_text()) for path in (c.store.root.parent / "baselines").glob("*.json")]
     assert [entry["timed_out"] for entry in saved] == ([True] if unusable.endswith("timeout") else [])
@@ -443,8 +448,9 @@ def _collected(tmp_path, monkeypatch, files, node_ids, *, command="", excluded=(
     git = SimpleNamespace(add_detached_worktree=lambda path, sha: shutil.copytree(base, path),
                           remove_worktree=lambda path: shutil.rmtree(path), at=at)
     log = tmp_path / "run.log"
-    ctx = SimpleNamespace(git=git, store=SimpleNamespace(log_path=lambda n: log),
-                          config=Config(acceptance_dir=acceptance_dir))
+    # The collection reads this repository's silence history from the baseline cache (#435).
+    ctx = SimpleNamespace(git=git, store=SimpleNamespace(log_path=lambda n: log, root=tmp_path / "state"),
+                          config=Config(acceptance_dir=acceptance_dir), repo_root=base)
     previous = AcceptanceBaseline(_pytest_command(command or f"{shlex.quote(sys.executable)} -m pytest"), node_ids)
     return collect_protected_ids(1, ctx, previous, "new"), log
 

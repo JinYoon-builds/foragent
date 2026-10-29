@@ -48,6 +48,10 @@ class AttemptFailure(Exception):
         return message if isinstance(message, WholeFailure) else str(self)
 
 
+class SilentCapture(AttemptFailure):
+    """A baseline capture or collection the silence watchdog stopped (#435): the run restarts."""
+
+
 class ConflictBudgetExhausted(Exception):
     """In-place conflict resolution used its budget; the PR's own files decide on a rebuild."""
 

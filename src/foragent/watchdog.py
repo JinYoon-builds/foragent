@@ -69,6 +69,9 @@ class SilenceWatchdog:
     def observe(self, now: float, output_bytes: int, progress_events: int, snapshot, identities) -> Decision:
         recorded = {(item["pid"], item["start_time"]) for item in identities}
         cpu_known = snapshot is not None  # None: the process table was unreadable.
+        # A recorded process the table could not read is unknown too, not absent.
+        if {pid for pid, _ in recorded} & set(getattr(snapshot, "unreadable", ()) or ()):
+            cpu_known = False
         cpu = {}
         for row in () if snapshot is None else snapshot.rows.values() if hasattr(snapshot, "rows") else snapshot:
             # Only the recorded lifetime counts: a reused PID is another process.
@@ -147,3 +150,15 @@ def safety_net(ctx) -> float:
 def silence_args(ctx) -> dict:
     """The watchdog inputs a check site passes to ``run_checks._check``."""
     return {"history_gaps": history_gaps(ctx), "safety_net": safety_net(ctx)}
+
+
+def hook_args(snapshot: Path, repository: Path | None, net: int | None) -> dict:
+    """The Stop hook's watchdog inputs: its run's history and safety net, passed on its command line.
+
+    ``snapshot`` is the run's approval under ``<state>/approvals``; the baseline cache sits
+    beside the repository stores, as for every other check site.
+    """
+    cache = snapshot.parent.parent.parent / "baselines"
+    return {"history_gaps": recorded_gaps(cache, repository) if repository is not None else (),
+            "safety_net": net or SAFETY_NET_SECONDS}
+

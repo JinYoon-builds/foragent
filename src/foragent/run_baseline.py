@@ -25,7 +25,7 @@ from foragent import cuts
 from foragent import run_baseline_plugins as resume
 from foragent.run_baseline_plugins import COLLECT_PLUGIN, _with_python_path  # noqa: F401  (re-exported)
 from foragent.git import GitError
-from foragent.run_attempt import AttemptFailure
+from foragent.run_attempt import AttemptFailure, SilentCapture
 from foragent.run_baseline_limits import load_reusable, record_timeout, repository_limit
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
 from foragent.watchdog import history_gaps, safety_net
@@ -120,7 +120,8 @@ def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str])
 
     request = {
         "repo_root": str(ctx.repo_root.resolve()), "store_root": str(ctx.store.root.resolve()),
-        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots, "repo": ctx.config.repo,
+        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots,
+        "safety_net_hours": ctx.config.safety_net_hours, "repo": ctx.config.repo,
         "machine_root": str(capacity.machine_root().resolve()),
         "build": asdict(build),
     }
@@ -457,7 +458,7 @@ def _capture_baseline(
                     save_baseline(node_ids, collected_ids, (), duration_seconds, result.exit_code, timed_out=True)
                 _append(log, f"Acceptance baseline count={len(node_ids)}, exit_code={result.exit_code}, timed_out={result.timed_out}")
                 if not cacheable:
-                    raise AttemptFailure(
+                    raise (SilentCapture if result.timed_out else AttemptFailure)(
                         f"acceptance baseline unavailable: exit_code={result.exit_code}, timed_out={result.timed_out}; "
                         "capture did not produce a complete, usable JUnit report"
                     )
@@ -512,7 +513,8 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
             selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
             command = _with_python_path(f"{selection} --collect-only -p {plugin}", str(plugins))
             result = runner._check(command, worktree, log, _baseline_capture_limit(ctx, log, remaining),
-                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                                   history_gaps=history_gaps(ctx), safety_net=safety_net(ctx))
             _progress(n, ctx)
             # Like a capture: a collection that changed tracked files proves nothing.
             _validate_baseline_checkout(_checkout(ctx.git, worktree), sha)
@@ -522,7 +524,7 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
             except (OSError, ValueError, KeyError, TypeError):
                 ids, errors, rootdir = None, None, None
             if result.timed_out or result.exit_code not in (0, 5) or ids is None or errors:
-                raise AttemptFailure(
+                raise (SilentCapture if result.timed_out else AttemptFailure)(
                     f"acceptance baseline unavailable: collecting {acceptance_dir} on {sha} failed "
                     f"(exit_code={result.exit_code}, timed_out={result.timed_out}, "
                     f"collection_errors={'unknown' if errors is None else errors})")

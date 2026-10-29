@@ -94,7 +94,7 @@ def test_check_done_errors_block_stop(hook, monkeypatch, capsys, failure):
     setup, _, counter = hook
     args = setup(["exit 0"] if failure != "no-command" else [])
     if failure == "timeout":
-        monkeypatch.setattr("foragent.runner._check", lambda *args: CheckResult(args[0], 0, True, "slow output"))
+        monkeypatch.setattr("foragent.runner._check", lambda *args, **kwargs: CheckResult(args[0], 0, True, "slow output"))
     elif failure in {"missing", "invalid"}:
         path = Path(args[args.index("--snapshot") + 1])
         if failure == "missing":
