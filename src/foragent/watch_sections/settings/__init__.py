@@ -99,11 +99,22 @@ def _value_text(setting, value: Any, store: Any, language: str, repo_root: Path 
         recorded = capacity.read_state(store) if store is not None else None
         count = int(recorded["parallel"]) if recorded else capacity.INITIAL_PARALLEL
         return watch.text("settings_window_auto", language, count=count)
-    if setting.key == "runner_unit_tests" and value == "auto":
-        from foragent import settings_runner
+    row = _rows().get(setting.key)
+    shown = row.value_text(value, repo_root, language) if row is not None else None
+    return shown if shown is not None else _label(setting, value, language)
 
-        return settings_runner.auto_text(repo_root, language)
-    return _label(setting, value, language)
+
+def _rows() -> dict[str, Any]:
+    """Modules in this package that draw one setting's value: KEY and value_text(value, repo_root,
+    language), which returns the row's text or None for the usual word. One file per setting."""
+    import importlib
+    import pkgutil
+
+    found = {}
+    for info in pkgutil.iter_modules(__path__, __name__ + "."):
+        module = importlib.import_module(info.name)
+        found[module.KEY] = module
+    return found
 
 
 def _note(setting, store: Any, repo_root: Path | None, language: str) -> str | None:

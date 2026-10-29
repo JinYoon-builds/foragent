@@ -242,12 +242,21 @@ def test_quota_save_shows_on_the_last_line_before_and_after_the_next_snapshot(ro
 
 
 def test_runner_unit_tests_automatic_names_the_choice_that_applies(tmp_path):
-    from foragent import settings_runner
+    from foragent.watch_sections.settings import runner_unit_tests as row
 
-    assert settings_runner.auto_text(tmp_path, "en") == "automatic (run all)"
+    assert row.value_text("auto", tmp_path, "en") == "automatic (run all)"
     workflow = tmp_path / ".github/workflows/ci.yml"
     workflow.parent.mkdir(parents=True)
     workflow.write_text("on: [pull_request]\njobs: {}\n", encoding="utf-8")
-    assert settings_runner.auto_text(tmp_path, "en") == "automatic (leave to CI)"
-    assert settings_runner.auto_text(tmp_path, "ko") == "자동 (CI에 맡기기)"
-    assert settings_runner.auto_text(None, "en") == "automatic (run all)"
+    assert row.value_text("auto", tmp_path, "en") == "automatic (leave to CI)"
+    assert row.value_text("auto", tmp_path, "ko") == "자동 (CI에 맡기기)"
+    assert row.value_text("auto", None, "en") == "automatic (run all)"
+    assert row.value_text("ci", tmp_path, "en") is None, "explicit choices use the window's usual word"
+
+
+def test_settings_window_draws_the_runner_row_through_its_own_module(root, store, monkeypatch):
+    from foragent.watch_sections.settings import runner_unit_tests as row
+
+    monkeypatch.setattr(row, "value_text", lambda value, repo_root, language: "FROM-ROW-MODULE")
+    lines = settings_view(store, load_config(root), root, "team")
+    assert any("FROM-ROW-MODULE" in line for line in lines), lines
