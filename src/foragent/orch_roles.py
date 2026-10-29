@@ -66,9 +66,27 @@ def _recent_merged_files(store: StateStore, now: datetime) -> set[str]:
     return files
 
 
-def _met(signal: dict[str, Any], files: set[str], kinds: set[str]) -> bool:
-    return (any(_matches(path, glob) for path in files for glob in signal.get("paths") or [])
-            or any(kind in kinds for kind in signal.get("kinds") or []))
+def matching_files(signal: dict[str, Any], files: set[str]) -> list[str]:
+    """The changed files that match one of the signal's path globs, sorted."""
+    return sorted(path for path in files if any(_matches(path, glob) for glob in signal.get("paths") or []))
+
+
+def signal_met(signal: dict[str, Any], files: set[str], kinds: set[str]) -> bool:
+    """Whether one signal is met: a matching recent merged file or one of its kinds present."""
+    return bool(matching_files(signal, files)) or any(kind in kinds for kind in signal.get("kinds") or [])
+
+
+def observe(store: StateStore, config: Config, root: Path,
+            roles: dict[str, Any]) -> tuple[set[str], set[str], dict[str, Any]]:
+    """The inputs every signal check reads: recent merged files, and the kinds and kind numbers
+    `fa orch facts` reports.
+
+    The facts snapshot is read once, and only when some signal names a kind.
+    """
+    files = _recent_merged_files(store, store._now())
+    wanted = any(signal.get("kinds") for entry in roles.values() for signal in entry["signals"])
+    facts = orch_facts.collect(store, config, root, checkout=True) if wanted else {}
+    return files, set(facts.get("kinds") or []), dict(facts.get("kind_numbers") or {})
 
 
 def _removal_proposed(name: str, entry: dict[str, Any], events, now: datetime) -> bool:
@@ -87,14 +105,11 @@ def collect(store: StateStore, config: Config, root: Path) -> dict[str, Any]:
     roles = load_roles(config)
     now = store._now()
     events = _events(store, now)
-    files = _recent_merged_files(store, now)
-    wanted = any(signal.get("kinds") for entry in roles.values() for signal in entry["signals"])
-    # The same snapshot `fa orch facts` shows, read only when some signal names a kind.
-    kinds = set(orch_facts.collect(store, config, root, checkout=True).get("kinds") or []) if wanted else set()
+    files, kinds, _ = observe(store, config, root, roles)
     rows = {}
     for name, entry in roles.items():
         signals = [{"paths": list(signal.get("paths") or []), "kinds": list(signal.get("kinds") or []),
-                    "met": _met(signal, files, kinds)} for signal in entry["signals"]]
+                    "met": signal_met(signal, files, kinds)} for signal in entry["signals"]]
         last = max((at for at, event in events if event.get("kind") == call_kind(name)), default=None)
         rows[name] = {"default": name in DEFAULT_ROLES, "signals": signals,
                       "last_call": last and last.isoformat(),
@@ -121,18 +136,64 @@ def scorecard(store: StateStore, config: Config, card: dict[str, Any]) -> dict[s
                 daily[bucket][name]["calls"] += 1
             elif role == name and id(event) in counted and event["accepted"]:
                 daily[bucket][name]["accepted_proposals"] += 1
+    signals = _signal_days(store, names, days)
+    for bucket, day in enumerate(daily):
+        for name in names:
+            day[name]["signals"] = signals[bucket][name]
     card["window"]["today"]["roles"] = daily[0]
     card["window"]["previous"]["roles"] = {
-        name: {key: orch_scorecard._half_up(median([day[name][key] for day in daily[1:]]))
-               for key in ("calls", "accepted_proposals")} for name in names}
+        name: {**{key: orch_scorecard._half_up(median([day[name][key] for day in daily[1:]]))
+                  for key in ("calls", "accepted_proposals")},
+               "signals": {key: orch_scorecard._half_up(median([day[name]["signals"][key] for day in daily[1:]]))
+                           for key in SIGNAL_COUNTS}} for name in names}
     return card
 
 
-def scorecard_lines(today: dict[str, Any], previous: dict[str, Any]) -> list[str]:
-    """One line per role for people: calls and accepted proposals today and the days before."""
-    return [f"Role {name}: calls {counts['calls']} (before {previous['roles'][name]['calls']}), accepted "
-            f"proposals {counts['accepted_proposals']} (before {previous['roles'][name]['accepted_proposals']})"
-            for name, counts in today.get("roles", {}).items()]
+SIGNAL_COUNTS = ("raised", "called", "not_now", "unanswered")
+
+
+def _signal_days(store: StateStore, names: list[str], days: int) -> list[dict[str, dict[str, int]]]:
+    """Role-signal raises per day bucket by raise time, split by their answer as of now (#794)."""
+    from foragent import orch_role_raise, orch_scorecard
+
+    daily = [{name: dict.fromkeys(SIGNAL_COUNTS, 0) for name in names} for _ in range(days)]
+    answered = orch_role_raise.answers(store)
+    for row in orch_role_raise.signal_requests(store):
+        bucket = orch_scorecard._bucket(_time(row.get("created_at")), store._now(), days)
+        if bucket is None or row["role"] not in names:
+            continue
+        counts = daily[bucket][row["role"]]
+        counts["raised"] += 1
+        how = (answered.get(row["id"]) or {}).get("answer")
+        counts[{"called": "called", "not-now": "not_now"}.get(how, "unanswered")] += 1
+    return daily
+
+
+def scorecard_lines(today: dict[str, Any], previous: dict[str, Any], language: str = "en") -> list[str]:
+    """One line per role for people: calls and accepted proposals today and the days before.
+
+    A role whose numbers are all zero in both windows gets no line. A role with any role-signal
+    count in either window also shows its four signal numbers, today's then the days before.
+    """
+    from foragent.i18n import text
+
+    def numbers(counts: dict[str, Any]) -> list[int]:
+        return [counts["calls"], counts["accepted_proposals"], *(counts.get("signals") or {}).values()]
+
+    lines = []
+    for name, counts in today.get("roles", {}).items():
+        before = previous["roles"][name]
+        if not any(numbers(counts) + numbers(before)):
+            continue
+        line = (f"Role {name}: calls {counts['calls']} (before {before['calls']}), accepted "
+                f"proposals {counts['accepted_proposals']} (before {before['accepted_proposals']})")
+        signals, earlier = counts.get("signals") or {}, before.get("signals") or {}
+        if any(signals.values()) or any(earlier.values()):
+            line += ", " + text("scorecard_role_signals_pair", language,
+                                today=text("scorecard_role_signals", language, **signals),
+                                before=text("scorecard_role_signals", language, **earlier))
+        lines.append(line)
+    return lines
 
 
 def human(payload: dict[str, Any]) -> str:

@@ -132,7 +132,8 @@ def executors_explicit(config: Config) -> bool:
 
 DEFAULTS: dict[str, Any] = asdict(Config())
 # Retired floors (#497): still accepted in YAML, dropped before Config is built.
-IGNORED_KEYS = frozenset({"test_slots_floor", "parallel_floor"})
+# role_signal_cooldown_hours is read by orch_role_raise straight from .foragent.yml (#794).
+IGNORED_KEYS = frozenset({"test_slots_floor", "parallel_floor", "role_signal_cooldown_hours"})
 # Keys a settings file may hold that Config stores under another name (#786: executors -> executor_list).
 FILE_KEYS = frozenset({"executors"})
 _REVIEW_LEVELS = {"fast", "batch", "careful"}
