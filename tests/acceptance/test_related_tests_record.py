@@ -195,13 +195,14 @@ def test_related_tests_record_timeout_retains_selection_and_total(git_history, t
         check_plan(seconds=900, exit_code=-9, timed_out=True, report=report),
     ])
 
-    assert run_issue(1, case.ctx) == "timeout", case.store.log_path(1).read_text()
+    # #435 (2026-10-29): a watchdog-stopped related check ends the run as stalled-restart (back to ready).
+    assert run_issue(1, case.ctx) == "stalled-restart", case.store.log_path(1).read_text()
     assert len(case.implementer.calls) == len(case.related_calls) == 1
     record, = stored_related_checks(case)
     assert record == {"changed_file_count": 3, "selected_files": list(SELECTED_FILES),
                       "file_seconds": {SELECTED_FILES[0]: 3.5} if report == "partial" else {},
                       "total_seconds": 900, "timed_out": True}, (
-        "Persist selection and measured total before timeout ends the run; keep only available file timings")
+        "Persist selection and measured total before the stop ends the run; keep only available file timings")
 
 
 def test_related_tests_record_no_selected_unit_files_is_empty(git_history, tmp_path, monkeypatch):
@@ -217,7 +218,8 @@ def test_related_tests_record_timeout_does_not_reuse_prior_junit_times(git_histo
         check_plan(exit_code=1), check_plan(seconds=900, exit_code=-9, timed_out=True, report="missing"),
     ])
 
-    assert run_issue(1, case.ctx) == "timeout", case.store.log_path(1).read_text()
+    # #435 (2026-10-29): a watchdog-stopped related check ends the run as stalled-restart (back to ready).
+    assert run_issue(1, case.ctx) == "stalled-restart", case.store.log_path(1).read_text()
     assert len(case.implementer.calls) == len(case.related_calls) == 2
     assert stored_related_checks(case) == [
         {"changed_file_count": 3, "selected_files": list(SELECTED_FILES),

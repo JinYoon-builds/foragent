@@ -37,14 +37,14 @@ def test_list_has_exactly_the_eleven_keys_in_scope_order(root, capsys):
     assert [(item["scope"], item["key"]) for item in items] == [
         ("team", "review"), ("team", "always_human"), ("team", "executor"), ("team", "reviewer"),
         ("me", "claude_quota.mode"), ("me", "notify"), ("me", "animation"), ("me", "language"),
-        ("machine", "max_parallel"), ("machine", "memory_pressure_limit"), ("machine", "log_retention_days")]
+        ("me", "view_glyphs"), ("machine", "max_parallel"), ("machine", "memory_pressure_limit"), ("machine", "log_retention_days")]
     values = {item["key"]: item["value"] for item in items}
     assert values["memory_pressure_limit"] == "critical" and values["log_retention_days"] == 7
 
 
 def test_plain_list_and_get_print_scope_key_value_description(root, capsys):
     lines = out(root, capsys, "list").splitlines()
-    assert len(lines) == 11
+    assert len(lines) == 12
     assert lines[0] == "team  review  batch  " + settings.item(settings.BY_KEY["review"], root, "en")["description"]
     assert out(root, capsys, "get", "always_human") == "-\n"
     assert run(root, "set", "always_human", "docs/**, LICENSE") == 0
