@@ -195,4 +195,6 @@ def test_installed_gates_visible_lane_frame_names_other_gates_in_one_section(ins
     index = matches[0]
     assert gates.case.ctx.repo not in lines[index], "the other-gates line must exclude the current repo"
     assert index > 0 and not lines[index - 1].strip(), "installed gates must occupy their own view section"
-    assert index + 1 == len(lines) or not lines[index + 1].strip(), "keep the next section separate"
+    # #115 (2026-10-29): the bottom footer (key help, then the usage line with q) may follow directly.
+    assert index + 1 == len(lines) or not lines[index + 1].strip() or index + 1 >= len(lines) - 2, (
+        "keep the next section separate")
