@@ -160,11 +160,14 @@ def recovered(windows: list[dict], exhausted: list[dict]) -> bool:
     return True
 
 
-def _clear(ctx: TickContext, executor: str, until: datetime, pause: str, mark: dict) -> bool:
+def _clear(ctx: TickContext, executor: str, until: datetime, pause: str, mark: dict,
+           windows: list[dict] | None = None, read_at: datetime | None = None) -> bool:
     """End the executor pause and the pauses it put on lanes that use it.
 
     Only the pause that was read before the usage read ends: when another runner
     renewed or re-noted it meanwhile, the older reading says nothing about it.
+    Under the same lock, the fresh ``windows`` replace the recorded usage (#186), unless
+    a reading newer than ``read_at`` was recorded meanwhile: then that one stands.
     """
     store = ctx.store
     with store._state_lock():
@@ -172,6 +175,11 @@ def _clear(ctx: TickContext, executor: str, until: datetime, pause: str, mark: d
         pauses = _read_pauses(store)
         if pauses.get(executor) != pause or _load(store).get(executor) != mark:
             return False
+        if windows is not None and read_at is not None:
+            seen = (store.usage().get(executor) or {}).get("seen_at")
+            if seen is not None and datetime.fromisoformat(seen) > read_at:
+                return False  # A newer reading came in during the read; it decides, not this one.
+            store._write_usage(executor, windows, read_at.astimezone(UTC).isoformat())
         pauses.pop(executor, None)
         store._write_json(path, pauses)
         records = _load(store)
@@ -202,7 +210,9 @@ def recheck(ctx: TickContext) -> list[str]:
         windows = read_codex(now) if executor == "codex" else read_claude(now, interval, since)
         if windows is None or not recovered(windows, mark.get("exhausted") or []):
             continue
-        if not _clear(ctx, executor, until, pauses[executor], mark):
+        # The fresh reading also replaces the recorded used-up window, which would otherwise
+        # still hold the executor as a hard limit (#186).
+        if not _clear(ctx, executor, until, pauses[executor], mark, windows, now):
             continue
         levels = ", ".join(f"{window['name']} {window['used_percent']:g}%" for window in windows)
         append_event(ctx.store, now, None, "quota-recovered",

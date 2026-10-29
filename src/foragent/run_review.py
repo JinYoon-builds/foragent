@@ -161,10 +161,10 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
 
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
-    from foragent import runner
+    from foragent import quota_reviewer, runner
 
     _phase(n, ctx, "reviewing")
-    reviewer = resolved_reviewer(ctx.config)
+    reviewer = resolved_reviewer((ctx := quota_reviewer.review_moved(n, ctx)).config)  # Late limits move it (#186).
     options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
     if reviewer == "claude" and pr is not None:
         options["review_pr"] = pr

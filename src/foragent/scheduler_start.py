@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, orch_plan, orch_queue, overlap_files, resource_sample, scheduler, scheduler_quota
+from foragent import machine_budget, orch_plan, orch_queue, overlap_files, quota_events, resource_sample, scheduler, scheduler_quota
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
@@ -15,7 +15,7 @@ from foragent.capacity import (  # noqa: F401
 from foragent.issue import parse_body
 from foragent.orch_tick_outcome import step, timed  # noqa: F401
 from foragent.run_baseline import prebuild_acceptance_baseline, start_baseline_thread  # noqa: F401
-from foragent.scheduler_quota import claude_allowed  # noqa: F401  # Re-exported by the facade (#107).
+from foragent.scheduler_quota import choose_executor, claude_allowed  # noqa: F401  # Re-exported by the facade (#107, #186).
 from foragent.tracker import Issue
 
 if TYPE_CHECKING:
@@ -209,6 +209,7 @@ def _start_ready(
         start = scheduler_quota.decide(ctx.store, ctx.config, lane, ctx.now(), number)
         if start.held:
             continue
+        executor, reviewer = quota_events.pair(start.config)  # Stored once per start (#186).
         if sample[0] == "critical":
             # This issue passed every start check; only critical memory holds it (#497).
             # Running work is left alone, and one row records the held tick.
@@ -236,9 +237,9 @@ def _start_ready(
             # Record availability, so recovery does not charge a crash.
             ctx.store.start_run(
                 number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number),
-                lane=lane, tier=scheduler.issue_size(issue.labels),
-                # Only a kept implementer: a new switch is chosen, and journaled, when the run really starts.
-                implementer=start.implementer if start.switch is None else None,
+                lane=lane, tier=scheduler.issue_size(issue.labels), executor=executor, reviewer=reviewer,
+                journal=scheduler_quota.start_journal(ctx.store, ctx.now(), number, start.switch,
+                                                      ctx.config, lane, executor, reviewer),
             )
             ctx.store.clear_run_start(number)
             scheduler.orch_github.wait_run(ctx, number, until)
@@ -247,8 +248,9 @@ def _start_ready(
             return None
         ctx.store.start_run(
             number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
-            tier=scheduler.issue_size(issue.labels), implementer=start.implementer,
-            journal=start.switch and scheduler_quota.switch_journal(ctx.store, ctx.now(), number, start.switch),
+            tier=scheduler.issue_size(issue.labels), executor=executor, reviewer=reviewer,
+            journal=scheduler_quota.start_journal(ctx.store, ctx.now(), number, start.switch,
+                                                  ctx.config, lane, executor, reviewer),
         )
         if start.switch is not None:  # Claude is held back: this run implements with Codex (#107).
             report.actions.append(scheduler_quota.switch_line(number, start.switch, ctx.config.language))

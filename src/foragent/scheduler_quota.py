@@ -4,7 +4,8 @@ allows credits, and an api executor stops at its daily spend_cap. ``fa quota mod
 turns off Claude's keep_percent only.
 
 `fa quota mode` is the only writer of ``<state>/claude-quota.json``; the tick only reads it.
-The tick writes a run's ``implementer`` once, when it starts the run.
+The tick writes a run's ``executor`` and ``reviewer`` once per start (#186).
+Without a written order, Claude and Codex are tried in headroom order (quota_headroom).
 """
 
 from __future__ import annotations
@@ -150,6 +151,8 @@ def blocked(entry: dict, store: StateStore, now: datetime, usage: dict, mode: st
         return Switch(f"{label(name)} spent {spent:g} of its daily cap {cap:g}", "switch_reason_cap",
                       {"name": label(name), "spent": f"{spent:g}", "cap": f"{cap:g}"}, name), False
     until = store.executor_pause_until(name, now)
+    if quota == "subscription" and (used := quota_headroom.used_up_until(usage, name, now)) is not None:
+        until = max(until, used) if until is not None else used  # A used-up window is a hard limit (#186).
     if until is not None and not (quota == "subscription" and cap is not None):
         # Past a subscription limit only credits under a cap run; others wait for the reset.
         return Switch(f"{label(name)} paused at its limit until {until.isoformat()}", "switch_reason_limit",
@@ -171,7 +174,15 @@ def credits(store: StateStore, config: Config, name: str, now: datetime) -> bool
     entry = entry_for(config, name)
     if entry.get("spend_cap") is None:
         return False
-    return entry.get("quota") == "api" or store.executor_paused(name, now)
+    return entry.get("quota") == "api" or store.executor_paused(name, now) or (
+        quota_headroom.used_up_until(_usage(store), name, now) is not None)
+
+
+def hard_limited(store: StateStore, config: Config, name: str, now: datetime, usage: dict | None = None) -> bool:
+    """Whether ``name`` is at a hard limit now: a pause or a used-up window (#186), not a cap."""
+    usage = _usage(store) if usage is None else usage
+    why = blocked(entry_for(config, name), store, now, usage, "keep", keep=False)[0]
+    return why is not None and why.key == "switch_reason_limit"
 
 
 # A new run record after one of these continues the same run (as ``restarts`` counts it).
@@ -179,9 +190,14 @@ CONTINUED_OUTCOMES = frozenset({"stalled-restart", "crashed", "limit-wait"})
 
 
 def kept_implementer(store: StateStore, number: int) -> str | None:
-    """The implementer a continued run keeps; None when the next start chooses afresh."""
+    """The executor a continued run keeps; None when the next start chooses afresh.
+
+    A record from before #186 stored only ``implementer`` (None = the lane's executor).
+    """
     previous = store.get_run(number)
-    return previous.implementer if previous is not None and previous.outcome in CONTINUED_OUTCOMES else None
+    if previous is None or previous.outcome not in CONTINUED_OUTCOMES:
+        return None
+    return getattr(previous, "executor", None) or previous.implementer
 
 
 class Start(NamedTuple):
@@ -206,11 +222,20 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
 
     adjusted = lane_config(config, lane)
     usage, mode = _usage(store), quota_mode(store, config)[0]
-    order = fallback_order(adjusted)
+    ranked = quota_headroom.order(adjusted, lane, usage, now, mode)
+    order = ranked[0] if ranked is not None else fallback_order(adjusted)
     kept = kept_implementer(store, number) if number is not None else None
+    switch, released = None, False
     if kept is not None:
-        order = [next((entry for entry in order if entry["name"] == kept), entry_for(adjusted, kept))]  # Billed as listed ones.
-    switch, chosen, asks = None, None, []
+        kept_entry = next((entry for entry in order if entry["name"] == kept), entry_for(adjusted, kept))  # Billed as listed.
+        why = blocked(kept_entry, store, now, usage, mode, keep=False)[0]
+        if why is not None and why.key == "switch_reason_limit":
+            # A kept executor at a hard limit (a pause or a used-up window, #186) is released and the
+            # next one takes over with a summary; the release is always journaled as a limit switch.
+            switch, kept, released = why, None, True
+        else:
+            order = [kept_entry]
+    chosen, asks = None, []
     for entry in order:
         # A continued run (crashed, stalled-restart, limit-wait) keeps its implementer: only a hard
         # limit, cap or unmeasured spend holds it, never keep_percent, as #107 continuations did.
@@ -226,7 +251,10 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
             _ask_credits(store, config, name)
         return Start(adjusted, kept, None, True, switch.reason)
     implementer = kept if kept is not None else (None if chosen == adjusted.executor else chosen)
-    switch = replace(switch, target=chosen) if kept is None and implementer is not None else None
+    if kept is None and implementer is not None and switch is None and ranked is not None:
+        switch = quota_headroom.switch(ranked[1], chosen, adjusted.executor)
+    switch = replace(switch, target=chosen) if kept is None and switch is not None and (
+        implementer is not None or released) else None
     chosen_config = run_config(store, adjusted, implementer, now)
     reason = None
     reviewer = resolved_reviewer(chosen_config)
@@ -264,24 +292,8 @@ def run_start(store: StateStore, config: Config, lane: str, number: int,
     return start.config, start.implementer, start.switch
 
 
-def switch_journal(store: StateStore, now: datetime, number: int, switch: Switch) -> Callable[[], None]:
-    """Write the run's executor-switch event; ``start_run`` calls it under the lock that stores the run."""
-    from foragent.orch_events import append_event
-
-    return lambda: append_event(store, now, number, "executor-switch",
-                                f"#{number} implementer {switch.source} -> {switch.target}: {switch.reason}",
-                                locked=True, **{"from": switch.source, "to": switch.target, "reason": switch.reason})
-
-
-def switch_line(number: int, switch: Switch, language: str) -> str:
-    """The tick report line for a switch, in the repository's language."""
-    from foragent.i18n import text
-
-    reason = text(switch.key, language, **{"name": label(switch.source), **switch.values})
-    return text("executor_switch", language, number=number, source=label(switch.source),
-                target=label(switch.target), reason=reason)
-
-
 # Split out to stay under the module line limit; re-exported so callers keep their imports.
-from foragent.quota_reviewer import can_review, choose_reviewer, run_config, switched_config  # noqa: E402,F401
+from foragent import quota_headroom  # noqa: E402
+from foragent.quota_reviewer import can_review, choose_reviewer, pair_config, run_config, switched_config  # noqa: E402,F401
 from foragent.quota_spend import record_cost  # noqa: E402,F401
+from foragent.quota_events import choose_executor, start_journal, switch_journal, switch_line  # noqa: E402,F401

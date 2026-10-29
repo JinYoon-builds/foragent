@@ -142,19 +142,22 @@ class LocalRecordsMixin:
     def record_usage(self, executor: str, windows: list[dict[str, Any]]) -> None:
         """Keep the latest usage per executor and append it to a bounded observation history."""
         with self._state_lock():
-            usage = self.usage()
-            seen_at = self._timestamp()
-            usage[executor] = {"seen_at": seen_at, "windows": windows}
-            self._write_json(self.root / "usage.json", usage)
-            # The history lets `fa orch facts` measure the rate within one window.
-            path = self.root / "usage-history.jsonl"
-            try:
-                lines = path.read_text(encoding="utf-8").splitlines()
-            except FileNotFoundError:
-                lines = []
-            lines.append(_state.json.dumps({"executor": executor, "seen_at": seen_at, "windows": windows},
-                                           ensure_ascii=False))
-            self._atomic_write(path, "\n".join(lines[-USAGE_HISTORY_LINES:]) + "\n")
+            self._write_usage(executor, windows, self._timestamp())
+
+    def _write_usage(self, executor: str, windows: list[dict[str, Any]], seen_at: str) -> None:
+        """Store one usage reading; the caller holds the state lock."""
+        usage = self.usage()
+        usage[executor] = {"seen_at": seen_at, "windows": windows}
+        self._write_json(self.root / "usage.json", usage)
+        # The history lets `fa orch facts` measure the rate within one window.
+        path = self.root / "usage-history.jsonl"
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            lines = []
+        lines.append(_state.json.dumps({"executor": executor, "seen_at": seen_at, "windows": windows},
+                                       ensure_ascii=False))
+        self._atomic_write(path, "\n".join(lines[-USAGE_HISTORY_LINES:]) + "\n")
 
     def claude_quota_mode(self) -> str | None:
         """The local `fa quota mode` override, or None when none is stored or it is unreadable."""
