@@ -242,7 +242,7 @@ class CodexExecutor:
             code, timed_out, _ = run_logged(
                 codex_command(worktree, output_path, model, effort, **options), cwd=worktree, prompt=prompt,
                 timeout_s=timeout_s, log_path=log_path,
-                capture_stdout=True, stdout_path=events_path,
+                capture_stdout=True, stdout_path=events_path, quiet_timeout=True,
             )
             last_message = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
             error_kind = _structured_error_kind(events_path, "codex")
@@ -288,7 +288,7 @@ class ClaudeExecutor:
         code, timed_out, _ = run_logged(
             command, cwd=worktree, prompt=None if review_level is not None else prompt, timeout_s=timeout_s,
             log_path=log_path, capture_stdout=True, stdout_path=output_path,
-            env=CLAUDE_SESSION_ENV,
+            env=CLAUDE_SESSION_ENV, quiet_timeout=True,
         )
         result = claude_stream_result(output_path) if review_level is None else {}
         value = result.get("result")

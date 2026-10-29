@@ -77,8 +77,8 @@ class Config:
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
     tick_failure_alert: int = 3
-    # None: no fixed runtime limit; the silence watchdog and safety net end runs (#435).
-    max_runtime_minutes: int | None = None
+    # A limit only on a run that is also silent past it (#435); progressing work runs on.
+    max_runtime_minutes: int = 90
     silence_minutes: int = 10
     safety_net_hours: int = 24
     max_retries: int = 2

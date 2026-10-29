@@ -224,7 +224,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             except MissingComparison:
                 from foragent import runner
 
-                remaining = min(deadline - ctx.now().timestamp(), runner._wait_remaining(n, ctx))
+                remaining = min(deadline - ctx.now().timestamp(), runner._runtime_left(n, ctx))
                 if infrastructure or remaining <= 0:
                     raise
                 from foragent.run_waits import _progress

@@ -18,6 +18,8 @@ from pathlib import Path
 
 DEFAULT_WINDOW_SECONDS = 600
 SAFETY_NET_SECONDS = 24 * 60 * 60
+# Past its runtime limit, a session that shows no growth for one gate tick is not progressing.
+RUNTIME_QUIET_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -42,8 +44,12 @@ def _number(value) -> bool:
 
 
 class SilenceWatchdog:
+    """``runtime_limit`` (an executor session's ``max_runtime_minutes`` budget) ends work
+    past it only once it is also quiet for ``RUNTIME_QUIET_SECONDS``, never while it grows."""
+
     def __init__(self, history_gaps=(), safety_net: float = SAFETY_NET_SECONDS,
-                 window_seconds: float | None = None, started: float | None = None):
+                 window_seconds: float | None = None, started: float | None = None,
+                 runtime_limit: float | None = None):
         gaps = [gap for gap in history_gaps if _number(gap)]
         if gaps:
             self.window_seconds, self.window_source = 2 * max(gaps), "history"
@@ -52,6 +58,7 @@ class SilenceWatchdog:
         else:
             self.window_seconds, self.window_source = DEFAULT_WINDOW_SECONDS, "default"
         self.safety_net = safety_net
+        self.runtime_limit = runtime_limit
         self.started = started
         self.last_output_at: float | None = started
         self.last_activity_at: float | None = started
@@ -101,6 +108,9 @@ class SilenceWatchdog:
             decision = "safety-net"
         elif cpu_known and now - self.last_activity_at >= self.window_seconds:
             decision = "silent"
+        elif (self.runtime_limit is not None and now - self.started >= self.runtime_limit
+              and cpu_known and now - self.last_activity_at >= RUNTIME_QUIET_SECONDS):
+            decision = "runtime-limit"
         else:
             decision = "running"
         return Decision(decision != "running", decision, now - self.last_output_at, cpu_delta,

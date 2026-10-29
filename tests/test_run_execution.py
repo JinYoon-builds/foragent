@@ -7,8 +7,6 @@ import sys
 
 import pytest
 
-from foragent.run_waits import RUNNER_MARGIN_SECONDS
-
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.runner import run_issue
@@ -199,8 +197,7 @@ def test_transients_preserve_attempt_and_budget_and_fallback_persists(run_case, 
     assert run_issue(1, c.ctx) == "merged"
     assert waits == [120, 240]
     assert [call["model"] for call in c.executor.calls] == ["primary", "primary", "fallback", "fallback"]
-    # Backoff waits are credited: every call gets the whole budget, the safety net plus the margin (#435).
-    assert [call["timeout_s"] for call in c.executor.calls] == [24 * 3600 + RUNNER_MARGIN_SECONDS] * 4
+    assert [call["timeout_s"] for call in c.executor.calls] == [60] * 4
     assert c.executor.calls[0]["prompt"] == c.executor.calls[1]["prompt"] == c.executor.calls[2]["prompt"]
     run = c.store.get_run(1)
     assert run.attempts == 2 and run.waited_seconds == 360

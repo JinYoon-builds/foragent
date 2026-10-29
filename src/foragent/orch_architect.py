@@ -20,7 +20,7 @@ import sys
 from typing import Iterator
 
 from foragent import executors, processes
-from foragent.config import Config, safety_net_seconds
+from foragent.config import Config
 from foragent.i18n import text
 from foragent.launcher import gate_environment
 from foragent.orch_events import append_event
@@ -189,7 +189,7 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
             options["events_path"] = events_path(store, started_at, role)
         result = executors.executor_for(config.executor).run(
             worktree=root, prompt=build_prompt(why, root, config.executor, role, entry),
-            timeout_s=safety_net_seconds(config), log_path=log, **options,
+            timeout_s=config.max_runtime_minutes * 60, log_path=log, **options,
         )
         code = 1 if result.timed_out or result.exit_code is None else result.exit_code
         message = _keep_message(log, result.full_message or result.last_message or "", role)

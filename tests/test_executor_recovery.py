@@ -30,7 +30,7 @@ def recovery(tmp_path):
         repo="owner/repo", repo_root=tmp_path, tracker=tracker, store=store,
         # The stall and configured runtime-limit paths (#435 keeps both); a day-long
         # silence window keeps the watchdog from ending these runs first.
-        config=Config(max_runtime_minutes=90, silence_minutes=24 * 60),
+        config=Config(silence_minutes=24 * 60),
         git=SimpleNamespace(remove_worktree=lambda path: path.rmdir()),
         now=lambda: now, launcher=lambda number: None, start_runs=False,
     )
@@ -79,6 +79,9 @@ def test_runner_persists_and_clears_real_executor_group(recovery, monkeypatch, f
     install_popen(monkeypatch, fake_process_table, matches=lambda argv: argv == ["offline-executor"],
                   timeout=timeout)
     monkeypatch.setattr(f"foragent.executors.{executor}_command", lambda *args: ["offline-executor"])
+    if timeout:
+        # Past its budget a session ends only once quiet (#435): this one is quiet, so it is stopped.
+        monkeypatch.setattr("foragent.processes._watch", lambda *args: True)
     runner_ctx = SimpleNamespace(store=ctx.store, now=ctx.now, poll_hook=lambda execute, poll: execute())
     result = _run_executor(
         1, runner_ctx, executor_for(executor), worktree=ctx.store.worktree_path(1),

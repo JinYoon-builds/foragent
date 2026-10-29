@@ -206,16 +206,16 @@ def test_quiescent_stop_ends_a_child_forked_after_the_snapshot(fake_process_tabl
 
 # Out of scope (CI polling, merge turns): waiting loops keep max_runtime_minutes as their bound.
 def test_waiting_loops_keep_the_configured_runtime_bound():
-    from foragent.run_waits import _wait_remaining
+    from foragent.run_waits import _runtime_left
 
     started = datetime(2026, 10, 29, tzinfo=UTC)
     run = SimpleNamespace(started_at=started.isoformat(), waited_seconds=0, slept_seconds=0)
     ctx = SimpleNamespace(store=SimpleNamespace(get_run=lambda n: run), now=lambda: started,
                           config=Config(max_runtime_minutes=2), deadline_seconds=None)
-    assert _wait_remaining(1, ctx) == 120
+    assert _runtime_left(1, ctx) == 120
     assert _remaining(1, ctx) > 24 * 3600, "Only waiting is bounded; progressing work is not"
-    ctx.config = Config()  # Unset: the waiting bound before #435, not the safety net.
-    assert _wait_remaining(1, ctx) == 90 * 60
+    ctx.config = Config()  # The default 90 minutes still bound waiting, not the safety net.
+    assert _runtime_left(1, ctx) == 90 * 60
 
 
 # A dream run shares the stop path by record key: it ends as error and touches no labels.
@@ -385,3 +385,51 @@ def test_gate_check_done_passes_the_hook_silence_inputs_only_when_given(monkeypa
     assert cli.main([*base, "--history-root", str(tmp_path), "--safety-net-seconds", "60"]) == 0
     assert cli.main(base) == 0
     assert calls == [{"history_root": tmp_path, "safety_net_seconds": 60}, {}]
+
+
+# Fixed deadline on a session: past its budget it runs on while its CPU grows, then ends once quiet.
+@pytest.mark.parametrize("busy_until,stopped,ends", [(1000, False, 1000), (500, True, 560)])
+def test_session_past_its_budget_ends_only_once_quiet(monkeypatch, tmp_path, busy_until, stopped, ends):
+    clock = [0.0]
+    monkeypatch.setattr(processes, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(processes, "list_processes", lambda: (Row(10, 1.0, min(clock[0], busy_until)),))
+    with (tmp_path / "out").open("w+b") as output, (tmp_path / "log").open("ab") as log:
+        result = processes._watch(Process(clock, output, [], 1000), processes._past_budget(), output, log,
+                                  lambda: None, lambda: RECORDED)
+    assert result is stopped and clock[0] == ends
+    if stopped:
+        assert json.loads((tmp_path / "log").read_text().splitlines()[-1])["decision"] == "runtime-limit"
+
+
+def test_executor_session_reaching_its_budget_is_watched_not_killed(monkeypatch, tmp_path):
+    from foragent.executors import ClaudeExecutor
+
+    watched, waits = [], []
+
+    class Session:
+        pid = 54321
+        returncode = 0
+
+        def __init__(self, args, **kwargs):
+            kwargs["stdout"].write(json.dumps({"result": "(none)", "is_error": False}).encode())
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise subprocess.TimeoutExpired("claude", timeout)  # Still working at its budget.
+            return 0
+
+        def poll(self):
+            return 0 if len(waits) > 1 else None
+
+    def watch(process, watchdog, *args):
+        watched.append(watchdog.runtime_limit)
+        process.wait(timeout=5)
+        return False  # It finished while growing.
+
+    monkeypatch.setattr("foragent.processes.subprocess.Popen", Session)
+    monkeypatch.setattr(processes, "_watch", watch)
+    result = ClaudeExecutor().run(worktree=tmp_path, prompt="ignored", model=None, timeout_s=12,
+                                  log_path=tmp_path / "review.log", review_level="high")
+    assert waits[0] == 12 and watched == [0]
+    assert not result.timed_out

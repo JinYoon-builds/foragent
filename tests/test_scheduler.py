@@ -81,7 +81,7 @@ def ctx(git_history, tmp_path, monkeypatch, fake_process_table):
         tracker=FakeTracker(strict=True), store=StateStore(tmp_path / "state"),
         # These tests exercise the stall and configured runtime-limit paths, which #435 keeps;
         # a day-long silence window keeps the watchdog from ending these runs first.
-        config=Config(approvers=["human"], max_runtime_minutes=90, silence_minutes=24 * 60), git=GitRepo(git_history.clone, git_run), now=lambda: NOW,
+        config=Config(approvers=["human"], silence_minutes=24 * 60), git=GitRepo(git_history.clone, git_run), now=lambda: NOW,
         launcher=lambda number: 7000 + number, start_runs=False,
         runner_process_exists=lambda number: False,
         kill_runner=kill_process_group,

@@ -135,7 +135,7 @@ def await_turn(n: int, ctx: RunContext, place: Seat, head_sha: str) -> tuple[boo
     join(ctx, place, head_sha)
     waited = False
     while not holds_turn(ctx.store, place):
-        remaining = runner._wait_remaining(n, ctx)
+        remaining = runner._runtime_left(n, ctx)
         if remaining <= 0:
             return waited, _timeout(n, ctx)
         if not waited:
@@ -158,7 +158,7 @@ def rejoin_after_failed_merge(n: int, ctx: RunContext, place: Seat, error: Excep
     withdraw(ctx, place)
     append_log(ctx.store.log_path(n), f"Merge failed with the head unchanged; rejoining the merge queue: {error}")
     _progress(n, ctx)
-    ctx.sleep(min(30, max(1, runner._wait_remaining(n, ctx))))
+    ctx.sleep(min(30, max(1, runner._runtime_left(n, ctx))))
 
 
 def claim(ctx: RunContext, place: Seat, head_sha: str) -> int | None:

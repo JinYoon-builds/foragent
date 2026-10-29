@@ -748,6 +748,13 @@ def _child_environment(cwd: Path) -> dict[str, str]:
 WATCH_POLL_SECONDS = 5
 
 
+def _past_budget():
+    """A session past its budget: the gate owns its silence and safety net; it ends once quiet."""
+    from foragent.watchdog import SilenceWatchdog
+
+    return SilenceWatchdog(safety_net=math.inf, window_seconds=math.inf, runtime_limit=0)
+
+
 def _watch(process, watchdog, output, log, forward, identities) -> bool:
     """Wait for ``process`` under the silence watchdog; True when it decided to stop."""
     def observe():
@@ -780,12 +787,15 @@ def run_logged(
     prompt: str | None = None, capture_stdout: bool = False,
     stdout_path: Path | None = None, terminate_children: bool = False,
     stderr_path: Path | None = None, env: dict[str, str] | None = None, watchdog=None,
+    quiet_timeout: bool = False,
 ) -> tuple[int | None, bool, str]:
     """Append output without buffering an unbounded session in memory; env adds variables.
 
     With a ``watchdog`` (foragent.watchdog.SilenceWatchdog), ``timeout_s`` is not a limit:
     the command ends only when the watchdog reports silence or its safety net. Its own
     output then goes through a private file, so other writers of the log are not output.
+    With ``quiet_timeout`` (executor sessions), reaching ``timeout_s`` does not stop a session
+    whose output or CPU still grows: from then on it ends once it is also quiet (#435).
     """
     on_process_group = _process_group_callback.get()
     on_process_tree = _process_tree_callback.get()
@@ -907,7 +917,9 @@ def run_logged(
             if on_process_tree is not None:
                 on_process_tree(identities)
             if watchdog is not None:
-                timed_out = _watch(process, watchdog, output, log, forward_stdout, lambda: identities)
+                # With a follower thread (captured stdout) it alone forwards; two writers would duplicate.
+                timed_out = _watch(process, watchdog, output, log,
+                                   forward_stdout if follower is None else (lambda: None), lambda: identities)
                 if timed_out:
                     stop_children()
                     process.wait()
@@ -915,9 +927,12 @@ def run_logged(
                 try:
                     process.wait(timeout=timeout_s)
                 except subprocess.TimeoutExpired:
-                    timed_out = True
-                    stop_children()
-                    process.wait()
+                    timed_out = not quiet_timeout or _watch(
+                        process, _past_budget(), output, log,
+                        forward_stdout if follower is None else (lambda: None), lambda: identities)
+                    if timed_out:
+                        stop_children()
+                        process.wait()
             if observation_errors:
                 raise observation_errors[0]
         finally:

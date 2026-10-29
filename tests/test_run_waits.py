@@ -146,7 +146,7 @@ def test_merge_lock_wait_does_not_consume_conflict_executor_backoff_budget(confl
     assert run.attempts == 1 and run.executor_waited_seconds == 120 * (2 if prior_backoff else 1)
     assert len(lock_waits) == 2  # Discover the conflict, then queue the verified resolution.
     assert run.waited_seconds == len(lock_waits) * 31 * 60 + run.executor_waited_seconds
-    assert [call["timeout_s"] for call in c.executor.calls] == [RUNNER_BUDGET] * (4 if prior_backoff else 3)
+    assert [call["timeout_s"] for call in c.executor.calls] == [60] * (4 if prior_backoff else 3)
     assert c.store.load_flag(1) is None
 
 
@@ -164,7 +164,7 @@ def test_backoff_oversleep_preserves_runtime_for_next_executor(run_case, monkeyp
     c.ctx.sleep = oversleep
     assert run_issue(1, c.ctx) == "merged"
     assert waits == [120]
-    assert [call["timeout_s"] for call in c.executor.calls] == [RUNNER_BUDGET, RUNNER_BUDGET]
+    assert [call["timeout_s"] for call in c.executor.calls] == [60, 60]
     assert c.store.get_run(1).waited_seconds == 300
     assert c.store.get_run(1).executor_waited_seconds == 300
 

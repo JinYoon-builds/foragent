@@ -194,7 +194,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
                     full_text_dir=cuts.issue_dir(ctx.store.root, n),
                     risk_notes=risk_notes,
                 ),
-                **settings, timeout_s=runner._remaining(n, ctx),
+                **settings, timeout_s=runner._runtime_left(n, ctx),
                 log_path=ctx.store.log_path(n), on_result=notes_of(n, ctx, reviewer, round_number), **options,
             )
             message = result.full_message if result.full_message is not None else result.last_message
@@ -289,7 +289,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     def call(prompt: str, log_path: Path = log) -> ExecResult:
         # The panel decides the round's outcome from every call, so no call blocks the issue itself.
         return _available_executor(n, ctx, executor, worktree=git.root, reviewer=True, prompt=prompt,
-                                   **settings, timeout_s=runner._remaining(n, ctx), log_path=log_path,
+                                   **settings, timeout_s=runner._runtime_left(n, ctx), log_path=log_path,
                                    flag_exhaustion=False, on_result=record)
 
     def failure(label: str, error: BaseException) -> str:

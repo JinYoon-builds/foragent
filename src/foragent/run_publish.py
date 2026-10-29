@@ -123,7 +123,7 @@ def _wait_for_ci(
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     wait.infrastructure = ""
     while True:
-        if runner._wait_remaining(n, ctx) <= 0:
+        if runner._runtime_left(n, ctx) <= 0:
             return _timeout(n, ctx)
         if status is None:
             status = _ci_status(ctx, pr, git.root, ready_at)
@@ -147,7 +147,7 @@ def _wait_for_ci(
                 return None
             flag(ctx, n, Reason.TIMEOUT, "CI did not finish", link)
             return "timeout"
-        ctx.sleep(min(30, remaining, runner._wait_remaining(n, ctx)))
+        ctx.sleep(min(30, remaining, runner._runtime_left(n, ctx)))
         wait.polls += 1
         status = None
 

@@ -74,7 +74,7 @@ def _log(ctx: TickContext, run: Run, decision: Decision, kind: str, summary: str
 def check(ctx: TickContext, run: Run, report: TickReport, runtime: float) -> bool:
     """Observe the run this tick and stop it if the watchdog says so; True when it stopped."""
     limit = ctx.config.max_runtime_minutes
-    return stop(ctx, run, report, observe(ctx, run), past_limit=limit is not None and runtime > (limit + 10) * 60,
+    return stop(ctx, run, report, observe(ctx, run), past_limit=runtime > (limit + 10) * 60,
                 wake_grace=sleep_credit.in_wake_grace(ctx.store, run, ctx.now()))
 
 

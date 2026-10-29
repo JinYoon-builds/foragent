@@ -55,7 +55,7 @@ from foragent.run_prompts import (
 from foragent.run_waits import (
     poll_executor,
     _remaining,
-    _wait_remaining,
+    _runtime_left,
     _timeout,
     _test_slot,
     _progress,

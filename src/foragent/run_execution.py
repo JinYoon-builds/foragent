@@ -174,7 +174,7 @@ def _available_executor(
         run = ctx.store.get_run(n)
         if not reviewer and run.fallback_model is not None:
             kwargs["model"] = run.fallback_model
-        kwargs["timeout_s"] = runner._remaining(n, ctx)
+        kwargs["timeout_s"] = runner._runtime_left(n, ctx)  # The session budget; it ends only once quiet past it (#435).
         session_id = (run.session_id if session_body is not None and resume_prompt is not None and not reviewer
                       and run.session_executor == ctx.config.executor else None)
         kwargs["prompt"] = resume_prompt if session_id is not None else full_prompt
@@ -199,7 +199,7 @@ def _available_executor(
             session_id = None
             kwargs.pop("resume_session_id")
             kwargs["prompt"] = full_prompt
-            kwargs["timeout_s"] = runner._remaining(n, ctx)
+            kwargs["timeout_s"] = runner._runtime_left(n, ctx)  # The session budget; it ends only once quiet past it (#435).
             result = execute()
         kind = classify_result(result)
         if not reviewer and result.num_turns == 0 and not result.timed_out and kind == "normal":

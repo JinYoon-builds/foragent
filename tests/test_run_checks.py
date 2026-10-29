@@ -440,7 +440,7 @@ def test_retry_gets_remaining_budget_after_checks_spend_time(run_case, monkeypat
 
     monkeypatch.setattr("foragent.runner._check", check)
     assert run_issue(1, c.ctx) == "merged"
-    assert [call["timeout_s"] for call in c.executor.calls] == [RUNNER_BUDGET, RUNNER_BUDGET - 2 * 60]
+    assert [call["timeout_s"] for call in c.executor.calls] == [90 * 60, 88 * 60]
 
 
 def test_batch_acceptance_binding_still_uses_approval_snapshot(run_case):

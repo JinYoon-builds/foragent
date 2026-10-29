@@ -12,7 +12,6 @@ import subprocess
 import tempfile
 from typing import TYPE_CHECKING, Any
 
-from foragent.config import safety_net_seconds
 from foragent.orch_dream import _runs_since, dream_config, last_dream_at, log_path, media_root, memory_path, record_done, worktree_path
 from foragent.orch_dream_publish import _dream_worktree, _publish  # noqa: F401
 
@@ -189,7 +188,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             with track_process_group(lambda pgid: store.update_run(key, executor_pgid=pgid),
                                      tree_callback=lambda identities: store.update_run(key, process_identities=identities)):
                 return executor.run(worktree=worktree, prompt=text, model=model,
-                                    timeout_s=safety_net_seconds(config), log_path=log, **options)
+                                    timeout_s=config.max_runtime_minutes * 60, log_path=log, **options)
 
         try:
             result = ctx.poll_hook(execute, poll)

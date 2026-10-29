@@ -71,7 +71,7 @@ def _validate(values: dict[str, Any]) -> None:
                 "max_parallel", "overlap_per_file", "transient_max_wait_minutes", "limit_wait_minutes",
                 "usage_recheck_minutes", "orchestrator_timeout_minutes", "tick_failure_alert", "test_slots",
                 "silence_minutes", "safety_net_hours"):
-        if key in {"max_parallel", "max_runtime_minutes"} and values[key] is None:
+        if key == "max_parallel" and values[key] is None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
