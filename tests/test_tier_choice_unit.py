@@ -88,9 +88,10 @@ def test_tier_steps_up_and_keeps_resumed_and_earlier_tiers(attempts, previous, e
     assert choose_tier(ctx(config, usage(codex=90)), chosen, "s") == expected
 
 
-def test_a_stored_turn_that_was_answered_is_not_a_resume():
+def test_the_same_attempt_number_keeps_its_stored_tier_even_after_an_answer():
+    # A crash after the answer but before checks redoes the same attempt (#238).
     config = Config(executor="codex", max_retries=2)
-    assert choose_tier(ctx(config, usage(codex=90)), run(2, {"1": "s", "2": "s"}), "s") == "m"
+    assert choose_tier(ctx(config, usage(codex=10)), run(2, {"1": "s", "2": "m"}), "s") == "m"
 
 
 def test_ample_quota_starts_small_issues_at_l():
@@ -172,8 +173,43 @@ def test_limit_wait_restart_keeps_the_open_turn(tmp_path):
     store.finish_run(1, "limit-wait")
     resumed = store.start_run(1, branch="b", worktree=tmp_path / "w")
     assert turn_key(resumed, conflict=True) == "1c2"
-    store.finish_run(1, "crashed")
-    assert store.start_run(1, branch="b", worktree=tmp_path / "w").open_turn is None
+    store.finish_run(1, "merged")
+    fresh = store.start_run(1, branch="b", worktree=tmp_path / "w")
+    assert (fresh.open_turn, fresh.attempt_tiers, fresh.tier) == (None, {}, "m")
+
+
+@pytest.mark.parametrize("outcome", ["stalled-restart", "crashed", "limit-wait"])
+def test_gate_restart_keeps_the_open_attempts_tier_under_tight_quota(tmp_path, outcome):
+    # Attempt 1 started at l with ample quota; after a restart the quota is tight.
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    store.start_run(1, branch="b", worktree=tmp_path / "w", tier="s")
+    store.update_run(1, tier="l", attempt_tiers={"1": "l"}, open_turn="1")
+    store.finish_run(1, outcome)
+    restarted = store.start_run(1, branch="b", worktree=tmp_path / "w", tier="s")
+    assert (restarted.attempts, restarted.tier, restarted.attempt_tiers) == (1, "l", {"1": "l"})
+    config = Config(executor="codex", max_retries=2)
+    assert choose_tier(ctx(config, usage(codex=90)), restarted, "s", turn_key(restarted, conflict=False)) == "l"
+
+
+@pytest.mark.parametrize("outcome", ["stalled-restart", "crashed"])
+def test_restart_during_a_later_attempt_resumes_it_then_steps_up(tmp_path, outcome):
+    # Crash during attempt 2 at m: the restart is attempt 2 at m; its failure leads to attempt 3 at l.
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    store.start_run(1, branch="b", worktree=tmp_path / "w")
+    store.update_run(1, attempts=2, attempt_tiers={"1": "s", "2": "m"}, open_turn="2")
+    store.finish_run(1, outcome)
+    restarted = store.start_run(1, branch="b", worktree=tmp_path / "w")
+    assert restarted.attempts == 2
+    config = Config(executor="codex", max_retries=5)
+    tight = ctx(config, usage(codex=90))
+    assert choose_tier(tight, restarted, "s", turn_key(restarted, conflict=False)) == "m"
+    failed = store.update_run(1, attempts=3, open_turn=None)
+    assert turn_key(failed, conflict=False) == "3"
+    assert choose_tier(tight, failed, "s", "3") == "l"
 
 
 def test_claude_effort_reaches_the_cli():

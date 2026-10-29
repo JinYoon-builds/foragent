@@ -130,14 +130,15 @@ def choose_tier(ctx: RunContext, run, size: str, key: str | None = None, *, fina
 
     l with ample quota, else the size; one tier up per earlier turn (failed attempts, CI repairs
     and conflict-resolution turns alike); l on the last allowed turn or a ``final`` one (a
-    rebuild); never below an earlier turn. The open turn of a resumed run keeps its stored tier. An executor
-    without tier keys stays at the size.
+    rebuild); never below an earlier turn. A key already recorded is the same turn resumed (an
+    attempt number survives every restart; ``turn_key`` never reuses an answered conflict turn),
+    so it keeps its stored tier. An executor without tier keys stays at the size.
     """
     if not has_tier_keys(ctx.config, ctx.config.executor):
         return size
     key = str(run.attempts) if key is None else key
     stored = run.attempt_tiers.get(key)
-    if key == run.open_turn and stored in _TIERS:
+    if stored in _TIERS:
         return stored
     earlier = [value for name, value in run.attempt_tiers.items() if name != key]
     turn = max(run.attempts, len(earlier) + 1)
