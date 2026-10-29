@@ -120,7 +120,11 @@ def lines(snapshot: Snapshot, config: Config, context: dict[str, Any]) -> tuple[
     # All lanes idle means no active runs, also in a repository without lanes.
     idle = not snapshot.status.get("active_runs")
     invite = watch.text("usage_idle_invite", config.language) if idle and left else None
-    return invite, [*parts, watch.text("usage_quit", config.language)]
+    from foragent.watch_sections.settings import review_label
+
+    # The merge setting (#173) joins the line before its quit key.
+    merge = watch.text("settings_window_merge", config.language, review=review_label(config))
+    return invite, [*parts, merge, watch.text("usage_quit", config.language)]
 
 
 def _rows(parts: list[str], width: int) -> list[str]:

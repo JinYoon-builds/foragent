@@ -126,7 +126,10 @@ def _frame(
     """
     from foragent import watch
 
-    sections = _sections()
+    from foragent.watch_sections import settings as settings_window
+
+    # The open settings window (#173) replaces everything between the header and the help line.
+    sections = settings_window.shown_sections(_sections(), state)
     Hit = tuple[int, int, int, int, Any]
     Mark = tuple[int, int, str | None]  # (row, issue number, its lane; None when not foldable)
     rendered: list[tuple[ModuleType, list[Line], list[Hit], list[Mark]]] = []

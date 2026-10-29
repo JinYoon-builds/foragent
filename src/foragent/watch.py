@@ -35,6 +35,7 @@ from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, r
 from foragent.watch_sections.acorns import issue_box, issue_url
 from foragent.watch_sections.detail import render_detail
 from foragent.watch_sections.finished import FIREWORKS_SECONDS, calm
+from foragent.watch_sections.settings import settings_view
 from foragent.watch_sections.stage import _stage
 from foragent.watch_mouse import (
     MIN_SCREEN, handle_key, handle_mouse, highlighted, highlighted_row, hit_test, osc8, scroll, scroll_limit, switch_to_orchestrator,

@@ -4,7 +4,7 @@ MESSAGES = {
     "en": {
         "settings_help": "List, read and change settings for the team, for you and for this computer",
         "settings_list_help": "Show every setting with its scope, value and a one-line description",
-        "settings_get_help": "Print one setting's value",
+        "settings_get_help": "Print one setting's value, or every setting in effect",
         "settings_set_help": "Change one setting in the file its scope owns",
         "settings_unset_help": "Clear the setting back to its default",
         "settings_desc_review": "How closely a person reviews finished work: fast, batch or careful.",
@@ -15,6 +15,7 @@ MESSAGES = {
         "settings_desc_notify": "Where alerts go: none, claude-push, macos, command:<path>, slack:<url> or ntfy:<topic>.",
         "settings_desc_animation": "Fireworks and the big squirrel in the lane view: true or false.",
         "settings_desc_language": "The language Foragent uses with you: en or ko.",
+        "settings_desc_view_glyphs": "How the lane view draws its rows: auto picks for your terminal, emoji or ascii.",
         "settings_desc_max_parallel": "The most runs this computer does at once, across every repository.",
         "settings_desc_memory_pressure_limit": "The memory pressure at which no new run starts: warn or critical.",
         "settings_desc_log_retention_days": "Days to keep logs of merged runs, 1 to 365.",
@@ -34,7 +35,7 @@ MESSAGES = {
     "ko": {
         "settings_help": "팀, 나, 이 컴퓨터의 설정을 보고 바꿔요",
         "settings_list_help": "모든 설정을 범위, 값, 한 줄 설명과 함께 보여 줘요",
-        "settings_get_help": "설정 하나의 값을 보여 줘요",
+        "settings_get_help": "설정 하나의 값이나 지금 적용되는 모든 설정을 보여 줘요",
         "settings_set_help": "설정 하나를 그 범위의 파일에서 바꿔요",
         "settings_unset_help": "설정을 기본값으로 되돌려요",
         "settings_desc_review": "끝난 일을 사람이 얼마나 꼼꼼히 볼지 정해요: fast, batch, careful.",
@@ -45,6 +46,7 @@ MESSAGES = {
         "settings_desc_notify": "알림을 보낼 곳이에요: none, claude-push, macos, command:<경로>, slack:<URL>, ntfy:<주제>.",
         "settings_desc_animation": "레인 화면의 불꽃놀이와 큰 다람쥐를 보여 줄지 정해요: true 또는 false.",
         "settings_desc_language": "Foragent가 쓰는 언어예요: en 또는 ko.",
+        "settings_desc_view_glyphs": "레인 화면의 줄을 그리는 기호예요: auto는 터미널에 맞춰 고르고, emoji나 ascii로 정할 수 있어요.",
         "settings_desc_max_parallel": "이 컴퓨터가 모든 저장소를 합쳐 한 번에 돌리는 최대 작업 수예요.",
         "settings_desc_memory_pressure_limit": "새 작업을 시작하지 않는 메모리 압박 수준이에요: warn 또는 critical.",
         "settings_desc_log_retention_days": "머지된 작업의 로그를 남겨 두는 날 수예요. 1에서 365까지예요.",
