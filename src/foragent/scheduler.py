@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -103,9 +103,9 @@ def tick(ctx: TickContext) -> TickReport:
                 if not exc.is_rate_limit:
                     raise
                 return keep(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions))
-            # After this tick's starts (idle lanes are really idle); a due tidy asks for judgment only.
-            if request := timed("tidy_check", tidy.post_if_due, ctx.store):
+            if request := timed("tidy_check", tidy.post_if_due, ctx.store):  # After this tick's starts; asks only.
                 report.actions.append(f"Tidy due; inbox request {request['id']}")
+            orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language)  # Met role signals (#794).
             return keep(report)
 
 
