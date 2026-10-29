@@ -56,7 +56,7 @@ def test_get_without_key_prints_every_setting_nested_or_dotted(root, store, caps
     assert json.loads(get_all(root, capsys, "--json"))["claude_quota"]["mode"] == "burn"
     lines = get_all(root, capsys).splitlines()
     assert "claude_quota.mode burn" in lines and "max_parallel -" in lines and "always_human -" in lines
-    assert len(lines) == 12
+    assert len(lines) == 13 and "runner_unit_tests auto" in lines
 
 
 def test_live_team_change_asks_in_the_window_and_n_reverts(root, store):
@@ -239,3 +239,15 @@ def test_quota_save_shows_on_the_last_line_before_and_after_the_next_snapshot(ro
     refresh.config = "saved"
     refresh()
     assert seen == ["saved"], "later snapshots read the saved configuration"
+
+
+def test_runner_unit_tests_automatic_names_the_choice_that_applies(tmp_path):
+    from foragent import settings_runner
+
+    assert settings_runner.auto_text(tmp_path, "en") == "automatic (run all)"
+    workflow = tmp_path / ".github/workflows/ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("on: [pull_request]\njobs: {}\n", encoding="utf-8")
+    assert settings_runner.auto_text(tmp_path, "en") == "automatic (leave to CI)"
+    assert settings_runner.auto_text(tmp_path, "ko") == "자동 (CI에 맡기기)"
+    assert settings_runner.auto_text(None, "en") == "automatic (run all)"

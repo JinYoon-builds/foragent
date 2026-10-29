@@ -91,7 +91,7 @@ def review_label(config: Config) -> str:
     return _label(settings.BY_KEY["review"], config.review, config.language)
 
 
-def _value_text(setting, value: Any, store: Any, language: str) -> str:
+def _value_text(setting, value: Any, store: Any, language: str, repo_root: Path | None = None) -> str:
     from foragent import capacity, watch
 
     if setting.key == "max_parallel" and value is None:
@@ -99,6 +99,10 @@ def _value_text(setting, value: Any, store: Any, language: str) -> str:
         recorded = capacity.read_state(store) if store is not None else None
         count = int(recorded["parallel"]) if recorded else capacity.INITIAL_PARALLEL
         return watch.text("settings_window_auto", language, count=count)
+    if setting.key == "runner_unit_tests" and value == "auto":
+        from foragent import settings_runner
+
+        return settings_runner.auto_text(repo_root, language)
     return _label(setting, value, language)
 
 
@@ -157,7 +161,7 @@ def _parts(store: Any, config: Config, repo_root: Path | None, tab: str,
         value = _current(setting, config, store)
         if shown is not None and shown[0] == setting.key and index == selected:
             value = shown[1]
-        text = watch._clean(_value_text(setting, value, store, language))
+        text = watch._clean(_value_text(setting, value, store, language, repo_root))
         if index == selected and setting.key not in READ_ONLY:
             text = f"‹ {text} ›"
         cursor = "›" if index == selected and is_open(state) else " "
