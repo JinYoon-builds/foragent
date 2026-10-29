@@ -150,15 +150,42 @@ def test_help_line_lists_m(tmp_path):
     assert "m keep/burn" in rows[-2]
 
 
-def test_short_screen_joins_the_usage_line_onto_the_key_letters(tmp_path):
+def test_short_screen_keeps_keys_invite_and_usage_on_their_own_rows(tmp_path):
+    from foragent.watch_cells import _cells
+
     left = {"usage": {"codex": record(10, NOW + timedelta(hours=1))}}
-    short = help_section.render(snapshot(left), config(), tmp_path, now=NOW, short=True)
-    assert [[value for value, _ in row] for row in short] == [
-        ["All lanes idle with quota left — type /fa to order work"],
-        ["j/k move · Enter open · f fold · a all · o orchestrator · m keep/burn · x close · q quit · "
-         "Claude — · Codex 10% (10 min ago · " + (NOW + timedelta(hours=1)).astimezone().strftime("%H:%M")
-         + ") · running 0/2 · keep 80%"]]
-    assert usage.render(snapshot(left), config(), tmp_path, now=NOW, short=True) == []
+    lanes = {f"lane{index}": {} for index in range(30)}
+    snap = snapshot(left)
+    snap.status["lanes"] = {slug: {"slug": slug, "lane_display": slug, "state": "idle", "issue": None,
+                                   "title": None, "phase": None, "elapsed_seconds": None,
+                                   "last_activity_seconds": None, "queued": [], "running": [],
+                                   "waiting_for": []} for slug in lanes}
+    rows = render_frame(snap, config(lanes=lanes), tmp_path, width=80, now=NOW).splitlines()
+    reset = (NOW + timedelta(hours=1)).astimezone().strftime("%H:%M")
+    assert rows[-3:] == [
+        "j/k move · Enter open · f fold · a all · o orchestrator · m keep/burn · x close",
+        "All lanes idle with quota left — type /fa to order work",
+        f"Claude — · Codex 10% (10 min ago · {reset}) · running 0/2 · keep 80% · q quit"]
+    assert all(_cells(row) <= 80 for row in rows[-3:])
+
+
+@pytest.mark.parametrize("width", [20, 30, 44])
+def test_a_narrow_frame_wraps_the_footer_between_items_instead_of_losing_its_end(tmp_path, width):
+    from foragent.watch_cells import _cells
+
+    soon = NOW + timedelta(hours=1)
+    snap = snapshot({"usage": {"claude": record(6, soon), "codex": record(67, soon)},
+                     "memory": "critical", "running": 2, "budget": 3})
+    rows = [[value for value, _ in row]
+            for row in usage.render(snap, config(), tmp_path, now=NOW, width=width)]
+    text = [" ".join(row) for row in rows]
+    assert all(_cells(row) <= width for row in text)
+    joined = " ".join(text)
+    for item in ("Claude 6%", "Codex 67%", "memory critical", "running 2/3", "keep 80%",
+                 "All lanes idle with quota left"):
+        assert item in joined.replace("  ", " ") or all(word in joined for word in item.split())
+    assert text[-1].endswith("q quit")
+    assert len(text) > 2, "the line wrapped rather than being clipped"
 
 
 def test_usage_line_sits_under_help_and_above_the_separate_other_gates(tmp_path):
@@ -166,10 +193,10 @@ def test_usage_line_sits_under_help_and_above_the_separate_other_gates(tmp_path)
     snap.status["installed_gates"] = [{"repo": "o/other", "last_tick": None, "stale": False,
                                        "running_runs": 0, "current": False}]
     rows = render_frame(snap, config(), tmp_path, width=200, now=NOW).splitlines()
-    assert "q quit" in rows[-4] and rows[-3].startswith("Claude —")
+    assert "x close" in rows[-4] and rows[-3].startswith("Claude —") and rows[-3].endswith("q quit")
     assert rows[-2] == "" and "o/other" in rows[-1], "the other gates keep their own section"
     plain = render_frame(snapshot(), config(), tmp_path, width=200, now=NOW).splitlines()
-    assert "q quit" in plain[-2], "directly under the help line"
+    assert plain[-2].endswith("x close") and plain[-1].endswith("q quit"), "directly under the help line"
 
 
 def test_meter_without_a_machine_state_folder_counts_this_repository(tmp_path):

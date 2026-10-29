@@ -1,9 +1,9 @@
 """The usage line: plan usage per executor, memory, concurrency and the Claude mode (#115).
 
-It sits directly under the help line, so it is the frame's last line unless other gates
-are listed below it. With every lane idle and quota left,
-one invite line stands above it. On a short screen the help section joins the usage
-line onto its key letters (``lines``), so this section then draws nothing.
+It is the frame's last line, directly under the help line, and ends with the quit key;
+only the other gates' own section (when any) comes after it.
+With every lane idle and quota left, one invite line stands above it. Both stay on a
+short screen, and both wrap between items instead of losing their end to the frame width.
 """
 
 from datetime import datetime, timedelta
@@ -14,12 +14,11 @@ from foragent.config import Config
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
-ORDER = 65  # After the help line (60), before the other gates (70).
+ORDER = 65  # Directly under the help line (60).
 GAP = False  # Directly under the help line.
 GAP_AFTER = False  # A section after it follows directly, so the line costs one row...
-APART = ("gates",)  # ...except the other gates, which keep their own section.
+APART = ("gates",)  # ...except the other gates, which keep their own section below it.
 KEEP = True  # The usage line stays when the screen is short.
-SHORT = True  # Drawn again with short=True, when the help line carries it.
 
 EXECUTORS = (("claude", "Claude"), ("codex", "Codex"))
 
@@ -114,23 +113,41 @@ def _parts(snapshot: Snapshot, config: Config, context: dict[str, Any]) -> tuple
     return parts, left
 
 
-def lines(snapshot: Snapshot, config: Config, context: dict[str, Any]) -> tuple[str | None, str]:
-    """(the invite line or None, the usage line)."""
+def lines(snapshot: Snapshot, config: Config, context: dict[str, Any]) -> tuple[str | None, list[str]]:
+    """(the invite line or None, the usage line's items ending with the quit key)."""
     from foragent import watch
 
     parts, left = _parts(snapshot, config, context)
     # All lanes idle means no active runs, also in a repository without lanes.
     idle = not snapshot.status.get("active_runs")
     invite = watch.text("usage_idle_invite", config.language) if idle and left else None
-    return invite, " · ".join(parts)
+    return invite, [*parts, watch.text("usage_quit", config.language)]
+
+
+def _rows(parts: list[str], width: int) -> list[str]:
+    """Join the items with ' · ', starting a new row between items when the next would not fit."""
+    from foragent import watch
+
+    rows = [parts[0]]
+    for part in parts[1:]:
+        joined = f"{rows[-1]} · {part}"
+        if watch._cells(joined) <= width:
+            rows[-1] = joined
+        else:
+            rows.append(part)
+    return rows
 
 
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
     from foragent import watch
 
-    if context.get("short"):
-        return []  # The help line carries the usage line on a short screen.
-    return [watch._line(value) for value in lines(snapshot, config, context) if value]
+    width = context.get("width") or 120
+    invite, parts = lines(snapshot, config, context)
+    rows = watch._wrap(invite, width) if invite else []
+    # An item wider than the frame still wraps word by word rather than being clipped.
+    for row in _rows(parts, width):
+        rows += [watch._line(row)] if watch._cells(row) <= width else watch._wrap(row, width)
+    return rows
 
 
 def _initial() -> int:

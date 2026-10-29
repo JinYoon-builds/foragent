@@ -136,7 +136,7 @@ def test_window_shows_position_line_only_when_taller_than_the_screen(tmp_path):
     shown = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)).splitlines()
     assert state["scroll"] == len(full) - 11
     assert shown[:-1] == full[-11:], "F's own footer row is an ordinary row and scrolls with it"
-    assert full[-1].startswith("j/k 이동")
+    assert full[-2].startswith("j/k 이동") and full[-1].endswith("q 끝내기")
     assert shown[-1].startswith(f"{len(full) - 10}–{len(full)}/{len(full)}줄")
     small = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, height=200, state={}))
     assert "줄 ·" not in small and "Option" not in small
@@ -381,7 +381,7 @@ def test_footers_list_the_new_keys_from_their_own_feature_file(tmp_path):
     snapshot, config = lane_case()
     # The help line sits directly above the usage line (#115), the last row.
     assert watch.render_frame(snapshot, config, tmp_path, width=200).splitlines()[-2] == (
-        "1–1: 담당 보기 · j/k 이동 · Enter 열기 · f 접기 · a 모두 · o 오케스트레이터 · m keep/burn · x 닫기 · q 끝내기")
+        "1–1: 담당 보기 · j/k 이동 · Enter 열기 · f 접기 · a 모두 · o 오케스트레이터 · m keep/burn · x 닫기")
     assert "acorns_keys" in acorns.MESSAGES["en"]
     assert all("j/k move" not in value for module in (squirrel, shared)
                for table in module.MESSAGES.values() for value in table.values())

@@ -163,7 +163,8 @@ def _frame(
             if not lines:
                 continue
             kept = section.__name__.rsplit(".", 1)[-1] in apart
-            gap = bool(frame) and getattr(section, "GAP", True) and (not joined or kept)
+            # APART keeps the blank line even for a GAP = False section or after GAP_AFTER = False.
+            gap = bool(frame) and (kept or (getattr(section, "GAP", True) and not joined))
             joined = not getattr(section, "GAP_AFTER", True)
             apart = getattr(section, "APART", ())
             if wide and index == side and mark is not None and mark < len(frame):
