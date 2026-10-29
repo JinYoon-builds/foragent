@@ -5,6 +5,7 @@ The visible groups live in foragent/watch_sections/<name>.py; this module only
 discovers them, stacks them by ORDER and keeps the helpers they share.
 """
 
+from dataclasses import replace
 from datetime import datetime
 import importlib
 from pathlib import Path
@@ -134,11 +135,12 @@ def _frame(
     Mark = tuple[int, int, str | None]  # (row, issue number, its lane; None when not foldable)
     rendered: list[tuple[ModuleType, list[Line], list[Hit], list[Mark]]] = []
 
-    def draw(section: ModuleType, **extra: Any) -> tuple[ModuleType, list[Line], list[Hit], list[Mark]]:
+    def draw(section: ModuleType, *, drawn: Config | None = None,
+             **extra: Any) -> tuple[ModuleType, list[Line], list[Hit], list[Mark]]:
         # A section draws from row 0; its click areas and issue rows move with it below.
         own: list[Hit] = []
         marks: list[Mark] = []
-        lines = section.render(snapshot, config, repo_root, tick=tick, width=width, selected=selected,
+        lines = section.render(snapshot, drawn or config, repo_root, tick=tick, width=width, selected=selected,
                                now=now, layout=layout, top=0, hits=own, marks=marks, rows=True,
                                height=height, state=state, **extra)
         return section, list(lines), own, marks
@@ -179,12 +181,26 @@ def _frame(
             if wide and mark is None and rows_end < index < side:
                 mark = top
             frame += [[]] * gap + lines
+            if section is settings_window and state is not None and "settings_focus_rel" in state:
+                first, last = state["settings_focus_rel"]
+                state["settings_focus"] = (top + first, top + last)
             hits += [(x0, y0 + top, x1, y1 + top, target) for x0, y0, x1, y1, target in own]
             marks += [(y + top, number, lane) for y, number, lane in rows]
             if getattr(section, "STAYS", False):
                 stays.append((top, top + len(lines)))
         return frame, hits, marks
 
+    if settings_window.is_open(state):
+        # The open window: the header in its one-line form (no big squirrel), and the window
+        # within the screen rows the header and the help line leave, so neither scrolls away.
+        calm_config = replace(config, animation=False)
+        rendered = [draw(section, drawn=calm_config) if section.__name__.endswith(".squirrels") else item
+                    for item in rendered for section in item[:1]]
+        screen = state.get("height")
+        if screen is not None and screen >= watch.MIN_SCREEN:
+            index = next(index for index, (section, *_) in enumerate(rendered) if section is settings_window)
+            others = len(assemble()[0]) - len(rendered[index][1])
+            rendered[index] = draw(settings_window, room=max(1, screen - others))
     frame, hits, marks = assemble()
     if height is not None and len(frame) > height:
         # A folded lane's last finished row and toggle give way first.
@@ -255,7 +271,14 @@ def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width:
         state["scroll"] = 0
         return frame
     rows = height - 1
-    top = state["scroll"] = max(0, min(state.get("scroll", 0), watch.scroll_limit(state)))
+    top = state.get("scroll", 0)
+    focus = state.get("settings_focus") if state.get("settings") else None
+    if focus is not None:
+        # The open settings window ignores scroll keys: follow its selected row and the
+        # message, prompt and keys below it, keeping the row itself when all do not fit.
+        first, last = focus
+        top = min(first, max(top, last - rows))
+    top = state["scroll"] = max(0, min(top, watch.scroll_limit(state)))
     if layout is not None:
         layout["offset"] = top  # Screen row + offset = F row.
         layout["hits"] = [(x0, max(0, y0 - top), x1, min(rows, y1 - top), target)
@@ -280,6 +303,8 @@ def render_frame(
     """
     from foragent import watch
 
+    if height is not None and state is not None:
+        state["height"] = height  # The settings window fits itself to this screen.
     frame = watch._frame(
         snapshot, config, repo_root, tick=tick, width=max(1, width), selected=selected,
         now=now or snapshot.captured_at, **({} if layout is None else {"layout": layout}),

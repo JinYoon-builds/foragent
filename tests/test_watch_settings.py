@@ -134,7 +134,8 @@ def test_open_window_replaces_the_rows_between_header_and_help(root, store):
     handle_key("s", store, config, state=state, repo_root=root)
     opened = render_frame(snapshot, config, root, width=120, state=state)
     assert "👥 팀" in opened and "머지: 하나씩" not in opened.splitlines()[-1]
-    assert closed.splitlines()[0] == opened.splitlines()[0], "the header stays"
+    calm = render_frame(snapshot, replace(config, animation=False), root, width=120)
+    assert calm.splitlines()[0] == opened.splitlines()[0], "the header stays, in its one-line form"
     assert "Enter" in opened.splitlines()[-1] or any("Enter" in line for line in opened.splitlines()[-3:])
 
 
@@ -144,3 +145,97 @@ def test_personal_glyph_choice_wins_over_a_repository_auto(root):
     assert load_config(root).view_glyphs == "ascii"
     (root / ".foragent.yml").write_text("repo: owner/repo\nskill_libraries: []\nview_glyphs: emoji\n")
     assert load_config(root).view_glyphs == "emoji", "an explicit repository choice still wins"
+
+
+def test_get_json_reads_each_scope_from_its_own_file_with_the_quota_override(root, store, capsys):
+    (root / ".foragent.yml").write_text("repo: owner/repo\nskill_libraries: []\nanimation: true\n"
+                                        "claude_quota: {mode: keep}\n")
+    config_module.set_setting(root, "animation", "false", language="en")
+    config_module.set_setting(root, "claude_quota.mode", "burn", language="en")
+    values = json.loads(get_all(root, capsys, "--json"))
+    assert values["animation"] is False, "the me scope's own file, not the repository's value"
+    assert values["claude_quota"]["mode"] == "burn"
+    store.set_claude_quota_mode("keep")
+    assert json.loads(get_all(root, capsys, "--json"))["claude_quota"]["mode"] == "keep"
+
+
+def test_reviewer_cycles_claude_codex_unset_none_with_their_labels(root, store):
+    state = {}
+    press(["s", "down", "down", "down"], root, store, state)  # reviewer, unset in this repository
+    view = lambda: "\n".join(settings_view(store, load_config(root), root, "team", state))
+    assert "다른 도구가 리뷰" in view()
+    press(["right"], root, store, state)
+    assert "리뷰 안 함" in view()
+    press(["enter", "y"], root, store, state)
+    assert team(root)["reviewer"] == "none"
+    for expected in ("claude", "codex"):
+        press(["right", "enter", "y"], root, store, state)
+        assert team(root)["reviewer"] == expected
+    press(["right", "enter", "y"], root, store, state)
+    assert "reviewer" not in team(root), "unset clears the key"
+    assert "다른 도구가 리뷰" in view()
+
+
+def test_note_names_the_repository_even_when_it_matches_the_user_value(root, store):
+    (root / ".foragent.yml").write_text("repo: owner/repo\nskill_libraries: []\nlanguage: ko\n"
+                                        "animation: true\nview_glyphs: auto\n")
+    config_module.set_setting(root, "animation", "true", language="en")
+    config_module.set_setting(root, "view_glyphs", "ascii", language="en")
+    lines = settings_view(store, load_config(root), root, "me", {})
+    after = lambda label: lines[next(i for i, line in enumerate(lines) if label in line) + 1]
+    assert ".foragent.yml" in after("애니메이션"), "presence in .foragent.yml decides the note"
+    assert ".foragent.yml" not in after("화면 기호"), "a repository auto yields to the person's glyphs"
+
+
+def test_prompt_counts_unmapped_keys_as_n_but_not_timeouts_or_resizes():
+    from foragent.watch_terminal import window_key
+
+    names, not_keys = {ord("y"): "y"}, (-1, 410, 409)
+    assert window_key(ord(" "), names, True, not_keys) == "other"
+    assert window_key(ord(" "), names, False, not_keys) is None
+    assert window_key(ord("y"), names, True, not_keys) == "y"
+    assert all(window_key(key, names, True, not_keys) is None for key in not_keys)
+
+
+def test_short_screen_scrolls_to_the_selected_row_and_the_prompt(root, store):
+    snapshot, config = done_snapshot()
+    state = {"store": store}
+    press(["s", "down", "down", "down", "right", "enter"], root, store, state)
+    screen = render_frame(snapshot, load_config(root), root, width=80, height=12, state=state)
+    assert "› 리뷰어" in screen and "팀 전체에 적용돼요" in screen
+    press(["n", "up", "up", "up"], root, store, state)
+    screen = render_frame(snapshot, load_config(root), root, width=80, height=12, state=state)
+    assert "› 머지" in screen
+
+
+@pytest.mark.parametrize("width,height", [(80, 12), (40, 12), (80, 8)])
+def test_short_screen_keeps_header_tabs_prompt_and_help_around_the_window(root, store, width, height):
+    snapshot, _ = done_snapshot()
+    state = {"store": store}
+    press(["s", "down", "down", "down", "right", "enter"], root, store, state)
+    lines = render_frame(snapshot, load_config(root), root, width=width, height=height, state=state).splitlines()
+    assert len(lines) <= height
+    closed = render_frame(snapshot, replace(load_config(root), animation=False), root, width=width).splitlines()
+    assert lines[0] == closed[0], "the header stays first, in its one-line form"
+    assert lines[-1].startswith("1–2: 담당 보기"), "the help line stays last"
+    text = "\n".join(lines)
+    assert "팀" in text.split("\n")[2] and "› 리뷰어" in text and "팀 전체에 적용돼요" in text
+    assert "위에" in text and "더 있어요" in text, "the hidden rows are named"
+
+
+def test_quota_save_shows_on_the_last_line_before_and_after_the_next_snapshot(root, store):
+    from foragent.watch import _Refresh
+
+    snapshot, _ = done_snapshot()
+    snapshot.meter["mode"] = "keep"  # Read before the save.
+    state = {"store": store}
+    press(["s", "2", "right", "enter"], root, store, state)
+    assert load_config(root).claude_quota["mode"] == "burn"
+    handle_key("s", store, load_config(root), state=state, repo_root=root)
+    last = render_frame(snapshot, load_config(root), root, width=120, state=state).splitlines()[-1]
+    assert "burn" in last and "keep 80%" not in last
+    seen = []
+    refresh = _Refresh(seen.append, "old")
+    refresh.config = "saved"
+    refresh()
+    assert seen == ["saved"], "later snapshots read the saved configuration"

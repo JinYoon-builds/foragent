@@ -59,24 +59,26 @@ def _fresh(config: Config, repo_root: Path | None) -> Config:
         return config
 
 
+# The reviewer also cycles through unset (None: the other tool reviews), which no stored choice names.
+REVIEWER_CYCLE = ("claude", "codex", None, "none")
+
+
 def _choices(setting) -> tuple:
-    return setting.choices or ()
+    return REVIEWER_CYCLE if setting.key == "reviewer" else setting.choices or ()
 
 
 def _current(setting, config: Config, store: Any) -> Any:
     from foragent import settings
 
-    value = settings.effective_value(setting, config, store)
-    if setting.key == "reviewer" and value is None:
-        return "none"
-    return value
+    return settings.effective_value(setting, config, store)
 
 
 def _label(setting, value: Any, language: str) -> str:
     from foragent import settings, watch
     from foragent.i18n import MESSAGES
 
-    key = f"settings_window_value_{setting.key}_{settings.plain(value)}"
+    word = "unset" if value is None else settings.plain(value)
+    key = f"settings_window_value_{setting.key}_{word}"
     if key in MESSAGES.get(language, MESSAGES["en"]):
         return watch.text(key, language)
     return settings.plain(value)
@@ -100,8 +102,9 @@ def _value_text(setting, value: Any, store: Any, language: str) -> str:
     return _label(setting, value, language)
 
 
-def _note(setting, config: Config, store: Any, repo_root: Path | None, language: str) -> str | None:
-    """Where a me-tab value comes from when a higher-priority place overrides the user config."""
+def _note(setting, store: Any, repo_root: Path | None, language: str) -> str | None:
+    """Where a me-tab value comes from when a higher-priority place sets it: the local
+    override, else .foragent.yml. Decided by where the key is set, not by comparing values."""
     from foragent import settings, watch
 
     if setting.scope != "me":
@@ -111,12 +114,19 @@ def _note(setting, config: Config, store: Any, repo_root: Path | None, language:
     if repo_root is None:
         return None
     try:
-        mine = settings.value_in(setting, settings._yaml_file(settings.config_module._global_path(), language))
+        team = settings._yaml_file(settings._team_path(repo_root), language)
+        mine = settings._yaml_file(settings.config_module._global_path(), language)
     except ConfigError:
         return None
-    if settings.effective_value(setting, config) == mine:
-        return None
-    return watch.text("settings_window_from_team", language)
+    if setting.key == "claude_quota.mode":
+        quota = team.get("claude_quota")
+        found = isinstance(quota, dict) and "mode" in quota
+    else:
+        found = setting.key in team
+    if setting.key == "view_glyphs" and team.get("view_glyphs") == "auto" \
+            and mine.get("view_glyphs") in ("emoji", "ascii"):
+        found = False  # A repository auto makes no choice; the person's own glyphs apply (load_config).
+    return watch.text("settings_window_from_team", language) if found else None
 
 
 def _tabs(tab: str, config: Config) -> str:
@@ -130,13 +140,11 @@ def _tabs(tab: str, config: Config) -> str:
     return "  ".join(names)
 
 
-def settings_view(store: Any, config: Config, repo_root: Path | None, tab: str = "team",
-                  state: dict[str, Any] | None = None) -> list[str]:
-    """The window's text rows for one tab: the tab line, one row per setting with its value
-    and #160's one-line description, then the message, the confirmation and the keys."""
-    from foragent import settings, watch
+def _parts(store: Any, config: Config, repo_root: Path | None, tab: str,
+           state: dict[str, Any]) -> tuple[list[str], list[list[str]], int, list[str]]:
+    """(the tab line, one group of lines per setting, the selected group, the closing lines)."""
+    from foragent import watch
 
-    state = state or {}
     language = config.language
     config = _fresh(config, repo_root)
     rows = _settings(tab)
@@ -144,7 +152,7 @@ def settings_view(store: Any, config: Config, repo_root: Path | None, tab: str =
     shown = state.get("settings_shown")
     labels = [watch.text(f"settings_window_label_{setting.key}", language) for setting in rows]
     width = max(watch._cells(label) for label in labels)
-    lines = [_tabs(tab, config), ""]
+    groups = []
     for index, (setting, label) in enumerate(zip(rows, labels)):
         value = _current(setting, config, store)
         if shown is not None and shown[0] == setting.key and index == selected:
@@ -155,17 +163,26 @@ def settings_view(store: Any, config: Config, repo_root: Path | None, tab: str =
         cursor = "›" if index == selected and is_open(state) else " "
         pad = " " * (width - watch._cells(label))
         description = watch.text(f"settings_desc_{setting.key}", language)
-        lines.append(f"{cursor} {label}{pad}  {text}  — {description}")
-        note = _note(setting, config, store, repo_root, language)
+        group = [f"{cursor} {label}{pad}  {text}  — {description}"]
+        note = _note(setting, store, repo_root, language)
         if note:
-            lines.append(f"  {' ' * width}  {note}")
-    lines.append("")
+            group.append(f"  {' ' * width}  {note}")
+        groups.append(group)
+    closing = []
     if state.get("settings_prompt") is not None:
-        lines.append(watch.text("settings_window_confirm", language))
+        closing.append(watch.text("settings_window_confirm", language))
     elif state.get("settings_message"):
-        lines.append(state["settings_message"])
-    lines.append(watch.text("settings_window_keys", language))
-    return lines
+        closing.append(state["settings_message"])
+    closing.append(watch.text("settings_window_keys", language))
+    return [_tabs(tab, config)], groups, selected, closing
+
+
+def settings_view(store: Any, config: Config, repo_root: Path | None, tab: str = "team",
+                  state: dict[str, Any] | None = None) -> list[str]:
+    """The window's text rows for one tab: the tab line, one row per setting with its value
+    and #160's one-line description, then the message, the confirmation and the keys."""
+    tabs, groups, _, closing = _parts(store, config, repo_root, tab, state or {})
+    return [*tabs, "", *(line for group in groups for line in group), "", *closing]
 
 
 def open_window(state: dict[str, Any]) -> None:
@@ -177,7 +194,8 @@ def _reset(state: dict[str, Any]) -> None:
     state.update(settings_shown=None, settings_prompt=None, settings_message=None)
 
 
-def _save(state: dict[str, Any], repo_root: Path | None, key: str, raw: str, language: str) -> None:
+def _save(state: dict[str, Any], repo_root: Path | None, key: str, raw: str | None, language: str) -> None:
+    """Save through config.set_setting; raw None clears the key (the reviewer's unset)."""
     from foragent import config as config_module
     from foragent import watch
 
@@ -186,7 +204,7 @@ def _save(state: dict[str, Any], repo_root: Path | None, key: str, raw: str, lan
         state["settings_message"] = watch.text("settings_window_no_repo", language)
         return
     try:
-        config_module.set_setting(repo_root, key, raw, language=language)
+        config_module.set_setting(repo_root, key, raw, unset=raw is None, language=language)
     except ConfigError as exc:
         state["settings_message"] = " ".join(str(exc).split())
         return
@@ -205,6 +223,8 @@ def handle(key: str, store: Any, config: Config, state: dict[str, Any], repo_roo
         # The team confirmation: y saves; any other key leaves it unsaved.
         if key in ("y", "Y"):
             _save(state, repo_root, *prompt, language)
+            if state.get("config_changed") and store is not None:
+                _show_mode(state, store, _fresh(config, repo_root))
         else:
             _reset(state)
         return
@@ -242,7 +262,7 @@ def handle(key: str, store: Any, config: Config, state: dict[str, Any], repo_roo
             return
         if value == current:
             return  # Nothing changed: nothing to save.
-        raw = settings.raw(value)
+        raw = None if value is None else settings.raw(value)
         if setting.scope == "team":
             if confirm is None:
                 state["settings_prompt"] = (setting.key, raw)
@@ -251,6 +271,17 @@ def handle(key: str, store: Any, config: Config, state: dict[str, Any], repo_roo
                 _reset(state)
                 return
         _save(state, repo_root, setting.key, raw, language)
+        if state.get("config_changed") and store is not None:
+            _show_mode(state, store, _fresh(config, repo_root))
+
+
+def _show_mode(state: dict[str, Any], store: Any, config: Config) -> None:
+    """The effective quota mode after a save; the usage line shows it before the next snapshot."""
+    from datetime import UTC, datetime
+
+    from foragent import scheduler_quota
+
+    state["quota_mode"] = (scheduler_quota.quota_mode(store, config)[0], datetime.now(UTC))
 
 
 def _row(row: str, width: int, style: str) -> list[Line]:
@@ -268,16 +299,54 @@ def _row(row: str, width: int, style: str) -> list[Line]:
 
 
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
+    """The window within ``room`` rows (the screen left between the header and the help line).
+
+    The tab line and the closing lines (message or confirmation, then the keys) always show;
+    the setting rows around the selected one fill what is left, with one line naming how
+    many rows are above and below. Without ``room`` every row shows.
+    """
     from foragent import watch
 
     state = context.get("state")
     if not is_open(state):
         return []
-    width = context.get("width") or 120
-    rows = settings_view(state.get("store"), config, repo_root, state.get("settings_tab", "team"), state)
-    lines: list[Line] = []
-    for index, row in enumerate(rows):
-        style = ("bold" if index == 0 or row.startswith("›") else "dim" if index == len(rows) - 1
-                 else "yellow" if index == len(rows) - 2 and state.get("settings_prompt") is not None else "")
-        lines += _row(row, width, style)
+    width, room = context.get("width") or 120, context.get("room")
+    tabs, groups, selected, closing = _parts(state.get("store"), config, repo_root,
+                                             state.get("settings_tab", "team"), state)
+    prompting = state.get("settings_prompt") is not None
+    wrap = lambda rows, style="": [line for row in rows for line in _row(row, width, style)]
+    head = wrap(tabs, "bold")
+    tail = [*wrap(closing[:-1], "yellow" if prompting else ""), *wrap(closing[-1:], "dim")]
+    bodies = [wrap(group, "bold" if index == selected else "") for index, group in enumerate(groups)]
+    spacer: list[Line] = [[]]
+    total = sum(map(len, bodies))
+    if room is not None and len(head) + len(tail) + 2 + total > room:
+        spacer = []  # Short screen: the blank lines around the rows give way first.
+    available = None if room is None else room - len(head) - len(tail) - 2 * len(spacer)
+    first = last = selected
+    if available is None or total <= available:
+        first, last = 0, len(bodies) - 1
+    else:
+        available -= 1  # One line names the hidden rows.
+        used = len(bodies[selected])
+        grown = True
+        while grown:
+            grown = False
+            for candidate in (last + 1, first - 1):
+                if 0 <= candidate < len(bodies) and used + len(bodies[candidate]) <= available:
+                    used += len(bodies[candidate])
+                    first, last = min(first, candidate), max(last, candidate)
+                    grown = True
+    shown = [line for body in bodies[first:last + 1] for line in body]
+    if available is not None and len(shown) > available:
+        shown = shown[:max(1, available)]  # The selected row alone is too tall: keep its start.
+    lines = [*head, *spacer]
+    focus = len(lines) + sum(map(len, bodies[first:selected]))
+    lines += shown
+    if first > 0 or last < len(bodies) - 1:
+        lines.append(watch._line(watch.text("settings_window_more", config.language,
+                                            above=first, below=len(bodies) - 1 - last), "dim"))
+    lines += [*spacer, *tail]
+    # From the selected row through the keys: _window keeps these on a screen still too short.
+    state["settings_focus_rel"] = (focus, len(lines))
     return lines
