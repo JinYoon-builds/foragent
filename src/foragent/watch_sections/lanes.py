@@ -14,6 +14,7 @@ from foragent.status import _age
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 from foragent.watch_layout import _clones
+from foragent import watch_dream as dream
 
 ORDER = 5
 GAP = False  # The rows follow the one-line header directly.
@@ -259,7 +260,7 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
             count = (snapshot.today_done.get(slug, 0) if snapshot.today_done is not None
                      else len(snapshot.done.get(slug, [])))
             rest = "✓ " + watch.text("done_state_lane_done", language, count=count) if count else ""
-            rows.append({"glyph": glyphs["idle"], "lane": name, "rest": rest})
+            rows.append(dream.idle_row(row, glyphs["idle"], glyph_mode(config), rest, language))
             hideable = len(finished)
             if is_open:
                 rows += [_finished_row(snapshot, config, issue, name, glyphs) for issue in finished]
