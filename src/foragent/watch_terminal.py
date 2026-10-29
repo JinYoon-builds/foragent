@@ -86,7 +86,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     if store is not None:
         view_state["store"] = store
     keys = {curses.KEY_DOWN: "down", curses.KEY_UP: "up", curses.KEY_NPAGE: "pagedown",
-            curses.KEY_PPAGE: "pageup", 27: "esc", **{ord(key): key for key in "jkfaoxqQ"}}
+            curses.KEY_PPAGE: "pageup", 27: "esc", **{ord(key): key for key in "jkfaomxqQ"}}
     with ExitStack() as cleanup:
         worker = cleanup.enter_context(watch.ThreadPoolExecutor(max_workers=1))
         while True:

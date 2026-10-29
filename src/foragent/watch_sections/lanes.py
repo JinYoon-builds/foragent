@@ -14,7 +14,7 @@ from foragent.status import _age
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 from foragent.watch_layout import _clones
-from foragent.watch_sections import dream
+from foragent import watch_dream as dream
 
 ORDER = 5
 GAP = False  # The rows follow the one-line header directly.
