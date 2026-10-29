@@ -57,7 +57,7 @@ class StateBase:
     def _run_value(self, run: "Run") -> dict[str, Any]:
         """A run's fields merged over the unknown fields its file holds on disk."""
         try:
-            saved = _state.json.loads((self.root / "runs" / f"{run.number}.json").read_text(encoding="utf-8"))
+            saved = _state.json.loads(self._run_path(run).read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError):
             saved = {}
         return _state.write_back(type(run), saved, _state.asdict(run))
@@ -65,8 +65,59 @@ class StateBase:
     def _write_run(self, run: "Run", value: dict[str, Any] | None = None) -> dict[str, Any]:
         """The one writer of run files; unknown fields always survive."""
         value = self._run_value(run) if value is None else value
-        self._write_json(self.root / "runs" / f"{run.number}.json", value)
+        self._write_json(self._run_path(run), value)
         return value
+
+    def _run_path(self, run: "Run") -> Path:
+        """runs/<n>.json for an issue run; runs/dream-<lane>.json for a lane's dream run."""
+        name = f"dream-{run.lane}" if run.kind == "dream" else str(run.number)
+        return self.root / "runs" / f"{name}.json"
+
+    def get_dream(self, lane: str) -> "Run | None":
+        """A lane's dream run record; it never enters runs.jsonl (that history is issue-only)."""
+        try:
+            value = (self.root / "runs" / f"dream-{lane}.json").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        return _state.load_record(_state.Run, _state.json.loads(value))
+
+    def dream_runs(self) -> list["Run"]:
+        """Every lane's dream record, running or finished (runs/dream-<lane>.json)."""
+        paths = sorted((self.root / "runs").glob("dream-*.json"))
+        return [run for path in paths if (run := self.get_dream(path.stem[6:])) is not None]
+
+    def start_dream(self, lane: str, *, worktree: str | Path, under_machine_lock: bool = False) -> "Run":
+        """Write a fresh dream record.
+
+        ``under_machine_lock``: as prepare_run_start's reservation, the tick writes it while
+        holding the machine lock alone (one lock at a time, the order `fa orch facts` relies on).
+        A new dream record has no other writer then: the tick lock admits one tick, and an
+        earlier worker of the lane finished its record as its last act.
+        """
+        if not under_machine_lock:
+            with self._state_lock():
+                return self.start_dream(lane, worktree=worktree, under_machine_lock=True)
+        # A fresh record, as start_run's for an issue: no earlier birth identity may judge this
+        # dream's worker. The lane does not dream while an earlier dream still owns processes.
+        timestamp = self._timestamp()
+        run = _state.Run(0, f"foragent/dream-{lane}", str(worktree), None, timestamp, timestamp,
+                         lane=lane, tier="s", last_activity_at=timestamp, kind="dream")
+        self._write_json(self.root / "runs" / f"dream-{lane}.json", _state.asdict(run))
+        return run
+
+    def finish_dream(self, lane: str, outcome: str, detail: str = "") -> "Run | None":
+        with self._state_lock():
+            run = self.get_dream(lane)
+            if run is None or run.status == "finished":
+                return run
+            from foragent.processes import observe_tree
+
+            # As finish_run: observe the recorded tree once more, so its descendants stay owned.
+            finished = _state.replace(run, status="finished", outcome=outcome,
+                                      detail=" ".join(detail.split())[:500] or f"Run finished with outcome {outcome}.",
+                                      process_identities=observe_tree(run.process_identities))
+            self._write_run(finished, {**self._run_value(finished), "finished_at": self._timestamp()})
+            return finished
 
     def worktree_path(self, number: int) -> Path:
         return self.root / "worktrees" / f"issue-{number}"

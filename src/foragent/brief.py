@@ -108,7 +108,7 @@ def _to_see(status: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _team(store: StateStore, config: Config) -> list[dict[str, Any]]:
     used: dict[str, list[str]] = {}
-    for run in [*store.read_history(), *store.active_runs()]:
+    for run in [*store.read_history(), *(run for run in store.active_runs() if run.kind == "issue")]:
         names = used.setdefault(run.lane, [])
         names.extend(name for name in run.skills_used if name not in names)
     slugs = list(config.lanes)

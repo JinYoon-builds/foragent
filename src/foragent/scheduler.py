@@ -11,13 +11,14 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, launchd, orch_github, orch_plan, orch_push, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_spawn, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
+from foragent.orch_dream import DREAM_EVERY_MERGES, dream_due  # noqa: F401
 from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import current_snapshot, kill_process_group, runner_commands_exist
@@ -45,7 +46,7 @@ class TickContext:
     config: Config
     git: GitRepo
     now: Callable[[], datetime]
-    launcher: Callable[[int], int | None]
+    launcher: Callable[..., int | None]  # (number) for an issue; (kind="dream", lane=...) for a dream.
     start_runs: bool = True
     runner_process_exists: Callable[[int], bool] = runner_process_exists
     kill_runner: Callable[[int], None] = kill_process_group
@@ -62,8 +63,7 @@ class TickReport:
     actions: list[str] = field(default_factory=list)
 
 
-# Preserve the original facade bindings for callers and monkeypatches.
-# Split modules call each other through this module, so patches here reach them.
+# Facade bindings for callers and monkeypatches; split modules call each other through here.
 from foragent.scheduler_approval import _check_integrity, _invalidate_approval, _latest_approval, _snapshot  # noqa: E402
 from foragent.scheduler_recovery import (  # noqa: E402
     _crash_detail, _kill_executor, _kill_run, _local_issue, _recover_orphan, _recover_runs, _remove_run_worktree,
@@ -115,9 +115,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     timed("fetch_base", fetch_base, ctx)  # Also applies origin's committed .foragent.yml for fa gate tick.
     base_ref = f"origin/{ctx.config.base_branch}"
     with step("github_refresh"):
-        # A listing taken this tick can confirm remembered per-issue reads.
-        # A periodic tick starts within process start-up jitter of its nominal 300 s
-        # cadence, and its refresh is stamped with its start; it is the next refresh tick.
+        # A listing taken this tick can confirm remembered per-issue reads. A periodic tick starts within
+        # start-up jitter of its nominal 300 s cadence; stamped with its start, it is the next refresh tick.
         listing_current = (ctx.store.issues_refresh_due(started + TICK_JITTER)
                            or bool(ctx.store.github_outbox()))
         if listing_current:
@@ -235,16 +234,17 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     if not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         timed("machine_budget", _machine_budget, ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
+    dreams = timed("dream_check", orch_dream.startable, ctx, sample)  # Worker demand like a ready issue.
     if not ready:
-        timed("machine_budget", _machine_budget, ctx, ready, sample)
+        orch_dream.start(ctx, dreams, timed("machine_budget", _machine_budget, ctx, ready, sample), report)
         _reopen_view(ctx, report)
         return report
 
-    with step("start_ready"):
-        # A lane's local queue picks the order; startability was already checked above.
+    with step("start_ready"):  # A lane's local queue picks the order; startability was checked above.
         ready = {lane: orch_queue.ordered(ctx.store, lane, numbers) for lane, numbers in ready.items()}
         started = _start_ready(ctx, ready, lane_for, base_ref, report, sample)
     if started is None:
         return report
+    orch_dream.start(ctx, dreams, ctx._tick_budget, report)  # Only a slot the ready issues left free.
     _reopen_view(ctx, report)
     return report
