@@ -162,11 +162,13 @@ def test_short_screen_keeps_keys_invite_and_usage_on_their_own_rows(tmp_path):
                                    "waiting_for": []} for slug in lanes}
     rows = render_frame(snap, config(lanes=lanes), tmp_path, width=80, now=NOW).splitlines()
     reset = (NOW + timedelta(hours=1)).astimezone().strftime("%H:%M")
-    assert rows[-3:] == [
+    # The merge setting (#173) makes the usage line wrap between items onto a second row.
+    assert rows[-4:] == [
         "j/k move · Enter open · f fold · a all · o orchestrator · m keep/burn · x close",
         "All lanes idle with quota left — type /fa to order work",
-        f"Claude — · Codex 10% (10 min ago · {reset}) · running 0/2 · keep 80% · q quit"]
-    assert all(_cells(row) <= 80 for row in rows[-3:])
+        f"Claude — · Codex 10% (10 min ago · {reset}) · running 0/2 · keep 80%",
+        "merge: batch · q quit"]
+    assert all(_cells(row) <= 80 for row in rows[-4:])
 
 
 @pytest.mark.parametrize("width", [20, 30, 44])

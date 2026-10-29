@@ -449,9 +449,16 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
     _overlay(values, global_values)
     local = _read_yaml(local_path)
     _overlay(values, local)
+    _personal_glyphs(values, global_values)
     _apply_executors(values, global_values, local)
     _validate(values)
     return Config(**values)
+
+
+def _personal_glyphs(values: dict[str, Any], global_values: dict[str, Any]) -> None:
+    """A repository's view_glyphs auto makes no choice, so a person's own emoji or ascii applies (#173)."""
+    if values.get("view_glyphs") == "auto" and global_values.get("view_glyphs") in ("emoji", "ascii"):
+        values["view_glyphs"] = global_values["view_glyphs"]
 
 
 def _file_executors(source: dict[str, Any]) -> tuple[bool, Any]:
@@ -518,6 +525,7 @@ def load_committed_config(local: Config, content: str | None, source: str,
         global_values = _read_yaml(global_path) if global_path.exists() else {}
         _overlay(values, global_values)
         _overlay(values, committed)
+        _personal_glyphs(values, global_values)
         _apply_executors(values, global_values, committed)
         # A language change is not a conflict worth a warning; repo and base_branch are.
         ignored = [key for key in ("repo", "base_branch") if key in committed and values[key] != getattr(local, key)]
@@ -630,6 +638,17 @@ def set_profile(repo_root: Path, *, kind: str, stage: str, priority: str) -> dic
     local["profile"] = profile
     path.write_text(yaml.safe_dump(local, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return profile
+
+
+def set_setting(repo_root: Path, key: str, raw: str | None, *, unset: bool = False,
+                language: str = "en") -> dict[str, Any]:
+    """Change one `fa settings` setting in the file its scope owns.
+
+    The one writer that `fa settings set` and the lane view's settings window share.
+    """
+    from foragent import settings_write
+
+    return settings_write.set_value(repo_root, key, raw, unset=unset, language=language)
 
 
 def resolved_reviewer(config: Config) -> str:

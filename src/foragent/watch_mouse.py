@@ -8,7 +8,9 @@ open box's number (or None), ``scroll`` the zero-based first visible frame row,
 dependencies resolve through foragent.watch to preserve its patch points.
 """
 
+from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from foragent import orch_inbox
@@ -112,20 +114,27 @@ def toggle_lane(state: dict[str, Any], slug: str) -> None:
     state["unfolded"] = unfolded
 
 
-def handle_key(key: str, store: StateStore, config: Config, *, state: dict[str, Any] | None = None) -> bool:
+def handle_key(key: str, store: StateStore | None, config: Config, *, state: dict[str, Any] | None = None,
+               repo_root: Path | None = None, confirm: Callable[[str], bool] | None = None) -> bool:
     """Act on one key name; True asks the view to quit.
 
     j/k (and the arrows) move one row, Enter opens the highlighted row's box, f folds
     its lane, a unfolds every lane when any is folded (else folds all), o switches to
     the orchestrator, m flips the Claude quota mode (keep/burn), x or Esc closes the box (Esc quits when none is open). While a
-    box is open, Enter, f, a and m do nothing.
+    box is open, Enter, f, a, m and s do nothing. s opens the settings window (#173); while it is
+    open it takes every key but q and m. ``confirm(message)`` approves a team change; without it the
+    window asks y/n itself. ``repo_root`` is where the window saves.
     """
     from foragent import watch
+    from foragent.watch_sections import settings as settings_window
 
     state = {} if state is None else state
     is_open = state.get("issue") is not None
     if key in ("q", "Q"):
         return True
+    if settings_window.is_open(state) and not (key == "m" and state.get("settings_prompt") is None):
+        settings_window.handle(key, store, config, state, repo_root, confirm)
+        return False
     if key == "esc":
         if not is_open:
             return True
@@ -143,9 +152,14 @@ def handle_key(key: str, store: StateStore, config: Config, *, state: dict[str, 
         watch.switch_to_orchestrator(store)
     elif is_open:
         pass
+    elif key == "s":
+        settings_window.open_window(state)
     elif key == "m":
         # The same flip as `fa quota mode`: from the effective mode to the other one.
         from foragent import scheduler_quota
+
+        if store is None:
+            return False  # No repository state to hold the override.
 
         mode = "burn" if scheduler_quota.quota_mode(store, config)[0] == "keep" else "keep"
         store.set_claude_quota_mode(mode)
