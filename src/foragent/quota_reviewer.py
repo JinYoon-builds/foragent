@@ -106,21 +106,47 @@ def stored_config(store: StateStore, config: Config, run, now: datetime) -> Conf
 def review_moved(n: int, ctx):
     """``ctx`` for a review launching now: a reviewer at a hard limit moves to the run's own executor.
 
-    The review never waits for it (#186); the move is journaled as a same-model review (reason limit).
+    The review never waits for it (#186). The move is journaled as a same-model review (reason
+    limit) once per run: a later round of the same run finds the event and adds none.
     """
-    from foragent.orch_events import append_event
+    from foragent.orch_events import append_event, has_event
 
     config, now = ctx.config, ctx.now()
     reviewer, executor = resolved_reviewer(config), config.executor
-    if getattr(ctx.store.get_run(n), "executor", None) is None:
+    run = ctx.store.get_run(n)
+    if getattr(run, "executor", None) is None:
         return ctx  # A record from before #186 keeps the old derivation (legacy_config).
     if reviewer in ("none", executor) or not scheduler_quota.hard_limited(ctx.store, config, reviewer, now):
         return ctx
     moved = executor if can_review(config, executor) else None
-    if moved is not None:
+    if moved is not None and not has_event(ctx.store, n, "same-model-review", run=run.started_at):
         append_event(ctx.store, now, n, "same-model-review", f"#{n} {executor} reviews its own work: limit",
-                     executor=executor, reason="limit")
+                     executor=executor, reason="limit", run=run.started_at)
     return replace(ctx, config=pair_config(config, executor, moved))
+
+
+def reviewer_limited(n: int, ctx, name: str) -> bool:
+    """Whether a review session of ``name`` must move instead of launching (``review_moved``)."""
+    if name == ctx.config.executor or getattr(ctx.store.get_run(n), "executor", None) is None:
+        return False
+    return scheduler_quota.hard_limited(ctx.store, ctx.config, name, ctx.now())
+
+
+def moving_review(review):
+    """Run ``review`` with the reviewer it may use now; one that reaches its limit during the
+    review's preparation (``ReviewerLimited`` at launch) reruns once on the run's own executor."""
+    from functools import wraps
+
+    from foragent.run_attempt import ReviewerLimited
+
+    @wraps(review)
+    def run(n: int, ctx, *args, **kwargs):
+        try:
+            return review(n, review_moved(n, ctx), *args, **kwargs)
+        except ReviewerLimited:
+            return review(n, review_moved(n, ctx), *args, **kwargs)
+
+    return run
 
 
 def legacy_config(store: StateStore, config: Config, implementer: str | None, now: datetime) -> Config:

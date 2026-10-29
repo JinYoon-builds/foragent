@@ -431,3 +431,27 @@ def test_runner_moves_claude_review_to_codex_while_claude_is_paused(monkeypatch,
     monkeypatch.setattr(runner, "observe_tree", lambda roots: [])
     runner.run_issue(1, context)
     assert (seen[0].executor, seen[0].reviewer, seen[0].reviewer_model) == ("codex", "codex", None)
+
+
+def test_queued_github_limit_during_start_stores_the_pair_and_its_switch(ctx, monkeypatch):
+    """#186: a label write the RecordingTracker only queued (no raise) still stores the pair and its switch."""
+    from foragent import board
+
+    ctx.config = replace(ctx.config, executor="claude")
+    ctx.start_runs = True
+    usage(ctx.store, 85.0)
+    approve(ctx, 1)
+    until = NOW + timedelta(minutes=5)
+
+    def queued(context, issue, status, **kwargs):
+        if status == "Running":  # The outbox queued the write and noted the GitHub pause.
+            (ctx.store.root / "github-pause.json").write_text(json.dumps({"until": until.isoformat()}))
+
+    monkeypatch.setattr(board, "sync_status", queued)
+    report = tick(ctx)
+    run = ctx.store.get_run(1)
+    assert report.skipped == f"GitHub rate limit until {until.isoformat()}"
+    assert (run.outcome, run.executor, run.reviewer) == ("limit-wait", "codex", "claude")
+    [event] = [event for event in events(ctx.store) if event["kind"] == "executor-switch"]
+    assert (event["from"], event["to"]) == ("claude", "codex")
+    assert not ctx.store.run_start_pending(1), "the reservation is released like the raising path"

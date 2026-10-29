@@ -17,7 +17,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import orch_events, orch_reviewers, review_notes, review_perspectives, risks
+from foragent import orch_events, orch_reviewers, quota_reviewer, review_notes, review_perspectives, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -159,12 +159,13 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
             path.chmod(mode)
 
 
+@quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
-    from foragent import quota_reviewer, runner
+    from foragent import runner
 
     _phase(n, ctx, "reviewing")
-    reviewer = resolved_reviewer((ctx := quota_reviewer.review_moved(n, ctx)).config)  # Late limits move it (#186).
+    reviewer = resolved_reviewer(ctx.config)
     options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
     if reviewer == "claude" and pr is not None:
         options["review_pr"] = pr
@@ -187,8 +188,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
         before = git.review_state()
         try:
             result = _available_executor(
-                n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
-                reviewer=True,
+                n, ctx, ctx.executor_factory(reviewer), worktree=git.root, reviewer=True,
                 prompt="" if reviewer == "claude" else build_review_prompt(
                     parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
                     full_text_dir=cuts.issue_dir(ctx.store.root, n),

@@ -27,7 +27,7 @@ DEFAULTS: dict[str, int | None] = {item.name: item.default for item in fields(Co
 @dataclass(frozen=True)
 class MachineBudget:
     values: dict[str, int | None]
-    sources: dict[str, str]  # machine, default or invalid
+    sources: dict[str, str]  # machine, settings, default or invalid
     unknown_keys: list[str] = field(default_factory=list)
 
     def report(self) -> dict[str, Any]:
@@ -52,6 +52,18 @@ def _valid(value: Any) -> bool:
 
 
 def read() -> MachineBudget:
+    """Read machine.yml now, then let `fa settings`' machine max_parallel win (source ``settings``)."""
+    from foragent import settings
+
+    budget = _read_file()
+    cap = settings.read_machine().get("max_parallel")
+    if cap is None:
+        return budget
+    return MachineBudget({**budget.values, "max_parallel": cap},
+                         {**budget.sources, "max_parallel": "settings"}, budget.unknown_keys)
+
+
+def _read_file() -> MachineBudget:
     """Read machine.yml now; invalid keys use defaults, unknown keys are ignored."""
     values, sources = dict(DEFAULTS), dict.fromkeys(KEYS, "default")
     try:

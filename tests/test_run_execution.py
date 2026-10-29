@@ -401,3 +401,36 @@ def test_undelivered_feedback_survives_an_executor_error(run_case):
     assert run.resume_reason.startswith(pending + "\n\nExecutor exit_code=1") and run.resume_whole
     c.store.finish_run(1, "executor-error")
     c.tracker.remove_labels(1, ["running"])
+
+
+def test_reviewer_limited_during_review_preparation_moves_to_the_worker_once(run_case):
+    """#186: the stored reviewer hits its limit after the review began preparing; the launch moves it to
+    the run's own executor instead of limit-wait, and a later round adds no second same-model event."""
+    import json as _json
+
+    from foragent.config import resolved_reviewer
+    from foragent.quota_reviewer import moving_review
+    from foragent.run_execution import _available_executor
+
+    c = run_case
+    codex_calls = enable_reviewer(c, [])
+    c.executor.steps = [{}, {}]
+    c.store.update_run(1, executor="claude", reviewer="codex")  # The pair the tick stored.
+    reviewers = []
+
+    @moving_review
+    def review(n, ctx):
+        reviewers.append(resolved_reviewer(ctx.config))
+        c.store.pause_executor("codex", c.now[0] + timedelta(hours=1))  # The limit hits while preparing.
+        return _available_executor(n, ctx, ctx.executor_factory(reviewers[-1]), reviewer=True, prompt="review",
+                                   worktree=c.history.clone, log_path=c.store.log_path(1), timeout_s=60)
+
+    for _ in range(2):
+        assert review(1, c.ctx).exit_code == 0
+    assert reviewers == ["codex", "claude", "claude"] and codex_calls == [] and len(c.executor.calls) == 2
+    assert "running" in c.tracker.get_issue(1).labels, "never a limit-wait"
+    rows = [_json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
+    moves = [row for row in rows if row["kind"] == "same-model-review"]
+    assert [(row["reason"], row["run"]) for row in moves] == [("limit", c.store.get_run(1).started_at)]
+    c.store.finish_run(1, "merged")
+    c.tracker.remove_labels(1, ["running"])

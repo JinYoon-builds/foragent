@@ -56,9 +56,10 @@ def start_journal(store: StateStore, now: datetime, number: int, switch: Switch 
         previous.outcome in CONTINUED_OUTCOMES else None
     if reviewer == executor and before != (executor, reviewer):
         reason = "configured" if resolved_reviewer(lane_config(config, lane)) == executor else "limit"
+        # Called after start_run wrote the record, so the event names the run it belongs to.
         writes.append(lambda: append_event(
             store, now, number, "same-model-review", f"#{number} {executor} reviews its own work: {reason}",
-            locked=True, executor=executor, reason=reason))
+            locked=True, executor=executor, reason=reason, run=store.get_run(number).started_at))
     if not writes:
         return None
     return lambda: [write() for write in writes] and None

@@ -189,15 +189,15 @@ def hard_limited(store: StateStore, config: Config, name: str, now: datetime, us
 CONTINUED_OUTCOMES = frozenset({"stalled-restart", "crashed", "limit-wait"})
 
 
-def kept_implementer(store: StateStore, number: int) -> str | None:
+def kept_implementer(store: StateStore, number: int, lane_executor: str) -> str | None:
     """The executor a continued run keeps; None when the next start chooses afresh.
 
-    A record from before #186 stored only ``implementer`` (None = the lane's executor).
+    A record from before #186 stored only ``implementer``; None there meant ``lane_executor``.
     """
     previous = store.get_run(number)
     if previous is None or previous.outcome not in CONTINUED_OUTCOMES:
         return None
-    return getattr(previous, "executor", None) or previous.implementer
+    return getattr(previous, "executor", None) or previous.implementer or lane_executor
 
 
 class Start(NamedTuple):
@@ -224,7 +224,7 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
     usage, mode = _usage(store), quota_mode(store, config)[0]
     ranked = quota_headroom.order(adjusted, lane, usage, now, mode)
     order = ranked[0] if ranked is not None else fallback_order(adjusted)
-    kept = kept_implementer(store, number) if number is not None else None
+    kept = kept_implementer(store, number, adjusted.executor) if number is not None else None
     switch, released = None, False
     if kept is not None:
         kept_entry = next((entry for entry in order if entry["name"] == kept), entry_for(adjusted, kept))  # Billed as listed.
@@ -250,7 +250,7 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
         for name in asks:
             _ask_credits(store, config, name)
         return Start(adjusted, kept, None, True, switch.reason)
-    implementer = kept if kept is not None else (None if chosen == adjusted.executor else chosen)
+    implementer = None if chosen == adjusted.executor else chosen  # None: the lane default.
     if kept is None and implementer is not None and switch is None and ranked is not None:
         switch = quota_headroom.switch(ranked[1], chosen, adjusted.executor)
     switch = replace(switch, target=chosen) if kept is None and switch is not None and (

@@ -122,6 +122,14 @@ def _machine_budget(
     return ctx._tick_budget
 
 
+def _memory_holds(pressure: str) -> bool:
+    """Whether memory pressure has reached `fa settings`' memory_pressure_limit (default critical)."""
+    from foragent import settings
+
+    limit = settings.read_machine().get("memory_pressure_limit", "critical")
+    return pressure == "critical" or (limit == "warn" and pressure == "warn")
+
+
 def _has_slot(ctx: TickContext, budget: int) -> bool:
     """Machine-wide runs stay under the shared budget; this project's under its ceiling."""
     if scheduler.machine_runs(ctx.store, ctx.now()) >= budget:
@@ -210,8 +218,8 @@ def _start_ready(
         if start.held:
             continue
         executor, reviewer = quota_events.pair(start.config)  # Stored once per start (#186).
-        if sample[0] == "critical":
-            # This issue passed every start check; only critical memory holds it (#497).
+        if _memory_holds(sample[0]):
+            # This issue passed every start check; only memory at the machine's limit holds it (#497, #160).
             # Running work is left alone, and one row records the held tick.
             scheduler.append_memory_hold(
                 ctx.store.root.parent, ctx.now(), pressure=sample[0], load_per_cpu=sample[1],
@@ -226,32 +234,25 @@ def _start_ready(
             ctx.tracker.remove_labels(number, [scheduler.READY])
             ctx.tracker.add_labels(number, [scheduler.RUNNING])
             scheduler.board.sync_status(ctx, number, "Running")
-            if until := ctx.store.github_wait_until(ctx.now()):
-                report.skipped = f"GitHub rate limit until {until.isoformat()}"
-                return None
+            until = ctx.store.github_wait_until(ctx.now())  # A queued label write may have met the limit.
+            detail = f"GitHub rate limit until {until.isoformat()}" if until else ""
         except scheduler.TrackerError as exc:
             if not exc.is_rate_limit:
                 raise
-            until = scheduler.orch_github.pause(ctx, exc)
-            # A label may already say running even though no process started.
-            # Record availability, so recovery does not charge a crash.
-            ctx.store.start_run(
-                number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number),
-                lane=lane, tier=scheduler.issue_size(issue.labels), executor=executor, reviewer=reviewer,
-                journal=scheduler_quota.start_journal(ctx.store, ctx.now(), number, start.switch,
-                                                      ctx.config, lane, executor, reviewer),
-            )
-            ctx.store.clear_run_start(number)
-            scheduler.orch_github.wait_run(ctx, number, until)
-            ctx.store.finish_run(number, "limit-wait", detail=str(exc))
-            report.skipped = f"GitHub rate limit until {until.isoformat()}"
-            return None
+            until, detail = scheduler.orch_github.pause(ctx, exc), str(exc)
+        # Every start, also one a GitHub limit stops, stores its pair and journals its switch (#186).
         ctx.store.start_run(
             number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
             tier=scheduler.issue_size(issue.labels), executor=executor, reviewer=reviewer,
             journal=scheduler_quota.start_journal(ctx.store, ctx.now(), number, start.switch,
                                                   ctx.config, lane, executor, reviewer),
         )
+        if until:  # A label may already say running though no process started: availability, not a crash.
+            ctx.store.clear_run_start(number)
+            scheduler.orch_github.wait_run(ctx, number, until)
+            ctx.store.finish_run(number, "limit-wait", detail=detail)
+            report.skipped = f"GitHub rate limit until {until.isoformat()}"
+            return None
         if start.switch is not None:  # Claude is held back: this run implements with Codex (#107).
             report.actions.append(scheduler_quota.switch_line(number, start.switch, ctx.config.language))
         ctx.store.clear_run_start(number)

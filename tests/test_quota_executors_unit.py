@@ -633,3 +633,18 @@ def test_recheck_keeps_a_newer_reading_recorded_during_its_read(tmp_path, monkey
     monkeypatch.setattr(usage_recheck, "read_codex", lambda now: fresh)
     assert usage_recheck.recheck(later) == ["codex"]
     assert store.usage()["codex"]["windows"][0]["used_percent"] == 10, "a recovery records its own reading"
+
+
+@pytest.mark.parametrize("outcome", ["crashed", "stalled-restart", "limit-wait"])
+def test_legacy_continued_run_without_implementer_keeps_the_lane_default(tmp_path, outcome):
+    """#186: implementer None on an old record meant the lane default; headroom never moves a continued run."""
+    config = load(tmp_path, {"executor": "codex"})
+    store = store_at(tmp_path)
+    for name, used, hours in (("codex", 67, 72), ("claude", 5, 4)):
+        store.record_usage(name, [{"name": "w", "used_percent": used,
+                                   "resets_at": (NOW + timedelta(hours=hours)).isoformat()}])
+    assert decide(store, config, "main", NOW).config.executor == "claude", "a fresh start goes by headroom"
+    store.start_run(1, branch="b", worktree=tmp_path / "w")  # Before #186: no executor, implementer None.
+    store.finish_run(1, outcome)
+    start = decide(store, config, "main", NOW, 1)
+    assert (start.config.executor, start.switch, start.implementer) == ("codex", None, None)

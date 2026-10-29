@@ -12,14 +12,14 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board, cuts, usage_events, usage_recheck
+from foragent import board, cuts, quota_reviewer, usage_events, usage_recheck
 from foragent.actions import flag
 from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
 from foragent.labels import READY, RUNNING
 from foragent.processes import track_process_group
 from foragent.reasons import Reason
-from foragent.run_attempt import ExecutorStopped
+from foragent.run_attempt import ExecutorStopped, ReviewerLimited
 from foragent.run_waits import _executor_wait, _progress
 
 if TYPE_CHECKING:
@@ -152,6 +152,8 @@ def _available_executor(
         # here: another run may have paused this executor, or this run reached its spend_cap (#786).
         # A keep-mode switched run (#107) never pauses its lane: the lane's own pair may be free.
         current = ctx.store.get_run(n)
+        if reviewer and quota_reviewer.reviewer_limited(n, ctx, name):
+            raise ReviewerLimited(name)  # Before _limit_wait: the review moves to the worker (#186).
         if (hold := _session_hold(ctx, name, current.lane if lane_default(ctx, current) else None)) is not None:
             _limit_wait(n, ctx, hold)
         log = kwargs["log_path"]

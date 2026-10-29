@@ -30,3 +30,20 @@ def append_event(store: StateStore, at: datetime, issue: int | None, kind: str, 
 def _write_line(store: StateStore, event: dict) -> None:
     with (store.root / "orch-events.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def has_event(store: StateStore, issue: int | None, kind: str, **fields: Any) -> bool:
+    """Whether the journal already holds an event of ``kind`` for ``issue`` with these ``fields``."""
+    path = store.root / "orch-events.jsonl"
+    if not path.exists():
+        return False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("issue") == issue and event.get("kind") == kind and all(
+            event.get(key) == value for key, value in fields.items()
+        ):
+            return True
+    return False
