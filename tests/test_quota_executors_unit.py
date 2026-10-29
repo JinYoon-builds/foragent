@@ -12,6 +12,7 @@ from foragent.orch_inbox import questions
 from foragent.scheduler_quota import (
     Switch, credits, decide, record_cost, switch_journal, switch_line, switched_config,
 )
+from foragent.quota_view import QuotaView
 from foragent.state import StateStore
 
 from test_scheduler import approve as sched_approve, ctx  # noqa: F401
@@ -274,7 +275,7 @@ def test_paid_review_reaches_the_cap_and_blocks_the_next_launch(tmp_path, monkey
                                          prompt="p", model=None, timeout_s=12, log_path=tmp_path / "review.log",
                                          review_level="high")
     assert result.cost_usd == 1.0 and ctx.store.spend_today("claude", NOW) == 1.0
-    assert "daily cap" in run_execution._session_hold(ctx, "claude", "main")
+    assert "daily cap" in run_execution._session_hold(ctx, "claude", "main", QuotaView(ctx.store, ctx.now()))
 
 
 
@@ -327,10 +328,10 @@ def test_session_gate_stops_at_the_cap_and_lets_credits_past_the_pause(tmp_path)
     ctx = runner_ctx(tmp_path, load(tmp_path, {"executors": [entry("claude", spend_cap=4), entry("codex")]}))
     ctx.store.pause_executor("claude", NOW + timedelta(hours=1))
     ctx.store.pause_executor("codex", NOW + timedelta(hours=1))
-    assert _session_hold(ctx, "claude", "main") is None, "credits under the cap launch past the pause"
-    assert "paused for a usage limit" in _session_hold(ctx, "codex", "main")
+    assert _session_hold(ctx, "claude", "main", QuotaView(ctx.store, ctx.now())) is None, "credits under the cap launch past the pause"
+    assert "paused for a usage limit" in _session_hold(ctx, "codex", "main", QuotaView(ctx.store, ctx.now()))
     ctx.store.record_spend("claude", 4)
-    assert "daily cap" in _session_hold(ctx, "claude", "main"), "a later session stops at the cap"
+    assert "daily cap" in _session_hold(ctx, "claude", "main", QuotaView(ctx.store, ctx.now())), "a later session stops at the cap"
 
 
 @pytest.mark.parametrize("name", ["codex", "local"])
@@ -648,3 +649,74 @@ def test_legacy_continued_run_without_implementer_keeps_the_lane_default(tmp_pat
     store.finish_run(1, outcome)
     start = decide(store, config, "main", NOW, 1)
     assert (start.config.executor, start.switch, start.implementer) == ("codex", None, None)
+
+
+def _counting_reads(store, monkeypatch):
+    reads = {"usage": 0, "pauses": 0}
+    usage, pauses = store.usage, store.executor_pauses
+
+    def read_usage():
+        reads["usage"] += 1
+        return usage()
+
+    def read_pauses(now):
+        reads["pauses"] += 1
+        return pauses(now)
+
+    monkeypatch.setattr(store, "usage", read_usage)
+    monkeypatch.setattr(store, "executor_pauses", read_pauses)
+    return reads
+
+
+def test_one_start_decision_reads_the_quota_facts_once(tmp_path, monkeypatch):
+    """#186: decide() answers who implements, who reviews and whether the start waits from one
+    snapshot, so a pause or reading written midway cannot make those answers disagree."""
+    from foragent.scheduler_quota import run_config
+
+    config = load(tmp_path, {"executor": "codex", "reviewer": "claude"})
+    store = store_at(tmp_path)
+    for name, used, hours in (("codex", 67, 72), ("claude", 5, 4)):
+        store.record_usage(name, [{"name": "w", "used_percent": used,
+                                   "resets_at": (NOW + timedelta(hours=hours)).isoformat()}])
+    store.pause_executor("claude", NOW + timedelta(hours=1))
+    reads = _counting_reads(store, monkeypatch)
+    start = decide(store, config, "main", NOW)
+    assert (start.config.executor, start.config.reviewer, start.held) == ("codex", "codex", False)
+    assert reads == {"usage": 1, "pauses": 1}
+    reads.update(usage=0, pauses=0)
+    assert run_config(store, config, None, NOW).reviewer == "codex"
+    assert reads == {"usage": 1, "pauses": 1}, "run_config alone also reads once"
+    # A fallback whose chain asks about paused Claude twice still reads the pauses once.
+    reads.update(usage=0, pauses=0)
+    fallback = load(tmp_path, {"executor": "claude", "reviewer": "claude"})
+    assert run_config(store, fallback, "codex", NOW).reviewer == "codex"
+    assert reads == {"usage": 1, "pauses": 1}
+
+
+def test_limited_reviewer_stays_when_the_worker_cannot_review(tmp_path):
+    """#186: an unlimited worker cannot take the review over; a limited reviewer stays and the start
+    waits for it, so a quota limit never removes the review (no reviewer ``none``)."""
+    from dataclasses import dataclass
+    from typing import Any
+
+    from foragent.quota_reviewer import review_moved, stored_config
+
+    config = load(tmp_path, {"reviewer": "claude", "executors": [entry("local", "unlimited"), entry("claude")]})
+    store = store_at(tmp_path)
+    store.pause_executor("claude", NOW + timedelta(hours=1))
+    start = decide(store, config, "main", NOW)
+    assert (start.config.executor, start.config.reviewer, start.held) == ("local", "claude", True)
+    assert "Claude paused at its limit" in start.reason
+
+    @dataclass
+    class RunCtx:
+        store: Any
+        config: Any
+        now: Any
+
+    run = store.start_run(1, branch="b", worktree=tmp_path / "w", executor="local", reviewer="claude")
+    ctx = RunCtx(store, stored_config(store, config, run, NOW), lambda: NOW)
+    assert review_moved(1, ctx) is ctx, "the review stays with Claude; nothing to journal"
+    path = store.root / "orch-events.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    assert [row for row in rows if row["kind"] == "same-model-review"] == []

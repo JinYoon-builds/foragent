@@ -220,6 +220,7 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
     from foragent.config import lane_executors
     from foragent.run_implementation import lane_config
 
+    store = quota_view.view(store, now)  # Every question below reads one snapshot of the quota facts.
     adjusted = lane_config(config, lane)
     usage, mode = _usage(store), quota_mode(store, config)[0]
     ranked = quota_headroom.order(adjusted, lane, usage, now, mode)
@@ -293,7 +294,7 @@ def run_start(store: StateStore, config: Config, lane: str, number: int,
 
 
 # Split out to stay under the module line limit; re-exported so callers keep their imports.
-from foragent import quota_headroom  # noqa: E402
+from foragent import quota_headroom, quota_view  # noqa: E402
 from foragent.quota_reviewer import can_review, choose_reviewer, pair_config, run_config, switched_config  # noqa: E402,F401
 from foragent.quota_spend import record_cost  # noqa: E402,F401
 from foragent.quota_events import choose_executor, start_journal, switch_journal, switch_line  # noqa: E402,F401

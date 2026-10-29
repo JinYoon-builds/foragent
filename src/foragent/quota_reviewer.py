@@ -26,7 +26,8 @@ def choose_reviewer(config: Config, executor: str, limited: Callable[[str], bool
     """The reviewer of a run of lane-adjusted ``config`` on ``executor``; the one place it is chosen.
 
     A run on its own executor keeps the configured reviewer; one that is hard-limited moves to
-    the run's own executor (#186), so the review never waits on a used-up side. A fallback never
+    the run's own executor when that can review (``moves_to_worker``, #186); otherwise it stays and
+    the start waits for it, so a quota limit never removes the review. A fallback never
     waits for a reviewer. One between Claude and Codex is reviewed by the executor it fell back
     from when that is free, else by the configured reviewer when free and not the run's
     executor, else by the run's own executor. Any other fallback keeps the configured reviewer
@@ -45,8 +46,15 @@ def choose_reviewer(config: Config, executor: str, limited: Callable[[str], bool
         # Any other fallback keeps the configured reviewer while it is free; it never waits for it.
         return next((name for name in (previous, executor) if can_review(config, name) and
                      (name == executor or available(name))), "none")
-    kept = executor if limited(previous) else previous
+    kept = executor if moves_to_worker(config, previous, executor, limited) else previous
     return next((name for name in (kept, executor) if can_review(config, name)), "none")
+
+
+def moves_to_worker(config: Config, reviewer: str, executor: str, limited: Callable[[str], bool]) -> bool:
+    """Whether a hard-limited ``reviewer`` moves to the run's own ``executor``; the one rule for the
+    start, the review launch and the session launch. A worker that cannot review (unlimited or
+    unknown) takes nothing over: the reviewer stays, and the run waits for its reset."""
+    return reviewer not in ("none", executor) and can_review(config, executor) and limited(reviewer)
 
 
 def switched_config(config: Config, implementer: str | None, limited: Callable[[str], bool] | None = None,
@@ -81,6 +89,7 @@ def run_config(store: StateStore, config: Config, implementer: str | None, now: 
 
     It reads the same recorded usage as ``decide``, so a used-up window counts on both sides.
     """
+    store = quota_view.view(store, now)  # The same snapshot as the caller's decision, when it has one.
     usage = scheduler_quota._usage(store)
 
     def available(name: str) -> bool:
@@ -109,27 +118,37 @@ def review_moved(n: int, ctx):
     The review never waits for it (#186). The move is journaled as a same-model review (reason
     limit) once per run: a later round of the same run finds the event and adds none.
     """
-    from foragent.orch_events import append_event, has_event
-
     config, now = ctx.config, ctx.now()
     reviewer, executor = resolved_reviewer(config), config.executor
     run = ctx.store.get_run(n)
     if getattr(run, "executor", None) is None:
         return ctx  # A record from before #186 keeps the old derivation (legacy_config).
-    if reviewer in ("none", executor) or not scheduler_quota.hard_limited(ctx.store, config, reviewer, now):
-        return ctx
-    moved = executor if can_review(config, executor) else None
-    if moved is not None and not has_event(ctx.store, n, "same-model-review", run=run.started_at):
-        append_event(ctx.store, now, n, "same-model-review", f"#{n} {executor} reviews its own work: limit",
+    if not moves_to_worker(config, reviewer, executor,
+                           lambda name: scheduler_quota.hard_limited(ctx.store, config, name, now)):
+        return ctx  # Free, or no worker can take it over: the launch hold then waits for the reset.
+    return _moved(n, ctx)
+
+
+def _moved(n: int, ctx):
+    """``ctx`` with the review on the run's own executor, journaled once per run as a same-model review."""
+    from foragent.orch_events import append_event, has_event
+
+    executor, run = ctx.config.executor, ctx.store.get_run(n)
+    if not has_event(ctx.store, n, "same-model-review", run=run.started_at):
+        append_event(ctx.store, ctx.now(), n, "same-model-review", f"#{n} {executor} reviews its own work: limit",
                      executor=executor, reason="limit", run=run.started_at)
-    return replace(ctx, config=pair_config(config, executor, moved))
+    return replace(ctx, config=pair_config(ctx.config, executor, executor))
 
 
-def reviewer_limited(n: int, ctx, name: str) -> bool:
-    """Whether a review session of ``name`` must move instead of launching (``review_moved``)."""
-    if name == ctx.config.executor or getattr(ctx.store.get_run(n), "executor", None) is None:
+def reviewer_limited(n: int, ctx, name: str, view) -> bool:
+    """Whether a review session of ``name`` must move instead of launching (``review_moved``).
+
+    ``view`` is the launch's one quota snapshot, which the launch hold also reads.
+    """
+    if getattr(ctx.store.get_run(n), "executor", None) is None:
         return False
-    return scheduler_quota.hard_limited(ctx.store, ctx.config, name, ctx.now())
+    return moves_to_worker(ctx.config, name, ctx.config.executor,
+                           lambda other: scheduler_quota.hard_limited(view, ctx.config, other, view.now))
 
 
 def moving_review(review):
@@ -144,7 +163,9 @@ def moving_review(review):
         try:
             return review(n, review_moved(n, ctx), *args, **kwargs)
         except ReviewerLimited:
-            return review(n, review_moved(n, ctx), *args, **kwargs)
+            # The launch decided from its snapshot that moves_to_worker holds; the rerun honors that
+            # decision instead of asking again, so a second read cannot undo it or raise again.
+            return review(n, _moved(n, ctx), *args, **kwargs)
 
     return run
 
@@ -161,4 +182,4 @@ def legacy_config(store: StateStore, config: Config, implementer: str | None, no
     return switched_config(config, implementer, lambda name: claude_paused and name == "claude", available)
 
 
-from foragent import scheduler_quota  # noqa: E402  # Call-time lookups; scheduler_quota imports this module.
+from foragent import quota_view, scheduler_quota  # noqa: E402  # Call-time lookups; scheduler_quota imports this module.

@@ -201,12 +201,7 @@ class RunRecordsMixin:
 
     def executor_pause_until(self, executor: str, now: datetime) -> datetime | None:
         """When a usage-limit pause of ``executor`` ends, or None when it is not paused."""
-        try:
-            pauses = _state.json.loads((self.root / "executor-pauses.json").read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None
-        until = _state.datetime.fromisoformat(pauses[executor]) if executor in pauses else None
-        return until if until is not None and now < until else None
+        return self.executor_pauses(now).get(executor)
 
     def executor_paused(self, executor: str, now: datetime) -> bool:
         return self.executor_pause_until(executor, now) is not None

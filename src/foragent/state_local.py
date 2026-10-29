@@ -121,6 +121,15 @@ class LocalRecordsMixin:
         with self._state_lock(), (self.root / "spend.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(line + "\n")
 
+    def executor_pauses(self, now: Any) -> dict[str, Any]:
+        """Every executor's usage-limit pause still ahead of ``now``, from one read of the file."""
+        try:
+            pauses = _state.json.loads((self.root / "executor-pauses.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        ends = {name: _state.datetime.fromisoformat(value) for name, value in pauses.items()}
+        return {name: until for name, until in ends.items() if now < until}
+
     def spend_today(self, executor: str, now: Any = None) -> float:
         """The executor's charges on the UTC day of ``now``, as providers count usage."""
         day = (now or self._now()).astimezone(_state.UTC).date()

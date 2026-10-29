@@ -434,3 +434,88 @@ def test_reviewer_limited_during_review_preparation_moves_to_the_worker_once(run
     assert [(row["reason"], row["run"]) for row in moves] == [("limit", c.store.get_run(1).started_at)]
     c.store.finish_run(1, "merged")
     c.tracker.remove_labels(1, ["running"])
+
+
+def test_reviewer_limit_written_between_launch_questions_cannot_split_their_answers(run_case, monkeypatch):
+    """#186: the move check and the launch hold read one quota snapshot. A Codex limit recorded just
+    after the move check said "free" must not turn the same launch into a limit-wait."""
+    from foragent import quota_reviewer
+    from foragent.run_execution import _available_executor
+
+    c = run_case
+    codex_calls = enable_reviewer(c, ["VERDICT: PASS"])
+    c.store.update_run(1, executor="claude", reviewer="codex")  # The pair the tick stored.
+    check = quota_reviewer.reviewer_limited
+
+    def then_limited(n, ctx, name, view):
+        answer = check(n, ctx, name, view)
+        c.store.record_usage("codex", [{"name": "5h", "used_percent": 100,
+                                        "resets_at": (c.now[0] + timedelta(hours=2)).isoformat()}])
+        return answer
+
+    monkeypatch.setattr(quota_reviewer, "reviewer_limited", then_limited)
+    result = _available_executor(1, c.ctx, c.ctx.executor_factory("codex"), reviewer=True, prompt="review",
+                                 worktree=c.history.clone, log_path=c.store.log_path(1), timeout_s=60)
+    assert result.last_message == "VERDICT: PASS" and len(codex_calls) == 1
+    assert "running" in c.tracker.get_issue(1).labels and "ready" not in c.tracker.get_issue(1).labels
+    c.store.finish_run(1, "merged")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_late_reviewer_limit_with_a_worker_that_cannot_review_waits_instead_of_crashing(run_case):
+    """#186: with an unlimited worker, a reviewer limited late is not removed (no executor ``none``);
+    the launch is an ordinary limit-wait that hands the issue back to the queue."""
+    from foragent.executors import executor_for
+    from foragent.quota_reviewer import moving_review
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.run_execution import _available_executor
+
+    c = run_case
+    enable_reviewer(c, [])
+    c.ctx.config = replace(c.ctx.config, executor="local", reviewer="claude",
+                           executor_list=[{"name": "local", "quota": "unlimited"},
+                                          {"name": "claude", "quota": "subscription"}])
+    asked = []
+    c.ctx.executor_factory = lambda name: asked.append(name) or executor_for(name) if name == "none" else c.executor
+    c.store.update_run(1, executor="local", reviewer="claude")
+
+    @moving_review
+    def review(n, ctx):
+        c.store.pause_executor("claude", c.now[0] + timedelta(hours=1))  # The limit hits while preparing.
+        reviewer = ctx.config.reviewer
+        return _available_executor(n, ctx, ctx.executor_factory(reviewer), reviewer=True, prompt="review",
+                                   worktree=c.history.clone, log_path=c.store.log_path(1), timeout_s=60)
+
+    with pytest.raises(ExecutorStopped) as stopped:
+        review(1, c.ctx)
+    assert stopped.value.outcome == "limit-wait" and asked == [] and c.executor.calls == []
+    assert "ready" in c.tracker.get_issue(1).labels and "running" not in c.tracker.get_issue(1).labels
+    c.store.finish_run(1, "limit-wait")
+
+
+def test_rerun_after_a_launch_move_decision_does_not_ask_again(run_case, monkeypatch):
+    """#186: once a launch decided the reviewer moves, the rerun uses the worker even if the limit
+    reads as cleared right after; it neither asks again nor raises a second ReviewerLimited."""
+    from foragent import quota_reviewer
+    from foragent.quota_reviewer import moving_review
+    from foragent.run_execution import _available_executor
+
+    c = run_case
+    codex_calls = enable_reviewer(c, [])
+    c.executor.steps = [{}]
+    c.store.update_run(1, executor="claude", reviewer="codex")
+    answers = iter([True])
+    monkeypatch.setattr(quota_reviewer, "reviewer_limited", lambda n, ctx, name, view: next(answers, False))
+    reviewers = []
+
+    @moving_review
+    def review(n, ctx):
+        reviewers.append(ctx.config.reviewer)
+        return _available_executor(n, ctx, ctx.executor_factory(ctx.config.reviewer), reviewer=True,
+                                   prompt="review", worktree=c.history.clone, log_path=c.store.log_path(1),
+                                   timeout_s=60)
+
+    assert review(1, c.ctx).exit_code == 0
+    assert reviewers == ["codex", "claude"] and codex_calls == [] and len(c.executor.calls) == 1
+    c.store.finish_run(1, "merged")
+    c.tracker.remove_labels(1, ["running"])
