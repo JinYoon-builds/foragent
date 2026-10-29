@@ -1,4 +1,4 @@
-"""`fa settings`: twelve settings in three scopes, each read from and written to its own file (#160).
+"""`fa settings`: thirteen settings in three scopes, each read from and written to its own file (#160).
 
 - team: the repository's ``.foragent.yml``
 - me: the user config, ``~/.config/foragent/config.yml``
@@ -46,6 +46,7 @@ SETTINGS = (
     Setting("always_human", "team", [], kind="list"),
     Setting("executor", "team", "codex", ("claude", "codex")),
     Setting("reviewer", "team", None, ("claude", "codex", "none")),
+    Setting("runner_unit_tests", "team", "auto", ("auto", "ci", "all")),
     Setting("claude_quota.mode", "me", "keep", ("keep", "burn")),
     Setting("notify", "me", None, NOTIFY_FIXED, kind="notify"),
     Setting("animation", "me", True, (True, False), kind="bool"),
