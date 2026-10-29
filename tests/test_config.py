@@ -26,15 +26,19 @@ def test_exact_defaults(repo):
         "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "run_hours": "always",
-        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "base_branch": "main",
+        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "tick_failure_alert": 3,
-        "repo": None, "board": None, "board_map": None, "language": "en", "codex_goal": False, "review_level": "low",
+        "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low",
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
         "interview": "native", "ouroboros_version": None, "profile": None, "animation": True, "update_check": True,
-        "upstream_reports": None, "perspectives": {}, "view_glyphs": "auto",
+        "upstream_reports": None, "perspectives": {}, "claude_quota": {"mode": "keep", "keep_percent": 80},
+        "view_glyphs": "auto",
+        "presence": {"statusline": True, "session_start": True, "report": True},
+        "executor_list": None,  # No repository executors list (#786).
+        "order_written": False,  # No executor order written: headroom chooses (#186).
         "skill_roles": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,
@@ -65,6 +69,22 @@ def test_tiers_merge_global_and_repository_fields(repo, tmp_path):
 def test_invalid_tiers_are_rejected(repo, value):
     write_settings(repo / ".foragent.yml", {"tiers": value})
     with pytest.raises(ConfigError, match="tiers"):
+        load_config(repo)
+
+
+def test_presence_parts_merge_global_and_repository(repo, tmp_path):
+    global_path = tmp_path / "global.yml"
+    write_settings(global_path, {"presence": {"report": False}})
+    write_settings(repo / ".foragent.yml", {"presence": {"statusline": False}})
+    assert load_config(repo, global_path).presence == {
+        "statusline": False, "session_start": True, "report": False}
+
+
+@pytest.mark.parametrize("value", [None, [], "off", {"statusline": "no"}, {"statusline": 0},
+                                    {"squirrel": True}])
+def test_invalid_presence_is_rejected(repo, value):
+    write_settings(repo / ".foragent.yml", {"presence": value})
+    with pytest.raises(ConfigError, match="presence"):
         load_config(repo)
 
 
@@ -381,3 +401,75 @@ def test_committed_config_keeps_local_repo_and_base_and_names_them(tmp_path):
 def test_committed_config_missing_or_invalid_falls_back(tmp_path, content):
     from foragent.config import Config, load_committed_config
     assert load_committed_config(Config(), content, "origin/main:.foragent.yml", tmp_path / "none.yml") == (None, [])
+
+
+@pytest.mark.parametrize("value", [2, 0, "1", True])
+def test_merge_turn_size_is_one_until_merge_groups(repo, value):
+    assert load_config(repo).merge_turn_size == 1
+    (repo / ".foragent.yml").write_text(yaml.safe_dump({"merge_turn_size": 1}), encoding="utf-8")
+    assert load_config(repo).merge_turn_size == 1
+    (repo / ".foragent.yml").write_text(yaml.safe_dump({"merge_turn_size": value}), encoding="utf-8")
+    with pytest.raises(ConfigError, match=r"merge_turn_size must be 1 until merge groups \(#459\)"):
+        load_config(repo)
+
+
+@pytest.mark.parametrize("roles", [[], {"Bad": {}}, {"x": {"color": "red"}}, {"x": {"skills": "a"}},
+                                   {"x": {"signals": [{"paths": "a"}]}}, {"x": {"signals": [{"paths": ["a"]}]}}, {"x": {"idle_days": 0}}])
+def test_invalid_roles_are_rejected(repo, roles):
+    (repo / ".foragent.yml").write_text(yaml.safe_dump({"roles": roles}))
+    with pytest.raises(ConfigError, match="roles"):
+        load_config(repo)
+
+
+def test_roles_load_with_defaults_for_optional_fields(repo):
+    from foragent.roles import load_roles
+
+    entry = {"agent": "fa-security", "skills": ["audit"], "memory": ".claude/agent-memory/fa-security/",
+             "signals": [{"paths": ["src/**"], "kinds": []}]}
+    (repo / ".foragent.yml").write_text(yaml.safe_dump({"roles": {"security": entry}}))
+    assert load_roles(load_config(repo)) == {"security": {**entry, "scope": [], "created_at": None, "idle_days": 14}}
+
+
+def test_edit_roles_touches_only_changed_entries_and_fields(capsys):
+    """Bar set 2026-10-27: only the top-level roles block is rewritten; bytes outside it stay identical."""
+    from foragent.roles import edit_roles, report_dropped_comments
+
+    head = "# Settings header\nreview: fast  # top\n\n"
+    tail = "# about lanes\nlanes: {}  # none yet\n# tail\n"
+    block = ("roles:  # owned by fa role\n  # about roles\n  orchestrator:\n    agent: fa-orchestrator  # keep\n"
+             "    skills: [fa-orchestrator]\n    signals: []\n  security: {agent: fa-security, skills: [audit],"
+             " signals: []}\n")
+    text = head + block + tail
+    roles = yaml.safe_load(text)["roles"]
+    for changed in ({**roles, "security": {**roles["security"], "skills": ["deep"]}},  # set
+                    {**roles, "docs": {"agent": "fa-docs", "skills": [], "signals": []}},  # add
+                    {"orchestrator": roles["orchestrator"]}):  # remove
+        edited = edit_roles(text, changed)
+        assert edited.startswith(head) and edited.endswith(tail), "Every byte outside the roles block is kept"
+        middle = edited[len(head):len(edited) - len(tail)]
+        assert middle == yaml.safe_dump({"roles": changed}, sort_keys=False), "Block-style roles at the same place"
+        assert yaml.safe_load(edited) == {**yaml.safe_load(text), "roles": changed}
+        assert capsys.readouterr().err == "", "Preparing the text reports nothing; the writer reports once"
+        report_dropped_comments(text)
+        notice = capsys.readouterr().err
+        assert notice.count("\n") == 1 and "dropped 3 comment" in notice, "One line names the dropped comments"
+    plain = edit_roles("review: fast  # top", {"docs": {"agent": "fa-docs", "skills": [], "signals": []}})
+    assert plain == "review: fast  # top\nroles:\n  docs:\n    agent: fa-docs\n    skills: []\n    signals: []\n"
+    report_dropped_comments("review: fast  # top")
+    assert capsys.readouterr().err == "", "No notice when no comment was dropped"
+
+
+def test_roles_are_derived_when_the_config_has_no_roles_key(repo):
+    """Spec answer 2026-10-27 (option 3, D95): derive the defaults instead of storing them."""
+    from foragent.roles import ARCHITECT_KINDS, DEFAULT_ROLES, load_roles, role_drift
+
+    (repo / ".foragent.yml").write_text("review: fast\n")
+    config = load_config(repo)
+    derived = load_roles(config)
+    assert list(derived) == list(DEFAULT_ROLES)
+    assert derived["architect"]["signals"] == [{"paths": [], "kinds": [kind]} for kind in ARCHITECT_KINDS]
+    assert derived["docs"]["scope"] == ["docs/**", "README*"] and derived["docs"]["skills"] == ["fa-docs"]
+    assert all(entry["created_at"] is None and entry["idle_days"] == 14 for entry in derived.values())
+    assert role_drift(repo, config) == [], "Derived defaults have no stored entry to drift from"
+    (repo / ".foragent.yml").write_text(yaml.safe_dump({"roles": {"security": {"agent": "fa-security"}}}))
+    assert list(load_roles(load_config(repo))) == ["security"], "A stored block is the whole source"

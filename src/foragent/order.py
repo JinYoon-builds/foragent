@@ -14,6 +14,7 @@ from foragent import board, design
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
+from foragent.i18n import text
 from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, latest_flag
 from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
@@ -23,7 +24,7 @@ from foragent.order_files import issue_body, validate_paths
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
-from foragent.tracker import LabelSpec, Tracker
+from foragent.tracker import LabelSpec, Tracker, pr_issue_number
 
 
 class PlanError(ValueError):
@@ -156,6 +157,18 @@ def detect_test_commands(root: Path) -> list[str]:
     return commands
 
 
+PR_HISTORY = 30
+
+
+def _pull_requests(tracker: Tracker) -> list[dict]:
+    """Open PRs and the latest merged ones, so planning sees what was done and by whom (#848)."""
+    merged = sorted(tracker.list_prs(state="merged"), key=lambda pr: (pr.merged_at or "", pr.number))[-PR_HISTORY:]
+    return [{"number": pr.number, "title": pr.title, "head": pr.head, "state": state,
+             "merged_at": pr.merged_at, "foragent": pr_issue_number(pr.head) is not None}
+            for state, prs in (("open", tracker.list_prs(state="open")), ("merged", merged[::-1]))
+            for pr in prs]
+
+
 def context(root: Path, config: Config, tracker: Tracker) -> dict:
     issues = sorted(tracker.list_open_issues(), key=lambda issue: issue.number)
     feedback, decisions = [], []
@@ -215,6 +228,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),
                          "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
                          "state_group": state_group(issue, tracker)} for issue in issues],
+        "pull_requests": _pull_requests(tracker),
         "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
                                  "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
     }
@@ -523,11 +537,15 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
         return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n"
 
+    # An order with no sub-issues (edits or approvals only) is finished once it
+    # applies: publish closes its record below, so it never gets a Backlog card.
+    childless = not plan["issues"] and not mapping
     if parent is None:
         parent = tracker.create_issue(plan["title"], parent_body(), [])
     else:
         tracker.update_issue(parent, title=plan["title"], body=parent_body())
-    board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
+    if not childless:
+        board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
     for item in plan["issues"]:
         body = issue_body(item, repo, config.base_branch, config.acceptance_dir) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
@@ -587,6 +605,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
     if approved_numbers:
         kick_tick(root)
+    if childless and (parent not in by_number or by_number[parent].state == "open"):
+        tracker.close_issue(parent, text("order_record_closed", config.language, count=0))
     for item, row in zip(plan["issues"], rows):
         row["number"] = mapping[item["key"]]
         row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]

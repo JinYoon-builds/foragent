@@ -76,7 +76,7 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
         "stale": observation["error"] is not None,
         "error": observation["error"],
         "failed_at": observation["failed_at"],
-        "active_runs": [asdict(run) for run in store.active_runs()],
+        "active_runs": [asdict(run) for run in store.active_runs() if run.kind == "issue"],  # Dreams hold no issue.
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
 
@@ -121,13 +121,16 @@ def collect_lanes(
     summary = dict(working=0, blocked=0, waiting_human=0, queued=0)
     priority = {"working": 0, "waiting-human": 1, "blocked": 2, "queued": 3, "idle": 4}
     grouped = {item["number"]: (group, item) for group, items in groups.items() for item in items}
+    # A lane dreams while its dream record runs; the tick owns that record's liveness.
+    dreaming = {run.lane for run in store.dream_runs() if run.status == "running"}
 
     def lane_row(slug: str) -> dict[str, Any]:
         return lanes.setdefault(slug, {
             "slug": slug, "lane_display": lane_display(config, slug, config.language),
             "state": "idle", "issue": None, "title": None, "phase": None,
             "elapsed_seconds": None, "last_activity_seconds": None, "waiting_for": [],
-            RUNNING: [], READY: [], "queued": [],
+            RUNNING: [], READY: [], "queued": [], "held": [],
+            "dreaming": slug in dreaming,
         })
 
     def show(row: dict[str, Any], state: str, number: int, title: str | None, run, waiting_for) -> None:
@@ -157,12 +160,15 @@ def collect_lanes(
         summary[state.replace("-", "_")] += 1
         if state == "queued":
             row["queued"].append(item)
+        elif state in {"blocked", "waiting-human"} and not active:
+            # Every held issue, not only the lane's most urgent one, has a lane row.
+            row["held"].append({**item, "state": state})
         show(row, state, issue.number, issue.title, run if active else None,
              waiting.get(issue.number, []) if state == "queued" else [])
     # Runs recorded locally are working even when the snapshot predates them or is missing.
     seen = {issue.number for issue in issues}
     for run in store.active_runs():
-        if run.number in seen:
+        if run.kind != "issue" or run.number in seen:  # A lane's dream is no issue row.
             continue
         summary["working"] += 1
         show(lane_row(run.lane), "working", run.number, (titles or {}).get(run.number), run, [])

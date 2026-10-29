@@ -18,7 +18,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import orch_events, orch_reviewers, review_notes, review_perspectives, risks
+from foragent import orch_events, orch_reviewers, quota_reviewer, review_notes, review_perspectives, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -74,24 +74,26 @@ def parse_review(message: str) -> ReviewResult:
     return ReviewResult("UNUSABLE", "", ("reviewer gave no verdict",))
 
 
-def parse_code_review(message: str) -> ReviewResult:
-    try:
-        event = json.loads(message)
-    except ValueError:
-        event = None
-    if not isinstance(event, dict) or event.get("is_error") or not isinstance(event.get("result"), str):
-        return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
+FINDING_LINE = re.compile(r"^(?:[-*]|\d+[.)])?\s*`?\S+?:\d+`?\s+(—|-|--)\s+")
+
+
+def code_review_findings(text: str) -> tuple[str, list[str] | list[dict], str]:
+    """/code-review result text as (verdict, findings, note).
+
+    Findings are the path:line lines when there are any, else the finding objects of the
+    one JSON payload (each keeps every field the reviewer wrote, such as ``class``).
+    """
     # NOTE lines are plain text beside the findings; they never count as findings.
-    text = review_notes.strip(event["result"])
+    text = review_notes.strip(text)
     lines = [line for line in text.splitlines() if line.strip()]
-    findings = [line for line in lines if re.match(r"^(?:[-*]|\d+[.)])?\s*`?\S+?:\d+`?\s+(—|-|--)\s+", line)]
+    findings = [line for line in lines if FINDING_LINE.match(line)]
     if findings:
-        return ReviewResult("FAIL", "\n".join(findings))
+        return "FAIL", findings, ""
     payload = text.strip()
     blocks = list(re.finditer(r"^[ \t]*```([^\r\n]*)\r?\n(.*?)^[ \t]*```[ \t]*\r?$", payload, re.M | re.S))
     json_blocks = [block for block in blocks if block[1].strip() == "json"]
     if len(json_blocks) > 1:
-        return ReviewResult("UNUSABLE", "", ("/code-review gave multiple findings payloads",))
+        return "UNUSABLE", [], "/code-review gave multiple findings payloads"
     if len(blocks) == 1 and blocks[0].span() == (0, len(payload)):
         payload = blocks[0][2]
     elif json_blocks:
@@ -102,15 +104,29 @@ def parse_code_review(message: str) -> ReviewResult:
         items = None
     if isinstance(items, list):
         if not items:
-            return ReviewResult("PASS", "")
+            return "PASS", [], ""
         if any(not isinstance(item, dict) or not {"file", "line", "summary"}.intersection(item) for item in items):
-            return ReviewResult("UNUSABLE", "", ("/code-review gave invalid findings",))
-        return ReviewResult("FAIL", "\n".join(
-            f"{item.get('file', '?')}:{item.get('line', '?')} — {item.get('summary', '')}" for item in items
-        ))
+            return "UNUSABLE", [], "/code-review gave invalid findings"
+        return "FAIL", items, ""
     if not blocks and lines and lines[0].strip() == "(none)":
-        return ReviewResult("PASS", "")
-    return ReviewResult("UNUSABLE", "", ("/code-review gave no verdict",))
+        return "PASS", [], ""
+    return "UNUSABLE", [], "/code-review gave no verdict"
+
+
+def parse_code_review(message: str) -> ReviewResult:
+    try:
+        event = json.loads(message)
+    except ValueError:
+        event = None
+    if not isinstance(event, dict) or event.get("is_error") or not isinstance(event.get("result"), str):
+        return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
+    verdict, findings, note = code_review_findings(event["result"])
+    if verdict == "UNUSABLE":
+        return ReviewResult("UNUSABLE", "", (note,))
+    return ReviewResult(verdict, "\n".join(
+        item if isinstance(item, str) else f"{item.get('file', '?')}:{item.get('line', '?')} — {item.get('summary', '')}"
+        for item in findings
+    ))
 
 
 @contextmanager
@@ -144,6 +160,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
             path.chmod(mode)
 
 
+@quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
     from foragent import runner
@@ -172,8 +189,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
         before = git.review_state()
         try:
             result = _available_executor(
-                n, ctx, ctx.executor_factory(reviewer), worktree=git.root,
-                reviewer=True,
+                n, ctx, ctx.executor_factory(reviewer), worktree=git.root, reviewer=True,
                 prompt="" if reviewer == "claude" else build_review_prompt(
                     parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
                     full_text_dir=cuts.issue_dir(ctx.store.root, n),
@@ -223,7 +239,8 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
             + "".join(f"\nNOTE: {note}" for note in review.review_notes))
     if review.conflicts:
         _append(log, "Review spec conflicts:\n" + "\n".join(review.conflicts))
-        _journal_review(n, ctx, "SPEC-CONFLICT", "\n".join(review.conflicts), round_number)
+        _journal_review(n, ctx, "SPEC-CONFLICT", "\n".join(review.conflicts), round_number,
+                        review_verdict=review.verdict)
     else:
         _journal_review(n, ctx, review.verdict, review.findings, round_number)
     _progress(n, ctx)
@@ -392,12 +409,17 @@ _FINDING_LOCATION = re.compile(r"[\w.-]*[/.][\w./-]*:\d+")
 
 
 def _journal_review(n: int, ctx: RunContext, verdict: str, findings: str, round_number: int,
-                    source: str = "reviewer") -> None:
-    """Record the round's verdict locally before any next round can start."""
+                    source: str = "reviewer", review_verdict: str | None = None) -> None:
+    """Record the round's verdict locally before any next round can start.
+
+    A SPEC-CONFLICT round also keeps the reviewer's own verdict (PASS, FAIL or UNUSABLE),
+    so a reader can still count the defects found beside the conflict.
+    """
     count = 0 if verdict == "UNUSABLE" else sum(
         1 for line in findings.splitlines() if _FINDING_LOCATION.search(line))
     orch_events.append_event(ctx.store, ctx.now(), n, "review", f"{verdict} {count} findings",
-                             verdict=verdict, findings=count, round=round_number, source=source)
+                             verdict=verdict, findings=count, round=round_number, source=source,
+                             **({} if review_verdict is None else {"review_verdict": review_verdict}))
 
 
 def _is_limit(error: BaseException) -> bool:
@@ -578,4 +600,6 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     return _publish_reviewed_head(
         n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
         comparison_attempt=comparison_attempt,
+        # On its merge turn a moved base is merged in and this head's checks run again (#712).
+        reverify=lambda new_head: _verify_review_head(n, ctx, git, parsed, new_head, link),
     )

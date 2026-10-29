@@ -70,8 +70,10 @@ def test_a_lane_with_a_worker_shows_only_its_worker_row(tmp_path):
     store.start_run(1, branch="active", worktree="unused", lane="api")
     output = watch.render_frame(snapshot(tracker, store, config), config, tmp_path)
     rows = [line for line in output.splitlines() if "Server" in line]
-    assert len(rows) == 1 and rows[0].startswith("🐿") and "#1 Working" in rows[0]
-    assert "#2" not in output and "#3" not in output
+    # Folded, the worker row is followed only by the next waiting issue (#170).
+    assert len(rows) == 2 and rows[0].startswith("🐿") and "#1 Working" in rows[0]
+    assert rows[1].startswith("⏳") and "#2 Ready" in rows[1]
+    assert "#3" not in output
 
 
 def test_open_order_after_last_child_and_no_order_are_renderable(tmp_path):
@@ -201,7 +203,13 @@ def test_unicode_layout_fits_resized_terminal_and_preserves_event_summary(tmp_pa
     result.events = [{"summary": "긴 사건 기록도 잘리지 않고 마지막 내용까지 보여야 합니다 끝", "at": NOW.isoformat()}]
     output = watch.render_frame(result, config, tmp_path, width=width)
     assert all(watch._cells(line) <= width for line in output.splitlines())
-    assert "합니다 끝 ✓" in output
+    if width > 40:
+        assert "합니다 끝 ✓" in output
+    else:
+        # At 40 columns the usage line (#115, KEEP) wraps instead of losing its end, and
+        # the event log gives way from the bottom up; it is never left half shown.
+        assert "긴 사건" not in output and output.endswith("q 끝내기")
+        assert "Claude —" in output and "동시 " in output and "keep 80%" in output
 
 
 @pytest.mark.parametrize("lane_count,keys", [(1, "11q"), (12, "12\n12\nq")])

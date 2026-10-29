@@ -1208,3 +1208,27 @@ def test_the_ticks_talk_step_keeps_an_open_talk_and_reports_a_closed_one(store, 
     terminals.alive = False
     assert lane_talk.tick_talk(ctx, store.get_run(1), report) is False
     assert report.actions == ["#1 talk terminal closed; stall clock restarted"]
+
+
+@pytest.mark.parametrize("limit", ["runtime", "stall"])
+def test_the_ticks_timed_stops_go_through_the_talk_guard(limit, git_history, tmp_path, monkeypatch, fake_process_table):
+    import test_scheduler as sched
+
+    from foragent import scheduler
+    from foragent.scheduler import tick
+
+    ctx = sched.ctx.__wrapped__(git_history, tmp_path, monkeypatch, fake_process_table)
+    sched.approve(ctx)
+    tick(ctx)
+    sched.mark_running(ctx)
+    minutes = ctx.config.max_runtime_minutes + 11 if limit == "runtime" else ctx.config.stall_minutes + 1
+    ctx.now = lambda: sched.NOW + timedelta(minutes=minutes)
+    if limit == "runtime":
+        ctx.store.update_run(1, last_progress_at=ctx.now().isoformat())  # Busy, but past the runtime limit.
+    guarded = []
+    original = scheduler.lane_talk.guarded_stop
+    monkeypatch.setattr(scheduler.lane_talk, "guarded_stop",
+                        lambda ctx, number, report, stop, mark=None: guarded.append(number)
+                        or original(ctx, number, report, stop, mark))
+    tick(ctx)
+    assert guarded == [1] and ctx.store.get_run(1).status == "finished"

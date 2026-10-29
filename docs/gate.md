@@ -51,7 +51,7 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 
 | 상태 | 판정 조건 | 행동 |
 |---|---|---|
-| **쉼** | ready가 있고 running이 없음 | 우선순위 가장 높은 ready → running, runner 실행 |
+| **쉼** | ready가 있고 동시 실행 한도에 여유가 있음 | 우선순위 가장 높은 ready → running, runner 실행 |
 | **멈춤** | running인데 N분(기본 30) 동안 커밋·세션 출력 변화 없음 | 세션 종료 → 한 번 재시작 |
 | **너무 큼** | running이 `max_runtime_minutes`(기본 90)를 넘김 — 진척이 있어도 | 세션 종료, needs-human `reason=timeout` ("쪼개서 다시 order" 추천) |
 | **막힘** | 재시작 후 또 멈춤 / 검사 실패가 재시도 상한(기본 2) 도달 / 해시 불일치 / 실행기가 질문을 남김 | needs-human + 이유 코드 댓글(contract 추가 8), 그 이슈는 건너뛰고 다음으로 |
@@ -105,7 +105,7 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 
 ## 8. 동시 실행과 시간
 
-- 프로젝트당 동시 실행 1개 (같은 파일 충돌 방지).
+- 레인은 각자 자기 worktree에서 동시에 돈다. 레인마다 자기 경로를 맡아 같은 파일 충돌을 막는다. 동시 실행 수는 AIMD가 정하고(D60), `max_parallel`은 선택 상한이며 기본값은 상한 없음이다.
 - **시간에 묶지 않는다 (D15).** 승인된 이슈가 있으면 언제든 돈다. `run_hours`는 선택 설정이고 기본값은 `always`. 쿼터를 사람 몫으로 남기고 싶을 때만 시간대(예: `22-08`)를 준다.
 - 여러 프로젝트를 묶는 **공용 슬롯은 v1에 넣지 않는다.** 쿼터는 총량을 정할 뿐이라 슬롯이 처리량을 늘리지 않는다. 맥미니 자원 부족(Xcode 빌드 겹침)이나 쿼터 문제가 실제로 보이면 붙인다.
 - 쿼터 한도에 걸리면 기다렸다 이어 간다(멈춤으로 판정하지 않는다). 남은 사용량 기반 예산은 marcus `internal/budget/budget.go` 199 부근을 참고 후보로 둔다.
@@ -133,7 +133,7 @@ review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]
 review_reviewers: 1      # 1 이상 정수; 1이면 리뷰어 하나가 모든 관점을 체크리스트로 받음
 perspectives: {}         # fa order perspectives 자리별 실행기 {skeptic|first_time_user|attacker|operator|maintainer|incidents|other_users: codex|claude}; 없으면 attacker·maintainer는 codex, 나머지는 claude
 review_max: 2            # 리뷰 FAIL 허용 수; 초과하면 PR을 열고 risk-high로 보류
-approvers: [JinYoon-builds]   # v1 승인 라벨을 붙일 수 있는 사람 (D14)
+approvers: [YOUR_GITHUB_LOGIN]   # v1 승인 라벨을 붙일 수 있는 사람 (D14); 자기 GitHub 로그인으로 바꿈. init은 `gh api user`의 로그인을 씀
 acceptance_dir: tests/acceptance/   # order가 구현 전에 쓰고 잠그는 인수 시험 (D11)
 notify: slack:#proj-dev  # 프로젝트 오케스트레이터 창구 (형태·개수 자유)
 run_hours: always         # 선택: "22-08"처럼 시간대 제한
@@ -165,14 +165,3 @@ Claude 구현 세션은 `/goal`과 실행별 deny 규칙·Stop 훅을 쓴다. St
 - **OpenAI Symphony** (스타 약 2.8만, 2026-02 공개, 0.0.3, 월 1~2커밋): 같은 발상(이슈 보드 = 컨트롤 플레인). gate의 차이는 **입구와 출구의 관문**: 승인된 본문만 실행, Done when 직접 실행, 검수 강도·항상 사람 경로. 가운데 스케줄러는 빌리거나 참고할 대상. SPEC과 코드는 아직 직접 읽지 않았다.
 - **orwa-mahmoud/nightshift, marcus/nightshift**: 이슈 큐를 외부 검증하며 당겨 오지 않는다 ([research/nightshift-scan-raw.md](research/nightshift-scan-raw.md)).
 - **공식 `/goal`** (Claude Code, Codex 실험): 작업 하나를 끝까지 돌리는 것은 흡수됐다. 큐에서 새 컨텍스트로 하나씩 꺼내는 것은 흡수되지 않았다. gate는 후자만 한다.
-
-## 12. 남은 것
-
-- Symphony SPEC 직접 읽기 → 가운데 스케줄러를 빌릴지 판단
-- 빌려 볼 코드 줄 확인 (orwa 344·358·366, ownership.sh 335, marcus budget.go 199)
-- 멈춤 판정에 쓸 "세션 출력 변화"의 구체 신호 (실행기별)
-- 시험: 이슈 3~5개짜리 시험 저장소로 쉼·멈춤·막힘 판정 확인
-
-## 운영 메모: gate 고정본 올리기 (2026-10-21)
-- `uv tool install --force .`만으로는 같은 버전(0.1.0)의 캐시된 빌드가 재사용되어 **예전 코드가 그대로 남는다**(실제로 리뷰 해석기 수정이 반영되지 않아 #2·#7이 다시 멈춤).
-- 반드시 `uv tool install --force --reinstall .` 후 `diff -rq src/foragent <설치 경로>/foragent --exclude=__pycache__`로 같음을 확인한다. 나중 후보: `fa --version`에 커밋 SHA를 넣어 한 줄로 확인.

@@ -383,7 +383,8 @@ def test_lane_clone_uses_repository_filesystem_case_behavior(
 
     monkeypatch.setattr(Path, "stat", filesystem_stat)
     tick(ctx)
-    allowed = case_sensitive is not None and (case_sensitive or not overlap)
+    # Unknown case behaviour is compared case-sensitively (D96): it never makes paths overlap.
+    allowed = case_sensitive is not False or not overlap
     assert starts == ([2] if allowed else [])
     assert {run.number for run in ctx.store.active_runs()} == ({1, 2} if allowed else {1})
 

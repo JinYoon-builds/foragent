@@ -26,6 +26,9 @@ def add(commands) -> None:
     talk.add_argument("number", type=int)
     talk.add_argument("--message", help="Message for the worker (running) or first prompt (finished or blocked)")
     talk.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    dreamed = lane_actions.add_parser("dreamed", help="Record that a lane's memory dream is done")
+    dreamed.add_argument("name")
+    dreamed.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
 
 def run(args) -> int:
@@ -43,6 +46,10 @@ def run(args) -> int:
                 print(exc.stdout)
             raise
         return 0
+    if args.action == "dreamed":
+        config = cli.load_config(root)
+        store = cli.StateStore.for_repo(config.repo or cli.GitRepo(root).remote_slug())
+        return cli.orch_dream.dreamed_command(store, config, args.name)
     if args.action == "skills":
         lane = cli.set_lane_skills(root, args.name, args.ids)
         print(f"Updated lane:{args.name} skills: {', '.join(lane['skills']) or '(none)'}")

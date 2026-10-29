@@ -127,3 +127,9 @@
 - [#167 레인 줄](project_lane_rows.md) — 머리줄·작업자 줄·24줄 예산·KEEP/SIDE, 옛 도로/표 고정 시험 14개 충돌
 - [#168 완료 불꽃](project_finished_fireworks.md) — GAP_AFTER·STAYS, state·calm(), render_frame 고정 인자 함정
 - [#171 준비 줄](project_prep_rows.md) — Snapshot.prep·prep 구역 ORDER 4·고정 시험 함정
+- [#756 보류·해제는 사건 기록만](project_hold_sources.md) — orch-events.jsonl의 다섯 보류·세 해제 종류+머지, flags·승인 스냅숏 금지
+- [#756 /fa는 GitHub 호출 없음](project_fa_offline.md) — --report는 캐시 안내만, 스킬 2단계는 FORAGENT_UPDATE_CHECK=off, 반박 반복되면 재설계
+- [#170 도토리 클릭·접기·스크롤](project_acorn_interact.md) — F 한 규칙 스크롤(_window), 화면 줄 hits, held 나열, 상자 상태/레인, 끝난 주문도 ▸
+- [#115 사용량 줄](project_usage_line.md) — ORDER 65·SHORT/APART, 바닥 줄을 고정한 시험 4종, Snapshot.meter, m 키
+- [#190 꿈꾸는 레인 줄](project_dream_row.md) — status lanes의 dreaming; watch_sections 도우미 모듈은 GAP=False(24줄 한도); fa test는 기준본 검사 불가
+- [#173 설정 창](project_settings_window.md) — 창 패키지·범위별 get·glyph 규칙; fa test는 ~/.cache/uv를 씀(UV_CACHE_DIR 필수)

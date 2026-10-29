@@ -6,7 +6,8 @@ ORDER = 120
 # An orchestrator whose heartbeat is at most this old counts as alive.
 ALIVE_SECONDS = 30
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive",
-                 "reviewers", "ensure", "facts", "scorecard", "pause", "resume", "plan"}
+                 "reviewers", "ensure", "facts", "scorecard", "roles", "role-decision", "signal-answer", "pause", "resume",
+                 "plan"}
 
 
 def add(commands) -> None:
@@ -40,6 +41,12 @@ def add(commands) -> None:
             command.add_argument("--tried", required=True)
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
+    stop = orch_actions.add_parser("stop", help="Stop a running issue, keep its work and return it to ready")
+    stop.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    stop.add_argument("number", type=int)
+    stop.add_argument("--keep-work", action="store_true", required=True,
+                      help="Save unfinished changes as a WIP commit on the issue branch")
+    stop.add_argument("--why", required=True, help="Why the run is stopped; named in the WIP commit and event")
     from foragent.commands import _orch_park
     from foragent.commands._orch_architect import add_orch
     from foragent.commands._orch_box import _add_inbox
@@ -132,4 +139,6 @@ def run(args) -> int:
         return 0 if report["ready"] else 1
     elif args.action == "merge":
         print(orch.merge(ctx, args.number, approved_by=args.approved_by, at=args.at))
+    elif args.action == "stop":
+        print(orch.stop(ctx, args.number, args.why))
     return 0

@@ -74,7 +74,7 @@ class IssueRefreshMixin:
             # which recorded run it ended.
             history = self.read_history()
             starts: dict[int, set[str]] = {}
-            for run in [*history, *self.active_runs()]:
+            for run in [*history, *(run for run in self.active_runs() if run.kind == "issue")]:
                 starts.setdefault(run.number, set()).add(run.started_at)
             pr_facts: dict[str, dict[str, Any]] = {}
             for pr in prs:
@@ -127,6 +127,18 @@ class IssueRefreshMixin:
     def record_merged_pr_listing(self, listing: dict[str, Any]) -> None:
         with self._state_lock():
             self._write_json(self.root / "merged_prs.json", listing)
+
+    def closed_issue_watermark(self) -> datetime | None:
+        """When the last light read of closed issues began, if one was recorded."""
+        try:
+            data = _state.json.loads((self.root / "closed_issues.json").read_text(encoding="utf-8"))
+            return datetime.fromisoformat(data["watermark"])
+        except (FileNotFoundError, ValueError, TypeError, KeyError):
+            return None
+
+    def record_closed_issue_watermark(self, at: datetime) -> None:
+        with self._state_lock():
+            self._write_json(self.root / "closed_issues.json", {"watermark": at.isoformat()})
 
     def read_baseline(self) -> dict[str, Any]:
         """Facts a per-issue read will depend on, taken before the read starts."""

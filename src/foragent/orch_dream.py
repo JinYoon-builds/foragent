@@ -1,0 +1,262 @@
+"""Lane dreams (#189): between work, a lane tidies its own memory.
+
+The gate decides from local facts only when a lane is due: its queue is empty
+after at least one merge since its last dream, or ten merges have landed since
+then. A dream runs the lane's implementer at tier s in its own worktree on
+``foragent/dream-<lane>``; it edits only ``.claude/agent-memory/<dir>/`` and may
+propose a cross-project media bundle that the worker copies outside the
+repository. A changed memory becomes a normal PR; an unchanged one makes no
+GitHub call. Only a completed dream (its ``dream-done`` event) resets the lane.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+import json
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from foragent.i18n import text
+from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, issue_lane
+from foragent.orch_events import append_event
+from foragent.state import StateStore
+
+if TYPE_CHECKING:
+    from foragent.config import Config
+    from foragent.runner import RunContext
+    from foragent.scheduler import TickContext, TickReport
+
+DREAM_EVERY_MERGES = 10
+DONE = "dream-done"
+
+
+def dream_config(config: Config, lane: str) -> Config:
+    """The configuration a dream of ``lane`` runs with: that lane's own executor and model win.
+
+    Every dreaming lane is in ``config.lanes``, a lane named main included, so its settings are
+    read from there (run_implementation.lane_config treats main as the implicit lane).
+    """
+    from dataclasses import replace
+
+    settings = config.lanes.get(lane) or {}
+    return replace(config, executor=settings.get("executor") or config.executor,
+                   executor_model=settings.get("model") if settings.get("model") is not None else config.executor_model)
+
+
+def memory_dir(config: Config, lane: str) -> str:
+    """The lane's agent name when the lane sets one (for example fa-orch), else the lane name."""
+    return (config.lanes.get(lane) or {}).get("agent") or lane
+
+
+def memory_path(config: Config, lane: str) -> str:
+    return f".claude/agent-memory/{memory_dir(config, lane)}/MEMORY.md"
+
+
+def media_root() -> Path:
+    """The cross-project media bundle; it lives outside every repository (decision 2026-10-27)."""
+    return Path.home() / ".local/share/foragent/media"
+
+
+def _done_events(store: StateStore, lane: str) -> list[dict]:
+    try:
+        lines = (store.root / "orch-events.jsonl").read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    events = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("kind") == DONE and event.get("lane") == lane:
+            events.append(event)
+    return events
+
+
+def last_dream_at(store: StateStore, lane: str) -> datetime | None:
+    """When the lane's latest completed dream was recorded, from the local journal.
+
+    A dream covers the runs finished before its prompt was built, not those during it.
+    """
+    times = [datetime.fromisoformat(event.get("covered_until") or event["at"]) for event in _done_events(store, lane)]
+    return max(times, default=None)
+
+
+def _runs_since(store: StateStore, lane: str, since: datetime | None) -> list[tuple[Any, str | None]]:
+    """The lane's finished issue runs since ``since`` (all before the first dream), oldest first."""
+    times = store.finish_times()
+    rows = []
+    for run in store.read_history():
+        if run.kind != "issue" or run.lane != lane:
+            continue
+        finished = times.get((run.number, run.started_at))
+        if since is not None and (finished is None or datetime.fromisoformat(finished) <= since):
+            continue
+        rows.append((run, finished))
+    return sorted(rows, key=lambda row: row[1] or row[0].started_at)
+
+
+def _queue_empty(config: Config, tracker, lane: str) -> bool:
+    for issue in tracker.list_open_issues():
+        if issue.is_pull_request or issue.labels & {BLOCKED, NEEDS_HUMAN}:
+            continue
+        if issue.labels & {APPROVED, READY} and issue_lane(issue.labels, config.lanes) == lane:
+            return False
+    return True
+
+
+def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list[str]:
+    """Configured lanes due to dream, each once; a lane with any active run of its own is not due."""
+    active = store.active_runs()
+    due = []
+    for lane in config.lanes:
+        if any(run.lane == lane for run in active):
+            continue  # Its dream is already running, or an issue run of the lane is.
+        if (previous := store.get_dream(lane)) is not None and previous.process_identities:
+            continue  # An earlier dream still owns processes; the tick reaps them first (D95).
+        merges = sum(run.outcome == "merged" for run, _ in _runs_since(store, lane, last_dream_at(store, lane)))
+        if merges >= DREAM_EVERY_MERGES or (merges and _queue_empty(config, tracker, lane)):
+            due.append(lane)
+    return due
+
+
+class LocalIssues:
+    """The issue rows the gate already holds, so the due check reads no GitHub."""
+
+    def __init__(self, store: StateStore):
+        self.store = store
+
+    def list_open_issues(self):
+        from foragent.tracker import local_issue_models
+
+        return [issue for issue in local_issue_models(self.store) if issue.state == "open"]
+
+
+def _quota_exhausted(store: StateStore, now: datetime) -> bool:
+    """Any recorded usage window at 100% that has not reset; missing usage allows a dream."""
+    for record in store.usage().values():
+        for window in (record or {}).get("windows") or []:
+            reset = window.get("resets_at")
+            if float(window.get("used_percent", 0)) >= 100 and not (reset and datetime.fromisoformat(reset) <= now):
+                return True
+    return False
+
+
+def _admissible(ctx: TickContext, lanes: list[str] | None = None) -> list[str]:
+    """Every start condition, read fresh: due now, no usage window exhausted, implementer not paused.
+
+    The same check estimates this tick's demand before the issue starts and admits
+    the dream after them, so a window exhausted or a lane started meanwhile counts.
+    """
+
+    now = ctx.now()
+    if _quota_exhausted(ctx.store, now):
+        return []
+    due = dream_due(ctx.store, ctx.config, LocalIssues(ctx.store), now)
+    return [lane for lane in (due if lanes is None else [lane for lane in lanes if lane in due])
+            if not ctx.store.executor_paused(dream_config(ctx.config, lane).executor, now)]
+
+
+def startable(ctx: TickContext, sample) -> list[str]:
+    """Due lanes whose dream may start this tick; at most one starts, so it asks for one worker."""
+    lanes = [] if sample[0] == "critical" else _admissible(ctx)
+    ctx._dream_demand = min(1, len(lanes))
+    return lanes
+
+
+def start(ctx: TickContext, lanes: list[str], budget: int, report: TickReport) -> None:
+    """Start at most one dream per tick, in a slot the ready issues left free.
+
+    The candidates were computed before this tick's issue starts; every start condition
+    is checked again under the machine lock (an issue started in the lane, an exhausted
+    usage window, a paused implementer), so none of them is stale.
+    """
+    from foragent import scheduler
+    from foragent.tracker import TrackerError
+
+    if not lanes or not scheduler._has_slot(ctx, budget):
+        return
+    for lane in lanes:  # One lookup per due lane, before the lock; a lane with an open dream PR waits.
+        try:
+            open_pr = ctx.tracker.find_pr(f"foragent/dream-{lane}")
+        except TrackerError as exc:
+            if exc.is_rate_limit:
+                scheduler.orch_github.pause(ctx, exc)  # Only the tick records the shared GitHub pause.
+            report.actions.append(f"lane {lane} dream not started: {' '.join(str(exc).split())[:200]}")
+            return
+        if open_pr is not None:
+            report.actions.append(f"lane {lane} dream PR #{open_pr} is open; the lane does not dream")
+            continue
+        # Slot and start conditions again under the machine lock, which is the only lock held: the
+        # record is written as an issue start's reservation is, never waiting on the state lock here.
+        # A lane no longer admissible (its issue started this tick) gives way to the next due lane.
+        with scheduler.machine_lock(ctx.store):
+            if not scheduler._has_slot(ctx, budget):
+                return
+            if lane not in _admissible(ctx, [lane]):
+                continue
+            ctx.store.start_dream(lane, worktree=worktree_path(ctx.store, lane), under_machine_lock=True)
+        break
+    else:
+        return
+    pid = ctx.launcher(kind="dream", lane=lane)
+    if pid is not None:  # As for an issue run: the record's pid, with its observed birth identity.
+        ctx.store.update_run(f"dream-{lane}", pid=pid)
+        report.actions.append(f"lane {lane} started dreaming (pid={pid})")
+        return
+    run = ctx.store.get_dream(lane)  # A fresh read: an in-process worker may already have finished it.
+    if run is not None and run.status == "running":
+        # No process and an unfinished record: a failed start; the lane stays due.
+        ctx.store.finish_run(run.key, "error", "The launcher started no dream process.")
+        report.actions.append(f"lane {lane} dream start failed: no process")
+    else:
+        report.actions.append(f"lane {lane} dreamed in process")
+
+
+def worktree_path(store: StateStore, lane: str) -> Path:
+    return store.root / "worktrees" / f"dream-{lane}"
+
+
+def log_path(store: StateStore, lane: str) -> Path:
+    return store.root / "logs" / f"dream-{lane}.log"
+
+
+def record_done(store: StateStore, lane: str, count: int, language: str, at: datetime | None = None, *,
+                covered_until: datetime | None = None, pr: int | None = None) -> dict:
+    """The completed-dream event: the one fact that resets the lane's eligibility."""
+    at = at or store._now()
+    say = text("dream_done", language, lane=lane, count=count)
+    summary = f"Lane {lane} dreamed; {count} memory lines tidied." + (
+        f" Memory PR #{pr} waits for the orchestrator (skills/fa-orchestrator/references/dreams.md)." if pr else "")
+    return append_event(store, at, None, DONE, summary, say, lane=lane, memories=count, pr=pr,
+                        covered_until=(covered_until or at).astimezone().isoformat())
+
+
+def run_dream(lane: str, ctx: RunContext) -> int:
+    """The worker runs with the configuration the tick admitted it with, not the checkout's."""
+    from foragent.orch_dream_worker import run_dream
+    from foragent.scheduler_config import tick_config
+
+    ctx.config = tick_config(ctx.store, ctx.config)
+    return run_dream(lane, ctx)
+
+
+def dreamed_command(store: StateStore, config: Config, lane: str) -> int:
+    """`fa lanes dreamed <lane>`: append a completed-dream event; never write the dream record."""
+    from foragent.scheduler_config import tick_config
+
+    config = tick_config(store, config)  # The lanes the gate dreams with, from its committed config.
+    if lane not in config.lanes:
+        print(f"foragent: lane {lane} is not configured", flush=True)
+        return 2
+    from foragent.scheduler_stop import runner_alive
+
+    run = store.get_dream(lane)  # A fresh read; the record itself is never written here.
+    if run is not None and run.status == "running" and run.pid is not None and runner_alive(run) is True:
+        print(f"foragent: lane {lane} is dreaming now; wait for it to finish", flush=True)
+        return 2
+    # Not confirmed alive (gone or unknown): only the completed-dream event is appended;
+    # the record stays for the tick, which finishes it once its process is confirmed dead.
+    event = record_done(store, lane, 0, config.language)
+    print(event["say"])
+    return 0
