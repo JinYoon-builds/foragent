@@ -122,9 +122,10 @@ def scorecard(store: StateStore, config: Config, card: dict[str, Any]) -> dict[s
 
     Today is the first 24-hour bucket; the window before holds the per-day median, rounded half up.
     """
-    from foragent import orch_scorecard
+    from foragent import orch_role_raise, orch_scorecard
 
-    names, days = list(load_roles(config)), card["days"]
+    days = card["days"]
+    names = list(dict.fromkeys([*load_roles(config), *_signal_roles(store, days)]))
     daily = [{name: {"calls": 0, "accepted_proposals": 0} for name in names} for _ in range(days)]
     pairs = orch_scorecard._events(store, store._now(), days)
     # Each call event is one launched session; a decision counts once per request (see decisions).
@@ -140,6 +141,9 @@ def scorecard(store: StateStore, config: Config, card: dict[str, Any]) -> dict[s
     for bucket, day in enumerate(daily):
         for name in names:
             day[name]["signals"] = signals[bucket][name]
+    still_open = [row["role"] for row in orch_role_raise.signal_requests(store) if row.get("status") != "done"]
+    for name in names:  # Open now, whenever raised: what still waits for an answer.
+        daily[0][name]["open_signals"] = still_open.count(name)
     card["window"]["today"]["roles"] = daily[0]
     card["window"]["previous"]["roles"] = {
         name: {**{key: orch_scorecard._half_up(median([day[name][key] for day in daily[1:]]))
@@ -150,6 +154,18 @@ def scorecard(store: StateStore, config: Config, card: dict[str, Any]) -> dict[s
 
 
 SIGNAL_COUNTS = ("raised", "called", "not_now", "unanswered")
+
+
+def _signal_roles(store: StateStore, days: int) -> list[str]:
+    """Roles with a signal request raised in the window or still open, even when no longer configured.
+
+    A removed role's signals stay visible until they are answered.
+    """
+    from foragent import orch_role_raise, orch_scorecard
+
+    return [row["role"] for row in orch_role_raise.signal_requests(store)
+            if row.get("status") != "done"
+            or orch_scorecard._bucket(_time(row.get("created_at")), store._now(), days) is not None]
 
 
 def _signal_days(store: StateStore, names: list[str], days: int) -> list[dict[str, dict[str, int]]]:
@@ -172,13 +188,15 @@ def _signal_days(store: StateStore, names: list[str], days: int) -> list[dict[st
 def scorecard_lines(today: dict[str, Any], previous: dict[str, Any], language: str = "en") -> list[str]:
     """One line per role for people: calls and accepted proposals today and the days before.
 
-    A role whose numbers are all zero in both windows gets no line. A role with any role-signal
-    count in either window also shows its four signal numbers, today's then the days before.
+    A role whose numbers are all zero in both windows and with no open signal gets no line. A role
+    with any role-signal count in either window also shows its four signal numbers, today's then
+    the days before; a role with open signals also shows how many are still open.
     """
     from foragent.i18n import text
 
     def numbers(counts: dict[str, Any]) -> list[int]:
-        return [counts["calls"], counts["accepted_proposals"], *(counts.get("signals") or {}).values()]
+        return [counts["calls"], counts["accepted_proposals"], counts.get("open_signals", 0),
+                *(counts.get("signals") or {}).values()]
 
     lines = []
     for name, counts in today.get("roles", {}).items():
@@ -192,6 +210,8 @@ def scorecard_lines(today: dict[str, Any], previous: dict[str, Any], language: s
             line += ", " + text("scorecard_role_signals_pair", language,
                                 today=text("scorecard_role_signals", language, **signals),
                                 before=text("scorecard_role_signals", language, **earlier))
+        if counts.get("open_signals"):
+            line += ", " + text("scorecard_role_signals_open", language, count=counts["open_signals"])
         lines.append(line)
     return lines
 

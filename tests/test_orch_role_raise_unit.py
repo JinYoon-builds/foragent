@@ -127,7 +127,8 @@ def test_previous_window_takes_the_per_day_median_and_human_line_shows_signals(s
     lines = orch_roles.scorecard_lines(roles["today"], roles["previous"], "en")
     assert [line.split(":")[0] for line in lines] == ["Role security"], "All-zero roles get no line"
     assert lines[0].endswith("signals 3 raised · 1 called · 0 not now · 2 unanswered "
-                             "(before signals 3 raised · 0 called · 2 not now · 1 unanswered)")
+                             "(before signals 3 raised · 0 called · 2 not now · 1 unanswered), "
+                             "2 signal(s) still open")
 
 
 def test_a_role_with_calls_but_no_signals_keeps_its_line_without_signal_numbers():
@@ -221,3 +222,64 @@ def test_a_folder_without_settings_raises_nothing_and_logs_nothing(store, tmp_pa
     assert orch_role_raise.tick(store, tmp_path, NOW, "en") == []
     assert capsys.readouterr().err == "", "No .foragent.yml is no roles source, not a failure"
     assert orch_inbox.requests(store) == []
+
+
+def test_a_removed_role_keeps_its_signals_on_the_scorecard_until_answered(store, tmp_path, measured):
+    measured["signals"][:] = [dict(SIGNAL), {"paths": [], "kinds": ["files_over_limit"]}]
+    measured["kinds"] = {"hot_overlap_files"}
+    store.clock[0] = NOW - timedelta(days=9)  # Outside every window.
+    [old] = orch_role_raise.raise_due(store, tmp_path, store.clock[0])
+    measured["kinds"] = {"files_over_limit"}
+    store.clock[0] = NOW - timedelta(hours=1)
+    [recent] = orch_role_raise.raise_due(store, tmp_path, store.clock[0])
+    orch_role_raise.answer(store, recent["id"], "called", "looked")
+    store.clock[0] = NOW
+    config = SimpleNamespace(roles={})  # The security role was removed from the roles source.
+    card = orch_roles.scorecard(store, config, orch_scorecard.collect(store, days=4))
+    row = card["window"]["today"]["roles"]["security"]
+    assert row["open_signals"] == 1
+    assert row["signals"] == {"raised": 1, "called": 1, "not_now": 0, "unanswered": 0}
+    assert "security" in card["window"]["previous"]["roles"]
+    [line] = [line for line in orch_roles.scorecard_lines(card["window"]["today"], card["window"]["previous"])
+              if line.startswith("Role security")]
+    assert line.endswith("1 signal(s) still open")
+    store.clock[0] = NOW + timedelta(days=5)  # Only the old, still-open signal is left.
+    card = orch_roles.scorecard(store, config, orch_scorecard.collect(store, days=4))
+    window = card["window"]
+    assert window["today"]["roles"]["security"]["signals"]["raised"] == 0
+    assert [line for line in orch_roles.scorecard_lines(window["today"], window["previous"])
+            if line.startswith("Role security")], "An open signal keeps the role's line"
+    orch_role_raise.answer(store, old["id"], "not-now", "role removed")
+    card = orch_roles.scorecard(store, config, orch_scorecard.collect(store, days=4))
+    assert "security" not in card["window"]["today"]["roles"], "Answered and outside the window: gone"
+
+
+def test_two_concurrent_answers_to_one_signal_record_one_answer(store, tmp_path, measured, monkeypatch):
+    """A second answer arrives while the first is checking the request: exactly one succeeds."""
+    import threading
+    import time
+
+    measured["kinds"] = {"hot_overlap_files"}
+    [row] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    original, outcomes, threads = orch_role_raise.is_signal_request, {}, []
+
+    def answer(how, why):
+        try:
+            orch_role_raise.answer(store, row["id"], how, why)
+            outcomes[how] = "ok"
+        except orch_inbox.InboxError as exc:
+            outcomes[how] = str(exc)
+
+    def checking(record):
+        if not threads:  # The first answer is checking: start the competing one now.
+            threads.append(threading.Thread(target=answer, args=("not-now", "racing")))
+            threads[0].start()
+            time.sleep(0.3)  # Give it time to check and wait, before the first one writes.
+        return original(record)
+
+    monkeypatch.setattr(orch_role_raise, "is_signal_request", checking)
+    answer("called", "looked")
+    threads[0].join(timeout=30)
+    assert sorted(outcomes.values()) == ["ok", f"request {row['id']} is already done"], outcomes
+    answers = [event for event in _jsonl(store.root / "orch-events.jsonl") if event.get("kind") == "role-signal-answer"]
+    assert [event["answer"] for event in answers] == ["called"]

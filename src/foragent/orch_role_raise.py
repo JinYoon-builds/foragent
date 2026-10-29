@@ -142,24 +142,29 @@ def tick(store: StateStore, repo_root: Path, now: datetime, language: str) -> li
 
 
 def answer(store: StateStore, request_id: str, how: str, why: str) -> dict[str, Any]:
-    """Record the orchestrator's answer to one role-signal request and mark it done."""
+    """Record the orchestrator's answer to one role-signal request and mark it done.
+
+    The not-done check and the done mark are one step under the inbox state lock, so of two
+    concurrent answers only one succeeds; the other fails and appends no answer event.
+    """
     if how not in ANSWERS:
         raise orch_inbox.InboxError(f"answer must be one of: {', '.join(ANSWERS)}")
-    record = next((row for row in orch_inbox.requests(store) if row.get("id") == request_id), None)
-    if record is None:
-        raise orch_inbox.InboxError(f"no request with id {request_id!r}")
-    if not is_signal_request(record):
-        raise orch_inbox.InboxError(f"request {request_id} is not a role signal")
-    if record.get("status") == "done":
-        raise orch_inbox.InboxError(f"request {request_id} is already done")
     why = (why or "").strip()
     if how == "not-now" and not why:
         raise orch_inbox.InboxError("not-now needs a reason in --why")
-    event = orch_events.append_event(store, store._now(), None, ANSWER, f"{request_id} {record['role']} {how}: {why}",
-                                     request_id=request_id, role=record["role"], answer=how, why=why,
-                                     signal=record["signal"])
-    orch_inbox.set_request_status(store, request_id, "done", f"role signal {how}: {why}" if why else f"role signal {how}")
-    return event
+
+    def open_signal(record: dict[str, Any]) -> None:
+        if not is_signal_request(record):
+            raise orch_inbox.InboxError(f"request {request_id} is not a role signal")
+        if record.get("status") == "done":
+            raise orch_inbox.InboxError(f"request {request_id} is already done")
+
+    record = orch_inbox.set_request_status(store, request_id, "done",
+                                           f"role signal {how}: {why}" if why else f"role signal {how}",
+                                           check=open_signal)
+    return orch_events.append_event(store, store._now(), None, ANSWER, f"{request_id} {record['role']} {how}: {why}",
+                                    request_id=request_id, role=record["role"], answer=how, why=why,
+                                    signal=record["signal"])
 
 
 def add_parser(orch_actions) -> None:

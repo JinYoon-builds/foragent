@@ -101,7 +101,8 @@ def test_scorecard_previous_window_holds_the_median_per_role_day(store):
     config = SimpleNamespace(roles={"docs": {"agent": "fa-docs"}})
     card = orch_roles.scorecard(store, config, orch_scorecard.collect(store, days=4))
     no_signals = {"signals": {"raised": 0, "called": 0, "not_now": 0, "unanswered": 0}}
-    assert card["window"]["today"]["roles"] == {"docs": {"calls": 0, "accepted_proposals": 1, **no_signals}}
+    assert card["window"]["today"]["roles"] == {"docs": {"calls": 0, "accepted_proposals": 1, **no_signals,
+                                                             "open_signals": 0}}
     assert card["window"]["previous"]["roles"] == {"docs": {"calls": 2, "accepted_proposals": 0, **no_signals}}
     assert orch_scorecard.human(card, "en").count("Role docs: calls 0 (before 2)") == 1
 
