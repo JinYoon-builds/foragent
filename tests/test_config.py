@@ -36,7 +36,7 @@ def test_exact_defaults(repo):
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
-        "interview": "native", "ouroboros_version": None, "profile": None, "animation": True, "update_check": True,
+        "interview": "native", "ouroboros_version": None, "profile": None, "legacy_owner": None, "animation": True, "update_check": True,
         "upstream_reports": None, "perspectives": {}, "claude_quota": {"mode": "keep", "keep_percent": 80},
         "view_glyphs": "auto",
         "presence": {"statusline": True, "session_start": True, "report": True},
@@ -497,3 +497,16 @@ def test_personal_notify_filter_wins_over_the_repository_and_is_checked(tmp_path
     personal.write_text("skill_libraries: []\nnotify_filter: urgent\n")
     with pytest.raises(ConfigError, match="notify_filter"):
         load_config(tmp_path, personal)
+
+
+@pytest.mark.parametrize("login", ["", "-alice", "alice-", "a--b", "al ice", "by:alice", 3, ["alice"], "a" * 40])
+def test_legacy_owner_must_be_a_github_login(repo, tmp_path, login):
+    write_settings(repo / ".foragent.yml", {"legacy_owner": login})
+    with pytest.raises(ConfigError, match="legacy_owner"):
+        load_config(repo, tmp_path / "global.yml")
+
+
+def test_legacy_owner_is_optional_and_kept_as_written(repo, tmp_path):
+    assert load_config(repo, tmp_path / "global.yml").legacy_owner is None
+    write_settings(repo / ".foragent.yml", {"legacy_owner": "Jin-Yoon"})
+    assert load_config(repo, tmp_path / "global.yml").legacy_owner == "Jin-Yoon"

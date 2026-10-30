@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from foragent.config_validation import _validate
+from foragent.config_validation import _validate as _validate_settings
 
 
 class ConfigError(ValueError):
@@ -104,6 +104,9 @@ class Config:
     animation: bool = True  # Lane-view fireworks and the big squirrel sprite (#168).
     update_check: bool = True  # The daily release check (#417); FORAGENT_UPDATE_CHECK=off also opts out.
     profile: dict[str, Any] | None = None
+    # The GitHub login whose factory works unlabelled (pre-team) issues (D78 revision, 2026-10-30).
+    # None keeps the single-factory path; set it before a second person's factory joins.
+    legacy_owner: str | None = None
     # Whether `fa report propose` may prepare upstream error reports; None means not asked yet (#419).
     upstream_reports: bool | None = None
     # Order perspective seat -> executor (#414); unnamed seats use the built-in split.
@@ -438,6 +441,19 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
         # null is the default (no ceiling), as when the key is left out; a dump of Config writes it.
         value = {key: item for key, item in value.items() if key != "max_parallel"}
     return value
+
+
+def _validate(values: dict[str, Any]) -> None:
+    """Every setting's checks, plus the repository's legacy_owner login."""
+    _validate_settings(values)
+    if values.get("legacy_owner") is not None:
+        from foragent.ownership import OwnershipError, normalize_login
+
+        language = values["language"] if isinstance(values.get("language"), str) else "en"
+        try:
+            normalize_login(values["legacy_owner"], language)
+        except OwnershipError as exc:
+            raise ConfigError(f"legacy_owner: {exc}") from exc
 
 
 def _hours(run_hours: str) -> tuple[int, int] | None:

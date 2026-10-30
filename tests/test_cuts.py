@@ -42,6 +42,8 @@ def test_parent_summary_needs_plan_marker_and_drops_checklist():
     body = "Outcome.\n\nConstraint A.\n\n- [ ] #2 Child\n- [x] #3 Other\n\n<!-- foragent:plan id=x map={} acceptance={} -->\n"
     assert parent_summary(body) == "Outcome.\n\nConstraint A."
     assert parent_summary("Batch parent without a marker") == ""
+    owned = body + "<!-- foragent:owner-label -->\n"  # A parent published under owner labels.
+    assert parent_summary(owned) == "Outcome.\n\nConstraint A."
 
 
 def test_resume_prompt_names_moved_files():
