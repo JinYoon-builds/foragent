@@ -61,6 +61,19 @@ def lane_files(root: Path, name: str, skills: list[str]) -> list[str]:
     return paths
 
 
+def agent_text(name: str, paths: list[str], installed: list[str]) -> str:
+    """The lane agent definition add_lane writes; order preparation shows a proposed lane the same file."""
+    areas = ", ".join(paths)
+    # Keep the agent definition readable and its skill list inline.
+    header = yaml.safe_dump({
+        "name": f"fa-{name}", "description": f'Foragent lane "{name}": implements issues in {areas}.',
+    }, sort_keys=False) + "skills: " + yaml.safe_dump(installed, default_flow_style=True).strip() + "\n"
+    return (f"---\n{header}---\n"
+            f"You implement one GitHub issue at a time in this repository's {name} lane ({areas}).\n"
+            f"{lane_memory.instruction(f'fa-{name}')}\n"
+            "Run tests with `fa test <pytest args>`; it waits for a machine-wide test slot.\n")
+
+
 def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | None = None,
              executor: str | None = None, model: str | None = None,
              git: GitRepo | None = None, manager: SkillManager | None = None,
@@ -87,21 +100,10 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     for identity in skills:
         manager.install(identity, root)
     settings.save()
-    areas = ", ".join(paths)
-    # Keep the agent definition readable and its skill list inline.
-    header = yaml.safe_dump({
-        "name": f"fa-{name}", "description": f'Foragent lane "{name}": implements issues in {areas}.',
-    }, sort_keys=False) + "skills: " + yaml.safe_dump(installed, default_flow_style=True).strip() + "\n"
     agent_path = f".claude/agents/fa-{name}.md"
     destination = repo_path(root, agent_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        f"---\n{header}---\n"
-        f"You implement one GitHub issue at a time in this repository's {name} lane ({areas}).\n"
-        f"{lane_memory.instruction(f'fa-{name}')}\n"
-        "Run tests with `fa test <pytest args>`; it waits for a machine-wide test slot.\n",
-        encoding="utf-8",
-    )
+    destination.write_text(agent_text(name, paths, installed), encoding="utf-8")
     if (attributes := lane_memory.union_change(root, load_config(root))) is not None:
         lane_memory.apply(root, {lane_memory.ATTRIBUTES: attributes})
     published = lane_files(root, name, installed)
