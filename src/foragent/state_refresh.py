@@ -4,6 +4,8 @@ from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
 
+from foragent.state_issues import WRITES, _copy
+
 
 class IssueRefreshMixin:
     def refresh_local_issues(
@@ -60,11 +62,21 @@ class IssueRefreshMixin:
                     fields = ("labels", "state")
                     matches = all(remote[key] == expected.get(key) for key in fields)
                     if concurrent or matches:
-                        rows[str(issue.number)] = dict(old)
+                        # Queued writes keep only the fields they set; GitHub's other facts are
+                        # newer. Writes made after the listing began are kept below.
+                        kept = {**remote, **{key: old[key] for key in pending_fields(pending) if key in old}}
+                        if not concurrent:
+                            # Nothing changed locally since the listing began: it confirms GitHub.
+                            snapshot.get("outbox_base", {}).get(str(issue.number), {}).update(
+                                {key: remote[key] for key in OBSERVED})
+                        rows[str(issue.number)] = kept
                         continue
                     dropped.add(issue.number)
                 rows[str(issue.number)] = remote
             for number, row in rows.items():
+                # A listing never replaces issue facts observed after it began (a later read or refresh).
+                if (seen := _merge_time((previous.get(number) or {}).get("observed_at"))) is not None and seen > now:
+                    row.update({key: previous[number][key] for key in OBSERVED if key in previous[number]})
                 # Order edges and dependencies are observations, never local intent.
                 if parents is not None:
                     row["parent"] = parents.get(int(number))
@@ -100,8 +112,11 @@ class IssueRefreshMixin:
                           if complete_prs else {key: row.get(key) for key in ("pr_number", "pr_head", "merged")})
                 row["observed"] = {**facts[number], **listed}
             if since_revision is not None:
-                rows.update({number: row for number, row in previous.items()
-                             if row.get("revision", 0) > since_revision and int(number) not in dropped})
+                # A field written locally since the listing began is newer than the listing;
+                # every other field of the row takes what the listing showed.
+                for number, row in previous.items():
+                    if row.get("revision", 0) > since_revision and int(number) not in dropped:
+                        rows[number] = _keep_local_writes(row, rows.get(number), since_revision)
             snapshot.pop("refresh_failure", None)
             self._write_json(self.root / "issues.json", {
                 **snapshot, "refreshed_at": now.isoformat(), "issues": rows,
@@ -110,6 +125,23 @@ class IssueRefreshMixin:
                                 if int(number) not in dropped},
             })
             return sorted(dropped)
+
+    def confirmed_local_issues(self) -> list[dict[str, Any]]:
+        """Issue facts without undelivered local writes.
+
+        Only the fields a queued write sets read from its delivery baseline; every other
+        fact (state, completion reason, merges, observation time) is the row's own."""
+        record = self._issue_record()
+        pending: dict[str, list[dict[str, Any]]] = {}
+        for entry in record.get("outbox", []):
+            pending.setdefault(str(entry["issue"]), []).append(entry)
+        rows = []
+        for key, row in record["issues"].items():
+            base = record.get("outbox_base", {}).get(key)
+            if key in pending and base is not None:
+                row = {**row, **{field: base[field] for field in pending_fields(pending[key]) if field in base}}
+            rows.append(_copy(row))
+        return sorted(rows, key=lambda row: row["number"])
 
     def merged_pr_listing(self) -> dict[str, Any] | None:
         """The stored merged-PR listing and the refresh start it covers, if any."""
@@ -190,6 +222,43 @@ class IssueRefreshMixin:
             }
             # A remembered read is not an issue change; keep revisions for real writes.
             self._write_json(self.root / "issues.json", snapshot)
+
+
+OBSERVED = ("title", "body", "labels", "lane", "state", "state_reason", "observed_at")
+
+
+def pending_fields(pending: list[dict[str, Any]]) -> set[str]:
+    """Row fields that queued writes set locally; an unknown write keeps every observed field."""
+    return {field for entry in pending for field in WRITES.get(entry["action"], OBSERVED)}
+
+
+def observe_under_pending(snapshot: dict[str, Any], row: dict[str, Any], observed: dict[str, Any],
+                          pending: list[dict[str, Any]]) -> list[str]:
+    """Apply a fresh read to an issue: queued writes keep their fields, the rest are observed.
+
+    Returns the fields set, which the caller saves as written: this read is newer than any
+    listing that began before it, so that listing must not overwrite them. The delivery
+    baseline is GitHub as confirmed, so it takes every observed field, and its revision
+    advances so such a listing treats the issue as changed concurrently."""
+    newer = {key: value for key, value in observed.items() if key not in pending_fields(pending)}
+    if any(row.get(key) != value for key, value in newer.items() if key != "observed_at"):
+        _state._forget_reads(row)
+    row.update(newer)
+    if (base := snapshot.get("outbox_base", {}).get(str(row["number"]))) is not None:
+        base.update(observed, revision=snapshot.get("revision", 0) + 1)
+    return list(newer)
+
+
+def _keep_local_writes(local: dict[str, Any], listed: dict[str, Any] | None, since: int) -> dict[str, Any]:
+    """The local row with the listing's issue facts, except those written after the listing began.
+
+    Only issue facts (OBSERVED) are merged field by field. PR facts and other records keep
+    the existing rule: a local change since the listing began keeps the local row."""
+    if listed is None:
+        return local
+    written = local.get("written", {})
+    return {**local, **{field: listed[field] for field in OBSERVED
+                        if field in listed and written.get(field, 0) <= since}}
 
 
 def _merge_time(value: Any) -> datetime | None:

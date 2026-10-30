@@ -13,6 +13,7 @@ from typing import Any
 
 ID = re.compile(r"D[1-9][0-9]*")
 MARKER = re.compile(r"^<!-- foragent:decisions (\[[^\n]*\]) -->$", re.MULTILINE)
+MARKER_LINE = re.compile(r"^<!-- foragent:decisions \[[^\n]*\] -->$\n?", re.MULTILINE)
 HEADING = re.compile(r"^### (D[1-9][0-9]*)\.", re.MULTILINE)
 # An exact citation: D74 or the subclause D74-2, but never D740, D74x, D74_1 or XD74.
 CITATION = re.compile(r"(?<![A-Za-z0-9_])(D[1-9][0-9]*)(?![A-Za-z0-9_])")
@@ -54,15 +55,17 @@ def explicit(body: str) -> list[str] | None:
 
 
 def with_marker(body: str, ids: list[str] | None, previous: str | None) -> str:
-    """The body with one canonical marker: new links, else the previous issue's marker kept."""
+    """The body with exactly one canonical marker: new links, else the previous issue's marker kept.
+
+    Marker lines already in the generated text (for example quoted in a goal) are removed
+    first, so they can neither duplicate nor override the links."""
+    body = MARKER_LINE.sub("", body)
     if ids is None:
-        kept = MARKER.findall(previous or "")
-        if not kept:
+        kept = explicit(previous or "")
+        if kept is None:
             return body
-        line = f"<!-- foragent:decisions {kept[-1]} -->"
-    else:
-        line = marker(ids)
-    return body.rstrip("\n") + "\n" + line + "\n"
+        ids = kept
+    return body.rstrip("\n") + "\n" + marker(ids) + "\n"
 
 
 def ledger_ids(text: str) -> list[str]:
@@ -74,15 +77,16 @@ def _citations(text: str) -> set[str]:
 
 
 def _spec_names(row: dict[str, Any], parents: dict[int, set[str]]) -> set[str]:
+    # The publisher writes its own marker after the text, so an earlier one is quoted text.
     body = row.get("body") or ""
-    return set(CHILD.findall(body)) | set(SPEC_LINK.findall(body)) | parents.get(row["number"], set())
+    return set(CHILD.findall(body)[-1:]) | set(SPEC_LINK.findall(body)) | parents.get(row["number"], set())
 
 
 def _parent_map(rows: list[dict[str, Any]]) -> dict[int, set[str]]:
     """Children named in each published order record's issue map, by spec name."""
     found: dict[int, set[str]] = {}
     for row in rows:
-        for identity, mapping, acceptance in PARENT.findall(row.get("body") or ""):
+        for identity, mapping, acceptance in PARENT.findall(row.get("body") or "")[-1:]:
             numbers: list[Any] = []
             for text, read in ((mapping, lambda value: value.values()),
                                (acceptance, lambda value: [int(key) for key in value if key.isdecimal()])):
