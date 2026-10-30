@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import capacity, cuts
+from foragent import capacity, cuts, harness_guard
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config
 from foragent.git import GitRepo
@@ -60,9 +60,7 @@ def _check(
 ) -> CheckResult:
     """Run one check; a cut output tail links its full copy under ``full_text_dir`` (the issue's folder)."""
     from foragent import runner
-    from foragent.harness_guard import before_measurement
 
-    before_measurement(worktree)
     _append(log, f"\nDone when command:\n{command}")
     offset = log.stat().st_size
 
@@ -268,12 +266,9 @@ def has_pull_request_ci(root: Path) -> bool:
     if not workflows.is_dir():
         return False
     for path in sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")]):
-        from foragent.harness_guard import read_regular
-
-        data = read_regular(path)  # never blocks on a FIFO the measured process left
         try:
-            document = yaml.safe_load(data.decode("utf-8")) if data is not None else None
-        except (UnicodeError, yaml.YAMLError):
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError):
             continue
         if not isinstance(document, dict):
             continue
@@ -330,13 +325,8 @@ def _related_unit_tests(
     for name, path in tests.items():
         if name in selected:
             continue
-        from foragent.harness_guard import read_regular
-
-        data = read_regular(path)  # never blocks on a FIFO the measured process left
-        if data is None:
-            continue
         try:
-            tree = ast.parse(data, filename=name)
+            tree = ast.parse(path.read_bytes(), filename=name)
         except (SyntaxError, UnicodeError):
             continue
         imports = set()
@@ -471,25 +461,19 @@ def _verify_implementation(attempt: Implementation) -> str:
 def _verify_contents(attempt: Implementation) -> str:
     from foragent import runner
     from foragent.run_conflicts import _prepare_target
-    from foragent.run_publish import _check_publication, _guard_harness
+    from foragent.run_publish import _check_publication
     from foragent.ci_mode import enabled
     from foragent.ci_local import verify_local_only_units
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "checking")
-    # The guard reads the worktree itself, so it runs before staging can fail.
-    _guard_harness(attempt)
     git.stage_changes()
     if not _prepare_target(attempt):
         raise ExecutorStopped("hash-mismatch")
     attempt.paths = git.changed_paths(attempt.start_ref)
     _progress(n, ctx)
     attempt.checks = []
-
-    # Retargeting may change the base; _check repeats this before each measurement.
-    _guard_harness(attempt)
-    git.stage_changes()
     # Cleaning tracked runner scratch files is not an implementation change.
     if not any(not path.startswith(".foragent/") for path in attempt.paths):
         return "The session made no changes."
@@ -497,6 +481,11 @@ def _verify_contents(attempt: Implementation) -> str:
     for verification in range(2):
         from foragent.run_implementation import follow_base
         follow_base(attempt)
+        # The test-harness guard on exactly the staged tree about to be measured.
+        if held := harness_guard.guard_measured(ctx, n, git, f"origin/{attempt.target_branch}",
+                                                git.staged_tree_sha(), attempt.parsed.files, tree=True):
+            attempt.review_hold, attempt.review_hold_reason = True, Reason.TEST_HARNESS_CHANGED
+            return harness_guard.hold_details(ctx, held)
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
@@ -515,9 +504,6 @@ def _verify_contents(attempt: Implementation) -> str:
                 previous = ctx.store.get_run(n).comparison or {}
                 ctx.store.update_run(n, comparison={"source": "local", "duration_seconds":
                     previous.get("duration_seconds", 0) + max(0, ctx.monotonic() - started)})
-        # The runner now reads worktree files (test detection, related units,
-        # local_only markers) that the measurements above could have replaced.
-        _guard_harness(attempt)
         test_command = ctx.config.test_command
         if test_command is None:
             test_command = next(iter(runner.detect_test_commands(worktree)), None)
@@ -544,12 +530,10 @@ def _verify_contents(attempt: Implementation) -> str:
                 raise ExecutorStopped("timeout", detail)
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
-        _guard_harness(attempt)
         git.stage_changes()
         if not _prepare_target(attempt):
             raise ExecutorStopped("hash-mismatch")
         attempt.paths = git.changed_paths(attempt.start_ref)
-        _guard_harness(attempt)
         checked_tree = git.staged_tree_sha()
         if checked_tree != staged_tree:
             # Save this pass before anything replaces it: if re-verification cannot finish,
@@ -588,7 +572,6 @@ def _check_review_head(
 ) -> str | None:
     from foragent import runner
 
-    # _review_only guards every measurement in this worktree (harness_guard).
     worktree = git.root
     log = ctx.store.log_path(n)
     # Done when on the PR head is checking time, as in an implementation's verification.
@@ -609,8 +592,6 @@ def _check_review_head(
     if bundle := save_failures(ctx.store.root, n, checks, complete=False):
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.", f"{bundle}\n{link}")
         return "checks-failed"
-    from foragent.harness_guard import before_measurement
-    before_measurement(worktree)  # the review guard decides before staging can fail
     git.stage_changes()
     if git.head_sha() != head or git.has_staged_changes():
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when changed the verified PR contents.", link)

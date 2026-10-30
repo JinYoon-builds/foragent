@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass, replace
+from functools import partial
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
 from hashlib import sha256
@@ -30,14 +31,13 @@ from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
 from foragent.git import GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
-from foragent.orch_events import append_event
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
 from foragent.order import detect_test_commands
 from foragent.orch_reinstall import after_merge
 from foragent.policy import merge_decision, review_mode_for, touched
-from foragent.processes import observe_tree, run_logged, track_process_group
+from foragent.processes import extend_deadline, observe_tree, run_logged, track_process_group
 from foragent.reasons import Reason
 from foragent.skills import SkillManager, copy_lane_skills
 from foragent.state import Approval, StateStore
@@ -54,6 +54,7 @@ from foragent.run_prompts import (
     build_resume_prompt,
 )
 from foragent.run_waits import (
+    paused_seconds,
     poll_executor,
     _remaining,
     _timeout,
@@ -129,8 +130,7 @@ from foragent.run_conflicts import (
     _block_rebuild, _rebuild, _rebuild_after_conflicts, _recover_replay, _resume_implementation,
 )
 from foragent.run_implementation import _implement, _prepare_implementation
-from foragent.harness_guard import guard_measurements
-from foragent.run_publish import _guard_before_measurement, _publish, _push_branch
+from foragent.run_publish import _publish, _push_branch
 from foragent.run_review import _review_implementation
 
 
@@ -196,9 +196,14 @@ def _implement_and_publish(
     """Run named implementation, check, review and publication steps."""
     attempt = _prepare_implementation(n, ctx, git, target_branch=target_branch, failure=failure)
     outcome = "error"
-    stop_guarding = guard_measurements(git.root, lambda: _guard_before_measurement(attempt))
     try:
-        resume_verified = _resume_implementation(attempt)
+        try:
+            resume_verified = _resume_implementation(attempt)
+        except AttemptFailure:
+            if not attempt.review_hold:
+                raise
+            outcome = _publish(attempt)  # the test-harness guard held during conflict resolution
+            return outcome
         if not _acceptance_matches(n, ctx, git, attempt.approval):
             raise ExecutorStopped("hash-mismatch")
         attempt.approved_ref = git.head_sha()
@@ -236,6 +241,10 @@ def _implement_and_publish(
                     attempt.failure = exc
                     continue
                 except (AttemptFailure, PatchReplayError) as exc:
+                    if attempt.review_hold:
+                        # The test-harness guard held during a base-move re-check: publish the hold.
+                        outcome = _publish(attempt)
+                        return outcome
                     attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else exc.failure
                     if not attempt.failure:
                         # The replay was resolved and verified in place; publish it without a new turn.
@@ -265,23 +274,13 @@ def _implement_and_publish(
         outcome = "killed"
         raise
     finally:
-        stop_guarding()
         if outcome != "merged":
             run = ctx.store.get_run(n)
-            try:
-                _preserve_failed_implementation(
-                    n, ctx, git, run.outcome or outcome, approval=attempt.approval,
-                    approved_ref=attempt.approved_ref, title=attempt.issue.title, pushed_head=attempt.pushed_head,
-                    tracker_available=attempt.tracker_available, push_branch=lambda: _push_branch(attempt),
-                )
-            except GitError as exc:
-                if outcome != "held":
-                    raise
-                # A hold already reported its evidence; contents Git refuses to
-                # stage (for example a FIFO) must not replace it with an error.
-                detail = f"WIP preservation failed after the hold: {exc}"
-                _append(ctx.store.log_path(n), detail)
-                append_event(ctx.store, ctx.now(), n, "wip-preservation-failed", detail)
+            _preserve_failed_implementation(
+                n, ctx, git, run.outcome or outcome, approval=attempt.approval, approved_ref=attempt.approved_ref,
+                title=attempt.issue.title, pushed_head=attempt.pushed_head, tracker_available=attempt.tracker_available,
+                push_branch=lambda: _push_branch(attempt),
+            )
 
 
 def review_only(
@@ -313,16 +312,17 @@ def review_only(
         ctx.tracker.add_labels(n, [RUNNING])
         ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
         ctx.git.remove_worktree(worktree)
-        try:
-            outcome = _review_only(n, ctx, worktree, verdict_head)
-        except AttemptFailure as exc:
-            if not repair_ci:
-                # Let the caller schedule repair without changing the verdict's head.
-                raise ExecutorStopped("ci-failed", str(exc)) from exc
-            git = ctx.git.at(worktree)
-            git.attach_branch(f"foragent/issue-{n}")
-            _inject_lane_skills(ctx, n, git, f"origin/{exc.target_branch}")
-            outcome = _implement_and_publish(n, ctx, git, target_branch=exc.target_branch, failure=exc)
+        with extend_deadline(partial(paused_seconds, n, ctx)):  # Talk pauses (D55 addendum).
+            try:
+                outcome = _review_only(n, ctx, worktree, verdict_head)
+            except AttemptFailure as exc:
+                if not repair_ci:
+                    # Let the caller schedule repair without changing the verdict's head.
+                    raise ExecutorStopped("ci-failed", str(exc)) from exc
+                git = ctx.git.at(worktree)
+                git.attach_branch(f"foragent/issue-{n}")
+                _inject_lane_skills(ctx, n, git, f"origin/{exc.target_branch}")
+                outcome = _implement_and_publish(n, ctx, git, target_branch=exc.target_branch, failure=exc)
     except ExecutorStopped as exc:
         outcome = exc.outcome
         detail = str(exc)
@@ -389,7 +389,9 @@ def run_issue(n: int, ctx: RunContext) -> str:
         ctx = replace(ctx, config=stored_config(ctx.store, lane_settings, run, ctx.now()),
                       lane_executor=lane_settings.executor)
         try:
-            outcome = _execute(n, ctx, worktree)
+            # Every command's timeout grows by time a talk paused the run (D55 addendum).
+            with extend_deadline(partial(paused_seconds, n, ctx)):
+                outcome = _execute(n, ctx, worktree)
         finally:
             ctx.git.remove_worktree(worktree)
     except ExecutorStopped as exc:

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shlex
@@ -65,9 +66,12 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
     unknown_path = ctx.store.root / "orch-watch-unknown.json"
     last_error = None
     session = claude_session()  # The gate's spawn check trusts it past a stale heartbeat.
+    # #413: the id its spawn gave this session; writes from a retired session are ignored.
+    session_id = os.environ.get("FORAGENT_SESSION_ID")
     while True:
         try:  # Every read, changed or not, shows the orchestrator is alive.
-            ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session)
+            ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session,
+                                      session_id=session_id)
         except Exception:
             pass  # a heartbeat is best effort; the read below reports state errors
         try:

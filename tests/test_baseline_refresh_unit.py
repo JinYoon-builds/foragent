@@ -149,7 +149,6 @@ def test_rebuild_verification_uses_the_rebuilt_base(git_history, tmp_path, monke
     attempt.git.publication_paths = set()
     attempt.git.staged_tree_sha = lambda: "tree"
     attempt.worktree, attempt.log = git_history.clone, None
-    attempt.parsed = SimpleNamespace(files=[])  # the harness guard reads ## Files
 
     with pytest.raises(Stop):
         run_checks._verify_implementation(attempt)

@@ -28,6 +28,8 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
+        "orch_refresh_compactions": 4,
+        "orch_refresh_hours": 24,
         "tick_failure_alert": 3,
         "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low",
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
@@ -164,6 +166,7 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
 @pytest.mark.parametrize("key,value", [
     ("orchestrator_timeout_minutes", 0), ("orchestrator_timeout_minutes", -1),
     ("orchestrator_timeout_minutes", True), ("orchestrator_timeout_minutes", "5"),
+    ("orch_refresh_compactions", 0), ("orch_refresh_hours", -1), ("orch_refresh_hours", True),
     ("interview", "magic"), ("interview", None), ("interview", []), ("interview", True),
     ("ouroboros_version", 52), ("ouroboros_version", []), ("ouroboros_version", False),
     ("review", "FAST"), ("review", None), ("review", []),
@@ -366,6 +369,10 @@ def test_lane_validation(repo, settings):
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_parallel_and_wait_settings_are_positive(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
+    if key == "max_parallel" and value is None:
+        # null is the default (no ceiling), as when the key is left out (a dump of Config writes it).
+        assert load_config(repo).max_parallel is None
+        return
     with pytest.raises(ConfigError, match=key):
         load_config(repo)
 

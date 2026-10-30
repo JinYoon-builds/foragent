@@ -114,6 +114,9 @@ def no_view_windows(monkeypatch):
     """Never open real terminal windows during the test suite."""
     monkeypatch.setenv("FORAGENT_VIEW", "off")
     monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")  # Nor real orchestrator sessions (D76).
+    # A suite run inside an orchestrator session must not write heartbeats under its id (#413).
+    for name in ("FORAGENT_SESSION_ID", "FORAGENT_ROLE"):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

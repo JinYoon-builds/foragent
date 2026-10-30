@@ -82,13 +82,6 @@ class GitRepo:
             timeout=timeout, errors="replace",
         ).stdout
 
-    def run_bytes(self, args: list[str]) -> subprocess.CompletedProcess[bytes]:
-        """Run Git without decoding or raising, so paths and file bytes are never replaced."""
-        try:
-            return subprocess.run(["git", *args], cwd=self.root, capture_output=True, timeout=120)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise GitError(str(exc)) from exc
-
     def _call(self, args: list[str]) -> str:
         try:
             return self._run(args)
@@ -170,31 +163,16 @@ class GitRepo:
         """Continue work on a detached PR head without replacing its worktree."""
         self._call(["switch", "-C", branch, "HEAD"])
 
-    def stage_changes(self, *, skip_refused: bool = False) -> list[str]:
-        """Stage the worktree; with skip_refused, stage what Git accepts and return the rest.
-
-        Git refuses some contents (for example a FIFO) and then stages nothing.
-        """
+    def stage_changes(self) -> None:
         output = self._call([
             "ls-files", "--modified", "--deleted", "--others", "--exclude-standard", "-z",
             "--", ".", *(f":!{path}" for path in ARTIFACT_PATHS), f":!{REVIEW_SCOPE_FILE}",
             *(f":(exclude,literal){path}" for path in sorted(self.local_skill_paths)),
         ])
         paths = sorted(set(filter(None, output.split("\0"))))
-        refused: list[str] = []
         if paths:
-            try:
-                self._call(["--literal-pathspecs", "add", "-A", "--", *paths])
-            except GitError:
-                if not skip_refused:
-                    raise
-                for path in paths:
-                    try:
-                        self._call(["--literal-pathspecs", "add", "-A", "--", path])
-                    except GitError:
-                        refused.append(path)
+            self._call(["--literal-pathspecs", "add", "-A", "--", *paths])
         self._exclude_artifacts()
-        return refused
 
     def reconcile_local_skills(self, target_ref: str) -> None:
         """Release injected dependencies only after clearing copies owned by target."""
@@ -254,6 +232,35 @@ class GitRepo:
         # NUL delimiters retain filenames containing tabs, quotes, or newlines.
         output = self._call(["diff", "--cached", "--name-only", "--no-renames", "-z", self._own_base(base_ref)])
         return [path for path in output.split("\0") if path]
+
+    def committed_diff(self, base: str, head: str) -> list[tuple[bytes, bytes, bytes, bytes, bytes]]:
+        """Raw `diff-tree` entries from base to head (commits or trees), never decoded.
+
+        Each entry is (old mode, new mode, old sha, new sha, path bytes). No
+        rename detection, so a rename is its deletion and addition; blobs are
+        never read, so this lists exactly what Git records.
+        """
+        try:
+            output = subprocess.run(
+                ["git", "-c", "core.precomposeUnicode=false", "diff-tree", "-r", "-z", "--no-renames", "--raw",
+                 base, head], cwd=self.root, check=True, capture_output=True, timeout=120).stdout
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise GitError(str(getattr(exc, "stderr", b"") or exc)) from exc
+        tokens = output.split(b"\0")
+        entries = []
+        for i in range(0, len(tokens) - 1, 2):
+            meta, path = tokens[i], tokens[i + 1]
+            old_mode, new_mode, old_sha, new_sha, _status = meta.lstrip(b":").split(b" ")
+            entries.append((old_mode, new_mode, old_sha, new_sha, path))
+        return entries
+
+    def blob_bytes(self, sha: bytes) -> bytes:
+        """A blob's exact bytes (git cat-file applies no filter)."""
+        try:
+            return subprocess.run(["git", "cat-file", "blob", sha.decode()], cwd=self.root, check=True,
+                                  capture_output=True, timeout=120).stdout
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise GitError(str(getattr(exc, "stderr", b"") or exc)) from exc
 
     def staged_tree_sha(self) -> str:
         return self._call(["write-tree"]).strip()

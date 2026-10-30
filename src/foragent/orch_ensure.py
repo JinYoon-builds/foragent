@@ -13,11 +13,9 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import subprocess
 
-from foragent import notify, orch_spawn
+from foragent import orch_spawn
 from foragent.config import Config
-from foragent.i18n import text
 from foragent.state import StateStore
 
 
@@ -89,22 +87,11 @@ def ensure_explicit(repo_root: Path, store: StateStore, config: Config, now: dat
         if _last_spawn(store) != seen or (busy and orch_spawn._spaced(store, now)):
             why.append("raced")
             return None
-        chosen = orch_spawn._command(root, store, f"orch: {root.name}")
-        if chosen is None:
-            why.append("failed")
-            return None
-        screen, argv = chosen
+        planned = orch_spawn.plan_launch(root, store, now)
         # The same record as the gate writes, so the gate's spacing also covers this spawn.
-        store._write_json(orch_spawn._record_path(store), {"spawned_at": now.isoformat(), "screen": screen})
-        try:
-            result = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, check=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            orch_spawn.record_launch(store, now, screen, None)
+        if planned is None or not orch_spawn.launch(root, store, now, planned):
             why.append("failed")
             return None
-        orch_spawn.record_launch(store, now, screen, result)
-    language = config.language
-    notify.send(config, text("orch_spawn_title", language),
-                text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
-    return screen
+        orch_spawn.adopt(store, planned, now)
+    orch_spawn._opened(store, config, root, now, planned)
+    return planned[0]

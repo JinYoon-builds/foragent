@@ -23,8 +23,9 @@ def flag(
 ) -> None:
     """Block an issue with a reason; needs_human also hands it to a person at once.
 
-    With needs_human the issue gets the needs-human label and one comment with the
-    needs-human marker, so the orchestrator timeout does not escalate it again.
+    With needs_human the issue also gets the needs-human label, and the one
+    comment carries the needs-human marker, so the orchestrator timeout does
+    not escalate it again.
     """
     run = ctx.store.get_run(n)
     if run is not None and run.status == "running":

@@ -841,66 +841,41 @@ def test_bug_steps_are_left_out_of_the_conflict_resolution_turn(conflicting_lane
     assert "This issue is a bug. Follow these steps:" not in conflict
 
 
-def test_conflict_resolution_that_leaves_a_fifo_pyproject_is_held_before_staging(conflicting_lanes, monkeypatch):
-    """The resolver's turn is guarded before the staging Git would refuse."""
-    import os
-
-    from foragent.reasons import Reason
+def test_harness_hold_during_conflict_resolution_is_published_as_a_hold(conflicting_lanes, monkeypatch):
+    """The guard re-runs before the resolved head is measured; its hold reaches publication, not a retry."""
+    from foragent import harness_guard
 
     c = conflicting_lanes
-    c.history.update({"pyproject.toml": '[tool.pytest.ini_options]\naddopts = "-q"\n'})
     c.executor.steps += [{"cli.py": "commands = ['help', 'base', 'issue']\n"}]
-    run = c.executor.run
+    calls = []
+    real = harness_guard.guard_measured
 
-    def implement(**kwargs):
-        result = run(**kwargs)
-        if len(c.executor.calls) == 2:  # the conflict resolver
-            path = kwargs["worktree"] / "pyproject.toml"
-            path.unlink()
-            os.mkfifo(path)
-        return result
+    def second_call_holds(ctx, n, git, target_ref, measured, files, *, tree=False):
+        calls.append(measured)
+        return ["tests/conftest.py"] if len(calls) > 1 else real(ctx, n, git, target_ref, measured, files, tree=tree)
 
-    monkeypatch.setattr(c.executor, "run", implement)
-    outcome = run_issue(1, c.ctx)
-    assert outcome == "held", c.store.log_path(1).read_text()[-3000:]
-    assert len(c.executor.calls) == 2
+    monkeypatch.setattr(harness_guard, "guard_measured", second_call_holds)
+    assert run_issue(1, c.ctx) == "held"
+    assert len(calls) >= 2 and len(c.executor.calls) == 2  # no extra implementer turn after the hold
     assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
     assert "needs-human" in c.tracker.get_issue(1).labels
+    assert c.tracker.merged_prs == []
 
 
-def test_conflict_resolution_hold_publishes_the_resolved_merge(conflicting_lanes):
-    """The resolver's unstaged resolution and harness change are what the held PR carries."""
-    from foragent.reasons import Reason
+def test_harness_hold_while_resuming_saved_conflicts_is_published_as_a_hold(run_case, monkeypatch):
+    """Resuming saved conflicts re-verifies before the loop; a guard hold there must still be published."""
+    from foragent import runner
+    from foragent.run_attempt import AttemptFailure
 
-    c = conflicting_lanes
-    resolved = "commands = ['help', 'base', 'issue']\n"
-    c.executor.steps += [{"cli.py": resolved, "tests/sub/conftest.py": "# harness\n"}]
+    c = run_case
+
+    def resume_hits_hold(attempt):
+        attempt.review_hold, attempt.review_hold_reason = True, Reason.TEST_HARNESS_CHANGED
+        attempt.failure = "- `tests/conftest.py`"
+        raise AttemptFailure(attempt.failure)
+
+    monkeypatch.setattr(runner, "_resume_implementation", resume_hits_hold)
     assert run_issue(1, c.ctx) == "held"
+    assert c.executor.calls == []
     assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
-    assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == resolved.strip()
-    assert git_command(c.history.origin, "show", "foragent/issue-1:tests/sub/conftest.py") == "# harness"
-
-
-@pytest.mark.parametrize("inherited", [
-    {"tests/sub/conftest.py": "# target harness\n"},
-    {"pyproject.toml": '[tool.pytest.ini_options]\naddopts = "-q"\n'},
-], ids=["conftest", "pyproject-table"])
-def test_conflict_resolution_inherits_target_only_harness_changes(conflicting_lanes, monkeypatch, inherited):
-    """A harness change the target makes in the same move as the conflict is not the PR's."""
-    c = conflicting_lanes
-    c.executor.steps += [{"cli.py": "commands = ['help', 'base', 'issue']\n"}]
-    poll = c.tracker.pr_checks
-
-    def ci(pr):
-        status = poll(pr)
-        if len(c.target_heads) == 1 and c.target_heads[0] == c.history.tip:
-            c.history.update(inherited)
-            c.target_heads.append(c.history.tip)
-        return status
-
-    monkeypatch.setattr(c.tracker, "pr_checks", ci)
-    outcome = run_issue(1, c.ctx)
-    assert outcome == "merged", c.store.log_path(1).read_text()[-2000:]
-    assert c.store.load_flag(1) is None
-    path, content = next(iter(inherited.items()))
-    assert git_command(c.history.origin, "show", f"foragent/issue-1:{path}") == content.strip()
+    assert "needs-human" in c.tracker.get_issue(1).labels

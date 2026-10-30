@@ -16,10 +16,9 @@ import os
 from pathlib import Path
 import shlex
 import shutil
-import subprocess
 from types import SimpleNamespace
 
-from foragent import notify, orch_binding, orch_push, orch_stale_files, processes, watch_open
+from foragent import orch_binding, orch_push, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
@@ -139,20 +138,35 @@ def _orca(store: StateStore, root: Path) -> str | None:
     return None
 
 
-def _command(root: Path, store: StateStore, title: str) -> tuple[str, list[str]] | None:
+def _command(root: Path, store: StateStore, title: str, session_id: str | None = None,
+             prompt: str | None = None) -> tuple[str, list[str]] | None:
+    """The launch argv for the first available screen.
+
+    With ``session_id`` (#413) Claude gets ``--session-id`` and the role
+    environment as an ``env`` prefix in the Orca and tmux commands; the
+    background path takes that environment from ``_environment``. ``prompt``
+    follows ``/fa-orchestrator`` as its first message.
+    """
     claude = shutil.which("claude")
     if not claude:
         return None
     # The role agent loads its skill and project memory when the project defines it.
     agent = ["--agent", "fa-orchestrator"] if (root / AGENT).is_file() else []
-    session = shlex.join([claude, *agent, SKILL])
+    named = ["--session-id", session_id] if session_id else []
+    first = [prompt] if prompt else []
+    prefix = ["env", *(f"{key}={value}" for key, value in _role_env(session_id).items())] if session_id else []
+    session = shlex.join([*prefix, claude, *agent, *named, SKILL, *first])
     if orca := _orca(store, root):
         return "orca", [orca, "terminal", "create", "--worktree", f"path:{root}",
                         "--title", title, "--command", session]
     tmux = shutil.which("tmux") if os.environ.get("TMUX") else None
     if tmux:
         return "tmux", [tmux, "new-window", "-d", "-n", title, "-c", str(root), session]
-    return "background", [claude, "--bg", "-n", title, *agent, SKILL]
+    return "background", [claude, "--bg", "-n", title, *agent, *named, SKILL, *first]
+
+
+def _role_env(session_id: str) -> dict[str, str]:
+    return {"FORAGENT_ROLE": "orchestrator", "FORAGENT_SESSION_ID": session_id}
 
 
 def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, now: datetime,
@@ -177,27 +191,12 @@ def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, n
         if _spaced(store, now):
             return None
         root = repo_root.resolve()
-        title = f"orch: {root.name}"
-        chosen = _command(root, store, title)
-        if chosen is None:
+        planned = plan_launch(root, store, now)
+        if planned is None or not launch(root, store, now, planned):
             return None
-        screen, argv = chosen
-        # A failed or timed-out command may still open later, so it reserves the spacing too.
-        store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen})
-        try:
-            result = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, check=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            record_launch(store, now, screen, None)
-            return None
-        record_launch(store, now, screen, result)
-    language = config.language
-    try:
-        notify.send(config, text("orch_spawn_title", language),
-                    text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
-    except Exception:  # noqa: BLE001 - the session opened even when its push fails
-        pass
-    return screen
+        adopt(store, planned, now)
+    _opened(store, config, root, now, planned)
+    return planned[0]
 
 
 def on_tick(ctx, report):
@@ -266,3 +265,9 @@ def deciding(ctx, acquired: bool = True):
             except Exception as exc:  # noqa: BLE001 - the push must not fail a finished tick
                 report.actions.append(text("push_blocked_failed", language,
                                            error=" ".join(str(exc).split())[:200]))
+
+
+# Launch steps live in orch_spawn_launch; imported last because it imports this module.
+from foragent.orch_spawn_launch import (  # noqa: E402,F401 - re-exported
+    _environment, _opened, adopt, launch, plan_launch, spawn_orchestrator, transcript_path,
+)

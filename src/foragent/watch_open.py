@@ -12,13 +12,34 @@ import shutil
 import subprocess
 import sys
 
+import psutil
+
 from foragent.i18n import text
 from foragent.state import StateStore
 
 
-def _running(store: StateStore) -> bool:
+# Timestamps from the kernel and the file system differ in precision.
+REUSE_SLACK_SECONDS = 2.0
+
+
+def _reused(pid: int, written_at: float) -> bool:
+    """True when the process at pid started after watch.pid was written.
+
+    The view writes watch.pid after it starts, so its process is never younger
+    than the file. An unreadable start time keeps the PID live.
+    """
     try:
-        pid = int((store.root / "watch.pid").read_text(encoding="utf-8"))
+        started = psutil.Process(pid).create_time()
+    except (psutil.Error, OSError, OverflowError, ValueError):
+        return False
+    return started > written_at + REUSE_SLACK_SECONDS
+
+
+def _running(store: StateStore) -> bool:
+    path = store.root / "watch.pid"
+    try:
+        written_at = path.stat().st_mtime
+        pid = int(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         return False
     if pid <= 0:
@@ -31,7 +52,7 @@ def _running(store: StateStore) -> bool:
         pass  # A process owned by another user still exists.
     except OverflowError:
         return False
-    return True
+    return not _reused(pid, written_at)
 
 
 LOCK_NAME = "watch.lock"
@@ -147,6 +168,24 @@ def _recorded_terminal(store: StateStore, root: Path, *, guarded: bool = False) 
     except (OSError, subprocess.SubprocessError):
         return None
     return executable, handle
+
+
+def record_terminal(store: StateStore, cwd: Path, executable: str, handle: str, now: datetime) -> bool:
+    """Record the person's Orca terminal in watch-terminal.json; False when skipped.
+
+    Role sessions (FORAGENT_ROLE) and sessions inside the gate's worktrees are not the
+    person's terminal, so they never replace the record.
+    """
+    if "FORAGENT_ROLE" in os.environ:  # Set at all, even empty: a role launched this session.
+        return False
+    with suppress(OSError, ValueError):
+        if cwd.resolve().is_relative_to((store.root / "worktrees").resolve()):
+            return False
+    store._write_json(store.root / "watch-terminal.json", {
+        "executable": executable, "handle": handle,
+        "recorded_at": now.isoformat(),
+    })
+    return True
 
 
 REOPEN_SPACING = timedelta(minutes=5)
@@ -269,9 +308,9 @@ def _launch(repo_root: Path, store: StateStore, language: str, record_at: dateti
         terminal = None
         if executable:
             executable = str(Path(executable).absolute())
-            store._write_json(store.root / "watch-terminal.json", {
-                "executable": executable, "handle": handle,
-            })
+            # Kept for the locked view tests that open with a handle, then without one;
+            # the SessionStart hook is the writer for the planning terminal.
+            record_terminal(store, Path.cwd(), executable, handle, datetime.now(UTC))
             terminal = executable, handle
         elif not handle:
             terminal = _recorded_terminal(store, root, guarded=True)

@@ -181,6 +181,11 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     from foragent.ci_local import LocalComparisonUnavailable, fallback_comparison
 
     n, ctx = attempt.n, attempt.ctx
+    from foragent.harness_guard import guard_or_stop
+    # The acceptance comparison measures this exact head: guard it first.
+    target = getattr(attempt, "target_branch", None) or ctx.config.base_branch
+    guard_or_stop(ctx, n, attempt.git, f"origin/{target}", head,
+                  f"https://github.com/{ctx.repo}/pull/{pr}")
     if deadline is None:
         deadline = ctx.now().timestamp() + 1200
     if base_sha is None:
@@ -270,6 +275,8 @@ def review_checks(n, ctx, git, target_branch):
     import shlex
 
     base = f"origin/{target_branch}"
+    from foragent.harness_guard import guard_or_stop
+    guard_or_stop(ctx, n, git, base, git.head_sha())  # the acceptance ids below measure this head
     command = ctx.config.test_command or next(iter(runner.detect_test_commands(git.root)), None)
     try:
         baseline = capture_local_only(n, ctx, git, command, git.ref_sha(base),

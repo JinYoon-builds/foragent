@@ -599,44 +599,6 @@ def test_cli_routes_all_verbs_to_injected_context(review_case, monkeypatch, caps
     assert "resolved review fail" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("entry", ["review-only", "resolve"])
-def test_review_entries_hold_unlisted_harness_change_before_measuring_head(review_case, monkeypatch, entry):
-    assert_review_harness_hold(review_case, monkeypatch, entry, "tests/sub/conftest.py")
-
-
-@pytest.mark.parametrize("entry", ["review-only", "resolve"])
-def test_review_hold_sees_head_paths_the_runner_index_omits(review_case, monkeypatch, entry):
-    """Paths the runner's staging can drop (local skill paths) are still judged from the PR head."""
-    assert_review_harness_hold(review_case, monkeypatch, entry, ".claude/skills/demo/conftest.py")
-
-
-def assert_review_harness_hold(c, monkeypatch, entry, path):
-    base = git_command(c.history.origin, "rev-parse", "refs/heads/main")
-    c.history.update({path: "# changed harness\n"})
-    c.head = c.history.tip
-    c.tracker.set_pr_head_sha(c.pr, c.head)
-    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", c.head)
-    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
-    c.ctx.git.fetch()
-    measured = []
-    monkeypatch.setattr(runner, "_check", lambda *args, **kwargs: measured.append(args))
-    if entry == "resolve":
-        orch.resolve(c.ctx, 1, "pass", "Reviewed the current head")
-    else:
-        assert runner.review_only(1, c.ctx) == "held"
-    assert measured == [] and c.review_calls == []
-    assert c.tracker.merged_prs == []
-    assert c.tracker.get_issue(c.pr).state == "open"
-    assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
-    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
-    assert any(path in comment.body for comment in c.tracker.list_comments(1)
-               if "reason=test-harness-changed" in comment.body)
-    # A held PR is left as it is: only the flag and comment, no push and no new PR.
-    assert len(c.tracker.created_prs) == 1
-    assert not any("push" in args or "commit" in args for _, args in c.operations)
-    assert git_command(c.history.origin, "rev-parse", "refs/heads/foragent/issue-1") == c.head
-
-
 def test_review_only_spec_conflict_stops_with_spec_question_and_keeps_pr_open(review_case):
     c = review_case
     conflict = f"SPEC-CONFLICT: {ACCEPTANCE}:1 requires X; the finding wants Y"
@@ -652,93 +614,35 @@ def test_review_only_spec_conflict_stops_with_spec_question_and_keeps_pr_open(re
     assert [e["verdict"] for e in events if e["kind"] == "review"] == ["SPEC-CONFLICT"]
 
 
-def test_review_done_when_that_leaves_a_fifo_pyproject_is_held_not_a_staging_error(review_case):
-    """The last measurement's leftovers are guarded before the final staging, which Git would refuse."""
-    from runner_support import set_done_when
-
+@pytest.mark.parametrize("entry", ["review-only", "resolve"])
+def test_review_entries_hold_unlisted_harness_change_before_measuring_head(review_case, monkeypatch, entry):
+    """The PR head commits an unlisted conftest.py: hold for a person before any Done when runs."""
     c = review_case
-    c.history.update({"pyproject.toml": '[tool.pytest.ini_options]\naddopts = "-q"\n'})
+    base = git_command(c.history.origin, "rev-parse", "refs/heads/main")
+    c.history.update({"tests/sub/conftest.py": "# changed harness\n"})
     c.head = c.history.tip
     c.tracker.set_pr_head_sha(c.pr, c.head)
     git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", c.head)
-    git_command(c.history.origin, "update-ref", "refs/heads/main", c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
     c.ctx.git.fetch()
-    set_done_when(c, ["rm pyproject.toml && mkfifo pyproject.toml"])
-    c.tracker.edit_body(1, c.store.load_approval(1).body)
-
-    assert runner.review_only(1, c.ctx) == "held"
-    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
-    assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
+    measured = []
+    monkeypatch.setattr(runner, "_check", lambda *args, **kwargs: measured.append(args))
+    if entry == "resolve":
+        orch.resolve(c.ctx, 1, "pass", "Reviewed the current head")
+    else:
+        assert runner.review_only(1, c.ctx) == "held"
+    assert measured == [] and c.review_calls == []
     assert c.tracker.merged_prs == [] and c.tracker.get_issue(c.pr).state == "open"
-
-
-def test_review_fifo_between_done_when_commands_is_held_before_staging(review_case):
-    """The guard before the second measurement decides before it stages the FIFO."""
-    from runner_support import set_done_when
-
-    c = review_case
-    c.history.update({"pyproject.toml": '[tool.pytest.ini_options]\naddopts = "-q"\n'})
-    c.head = c.history.tip
-    c.tracker.set_pr_head_sha(c.pr, c.head)
-    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", c.head)
-    git_command(c.history.origin, "update-ref", "refs/heads/main", c.head)
-    c.ctx.git.fetch()
-    set_done_when(c, ["rm pyproject.toml && mkfifo pyproject.toml", "true"])
-    c.tracker.edit_body(1, c.store.load_approval(1).body)
-
-    assert runner.review_only(1, c.ctx) == "held"
-    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
     assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
-
-
-def test_review_guard_runs_no_git_filter_before_a_measurement(review_case):
-    """The review guard must not stage: a clean filter could write conftest.py after it."""
-    from runner_support import set_done_when
-
-    c = review_case
-    git_command(c.history.clone, "config", "filter.mk.clean",
-                "sh -c 'mkdir -p gen && echo \"# made by a filter\" > gen/conftest.py; cat'")
-    (c.history.clone / ".git/info").mkdir(exist_ok=True)
-    (c.history.clone / ".git/info/attributes").write_text("feature.txt filter=mk\n")
-    set_done_when(c, ["echo more >> feature.txt",
-                      'echo RAN_""SECOND; if test -f gen/conftest.py; then echo MEASURED_""WITH_HARNESS; fi'])
-    c.tracker.edit_body(1, c.store.load_approval(1).body)
-    runner.review_only(1, c.ctx)
-    log = c.store.log_path(1).read_text()
-    assert "RAN_SECOND" in log, "the second measurement must actually run"
-    assert "MEASURED_WITH_HARNESS" not in log
-
-
-def test_review_final_staging_cannot_hide_a_filter_written_harness(review_case):
-    """A clean filter that returns feature.txt's own bytes but writes gen/conftest.py, run by the final staging."""
-    from runner_support import set_done_when
-
-    c = review_case
-    git_command(c.history.clone, "config", "filter.mk.clean",
-                "sh -c 'mkdir -p gen && echo \"# made by a filter\" > gen/conftest.py; cat'")
-    (c.history.clone / ".git/info").mkdir(exist_ok=True)
-    (c.history.clone / ".git/info/attributes").write_text("feature.txt filter=mk\n")
-    # Rewrite feature.txt with the same bytes, so staging re-cleans it and finds no change.
-    set_done_when(c, ['cp feature.txt f.tmp && mv f.tmp feature.txt && echo RAN_""DONE_WHEN'])
-    c.tracker.edit_body(1, c.store.load_approval(1).body)
-    assert runner.review_only(1, c.ctx) == "held"
-    assert "RAN_DONE_WHEN" in c.store.log_path(1).read_text()
-    assert c.tracker.merged_prs == []
     assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
-    assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
+    held = [comment.body for comment in c.tracker.list_comments(1) if "reason=test-harness-changed" in comment.body]
+    assert len(held) == 1 and held[0].startswith("<!-- foragent:needs-human") and "tests/sub/conftest.py" in held[0]
+    # A held PR is left as it is: no push and no new PR.
+    assert len(c.tracker.created_prs) == 1
+    assert not any("push" in args or "commit" in args for _, args in c.operations)
 
 
-def test_review_harness_written_after_the_last_measurement_is_held_before_merging(review_case, monkeypatch):
+def test_review_head_without_harness_changes_is_measured_and_recorded(review_case):
     c = review_case
-    checks = c.tracker.pr_checks
-
-    def ci_writes_harness(pr):
-        worktree = c.store.worktree_path(1)
-        (worktree / "gen").mkdir(exist_ok=True)
-        (worktree / "gen/conftest.py").write_text("# appeared after the checks\n")
-        return checks(pr)
-
-    monkeypatch.setattr(c.tracker, "pr_checks", ci_writes_harness)
-    assert runner.review_only(1, c.ctx) == "held"
-    assert c.tracker.merged_prs == []
-    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert runner.review_only(1, c.ctx) == "merged"
+    assert c.store.get_run(1).harness_guard["guarded"] == c.head

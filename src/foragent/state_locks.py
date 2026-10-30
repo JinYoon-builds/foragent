@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 import threading
+import time
 from typing import IO, Any
 
 # Tick-lock paths this thread holds through StateStore.hold_tick_lock.
@@ -19,6 +20,30 @@ def _file_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
         _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
+
+
+class LockBusy(Exception):
+    """A timed lock stayed held by someone else for the whole wait."""
+
+
+@contextmanager
+def _timed_lock(path: Path, timeout: float) -> Iterator[None]:
+    """Like ``_file_lock``, but polling a non-blocking lock every 0.1 s for up to ``timeout``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX | _state.fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LockBusy(str(path)) from None
+                time.sleep(0.1)
         try:
             yield
         finally:
@@ -68,16 +93,18 @@ class StateLocksMixin:
     def _state_lock(self) -> AbstractContextManager[None]:
         return _file_lock(self.root / "state.lock")
 
-    def worktree_lock(self, number: int) -> AbstractContextManager[None]:
-        """Serialize an issue's WIP preservation and worktree removal.
+    def worktree_lock(self, number: int, timeout: float | None = None) -> AbstractContextManager[None]:
+        """Serialize an issue's WIP preservation, worktree removal, talk decision and timed stop.
 
         Lock order: tick (if held) -> worktree -> state. Never wait for a
         worktree lock under the state lock, or take the tick lock under a
         worktree lock. These locks are not reentrant; cleanup acquires it
         separately from preservation. Keep lock files after removal so all
-        contenders continue to lock the same inode.
+        contenders continue to lock the same inode. ``timeout`` None blocks;
+        0 tries once; a number waits that long; a busy lock raises ``LockBusy``.
         """
-        return _file_lock(self.root / "runs" / f"issue-{number}.worktree.lock")
+        path = self.root / "runs" / f"issue-{number}.worktree.lock"
+        return _file_lock(path) if timeout is None else _timed_lock(path, timeout)
 
     @contextmanager
     def try_worktree_lock(self, number: int) -> Iterator[bool]:

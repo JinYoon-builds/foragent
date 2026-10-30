@@ -76,6 +76,9 @@ class Config:
     run_hours: str = "always"
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
+    # `fa orch refresh-due`: either threshold (inclusive) makes a fresh orchestrator session due.
+    orch_refresh_compactions: int = 4
+    orch_refresh_hours: int = 24
     tick_failure_alert: int = 3
     max_runtime_minutes: int = 90
     max_retries: int = 2
@@ -423,7 +426,8 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
         if key not in DEFAULTS and key not in IGNORED_KEYS and key not in FILE_KEYS:
             raise ConfigError(f"unknown configuration key: {key}")
     if "max_parallel" in value and value["max_parallel"] is None:
-        raise ConfigError("max_parallel must be a positive integer; omit it to have no ceiling")
+        # null is the default (no ceiling), as when the key is left out; a dump of Config writes it.
+        value = {key: item for key, item in value.items() if key != "max_parallel"}
     return value
 
 
