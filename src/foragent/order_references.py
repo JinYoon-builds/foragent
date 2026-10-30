@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
@@ -19,7 +20,7 @@ from foragent.paths import repo_path
 NAMESPACE = "docs/design/"
 LIMIT = 1024 * 1024
 IMAGE_TYPES = {".png": "png", ".jpg": "jpg", ".jpeg": "jpg", ".gif": "gif"}
-SNAPSHOTS = ".foragent/preread-references"
+SNAPSHOTS = ".foragent/references"
 
 
 def _error(message: str):
@@ -141,12 +142,16 @@ def snapshot_dir(root: Path, contents: dict[str, str | bytes]) -> Path:
     return root / SNAPSHOTS / digest
 
 
-def preread_section(plan: dict, item: dict, root: Path) -> str:
-    """Selected text inline and absolute paths of the images materialized for preread."""
+def preread_section(plan: dict, item: dict, root: Path, reader: Path | None = None) -> str:
+    """Selected text inline and absolute paths of the images materialized for preread.
+
+    Image paths point into the reader's own directory when given; without one they name
+    the shared content-addressed parent, which is the form the evidence digest uses.
+    """
     contents = _decoded(plan, selected(plan, item))
     if not contents:
         return ""
-    snapshot = snapshot_dir(root, contents)
+    snapshot = reader or snapshot_dir(root, contents)
     parts = ["## References (approved design files)"]
     for name, content in contents.items():
         if isinstance(content, bytes):
@@ -190,33 +195,34 @@ def _write_new(path: Path, data: bytes) -> None:
 
 
 def materialize(plan: dict, item: dict, root: Path) -> Path | None:
-    """Write the issue's selected references into a fresh, ignored content-addressed snapshot."""
+    """Write the issue's selected references into a new directory owned by this reader.
+
+    It sits in the content-addressed parent .foragent/references/<hash>/, which always
+    stays; concurrent prereads never share a reader directory.
+    """
     from foragent.order_files import check_destinations
 
     contents = _decoded(plan, selected(plan, item))
     if not contents:
         return None
-    snapshot = snapshot_dir(root, contents)
-    relative = snapshot.relative_to(root).as_posix()
-    check_destinations(snapshot, contents)
-    real_directory(root, SNAPSHOTS)
-    # A leftover from an interrupted reader is replaced; rmtree never follows links inside it.
-    remove(root, snapshot)
+    parent = snapshot_dir(root, contents)
+    check_destinations(parent, contents)
+    real_directory(root, parent.relative_to(root).as_posix())
+    reader = Path(tempfile.mkdtemp(prefix="reader-", dir=parent))
     try:
-        real_directory(root, relative)
         for name, content in contents.items():
-            parent = real_directory(snapshot, PurePosixPath(name).parent.as_posix())
-            _write_new(parent / PurePosixPath(name).name,
+            directory = real_directory(reader, PurePosixPath(name).parent.as_posix())
+            _write_new(directory / PurePosixPath(name).name,
                        content.encode("utf-8") if isinstance(content, str) else content)
     except BaseException:
-        remove(root, snapshot)
+        remove(root, reader)
         raise
-    return snapshot
+    return reader
 
 
-def remove(root: Path, snapshot: Path | None) -> None:
-    """Delete a snapshot only through real directories, so a link never redirects the deletion."""
-    if snapshot is None:
+def remove(root: Path, reader: Path | None) -> None:
+    """Delete only this reader's directory, through real directories, keeping the shared parent."""
+    if reader is None:
         return
-    if real_directory(root, snapshot.relative_to(root).as_posix(), create=False) is not None:
-        shutil.rmtree(snapshot)
+    if real_directory(root, reader.relative_to(root).as_posix(), create=False) is not None:
+        shutil.rmtree(reader)

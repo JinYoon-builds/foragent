@@ -1404,19 +1404,21 @@ def test_preread_reference_snapshot_holds_only_selected_files_and_is_removed_aft
                                image: {"path": image, "base64": base64.b64encode(b"GIF89a").decode()}}
     for item in plan["issues"]:
         item["references"] = [image]
-    snapshots = root / ".foragent/preread-references"
+    snapshots = root / ".foragent/references"
     seen = []
 
     class Reader:
         def run(self, **kwargs):
-            seen.append(sorted(p.relative_to(snapshots).as_posix().split("/", 1)[1]
+            seen.append(sorted(p.relative_to(snapshots).as_posix().split("/", 2)[2]
                                for p in snapshots.rglob("*") if p.is_file()))
             return SimpleNamespace(exit_code=0, timed_out=False, last_message="NONE")
 
     monkeypatch.setattr(order, "executor_for", lambda name: Reader())
     order.preread(plan, root, config)
     assert seen == [[image]] * len(plan["issues"])
-    assert not any(snapshots.iterdir()) and not (root / image).exists()
+    # Only the empty content-addressed parent stays; each reader removed its own directory.
+    parents = list(snapshots.iterdir())
+    assert len(parents) == 1 and not any(parents[0].iterdir()) and not (root / image).exists()
 
 
 @pytest.mark.parametrize("names", [
@@ -1481,8 +1483,8 @@ def test_preread_snapshot_is_removed_when_materializing_fails(tmp_path, monkeypa
     monkeypatch.setattr(order_references, "_write_new", failing)
     with pytest.raises(OSError):
         order_references.materialize(plan, {}, tmp_path)
-    snapshots = tmp_path / order_references.SNAPSHOTS
-    assert len(calls) == 2 and snapshots.is_dir() and not any(snapshots.iterdir())
+    parent = order_references.snapshot_dir(tmp_path, {"docs/design/a/one.md": "1", "docs/design/b/two.md": "2"})
+    assert len(calls) == 2 and parent.is_dir() and not any(parent.iterdir())
 
 
 @pytest.mark.parametrize("references,expected", [
@@ -1521,7 +1523,7 @@ def _snapshot_name(root):
     return order_references.snapshot_dir(root, {"docs/design/a/HANDOFF.md": "approved"}).name
 
 
-@pytest.mark.parametrize("link", [".foragent", ".foragent/preread-references", "hash", "inner"])
+@pytest.mark.parametrize("link", [".foragent", ".foragent/references", "hash", "inner"])
 def test_preread_snapshot_never_writes_or_deletes_through_symlinks(tmp_path, link):
     from foragent import order_references
 
@@ -1531,7 +1533,7 @@ def test_preread_snapshot_never_writes_or_deletes_through_symlinks(tmp_path, lin
     snapshots = root / order_references.SNAPSHOTS
     if link == ".foragent":
         (root / ".foragent").symlink_to(outside, target_is_directory=True)
-    elif link == ".foragent/preread-references":
+    elif link == ".foragent/references":
         (root / ".foragent").mkdir()
         (outside / _snapshot_name(root)).mkdir()
         (outside / _snapshot_name(root) / "keep.txt").write_text("keep me")
@@ -1540,16 +1542,17 @@ def test_preread_snapshot_never_writes_or_deletes_through_symlinks(tmp_path, lin
         snapshots.mkdir(parents=True)
         (snapshots / _snapshot_name(root)).symlink_to(outside, target_is_directory=True)
     else:
-        # A stale real snapshot whose inner directory links outside.
-        stale = snapshots / _snapshot_name(root)
-        stale.mkdir(parents=True)
-        (stale / "docs").symlink_to(outside / "docs", target_is_directory=True)
+        # Another reader's directory, holding a link outside, is not ours to touch.
+        other = snapshots / _snapshot_name(root) / "reader-other"
+        other.mkdir(parents=True)
+        (other / "docs").symlink_to(outside / "docs", target_is_directory=True)
     if link == "inner":
         snapshot = order_references.materialize(SNAPSHOT_PLAN, {}, root)
+        assert snapshot.parent == other.parent and snapshot != other
         assert (snapshot / "docs").is_dir() and not (snapshot / "docs").is_symlink()
         assert (snapshot / "docs/design/a/HANDOFF.md").read_text() == "approved"
         order_references.remove(root, snapshot)
-        assert not snapshot.exists()
+        assert not snapshot.exists() and (other / "docs").is_symlink()
     else:
         with pytest.raises(order.PlanError, match="real directory"):
             order_references.materialize(SNAPSHOT_PLAN, {}, root)
@@ -1557,24 +1560,113 @@ def test_preread_snapshot_never_writes_or_deletes_through_symlinks(tmp_path, lin
     assert sorted(p.relative_to(outside).as_posix() for p in outside.rglob("*")) == sorted(
         ["docs", "docs/design", "docs/design/a", "docs/design/a/HANDOFF.md",
          *([_snapshot_name(root), f"{_snapshot_name(root)}/keep.txt"]
-           if link == ".foragent/preread-references" else [])])
+           if link == ".foragent/references" else [])])
 
 
 def test_preread_snapshot_removal_skips_a_path_redirected_while_the_reader_ran(tmp_path):
+    import shutil
+
     from foragent import order_references
 
     root = tmp_path / "repo"
     root.mkdir()
     outside = _outside(tmp_path)
     snapshot = order_references.materialize(SNAPSHOT_PLAN, {}, root)
-    snapshots = snapshot.parent
-    import shutil
-    shutil.rmtree(snapshots)
-    snapshots.symlink_to(outside, target_is_directory=True)
+    parent = snapshot.parent
+    shutil.rmtree(parent)
+    parent.symlink_to(outside, target_is_directory=True)
     (outside / snapshot.name).mkdir()
     with pytest.raises(order.PlanError, match="real directory"):
         order_references.remove(root, snapshot)
     assert (outside / snapshot.name).is_dir()
+
+
+def test_overlapping_prereads_own_separate_reader_directories(tmp_path):
+    from foragent import order_references
+
+    first = order_references.materialize(SNAPSHOT_PLAN, {}, tmp_path)
+    second = order_references.materialize(SNAPSHOT_PLAN, {}, tmp_path)
+    assert first != second and first.parent == second.parent
+    order_references.remove(tmp_path, second)
+    assert (first / "docs/design/a/HANDOFF.md").read_text() == "approved"
+    order_references.remove(tmp_path, first)
+    assert first.parent.is_dir() and not any(first.parent.iterdir())
+
+
+def test_preread_prompt_points_to_the_reader_directory_but_digest_uses_the_shared_path(publishing, plan):
+    import base64
+
+    from foragent import order_references
+
+    root, config = publishing[0], publishing[1]
+    image = "docs/design/a/shot.gif"
+    plan["reference_files"] = {image: {"path": image, "base64": base64.b64encode(b"GIF89a").decode()}}
+    item = plan["issues"][0]
+    shared = order_references.snapshot_dir(root, {image: b"GIF89a"})
+    _setup, free, digest = order.preread_target(plan, item, config, root)
+    assert str(shared / image) in free.splitlines()
+    first = order_references.materialize(plan, item, root)
+    second = order_references.materialize(plan, item, root)
+    prompts = []
+    for reader in (first, second):
+        _setup, sent, key = order.preread_target(plan, item, config, root, reader)
+        assert str(reader / image) in sent.splitlines() and str(shared / image) not in sent.splitlines()
+        assert key == digest and sent.replace(str(reader), str(shared)) == free
+        prompts.append(sent)
+    assert prompts[0] != prompts[1]
+
+
+class RefreshingGit(PublishingGit):
+    """A base refresh that brings in a symlinked destination directory."""
+
+    def __init__(self, root, events, link):
+        super().__init__(root, events)
+        self.link = link
+
+    def update_base(self, branch):
+        target = self.root / "elsewhere"
+        target.mkdir(exist_ok=True)
+        (target / "keep.txt").write_text("keep me")
+        path = self.root / self.link
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target, target_is_directory=True)
+
+
+@pytest.mark.parametrize("link", ["docs/design", "docs/design/a", "docs/specs", "tests/acceptance", "docs"])
+def test_publication_checks_destinations_after_the_base_refresh_before_any_write(publishing, plan, link):
+    root, config, tracker, _git, events = publishing
+    plan["reference_files"] = {"docs/design/a/HANDOFF.md": "approved"}
+    git = RefreshingGit(root, events, link)
+    with pytest.raises(order.PlanError, match="symlink"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert sorted(p.name for p in (root / "elsewhere").iterdir()) == ["keep.txt"]
+    assert (root / "elsewhere/keep.txt").read_text() == "keep me"
+    assert events == []
+    written = [p for p in root.rglob("*") if p.is_file() and not p.is_relative_to(root / "elsewhere")
+               and p.suffix in {".md", ".py"}]
+    assert written == [], written
+
+
+def test_publication_rechecks_each_destination_right_before_writing_it(publishing, plan, monkeypatch):
+    from pathlib import Path
+
+    root, config, tracker, git, events = publishing
+    plan["reference_files"] = {"docs/design/a/HANDOFF.md": "approved"}
+    elsewhere = root / "elsewhere"
+    elsewhere.mkdir()
+    real = Path.write_bytes
+
+    def write_then_swap(self, data):
+        result = real(self, data)
+        if not (root / "docs/design").exists():
+            (root / "docs").mkdir(exist_ok=True)
+            (root / "docs/design").symlink_to(elsewhere, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(Path, "write_bytes", write_then_swap)
+    with pytest.raises(order.PlanError, match="symlink"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert list(elsewhere.iterdir()) == [] and events == []
 
 
 @pytest.mark.parametrize("name", [".gitignore", "preread.json.tmp"])
@@ -1638,3 +1730,15 @@ def test_acceptance_links_escape_specials_but_keep_ordinary_names_unchanged():
     assert _link_labels(body)["tests/acceptance/test_a]b.py"].endswith("/test_a%5Db.py")
     assert ("[tests/acceptance/test_login_flow.py](https://github.com/owner/repo/blob/main/"
             "tests/acceptance/test_login_flow.py)") in body.splitlines()
+
+
+def test_publication_write_must_stay_inside_its_own_root(tmp_path):
+    from foragent.order_files import check_write
+
+    (tmp_path / "docs/design").mkdir(parents=True)
+    check_write(tmp_path, "docs/design/a.md", "docs/design")
+    check_write(tmp_path, "tests/acceptance/test_a.py", "tests/acceptance/")
+    for name, own in (("docs/specs/x.md", "docs/design"), ("docs/design-other/a.md", "docs/design"),
+                      ("tests/test_a.py", "tests/acceptance/")):
+        with pytest.raises(order.PlanError, match="outside"):
+            check_write(tmp_path, name, own)

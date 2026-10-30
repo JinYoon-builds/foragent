@@ -20,7 +20,7 @@ from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
 from foragent.lanes import add_lane, lane_files, validate_lane
-from foragent.order_files import check_destinations, issue_body, validate_paths
+from foragent.order_files import check_destinations, check_write, issue_body, validate_paths
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
@@ -410,6 +410,14 @@ class PublishReport:
 def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
                    manager: SkillManager | None) -> dict[str, str]:
     """Commit only this order's own paths on the latest base and push them."""
+    # Destinations are checked here, after the base refresh, so upstream changes count.
+    spec = f"docs/specs/{plan['id']}.md"
+    references = set(plan.get("reference_files", {}))
+    roots = {name: "docs/specs" if name == spec else "docs/design" if name in references
+             else config.acceptance_dir for name in files}
+    check_destinations(root, files)
+    for name in files:
+        check_write(root, name, roots[name])
     for lane in plan.get("new_lanes", []):
         if lane["name"] not in config.lanes:
             add_lane(root, lane["name"], lane["paths"], skills=lane["skills"], git=git, manager=manager, push=False)
@@ -426,7 +434,10 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
         data = content.encode("utf-8") if isinstance(content, str) else content
         path = repo_path(root, name)
         if not path.exists() or path.read_bytes() != data:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            # Parents are created one real directory at a time, never through a symlink.
+            check_write(root, name, roots[name])
+            order_references.real_directory(root, PurePosixPath(name).parent.as_posix())
+            check_write(root, name, roots[name])
             path.write_bytes(data)
     git.ensure_tracked(list(files))
     changed = git.uncommitted_paths(list(files))
@@ -647,7 +658,7 @@ def edit_view(item: dict, issue, config: Config) -> dict:
             "interactive": "interactive" in issue.labels, "edit": True}
 
 
-def preread_prompt(plan: dict, item: dict, root: Path | None = None) -> str:
+def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Path | None = None) -> str:
     """What the implementer would receive, asked read-only for its unknowns."""
     commands = "\n".join(item.get("done_when", []))
     tests = "".join(f"\n### {path}\n```\n{content}\n```\n"
@@ -660,7 +671,7 @@ def preread_prompt(plan: dict, item: dict, root: Path | None = None) -> str:
     heading = (f"# Edit of existing issue {item['key']}: {item['title']}" if item.get("edit")
                else f"# Issue {item['key']}: {item['title']}")
     # Selected reference text inline; images as absolute paths into the preread snapshot.
-    references = order_references.preread_section(plan, item, root) if root is not None else ""
+    references = order_references.preread_section(plan, item, root, reader) if root is not None else ""
     return (
         "You will implement the issue below later. Do not implement it now and do not change any file.\n"
         "Read the issue and the repository read-only, then list every unknown: a question whose answer\n"
@@ -683,21 +694,24 @@ def preread_prompt(plan: dict, item: dict, root: Path | None = None) -> str:
     ) + (f"\n{references}" if references else "")
 
 
-def preread_target(plan: dict, item: dict, config: Config, root: Path):
+def preread_target(plan: dict, item: dict, config: Config, root: Path, reader: Path | None = None):
     """The implementer the runner would start for this issue, its prompt and the evidence key.
 
     Executor, model, lane agent, lane notes and skills come from the same function the
     runner's first implementation attempt uses, so preread cannot differ from it.
+    With a reader directory the prompt points images there; the digest always uses the
+    reader-free prompt, so each reader's own directory never changes the evidence key.
     """
     from foragent.run_implementation import implementer_setup, lane_config
 
     setup = implementer_setup(lane_config(config, item["lane"]), item["lane"], item["size"], root)
     prompt = setup.notes + preread_prompt(plan, item, root) + setup.memory_notice
+    sent = prompt if reader is None else setup.notes + preread_prompt(plan, item, root, reader) + setup.memory_notice
     # The whole plan is part of the key: any change to any issue needs a new preread.
     digest = hashlib.sha256(json.dumps(
         [setup.executor, setup.model, setup.options, prompt, plan], ensure_ascii=False, sort_keys=True,
     ).encode("utf-8")).hexdigest()
-    return setup, prompt, digest
+    return setup, sent, digest
 
 
 def _preread_records(root: Path) -> dict:
@@ -748,13 +762,13 @@ def preread(plan: dict, root: Path, config: Config,
         ignore.write_text("*\n", encoding="utf-8")
     results = []
     for item in items:
-        setup, prompt, digest = preread_target(plan, item, config, root)
-        log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
-        # Readers see approved references only in this ignored snapshot, never at their destination.
-        if log.is_symlink():
-            log.unlink()
+        # Each reader gets its own snapshot directory, never the references' destination.
         snapshot = order_references.materialize(plan, item, root)
         try:
+            setup, prompt, digest = preread_target(plan, item, config, root, snapshot)
+            log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
+            if log.is_symlink():
+                log.unlink()
             result = executor_for(setup.executor).run(
                 worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
                 log_path=log, read_only=True, **setup.options)

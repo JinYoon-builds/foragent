@@ -45,6 +45,24 @@ def check_destinations(root: Path, files: dict) -> None:
             raise PlanError(f"published path {name} is under the existing file {blocked}")
 
 
+def check_write(root: Path, name: str, own_root: str) -> None:
+    """Refuse a publication write that a symlink could redirect.
+
+    No component from the repository root down to the file may be a symlink, and the
+    real path must stay inside the write's own root (spec, tests or design files).
+    """
+    from foragent.order import PlanError
+
+    current = root
+    for part in PurePosixPath(name).parts:
+        current = current / part
+        if current.is_symlink():
+            raise PlanError(f"cannot write {name}: {current.relative_to(root).as_posix()} is a symlink")
+    inside = (root.resolve() / PurePosixPath(own_root)).as_posix().rstrip("/") + "/"
+    if not (root / name).resolve().as_posix().startswith(inside):
+        raise PlanError(f"cannot write {name}: its real path is outside {PurePosixPath(own_root).as_posix()}/")
+
+
 def issue_body(item: dict, repo: str, base: str, acceptance_dir: str = "tests/acceptance/",
                references: list[str] = ()) -> str:
     lines = [MARKER, *exclusive_header(item.get("exclusive", [])), "## Goal", item["goal"], "", "## Out of scope", item["out_of_scope"]]
