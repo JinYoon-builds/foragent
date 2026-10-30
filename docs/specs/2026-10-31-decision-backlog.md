@@ -34,3 +34,6 @@ Every issue is stocked unapproved. done_when: ["true"] and acceptance_files: {} 
 ## D98 and assumptions
 
 D98 means WHAT, observable behavior and scope, without private names or prescribed implementation. The current request and the existing 2026-10-31 spec supply D98 because the decision ledger stops at D97. No AGENTS.md exists in the inspected repository or workspace, consistent with that existing spec; apply the decision principles and current request. Public product terms, PR evidence and provisional Files entries do not pin private helpers, wire formats or a lane's workflow. D58's consolidated lifecycle is one outcome; D80's assignment/goal controls share the existing plan, and D85's orders/notes share the publication outcome, so those remain one issue per decision. The supplied audit is the status snapshot; no live issue-status reconciliation or benefit ranking is attempted.
+
+
+Jin 2026-10-31: the D49 browser lane view is dropped (not stocked).
