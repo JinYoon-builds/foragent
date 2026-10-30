@@ -32,7 +32,9 @@ def _run_row(git_history, tmp_path, monkeypatch, *, phase, runner_minutes,
     monkeypatch.setattr("foragent.watch.os.kill", lambda pid, signal: None)
     status = collect_status(case.store, case.config, now)
     snapshot = collect(status, case.tracker, case.store, case.config, now)
-    return _api_row(render_frame(snapshot, case.config, case.root, width=90, now=now))
+    from test_lane_m2_contract import pick, bubble
+    opened, _ = pick(snapshot, case.config, case.root, case.store, ("acorn", 1), width=240)
+    return bubble(opened)
 
 
 @pytest.mark.parametrize("phase,language,phase_minutes,age", [
@@ -47,7 +49,9 @@ def test_waiting_with_fresh_runner_shows_localized_phase_and_age(
                    runner_minutes=1, language=language, phase_minutes=phase_minutes)
     stalled = MESSAGES[language]["watch_stalled"].partition("{minutes}")[0].strip()
     # Lane rows show the unified phase word and the worker's total elapsed age.
-    missing = [label for label in (text(f"squirrel_{phase}", language), age) if label not in row]
+    sentence = {("checking", "en"): "running related tests on this computer", ("ci", "en"): "running CI on GitHub", ("checking", "ko"): "내 컴퓨터에서 관련 테스트를 돌리고 있어요"}[(phase, language)]
+    expected_age = f"{phase_minutes}분" if language == "ko" else f"{phase_minutes}m"
+    missing = [label for label in (sentence, expected_age) if label not in row]
     assert not missing and stalled not in row, (
         f"Fresh runner in {phase}: missing phase/age {missing!r}; "
         f"stalled={stalled in row}; row={row}"

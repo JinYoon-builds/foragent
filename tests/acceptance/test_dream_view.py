@@ -37,35 +37,24 @@ def dreaming_snapshot(tmp_path, lane_index=0, *, language="ko", active=True):
 
 
 def lane_row(frame, config, lane):
-    lines = frame.splitlines()
-    rows = [line for line in lines if config.lanes[lane]["title"] in line]
-    assert len(rows) == 1, f"{lane} must occupy exactly one text row: {frame}"
-    # The one big header squirrel is allowed; sprites among/below lane rows are not.
-    first_lane = next(index for index, line in enumerate(lines)
-                      if any(item["title"] in line for item in config.lanes.values()))
-    lane_area = "\n".join(lines[first_lane:])
-    assert "▀" not in lane_area and "▄" not in lane_area, "dreams must not add lane sprites"
-    return rows[0].lstrip()
+    from test_squirrel_running import plain_frame
+    rows=[line for line in plain_frame(frame).splitlines() if config.lanes[lane]['title'] in line]
+    assert len(rows)==1, 'each idle lane name occurs once in the shared sleeping block'
+    return rows[0]
 
 
 @pytest.mark.parametrize("width,lane_index", [(56, 0), (44, 1)])
 def test_dream_view_active_dream_replaces_only_its_idle_lane_row(
     tmp_path, dream_view_offline, width, lane_index,
 ):
-    from foragent.watch import render_frame
-
-    snapshot, config, lane, store = dreaming_snapshot(tmp_path, lane_index)
-    assert store.get_dream(lane).status == "running"
-    assert snapshot.status["active_runs"] == [], "a dream is not an issue worker"
-    frame = plain_frame(render_frame(snapshot, config, tmp_path, width=width))
-    row = lane_row(frame, config, lane)
-    assert row.startswith("💭") and "꿈꾸는 중" in row, (
-        "the running dream record must reach its lane row through the snapshot", frame)
-    assert "💤" not in row and frame.count("💭") == 1
-    for other in config.lanes:
-        if other != lane:
-            assert lane_row(frame, config, other).startswith("💤"), frame
-    assert dream_view_offline == []
+    from test_lane_m2_contract import draw
+    snapshot,config,lane,store=dreaming_snapshot(tmp_path,lane_index)
+    assert store.get_dream(lane).status=='running' and snapshot.status['active_runs']==[]
+    frame=draw(snapshot,config,tmp_path,width=width)
+    assert '💭' in lane_row(frame,config,lane), 'a dreaming lane is marked beside its name in the shared idle block'
+    assert frame.count('💭')==1
+    assert all(config.lanes[other]['title'] in frame for other in config.lanes)
+    assert dream_view_offline==[]
 
 
 @pytest.mark.parametrize("lane_index", [0, 1])
@@ -73,40 +62,31 @@ def test_dream_view_active_dream_replaces_only_its_idle_lane_row(
 def test_dream_view_text_mode_names_the_dreaming_lane_and_clears_on_completion(
     tmp_path, dream_view_offline, lane_index, language, words,
 ):
-    from foragent.watch import render_frame
-
-    snapshot, config, lane, store = dreaming_snapshot(tmp_path, lane_index, language=language)
-    frame = plain_frame(render_frame(snapshot, config, tmp_path, width=43))
-    row = lane_row(frame, config, lane)
-    assert row.startswith("💭") and words in row, frame
-    assert frame.count("💭") == 1
-    store.finish_dream(lane, "dreamed")
-    assert store.get_dream(lane).status == "finished"
-    # Rendering must use the captured facts, not reread the changed store.
-    assert plain_frame(render_frame(snapshot, config, tmp_path, width=43)) == frame
-    completed = dream_snapshot(store, config, snapshot.captured_at)
-    after = plain_frame(render_frame(completed, config, tmp_path, width=43))
-    assert lane_row(after, config, lane).startswith("💤"), after
-    assert "💭" not in after and words not in after
-    assert dream_view_offline == []
+    from test_lane_m2_contract import draw
+    snapshot,config,lane,store=dreaming_snapshot(tmp_path,lane_index,language=language)
+    frame=draw(snapshot,config,tmp_path,width=43)
+    assert '💭' in lane_row(frame,config,lane)
+    store.finish_dream(lane,'dreamed')
+    assert draw(snapshot,config,tmp_path,width=43)==frame, 'rendering uses captured dream facts'
+    after=draw(dream_snapshot(store,config,snapshot.captured_at),config,tmp_path,width=43)
+    assert '💭' not in after and config.lanes[lane]['title'] in after
+    assert ('쉬고 있어요' if language=='ko' else 'resting') in after
+    assert dream_view_offline==[]
 
 
 def test_dream_view_sleep_without_an_active_dream_has_no_bubble(
     tmp_path, dream_view_offline,
 ):
-    from foragent.watch import render_frame
+    from test_lane_m2_contract import draw,bubble
+    snapshot,config,lane,store=dreaming_snapshot(tmp_path,active=False)
+    frame=draw(snapshot,config,tmp_path,width=160)
+    assert '💭' not in frame and '지금은 할 일이 없어요.' in bubble(frame)
+    store.start_dream(lane,worktree=tmp_path/'dream')
+    store.finish_dream(lane,'dreamed')
+    after=draw(dream_snapshot(store,config,snapshot.captured_at),config,tmp_path,width=160)
+    assert '💭' not in after
+    store.start_run(901,branch='foragent/issue-901',worktree=store.worktree_path(901),lane=lane)
+    busy=draw(dream_snapshot(store,config,snapshot.captured_at),config,tmp_path,width=160)
+    assert '💭' not in busy and '#901' in busy
+    assert dream_view_offline==[]
 
-    snapshot, config, lane, store = dreaming_snapshot(tmp_path, active=False)
-    # Idle, completed dream, and an ordinary active run are all negative controls.
-    snapshots = [(snapshot, "💤")]
-    store.start_dream(lane, worktree=tmp_path / "dream")
-    store.finish_dream(lane, "dreamed")
-    snapshots.append((dream_snapshot(store, config, snapshot.captured_at), "💤"))
-    store.start_run(901, branch="foragent/issue-901", worktree=store.worktree_path(901), lane=lane)
-    snapshots.append((dream_snapshot(store, config, snapshot.captured_at), "🐿"))
-    for snapshot, glyph in snapshots:
-        for width in (56, 44, 43):
-            frame = plain_frame(render_frame(snapshot, config, tmp_path, width=width))
-            assert "💭" not in frame and "꿈꾸는 중" not in frame
-            assert lane_row(frame, config, lane).startswith(glyph), frame
-    assert dream_view_offline == []

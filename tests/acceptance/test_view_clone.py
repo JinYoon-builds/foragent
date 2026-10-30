@@ -25,28 +25,20 @@ def _view_clone_case(git_history, tmp_path, monkeypatch, *, workers, title="orch
 def test_view_clone_two_workers_append_multiplier_to_lane_display_name(
     git_history, tmp_path, monkeypatch, capsys, title,
 ):
-    from foragent.labels import lane_display
     from foragent.scheduler import tick
     from foragent.watch import render_frame
     from test_orch_review_handoff import tick_context
     from test_view_evidence import view_evidence_snapshot
-
-    case, main = _view_clone_case(git_history, tmp_path, monkeypatch, workers=2, title=title)
-    tick(tick_context(case, start_runs=False))
-    snapshot = view_evidence_snapshot(case, main, capsys)
-    frame = render_frame(snapshot, case.config, case.root, width=160, now=case.clock[0])
-    # Jin, 2026-10-25: one row per running worker, never one lane row with a multiplier.
-    # (Name kept from the multiplier era so running baselines stay valid.)
-    name = lane_display(case.config, "orch", "en")
-    assert "×" not in frame, frame
-    rows = frame.splitlines()
-    first = [row for row in rows if f"{name} 1" in row]
-    second = [row for row in rows if f"{name} 2" in row]
-    assert len(first) == 1 and "#1" in first[0], f"Worker 1 needs its own row with its issue:\n{frame}"
-    assert len(second) == 1 and "#2" in second[0], f"Worker 2 needs its own row with its issue:\n{frame}"
-    assert "#2" not in first[0] and "#1" not in second[0], frame
-    idle = [row for row in rows if lane_display(case.config, "docs", "en") in row]
-    assert idle and not any("#" in row for row in idle), f"An idle lane keeps its own row:\n{frame}"
+    from test_acorn_interact import hit_positions
+    case,main=_view_clone_case(git_history,tmp_path,monkeypatch,workers=2,title=title)
+    tick(tick_context(case,start_runs=False))
+    snapshot=view_evidence_snapshot(case,main,capsys)
+    layout={}
+    frame=render_frame(snapshot,case.config,case.root,width=160,layout=layout)
+    assert any('#1 write' in row and '#2 local' in row for row in frame.splitlines()), 'two workers share one lane block with distinct step acorns'
+    hits=hit_positions(layout,frame,160)
+    assert ('squirrel','orch') in hits and {('acorn',1),('acorn',2)}<=hits.keys()
+    assert '×' not in frame and f'{title} 1' not in frame and f'{title} 2' not in frame
 
 
 def test_view_clone_both_active_issue_numbers_are_visible(git_history, tmp_path, monkeypatch, capsys):
@@ -79,3 +71,4 @@ def test_view_clone_one_worker_with_queued_work_has_no_multiplier(git_history, t
     assert name in frame and "#1" in frame
     assert "×" not in frame, frame
     assert f"{name} 1" not in frame, "A lane with one worker keeps its plain name"
+

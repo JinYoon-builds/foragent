@@ -200,4 +200,5 @@ def test_view_sections_existing_groups_are_modules_used_by_the_compositor(tmp_pa
             snapshot, config, tmp_path, tick=2, selected="work", now=snapshot.captured_at, layout=layout,
         ))
         assert calls == expected, "render_frame must invoke every discovered section in ORDER"
-        assert [line for line in frame.splitlines() if line] == expected
+        replaced = {name for module in modules for name in getattr(module, "REPLACES", ())}
+        assert [line for line in frame.splitlines() if line] == [name for name in expected if name not in replaced]

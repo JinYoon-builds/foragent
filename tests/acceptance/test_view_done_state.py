@@ -41,28 +41,28 @@ def cell_count(value):
 
 
 def test_view_done_state_completed_order_has_completion_sentence_and_each_issue_lane(tmp_path):
-    from foragent.watch import render_frame
-
-    snapshot, config = done_snapshot()
-    frame = render_frame(snapshot, config, tmp_path)
-    assert "이번 주문을 모두 끝냈어요 ✓" in frame
-    for slug, issues in snapshot.done.items():
-        for issue in issues:
-            assert any(f"#{issue.number}" in line and config.lanes[slug]["title"] in line
-                       for line in frame.splitlines()), (issue.number, slug)
+    from test_lane_m2_contract import draw,bubble
+    snapshot,config=done_snapshot()
+    snapshot.today=3
+    snapshot.today_done={'lane-0':2,'lane-1':1}
+    snapshot.status['issues']={}
+    frame=draw(snapshot,config,tmp_path,width=160)
+    assert '지금은 할 일이 없어요. 새 일은 기획 세션에서 말해 주세요.' in bubble(frame)
+    assert '100% · 이슈 3개 중 3개 완료' in frame
+    assert all(lane['title'] in frame for lane in config.lanes.values()), 'completion is a shared idle block, not one historical row per issue'
 
 
 @pytest.mark.parametrize("language,done_words,header", [("ko", "2개 끝냄", "지금 하는 일"),
                                                        ("en", "2 done", "now doing")])
 def test_view_done_state_idle_uses_words_and_omits_work_header_and_arrows(tmp_path, language, done_words, header):
-    from foragent.watch import render_frame
-
-    snapshot, config = done_snapshot(language=language)
-    frame = render_frame(snapshot, config, tmp_path)
-    assert done_words in frame
-    assert "✓2" not in frame
-    assert header not in frame
-    assert "▸" not in frame and "▶" not in frame
+    from test_lane_m2_contract import draw
+    snapshot,config=done_snapshot(language=language)
+    frame=draw(snapshot,config,tmp_path,width=160)
+    idle='쉬고 있어요' if language=='ko' else 'resting'
+    assert idle in frame and header not in frame
+    assert '▸' not in frame and '▶' not in frame
+    assert all(lane['title'] in frame for lane in config.lanes.values())
+    assert any('담당0' in line and '담당1' in line for line in frame.splitlines()) if language=='ko' else any('Agent0' in line and 'Agent1' in line for line in frame.splitlines())
 
 
 def test_view_done_state_waiting_count_is_shown_at_most_once(tmp_path):
@@ -82,3 +82,4 @@ def test_view_done_state_narrow_frame_keeps_every_lane_visible_with_long_order_t
     assert all(cell_count(line) <= 80 for line in frame.splitlines())
     for lane in config.lanes.values():
         assert lane["title"] in frame, f"lane disappeared at width 80: {lane['title']}"
+

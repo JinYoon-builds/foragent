@@ -24,8 +24,10 @@ def test_view_theme_colors_palette_has_no_yellow_or_orange_foregrounds(colors):
 
     pairs = color_pairs(colors)
     assert pairs
-    assert not {foreground for foreground, background in pairs} & {
-        curses.COLOR_YELLOW, 3, 11, 178, 184, 208, 214, 220, 226}
+    assert (pairs[1][0] == (curses.COLOR_YELLOW if colors == 8 else 220)
+            and not {foreground for foreground, background in pairs[:1] + pairs[2:]} & {
+                curses.COLOR_YELLOW, 3, 11, 178, 184, 208, 214, 220, 226}), (
+        "r53/r55 require real yellow at pair 2; other base pairs still exclude yellow/orange")
 
 
 @pytest.mark.parametrize("colors", [8, 256])
