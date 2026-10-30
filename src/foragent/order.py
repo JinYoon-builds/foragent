@@ -674,10 +674,13 @@ def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Pat
     references = order_references.preread_section(plan, item, root, reader) if root is not None else ""
     return (
         "You will implement the issue below later. Do not implement it now and do not change any file.\n"
-        "Read the issue and the repository read-only, then list every unknown: a question whose answer\n"
-        "is not in the issue text or the code and that you would otherwise have to guess.\n"
-        "Reply with one unknown per line and nothing else.\n"
-        "If there are no unknowns, reply with exactly NONE.\n\n"
+        "Your lane owns HOW: structure, names, values and internal shapes are yours to decide.\n"
+        "Read the issue and the repository read-only, then reply with lines of three kinds only:\n"
+        "APPROACH: <one line of your plan> (at most 8 lines).\n"
+        "DECIDE: <a reversible detail you will settle yourself and follow>.\n"
+        "QUESTION: <an unknown, only when the WHAT is unclear: a wrong guess would fail a locked test, break a\n"
+        "contract with another issue, or change behaviour the person notices>.\n"
+        "If you have nothing to add, reply with exactly NONE.\n\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n"
         f"## Spec\n{plan.get('spec_markdown', '')}\n\n"
         f"New lanes in this order: {lanes}\n\n"
@@ -724,11 +727,26 @@ def _preread_records(root: Path) -> dict:
     return records if isinstance(records, dict) else {}
 
 
-def _unknowns(message: str) -> list[str]:
+def _preread_lines(message: str) -> list[str]:
     if message.strip() == "NONE":
         return []
     lines = (re.sub(r"^(?:[-*•]|\d+[.)])\s+", "", line.strip()) for line in message.splitlines())
     return [line for line in lines if line and line != "NONE"]
+
+
+def _unknowns(message: str) -> list[str]:
+    """QUESTION lines, and unprefixed lines as before; the lane's APPROACH and DECIDE lines do not block."""
+    unknowns = []
+    for line in _preread_lines(message):
+        if re.match(r"(?i)^(?:APPROACH|DECIDE):", line):
+            continue
+        unknowns.append(re.sub(r"(?i)^QUESTION:\s*", "", line))
+    return unknowns
+
+
+def _decisions(message: str) -> list[str]:
+    return [re.sub(r"(?i)^DECIDE:\s*", "", line) for line in _preread_lines(message)
+            if re.match(r"(?i)^DECIDE:", line)]
 
 
 def preread(plan: dict, root: Path, config: Config,
@@ -778,13 +796,14 @@ def preread(plan: dict, root: Path, config: Config,
             raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
         unknowns = _unknowns(result.last_message)
         records = _preread_records(root)
-        records[digest] = {"key": item["key"], "unknowns": unknowns,
+        decisions = _decisions(result.last_message)
+        records[digest] = {"key": item["key"], "unknowns": unknowns, "decisions": decisions,
                            "at": datetime.now(UTC).isoformat(timespec="seconds")}
         temporary = root / (PREREAD_FILE + ".tmp")
         temporary.unlink(missing_ok=True)  # never write through a leftover link
         temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, root / PREREAD_FILE)
-        results.append({"key": item["key"], "unknowns": unknowns})
+        results.append({"key": item["key"], "unknowns": unknowns} | ({"decisions": decisions} if decisions else {}))
     return results
 
 
