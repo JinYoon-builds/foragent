@@ -72,13 +72,10 @@ def _note_silent(store: StateStore, now: datetime) -> None:
 
 
 def observe_silence(repo_root: Path, store: StateStore, config: Config, now: datetime, reason: str) -> None:
-    """The one silence step for the gate and ``fa orch ensure``, given why no orchestrator opened.
+    """The one silence step (gate and ``fa orch ensure``) for why no orchestrator opened (#952).
 
-    A fresh heartbeat (``alive``, or one renewed since the caller's check)
-    rearms the silence push. A live orchestrator without one (``session``:
-    recorded or argv evidence; ``seat``: the lease holder) gets the hourly note,
-    and the seat's holder alone may get one silence push (#952). ``off`` and
-    ``no_work`` do nothing.
+    A fresh heartbeat rearms; a live one without it (``session``/``seat``) gets
+    the hourly note, and only the seat holder may push (``orch_silent.check``).
     """
     if reason == "alive" or (reason in ("session", "seat") and _alive(store, now)):
         orch_silent.rearm(store)
