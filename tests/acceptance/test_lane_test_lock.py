@@ -89,15 +89,32 @@ def test_mixed_plan_keeps_old_acceptance_files_and_requires_its_clean_preread(la
     assert (case.root / legacy_path).read_text() == legacy["acceptance_files"][legacy_path]
 
 
-def test_empty_legacy_files_cannot_bypass_test_preparation_with_a_clean_none(lane_case, capsys):
+@pytest.mark.parametrize("with_statements", [True, False], ids=["statement-issue", "legacy-issue"])
+def test_empty_legacy_files_cannot_bypass_test_preparation_with_a_clean_none(lane_case, capsys, with_statements):
     case = lane_case
-    del case.plan["issues"][0]["statements"]
-    case.plan["issues"][0]["acceptance_files"] = {}
+    item = case.plan["issues"][0]
+    item["acceptance_files"] = {}
+    if not with_statements:
+        del item["statements"]
     case.save()
-    code, out, err = invoke(case, capsys, "preread", str(case.path), "--json")
-    assert code == 0, out + err
-    assert json.loads(out)["issues"][0]["unknowns"] == []
+    if with_statements:
+        # The explicit statements field selects reviewed preparation, even with no files.
+        code, out, err = publish(case, capsys, "--dry-run")
+        assert code == 0, f"A statement issue must be a valid draft: {out}{err}"
+    else:
+        # No statements and no files is the existing legacy approval route.
+        code, out, err = invoke(case, capsys, "preread", str(case.path), "--json")
+        assert code == 0, out + err
+        assert json.loads(out)["issues"] == [{"key": "notice", "unknowns": []}]
+    before = len(case.calls)
     code, out, err = publish(case, capsys, "--approve")
-    assert code != 0, "A clean read cannot approve an issue with no locked test files"
-    assert "test" in (out + err).lower() and "notice" in out + err
-    assert_no_publication(case)
+    assert len(case.calls) == before, "Publication must not start a model"
+    if with_statements:
+        assert code != 0, "A statement issue needs reviewed tests before approval"
+        message = (out + err).lower()
+        assert "notice" in message and "prepare" in message and "review" in message, out + err
+        assert_no_publication(case)
+    else:
+        assert code == 0, f"A legacy issue with a clean NONE preread must still approve: {out}{err}"
+        children = [issue for issue in case.tracker.list_issues() if issue.title == "Notice delivery"]
+        assert len(children) == 1 and "approved" in children[0].labels
