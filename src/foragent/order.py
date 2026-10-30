@@ -407,9 +407,9 @@ class PublishReport:
         return "\n".join(lines)
 
 
-def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
-                   manager: SkillManager | None) -> dict[str, str]:
-    """Commit only this order's own paths on the latest base and push them."""
+def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
+                      manager: SkillManager | None) -> None:
+    """Write this order's own paths (and new lanes) on the refreshed base, without committing them."""
     # Destinations are checked here, after the base refresh, so upstream changes count.
     spec = f"docs/specs/{plan['id']}.md"
     references = set(plan.get("reference_files", {}))
@@ -439,10 +439,14 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
             order_references.real_directory(root, PurePosixPath(name).parent.as_posix())
             check_write(root, name, roots[name])
             path.write_bytes(data)
+
+
+def commit_and_push(config: Config, git: GitRepo, files: dict, title: str) -> dict[str, str]:
+    """Commit the given written paths once, confirm HEAD has them all, and push the base."""
     git.ensure_tracked(list(files))
     changed = git.uncommitted_paths(list(files))
     if changed:
-        git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests and spec")
+        git.commit_paths(changed, title)
     published_blobs = git.blob_shas(git.head_sha(), files)
     missing = [name for name in files if published_blobs.get(name, "missing") == "missing"]
     if missing:
@@ -452,10 +456,20 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
     return published_blobs
 
 
+def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
+                   manager: SkillManager | None) -> dict[str, str]:
+    """Commit only this order's own paths on the latest base and push them."""
+    write_order_files(plan, root, config, git, files, manager)
+    return commit_and_push(config, git, files, f"Foragent order {plan['id']}: acceptance tests and spec")
+
+
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
             git: GitRepo | None = None, manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
-            approve_numbers: list[int] | None = None, dry_run: bool = False) -> PublishReport:
+            approve_numbers: list[int] | None = None, dry_run: bool = False,
+            check_only: bool = False, published_blobs: dict[str, str] | None = None) -> PublishReport:
+    """Publish an order. ``check_only`` stops after every pre-write check, including preread;
+    ``published_blobs`` means a batch already committed and pushed this order's files."""
     try:
         files = validate_plan(plan, root, config)
     except ValueError as exc:
@@ -538,12 +552,15 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
           if approve or item["number"] in selected_numbers),
     ])
-    git = git or GitRepo(root)
-    if git.current_branch() != config.base_branch:
-        raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
-    with git.publish_lock():
-        git.update_base(config.base_branch)
-        published_blobs = _publish_files(plan, root, config, git, files, manager)
+    if check_only:
+        return PublishReport(plan["title"], parent, rows, sorted(files), True)
+    if published_blobs is None:
+        git = git or GitRepo(root)
+        if git.current_branch() != config.base_branch:
+            raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
+        with git.publish_lock():
+            git.update_base(config.base_branch)
+            published_blobs = _publish_files(plan, root, config, git, files, manager)
     lane_names = {item["lane"] for item in plan["issues"]} - {"main"}
     tracker.ensure_labels([*LABELS, *(LabelSpec(f"lane:{name}", "ededed", f"Foragent lane {name}.") for name in sorted(lane_names))])
     if any(item.get("interactive", False) for item in plan["issues"]):

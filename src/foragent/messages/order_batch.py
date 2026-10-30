@@ -1,0 +1,58 @@
+"""`fa order publish --defer`, `note`, `pending` and `flush` human output (D85, #1043)."""
+
+MESSAGES = {
+    "en": {
+        "batch_bad_boundary": "a publication boundary must be one non-empty line, for example next-code-merge",
+        "batch_bad_kind": "a planning note kind must be one of: {kinds}",
+        "batch_empty_note": "a planning note needs non-empty --text",
+        "batch_path_conflict": "two waiting orders write different content to {path}; publish one of them first",
+        "batch_input_changed": "order {id} changed since it was deferred: {paths}; check it and run "
+                               "fa order publish --defer again so its approval covers the current files",
+        "batch_lane_conflict": "two waiting orders create the lane {lane} differently; make them agree first",
+        "batch_waiting": "Waiting for {boundary}: {title} ({approved} of {count} issue(s) approved). "
+                         "Run fa order flush --boundary {boundary} when that boundary arrives.",
+        "batch_note_waiting": "Waiting for {boundary}: {kind} note {id}. It is published with the next "
+                              "fa order flush --boundary {boundary}.",
+        "batch_nothing": "Nothing is waiting for {boundary}.",
+        "batch_flushed": "Published for {boundary}: {orders} order(s) and {notes} note(s) in one commit.",
+        "batch_flushed_order": "  {id}: parent #{parent}",
+        "batch_pending_order": "{status} [{boundary}] order {id}: {title}",
+        "batch_pending_note": "{status} [{boundary}] {kind} {id}: {text}",
+        "batch_pending_empty": "No waiting orders or notes.",
+        "batch_help_defer": "keep the checked order waiting for this named publication boundary instead of publishing now",
+        "batch_help_urgent": "publish now even with --defer: the order was explicitly judged urgent",
+        "batch_help_note": "Keep a planning decision or idea for a publication boundary without touching the checkout",
+        "batch_help_kind": "decision goes to docs/decisions.md, idea to docs/ideas.md",
+        "batch_help_text": "the note text, appended as written",
+        "batch_help_pending": "Show waiting and published orders and notes",
+        "batch_help_flush": "Publish everything waiting for a boundary in one commit, then the orders' issues",
+        "batch_help_boundary": "the boundary that has arrived, for example next-code-merge",
+    },
+    "ko": {
+        "batch_bad_boundary": "올릴 때의 이름은 비어 있지 않은 한 줄이어야 해요. 예: next-code-merge",
+        "batch_bad_kind": "기획 기록 종류는 다음 중 하나여야 해요: {kinds}",
+        "batch_empty_note": "기획 기록에는 비어 있지 않은 --text가 필요해요",
+        "batch_path_conflict": "기다리는 두 주문이 {path}에 다른 내용을 써요. 하나를 먼저 올려 주세요",
+        "batch_input_changed": "주문 {id}이(가) 맡긴 뒤에 바뀌었어요: {paths}. 확인한 다음 "
+                               "fa order publish --defer를 다시 실행해 승인이 지금 파일을 덮게 하세요",
+        "batch_lane_conflict": "기다리는 두 주문이 {lane} 레인을 서로 다르게 만들어요. 먼저 둘을 맞춰 주세요",
+        "batch_waiting": "{boundary}을(를) 기다려요: {title} (이슈 {count}개 중 {approved}개 승인). "
+                         "그때가 오면 fa order flush --boundary {boundary}를 실행하세요.",
+        "batch_note_waiting": "{boundary}을(를) 기다려요: {kind} 기록 {id}. 다음 "
+                              "fa order flush --boundary {boundary} 때 함께 올라가요.",
+        "batch_nothing": "{boundary}을(를) 기다리는 것이 없어요.",
+        "batch_flushed": "{boundary}에 올렸어요: 주문 {orders}개와 기록 {notes}개를 커밋 하나로.",
+        "batch_flushed_order": "  {id}: 부모 #{parent}",
+        "batch_pending_order": "{status} [{boundary}] 주문 {id}: {title}",
+        "batch_pending_note": "{status} [{boundary}] {kind} {id}: {text}",
+        "batch_pending_empty": "기다리는 주문이나 기록이 없어요.",
+        "batch_help_defer": "확인한 주문을 지금 올리지 않고 이 이름의 올릴 때까지 기다리게 해요",
+        "batch_help_urgent": "--defer가 있어도 지금 올려요. 급하다고 명시적으로 판단한 주문에만 써요",
+        "batch_help_note": "기획 결정이나 아이디어를 체크아웃을 건드리지 않고 올릴 때까지 보관해요",
+        "batch_help_kind": "decision은 docs/decisions.md, idea는 docs/ideas.md에 붙어요",
+        "batch_help_text": "기록 글. 쓴 그대로 붙어요",
+        "batch_help_pending": "기다리는 주문·기록과 올린 주문·기록을 보여 줘요",
+        "batch_help_flush": "이때를 기다리는 것을 커밋 하나로 올리고, 이어서 주문의 이슈를 올려요",
+        "batch_help_boundary": "도착한 올릴 때. 예: next-code-merge",
+    },
+}

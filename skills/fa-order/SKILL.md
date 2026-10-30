@@ -109,6 +109,10 @@ The person's current words take precedence over old documents and the ledger.
   `docs/decisions.md` if none exists. For Exception this once, record its scope in the
   order spec and ledger without replacing the standing rule. For Keep, adapt the plan.
   Persist changes with the approved order so lane agents read the current decision.
+- A decision or idea that belongs to no order waits for a publication boundary instead of
+  being edited into the shared checkout: `fa order note --defer <boundary> --kind decision|idea
+  --text "<text>"` keeps it, and the next `fa order flush` appends it to `docs/decisions.md`
+  or `docs/ideas.md` in the same commit as the waiting orders.
 
 ## 2. Interview
 Native is the default interview. Read `interview.engine` from `fa order context --json`
@@ -352,7 +356,15 @@ the dry-run and present the revised scope for approval.
 ## 7. Publish
 After receiving the person's first-hand approval here, this planning session runs the
 validated `fa order publish PLAN.json` for real with
-`--approve` (or `--approve-keys` for a partial approval). `fa order publish` places the
+`--approve` (or `--approve-keys` for a partial approval) and `--defer <boundary>`. An
+ordinary order waits for the shared publication boundary the person chose (for example
+`next-code-merge`, or a named publication time), so several orders and notes reach main in one
+commit. Waiting runs every publication check now, including the clean preread, and never
+approves anything by itself. Add `--urgent` only when the person or you explicitly judged this
+order urgent; it then publishes immediately. `fa order pending --json` shows what waits.
+When the boundary arrives (the next code merge lands, or the chosen time comes), run
+`fa order flush --boundary <boundary>`; rerunning it after an interruption finishes the rest
+without duplicate issues or notes. `fa order publish` places the
 acceptance files and the spec in the checkout itself: it takes a publish lock, fetches and
 fast-forwards to the latest base branch, writes and commits only this order's own paths,
 and pushes. Other sessions' edits stay out of the commit, so no manual rebase is needed. If
@@ -363,7 +375,8 @@ a plan the orchestrator drafted, mark the originating request done with
 `fa orch request-status ID done --note "<issues>"`, using the originating request ID and the
 published issue numbers. A failed publication leaves the request processing.
 Show the printed summary and one line on what
-happens next ("the gate starts within 5 minutes; /fa shows results"), then run
+happens next ("the gate starts within 5 minutes; /fa shows results", or for a waiting order
+which boundary it waits for), then run
 `fa order progress end`.
 
 After publishing, check the orchestrator. This session is the planning session (D76). It never becomes the orchestrator and never

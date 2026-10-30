@@ -1742,3 +1742,171 @@ def test_publication_write_must_stay_inside_its_own_root(tmp_path):
                       ("tests/test_a.py", "tests/acceptance/")):
         with pytest.raises(order.PlanError, match="outside"):
             check_write(tmp_path, name, own)
+
+
+def _batch(publishing, plan, boundary="next-code-merge", **kwargs):
+    from foragent import order_batch
+
+    root, config, tracker, _git, _ = publishing
+    return order_batch.defer(plan, boundary, root, config, tracker, repo="owner/repo", **kwargs)
+
+
+def _flush(publishing, boundary="next-code-merge"):
+    from foragent import order_batch
+
+    root, config, tracker, git, _ = publishing
+    return order_batch.flush(boundary, root, config, tracker, repo="owner/repo", git=git)
+
+
+def test_batch_redeferred_order_replaces_its_waiting_version(publishing, plan):
+    from foragent import order_batch
+
+    _batch(publishing, plan, approve=True)
+    changed = deepcopy(plan)
+    changed["title"] = "Login MVP v2"
+    _batch(publishing, changed)
+    rows = order_batch.pending(publishing[0])["orders"]
+    assert [(row["title"], row["approve"]) for row in rows] == [("Login MVP v2", False)]
+    _flush(publishing)
+    parent, = [issue for issue in publishing[2].list_issues() if issue.title == "Login MVP v2"]
+    assert not any("approved" in issue.labels for issue in publishing[2].list_issues())
+    assert order_batch.pending(publishing[0])["orders"][0]["parent"] == parent.number
+
+
+def test_batch_rejects_two_waiting_orders_writing_different_content_before_writes(publishing, plan):
+    other = deepcopy(plan)
+    other["id"], other["title"] = "2026-10-31-other", "Other"
+    other["issues"][0]["acceptance_files"] = {FILE: "assert 1\n"}
+    _batch(publishing, plan)
+    _batch(publishing, other)
+    with pytest.raises(order.PlanError, match=FILE):
+        _flush(publishing)
+    assert publishing[4] == [] and publishing[2].issues == {}
+
+
+def test_batch_note_is_appended_once_even_when_its_commit_is_retried(publishing):
+    from foragent import order_batch
+
+    root = publishing[0]
+    (root / "docs").mkdir()
+    (root / "docs/ideas.md").write_text("# Ideas\nOld.\n")
+    entry = order_batch.note(root, "idea", "A new idea.", "next-code-merge", "en")
+    other = order_batch.note(root, "idea", "Later idea.", "a-later-time", "en")
+    for _ in range(2):  # The second pass is a resume of a push that already happened.
+        _flush(publishing)
+        order_batch._update(root, lambda state: [row.update(status="waiting") for row in state["notes"]
+                                                 if row["id"] == entry["id"]])
+    content = (root / "docs/ideas.md").read_text()
+    assert content.startswith("# Ideas\nOld.\n") and content.count("A new idea.") == 1
+    assert "Later idea." not in content
+    assert [event[0] for event in publishing[4]] == ["commit", "push", "push"]
+    statuses = {row["text"]: row["status"] for row in order_batch.pending(root)["notes"]}
+    assert statuses == {"A new idea.": "waiting", "Later idea.": "waiting"}
+    assert other["boundary"] == "a-later-time"
+
+
+@pytest.mark.parametrize("boundary", ["", "  ", "a\nb"])
+def test_batch_boundary_must_be_one_named_line(publishing, plan, boundary):
+    from foragent import order_batch
+
+    with pytest.raises(order.PlanError, match="boundary"):
+        _batch(publishing, plan, boundary)
+    with pytest.raises(order.PlanError, match="boundary"):
+        order_batch.note(publishing[0], "decision", "Text", boundary, "en")
+    assert not (publishing[0] / ".foragent/order-batch.json").exists()
+
+
+def _same_second(monkeypatch):
+    from foragent import order_batch
+
+    monkeypatch.setattr(order_batch, "_now", lambda: "2026-10-31T00:00:00+00:00")
+
+
+def test_batch_redeferred_during_its_flush_in_the_same_second_stays_waiting(publishing, plan, monkeypatch):
+    from foragent import order_batch
+
+    _same_second(monkeypatch)
+    _batch(publishing, plan)
+    tracker, replacement = publishing[2], deepcopy(plan)
+    replacement["title"] = "Login MVP v2"
+    original = tracker.create_issue
+
+    def redefer_once(*args, **kwargs):
+        if not order_batch.pending(publishing[0])["orders"][-1]["title"].endswith("v2"):
+            _batch(publishing, replacement)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tracker, "create_issue", redefer_once)
+    _flush(publishing)
+    rows = order_batch.pending(publishing[0])["orders"]
+    assert [(row["title"], row["status"]) for row in rows] == [("Login MVP v2", "waiting")]
+    monkeypatch.setattr(tracker, "create_issue", original)
+    _flush(publishing)
+    assert [row["status"] for row in order_batch.pending(publishing[0])["orders"]] == ["published"]
+    assert any(issue.title == "Login MVP v2" for issue in tracker.list_issues())
+
+
+def test_batch_identical_notes_in_the_same_second_are_both_published(publishing, monkeypatch):
+    from foragent import order_batch
+
+    _same_second(monkeypatch)
+    root = publishing[0]
+    first = order_batch.note(root, "decision", "Same text.", "next-code-merge", "en")
+    second = order_batch.note(root, "decision", "Same text.", "next-code-merge", "en")
+    assert first["id"] != second["id"]
+    _flush(publishing)
+    assert (root / "docs/decisions.md").read_text().count("Same text.") == 2
+
+
+def _lane_plan(plan, identity):
+    value = deepcopy(plan)
+    value["id"], value["title"] = f"2026-10-31-{identity}", f"Order {identity}"
+    value["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": []}]
+    value["issues"] = [dict(value["issues"][1], key=identity, title=f"{identity} web", lane="web", blocked_by=[])]
+    return value
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_batch_orders_creating_the_same_new_lane_publish_with_the_created_lane(publishing, plan, count):
+    plans = [_lane_plan(plan, f"web{index}") for index in range(count)]
+    for value in plans:
+        _batch(publishing, value)
+    _flush(publishing)
+    root, tracker, events = publishing[0], publishing[2], publishing[4]
+    assert load_config(root).lanes["web"]["paths"] == ["web/**"]
+    assert [event[1] for event in events if event[0] == "commit"].count("Foragent lane web") == 1
+    titles = {issue.title: issue for issue in tracker.list_issues()}
+    for value in plans:
+        assert "lane:web" in titles[value["issues"][0]["title"]].labels
+
+
+def test_batch_rejects_one_new_lane_declared_two_ways_before_writes(publishing, plan):
+    first, second = _lane_plan(plan, "one"), _lane_plan(plan, "two")
+    second["new_lanes"][0]["paths"] = ["site/**"]
+    _batch(publishing, first)
+    _batch(publishing, second)
+    with pytest.raises(order.PlanError, match="web"):
+        _flush(publishing)
+    assert publishing[4] == [] and not (publishing[0] / ".claude/agents/fa-web.md").exists()
+
+
+def test_batch_refuses_a_done_when_file_that_changed_after_deferral(publishing, plan):
+    from foragent import order_batch
+
+    root = publishing[0]
+    existing = "tests/acceptance/test_existing.py"
+    (root / "tests/acceptance").mkdir(parents=True, exist_ok=True)
+    (root / existing).write_text("def test_strong():\n    assert False\n")
+    # Done when names a test already in the repository, so the plan JSON has no copy of it.
+    plan["issues"][1]["done_when"] = [f"uv run pytest -q {existing}"]
+    _batch(publishing, plan, approve=True)
+    (root / existing).write_text("def test_strong():\n    pass\n")
+    with pytest.raises(order.PlanError, match=f"changed since.*{existing}"):
+        _flush(publishing)
+    assert publishing[4] == [] and publishing[2].issues == {}
+    assert order_batch.pending(root)["orders"][0]["status"] == "waiting"
+    _batch(publishing, plan, approve=True)  # Deferring again snapshots the current files.
+    _flush(publishing)
+    assert [event[0] for event in publishing[4]][:2] == ["commit", "push"]
+    assert all("approved" in issue.labels for issue in publishing[2].list_issues()
+               if issue.title in {item["title"] for item in plan["issues"]})

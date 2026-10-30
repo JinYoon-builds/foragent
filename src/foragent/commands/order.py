@@ -112,6 +112,21 @@ def add(commands) -> None:
     publish.add_argument("--approve-keys", type=cli._comma_keys, default=[])
     publish.add_argument("--approve-numbers", type=cli._comma_numbers, default=[])
     publish.add_argument("--dry-run", action="store_true")
+    publish.add_argument("--defer", metavar="BOUNDARY", help=say("batch_help_defer"))
+    publish.add_argument("--urgent", action="store_true", help=say("batch_help_urgent"))
+    note = order_actions.add_parser("note", help=say("batch_help_note"), description=say("batch_help_note"))
+    note.add_argument("--defer", metavar="BOUNDARY", required=True, help=say("batch_help_boundary"))
+    note.add_argument("--kind", choices=("decision", "idea"), required=True, help=say("batch_help_kind"))
+    note.add_argument("--text", required=True, help=say("batch_help_text"))
+    note.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    note.add_argument("--json", action="store_true")
+    pending = order_actions.add_parser("pending", help=say("batch_help_pending"), description=say("batch_help_pending"))
+    pending.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    pending.add_argument("--json", action="store_true")
+    flush = order_actions.add_parser("flush", help=say("batch_help_flush"), description=say("batch_help_flush"))
+    flush.add_argument("--boundary", required=True, help=say("batch_help_boundary"))
+    flush.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    flush.add_argument("--json", action="store_true")
 
 
 def _preread(args, root) -> int:
@@ -172,6 +187,66 @@ def _perspectives(args, root) -> int:
     return 0
 
 
+def _batch_local(args, root) -> int:
+    from foragent import order_batch
+    from foragent.i18n import text
+
+    cli = facade()
+    config = cli.load_config(root)
+    say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
+    if args.action == "note":
+        entry = order_batch.note(root, args.kind, args.text, args.defer, config.language)
+        print(cli.json.dumps(entry, ensure_ascii=False) if args.json else
+              say("batch_note_waiting", boundary=entry["boundary"], kind=entry["kind"], id=entry["id"]))
+        return 0
+    shown = order_batch.pending(root)
+    if args.json:
+        print(cli.json.dumps(shown, ensure_ascii=False))
+        return 0
+    for row in shown["orders"]:
+        print(say("batch_pending_order", **{key: row[key] for key in ("status", "boundary", "id", "title")}))
+    for row in shown["notes"]:
+        print(say("batch_pending_note", **{key: row[key] for key in ("status", "boundary", "kind", "id", "text")}))
+    if not shown["orders"] and not shown["notes"]:
+        print(say("batch_pending_empty"))
+    return 0
+
+
+def _defer(args, root, config, tracker, repo, plan) -> int:
+    from foragent import order_batch
+    from foragent.i18n import text
+
+    entry = order_batch.defer(plan, args.defer, root, config, tracker, repo=repo, approve=args.approve,
+                              approve_keys=args.approve_keys, approve_numbers=args.approve_numbers)
+    count = len(plan["issues"]) + len(plan.get("edits", []))
+    approved = count if args.approve else len(args.approve_keys) + len(args.approve_numbers)
+    print(text("batch_waiting", config.language, boundary=entry["boundary"], title=plan["title"],
+               approved=min(approved, count), count=count))
+    return 0
+
+
+def _flush(args, root, config, tracker, repo, git) -> int:
+    from foragent import order_batch
+    from foragent.i18n import text
+
+    cli = facade()
+    result = order_batch.flush(args.boundary, root, config, tracker,
+                               repo=repo, git=git)
+    say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
+    if args.json:
+        print(cli.json.dumps(result, ensure_ascii=False))
+    elif not result["orders"] and not result["notes"]:
+        print(say("batch_nothing", boundary=result["boundary"]))
+    else:
+        print(say("batch_flushed", boundary=result["boundary"], orders=len(result["orders"]),
+                  notes=len(result["notes"])))
+        for identity, parent in result["parents"].items():
+            print(say("batch_flushed_order", id=identity, parent=parent))
+    if result["orders"]:
+        cli._open_lane_view(root)
+    return 0
+
+
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
@@ -186,6 +261,8 @@ def run(args) -> int:
         return _preread(args, root)
     if args.action == "perspectives":
         return _perspectives(args, root)
+    if args.action in {"note", "pending"}:
+        return _batch_local(args, root)
     git = cli.GitRepo(root)
     config = cli.load_config(root)
     repo = config.repo or git.remote_slug()
@@ -196,7 +273,11 @@ def run(args) -> int:
     tracker = cli.RunContext(repo=repo, repo_root=root, tracker=tracker,
                              store=cli.StateStore.for_repo(repo), config=config, git=git,
                              now=lambda: cli.datetime.now(cli.UTC)).tracker
+    if args.action == "flush":
+        return _flush(args, root, config, tracker, repo, git)
     plan = cli.order.read_plan(args.plan)
+    if args.defer is not None and not args.urgent and not args.dry_run:
+        return _defer(args, root, config, tracker, repo, plan)
     print(cli.order.publish(
         plan, root, config, tracker, repo=repo, git=git,
         approve=args.approve, approve_keys=args.approve_keys,
