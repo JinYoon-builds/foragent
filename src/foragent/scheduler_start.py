@@ -172,6 +172,36 @@ def _ranked(ctx: TickContext, ready: dict[str, list[int]], claims: list | None =
     return [(lane, number) for _, lane, number in sorted(keyed)]
 
 
+def _start_checks(
+    ctx: TickContext, number: int, lane: str, eligible: Callable[[Issue, str], bool], base_ref: str,
+    report: TickReport,
+) -> Issue | None:
+    """Read the issue now and return it when every start check passes.
+
+    After a failed refresh the read is one GitHub issue GET of at most
+    GH_CALL_SECONDS with no retry, so the stored candidate never starts on
+    stale labels, body or state; the usual approval and integrity checks follow.
+    """
+    if getattr(ctx, "_refresh_failed", False):
+        with scheduler.gh.bounded(scheduler.GH_CALL_SECONDS, scheduler.GH_CALL_SECONDS):
+            issue = ctx.tracker.get_issue(number)
+    else:
+        issue = ctx.tracker.get_issue(number)
+    if not eligible(issue, lane):
+        return None
+    if not scheduler._can_start_in_lane(ctx, lane, issue):
+        return None
+    approval = ctx.store.load_approval(number)
+    event, _ = scheduler._latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
+    if approval is None or event is None or event.created_at != approval.approved_at:
+        return None
+    if not scheduler._check_integrity(ctx, issue, approval, base_ref, report):
+        return None
+    if not scheduler._check_prerequisites(ctx, issue, approval, report):
+        return None
+    return issue
+
+
 def _start_ready(
     ctx: TickContext, ready: dict[str, list[int]], lane_for: Callable[[Issue], str], base_ref: str,
     report: TickReport, sample: tuple[str, float] | None = None,
@@ -187,6 +217,11 @@ def _start_ready(
     sample = sample if sample is not None else scheduler.machine_load()
     budget = scheduler._machine_budget(ctx, ready, sample)
     started = False
+    if ctx.store.github_outbox():
+        # Undelivered writes queue every later write, so READY/RUNNING would change only locally while
+        # GitHub still shows the issue ready: a runner must not start on a queued write.
+        report.actions.append(scheduler.text("tick_starts_wait_outbox", ctx.config.language))
+        return started
     for lane, number in _ranked(ctx, ready):
         if not scheduler._has_slot(ctx, budget):
             break
@@ -197,18 +232,16 @@ def _start_ready(
         local = scheduler._local_issue(ctx, number)
         if local is not None and not eligible(local, lane):
             continue
-        issue = ctx.tracker.get_issue(number)
-        if not eligible(issue, lane):
+        try:
+            issue = _start_checks(ctx, number, lane, eligible, base_ref, report)
+        except scheduler.TrackerError as exc:
+            # After a failed refresh, a candidate whose current facts cannot be read waits; others go on.
+            if exc.is_rate_limit or not getattr(ctx, "_refresh_failed", False):
+                raise
+            report.actions.append(scheduler.text("tick_issue_deferred", ctx.config.language,
+                                                 number=number, error=scheduler._one_line(exc)))
             continue
-        if not scheduler._can_start_in_lane(ctx, lane, issue):
-            continue
-        approval = ctx.store.load_approval(number)
-        event, _ = scheduler._latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
-        if approval is None or event is None or event.created_at != approval.approved_at:
-            continue
-        if not scheduler._check_integrity(ctx, issue, approval, base_ref, report):
-            continue
-        if not scheduler._check_prerequisites(ctx, issue, approval, report):
+        if issue is None:
             continue
 
         if not eligible(scheduler._local_issue(ctx, number) or issue, lane):
