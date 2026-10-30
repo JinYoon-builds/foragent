@@ -52,6 +52,9 @@ class Config:
     # Cautious start: one conflict (#196) in 231 runs; the orchestrator
     # changes this only from conflict facts (fa orch facts).
     overlap_per_file: int = 2
+    # measured: a live per-file plan limit (fa orch plan --overlap, chosen from recorded overlap
+    # facts) replaces overlap_per_file for its file; fixed: overlap_per_file applies to every file.
+    overlap_mode: str = "measured"
     test_slots: int = 2  # Machine-wide test command ceiling; AIMD lowers it under load (#243).
     transient_max_wait_minutes: int = 30
     limit_wait_minutes: int = 60
