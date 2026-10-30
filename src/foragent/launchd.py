@@ -8,10 +8,12 @@ from pathlib import Path
 import plistlib
 import re
 import fcntl
+import json
 import shutil
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 
 from foragent.git import GitRepo
 from foragent.state import StateStore
@@ -71,6 +73,29 @@ def _bootout(call: Callable[[list[str]], subprocess.CompletedProcess[str]], targ
         raise LaunchdError(f"launchctl bootout: {message or result.returncode}")
 
 
+# D97: launchd starts the gate through osascript's JXA $.system, so macOS holds
+# the Apple platform binary responsible for the gate's children and denies a
+# protected-folder request without a permission prompt. $.system, not
+# `do shell script`, which keeps polling the WindowServer. The gate command
+# follows the script as its run(argv), so --repo-root stays readable.
+OSASCRIPT = "/usr/bin/osascript"
+_JXA = (r"""function run(argv) { ObjC.import("stdlib"); """
+        r"""var quote = function (a) { return "'" + a.split("'").join("'\\''") + "'" }; """
+        r"""$.exit($.system("exec " + argv.map(quote).join(" ")) >> 8) }""")
+_WRAPPER = [OSASCRIPT, "-l", "JavaScript", "-e"]
+
+
+def wrap_arguments(command: list[str]) -> list[str]:
+    """The launchd ProgramArguments that run ``command`` under the D97 wrapper."""
+    return [*_WRAPPER, _JXA, *gate_command(command)]
+
+
+def gate_command(arguments: list) -> list:
+    """The gate command inside ProgramArguments, wrapped (D97) or legacy."""
+    arguments = list(arguments)
+    return arguments[len(_WRAPPER) + 1:] if arguments[:len(_WRAPPER)] == _WRAPPER else arguments
+
+
 # Keep gate imports from writing bytecode into installed package trees.
 # Python needs this environment when the process starts, before any imports.
 GATE_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
@@ -120,14 +145,120 @@ def _refreshed_plist(path: Path) -> dict | None:
     environment = data.get("EnvironmentVariables")
     environment = environment if isinstance(environment, dict) else {}
     arguments = data.get("ProgramArguments")
-    current_executable = (shim is None or not isinstance(arguments, list) or not arguments
-                          or arguments[0] == str(shim))
+    command = gate_command(arguments) if isinstance(arguments, list) else []
+    current_executable = shim is None or not command or command[0] == str(shim)
     if current_executable and all(environment.get(name) == value for name, value in GATE_ENVIRONMENT.items()):
         return None
     data["EnvironmentVariables"] = {**environment, **GATE_ENVIRONMENT}
-    if shim is not None and isinstance(arguments, list) and arguments:
-        data["ProgramArguments"] = [str(shim), *arguments[1:]]
+    if shim is not None and command:
+        data["ProgramArguments"] = _rewrap(arguments, [str(shim), *command[1:]])
     return data
+
+
+def _rewrap(arguments: list, command: list) -> list:
+    """``command`` in the shape ``arguments`` had: wrapped stays wrapped, legacy stays legacy."""
+    return wrap_arguments(command) if arguments[:len(_WRAPPER)] == _WRAPPER else command
+
+
+def _definitions(path: Path) -> tuple[dict, dict]:
+    """The candidate and rollback definitions for a reload, validated before any bootout.
+
+    Candidate: the refreshed environment and stable executable. Rollback: the
+    installed definition, its removed executable replaced by the stable shim.
+    Both run under the D97 wrapper; a legacy unwrapped definition is never loaded.
+    """
+    if (old := _plist(path)) is None:
+        raise LaunchdError(f"cannot read {path}; run fa gate install to rewrite it")
+    candidate = _refreshed_plist(path) or _plist(path)
+    rollback = dict(old)
+    command = gate_command(old.get("ProgramArguments") or [])
+    if command and not Path(str(command[0])).is_file() and (shim := _fa_shim()) is not None:
+        command = [str(shim), *command[1:]]
+    rollback["ProgramArguments"] = command
+    for definition in (candidate, rollback):
+        command = definition.get("ProgramArguments")
+        if (not isinstance(definition.get("Label"), str) or not isinstance(command, list) or not command
+                or "--repo-root" not in gate_command(command)
+                or not all(isinstance(value, str) for value in command)):
+            raise LaunchdError(f"{path} does not define a gate tick; run fa gate install to rewrite it")
+        definition["ProgramArguments"] = wrap_arguments(command)
+        plistlib.loads(plistlib.dumps(definition))
+    return candidate, rollback
+
+
+RELOAD_FACT = "launchd-reload.json"
+
+
+def _reload_store(root: Path) -> StateStore:
+    from foragent import update_check
+
+    return update_check.gate_store(root)[1]
+
+
+def reload_fact(state_root: Path | None) -> dict | None:
+    """The latest reload fact of a gate's state folder; None until a reload is attempted."""
+    if state_root is None:
+        return None
+    try:
+        fact = json.loads((Path(state_root) / RELOAD_FACT).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return fact if isinstance(fact, dict) else None
+
+
+def reload_pending(job: "InstalledJob") -> bool:
+    """True when this job's last reload left it unloaded, so a refresher retries it."""
+    try:
+        fact = reload_fact(_reload_store(job.repo_root).root)
+    except Exception:
+        return False
+    return bool(fact and fact.get("pending") and fact.get("plist") == str(job.plist_path))
+
+
+def _write_plist(path: Path, content: bytes) -> None:
+    """Replace the plist atomically: launchd finds the old file or the new one, never a torn one."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(content)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _service_state(run: Callable[[list[str]], subprocess.CompletedProcess[str]], target: str) -> str:
+    """loaded, absent (launchd says no such service) or unknown (any other failure)."""
+    try:
+        result = run(["print", target])
+    except OSError:
+        return "unknown"
+    if result.returncode == 0:
+        return "loaded"
+    output = f"{result.stderr or ''}{result.stdout or ''}".lower()
+    return "absent" if result.returncode == 113 or "could not find service" in output else "unknown"
+
+
+def _reload_record(label: str, plist: Path, *, error: str | None, attempts: int, state: str,
+                   rolled_back: bool = False) -> dict:
+    """One reload fact. A job not confirmed loaded is pending, and always names why."""
+    loaded = state == "loaded"
+    if not loaded and error is None:
+        error = f"launchctl print: job {state} after bootstrap"
+    return {"at": datetime.now(UTC).isoformat(), "error": error, "attempts": attempts,
+            "recovered": error is not None and loaded, "loaded": loaded, "pending": not loaded,
+            "rolled_back": rolled_back, "label": label, "plist": str(plist)}
+
+
+def _one_line(error: BaseException | str) -> str:
+    return " ".join(str(error).split()) or type(error).__name__
+
+
+def _record_reload(root: Path, store: StateStore | None, fact: dict) -> None:
+    """Replace the latest reload fact; a lost record never undoes the reload."""
+    try:
+        store = store or _reload_store(root)
+        store._write_json(store.root / RELOAD_FACT, fact)
+    except Exception as exc:
+        print(f"foragent: cannot record launchd reload: {' '.join(str(exc).split())}", file=sys.stderr)
 
 
 def _migrate_environment(path: Path) -> None:
@@ -223,8 +354,16 @@ def refresh_jobs(repo_root: Path, *, sleep: Callable[[float], None] = time.sleep
 
 def _jobs_to_refresh(root: Path) -> list[tuple["InstalledJob", str]]:
     """Stale jobs of the gate that launchd may hold; a confirmed absent job starts no tick."""
-    states = [(job, job.state()) for job in stale_jobs(root)]
-    return [(job, state) for job, state in states if state != "absent"]
+    stale = stale_jobs(root)
+    states = [(job, job.state()) for job in stale]
+    jobs = [(job, state) for job, state in states if state != "absent"]
+    # A reload that ended unloaded is recorded as pending: retry it although no tick runs.
+    known = {job.plist_path for job, _ in jobs}
+    for job in installed_jobs():
+        if (Path(job.repo_root).resolve() == root and job.plist_path not in known
+                and reload_pending(job) and (state := job.state()) != "loaded"):
+            jobs.append((job, state))  # unknown stops the refresher; the next tick retries.
+    return jobs
 
 
 @dataclass(frozen=True)
@@ -253,26 +392,47 @@ class InstalledJob:
 
     def state(self) -> str:
         """loaded, absent (launchd says no such service) or unknown (any other failure)."""
-        try:
-            result = _run_launchctl(["print", self.target])
-        except OSError:
-            return "unknown"
-        if result.returncode == 0:
-            return "loaded"
-        output = f"{result.stderr or ''}{result.stdout or ''}".lower()
-        return "absent" if result.returncode == 113 or "could not find service" in output else "unknown"
+        return _service_state(_run_launchctl, self.target)
 
     def restart(self) -> None:
-        """Reload the plist as installed: bootout, then bootstrap the same file.
+        """Reload the plist: one bootout, then at most three bootstraps.
 
-        An older plist gains the gate environment and stable shim while out, so a
-        kickstart never sees the new file with the old definition loaded.
+        The candidate (gate environment, stable shim, D97 wrapper) is built and
+        validated before the bootout and written while the job is out, so a
+        kickstart never sees the new file with the old definition loaded. A failed
+        bootstrap gets one retry, then one rollback to the installed definition
+        (still D97-wrapped). The outcome is recorded as the gate's latest reload fact.
         """
+        candidate, rollback = _definitions(self.plist_path)
         _bootout(self._call, self.target)
-        _migrate_environment(self.plist_path)
-        result = self._call(["bootstrap", self.domain, str(self.plist_path)])
-        if result.returncode:
-            raise LaunchdError(f"launchctl bootstrap: {result.stderr or result.stdout or result.returncode}")
+        # From here the job may be out: every failure is recorded, never raised past the record.
+        error, attempts, applied = None, 0, None
+        for definition in (candidate, candidate, rollback):
+            if attempts:
+                time.sleep(1)  # Let launchd finish the bootout before trying again.
+            try:
+                _write_plist(self.plist_path, plistlib.dumps(definition))
+            except Exception as exc:  # The next definition may still be written and loaded.
+                error = error or _one_line(f"cannot write {self.plist_path}: {exc}")
+                continue
+            attempts += 1
+            try:
+                result = self._call(["bootstrap", self.domain, str(self.plist_path)])
+                failure = (f"launchctl bootstrap: {result.stderr or result.stdout or result.returncode}"
+                           if result.returncode else None)
+            except Exception as exc:
+                failure = str(exc)
+            if failure is None:
+                applied = definition
+                break
+            error = error or _one_line(failure)
+        fact = _reload_record(self.label, self.plist_path, error=error, attempts=attempts,
+                              state=self.state(), rolled_back=applied is rollback and applied is not candidate)
+        _record_reload(self.repo_root, None, fact)
+        if not fact["loaded"]:
+            raise LaunchdError(f"{fact['error']}; job not loaded")
+        if applied is not candidate:
+            raise LaunchdError(f"{fact['error']}; the new definition was not loaded")
 
 
 def installed_jobs(home: Path | None = None, uid: int | None = None) -> list[InstalledJob]:
@@ -325,7 +485,8 @@ class Launchd:
         )
         return plistlib.dumps({
             "Label": self.label,
-            "ProgramArguments": [str(executable), "gate", "tick", "--repo-root", str(self.repo_root)],
+            "ProgramArguments": wrap_arguments(
+                [str(executable), "gate", "tick", "--repo-root", str(self.repo_root)]),
             "StartInterval": 300,
             "RunAtLoad": True,
             # Background confines the tick and every run it starts (tests, agents) to
@@ -362,11 +523,27 @@ class Launchd:
         # Write while the job is out: a kickstart must not find the new file
         # with the old definition still loaded.
         self._bootout()
-        if not self.plist_path.exists() or self.plist_path.read_bytes() != content:
-            self.plist_path.write_bytes(content)
-        result = self._call(["bootstrap", self.domain, str(self.plist_path)])
-        if result.returncode:
-            raise LaunchdError(f"launchctl bootstrap: {result.stderr or result.stdout or result.returncode}")
+        # The job is out: the outcome replaces the gate's latest reload fact, failed or not.
+        error, attempts = None, 0
+        try:
+            if not self.plist_path.exists() or self.plist_path.read_bytes() != content:
+                _write_plist(self.plist_path, content)
+            attempts = 1
+            result = self._call(["bootstrap", self.domain, str(self.plist_path)])
+            if result.returncode:
+                error = f"launchctl bootstrap: {result.stderr or result.stdout or result.returncode}"
+        except LaunchdError as exc:
+            error = str(exc)
+        except OSError as exc:
+            error = f"cannot write {self.plist_path}: {exc}"
+        state = _service_state(self._run, self.target)
+        fact = _reload_record(self.label, self.plist_path, error=error and _one_line(error),
+                              attempts=attempts, state=state)
+        _record_reload(self.repo_root, StateStore(self.state_root), fact)
+        if error is not None:
+            raise LaunchdError(error)
+        if not fact["loaded"]:
+            raise LaunchdError(f"{fact['error']}; job not loaded")
         return self.label
 
     def uninstall(self) -> str:
