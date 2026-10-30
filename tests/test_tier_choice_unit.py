@@ -100,7 +100,7 @@ def test_a_turn_never_rewrites_a_recorded_key():
 
 
 @pytest.mark.parametrize("case", ["no-record", "other-executor-only", "expired", "unlimited", "api-claude"])
-def test_without_current_usage_the_last_attempt_only_steps_up(case, monkeypatch):
+def test_without_current_usage_turns_step_up_and_the_last_attempt_is_l(case, monkeypatch):
     # The last allowed attempt is l whatever the usage or executor kind (orchestrator, 2026-10-30);
     # before it, an executor without current usage only steps up from its size.
     config = Config(executor="codex", max_retries=2)
