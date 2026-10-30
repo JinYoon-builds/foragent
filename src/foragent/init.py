@@ -11,7 +11,7 @@ import sys
 
 import yaml
 
-from foragent import board, gh, launchd, role_agents, roles
+from foragent import board, gh, lane_memory, launchd, role_agents, roles
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
@@ -210,6 +210,17 @@ def _preflight_language(root: Path, language: str | None) -> str:
         return "en"
 
 
+def _bind_checkout(root: Path) -> None:
+    """Bind this checkout to its repository's box when it is the first with that origin (#1026)."""
+    from datetime import UTC, datetime
+
+    from foragent import presence
+    try:
+        presence.bind_checkout(root, datetime.now(UTC))
+    except Exception:  # Optional upkeep: the session-start hook binds later instead.
+        logging.getLogger(__name__).debug("checkout binding skipped", exc_info=True)
+
+
 def init_repo(
     repo_root: Path, *, approvers: list[str] | None = None, review: str | None = None,
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
@@ -325,6 +336,9 @@ def init_repo(
         print(f"Warning: kept {', '.join(invalid_agents)} unchanged; its frontmatter needs name, "
               "memory: project and the skills of its roles entry.", file=sys.stderr)
 
+    # Re-running init moves lane memory to its two writers (D95); a second run changes nothing.
+    migrated = lane_memory.migrate(root, config)
+
     created = [path for path in contents if not (root / path).exists()]
     existed = [path for path in contents if (root / path).exists()]
     if config_path.exists():
@@ -342,7 +356,9 @@ def init_repo(
     # Also recover a deletion left uncommitted by an interrupted setup.
     legacy_paths = [LEGACY_PUBLISH_WORKFLOW] if not (root / LEGACY_PUBLISH_WORKFLOW).exists() else []
     pending = list(dict.fromkeys([
-        *created, *tracked_removals, *([".foragent.yml"] if updated_config is not None else []),
+        *created, *tracked_removals, *([".foragent.yml"] if updated_config is not None else []), *migrated,
+        # Files an interrupted earlier run migrated but never committed are found by their state.
+        *git.uncommitted_paths(lane_memory.managed_paths(root, config)),
         *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root, role_skills), *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
@@ -407,6 +423,7 @@ def init_repo(
                 stream.write(data if isinstance(data, bytes) else data.encode("utf-8"))
     for path in removed:
         (root / path).unlink()
+    lane_memory.apply(root, migrated)
     if WORKFLOW in created:
         write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:
@@ -419,6 +436,7 @@ def init_repo(
     if push_planned:
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
+    _bind_checkout(root)
     return InitReport(created, existed, False, bool(pending), push_planned, label,
                       normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
                       notes=notes, tracker=tracker)

@@ -12,6 +12,8 @@ def add(commands) -> None:
                                     help="Put back the statusline you had before Foragent's wrapper")
     statusline_command.add_argument("--session-start", action="store_true",
                                     help="Claude Code SessionStart hook: print the since-last-report line")
+    statusline_command.add_argument("--prompt-context", action="store_true",
+                                    help="Claude Code UserPromptSubmit hook: give a planning turn the box facts")
 
 
 def _uninstall_statusline() -> int:
@@ -33,4 +35,6 @@ def run(args) -> int:
     from foragent import statusline
     if args is not None and args.session_start:
         return statusline.session_start()
+    if args is not None and args.prompt_context:
+        return statusline.prompt_context()
     return statusline.run()

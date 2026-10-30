@@ -6,6 +6,7 @@ import re
 
 import yaml
 
+from foragent import lane_memory
 from foragent.config import Config, LaneSettings, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.paths import repo_path
@@ -55,6 +56,8 @@ def lane_files(root: Path, name: str, skills: list[str]) -> list[str]:
             raise LaneError(f"installed lane skill is missing: {skill}")
     if skills:
         paths.append(".gitignore")
+    if repo_path(root, lane_memory.ATTRIBUTES).is_file():
+        paths.append(lane_memory.ATTRIBUTES)  # add_lane installs the pending-memory union line.
     return paths
 
 
@@ -88,7 +91,6 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     # Keep the agent definition readable and its skill list inline.
     header = yaml.safe_dump({
         "name": f"fa-{name}", "description": f'Foragent lane "{name}": implements issues in {areas}.',
-        "memory": "project",
     }, sort_keys=False) + "skills: " + yaml.safe_dump(installed, default_flow_style=True).strip() + "\n"
     agent_path = f".claude/agents/fa-{name}.md"
     destination = repo_path(root, agent_path)
@@ -96,10 +98,12 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     destination.write_text(
         f"---\n{header}---\n"
         f"You implement one GitHub issue at a time in this repository's {name} lane ({areas}).\n"
-        "Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.\n"
+        f"{lane_memory.instruction(f'fa-{name}')}\n"
         "Run tests with `fa test <pytest args>`; it waits for a machine-wide test slot.\n",
         encoding="utf-8",
     )
+    if (attributes := lane_memory.union_change(root, load_config(root))) is not None:
+        lane_memory.apply(root, {lane_memory.ATTRIBUTES: attributes})
     published = lane_files(root, name, installed)
     git.ensure_tracked(published)
     git.commit_paths(published, f"Foragent lane {name}")
@@ -121,7 +125,7 @@ def set_lane_skills(root: Path, name: str, skills: list[str], *,
         content = agent.read_text(encoding="utf-8")
     except OSError as exc:
         raise LaneError(f"cannot read lane agent {agent}: {exc}") from exc
-    match = re.match(r"\A---[ \t]*\n(.*?)^---[ \t]*(?:\n|$)", content, re.S | re.M)
+    match = re.match(r"\A\ufeff?---[ \t]*\r?\n(.*?)^---[ \t]*\r?(?:\n|$)", content, re.S | re.M)
     try:
         header = yaml.safe_load(match[1]) if match else None
     except yaml.YAMLError as exc:

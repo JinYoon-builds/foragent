@@ -141,10 +141,10 @@ def implementer_setup(
     agent, notes = lane_notes(config, lane, worktree, full_text_dir)
     missing: list[str] = []
     if native_claude:
-        # Claude reads the lane agent and memory itself; only a cut notice is added, after the task.
+        # Claude reads the lane agent itself; the lane memory it does not load comes after the task.
         if agent is not None:
             options["agent"] = agent
-        memory_notice = lane_memory_notice(config, lane, worktree, full_text_dir) if agent is not None else ""
+        memory_notice = lane_memory_notice(config, lane, worktree, full_text_dir)
         notes = ""
     else:
         skill_notes, missing = lane_skills(config, lane, worktree, agent)
