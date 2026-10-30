@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_seat
+from foragent import capacity, orch_inbox, orch_seat
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -63,12 +63,15 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False,
     holder ``fa orch watch --follow`` took) every poll checks, in one locked
     step with its heartbeat, that this lifetime still holds the seat, and
     raises ``orch_seat.SeatHeld`` instead of writing once it does not.
+    With ``follow``, each new inbox request id and each newly answered question
+    also yields one event line (#970); ones present at the first read are seen.
     """
     if not math.isfinite(interval) or interval <= 0:
         raise OrchError("interval must be a finite positive number")
     path = ctx.store.root / "orch-watch.json"
     unknown_path = ctx.store.root / "orch-watch-unknown.json"
     last_error = None
+    inbox = orch_inbox.FollowEvents(ctx.store) if follow else None  # baseline at start
     session = claude_session()  # The gate's spawn check trusts it past a stale heartbeat.
     # #413: the id its spawn gave this session; writes from a retired session are ignored.
     session_id = os.environ.get("FORAGENT_SESSION_ID")
@@ -98,6 +101,7 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False,
                     ctx.store._write_json(path, snapshot)
                 if recovered:
                     unknown_path.unlink(missing_ok=True)
+            events = inbox.poll(ctx.store) if inbox is not None else []
         except Exception as error:  # an unreadable state must never look like empty sets
             message = str(error) or type(error).__name__
             reading = {"unknown": True, "error": message}
@@ -120,6 +124,7 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False,
             yield snapshot
             if not follow:
                 return
+        yield from events
         time.sleep(interval)
 
 

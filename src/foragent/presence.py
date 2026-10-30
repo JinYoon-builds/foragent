@@ -91,6 +91,31 @@ def _project(cwd: Path):
     return config, (StateStore.for_repo(repo) if repo else None)
 
 
+def renew_planning(cwd: Path) -> bool:
+    """Keep this planning session's ``fa plan heartbeat`` fresh from the statusline (#970).
+
+    Only a planning session renews: no FORAGENT_ROLE at all (even empty) and not
+    inside the gate's worktrees. Only an existing heartbeat older than a minute is
+    rewritten; nothing else, such as the session start record, is touched.
+    """
+    import os
+
+    from foragent.orch_inbox import renew_plan_heartbeat
+
+    if "FORAGENT_ROLE" in os.environ:
+        return False
+    try:
+        project = _project(cwd)
+        if project is None or project[1] is None:
+            return False
+        store = project[1]
+        if cwd.resolve().is_relative_to((store.root / "worktrees").resolve()):
+            return False
+        return renew_plan_heartbeat(store)
+    except Exception:  # The user's statusline must keep working whatever the local state holds.
+        return False
+
+
 def statusline_segment(cwd: Path, now: datetime) -> str | None:
     """The segment for a Foragent project, else None (and when the project config cannot be read)."""
     from foragent.i18n import text

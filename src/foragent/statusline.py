@@ -230,6 +230,7 @@ def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
         result = subprocess.run(previous, shell=True, input=raw, stdout=subprocess.PIPE, env=env, check=False)
         output, code = result.stdout, (result.returncode if result.returncode >= 0 else 128 - result.returncode)
     from foragent import presence
+    presence.renew_planning(Path.cwd())
     now = datetime.now(UTC)
     output = presence.append(output, presence.statusline_segment(Path.cwd(), now))
     session_id = _session_input(raw).get("session_id")
