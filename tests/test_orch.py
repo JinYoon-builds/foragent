@@ -646,3 +646,21 @@ def test_review_head_without_harness_changes_is_measured_and_recorded(review_cas
     c = review_case
     assert runner.review_only(1, c.ctx) == "merged"
     assert c.store.get_run(1).harness_guard["guarded"] == c.head
+
+
+@pytest.mark.parametrize("last", [False, True], ids=["before-a-later-command", "last-command"])
+def test_review_done_when_that_commits_a_harness_change_holds(review_case, last):
+    """A head that moves between review measurements is guarded again; it is a harness hold, not checks-failed."""
+    from runner_support import set_done_when
+
+    c = review_case
+    commit_harness = ("mkdir -p gen && echo '# harness' > gen/conftest.py && git add gen/conftest.py && "
+                      "git -c user.name=t -c user.email=t@t commit -qm harness && echo RAN_""FIRST")
+    set_done_when(c, [commit_harness] if last else [commit_harness, 'echo RAN_""SECOND'])
+    c.tracker.edit_body(1, c.store.load_approval(1).body)
+    assert runner.review_only(1, c.ctx) == "held"
+    log = c.store.log_path(1).read_text()
+    assert "RAN_FIRST" in log and "RAN_SECOND" not in log
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
+    assert c.tracker.merged_prs == []

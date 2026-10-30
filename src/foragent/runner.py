@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 import yaml
 
 from foragent import board, capacity, orch_github
+from foragent.harness_guard import HarnessHeld
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -199,69 +200,68 @@ def _implement_and_publish(
     try:
         try:
             resume_verified = _resume_implementation(attempt)
-        except AttemptFailure:
-            if not attempt.review_hold:
-                raise
-            outcome = _publish(attempt)  # the test-harness guard held during conflict resolution
-            return outcome
-        if not _acceptance_matches(n, ctx, git, attempt.approval):
-            raise ExecutorStopped("hash-mismatch")
-        attempt.approved_ref = git.head_sha()
-        while True:
-            if resume_verified:
-                attempt.failure = ""
-                resume_verified = False
-            else:
-                _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
-                try:
-                    attempt.failure = _verify_implementation(attempt)
-                except PatchReplayError as exc:
-                    attempt.failure = _recover_replay(attempt, exc)
-            attempt.reviewer_text = None
-            run = ctx.store.get_run(n)
-            if not attempt.failure and ctx.config.reviewer != "none":
-                if _remaining(n, ctx) <= 0:
-                    outcome = _timeout(n, ctx)
-                    return outcome
-                _review_implementation(attempt)
-            if attempt.rebuilt and attempt.failure:
-                outcome = _block_rebuild(attempt, str(attempt.failure))
-                return outcome
-            if not attempt.failure or attempt.review_hold:
-                try:
-                    outcome = _publish(attempt)
-                    return outcome
-                except ConflictBudgetExhausted as exc:
-                    attempt.failure = _rebuild_after_conflicts(attempt, exc)
-                    continue
-                except CIFailure as exc:
-                    if attempt.rebuilt:
-                        outcome = _block_rebuild(attempt, str(exc))
+            if not _acceptance_matches(n, ctx, git, attempt.approval):
+                raise ExecutorStopped("hash-mismatch")
+            attempt.approved_ref = git.head_sha()
+            while True:
+                if resume_verified:
+                    attempt.failure = ""
+                    resume_verified = False
+                else:
+                    _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
+                    try:
+                        attempt.failure = _verify_implementation(attempt)
+                    except PatchReplayError as exc:
+                        attempt.failure = _recover_replay(attempt, exc)
+                attempt.reviewer_text = None
+                run = ctx.store.get_run(n)
+                if not attempt.failure and ctx.config.reviewer != "none":
+                    if _remaining(n, ctx) <= 0:
+                        outcome = _timeout(n, ctx)
                         return outcome
-                    attempt.failure = exc
-                    continue
-                except (AttemptFailure, PatchReplayError) as exc:
-                    if attempt.review_hold:
-                        # The test-harness guard held during a base-move re-check: publish the hold.
+                    _review_implementation(attempt)
+                if attempt.rebuilt and attempt.failure:
+                    outcome = _block_rebuild(attempt, str(attempt.failure))
+                    return outcome
+                if not attempt.failure or attempt.review_hold:
+                    try:
                         outcome = _publish(attempt)
                         return outcome
-                    attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else exc.failure
-                    if not attempt.failure:
-                        # The replay was resolved and verified in place; publish it without a new turn.
-                        resume_verified = True
+                    except ConflictBudgetExhausted as exc:
+                        attempt.failure = _rebuild_after_conflicts(attempt, exc)
                         continue
-                    run = ctx.store.get_run(n)
-            if attempt.rebuilt:
-                outcome = _block_rebuild(attempt, str(attempt.failure))
+                    except CIFailure as exc:
+                        if attempt.rebuilt:
+                            outcome = _block_rebuild(attempt, str(exc))
+                            return outcome
+                        attempt.failure = exc
+                        continue
+                    except (AttemptFailure, PatchReplayError) as exc:
+                        attempt.failure = _recover_replay(attempt, exc) if isinstance(exc, PatchReplayError) else exc.failure
+                        if not attempt.failure:
+                            # The replay was resolved and verified in place; publish it without a new turn.
+                            resume_verified = True
+                            continue
+                        run = ctx.store.get_run(n)
+                if attempt.rebuilt:
+                    outcome = _block_rebuild(attempt, str(attempt.failure))
+                    return outcome
+                _append(attempt.log, f"Attempt {run.attempts} failed:\n{attempt.failure}")
+                ctx.store.update_run(n, resume_reason=str(attempt.failure),
+                                     resume_whole=isinstance(attempt.failure, (WholeFailure, CIFailure)))
+                if run.attempts < ctx.config.max_retries + 1:
+                    ctx.store.update_run(n, attempts=run.attempts + 1)
+                    continue
+                flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", attempt.failure)
+                outcome = "retries-exceeded"
                 return outcome
-            _append(attempt.log, f"Attempt {run.attempts} failed:\n{attempt.failure}")
-            ctx.store.update_run(n, resume_reason=str(attempt.failure),
-                                 resume_whole=isinstance(attempt.failure, (WholeFailure, CIFailure)))
-            if run.attempts < ctx.config.max_retries + 1:
-                ctx.store.update_run(n, attempts=run.attempts + 1)
-                continue
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", attempt.failure)
-            outcome = "retries-exceeded"
+        except HarnessHeld as held:
+            # The test-harness guard held wherever the head was about to be measured
+            # (a turn, a base-move re-check, conflict resolution or replay). No ordinary
+            # failure handling applies: publish the held head for a person with its paths.
+            attempt.review_hold, attempt.review_hold_reason = True, Reason.TEST_HARNESS_CHANGED
+            attempt.failure = held.details
+            outcome = _publish(attempt)
             return outcome
     except ExecutorStopped as exc:
         outcome = exc.outcome

@@ -11,7 +11,7 @@ from foragent.git import GitError
 from foragent.i18n import text
 from foragent.policy import review_mode_for
 from foragent.reasons import Reason
-from foragent.run_attempt import AttemptFailure, ConflictBudgetExhausted, ExecutorStopped, PatchReplayError
+from foragent.run_attempt import ConflictBudgetExhausted, ExecutorStopped, PatchReplayError
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_lane_skills import _inject_lane_skills
 from foragent.run_overlap import conflict_resolution, record_redo
@@ -302,8 +302,6 @@ def _resolve_conflicts_inner(
         elif git.has_staged_changes():
             git.commit(title)
         check_failure = _verify_implementation(attempt)
-        if attempt.review_hold:
-            raise AttemptFailure(check_failure)  # the test-harness guard held: the run publishes the hold
         markers = git.conflict_marker_paths(conflicts)
         if markers:
             check_failure = f"Conflict markers remain in: {', '.join(markers)}"

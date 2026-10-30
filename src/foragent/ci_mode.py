@@ -294,6 +294,7 @@ def review_checks(n, ctx, git, target_branch):
                                   own_only=ctx.config.runner_unit_tests != "all"
                                   and (enabled(ctx, target_branch) or trusts_ci(git.root, ctx.config)))
         if baseline.node_ids:
+            guard_or_stop(ctx, n, git, base, git.head_sha())  # the local-only run above may have committed
             checks.append(check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", git.root))
         if own:
             # Related tests are a recorded check of their own, as in an implementation's verification.

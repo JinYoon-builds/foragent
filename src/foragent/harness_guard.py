@@ -10,8 +10,11 @@ the reviewer and GitHub CI on a clean checkout.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import contextmanager
 from fnmatch import fnmatchcase
 import math
+from pathlib import Path
 import tomllib
 from typing import TYPE_CHECKING
 
@@ -121,12 +124,15 @@ def _holds(git: GitRepo, entry: tuple[bytes, bytes, bytes, bytes, bytes], files:
         return True  # a Files entry is UTF-8, so such a path cannot be listed exactly
     if harness_dirs or any(mode not in (*_REGULAR, _ABSENT) for mode in (old_mode, new_mode)):
         return True  # a harness-named directory, a symlink or a submodule on either side
+    try:
+        # Every side Git records is read, for every harness name: a blob that
+        # cannot be read cannot be compared, listed or not.
+        blobs = [None if mode == _ABSENT else git.blob_bytes(sha)
+                 for mode, sha in ((old_mode, old_sha), (new_mode, new_sha))]
+    except GitError:
+        return True
     if name == PYPROJECT:
-        try:
-            tables = [_pytest_tables(None if mode == _ABSENT else git.blob_bytes(sha))
-                      for mode, sha in ((old_mode, old_sha), (new_mode, new_sha))]
-        except GitError:
-            return True  # an unreadable blob cannot be compared
+        tables = [_pytest_tables(blob) for blob in blobs]
         if _UNPARSABLE in tables:
             return True
         if tables[0] == tables[1]:
@@ -175,6 +181,38 @@ def guard_measured(ctx, n: int, git: GitRepo, target_ref: str, measured: str, fi
     if not held:
         ctx.store.update_run(n, harness_guard={"merge_base": base, "guarded": measured})
     return held
+
+
+class HarnessHeld(Exception):
+    """The guard held a head the implementation path was about to measure.
+
+    Not an ordinary attempt failure: no retry, rebuild or replay handler catches
+    it. runner._implement_and_publish publishes the hold with these details.
+    """
+
+    def __init__(self, details: str):
+        super().__init__(details)
+        self.details = details
+
+
+_GUARDS: dict[Path, Callable[[], str | None]] = {}
+
+
+@contextmanager
+def guarding(root: Path, check: Callable[[], str | None]):
+    """While measuring in root, before_measurement(root) runs check (a hold outcome or None)."""
+    key = Path(root).resolve()
+    _GUARDS[key] = check
+    try:
+        yield
+    finally:
+        _GUARDS.pop(key, None)
+
+
+def before_measurement(root: Path) -> str | None:
+    """The registered guard for root, run just before one measurement there."""
+    check = _GUARDS.get(Path(root).resolve())
+    return check() if check else None
 
 
 def issue_files(ctx, n: int) -> list[str]:

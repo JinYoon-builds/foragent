@@ -196,3 +196,47 @@ def test_acceptance_comparisons_guard_the_exact_head_before_reading_evidence(mon
     with pytest.raises(ExecutorStopped):
         ci_mode.review_checks(1, ctx, git, "main")
     assert guarded == [("origin/batch-7", "a" * 40), ("origin/main", "b" * 40)]
+
+
+@pytest.mark.parametrize("name", ["tests/conftest.py", "pytest.ini", "tox.ini", "setup.cfg",
+                                  "pkg/sitecustomize.py", "pkg/usercustomize.py", "pyproject.toml"])
+def test_listed_harness_file_with_an_unreadable_blob_holds(case, name):
+    """Every harness name has its blobs read: one that cannot be read cannot be compared, listed or not."""
+    missing = b"1" * 40
+    raw_git(case.repo, "read-tree", case.base)
+    raw_git(case.repo, "update-index", "-z", "--index-info", stdin=b"100644 " + missing + b"\t" + name.encode() + b"\0")
+    tree = raw_git(case.repo, "write-tree", "--missing-ok").strip().decode()
+    sha = git_command(case.repo, "commit-tree", tree, "-p", case.base, "-m", "missing blob")
+    held = guard_measured(case.ctx, 1, GitRepo(case.repo), "target", sha, ["**"])
+    assert held == [name]
+    assert case.store.get_run(1).harness_guard == {}, "a held head is never recorded as guarded"
+
+
+def test_review_checks_guard_again_before_the_acceptance_ids(monkeypatch):
+    """The local-only run is a measured process too; the acceptance ids measure the head as it is after it."""
+    from foragent import ci_local, ci_mode, harness_guard
+    from foragent.run_attempt import ExecutorStopped
+
+    heads = iter(["a" * 40, "b" * 40])
+    guarded = []
+
+    def guard(ctx, n, git, target_ref, measured, link=""):
+        guarded.append(measured)
+        if len(guarded) == 2:
+            raise ExecutorStopped("held")
+
+    monkeypatch.setattr(harness_guard, "guard_or_stop", guard)
+    monkeypatch.setattr(ci_local, "capture_local_only",
+                        lambda *args: SimpleNamespace(command="true", node_ids=("tests/acceptance/test_x.py::t",)))
+    monkeypatch.setattr(ci_local, "verify_local_only_units", lambda *args: None)
+    monkeypatch.setattr(ci_mode, "_baseline_exclusions", lambda *args: [])
+    ctx = SimpleNamespace(repo="owner/repo", config=Config(test_command="true"),
+                          store=SimpleNamespace(log_path=lambda n: "log"))
+    from pathlib import Path
+    git = SimpleNamespace(head_sha=lambda: next(heads), ref_sha=lambda ref: "c" * 40, root=Path("/nonexistent"),
+                          changed_paths=lambda ref: [])
+    from contextlib import nullcontext
+    monkeypatch.setattr("foragent.run_waits.in_phase", lambda *args: nullcontext())
+    with pytest.raises(ExecutorStopped):
+        ci_mode.review_checks(1, ctx, git, "main")
+    assert guarded == ["a" * 40, "b" * 40]
