@@ -56,7 +56,8 @@ def test_skills_autosync_catalog_clones_missing_library(git_history, tmp_path, c
     destination, _ = missing_library(git_history, tmp_path)
     assert not destination.exists()
     assert main(["skills", "catalog", "--json"]) == 0
-    catalog = json.loads(capsys.readouterr().out)
+    # #1028 (2026-10-31): Foragent's vendored principles (library "pstack") may also be listed.
+    catalog = [item for item in json.loads(capsys.readouterr().out) if not item["id"].startswith("pstack:")]
     assert [item["name"] for item in catalog] == ["demo"]
     assert (destination / "skills/demo/SKILL.md").is_file()
 
