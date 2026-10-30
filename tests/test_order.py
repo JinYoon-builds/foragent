@@ -1118,8 +1118,9 @@ def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_pa
     assert {key: implementation[key] for key in setup.options} == setup.options
     if lane == "api":
         assert ("agent" in setup.options) == (executor == "claude")
-    expected_prefix = implementation["prompt"].removesuffix("PROMPT")
-    assert prompt.startswith(expected_prefix) and prompt.removeprefix(expected_prefix) == order.preread_prompt(plan, item)
+    # The lane-memory notice (the writer contract, D95) follows the task in both prompts.
+    expected_prefix, _, notice = implementation["prompt"].partition("PROMPT")
+    assert prompt == expected_prefix + order.preread_prompt(plan, item) + notice
     if executor == "codex" and lane == "api":
         assert "API lane rules." in expected_prefix and "polish" in expected_prefix
 

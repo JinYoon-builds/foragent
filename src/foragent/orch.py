@@ -499,6 +499,26 @@ def _merge_title(ctx: RunContext, pr: PullRequest) -> str:
     return f"Batch: {title}" if pr.head.startswith("foragent/batch-") else title
 
 
+def _merge_base_into_pr(ctx: RunContext, n: int, pr: PullRequest, head: str, pending: list[str]) -> None:
+    """Bring the base into the PR with lane-memory reconciliation, push it, and stop this merge.
+
+    Both sides changed a lane's MEMORY.new.md; GitHub's merge could keep pending lessons a dream
+    already folded. The pushed head is checked again when the merge is run again.
+    """
+    with TemporaryDirectory(prefix=f"foragent-memory-{n}-") as directory:
+        worktree = Path(directory) / "worktree"
+        ctx.git.add_detached_worktree(worktree, head)
+        try:
+            probe = ctx.git.at(worktree)
+            probe.merge_base(f"origin/{pr.base}")
+            probe._call(["push", f"--force-with-lease=refs/heads/{pr.head}:{head}", "origin",
+                         f"HEAD:refs/heads/{pr.head}"])
+        finally:
+            ctx.git.remove_worktree(worktree)
+    raise OrchError(f"PR #{n}: merged {pr.base} into the branch to keep pending lane memory "
+                    f"({', '.join(pending)}); run again after its checks pass")
+
+
 def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -> str:
     """Record the human's decision and merge only the freshly checked PR head."""
     approved_by = _text(approved_by, "approved-by")
@@ -528,6 +548,9 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                     or ctx.git.ref_sha(f"refs/remotes/origin/{current.base}") != checked.base
                     or ctx.tracker.pr_head_sha(n) != checked.head):
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
+            if not current.head.startswith("foragent/dream-"):  # A dream PR is checked by its digests below.
+                if pending := ctx.git.pending_both_changed(checked.head, f"origin/{current.base}"):
+                    _merge_base_into_pr(ctx, n, current, checked.head, pending)
             if current.head.startswith("foragent/dream-"):
                 from foragent.orch_dream import memory_path, published_event
                 from foragent.orch_dream_publish import memory_moved

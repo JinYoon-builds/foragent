@@ -154,3 +154,29 @@ def apply(root: Path, changes: dict[str, str]) -> None:
         path = Path(root) / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(text.encode("utf-8"))
+
+
+def is_pending(path: str) -> bool:
+    return path.startswith(".claude/agent-memory/") and path.rsplit("/", 1)[-1] == PENDING
+
+
+def merge_pending(fork: bytes, ours: bytes, theirs: bytes) -> bytes:
+    """A pending buffer after merging ``theirs`` (the base) into ``ours`` (a branch) from ``fork``.
+
+    The base's buffer is authoritative: a dream may have removed lines from its start. The branch
+    contributes only the lines it appended after ``fork``. A union merge would instead keep the
+    branch's copy of lines the dream already consumed. A branch that edited earlier lines (against
+    its append-only instruction) contributes every line after its common prefix with ``fork``.
+    """
+    if ours.startswith(fork):
+        added = ours[len(fork):]
+    else:
+        old, new = fork.splitlines(keepends=True), ours.splitlines(keepends=True)
+        same = 0
+        while same < min(len(old), len(new)) and old[same] == new[same]:
+            same += 1
+        added = b"".join(new[same:])
+    if not added:
+        return theirs
+    separator = b"" if not theirs or theirs.endswith(b"\n") else b"\n"
+    return theirs + separator + added

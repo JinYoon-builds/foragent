@@ -36,13 +36,32 @@ def lane_notes(
     A lane without an agent file still gets its memory.
     """
     memory = _memory_sections(config, lane, worktree, full_text_dir, curated=True)
+    agent, body = _agent_text(config, lane, worktree)
+    if body is not None:
+        body = re.sub(r"\A\ufeff?---\s*\n.*?\n---[^\S\n]*(?:\n|$)", "", body, count=1, flags=re.DOTALL)
+    notes = ((body or "").strip() + _writer_contract(config, lane, body) + memory).strip()
+    return agent, ("Lane notes:\n" + notes + "\n\n" if notes else "")
+
+
+def _agent_text(config: Config, lane: str, worktree: Path) -> tuple[str | None, str | None]:
+    """The lane's agent name and file text, or (None, None) when it has no readable agent file."""
     agent = _lane_settings(config, lane).get("agent")
-    path = worktree / ".claude/agents" / f"{agent}.md" if isinstance(agent, str) else None
-    if path is None or not re.fullmatch(r"fa-[a-z0-9-]+", agent) or not path.is_file():
-        return None, ("Lane notes:\n" + memory.strip() + "\n\n" if memory else "")
-    body = path.read_text(encoding="utf-8", errors="replace")
-    body = re.sub(r"\A\ufeff?---\s*\n.*?\n---[^\S\n]*(?:\n|$)", "", body, count=1, flags=re.DOTALL)
-    return agent, "Lane notes:\n" + (body + memory).strip() + "\n\n"
+    if not isinstance(agent, str) or not re.fullmatch(r"fa-[a-z0-9-]+", agent):
+        return None, None
+    path = worktree / ".claude/agents" / f"{agent}.md"
+    return (agent, path.read_text(encoding="utf-8", errors="replace")) if path.is_file() else (None, None)
+
+
+def _writer_contract(config: Config, lane: str, agent_text: str | None) -> str:
+    """The append-only writer instruction, when the agent file does not already carry it.
+
+    Every lane's executor gets the same contract (D95): lanes without an agent file, with a
+    missing one, or with one not yet migrated by ``fa init`` get it here.
+    """
+    if _memory_folder(config, lane, Path(".")) is None:  # The same lanes whose memory is read.
+        return ""
+    contract = lane_memory.instruction(lane_memory.memory_dir(config, lane))
+    return "" if agent_text is not None and contract in agent_text else "\n\n" + contract
 
 
 def _memory_folder(config: Config, lane: str, worktree: Path) -> Path | None:
@@ -83,14 +102,14 @@ def lane_memory_notice(config: Config, lane: str, worktree: Path, full_text_dir:
     The pending lessons always come here. The curated memory comes here too, unless the agent
     still loads it natively (``memory: project``); then only its cut notice is added.
     """
-    agent = _lane_settings(config, lane).get("agent")
-    definition = worktree / ".claude/agents" / f"{agent}.md" if isinstance(agent, str) else None
-    loaded = (definition is not None and re.fullmatch(r"fa-[a-z0-9-]+", agent) is not None and definition.is_file()
-              and lane_memory.native(definition.read_text(encoding="utf-8", errors="replace")))
+    _, text = _agent_text(config, lane, worktree)
+    loaded = text is not None and lane_memory.native(text)
     folder = _memory_folder(config, lane, worktree)
     notice = _native_cut_notice(folder, full_text_dir) if loaded and folder is not None else ""
+    contract = _writer_contract(config, lane, text)
     sections = _memory_sections(config, lane, worktree, full_text_dir, curated=not loaded)
-    return notice + ("\n\nLane memory:" + sections + "\n" if sections else "")
+    body = contract + sections
+    return notice + ("\n\nLane memory:" + body + "\n" if body else "")
 
 
 def _native_cut_notice(folder: Path, full_text_dir: Path | None) -> str:

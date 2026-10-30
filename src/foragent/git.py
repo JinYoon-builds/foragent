@@ -13,6 +13,7 @@ import stat
 import subprocess
 import time
 
+from foragent import lane_memory
 from foragent.state import StateStore
 
 
@@ -376,8 +377,57 @@ class GitRepo:
         return True
 
     def merge_base(self, target: str, *, commit: bool = True) -> None:
-        self._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
-                    "merge", "--no-edit", *([] if commit else ["--no-commit"]), target])
+        """Merge ``target`` into HEAD; pending lane memory keeps the target's buffer (#1000).
+
+        Where both sides changed a lane's MEMORY.new.md, its union merge is replaced by the
+        target's buffer plus the lines this branch appended, so lessons a dream already folded
+        out of the target are never brought back.
+        """
+        pending = self._pending_both_changed(target)
+        if not pending:
+            self._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                        "merge", "--no-edit", *([] if commit else ["--no-commit"]), target])
+            return
+        fork = self._call(["merge-base", "HEAD", target]).strip()
+        texts = {path: tuple(self._blob(ref, path) for ref in (fork, "HEAD", target)) for path in pending}
+        failure = None
+        try:
+            self._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                        "merge", "--no-edit", "--no-commit", target])
+        except GitError as exc:
+            failure = exc
+        for path, (base_text, ours, theirs) in texts.items():
+            (self.root / path).write_bytes(lane_memory.merge_pending(base_text, ours, theirs))
+        self._call(["add", "-f", "--", *texts])
+        if failure is not None and self.conflict_paths():
+            raise failure  # Other files conflict; the caller resolves them and concludes the merge.
+        if commit:
+            self.continue_merge()
+
+    def _blob(self, ref: str, path: str) -> bytes:
+        sha = self.blob_sha(ref, path)
+        return self.blob_bytes(sha.encode()) if sha is not None else b""
+
+    def _pending_both_changed(self, target: str) -> list[str]:
+        return self.pending_both_changed("HEAD", target)
+
+    def pending_both_changed(self, ours: str, target: str) -> list[str]:
+        """Lane pending buffers that both ``ours`` and ``target`` changed since their merge base.
+
+        Merging such a pair with Git's union driver could restore lines a dream removed;
+        merge_base reconciles them instead.
+        """
+        try:
+            fork = self._call(["merge-base", ours, target]).strip()
+        except GitError:
+            return []
+
+        def changed(ref: str) -> set[str]:
+            names = self._call(["diff", "--name-only", "--no-renames", "-z", fork, ref, "--",
+                                ".claude/agent-memory/"]).split("\0")
+            return {name for name in names if name and lane_memory.is_pending(name)}
+
+        return sorted(changed(ours) & changed(target))
 
     def moved_by(self, target: str) -> list[tuple[str, str]]:
         """Files this branch changed that ``target`` renamed or copied (split) since the merge base.

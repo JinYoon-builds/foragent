@@ -9,7 +9,13 @@ lane's `agent`, else the lane name):
   the dream's input; the dream never overwrites it silently.
 
 Every reader shows both files: Codex lane notes, the Claude memory notice, the dream prompt and the
-lane view.
+lane view. Every lane executor gets the same append-only instruction: from its agent file, or from
+the gate when the lane has no agent file or its agent is not migrated yet.
+
+A lane PR that appended to `MEMORY.new.md` keeps only its own new lines when the base comes in:
+the gate's base merge and `fa orch merge` take the base's `MEMORY.new.md` and add the lines the
+branch appended. Lessons a dream already folded never come back. When `fa orch merge` has to do
+this, it pushes the merged branch and stops; run it again after the checks pass.
 
 Between work, the gate runs a lane's *dream* on branch `foragent/dream-<lane>`, always from the
 base. The dream folds the pending lessons into `MEMORY.md` and removes exactly the lines it folded
@@ -51,18 +57,35 @@ changed. A second `fa init` changes nothing.
 
 An open lane PR may still append lessons to `MEMORY.md`. Before you merge it, review the
 diff of `.claude/agent-memory/` with the lane agent. Move each appended lesson to the end of
-`MEMORY.new.md` on the PR branch and restore `MEMORY.md` to the base. Do not restore a lesson that
-a dream already folded out of `MEMORY.new.md`.
+`MEMORY.new.md` on the PR branch, each with its source (`from #<PR> <head sha>`), and restore
+`MEMORY.md` to the base. Do not restore a lesson that a dream already folded out of
+`MEMORY.new.md`. The PR's merge keeps the moved lines and their source in Git history.
 
 ## Stale dream PRs #898 and #901
 
-These two dream PRs edited `MEMORY.md` before the split. Handle them in this order:
+These two dream PRs edited `MEMORY.md` before the split. Closing them is the only step that cannot
+be undone, so every piece of evidence is on the base first, in the lane's `MEMORY.new.md`. Handle
+them in this order:
 
-1. For each PR, record its head, its base and `gh pr diff`.
-2. Find lessons that exist only in that PR (not in the current base `MEMORY.md` or
-   `MEMORY.new.md`). Append them to the base `MEMORY.new.md`, each with its source
-   (`from #898 <head sha>`). Put that change on the base first.
-3. Show the person the preservation diff (the lessons you carried and where they came from) and
-   ask them to confirm closing both PRs. Do not infer approval.
-4. Only after the person confirms: close #898 and #901 without merging, and let the lanes dream
-   again from the current base.
+1. For each PR, append one evidence block to the end of that lane's base `MEMORY.new.md`:
+
+   ````markdown
+   ## Carried from dream PR #898 (head <head sha>, base <base sha>)
+   - <each lesson that exists only in this PR> (from #898 <head sha>)
+
+   ```diff
+   <the full output of `gh pr diff 898`>
+   ```
+   ````
+
+   Read the head and base with `gh pr view 898 --json headRefOid,baseRefOid`. A lesson exists
+   only in the PR when it is in neither the current base `MEMORY.md` nor `MEMORY.new.md`. Write
+   `- (none)` when no lesson is unique; the head, base and diff are still recorded.
+2. Put that change on the base (a normal lane PR that touches only `MEMORY.new.md`) and wait until
+   it merges. Check with `git show origin/<base>:<path to MEMORY.new.md>` that both blocks are
+   there.
+3. Show the person the preservation diff (the merged change from step 2) and ask them to confirm
+   closing both PRs. Do not infer approval.
+4. Only after the person confirms: close #898 and #901 without merging, with a comment that names
+   the commit from step 2, and let the lanes dream again from the current base. The dream folds the
+   carried lessons; the evidence stays in Git history.

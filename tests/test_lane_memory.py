@@ -211,3 +211,70 @@ def test_rerun_publishes_a_migration_whose_commit_failed(setup):
     assert git_command(setup.root, "status", "--porcelain", "--", ".claude/agents", ".gitattributes") == ""
     assert lane_memory.instruction("fa-api") in git_command(setup.root, "show", "HEAD:.claude/agents/fa-api.md")
     assert lane_memory.UNION in git_command(setup.root, "show", "HEAD:.gitattributes")
+
+
+@pytest.mark.parametrize("fork, ours, theirs, merged", [
+    (b"P\n", b"P\nLate\n", b"", b"Late\n"),  # The dream consumed P; the worker's append stays.
+    (b"P\n", b"P\nL\n", b"P\nB\n", b"P\nB\nL\n"),  # Both appended: the base's order, then the branch's.
+    (b"P\n", b"P\n", b"", b""),  # Nothing appended on the branch.
+    (b"P\nQ\n", b"P\nX\nR\n", b"", b"X\nR\n"),  # A branch that edited earlier lines keeps what follows the common start.
+    (b"P", b"PLate\n", b"B", b"B\nLate\n"),
+])
+def test_merge_pending_keeps_the_base_buffer_and_only_the_branch_appends(fork, ours, theirs, merged):
+    assert lane_memory.merge_pending(fork, ours, theirs) == merged
+
+
+@pytest.mark.parametrize("union", [True, False], ids=["union", "no-attributes"])
+@pytest.mark.parametrize("commit", [True, False])
+@pytest.mark.parametrize("branch_appends", [True, False])
+def test_merging_the_base_into_a_worker_branch_never_restores_consumed_pending_lines(
+        git_history, tmp_path, commit, branch_appends, union):
+    from conftest import git_command
+    from foragent.git import GitRepo
+
+    pending, other = ".claude/agent-memory/fa-api/MEMORY.new.md", "src/feature.py"
+    attributes = {".gitattributes": lane_memory.UNION + "\n"} if union else {}
+    git_history.update({pending: "P\n", other: "A = 1\n", **attributes})
+    fork = git_history.tip
+    worker = {other: "A = 2\n", **({pending: "P\nLate\n"} if branch_appends else {})}
+    git_history.update(worker, message="worker")
+    git_command(git_history.origin, "update-ref", "refs/heads/foragent/issue-7", git_history.tip)
+    git_command(git_history.origin, "update-ref", "refs/heads/main", fork)
+    git_history.tip = fork
+    git_history.update({pending: "", ".claude/agent-memory/fa-api/MEMORY.md": "P\n"}, message="dream")
+    clone = GitRepo(git_history.clone)
+    clone.fetch("origin", "main")
+    clone.fetch("origin", "foragent/issue-7")
+    assert clone.pending_both_changed("origin/foragent/issue-7", "origin/main") == ([pending] if branch_appends else [])
+    worktree = tmp_path / "worker"
+    clone.add_detached_worktree(worktree, "origin/foragent/issue-7")
+    branch = GitRepo(worktree)
+    branch.merge_base("origin/main", commit=commit)
+    expected = "Late\n" if branch_appends else ""
+    assert (worktree / pending).read_text() == expected
+    assert git_command(worktree, "show", f":{pending}") + ("\n" if expected else "") == expected
+    assert branch.merge_in_progress() is (not commit)
+    if commit:
+        assert git_command(worktree, "show", f"HEAD:{pending}") + ("\n" if expected else "") == expected
+        assert len(git_command(worktree, "rev-list", "--parents", "-n", "1", "HEAD").split()) == 3, "A merge commit"
+    assert (worktree / other).read_text() == "A = 2\n"
+
+
+@pytest.mark.parametrize("lane, agent_text", [
+    ({"paths": ["api/**"]}, None),  # No agent at all.
+    ({"agent": "fa-api"}, None),  # The named agent file is missing.
+    ({"agent": "fa-api"}, OLD),  # Not migrated yet.
+    ({"agent": "fa-api"}, lane_memory.migrate_agent(OLD, "fa-api")),  # Already carries the contract.
+], ids=["agentless", "missing-file", "unmigrated", "migrated"])
+def test_every_lane_executor_gets_the_writer_contract_exactly_once(tmp_path, lane, agent_text):
+    config = Config(lanes={"api": lane})
+    if agent_text is not None:
+        (tmp_path / ".claude/agents").mkdir(parents=True)
+        (tmp_path / ".claude/agents/fa-api.md").write_text(agent_text)
+    contract = lane_memory.instruction(lane_memory.memory_dir(config, "api"))
+    _, notes = run_lane_skills.lane_notes(config, "api", tmp_path)
+    assert notes.count(contract) == 1, "Codex: the agent body or the reader carries it, never both"
+    notice = run_lane_skills.lane_memory_notice(config, "api", tmp_path)
+    # Claude reads the agent file itself; the notice adds the contract only when that file lacks it.
+    carried = agent_text is not None and contract in agent_text
+    assert notice.count(contract) == (0 if carried else 1)
