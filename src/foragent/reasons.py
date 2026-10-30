@@ -20,6 +20,7 @@ class Reason(StrEnum):
     REVIEW_DISPUTE = "review-dispute"
     ACCEPTANCE_BASELINE_UNAVAILABLE = "acceptance-baseline-unavailable"
     CI_NOT_STARTED = "ci-not-started"
+    TEST_HARNESS_CHANGED = "test-harness-changed"
 
 
 GROUP: dict[Reason, str] = {
@@ -37,6 +38,7 @@ GROUP: dict[Reason, str] = {
     Reason.REVIEW_DISPUTE: "tech-failure",
     Reason.ACCEPTANCE_BASELINE_UNAVAILABLE: "tech-failure",
     Reason.CI_NOT_STARTED: "tech-failure",
+    Reason.TEST_HARNESS_CHANGED: "review",
 }
 
 APPROVAL_MARKER = "<!-- foragent:approved"

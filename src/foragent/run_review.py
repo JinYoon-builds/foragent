@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
-from foragent import cuts
+from foragent import cuts, harness_guard
 from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
@@ -571,7 +571,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         flag(ctx, n, Reason.RISK_HIGH, "PR base changed; retry implementation on the current base.", link)
         return "base-changed"
 
-    if stopped := _verify_review_head(n, ctx, git, parsed, head, link):
+    guarded_head = harness_guard.review_guard(ctx, n, git, base_ref, parsed.files, link,
+                                              lambda new: _verify_review_head(n, ctx, git, parsed, new, link))
+    if stopped := guarded_head(head):
         return stopped
     _check_publication(git, pr.base)
 
@@ -601,5 +603,5 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
         comparison_attempt=comparison_attempt,
         # On its merge turn a moved base is merged in and this head's checks run again (#712).
-        reverify=lambda new_head: _verify_review_head(n, ctx, git, parsed, new_head, link),
+        reverify=guarded_head,
     )

@@ -852,3 +852,249 @@ def test_bug_steps_are_left_out_of_the_conflict_resolution_turn(conflicting_lane
     assert "This issue is a bug. Follow these steps:" in first
     assert "Resolve the conflict markers" in conflict
     assert "This issue is a bug. Follow these steps:" not in conflict
+
+
+def test_harness_hold_during_conflict_resolution_is_published_as_a_hold(conflicting_lanes, monkeypatch):
+    """The guard re-runs before the resolved head is measured; its hold reaches publication, not a retry."""
+    from foragent import harness_guard
+
+    c = conflicting_lanes
+    c.executor.steps += [{"cli.py": "commands = ['help', 'base', 'issue']\n"}]
+    calls = []
+    real = harness_guard.guard_measured
+
+    def second_call_holds(ctx, n, git, target_ref, measured, files, *, tree=False):
+        calls.append(measured)
+        # Hold once the conflict resolver's turn has run, i.e. when its result is measured.
+        return (["tests/conftest.py"] if len(c.executor.calls) > 1
+                else real(ctx, n, git, target_ref, measured, files, tree=tree))
+
+    monkeypatch.setattr(harness_guard, "guard_measured", second_call_holds)
+    assert run_issue(1, c.ctx) == "held"
+    assert len(calls) >= 2 and len(c.executor.calls) == 2  # no extra implementer turn after the hold
+    assert_harness_hold_published(c)
+
+
+def assert_harness_hold_published(c):
+    """Held for a person with the paths named, on a published, unmerged PR."""
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert "needs-human" in c.tracker.get_issue(1).labels
+    held = [comment.body for comment in c.tracker.list_comments(1) if "reason=test-harness-changed" in comment.body]
+    assert len(held) == 1 and "tests/conftest.py" in held[0], held
+    assert c.tracker.find_pr("foragent/issue-1") is not None and c.tracker.merged_prs == []
+
+
+def test_harness_hold_while_resuming_saved_conflicts_is_published_as_a_hold(run_case, monkeypatch):
+    """Resuming saved conflicts re-verifies before the loop; a guard hold there must still be published."""
+    from foragent import runner
+    from foragent.harness_guard import HarnessHeld
+
+    c = run_case
+
+    def resume_hits_hold(attempt):
+        raise HarnessHeld("- `tests/conftest.py`")
+
+    monkeypatch.setattr(runner, "_resume_implementation", resume_hits_hold)
+    assert run_issue(1, c.ctx) == "held"
+    assert c.executor.calls == []
+    assert_harness_hold_published(c)
+
+
+def test_harness_hold_after_a_rebuild_is_a_hold_not_a_rebuild_failure(run_case, monkeypatch):
+    """A rebuilt attempt's ordinary failure exit (_block_rebuild) must not swallow a human hold."""
+    from foragent import runner
+    from foragent.harness_guard import HarnessHeld
+
+    c = run_case
+
+    def rebuilt_then_held(attempt):
+        attempt.rebuilt = True
+        raise HarnessHeld("- `tests/conftest.py`")
+
+    monkeypatch.setattr(runner, "_verify_implementation", rebuilt_then_held)
+    assert run_issue(1, c.ctx) == "held"
+    assert_harness_hold_published(c)
+
+
+def test_harness_hold_during_replay_recovery_is_published(run_case, monkeypatch):
+    """_recover_replay re-verifies the replayed head; its hold must reach publication."""
+    from foragent import runner
+    from foragent.harness_guard import HarnessHeld
+    from foragent.run_attempt import PatchReplayError
+
+    c = run_case
+
+    def replay_fails(attempt):
+        raise PatchReplayError("replay failed", ["feature.txt"])
+
+    def recovery_held(attempt, exc):
+        raise HarnessHeld("- `tests/conftest.py`")
+
+    monkeypatch.setattr(runner, "_verify_implementation", replay_fails)
+    monkeypatch.setattr(runner, "_recover_replay", recovery_held)
+    assert run_issue(1, c.ctx) == "held"
+    assert_harness_hold_published(c)
+
+
+COMMIT_HARNESS = ("mkdir -p gen && echo '# harness' > gen/conftest.py && git add gen/conftest.py && "
+                  "git -c user.name=t -c user.email=t@t commit -qm harness && echo RAN_""FIRST")
+
+
+@pytest.mark.parametrize("commands", [[COMMIT_HARNESS, 'echo RAN_""SECOND'], [COMMIT_HARNESS]],
+                         ids=["before-a-later-command", "last-command"])
+def test_done_when_that_commits_a_harness_change_holds_before_the_next_measurement(run_case, commands):
+    c = run_case
+    set_done_when(c, commands)
+    assert run_issue(1, c.ctx) == "held"
+    log = c.store.log_path(1).read_text()
+    assert "RAN_FIRST" in log and "RAN_SECOND" not in log
+    held = [comment.body for comment in c.tracker.list_comments(1) if "reason=test-harness-changed" in comment.body]
+    assert len(held) == 1 and "gen/conftest.py" in held[0]
+    assert "needs-human" in c.tracker.get_issue(1).labels
+
+
+def test_harness_committed_by_the_second_passes_last_command_holds(run_case):
+    """Pass 1 changes a tracked file (so a second pass runs); pass 2's last command commits a harness change."""
+    c = run_case
+    set_done_when(c, ["if test -f marker2; then " + COMMIT_HARNESS + "; else echo more >> feature.txt; touch marker2; fi"])
+    assert run_issue(1, c.ctx) == "held"
+    assert "RAN_FIRST" in c.store.log_path(1).read_text()
+    held = [comment.body for comment in c.tracker.list_comments(1) if "reason=test-harness-changed" in comment.body]
+    assert len(held) == 1 and "gen/conftest.py" in held[0]
+
+
+def test_baseline_comparison_is_guarded_after_the_done_when_commands(run_case, monkeypatch):
+    """The acceptance baseline ids measure the head after Done when; a command may have committed a harness change."""
+    from foragent import run_implementation
+    from foragent.run_baseline import AcceptanceBaseline
+
+    c = run_case
+    monkeypatch.setattr(run_implementation, "_capture_acceptance_baseline",
+                        lambda *args, **kwargs: AcceptanceBaseline('echo RAN_""BASELINE', ("t",)))
+    set_done_when(c, [COMMIT_HARNESS])
+    assert run_issue(1, c.ctx) == "held"
+    log = c.store.log_path(1).read_text()
+    assert "RAN_FIRST" in log and "RAN_BASELINE" not in log
+
+
+MARKED = "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> target\n"
+
+
+def _held_with_needs_human(c):
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert "needs-human" in c.tracker.get_issue(1).labels
+    held = [comment.body for comment in c.tracker.list_comments(1) if "reason=test-harness-changed" in comment.body]
+    assert len(held) == 1 and "tests/sub/conftest.py" in held[0], held
+    assert c.tracker.merged_prs == []
+    return held[0]
+
+
+def test_hold_wins_over_the_conflict_marker_publication_check(run_case):
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done", "tests/sub/conftest.py": MARKED}]
+    assert run_issue(1, c.ctx) == "held"
+    _held_with_needs_human(c)
+    pr = c.tracker.find_pr("foragent/issue-1")
+    assert pr is not None and c.tracker.get_issue(pr).state == "open"
+    assert git_command(c.history.origin, "show", "foragent/issue-1:tests/sub/conftest.py") == MARKED.strip()
+
+
+def test_hold_wins_over_the_pr_head_check(run_case, monkeypatch):
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done", "tests/sub/conftest.py": "# harness\n"}]
+    monkeypatch.setattr(c.tracker, "pr_head_sha", lambda pr: "f" * 40)
+    assert run_issue(1, c.ctx) == "held"
+    _held_with_needs_human(c)
+
+
+@pytest.mark.parametrize("failure", ["push", "create-pr"])
+def test_hold_wins_when_publication_fails(run_case, monkeypatch, failure):
+    from foragent import run_publish
+    from foragent.git import GitError
+    from foragent.tracker import TrackerError
+
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done", "tests/sub/conftest.py": "# harness\n"}]
+    if failure == "push":
+        monkeypatch.setattr(run_publish, "_push_branch", lambda attempt: (_ for _ in ()).throw(GitError("push refused")))
+    else:
+        monkeypatch.setattr(c.tracker, "create_pr", lambda **kwargs: (_ for _ in ()).throw(TrackerError("No commits")))
+    assert run_issue(1, c.ctx) == "held"
+    comment = _held_with_needs_human(c)
+    assert "could not be published" in comment
+
+
+def test_hold_reaching_the_merge_turn_publish_still_wins(run_case, monkeypatch):
+    """_publish_in_turn's first branch: a harness hold there skips every publication check too."""
+    from foragent import harness_guard, run_publish
+
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done", "tests/sub/conftest.py": MARKED}]
+    calls = []
+    original = harness_guard.publish_hold
+
+    def through_the_merge_turn(attempt):
+        # The runner's handler goes through the ordinary publish; the merge turn's branch must hold.
+        calls.append(attempt)
+        return run_publish._publish(attempt) if len(calls) == 1 else original(attempt)
+
+    monkeypatch.setattr(harness_guard, "publish_hold", through_the_merge_turn)
+    assert run_issue(1, c.ctx) == "held"
+    assert len(calls) == 2
+    _held_with_needs_human(c)
+
+
+@pytest.mark.parametrize("step", ["push", "stage", "commit", "remove-worktree"])
+def test_cleanup_failure_after_the_hold_keeps_it(run_case, monkeypatch, step):
+    """Cleanup after a hold (WIP staging, commit, push; worktree removal) cannot replace the hold with an error."""
+    from foragent import harness_guard, run_publish, runner
+    from foragent.git import GitError, GitRepo
+
+    c = run_case
+    c.executor.steps = [{"feature.txt": "done", "tests/sub/conftest.py": "# harness\n"}]
+    armed = []
+    original = harness_guard.publish_hold
+
+    def arm(attempt):
+        armed.append(True)
+        return original(attempt)
+
+    monkeypatch.setattr(harness_guard, "publish_hold", arm)
+    if step == "push":
+        # Both push paths fail: the hold's publication and the WIP save.
+        refuse = lambda attempt: (_ for _ in ()).throw(GitError("push refused"))  # noqa: E731
+        monkeypatch.setattr(run_publish, "_push_branch", refuse)
+        monkeypatch.setattr(runner, "_push_branch", refuse)
+    else:
+        name = {"stage": "stage_changes", "commit": "commit", "remove-worktree": "remove_worktree"}[step]
+        real = getattr(GitRepo, name)
+
+        def after_the_hold(self, *args, **kwargs):
+            if armed:
+                raise GitError(f"{name} refused")
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(GitRepo, name, after_the_hold)
+    assert run_issue(1, c.ctx) == "held"
+    assert armed
+    _held_with_needs_human(c)
+    assert "failed after the hold" in c.store.log_path(1).read_text()
+    monkeypatch.undo()
+    c.ctx.git.remove_worktree(c.store.worktree_path(1))  # the fixture checks the worktree is gone
+
+
+def test_worktree_removal_failure_after_a_stopped_hold_keeps_it(run_case, monkeypatch):
+    """A hold raised as ExecutorStopped (a comparison guard) also survives the worktree cleanup."""
+    from foragent import runner
+    from foragent.git import GitError, GitRepo
+    from foragent.run_attempt import ExecutorStopped
+
+    c = run_case
+    def held(*args):
+        c.tracker.remove_labels(1, ["running"])
+        raise ExecutorStopped("held")
+
+    monkeypatch.setattr(runner, "_execute", held)
+    monkeypatch.setattr(GitRepo, "remove_worktree", lambda self, path: (_ for _ in ()).throw(GitError("busy")))
+    assert run_issue(1, c.ctx) == "held"
+    assert "Worktree removal failed after the hold" in c.store.log_path(1).read_text()

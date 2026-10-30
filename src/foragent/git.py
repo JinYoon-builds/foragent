@@ -233,6 +233,35 @@ class GitRepo:
         output = self._call(["diff", "--cached", "--name-only", "--no-renames", "-z", self._own_base(base_ref)])
         return [path for path in output.split("\0") if path]
 
+    def committed_diff(self, base: str, head: str) -> list[tuple[bytes, bytes, bytes, bytes, bytes]]:
+        """Raw `diff-tree` entries from base to head (commits or trees), never decoded.
+
+        Each entry is (old mode, new mode, old sha, new sha, path bytes). No
+        rename detection, so a rename is its deletion and addition; blobs are
+        never read, so this lists exactly what Git records.
+        """
+        try:
+            output = subprocess.run(
+                ["git", "-c", "core.precomposeUnicode=false", "diff-tree", "-r", "-z", "--no-renames", "--raw",
+                 base, head], cwd=self.root, check=True, capture_output=True, timeout=120).stdout
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise GitError(str(getattr(exc, "stderr", b"") or exc)) from exc
+        tokens = output.split(b"\0")
+        entries = []
+        for i in range(0, len(tokens) - 1, 2):
+            meta, path = tokens[i], tokens[i + 1]
+            old_mode, new_mode, old_sha, new_sha, _status = meta.lstrip(b":").split(b" ")
+            entries.append((old_mode, new_mode, old_sha, new_sha, path))
+        return entries
+
+    def blob_bytes(self, sha: bytes) -> bytes:
+        """A blob's exact bytes (git cat-file applies no filter)."""
+        try:
+            return subprocess.run(["git", "cat-file", "blob", sha.decode()], cwd=self.root, check=True,
+                                  capture_output=True, timeout=120).stdout
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise GitError(str(getattr(exc, "stderr", b"") or exc)) from exc
+
     def staged_tree_sha(self) -> str:
         return self._call(["write-tree"]).strip()
 
