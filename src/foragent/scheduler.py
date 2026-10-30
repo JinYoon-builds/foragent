@@ -2,6 +2,7 @@
 
 from collections import Counter
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from fnmatch import translate
@@ -111,6 +112,13 @@ def tick(ctx: TickContext) -> TickReport:
 
 
 def _tick_locked(ctx: TickContext) -> TickReport:
+    """Run one tick's steps; after a failed refresh every gh subprocess is capped (see _tick_steps)."""
+    with ExitStack() as fallback:
+        ctx._fallback = fallback
+        return _tick_steps(ctx)
+
+
+def _tick_steps(ctx: TickContext) -> TickReport:
     report, ctx._budget_sample = TickReport(), None
     started = ctx.now()  # The tick's own time; the fetch below can take seconds.
     timed("fetch_base", fetch_base, ctx)  # Also applies origin's committed .foragent.yml for fa gate tick.
@@ -132,6 +140,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                 # The failure and the old as_of stay recorded; admission works from stored issues
                 # and re-reads each one just before its start.
                 ctx._refresh_failed, listing_current = True, False
+                # GitHub is failing: no later gh subprocess of this tick may wait longer than one fallback read.
+                ctx._fallback.enter_context(gh.bounded(float("inf"), GH_CALL_SECONDS))
                 report.actions.append(text("tick_refresh_failed", ctx.config.language,
                                            error=ctx.store.issues_observation()["error"]))
             else:
@@ -146,7 +156,18 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     # Unknown liveness defers routine recovery while the queue keeps moving.
     if processes_available:
         with step("run_recovery"):
-            _recover_runs(ctx, report)
+            before = {run.number for run in ctx.store.active_runs()}
+            try:
+                _recover_runs(ctx, report)
+            except TrackerError as exc:
+                if exc.is_rate_limit or not ctx._refresh_failed:
+                    raise
+                report.actions.append(text("tick_step_deferred", ctx.config.language,
+                                           step="run_recovery", error=_one_line(exc)))
+            # Recovery read these issues from GitHub; after a failed refresh they start next tick, with one read.
+            recovered = before - {run.number for run in ctx.store.active_runs()}
+    else:
+        recovered = set()
     optional = gh.Budget(OPTIONAL_GH_SECONDS, GH_CALL_SECONDS)  # Batch and parent gh work share it.
     with step("batch_reconcile"):
         _optional_step(ctx, report, optional, "batch_reconcile", lambda: _reconcile_batches(ctx, report))
@@ -168,7 +189,12 @@ def _tick_locked(ctx: TickContext) -> TickReport:
             board.sync_status(ctx, issue, "closed", existing_only=True)
             return
         if processes_available:  # Cleans a left-over worktree; board writes skip parents.
+            repaired = RUNNING in issue.labels or ctx.store.run_start_pending(issue.number)
             issue = _recover_orphan(ctx, issue, report)
+            if repaired and ctx._refresh_failed and RUNNING not in issue.labels:
+                return  # Its repair read GitHub; a second read before a start waits for the next tick.
+        if ctx._refresh_failed and issue.number in recovered:
+            return
         if issue.number in parents:
             return  # Its column follows its children, whatever its own labels say.
         issue = _escalate_overdue_blocker(ctx, issue, report)
@@ -199,6 +225,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         if waiting_labels:
             if datetime.fromisoformat(event.created_at) <= datetime.fromisoformat(previous_flag.flagged_at):
                 return
+            if ctx._refresh_failed:
+                return  # A re-approval is new evidence; it is read and resumed after a successful refresh.
             # A new approval is a new generation even between full refreshes.
             issue = ctx.tracker.get_issue(issue.number)
             if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
@@ -209,6 +237,8 @@ def _tick_locked(ctx: TickContext) -> TickReport:
 
         approval = ctx.store.load_approval(issue.number)
         if approval is None or approval.approved_at != event.created_at:
+            if ctx._refresh_failed:
+                return  # Missing approval evidence: the snapshot needs a read; only stored approvals start now.
             if not waiting_labels:
                 issue = ctx.tracker.get_issue(issue.number)
             if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:

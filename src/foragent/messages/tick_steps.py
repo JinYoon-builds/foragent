@@ -8,6 +8,7 @@ MESSAGES = {
         "tick_refresh_failed": ("GitHub issue refresh failed; this tick re-reads each issue just before"
                                 " starting it: {error}"),
         "tick_issue_deferred": "#{number} deferred to a later tick: reading GitHub failed: {error}",
+        "tick_starts_wait_outbox": "No run starts this tick: queued GitHub writes are not delivered yet",
     },
     "ko": {
         "tick_step_slow": "게이트 tick 단계 {step}에 {seconds:.2f}초가 걸렸어요",
@@ -15,5 +16,6 @@ MESSAGES = {
         "tick_step_deferred": "게이트 tick 단계 {step}를 다음 tick으로 미뤘어요: {error}",
         "tick_refresh_failed": "GitHub 이슈 새로고침이 실패해서, 이번 tick은 시작 직전에 이슈를 하나씩 다시 읽어요: {error}",
         "tick_issue_deferred": "#{number}는 GitHub 읽기가 실패해서 다음 tick으로 미뤘어요: {error}",
+        "tick_starts_wait_outbox": "GitHub에 아직 전달되지 않은 쓰기가 있어서 이번 tick에는 실행을 시작하지 않아요",
     },
 }

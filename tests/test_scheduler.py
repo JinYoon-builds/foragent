@@ -353,8 +353,11 @@ def test_tick_rate_limit_persists_wait_but_other_tracker_errors_raise(ctx, monke
 
     monkeypatch.setattr(ctx.tracker, "list_issues", unavailable)
     if not limited:
-        with pytest.raises(TrackerError, match=message):
-            tick(ctx)
+        # Another refresh error is recorded and the tick goes on from stored issues (#995); no wait starts.
+        report = tick(ctx)
+        assert report.skipped is None
+        assert any(message in line for line in report.actions)
+        assert ctx.store.issues_observation()["error"] == message
         assert ctx.store.github_wait_until(NOW) is None
         return
     assert "GitHub rate limit" in tick(ctx).skipped
@@ -3108,3 +3111,56 @@ def test_tick_during_github_wait_still_expires_the_plan_and_drops_lapsed_pauses(
     assert list(stored["paused"]) == ["main"], "The tick never writes the plan"
     assert orch_plan.load(ctx.store, NOW)["paused"] == {}
     assert orch_plan.load(ctx.store, NOW)["width"] == {"main": 2}
+
+
+def _fail_refresh_and_count_reads(ctx, monkeypatch):
+    """Make the bulk listing fail and count every issue GET of the next tick (#995)."""
+    from collections import Counter
+
+    def listing_down(*args, **kwargs):
+        raise TrackerError("HTTP 502 Bad Gateway")
+
+    monkeypatch.setattr(ctx.tracker._tracker, "list_issues", listing_down)
+    reads, get_issue = Counter(), ctx.tracker.get_issue
+
+    def counted(number):
+        reads[number] += 1
+        return get_issue(number)
+
+    monkeypatch.setattr(ctx.tracker, "get_issue", counted)
+    return reads
+
+
+def test_refresh_failure_reads_a_new_approval_never_and_a_stored_one_once(ctx, monkeypatch):
+    from foragent import capacity
+
+    approve(ctx)
+    assert tick(ctx).skipped is None  # #1's approval snapshot is stored and it is ready.
+    approve(ctx, 2)  # #2's approval is new: its snapshot needs a read.
+    ctx.now = lambda: NOW + timedelta(minutes=6)
+    capacity.write_state(ctx.store, 2, ctx.now())
+    reads = _fail_refresh_and_count_reads(ctx, monkeypatch)
+    ctx.start_runs = True
+    report = tick(ctx)
+    assert report.skipped is None
+    assert reads == {1: 1}, "After a failed refresh only the start read may GET an issue, once"
+    assert [run.number for run in ctx.store.active_runs()] == [1]
+    assert ctx.store.load_approval(2) is None
+
+
+def test_refresh_failure_with_queued_writes_starts_nothing(ctx, monkeypatch):
+    from foragent import capacity
+
+    approve(ctx)
+    assert tick(ctx).skipped is None
+    ctx.store.queue_github_write(1, "comment", body="Queued while GitHub was limited")
+    ctx.now = lambda: NOW + timedelta(minutes=6)
+    capacity.write_state(ctx.store, 2, ctx.now())
+    _fail_refresh_and_count_reads(ctx, monkeypatch)
+    launched = []
+    ctx.start_runs, ctx.launcher = True, lambda number: launched.append(number) or 7001
+    report = tick(ctx)
+    assert launched == [] and ctx.store.active_runs() == []
+    assert "No run starts this tick: queued GitHub writes are not delivered yet" in report.actions
+    assert {"approved", "ready"} <= ctx.tracker._tracker.get_issue(1).labels
+    assert ctx.store.github_outbox()  # The queued write waits for a successful refresh.

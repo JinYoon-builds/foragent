@@ -217,6 +217,11 @@ def _start_ready(
     sample = sample if sample is not None else scheduler.machine_load()
     budget = scheduler._machine_budget(ctx, ready, sample)
     started = False
+    if ctx.store.github_outbox():
+        # Undelivered writes queue every later write, so READY/RUNNING would change only locally while
+        # GitHub still shows the issue ready: a runner must not start on a queued write.
+        report.actions.append(scheduler.text("tick_starts_wait_outbox", ctx.config.language))
+        return started
     for lane, number in _ranked(ctx, ready):
         if not scheduler._has_slot(ctx, budget):
             break
