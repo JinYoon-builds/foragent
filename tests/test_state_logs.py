@@ -199,7 +199,7 @@ def test_housekeeping_reports_trims_and_errors_and_checks_tidy_only_when_finishe
     def broken(now):
         raise PermissionError("denied")
 
-    monkeypatch.setattr(store, "prune_logs", broken)
+    monkeypatch.setattr(store, "prune_log_files", broken)
     report = SimpleNamespace(actions=[])
     with scheduler_housekeeping.after_tick(ctx) as done:
         done(report)

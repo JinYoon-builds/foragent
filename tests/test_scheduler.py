@@ -281,8 +281,8 @@ def test_tick_opens_orchestrator_when_an_earlier_step_raises(ctx, monkeypatch, s
     spawned = []
     monkeypatch.setattr(orch_spawn, "ensure_orchestrator",
                         lambda root, store, config, *, now: spawned.append(now) or "tmux")
-    error = {"fetch": GitError("fetch failed"), "refresh": TrackerError("HTTP 500 Server Error")}.get(
-        step, OSError(f"{step} failed"))
+    # A failed GitHub refresh (TrackerError) is recorded and the tick goes on; anything else propagates.
+    error = {"fetch": GitError("fetch failed")}.get(step, OSError(f"{step} failed"))
 
     def boom(*args, **kwargs):
         raise error
@@ -698,7 +698,12 @@ def test_scheduler_moves_a_card_people_add_after_the_board_had_none(ctx, monkeyp
     }""", {"input": {"projectId": project_id, "itemId": item["id"], "fieldId": status["id"],
                      "value": {"singleSelectOptionId": option["id"]}}})
     writes = _board_writes(ctx, monkeypatch)
-    ctx.now = lambda: NOW + timedelta(minutes=6)  # The next periodic refresh reads the board.
+    ctx.now = lambda: NOW + timedelta(minutes=6)  # An unchanged listing reads no board (tick-github-budget).
+    tick(ctx)
+    assert item_values(ctx.tracker, project_id, 8)["Status"] == "🐿 In progress"
+    assert writes == []
+    ctx.tracker.update_issue(8, title="Closed without a card", body="Edited later")
+    ctx.now = lambda: NOW + timedelta(minutes=12)  # A refresh whose listing changed reads the board.
     tick(ctx)
     assert item_values(ctx.tracker, project_id, 8)["Status"] == "📦 Done"
     assert len(writes) == 1

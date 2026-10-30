@@ -81,6 +81,10 @@ class LogRetentionMixin:
         files count toward the cap only.
         """
         self.trim_journals(now)
+        return self.prune_log_files(now)
+
+    def prune_log_files(self, now: datetime) -> list[Path]:
+        """``prune_logs`` without its journal trim, for a caller that just trimmed them."""
         logs = self.root / "logs"
         if not logs.is_dir():
             return []
