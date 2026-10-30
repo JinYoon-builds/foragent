@@ -2,7 +2,6 @@ from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 import fcntl
-from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -351,7 +350,7 @@ def test_empty_baseline_does_not_rerun_failing_tests_or_default_to_the_full_suit
 
 
 def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp_path):
-    from foragent.runner import _baseline_environment, _capture_acceptance_baseline
+    from foragent.runner import _capture_acceptance_baseline
 
     command = f"{shlex.quote(sys.executable)} -m pytest -q"
     store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
@@ -362,10 +361,9 @@ def test_baseline_lock_wait_is_credited_and_keeps_the_heartbeat(git_history, tmp
         config=Config(test_command=command), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
         monotonic=lambda: mono[0],
     )
-    key = sha256(json.dumps(
-        [git_history.tip, command, ctx.config.acceptance_dir, _baseline_environment(git_history.clone), []],
-        sort_keys=True,
-    ).encode()).hexdigest()
+    from foragent.run_baseline import _baseline_cache
+
+    _, key = _baseline_cache(ctx, command, git_history.tip, [])  # The key includes its version (#435).
     lock_path = store.root.parent / "baselines" / f"{key}.lock"
     lock_path.parent.mkdir(parents=True)
     with ThreadPoolExecutor(max_workers=1) as pool, lock_path.open("a") as lock:

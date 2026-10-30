@@ -8,6 +8,7 @@ Kept apart from run_baseline only for its module-size limit.
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 import re
@@ -26,17 +27,48 @@ def checkout(git, worktree: Path):
     return at(worktree) if at is not None else None
 
 
+# Part of every D53 baseline and .partial cache key: ids before #435's shared identity are not reused.
+CACHE_VERSION = "435-ids-2"
+
+
+def test_id(nodeid, rootdir, worktree):
+    """The one test identity: ``nodeid`` relative to the worktree root.
+
+    realpath applies to the two roots only (so /var and /private/var match), never to the
+    joined test path; an id whose rootdir lies outside the worktree stays the raw nodeid.
+    This body is copied into the generated plugin, which cannot import foragent.
+    """
+    import os
+
+    prefix = os.path.relpath(os.path.realpath(str(rootdir)), os.path.realpath(str(worktree))).replace(os.sep, "/")
+    if prefix == "." or prefix == ".." or prefix.startswith("../"):
+        return nodeid
+    return prefix + "/" + nodeid
+
+
 def retained_path(cache: StateStore, key: str) -> Path:
     return cache.root / f"{key}.partial"
 
 
-def retained_passes(cache: StateStore, key: str) -> set[str]:
+def _retained(cache: StateStore, key: str) -> tuple[set[str], set[str]]:
+    """(kept passes, ids reported as anything else), saved together across stopped captures."""
     try:
         saved = json.loads(retained_path(cache, key).read_text(encoding="utf-8"))
-        nodes = saved["node_ids"] if isinstance(saved, dict) else ()
-        return {node for node in nodes if isinstance(node, str)}
-    except (OSError, ValueError, TypeError, KeyError):
-        return set()
+    except (OSError, ValueError):
+        return set(), set()
+    if not isinstance(saved, dict):
+        return set(), set()
+
+    def ids(name):
+        values = saved.get(name)
+        return {node for node in values if isinstance(node, str)} if isinstance(values, list) else set()
+
+    failed = ids("failed")
+    return ids("node_ids") - failed, failed
+
+
+def retained_passes(cache: StateStore, key: str) -> set[str]:
+    return _retained(cache, key)[0]
 
 
 def prepare(cache: StateStore, key: str, command: str, directory: Path, worktree: Path) -> tuple[set[str], str, Path]:
@@ -55,15 +87,31 @@ def prepare(cache: StateStore, key: str, command: str, directory: Path, worktree
     plugins.mkdir()
     plugin = f"_foragent_results_{secrets.token_hex(8)}"
     (plugins / f"{plugin}.py").write_text(RESULTS_PLUGIN.format(
-        listing=str(listing), keep=sorted(retained), repo=str(worktree)), encoding="utf-8")
+        listing=str(listing), keep=sorted(retained), repo=str(worktree), test_id=inspect.getsource(test_id)),
+        encoding="utf-8")
     return retained, _with_python_path(f"{command} -p {plugin}", str(plugins)), listing
 
 
-def combine(node_ids, collected_ids, retained: set[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """A resumed capture's passing and collected ids: its own results, plus the kept passes it
-    did not run again; a kept id this capture ran again keeps this capture's result."""
-    kept = retained - set(collected_ids)
-    return tuple(sorted({*node_ids, *kept})), tuple(sorted({*collected_ids, *kept}))
+def combine(node_ids, collected_ids, failing_ids, retained: set[str], log: Path, offset: int, worktree: Path):
+    """A normal-end capture's passing, collected and failing ids, in the shared identity: its own
+    results, plus the kept passes it did not run again (a rerun keeps this capture's result)."""
+    rootdir = _rootdir(log, offset, worktree)
+    own = [tuple(test_id(node, rootdir, worktree) for node in ids) for ids in (node_ids, collected_ids, failing_ids)]
+    kept = retained - set(own[1])
+    return tuple(sorted({*own[0], *kept})), tuple(sorted({*own[1], *kept})), tuple(sorted(own[2]))
+
+
+def _rootdir(log: Path, offset: int, worktree: Path):
+    """The rootdir pytest printed in its header (``rootdir: ...``), else the worktree root."""
+    try:
+        with log.open(encoding="utf-8", errors="replace") as stream:
+            stream.seek(offset)
+            for line in stream:
+                if match := re.match(r"rootdir: (.+?)(?:, |$)", line.rstrip("\n")):
+                    return match[1]
+    except OSError:
+        pass
+    return worktree
 
 
 def deselect_count(command: str) -> int:
@@ -105,10 +153,7 @@ import pytest
 _keep, _repo, _root, _passed = set({keep!r}), {repo!r}, None, {{}}
 
 
-def _id(nodeid):
-    prefix = os.path.relpath(_root, _repo).replace(os.sep, "/")
-    return nodeid if prefix == "." else prefix + "/" + nodeid
-
+{test_id}
 
 def _record(value):
     with open({listing!r}, "a", encoding="utf-8") as stream:
@@ -130,35 +175,42 @@ def pytest_collection_modifyitems(session, config, items):
     items.extend(item for item in original if id(item) not in present and prefixes
                  and item.nodeid.startswith(prefixes))
     # ... then leave out exactly the kept ids, also those not passed to --deselect.
-    kept = [item for item in items if _id(item.nodeid) in _keep]
-    items[:] = [item for item in items if _id(item.nodeid) not in _keep]
+    kept = [item for item in items if test_id(item.nodeid, _root, _repo) in _keep]
+    items[:] = [item for item in items if test_id(item.nodeid, _root, _repo) not in _keep]
     if kept:
         config.hook.pytest_deselected(items=kept)
     _record({{"deselected": len(original) - len(items)}})  # What this capture really did not run.
 
 
 def pytest_runtest_logreport(report):
-    if report.failed or (report.skipped and report.when == "call"):
+    # A pass needs setup, call and teardown to pass; failed, error, skipped, xfail or xpass is not one.
+    if report.failed or report.skipped or hasattr(report, "wasxfail"):
+        if _passed.get(report.nodeid) is not False:
+            _record({{"failed": test_id(report.nodeid, _root, _repo)}})
         _passed[report.nodeid] = False
-    elif report.when == "call" and report.passed:
+    elif report.when == "call":
         _passed.setdefault(report.nodeid, True)
     if report.when == "teardown" and _passed.pop(report.nodeid, False):
-        _record({{"passed": _id(report.nodeid)}})
+        _record({{"passed": test_id(report.nodeid, _root, _repo)}})
 """
 
 
-def after_capture(cache: StateStore, key: str, retained: set[str], result: CheckResult, complete: bool,
-                  report: Path, log: Path, offset: int, listing: Path) -> None:
-    """A complete capture drops the kept passes; one the watchdog stopped keeps every pass it
-    reported, beside those kept before."""
+def after_capture(cache: StateStore, key: str, result: CheckResult, complete: bool,
+                  report: Path, log: Path, offset: int, listing: Path, worktree: Path) -> None:
+    """A normal-end complete capture drops the kept results. Any other capture saves every
+    non-pass it reported (a failure always wins over a pass, now and in later captures), and
+    one that was stopped (silence, safety net, runtime limit) also keeps the passes it reported."""
     if complete:
         retained_path(cache, key).unlink(missing_ok=True)
-    elif result.timed_out:
-        plugin = {record["passed"] for record in _records(listing) if isinstance(record.get("passed"), str)}
-        passes = retained | reported_passes(report, log, offset) | plugin
-        if passes:
-            cache._atomic_write(retained_path(cache, key), json.dumps({"node_ids": sorted(passes)}) + "\n")
-            _append(log, f"Acceptance baseline kept {len(passes)} reported passes for the next capture")
+        return
+    kept, failed = _retained(cache, key)
+    passed, now_failed = reported_results(report, log, offset, listing, worktree)
+    failed |= now_failed
+    passes = (kept | (passed if result.timed_out else set())) - failed
+    if passes or failed:
+        cache._atomic_write(retained_path(cache, key),
+                            json.dumps({"node_ids": sorted(passes), "failed": sorted(failed)}) + "\n")
+        _append(log, f"Acceptance baseline kept {len(passes)} reported passes for the next capture")
 
 
 def capture_failure(result: CheckResult, message: str) -> AttemptFailure:
@@ -169,20 +221,25 @@ def capture_failure(result: CheckResult, message: str) -> AttemptFailure:
     return failure
 
 
-def reported_passes(report: Path, log: Path, offset: int) -> set[str]:
-    """Ids a stopped capture reported as passed, and nothing else about them failed.
+def reported_results(report: Path, log: Path, offset: int, listing: Path, worktree: Path) -> tuple[set[str], set[str]]:
+    """(passed, failed) ids from all three sources, in the shared identity; failed wins over passed.
 
-    Results are aggregated per id across every record: a pass followed by a teardown
-    error (two JUnit records, or a PASSED then an ERROR line) is not a pass.
+    The plugin's records are already relative to the worktree; JUnit ids are relative to the
+    rootdir pytest printed; PASSED lines are relative to the directory pytest ran in, the worktree.
     """
     passed, failed = set(), set()
+    for record in _records(listing):
+        for outcome, ids in (("passed", passed), ("failed", failed)):
+            if isinstance(record.get(outcome), str):
+                ids.add(record[outcome])
+    rootdir = _rootdir(log, offset, worktree)
     parser = ET.XMLPullParser(events=("end",))
     try:
         parser.feed(report.read_bytes())
         for _, element in parser.read_events():
             if element.tag == "testcase" and (node := junit_node_id(element)) is not None:
                 bad = any(element.find(tag) is not None for tag in ("failure", "error", "skipped"))
-                (failed if bad else passed).add(node)
+                (failed if bad else passed).add(test_id(node, rootdir, worktree))
     except (OSError, ET.ParseError):
         pass
     try:
@@ -191,7 +248,8 @@ def reported_passes(report: Path, log: Path, offset: int) -> set[str]:
             for line in stream:
                 # Verbose lines; a parameterized id can contain spaces.
                 if match := re.match(r"(\S.*?::.+?) (PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)(?:\s|$)", line):
-                    (passed if match[2] == "PASSED" else failed).add(match[1])
+                    (passed if match[2] == "PASSED" else failed).add(test_id(match[1], worktree, worktree))
     except OSError:
         pass
-    return passed - failed
+    return passed - failed, failed
+

@@ -138,7 +138,9 @@ def test_reported_passes_aggregate_every_record_of_an_id(tmp_path):
                       '<testcase file="t.py" name="test_b"/>')
     log = tmp_path / "log"
     log.write_text("t.py::test_c PASSED [ 50%]\nt.py::test_c ERROR [ 50%]\nt.py::test_d[a b] PASSED [ 75%]\n")
-    assert run_baseline_resume.reported_passes(report, log, 0) == {"t.py::test_b", "t.py::test_d[a b]"}
+    passed, failed = run_baseline_resume.reported_results(report, log, 0, tmp_path / "none.jsonl", tmp_path)
+    assert passed == {"t.py::test_b", "t.py::test_d[a b]"}
+    assert failed == {"t.py::test_a", "t.py::test_c"}
 
 
 # Inexact selection: --deselect matches prefixes, so a kept id that prefixes another kept id reruns.
@@ -168,11 +170,12 @@ def test_a_stopped_capture_carries_its_kind_and_a_complete_one_drops_the_kept_pa
     cache.root.mkdir(parents=True)
     log = tmp_path / "log"
     log.write_text("t.py::test_a PASSED\n")
-    run_baseline_resume.after_capture(cache, "k", {"t.py::test_z"}, stopped, False, tmp_path / "none.xml", log, 0,
-                                      tmp_path / "none.jsonl")
+    run_baseline_resume.retained_path(cache, "k").write_text(json.dumps({"node_ids": ["t.py::test_z"]}))
+    run_baseline_resume.after_capture(cache, "k", stopped, False, tmp_path / "none.xml", log, 0,
+                                      tmp_path / "none.jsonl", tmp_path)
     assert run_baseline_resume.retained_passes(cache, "k") == {"t.py::test_a", "t.py::test_z"}
-    run_baseline_resume.after_capture(cache, "k", set(), run_checks.CheckResult("pytest", 0, False, ""), True,
-                                      tmp_path / "none.xml", log, 0, tmp_path / "none.jsonl")
+    run_baseline_resume.after_capture(cache, "k", run_checks.CheckResult("pytest", 0, False, ""), True,
+                                      tmp_path / "none.xml", log, 0, tmp_path / "none.jsonl", tmp_path)
     assert not run_baseline_resume.retained_path(cache, "k").exists()
 
 
@@ -354,7 +357,7 @@ def test_a_stopped_capture_keeps_the_passes_the_plugin_recorded(tmp_path):
     stopped = run_checks.CheckResult(command, -15, True, "", stop="silent")
     log = tmp_path / "log"
     log.write_text("")
-    run_baseline_resume.after_capture(cache, "k", retained, stopped, False, tmp_path / "none.xml", log, 0, listing)
+    run_baseline_resume.after_capture(cache, "k", stopped, False, tmp_path / "none.xml", log, 0, listing, project)
     assert run_baseline_resume.retained_passes(cache, "k") == {"tests/test_a.py::test_pass"}
 
 
@@ -401,8 +404,136 @@ def test_resumed_capture_leaves_out_every_kept_id_and_counts_what_it_left_out(tm
     assert run_baseline_resume.selected(3, line, listing, command) == 1  # Equal to what JUnit recorded.
 
 
-def test_a_kept_id_run_again_keeps_its_fresh_result():
-    passing, collected = run_baseline_resume.combine(
-        ("t.py::test_b",), ("t.py::test_a", "t.py::test_b"), {"t.py::test_a", "t.py::test_z"})
+def test_a_kept_id_run_again_keeps_its_fresh_result(tmp_path):
+    log = tmp_path / "log"
+    log.write_text("")
+    passing, collected, failing = run_baseline_resume.combine(
+        ("t.py::test_b",), ("t.py::test_a", "t.py::test_b"), ("t.py::test_a",), {"t.py::test_a", "t.py::test_z"},
+        log, 0, tmp_path)
     assert passing == ("t.py::test_b", "t.py::test_z")  # test_a failed when it ran again.
-    assert collected == ("t.py::test_a", "t.py::test_b", "t.py::test_z")
+    assert collected == ("t.py::test_a", "t.py::test_b", "t.py::test_z") and failing == ("t.py::test_a",)
+
+
+# Inconsistent identity: one test_id, realpath on the roots only, relative to the worktree root.
+def test_one_identity_matches_symlinked_roots_and_keeps_outside_ids_raw(tmp_path):
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert run_baseline_resume.test_id("t.py::a", real, link) == "t.py::a"  # /private/var vs /var
+    assert run_baseline_resume.test_id("t.py::a", real / "sub", link) == "sub/t.py::a"
+    assert run_baseline_resume.test_id("t.py::a", tmp_path / "elsewhere", real) == "t.py::a"
+    # The generated plugin carries the same function, not a second implementation.
+    import inspect
+    assert inspect.getsource(run_baseline_resume.test_id) in run_baseline_resume.RESULTS_PLUGIN.format(
+        listing="x", keep=[], repo="r", test_id=inspect.getsource(run_baseline_resume.test_id))
+
+
+def test_resumed_capture_through_a_symlinked_worktree_does_not_rerun_kept_tests(tmp_path):
+    import sys
+
+    from foragent.state import StateStore
+
+    real = _pytest_project(tmp_path, "def test_a(): pass\ndef test_b(): pass\n")
+    link = tmp_path / "linked"
+    link.symlink_to(real)
+    cache = StateStore(tmp_path / "baselines")
+    cache.root.mkdir(parents=True)
+    run_baseline_resume.retained_path(cache, "k").write_text(json.dumps({"node_ids": ["tests/test_a.py::test_a"]}))
+    report, work = tmp_path / "out.xml", tmp_path / "work"
+    work.mkdir()
+    command = (f"{sys.executable} -m pytest -p no:cacheprovider --rootdir={real} tests "
+               f"-o junit_family=legacy --junit-prefix= --junitxml={report}")
+    retained, command, listing = run_baseline_resume.prepare(cache, "k", command, work, link)
+    subprocess.run(["/bin/sh", "-c", command], cwd=link, capture_output=True, check=False)
+    assert run_checks._passing_acceptance_ids(report) == ("tests/test_a.py::test_b",)
+
+
+# Premature promotion: any non-pass from any source wins, now and in later captures.
+def test_a_failure_stays_saved_until_a_normal_end_capture(tmp_path):
+    from foragent.state import StateStore
+
+    cache = StateStore(tmp_path / "baselines")
+    cache.root.mkdir(parents=True)
+    log = tmp_path / "log"
+    stopped = run_checks.CheckResult("pytest", -15, True, "", stop="silent")
+    ended = run_checks.CheckResult("pytest", 1, False, "")
+
+    def capture(result, lines, complete=False):
+        log.write_text(lines)
+        run_baseline_resume.after_capture(cache, "k", result, complete, tmp_path / "none.xml", log, 0,
+                                          tmp_path / "none.jsonl", tmp_path)
+
+    capture(stopped, "t.py::test_x PASSED\nt.py::test_y PASSED\n")
+    capture(ended, "t.py::test_x FAILED\nt.py::test_z PASSED\n")  # A later failure removes it; ended adds no pass.
+    assert run_baseline_resume.retained_passes(cache, "k") == {"t.py::test_y"}
+    capture(stopped, "t.py::test_x PASSED\n")  # A later PASSED cannot bring it back.
+    assert run_baseline_resume.retained_passes(cache, "k") == {"t.py::test_y"}
+    capture(ended, "", complete=True)  # Only a normal-end capture clears the record.
+    assert not run_baseline_resume.retained_path(cache, "k").exists()
+
+
+def test_plugin_records_every_non_pass_and_only_full_passes(tmp_path):
+    import sys
+
+    from foragent.state import StateStore
+
+    project = _pytest_project(tmp_path, "import pytest\n"
+                              "def test_pass(): pass\n"
+                              "def test_fail(): assert False\n"
+                              "@pytest.mark.skip\n"
+                              "def test_skip(): pass\n"
+                              "@pytest.mark.xfail\n"
+                              "def test_xfail(): assert False\n"
+                              "@pytest.mark.xfail\n"
+                              "def test_xpass(): pass\n"
+                              "@pytest.fixture\n"
+                              "def broken():\n    yield\n    raise RuntimeError('teardown')\n"
+                              "def test_teardown(broken): pass\n")
+    cache = StateStore(tmp_path / "baselines")
+    cache.root.mkdir(parents=True)
+    work = tmp_path / "work"
+    work.mkdir()
+    _, command, listing = run_baseline_resume.prepare(cache, "k", f"{sys.executable} -m pytest -q -p no:cacheprovider tests",
+                                                      work, project)
+    subprocess.run(["/bin/sh", "-c", command], cwd=project, capture_output=True, check=False)
+    passed, failed = run_baseline_resume.reported_results(tmp_path / "none.xml", tmp_path / "none.log", 0, listing, project)
+    assert passed == {"tests/test_a.py::test_pass"}
+    assert failed == {f"tests/test_a.py::test_{name}" for name in ("fail", "skip", "xfail", "xpass", "teardown")}
+
+
+def test_cache_key_carries_the_identity_version(tmp_path):
+    from foragent import run_baseline
+
+    ctx = SimpleNamespace(config=Config(), repo_root=tmp_path)
+    assert run_baseline._baseline_identity(ctx, "pytest", "sha")[-1] == run_baseline_resume.CACHE_VERSION
+
+
+# Incomplete stop propagation: a watchdog-stopped related check ends the run for every caller
+# (implementation and CI review), with the checks gathered before it.
+def test_a_stopped_related_check_ends_the_run_for_every_caller(monkeypatch, tmp_path):
+    from foragent import runner
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.state import StateStore
+
+    started = datetime(2026, 10, 30, tzinfo=UTC)
+    store = StateStore(tmp_path / "state", now=lambda: started)
+    store.start_run(1, branch="b", worktree=tmp_path / "w")
+    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: started + timedelta(minutes=5),
+                          repo_root=tmp_path, monotonic=lambda: 0.0)
+    monkeypatch.setattr(runner, "_check", lambda command, *a, **k: run_checks.CheckResult(command, -15, True, "", stop="silent"))
+    monkeypatch.setattr(run_checks, "_test_slot", lambda n, ctx: None)
+    ended = []
+
+    def end(n, ctx, kind, checks, detail):
+        ended.append((kind, [check.command for check in checks]))
+        raise ExecutorStopped("stalled-restart", detail)
+
+    monkeypatch.setattr(run_waits, "end_by_watchdog", end)
+    earlier = run_checks.CheckResult("done-when", 0, False, "")
+    with pytest.raises(ExecutorStopped):
+        run_checks.run_related_check(1, ctx, tmp_path, "pytest", ["tests/test_a.py"], 1, 900, gathered=[earlier])
+    assert ended == [("silent", ["done-when", ended[0][1][1]])] and "tests/test_a.py" in ended[0][1][1]
+    with pytest.raises(ExecutorStopped):  # CI review passes nothing gathered: the check alone.
+        run_checks.run_related_check(1, ctx, tmp_path, "pytest", ["tests/test_a.py"], 1, 900)
+    assert len(ended[1][1]) == 1

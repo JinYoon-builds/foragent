@@ -244,6 +244,7 @@ def _record_related_check(
 
 def run_related_check(
     n: int, ctx: RunContext, worktree: Path, unit_command: str, unit_tests: list[str], changed: int, limit: int,
+    gathered: list[CheckResult] = (),
 ) -> CheckResult:
     """Run the selected related unit tests with their own JUnit report and record the check.
 
@@ -261,7 +262,8 @@ def run_related_check(
                            progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
                            full_text_dir=cuts.issue_dir(ctx.store.root, n), **watchdog.silence_args(ctx))
     _record_related_check(n, ctx, changed, unit_tests, report, result)
-    _progress(n, ctx)
+    # For every caller (implementation, CI review): a stopped check ends the run through its outcome (#435).
+    after_check(n, ctx, [*gathered, result])
     return result
 
 
@@ -517,9 +519,8 @@ def _verify_contents(attempt: Implementation) -> str:
                 attempt.checks.append(local_units)
         if unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
-            result = run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths), limit)
-            attempt.checks.append(result)
-            after_check(n, ctx, attempt.checks)  # A stopped related check ends the run through its outcome (#435).
+            attempt.checks.append(run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths),
+                                                    limit, gathered=attempt.checks))
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
         git.stage_changes()

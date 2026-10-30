@@ -191,7 +191,7 @@ def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]
 
 
 def _baseline_identity(ctx: RunContext, test_command: str, base_sha: str) -> list:
-    return [base_sha, test_command, ctx.config.acceptance_dir, _baseline_environment(ctx.repo_root)]
+    return [base_sha, test_command, ctx.config.acceptance_dir, _baseline_environment(ctx.repo_root), resume.CACHE_VERSION]
 
 
 def _baseline_cache(ctx: RunContext, test_command: str, base_sha: str,
@@ -424,12 +424,12 @@ def _capture_baseline(
                     else:
                         report.unlink(missing_ok=True)
                 if cacheable:
-                    node_ids, collected_ids = resume.combine(node_ids, collected_ids, retained)
+                    node_ids, collected_ids, failing_ids = resume.combine(node_ids, collected_ids, failing_ids, retained, log, offset, worktree)
                     save_baseline(node_ids, collected_ids, failing_ids, duration_seconds, result.exit_code,
                                   result_gaps=result.result_gaps)
                 elif result.timed_out and record_timeouts:
                     save_baseline(node_ids, collected_ids, (), duration_seconds, result.exit_code, timed_out=True)
-                resume.after_capture(cache, key, retained, result, cacheable, capture_report, log, offset, listing)
+                resume.after_capture(cache, key, result, cacheable, capture_report, log, offset, listing, worktree)
                 _append(log, f"Acceptance baseline count={len(node_ids)}, exit_code={result.exit_code}, timed_out={result.timed_out}")
                 if not cacheable:
                     raise resume.capture_failure(result,

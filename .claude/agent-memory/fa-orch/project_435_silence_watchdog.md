@@ -27,3 +27,7 @@ metadata:
 10차: `silence_minutes`의 기본은 None(미설정, 실제 창 10분)이다. `watchdog.silence_window`가 'config'와 'default'를 가른다. 멈춘 검사의 종류는 `stopped_check_kind(stop, run_elapsed, config)`로 실행의 안전망과 한도에 맞춰 다시 판정한다. `scheduler_silence.observe`는 판정에 쓴 기록에 표본만 바꿔(replace) 돌려준다. 그 사이 진행이 기록되면 `_kill_run`의 DECISION_FIELDS가 막는다. 기준선 캡처는 RESULTS_PLUGIN을 다시 쓴다. 통과는 끝나는 즉시 기록하고, `--deselect` 접두어로만 빠진 시험은 hookwrapper가 되돌린다(정확히 남긴 ID만 제외, 그 수를 기록). PR head의 Done when은 경과 시간만으로 멈추지 않는다. 비교 기준선은 HEAD~1이 아니라 main 커밋(a7433000)이다. 브랜치 커밋이 병합 커밋이다.
 
 11차: 플러그인이 정확히 남긴 ID를 모두 직접 제외한다(--deselect에 넘기지 않은 접두어 ID 포함). 제외 수는 `len(original) - len(items)`, 즉 실제로 돌리지 않은 수다. `resume.combine`은 다시 돌린 ID에 이번 결과를 쓴다. 선택과 개수는 같은 한 곳(플러그인의 최종 items)에서 나와야 한다.
+
+12차(규칙 2026-10-30): ID는 `run_baseline_resume.test_id` 하나로 정한다(뿌리 경로에만 realpath, 워크트리 기준, 밖이면 원래 nodeid). 이 함수는 inspect.getsource로 플러그인에 그대로 복사된다. `.partial` 파일은 {node_ids, failed}이며 실패가 언제나 이긴다. 정상 종료가 아닌 캡처는 실패를 저장하고, 멈춘 캡처만 통과를 더한다. 키에 `CACHE_VERSION`을 넣었다(_baseline_identity). test_run_baseline이 키를 손으로 계산하던 곳은 `_baseline_cache`를 쓰게 바꿨다. teardown 멈춤은 비목표다.
+
+13차: `run_related_check`가 직접 `after_check(n, ctx, [*gathered, result])`를 부른다. 그래서 ci_mode를 고치지 않고도 모든 호출자에서 멈춤이 전달된다. runtime-limit의 실행기 쪽 기록 이름(timeout인지 killed인지)은 잠긴 test_keep_unfinished_work:170/172와 리뷰가 충돌해서 QUESTION.md에 남겼다.
