@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shlex
@@ -14,7 +15,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_sessions
+from foragent import capacity
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -65,11 +66,8 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
     unknown_path = ctx.store.root / "orch-watch-unknown.json"
     last_error = None
     session = claude_session()  # The gate's spawn check trusts it past a stale heartbeat.
-    session_id = orch_sessions.own_id()  # #413: writes from a retired session are ignored.
-    try:
-        orch_sessions.claim_own(ctx.store, ctx.repo_root, ctx.now())
-    except Exception:
-        pass  # best effort, like the heartbeat itself
+    # #413: the id its spawn gave this session; writes from a retired session are ignored.
+    session_id = os.environ.get("FORAGENT_SESSION_ID")
     while True:
         try:  # Every read, changed or not, shows the orchestrator is alive.
             ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session,

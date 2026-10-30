@@ -132,8 +132,9 @@ def test_gate_path_is_unchanged_by_the_explicit_call(tmp_path, monkeypatch):
     monkeypatch.setattr(watch_open, "_opening", opening)
     assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW) == "background"
     assert len(calls) == 1
-    assert json.loads((store.root / "orch-spawn.json").read_text()) == {
-        "spawned_at": NOW.isoformat(), "screen": "background", "launched": True}
+    record = json.loads((store.root / "orch-spawn.json").read_text())
+    assert record.pop("descriptor")["started_at"] == NOW.isoformat()  # #413: the new session's descriptor
+    assert record == {"spawned_at": NOW.isoformat(), "screen": "background", "launched": True}
 
 
 def test_missing_claude_opens_nothing_and_keeps_no_record(tmp_path, monkeypatch):

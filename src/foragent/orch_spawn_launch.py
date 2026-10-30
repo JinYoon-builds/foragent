@@ -23,30 +23,30 @@ def transcript_path(root: Path, session_id: str) -> str:
     return str(base / "projects" / project / f"{session_id}.jsonl")
 
 
-def _environment(session_id: str | None) -> dict[str, str]:
-    """The launch command's own environment: the role, and the session id when Claude is given one."""
+def _environment(session_id: str) -> dict[str, str]:
+    """The launch command's own environment: the role and this launch's new session id.
+
+    The new id replaces any ``FORAGENT_SESSION_ID`` the launcher inherited (a
+    gate started from an orchestrator session), so the new session never
+    writes heartbeats under someone else's id.
+    """
     return {**os.environ, **orch_spawn._role_env(session_id)}
 
 
-def plan_launch(root: Path, store: StateStore, now: datetime, prompt: str | None = None,
-                *, named_background: bool = False) -> tuple[str, list[str], dict, dict | None] | None:
-    """Pick a session id and the launch command: ``(screen, argv, env, descriptor)``, or None without Claude.
+def plan_launch(root: Path, store: StateStore, now: datetime,
+                prompt: str | None = None) -> tuple[str, list[str], dict, dict] | None:
+    """Pick a new session id and the launch command: ``(screen, argv, env, descriptor)``, or None without Claude.
 
-    The gate's own ``claude --bg`` launch keeps its argv (a locked contract), so
-    only ``named_background`` (refresh) names the session there; an unnamed
-    launch has no descriptor.
+    Every screen (Orca, tmux, ``claude --bg``) passes ``--session-id`` with the
+    new id, so every launch has a descriptor to record.
     """
     session_id = str(uuid.uuid4())
     chosen = orch_spawn._command(root, store, f"orch: {root.name}", session_id, prompt)
     if chosen is None:
         return None
-    if chosen[0] == "background" and not named_background:
-        chosen = orch_spawn._command(root, store, f"orch: {root.name}")
-        session_id = None
     screen, argv = chosen
-    descriptor = None if session_id is None else {
-        "session_id": session_id, "transcript_path": transcript_path(root, session_id),
-        "started_at": now.isoformat()}
+    descriptor = {"session_id": session_id, "transcript_path": transcript_path(root, session_id),
+                  "started_at": now.isoformat()}
     return screen, argv, _environment(session_id), descriptor
 
 
@@ -54,7 +54,7 @@ def launch(root: Path, store: StateStore, now: datetime, planned) -> bool:
     """Reserve the spacing, run the launch command and record its outcome; whether it ran."""
     screen, argv, env, _descriptor = planned
     # A failed or timed-out command may still open later, so it reserves the spacing too.
-    store._write_json(orch_spawn._record_path(store), {"spawned_at": now.isoformat(), "screen": screen})
+    orch_spawn._write_record(store, {"spawned_at": now.isoformat(), "screen": screen})
     try:
         result = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, check=True, timeout=10, env=env)
@@ -66,19 +66,14 @@ def launch(root: Path, store: StateStore, now: datetime, planned) -> bool:
 
 
 def adopt(store: StateStore, planned, now: datetime) -> None:
-    """Inside the openers' lock, right after a launch: record who holds the orchestrator slot.
+    """Inside the openers' lock, right after a launch: the new session becomes the active one.
 
-    A named launch becomes the active session. An unnamed ``claude --bg``
-    launch leaves the slot empty (the dead session it replaces is retired), so
-    the new session claims it from ``fa orch watch``.
+    Its descriptor goes into the spawn record; the heartbeat is left as the watch
+    wrote it, and ``orch_sessions`` derives the active session from both.
     """
     from foragent import orch_sessions
 
-    descriptor = planned[3]
-    if descriptor is not None:
-        orch_sessions.activate(store, descriptor, now)
-    else:
-        orch_sessions.retire_active(store, now)
+    orch_sessions.record_spawn(store, planned[3], now)
 
 
 def _opened(store: StateStore, config: Config, root: Path, now: datetime, planned) -> None:
@@ -108,7 +103,7 @@ def spawn_orchestrator(repo_root: Path, store: StateStore, config: Config, *, pr
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
         return None
     root = repo_root.resolve()
-    planned = plan_launch(root, store, now, prompt, named_background=True)
+    planned = plan_launch(root, store, now, prompt)
     if planned is None or not launch(root, store, now, planned):
         return None
     _opened(store, config, root, now, planned)

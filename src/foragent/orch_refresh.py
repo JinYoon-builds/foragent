@@ -67,6 +67,8 @@ def due(store: StateStore, config: Config, now: datetime) -> dict:
                   "orch_refresh_hours": config.orch_refresh_hours}
     report = {"session_id": None, "transcript_path": None, "compactions": None, "age_seconds": None,
               "thresholds": thresholds, "due": False}
+    if not orch_sessions.heartbeat_path(store).is_file():
+        return {**report, "reason": text("orch_refresh_no_heartbeat", language)}
     session = orch_sessions.active(store)
     try:
         started = datetime.fromisoformat(session["started_at"]) if session else None
