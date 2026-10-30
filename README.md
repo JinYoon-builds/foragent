@@ -121,7 +121,8 @@ Codex CLI는 선택이에요. Codex CLI에 로그인되어 있으면 gate가 Cod
 
 ### 문서
 
-- [docs/decisions.md](docs/decisions.md) — 확정된 결정과 이유
+- [docs/rules.md](docs/rules.md) — 지금 지키는 규칙
+- [docs/decisions.md](docs/decisions.md) — 확정된 결정과 이유 (지난 기록)
 - [docs/status.md](docs/status.md) — 무엇이 설계됐고 무엇이 남았나
 - [docs/order.md](docs/order.md) · [docs/gate.md](docs/gate.md) · [docs/inspect.md](docs/inspect.md) — 단계별 설계
 - [docs/contract.md](docs/contract.md) — order ↔ gate 경계 계약 (gate 쪽 답신, 확정본)

@@ -15,7 +15,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_roles, orch_scorecard_flow as flow
+from foragent import orch_roles, orch_scorecard_flow as flow, orch_scorecard_main_tests as main_tests
 from foragent.config import Config
 from foragent.orch_binding import scorecard as binding
 from foragent.i18n import text
@@ -162,9 +162,14 @@ def collect(store: StateStore, days: int = 7, lanes: dict | None = None) -> dict
     previous["merges"] = _half_up(previous["merges"]) if previous["merges"] is not None else None
     order = [*_day([], [], 0), "phase_minutes", "load", "merges", *flow.NAMES]
     today, previous = {name: today[name] for name in order}, {name: previous[name] for name in order}
+    today["main_tests"], previous["main_tests"] = main_tests.windows(store, now, days)
+    worse = _worse(today, previous) + flow.worse_names(today, previous)
+    now_count, before_count = today["main_tests"]["count"], previous["main_tests"]["count"]
+    if now_count is not None and before_count is not None and now_count > before_count:
+        worse.append("main_tests")
     repeated, unexplained = _failures([run for index, run in runs if index == 0])
     return {"now": now.isoformat(), "days": days, "window": {"today": today, "previous": previous},
-            "worse": _worse(today, previous) + flow.worse_names(today, previous), "repeated_failures": repeated,
+            "worse": worse, "repeated_failures": repeated,
             "unexplained_failures": unexplained}
 
 
@@ -199,6 +204,18 @@ def _flow_line(key: str, metrics: dict[str, Any], language: str) -> str:
                 merges=_number(metrics["merges"]))
 
 
+def _main_tests_lines(today: dict[str, Any], previous: dict[str, Any], language: str) -> list[str]:
+    """The observed main-test failures against the days before, then each of today's failures."""
+    if "main_tests" not in today:
+        return []
+    now, before = today["main_tests"], previous["main_tests"]
+    lines = [text("scorecard_main_tests", language, count=_number(now["count"]),
+                  coverage=text(f"scorecard_main_{now['coverage']}", language),
+                  before=_number(before["count"]),
+                  before_coverage=text(f"scorecard_main_{before['coverage']}", language))]
+    return lines + [text("scorecard_main_failure", language, **row) for row in now["failures"]]
+
+
 def _binding_line(binding: dict[str, Any], language: str) -> str:
     today, before = binding["today"], binding["previous"]
     if before is not None and before != today:
@@ -212,6 +229,8 @@ def _pair(card: dict[str, Any], name: str) -> tuple[Any, Any]:
     group, _, key = name.partition(".")
     if key:
         return previous[group][key], today[group][key]
+    if name == "main_tests":
+        return previous[name]["count"], today[name]["count"]
     return previous[name], today[name]
 
 
@@ -272,6 +291,7 @@ def human(card: dict[str, Any], language: str) -> str:
     if card["unexplained_failures"]:
         lines.append(text("scorecard_unexplained", language,
                           issues=", ".join(f"#{n}" for n in card["unexplained_failures"])))
+    lines += _main_tests_lines(today, previous, language)
     return "\n".join(lines)
 
 
@@ -292,9 +312,18 @@ def add_parser(orch_actions) -> None:
     scorecard.add_argument("--json", action="store_true")
     scorecard.add_argument("--days", type=_days, default=7,
                            help="Today plus N-1 earlier days to compare against (default: 7, at least 2)")
+    scorecard.add_argument("--record-main-tests", type=Path, metavar="FILE",
+                           help="Record an export of observed main-branch check results, then exit")
 
 
 def command(args, store: StateStore, config: Config) -> None:
+    if getattr(args, "record_main_tests", None) is not None:
+        try:
+            fresh = main_tests.record(store, args.record_main_tests, config.base_branch)
+        except main_tests.ExportError as error:
+            raise SystemExit(f"fa orch scorecard: {error}") from error
+        print(text("scorecard_main_recorded", config.language, count=fresh))
+        return
     card = orch_roles.scorecard(store, config, collect(store, args.days, config.lanes))
     card["binding"] = binding(store, config, args.repo_root, card)
     print(json.dumps(card, ensure_ascii=False) if args.json else human(card, config.language))
