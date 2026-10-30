@@ -4,6 +4,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 import shlex
+import uuid
 
 from test_heartbeats import heartbeats_offline, heartbeats_write
 
@@ -157,7 +158,13 @@ def test_orch_spawn_background_cooldown_survives_store_reopening(git_history, tm
     case, commands, pushes = orch_spawn_case(git_history, tmp_path, monkeypatch)
     assert ensure_orchestrator(case.root, case.store, case.config, now=case.clock[0]) == "background"
     assert len(commands) == 1, commands
-    assert [Path(commands[0][0]).name, *commands[0][1:]] == [
+    argv = [Path(commands[0][0]).name, *commands[0][1:]]
+    # #413 (2026-10-29): every launch gives the new session its own id through --session-id.
+    assert "--session-id" in argv, argv
+    at = argv.index("--session-id")
+    session_id = argv[at + 1]
+    assert str(uuid.UUID(session_id)) == session_id, argv
+    assert argv[:at] + argv[at + 2:] == [
         "claude", "--bg", "-n", f"orch: {case.root.name}", "/fa-orchestrator",
     ]
     orch_spawn_assert_push(pushes)
