@@ -1,11 +1,13 @@
 """One silence decision shared by checks, baseline captures and run runtimes (#435).
 
-Work is silent only when its output, its progress events and the CPU time of
-its recorded process tree all stopped growing for the whole window. The window
-is twice the longest gap between results this repository recorded, or the
-default (or configured) window without such history. The safety net ends work
-after a generous elapsed time even while it still progresses. The decision
-itself never enumerates or signals processes: callers supply the snapshot.
+``decide(facts)`` is the only decider and ``outcome_for(kind)`` the only mapper from its
+kind to a run outcome; no other module branches on watchdog kinds. Work is silent only
+when its output, its progress and the CPU time of its recorded process tree all stopped
+growing for the whole window: twice the longest gap between results this repository
+recorded, or the default (or configured) window. Without an earlier sample the reference
+point is the start, and growth is 0. Unknown CPU (an unreadable table or process) is
+never silence: then only the safety net stops. The safety net ends work even while it
+progresses. Nothing here enumerates or signals processes: callers supply the snapshot.
 """
 
 from __future__ import annotations
@@ -18,22 +20,62 @@ from pathlib import Path
 
 DEFAULT_WINDOW_SECONDS = 600
 SAFETY_NET_SECONDS = 24 * 60 * 60
-# Past its runtime limit, a session that shows no growth for one gate tick is not progressing.
-RUNTIME_QUIET_SECONDS = 60
+# The run outcome of each stopping kind; precedence in one observation follows decide().
+OUTCOMES = {"safety-net": "stalled-restart", "runtime-limit": "killed", "silent": "stalled-restart"}
+
+
+@dataclass(frozen=True)
+class Facts:
+    """What a decision reads, all from one observation."""
+
+    silence_age: float  # Since the latest output, progress or tree CPU growth (or the start).
+    window_seconds: float
+    elapsed: float
+    safety_net: float
+    cpu_known: bool
+    runtime_limit: float | None = None  # A run's max_runtime_minutes (with its grace), if any.
+
+
+def decide(facts: Facts) -> str:
+    """running, silent, runtime-limit or safety-net; safety-net > runtime-limit > silent."""
+    if facts.elapsed >= facts.safety_net:
+        return "safety-net"
+    silent = facts.cpu_known and facts.silence_age >= facts.window_seconds
+    if silent and facts.runtime_limit is not None and facts.elapsed > facts.runtime_limit:
+        return "runtime-limit"
+    return "silent" if silent else "running"
+
+
+def stopped_check_kind(stop: str | None, past_runtime_limit: bool) -> str:
+    """The run's kind for a check the watchdog stopped: its own kind ("silent" unless it says
+    otherwise), decided again with the run's runtime limit, so precedence stays decide()'s."""
+    return decide(Facts(silence_age=1, window_seconds=1, elapsed=1,
+                        safety_net=0 if stop == "safety-net" else float("inf"), cpu_known=True,
+                        runtime_limit=0 if past_runtime_limit else None))
+
+
+def runtime_limit_seconds(config) -> float:
+    """max_runtime_minutes with main's ten-minute grace: past it, a silent run is a runtime-limit."""
+    return (config.max_runtime_minutes + 10) * 60
+
+
+def outcome_for(kind: str) -> str | None:
+    """The run outcome for a stopping kind: stalled-restart keeps the WIP and returns to ready."""
+    return OUTCOMES.get(kind)
 
 
 @dataclass(frozen=True)
 class Decision:
     stop: bool
-    decision: str  # "running", "silent" or "safety-net"
+    decision: str  # The logged fact: "running", "silent" (also past the runtime limit) or "safety-net".
     last_output_age: float
     cpu_delta: float
     window_seconds: float
     window_source: str  # "history", "config" or "default"
-    grew: bool  # Any of output, progress or tree CPU grew since the previous observation.
-    # False when the process table or a recorded process's CPU could not be read:
-    # unknown CPU is never silence, so only the safety net can stop such work.
-    cpu_known: bool = True
+    grew: bool  # Output, progress or tree CPU grew since the previous observation.
+    cpu_known: bool
+    kind: str  # decide()'s kind
+    outcome: str | None  # outcome_for(kind)
 
     def facts(self) -> dict:
         return asdict(self)
@@ -44,8 +86,7 @@ def _number(value) -> bool:
 
 
 class SilenceWatchdog:
-    """``runtime_limit`` (an executor session's ``max_runtime_minutes`` budget) ends work
-    past it only once it is also quiet for ``RUNTIME_QUIET_SECONDS``, never while it grows."""
+    """The samples of one piece of work; each observation is decided by decide()."""
 
     def __init__(self, history_gaps=(), safety_net: float = SAFETY_NET_SECONDS,
                  window_seconds: float | None = None, started: float | None = None,
@@ -57,8 +98,7 @@ class SilenceWatchdog:
             self.window_seconds, self.window_source = window_seconds, "config"
         else:
             self.window_seconds, self.window_source = DEFAULT_WINDOW_SECONDS, "default"
-        self.safety_net = safety_net
-        self.runtime_limit = runtime_limit
+        self.safety_net, self.runtime_limit = safety_net, runtime_limit
         self.started = started
         self.last_output_at: float | None = started
         self.last_activity_at: float | None = started
@@ -66,7 +106,7 @@ class SilenceWatchdog:
         self.progress_events: int | None = None
         self.cpu: dict[str, float] = {}
         self.result_times: list[float] = []
-        self.last: Decision | None = None  # The latest decision, read by whoever ran the check.
+        self.last: Decision | None = None
 
     @property
     def result_gaps(self) -> tuple[float, ...]:
@@ -77,24 +117,22 @@ class SilenceWatchdog:
     def observe(self, now: float, output_bytes: int, progress_events: int, snapshot, identities) -> Decision:
         recorded = {(item["pid"], item["start_time"]) for item in identities}
         cpu_known = snapshot is not None  # None: the process table was unreadable.
-        # A recorded process the table could not read is unknown too, not absent.
         if {pid for pid, _ in recorded} & set(getattr(snapshot, "unreadable", ()) or ()):
-            cpu_known = False
+            cpu_known = False  # A recorded process the table could not read is unknown, not absent.
         cpu = {}
         for row in () if snapshot is None else snapshot.rows.values() if hasattr(snapshot, "rows") else snapshot:
-            # Only the recorded lifetime counts: a reused PID is another process.
             if (row.pid, row.start_time) not in recorded:
-                continue
-            seconds = getattr(row, "cpu_time", None)
+                continue  # Only the recorded lifetime counts: a reused PID is another process.
+            # A row type without CPU carries no growth; a CPU read that failed (None) is unknown.
+            seconds = getattr(row, "cpu_time", 0.0)
             if seconds is None:
-                cpu_known = False  # A live recorded process whose CPU could not be read.
+                cpu_known = False
             else:
                 cpu[f"{row.pid}:{row.start_time}"] = float(seconds)
         if self.started is None:
             self.started = self.last_output_at = self.last_activity_at = now
-        first = self.output_bytes is None
-        cpu_delta = sum(max(0.0, seconds - self.cpu.get(key, seconds if first else 0.0))
-                        for key, seconds in cpu.items())
+        first = self.output_bytes is None  # No earlier sample: no growth, the start is the reference.
+        cpu_delta = 0.0 if first else sum(max(0.0, seconds - self.cpu.get(key, 0.0)) for key, seconds in cpu.items())
         output_grew = not first and (output_bytes > self.output_bytes or progress_events > self.progress_events)
         if not first and output_bytes > self.output_bytes:
             self.result_times.append(now)
@@ -103,38 +141,28 @@ class SilenceWatchdog:
         grew = output_grew or cpu_delta > 0
         if grew:
             self.last_activity_at = now
-        # A first sample has nothing to compare with: its last measured activity decides
-        # whether it is still growing, never the missing earlier sample.
-        if first and now - self.last_activity_at < RUNTIME_QUIET_SECONDS:
-            grew = True
         self.output_bytes, self.progress_events = output_bytes, progress_events
         self.cpu = {**self.cpu, **cpu}
-        if now - self.started >= self.safety_net:
-            decision = "safety-net"
-        elif cpu_known and now - self.last_activity_at >= self.window_seconds:
-            decision = "silent"
-        elif (self.runtime_limit is not None and now - self.started >= self.runtime_limit
-              and cpu_known and now - self.last_activity_at >= RUNTIME_QUIET_SECONDS):
-            decision = "runtime-limit"
-        else:
-            decision = "running"
-        self.last = Decision(decision != "running", decision, now - self.last_output_at, cpu_delta,
-                             self.window_seconds, self.window_source, grew, cpu_known)
+        kind = decide(Facts(now - self.last_activity_at, self.window_seconds, now - self.started,
+                            self.safety_net, cpu_known, self.runtime_limit))
+        logged = "running" if kind == "running" else "safety-net" if kind == "safety-net" else "silent"
+        self.last = Decision(kind != "running", logged, now - self.last_output_at, cpu_delta, self.window_seconds,
+                             self.window_source, grew, cpu_known, kind, outcome_for(kind))
         return self.last
 
     def state(self) -> dict:
-        return {"started": self.started, "last_output_at": self.last_output_at,
-                "last_activity_at": self.last_activity_at, "output_bytes": self.output_bytes,
-                "progress_events": self.progress_events, "cpu": self.cpu}
+        return {"last_output_at": self.last_output_at, "last_activity_at": self.last_activity_at,
+                "output_bytes": self.output_bytes, "progress_events": self.progress_events, "cpu": self.cpu}
 
     def restore(self, state: dict) -> None:
-        for name in ("started", "last_output_at", "last_activity_at", "output_bytes", "progress_events"):
-            setattr(self, name, state.get(name))
+        for name in ("last_output_at", "last_activity_at", "output_bytes", "progress_events"):
+            if state.get(name) is not None:
+                setattr(self, name, state[name])
         self.cpu = dict(state.get("cpu") or {})
 
 
 def recorded_gaps(cache_root: Path, repository: Path) -> tuple[float, ...]:
-    """Result gaps of this repository's latest capture that recorded them."""
+    """Result gaps of this repository's latest capture that recorded them (main's capture history)."""
     target, latest = str(repository.resolve()), None
     for path in cache_root.glob("*.json"):
         try:
@@ -152,29 +180,9 @@ def recorded_gaps(cache_root: Path, repository: Path) -> tuple[float, ...]:
     return () if latest is None else latest[1]
 
 
-def history_gaps(ctx) -> tuple[float, ...]:
-    """This repository's recorded result gaps; every check site sizes its silence window from them."""
-    return recorded_gaps(ctx.store.root.parent / "baselines", ctx.repo_root)
-
-
-def safety_net(ctx) -> float:
-    from foragent.config import safety_net_seconds
-
-    return safety_net_seconds(ctx.config)
-
-
 def silence_args(ctx) -> dict:
     """The watchdog inputs a check site passes to ``run_checks._check``."""
-    return {"history_gaps": history_gaps(ctx), "safety_net": safety_net(ctx)}
+    from foragent.config import safety_net_seconds
 
-
-def hook_args(snapshot: Path, repository: Path | None, net: int | None) -> dict:
-    """The Stop hook's watchdog inputs: its run's history and safety net, passed on its command line.
-
-    ``snapshot`` is the run's approval under ``<state>/approvals``; the baseline cache sits
-    beside the repository stores, as for every other check site.
-    """
-    cache = snapshot.parent.parent.parent / "baselines"
-    return {"history_gaps": recorded_gaps(cache, repository) if repository is not None else (),
-            "safety_net": net or SAFETY_NET_SECONDS}
-
+    return {"history_gaps": recorded_gaps(ctx.store.root.parent / "baselines", ctx.repo_root),
+            "safety_net": safety_net_seconds(ctx.config)}

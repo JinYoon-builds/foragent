@@ -79,9 +79,7 @@ def ctx(git_history, tmp_path, monkeypatch, fake_process_table):
     context = TickContext(
         repo="owner/repo", repo_root=git_history.clone,
         tracker=FakeTracker(strict=True), store=StateStore(tmp_path / "state"),
-        # These tests exercise the stall and configured runtime-limit paths, which #435 keeps;
-        # a day-long silence window keeps the watchdog from ending these runs first.
-        config=Config(approvers=["human"], silence_minutes=24 * 60), git=GitRepo(git_history.clone, git_run), now=lambda: NOW,
+        config=Config(approvers=["human"]), git=GitRepo(git_history.clone, git_run), now=lambda: NOW,
         launcher=lambda number: 7000 + number, start_runs=False,
         runner_process_exists=lambda number: False,
         kill_runner=kill_process_group,
@@ -826,8 +824,10 @@ def test_running_overtime_backstop_kills_alive_runner(ctx, monkeypatch, seconds,
     actions = []
     ctx.kill_runner = record_stop(ctx, actions.append)
     ctx.now = lambda: NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 10, seconds=seconds)
-    # Progress 20 minutes ago: no stall yet, but past the limit with no growing fact it is killed (#435).
-    ctx.store.update_run(1, last_progress_at=(NOW + timedelta(minutes=ctx.config.max_runtime_minutes - 10)).isoformat())
+    # Progress one second inside the silence window at the limit: one second later the run is
+    # both past the runtime limit and silent, so it is killed (#435).
+    limit = NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 10)
+    ctx.store.update_run(1, last_progress_at=(limit - timedelta(minutes=ctx.config.silence_minutes, seconds=-1)).isoformat())
     tick(ctx)
     assert actions == ([5432] if killed else [])
     if killed:
@@ -847,7 +847,7 @@ def test_runtime_backstop_outbox_survives_uncollected_old_comment_after_reset(ct
     assert all(comment["id"] != old_comment for comment in ctx.store.local_issues()[0]["comments"])
 
     ctx.now = lambda: NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 11)
-    # Progress 20 minutes ago: no stall yet, but past the limit with no growing fact it is killed (#435).
+    # Progress 20 minutes ago: no stall yet, but silent past the runtime limit, so it is killed (#435).
     ctx.store.update_run(1, last_progress_at=(NOW + timedelta(minutes=ctx.config.max_runtime_minutes - 10)).isoformat())
     until = ctx.now() + timedelta(minutes=1)
     add_labels = remote.add_labels
@@ -1779,6 +1779,7 @@ def test_stall_restarts_once_then_flags_second_stall(ctx):
 
 @pytest.mark.parametrize("progress,stalls", [("recent", False), ("boundary", False), ("missing", True)])
 def test_stall_uses_latest_progress_or_start_time(ctx, progress, stalls):
+    ctx.config = replace(ctx.config, silence_minutes=24 * 60)  # The stall rule alone; silence is a separate stop (#435).
     approve(ctx)
     tick(ctx)
     mark_running(ctx)
@@ -2500,6 +2501,7 @@ def test_tick_runtime_backstop_excludes_waited_seconds(ctx):
     tick(ctx)
     assert ctx.store.active_runs() == [run]
     ctx.store.update_run(1, waited_seconds=0)
+    ctx.now = lambda: NOW + timedelta(minutes=141)  # Past the limit and silent for the window (#435).
     tick(ctx)
     assert ctx.store.get_run(1).outcome == "killed"
     assert ctx.store.load_flag(1).reason == Reason.TIMEOUT

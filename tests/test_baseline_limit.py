@@ -278,7 +278,7 @@ def test_baseline_timeout_still_refuses_merge_without_protection(run_case, monke
     monkeypatch.setattr(runner, "_check", timeout)
     ticks = iter((0.0, 900.0))
     monkeypatch.setattr(run_baseline, "monotonic", lambda: next(ticks))
-    # The watchdog stopped the capture: the run restarts back to ready, still without a merge (#435).
+    # The watchdog stopped the capture: the run ends by outcome_for (stalled-restart), still without a merge (#435).
     assert runner.run_issue(1, c.ctx) == "stalled-restart"
     assert calls == [900]
     assert c.executor.calls == []

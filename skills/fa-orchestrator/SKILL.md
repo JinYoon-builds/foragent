@@ -48,10 +48,10 @@ or only items waiting for a human decision remain; no blocked items; print `fa g
 each turn as evidence". Print the command's actual JSON output every turn, including after taking
 action. When the condition holds, wait quietly for a new event or user message.
 
-Keep `fa orch watch --follow` running in a Monitor for this session's whole life; it is the heartbeat
-and records this session, so the gate opens no second orchestrator. Restart it if it ever stops; see
-[watch](references/watch.md). Say you are watching only while `fa orch watch --follow` is running in
-this session and renewing the heartbeat; otherwise say it is stopped and restart it.
+Keep `fa orch watch --follow` running in a Monitor for this session's whole life; it is the heartbeat and
+records this session, so the gate opens no second orchestrator. Restart it if it stops ([watch](references/watch.md)).
+Say you are watching only while it runs in this session and renews the heartbeat; else restart it. Check
+`fa orch refresh-due --json` too; a due session hands off and refreshes: [refresh](references/refresh.md).
 
 ## Check loop (D80)
 

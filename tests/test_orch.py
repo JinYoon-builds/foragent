@@ -267,7 +267,7 @@ def test_failed_rerun_preserves_pr_and_raw_review_with_visible_reason(review_cas
 @pytest.mark.parametrize("entry", ["rerun-review", "resolve"])
 @pytest.mark.parametrize("failure,reason", [
     ("checks", Reason.RETRIES_EXCEEDED), ("ci", Reason.RETRIES_EXCEEDED),
-    ("ci-timeout", Reason.TIMEOUT), ("check-timeout", Reason.STALLED),
+    ("ci-timeout", Reason.TIMEOUT), ("check-timeout", Reason.TIMEOUT),
     ("base", Reason.RISK_HIGH), ("head", Reason.RISK_HIGH),
     ("body", Reason.HASH_MISMATCH), ("acceptance", Reason.HASH_MISMATCH),
     ("missing-approval", Reason.HASH_MISMATCH), ("no-check", Reason.NO_MACHINE_CHECK),
@@ -426,7 +426,7 @@ def test_missing_pr_remains_visible_with_or_without_run_record(review_case, prev
 def test_rerun_early_verification_failures_remain_blocked(review_case, monkeypatch, failure):
     c = review_case
     if failure == "runtime":
-        monkeypatch.setattr(runner, "_budget_left", lambda *args: 0)  # The run's own bound at a step (#435).
+        monkeypatch.setattr(runner, "_remaining", lambda *args: 0)
         reason = Reason.TIMEOUT
     elif failure == "head-before-review":
         c.tracker.set_pr_head_sha(c.pr, "f" * 40)

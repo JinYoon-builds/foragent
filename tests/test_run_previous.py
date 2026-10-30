@@ -21,7 +21,7 @@ def test_retry_marker_adds_default_before_hint_and_is_consumed_with_it(tmp_path)
     assert pending_hint(tmp_path, 1) == (True, "Keep the locale")
     prompt = build_resume_prompt(1, None, "body", retry_default=True, orchestrator_hint="Keep the locale")
     assert prompt.index(DEFAULT_RETRY_HINT) < prompt.index("Keep the locale")
-    consume_hint(tmp_path, 1)
+    consume_hint(tmp_path, 1, "Keep the locale")
     assert pending_hint(tmp_path, 1) == (False, None)
 
 

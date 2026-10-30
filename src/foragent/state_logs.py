@@ -35,29 +35,37 @@ class LogRetentionMixin:
         """Drop journal lines older than 30 days; return the journals that changed.
 
         Lines with a missing or unparseable ``at`` stay. The rewrite runs under the
-        state lock, which every journal append also takes.
+        state lock, which every journal append also takes. The talk events of a run
+        still active stay whatever their age: its talk state and paused time are
+        derived from them (D95), so trimming one would end a talk without evidence.
         """
         cutoff, trimmed = now - JOURNAL_RETENTION, []
         with self._state_lock():
+            active = {(run.number, run.started_at) for run in self.active_runs()}
             for name in JOURNALS:
                 path = self.root / name
                 try:
                     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
                 except FileNotFoundError:
                     continue
-                kept = [line for line in lines if not self._journal_line_expired(line, cutoff)]
+                kept = [line for line in lines if not self._journal_line_expired(line, cutoff, active)]
                 if len(kept) != len(lines):
                     self._atomic_write(path, "".join(kept))
                     trimmed.append(path)
         return trimmed
 
     @staticmethod
-    def _journal_line_expired(line: str, cutoff: datetime) -> bool:
+    def _journal_line_expired(line: str, cutoff: datetime, active: set = frozenset()) -> bool:
         try:
             value = _state.json.loads(line)
         except ValueError:
             return False
-        at = _parse_time(value.get("at")) if isinstance(value, dict) else None
+        if not isinstance(value, dict):
+            return False
+        if value.get("kind") in ("talk-opened", "talk-closed") and (
+                value.get("issue"), value.get("run_started_at")) in active:
+            return False  # An active run's talk is read from these lines.
+        at = _parse_time(value.get("at"))
         return at is not None and at < cutoff
 
     def prune_logs(self, now: datetime) -> list[Path]:

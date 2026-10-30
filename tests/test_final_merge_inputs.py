@@ -200,8 +200,7 @@ def test_each_changed_merge_input_is_rejected_after_queuing(queued_publish, monk
         elif changed == "acceptance-base":
             case.history.update({ACCEPTANCE: "def test_changed():\n    assert False\n"})
         elif changed == "runtime-budget":
-            # The run's own budget is exhausted (max_runtime_minutes no longer bounds a run, #435).
-            case.active_ctx.deadline_seconds = 0
+            case.active_ctx.config = replace(case.active_ctx.config, max_runtime_minutes=0)
         elif changed == "publication":
             (case.store.worktree_path(1) / "feature.txt").write_text("<<<<<<< HEAD\n=======\n>>>>>>> other\n")
             git_command(case.store.worktree_path(1), "add", "--", "feature.txt")

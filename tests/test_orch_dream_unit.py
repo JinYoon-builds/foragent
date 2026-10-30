@@ -131,10 +131,8 @@ def test_stalled_dream_is_stopped_through_its_recorded_identity_and_ends_as_erro
 def test_dream_over_its_runtime_limit_is_stopped(world):
     dreaming(world)
     world.table[0] = processes.ProcessTable([row(4100)])
-    progressed = world.clock[0] + timedelta(minutes=30)
     world.clock[0] += timedelta(minutes=world.config.max_runtime_minutes + 11)
-    # Past the limit with no growing fact since: killed (#435); a dream still progressing runs on.
-    world.store.update_run(KEY, last_progress_at=progressed.isoformat())
+    world.store.update_run(KEY, last_progress_at=world.clock[0].isoformat())  # Progressing, but too long.
     recover(world)
     finished = world.store.get_dream("orch")
     assert world.killed == [4100] and finished.outcome == "error" and "runtime" in finished.detail

@@ -70,7 +70,8 @@ def _validate(values: dict[str, Any]) -> None:
     for key in ("stall_minutes", "max_runtime_minutes", "max_retries", "conflict_retries", "review_max",
                 "max_parallel", "overlap_per_file", "transient_max_wait_minutes", "limit_wait_minutes",
                 "usage_recheck_minutes", "orchestrator_timeout_minutes", "tick_failure_alert", "test_slots",
-                "silence_minutes", "safety_net_hours"):
+                "silence_minutes", "safety_net_hours",
+                "orch_refresh_compactions", "orch_refresh_hours"):
         if key == "max_parallel" and values[key] is None:
             continue
         if type(values[key]) is not int or values[key] <= 0:

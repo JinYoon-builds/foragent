@@ -1071,7 +1071,6 @@ def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
 
     monkeypatch.setattr(run_implementation, "_available_executor", capture)
     monkeypatch.setattr(runner, "_remaining", lambda n, ctx: 60)
-    monkeypatch.setattr(runner, "_budget_left", lambda n, ctx: 60)  # The step bound (#435).
     monkeypatch.setattr(run_implementation, "_phase", lambda *a, **kw: None)
     store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
     body = "<!-- foragent:v1 -->\n## Goal\nG\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
@@ -1083,7 +1082,7 @@ def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
                               size=size, options={}, missing_skills=[], native_claude=ctx.config.executor == "claude",
                               parsed=parse_body(body), baseline=None, executor=None,
                               approval=store.load_approval(1), review_feedback=False,
-                              issue=SimpleNamespace(labels=set()), checks=[])
+                              issue=SimpleNamespace(labels=set()))
     monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
     monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
     with pytest.raises(Stop):

@@ -117,7 +117,6 @@ def test_claude_native_goal_settings_and_independent_retry(run_case, acceptance_
         sys.executable, "-m", "foragent.cli", "gate", "check-done",
         "--snapshot", str(c.store.root / "approvals/1.json"),
         "--worktree", str(c.store.worktree_path(1)), "--acceptance-dir", acceptance_dir,
-        "--history-root", str(c.ctx.repo_root.resolve()), "--safety-net-seconds", str(24 * 3600),
     ])
     path = Path(acceptance_dir).as_posix().rstrip("/") + "/"
     assert settings == {
@@ -125,7 +124,7 @@ def test_claude_native_goal_settings_and_independent_retry(run_case, acceptance_
                                  "Bash(git commit:*)", "Bash(git push:*)",
                                  "Bash(git checkout:*)", "Bash(git switch:*)", "Bash(git merge:*)"]},
         "hooks": {"Stop": [{"hooks": [{"type": "command", "command": expected_command,
-                                      "timeout": c.ctx.config.safety_net_hours * 3600}]}]},
+                                      "timeout": c.ctx.config.max_runtime_minutes * 60}]}]},
     }
     assert not settings_path.is_relative_to(c.store.worktree_path(1))
     assert (settings_path.parent / "stop-block-count").read_text() == "0"

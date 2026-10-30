@@ -1,6 +1,6 @@
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 import fcntl
 from hashlib import sha256
 import json
@@ -124,7 +124,7 @@ def test_unusable_baseline_stops_before_publish_without_retry(run_case, monkeypa
         return CheckResult(command, code, timed_out, "")
 
     monkeypatch.setattr("foragent.runner._check", check)
-    stopped = unusable.endswith("timeout")  # The watchdog stopped the capture: the run restarts (#435).
+    stopped = unusable.endswith("timeout")  # The watchdog stopped it: the run ends by outcome_for (#435).
     assert run_issue(1, c.ctx) == ("stalled-restart" if stopped else "acceptance-baseline-unavailable")
     assert captures == [60]
     assert c.now[0] == BASE_TIME + timedelta(hours=1, seconds=20)
@@ -172,8 +172,7 @@ def test_baseline_uses_a_prebuilt_cache_before_implementation(run_case, monkeypa
 def test_baseline_budget_exhausted_before_capture_stops_with_unavailable_reason(run_case, monkeypatch):
     c = run_case
     c.history.update({"tests/acceptance/test_keep.py": "def test_keep():\n    assert True\n"})
-    c.ctx.config = replace(c.ctx.config, test_command="pytest")
-    c.ctx.deadline_seconds = 60  # The run's own budget (max_runtime_minutes no longer bounds a run, #435).
+    c.ctx.config = replace(c.ctx.config, test_command="pytest", max_runtime_minutes=1)
     c.now[0] += timedelta(minutes=1)
     monkeypatch.setattr("foragent.runner._check", lambda *args, **kwargs: pytest.fail("no capture budget remains"))
 
@@ -447,13 +446,8 @@ def _collected(tmp_path, monkeypatch, files, node_ids, *, command="", excluded=(
     git = SimpleNamespace(add_detached_worktree=lambda path, sha: shutil.copytree(base, path),
                           remove_worktree=lambda path: shutil.rmtree(path), at=at)
     log = tmp_path / "run.log"
-    # The collection reads this repository's silence history from the baseline cache, and the
-    # run record for its step bound (#435).
-    started = datetime(2026, 10, 20, tzinfo=UTC)
-    run = SimpleNamespace(started_at=started.isoformat(), waited_seconds=0, slept_seconds=0)
-    ctx = SimpleNamespace(git=git, store=SimpleNamespace(log_path=lambda n: log, root=tmp_path / "state",
-                                                         get_run=lambda n: run),
-                          config=Config(acceptance_dir=acceptance_dir), repo_root=base, now=lambda: started)
+    ctx = SimpleNamespace(git=git, store=SimpleNamespace(log_path=lambda n: log),
+                          config=Config(acceptance_dir=acceptance_dir))
     previous = AcceptanceBaseline(_pytest_command(command or f"{shlex.quote(sys.executable)} -m pytest"), node_ids)
     return collect_protected_ids(1, ctx, previous, "new"), log
 

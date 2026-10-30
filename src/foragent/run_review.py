@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import contextvars
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, replace
 import json
@@ -319,7 +320,9 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     before = git.review_state()
     try:
         with ThreadPoolExecutor(max_workers=len(prompts), thread_name_prefix=f"review-{n}") as pool:
-            futures = [pool.submit(call, prompt, path) for prompt, path in zip(prompts, logs)]
+            # Each reviewer runs in a copy of this context, so the run's pause clock reaches it.
+            futures = [pool.submit(contextvars.copy_context().run, call, prompt, path)
+                       for prompt, path in zip(prompts, logs)]
         errors = [future.exception() for future in futures]
     finally:
         edited = restore(before)
@@ -573,7 +576,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     _check_publication(git, pr.base)
 
     if verdict_head is None and ctx.config.reviewer != "none":
-        if runner._budget_left(n, ctx) <= 0:
+        if runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
         if ctx.config.review_scope == "pr-body":
             # Native PR review reads only the PR body: refresh the risk notes for this head and base.
@@ -586,7 +589,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
                          pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
         _stop_on_spec_conflict(n, ctx, review)
-        if review.timed_out or runner._budget_left(n, ctx) <= 0:
+        if review.timed_out or runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
         if review.verdict != "PASS":
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)

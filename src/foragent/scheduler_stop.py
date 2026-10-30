@@ -84,8 +84,8 @@ LIVENESS_FIELDS = ("pid", "process_identities", "executor_pgid", "last_progress_
 def _listing(pids=()):
     """The process table, or None when it cannot be read (no evidence either way).
 
-    Stopping a tree the watchdog proved silent (#435) reads only the run's own ``pids``,
-    one targeted identity read each: the tick's single snapshot plus these rechecks.
+    A stop of a tree the watchdog proved silent reads only the run's own ``pids``, one
+    targeted identity read each: the tick's single snapshot plus these rechecks (#435).
     """
     if pids and processes.in_quiescent_stop():
         return processes.targeted_table(pids)
@@ -168,14 +168,9 @@ def _stop_unconfirmed(run: Run) -> bool:
 
 
 def _stop_run_processes(
-    ctx: TickContext, run: Run, report: TickReport, *, stop_runner: bool = True, on_stopped=None,
+    ctx: TickContext, run: Run, report: TickReport, *, stop_runner: bool = True,
 ) -> str:
-    """A refused stop belongs to this run, never to the whole gate tick.
-
-    ``on_stopped`` runs once this stop has ended the run's processes, before any later
-    check of the record: a runner that finishes its record meanwhile cannot hide the stop.
-    """
-    stopped = on_stopped or (lambda: None)
+    """A refused stop belongs to this run, never to the whole gate tick."""
     try:
         if _stop_already_refused(ctx, run):
             return "refused" if _run_processes_exist(run) else "gone"
@@ -188,13 +183,11 @@ def _stop_run_processes(
     except (ValueError, PermissionError, TimeoutError) as exc:
         try:
             if not _run_processes_exist(ctx.store.get_run(run.key) or run):
-                stopped()  # The stop raised, but the processes it targeted are gone.
                 return "gone"
         except PermissionError:
             pass  # An unreadable table cannot prove death.
         _flag_stop_refused(ctx, run, report, exc)
         return "refused"
-    stopped()
     return "stopped"
 
 

@@ -108,7 +108,7 @@ def _final_merge_inputs(
     if git.head_sha() != head or ctx.tracker.pr_head_sha(pr) != head:
         return run_publish._MergeInputs(stop=lambda: run_publish._hold_changed_head(n, ctx, link))
     from foragent import runner
-    if runner._budget_left(n, ctx) <= 0:
+    if runner._remaining(n, ctx) <= 0:
         return run_publish._MergeInputs(stop=lambda: run_publish._timeout(n, ctx))
     comparison_current = True
     if run_publish.enabled(ctx, base):

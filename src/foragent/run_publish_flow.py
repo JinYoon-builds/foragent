@@ -45,7 +45,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
 
     def finish_base() -> None:
         nonlocal verified_head_sha
-        if runner._budget_left(n, ctx) <= 0:
+        if runner._remaining(n, ctx) <= 0:
             raise run_publish.ExecutorStopped(run_publish._timeout(n, ctx))
         run_publish.commit_exclusions(attempt, title)
         verified_head_sha = git.head_sha()
@@ -80,7 +80,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         verified_base_sha = move.target_sha
         if not git.is_ancestor(move.target_sha, move.head_sha):
             target_sha = refresh_base(move)
-    if not attempt.review_hold and runner._budget_left(n, ctx) <= 0:
+    if not attempt.review_hold and runner._remaining(n, ctx) <= 0:
         return run_publish._timeout(n, ctx)
     run_publish._check_publication(git, attempt.target_branch, None if attempt.review_hold else verified_base_sha)
     run_publish._push_branch(attempt)

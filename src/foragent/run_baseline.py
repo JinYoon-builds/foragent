@@ -21,14 +21,11 @@ from time import monotonic
 from typing import IO, TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
-from foragent import cuts
-from foragent import run_baseline_plugins as resume
-from foragent.run_baseline_plugins import COLLECT_PLUGIN, _with_python_path  # noqa: F401  (re-exported)
+from foragent import cuts, run_baseline_resume as resume, watchdog
 from foragent.git import GitError
-from foragent.run_attempt import AttemptFailure, SilentCapture
+from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline_limits import load_reusable, record_timeout, repository_limit
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
-from foragent.watchdog import history_gaps, safety_net
 from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot, phase_identity, restore_phase
 from foragent.state import StateStore
 
@@ -62,17 +59,9 @@ class BaselineBuild:
     scope: str
 
 
-def _checkout(git, worktree: Path):
-    """The capture checkout's repository; a Git adapter without checkouts has none to inspect."""
-    at = getattr(git, "at", None)
-    return at(worktree) if at is not None else None
-
-
 def _validate_baseline_checkout(git, base_sha: str) -> None:
     """A measurement must describe the requested base, including its index."""
-    if git is None:
-        return
-    if (git.head_sha() != base_sha
+    if git is not None and (git.head_sha() != base_sha
             or git._call(["status", "--porcelain=v1", "--untracked-files=no"])):
         raise AttemptFailure("acceptance baseline unavailable: capture modified tracked files")
 
@@ -97,8 +86,7 @@ def _build_baseline(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> Non
                 report=cache.root / f"{build.key}.xml",
                 check=lambda command, root: runner._check(
                     command, root, log, _baseline_capture_limit(ctx, log),
-                    slot=capacity.hold_test_slot(ctx.config.test_slots),
-                    history_gaps=history_gaps(ctx), safety_net=safety_net(ctx)),
+                    slot=capacity.hold_test_slot(ctx.config.test_slots), **watchdog.silence_args(ctx)),
                 prepare=lambda: None, wait=lambda acquire: acquire(), build=build, lock=lock,
                 # Locked test_baseline_prebuild (unusable "timeout") forbids caching a timed-out prebuild.
                 record_timeouts=False,
@@ -120,8 +108,7 @@ def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str])
 
     request = {
         "repo_root": str(ctx.repo_root.resolve()), "store_root": str(ctx.store.root.resolve()),
-        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots,
-        "safety_net_hours": ctx.config.safety_net_hours, "repo": ctx.config.repo,
+        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots, "repo": ctx.config.repo,
         "machine_root": str(capacity.machine_root().resolve()),
         "build": asdict(build),
     }
@@ -260,21 +247,18 @@ def _capture_acceptance_baseline(
     from foragent import runner
 
     def check(command: str, worktree: Path) -> CheckResult:
-        remaining = runner._budget_left(n, ctx)
+        remaining = runner._remaining(n, ctx)
         if remaining <= 0:
             raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before capture")
         # A capture (not a cache hit) is work on this base; a second capture of it repeats it.
-        checkout = _checkout(ctx.git, worktree)
         try:
-            if checkout is not None:
-                ctx.store.update_run(n, phase_work_id=f"baseline:{checkout.head_sha()}")
-        except GitError:
+            ctx.store.update_run(n, phase_work_id=f"baseline:{resume.checkout(ctx.git, worktree).head_sha()}")
+        except (GitError, AttributeError):  # A Git adapter without checkouts has no identity to link.
             pass  # Without the base identity the capture is still measured, only not linked.
         result = runner._check(command, worktree, ctx.store.log_path(n),
-                               _baseline_capture_limit(ctx, ctx.store.log_path(n), runner._remaining(n, ctx)),
+                               _baseline_capture_limit(ctx, ctx.store.log_path(n), remaining),
                                progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
-                               full_text_dir=cuts.issue_dir(ctx.store.root, n),
-                               history_gaps=history_gaps(ctx), safety_net=safety_net(ctx))
+                               full_text_dir=cuts.issue_dir(ctx.store.root, n), **watchdog.silence_args(ctx))
         _progress(n, ctx)
         return result
 
@@ -313,8 +297,7 @@ def _capture_baseline(
 
     def save_baseline(node_ids: tuple[str, ...], collected_ids: tuple[str, ...],
                       failing_ids: tuple[str, ...], duration_seconds: float | None = None,
-                      exit_code: int | None = None, timed_out: bool = False,
-                      result_gaps: tuple[float, ...] = ()) -> None:
+                      exit_code: int | None = None, timed_out: bool = False, result_gaps: tuple = ()) -> None:
         saved = {
             "node_ids": node_ids, "collected_ids": collected_ids, "failing_ids": failing_ids,
             "excluded": excluded, "scope": build.scope, "created_at": ctx.now().isoformat(),
@@ -322,10 +305,8 @@ def _capture_baseline(
             **({"repo": ctx.config.repo} if ctx.config.repo else {}),
             "repository": str(ctx.repo_root.resolve()), "base_sha": base_sha, "exit_code": exit_code,
             "timed_out": timed_out, **({} if duration_seconds is None else {"duration_seconds": duration_seconds}),
+            **({"result_gaps_seconds": list(result_gaps)} if result_gaps else {}),  # The watchdog's history (#435).
         }
-        if result_gaps:
-            # The silence window of later checks comes from these measured gaps (#435).
-            saved["result_gaps_seconds"] = list(result_gaps)
         if timed_out:
             record_timeout(cache, cached_ids, saved)  # Partial ids; never reused (load_reusable).
         else:
@@ -376,20 +357,16 @@ def _capture_baseline(
                         return replace(_saved_baseline(command, saved), excluded=tuple(excluded), base_sha=base_sha)
                 selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)}"
                 selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
-                # A capture stopped by silence kept the passes it reported; resume after them (#435).
-                retained = resume.retained_passes(cache, key)
-                selection += "".join(f" {shlex.quote('--deselect=' + node)}"
-                                     for node in sorted(resume.deselectable(cache, key, retained)))
+                retained, selection = resume.resume_selection(cache, key, selection)  # Passes a stopped capture kept.
                 baseline_command = (
                     f"{selection} "
                     f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(capture_report))}"
                 )
-                baseline_command, passes = resume.with_results_plugin(baseline_command, Path(directory))
                 offset = log.stat().st_size if log.exists() else 0
                 started = monotonic()
                 result = check(baseline_command, worktree)
                 duration_seconds = monotonic() - started
-                _validate_baseline_checkout(_checkout(ctx.git, worktree), base_sha)
+                _validate_baseline_checkout(resume.checkout(ctx.git, worktree), base_sha)
                 # Read this execution's collection count from the full log: a long
                 # traceback can push it out of CheckResult's bounded output tail.
                 collected = None
@@ -399,8 +376,8 @@ def _capture_baseline(
                         stream.seek(offset)
                         for line in stream:
                             if count := re.match(r"collected (\d+) items?\b", line):
-                                deselected = re.search(r"(\d+) deselected", line)
-                                collected = int(count[1]) - (int(deselected[1]) if deselected else 0)
+                                # More deselected than kept (a prefix match dropped an unrun id): incomplete.
+                                collected = int(count[1]) - d if (d := int((re.search(r"(\d+) deselected", line) or [0, 0])[1])) == resume.deselect_count(baseline_command) else -1
                                 break
                 except OSError:
                     pass
@@ -446,26 +423,88 @@ def _capture_baseline(
                         shutil.copyfile(capture_report, report)
                     else:
                         report.unlink(missing_ok=True)
-                if result.timed_out and not cacheable:
-                    resume.stopped_capture(cache, key, retained, capture_report, log, offset, passes, worktree)
-                if cacheable and retained:
-                    node_ids = tuple(sorted(set(node_ids) | retained))
-                    collected_ids = tuple(sorted(set(collected_ids) | retained))
                 if cacheable:
+                    node_ids, collected_ids = (tuple(sorted({*ids, *retained})) for ids in (node_ids, collected_ids))
                     save_baseline(node_ids, collected_ids, failing_ids, duration_seconds, result.exit_code,
                                   result_gaps=result.result_gaps)
-                    resume.retained_path(cache, key).unlink(missing_ok=True)
                 elif result.timed_out and record_timeouts:
                     save_baseline(node_ids, collected_ids, (), duration_seconds, result.exit_code, timed_out=True)
+                resume.after_capture(cache, key, retained, result, cacheable, capture_report, log, offset)
                 _append(log, f"Acceptance baseline count={len(node_ids)}, exit_code={result.exit_code}, timed_out={result.timed_out}")
                 if not cacheable:
-                    raise (SilentCapture if result.timed_out else AttemptFailure)(
+                    raise resume.capture_failure(result,
                         f"acceptance baseline unavailable: exit_code={result.exit_code}, timed_out={result.timed_out}; "
                         "capture did not produce a complete, usable JUnit report"
                     )
                 return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded), base_sha)
             finally:
                 ctx.git.remove_worktree(worktree)
+
+
+# Written into a throwaway checkout of the new base. It prints nothing, so the
+# configured command's terminal flags (-q, verbosity_test_cases, -p no:terminal)
+# cannot change the listing; the listing path is part of the source, not the environment.
+COLLECT_PLUGIN = """\
+import json
+
+_ids, _errors = [], 0
+
+
+def pytest_collectreport(report):
+    global _errors
+    if report.failed:  # A collection error; an importorskip skip is not one.
+        _errors += 1
+
+
+def pytest_collection_finish(session):
+    _ids[:] = [item.nodeid for item in session.items]
+
+
+def pytest_sessionfinish(session, exitstatus):
+    with open({listing!r}, "w", encoding="utf-8") as stream:
+        json.dump({{"ids": _ids, "errors": _errors, "rootdir": str(session.config.rootpath)}}, stream)
+"""
+def _with_python_path(command: str, directory: str) -> str:
+    """Give only this subprocess ``directory`` on PYTHONPATH, joined with the command's own.
+
+    Inline assignments win over outer ones, so the directory joins every
+    PYTHONPATH assignment before the command and right after an ``env``
+    launcher; without one it is added in front. Assignments keep NAME=
+    unquoted (a quoted 'NAME=v' is run as a command, exit 127).
+    """
+    words = shlex.split(command)
+
+    def assignment(word: str) -> bool:
+        return re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", word, re.S) is not None
+
+    # Positions of the leading assignments and of those right after each `env`.
+    positions: list[int] = []
+    index = 0
+    while True:
+        while index < len(words) and assignment(words[index]):
+            positions.append(index)
+            index += 1
+        if index < len(words) and Path(words[index]).name == "env":
+            index += 1
+            continue
+        break
+    joined = False
+    for position in positions:
+        name, value = words[position].split("=", 1)
+        if name == "PYTHONPATH":
+            words[position] = "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, value]))
+            joined = True
+    if not joined:
+        words.insert(0, "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, os.environ.get("PYTHONPATH")])))
+        positions = [0, *(position + 1 for position in positions)]
+    rendered = []
+    for position, word in enumerate(words):
+        if position in positions:
+            name, value = word.split("=", 1)
+            rendered.append(f"{name}={shlex.quote(value)}")
+        else:
+            rendered.append(shlex.quote(word))
+    return " ".join(rendered)
 
 
 def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
@@ -503,7 +542,7 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
         try:
             if not (worktree / acceptance_dir).is_dir():
                 return owned, selectable
-            remaining = runner._budget_left(n, ctx)
+            remaining = runner._remaining(n, ctx)
             if remaining <= 0:
                 raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before collection")
             plugins = Path(directory) / "plugins"
@@ -513,19 +552,18 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
             selection = f"{previous.command} {shlex.quote(acceptance_dir)}"
             selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
             command = _with_python_path(f"{selection} --collect-only -p {plugin}", str(plugins))
-            result = runner._check(command, worktree, log, _baseline_capture_limit(ctx, log, runner._remaining(n, ctx)),
-                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
-                                   history_gaps=history_gaps(ctx), safety_net=safety_net(ctx))
+            result = runner._check(command, worktree, log, _baseline_capture_limit(ctx, log, remaining),
+                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
             _progress(n, ctx)
             # Like a capture: a collection that changed tracked files proves nothing.
-            _validate_baseline_checkout(_checkout(ctx.git, worktree), sha)
+            _validate_baseline_checkout(resume.checkout(ctx.git, worktree), sha)
             try:
                 found = json.loads(listing.read_text(encoding="utf-8"))
                 ids, errors, rootdir = list(found["ids"]), int(found["errors"]), Path(found["rootdir"])
             except (OSError, ValueError, KeyError, TypeError):
                 ids, errors, rootdir = None, None, None
             if result.timed_out or result.exit_code not in (0, 5) or ids is None or errors:
-                raise (SilentCapture if result.timed_out else AttemptFailure)(
+                raise AttemptFailure(
                     f"acceptance baseline unavailable: collecting {acceptance_dir} on {sha} failed "
                     f"(exit_code={result.exit_code}, timed_out={result.timed_out}, "
                     f"collection_errors={'unknown' if errors is None else errors})")

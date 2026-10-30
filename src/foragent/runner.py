@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass, replace
+from functools import partial
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
 from hashlib import sha256
@@ -36,7 +37,7 @@ from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, atte
 from foragent.order import detect_test_commands
 from foragent.orch_reinstall import after_merge
 from foragent.policy import merge_decision, review_mode_for, touched
-from foragent.processes import observe_tree, run_logged, track_process_group
+from foragent.processes import extend_deadline, observe_tree, run_logged, track_process_group
 from foragent.reasons import Reason
 from foragent.skills import SkillManager, copy_lane_skills
 from foragent.state import Approval, StateStore
@@ -53,9 +54,9 @@ from foragent.run_prompts import (
     build_resume_prompt,
 )
 from foragent.run_waits import (
+    paused_seconds,
     poll_executor,
     _remaining,
-    _budget_left,
     _timeout,
     _test_slot,
     _progress,
@@ -147,8 +148,6 @@ class RunContext:
     poll_hook: Callable[[Callable[[], ExecResult], Callable[[], None]], ExecResult] = poll_executor
     monotonic: Callable[[], float] = time.monotonic
     lane_executor: str | None = None  # The lane's configured executor, before the run's pair (#186).
-    # A probe's own hard deadline (fa doctor); runs have none but the safety net (#435).
-    deadline_seconds: int | None = None
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self)
@@ -215,7 +214,7 @@ def _implement_and_publish(
             attempt.reviewer_text = None
             run = ctx.store.get_run(n)
             if not attempt.failure and ctx.config.reviewer != "none":
-                if _budget_left(n, ctx) <= 0:
+                if _remaining(n, ctx) <= 0:
                     outcome = _timeout(n, ctx)
                     return outcome
                 _review_implementation(attempt)
@@ -303,16 +302,17 @@ def review_only(
         ctx.tracker.add_labels(n, [RUNNING])
         ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
         ctx.git.remove_worktree(worktree)
-        try:
-            outcome = _review_only(n, ctx, worktree, verdict_head)
-        except AttemptFailure as exc:
-            if not repair_ci:
-                # Let the caller schedule repair without changing the verdict's head.
-                raise ExecutorStopped("ci-failed", str(exc)) from exc
-            git = ctx.git.at(worktree)
-            git.attach_branch(f"foragent/issue-{n}")
-            _inject_lane_skills(ctx, n, git, f"origin/{exc.target_branch}")
-            outcome = _implement_and_publish(n, ctx, git, target_branch=exc.target_branch, failure=exc)
+        with extend_deadline(partial(paused_seconds, n, ctx)):  # Talk pauses (D55 addendum).
+            try:
+                outcome = _review_only(n, ctx, worktree, verdict_head)
+            except AttemptFailure as exc:
+                if not repair_ci:
+                    # Let the caller schedule repair without changing the verdict's head.
+                    raise ExecutorStopped("ci-failed", str(exc)) from exc
+                git = ctx.git.at(worktree)
+                git.attach_branch(f"foragent/issue-{n}")
+                _inject_lane_skills(ctx, n, git, f"origin/{exc.target_branch}")
+                outcome = _implement_and_publish(n, ctx, git, target_branch=exc.target_branch, failure=exc)
     except ExecutorStopped as exc:
         outcome = exc.outcome
         detail = str(exc)
@@ -379,7 +379,9 @@ def run_issue(n: int, ctx: RunContext) -> str:
         ctx = replace(ctx, config=stored_config(ctx.store, lane_settings, run, ctx.now()),
                       lane_executor=lane_settings.executor)
         try:
-            outcome = _execute(n, ctx, worktree)
+            # Every command's timeout grows by time a talk paused the run (D55 addendum).
+            with extend_deadline(partial(paused_seconds, n, ctx)):
+                outcome = _execute(n, ctx, worktree)
         finally:
             ctx.git.remove_worktree(worktree)
     except ExecutorStopped as exc:

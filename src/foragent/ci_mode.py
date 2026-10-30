@@ -10,7 +10,6 @@ from foragent.git import GitError
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
 from foragent.run_baseline import _baseline_exclusions
-from foragent.run_waits import after_check
 from foragent.tracker import TrackerError
 
 
@@ -294,7 +293,6 @@ def review_checks(n, ctx, git, target_branch):
             checks.append(run_related_check(n, ctx, git.root, baseline.command, own, len(changed),
                                             max(1, runner._remaining(n, ctx))))
     for result in checks:
-        after_check(n, ctx, [result])  # A check stopped at the safety net restarts the run (#435).
         if result.exit_code != 0 or result.timed_out:
             raise AttemptFailure(f"{result.command}\n{result.output}", target_branch)
     return attempt

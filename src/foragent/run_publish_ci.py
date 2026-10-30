@@ -77,7 +77,7 @@ def _wait_for_ci(
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     wait.infrastructure = ""
     while True:
-        if runner._remaining(n, ctx) <= 0:  # Waiting keeps its earlier bound (#435 out of scope).
+        if runner._remaining(n, ctx) <= 0:
             return run_publish._timeout(n, ctx)
         if status is None:
             status = run_publish._ci_status(ctx, pr, git.root, ready_at)

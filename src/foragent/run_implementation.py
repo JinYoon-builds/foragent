@@ -13,7 +13,7 @@ from foragent.executors import ExecResult, classify_result
 from foragent.issue import parse_body
 from foragent.labels import attempt_tier, issue_size
 from foragent.reasons import Reason
-from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation, SilentCapture, WholeFailure
+from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation, WholeFailure
 from foragent.run_baseline import _capture_acceptance_baseline
 from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
@@ -26,7 +26,7 @@ from foragent.run_parent import parent_context
 from foragent.run_prompts import bug_fix_steps, build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
 from foragent.run_overlap import wait_for_overlap
-from foragent.run_waits import _phase, _timeout, past_runtime_limit, watchdog_restart
+from foragent.run_waits import _elapsed, _phase, _timeout, end_by_watchdog
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -147,8 +147,10 @@ def capture_acceptance_baseline(
 
 def _baseline_unavailable(n: int, ctx: RunContext, detail: str, cause: Exception | None = None) -> None:
     """The #327 stop: no merge without a usable protected set."""
-    if isinstance(cause, SilentCapture):  # Stopped by the watchdog: resume the kept passes (#435).
-        watchdog_restart(n, ctx, detail)
+    if (kind := getattr(cause, "watchdog_kind", None)) is not None:  # Stopped by the watchdog (#435).
+        from foragent import watchdog
+        past = _elapsed(n, ctx) > watchdog.runtime_limit_seconds(ctx.config)
+        end_by_watchdog(n, ctx, watchdog.stopped_check_kind(kind, past), [], detail)
     _append(ctx.store.log_path(n), detail)
     reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
     flag(ctx, n, reason, "acceptance baseline unavailable", detail)
@@ -287,12 +289,8 @@ def _implement(
     wait_for_overlap(attempt)
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")
-    remaining = runner._budget_left(n, ctx)
-    # The step just finished was stopped (a check the watchdog found silent, or a review
-    # session that timed out): past max_runtime_minutes, the run ends here (#435).
-    stopped = (any(check.timed_out for check in attempt.checks)
-               or bool(getattr(attempt, "reviews", None)) and attempt.reviews[-1].timed_out)
-    if remaining <= 0 or (stopped and past_runtime_limit(n, ctx)):
+    remaining = runner._remaining(n, ctx)
+    if remaining <= 0:
         raise ExecutorStopped(_timeout(n, ctx))
     run = ctx.store.get_run(n)
     tier = attempt_tier(attempt.size, run.attempts)
@@ -365,14 +363,14 @@ def _implement(
     # availability waits, launch failures and interruptions; acknowledge it
     # only once the implementer returns an ordinary execution result.
     if (retry_default or hint is not None) and classify_result(result) == "normal":
-        consume_hint(ctx.store.root, n)
+        consume_hint(ctx.store.root, n, hint)
     if moved_files and classify_result(result) == "normal":
         ctx.store.update_run(n, moved_files=[])  # named once, after delivery
     _record_skills_used(n, ctx, result)
     rebuttal = _read_rebuttals(worktree)
     if rebuttal.strip() and rebuttal not in attempt.rebuttals:
         attempt.rebuttals.append(rebuttal)
-    if result.timed_out or runner._budget_left(n, ctx) <= 0:
+    if result.timed_out or runner._remaining(n, ctx) <= 0:
         raise ExecutorStopped(_timeout(n, ctx))
     question = worktree / ".foragent/QUESTION.md"
     if question.exists():

@@ -27,7 +27,7 @@ from foragent.reasons import Reason
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout, after_check, in_phase, watchdog_restart
+from foragent.run_waits import _phase, _progress, _test_slot, _timeout, after_check, in_phase
 from foragent.state import Approval
 
 if TYPE_CHECKING:
@@ -43,8 +43,8 @@ class CheckResult:
     output: str
     # Elapsed command time (excluding any test-slot queue) when a clock was supplied.
     seconds: float | None = None
-    result_gaps: tuple[float, ...] = ()
-    stop: str | None = None  # Why the watchdog stopped it ("silent", "safety-net"), when it did (#435).
+    result_gaps: tuple[float, ...] = ()  # The watchdog's measured gaps between results (#435).
+    stop: str | None = None  # The watchdog's kind when it stopped the check.
 
 
 def _append(log: Path, text: str) -> None:
@@ -58,8 +58,7 @@ def _check(
     *, progress: Callable[[], None] | None = None,
     slot: AbstractContextManager | None = None,
     clock: Callable[[], float] | None = None,
-    full_text_dir: Path | None = None,
-    history_gaps: tuple[float, ...] = (), safety_net: float = watchdog.SAFETY_NET_SECONDS,
+    full_text_dir: Path | None = None, history_gaps: tuple[float, ...] = (), safety_net: float | None = None,
 ) -> CheckResult:
     """Run one check; a cut output tail links its full copy under ``full_text_dir`` (the issue's folder).
     The shared watchdog ends it on silence or the safety net, never at ``timeout_s`` (#435)."""
@@ -73,7 +72,7 @@ def _check(
     environment = {"PYTHONDONTWRITEBYTECODE": "1"}
 
     elapsed: list[float] = []
-    watch = watchdog.SilenceWatchdog(history_gaps=history_gaps, safety_net=safety_net)
+    watch = watchdog.SilenceWatchdog(history_gaps, **({} if safety_net is None else {"safety_net": safety_net}))
 
     def timed(env):
         started = clock() if clock is not None else None
@@ -96,8 +95,8 @@ def _check(
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
     tail = cuts.read_tail(log, offset, 4000, "check", full_text_dir)
     _append(log, f"\nCheck exit_code={code}, timed_out={timed_out}\nOutput tail:\n{tail}")
-    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None, watch.result_gaps,
-                       watch.last.decision if timed_out and watch.last is not None and watch.last.stop else None)
+    stop = watch.last.kind if timed_out and watch.last is not None and watch.last.stop else None
+    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None, watch.result_gaps, stop)
 
 
 def _pytest_command(command: str) -> str | None:
@@ -348,7 +347,7 @@ def _related_unit_tests(
     return tuple(sorted(selected))
 
 
-def check_done(snapshot: Path, worktree: Path, acceptance_dir: str, *, history_root: Path | None = None, safety_net_seconds: int | None = None) -> int:
+def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
     """Stop hook: re-use independent checks, allowing at most eight blocked stops."""
     from foragent import runner
 
@@ -379,7 +378,7 @@ def check_done(snapshot: Path, worktree: Path, acceptance_dir: str, *, history_r
             raise ValueError("Done when has no machine check")
         # Every failing command is reported, each with its own limited tail and cut notice.
         for command in parsed.done_when_commands:
-            result = runner._check(command, worktree, directory / "check-done.log", 900, **watchdog.hook_args(snapshot, history_root, safety_net_seconds))
+            result = runner._check(command, worktree, directory / "check-done.log", 900)
             if result.exit_code != 0 or result.timed_out:
                 failures.append(result)
         if failures:
@@ -517,16 +516,10 @@ def _verify_contents(attempt: Implementation) -> str:
             if local_units is not None:
                 attempt.checks.append(local_units)
         if unit_tests and unit_command:
-            limit = max(900, runner._remaining(n, ctx))  # Logged only: the watchdog ends the check (#435).
+            limit = max(900, runner._remaining(n, ctx))
             result = run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths), limit)
             attempt.checks.append(result)
-            if result.timed_out:
-                # Keep every failure gathered so far, not only the timeout, for the next attempt.
-                # Done when and the baseline ran; the unit run did not finish: a partial update.
-                save_failures(ctx.store.root, n, attempt.checks, complete=False)
-                bundle = WholeFailure(cuts.failures_path(ctx.store.root, n).read_text(encoding="utf-8"))
-                ctx.store.update_run(n, resume_reason=bundle, resume_whole=True)
-                watchdog_restart(n, ctx, f"Related unit tests were stopped by the watchdog ({len(unit_tests)} selected tests).")
+            after_check(n, ctx, attempt.checks)  # A stopped related check ends the run through its outcome (#435).
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
         git.stage_changes()
@@ -576,18 +569,16 @@ def _check_review_head(
     # Done when on the PR head is checking time, as in an implementation's verification.
     with in_phase(n, ctx, "checking"):
         for command in parsed.done_when_commands:
-            if runner._budget_left(n, ctx) <= 0:
+            if runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
             check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)),
                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
-                                  full_text_dir=cuts.issue_dir(ctx.store.root, n), **watchdog.silence_args(ctx))
+                                  full_text_dir=cuts.issue_dir(ctx.store.root, n))
             checks.append(check)
             _progress(n, ctx)
-            if check.timed_out or runner._budget_left(n, ctx) <= 0:
+            if check.timed_out or runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
-                if check.timed_out:  # Stopped by the watchdog: restart, as the gate's silence stop does.
-                    watchdog_restart(n, ctx, f"Done when on the PR head was stopped by the watchdog: {command}")
                 return _timeout(n, ctx)
     # PR-head checks rerun only Done when: other saved failures (baseline, units) are not re-verified here.
     if bundle := save_failures(ctx.store.root, n, checks, complete=False):

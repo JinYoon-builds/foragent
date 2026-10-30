@@ -76,6 +76,9 @@ class Config:
     run_hours: str = "always"
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
+    # `fa orch refresh-due`: either threshold (inclusive) makes a fresh orchestrator session due.
+    orch_refresh_compactions: int = 4
+    orch_refresh_hours: int = 24
     tick_failure_alert: int = 3
     # A limit only on a run that is also silent past it (#435); progressing work runs on.
     max_runtime_minutes: int = 90
@@ -443,11 +446,7 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
 
 
 def safety_net_seconds(config: Config) -> int:
-    """The only fixed bound on work (#435); silence ends it long before.
-
-    ``max_runtime_minutes`` is not a bound here: the gate applies it only to a run
-    that is also silent, so progressing work is never cut at that time.
-    """
+    """The watchdog's one fixed bound (#435): it ends work even while it still progresses."""
     return config.safety_net_hours * 3600
 
 

@@ -134,3 +134,5 @@
 - [#190 꿈꾸는 레인 줄](project_dream_row.md) — status lanes의 dreaming; watch_sections 도우미 모듈은 GAP=False(24줄 한도); fa test는 기준본 검사 불가
 - [#173 설정 창](project_settings_window.md) — 창 패키지·범위별 get·glyph 규칙; fa test는 ~/.cache/uv를 씀(UV_CACHE_DIR 필수)
 - [#308 runner_unit_tests 설정](project_settings_runner.md) — 새 팀 설정 추가 경로, auto 표시, max_parallel null 허용
+- #942 `watch_open._running`은 `psutil.Process(pid).create_time()`이 watch.pid mtime+2초보다 늦으면 재사용으로 본다(읽기 실패=살아 있음). `_opening`이 잠금 안에서 다시 확인해 Process가 두 번 불린다. 부수기 확인용 백업은 존재하는 폴더에 둔다.
+- #951 watch-terminal.json 기록은 `watch_open.record_terminal(store, cwd, exe, handle, now)` 하나로 한다(FORAGENT_ROLE은 빈 값도 존재로 판정·워크트리 안은 건너뜀). 훅은 `presence.record_terminal`, 시각은 호출자가 넘긴다(시험이 presence·statusline의 datetime만 바꿈).

@@ -185,3 +185,28 @@ def append(output: bytes, segment: str | None) -> bytes:
     body = output.rstrip(b"\r\n")
     separator = b"  " if body else b""
     return body + separator + segment.encode("utf-8") + output[len(body):]
+
+
+def record_terminal(cwd: Path, now: datetime) -> None:
+    """Best effort: record the planning session's live Orca terminal for the gate's readers.
+
+    Runs whatever presence.session_start says. Skips silently without a handle, without
+    orca on PATH, outside a project, without a nameable or existing state directory,
+    and on any failure: the session that is starting must not notice.
+    """
+    import os
+    import shutil
+
+    from foragent import watch_open
+
+    try:
+        handle = os.environ.get("ORCA_TERMINAL_HANDLE")
+        executable = shutil.which("orca") if handle else None
+        if not executable:
+            return
+        project = _project(cwd)
+        if project is None or project[1] is None or not project[1].root.is_dir():
+            return
+        watch_open.record_terminal(project[1], cwd, str(Path(executable).absolute()), handle, now)
+    except Exception:
+        return

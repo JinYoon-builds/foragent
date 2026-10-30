@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shlex
@@ -23,13 +24,11 @@ from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
-from foragent.config import safety_net_seconds
 from foragent.processes import claude_session, run_logged
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_checks import CheckResult, trusts_ci
-from foragent.watchdog import SilenceWatchdog, history_gaps
 from foragent.run_previous import retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
@@ -67,9 +66,12 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
     unknown_path = ctx.store.root / "orch-watch-unknown.json"
     last_error = None
     session = claude_session()  # The gate's spawn check trusts it past a stale heartbeat.
+    # #413: the id its spawn gave this session; writes from a retired session are ignored.
+    session_id = os.environ.get("FORAGENT_SESSION_ID")
     while True:
         try:  # Every read, changed or not, shows the orchestrator is alive.
-            ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session)
+            ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session,
+                                      session_id=session_id)
         except Exception:
             pass  # a heartbeat is best effort; the read below reports state errors
         try:
@@ -295,16 +297,12 @@ def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
-    watch = SilenceWatchdog(history_gaps=history_gaps(ctx), safety_net=safety_net_seconds(ctx.config))
     with slot:
-        # Like every check: it ends on silence or the safety net, never at a fixed time (#435).
         code, timed_out, output = run_logged(
             ["/bin/sh", "-c", command], cwd=worktree,
-            timeout_s=safety_net_seconds(ctx.config), log_path=log_path, env=capacity.HELD_ENV, watchdog=watch,
+            timeout_s=ctx.config.max_runtime_minutes * 60, log_path=log_path, env=capacity.HELD_ENV,
         )
-    # The measured gaps reach the capture history a premerge baseline saves (#435).
-    stop = watch.last.decision if timed_out and watch.last is not None and watch.last.stop else None
-    return CheckResult(command, code, timed_out, output, result_gaps=watch.result_gaps, stop=stop)
+    return CheckResult(command, code, timed_out, output)
 
 
 def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Path,

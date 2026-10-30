@@ -44,6 +44,62 @@ _process_tree_callback: ContextVar[Callable[[list[dict]], None] | None] = Contex
     "process_tree_callback", default=None,
 )
 
+# Cumulative paused seconds of the current run (an open talk terminal, D55 addendum).
+# The runner sets it for a whole run, so every command's timeout (executor
+# sessions, Done when and unit checks, baseline capture, local CI) grows by the
+# time paused while that command ran. Without it a timeout stays fixed.
+_paused_seconds: ContextVar[Callable[[], float] | None] = ContextVar("paused_seconds", default=None)
+# A ContextVar does not reach threads started without a copied context (thread pools,
+# plain threads), so the run's pause is also kept process-wide: a runner process
+# runs one issue, and its worker threads' commands pause with it.
+_process_paused: Callable[[], float] | None = None
+
+
+@contextmanager
+def extend_deadline(paused: Callable[[], float]) -> Iterator[None]:
+    """Within this context, ``run_logged`` adds the growth of ``paused()`` to each timeout, in every thread."""
+    global _process_paused
+    token = _paused_seconds.set(paused)
+    previous, _process_paused = _process_paused, paused
+    try:
+        yield
+    finally:
+        _process_paused = previous
+        _paused_seconds.reset(token)
+
+
+def current_pause() -> Callable[[], float] | None:
+    """The pause clock of the run this thread works for, if any."""
+    return _paused_seconds.get() or _process_paused
+
+
+def _paused_now(paused: Callable[[], float]) -> float | None:
+    try:
+        return float(paused())
+    except Exception:  # noqa: BLE001 - an unreadable record keeps the original limit
+        return None
+
+
+def _wait_with_deadline(process, timeout_s: float) -> None:
+    """Wait like ``process.wait(timeout_s)``, extended by time paused since the wait began."""
+    paused = current_pause()
+    base = _paused_now(paused) if paused is not None else None
+    granted = 0.0
+    timeout = timeout_s
+    while True:
+        try:
+            process.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            current = _paused_now(paused) if base is not None else None
+            if current is None:
+                raise
+            extra = current - base - granted
+            if extra <= 0:
+                raise
+            granted += extra
+            timeout = extra
+
 
 @contextmanager
 def track_process_group(
@@ -574,10 +630,10 @@ def targeted_table(pids) -> ProcessTable:
 def _observe_quiescent(identities, rows) -> list[dict]:
     """A stop of a silent tree: the tick snapshot's tree, each parent rechecked by a targeted read.
 
-    No further whole-table listing: the tree proved silent for the whole window, so the
-    snapshot taken at this tick is its current shape. A protected process (init, our own
-    lineage, group or session) is never a root, and a parent must be the same lifetime
-    before and after its children are taken, so a reused PID adopts nothing (#435).
+    No further listing: the tree was silent for the whole window, so this tick's snapshot
+    is its shape. Children forked after it are left to the next tick's reaper (#435). A
+    protected process is never a root, and a parent must be the same lifetime before and
+    after its children are taken, so a reused PID adopts nothing.
     """
     known = {item["pid"]: item["start_time"] for item in identities}
     lineage, group, session = _protected(rows)
@@ -627,9 +683,7 @@ def kill_process_group(pid: int) -> int:
     recorded = _recorded_tree.get()
     if not recorded:
         raise ValueError(f"No recorded process identity for {pid}")
-    # A tree the watchdog proved silent forked nothing since the tick's snapshot:
-    # that snapshot supplies it, and each target gets a targeted recheck (#435).
-    # Any other stop lists afresh, so a child forked after the snapshot ends too.
+    # A silent tree's stop reads the tick snapshot and rechecks each target by a targeted read (#435).
     snapshot = current_snapshot() if _quiescent.get() else None
     tick_rows = snapshot.rows if snapshot is not None and snapshot.available else None
     identities = observe_tree(recorded)
@@ -637,19 +691,13 @@ def kill_process_group(pid: int) -> int:
         return 0
     signaled = set()
 
-    def listing():
+    def current():
         if tick_rows is None:
             rows = {row.pid: row for row in list_processes()}
-            return rows, _protected(rows)
-        rows = {}
-        for item in identities:
-            row = read_process_identity(item["pid"])
-            if row is not None:
-                rows[item["pid"]] = row
-        return rows, _protected(tick_rows)
-
-    def current():
-        rows, (lineage, group, session) = listing()
+            lineage, group, session = _protected(rows)
+        else:
+            rows = {row.pid: row for row in targeted_table(item["pid"] for item in identities)}
+            lineage, group, session = _protected(tick_rows)
         return {item["pid"]: rows[item["pid"]] for item in identities
                 if item["pid"] in rows and rows[item["pid"]].start_time == item["start_time"]
                 and item["pid"] > 1 and item["pid"] not in lineage
@@ -729,28 +777,22 @@ def _child_environment(cwd: Path) -> dict[str, str]:
 WATCH_POLL_SECONDS = 5
 
 
-def _past_budget():
-    """A session past its budget: the gate owns its silence and safety net; it ends once quiet."""
-    from foragent.watchdog import SilenceWatchdog
-
-    return SilenceWatchdog(safety_net=math.inf, window_seconds=math.inf, runtime_limit=0)
-
-
 def _watch(process, watchdog, output, log, forward, identities, channels=()) -> bool:
     """Wait for ``process`` under the silence watchdog; True when it decided to stop.
 
     Output is every channel the process writes: its private stdout file and ``channels``
-    (a separate stderr file, or the log that receives its stderr directly).
+    (a separate stderr file, or the log receiving its stderr directly). The decision's facts
+    are logged as one JSON line.
     """
     def observe():
         forward()
         try:
             snapshot = list_processes()
         except OSError:
-            snapshot = None  # CPU unknown this poll: the watchdog never reads that as silence.
+            snapshot = None  # CPU unknown this poll: never silence.
         written = sum(os.fstat(stream.fileno()).st_size for stream in (output, *channels))
-        return watchdog.observe(now=time.monotonic(), output_bytes=written,
-                                progress_events=0, snapshot=snapshot, identities=identities())
+        return watchdog.observe(now=time.monotonic(), output_bytes=written, progress_events=0,
+                                snapshot=snapshot, identities=identities())
 
     observe()
     while True:
@@ -773,15 +815,12 @@ def run_logged(
     prompt: str | None = None, capture_stdout: bool = False,
     stdout_path: Path | None = None, terminate_children: bool = False,
     stderr_path: Path | None = None, env: dict[str, str] | None = None, watchdog=None,
-    quiet_timeout: bool = False,
 ) -> tuple[int | None, bool, str]:
     """Append output without buffering an unbounded session in memory; env adds variables.
 
-    With a ``watchdog`` (foragent.watchdog.SilenceWatchdog), ``timeout_s`` is not a limit:
-    the command ends only when the watchdog reports silence or its safety net. Its own
-    output then goes through a private file, so other writers of the log are not output.
-    With ``quiet_timeout`` (executor sessions), reaching ``timeout_s`` does not stop a session
-    whose output or CPU still grows: from then on it ends once it is also quiet (#435).
+    With a ``watchdog`` (foragent.watchdog.SilenceWatchdog) ``timeout_s`` is not a limit: the
+    command ends only on silence or the safety net (#435). Its output then goes through a
+    private file, so other writers of the log are not counted as its output.
     """
     on_process_group = _process_group_callback.get()
     on_process_tree = _process_tree_callback.get()
@@ -897,32 +936,27 @@ def run_logged(
         follower = threading.Thread(target=follow_stdout, daemon=True) if capture_stdout else None
         if follower is not None:
             follower.start()
-        # Where the process's stderr lands when it is not in the private stdout file.
-        stderr_channels = (errors,) if errors is not None else (log,) if capture_stdout else ()
         try:
             if on_process_group is not None:
                 on_process_group(process.pid)  # start_new_session makes PID == PGID.
             if on_process_tree is not None:
                 on_process_tree(identities)
+            # Where the process's stderr lands when it is not in the private stdout file.
+            channels = (errors,) if errors is not None else (log,) if capture_stdout else ()
             if watchdog is not None:
                 # With a follower thread (captured stdout) it alone forwards; two writers would duplicate.
-                timed_out = _watch(process, watchdog, output, log,
-                                   forward_stdout if follower is None else (lambda: None), lambda: identities,
-                                   channels=stderr_channels)
+                timed_out = _watch(process, watchdog, output, log, forward_stdout if follower is None else (lambda: None),
+                                   lambda: identities, channels)
                 if timed_out:
                     stop_children()
                     process.wait()
             else:
                 try:
-                    process.wait(timeout=timeout_s)
+                    _wait_with_deadline(process, timeout_s)
                 except subprocess.TimeoutExpired:
-                    timed_out = not quiet_timeout or _watch(
-                        process, _past_budget(), output, log,
-                        forward_stdout if follower is None else (lambda: None), lambda: identities,
-                        channels=stderr_channels)
-                    if timed_out:
-                        stop_children()
-                        process.wait()
+                    timed_out = True
+                    stop_children()
+                    process.wait()
             if observation_errors:
                 raise observation_errors[0]
         finally:

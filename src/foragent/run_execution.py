@@ -14,16 +14,18 @@ from typing import TYPE_CHECKING
 
 from foragent import board, cuts, quota_reviewer, usage_events, usage_recheck
 from foragent.actions import flag
-from foragent.config import resolved_reviewer, safety_net_seconds
+from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
 from foragent.labels import READY, RUNNING
 from foragent.processes import track_process_group
 from foragent.reasons import Reason
 from foragent.quota_view import QuotaView
 from foragent.run_attempt import ExecutorStopped, ReviewerLimited
-from foragent.run_waits import _executor_wait, _progress, past_runtime_limit
+from foragent.run_waits import _executor_wait, _progress
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from foragent.runner import RunContext
 
 
@@ -40,8 +42,6 @@ def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
     command = shlex.join([
         sys.executable, "-m", "foragent.cli", "gate", "check-done", "--snapshot", str(snapshot),
         "--worktree", str(worktree.resolve()), "--acceptance-dir", ctx.config.acceptance_dir,
-        # The hook's checks use the run's silence history and safety net, as the runner's do (#435).
-        "--history-root", str(ctx.repo_root.resolve()), "--safety-net-seconds", str(safety_net_seconds(ctx.config)),
     ])
     settings = {
         "permissions": {"deny": [
@@ -50,7 +50,7 @@ def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
             "Bash(git merge:*)",
         ]},
         "hooks": {"Stop": [{"hooks": [{"type": "command", "command": command,
-                                      "timeout": max(900, safety_net_seconds(ctx.config))}]}]},
+                                      "timeout": max(900, ctx.config.max_runtime_minutes * 60)}]}]},
     }
     path = directory / "claude-settings.json"
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -58,17 +58,25 @@ def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
 
 
 def _run_executor(n: int, ctx: RunContext, executor: Executor, *, spender: str | None = None,
-                  **kwargs) -> ExecResult:
+                  on_session: Callable[[str], None] | None = None, **kwargs) -> ExecResult:
+    """Run one executor call; ``on_session`` receives its session ID as soon as the log shows it."""
     log = kwargs["log_path"]
     size = log.stat().st_size if log.exists() else 0
     offset = size
+    announced = on_session is None
 
     def poll():
-        nonlocal size
+        nonlocal size, announced
         current = log.stat().st_size if log.exists() else 0
         if current > size:
             timestamp = ctx.now().astimezone(UTC).isoformat()
             ctx.store.update_run(n, last_progress_at=timestamp, last_activity_at=timestamp)
+            if not announced:
+                # The worker is live before it returns; fa lanes talk needs its session now.
+                identity = stream_session_id(log, ctx.config.executor, offset=offset)
+                if identity is not None:
+                    announced = True
+                    on_session(identity)
         size = current
 
     def execute():
@@ -148,6 +156,19 @@ def _available_executor(
     errors = 0
     full_prompt = kwargs["prompt"]
 
+    def record_session(identity: str) -> None:
+        # `fa lanes talk` reads the session from the record at send time; it is the worker's now.
+        current = ctx.store.get_run(n)
+        if current.session_id == identity and current.session_executor == ctx.config.executor:
+            return
+        ctx.store.update_run(
+            n, session_id=identity, session_executor=ctx.config.executor, session_stale=False,
+            session_ids=[*current.session_ids, *([identity] if identity not in current.session_ids else [])],
+            session_body=session_body,
+        )
+
+    live = record_session if session_body is not None and not reviewer else None
+
     def execute() -> ExecResult:
         # Every launch, including a fresh start after a failed resume and each retry, is admitted
         # here: another run may have paused this executor, or this run reached its spend_cap (#786).
@@ -159,23 +180,23 @@ def _available_executor(
             _limit_wait(n, ctx, hold)
         log = kwargs["log_path"]
         offset = log.stat().st_size if log.exists() else 0
+        if live is not None:
+            # Before the worker starts: a resumed thread is the worker's; a fresh one is not known
+            # yet, so the recorded session must not receive messages until its new ID is recorded.
+            ctx.store.update_run(n, session_stale=kwargs.get("resume_session_id") is None)
         try:
             spender = name if credits(view, ctx.config, name, view.now) else None
-            result = _run_executor(n, ctx, executor, spender=spender, **kwargs)
+            result = _run_executor(n, ctx, executor, spender=spender, on_session=live, **kwargs)
             if on_result is not None:
                 on_result(result)
             return result
         except BaseException:
             # run_logged flushes stdout into the log during interruption cleanup.
             # Recover this call's lifecycle before run_issue finishes its history.
-            if session_body is not None and not reviewer and log.exists():
+            if live is not None and log.exists():
                 identity = stream_session_id(log, ctx.config.executor, offset=offset)
                 if identity is not None:
-                    current = ctx.store.get_run(n)
-                    ctx.store.update_run(
-                        n, session_id=identity, session_executor=ctx.config.executor,
-                        session_ids=[*current.session_ids, identity], session_body=session_body,
-                    )
+                    live(identity)
             raise
 
     name = resolved_reviewer(ctx.config) if reviewer else ctx.config.executor
@@ -186,7 +207,7 @@ def _available_executor(
         run = ctx.store.get_run(n)
         if not reviewer and run.fallback_model is not None:
             kwargs["model"] = run.fallback_model
-        kwargs["timeout_s"] = runner._remaining(n, ctx)  # The session budget; it ends only once quiet past it (#435).
+        kwargs["timeout_s"] = runner._remaining(n, ctx)
         session_id = (run.session_id if session_body is not None and resume_prompt is not None and not reviewer
                       and run.session_executor == ctx.config.executor else None)
         kwargs["prompt"] = resume_prompt if session_id is not None else full_prompt
@@ -211,7 +232,7 @@ def _available_executor(
             session_id = None
             kwargs.pop("resume_session_id")
             kwargs["prompt"] = full_prompt
-            kwargs["timeout_s"] = runner._remaining(n, ctx)  # The session budget; it ends only once quiet past it (#435).
+            kwargs["timeout_s"] = runner._remaining(n, ctx)
             result = execute()
         kind = classify_result(result)
         if not reviewer and result.num_turns == 0 and not result.timed_out and kind == "normal":
@@ -223,7 +244,7 @@ def _available_executor(
             reason = (f"Executor exit_code={result.exit_code}, timed_out={result.timed_out}\n"
                       f"{result.last_message}\n{result.log_tail}" if result.exit_code != 0 or result.timed_out else "")
             run = ctx.store.update_run(
-                n, session_id=identity, session_executor=ctx.config.executor,
+                n, session_id=identity, session_executor=ctx.config.executor, session_stale=identity is None,
                 session_ids=[*run.session_ids, *([identity] if identity is not None else [])],
                 session_body=(session_body if result.session_id is not None or (
                     result.exit_code == 0 and not result.timed_out
@@ -235,9 +256,7 @@ def _available_executor(
                 resume_prompt = (resume_prompt or "") + "\n\n" + reason
         if kind == "normal":
             return result
-        # A transient failure did no work: past max_runtime_minutes it ends the run, as a
-        # silent step does at an attempt boundary (#435); otherwise only the budget ends it.
-        if kind == "transient" and (runner._budget_left(n, ctx) <= 0 or past_runtime_limit(n, ctx)):
+        if kind == "transient" and runner._remaining(n, ctx) <= 0:
             return replace(result, timed_out=True)
         if kind == "limit":
             now = ctx.now()

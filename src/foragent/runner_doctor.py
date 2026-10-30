@@ -105,6 +105,7 @@ def live_check(repo_root: Path, config: Config, executor_name: str, *, timeout_s
         return LiveCheck(executor_name, False, f"`{executor_name}` executable not found on PATH")
     config = replace(
         config, executor=executor_name, board=None,
+        max_runtime_minutes=max(1, min(config.max_runtime_minutes, timeout_s // 60)),
         # A doctor reports unavailability instead of waiting it out.
         transient_max_wait_minutes=0,
     )
@@ -135,7 +136,6 @@ def live_check(repo_root: Path, config: Config, executor_name: str, *, timeout_s
         ctx = RunContext(
             repo=config.repo or "local/doctor", repo_root=clone, tracker=tracker, store=store,
             config=config, git=GitRepo(clone), now=now, executor_factory=lambda name: recorded,
-            deadline_seconds=max(60, timeout_s),
         )
         stopped = ""
         try:
@@ -167,7 +167,7 @@ def live_check(repo_root: Path, config: Config, executor_name: str, *, timeout_s
             return LiveCheck(executor_name, False,
                              f"{stopped or 'stopped before any work'} ({stats}); executor said: {said}")
         for command in attempt.parsed.done_when_commands:
-            check = _check(command, clone, log, 60, safety_net=60)  # A probe keeps its bound as the safety net.
+            check = _check(command, clone, log, 60)
             if check.exit_code != 0 or check.timed_out:
                 return LiveCheck(executor_name, False,
                                  f"Done when check failed: {command} ({stats}); executor said: {said}")

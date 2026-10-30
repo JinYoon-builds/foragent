@@ -16,11 +16,6 @@ from foragent.runner import CheckResult, run_issue
 from conftest import ACCEPTANCE, git_command
 from runner_support import COMMAND, batch_setup, run_case, seed_batch, set_done_when
 
-from foragent.run_waits import RUNNER_MARGIN_SECONDS
-
-# A run's own budget: the safety net plus the margin that lets the gate stop it first (#435).
-RUNNER_BUDGET = 24 * 3600 + RUNNER_MARGIN_SECONDS
-
 
 def test_generated_source_is_rechecked_and_committed_instead_of_old_index(run_case):
     c = run_case
@@ -297,15 +292,16 @@ def test_related_unit_check_uses_current_budget_excluding_waits(run_case, monkey
         return CheckResult(command, -9 if killed else 0, killed, "")
 
     monkeypatch.setattr("foragent.runner._check", check)
+    # A watchdog-stopped related check ends the run through outcome_for: stalled-restart (#435).
     assert run_issue(1, c.ctx) == ("stalled-restart" if timed_out else "merged")
     assert [limit for _, limit in calls] == [900, 900, 2160, 2040, 1920]
     assert '--collect-only' in calls[-3][0]
     assert '-m local_only' in calls[-2][0]
     assert "tests/test_new.py" in shlex.split(calls[-1][0])
     assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
-    if timed_out:  # A watchdog stop restarts the run back to ready (#435).
+    if timed_out:
         assert c.store.load_flag(1) is None and "ready" in c.tracker.get_issue(1).labels
-        assert c.store.get_run(1).detail == "Related unit tests were stopped by the watchdog (1 selected tests)."
+        assert "The watchdog stopped a check (silent)" in c.store.get_run(1).detail
         assert c.tracker.created_prs == []
 
 
@@ -331,19 +327,18 @@ def test_related_check_timeout_preserves_implementation_before_cleanup(run_case,
         return CheckResult(command, -9 if timed_out else 0, timed_out, "")
 
     monkeypatch.setattr("foragent.runner._check", check)
-    assert run_issue(1, c.ctx) == "stalled-restart"
+    assert run_issue(1, c.ctx) == "stalled-restart"  # Through outcome_for, keeping the WIP (#435).
     assert not c.store.worktree_path(1).exists()
     assert git_command(c.history.clone, "show", "foragent/issue-1:src/sample.py") == "VALUE = 2"
     assert git_command(c.history.origin, "show", "foragent/issue-1:src/sample.py") == "VALUE = 2"
     assert len(c.executor.calls) == c.store.get_run(1).attempts == 1
     assert c.store.load_flag(1) is None and "ready" in c.tracker.get_issue(1).labels
-    assert c.store.get_run(1).detail == "Related unit tests were stopped by the watchdog (1 selected tests)."
+    assert "The watchdog stopped a check (silent)" in c.store.get_run(1).detail
     assert c.tracker.created_prs == c.tracker.merged_prs == []
 
 
 @pytest.mark.parametrize("slow_check", ["baseline", "done-when", "related"])
 def test_silent_checks_report_progress_and_survive_scheduler_stall_limit(run_case, monkeypatch, slow_check):
-    from foragent import runner
     from foragent.scheduler import TickContext, TickReport, _recover_runs
 
     c = run_case
@@ -420,10 +415,12 @@ def test_check_timeout_uses_retry_limit_and_reports_command(run_case, monkeypatc
         return CheckResult(command, -9, True, "slow check output")
 
     monkeypatch.setattr("foragent.runner._check", check)
-    assert run_issue(1, c.ctx) == "retries-exceeded"
-    assert calls == [(COMMAND, 900), (f"test -f {ACCEPTANCE}", 900)] * 2
-    assert "slow check output" in c.executor.calls[1]["prompt"]
-    assert "Check timed out." in c.tracker.list_comments(1)[-1].body
+    # A watchdog-stopped Done-when check ends the run through outcome_for, not an implementation
+    # retry (#435): the next run gets the check's output.
+    assert run_issue(1, c.ctx) == "stalled-restart"
+    assert calls == [(COMMAND, 900)]
+    assert len(c.executor.calls) == 1
+    assert "slow check output" in c.store.get_run(1).resume_reason
     assert c.tracker.created_prs == []
 
 
@@ -571,7 +568,7 @@ def test_related_check_timeout_keeps_earlier_done_when_failures(run_case, monkey
         return CheckResult(command, 0, False, "")
 
     monkeypatch.setattr("foragent.runner._check", check)
-    assert run_issue(1, c.ctx) == "stalled-restart"
+    assert run_issue(1, c.ctx) == "stalled-restart"  # Through outcome_for (#435).
     saved = cuts.failures_path(c.store.root, 1).read_text()
     assert "done-when output" in saved and "unit output" in saved
     run = c.store.get_run(1)

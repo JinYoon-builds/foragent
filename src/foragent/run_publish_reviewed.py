@@ -74,7 +74,7 @@ def _publish_reviewed_in_turn(
     def refresh(target_sha: str) -> str | None:
         """Merge the moved base into the reviewed head, re-verify and push it."""
         nonlocal head, base_sha, started, ci_wait, queued_status
-        if runner._budget_left(n, ctx) <= 0:
+        if runner._remaining(n, ctx) <= 0:
             return run_publish._timeout(n, ctx)
         if reverify is None:
             return base_changed()
