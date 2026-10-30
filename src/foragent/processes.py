@@ -44,6 +44,62 @@ _process_tree_callback: ContextVar[Callable[[list[dict]], None] | None] = Contex
     "process_tree_callback", default=None,
 )
 
+# Cumulative paused seconds of the current run (an open talk terminal, D55 addendum).
+# The runner sets it for a whole run, so every command's timeout (executor
+# sessions, Done when and unit checks, baseline capture, local CI) grows by the
+# time paused while that command ran. Without it a timeout stays fixed.
+_paused_seconds: ContextVar[Callable[[], float] | None] = ContextVar("paused_seconds", default=None)
+# A ContextVar does not reach threads started without a copied context (thread pools,
+# plain threads), so the run's pause is also kept process-wide: a runner process
+# runs one issue, and its worker threads' commands pause with it.
+_process_paused: Callable[[], float] | None = None
+
+
+@contextmanager
+def extend_deadline(paused: Callable[[], float]) -> Iterator[None]:
+    """Within this context, ``run_logged`` adds the growth of ``paused()`` to each timeout, in every thread."""
+    global _process_paused
+    token = _paused_seconds.set(paused)
+    previous, _process_paused = _process_paused, paused
+    try:
+        yield
+    finally:
+        _process_paused = previous
+        _paused_seconds.reset(token)
+
+
+def current_pause() -> Callable[[], float] | None:
+    """The pause clock of the run this thread works for, if any."""
+    return _paused_seconds.get() or _process_paused
+
+
+def _paused_now(paused: Callable[[], float]) -> float | None:
+    try:
+        return float(paused())
+    except Exception:  # noqa: BLE001 - an unreadable record keeps the original limit
+        return None
+
+
+def _wait_with_deadline(process, timeout_s: float) -> None:
+    """Wait like ``process.wait(timeout_s)``, extended by time paused since the wait began."""
+    paused = current_pause()
+    base = _paused_now(paused) if paused is not None else None
+    granted = 0.0
+    timeout = timeout_s
+    while True:
+        try:
+            process.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            current = _paused_now(paused) if base is not None else None
+            if current is None:
+                raise
+            extra = current - base - granted
+            if extra <= 0:
+                raise
+            granted += extra
+            timeout = extra
+
 
 @contextmanager
 def track_process_group(
@@ -761,7 +817,7 @@ def run_logged(
             if on_process_tree is not None:
                 on_process_tree(identities)
             try:
-                process.wait(timeout=timeout_s)
+                _wait_with_deadline(process, timeout_s)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 stop_children()

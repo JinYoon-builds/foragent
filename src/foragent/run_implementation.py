@@ -108,45 +108,21 @@ def ample_quota(ctx: RunContext) -> bool:
     return left is not None and left >= config.tiers_headroom_ample
 
 
-def turn_key(run, conflict: bool) -> str:
-    """The attempt_tiers key of the next implementation turn, from the stored record alone.
+def choose_tier(ctx: RunContext, run, size: str) -> tuple[str, str]:
+    """The next executor turn's key and tier (#238, architect r42): derived, never looked up.
 
-    An implementation turn is its attempt number. A conflict-resolution turn does not advance
-    attempts: it is ``<attempt>c<k>``, the open one when a resumed run left it unanswered,
-    else one past the attempt's last recorded conflict turn, so a restart never reuses one.
+    Turn k = len(attempt_tiers) + 1 counts every executor turn (implementation, conflict
+    resolution, CI repair, rebuild, a turn again after a limit wait or restart). The base is
+    turn 1's recorded tier, or, when there is none, l with ample quota of the run's executor,
+    else the size. Turn k is the base stepped up k - 1 times, capped at l, and l on the last
+    allowed attempt.
     """
-    if not conflict:
-        return str(run.attempts)
-    prefix = f"{run.attempts}c"
-    if run.open_turn is not None and run.open_turn.startswith(prefix):
-        return run.open_turn
-    done = [int(name[len(prefix):]) for name in run.attempt_tiers
-            if name.startswith(prefix) and name[len(prefix):].isdigit()]
-    return f"{prefix}{max(done, default=0) + 1}"
-
-
-def choose_tier(ctx: RunContext, run, size: str, key: str | None = None, *, final: bool = False) -> str:
-    """The tier of the implementation turn recorded under ``key`` in attempt_tiers (default: the attempt).
-
-    l with ample quota, else the size; one tier up per earlier turn (failed attempts, CI repairs
-    and conflict-resolution turns alike); l on the last allowed turn or a ``final`` one (a
-    rebuild); never below an earlier turn. A key already recorded is the same turn resumed (an
-    attempt number survives every restart; ``turn_key`` never reuses an answered conflict turn),
-    so it keeps its stored tier. An executor without tier keys stays at the size.
-    """
-    if not has_tier_keys(ctx.config, ctx.config.executor):
-        return size
-    key = str(run.attempts) if key is None else key
-    stored = run.attempt_tiers.get(key)
-    if stored in _TIERS:
-        return stored
-    earlier = [value for name, value in run.attempt_tiers.items() if name != key]
-    turn = max(run.attempts, len(earlier) + 1)
-    tier = attempt_tier("l" if ample_quota(ctx) else size, turn)
-    if final or turn >= ctx.config.max_retries + 1:
-        tier = "l"
-    floor = max((_TIERS.index(value) for value in earlier if value in _TIERS), default=0)
-    return _TIERS[max(_TIERS.index(tier), floor)]
+    k = len(run.attempt_tiers) + 1
+    base = run.attempt_tiers.get("1")
+    if base not in _TIERS:
+        base = "l" if ample_quota(ctx) else size
+    tier = "l" if run.attempts >= ctx.config.max_retries + 1 else attempt_tier(base, k)
+    return str(k), tier
 
 
 def implementer_setup(
@@ -373,10 +349,9 @@ def _implement(
     if remaining <= 0:
         raise ExecutorStopped(_timeout(n, ctx))
     run = ctx.store.get_run(n)
-    # A conflict-resolution turn does not advance attempts; it is a failed turn of its own (#238).
-    key = turn_key(run, merge_conflicts is not None)
-    tier = choose_tier(ctx, run, attempt.size, key, final=attempt.rebuilt)
-    ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, key: tier}, open_turn=key)
+    # Every executor turn writes one new key; a key is never rewritten (#238).
+    key, tier = choose_tier(ctx, run, attempt.size)
+    ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, key: tier})
     full_text_dir = cuts.issue_dir(ctx.store.root, n)
     setup = implementer_setup(ctx.config, run.lane, tier, worktree, full_text_dir)
     model, notes = setup.model, setup.notes
@@ -446,9 +421,7 @@ def _implement(
     # availability waits, launch failures and interruptions; acknowledge it
     # only once the implementer returns an ordinary execution result.
     if (retry_default or hint is not None) and classify_result(result) == "normal":
-        consume_hint(ctx.store.root, n)
-    if classify_result(result) == "normal":
-        ctx.store.update_run(n, open_turn=None)  # answered: the next turn is a new one
+        consume_hint(ctx.store.root, n, hint)
     if moved_files and classify_result(result) == "normal":
         ctx.store.update_run(n, moved_files=[])  # named once, after delivery
     _record_skills_used(n, ctx, result)

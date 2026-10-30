@@ -164,6 +164,8 @@
 - [#603 cross-lane start](project_603_cross_lane.md) — _ranked sort key, global-queue.json; no main-last key; ranking applies in one lane too
 - #604: `orch_stale_files.report()`가 board_sync 뒤 tick마다 승인 스냅샷의 Files를 `rev-list -1 --first-parent --until=<unix ts>`(포함; first-parent 없으면 나중에 병합된 토픽 커밋이 기준이 됨)로 찾은 승인 시점 base 트리와 현재 트리로 비교, `stale-files.json`(이슈→보고한 SHA 목록, 닫힌 이슈도 지우지 않음)으로 SHA당 한 번만 기록. 시험의 conftest 가드가 git commit/checkout을 막으니 commit-tree 등 plumbing으로 이력을 만든다. scheduler.py facade는 `test_scheduler_split`이 250줄 상한을 강제하므로 줄을 더하면 기존 `with step` 블록을 `timed(...)` 한 줄로 접는다.
 - #604 리뷰: 잠금을 잡은 tick의 모든 종료(GitHub 대기·한도 예외 포함)에서 돌아야 하는 로컬 사실 검사는 `orch_spawn.deciding()` 래퍼에 넣는다(scheduler 본문의 중간 호출은 이른 반환에 건너뛰어짐). `ls-tree -z` 출력은 split 뒤 빈 이름을 빼야 `**`가 빈 트리에 일치하지 않는다. scheduler에 git 호출을 더하면 test_cli의 엄격한 가짜 git이 깨지므로 대상이 있을 때만 git을 읽는다.
+- #154: `lane_talk.py`(`fa lanes talk`)는 `<state>/talk/<n>.json`에 터미널 핸들을 두고 Run의 `talking`·`talking_since`로 tick의 stall·runtime 검사를 건너뛴다. 닫힘은 `scheduler_recovery`가 감지해 waited_seconds 가산·last_progress_at=now. 인수 시험이 `"-f" in command`를 요구해 `tail -f -F`를 쓴다. Orca는 issue worktree를 모르므로 `--worktree path:<repo root>`+subprocess cwd, codex resume엔 `-C dir`.
+- #154 리뷰: waited_seconds는 runner·tick이 함께 쓰므로 `StateStore.add_waited` 증분으로만 더한다(스냅샷+절대값은 손실). 힌트 소비는 전달한 문자열만 지운다(`consume_hint(root,n,used)`). 실행기 시간 제한은 `processes.extend_deadline`이 `_remaining()`을 다시 묻는다.
 - [#366 installed gates](project_366_installed_gates.md) — gates.py discovery, remote fallback for state root, conftest real-HOME isolation
 - [#370 orch stop](project_370_orch_stop.md) — option A: thin stall-kill caller under tick lock; why D95 ownership design was dropped
 - [#287 lane plan](project_287_plan.md) — plan.json, non-reentrant state lock, CLI stderr exits, stall vs 1h clock in locked test
@@ -213,4 +215,5 @@
 - #158: 오케 스킬 150줄 한도(splitlines 기준, wc보다 1 많음)는 라우팅 표에 한 줄 행을 더하고 세부는 references/settings.md로 맞췄다. zsh는 `$files` 변수를 단어로 나누지 않으니 `fa test`에는 `$(... | tr '\n' ' ')`를 직접 넘긴다.
 - #794 재시도: 요청을 끝내는 동사는 `orch_inbox.set_request_status(..., check=fn)`으로 상태 확인과 완료 표시를 state lock 안에서 한 번에 한다(동시 답 경쟁). 스코어카드 역할 행은 설정 역할만이 아니라 열린 신호·창 안 신호가 있는 역할도 넣는다. 동시성 시험은 `_file_lock`이 호출마다 새 fd로 flock하므로 스레드 두 개로 재현된다. 작업공간 재생성 때 `.foragent/TRY.md`·`REBUTTAL.md`는 사라지므로 다시 써야 한다. "파일 이동" 안내는 오탐일 수 있으니 `git ls-tree origin/main`으로 확인한다.
 - #131 재시도: Goal(2026-10-29)이 묶음 나이를 finished_at, 없으면 묶음의 가장 새 파일 mtime으로 정했다(기간·크기 규칙 공통 `_group_age`). 병합 보존 일수는 `settings.read_machine()`의 log_retention_days(기본 7, conftest가 XDG_STATE_HOME 격리). main의 `orch_role_raise.tick`은 정상 종료 경로의 `done(..., finished=True)` 직전에 둔다.
-- [#238 tier choice](project_238_tiers.md) — choose_tier/ample_quota, shared cap, run_case max_retries=1 makes attempt 2 l
+- [#238 tier choice](project_238_tiers.md) — derived tier from turn count k (r42), why lookup rules failed, shared cap
+- [#413 orch refresh](project_413_refresh.md) — heartbeat session fields, orch_spawn_launch split, locked --bg argv, zsh ${=T}

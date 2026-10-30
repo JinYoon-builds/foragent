@@ -47,23 +47,23 @@ def _remove_run_worktree(
 
 def _kill_run(
     ctx: TickContext, number: int | str, report: TickReport, *, outcome: str = "killed",
-    count_stall: bool = False, detail: str = "", decided: Run | None = None,
+    count_stall: bool = False, detail: str = "", decided: Run | None = None, unless_talking: bool = False,
 ) -> bool:
     run = ctx.store.get_run(number)
     if run is None or run.status != "running":
         return False
     if decided is not None and any(getattr(run, name) != getattr(decided, name) for name in DECISION_FIELDS):
         return False  # The runner recorded progress or a wait after the limit check: decide again next tick.
-    if count_stall:
-        ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)
-    try:
-        stopped = _stop_run_processes(ctx, run, report)
+    mark = (lambda: ctx.store.update_run(number, restarts=run.restarts + 1, outcome=outcome)) if count_stall else None
+    try:  # A timed stop writes its stall mark only under worktree_lock, after reading the talk again.
+        stopped = (scheduler.lane_talk.guarded_stop(ctx, number, report, lambda c: _stop_run_processes(c, run, report), mark)
+                   if unless_talking else (mark and mark(), _stop_run_processes(ctx, run, report))[1])
     except Exception:
         if count_stall:
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         raise
     if stopped != "stopped" or registered_since(ctx, run):  # A fresh read decides the last transition.
-        if count_stall:
+        if count_stall and stopped != "skipped":  # A skipped stop wrote nothing to undo.
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         if stopped == "gone":
             _finish_dead_run(ctx, run, report)
@@ -227,25 +227,25 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 getattr(run, name) != getattr(decided, name) for name in LIVENESS_FIELDS):
             continue
         if not dead:
-            if _stop_already_refused(ctx, run):
-                continue
+            if run.talking and scheduler.lane_talk.tick_talk(ctx, run, report) or _stop_already_refused(ctx, run):
+                continue  # The talk is probed first, even past a refused stop; only a confirmed closure ends it.
             waiting = run.waiting_until is not None and ctx.now() < scheduler.datetime.fromisoformat(run.waiting_until)
             runtime = ((ctx.now() - scheduler.datetime.fromisoformat(run.started_at)).total_seconds()
-                       - run.waited_seconds - run.slept_seconds)
+                       - run.waited_seconds - run.slept_seconds - run.talk_pause_seconds(ctx.now()))
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
-                if scheduler._kill_run(ctx, run.key, report, outcome="killed" if issue else "error",
+                if scheduler._kill_run(ctx, run.key, report, outcome="killed" if issue else "error", unless_talking=True,
                                        detail="Runner exceeded its runtime limit.", decided=run) and issue:
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
             elif run.pid is not None and not waiting and not sleep_credit.in_wake_grace(
-                    ctx.store, run, ctx.now()) and ctx.now() - scheduler.datetime.fromisoformat(
-                run.last_progress_at or run.started_at,
+                    ctx.store, run, ctx.now()) and ctx.now() - scheduler.lane_talk.stall_since(
+                ctx.store, run,  # The later of the last progress and the latest talk closing (D95).
             ) - scheduler.timedelta(seconds=run.slept_since_progress) > scheduler.timedelta(
                 minutes=ctx.config.stall_minutes):
                 restarts = run.restarts + 1
                 outcome = ("stalled-restart" if restarts <= 1 else "stalled") if issue else "error"
                 if scheduler._kill_run(ctx, run.key, report, outcome=outcome, count_stall=True, decided=run,
-                          detail="Runner stopped making progress past the stall limit.") and issue:
+                          detail="Runner stopped making progress past the stall limit.", unless_talking=True) and issue:
                     scheduler._restore_stalled(ctx, run.number, restarts, report)
             continue
         # Clean up a crashed group or finish an interrupted stall; a recorded completion needs no signal.

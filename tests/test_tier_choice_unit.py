@@ -9,7 +9,7 @@ import pytest
 from foragent import quota_headroom
 from foragent.config import Config, ConfigError, load_config
 from foragent.executors import claude_command
-from foragent.run_implementation import ample_quota, choose_tier, tier_model_effort, turn_key
+from foragent.run_implementation import ample_quota, choose_tier, tier_model_effort
 
 NOW = datetime(2026, 10, 29, 12, tzinfo=UTC)
 
@@ -35,8 +35,8 @@ def ctx(config, used, mode=None):
     return SimpleNamespace(config=config, store=FakeStore(used, mode), now=lambda: NOW)
 
 
-def run(attempts, tiers=None, open_turn=None):
-    return SimpleNamespace(attempts=attempts, attempt_tiers=tiers or {}, open_turn=open_turn)
+def run(attempts, tiers=None):
+    return SimpleNamespace(attempts=attempts, attempt_tiers=tiers or {})
 
 
 def test_quota_owner_is_the_run_executor_not_the_reviewer():
@@ -48,7 +48,7 @@ def test_quota_owner_is_the_run_executor_not_the_reviewer():
 def test_no_current_usage_keeps_the_size_tier():
     config = Config(executor="codex")
     assert not ample_quota(ctx(config, {}))
-    assert choose_tier(ctx(config, {}), run(1), "s") == "s"
+    assert choose_tier(ctx(config, {}), run(1), "s") == ("1", "s")
 
 
 def test_api_billed_claude_never_upgrades(monkeypatch):
@@ -76,32 +76,33 @@ def test_threshold_above_one_turns_the_upgrade_off():
     assert not ample_quota(ctx(config, usage(codex=0)))
 
 
-@pytest.mark.parametrize("attempts,previous,expected", [
-    (1, {}, "s"), (2, {"1": "s"}, "m"),
-    (2, {"1": "l"}, "l"),          # never below an earlier attempt
-    (3, {"1": "s", "2": "m"}, "l"),  # the last allowed attempt is l
-    (2, {"1": "s", "2": "s"}, "s"),  # the open (resumed) attempt keeps its stored tier
+@pytest.mark.parametrize("attempts,previous,used,expected", [
+    (1, {}, 90, ("1", "s")),                      # tight: turn 1 is the size
+    (1, {}, 10, ("1", "l")),                      # ample: turn 1 is l
+    (2, {"1": "s"}, 90, ("2", "m")),              # one failed turn steps up once
+    (1, {"1": "s"}, 90, ("2", "m")),              # a conflict turn counts like any turn
+    (1, {"1": "s", "2": "m"}, 90, ("3", "l")),    # restart after a resolved conflict: never back to s
+    (1, {"1": "s", "2": "m", "3": "l"}, 90, ("4", "l")),  # capped at l
+    (1, {"1": "s"}, 10, ("2", "m")),              # the base is read once, at turn 1
+    (1, {"1": "l"}, 90, ("2", "l")),              # an ample base stays l when quota turns tight
+    (1, {"1": "x"}, 10, ("2", "l")),              # no valid turn-1 tier: headroom read now
+    (1, {"1": "x"}, 90, ("2", "m")),
 ])
-def test_tier_steps_up_and_keeps_resumed_and_earlier_tiers(attempts, previous, expected):
-    config = Config(executor="codex", max_retries=2)
-    chosen = run(attempts, previous, open_turn=str(attempts) if str(attempts) in previous else None)
-    assert choose_tier(ctx(config, usage(codex=90)), chosen, "s") == expected
+def test_tier_is_derived_from_the_turn_count_and_turn_one(attempts, previous, used, expected):
+    config = Config(executor="codex", max_retries=5)
+    assert choose_tier(ctx(config, usage(codex=used)), run(attempts, previous), "s") == expected
 
 
-def test_the_same_attempt_number_keeps_its_stored_tier_even_after_an_answer():
-    # A crash after the answer but before checks redoes the same attempt (#238).
-    config = Config(executor="codex", max_retries=2)
-    assert choose_tier(ctx(config, usage(codex=10)), run(2, {"1": "s", "2": "m"}), "s") == "m"
+def test_a_turn_never_rewrites_a_recorded_key():
+    config = Config(executor="codex", max_retries=5)
+    for tiers in ({}, {"1": "s"}, {"1": "s", "2": "m"}, {"1": "x", "2": "y", "3": "z"}):
+        assert choose_tier(ctx(config, usage(codex=90)), run(1, tiers), "s")[0] not in tiers
 
 
-def test_ample_quota_starts_small_issues_at_l():
-    config = Config(executor="codex")
-    assert choose_tier(ctx(config, usage(codex=10)), run(1), "s") == "l"
-
-
-def test_last_allowed_attempt_reaches_l_even_when_the_budget_skips_m():
-    config = Config(executor="codex", max_retries=1)
-    assert choose_tier(ctx(config, usage(codex=90)), run(2, {"1": "s"}), "s") == "l"
+@pytest.mark.parametrize("attempts,previous", [(2, {"1": "s"}), (2, {}), (3, {"1": "s", "2": "m"})])
+def test_the_last_allowed_attempt_is_l(attempts, previous):
+    config = Config(executor="codex", max_retries=attempts - 1)
+    assert choose_tier(ctx(config, usage(codex=90)), run(attempts, previous), "s")[1] == "l"
 
 
 @pytest.mark.parametrize("tier_model,global_model,lane_model,expected", [
@@ -123,93 +124,47 @@ def test_lane_model_does_not_follow_a_run_moved_to_another_executor():
     assert tier_model_effort(config, "api", "m") == (None, "high")
 
 
-def test_other_executor_without_tier_keys_gets_no_flags_and_stays_at_its_size():
-    config = Config(executor="gemini", executor_model="g1", lanes={"api": {"model": "g1"}})
+def test_other_executor_without_tier_keys_gets_no_flags_but_records_its_tier():
+    config = Config(executor="gemini", executor_model="g1", lanes={"api": {"model": "g1"}}, max_retries=5)
     assert tier_model_effort(config, "main", "l") == (None, None)
     assert tier_model_effort(config, "api", "l") == (None, None)
     assert not ample_quota(ctx(config, usage(gemini=0)))
-    for attempts, previous in ((1, {}), (2, {"1": "s"}), (3, {"1": "s", "2": "s"})):
-        assert choose_tier(ctx(replace(config, max_retries=2), usage(gemini=0)), run(attempts, previous), "s") == "s"
+    assert choose_tier(ctx(config, usage(gemini=0)), run(1), "s") == ("1", "s")
+    assert choose_tier(ctx(config, usage(gemini=0)), run(2, {"1": "s"}), "s") == ("2", "m")
 
 
 def test_other_executor_with_tier_keys_uses_them():
     tiers = {name: {**tier, "gemini_model": f"g-{name}", "gemini_effort": None} for name, tier in Config().tiers.items()}
     config = Config(executor="gemini", tiers=tiers)
     assert tier_model_effort(config, "main", "m") == ("g-m", None)
-    assert choose_tier(ctx(config, usage(gemini=90)), run(2, {"1": "s"}), "s") == "m"
-
-
-@pytest.mark.parametrize("key,previous,final,expected", [
-    ("1c1", {"1": "s"}, False, "m"),              # a conflict turn steps up within the same attempt
-    ("1c2", {"1": "s", "1c1": "m"}, False, "l"),  # the third turn of three allowed is the last
-    ("1c1", {"1": "s", "1c1": "s"}, False, "s"),  # the open conflict turn keeps its tier
-    ("2", {"1": "s"}, True, "l"),                 # a rebuilt attempt is final
-])
-def test_conflict_and_rebuild_turns_count_as_failed_turns(key, previous, final, expected):
-    config = Config(executor="codex", max_retries=2)
-    attempts = int(key.partition("c")[0])
-    chosen = run(attempts, previous, open_turn=key if key in previous else None)
-    assert choose_tier(ctx(config, usage(codex=90)), chosen, "s", key, final=final) == expected
-
-
-@pytest.mark.parametrize("record,expected", [
-    (run(1, {"1": "s"}), "1c1"),
-    (run(1, {"1": "s", "1c1": "m"}), "1c2"),
-    (run(1, {"1": "s", "1c1": "m", "1c2": "l"}, open_turn="1c2"), "1c2"),  # resumed after a limit wait
-    (run(1, {"1": "s", "1c1": "m", "1c2": "l"}), "1c3"),                   # never a stored, answered turn
-    (run(2, {"1": "s", "1c1": "m"}, open_turn="1c1"), "2c1"),              # another attempt's open turn
-])
-def test_conflict_turn_key_comes_from_the_stored_record(record, expected):
-    assert turn_key(record, conflict=True) == expected
-    assert turn_key(record, conflict=False) == str(record.attempts)
-
-
-def test_limit_wait_restart_keeps_the_open_turn(tmp_path):
-    from foragent.state import StateStore
-
-    store = StateStore(tmp_path / "state", now=lambda: NOW)
-    store.start_run(1, branch="b", worktree=tmp_path / "w")
-    store.update_run(1, attempt_tiers={"1": "s", "1c1": "m", "1c2": "l"}, open_turn="1c2")
-    store.finish_run(1, "limit-wait")
-    resumed = store.start_run(1, branch="b", worktree=tmp_path / "w")
-    assert turn_key(resumed, conflict=True) == "1c2"
-    store.finish_run(1, "merged")
-    fresh = store.start_run(1, branch="b", worktree=tmp_path / "w")
-    assert (fresh.open_turn, fresh.attempt_tiers, fresh.tier) == (None, {}, "m")
+    assert choose_tier(ctx(config, usage(gemini=90)), run(2, {"1": "s"}), "s") == ("2", "m")
 
 
 @pytest.mark.parametrize("outcome", ["stalled-restart", "crashed", "limit-wait"])
-def test_gate_restart_keeps_the_open_attempts_tier_under_tight_quota(tmp_path, outcome):
-    # Attempt 1 started at l with ample quota; after a restart the quota is tight.
-    from foragent.state import StateStore
-
-    store = StateStore(tmp_path / "state", now=lambda: NOW)
-    store.start_run(1, branch="b", worktree=tmp_path / "w", tier="s")
-    store.update_run(1, tier="l", attempt_tiers={"1": "l"}, open_turn="1")
-    store.finish_run(1, outcome)
-    restarted = store.start_run(1, branch="b", worktree=tmp_path / "w", tier="s")
-    assert (restarted.attempts, restarted.tier, restarted.attempt_tiers) == (1, "l", {"1": "l"})
-    config = Config(executor="codex", max_retries=2)
-    assert choose_tier(ctx(config, usage(codex=90)), restarted, "s", turn_key(restarted, conflict=False)) == "l"
-
-
-@pytest.mark.parametrize("outcome", ["stalled-restart", "crashed"])
-def test_restart_during_a_later_attempt_resumes_it_then_steps_up(tmp_path, outcome):
-    # Crash during attempt 2 at m: the restart is attempt 2 at m; its failure leads to attempt 3 at l.
+def test_a_restart_keeps_the_turns_so_the_next_turn_adds_one(tmp_path, outcome):
+    # Turn 1 ran at l with ample quota; quota is tight after the restart.
     from foragent.state import StateStore
 
     store = StateStore(tmp_path / "state", now=lambda: NOW)
     store.start_run(1, branch="b", worktree=tmp_path / "w")
-    store.update_run(1, attempts=2, attempt_tiers={"1": "s", "2": "m"}, open_turn="2")
+    store.update_run(1, attempts=2, tier="l", attempt_tiers={"1": "l", "2": "l"})
     store.finish_run(1, outcome)
     restarted = store.start_run(1, branch="b", worktree=tmp_path / "w")
-    assert restarted.attempts == 2
+    assert (restarted.tier, restarted.attempt_tiers) == ("l", {"1": "l", "2": "l"})
+    # #84: only a limit-wait keeps the attempt number.
+    assert restarted.attempts == (2 if outcome == "limit-wait" else 1)
     config = Config(executor="codex", max_retries=5)
-    tight = ctx(config, usage(codex=90))
-    assert choose_tier(tight, restarted, "s", turn_key(restarted, conflict=False)) == "m"
-    failed = store.update_run(1, attempts=3, open_turn=None)
-    assert turn_key(failed, conflict=False) == "3"
-    assert choose_tier(tight, failed, "s", "3") == "l"
+    assert choose_tier(ctx(config, usage(codex=90)), restarted, "s") == ("3", "l")
+
+
+def test_a_new_run_after_a_finished_one_starts_from_turn_one(tmp_path):
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    store.start_run(1, branch="b", worktree=tmp_path / "w")
+    store.update_run(1, attempt_tiers={"1": "s", "2": "m"})
+    store.finish_run(1, "merged")
+    assert store.start_run(1, branch="b", worktree=tmp_path / "w").attempt_tiers == {}
 
 
 def test_claude_effort_reaches_the_cli():

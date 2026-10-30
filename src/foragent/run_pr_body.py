@@ -60,14 +60,9 @@ def _pr_body(
     if fallback_model is not None:
         lines.extend(["", f"Executor fallback model: {fallback_model}"])
     if attempt_tiers:
-        lines.extend(["", *(_tier_line(number, tier) for number, tier in attempt_tiers.items())])
+        lines.extend(["", *(f"Attempt {number} at tier {tier}" for number, tier in attempt_tiers.items())])
     lines.extend(["", f"Opened by Foragent gate (attempt {attempt})"])
     return "\n".join(lines) + "\n\n## Try it\n\n" + (
         try_text if try_text is not None else "_not provided by the implementer_"
     )
 
-
-def _tier_line(key: str, tier: str) -> str:
-    """``1`` is attempt 1; ``1c2`` is conflict-resolution turn 2 during attempt 1 (#238)."""
-    attempt, _, turn = key.partition("c")
-    return f"Attempt {attempt}" + (f", conflict turn {turn}" if turn else "") + f" at tier {tier}"

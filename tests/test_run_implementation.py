@@ -65,6 +65,8 @@ def test_limit_wait_resume_cannot_reset_consumed_implementation_attempt(run_case
     assert run_issue(1, c.ctx) == "retries-exceeded"
     assert len(c.executor.calls) == 3
     assert (c.store.get_run(1).attempts, c.store.get_run(1).restarts) == (2, 1)
+    # #238: the turn again after the limit wait is a new turn with its own key.
+    assert c.store.get_run(1).attempt_tiers == {"1": "m", "2": "l", "3": "l"}
 
 
 @pytest.mark.parametrize("size,efforts,tiers", [
@@ -99,7 +101,7 @@ def test_a_tier_without_effort_does_not_keep_the_previous_turns_effort(run_case)
     assert run_issue(1, c.ctx) == "merged"
     assert [call.get("effort") for call in c.executor.calls] == ["medium", None]
     assert "effort" not in c.executor.calls[1]
-    assert c.store.get_run(1).open_turn is None
+    assert c.store.get_run(1).attempt_tiers == {"1": "s", "2": "l"}
 
 
 @pytest.mark.parametrize("lane_model,expected", [(None, ["small-model", "medium-model"]),

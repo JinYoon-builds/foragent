@@ -605,16 +605,16 @@ def test_conflict_resolution_has_full_budget_after_implementation_retries(confli
 
 
 def test_conflict_resolution_turns_step_up_the_tier_like_failed_attempts(conflicting_lanes):
-    # #238: a conflict-resolution turn is a failed turn of its own, not a resume of the attempt.
+    # #238: every executor turn, conflict resolution included, is counted as turn k.
     c = conflicting_lanes
     c.tracker.add_labels(1, ["size:s"])
     c.ctx.config = replace(c.ctx.config, max_retries=5)
     c.executor.steps.insert(0, {"cli.py": "commands = ['help']\n"})
     c.executor.steps += [{}, {"cli.py": "commands = ['help', 'base', 'issue']\n"}]
     assert run_issue(1, c.ctx) == "merged"
-    assert c.store.get_run(1).attempt_tiers == {"1": "s", "2": "m", "2c1": "l", "2c2": "l"}
+    assert c.store.get_run(1).attempt_tiers == {"1": "s", "2": "m", "3": "l", "4": "l"}
     assert [call.get("effort") for call in c.executor.calls] == ["medium", "high", "xhigh", "xhigh"]
-    assert "Attempt 2, conflict turn 1 at tier l" in c.tracker.created_prs[0].body
+    assert "Attempt 3 at tier l" in c.tracker.created_prs[0].body
 
 
 @pytest.mark.parametrize("before_push", [False, True])
