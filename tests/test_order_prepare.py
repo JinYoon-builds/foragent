@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import json
+import subprocess
 from types import SimpleNamespace
 
 from conftest import git_command
@@ -264,3 +265,130 @@ def test_a_failed_writer_still_reports_the_paths_it_changed(git_history, tmp_pat
     outcome = order_prepare._judge(None, stopped, tree, git, manifest, config, ())
     assert outcome["status"] == "interrupted" and outcome["refused"] == []
     assert outcome["written"] == {"tests/acceptance/test_partial.py": "assert"}
+
+
+def test_symlinked_context_reaches_the_writer_as_preread_reads_it(git_history, tmp_path):
+    from foragent import lane_memory
+
+    git_history.update({"app.py": "x = 1\n"})
+    root = git_history.clone
+    git_command(root, "fetch", "origin", "main")
+    git = GitRepo(root)
+    base = git.ref_sha("refs/remotes/origin/main")
+    config = Config(executor="codex", lanes={"api": {"paths": ["api/**"], "agent": "fa-api",
+                                                       "skills": ["tdd", "linked"]}})
+    shared = root / "shared"
+    (shared / "linked-skill").mkdir(parents=True)
+    (shared / "agent.md").write_text("---\nname: fa-api\n---\nLINKED AGENT NOTES\n")
+    (shared / "memory.md").write_text("- LINKED LESSON\n")
+    (shared / "SKILL.md").write_text("---\nname: tdd\ndescription: linked skill file\n---\nbody\n")
+    (shared / "linked-skill/SKILL.md").write_text("---\nname: linked\ndescription: linked folder\n---\nbody\n")
+    (tmp_path / "outside.md").write_text("OUTSIDE THE REPOSITORY\n")
+    (root / ".claude/agents").mkdir(parents=True)
+    (root / ".claude/agents/fa-api.md").symlink_to(shared / "agent.md")
+    memory = root / lane_memory.lane_directory(config, "api")
+    memory.mkdir(parents=True)
+    (memory / "MEMORY.md").symlink_to(shared / "memory.md")
+    (memory / "escape.md").symlink_to(tmp_path / "outside.md")
+    (root / ".claude/skills/tdd").mkdir(parents=True)
+    (root / ".claude/skills/tdd/SKILL.md").symlink_to(shared / "SKILL.md")
+    (root / ".claude/skills/linked").symlink_to(shared / "linked-skill")
+    _config, overlay = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
+    tree = tmp_path / "attempt/tree"
+    order_scratch.build(git, base, tree, overlay)
+    for name in (".claude/agents/fa-api.md", ".claude/skills/tdd/SKILL.md", ".claude/skills/linked/SKILL.md",
+                 f"{lane_memory.lane_directory(config, 'api')}/MEMORY.md"):
+        assert (tree / name).is_file() and not (tree / name).is_symlink(), name
+    # The notes read memory wherever it links, so the writer gets the outside file too.
+    assert (tree / lane_memory.lane_directory(config, "api") / "escape.md").read_text() == "OUTSIDE THE REPOSITORY\n"
+    writer = order_prepare_setup.writer_setup(config, {"lane": "api", "size": "s"}, tree)
+    preread = order_prepare_setup.writer_setup(config, {"lane": "api", "size": "s"}, root)
+    assert "LINKED AGENT NOTES" in writer.notes and "LINKED LESSON" in writer.notes
+    assert writer.missing_skills == [] and writer.notes == preread.notes
+
+
+
+def test_overlay_never_reaches_through_a_tracked_symlink_into_the_checkout(git_history, tmp_path):
+    from foragent import lane_memory
+
+    config = Config(executor="codex", lanes={"api": {"paths": ["api/**"], "agent": "fa-api"}})
+    folder = lane_memory.lane_directory(config, "api")
+    outside = tmp_path / "checkout-claude"
+    (outside / folder.removeprefix(".claude/")).mkdir(parents=True)
+    (outside / folder.removeprefix(".claude/") / "MEMORY.md").write_text("- original lesson\n")
+    (outside / "agents").mkdir()
+    (outside / "agents/fa-api.md").write_text("ORIGINAL AGENT\n")
+    # main tracks `.claude` as a symlink that leaves the scratch tree.
+    target = str(outside).encode()
+    stream = (f"commit refs/heads/main\ncommitter T <t@example.com> 1792483200 +0000\ndata 4\nlink\n"
+              f"from {git_history.tip}\nM 120000 inline .claude\ndata {len(target)}\n").encode() + target + b"\n\ndone\n"
+    subprocess.run(["git", "fast-import", "--quiet"], cwd=git_history.origin, input=stream, check=True)
+    root = git_history.clone
+    git_command(root, "fetch", "origin", "main")
+    git = GitRepo(root)
+    overlay = {folder: None, f"{folder}/MEMORY.md": b"- lesson\n", ".claude/agents/fa-api.md": None,
+               ".claude/skills/tdd": None, ".claude/skills/tdd/SKILL.md": b"skill\n"}
+    tree = tmp_path / "attempt/tree"
+    order_scratch.build(git, git.ref_sha("refs/remotes/origin/main"), tree, overlay)
+    assert (outside / folder.removeprefix(".claude/") / "MEMORY.md").read_text() == "- original lesson\n"
+    assert (outside / "agents/fa-api.md").read_text() == "ORIGINAL AGENT\n"
+    assert not (outside / "skills").exists()
+    assert not (tree / ".claude").is_symlink()
+    assert (tree / folder / "MEMORY.md").read_text() == "- lesson\n"
+    assert (tree / ".claude/skills/tdd/SKILL.md").read_text() == "skill\n"
+
+
+def test_a_directory_alias_inside_a_skill_is_copied_under_both_names(tmp_path):
+    skill = tmp_path / ".claude/skills/tdd"
+    (skill / "resources").mkdir(parents=True)
+    (skill / "resources/example.txt").write_text("example\n")
+    (skill / "linked").symlink_to("resources")
+    (skill / "loop").symlink_to(".")
+    files = order_prepare_setup._readable(tmp_path, ".claude/skills/tdd", inside_only=True)
+    assert files == {".claude/skills/tdd/resources/example.txt": b"example\n",
+                     ".claude/skills/tdd/linked/example.txt": b"example\n"}
+
+
+
+def test_outside_links_follow_each_reader_and_cycles_never_crash(git_history, tmp_path):
+    from foragent import lane_memory
+    from foragent.executors import ExecResult
+
+    git_history.update({"app.py": "x = 1\n", ".gitignore": ".venv/\n"})
+    root = git_history.clone
+    git_command(root, "fetch", "origin", "main")
+    git = GitRepo(root)
+    config = Config(executor="codex", lanes={"api": {"paths": ["api/**"], "agent": "fa-api",
+                                                       "skills": ["outside"]}})
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "skill").mkdir(parents=True)
+    (elsewhere / "agent.md").write_text("---\nname: fa-api\n---\nOUTSIDE AGENT NOTES\n")
+    (elsewhere / "memory.md").write_text("- OUTSIDE LESSON\n")
+    (elsewhere / "skill/SKILL.md").write_text("---\nname: outside\ndescription: d\n---\nbody\n")
+    (root / ".claude/agents").mkdir(parents=True)
+    (root / ".claude/agents/fa-api.md").symlink_to(elsewhere / "agent.md")
+    memory = root / lane_memory.lane_directory(config, "api")
+    memory.mkdir(parents=True)
+    (memory / "MEMORY.md").symlink_to(elsewhere / "memory.md")
+    (memory / "cycle.md").symlink_to(memory / "cycle.md")
+    (root / ".claude/skills").mkdir(parents=True)
+    (root / ".claude/skills/outside").symlink_to(elsewhere / "skill")
+    _config, overlay = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
+    tree = tmp_path / "attempt/tree"
+    manifest = order_scratch.build(git, git.ref_sha("refs/remotes/origin/main"), tree, overlay)
+    writer = order_prepare_setup.writer_setup(config, {"lane": "api", "size": "s"}, tree)
+    preread = order_prepare_setup.writer_setup(config, {"lane": "api", "size": "s"}, root)
+    assert "OUTSIDE AGENT NOTES" in writer.notes and "OUTSIDE LESSON" in writer.notes
+    assert writer.notes == preread.notes
+    # Lane skills count only inside the repository, for preread and the writer alike.
+    assert writer.missing_skills == preread.missing_skills == ["outside"]
+    # A cyclic link the writer leaves behind becomes a path question, not a crash.
+    (tree / "tests/acceptance").mkdir(parents=True, exist_ok=True)
+    (tree / "tests/acceptance/loop.py").symlink_to(tree / "tests/acceptance/loop.py")
+    (tree / ".venv").mkdir()
+    (tree / ".venv/loop").symlink_to(tree / ".venv/loop")
+    result = ExecResult(0, False, "{}", tmp_path / "log")
+    outcome = order_prepare._judge(result, None, tree, git, manifest, Config(language="en"), ())
+    assert outcome["status"] == "question"
+    assert any("tests/acceptance/loop.py" in question for question in outcome["questions"])
+    assert any(".venv/loop" in question for question in outcome["questions"])

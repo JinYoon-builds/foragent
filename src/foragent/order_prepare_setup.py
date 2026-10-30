@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 import re
 
+from foragent import order_scratch
 from foragent.config import Config
 from foragent.lanes import agent_text
 from foragent.skills import SkillManager, with_vendored_library
@@ -50,21 +51,48 @@ def _checkout_context(config: Config, lane: str, root: Path) -> dict[str, bytes 
 
     named = _lane_settings(config, lane).get("agent")
     agent = named if isinstance(named, str) and re.fullmatch(r"fa-[a-z0-9-]+", named) else None
-    places = [f".claude/agents/{agent}.md"] if agent is not None else []
+    # (place, readers accept it only inside the repository)
+    places = [(f".claude/agents/{agent}.md", False)] if agent is not None else []
     memory = _memory_folder(config, lane, Path("."))
     if memory is not None:
-        places.append(memory.as_posix())
-    places += [f".claude/skills/{name}" for name in lane_skill_names(config, lane, root, _agent_text(config, lane, root)[0])
+        places.append((memory.as_posix(), False))
+    places += [(f".claude/skills/{name}", True) for name in lane_skill_names(config, lane, root, _agent_text(config, lane, root)[0])
                if re.fullmatch(r"[A-Za-z0-9._-]+", name)]
     files: dict[str, bytes | None] = {}
-    for place in places:
+    for place, inside_only in places:
         files[place] = None
-        start = root / place
-        paths = [start] if start.is_file() else sorted(start.rglob("*")) if start.is_dir() else []
-        for path in paths:
-            if path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(root.resolve()):
-                files[path.relative_to(root).as_posix()] = path.read_bytes()
+        files.update(_readable(root, place, inside_only=inside_only))
     return files
+
+
+def _readable(root: Path, place: str, *, inside_only: bool) -> dict[str, bytes]:
+    """The files a reader of ``root/place`` sees, as plain bytes under their own paths.
+
+    Readers follow symlinks, so a link is copied as the content it resolves to, through linked
+    directories too, and a directory reachable under two names appears under both. The lane
+    notes read the agent file and memory wherever their links point; lane skills count only
+    when they resolve inside the repository (``inside_only``), as ``run_lane_skills.lane_skills``
+    checks. A link back into its own ancestors (a cycle) or one that cannot be resolved is
+    left out, as readers cannot read it either.
+    """
+    base = order_scratch.real(root)
+    found: dict[str, bytes] = {}
+
+    def visit(path: Path, ancestors: frozenset[Path]) -> None:
+        target = order_scratch.real(path)
+        if target is None or base is None or inside_only and not target.is_relative_to(base):
+            return
+        try:
+            if target.is_file():
+                found[path.relative_to(root).as_posix()] = target.read_bytes()
+            elif target.is_dir() and target not in ancestors:
+                for child in sorted(path.iterdir()):
+                    visit(child, ancestors | {target})
+        except OSError:  # unreadable for the readers as well
+            return
+
+    visit(root / place, frozenset())
+    return found
 
 
 def lane_context(plan: dict, item: dict, config: Config, root: Path) -> tuple[Config, dict[str, bytes | None]]:

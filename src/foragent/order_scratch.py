@@ -50,6 +50,14 @@ def _names_above(manifest: dict, acceptance_dir: str) -> set[str]:
     return {PurePosixPath(name).name.lower() for name in manifest if str(PurePosixPath(name).parent) in above}
 
 
+def real(path: Path) -> Path | None:
+    """Where ``path`` resolves, or None when it cannot be resolved (a link cycle, a broken link loop)."""
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
 def blob(data: bytes) -> str:
     """Git's blob hash, so tree entries and written files compare without Git."""
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
@@ -91,16 +99,32 @@ def build(git: GitRepo, base: str, tree: Path, overlay: dict[str, bytes | None])
     finally:
         index.unlink(missing_ok=True)
     for name in sorted(name for name, data in overlay.items() if data is None):
-        _remove_path(tree / name)
+        if _own_parents(tree, name, create=False):
+            _remove_path(tree / name)
     for name, data in sorted((name, data) for name, data in overlay.items() if data is not None):
-        for parent in reversed(PurePosixPath(name).parents[:-1]):
-            directory = tree / parent
-            if directory.is_symlink() or directory.exists() and not directory.is_dir():
-                directory.unlink()
-            directory.mkdir(exist_ok=True)
+        _own_parents(tree, name, create=True)
         _remove_path(tree / name)
         (tree / name).write_bytes(data)
     return _entries(tree)
+
+
+def _own_parents(tree: Path, name: str, *, create: bool) -> bool:
+    """Make every folder above ``tree/name`` a real directory in the tree, one level at a time.
+
+    A symlinked or non-directory component is replaced by a real directory (only the link or
+    file inside the tree is removed, never what it points to), so overlay removals and writes
+    cannot reach the original checkout or anything else through a link. Without ``create``
+    nothing is made and False means the path has no real parent in the tree to act on.
+    """
+    for parent in reversed(PurePosixPath(name).parents[:-1]):
+        directory = tree / parent
+        if directory.is_symlink() or directory.exists() and not directory.is_dir():
+            directory.unlink()
+        if not directory.exists():
+            if not create:
+                return False
+            directory.mkdir()
+    return True
 
 
 def protected(git: GitRepo, root: Path, state: Path) -> tuple[Path, ...]:
@@ -189,27 +213,20 @@ def changes(git: GitRepo, tree: Path, manifest: dict[str, tuple[str, str]], acce
                           if str(parent) + "/" in ignored), None)
         # The exemption covers tool output only: anything there that reaches a protected place
         # (by symlink) or is shared test configuration inside the acceptance directory is refused.
-        target = path.resolve()
-        if name not in manifest and directory is not None and (target.is_relative_to(root) or not any(
-                target.is_relative_to(place.resolve()) for place in protected)) and not (
+        # A link that cannot be resolved (a cycle) is refused by path like any other escape.
+        target = real(path)
+        if target is not None and name not in manifest and directory is not None and (
+                target.is_relative_to(root) or not any(target.is_relative_to(place) for place in protected)) and not (
                 PurePosixPath(name).is_relative_to(inside) and shared_configuration(name, acceptance_dir, above, directories=False)):
             output.add(directory)
         elif (name in manifest or found.get(name, ("",))[0] == "120000"
                 or not PurePosixPath(name).is_relative_to(inside)
                 or shared_configuration(name, acceptance_dir, above)
                 or any((tree / parent).is_symlink() for parent in PurePosixPath(name).parents)
-                or not path.resolve().is_relative_to(root)):
+                or target is None or not target.is_relative_to(root)):
             refused.append(name)
         else:
             candidates[name] = path.read_bytes()
     unignored = [name for name in candidates if name not in _ignored(git, tree, list(candidates))]
     refused += sorted(set(candidates) - set(unignored))
     return {name: candidates[name] for name in unignored}, sorted(refused), sorted(output)
-
-
-def remove(tree: Path) -> None:
-    """Delete a scratch tree this command made; symlinks inside are removed, not followed."""
-    if tree.is_symlink():
-        tree.unlink()
-    elif tree.exists():
-        shutil.rmtree(tree)
