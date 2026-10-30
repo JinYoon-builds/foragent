@@ -3,7 +3,7 @@
 The gate calls ``ensure_orchestrator`` every tick. It opens one Claude session
 running ``/fa-orchestrator`` only when approved work exists, no orchestrator
 renewed its heartbeat lately, no recorded or gate-spawned orchestrator session
-is still running, and no spawn happened in the last two minutes.
+is still running, no live lease holder sits in the seat (``orch_seat``), and no spawn happened in the last two minutes.
 The session opens in the background: a new Orca tab without focus, a detached
 tmux window, or ``claude --bg`` without a screen. The lane view stays beside the
 planning session, so nothing here splits a pane or switches focus.
@@ -18,7 +18,7 @@ import shlex
 import shutil
 from types import SimpleNamespace
 
-from foragent import orch_binding, orch_push, orch_stale_files, processes, watch_open
+from foragent import orch_binding, orch_push, orch_seat, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
@@ -184,11 +184,16 @@ def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, n
         return None
     if _alive(store, now) or not _approved_work(store):
         return None
-    if _session_alive(store, repo_root.resolve()):
+    if _session_alive(store, repo_root.resolve()) or orch_seat.blocks_spawn(store):
         _note_silent(store, now)
         return None
     with watch_open._opening(store):  # Serialize with other openers in this state root.
         if _spaced(store, now):
+            return None
+        if _alive(store, now):
+            return None
+        if _session_alive(store, repo_root.resolve()) or orch_seat.blocks_spawn(store):
+            _note_silent(store, now)
             return None
         root = repo_root.resolve()
         planned = plan_launch(root, store, now)

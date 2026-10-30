@@ -50,8 +50,8 @@ action. When the condition holds, wait quietly for a new event or user message.
 
 Keep `fa orch watch --follow` running in a Monitor for this session's whole life; it is the heartbeat and
 records this session, so the gate opens no second orchestrator. Restart it if it stops ([watch](references/watch.md)).
-Say you are watching only while it runs in this session and renews the heartbeat; else restart it. Check
-`fa orch refresh-due --json` too; a due session hands off and refreshes: [refresh](references/refresh.md).
+Say you are watching only while it runs in this session and renews the heartbeat; else restart it. Check `fa orch refresh-due --json` too; a due session hands off and refreshes: [refresh](references/refresh.md).
+If `fa orch watch --follow` refuses because another orchestrator holds the seat, end this session.
 
 ## Check loop (D80)
 

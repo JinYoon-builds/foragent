@@ -14,7 +14,7 @@ import json
 import os
 from pathlib import Path
 
-from foragent import orch_spawn
+from foragent import orch_seat, orch_spawn
 from foragent.config import Config
 from foragent.state import StateStore
 
@@ -38,7 +38,15 @@ def skip_reason(repo_root: Path, store: StateStore, now: datetime) -> str | None
         return "no_work"
     if orch_spawn._session_alive(store, repo_root.resolve()):
         return "session"
+    if orch_seat.blocks_spawn(store):  # #962: a live or unknown lease holder.
+        return "seat"
     return None
+
+
+def note_silent(store: StateStore, now: datetime, reason: str | None) -> None:
+    """A live but silent orchestrator (its session or the seat's holder) stopped the spawn: the hourly event."""
+    if reason in ("session", "seat"):
+        orch_spawn._note_silent(store, now)
 
 
 @contextmanager
@@ -75,13 +83,14 @@ def ensure_explicit(repo_root: Path, store: StateStore, config: Config, now: dat
     seen = _last_spawn(store)
     reason = skip_reason(repo_root, store, now)
     if reason is not None:
-        if reason == "session":
-            orch_spawn._note_silent(store, now)
+        note_silent(store, now, reason)
         why.append(reason)
         return None
     root = repo_root.resolve()
     with _explicit_lock(store) as busy:
         if (reason := skip_reason(root, store, now)) is not None:
+            if reason == "seat":
+                orch_spawn._note_silent(store, now)
             why.append(reason)
             return None
         if _last_spawn(store) != seen or (busy and orch_spawn._spaced(store, now)):

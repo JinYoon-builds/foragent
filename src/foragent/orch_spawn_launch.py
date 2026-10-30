@@ -65,10 +65,26 @@ def launch(root: Path, store: StateStore, now: datetime, planned) -> bool:
     return True
 
 
+def take_seat(store: StateStore, planned, now: datetime) -> bool:
+    """Inside the openers' lock, right after a launch: the launcher becomes the seat holder (#962).
+
+    The launcher's PID and start time come from the spawn record this launch
+    just wrote; when they could not be read, no lease is written (False).
+    """
+    from foragent import orch_seat
+
+    record = orch_spawn._read_record(store) or {}
+    if record.get("spawned_at") != now.isoformat() or record.get("launched") is not True:
+        return False
+    return orch_seat.hand_over(store, record.get("pid"), record.get("start_time"),
+                               planned[3]["session_id"], now)
+
+
 def adopt(store: StateStore, planned, now: datetime) -> None:
-    """Inside the openers' lock, right after a launch: the new session becomes the heartbeat's active one."""
+    """Inside the openers' lock, right after a launch: the new session holds the seat and is the heartbeat's active one."""
     from foragent import orch_sessions
 
+    take_seat(store, planned, now)
     orch_sessions.activate(store, planned[3], now)
 
 
@@ -102,5 +118,6 @@ def spawn_orchestrator(repo_root: Path, store: StateStore, config: Config, *, pr
     planned = plan_launch(root, store, now, prompt)
     if planned is None or not launch(root, store, now, planned):
         return None
+    take_seat(store, planned, now)  # The deliberate replacement: the old holder becomes previous.
     _opened(store, config, root, now, planned)
     return planned[3]

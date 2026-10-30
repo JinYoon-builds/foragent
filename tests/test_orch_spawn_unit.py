@@ -114,7 +114,7 @@ def test_explicit_call_checks_its_guards_again_inside_the_lock(tmp_path, monkeyp
 
 
 def test_gate_path_is_unchanged_by_the_explicit_call(tmp_path, monkeypatch):
-    """The gate checks liveness before the lock only and keeps its record shape."""
+    """The gate rechecks liveness inside the openers' lock (#962) and keeps its record shape."""
     from contextlib import contextmanager
     import json
 
@@ -130,6 +130,11 @@ def test_gate_path_is_unchanged_by_the_explicit_call(tmp_path, monkeypatch):
             yield
 
     monkeypatch.setattr(watch_open, "_opening", opening)
+    # A heartbeat renewed while the gate waited for the lock stops this spawn.
+    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW) is None
+    assert calls == [] and not (store.root / "orch-spawn.json").exists()
+    monkeypatch.setattr(watch_open, "_opening", real)
+    (store.root / "orch-heartbeat.json").unlink()
     assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW) == "background"
     assert len(calls) == 1
     assert json.loads((store.root / "orch-spawn.json").read_text()) == {
