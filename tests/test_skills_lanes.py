@@ -116,8 +116,8 @@ def test_sync_clones_then_fast_forwards_with_no_live_network(tmp_path):
         ["git", "clone", "--", "https://github.com/anthropics/knowledge-work-plugins", str(directory / "knowledge-work-plugins")],
         ["git", "clone", "--", "https://github.com/anthropics/skills", str(directory / "skills")],
     ]
-    (directory / "knowledge-work-plugins").mkdir()
-    (directory / "skills").mkdir()
+    (directory / "knowledge-work-plugins/.git").mkdir(parents=True)
+    (directory / "skills/.git").mkdir(parents=True)
     manager.sync()
     assert commands[-2:] == [
         ["git", "-C", str(directory / "knowledge-work-plugins"), "pull", "--ff-only"],
@@ -953,6 +953,7 @@ def test_vendored_library_prefers_project_then_installed_package_data(tmp_path, 
     data = tmp_path / "data"
     _vendored(data / "share/foragent")
     monkeypatch.setattr(skills.sysconfig, "get_path", lambda name: str(data))
+    monkeypatch.setattr(skills, "_CHECKOUT", tmp_path / "no-checkout")
     project = tmp_path / "project"
     _vendored(project, ("principle-local",))
     assert skills.vendored_library(project)["path"] == str(project)
@@ -984,8 +985,15 @@ def test_sync_never_pulls_pinned_or_self_sourced_libraries(tmp_path, monkeypatch
 
     _vendored(tmp_path / "base")
     local = tmp_path / "local"
-    local.mkdir()
+    (local / ".git").mkdir(parents=True)
+    # A folder inside a checkout, registered by a relative path: pulling it would pull the checkout.
+    (tmp_path / "checkout/.git").mkdir(parents=True)
+    (tmp_path / "checkout/skills/pstack").mkdir(parents=True)
+    (tmp_path / "checkout/own/.git").mkdir(parents=True)  # A person's own repository, named relatively.
+    monkeypatch.chdir(tmp_path / "checkout")
     config = Config(skill_libraries=[{"name": "local", "repo": str(local), "path": str(local)},
+                                     {"name": "relative", "repo": "own", "path": "own"},
+                                     {"name": "inside", "repo": "https://example.invalid/i", "path": "skills/pstack"},
                                      {"name": "remote", "repo": "https://example.invalid/r", "path": str(local)}])
     commands = []
     manager = SkillManager(skills.with_vendored_library(config, tmp_path / "base"),
@@ -993,3 +1001,26 @@ def test_sync_never_pulls_pinned_or_self_sourced_libraries(tmp_path, monkeypatch
     assert manager.sync() == ["remote"]
     assert commands == [["git", "-C", str(local), "pull", "--ff-only"]]
     assert manager._select("pstack:principle-demo").library.revision == "abc123"
+
+
+def test_install_into_another_project_keeps_the_advertised_vendored_source(tmp_path, monkeypatch, capsys):
+    from foragent import skills
+
+    source = tmp_path / "foragent"
+    _vendored(source)
+    monkeypatch.setattr(skills, "_CHECKOUT", source)  # An editable install: no package data.
+    monkeypatch.setattr(skills.sysconfig, "get_path", lambda name: str(tmp_path / "no-data"))
+    monkeypatch.setattr(cli, "load_global_config", lambda: Config(skill_libraries=[]))
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["skills", "install", "pstack:principle-demo", "--repo-root", str(empty)]) == 0
+    assert (empty / ".claude/skills/principle-demo/SKILL.md").read_text().endswith("Body.\n")
+    assert sorted(path.name for path in (empty / ".claude/skills").iterdir()) == ["principle-demo"]
+    project = tmp_path / "project"
+    _vendored(project, ("principle-local",))
+    monkeypatch.chdir(project)  # The catalog seen here advertises this project's copy.
+    assert cli.main(["skills", "install", "pstack:principle-local", "--repo-root", str(empty)]) == 0
+    assert "Installed: principle-local" in capsys.readouterr().out
+    entry = skills.vendored_library(tmp_path / "nothing", empty)
+    assert entry["path"] == str(source)

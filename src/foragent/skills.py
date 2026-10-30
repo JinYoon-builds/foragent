@@ -190,6 +190,8 @@ class SkillManager:
         for library in self.libraries:
             if library.revision is not None or _is_own_source(library):
                 continue  # Pinned or local libraries are their own source; pulling would move the checkout around them.
+            if library.path.exists() and not (library.path / ".git").exists():
+                continue  # Not a repository of its own: `git -C` would pull whatever checkout encloses it.
             if library.path.exists():
                 self.run(["git", "-C", str(library.path), "pull", "--ff-only"])
             else:
@@ -409,21 +411,24 @@ class SkillManager:
 
 def _is_own_source(library: Library) -> bool:
     """A library registered by local path at that same path has no upstream of its own to pull."""
-    repo = Path(library.repo).expanduser()
-    return repo.is_absolute() and repo.resolve() == library.path.expanduser().resolve()
+    repo = Path(library.repo).expanduser()  # Relative paths resolve against the current directory, as git does.
+    return repo.exists() and repo.resolve() == library.path.expanduser().resolve()
 
 
 VENDORED_MANIFEST = "skills/pstack/library.yml"
 
 
-def vendored_library(root: Path | None = None) -> dict[str, Any] | None:
+_CHECKOUT = Path(__file__).resolve().parents[2]
+
+
+def vendored_library(*roots: Path | None) -> dict[str, Any] | None:
     """The library entry for skills vendored with Foragent at a pinned revision.
 
-    The project's own copy wins, so a moved or copied checkout finds itself; otherwise the installed
-    package data. Only the skills the manifest lists belong to it.
+    The given projects' own copies come first, in order, so a moved or copied checkout finds itself;
+    then Foragent's source checkout (editable installs), then the installed package data. Only the skills the manifest lists belong to it.
     """
-    bases = [root] if root is not None else []
-    bases += [Path(sysconfig.get_path("data")) / "share/foragent"]
+    bases = [root for root in roots if root is not None]
+    bases += [_CHECKOUT, Path(sysconfig.get_path("data")) / "share/foragent"]
     for base in bases:
         manifest = base / VENDORED_MANIFEST
         if not manifest.is_file():
@@ -440,9 +445,9 @@ def vendored_library(root: Path | None = None) -> dict[str, Any] | None:
     return None
 
 
-def with_vendored_library(config: Config, root: Path | None = None) -> Config:
+def with_vendored_library(config: Config, *roots: Path | None) -> Config:
     """Put the vendored library before the configured ones, so a configured name cannot take its IDs."""
-    entry = vendored_library(root)
+    entry = vendored_library(*roots)
     if entry is None or any(isinstance(item, dict) and item.get("revision") for item in config.skill_libraries):
         return config
     return replace(config, skill_libraries=[entry, *config.skill_libraries])

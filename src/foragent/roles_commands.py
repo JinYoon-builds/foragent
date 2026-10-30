@@ -68,7 +68,7 @@ class _Edit:
         names = []
         for identity in skills:
             if self.manager is None:
-                self.manager = SkillManager(with_vendored_library(self.config, self.root))
+                self.manager = SkillManager(with_vendored_library(self.config, Path.cwd(), self.root))
             try:
                 names.append(self.manager.check_install(identity, self.root).path.name)
                 self.to_install.append(identity)
