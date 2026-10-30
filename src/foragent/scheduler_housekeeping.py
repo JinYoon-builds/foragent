@@ -38,9 +38,10 @@ def prune(ctx, actions: list[str]) -> None:
     now = ctx.now()
     with step("log_prune"):
         try:
-            for path in ctx.store.trim_journals(now):
+            ctx.store.trimmed_journals = []
+            ctx.store.prune_logs(now)  # Trims the journals once, then prunes the logs.
+            for path in ctx.store.trimmed_journals:
                 actions.append(f"Trimmed {path.name} lines older than 30 days")
-            ctx.store.prune_log_files(now)  # Journals were trimmed just above.
             if ctx.store.logs_total() > _limit():
                 actions.append("Logs still above 500 MB after pruning; active runs' logs are kept")
         except OSError as exc:
