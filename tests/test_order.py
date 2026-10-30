@@ -1060,8 +1060,9 @@ REPO = "owner/repo"
 
 
 def _child_body(plan, item, config):
-    """The body publish writes for a plan child, marker included."""
-    return order._published_body(plan, item, REPO, config) + "\n" + order._child_marker(plan["id"], item["key"]) + "\n"
+    """The body publish writes for a new plan child, its plan and owner-label markers included."""
+    return (order._published_body(plan, item, REPO, config) + "\n" + order._child_marker(plan["id"], item["key"])
+            + "\n" + order.OWNED_MARKER + "\n")
 
 
 API_FILES = {FILE: "assert True\n"}
@@ -1090,6 +1091,13 @@ def test_preread_proposal_is_recorded_and_bound_to_the_published_issue(publishin
     assert proposal["approach"] == ["Reuse the writer."]
     assert proposal["decisions"] == ["Name the helper while implementing."]
     assert _handover(root, 7, body.replace("\n", "\r\n"), API_FILES) is not None
+    legacy = body.replace(order.OWNED_MARKER + "\n", "")  # A child published before owner labels.
+    assert _handover(root, 7, legacy, API_FILES) == proposal
+    # The body publish writes is exactly the one the run is handed the proposal for.
+    tracker, git = publishing[2], publishing[3]
+    publish(publishing, plan)
+    assert tracker.get_issue(2).body == body
+    assert _handover(root, 7, body + "\nAppended by a person.\n", API_FILES) is None
     other = order._published_body(plan, plan["issues"][1], REPO, config) + order._child_marker(plan["id"], "api")
     assert _handover(root, 7, other, API_FILES) is None, "another issue's content is not this proposal"
     assert _handover(root, 7, body.replace(f"id={plan['id']}", "id=another-order"), API_FILES) is None
@@ -1162,6 +1170,9 @@ def test_preread_proposal_of_an_edit_is_bound_to_its_number(publishing, plan, mo
     order.preread(plan, root, config, lambda: tracker, repo=REPO)
     body = order._published_body(plan, edit, REPO, config)
     assert _handover(root, 3, body, API_FILES)["approach"] == ["Reuse the writer."], "the api issue supplies FILE"
+    # An edit of an issue published under owner labels keeps that contract line at its end.
+    contract = order._with_contract(body, f"old\n{order.OWNED_MARKER}\n")
+    assert contract != body and _handover(root, 3, contract, API_FILES)["approach"] == ["Reuse the writer."]
     assert _handover(root, 4, body, API_FILES) is None
     assert _handover(root, 3, body, {FILE: "assert 1 == 1\n"}) is None
 
@@ -2028,7 +2039,7 @@ def test_edits_keep_the_existing_issue_owner(publishing, plan):
 
 
 @pytest.mark.parametrize("refused", ["parent", "child"])
-@pytest.mark.parametrize("fault", ["label", "read", "retire", "close", "retire-and-close"])
+@pytest.mark.parametrize("fault", ["label", "read", "read-unlabelled", "retire", "close", "retire-and-close"])
 def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing, plan, refused, fault):
     tracker = publishing[2]
     target = plan["title"] if refused == "parent" else plan["issues"][1]["title"]
@@ -2043,15 +2054,19 @@ def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing
             return victim[0]
         return created(title, body, labels)
 
-    def faulty(method, kinds):
+    def faulty(method, kinds, once=False):
+        failed = []
+
         def call(n, *args, **kwargs):
-            if victim and n == victim[0] and fault in kinds:
+            if victim and n == victim[0] and fault in kinds and not (once and failed):
+                failed.append(n)
                 raise TrackerError(f"{method.__name__} failed")
             return method(n, *args, **kwargs)
         return call
 
     tracker.create_issue = create
-    tracker.get_issue = faulty(read, {"read"})
+    # One transient read failure: any rollback after it would succeed, so a wrong one shows.
+    tracker.get_issue = faulty(read, {"read", "read-unlabelled"}, once=True)
     tracker.update_issue = faulty(write, {"retire", "retire-and-close"})
     tracker.close_issue = faulty(close, {"close", "retire-and-close"})
     with pytest.raises((order.PlanError, TrackerError)):
@@ -2064,6 +2079,9 @@ def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing
     # Each cleanup step runs even when the other one fails.
     assert (first.state == "closed") == (fault in ("label", "retire"))
     assert ("<!-- foragent:plan" not in first.body) == (fault in ("label", "close"))
+    if fault == "read":  # The outcome was unknown, and it was a labelled issue: nothing undone.
+        assert owners(tracker)[number] == {"by:human"} and first.state == "open"
+        assert "<!-- foragent:plan" in first.body, "its live markers let a retry find it"
     if fault != "read":  # Whatever rollback failed, an unlabelled leftover is nobody's work, never legacy work.
         assert not owners(tracker)[number] and order.OWNED_MARKER in first.body
         for config in (publishing[1], replace(publishing[1], legacy_owner="jin")):
@@ -2074,7 +2092,7 @@ def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing
     numbers = {report.parent, *(row["number"] for row in report.rows)}
     labelled = "by:human" in tracker.get_issue(number).labels
     assert labelled == (fault == "read")
-    assert (number in numbers) <= labelled, "Only a labelled issue may be reused"
+    assert (number in numbers) == labelled, "A labelled issue is reused, an unlabelled one never"
     # A reused labelled parent keeps its original owner; a fresh parent belongs to the retrying person.
     expected = {"by:bob"} if refused == "parent" and number not in numbers else {"by:human"}
     assert all(owners(tracker)[n] == expected for n in numbers)

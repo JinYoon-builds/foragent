@@ -555,21 +555,18 @@ def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body
     """Create an issue carrying ``owner``'s label, or refuse it and stop publication.
 
     GitHub silently drops labels a creator may not apply, so the label is read back.
-    An unconfirmed issue (label missing or unreadable) is retired and publication
-    stops. Even when every rollback step fails, the issue is nobody's work: its body
-    carries ``OWNED_MARKER`` without the label, which ``ownership.effective_orderer``
-    refuses (never legacy work), discovery never reuses it (``_unconfirmed``), and
-    a retry retires it again.
+    Only an issue observed without its label is retired, and publication stops. When
+    the read itself fails, the outcome is unknown and nothing is touched: a labelled
+    issue keeps its live markers, so a retry reuses it under its original owner; an
+    unlabelled one carries ``OWNED_MARKER`` without the label, so it is nobody's work
+    (``ownership.effective_orderer``), discovery never reuses it (``_unconfirmed``),
+    and a retry retires it. The same holds when every rollback step fails.
     The issue is created in one request so its body has no edit that would
     postdate an approval added in the same publication.
     """
     label = owner_label(owner)
     number = tracker.create_issue(title, body, [label, *labels])
-    try:
-        confirmed = label in tracker.get_issue(number).labels
-    except Exception:
-        _retire(tracker, config, Issue(number, title, body, frozenset(), "open"), label)
-        raise
+    confirmed = label in tracker.get_issue(number).labels
     if not confirmed:
         _retire(tracker, config, Issue(number, title, body, frozenset(), "open"), label)
         raise PlanError(text("identity_label_missing", config.language, number=number, label=label))
@@ -916,9 +913,16 @@ def _body_digest(body: str) -> str:
 
 
 def _without_child_marker(body: str) -> tuple[str, re.Match | None]:
-    """Split off the plan-child marker publish appends as the body's last line, nothing else."""
+    """Split off the lines publish appends after the rendered body, nothing else.
+
+    Those are the plan-child marker (children) and the owner-label contract line
+    (``OWNED_MARKER``, last; children and edits of contract issues).
+    """
     text = body.replace("\r\n", "\n").rstrip()
     head, _, last = text.rpartition("\n")
+    if last == OWNED_MARKER:
+        text = head.rstrip()
+        head, _, last = text.rpartition("\n")
     marker = _CHILD_LINE.fullmatch(last)
     return (head if marker else text), marker
 
@@ -953,7 +957,7 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
 
     A record counts only when its key names this issue (plan child key in the same order,
     or an edit of #n), the body publish rendered for it equals the approved body byte for byte
-    (apart from the trailing plan-child marker publish appends), and every file it bound
+    (apart from the trailing lines publish appends), and every file it bound
     (acceptance tests and references) has the same content in the run's worktree and, where
     the approval snapshot names the file, in that snapshot. The preread writer keeps
     records in write order, so the last match is the latest answer; when that answer
