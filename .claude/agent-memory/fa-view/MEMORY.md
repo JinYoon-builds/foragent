@@ -136,3 +136,4 @@
 - [#308 runner_unit_tests 설정](project_settings_runner.md) — 새 팀 설정 추가 경로, auto 표시, max_parallel null 허용
 - #942 `watch_open._running`은 `psutil.Process(pid).create_time()`이 watch.pid mtime+2초보다 늦으면 재사용으로 본다(읽기 실패=살아 있음). `_opening`이 잠금 안에서 다시 확인해 Process가 두 번 불린다. 부수기 확인용 백업은 존재하는 폴더에 둔다.
 - [#174 다람쥐 클릭 대화](project_lane_talk_click.md) — hit_test 첫 인자 분기, 배지는 레인 첫 줄 위, last_issue·talking
+- #951 watch-terminal.json 기록은 `watch_open.record_terminal(store, cwd, exe, handle, now)` 하나로 한다(FORAGENT_ROLE은 빈 값도 존재로 판정·워크트리 안은 건너뜀). 훅은 `presence.record_terminal`, 시각은 호출자가 넘긴다(시험이 presence·statusline의 datetime만 바꿈).
