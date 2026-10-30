@@ -146,7 +146,9 @@ def _assert_previous_attempt(prompt, *, head, finding):
 
 
 def test_tier_escalation_fresh_session_keeps_review_and_branch_context(git_history, tmp_path, monkeypatch):
-    case = _case(git_history, tmp_path, monkeypatch, reviewer="codex", max_retries=1,
+    # #238 (2026-10-30): max_retries=2 keeps the second attempt from being the last,
+    # whose tier is always l; this test checks review and branch context, not that rule.
+    case = _case(git_history, tmp_path, monkeypatch, reviewer="codex", max_retries=2,
                  review_scope="pr-body", tiers={
                      "s": {"codex_effort": "medium", "claude_model": "offline-small"},
                      "m": {"codex_effort": "high", "claude_model": "offline-medium"},
