@@ -115,6 +115,54 @@ def test_live_pid_with_permission_denied_still_suppresses_opening(opening, tmp_p
     assert capsys.readouterr() == ("", "")
 
 
+@pytest.mark.parametrize(("started_after", "opened"), [(-60, 0), (1.5, 0), (2.0, 0), (2.5, 1), (3600, 1)])
+def test_pid_counts_as_reused_only_when_its_process_is_over_two_seconds_younger(
+    opening, tmp_path, monkeypatch, started_after, opened
+):
+    store, calls = opening
+    store.root.mkdir()
+    pid_file = store.root / "watch.pid"
+    pid_file.write_text("4242\n")
+    written_at = 1_800_000_000.0
+    os.utime(pid_file, (written_at, written_at))
+    monkeypatch.setattr(watch_open.os, "kill", lambda pid, sig: None)
+    seen = []
+
+    class Process:
+        def __init__(self, pid):
+            seen.append(pid)
+
+        def create_time(self):
+            return written_at + started_after
+
+    monkeypatch.setattr(watch_open.psutil, "Process", Process)
+    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/osascript" if name == "osascript" else None)
+    watch_open.open_view(tmp_path, store)
+    assert seen and set(seen) == {4242}
+    assert len(calls) == opened
+    assert pid_file.read_text() == "4242\n"
+
+
+@pytest.mark.parametrize("error", [watch_open.psutil.AccessDenied(4242), watch_open.psutil.NoSuchProcess(4242), OSError("x")])
+def test_unreadable_start_time_keeps_a_live_pid(opening, tmp_path, monkeypatch, error):
+    store, calls = opening
+    store.root.mkdir()
+    (store.root / "watch.pid").write_text("4242")
+    monkeypatch.setattr(watch_open.os, "kill", lambda pid, sig: None)
+
+    class Process:
+        def __init__(self, pid):
+            pass
+
+        def create_time(self):
+            raise error
+
+    monkeypatch.setattr(watch_open.psutil, "Process", Process)
+    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/osascript" if name == "osascript" else None)
+    watch_open.open_view(tmp_path, store)
+    assert calls == []
+
+
 @pytest.mark.parametrize("failure", [FileNotFoundError("gone\naway"), subprocess.TimeoutExpired("opener", 5)])
 def test_open_failure_is_one_localized_nonfatal_line(opening, tmp_path, monkeypatch, capsys, failure):
     store, calls = opening
