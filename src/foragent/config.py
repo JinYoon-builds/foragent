@@ -426,7 +426,8 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
         if key not in DEFAULTS and key not in IGNORED_KEYS and key not in FILE_KEYS:
             raise ConfigError(f"unknown configuration key: {key}")
     if "max_parallel" in value and value["max_parallel"] is None:
-        raise ConfigError("max_parallel must be a positive integer; omit it to have no ceiling")
+        # null is the default (no ceiling), as when the key is left out; a dump of Config writes it.
+        value = {key: item for key, item in value.items() if key != "max_parallel"}
     return value
 
 

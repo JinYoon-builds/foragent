@@ -369,6 +369,10 @@ def test_lane_validation(repo, settings):
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_parallel_and_wait_settings_are_positive(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
+    if key == "max_parallel" and value is None:
+        # null is the default (no ceiling), as when the key is left out (a dump of Config writes it).
+        assert load_config(repo).max_parallel is None
+        return
     with pytest.raises(ConfigError, match=key):
         load_config(repo)
 
