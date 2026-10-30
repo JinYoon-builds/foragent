@@ -19,6 +19,28 @@ conversational English, active voice, positive phrasing, and one idea per senten
 Explain the result and the next action in the person's terms. Run the commands in this
 skill yourself; the person supplies requests, links and choices in conversation.
 
+## Talking to the person
+Record the decision ledger, chunk cells and source labels with `fa order progress`.
+These records are not shown to the person as lists unless the person asks for them.
+
+Every question or confirmation to the person starts with this context, in order:
+the problem in the person's own words (what they asked or worried about), then what
+will change for the person when the work is done, then one decision to make.
+
+Only words the person actually said go in quotation marks or are attributed to them.
+Keep the person's original words untranslated in quotes.
+Mark a summary of the agreement as the session's summary.
+
+Confirm scope with one question, e.g. "Is this what you wanted?" in English;
+ask the confirmation question in the person's language. The session settles
+reversible details itself and keeps them in the records. Reuse that confirmation
+while the scope still fits; ask again only when the scope changes.
+
+Approval must come first-hand from the person in the session that publishes. The planning
+session publishes only after the person approves there. When the orchestrator drafts the
+plan, it sends the plan path to the planning session. Approval relayed from another session
+is not approval.
+
 ## Local preparation progress
 At order start, immediately run `fa order progress start --title "<request summary>"`,
 then `fa gate watch --open` so the lane view is available while the order is prepared.
@@ -55,10 +77,10 @@ Run `fa order context --json` and read it fully. Then read the repository yourse
   date (say unknown when the source has no date). Label each source: `code`, `docs`,
   `person` or `assumption`; cite a file/section or the person's words. Assumptions stay
   provisional until resolved. Record settled entries with `fa order progress ledger`.
-- Show the collected ledger once for confirmation, as one concise list. Correct it from
-  the person's response; then ask only about gaps. If this session already confirmed
-  the ledger, reuse it and show only changes. Documents fill gaps; they do not constrain
-  what the person may request now.
+- Once, confirm the person's goal in context as described in Talking to the person.
+  Correct it from the person's response; then ask only about gaps. If this session already
+  confirmed the goal, reuse it and explain only scope changes in context. Documents fill
+  gaps; they do not constrain what the person may request now.
 - Existing open issues without the Foragent format: propose per issue — rewrite (contract +
   acceptance test), split, merge duplicates, close (with reason, original kept) or leave
   (not finished by code). Apply only what the user approves; never delete.
@@ -101,9 +123,10 @@ Use Ouroboros only for interview and seed; never use Ouroboros run/evolve (D18).
 
 For the native interview, use AskUserQuestion, **one question at a time**. Offer 2–3
 options with your recommendation first and marked, while accepting a free answer.
-First show the big picture as proposed chunks and confirm that it matches the request.
-Then work on the least clear remaining cell, using the ledger and code to fill anything
-you can answer yourself. Show its source labels and the evidence behind the options.
+Reuse the goal confirmation from step 1; if it is still missing, ask the single scope
+question described in Talking to the person. Then work on the least clear remaining cell,
+using the ledger and code to fill anything you can answer yourself. Keep source labels in
+the records; explain the practical tradeoffs and evidence behind options in context.
 Refine a free answer into decision / reason / constraints / out of scope, and reflect it
 back for correction before treating an uncertain interpretation as settled.
 Ask only what changes product behaviour, scope, priority, UX or an approval boundary.
@@ -111,9 +134,10 @@ Do not ask about reversible implementation details — decide them and note them
 - New project (no specs yet): find the goal first — who uses it, the first thing they do,
   what "done for now" means, what is explicitly not in this round.
 - Daily order: process decisions/feedback, then the new request. Keep it short.
-Keep a visible list of **open questions** in your messages; the interview ends when it is
-empty and all five cells per chunk are settled. Stop asking once remaining choices are
-reversible; decide those yourself and record the assumptions.
+Keep **open questions** in the progress records; bring the next unresolved decision to
+the person with context. The interview ends when no open questions remain and all five
+cells per chunk are settled. Stop asking once remaining choices are reversible; decide
+those yourself and record the assumptions.
 
 ### Project profile
 Use `profile` from the context and the ledger as earlier answers, not a separate team
@@ -195,10 +219,13 @@ Carry the selected draft's run instructions and the same screen as the draft int
 visual Done when evidence so implementing workers can reproduce the agreed result.
 
 ## 3. Restate and confirm
-Before splitting, restate in a few lines: what will exist when this order is done, what is
-out of scope, and every decision you made on the user's behalf. Include the seed when
-Ouroboros produced one. Reuse the big-picture confirmation from step 2 if it still fits;
-otherwise get an explicit yes on the changed scope.
+Before splitting, give the session's summary in a few lines: the person's problem, what
+will change for them, and what is out of scope. Before approval, list the decisions the
+session settled itself once in this restatement, under "I decided these for you" (in the
+person's language), as one short list so the person can change them. Keep the decision
+ledger, source labels and chunk cells internal; this is a plain-language summary of choices.
+Include the seed when Ouroboros produced one. Reuse the goal confirmation from steps 1–2
+if it still fits; otherwise ask the single scope question on the changed result, in context.
 
 ## 4. Split into issues
 One issue = one PR that can be verified on its own, sized for one agent session.
@@ -206,6 +233,10 @@ Split further when any of these differ: the result that can be merged alone, the
 verification environment, an approval boundary, or a part that can be blocked while the
 rest still completes. For each issue you must be able to write one sentence:
 "Close when <specific evidence>". If you cannot, split or ask.
+When several issues depend on each other's code (shared interfaces, or one screen
+split into parts), the first issue is a skeleton that defines the shared names,
+signatures and data shapes in code. The order spec lists them under a Contracts
+heading. Every dependent issue lists the skeleton issue in `blocked_by`.
 - **Lane** = the area of the code it changes. Issues in one lane run one after another;
   lanes run in parallel. Use existing lanes; propose a new lane only for a genuinely new
   area (name, paths, confirmed fixed style skills from `fa skills catalog`). Never put two
@@ -226,12 +257,12 @@ rest still completes. For each issue you must be able to write one sentence:
   when the affected files are not yet known. The published issue lists these under `## Files`.
 - Put the shared outcome and cross-issue constraints in the parent summary, not in children.
 
-Show the lane map before writing acceptance tests: chunk × goal / out of scope /
+Record the lane map before writing acceptance tests: chunk × goal / out of scope /
 Done when / lane / skills, with source labels for the settled facts and open cells.
 Fill lanes from code paths and the existing lane definitions; ask only when ownership is
-unclear or a new lane needs agreement. Confirm the map once all five cells are settled,
-including executable check commands and the skills policy above. Keep reporting the
-corresponding `fa order progress` facts; unanswered cells stay open.
+unclear or a new lane needs agreement. Settle all five cells, including executable check
+commands and the skills policy above. Keep reporting the corresponding `fa order progress`
+facts; unanswered cells stay open. Reuse the person's scope confirmation from steps 1–3.
 
 ## 5. Write the final checks before any code exists
 For every issue, write the acceptance test file(s) now. They are the goal; the implementer
@@ -251,7 +282,8 @@ check). Done when commands must run with the repo's normal tooling from the repo
 
 ## 5b. Challenge the spec from other seats
 Once the spec is roughly formed, before you lock it for approval, write the plan JSON
-(schema in `fa order publish --help`) to a temp file and run
+(schema in `fa order publish --help`) to the state drafts folder
+`~/.local/share/foragent/<repo>/drafts/<order-id>/plan.json`, never /tmp or a worktree, and run
 `fa order perspectives PLAN.json --json`. Read-only agents question it in parallel from
 fixed seats: skeptic, first-time user, attacker, operator, maintainer in six months,
 incidents (risk map and decisions), and other users. A failed seat is listed under
@@ -263,25 +295,22 @@ changed the spec; mark every id of a merged duplicate). `fa order perspectives s
 shows which seats changed specs.
 
 ## 6. One approval
-Write the plan JSON (schema in `fa order publish --help`) to a temp file. Run
+Keep the plan JSON in that state drafts folder (schema in `fa order publish --help`). Run
 `fa order publish PLAN.json --dry-run`, fix validation errors, then record `progress check`.
 Then run `fa order preread PLAN.json --json`. The implementer reads each issue read-only and
-lists what it would have to guess. Show every unknown to the user as it is and ask them to
-answer it; never answer an unknown yourself. Fold the user's answers into the plan, then run
-preread again until every issue has no unknowns.
+lists what it would have to guess. Resolve unknowns from code, docs or settled decisions,
+and settle reversible details yourself, recording them in the plan. Bring only unknowns
+that need the person's decision to them, one at a time with context. Fold the answers into
+the plan, then run preread again until every issue has no unknowns.
 `--approve` refuses issues whose latest preread of the current content is missing or has
 unknowns; any plan edit needs a new preread. The dry-run is never blocked.
 Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
-so preread refuses them: publish once without `--approve` to create the lanes, run preread,
-then publish again with `--approve`.
-Show the order grouped by lane, work first:
-```
-This order: 7 issues
- api/  (lane api)   login API → token refresh → payment API     [m, m, l]
- web/  (lane web)   login page → error message → payment page   [m, s, m]
- docs/              README                                      [s]
- runs in parallel: api, web · skills: api=testing-strategy
-```
+so preread refuses them: after the person's first-hand approval here, publish once without
+`--approve` to create the lanes, run preread, then publish again with `--approve`. Reuse that
+approval only while the scope is unchanged; get approval here for any changed scope.
+Present the session's summary of the person's problem, the result they will get and
+what is out of scope. Explain any effect of lane assignments on delivery in their terms;
+keep the lane map and implementation details in the progress records.
 Before asking for approval, check every issue and fix the plan where a check fails:
 - (a) Reuse: does existing code already do this or most of it? If so, why is reusing it
   not enough? Name the measured gap.
@@ -297,14 +326,19 @@ Record `fa order progress approval` once the user approves. If the plan changes,
 the dry-run and present the revised scope for approval.
 
 ## 7. Publish
-Run the validated `fa order publish PLAN.json` for real with
+After receiving the person's first-hand approval here, this planning session runs the
+validated `fa order publish PLAN.json` for real with
 `--approve` (or `--approve-keys` for a partial approval). `fa order publish` places the
 acceptance files and the spec in the checkout itself: it takes a publish lock, fetches and
 fast-forwards to the latest base branch, writes and commits only this order's own paths,
 and pushes. Other sessions' edits stay out of the commit, so no manual rebase is needed. If
 it cannot fast-forward, report the error instead of rebasing or committing by hand. Decisions and feedback that change
 existing issues go into `edits`. Record `progress publish --issue <number>` for each
-published or updated issue in the result. Show the printed summary and one line on what
+published or updated issue in the result. After this planning session successfully publishes
+a plan the orchestrator drafted, mark the originating request done with
+`fa orch request-status ID done --note "<issues>"`, using the originating request ID and the
+published issue numbers. A failed publication leaves the request processing.
+Show the printed summary and one line on what
 happens next ("the gate starts within 5 minutes; /fa shows results"), then run
 `fa order progress end`.
 
@@ -319,7 +353,8 @@ takes over its work; it only makes sure one runs and talks to it:
   `fa orch request --from planning --text "<request>"`, so it survives a restart.
 - While this session is open, renew `fa plan heartbeat` about every minute, so
   questions reach this session by message instead of a push notification.
-- Show the open questions from `fa orch questions` and record answers with
+- Show the open questions from `fa orch questions`, each with its context as in Talking
+  to the person, and record answers with
   `fa orch answer <id> --text "<answer>"`.
 
 Never add `approved` yourself outside `fa order publish`, never edit acceptance tests of
