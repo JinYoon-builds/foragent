@@ -138,3 +138,4 @@
 - #951 watch-terminal.json 기록은 `watch_open.record_terminal(store, cwd, exe, handle, now)` 하나로 한다(FORAGENT_ROLE은 빈 값도 존재로 판정·워크트리 안은 건너뜀). 훅은 `presence.record_terminal`, 시각은 호출자가 넘긴다(시험이 presence·statusline의 datetime만 바꿈).
 - [#1058 m2 skeleton seams](project_m2_skeleton.md) — REPLACES/PIN, lazy pairs, COLOR_PAIRS after start_color, no state keys on click
 - [#1001 launchd 재불러오기 복구](project_launchd_reload.md) — D97 감싸기 도우미, 3회 bootstrap 순서, reload 사실 파일, pending 재시도
+- [#1059 m2 art](project_m2_art.md) — ansi_rows ▄ fix, pose frames; full suite blocked by sibling #1062/#1064 tests
