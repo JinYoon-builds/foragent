@@ -178,12 +178,13 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
 def claude_command(
     model: str | None = None, settings_path: Path | None = None, agent: str | None = None,
     *, resume_session_id: str | None = None, read_only: bool = False, prompt: str | None = None,
-    effort: str | None = None,
+    effort: str | None = None, permission_mode: str | None = None,
 ) -> list[str]:
     if resume_session_id is not None and (prompt is None or not prompt.strip()):
         raise ValueError("Session resume requires a non-empty prompt")
-    # Plan mode lets Claude read and answer without editing files or running commands.
-    mode = "plan" if read_only else "auto"
+    # Plan mode lets Claude read and answer without editing files or running commands;
+    # dontAsk refuses every tool the settings file does not allow.
+    mode = permission_mode or ("plan" if read_only else "auto")
     args = ["claude", "-p", "--permission-mode", mode, "--output-format", "stream-json", "--verbose"]
     if settings_path is not None:
         args += ["--settings", str(settings_path)]
@@ -269,9 +270,10 @@ class ClaudeExecutor:
         agent: str | None = None, review_pr: int | None = None,
         resume_session_id: str | None = None,
         goal: str | None = None, read_only: bool = False, effort: str | None = None,
+        permission_mode: str | None = None,
     ) -> ExecResult:
         output_path = log_path.with_suffix(".stdout")
-        options = {}
+        options = {} if permission_mode is None else {"permission_mode": permission_mode}
         if effort is not None:
             options["effort"] = effort
         if read_only:
