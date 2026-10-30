@@ -4,10 +4,13 @@ Before a flush writes anything it lists every path it will write (order files, n
 new-lane files) with its earlier bytes and the base commit. New lanes are committed in
 the batch commit itself. That commit is created first and its sha saved here before HEAD
 moves to it (``GitRepo.commit_recorded``), so a commit HEAD holds is always recorded.
+Order files and notes are committed from memory and written to the checkout only after
+the commit, so before it nothing of them is in the shared checkout for anyone to pick up.
 Whether the batch committed is that one fact:
 
-- the recorded sha is an ancestor of HEAD: the batch is done; only its checkpoint (orders
-  and notes marked committed with that commit) is written, and no file is touched;
+- the recorded sha is an ancestor of HEAD: the batch is done; paths it had not written
+  yet take HEAD's bytes, every listed path is unstaged to HEAD, and its checkpoint (orders
+  and notes marked committed with that commit) is written;
 - no sha is recorded, or it is not an ancestor: the batch did not land;
   every listed path is put back and unstaged, so nothing stays in the index: to
   HEAD's bytes when a commit since the base changed it (someone else's committed work),
@@ -31,7 +34,7 @@ from foragent.paths import repo_path
 from foragent.state_locks import _file_lock
 
 JOURNAL_FILE = "order-batch-journal.json"
-VERSION = 5
+VERSION = 6
 
 
 def _directory(root: Path) -> Path:
@@ -77,7 +80,7 @@ def lane_writes(root: Path, config, lanes: list[dict], manager=None) -> dict:
     """
     from foragent.lanes import lane_write_paths, validate_lane
 
-    files, directories, seen = set(), [], set()
+    files, seen, created = set(), set(), {}
     for lane in lanes:
         if lane["name"] in seen:
             continue
@@ -86,12 +89,12 @@ def lane_writes(root: Path, config, lanes: list[dict], manager=None) -> dict:
             files |= set(lane_write_paths(lane["name"], config.lanes[lane["name"]].get("skills", [])))
             continue
         installed = validate_lane(root, config, lane["name"], lane["paths"], lane["skills"], manager=manager)
-        files |= set(lane_write_paths(lane["name"], installed))
-        for skill in installed:
-            directory = f".claude/skills/{skill}"
-            if not repo_path(root, directory).exists() and directory not in directories:
-                directories.append(directory)
-    return {"files": {name: _encoded(_bytes(root, name)) for name in sorted(files)}, "directories": directories}
+        paths = lane_write_paths(lane["name"], installed)
+        files |= set(paths)
+        own = [f".claude/skills/{skill}" for skill in installed if not repo_path(root, f".claude/skills/{skill}").exists()]
+        # What this lane depends on: kept or removed together with its configuration.
+        created[lane["name"]] = {"files": [path for path in paths if path != ".foragent.yml"], "directories": own}
+    return {"files": {name: _encoded(_bytes(root, name)) for name in sorted(files)}, "created": created}
 
 
 def _save(directory: Path, value: dict) -> None:
@@ -124,7 +127,7 @@ def write(directory: Path, root: Path, files: dict[str, str | bytes], *, branch:
     """List every path the flush will write, with its bytes now, before any of them changes."""
     _save(directory, {"version": VERSION, "branch": branch, "base": base, "orders": orders, "notes": notes,
                       "files": {name: _encoded(_bytes(root, name)) for name in sorted(files)},
-                      "batch_commit": None, "lanes": lanes or {"files": {}, "directories": []}})
+                      "batch_commit": None, "lanes": lanes or {"files": {}, "created": {}}})
 
 
 def clear(directory: Path) -> None:
@@ -134,24 +137,67 @@ def clear(directory: Path) -> None:
 def _restore(root: Path, name: str, before: bytes | None) -> None:
     if _bytes(root, name) == before and not repo_path(root, name).is_symlink():
         return
-    check_write(root, name, PurePosixPath(name).parent.as_posix())  # never through a planted link
+    parent = PurePosixPath(name).parent.as_posix()
+    check_write(root, name, parent)  # never through a planted link
     if before is None:
         repo_path(root, name).unlink()
     else:
+        order_references.real_directory(root, parent)  # one real directory at a time
+        check_write(root, name, parent)
         write_atomic(root, name, before)
 
 
-def _put_back(root: Path, git, base: str, files: dict[str, str | None]) -> None:
-    """Undo a batch that is not in HEAD's history; work someone else committed since stays."""
+def _targets(git, base: str, files: dict[str, str | None]) -> dict[str, bytes | None]:
+    """The bytes each path goes back to: HEAD's when a commit since ``base`` changed it, else earlier."""
     names = list(files)
-    then, now = git.blob_shas(base, names), git.blob_shas("HEAD", names)
+    then, now = (git.blob_shas(base, names), git.blob_shas("HEAD", names)) if names else ({}, {})
+    return {name: (None if now[name] == "missing" else git.blob_bytes(now[name].encode()))
+            if then[name] != now[name] else _decoded(encoded) for name, encoded in files.items()}
+
+
+def _kept_lanes(configuration: bytes | None, created: dict) -> set[str]:
+    """Lanes this batch created that the configuration surviving recovery still lists."""
+    import yaml
+
+    try:
+        lanes = (yaml.safe_load(configuration.decode("utf-8")) or {}).get("lanes") if configuration else None
+    except (ValueError, yaml.YAMLError, AttributeError):
+        lanes = None
+    return set(created) & set(lanes) if isinstance(lanes, dict) else set()
+
+
+def _put_back(root: Path, git, base: str, files: dict[str, str | None], lanes: dict) -> None:
+    """Undo a batch that is not in HEAD's history; work someone else committed since stays.
+
+    A lane whose configuration survives (someone committed it) keeps everything it depends
+    on as it is now: its agent, skill directories and the shared ignore and attribute
+    lines. Every other created lane loses all of them, so the two never disagree.
+    """
+    targets = _targets(git, base, files)
+    created = lanes.get("created", {})
+    kept = _kept_lanes(targets.get(".foragent.yml", _bytes(root, ".foragent.yml")), created)
+    keep = {path for name in kept for path in created[name]["files"]}
+    for name, target in targets.items():
+        if name not in keep:
+            _restore(root, name, target)
+    git.restore_staged_paths("HEAD", list(files))  # nothing of the batch stays staged
+    _remove_directories(root, [directory for name, lane in created.items() if name not in kept
+                               for directory in lane["directories"]])
+
+
+def _finish(root: Path, git, files: dict[str, str | None], lane_paths: list[str]) -> None:
+    """Complete a landed batch that stopped before writing the checkout or syncing the index.
+
+    Order files and notes reach the checkout only after the commit, so a path still holding
+    its recorded earlier bytes was never written: it takes HEAD's bytes. Every listed path,
+    lane files included, is then unstaged to HEAD, so no reversal of the batch stays staged.
+    """
+    names = list(files)
+    heads = git.blob_shas("HEAD", names) if names else {}
     for name, encoded in files.items():
-        if then[name] != now[name]:
-            # Someone committed this path after the batch began; keep that committed work.
-            _restore(root, name, None if now[name] == "missing" else git.blob_bytes(now[name].encode()))
-        else:
-            _restore(root, name, _decoded(encoded))
-    git.restore_staged_paths("HEAD", names)  # nothing of the batch stays staged
+        if _bytes(root, name) == _decoded(encoded):
+            _restore(root, name, None if heads[name] == "missing" else git.blob_bytes(heads[name].encode()))
+    git.restore_staged_paths("HEAD", [*names, *lane_paths])
 
 
 def _remove_directories(root: Path, directories: list[str]) -> None:
@@ -187,10 +233,10 @@ def recover(directory: Path, root: Path, git, mark_committed, language: str) -> 
             leftover.unlink()  # an interrupted atomic write never reached its file
     commit = value["batch_commit"]
     if landed(git, commit):
+        _finish(root, git, files, list(lanes["files"]))
         # Committed blobs come from that commit, so later commits cannot change them.
         mark_committed(value["orders"], value["notes"], git.blob_shas(commit, list(files)), commit)
         clear(directory)
         return
-    _put_back(root, git, value["base"], {**lanes["files"], **files})
-    _remove_directories(root, lanes["directories"])
+    _put_back(root, git, value["base"], {**lanes["files"], **files}, lanes)
     clear(directory)

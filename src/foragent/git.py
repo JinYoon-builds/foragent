@@ -366,13 +366,18 @@ class GitRepo:
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()
 
-    def commit_recorded(self, paths: list[str], title: str, record: Callable[[str], None]) -> str | None:
+    def commit_recorded(self, paths: list[str], title: str, record: Callable[[str], None],
+                        contents: dict[str, bytes] | None = None) -> str | None:
         """Commit only ``paths`` (like commit_paths), handing the new sha to ``record`` before HEAD moves.
 
         The commit is built from HEAD plus these paths in a private index, so other staged
-        changes stay out. After ``record`` returns, HEAD moves to it only if HEAD has not
-        moved meanwhile, and these paths' index entries are set to the new commit.
+        changes stay out. A path in ``contents`` is committed with those bytes straight from
+        memory, never from the working tree, so nothing of it is in the checkout before the
+        commit exists; the caller writes it afterwards. After ``record`` returns, HEAD moves
+        to the commit only if HEAD has not moved meanwhile, and these paths' index entries
+        are set to the new commit.
         """
+        contents = contents or {}
         if not paths:
             return None  # an empty scope commits nothing and records nothing
         parent = self.head_sha()
@@ -380,19 +385,25 @@ class GitRepo:
         index = (git_dir if git_dir.is_absolute() else self.root / git_dir) / "foragent-batch-index"
         environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
 
-        def git(*args: str) -> str:
+        def git(*args: str, data: bytes | None = None) -> str:
             try:
                 return subprocess.run(["git", *args], cwd=self.root, env=environment, check=True,
-                                      capture_output=True, text=True, timeout=120).stdout
+                                      capture_output=True, input=data, timeout=120).stdout.decode("utf-8", "replace")
             except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                raise GitError(getattr(exc, "stderr", "") or str(exc)) from exc
+                raise GitError((getattr(exc, "stderr", b"") or b"").decode("utf-8", "replace") or str(exc)) from exc
 
         try:
             git("read-tree", parent)
-            present = [path for path in paths if (self.root / path).exists()]
+            for path in (path for path in paths if path in contents):
+                blob = git("hash-object", "-w", "--stdin", data=contents[path]).strip()
+                staged = git("--literal-pathspecs", "ls-files", "-s", "--", path).split()
+                mode = staged[0] if staged else "100644"
+                git("update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}")
+            on_disk = [path for path in paths if path not in contents]
+            present = [path for path in on_disk if (self.root / path).exists()]
             if present:
                 git("--literal-pathspecs", "add", "-f", "--", *present)
-            if missing := [path for path in paths if path not in present]:
+            if missing := [path for path in on_disk if path not in present]:
                 git("--literal-pathspecs", "rm", "--cached", "-q", "--ignore-unmatch", "--", *missing)
             tree = git("write-tree").strip()
         finally:

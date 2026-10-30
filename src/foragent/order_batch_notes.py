@@ -33,6 +33,9 @@ def _note_files(root: Path, notes: list[dict], language: str) -> dict[str, str]:
     for entry in notes:
         name = NOTE_FILES[entry["kind"]]
         if name not in contents:
+            # The destination is checked before it is read: a linked file or parent never
+            # puts another file's bytes into the batch commit.
+            check_write(root, name, PurePosixPath(name).parent.as_posix())
             path = repo_path(root, name)
             if entry["kind"] == "rule" and not path.is_file():
                 # A project without current rules records the decision only.

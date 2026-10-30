@@ -21,7 +21,7 @@ from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
 from foragent.lanes import add_lane, lane_files, resolve_skills, validate_lane
-from foragent.order_files import check_destinations, check_write, issue_body, validate_paths, write_atomic
+from foragent.order_files import blob_id, check_destinations, check_write, issue_body, validate_paths, write_atomic
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
@@ -427,15 +427,13 @@ class PublishReport:
 
 
 def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
-                      manager: SkillManager | None) -> None:
+                      manager: SkillManager | None, write_files: bool = True) -> None:
     """Write this order's own paths (and new lanes) on the refreshed base, without committing them.
 
-    New lanes commit through ``git``; a batch passes one that defers those commits to its own."""
+    New lanes commit through ``git``; a batch passes one that defers those commits to its own.
+    With ``write_files`` false only the checks and lanes run; ``write_files_now`` writes later."""
     # Destinations are checked here, after the base refresh, so upstream changes count.
-    spec = f"docs/specs/{plan['id']}.md"
-    references = set(plan.get("reference_files", {}))
-    roots = {name: "docs/specs" if name == spec else "docs/design" if name in references
-             else config.acceptance_dir for name in files}
+    roots = _own_roots(plan, config, files)
     check_destinations(root, files)
     for name in files:
         check_write(root, name, roots[name])
@@ -451,6 +449,20 @@ def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, file
             pending = git.uncommitted_paths(paths)
             if pending:
                 git.commit_paths(pending, f"Foragent lane {lane['name']}")
+    if write_files:
+        write_files_now(plan, root, config, files)
+
+
+def _own_roots(plan: dict, config: Config, files: dict) -> dict[str, str]:
+    spec = f"docs/specs/{plan['id']}.md"
+    references = set(plan.get("reference_files", {}))
+    return {name: "docs/specs" if name == spec else "docs/design" if name in references
+            else config.acceptance_dir for name in files}
+
+
+def write_files_now(plan: dict, root: Path, config: Config, files: dict[str, str | bytes]) -> None:
+    """Write this order's own paths, each checked right before it is written."""
+    roots = _own_roots(plan, config, files)
     for name, content in files.items():
         data = content.encode("utf-8") if isinstance(content, str) else content
         path = repo_path(root, name)
@@ -463,15 +475,23 @@ def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, file
 
 
 def commit_and_push(config: Config, git: GitRepo, files: dict, title: str,
-                    after_commit=None, record=None) -> dict[str, str]:
-    """Commit the given written paths once, confirm HEAD has them all, and push the base.
+                    after_commit=None, record=None, contents: dict[str, bytes] | None = None) -> dict[str, str]:
+    """Commit the given paths once, confirm HEAD has them all, and push the base.
 
-    ``after_commit`` receives the committed blobs before the push, so a caller can record
-    that the commit exists even when the push is interrupted."""
-    git.ensure_tracked(list(files))
-    changed = git.uncommitted_paths(list(files))
+    Paths in ``contents`` are committed from those bytes (``commit_recorded``), not from
+    the working tree; the others must already be written. ``after_commit`` receives the
+    committed blobs before the push, so a caller can write and record what landed even
+    when the push is interrupted."""
+    contents = contents or {}
+    on_disk = [name for name in files if name not in contents]
+    git.ensure_tracked(on_disk)
+    changed = git.uncommitted_paths(on_disk)
+    if contents:
+        heads = git.blob_shas(git.head_sha(), list(contents))
+        changed += [name for name in contents if heads[name] != blob_id(contents[name])]
     if changed and record is not None:
-        git.commit_recorded(changed, title, record)  # ``record`` gets the sha before HEAD moves
+        # ``record`` gets the sha before HEAD moves.
+        git.commit_recorded(changed, title, record, {name: contents[name] for name in changed if name in contents})
     elif changed:
         git.commit_paths(changed, title)
     published_blobs = git.blob_shas(git.head_sha(), files)

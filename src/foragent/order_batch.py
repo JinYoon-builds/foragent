@@ -234,6 +234,10 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
                               lanes=lanes)
 
                 def committed(blobs: dict[str, str]) -> None:
+                    # The commit exists; only now do its order files and notes reach the checkout.
+                    for entry, files in prepared:
+                        order.write_files_now(entry["plan"], root, config, files)
+                    _write_notes(root, note_contents)
                     # With nothing to commit, HEAD already holds the batch; record it the same way.
                     journal.batch_done(directory, git.head_sha())
                     _committed(root, written["orders"], written["notes"], blobs, git.head_sha())
@@ -242,18 +246,21 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
                 deferred = _DeferredCommits(git)
                 try:
                     for entry, files in prepared:
-                        order.write_order_files(entry["plan"], root, config, deferred, files, manager)
+                        # Checks and new lanes only: no order file is in the checkout before the commit.
+                        order.write_order_files(entry["plan"], root, config, deferred, files, manager,
+                                                write_files=False)
                         if any(lane["name"] not in config.lanes for lane in entry["plan"].get("new_lanes", [])):
                             # Later orders and the issue pass see the lane this order just created.
                             config = replace(config, lanes=load_config(root).lanes)
-                    _write_notes(root, note_contents)
                     title = f"Foragent batch {boundary}: {len(prepared)} order(s), {len(applying)} note(s)"
                     if unlisted := sorted(set(deferred.paths) - set(lanes["files"]) - set(planned)):
                         # Rollback can only undo and unstage listed paths; never commit any other.
                         raise order.PlanError(text("batch_manifest_missing", config.language, paths=", ".join(unlisted)))
                     # New lanes' files join this one commit: a single boundary to record and recover.
+                    contents = {name: data.encode("utf-8") if isinstance(data, str) else data
+                                for name, data in planned.items()}
                     order.commit_and_push(config, git, {**dict.fromkeys(deferred.paths), **planned}, title,
-                                          after_commit=committed,
+                                          after_commit=committed, contents=contents,
                                           record=lambda sha: journal.batch_done(directory, sha))
                 except BaseException:
                     # Undo an uncommitted write now, so waiting work never stays in the checkout.

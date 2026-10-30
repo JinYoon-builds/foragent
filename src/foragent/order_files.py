@@ -65,6 +65,13 @@ def check_write(root: Path, name: str, own_root: str) -> None:
         raise PlanError(f"cannot write {name}: its real path is outside {PurePosixPath(own_root).as_posix()}/")
 
 
+def blob_id(data: bytes | None) -> str:
+    """Git's blob id for these bytes ("missing" for no file), as ``blob_shas`` reports it."""
+    import hashlib
+
+    return "missing" if data is None else hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
+
+
 def temporary_path(root: Path, name: str) -> Path:
     """The fixed sibling a publication write fills before renaming it over ``name``."""
     path = repo_path(root, name)
