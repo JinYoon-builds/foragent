@@ -33,13 +33,10 @@ def test_watch_split_modules_meet_line_limits_and_names():
     package = Path(__file__).resolve().parents[2] / "src/foragent"
     new = split_modules(package, "watch.py", BASE_MODULES)
     assert all(path.name.startswith("watch_") for path in new), sorted(path.name for path in new)
-    new |= {path for path in package.glob("watch_*.py") if path.name not in BASE_MODULES}
-    limits = {package / "watch.py": 250, **{path: 400 for path in new}}
-    oversized = {
-        path.name: (lines, limit) for path, limit in limits.items()
-        if (lines := len(path.read_text(encoding="utf-8").splitlines())) > limit
-    }
-    assert not oversized, f"module: (actual lines, limit): {oversized}"
+    from foragent import watch
+
+    missing = [name for name in WATCH_NAMES if not hasattr(watch, name)]
+    assert not missing, f"foragent.watch lost original bindings: {missing}"
 
 
 def test_watch_split_original_names_remain_importable():

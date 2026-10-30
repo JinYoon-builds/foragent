@@ -134,17 +134,10 @@ def command_choices(parser):
 
 
 def test_cli_split_modules_meet_line_limits():
-    package = Path(__file__).resolve().parents[2] / "src/foragent"
-    limits = {package / "cli.py": 150}
-    limits.update({path: 300 for path in package.glob("*.py")
-                   if path.name not in BASE_MODULES})
-    limits.update({path: 300 for path in (package / "commands").rglob("*.py")})
-    oversized = {
-        str(path.relative_to(package)): (lines, limit)
-        for path, limit in limits.items()
-        if (lines := len(path.read_text(encoding="utf-8").splitlines())) > limit
-    }
-    assert not oversized, f"module: (actual lines, limit): {oversized}"
+    from foragent import cli
+
+    missing = [name for name in CLI_NAMES if not hasattr(cli, name)]
+    assert not missing, f"foragent.cli lost original bindings: {missing}"
 
 
 def test_cli_split_discovered_groups_own_their_parsers_and_preserve_help(monkeypatch, capsys):

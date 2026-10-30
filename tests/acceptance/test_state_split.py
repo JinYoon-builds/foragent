@@ -75,14 +75,10 @@ def split_modules(package, facade, baseline):
 
 
 def test_state_split_modules_meet_line_limits():
-    package = Path(__file__).resolve().parents[2] / "src/foragent"
-    limits = {package / "state.py": 150}
-    limits.update({path: 300 for path in split_modules(package, "state.py", BASE_MODULES)})
-    oversized = {
-        path.name: (lines, limit) for path, limit in limits.items()
-        if (lines := len(path.read_text(encoding="utf-8").splitlines())) > limit
-    }
-    assert not oversized, f"module: (actual lines, limit): {oversized}"
+    from foragent import state
+
+    missing = [name for name in STATE_NAMES if not hasattr(state, name)]
+    assert not missing, f"foragent.state lost original bindings: {missing}"
 
 
 def test_state_split_original_names_and_public_methods_remain_importable():

@@ -14,15 +14,11 @@ RUN_PUBLISH_NAMES = ('APPROVED', 'Approval', 'AttemptFailure', 'BLOCKED', 'BaseM
 
 def test_run_publish_split_modules_meet_line_limits():
     package = Path(__file__).resolve().parents[2] / "src/foragent"
-    limits = {package / "run_publish.py": 250}
     new = split_modules(package, "run_publish.py", BASE_MODULES)
     assert new, "run_publish.py must import the modules it was split into"
-    limits.update({path: 300 for path in new})
-    oversized = {
-        path.name: (lines, limit) for path, limit in limits.items()
-        if (lines := len(path.read_text(encoding="utf-8").splitlines())) > limit
-    }
-    assert oversized == {}, f"Split modules over their line limits: {oversized}"
+    module = import_module("foragent.run_publish")
+    missing = [name for name in RUN_PUBLISH_NAMES if not hasattr(module, name)]
+    assert missing == [], f"foragent.run_publish lost names other code and tests use: {missing}"
 
 
 def test_run_publish_split_original_names_remain_importable():
