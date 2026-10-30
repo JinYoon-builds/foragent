@@ -65,7 +65,10 @@ def check_write(root: Path, name: str, own_root: str) -> None:
 
 def issue_body(item: dict, repo: str, base: str, acceptance_dir: str = "tests/acceptance/",
                references: list[str] = ()) -> str:
-    lines = [MARKER, *exclusive_header(item.get("exclusive", [])), "## Goal", item["goal"], "", "## Out of scope", item["out_of_scope"]]
+    lines = [MARKER, *exclusive_header(item.get("exclusive", [])), "## Goal", item["goal"]]
+    if item.get("statements"):
+        lines.extend(["", "## Behaviour", *(f"- {text}" for text in item["statements"])])
+    lines.extend(["", "## Out of scope", item["out_of_scope"]])
     if item.get("files"):
         lines.extend(["", "## Files", *(f"- {path}" for path in item["files"])])
     lines.extend(body_lines(list(references), repo, base))

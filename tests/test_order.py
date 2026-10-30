@@ -627,7 +627,7 @@ def test_interrupted_lane_commit_is_completed_before_issues(publishing, plan, mo
     monkeypatch.setattr(git, "commit_paths", original)
     publish((root, load_config(root), tracker, git, events), plan)
     assert events[0][1] == "Foragent lane web"
-    assert set(events[0][2]) == {".foragent.yml", ".claude/agents/fa-web.md"}
+    assert set(events[0][2]) == {".foragent.yml", ".claude/agents/fa-web.md", ".gitattributes"}
 
 
 def test_edit_with_changed_acceptance_invalidates_approval_on_retry(publishing, plan):
@@ -707,7 +707,7 @@ def test_lane_skills_stay_local_and_copy_into_runner_worktree(offline_publicatio
     assert "skills: [testing-strategy]" in (runner / ".claude/agents/fa-web.md").read_text()
     lane_commit = next(args for args in calls if "commit" in args and args[args.index("-m") + 1] == "Foragent lane web")
     assert set(lane_commit[lane_commit.index("--") + 1:]) == {
-        ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ":!CLAUDE.local.md",
+        ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ".gitattributes", ":!CLAUDE.local.md",
     }
     assert len([args for args in calls if args[0] == "push"]) == 1
     order.publish(plan, root, load_config(root), tracker, repo="owner/repo", git=git, manager=manager)
@@ -1300,8 +1300,9 @@ def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_pa
     assert {key: implementation[key] for key in setup.options} == setup.options
     if lane == "api":
         assert ("agent" in setup.options) == (executor == "claude")
-    expected_prefix = implementation["prompt"].removesuffix("PROMPT")
-    assert prompt.startswith(expected_prefix) and prompt.removeprefix(expected_prefix) == order.preread_prompt(plan, item)
+    # The lane-memory notice (the writer contract, D95) follows the task in both prompts.
+    expected_prefix, _, notice = implementation["prompt"].partition("PROMPT")
+    assert prompt == expected_prefix + order.preread_prompt(plan, item) + notice
     if executor == "codex" and lane == "api":
         assert "API lane rules." in expected_prefix and "polish" in expected_prefix
 
@@ -1939,3 +1940,73 @@ def test_publication_write_must_stay_inside_its_own_root(tmp_path):
                       ("tests/test_a.py", "tests/acceptance/")):
         with pytest.raises(order.PlanError, match="outside"):
             check_write(tmp_path, name, own)
+
+
+STATEMENT = "A caller observes one receipt per login."
+# A test the lane has not written yet: a statement draft may name it before preparation.
+UNWRITTEN = "uv run pytest -q tests/acceptance/test_receipt.py"
+
+
+@pytest.mark.parametrize("statements", [False, True])
+def test_only_statement_drafts_may_name_unwritten_tests(publishing, plan, statements):
+    plan["issues"][1]["done_when"] = [UNWRITTEN]
+    if statements:
+        plan["issues"][1]["statements"] = [STATEMENT]
+        report = publish(publishing, plan, dry_run=True)
+        assert "tests/acceptance/test_receipt.py" not in report.paths
+    else:
+        with pytest.raises(order.PlanError, match="missing acceptance file: tests/acceptance/test_receipt.py"):
+            publish(publishing, plan, dry_run=True)
+
+
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+@pytest.mark.parametrize("options", [{}, {"approve": True}])
+def test_statement_issue_without_reviewed_tests_is_refused_before_writes(
+        publishing, plan, monkeypatch, kind, options):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config, tracker, _, events = publishing
+    if kind == "edits":
+        tracker.add_issue(9, "Existing", "old", ["needs-human"])
+        plan["id"] = "2026-10-21-login-update"
+        plan["issues"] = []
+        plan["edits"] = [{"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.",
+                          "done_when": [UNWRITTEN], "statements": [STATEMENT]}]
+        key = "#9"
+    else:
+        # Tests already in the plan and a clean old preread do not turn it into legacy work.
+        plan["issues"][0]["statements"] = [STATEMENT]
+        plan["issues"][0]["done_when"].append(UNWRITTEN)
+        for item in plan["issues"]:
+            _record_preread(root, config, plan, item, [])
+        key = "api"
+    assert publish(publishing, deepcopy(plan), dry_run=True).dry_run
+    before = dict(tracker.issues)
+    with pytest.raises(order.PlanError, match=rf"statement issue\(s\) {re.escape(key)} have no reviewed tests"):
+        publish(publishing, plan, **options)
+    assert events == [] and tracker.issues == before
+    assert not (root / "docs").exists()
+
+
+def test_legacy_issue_beside_a_statement_issue_keeps_the_preread_gate(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    plan["issues"][0]["statements"] = [STATEMENT]
+    with pytest.raises(order.PlanError, match=r"no preread of the current content for issue\(s\) client;"):
+        publish(publishing, plan, approve=True)
+
+
+@pytest.mark.parametrize("value", [[], [""], [" "], "one", [7], ["two\nlines"]])
+def test_invalid_statements_name_the_field(publishing, plan, value):
+    plan["issues"][1]["statements"] = value
+    with pytest.raises(order.PlanError, match=r"issues\[1\]\.statements"):
+        publish(publishing, plan, dry_run=True)
+
+
+def test_statements_appear_verbatim_in_the_issue_body(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    plan["issues"][0]["statements"] = [STATEMENT, "Nothing else changes."]
+    publish(publishing, plan)
+    body = publishing[2].get_issue(2).body
+    assert f"## Behaviour\n- {STATEMENT}\n- Nothing else changes.\n" in body
+    assert parse_body(body).goal == "Implement login."
+    assert "## Behaviour" not in publishing[2].get_issue(3).body
