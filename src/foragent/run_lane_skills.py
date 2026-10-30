@@ -72,7 +72,7 @@ def _memory_folder(config: Config, lane: str, worktree: Path) -> Path | None:
     name = lane_memory.memory_dir(config, lane)
     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
         return None
-    return worktree / lane_memory.directory(name)
+    return worktree / lane_memory.lane_directory(config, lane)
 
 
 def _memory_sections(config: Config, lane: str, worktree: Path, full_text_dir: Path | None, *, curated: bool) -> str:

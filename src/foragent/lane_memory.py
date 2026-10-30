@@ -120,13 +120,30 @@ def lane_agent(config: Config, lane: str) -> str | None:
     return agent if isinstance(agent, str) and re.fullmatch(r"fa-[a-z0-9-]+", agent) else None
 
 
-def memory_dir(config: Config, lane: str) -> str:
-    """The one memory directory name every writer and reader of the lane uses.
+def memory_directory(name: str, agent: str | None = None, memory: str | None = None, *,
+                     default: str | None = None) -> str:
+    """The one resolver of a lane's or role's memory directory, relative and ending in ``/``.
 
-    The lane's agent when it sets one (for example fa-orch), else the lane name; the agent's
-    append instruction, the executors' notes, the lane view and the dream all resolve it here.
+    The explicit ``memory`` when set; else the agent's own directory, where Claude's native agent
+    memory writes (``.claude/agent-memory/<agent>/``); else ``default``, which is ``fa-<name>``
+    unless the caller names another. Roles, lanes, migration, the attribute writer and dream
+    ownership all call this and nothing else derives a memory path. Lanes pass their own name as
+    ``default`` so no lane memory moves (a lane has no ``memory`` key).
     """
-    return (config.lanes.get(lane) or {}).get("agent") or lane
+    if isinstance(memory, str) and memory.strip().strip("/"):
+        return memory.strip().rstrip("/") + "/"
+    return f".claude/agent-memory/{agent or default or f'fa-{name}'}/"
+
+
+def lane_directory(config: Config, lane: str) -> str:
+    """The lane's memory directory (relative, no trailing ``/``): its agent's, else the lane name's."""
+    agent = (config.lanes.get(lane) or {}).get("agent")
+    return memory_directory(lane, agent if isinstance(agent, str) else None, default=lane).rstrip("/")
+
+
+def memory_dir(config: Config, lane: str) -> str:
+    """The lane's memory directory name (for example fa-orch), from lane_directory."""
+    return Path(lane_directory(config, lane)).name
 
 
 def _load(text: str):
@@ -250,32 +267,25 @@ def migrate_attributes(text: str | None, lanes: tuple[str, ...] = (), roles: tup
 
 
 def _roles(config: Config) -> dict[str, dict]:
-    """The configured roles plus the default roles a project without a roles block still has."""
+    """The roles as the roles module resolves them (defaults included without a roles block)."""
     from foragent import roles
 
-    found = {name: dict(entry or {}) for name, entry in (config.roles or {}).items()}
-    for name in roles.DEFAULT_ROLES:
-        found.setdefault(name, {"agent": f"fa-{name}", "memory": roles.memory_dir(name)})
-    return found
+    return roles.load_roles(config)
 
 
 def role_agents(config: Config) -> set[str]:
-    return {entry.get("agent") or f"fa-{name}" for name, entry in _roles(config).items()}
+    return {entry["agent"] for entry in _roles(config).values()}
 
 
 def role_memory_files(config: Config) -> set[str]:
     """Each role's MEMORY.md path; role memory keeps its own writer and merge (#1000 out of scope)."""
-    files = set()
-    for name, entry in _roles(config).items():
-        folder = entry.get("memory") or directory(entry.get("agent") or f"fa-{name}")
-        files.add(str(folder).strip("/") + f"/{CURATED}")
-    return files
+    return {entry["memory"].rstrip("/") + f"/{CURATED}" for entry in _roles(config).values()}
 
 
 def is_role_memory(config: Config, lane: str) -> bool:
     """Whether a lane's memory is a role's (by its agent or its directory): the role owns it."""
     return (lane_agent(config, lane) in role_agents(config)
-            or f"{directory(memory_dir(config, lane))}/{CURATED}" in role_memory_files(config))
+            or f"{lane_directory(config, lane)}/{CURATED}" in role_memory_files(config))
 
 
 def _memory_paths(config: Config) -> tuple[tuple[str, ...], tuple[str, ...]]:

@@ -34,11 +34,10 @@ def test_migrate_skips_roles_and_missing_agents_and_moves_union(tmp_path):
     changes = lane_memory.migrate(tmp_path, config)
     assert sorted(changes) == [".claude/agents/fa-api.md", ".gitattributes"]
     lm = lane_memory
-    # The old line covered every role's memory too (the default roles count without a roles block);
-    # each keeps its union in place. Lanes get their own text merge at the end.
+    # The old line covered the roles' memory too (roles as the roles module resolves them: this
+    # roles block names only docs); each keeps its union in place. Lanes get a text merge at the end.
     assert changes[".gitattributes"] == (
-        "*.txt text\n.claude/agent-memory/fa-architect/MEMORY.md merge=union\n"
-        ".claude/agent-memory/fa-docs/MEMORY.md merge=union\n.claude/agent-memory/fa-orchestrator/MEMORY.md merge=union\n"
+        "*.txt text\n.claude/agent-memory/fa-docs/MEMORY.md merge=union\n"
         f"*.md diff\n{lm.CURATED_COMMENT}\n.claude/agent-memory/fa-api/MEMORY.md !merge\n"
         f".claude/agent-memory/fa-web/MEMORY.md !merge\n{lm.UNION_COMMENT}\n{lm.UNION}\n")
     lane_memory.apply(tmp_path, changes)
@@ -481,3 +480,36 @@ def test_projects_without_a_roles_block_still_have_the_default_roles(tmp_path):
     assert ".claude/agents/fa-docs.md" not in changes
     assert ".claude/agent-memory/fa-docs/MEMORY.md !merge" not in changes[".gitattributes"]
     assert "dream" not in run_lane_skills.lane_notes(config, "docs", tmp_path)[1]
+
+
+def test_one_resolver_maps_a_role_with_a_custom_agent_to_its_agent_directory_everywhere(tmp_path):
+    from foragent import orch_dream, roles
+    from foragent.orch_dream import dream_due
+    from foragent.state import StateStore
+
+    config = Config(lanes={"review": {"agent": "fa-reviewer"}, "qa": {"paths": ["qa/**"]}},
+                    roles={"qa": {"agent": "fa-reviewer"}})
+    assert lane_memory.memory_directory("qa", "fa-reviewer") == ".claude/agent-memory/fa-reviewer/"
+    assert roles.load_roles(config)["qa"]["memory"] == ".claude/agent-memory/fa-reviewer/"
+    assert lane_memory.role_memory_files(config) == {".claude/agent-memory/fa-reviewer/MEMORY.md"}
+    assert lane_memory.is_role_memory(config, "review"), "A lane using the role's agent uses the role's memory"
+    assert not lane_memory.is_role_memory(config, "qa"), "A lane named like the role keeps its own memory (qa/)"
+    assert orch_dream.memory_path(config, "qa") == ".claude/agent-memory/qa/MEMORY.md"
+    lanes, role_files = lane_memory._memory_paths(config)
+    assert lanes == ("qa",) and role_files == (".claude/agent-memory/fa-reviewer/MEMORY.md",)
+    text = lane_memory.migrate_attributes(lane_memory.OLD_UNION + "\n", lanes, role_files)
+    assert ".claude/agent-memory/fa-reviewer/MEMORY.md merge=union" in text, "The real role memory keeps its union"
+    assert "fa-qa" not in text and "fa-reviewer/MEMORY.md !merge" not in text
+    store = StateStore(tmp_path / "state")
+    for number, lane in ((1, "review"), (2, "qa")):
+        store.start_run(number, branch=f"foragent/issue-{number}", worktree=tmp_path / f"w{number}", lane=lane)
+        store.finish_run(number, "merged", "")
+
+    class Empty:
+        def list_open_issues(self):
+            return []
+
+    assert dream_due(store, config, Empty(), None) == ["qa"], "No lane's dream owns the role's memory"
+    created = roles._ensure_memory(tmp_path, "qa", config.roles["qa"])
+    assert created == ".claude/agent-memory/fa-reviewer/MEMORY.md" and (tmp_path / created).is_file()
+    assert not (tmp_path / ".claude/agent-memory/fa-qa").exists()

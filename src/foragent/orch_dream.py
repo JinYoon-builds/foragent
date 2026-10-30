@@ -55,7 +55,9 @@ def memory_dir(config: Config, lane: str) -> str:
 
 
 def memory_path(config: Config, lane: str) -> str:
-    return f".claude/agent-memory/{memory_dir(config, lane)}/MEMORY.md"
+    from foragent import lane_memory
+
+    return f"{lane_memory.lane_directory(config, lane)}/{lane_memory.CURATED}"
 
 
 def media_root() -> Path:

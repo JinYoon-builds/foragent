@@ -30,7 +30,7 @@ def render_detail(config: Config, slug: str, repo_root: Path, done_count: int = 
         watch.text("watch_done_count", language, count=done_count),
         watch.text("watch_memory", language) + ":",
     ]
-    folder = watch.Path(repo_root) / lane_memory.directory(lane_memory.memory_dir(config, slug))
+    folder = watch.Path(repo_root) / lane_memory.lane_directory(config, slug)
     shown = False
     for name, title in ((lane_memory.CURATED, None), (lane_memory.PENDING, "watch_pending_memory")):
         if name == lane_memory.PENDING:  # Derived: lessons whose id the dream has not consumed.

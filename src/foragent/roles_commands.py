@@ -168,7 +168,7 @@ def add_role(root: Path, name: str, *, skills: list[str], scope: list[str], sign
     edit.check_branch("add")
     store = edit.store()
     installed = edit.check_skills(skills)
-    entry = {"agent": f"fa-{name}", "skills": installed, "memory": memory_dir(name),
+    entry = {"agent": f"fa-{name}", "skills": installed, "memory": memory_dir(name, f"fa-{name}"),
              "signals": parse_signals(signals), "scope": list(scope), "created_at": _now()}
     if idle_days is not None:
         entry["idle_days"] = idle_days
@@ -214,7 +214,7 @@ def set_role(root: Path, name: str, *, skills: list[str] | None = None, scope: l
     if not agent_path.exists():
         # Only a missing agent gets the generated body; an existing one, even empty, keeps its own.
         body = _agent_text(name, header["skills"]).split("---\n", 2)[2].encode("utf-8")
-    memory = _memory_file(edit.root, name, entry.get("memory") or memory_dir(name))
+    memory = _memory_file(edit.root, name, memory_dir(name, entry.get("agent"), entry.get("memory")))
     owned = [".foragent.yml", agent, memory.removesuffix("/MEMORY.md"), *([".gitignore"] if edit.to_install else [])]
     edit.save({**edit.roles, name: entry})
     _ensure_memory(edit.root, name, entry)
@@ -237,7 +237,7 @@ def remove_role(root: Path, name: str, *, git: GitRepo | None = None) -> None:
         raise RoleError(f"unknown role: {name}")
     entry = edit.roles[name]
     agent = f".claude/agents/{entry.get('agent') or f'fa-{name}'}.md"
-    memory = _memory_file(edit.root, name, entry.get("memory") or memory_dir(name)).removesuffix("/MEMORY.md")
+    memory = _memory_file(edit.root, name, memory_dir(name, entry.get("agent"), entry.get("memory"))).removesuffix("/MEMORY.md")
     memory_path = repo_path(edit.root, memory)
     edit.check_branch("remove")
     roles = {key: value for key, value in edit.roles.items() if key != name}

@@ -1,7 +1,10 @@
 # Lane dream PRs
 
-Lane memory has two writers (D95). In `.claude/agent-memory/<memory dir>/` (the memory dir is the
-lane's `agent`, else the lane name):
+Lane memory has two writers (D95). One function resolves every lane's and role's memory directory:
+the explicit `memory` when set (roles only), else the agent's directory
+`.claude/agent-memory/<agent>/` (where Claude's native agent memory writes), else the lane's name
+for a lane and `fa-<name>` for a role. A role `qa` with `agent: fa-reviewer` therefore uses
+`.claude/agent-memory/fa-reviewer/`. In a lane's directory:
 
 - `MEMORY.new.md` is the pending buffer. Lane workers (Claude and Codex get the same instruction)
   and people only append lessons at its end, one per line as `- [id:<id>] <lesson>`; an untagged
@@ -68,8 +71,9 @@ file exactly loses its merge setting and keeps its other attributes. A second `f
 nothing.
 
 A lane whose `agent` is a role agent (for example `fa-docs`) uses that role's memory. The role
-keeps owning it: that lane gets no append-only instruction and never dreams. The default roles
-(orchestrator, architect, docs) count even in a project without a `roles:` block.
+keeps owning it: that lane gets no append-only instruction and never dreams. The roles are those
+the roles module reads: the configured `roles:` block, or the default roles (orchestrator,
+architect, docs) when there is none.
 
 ## Lane PRs opened before the split
 
