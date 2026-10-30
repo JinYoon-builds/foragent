@@ -141,7 +141,7 @@ def test_restart_locks_the_store_named_by_config_repo_not_origin(machine, tmp_pa
     with update_check.StateStore(stores / "owner__origin").tick_lock() as held:
         assert held
         assert update_check._restart(root, gates[root], "en") == "restarted"
-    assert [argv[0] for argv in calls[1:]] == ["print", "bootout", "bootstrap"]
+    assert [argv[0] for argv in calls[1:]] == ["print", "bootout", "bootstrap", "print"]
 
 
 def test_loaded_legacy_label_plist_is_restarted(machine, tmp_path, monkeypatch):
@@ -151,7 +151,8 @@ def test_loaded_legacy_label_plist_is_restarted(machine, tmp_path, monkeypatch):
     assert list(gates) == [root]
     assert update_check._restart(root, gates[root], "en") == "restarted"
     target = f"gui/{os.getuid()}/dev.foragent.owner.repo"
-    assert calls == [["print", target], ["bootout", target], ["bootstrap", f"gui/{os.getuid()}", str(plist)]]
+    assert calls == [["print", target], ["bootout", target], ["bootstrap", f"gui/{os.getuid()}", str(plist)],
+                     ["print", target]]
 
 
 @pytest.mark.parametrize("command", [["brief"], ["gate", "status"]])
@@ -179,3 +180,18 @@ def test_check_lock_failure_is_silent_in_brief_and_status(machine, monkeypatch, 
     output = capsys.readouterr()
     assert output.err == "" and "update" not in json.loads(output.out)
     assert calls == [None] and lookups == []
+
+
+def test_current_release_still_retries_a_gate_left_unloaded_by_a_detached_reload(machine, monkeypatch, tmp_path):
+    """The detached refresher records only the reload fact, never pending_restart."""
+    from foragent import launchd
+
+    gate, other = (tmp_path / "gate").resolve(), (tmp_path / "other").resolve()
+    installs, restarts = _fake_update(monkeypatch, [gate, other], set())
+    pending_job, loaded_job = SimpleNamespace(name="pending"), SimpleNamespace(name="loaded")
+    monkeypatch.setattr(update_check, "installed_gates", lambda: {gate: [pending_job], other: [loaded_job]})
+    monkeypatch.setattr(launchd, "reload_pending", lambda job: job is pending_job)
+    (machine / "update-check.json").write_text(json.dumps({"installed": "v0.1.10"}))
+    assert update_check.update() == 0
+    assert installs == [], "The installed release is current: no reinstall"
+    assert restarts == [gate], "Only the gate whose reload ended unloaded is retried"
