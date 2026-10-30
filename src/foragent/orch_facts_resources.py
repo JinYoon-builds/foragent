@@ -154,7 +154,7 @@ def _admission(
     from foragent.overlap_files import Claim, admits, any_overlap, claims, recorded_union
     from foragent.scheduler_start import _lane_held
 
-    ctx = SimpleNamespace(store=store, config=config, repo_root=root)
+    ctx = SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: now)
     if not probe:
         ctx.case_sensitive = None  # Unknown: intersects() then compares paths case-sensitively.
     state = capacity.read_state(store)
