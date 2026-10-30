@@ -91,7 +91,7 @@ def review_label(config: Config) -> str:
     return _label(settings.BY_KEY["review"], config.review, config.language)
 
 
-def _value_text(setting, value: Any, store: Any, language: str) -> str:
+def _value_text(setting, value: Any, store: Any, language: str, repo_root: Path | None = None) -> str:
     from foragent import capacity, watch
 
     if setting.key == "max_parallel" and value is None:
@@ -99,7 +99,22 @@ def _value_text(setting, value: Any, store: Any, language: str) -> str:
         recorded = capacity.read_state(store) if store is not None else None
         count = int(recorded["parallel"]) if recorded else capacity.INITIAL_PARALLEL
         return watch.text("settings_window_auto", language, count=count)
-    return _label(setting, value, language)
+    row = _rows().get(setting.key)
+    shown = row.value_text(value, repo_root, language) if row is not None else None
+    return shown if shown is not None else _label(setting, value, language)
+
+
+def _rows() -> dict[str, Any]:
+    """Modules in this package that draw one setting's value: KEY and value_text(value, repo_root,
+    language), which returns the row's text or None for the usual word. One file per setting."""
+    import importlib
+    import pkgutil
+
+    found = {}
+    for info in pkgutil.iter_modules(__path__, __name__ + "."):
+        module = importlib.import_module(info.name)
+        found[module.KEY] = module
+    return found
 
 
 def _note(setting, store: Any, repo_root: Path | None, language: str) -> str | None:
@@ -157,7 +172,7 @@ def _parts(store: Any, config: Config, repo_root: Path | None, tab: str,
         value = _current(setting, config, store)
         if shown is not None and shown[0] == setting.key and index == selected:
             value = shown[1]
-        text = watch._clean(_value_text(setting, value, store, language))
+        text = watch._clean(_value_text(setting, value, store, language, repo_root))
         if index == selected and setting.key not in READ_ONLY:
             text = f"‹ {text} ›"
         cursor = "›" if index == selected and is_open(state) else " "

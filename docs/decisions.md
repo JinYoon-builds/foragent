@@ -834,3 +834,12 @@
      - 승인에서 머지까지 걸린 시간
      - 사람 개입: Jin에게 물은 결정, 그리고 회고보다 먼저 Jin이 찾은 문제
   3. 회고는 묶는 제약이 바뀌면 그것을 말한다.
+
+### D97. 게이트는 macOS 권한 팝업을 띄우지 않는다 (2026-10-29, Jin) — 미구현
+- 계기: 맥미니를 모니터 없이 쓰는데, 모니터를 연결하면 "python3.14가 문서·데스크탑·다운로드·네트워크 볼륨·사진·미디어 보관함에 접근하려고 합니다" 같은 권한 팝업이 수십 개 쌓여 있었다. 10-29 tccd 로그 2일치를 보니, 사용자에게 실제로 뜬 팝업(`AUTHREQ_PROMPTING`)의 주체는 모두 `~/.local/share/uv/python/cpython-3.14.7-…/bin/python3.14`였다. 이것은 `fa`의 인터프리터다. launchd가 5분마다 `fa gate tick`을 띄우고, 그 밑의 Claude CLI·Codex·git·sh가 보호 폴더에 닿으면 macOS가 책임을 python3.14에 돌려 팝업을 띄운다. 이 팝업은 화면 제어 에이전트(에디의 카톡 전송)도 가로막았다.
+- 같은 맥의 Hermes 게이트웨이는 팝업을 띄우지 않는다. launchd `ProgramArguments`를 `/usr/bin/osascript -l JavaScript -e '…$.system("exec …")'`로 감싸서, 자식의 책임 프로세스가 Apple 플랫폼 바이너리가 되게 한다. 그러면 권한 요청이 팝업 없이 거부된다. 원래 목적은 로컬 네트워크 권한이다(`~/.hermes/hermes-agent/hermes_cli/gateway_launchd.py`의 `launchd_program_arguments`). JXA `$.system`을 쓰는 이유는 `do shell script`가 WindowServer를 계속 확인해서 CPU를 쓰기 때문이다.
+- 결정:
+  1. 게이트 launchd 작업도 같은 방식으로 띄운다. 그러면 게이트와 그 밑의 실행기는 권한 팝업을 띄우지 않고, 보호 폴더 접근은 조용히 실패한다. 레인은 저장소 작업 폴더에서 일하므로 보호 폴더가 필요 없다.
+  2. 팝업이 사라지는 것은 사실로 확인한다. 바꾼 뒤 하루 동안 tccd 로그의 `AUTHREQ_PROMPTING` 줄 가운데 Foragent 인터프리터가 주체인 것이 0건이어야 한다.
+  3. 권한을 주는 방식(인터프리터 고정 서명 + 전체 디스크 접근)은 쓰지 않는다. 레인에 필요 없는 권한이고, 사람이 맥 앞에서 허용해야 한다.
+  4. 덧붙임(같은 날, Jin): 에디가 파일을 읽을 수 있도록 Jin이 `/usr/bin/osascript`에 전체 디스크 접근을 준다. 그러면 osascript로 감싼 게이트도 보호 폴더를 읽을 수 있다. 팝업은 여전히 뜨지 않는다. 레인이 이 권한에 기대는 기능을 만들지 않는다.

@@ -133,3 +133,4 @@
 - [#115 사용량 줄](project_usage_line.md) — ORDER 65·SHORT/APART, 바닥 줄을 고정한 시험 4종, Snapshot.meter, m 키
 - [#190 꿈꾸는 레인 줄](project_dream_row.md) — status lanes의 dreaming; watch_sections 도우미 모듈은 GAP=False(24줄 한도); fa test는 기준본 검사 불가
 - [#173 설정 창](project_settings_window.md) — 창 패키지·범위별 get·glyph 규칙; fa test는 ~/.cache/uv를 씀(UV_CACHE_DIR 필수)
+- [#308 runner_unit_tests 설정](project_settings_runner.md) — 새 팀 설정 추가 경로, auto 표시, max_parallel null 허용
