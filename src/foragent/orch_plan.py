@@ -291,31 +291,47 @@ def set_plan(store: StateStore, widths: dict[str, int | None], expires: datetime
     return _edit(store, by, change)
 
 
-def normal_file(path: str) -> str:
-    """One spelling per in-root file; a path outside the repository or a pattern is refused."""
+def normal_file(path: str, root: Path | None = None) -> str:
+    """One spelling per in-root file; a path outside the repository or a pattern is refused.
+
+    With the checkout ``root``, symbolic links in the path are followed, so a link that leaves
+    the repository is refused and an in-root alias names the file it points to. The path as
+    given is resolved there, not its text normal form: ``link/..`` is the link target's parent,
+    which text normalisation would silently drop.
+    """
     raw = path.strip().replace("\\", "/")
     if not raw or raw.startswith("/") or has_magic(raw):
         raise PlanRefused(f"'{path}' must be a file path inside the repository")
     normal = posixpath.normpath(raw)
     if normal in (".", "..") or normal.startswith("../"):
         raise PlanRefused(f"'{path}' is outside the repository")
-    return normal
+    if root is None:
+        return normal
+    base = root.resolve()
+    try:
+        real = (base / raw).resolve().relative_to(base).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        raise PlanRefused(f"'{path}' is outside the repository") from None
+    if real == ".":
+        raise PlanRefused(f"'{path}' must be a file path inside the repository")
+    return real
 
 
 def set_files(store: StateStore, limits: dict[str, int | None], why: str, expires: datetime | None,
-              by: str = "human", *, case_sensitive: bool | None = True) -> dict:
+              by: str = "human", *, case_sensitive: bool | None = True, root: Path | None = None) -> dict:
     """Set per-file overlap limits (None clears one) with their reason and expiry; all or nothing.
 
     Only the named files change: the plan's queues, pauses, widths and expiry stay as they are.
     Without ``expires`` an entry keeps its current expiry (a new one has none). On a
     case-insensitive checkout (``case_sensitive`` False) a spelling that differs only in case
-    names the stored entry, so it keeps that entry's author protection.
+    names the stored entry, so it keeps that entry's author protection. With ``root`` an alias
+    through a symbolic link names its target, so it shares that entry's protection too.
     """
     if not why.strip():
         raise PlanRefused("--overlap needs --why with the recorded evidence")
     normal: dict[str, int | None] = {}
     for path, value in limits.items():
-        normal[normal_file(path)] = value
+        normal[normal_file(path, root)] = value
 
     def change(plan, now):
         if case_sensitive is False:

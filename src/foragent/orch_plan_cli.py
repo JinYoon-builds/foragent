@@ -143,7 +143,8 @@ def run(args, store, config) -> None:
             from foragent.scheduler_lanes import _filesystem_case_sensitive
 
             current = plan_module.set_files(store, overlaps, args.why or "", expires, args.by,
-                                            case_sensitive=_filesystem_case_sensitive(args.repo_root))
+                                            case_sensitive=_filesystem_case_sensitive(args.repo_root),
+                                            root=args.repo_root)
         elif widths or expires:
             current = plan_module.set_plan(store, widths, expires, args.by)
         else:

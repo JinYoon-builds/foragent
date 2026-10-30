@@ -156,3 +156,49 @@ def test_case_insensitive_checkout_keeps_human_protection_across_case(context):
 def test_overlap_needs_a_reason(context):
     with pytest.raises(orch_plan.PlanRefused, match="--why"):
         orch_plan.set_files(context.store, {"a.py": 2}, " ", None, "orchestrator")
+
+
+@pytest.fixture
+def linked_root(tmp_path):
+    root, outside = tmp_path / "repo", tmp_path / "outside"
+    (root / "src").mkdir(parents=True)
+    outside.mkdir()
+    (root / "src" / "x.py").write_text("x\n")
+    (root / "out").symlink_to(outside, target_is_directory=True)
+    (root / "alias").symlink_to(root / "src", target_is_directory=True)
+    (root / "src" / "same.py").symlink_to(root / "src" / "x.py")
+    (outside / "nested").mkdir()
+    (root / "deep").symlink_to(outside / "nested", target_is_directory=True)
+    (root / "src" / "inner").mkdir()
+    (root / "inside").symlink_to(root / "src" / "inner", target_is_directory=True)
+    return root
+
+
+@pytest.mark.parametrize("path", ["out/file.py", "out/../out/new.py", "alias/../out/x.py",
+                                  "deep/../x.py", "deep/../../repo/../x.py", "./deep/../x.py"])
+def test_symlink_that_leaves_the_root_is_refused(context, linked_root, path):
+    with pytest.raises(orch_plan.PlanRefused, match="outside"):
+        orch_plan.set_files(context.store, {path: 5}, WHY, None, "orchestrator", root=linked_root)
+    assert not (context.store.root / "plan.json").exists()
+
+
+@pytest.mark.parametrize("alias", ["alias/x.py", "src/same.py", "./alias/../src/x.py", "inside/../x.py"])
+def test_in_root_symlink_alias_shares_human_protection(context, linked_root, alias):
+    orch_plan.set_files(context.store, {"src/x.py": 1}, WHY, None, "human", root=linked_root)
+    before = (context.store.root / "plan.json").read_bytes()
+    with pytest.raises(orch_plan.PlanRefused, match="human"):
+        orch_plan.set_files(context.store, {alias: 5}, WHY, None, "orchestrator", root=linked_root)
+    assert (context.store.root / "plan.json").read_bytes() == before
+    assert set(orch_plan.load(context.store, BASE_TIME)["files"]) == {"src/x.py"}
+
+
+def test_cli_passes_the_checkout_root_so_links_are_followed(context, linked_root, monkeypatch, capsys):
+    from types import SimpleNamespace
+    from foragent import orch_plan_cli
+
+    args = SimpleNamespace(action="plan", width=[], overlap=["out/file.py=5"], why=WHY, expires=None,
+                           by="orchestrator", json=True, repo_root=linked_root)
+    with pytest.raises(SystemExit):
+        orch_plan_cli.run(args, context.store, context.config)
+    assert "outside" in capsys.readouterr().err
+    assert not (context.store.root / "plan.json").exists()
