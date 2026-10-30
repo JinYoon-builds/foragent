@@ -4,6 +4,7 @@ Memory is a fact, not a budget input (#497): only the kernel's critical level
 matters, and it holds new starts and new test slots without changing a budget.
 """
 
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -16,6 +17,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 from typing import IO, Any
 
@@ -335,12 +337,10 @@ def _within_grace(timestamp: str | None, now: datetime) -> bool:
         return False
 
 
-def _holds_slot(run: Run, now: datetime) -> bool:
-    if run.pid is None:
-        # Between its record and its launch; after the grace it is a leftover.
-        return _within_grace(run.started_at, now)
+def _alive(pid: int) -> bool:
+    """The existing liveness rule: signal 0 probes only; a denied probe means alive."""
     try:
-        os.kill(run.pid, 0)
+        os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -348,28 +348,77 @@ def _holds_slot(run: Run, now: datetime) -> bool:
     return True
 
 
-def _store_slots(store: StateStore, now: datetime, *, own: bool) -> int:
+def _holds_slot(run: Run, now: datetime) -> bool:
+    if run.pid is None:
+        # Between its record and its launch; after the grace it is a leftover.
+        return _within_grace(run.started_at, now)
+    return _alive(run.pid)
+
+
+def _store_holders(
+    store: StateStore, now: datetime, *, live: bool, candidate: Any = None,
+) -> list[str]:
+    """One label per slot this store holds: runs, reserved starts and live workloads.
+
+    ``live`` applies the liveness rule to every run; without it the store's own
+    gate counts all of its active runs until its recovery clears them. A run or a
+    reserved start already holds one slot for its own agent, so the first live
+    workload of that agent (same pid, or the same issue while the run has no pid
+    yet) reuses it. ``candidate`` is a workload not yet written, counted the same way.
+    """
+    from foragent import capacity_sessions
+
     runs = store.active_runs()
     running = {run.number for run in runs}
-    count = len(runs) if own else sum(1 for run in runs if _holds_slot(run, now))
+    counted = [run for run in runs if _holds_slot(run, now)] if live else runs
+    holders = [f"#{run.number}" for run in counted]
     # A start reserves its slot before the GitHub labels and the run record.
-    return count + sum(
-        1 for number, prepared_at in store.run_starts().items()
-        if number not in running and _within_grace(prepared_at, now)
-    )
+    starts = [number for number, prepared_at in store.run_starts().items()
+              if number not in running and _within_grace(prepared_at, now)]
+    holders += [f"#{number}" for number in starts]
+    by_pid = Counter(run.pid for run in counted if run.pid is not None)
+    by_issue = {run.number for run in counted if run.pid is None} | set(starts)
+    workloads = capacity_sessions.read(store.root) + ([candidate] if candidate is not None else [])
+    for workload in workloads:
+        if not _alive(workload.pid):
+            continue
+        if by_pid[workload.pid] > 0:
+            by_pid[workload.pid] -= 1
+        elif workload.issue in by_issue:
+            by_issue.discard(workload.issue)
+        else:
+            holders.append(workload.label())
+    return holders
+
+
+def _holds_anything(root: Path) -> bool:
+    from foragent import capacity_sessions
+
+    return any((root / name).is_dir() for name in ("runs", "run-starts", capacity_sessions.WORKLOADS_DIR))
+
+
+def machine_holders(
+    store: StateStore, now: datetime, *, live: bool = False, candidate: Any = None,
+) -> list[str]:
+    """Label every held machine slot as "<project> <holder>", this store first.
+
+    Sibling stores always use the liveness rule; ``live`` applies it to this store too.
+    """
+    holders = [f"{store.root.name} {label}"
+               for label in _store_holders(store, now, live=live, candidate=candidate)]
+    for root in sorted(store.root.parent.iterdir()):
+        if root == store.root or not _holds_anything(root):
+            continue
+        try:
+            holders += [f"{root.name} {label}" for label in _store_holders(StateStore(root), now, live=True)]
+        except (OSError, ValueError, TypeError, KeyError):
+            continue  # Not a readable Foragent store; it cannot hold a slot.
+    return holders
 
 
 def machine_runs(store: StateStore, now: datetime) -> int:
-    """Count this store's active runs and the live runs of every sibling store."""
-    count = _store_slots(store, now, own=True)
-    for root in store.root.parent.iterdir():
-        if root == store.root or not ((root / "runs").is_dir() or (root / "run-starts").is_dir()):
-            continue
-        try:
-            count += _store_slots(StateStore(root), now, own=False)
-        except (OSError, ValueError, TypeError, KeyError):
-            continue  # Not a readable Foragent store; it cannot hold a slot.
-    return count
+    """Count this store's active runs and the live runs and workloads of every sibling store."""
+    return len(machine_holders(store, now))
 
 
 @contextmanager
@@ -424,6 +473,27 @@ def _flock(path: Path) -> Iterator[None]:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
         try:
             yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _flock_until(path: Path, deadline: float) -> Iterator[bool]:
+    """Like _flock, but give up at the monotonic ``deadline``; yields whether it is held."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        while True:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    yield False
+                    return
+                time.sleep(min(SLOT_POLL_SECONDS, remaining))
+        try:
+            yield True
         finally:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
@@ -549,12 +619,19 @@ def update_test_slots(
     return value
 
 
-def _take_test_slot(limit: int) -> IO[str] | None:
-    """Under the guard lock, hold one free slot file if fewer than limit are held."""
+def _take_test_slot(limit: int, deadline: float | None = None) -> IO[str] | None:
+    """Under the guard lock, hold one free slot file if fewer than limit are held.
+
+    With a monotonic ``deadline`` the guard lock wait is bounded too; a lock not
+    taken in time reads as no free slot.
+    """
     root = machine_root()
     directory = root / TEST_SLOTS_DIR
     directory.mkdir(parents=True, exist_ok=True)
-    with _flock(root / TEST_SLOTS_LOCK):
+    guard = _flock(root / TEST_SLOTS_LOCK) if deadline is None else _flock_until(root / TEST_SLOTS_LOCK, deadline)
+    with guard as locked:
+        if locked is False:
+            return None
         indexes = [int(path.stem.removeprefix("slot-")) for path in directory.glob("slot-*.lock")
                    if path.stem.removeprefix("slot-").isdigit()]
         held, free = 0, None
@@ -579,11 +656,16 @@ def _take_test_slot(limit: int) -> IO[str] | None:
 
 
 @contextmanager
-def hold_test_slot(ceiling: int, *, waiting: Callable[[], None] | None = None) -> Iterator[None]:
+def hold_test_slot(
+    ceiling: int, *, waiting: Callable[[], None] | None = None, deadline: float | None = None,
+    timed_out: Callable[[], str] | None = None,
+) -> Iterator[None]:
     """Hold one machine-wide test slot for one test command.
 
     A slot is an flock on a file, so the kernel releases it when the holder exits,
     including a crash. ``waiting`` runs when the wait starts and then periodically.
+    ``deadline`` (time.monotonic) bounds every wait, the guard lock included, and
+    raises TimeoutError with ``timed_out()``'s text; None waits until a slot frees.
     """
     if os.environ.get(TEST_SLOT_ENV) == "held":
         # The parent command already holds a slot; taking another could deadlock.
@@ -591,16 +673,189 @@ def hold_test_slot(ceiling: int, *, waiting: Callable[[], None] | None = None) -
         return
     heartbeat = None
     # While the kernel reports critical memory pressure, a free slot stays unclaimed.
-    while kernel_pressure() == "critical" or (stream := _take_test_slot(effective_test_slots(ceiling))) is None:
+    while (kernel_pressure() == "critical"
+           or (stream := _take_test_slot(effective_test_slots(ceiling), deadline)) is None):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(timed_out() if timed_out is not None else "No machine test slot became free in time")
         if waiting is not None and (heartbeat is None or time.monotonic() - heartbeat >= SLOT_HEARTBEAT_SECONDS):
             heartbeat = time.monotonic()
             waiting()
-        time.sleep(SLOT_POLL_SECONDS)
+        pause = SLOT_POLL_SECONDS if deadline is None else min(SLOT_POLL_SECONDS, deadline - time.monotonic())
+        time.sleep(max(0.0, pause))
     try:
         yield
     finally:
         fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         stream.close()
+
+
+# How often a waiting workload re-checks the machine budget and sensors.
+WORKLOAD_POLL_SECONDS = 2.0
+# The thread that holds each piece, with the workload record. A copied context
+# carries these values into other threads (run_review's reviewers do that), so
+# only the holding thread itself may reuse them: that is synchronous nesting.
+_WORKLOAD: ContextVar[tuple[threading.Thread, Path] | None] = ContextVar("foragent_capacity_workload", default=None)
+# The thread that holds a test slot through hold_workload(tests=True).
+_WORKLOAD_TESTS: ContextVar[threading.Thread | None] = ContextVar("foragent_capacity_workload_tests", default=None)
+
+
+def _held_here(holder: threading.Thread | None) -> bool:
+    return holder is threading.current_thread()
+
+
+def workload_budget(store: StateStore) -> int:
+    """The shared AIMD value the gate keeps, capped by machine.yml's max_parallel."""
+    from foragent import machine_budget
+
+    state = read_state(store)
+    value = int(state["parallel"]) if state else INITIAL_PARALLEL
+    ceiling = machine_budget.values()["max_parallel"]
+    return max(1, min(value, ceiling) if ceiling is not None else value)
+
+
+def _sensor_block() -> str | None:
+    """The existing holds on new work: critical kernel memory, then CPU overload."""
+    with observing():  # Admission reads the sensors; the gate tick owns their baselines.
+        load = machine_load()[1]
+    if kernel_pressure() == "critical":
+        return "critical"
+    return "overload" if load >= OVERLOAD_LOAD else None
+
+
+def _workload_text(
+    key: str, language: str, reason: str, holders: list[str], budget: int, used: int | None = None, **values: Any,
+) -> str:
+    from foragent import i18n
+
+    used = len(holders) if used is None else used
+    return i18n.text(
+        key, language, reason=i18n.text(f"workload_reason_{reason}", language),
+        used=used, budget=budget, free=max(0, budget - used),
+        holders=", ".join(holders) if holders else i18n.text("workload_holders_none", language), **values,
+    )
+
+
+def _say(message: str, wait_s: float) -> None:
+    if wait_s > 0:  # A tick's single try defers quietly; a person learns why.
+        print(message, file=sys.stderr, flush=True)
+
+
+def _acquire_workload(
+    store: StateStore, language: str, wait_s: float, deadline: float, *,
+    kind: str, issue: int | None, role: str | None,
+) -> Path:
+    """Add this process's workload record once a slot is free, by the monotonic ``deadline``.
+
+    The run or reserved start of this same agent already holds its slot, so that
+    workload is admitted at once whatever the budget and sensors say.
+    """
+    from foragent import capacity_sessions
+
+    pid, shown = os.getpid(), None
+    candidate = capacity_sessions.Workload(Path(), pid, kind, issue, role)
+    while True:
+        sensed = _sensor_block()  # Read outside the lock: waiting holds no lock.
+        # One try: the loop below does every wait, so each one is reported and bounded.
+        with _flock_until(store.root.parent / LOCK_FILE, time.monotonic()) as locked:
+            now = datetime.now(UTC)
+            holders, budget = machine_holders(store, now, live=True), workload_budget(store)
+            reused = len(machine_holders(store, now, live=True, candidate=candidate)) == len(holders)
+            reason = None if reused else sensed or ("full" if len(holders) >= budget else None)
+            if locked and reason is None:
+                return capacity_sessions.add(store, pid=pid, kind=kind, issue=issue, role=role)
+        reason = reason or "busy"  # Free, but another process kept the machine lock past the deadline.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            message = _workload_text("workload_timeout", language, reason, holders, budget, seconds=f"{wait_s:g}")
+            _say(message, wait_s)
+            raise TimeoutError(message)
+        if (reason, tuple(holders)) != shown:
+            shown = (reason, tuple(holders))
+            _say(_workload_text("workload_wait", language, reason, holders, budget, seconds=f"{wait_s:g}"), wait_s)
+        time.sleep(min(WORKLOAD_POLL_SECONDS, remaining))
+
+
+def _held_test_slots() -> int:
+    """How many slot files a process holds now; a probe takes and drops each free one at once."""
+    held = 0
+    for path in (machine_root() / TEST_SLOTS_DIR).glob("slot-*.lock"):
+        with path.open("a", encoding="utf-8") as stream:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held += 1
+                continue
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    return held
+
+
+@contextmanager
+def _workload_test_slot(store: StateStore, config: Any, language: str, wait_s: float, deadline: float):
+    """The existing test slot, inside the same deadline and with the same localized guidance."""
+    shown = None
+
+    def facts() -> tuple[str, list[str], int, int]:
+        reason = "critical" if kernel_pressure() == "critical" else "tests"
+        holders = machine_holders(store, datetime.now(UTC), live=True)
+        return reason, holders, effective_test_slots(config.test_slots), _held_test_slots()
+
+    def waiting() -> None:
+        nonlocal shown
+        reason, holders, budget, used = facts()
+        if (reason, tuple(holders), used) != shown:
+            shown = (reason, tuple(holders), used)
+            _say(_workload_text("workload_test_wait", language, reason, holders, budget, used,
+                                seconds=f"{wait_s:g}"), wait_s)
+
+    def timed_out() -> str:
+        reason, holders, budget, used = facts()
+        message = _workload_text("workload_test_timeout", language, reason, holders, budget, used,
+                                 seconds=f"{wait_s:g}")
+        _say(message, wait_s)
+        return message
+
+    with hold_test_slot(config.test_slots, waiting=waiting, deadline=deadline, timed_out=timed_out):
+        yield
+
+
+@contextmanager
+def hold_workload(
+    store: StateStore, config: Any, *, tests: bool = False, wait_s: float = 600,
+    kind: str = "workload", issue: int | None = None, role: str | None = None,
+) -> Iterator[None]:
+    """Hold one machine slot for one agent workload; ``tests`` also holds a test slot.
+
+    The slot is the shared gate budget: the same AIMD value, machine.yml ceiling,
+    load and critical-memory holds, and the same count of live runs across
+    stores. One ``wait_s`` budget of active (monotonic) seconds covers every wait
+    of this acquisition: locks, the machine slot and the test slot. A tick passes
+    0 and defers on TimeoutError. A synchronous nested hold in the same thread
+    reuses the outer slot; concurrent agents (e.g. N reviewers in N threads, even
+    with copied contexts) each hold one. Every exit releases what it took.
+    """
+    language = getattr(config, "language", "en") or "en"
+    deadline = time.monotonic() + wait_s
+    held = _WORKLOAD.get()
+    owner = held is None or not _held_here(held[0])
+    if owner:
+        record = _acquire_workload(store, language, wait_s, deadline, kind=kind, issue=issue, role=role)
+    token = _WORKLOAD.set((threading.current_thread(), record)) if owner else None
+    try:
+        if tests and not _held_here(_WORKLOAD_TESTS.get()):
+            tests_token = _WORKLOAD_TESTS.set(threading.current_thread())
+            try:
+                with _workload_test_slot(store, config, language, wait_s, deadline):
+                    yield
+            finally:
+                _WORKLOAD_TESTS.reset(tests_token)
+        else:
+            yield
+    finally:
+        if owner:
+            from foragent import capacity_sessions
+
+            _WORKLOAD.reset(token)
+            capacity_sessions.remove(record)
 
 
 SLEEP_BASELINES_FILE = "sleep-baselines.json"
