@@ -26,7 +26,7 @@ def test_exact_defaults(repo):
         "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "run_hours": "always",
-        "stall_minutes": 30, "max_runtime_minutes": 90, "silence_minutes": 10, "safety_net_hours": 24, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "base_branch": "main",
+        "stall_minutes": 30, "max_runtime_minutes": 90, "silence_minutes": None, "safety_net_hours": 24, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "orch_refresh_compactions": 4,
         "orch_refresh_hours": 24,
@@ -248,6 +248,9 @@ def test_acceptance_directory_allows_literal_paths(repo, directory):
 @pytest.mark.parametrize("value", [0, -1, 1.5, "2", True, None])
 def test_integer_fields_are_positive_integers(repo, key, value):
     write_settings(repo / ".foragent.yml", {key: value})
+    if key == "silence_minutes" and value is None:
+        assert load_config(repo).silence_minutes is None  # Unset: the watchdog's default window (#435).
+        return
     with pytest.raises(ConfigError, match=key):
         load_config(repo)
 

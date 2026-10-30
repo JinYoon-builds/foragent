@@ -82,7 +82,7 @@ class Config:
     tick_failure_alert: int = 3
     # A limit only on a run that is also silent past it (#435); progressing work runs on.
     max_runtime_minutes: int = 90
-    silence_minutes: int = 10
+    silence_minutes: int | None = None  # Unset: the watchdog's default window, 10 minutes.
     safety_net_hours: int = 24
     max_retries: int = 2
     conflict_retries: int = 2

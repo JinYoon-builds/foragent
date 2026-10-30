@@ -49,10 +49,19 @@ def test_outcome_for_maps_each_stopping_kind():
         None, "stalled-restart", "killed", "stalled-restart"]
 
 
-@pytest.mark.parametrize("stop,past,kind", [
-    (None, False, "silent"), ("silent", True, "runtime-limit"), ("safety-net", True, "safety-net")])
-def test_a_stopped_check_is_decided_again_with_the_run_limit(stop, past, kind):
-    assert stopped_check_kind(stop, past) == kind
+# A stopped check is decided with the run's own facts: safety net > runtime limit > silent.
+@pytest.mark.parametrize("stop,elapsed,kind", [
+    (None, 60, "silent"), ("silent", 6001, "runtime-limit"), ("silent", 86400, "safety-net"),
+    ("safety-net", 60, "safety-net")])
+def test_a_stopped_check_is_decided_with_the_run_facts(stop, elapsed, kind):
+    assert stopped_check_kind(stop, elapsed, Config()) == kind
+
+
+def test_window_source_follows_whether_silence_minutes_is_set():
+    assert watchdog.silence_window(Config()) == (600, "default")
+    assert watchdog.silence_window(Config(silence_minutes=10)) == (600, "config")
+    assert SilenceWatchdog(window_seconds=600).window_source == "config"
+    assert SilenceWatchdog().window_source == "default"
 
 
 # No earlier sample: the reference point is the start, growth is 0.
@@ -140,9 +149,11 @@ def test_resume_selection_deselects_only_prefix_safe_ids(tmp_path):
     cache.root.mkdir(parents=True)
     run_baseline_resume.retained_path(cache, "k").write_text(json.dumps(
         {"node_ids": ["t.py::test_work", "t.py::test_work_more", "t.py::test_other"]}))
-    retained, selection = run_baseline_resume.resume_selection(cache, "k", "pytest tests")
+    work = tmp_path / "work"
+    work.mkdir()
+    retained, selection, _ = run_baseline_resume.prepare(cache, "k", "pytest tests", work, tmp_path)
     assert retained == {"t.py::test_work", "t.py::test_work_more", "t.py::test_other"}
-    assert selection == "pytest tests --deselect=t.py::test_other --deselect=t.py::test_work_more"
+    assert "pytest tests --deselect=t.py::test_other --deselect=t.py::test_work_more -p _foragent_results_" in selection
     assert run_baseline_resume.deselect_count(selection) == 2
 
 
@@ -157,10 +168,11 @@ def test_a_stopped_capture_carries_its_kind_and_a_complete_one_drops_the_kept_pa
     cache.root.mkdir(parents=True)
     log = tmp_path / "log"
     log.write_text("t.py::test_a PASSED\n")
-    run_baseline_resume.after_capture(cache, "k", {"t.py::test_z"}, stopped, False, tmp_path / "none.xml", log, 0)
+    run_baseline_resume.after_capture(cache, "k", {"t.py::test_z"}, stopped, False, tmp_path / "none.xml", log, 0,
+                                      tmp_path / "none.jsonl")
     assert run_baseline_resume.retained_passes(cache, "k") == {"t.py::test_a", "t.py::test_z"}
     run_baseline_resume.after_capture(cache, "k", set(), run_checks.CheckResult("pytest", 0, False, ""), True,
-                                      tmp_path / "none.xml", log, 0)
+                                      tmp_path / "none.xml", log, 0, tmp_path / "none.jsonl")
     assert not run_baseline_resume.retained_path(cache, "k").exists()
 
 
@@ -266,3 +278,131 @@ def test_silent_stop_ignores_children_of_a_reused_parent_pid(fake_process_table,
         with processes.quiescent_tree():
             found = processes.observe_tree([{"pid": root.pid, "start_time": 10}])
     assert 47000 not in {item["pid"] for item in found}
+
+
+# A decision voided by progress written after it was taken: _kill_run must see the change.
+def test_the_decided_record_is_the_one_the_decision_read(tmp_path):
+    from foragent.state import StateStore
+
+    started = datetime(2026, 10, 30, tzinfo=UTC)
+    store = StateStore(tmp_path / "state", now=lambda: started)
+    store.start_run(1, branch="b", worktree=tmp_path / "w")
+    before = store.get_run(1)
+    write = store.update_run
+
+    def runner_progresses(key, **fields):
+        if "silence" in fields:  # The runner records progress between the observation and this write.
+            write(key, last_progress_at=(started + timedelta(minutes=30)).isoformat())
+        return write(key, **fields)
+
+    store.update_run = runner_progresses
+    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: started + timedelta(minutes=30))
+    decision, decided = scheduler_silence.observe(ctx, before, 1800)
+    assert decision.kind == "silent"
+    assert decided.last_progress_at == before.last_progress_at != store.get_run(1).last_progress_at
+
+
+def _pytest_project(tmp_path, source):
+    project = tmp_path / "project"
+    (project / "tests").mkdir(parents=True)
+    (project / "pytest.ini").write_text("[pytest]\n")
+    (project / "tests" / "test_a.py").write_text(source)
+    return project
+
+
+# Inexact selection: --deselect drops prefixes; only the exactly kept id stays out, even without a terminal.
+def test_resumed_capture_runs_every_test_but_the_exactly_kept_ones(tmp_path):
+    import sys
+
+    from foragent.state import StateStore
+
+    project = _pytest_project(tmp_path, "def test_a(): pass\ndef test_ab(): pass\n")
+    cache = StateStore(tmp_path / "baselines")
+    cache.root.mkdir(parents=True)
+    run_baseline_resume.retained_path(cache, "k").write_text(json.dumps({"node_ids": ["tests/test_a.py::test_a"]}))
+    report = tmp_path / "out.xml"
+    work = tmp_path / "work"
+    work.mkdir()
+    command = (f"{sys.executable} -m pytest -p no:cacheprovider -p no:terminal tests "
+               f"-o junit_family=legacy --junit-prefix= --junitxml={report}")
+    retained, command, listing = run_baseline_resume.prepare(cache, "k", command, work, project)
+    assert "--deselect=tests/test_a.py::test_a" in command
+    subprocess.run(["/bin/sh", "-c", command], cwd=project, capture_output=True, check=False)
+    assert run_checks._passing_acceptance_ids(report) == ("tests/test_a.py::test_ab",)
+    assert run_baseline_resume.selected(2, "collected 2 items / 2 deselected", listing, command) == 1
+
+
+# Lost passes: at -q pytest prints dots and writes JUnit at the end, so the plugin records each pass.
+def test_a_stopped_capture_keeps_the_passes_the_plugin_recorded(tmp_path):
+    import sys
+
+    from foragent.state import StateStore
+
+    project = _pytest_project(tmp_path, "import pytest\n"
+                              "def test_pass(): pass\n"
+                              "def test_fail(): assert False\n"
+                              "@pytest.fixture\n"
+                              "def broken():\n    yield\n    raise RuntimeError('teardown')\n"
+                              "def test_teardown(broken): pass\n")
+    cache = StateStore(tmp_path / "baselines")
+    cache.root.mkdir(parents=True)
+    work = tmp_path / "work"
+    work.mkdir()
+    retained, command, listing = run_baseline_resume.prepare(
+        cache, "k", f"{sys.executable} -m pytest -q -p no:cacheprovider tests", work, project)
+    subprocess.run(["/bin/sh", "-c", command], cwd=project, capture_output=True, check=False)
+    stopped = run_checks.CheckResult(command, -15, True, "", stop="silent")
+    log = tmp_path / "log"
+    log.write_text("")
+    run_baseline_resume.after_capture(cache, "k", retained, stopped, False, tmp_path / "none.xml", log, 0, listing)
+    assert run_baseline_resume.retained_passes(cache, "k") == {"tests/test_a.py::test_pass"}
+
+
+# A setting lost at a process boundary: the detached builder keeps the configured safety net.
+def test_detached_baseline_builder_keeps_the_configured_safety_net(monkeypatch, tmp_path):
+    from foragent import run_baseline, run_baseline_process
+
+    seen = []
+    monkeypatch.setattr(run_baseline, "_build_baseline", lambda context, build, lock: seen.append(context.config))
+    monkeypatch.setattr(run_baseline_process, "load_record", lambda cls, value: value)
+    monkeypatch.setattr(run_baseline_process.os, "fdopen", lambda fd, mode: None)
+    requests = []
+    monkeypatch.setattr(run_baseline.subprocess, "Popen", lambda argv, **kwargs: requests.append(json.loads(argv[3])))
+    ctx = SimpleNamespace(repo_root=tmp_path, store=SimpleNamespace(root=tmp_path / "state"),
+                          config=Config(safety_net_hours=2))
+    (tmp_path / "baselines").mkdir()
+    lock = (tmp_path / "lock").open("a")
+    build = run_baseline.BaselineBuild(base_sha="s", test_command="pytest", excluded=[], key="k", scope="x")
+    run_baseline.start_baseline_process(ctx, build, lock)
+    run_baseline_process.main(["x", json.dumps({**requests[0], "build": {}}), "9"])
+    assert seen[0].safety_net_hours == 2
+
+
+# Selection and count agree: every exactly kept id stays out, also one that prefixes another kept id.
+def test_resumed_capture_leaves_out_every_kept_id_and_counts_what_it_left_out(tmp_path):
+    import sys
+
+    from foragent.state import StateStore
+
+    project = _pytest_project(tmp_path, "def test_a(): pass\ndef test_ab(): pass\ndef test_b(): pass\n")
+    cache = StateStore(tmp_path / "baselines")
+    cache.root.mkdir(parents=True)
+    run_baseline_resume.retained_path(cache, "k").write_text(json.dumps(
+        {"node_ids": ["tests/test_a.py::test_a", "tests/test_a.py::test_ab"]}))
+    report, work = tmp_path / "out.xml", tmp_path / "work"
+    work.mkdir()
+    command = (f"{sys.executable} -m pytest -p no:cacheprovider tests "
+               f"-o junit_family=legacy --junit-prefix= --junitxml={report}")
+    retained, command, listing = run_baseline_resume.prepare(cache, "k", command, work, project)
+    assert "--deselect=tests/test_a.py::test_a " not in command + " "  # A prefix of another kept id.
+    output = subprocess.run(["/bin/sh", "-c", command], cwd=project, capture_output=True, text=True).stdout
+    assert run_checks._passing_acceptance_ids(report) == ("tests/test_a.py::test_b",)
+    line = next(line for line in output.splitlines() if line.startswith("collected"))
+    assert run_baseline_resume.selected(3, line, listing, command) == 1  # Equal to what JUnit recorded.
+
+
+def test_a_kept_id_run_again_keeps_its_fresh_result():
+    passing, collected = run_baseline_resume.combine(
+        ("t.py::test_b",), ("t.py::test_a", "t.py::test_b"), {"t.py::test_a", "t.py::test_z"})
+    assert passing == ("t.py::test_b", "t.py::test_z")  # test_a failed when it ran again.
+    assert collected == ("t.py::test_a", "t.py::test_b", "t.py::test_z")

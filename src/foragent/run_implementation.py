@@ -149,8 +149,7 @@ def _baseline_unavailable(n: int, ctx: RunContext, detail: str, cause: Exception
     """The #327 stop: no merge without a usable protected set."""
     if (kind := getattr(cause, "watchdog_kind", None)) is not None:  # Stopped by the watchdog (#435).
         from foragent import watchdog
-        past = _elapsed(n, ctx) > watchdog.runtime_limit_seconds(ctx.config)
-        end_by_watchdog(n, ctx, watchdog.stopped_check_kind(kind, past), [], detail)
+        end_by_watchdog(n, ctx, watchdog.stopped_check_kind(kind, _elapsed(n, ctx), ctx.config), [], detail)
     _append(ctx.store.log_path(n), detail)
     reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
     flag(ctx, n, reason, "acceptance baseline unavailable", detail)

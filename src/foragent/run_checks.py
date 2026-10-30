@@ -27,7 +27,7 @@ from foragent.reasons import Reason
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout, after_check, in_phase
+from foragent.run_waits import _phase, _progress, _test_slot, after_check, in_phase
 from foragent.state import Approval
 
 if TYPE_CHECKING:
@@ -569,17 +569,12 @@ def _check_review_head(
     # Done when on the PR head is checking time, as in an implementation's verification.
     with in_phase(n, ctx, "checking"):
         for command in parsed.done_when_commands:
-            if runner._remaining(n, ctx) <= 0:
-                save_failures(ctx.store.root, n, checks, complete=False)
-                return _timeout(n, ctx)
+            # Elapsed time alone ends nothing (#435): the watchdog stops a check, and the run ends by its outcome.
             check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)),
                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
-                                  full_text_dir=cuts.issue_dir(ctx.store.root, n))
+                                  full_text_dir=cuts.issue_dir(ctx.store.root, n), **watchdog.silence_args(ctx))
             checks.append(check)
-            _progress(n, ctx)
-            if check.timed_out or runner._remaining(n, ctx) <= 0:
-                save_failures(ctx.store.root, n, checks, complete=False)
-                return _timeout(n, ctx)
+            after_check(n, ctx, checks)
     # PR-head checks rerun only Done when: other saved failures (baseline, units) are not re-verified here.
     if bundle := save_failures(ctx.store.root, n, checks, complete=False):
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.", f"{bundle}\n{link}")

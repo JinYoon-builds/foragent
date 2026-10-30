@@ -10,11 +10,12 @@ its module-size limit.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
-from foragent.watchdog import Decision, SilenceWatchdog, outcome_for, runtime_limit_seconds
+from foragent.watchdog import Decision, SilenceWatchdog, outcome_for, runtime_limit_seconds, silence_window
 
 if TYPE_CHECKING:
     from foragent.scheduler import TickContext, TickReport
@@ -54,8 +55,9 @@ def observe(ctx: TickContext, run: Run, runtime: float) -> tuple[Decision, Run]:
     """This tick's decision, from the samples the run record keeps; the record is updated first."""
     now = ctx.now().timestamp()
     started = now - runtime  # The run start, moved by credited waits, sleep and talk pauses.
+    window, source = silence_window(ctx.config)
     watch = SilenceWatchdog(safety_net=ctx.config.safety_net_hours * 3600,
-                            window_seconds=ctx.config.silence_minutes * 60, started=started,
+                            window_seconds=None if source == "default" else window, started=started,
                             runtime_limit=runtime_limit_seconds(ctx.config))
     watch.restore(run.silence)
     if run.last_progress_at:  # Progress is a measured activity time, also with no earlier sample.
@@ -65,7 +67,9 @@ def observe(ctx: TickContext, run: Run, runtime: float) -> tuple[Decision, Run]:
     log = ctx.store.log_path(run.number)
     decision = watch.observe(now=now, output_bytes=log.stat().st_size if log.exists() else 0, progress_events=0,
                              snapshot=_rows(), identities=run.process_identities)
-    return decision, ctx.store.update_run(run.key, silence=watch.state())
+    ctx.store.update_run(run.key, silence=watch.state())
+    # The decision was taken from this record: progress written since must void it in _kill_run.
+    return decision, replace(run, silence=watch.state())
 
 
 def _rows():

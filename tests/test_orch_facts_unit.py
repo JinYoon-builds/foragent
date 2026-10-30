@@ -841,7 +841,7 @@ def test_review_head_done_when_is_checking_time(env, monkeypatch):
     git = SimpleNamespace(root=root, stage_changes=lambda: None, head_sha=lambda: "head",
                           has_staged_changes=lambda: False)
     ctx = SimpleNamespace(store=store, config=Config(repo="owner/repo"), now=lambda: clock[0],
-                          monotonic=lambda: clock[0].timestamp())
+                          monotonic=lambda: clock[0].timestamp(), repo_root=root)  # Its silence history (#435).
     from foragent import runner
     real = runner._check
 

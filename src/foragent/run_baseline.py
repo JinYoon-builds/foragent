@@ -108,7 +108,7 @@ def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str])
 
     request = {
         "repo_root": str(ctx.repo_root.resolve()), "store_root": str(ctx.store.root.resolve()),
-        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots, "repo": ctx.config.repo,
+        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots, "repo": ctx.config.repo, "safety_net_hours": ctx.config.safety_net_hours,
         "machine_root": str(capacity.machine_root().resolve()),
         "build": asdict(build),
     }
@@ -357,11 +357,11 @@ def _capture_baseline(
                         return replace(_saved_baseline(command, saved), excluded=tuple(excluded), base_sha=base_sha)
                 selection = f"{command} {shlex.quote(ctx.config.acceptance_dir)}"
                 selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
-                retained, selection = resume.resume_selection(cache, key, selection)  # Passes a stopped capture kept.
                 baseline_command = (
                     f"{selection} "
                     f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(capture_report))}"
                 )
+                retained, baseline_command, listing = resume.prepare(cache, key, baseline_command, Path(directory), worktree)
                 offset = log.stat().st_size if log.exists() else 0
                 started = monotonic()
                 result = check(baseline_command, worktree)
@@ -376,8 +376,8 @@ def _capture_baseline(
                         stream.seek(offset)
                         for line in stream:
                             if count := re.match(r"collected (\d+) items?\b", line):
-                                # More deselected than kept (a prefix match dropped an unrun id): incomplete.
-                                collected = int(count[1]) - d if (d := int((re.search(r"(\d+) deselected", line) or [0, 0])[1])) == resume.deselect_count(baseline_command) else -1
+                                # Collected less the exactly kept ids the resumed capture did not rerun.
+                                collected = resume.selected(int(count[1]), line, listing, baseline_command)
                                 break
                 except OSError:
                     pass
@@ -424,12 +424,12 @@ def _capture_baseline(
                     else:
                         report.unlink(missing_ok=True)
                 if cacheable:
-                    node_ids, collected_ids = (tuple(sorted({*ids, *retained})) for ids in (node_ids, collected_ids))
+                    node_ids, collected_ids = resume.combine(node_ids, collected_ids, retained)
                     save_baseline(node_ids, collected_ids, failing_ids, duration_seconds, result.exit_code,
                                   result_gaps=result.result_gaps)
                 elif result.timed_out and record_timeouts:
                     save_baseline(node_ids, collected_ids, (), duration_seconds, result.exit_code, timed_out=True)
-                resume.after_capture(cache, key, retained, result, cacheable, capture_report, log, offset)
+                resume.after_capture(cache, key, retained, result, cacheable, capture_report, log, offset, listing)
                 _append(log, f"Acceptance baseline count={len(node_ids)}, exit_code={result.exit_code}, timed_out={result.timed_out}")
                 if not cacheable:
                     raise resume.capture_failure(result,

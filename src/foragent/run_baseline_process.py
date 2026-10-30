@@ -25,7 +25,7 @@ def main(argv: list[str]) -> None:
     context = SimpleNamespace(
         repo_root=root, store=StateStore(Path(request["store_root"])), git=GitRepo(root),
         config=Config(acceptance_dir=request["acceptance_dir"], test_slots=request["test_slots"],
-                      repo=request.get("repo")),
+                      repo=request.get("repo"), safety_net_hours=request.get("safety_net_hours", 24)),
         now=lambda: datetime.now(UTC),
     )
     _build_baseline(context, load_record(BaselineBuild, request["build"]), os.fdopen(int(argv[2]), "a"))

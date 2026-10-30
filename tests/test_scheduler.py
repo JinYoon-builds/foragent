@@ -827,7 +827,7 @@ def test_running_overtime_backstop_kills_alive_runner(ctx, monkeypatch, seconds,
     # Progress one second inside the silence window at the limit: one second later the run is
     # both past the runtime limit and silent, so it is killed (#435).
     limit = NOW + timedelta(minutes=ctx.config.max_runtime_minutes + 10)
-    ctx.store.update_run(1, last_progress_at=(limit - timedelta(minutes=ctx.config.silence_minutes, seconds=-1)).isoformat())
+    ctx.store.update_run(1, last_progress_at=(limit - timedelta(minutes=10, seconds=-1)).isoformat())  # The default window.
     tick(ctx)
     assert actions == ([5432] if killed else [])
     if killed:
@@ -2492,19 +2492,20 @@ def test_paused_lane_skipped_until_expiry(ctx):
     assert ctx.store.get_run(1).lane == "ui"
 
 
-def test_tick_runtime_backstop_excludes_waited_seconds(ctx):
+@pytest.mark.parametrize("waited_minutes,outcome", [(60, "stalled-restart"), (0, "killed")])
+def test_tick_runtime_backstop_excludes_waited_seconds(ctx, waited_minutes, outcome):
     approve(ctx)
     tick(ctx)
     mark_running(ctx)
     ctx.now = lambda: NOW + timedelta(minutes=130)
-    run = ctx.store.update_run(1, waited_seconds=60 * 60, last_progress_at=ctx.now().isoformat())
+    # Silent for 20 minutes (no stall yet). Credited waits make it 70 minutes of runtime, under the
+    # limit: a silence restart. Without the credit it is past the limit: killed (#435).
+    ctx.store.update_run(1, waited_seconds=waited_minutes * 60,
+                         last_progress_at=(ctx.now() - timedelta(minutes=20)).isoformat())
     tick(ctx)
-    assert ctx.store.active_runs() == [run]
-    ctx.store.update_run(1, waited_seconds=0)
-    ctx.now = lambda: NOW + timedelta(minutes=141)  # Past the limit and silent for the window (#435).
-    tick(ctx)
-    assert ctx.store.get_run(1).outcome == "killed"
-    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert ctx.store.get_run(1).outcome == outcome
+    if outcome == "killed":
+        assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
 
 
 def test_tick_does_not_stall_a_waiting_executor(ctx):

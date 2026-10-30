@@ -46,12 +46,26 @@ def decide(facts: Facts) -> str:
     return "silent" if silent else "running"
 
 
-def stopped_check_kind(stop: str | None, past_runtime_limit: bool) -> str:
-    """The run's kind for a check the watchdog stopped: its own kind ("silent" unless it says
-    otherwise), decided again with the run's runtime limit, so precedence stays decide()'s."""
-    return decide(Facts(silence_age=1, window_seconds=1, elapsed=1,
-                        safety_net=0 if stop == "safety-net" else float("inf"), cpu_known=True,
-                        runtime_limit=0 if past_runtime_limit else None))
+def stopped_check_kind(stop: str | None, run_elapsed: float, config) -> str:
+    """The run's kind for a check the watchdog stopped, decided with the run's own facts.
+
+    The check was silent (or reached its own safety net); the run's elapsed time is then
+    measured against the run's safety net and runtime limit, so decide()'s precedence holds:
+    a run past its safety net restarts, even when the check itself stopped as silent.
+    """
+    from foragent.config import safety_net_seconds
+
+    return decide(Facts(silence_age=1, window_seconds=1,
+                        elapsed=float("inf") if stop == "safety-net" else run_elapsed,
+                        safety_net=safety_net_seconds(config), cpu_known=True,
+                        runtime_limit=runtime_limit_seconds(config)))
+
+
+def silence_window(config) -> tuple[float, str]:
+    """A run's silence window and its source: "config" when silence_minutes is set, else "default"."""
+    if config.silence_minutes is None:
+        return DEFAULT_WINDOW_SECONDS, "default"
+    return config.silence_minutes * 60, "config"
 
 
 def runtime_limit_seconds(config) -> float:
@@ -94,7 +108,7 @@ class SilenceWatchdog:
         gaps = [gap for gap in history_gaps if _number(gap)]
         if gaps:
             self.window_seconds, self.window_source = 2 * max(gaps), "history"
-        elif window_seconds is not None and window_seconds != DEFAULT_WINDOW_SECONDS:
+        elif window_seconds is not None:  # A configured window, even if it equals the default.
             self.window_seconds, self.window_source = window_seconds, "config"
         else:
             self.window_seconds, self.window_source = DEFAULT_WINDOW_SECONDS, "default"

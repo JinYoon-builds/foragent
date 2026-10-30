@@ -267,7 +267,7 @@ def test_failed_rerun_preserves_pr_and_raw_review_with_visible_reason(review_cas
 @pytest.mark.parametrize("entry", ["rerun-review", "resolve"])
 @pytest.mark.parametrize("failure,reason", [
     ("checks", Reason.RETRIES_EXCEEDED), ("ci", Reason.RETRIES_EXCEEDED),
-    ("ci-timeout", Reason.TIMEOUT), ("check-timeout", Reason.TIMEOUT),
+    ("ci-timeout", Reason.TIMEOUT), ("check-timeout", Reason.STALLED),  # A watchdog stop ends by outcome_for; open PR: stalled (#435)
     ("base", Reason.RISK_HIGH), ("head", Reason.RISK_HIGH),
     ("body", Reason.HASH_MISMATCH), ("acceptance", Reason.HASH_MISMATCH),
     ("missing-approval", Reason.HASH_MISMATCH), ("no-check", Reason.NO_MACHINE_CHECK),

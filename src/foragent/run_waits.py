@@ -77,8 +77,7 @@ def after_check(n: int, ctx: RunContext, checks: list) -> None:
     check = checks[-1] if checks else None
     if check is None or not check.timed_out:
         return
-    past = _elapsed(n, ctx) > watchdog.runtime_limit_seconds(ctx.config)
-    kind = watchdog.stopped_check_kind(getattr(check, "stop", None), past)
+    kind = watchdog.stopped_check_kind(getattr(check, "stop", None), _elapsed(n, ctx), ctx.config)
     end_by_watchdog(n, ctx, kind, checks, f"The watchdog stopped a check ({kind}): {check.command}")
 
 
