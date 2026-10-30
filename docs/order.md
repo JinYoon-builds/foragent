@@ -102,6 +102,16 @@ Done when이 `pnpm test -- login` 같은 테스트를 가리킬 때, 그 테스�
 observed conflict (#196) in 231 runs. The orchestrator changes it only using
 conflict evidence from `fa orch facts`; the facts display is a separate issue.
 
+For one file, the orchestrator can set its own limit from that file's records:
+`fa orch plan --overlap PATH=N --why "<evidence>" --by orchestrator [--expires ISO]`
+(`PATH=off` clears it). N counts every run sharing the file, the new one included.
+A live entry replaces `overlap_per_file` for that exact file at admission and at
+the runner's late-file wait; a glob claim meets every entry it may cover and the
+fallback. Exclusive reservations, union files and budgets still apply. An entry
+keeps its author, reason and expiry; an orchestrator never changes a person's
+entry. `overlap_mode: fixed` in `.foragent.yml` ignores the entries and applies
+`overlap_per_file` to every file (default `measured`).
+
 Plan `issues[]` and `edits[]` accept `exclusive: [path, glob]`, rendered as YAML
 metadata immediately after the version marker. These reservations remain locked
 even when effective Files narrow. Other Files may share up to the configured
