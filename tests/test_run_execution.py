@@ -204,6 +204,27 @@ def test_transients_preserve_attempt_and_budget_and_fallback_persists(run_case, 
     assert "Executor fallback model: fallback" in c.tracker.created_prs[0].body
 
 
+def test_assigned_model_survives_transients_instead_of_the_configured_fallback(run_case, monkeypatch):
+    """D80: an issue assignment's model is an explicit choice; recovery never swaps in the fallback."""
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_runtime_minutes=1, executor_model="lane-model",
+                           executor_fallback_model="fallback")
+    c.store.update_run(1, executor=c.ctx.config.executor, executor_model="assigned")
+    c.executor.steps = [{}, {}, {"feature.txt": "wrong"}, {"feature.txt": "done"}]
+    scripted_results(c, monkeypatch, [("at capacity", "transient"), ("overloaded", "transient"),
+                                     ("done", "normal"), ("done", "normal")])
+
+    def sleep(seconds):
+        c.now[0] += timedelta(seconds=seconds)
+
+    c.ctx.sleep = sleep
+    assert run_issue(1, c.ctx) == "merged"
+    assert [call["model"] for call in c.executor.calls] == ["assigned"] * 4
+    run = c.store.get_run(1)
+    assert run.fallback_model is None and run.executor_model == "assigned"
+    assert "Executor fallback model" not in c.tracker.created_prs[0].body
+
+
 def test_transient_budget_exhaustion_is_not_an_implementation_failure(run_case, monkeypatch):
     c = run_case
     c.executor.steps = [{}] * 5

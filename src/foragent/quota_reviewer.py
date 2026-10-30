@@ -107,9 +107,20 @@ def stored_config(store: StateStore, config: Config, run, now: datetime) -> Conf
     that is hard-limited when a review launches moves then (``review_moved``), never here.
     """
     executor = getattr(run, "executor", None)
-    if executor is None:
-        return legacy_config(store, config, run.implementer, now)
-    return pair_config(config, executor, run.reviewer)
+    paired = (legacy_config(store, config, run.implementer, now) if executor is None
+              else pair_config(config, executor, run.reviewer))
+    return assigned_model(paired, getattr(run, "executor_model", None))
+
+
+def assigned_model(config: Config, model: str | None) -> Config:
+    """``config`` running an issue assignment's model (D80); None leaves it unchanged.
+
+    The assignment is the person's or orchestrator's explicit choice, so no configured fallback
+    model replaces it during recovery (transient errors): the run keeps the assigned model.
+    """
+    if model is None:
+        return config
+    return replace(config, executor_model=model, executor_fallback_model=None)
 
 
 def review_moved(n: int, ctx):

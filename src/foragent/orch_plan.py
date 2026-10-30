@@ -2,7 +2,10 @@
 
 One file holds the lane queues, plan pauses (until, why), lane widths and the
 plan's expiry, each with the author who wrote it (``human`` or
-``orchestrator``). The plan is a preference above the safety lines: the tick
+``orchestrator``). It also holds per-issue executor/model assignments and the
+goal with its deadline (``orch_assign``); the plan's expiry never lapses those:
+an assignment lapses at its own ``until``, and the goal stays until it is
+changed or cleared. The plan is a preference above the safety lines: the tick
 still applies blockers, budgets, the overlap cap and exclusive rules, and a
 queue never unpauses a lane. An orchestrator never changes or clears an item a
 person wrote.
@@ -39,11 +42,12 @@ def _path(store: StateStore) -> Path:
 
 def _empty() -> dict:
     return {"queues": {}, "paused": {}, "width": {}, "expires_at": None,
-            "authors": {"queues": {}, "width": {}, "expires_at": None}}
+            "authors": {"queues": {}, "width": {}, "expires_at": None},
+            "assignments": {}, "goal": None}
 
 
 # Every key the plan loader reads; anything else (e.g. a throughput goal) is not plan state here.
-STORED_KEYS = ("queues", "paused", "width", "expires_at", "authors", "written_by")
+STORED_KEYS = ("queues", "paused", "width", "expires_at", "authors", "written_by", "assignments", "goal")
 
 
 def plan_fields(data: dict) -> dict:
@@ -79,6 +83,8 @@ def _read(store: StateStore) -> dict:
         "width": {lane: (authors.get("width") or {}).get(lane, "human") for lane in plan["width"]},
         "expires_at": (authors.get("expires_at") or "human") if plan["expires_at"] else None,
     }
+    plan["assignments"] = {str(number): dict(item) for number, item in (data.get("assignments") or {}).items()}
+    plan["goal"] = dict(data["goal"]) if data.get("goal") else None
     return plan
 
 
@@ -95,7 +101,10 @@ def _stored(plan: dict) -> dict:
 def written_by(plan: dict) -> str | None:
     """``human`` when any live item is a person's, else ``orchestrator``; None when empty."""
     authors = [*plan["authors"]["queues"].values(), *plan["authors"]["width"].values(),
-               *(item["by"] for item in plan["paused"].values())]
+               *(item["by"] for item in plan["paused"].values()),
+               *(item["by"] for item in plan["assignments"].values())]
+    if plan["goal"]:
+        authors.append(plan["goal"]["by"])
     if plan["expires_at"]:
         authors.append(plan["authors"]["expires_at"])
     if not authors:
@@ -108,11 +117,16 @@ def _expired(plan: dict, now: datetime) -> bool:
 
 
 def _in_force(plan: dict, now: datetime) -> dict:
-    """The derived plan: empty once expired; pauses whose ``until`` has passed left out."""
+    """The derived plan: empty once expired; pauses and assignments whose ``until`` has passed left out.
+
+    The plan's expiry lapses lane preferences only; assignments and the goal outlive it.
+    """
     if _expired(plan, now):
-        return _empty()
+        plan = {**_empty(), "assignments": plan["assignments"], "goal": plan["goal"]}
     plan["paused"] = {lane: item for lane, item in plan["paused"].items()
                       if now < datetime.fromisoformat(item["until"])}
+    plan["assignments"] = {number: item for number, item in plan["assignments"].items()
+                           if not item.get("until") or now < datetime.fromisoformat(item["until"])}
     return plan
 
 
