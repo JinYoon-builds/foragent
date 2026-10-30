@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 import re
 
-from foragent import orch_inbox, orch_sessions, orch_spawn, watch_open
+from foragent import orch_inbox, orch_rules, orch_sessions, orch_spawn, watch_open
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.labels import lane_order
@@ -184,21 +184,35 @@ def _quiet(store: StateStore, now: datetime, language: str) -> None:
         raise RefreshRefused(text("orch_refresh_questions", language, minutes=minutes, ids=", ".join(questions)))
 
 
-def first_prompt(config: Config, note: Path, old: str | None) -> str:
-    """The fresh session's first message: the note and the sources to read before acting."""
+def first_prompt(config: Config, note: Path, old: str | None, repo_root: Path | None = None) -> str:
+    """The fresh session's first message: the note and the sources to read before acting.
+
+    Item 2 is the project's current rules (docs/rules.md, else docs/decisions.md),
+    read from repo_root and quoted at the end so the session has their text.
+    """
     lanes = sorted({*config.lanes, "main"}, key=lane_order)
     queues = "\n".join(f"   - `fa orch queue {lane}`" for lane in lanes)
     replacing = f" replacing session {old}" if old else ""
+    source, content = orch_rules.current_rules(repo_root)
+    if content is None:
+        rules = source
+    elif source == orch_rules.RULES:
+        rules = (f"{source}, the current rules, quoted below "
+                 f"(read {orch_rules.HISTORY} only when you need the reason behind a rule)")
+    else:
+        rules = f"{source}, quoted below"
+    quote = f"\n\n{orch_rules.quoted(source, content)}" if content is not None else ""
     return (
         f"You are a fresh orchestrator session{replacing}. Read all of these before you act:\n"
         f"1. The handoff note: {note}\n"
-        "2. docs/decisions.md\n"
+        f"2. {rules}\n"
         "3. `fa orch plan`\n"
         f"4. Each lane's queue:\n{queues}\n"
         "5. `fa orch inbox --json`\n"
         "6. `fa orch questions --json`\n"
         "7. `fa orch log`\n"
         "Then re-arm the watches the note lists and keep its open promises."
+        f"{quote}"
     )
 
 
@@ -219,7 +233,7 @@ def _refresh_locked(repo_root: Path, store: StateStore, config: Config, now: dat
     _quiet(store, now, language)
     old = orch_sessions.active(store)
     old_id = old["session_id"] if old else None
-    session = orch_spawn.spawn_orchestrator(repo_root, store, config, prompt=first_prompt(config, note, old_id),
+    session = orch_spawn.spawn_orchestrator(repo_root, store, config, prompt=first_prompt(config, note, old_id, repo_root),
                                             now=now)
     if not session:
         append_event(store, now, None, "refresh-failed", "fresh orchestrator session did not open",
