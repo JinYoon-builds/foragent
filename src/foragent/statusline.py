@@ -200,7 +200,7 @@ def record_usage(raw: bytes, now: Callable[[], datetime] = lambda: datetime.now(
 def _session_input(raw: bytes) -> dict:
     try:
         payload = json.loads(raw)
-    except ValueError:
+    except Exception:  # Claude's hook input is outside data; any parse failure means no input
         return {}
     return payload if isinstance(payload, dict) else {}
 
@@ -259,11 +259,15 @@ def prompt_context(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None
         context, problems = presence.prompt_context(folder, datetime.now(UTC))
     except Exception as exc:  # The person's prompt must go on whatever the local state holds.
         context, problems = None, [f"could not read the Foragent box ({type(exc).__name__}: {exc})"]
+    from foragent.orch_inbox import clean
+
+    # The one place box text leaves the process: whatever slipped past the row
+    # rendering, an unencodable character becomes "?" here instead of an error.
     for problem in problems:
-        print(f"fa statusline --prompt-context: partial read: {problem}", file=sys.stderr)
+        print(clean(f"fa statusline --prompt-context: partial read: {problem}"), file=sys.stderr)
     if context:
-        output = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}
-        stdout.write((json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8"))
+        output = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": clean(context)}}
+        stdout.write((json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8", "replace"))
         stdout.flush()
     return 0
 

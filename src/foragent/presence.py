@@ -160,7 +160,10 @@ def stalled(rows: list[dict], now: datetime) -> tuple[list[tuple[dict, datetime]
     for row in rows:
         if row.get("status") != "processing":
             continue
-        since = _processing_since(row)
+        try:
+            since = _processing_since(row)
+        except Exception:  # one row's malformed notes cannot stop the others
+            since = None
         if since is None:
             unreadable.append(row["id"])
         elif now - since > STALL_AFTER:
@@ -238,7 +241,7 @@ def _bound_root(store, repo: str, problems: list[str] | None = None) -> Path | N
         root = Path(record["root"])
     except FileNotFoundError:
         return None
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except Exception as exc:  # any other failure, deep nesting's RecursionError too, is a failed read
         if problems is not None:
             problems.append(f"{BINDING}: unreadable ({type(exc).__name__})")
         return None
@@ -277,20 +280,31 @@ def bind_checkout(cwd: Path, now: datetime) -> bool:
     repo = _repo(config, root)
     if not repo or not _planning_session(cwd, store) or not _origin_matches(root, repo):
         return False
-    if _bound_root(store, repo) is not None:
-        return False
     store.root.mkdir(parents=True, exist_ok=True)
-    store._write_json(_binding_path(store), {"root": str(root.resolve()), "repo": repo,
-                                             "bound_at": now.isoformat()})
+    # Check and write under the state lock: two checkouts starting at once must not
+    # both see "unbound" and overwrite each other's binding.
+    with store._state_lock():
+        if _bound_root(store, repo) is not None:
+            return False
+        store._write_json(_binding_path(store), {"root": str(root.resolve()), "repo": repo,
+                                                 "bound_at": now.isoformat()})
     return True
 
 
 def _quote(value) -> str:
     """Outside text as one bounded JSON string, so it cannot break the context's lines."""
-    value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    from foragent.orch_inbox import clean
+
+    value = clean(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str))
     if len(value) > CONTEXT_TEXT_LIMIT:
-        value = value[:CONTEXT_TEXT_LIMIT] + "…"
+        value = value[:CONTEXT_TEXT_LIMIT] + f"… [{len(value) - CONTEXT_TEXT_LIMIT} more characters not shown]"
     return json.dumps(value, ensure_ascii=False)
+
+
+def _row_id(item) -> object:
+    """The id a skipped row is named by: a request (row, since) pair, a box row or a notice."""
+    row = item[0] if isinstance(item, tuple) else item
+    return row.get("id", row.get("at")) if isinstance(row, dict) else None
 
 
 def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
@@ -324,33 +338,51 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
     problems += skipped
     stuck, unreadable = stalled(requests, now)
     lines = []
-    if stuck:
-        lines.append(f"Stalled requests (processing for over {STALL_AFTER // timedelta(minutes=1)} min):")
-        for row, since in stuck:
-            hours = int((now - since) // timedelta(hours=1))
-            lines.append(f"- {_quote(row['id'])} from {_quote(row.get('from'))}, processing for {hours} h "
-                         f"since {since.isoformat()}: {_quote(row.get('text'))}")
+
+    def rows(title: str, kind: str, items, render) -> None:
+        """Render each row on its own: one row that cannot be shown is left out and named."""
+        shown = []
+        for item in items:
+            try:
+                shown.append(render(item))
+            except Exception as exc:
+                problems.append(f"{kind} {_quote(_row_id(item))}: could not be shown ({type(exc).__name__})")
+        if shown:
+            lines.extend([title, *shown])
+
+    def request(item) -> str:
+        row, since = item
+        hours = int((now - since) // timedelta(hours=1))
+        return (f"- {_quote(row['id'])} from {_quote(row.get('from'))}, processing for {hours} h "
+                f"since {since.isoformat()}: {_quote(row.get('text'))}")
+
+    def question(row) -> str:
+        options = row.get("options") if isinstance(row.get("options"), list) else []
+        choices = "; ".join(f"{index}. {_quote(option)}" for index, option in enumerate(options, 1))
+        recommend = row.get("recommend")
+        return (f"- {_quote(row['id'])} ({_quote(row.get('kind', 'question'))}): {_quote(row.get('question'))}"
+                + (f"; options: {choices}" if choices else "")
+                + (f"; recommended: {recommend}" if type(recommend) is int else ""))
+
+    def notice(event) -> str:
+        about = " ".join(f"{key} {_quote(event[key])}" for key in ("channel", "ref") if event.get(key))
+        return (f"- {_quote(event['at'])} {_quote(event.get('status'))}"
+                + (f" ({about})" if about else "")
+                + (f" #{event['issue']}" if type(event.get("issue")) is int else "")
+                + f": {_quote(event['summary'])}")
+
+    rows(f"Stalled requests (processing for over {STALL_AFTER // timedelta(minutes=1)} min):",
+         "request", stuck, request)
     if unreadable:
         lines.append("Processing requests with an unreadable time (left out): "
                      + ", ".join(map(_quote, unreadable)))
-    waiting = [row for row in questions if row["status"] == "open"]
-    if waiting:
-        lines.append("Open questions waiting for the person:")
-        for row in waiting:
-            options = row.get("options") if isinstance(row.get("options"), list) else []
-            choices = "; ".join(f"{index}. {_quote(option)}" for index, option in enumerate(options, 1))
-            recommend = row.get("recommend")
-            lines.append(f"- {_quote(row['id'])} ({_quote(row.get('kind', 'question'))}): {_quote(row.get('question'))}"
-                         + (f"; options: {choices}" if choices else "")
-                         + (f"; recommended: {recommend}" if type(recommend) is int else ""))
-    if notices:
-        lines.append(f"Notification notices (last {NOTICE_WINDOW // timedelta(hours=1)} h):")
-        for event in notices[-NOTICE_LIMIT:]:
-            about = " ".join(f"{key} {_quote(event[key])}" for key in ("channel", "ref") if event.get(key))
-            lines.append(f"- {event['at']} {_quote(event.get('status'))}"
-                         + (f" ({about})" if about else "")
-                         + (f" #{event['issue']}" if type(event.get("issue")) is int else "")
-                         + f": {_quote(event['summary'])}")
+    rows("Open questions waiting for the person:", "question",
+         [row for row in questions if row["status"] == "open"], question)
+    rows(f"Notification notices (last {NOTICE_WINDOW // timedelta(hours=1)} h):", "notice",
+         notices[-NOTICE_LIMIT:], notice)
+    if len(notices) > NOTICE_LIMIT:
+        lines.append(f"{len(notices) - NOTICE_LIMIT} earlier notices in the window not shown "
+                     f"(only the last {NOTICE_LIMIT})")
     if problems:
         lines.append("Partial read, these were left out: " + "; ".join(problems))
     if not lines:

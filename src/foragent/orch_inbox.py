@@ -52,9 +52,18 @@ def _records(store: StateStore, kind: str) -> list[dict[str, Any]]:
     return sorted(rows, key=lambda row: int(row.get("seq", 0)))
 
 
+def clean(text: str) -> str:
+    """``text`` with anything UTF-8 cannot encode (a lone surrogate such as \\ud800) replaced by "?".
+
+    Box strings are outside input: a JSON escape or an undecodable file name can carry
+    a lone surrogate, which would fail when the line is written out.
+    """
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def _name(kind: str, path: Path) -> str:
     """A box file's name as one JSON string: a file name is outside input too."""
-    return json.dumps(f"inbox/{kind}/{path.name}", ensure_ascii=False)
+    return json.dumps(clean(f"inbox/{kind}/{path.name}"), ensure_ascii=False)
 
 
 def scan(store: StateStore, kind: str) -> tuple[list[dict[str, Any]], list[str]]:
@@ -82,7 +91,7 @@ def scan(store: StateStore, kind: str) -> tuple[list[dict[str, Any]], list[str]]
     for path in paths:
         try:
             row = _read(path)
-        except (OSError, ValueError) as exc:
+        except Exception as exc:  # any failure (bad JSON, deep nesting's RecursionError) skips this file alone
             skipped.append(f"{_name(kind, path)}: unreadable ({type(exc).__name__})")
             continue
         if not (isinstance(row, dict) and isinstance(row.get("id"), str)
@@ -294,8 +303,15 @@ def recent_notices(store: StateStore, since: datetime) -> tuple[list[dict[str, A
     except OSError as exc:
         return [], [f"orch-events.jsonl: unreadable ({exc.strerror or exc})"]
     lines = data.decode("utf-8", errors="replace").splitlines()
-    if size > NOTICE_TAIL_BYTES and lines:
+    problems = []
+    if size > NOTICE_TAIL_BYTES:
         lines = lines[1:]  # the first line may start mid-record
+        # Only the tail was read. Unless it reaches back past ``since``, notices in the
+        # window may sit in the part not read: say so instead of looking complete.
+        earliest = _earliest_at(lines)
+        if earliest is None or earliest > since:
+            problems.append(f"orch-events.jsonl: only the last {NOTICE_TAIL_BYTES} bytes read; "
+                            "earlier notices in the window may be missing")
     notices, skipped = [], 0
     for line in lines:
         if f'"{NOTICE_KIND}"' not in line:
@@ -303,7 +319,7 @@ def recent_notices(store: StateStore, since: datetime) -> tuple[list[dict[str, A
         try:
             event = json.loads(line)
             at = datetime.fromisoformat(event["at"])
-        except (ValueError, TypeError, KeyError):
+        except Exception:  # any failure (bad JSON, deep nesting's RecursionError) skips this line alone
             skipped += 1
             continue
         if not isinstance(event, dict) or event.get("kind") != NOTICE_KIND:
@@ -313,7 +329,21 @@ def recent_notices(store: StateStore, since: datetime) -> tuple[list[dict[str, A
             continue
         if at > since:
             notices.append(event)
-    return notices, ([f"orch-events.jsonl: {skipped} unreadable notice line(s)"] if skipped else [])
+    if skipped:
+        problems.append(f"orch-events.jsonl: {skipped} unreadable notice line(s)")
+    return notices, problems
+
+
+def _earliest_at(lines: list[str]) -> datetime | None:
+    """The time of the first journal line that has a readable timezone-aware one, else None."""
+    for line in lines:
+        try:
+            at = datetime.fromisoformat(json.loads(line)["at"])
+        except Exception:
+            continue
+        if at.tzinfo is not None:
+            return at
+    return None
 
 
 class FollowEvents:

@@ -237,7 +237,7 @@ def test_prompt_context_carries_recent_notices_and_names_unreadable_ones(stall_s
     context, problems = presence.prompt_context(root, now)
     assert problems == []
     assert "Too old to show" not in context
-    assert f'- {event["at"]} "failed" (channel "ntfy" ref "q2") #7: "Push for q2 failed"' in context
+    assert f'- "{event["at"]}" "failed" (channel "ntfy" ref "q2") #7: "Push for q2 failed"' in context
     with (store.root / "orch-events.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps({"kind": "notice", "at": "broken", "summary": "x"}) + "\n")
     context, problems = presence.prompt_context(root, now)
@@ -333,3 +333,243 @@ def test_an_unreadable_state_folder_is_reported(stall_store, monkeypatch):
     monkeypatch.setattr(presence.os, "stat", denied)
     assert presence.prompt_context(root, now) == (
         None, ["state folder: unreadable (PermissionError: Permission denied)"])
+
+
+def _hook(root, monkeypatch):
+    """Run the installed prompt hook entry with a strict UTF-8 stderr, as Claude Code's pipe is."""
+    import json
+    import sys
+
+    from foragent import statusline
+
+    stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+    out = io.BytesIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    assert statusline.prompt_context(io.BytesIO(json.dumps({"cwd": str(root)}).encode()), out) == 0
+    stderr.flush()
+    error = stderr.buffer.getvalue().decode("utf-8")
+    return json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"], error
+
+
+SURROGATE = "bad\ud800text"
+
+
+@pytest.mark.parametrize("field", ["request-text", "request-from", "question", "question-option",
+                                   "notice-summary", "notice-channel", "filename"])
+def test_a_lone_surrogate_in_one_field_replaces_only_that_character(stall_store, monkeypatch, field):
+    import json
+    from datetime import timedelta
+
+    from foragent import orch_inbox
+
+    root, store, now = _bound_stall_store(stall_store)
+    if field.startswith("request"):
+        row = orch_inbox.add_request(store, "planning", "placeholder")
+        path = store.root / "inbox/requests" / f"{row['id']}.json"
+        record = json.loads(path.read_text())
+        record.update(status="processing", notes=[], created_at=(now - timedelta(hours=3)).isoformat(),
+                      **({"text": SURROGATE} if field == "request-text" else {"from": SURROGATE}))
+        path.write_text(json.dumps(record))  # ensure_ascii writes the JSON escape \ud800
+    elif field.startswith("question"):
+        row = orch_inbox.ask(store, "placeholder", ["fine"], 1)
+        path = store.root / "inbox/questions" / f"{row['id']}.json"
+        record = json.loads(path.read_text())
+        record.update({"question": SURROGATE} if field == "question" else {"options": ["fine", SURROGATE]})
+        path.write_text(json.dumps(record))
+    elif field.startswith("notice"):
+        event = {"at": (now - timedelta(minutes=1)).isoformat(), "issue": None, "kind": "notice",
+                 "status": "sent", "summary": SURROGATE if field == "notice-summary" else "Summary",
+                 "channel": SURROGATE if field == "notice-channel" else "push", "ref": None}
+        with (store.root / "orch-events.jsonl").open("a") as stream:
+            stream.write(json.dumps(event) + "\n")
+    else:
+        real = orch_inbox.os.scandir
+        folder = store.root / "inbox" / "questions"
+
+        class Entry:
+            name = "bad\udc80.json"
+
+        class Listing(list):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def scandir(path):
+            names = list(real(path))
+            return Listing(names + [Entry()]) if str(path) == str(folder) else Listing(names)
+
+        monkeypatch.setattr(orch_inbox.os, "scandir", scandir)
+    context, error = _hook(root, monkeypatch)
+    assert '"opaque"' in context and "Visible question" in context, "valid rows still reach the turn"
+    assert "bad?text" in context or "bad?.json" in context, "only the unencodable character is replaced"
+    if field == "filename":
+        assert "bad?.json" in error
+
+
+def test_a_row_that_cannot_be_rendered_is_left_out_alone_and_named(stall_store, monkeypatch):
+    from foragent import orch_inbox, presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    orch_inbox.ask(store, "Unrenderable", ["x"], 1)
+    real = presence._quote
+
+    def fragile(value):
+        if value == "Unrenderable":
+            raise RuntimeError("cannot render")
+        return real(value)
+
+    monkeypatch.setattr(presence, "_quote", fragile)
+    context, problems = presence.prompt_context(root, now)
+    assert "Visible question" in context and '"opaque"' in context
+    assert problems == ['question "q2": could not be shown (RuntimeError)']
+
+
+DEEP = "[" * 10000 + "]" * 10000
+
+
+@pytest.mark.parametrize("place", ["requests", "questions", "notice"])
+def test_a_deeply_nested_row_is_skipped_alone(stall_store, monkeypatch, place):
+    from foragent import presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    if place == "notice":
+        with (store.root / "orch-events.jsonl").open("a") as stream:
+            stream.write('{"kind": "notice", "at": ' + DEEP + "}\n")
+    else:
+        (store.root / "inbox" / place / "deep.json").write_text(DEEP)
+    context, error = _hook(root, monkeypatch)
+    assert '"opaque"' in context and "Visible question" in context, "valid rows still reach the turn"
+    assert "RecursionError" in error or "unreadable notice line" in error, "the skipped row is named"
+    assert presence.prompt_context(root, now)[1], "a partial read, not a complete box"
+
+
+def test_a_deeply_nested_binding_file_is_a_failed_read(stall_store):
+    from foragent import presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    (store.root / presence.BINDING).write_text(DEEP)
+    assert presence.prompt_context(root, now) == (None, ["checkout.json: unreadable (RecursionError)"])
+
+
+def test_deeply_nested_hook_input_is_no_input(stall_store):
+    from foragent import statusline
+
+    out = io.BytesIO()
+    assert statusline.prompt_context(io.BytesIO(DEEP.encode()), out) == 0
+
+
+def test_one_request_whose_time_cannot_be_computed_does_not_stop_the_others(stall_store, monkeypatch):
+    from datetime import timedelta
+
+    from foragent import presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    real = presence._processing_since
+    rows = [{"id": "r8", "status": "processing", "text": "fragile"},
+            {"id": "r9", "status": "processing", "created_at": (now - timedelta(hours=2)).isoformat()}]
+
+    def fragile(row):
+        if row["id"] == "r8":
+            raise RecursionError("deep")
+        return real(row)
+
+    monkeypatch.setattr(presence, "_processing_since", fragile)
+    stuck, unreadable = presence.stalled(rows, now)
+    assert [row["id"] for row, _ in stuck] == ["r9"] and unreadable == ["r8"]
+
+
+def _journal(store, *events):
+    import json
+
+    with (store.root / "orch-events.jsonl").open("a") as stream:
+        for event in events:
+            stream.write(json.dumps(event) + "\n")
+
+
+def _notice(at, summary):
+    return {"at": at.isoformat(), "issue": None, "kind": "notice", "status": "sent",
+            "summary": summary, "channel": None, "ref": None}
+
+
+def test_a_journal_tail_that_cuts_into_the_window_is_a_partial_read(stall_store, monkeypatch):
+    from datetime import timedelta
+
+    from foragent import orch_inbox
+
+    root, store, now = _bound_stall_store(stall_store)
+    monkeypatch.setattr(orch_inbox, "NOTICE_TAIL_BYTES", 400)
+    since = now - timedelta(hours=24)
+    _journal(store, _notice(now - timedelta(hours=5), "Cut off but in the window"),
+             *[{"at": (now - timedelta(hours=1)).isoformat(), "kind": "note", "summary": "filler " * 5}] * 6,
+             _notice(now - timedelta(minutes=1), "In the tail"))
+    notices, problems = orch_inbox.recent_notices(store, since)
+    assert [event["summary"] for event in notices] == ["In the tail"]
+    assert problems == ["orch-events.jsonl: only the last 400 bytes read; earlier notices in the window may be missing"]
+
+
+def test_a_journal_tail_that_reaches_past_the_window_is_complete(stall_store, monkeypatch):
+    from datetime import timedelta
+
+    from foragent import orch_inbox
+
+    root, store, now = _bound_stall_store(stall_store)
+    monkeypatch.setattr(orch_inbox, "NOTICE_TAIL_BYTES", 400)
+    _journal(store, *[{"at": (now - timedelta(hours=30)).isoformat(), "kind": "note", "summary": "old " * 10}] * 6,
+             _notice(now - timedelta(minutes=1), "In the tail"))
+    notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
+    assert [event["summary"] for event in notices] == ["In the tail"] and problems == []
+
+
+def test_notices_over_the_limit_and_long_text_say_what_was_left_out(stall_store):
+    from datetime import timedelta
+
+    from foragent import presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    _journal(store, *[_notice(now - timedelta(minutes=30 - index), f"notice {index}") for index in range(12)],
+             _notice(now - timedelta(minutes=1), "x" * (presence.CONTEXT_TEXT_LIMIT + 7)))
+    context = presence.prompt_context(root, now)[0]
+    assert "notice 2" not in context and "notice 3" in context
+    assert "3 earlier notices in the window not shown (only the last 10)" in context
+    assert "… [7 more characters not shown]" in context
+
+
+def test_two_checkouts_starting_at_once_bind_only_one(stall_store, monkeypatch):
+    import shutil
+    import threading
+
+    from foragent import presence
+
+    root, store, now = stall_store
+    (root / ".git").mkdir()
+    (root / ".git/config").write_text('[remote "origin"]\n\turl = https://github.com/offline/stall.git\n')
+    copy = root.parent / "copy"
+    shutil.copytree(root, copy)
+    store.root.mkdir(parents=True, exist_ok=True)
+    real = presence._bound_root
+    first_checked, second_done = threading.Event(), threading.Event()
+
+    def slow_check(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if threading.current_thread().name == "first":
+            first_checked.set()
+            second_done.wait(0.5)  # without the lock the second binder writes here
+        return result
+
+    monkeypatch.setattr(presence, "_bound_root", slow_check)
+    results = {}
+
+    def bind(name, folder):
+        results[name] = presence.bind_checkout(folder, now)
+
+    first = threading.Thread(target=bind, args=("first", root), name="first")
+    first.start()
+    assert first_checked.wait(5)
+    second = threading.Thread(target=lambda: (bind("second", copy), second_done.set()), name="second")
+    second.start()
+    first.join(5)
+    second.join(5)
+    assert results == {"first": True, "second": False}
+    assert presence._bound_root(store, "offline/stall") == root.resolve()
