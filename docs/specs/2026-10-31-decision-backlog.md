@@ -37,3 +37,5 @@ D98 means WHAT, observable behavior and scope, without private names or prescrib
 
 
 Jin 2026-10-31: the D49 browser lane view is dropped (not stocked).
+
+Jin 2026-10-31: D49 dropped entirely (browser view and result cards).
