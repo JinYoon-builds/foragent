@@ -25,7 +25,9 @@ from foragent.run_attempt import WholeFailure
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
 from foragent.run_attempt import ExecutorStopped
 from foragent.run_execution import _available_executor
-from foragent.run_prompts import build_review_prompt, review_scope_rules
+from foragent.run_prompts import (
+    build_review_prompt, lane_decisions_section, refresh_lane_decisions, review_scope_rules,
+)
 from foragent.run_waits import _phase, _progress, _timeout
 
 if TYPE_CHECKING:
@@ -130,7 +132,8 @@ def parse_code_review(message: str) -> ReviewResult:
 
 
 @contextmanager
-def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = "", risk_notes: str = ""):
+def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals: str = "", risk_notes: str = "",
+                        lane_decisions: str = ""):
     git.ignore_review_scope()
     path = git.root / REVIEW_SCOPE_FILE
     link = os.readlink(path) if path.is_symlink() else None
@@ -140,6 +143,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
         "# Review scope (written by Foragent for this review only)\n\n"
         f"{body}\n\n{review_scope_rules(acceptance_dir)}\n\n"
         + (f"{risk_notes}\n\n" if risk_notes else "")
+        + (f"{lane_decisions}\n\n" if lane_decisions else "")
         + (f"Implementer rebuttals (judge them):\n{rebuttals}\n\n" if rebuttals else "")
     ).encode("utf-8")
     try:
@@ -160,6 +164,17 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
             path.chmod(mode)
 
 
+def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
+    """The DECIDE lines of the lane's latest preread proposal for the approved body, as review context."""
+    from foragent.order import lane_proposal
+
+    approval = ctx.store.load_approval(n)
+    if approval is None:
+        return ""
+    proposal = lane_proposal(ctx.repo_root, n, approval.body, approval.acceptance_blobs or {}, worktree)
+    return lane_decisions_section([str(line) for line in (proposal or {}).get("decisions") or []])
+
+
 @quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
@@ -171,10 +186,12 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
     if reviewer == "claude" and pr is not None:
         options["review_pr"] = pr
     rebuttals = _read_rebuttals(git.root)
+    decisions = _lane_decisions(n, ctx, git.root)
     notes = _risk_notes(git, base_ref)
     if notes and len(shares := review_perspectives.shares(
             ctx.config, orch_reviewers.effective(ctx.store, ctx.config, n))) > 1:
-        return _panel_review(n, ctx, git, parsed, base_ref, reviewer, rebuttals, notes, shares, round_number)
+        return _panel_review(n, ctx, git, parsed, base_ref, reviewer, rebuttals, notes, shares, round_number,
+                             lane_decisions=decisions)
     risk_notes = review_perspectives.with_checklist(notes, ctx.config)
     settings = risks.review_options(ctx.config, reviewer, ctx.config.reviewer_model) if risk_notes else {
         "model": ctx.config.reviewer_model}
@@ -185,7 +202,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
             if approval is None:
                 raise ValueError("Claude review requires an approved snapshot")
             scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir, rebuttals,
-                                                      risk_notes))
+                                                      risk_notes, decisions))
         before = git.review_state()
         try:
             result = _available_executor(
@@ -193,7 +210,7 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
                 prompt="" if reviewer == "claude" else build_review_prompt(
                     parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
                     full_text_dir=cuts.issue_dir(ctx.store.root, n),
-                    risk_notes=risk_notes,
+                    risk_notes=risk_notes, lane_decisions=decisions,
                 ),
                 **settings, timeout_s=runner._remaining(n, ctx),
                 log_path=ctx.store.log_path(n), on_result=notes_of(n, ctx, reviewer, round_number), **options,
@@ -271,7 +288,7 @@ def _save_review(n: int, ctx: RunContext, name: str, raw: str) -> None:
 
 def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str, reviewer: str,
                   rebuttals: str, notes: str, shares: list[list[dict[str, str]]],
-                  round_number: int) -> ReviewResult:
+                  round_number: int, *, lane_decisions: str = "") -> ReviewResult:
     """N independent reviewers run at once on disjoint perspective shares; one merge call decides.
 
     Every call uses the prompt path at the risk-map tier, whatever reviewer or review_scope is
@@ -315,7 +332,8 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
 
     prompts = [build_review_prompt(parsed, diff, acceptance, rebuttals=rebuttals,
                                    full_text_dir=cuts.issue_dir(ctx.store.root, n),
-                                   risk_notes=review_perspectives.with_checklist(notes, ctx.config, share))
+                                   risk_notes=review_perspectives.with_checklist(notes, ctx.config, share),
+                                   lane_decisions=lane_decisions)
                for share in shares]
     before = git.review_state()
     try:
@@ -365,7 +383,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
             result = call(build_review_prompt(parsed, diff, acceptance, rebuttals=rebuttals,
                                               full_text_dir=cuts.issue_dir(ctx.store.root, n),
                                               risk_notes=review_perspectives.with_checklist(notes, ctx.config),
-                                              panel_findings=findings))
+                                              panel_findings=findings, lane_decisions=lane_decisions))
         except BaseException as error:
             result = None
             raw = unusable_error("Findings merge", error)
@@ -584,6 +602,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             # Native PR review reads only the PR body: refresh the risk notes for this head and base.
             body = with_review_scope(pr.body, ctx.config.acceptance_dir, ctx.config.language)
             body = risks.refresh_notes(body, review_perspectives.with_checklist(_risk_notes(git, base_ref), ctx.config))
+            body = refresh_lane_decisions(body, _lane_decisions(n, ctx, git.root))
             if body != pr.body:
                 pr = replace(pr, body=body)
                 ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)

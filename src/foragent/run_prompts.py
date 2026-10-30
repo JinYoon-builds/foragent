@@ -48,6 +48,12 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"
+        "Those grounds in full: FAIL only for a failing or circumvented locked acceptance test, an unmet Goal "
+        "(a change to Out of scope or a weakened check is one), a broken repository principle (as the "
+        "repository's own instruction and decision files state it), or a real defect: a bug, a race, "
+        "data loss or a security hole.\n"
+        "A different valid approach from the one you would choose is not a defect and never a reason to FAIL. "
+        "Naming, structure or other implementation taste is not a defect either; write it as a NOTE line.\n"
         f"Tests under {acceptance_dir} that this issue lists are locked acceptance tests. If a finding would "
         "require behaviour a locked acceptance test forbids, or forbid behaviour it requires, it is a spec "
         "conflict, not a defect: report it as one line "
@@ -65,15 +71,19 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
 def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
     full_text_dir: Path | None = None,
-    risk_notes: str = "", panel_findings: str = "",
+    risk_notes: str = "", panel_findings: str = "", lane_decisions: str = "",
 ) -> str:
-    """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings."""
+    """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings.
+
+    `lane_decisions` is `lane_decisions_section` output: the lane's recorded choices, as context.
+    """
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
         f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
         + (f"\n\n{risk_notes}" if risk_notes else "")
         + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
-        f"\n\nDone when commands:\n{commands}\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
+        + (f"\n\n{lane_decisions}" if lane_decisions else "")
+        + f"\n\nDone when commands:\n{commands}\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
         + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
         + (f"\n\n{PANEL_MERGE_PROMPT}\n\n{panel_findings}" if panel_findings else "")
     )
@@ -92,6 +102,38 @@ def lane_plan_section(approach: list[str], decisions: list[str]) -> str:
     if decisions:
         lines += ["Decisions you said you would settle yourself:", *(f"- {line}" for line in decisions)]
     return "\n".join(lines)
+
+
+def lane_decisions_section(decisions: list[str]) -> str:
+    """The lane's recorded DECIDE lines for a reviewer: context, never acceptance criteria."""
+    if not decisions:
+        return ""
+    return "\n".join([
+        "Implementation choices the lane recorded before approval (its DECIDE lines). They are context "
+        "for this review, not acceptance criteria: settling one differently, or as recorded, is never "
+        "by itself a reason to FAIL.",
+        *(f"- {line}" for line in decisions),
+    ])
+
+
+DECISIONS_START = "<!-- foragent:lane-decisions -->"
+DECISIONS_END = "<!-- /foragent:lane-decisions -->"
+
+
+def lane_decisions_block(section: str) -> str:
+    """`section` between markers, so a later review of the same PR can replace it."""
+    return f"{DECISIONS_START}\n{section}\n{DECISIONS_END}" if section else ""
+
+
+def refresh_lane_decisions(body: str, section: str) -> str:
+    """Replace a PR body's lane-decisions block with `section` (append, or drop when empty)."""
+    import re
+
+    block = lane_decisions_block(section)
+    pattern = re.compile(rf"(?:\n\n)?{re.escape(DECISIONS_START)}.*?{re.escape(DECISIONS_END)}", re.S)
+    if pattern.search(body):
+        return pattern.sub(lambda match: f"\n\n{block}" if block else "", body, count=1)
+    return f"{body}\n\n{block}" if block else body
 
 
 def moved_files_section(moved_files: list[str]) -> str:
