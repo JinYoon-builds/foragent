@@ -52,6 +52,7 @@ class LogRetentionMixin:
                 if len(kept) != len(lines):
                     self._atomic_write(path, "".join(kept))
                     trimmed.append(path)
+        self.trimmed_journals = trimmed  # The tick's housekeeping reports the trim prune_logs did.
         return trimmed
 
     @staticmethod
