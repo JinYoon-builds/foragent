@@ -8,7 +8,7 @@ import pytest
 
 from conftest import BASE_TIME
 from foragent import orch_plan
-from foragent.overlap_files import can_start, file_limits, limit_for
+from foragent.overlap_files import can_start, file_limits, shared_limit
 from foragent.run_overlap import wait_for_overlap
 from test_overlap_files import context, edit, reserve  # noqa: F401
 from test_run_overlap import attempt, clock
@@ -41,15 +41,55 @@ def test_file_limit_counts_the_candidate_and_can_lower_the_fallback(context):
     assert not can_start(context, "c", 2)
 
 
-def test_glob_claim_meets_every_applicable_limit_and_the_fallback(context):
+def test_shared_files_set_the_limit_not_the_whole_glob(context):
     context.config = replace(context.config, overlap_per_file=1)
     plan_file(context, "src/a.py", 5)
     planned = file_limits(context)
-    assert limit_for(context, "src/a.py", planned) == 5
-    assert limit_for(context, "src/b.py", planned) == 1
-    assert limit_for(context, "src/*.py", planned) == 1, "A glob may also cover unplanned files"
+    assert shared_limit(context, ["src/a.py"], planned) == 5
+    assert shared_limit(context, ["src/b.py"], planned) == 1
+    assert shared_limit(context, ["src/*.py", "src/a.py"], planned) == 5, "The glob meets only a.py here"
+    assert shared_limit(context, ["src/*.py", "src/b.py"], planned) == 1
+    assert shared_limit(context, ["src/*.py", "src/*"], planned) == 1, "Two globs may share unplanned files"
     context.config = replace(context.config, overlap_per_file=9)
-    assert limit_for(context, "src/*.py", planned) == 5
+    assert shared_limit(context, ["src/*.py", "src/*"], planned) == 5
+
+
+def test_glob_candidate_keeps_the_fallback_for_an_unplanned_peer_file(context):
+    # Review case: fallback 3, src/a.py=1, one peer on src/b.py; the glob shares only b.py with it.
+    context.config = replace(context.config, overlap_per_file=3)
+    plan_file(context, "src/a.py", 1)
+    reserve(context, 1, ["src/b.py"], lane="a")
+    reserve(context, 2, ["src/*.py"], running=False)
+    reserve(context, 3, ["src/a.py", "src/b.py"], running=False)
+    assert can_start(context, "c", 3)
+    assert can_start(context, "c", 2)
+
+
+def test_glob_candidate_is_held_by_a_full_planned_file_it_shares(context):
+    context.config = replace(context.config, overlap_per_file=3)
+    plan_file(context, "src/a.py", 1)
+    reserve(context, 1, ["src/a.py"], lane="a")
+    reserve(context, 2, ["src/*.py"], running=False)
+    assert not can_start(context, "c", 2)
+
+
+@pytest.mark.parametrize("peer,admitted", [("src/*.py", False), ("src/b*.py", False), ("lib/*.py", True)])
+def test_two_globs_keep_the_fallback_for_files_they_may_share(context, peer, admitted):
+    context.config = replace(context.config, overlap_per_file=1)
+    plan_file(context, "src/a.py", 5)
+    reserve(context, 1, [peer], lane="a")
+    reserve(context, 2, ["src/*.py"], running=False)
+    assert can_start(context, "c", 2) is admitted
+
+
+def test_glob_peers_fill_a_planned_file_only_at_its_limit(context):
+    context.config = replace(context.config, overlap_per_file=9)
+    plan_file(context, "src/a.py", 2)
+    reserve(context, 1, ["src/*.py"], lane="a")
+    reserve(context, 3, ["src/a.py"], running=False)
+    assert can_start(context, "c", 3)
+    reserve(context, 2, ["src/a*.py"], lane="b")
+    assert not can_start(context, "c", 3)
 
 
 def test_fixed_mode_ignores_file_limits(context):
