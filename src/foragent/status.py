@@ -76,7 +76,8 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
         "stale": observation["error"] is not None,
         "error": observation["error"],
         "failed_at": observation["failed_at"],
-        "active_runs": [asdict(run) for run in store.active_runs() if run.kind == "issue"],  # Dreams hold no issue.
+        # Dreams hold no issue. ``talking`` is derived from the talk events, never stored.
+        "active_runs": [{**asdict(run), "talking": run.talking} for run in store.active_runs() if run.kind == "issue"],
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
 
@@ -123,6 +124,13 @@ def collect_lanes(
     grouped = {item["number"]: (group, item) for group, items in groups.items() for item in items}
     # A lane dreams while its dream record runs; the tick owns that record's liveness.
     dreaming = {run.lane for run in store.dream_runs() if run.status == "running"}
+    # Each lane's last issue: its most recently finished run of any outcome, by finished_at.
+    finished = store.finish_times()
+    last: dict[str, int] = {}
+    for run in sorted((run for run in store.read_history()
+                       if run.kind == "issue" and (run.number, run.started_at) in finished),
+                      key=lambda run: datetime.fromisoformat(finished[run.number, run.started_at])):
+        last[run.lane] = run.number
 
     def lane_row(slug: str) -> dict[str, Any]:
         return lanes.setdefault(slug, {
@@ -130,7 +138,7 @@ def collect_lanes(
             "state": "idle", "issue": None, "title": None, "phase": None,
             "elapsed_seconds": None, "last_activity_seconds": None, "waiting_for": [],
             RUNNING: [], READY: [], "queued": [], "held": [],
-            "dreaming": slug in dreaming,
+            "dreaming": slug in dreaming, "talking": False, "last_issue": last.get(slug),
         })
 
     def show(row: dict[str, Any], state: str, number: int, title: str | None, run, waiting_for) -> None:
@@ -141,7 +149,7 @@ def collect_lanes(
             phase=run.phase if run else None,
             elapsed_seconds=_age(run.phase_started_at, now) if run else None,
             last_activity_seconds=_age(run.last_activity_at or run.started_at, now) if run else None,
-            waiting_for=waiting_for,
+            waiting_for=waiting_for, talking=bool(run and run.talking),
         )
 
     for slug in {*config.lanes, "main"}:

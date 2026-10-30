@@ -19,6 +19,7 @@ MESSAGES = {
         "talk_unknown": "Cannot tell whether the talk terminal of #{n} is open; nothing was brought forward or opened.",
         "talk_bring_failed": "Could not bring the talk terminal of #{n} forward; it stays open.",
         "talk_session_starting": "#{n} is starting a new worker session; send the message again in a minute.",
+        "talk_talking": "talking 💬",
     },
     "ko": {
         "talk_no_session": "#{n}에는 아직 대화할 세션 기록이 없어요.",
@@ -38,5 +39,6 @@ MESSAGES = {
         "talk_unknown": "#{n}의 대화 터미널이 열려 있는지 알 수 없어요. 아무것도 앞으로 가져오거나 열지 않았어요.",
         "talk_bring_failed": "#{n}의 대화 터미널을 앞으로 가져오지 못했어요. 대화는 열린 채로 둬요.",
         "talk_session_starting": "#{n}이 새 작업자 세션을 시작하는 중이에요. 1분 뒤에 메시지를 다시 보내세요.",
+        "talk_talking": "대화 중 💬",
     },
 }

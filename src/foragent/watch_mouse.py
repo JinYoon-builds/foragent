@@ -18,8 +18,27 @@ from foragent.config import Config
 from foragent.state import StateStore
 
 
-def hit_test(layout: dict[str, Any], x: int, y: int) -> Any:
-    """The target under one screen cell, or None. Later boxes are drawn on top."""
+def _snapshot_layout(snapshot: Any, config: Config, root: Path, width: int) -> dict[str, Any]:
+    """The hit boxes of the heightless render_frame(snapshot, config, root, width=width)."""
+    from foragent import watch
+
+    layout: dict[str, Any] = {}
+    watch.render_frame(snapshot, config, root, width=width, layout=layout)
+    return layout
+
+
+def hit_test(layout: Any, *args: Any, **kwargs: Any) -> Any:
+    """The target under one screen cell, or None. Later boxes are drawn on top.
+
+    ``hit_test(layout, x, y)`` reads a filled layout dict. ``hit_test(snapshot, config,
+    root, *, x, y, width)`` takes a status snapshot and renders it first (#174).
+    """
+    if not isinstance(layout, dict):
+        config, root = args
+        x, y, width = kwargs["x"], kwargs["y"], kwargs["width"]
+        layout = _snapshot_layout(layout, config, root, width)
+    else:
+        x, y = args if args else (kwargs["x"], kwargs["y"])
     for left, top, right, bottom, target in reversed(layout.get("hits", [])):
         if left <= x < right and top <= y < bottom:
             return target
@@ -84,12 +103,35 @@ def _open(state: dict[str, Any], number: int | None, store: StateStore | None, r
         state["scroll"] = state.pop("rows_scroll", 0)
 
 
-def handle_mouse(
+def handle_mouse(button: Any, *args: Any, **kwargs: Any) -> Any:
+    """Act on one mouse event. Wheel steps only scroll; a left click acts on its target.
+
+    ``handle_mouse(button, x, y, layout, store, config, *, state=None)`` is the live view's
+    form. ``handle_mouse(snapshot, config, root, *, x, y, width)`` is one left click on the
+    heightless frame of a status snapshot; a squirrel click returns the talk line (#174).
+    """
+    if not isinstance(button, str):
+        return _click_snapshot(button, *args, **kwargs)
+    return _handle_mouse(button, *args, **kwargs)
+
+
+def _click_snapshot(snapshot: Any, config: Config, root: Path, *, x: int, y: int, width: int) -> str | None:
+    from foragent import watch
+    from foragent.watch_sections import talk
+
+    target = watch.hit_test(_snapshot_layout(snapshot, config, root, width), x, y)
+    if not (isinstance(target, tuple) and target[0] == "squirrel"):
+        return None
+    number = talk.lane_issue(snapshot.status.get("lanes", {}).get(target[1]))
+    return None if number is None else talk.talk(number, config, root)
+
+
+def _handle_mouse(
     button: str, x: int, y: int, layout: dict[str, Any], store: StateStore, config: Config,
     *, state: dict[str, Any] | None = None,
 ) -> None:
-    """Act on one mouse event. Wheel steps only scroll; a left click acts on its target."""
     from foragent import watch
+    from foragent.watch_sections import talk
 
     state = {} if state is None else state
     if button in ("wheel-down", "wheel-up"):
@@ -106,6 +148,11 @@ def handle_mouse(
         _open(state, None if state.get("issue") == target[1] else target[1], store, row)
     elif isinstance(target, tuple) and target[0] == "more":
         toggle_lane(state, target[1])
+    elif isinstance(target, tuple) and target[0] == "squirrel":
+        # The lane rows recorded what each squirrel talks to; a lane with no issue does nothing.
+        number = state.get("talk_issues", {}).get(target[1])
+        if number is not None:
+            talk.show(state, talk.talk(number, config, state.get("repo_root") or Path.cwd(), store))
 
 
 def toggle_lane(state: dict[str, Any], slug: str) -> None:

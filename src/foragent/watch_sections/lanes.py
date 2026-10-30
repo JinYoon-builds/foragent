@@ -15,6 +15,7 @@ from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 from foragent.watch_layout import _clones
 from foragent import watch_dream as dream
+from foragent.watch_sections import talk
 
 ORDER = 5
 GAP = False  # The rows follow the one-line header directly.
@@ -175,7 +176,9 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
             "words": watch.text(words, language), "activity": activity,
             # Without a recorded time (a queued issue, a row with no run) the cell says so.
             "elapsed": elapsed_text(elapsed, language) or "—", "acorns": acorns,
-            "style": "yellow" if activity or kind == "person" else ""}
+            "style": "yellow" if activity or kind == "person" else "",
+            # A talk belongs to an active run (#174); a finished run never talks.
+            "talking": bool((run or {}).get("talking"))}
 
 
 def _finished_row(snapshot: Snapshot, config: Config, issue: Any, name: str,
@@ -293,8 +296,17 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     glyphs = GLYPHS[glyph_mode(config)]
     unfolded = set(state.get("unfolded", ())) if state is not None else set()
     rows = _rows(snapshot, config, glyphs, context["now"], unfolded, bool(context.get("tight")))
+    if state is not None:
+        # What a squirrel click in the live view talks to (watch_sections/talk).
+        state["talk_issues"] = {slug: talk.lane_issue(row) for slug, row in snapshot.status["lanes"].items()}
+        state["repo_root"] = repo_root
     if not rows:
         return []
+    badges = width >= talk.BADGE_WIDTH
+    if not badges:
+        # Text mode: the state in words replaces the phase word of a talking row.
+        rows = [{**row, "words": watch.text("talk_talking", config.language)} if row.get("talking") else row
+                for row in rows]
     cells = [row for row in rows if "toggle" not in row]
     size = lambda key: max((watch._cells(row.get(key, "")) for row in cells if "number" in row), default=0)
     glyph_width = max(watch._cells(value) for value in glyphs.values())
@@ -318,7 +330,12 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     shown = [key for key in columns if widths[key]]
     hits, marks = context.get("hits"), context.get("marks")
     lines: list[Line] = []
+    # One speech badge per talking lane, directly above the lane's first row and its squirrel.
+    talking = {row["slug"] for row in rows if row.get("talking")} if badges else set()
     for row in rows:
+        if row.get("slug") in talking:
+            talking.discard(row["slug"])
+            lines.append(watch._line("💬"))
         if "toggle" in row:
             # The toggle sits under the lane's rows, in the lane column.
             text = watch._clean(row["text"])
@@ -327,8 +344,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
                       len(lines), ("more", row["toggle"]))
         elif "number" in row:
             lines += watch._columns([row[key] for key in shown], [widths[key] for key in shown], row["style"])
-            # The whole row, from its #issue to its acorns, opens the issue's box.
-            target = (0, len(lines) - 1, min(width, watch._cells("".join(v for v, _ in lines[-1]).rstrip())),
+            # The whole row after the squirrel, from its #issue to its acorns, opens the issue's box.
+            target = (glyph_width, len(lines) - 1, min(width, watch._cells("".join(v for v, _ in lines[-1]).rstrip())),
                       len(lines), ("acorn", row["issue"]))
             if marks is not None:
                 marks.append((len(lines) - 1, row["issue"], row["slug"]))  # A lane row folds its lane.
@@ -337,7 +354,11 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             sizes = [glyph_width, max(lane_width, watch._cells(row["lane"]))] + (
                 [watch._cells(row["rest"])] if row["rest"] else [])
             lines += watch._columns(values, sizes)
-            continue
+            target = None
         if hits is not None:
-            hits.append(target)
+            if target is not None:
+                hits.append(target)
+            if "toggle" not in row:
+                # The squirrel (the glyph cell) talks to the lane's worker (#174).
+                hits.append((0, len(lines) - 1, glyph_width, len(lines), ("squirrel", row["slug"])))
     return lines
