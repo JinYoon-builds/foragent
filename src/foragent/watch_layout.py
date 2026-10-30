@@ -124,13 +124,20 @@ def _frame(
     marked STAYS (the fireworks band while it plays) stays too and is moved up into
     the first screen when the KEEP sections push it below. ``state`` is the live view's
     memory across frames (None for a stateless frame).
+
+    A section's ``REPLACES`` names other sections by their full module name: after every
+    section has drawn, their rows, click areas, issue rows and layout roles are dropped.
+    A section's ``PIN`` ('header' or 'footer') records its final rows in
+    ``state['pinned_rows']``.
     """
     from foragent import watch
 
     from foragent.watch_sections import settings as settings_window
 
-    # The open settings window (#173) replaces everything between the header and the help line.
-    sections = settings_window.shown_sections(_sections(), state)
+    discovered = _sections()
+    # Declarations are unconditional: a section replaces its targets even when it draws
+    # nothing or the settings window hides it. Absent names are ignored.
+    replaced = {name for section in discovered for name in getattr(section, "REPLACES", ())}
     Hit = tuple[int, int, int, int, Any]
     Mark = tuple[int, int, str | None]  # (row, issue number, its lane; None when not foldable)
     rendered: list[tuple[ModuleType, list[Line], list[Hit], list[Mark]]] = []
@@ -145,8 +152,15 @@ def _frame(
                                height=height, state=state, **extra)
         return section, list(lines), own, marks
 
-    for section in sections:
+    for section in discovered:
         rendered.append(draw(section))
+    # Every discovered section drew once in ORDER; replaced ones now leave no rows, hits,
+    # marks or roles. Only then does the open settings window (#173) keep the header, its
+    # window and the help line among the surviving contributions.
+    rendered = [item for item in rendered if item[0].__name__ not in replaced]
+    surviving = {id(item[0]): item for item in rendered}
+    rendered = [surviving.get(id(section)) or draw(section)
+                for section in settings_window.shown_sections([item[0] for item in rendered], state)]
     # From its SIDE width on, a section (the orchestrator box) stands to the right
     # of the sections between the lane rows and itself.
     side = next((index for index, (section, *_) in enumerate(rendered) if getattr(section, "SIDE", None)), None)
@@ -155,12 +169,15 @@ def _frame(
                     if getattr(section, "KEEP", False) and (side is None or index < side)), default=-1)
 
     stays: list[tuple[int, int]] = []  # Row spans of the STAYS sections in the last assembly.
+    pins: dict[str, list[int]] = {"header": [], "footer": []}  # Rows of PIN sections, likewise.
 
     def assemble() -> tuple[list[Line], list[Hit], list[Mark]]:
         hits: list[Hit] = []
         marks: list[Mark] = []
         frame: list[Line] = []
         stays.clear()
+        for rows in pins.values():
+            rows.clear()
         mark = None  # Where the sections beside the SIDE section begin.
         joined = False  # The previous section asked the next one to follow it directly.
         for index, (section, lines, own, rows) in enumerate(rendered):
@@ -176,6 +193,8 @@ def _frame(
                 hits += [(x0 + left_width + 2, y0 + mark, x1 + left_width + 2, y1 + mark, target)
                          for x0, y0, x1, y1, target in own]
                 marks += [(y + mark, number, lane) for y, number, lane in rows]
+                if getattr(section, "PIN", None) in pins:
+                    pins[section.PIN] += range(mark, mark + len(lines))
                 continue
             top = len(frame) + gap
             if wide and mark is None and rows_end < index < side:
@@ -188,6 +207,8 @@ def _frame(
             marks += [(y + top, number, lane) for y, number, lane in rows]
             if getattr(section, "STAYS", False):
                 stays.append((top, top + len(lines)))
+            if getattr(section, "PIN", None) in pins:
+                pins[section.PIN] += range(top, top + len(lines))
         return frame, hits, marks
 
     if settings_window.is_open(state):
@@ -235,6 +256,9 @@ def _frame(
                     for x0, y0, x1, y1, item in hits]
             marks = [(y + size, number, lane) if target <= y < start else (y, number, lane)
                      for y, number, lane in marks]
+            for name, rows in pins.items():
+                pins[name] = [y + size if target <= y < start else y - (start - target) if start <= y < end else y
+                              for y in rows]
     if layout is not None:
         layout["hits"] = hits
         layout["offset"] = 0  # Hits are in F rows; a height render shifts them (``_window``).
@@ -248,6 +272,7 @@ def _frame(
         # (foldable) and again as a completion row (not foldable).
         state["row_lanes"] = {y: lane for y, _, lane in marks if lane is not None}
         state["lanes"] = list(snapshot.status.get("lanes", {}))
+        state["pinned_rows"] = {name: sorted(rows) for name, rows in pins.items()}
     return [watch._fit(list(line), width) for line in frame]
 
 
