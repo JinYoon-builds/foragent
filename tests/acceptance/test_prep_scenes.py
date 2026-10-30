@@ -44,7 +44,8 @@ def preparation_frame(case, main, capsys):
 def preparation_row(frame, title="Login 준비"):
     lines = frame.splitlines()
     assert any(title in line for line in lines), "the CLI preparation title must appear in a text row"
-    assert "▀" not in frame and "▄" not in frame, "preparation and lanes must use text rows without sprites"
+    from test_lane_m2_contract import bubble
+    assert bubble(frame), "preparation continues above the new lane blocks without removing the orchestrator"
     worker = issue_row(frame, 1)
     rows = [line for line in lines[:lines.index(worker)] if title in line]
     assert len(rows) == 1, "the order title must appear in exactly one preparation row above the lanes"
@@ -138,8 +139,9 @@ def test_prep_scenes_absent_preparation_state_keeps_the_normal_running_scene(tmp
 
     snapshot, config = running_snapshot()
     frame = plain_frame(render_frame(snapshot, config, tmp_path, width=100))
-    assert "▀" not in frame and "▄" not in frame, "the normal busy scene must use text rows without sprites"
+    from test_lane_m2_contract import bubble
+    assert bubble(frame), "normal busy scene uses the approved orchestrator area"
     for number in (101, 102, 103, 104):
         row = issue_row(frame, number)
-        assert row.lstrip().startswith(("🐿", "⏳", "✋", "[*]", "[.]", "[!]")), "normal lane rows keep their state glyphs"
+        assert f"#{number}" in row and "▌" in row, "normal lanes have sideways acorns"
     assert "남은 빈칸" not in frame and "확인해 주세요" not in frame

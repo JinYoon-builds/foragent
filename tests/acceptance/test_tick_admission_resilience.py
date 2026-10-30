@@ -21,13 +21,16 @@ from test_order_machine_budget import fake_workloads  # noqa: F401
 def test_non_start_failure_keeps_three_cached_admissions_and_records_the_fact(
     git_history, tmp_path, monkeypatch, failed_step,
 ):
-    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
+    # #995 (2026-10-30): #2 and #3 sit in their own lanes, because D69 runs one Files-less issue
+    # per lane; this test is about failed auxiliary steps, not lane width.
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true",
+                     lanes={"two": {"paths": ["src/two/**"]}, "three": {"paths": ["src/three/**"]}})
     case.store.finish_run(1, "error")
     case.tracker.remove_labels(1, ["running"])
     case.tracker.record_label(1, "approved", "human")
     body = case.tracker.get_issue(1).body
-    for number in (2, 3):
-        case.tracker.add_issue(number, f"Queued {number}", body)
+    for number, lane in ((2, "two"), (3, "three")):
+        case.tracker.add_issue(number, f"Queued {number}", body, labels=[f"lane:{lane}"])
         case.tracker.record_label(number, "approved", "human")
     monkeypatch.setattr(scheduler, "machine_load", lambda: ("normal", 0.5))
     assert scheduler.tick(tick_context(case, start_runs=False)).skipped is None

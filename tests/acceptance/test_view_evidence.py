@@ -56,7 +56,7 @@ def test_view_evidence_orchestrator_claim_follows_heartbeat_age(git_history, tmp
     case, main = view_evidence_case(git_history, tmp_path, monkeypatch)
     fresh = render_frame(view_evidence_snapshot(case, main, capsys), case.config, case.root,
                          width=90, now=case.clock[0])
-    assert "지켜보는 중" in fresh
+    assert "레인 1곳에서 이슈 1개를 작업하고 있어요." in fresh, "the fresh frame uses the r56 running summary"
     heartbeats_write(case.store, "orch", case.clock[0] - timedelta(minutes=2))
     stale = render_frame(view_evidence_snapshot(case, main, capsys), case.config, case.root,
                          width=90, now=case.clock[0])
@@ -75,7 +75,7 @@ def test_view_evidence_working_and_quiet_use_log_age_rather_than_fresh_state_met
     fresh = render_frame(view_evidence_snapshot(case, main, capsys), case.config, case.root,
                          width=90, now=case.clock[0])
     row = view_evidence_worker_row(fresh)
-    assert row.lstrip().startswith(("🐿", "[*]")) and "조용해요" not in row and "멈춘 듯" not in row, row
+    assert "#1" in row and "작성" in row and "조용해요" not in row and "멈춘 듯" not in row, row
     # Conversely, fresh state metadata is not evidence of executor output.
     case.store.update_run(1, last_activity_at=case.clock[0].isoformat())
     view_evidence_log(case, minutes=10)

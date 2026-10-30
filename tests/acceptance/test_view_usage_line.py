@@ -35,14 +35,16 @@ def test_view_usage_line_last_line_contains_both_usage_ages_resets_capacity_and_
     case.ctx.config = replace(case.ctx.config, language=language, max_parallel=3)
     case.clock[0] += timedelta(minutes=10)
     snapshot, _ = usage_snapshot(case, monkeypatch, capsys)
-    line = render_frame(snapshot, case.ctx.config, case.root, width=240, now=case.clock[0]).splitlines()[-1]
+    line = render_frame(snapshot, case.ctx.config, case.root, width=240, now=case.clock[0]).splitlines()[-2]
     assert "Claude" in line and "Codex" in line
     assert "6%" in line and "67%" in line
     assert age in line
     for reset in (CLAUDE_RESET, CODEX_RESET):
         assert datetime.fromtimestamp(reset, UTC).astimezone().strftime("%H:%M") in line
     assert "keep" in line
-    assert re.search(r"(?<!\d)3(?!\d)", line), "explicit concurrency ceiling must be visible"
+    assert "running " not in line and "동시" not in line, "r56 removes the concurrency footer count"
+    hints = render_frame(snapshot, case.ctx.config, case.root, width=240, now=case.clock[0]).splitlines()[-1]
+    assert "s " in hints and "m " in hints and "q " in hints
 
 
 def test_view_usage_line_m_key_toggles_persisted_mode_both_ways(git_history, tmp_path, monkeypatch, capsys):
@@ -68,7 +70,9 @@ def test_view_usage_line_idle_with_remaining_quota_invites_next_order(git_histor
     snapshot, _ = usage_snapshot(case, monkeypatch, capsys)
     assert all(row["state"] == "idle" for row in snapshot.status["lanes"].values())
     frame = render_frame(snapshot, case.ctx.config, case.root)
-    assert "쿼터가 남아 있어요" in frame and "/fa" in frame
+    assert "쿼터가 남아 있어요" not in frame.splitlines()[-2], "the obsolete footer invite is replaced; scene owns its bubble sentence"
+    assert "Claude" in frame.splitlines()[-2] and "Codex" in frame.splitlines()[-2]
+    assert "s 설정" in frame.splitlines()[-1]
 
 
 def test_view_usage_line_without_usage_still_renders_placeholder(tmp_path):
@@ -76,6 +80,6 @@ def test_view_usage_line_without_usage_still_renders_placeholder(tmp_path):
     from test_view_done_state import done_snapshot
 
     snapshot, config = done_snapshot()
-    last = render_frame(snapshot, config, tmp_path, width=240).splitlines()[-1]
+    last = render_frame(snapshot, config, tmp_path, width=240).splitlines()[-2]
     assert "—" in last
     assert "Claude" in last and "Codex" in last

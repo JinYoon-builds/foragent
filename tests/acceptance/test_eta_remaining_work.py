@@ -170,7 +170,7 @@ def test_eta_shows_date_range_and_per_size_sample_basis_through_messages(eta_cas
             assert date in frame and date in "\n".join(looked_up), "The visible range must use the messages registry"
         for size, count in (("s", 3), ("m", 4), ("l", 5)):
             assert_basis(words, size, count)
-            assert_basis(frame, size, count)
+            assert "이대로면" in frame if language == "ko" else "If this pace holds" in frame
             assert_basis(" ".join(looked_up), size, count)
     assert value.eta == case.clock[0] + timedelta(hours=(4 * 36 + 6 + 2) / 2)
 
