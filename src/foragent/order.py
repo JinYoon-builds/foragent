@@ -384,6 +384,11 @@ def _child_marker(identity: str, key: str) -> str:
     return f"<!-- foragent:plan-child id={identity} key={key} -->"
 
 
+def _published_body(plan: dict, item: dict, repo: str, config: Config) -> str:
+    """The issue body publish writes for a plan child or edit, before any plan-child marker."""
+    return issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+
+
 @dataclass
 class PublishReport:
     title: str
@@ -575,8 +580,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     if not childless:
         board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
     for item in plan["issues"]:
-        body = (issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
-                + "\n" + _child_marker(plan["id"], item["key"]) + "\n")
+        body = _published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
         if item.get("interactive", False):
             labels.append("interactive")
@@ -614,7 +618,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
-        body = issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+        body = _published_body(plan, item, repo, config)
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
             name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
@@ -757,19 +761,20 @@ def _approach(message: str) -> list[str]:
     return _tagged(message, "APPROACH")
 
 
-_LINK_LINE = re.compile(r"\[[^\]\n]+\]\(https://github\.com/[^)\s]+\)")
 _CHILD_LINE = re.compile(r"<!-- foragent:plan-child id=(\S+) key=(\S+) -->")
 
 
-def _issue_text(body: str) -> str:
-    """The approved issue text without per-repository links and the plan-child marker.
+def _body_digest(body: str) -> str:
+    """Every authored byte of an issue body counts; only line endings and outer blank space do not."""
+    return hashlib.sha256(body.replace("\r\n", "\n").strip().encode("utf-8")).hexdigest()
 
-    Those lines name the repository and base branch, which preread does not know; the
-    acceptance files they point to are bound separately by their blob hashes.
-    """
-    lines = [line for line in body.replace("\r\n", "\n").splitlines()
-             if not _LINK_LINE.fullmatch(line.strip()) and not _CHILD_LINE.fullmatch(line.strip())]
-    return "\n".join(lines).strip()
+
+def _without_child_marker(body: str) -> tuple[str, re.Match | None]:
+    """Split off the plan-child marker publish appends as the body's last line, nothing else."""
+    text = body.replace("\r\n", "\n").rstrip()
+    head, _, last = text.rpartition("\n")
+    marker = _CHILD_LINE.fullmatch(last)
+    return (head if marker else text), marker
 
 
 def _blob(data: bytes) -> str:
@@ -777,26 +782,34 @@ def _blob(data: bytes) -> str:
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def _binding(item: dict, root: Path, config: Config) -> dict:
-    """What approval binds for this item: the issue text and its acceptance files' contents."""
-    text = _issue_text(issue_body(item, "preread/preread", config.base_branch, config.acceptance_dir))
-    blobs = {}
-    for path in sorted(set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))):
-        if path in item.get("acceptance_files", {}):
-            blobs[path] = _blob(item["acceptance_files"][path].encode("utf-8"))
-        elif (root / path).is_file():
-            blobs[path] = _blob((root / path).read_bytes())
-        else:
-            blobs[path] = "missing"
-    return {"content": hashlib.sha256(text.encode("utf-8")).hexdigest(), "acceptance": blobs}
+def _binding(plan: dict, item: dict, config: Config, repo: str | None,
+             published: dict[str, str | bytes]) -> dict:
+    """What the implementer of this item will receive: the exact body and the files it names.
+
+    The files are this issue's acceptance tests and selected references with the contents
+    publication writes (``published`` from validate_plan: plan contents from any issue, else
+    the repository's). The body names the repository in links publish generates; without the
+    repository the body cannot be reproduced, so the record is not bound and never handed over.
+    """
+    content = None if repo is None else _body_digest(_published_body(plan, item, repo, config))
+    names = (set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))
+             | set(order_references.selected(plan, item)))
+    files = {}
+    for name in sorted(names):
+        data = published.get(name)
+        files[name] = "missing" if data is None else _blob(data.encode("utf-8") if isinstance(data, str) else data)
+    return {"content": content, "files": files}
 
 
-def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str]) -> dict | None:
-    """The latest preread proposal recorded for this issue's approved snapshot, if any.
+def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str],
+                  worktree: Path) -> dict | None:
+    """The latest preread proposal recorded for what this run's implementer receives, if any.
 
     A record counts only when its key names this issue (plan child key in the same order,
-    or an edit of #n), its issue text equals the approved body's, and every acceptance file
-    the approval snapshot recorded has the content the preread saw. The preread writer keeps
+    or an edit of #n), the body publish rendered for it equals the approved body byte for byte
+    (apart from the trailing plan-child marker publish appends), and every file it bound
+    (acceptance tests and references) has the same content in the run's worktree and, where
+    the approval snapshot names the file, in that snapshot. The preread writer keeps
     records in write order, so the last match is the latest answer; when that answer
     proposed nothing (NONE or questions only), there is no proposal to hand over.
     """
@@ -804,15 +817,24 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
         records = _preread_records(root)
     except PlanError:
         return None
-    content = hashlib.sha256(_issue_text(body).encode("utf-8")).hexdigest()
-    child = _CHILD_LINE.search(body)
+    text, child = _without_child_marker(body)
+    content = _body_digest(text)
+    actual: dict[str, str] = {}
+
+    def current(name: str) -> str:
+        if name not in actual:
+            path = worktree / name
+            actual[name] = _blob(path.read_bytes()) if path.is_file() else "missing"
+        return actual[name]
+
     latest = None
     for record in records.values():
         if not isinstance(record, dict) or record.get("content") != content:
             continue
-        seen = record.get("acceptance")
+        seen = record.get("files")
         if not isinstance(seen, dict) or any(
-                path in acceptance_blobs and acceptance_blobs[path] != sha for path, sha in seen.items()):
+                not isinstance(sha, str) or current(name) != sha
+                or acceptance_blobs.get(name, sha) != sha for name, sha in seen.items()):
             continue
         if record.get("key") == f"#{n}" or (
                 child is not None and record.get("plan") == child[1] and record.get("key") == child[2]):
@@ -823,13 +845,13 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
 
 
 def preread(plan: dict, root: Path, config: Config,
-            tracker: Callable[[], Tracker] | None = None) -> list[dict]:
+            tracker: Callable[[], Tracker] | None = None, repo: str | None = None) -> list[dict]:
     """Ask each issue's implementer, read-only, for its unknowns and record them by content.
 
     Edits need the tracker for each existing issue's title and lane; it is opened only then.
     """
     try:
-        validate_plan(plan, root, config)
+        published = validate_plan(plan, root, config)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
     items = list(plan["issues"])
@@ -873,7 +895,7 @@ def preread(plan: dict, root: Path, config: Config,
         approach = _approach(result.last_message)
         # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
         records.pop(digest, None)
-        records[digest] = {"key": item["key"], "plan": plan["id"], **_binding(item, root, config),
+        records[digest] = {"key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
                            "unknowns": unknowns, "decisions": decisions, "approach": approach,
                            "at": datetime.now(UTC).isoformat(timespec="seconds")}
         temporary = root / (PREREAD_FILE + ".tmp")

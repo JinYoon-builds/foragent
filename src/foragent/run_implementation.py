@@ -341,10 +341,10 @@ def _prepare_implementation(
     )
 
 
-def _lane_plan(n: int, ctx: RunContext, approval) -> str:
+def _lane_plan(n: int, ctx: RunContext, approval, worktree: Path) -> str:
     from foragent.order import lane_proposal
 
-    proposal = lane_proposal(ctx.repo_root, n, approval.body, approval.acceptance_blobs or {})
+    proposal = lane_proposal(ctx.repo_root, n, approval.body, approval.acceptance_blobs or {}, worktree)
     if proposal is None:
         return ""
     return lane_plan_section([str(line) for line in proposal.get("approach") or []],
@@ -392,7 +392,7 @@ def _implement(
     # Bug-fix steps reach implementation turns (first, retries, resumes), not conflict resolution.
     procedure = bug_fix_steps(attempt.issue.labels, worktree) if merge_conflicts is None else None
     fixed = lane_skill_names(ctx.config, run.lane, worktree, lane_notes(ctx.config, run.lane, worktree)[0])
-    lane_plan = _lane_plan(n, ctx, attempt.approval)
+    lane_plan = _lane_plan(n, ctx, attempt.approval, worktree)
     prompt = build_prompt(
         n, attempt.parsed, ctx.config.acceptance_dir, failure_context, ctx.config.language,
         native_goal=not attempt.native_claude and ctx.config.codex_goal, acceptance_locked=attempt.native_claude,
