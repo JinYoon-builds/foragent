@@ -231,3 +231,4 @@
 - [#995 tick admission](project_995_tick_admission.md) — refresh-failure fallback, gh.Budget 10s/5s, board read only on changed listing, D69 lane conflict
 - #1055: refresh 첫 프롬프트 2번과 dream 권위 문구는 `orch_rules.current_rules(root)`(rules.md → decisions.md)로 대상 저장소·dream 작업공간에서 고르고 본문을 인용한다. test_lane_memory_writers 6개 실패는 범위 밖 기준선.
 - [#1042 D80 assign/goal](project_1042_assign_goal.md) — plan.json assignments/goal, decide() hook, Run.executor_model
+- [#1016 review WHAT/HOW](project_1016_review_what_how.md) — frozen review text in test_risk_map/runner_support; DECIDE lines to all 4 review paths incl. pr-body

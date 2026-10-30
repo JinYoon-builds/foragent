@@ -32,6 +32,9 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
     globs = ctx.config.lanes.get(lane, {}).get("paths", []) if lane != "main" else None
     inside = set(run_publish.touched(attempt.paths, globs)) if globs is not None else set(attempt.paths)
     outside = [path for path in attempt.paths if path not in inside]
+    pr_scope = ctx.config.review_scope == "pr-body"
+    if pr_scope:
+        from foragent.run_review import _lane_decisions
     return run_publish._pr_body(
         n, attempt.parsed, attempt.checks, ctx.store.get_run(n).attempts, attempt.reviews, try_text, outside_lane=outside,
         fallback_model=ctx.store.get_run(n).fallback_model,
@@ -41,7 +44,8 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
         rebuttals="\n\n".join(attempt.rebuttals),
         review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
         language=ctx.config.language,
-        risk_notes=run_publish.review_perspectives.with_checklist(run_publish._risk_notes(attempt), ctx.config) if ctx.config.review_scope == "pr-body" else "",
+        risk_notes=run_publish.review_perspectives.with_checklist(run_publish._risk_notes(attempt), ctx.config) if pr_scope else "",
+        lane_decisions=_lane_decisions(n, ctx, attempt.worktree) if pr_scope else "",
     )
 
 
