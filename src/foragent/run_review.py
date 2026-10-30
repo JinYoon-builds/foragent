@@ -571,19 +571,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         flag(ctx, n, Reason.RISK_HIGH, "PR base changed; retry implementation on the current base.", link)
         return "base-changed"
 
-    def guard_current() -> str | None:
-        # The test-harness guard on exactly the head about to be measured; a
-        # Done when command can commit, so this runs before every measurement.
-        if held := harness_guard.guard_measured(ctx, n, git, base_ref, git.head_sha(), parsed.files):
-            return harness_guard.hold(ctx, n, held, link)
-        return None
-
-    def guarded_head(measured: str) -> str | None:
-        with harness_guard.guarding(git.root, guard_current):
-            if stopped := guard_current():
-                return stopped
-            return _verify_review_head(n, ctx, git, parsed, measured, link)
-
+    guarded_head = harness_guard.review_guard(ctx, n, git, base_ref, parsed.files, link,
+                                              lambda new: _verify_review_head(n, ctx, git, parsed, new, link))
     if stopped := guarded_head(head):
         return stopped
     _check_publication(git, pr.base)

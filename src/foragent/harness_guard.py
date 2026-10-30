@@ -1,11 +1,7 @@
 """Hold a head whose committed diff changes the test harness outside the issue's ## Files.
 
-Scope (2026-10-30, option A): the guard checks only what a measured head
-commits, never the worktree. Each measurement of a head (Done when, the
-acceptance comparison) calls `guard_measured` with the exact commit or staged
-tree it measures. The diff from the merge base with the PR's target is read as
-raw Git entries (path bytes, modes, blob ids). Worktree-only tricks are left to
-the reviewer and GitHub CI on a clean checkout.
+Each measurement (Done when, the acceptance comparison) first guards the exact commit or staged tree it
+measures: raw Git entries from the merge base with the PR's target. The worktree is not checked (scope A).
 """
 
 from __future__ import annotations
@@ -223,6 +219,20 @@ def issue_files(ctx, n: int) -> list[str]:
     return parse_body(approval.body).files if approval is not None else []
 
 
+def review_guard(ctx, n: int, git: GitRepo, base_ref: str, files, link: str,
+                 verify: Callable[[str], str | None]) -> Callable[[str], str | None]:
+    """Wrap a review head's verification so the guard runs before each of its measurements."""
+    def current() -> str | None:
+        if held := guard_measured(ctx, n, git, base_ref, git.head_sha(), files):
+            return hold(ctx, n, held, link)
+        return None
+
+    def guarded(measured: str) -> str | None:
+        with guarding(git.root, current):
+            return current() or verify(measured)
+    return guarded
+
+
 def guard_or_stop(ctx, n: int, git: GitRepo, target_ref: str, measured: str, link: str = "") -> None:
     """Guard a commit about to be measured; hold and stop the run if it changes the harness."""
     from foragent.run_attempt import ExecutorStopped
@@ -242,4 +252,47 @@ def hold(ctx, n: int, paths: list[str], link: str) -> str:
 
     flag(ctx, n, Reason.TEST_HARNESS_CHANGED, text("harness_changed_summary", ctx.config.language),
          f"{hold_details(ctx, paths)}\n\n{link}".rstrip(), needs_human=True)
+    return "held"
+
+
+def guard_staged(attempt) -> None:
+    """Guard exactly the staged tree about to be measured; HarnessHeld stops the attempt."""
+    ctx, git = attempt.ctx, attempt.git
+    if held := guard_measured(ctx, attempt.n, git, f"origin/{attempt.target_branch}", git.staged_tree_sha(),
+                              attempt.parsed.files, tree=True):
+        raise HarnessHeld(hold_details(ctx, held))
+
+
+def guard_comparison(attempt, head: str, pr: int | None = None) -> None:
+    """Guard the head an acceptance comparison is about to measure."""
+    ctx, target = attempt.ctx, getattr(attempt, "target_branch", None) or attempt.ctx.config.base_branch
+    link = f"https://github.com/{ctx.repo}/pull/{pr}" if pr is not None else ""
+    guard_or_stop(ctx, attempt.n, attempt.git, f"origin/{target}", head, link)
+
+
+def publish_hold(attempt) -> str:
+    """Publish a held head for a person (the PR when possible); no publication check overrides the hold."""
+    from foragent import run_publish
+
+    n, ctx = attempt.n, attempt.ctx
+    try:
+        title = f"{ctx.tracker.get_issue(n).title} (#{n})"
+        run_publish.commit_exclusions(attempt, title)
+        run_publish._push_branch(attempt)
+        body = run_publish._render_pr_body(attempt)
+        pr = ctx.tracker.find_pr(attempt.branch)
+        if pr is None:
+            pr = ctx.tracker.create_pr(head=attempt.branch, base=attempt.target_branch, title=title, body=body)
+            attempt.pr_title = title
+        else:
+            run_publish._update_open_pr(attempt, pr, title, body)
+        where = f"https://github.com/{ctx.repo}/pull/{pr}"
+    except (run_publish.GitError, run_publish.AttemptFailure, run_publish.TrackerError) as exc:
+        if isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
+            raise  # the existing GitHub wait restarts the run, and the guard holds again
+        where = run_publish.text("harness_not_published", ctx.config.language,
+                                 detail=" ".join(str(exc).split())[:300])
+    run_publish.flag(ctx, n, run_publish.Reason.TEST_HARNESS_CHANGED,
+                     run_publish.text("harness_changed_summary", ctx.config.language),
+                     f"{attempt.failure}\n\n{where}", needs_human=True)
     return "held"

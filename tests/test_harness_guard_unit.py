@@ -193,9 +193,7 @@ def test_acceptance_comparisons_guard_the_exact_head_before_reading_evidence(mon
     attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="batch-7")
     with pytest.raises(ExecutorStopped):
         ci_mode.require_comparison(attempt, 9, "a" * 40)
-    with pytest.raises(ExecutorStopped):
-        ci_mode.review_checks(1, ctx, git, "main")
-    assert guarded == [("origin/batch-7", "a" * 40), ("origin/main", "b" * 40)]
+    assert guarded == [("origin/batch-7", "a" * 40)]
 
 
 @pytest.mark.parametrize("name", ["tests/conftest.py", "pytest.ini", "tox.ini", "setup.cfg",
@@ -221,14 +219,16 @@ def test_review_checks_guard_again_before_the_acceptance_ids(monkeypatch):
     guarded = []
 
     def guard(ctx, n, git, target_ref, measured, link=""):
-        guarded.append(measured)
-        if len(guarded) == 2:
-            raise ExecutorStopped("held")
+        guarded.append((target_ref, measured))
+        raise ExecutorStopped("held")
+
+    def local_only_run_commits(*args):
+        next(heads)  # the local-only run moved the head
 
     monkeypatch.setattr(harness_guard, "guard_or_stop", guard)
     monkeypatch.setattr(ci_local, "capture_local_only",
                         lambda *args: SimpleNamespace(command="true", node_ids=("tests/acceptance/test_x.py::t",)))
-    monkeypatch.setattr(ci_local, "verify_local_only_units", lambda *args: None)
+    monkeypatch.setattr(ci_local, "verify_local_only_units", local_only_run_commits)
     monkeypatch.setattr(ci_mode, "_baseline_exclusions", lambda *args: [])
     ctx = SimpleNamespace(repo="owner/repo", config=Config(test_command="true"),
                           store=SimpleNamespace(log_path=lambda n: "log"))
@@ -239,4 +239,29 @@ def test_review_checks_guard_again_before_the_acceptance_ids(monkeypatch):
     monkeypatch.setattr("foragent.run_waits.in_phase", lambda *args: nullcontext())
     with pytest.raises(ExecutorStopped):
         ci_mode.review_checks(1, ctx, git, "main")
-    assert guarded == ["a" * 40, "b" * 40]
+    assert guarded == [("origin/main", "b" * 40)], "the acceptance ids guard the head after the local-only run"
+
+
+def test_local_fallback_guards_the_commit_it_measures(case, monkeypatch):
+    """The fallback measures the checkout, which a local-only run may have moved past the PR head the caller guarded."""
+    from foragent import ci_local, harness_guard, run_baseline
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.run_baseline import AcceptanceBaseline
+
+    moved = commit(case.repo, [(b"100644", b"tests/conftest.py", b"# committed by a local-only run\n")],
+                   parent=case.base)
+    git_command(case.repo, "update-ref", "refs/heads/main", moved)
+    git_command(case.repo, "update-ref", "refs/remotes/origin/target", case.base)
+    held, measured = [], []
+    monkeypatch.setattr(harness_guard, "hold", lambda ctx, n, paths, link: held.append(paths) or "held")
+    monkeypatch.setattr(harness_guard, "issue_files", lambda ctx, n: [])
+    monkeypatch.setattr(run_baseline, "_capture_acceptance_baseline",
+                        lambda *args: AcceptanceBaseline("true", ("tests/acceptance/test_x.py::t",)))
+    monkeypatch.setattr(ci_local, "check", lambda *args: measured.append(args))
+    ctx = SimpleNamespace(**vars(case.ctx), monotonic=lambda: 0.0)
+    attempt = SimpleNamespace(n=1, ctx=ctx, git=GitRepo(case.repo), worktree=case.repo,
+                              target_branch="target", baseline=SimpleNamespace(command="true"))
+    with pytest.raises(ExecutorStopped):
+        ci_local.fallback_comparison(attempt, case.base)
+    assert held == [["tests/conftest.py"]]
+    assert measured == [], "nothing is measured on a held commit"

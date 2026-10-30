@@ -478,25 +478,17 @@ def _verify_contents(attempt: Implementation) -> str:
     if not any(not path.startswith(".foragent/") for path in attempt.paths):
         return "The session made no changes."
     staged_tree = git.staged_tree_sha()
-
-    def guard_tree() -> None:
-        # The test-harness guard on exactly the staged tree about to be measured.
-        # A Done when command can commit, so it runs before every measurement.
-        if held := harness_guard.guard_measured(ctx, n, git, f"origin/{attempt.target_branch}",
-                                                git.staged_tree_sha(), attempt.parsed.files, tree=True):
-            raise harness_guard.HarnessHeld(harness_guard.hold_details(ctx, held))
-
     for verification in range(2):
         from foragent.run_implementation import follow_base
         follow_base(attempt)
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
-            guard_tree()
+            harness_guard.guard_staged(attempt)  # a Done when command can commit
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                                  slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n)))
             _progress(n, ctx)
         if attempt.baseline and attempt.baseline.node_ids:
-            guard_tree()
+            harness_guard.guard_staged(attempt)
             started = ctx.monotonic()
             command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
             result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
@@ -539,7 +531,7 @@ def _verify_contents(attempt: Implementation) -> str:
         if not _prepare_target(attempt):
             raise ExecutorStopped("hash-mismatch")
         attempt.paths = git.changed_paths(attempt.start_ref)
-        guard_tree()  # a command committed a harness change: that, not the result, decides
+        harness_guard.guard_staged(attempt)  # a command committed a harness change: that, not the result, decides
         checked_tree = git.staged_tree_sha()
         if checked_tree != staged_tree:
             # Save this pass before anything replaces it: if re-verification cannot finish,
@@ -586,19 +578,17 @@ def _check_review_head(
             if runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
-            if stopped := harness_guard.before_measurement(worktree):
-                return stopped
             check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)),
                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
                                   full_text_dir=cuts.issue_dir(ctx.store.root, n))
+            if stopped := harness_guard.before_measurement(worktree):
+                return stopped  # the command committed a harness change: that, not its result, decides
             checks.append(check)
             _progress(n, ctx)
             if check.timed_out or runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
     # PR-head checks rerun only Done when: other saved failures (baseline, units) are not re-verified here.
-    if stopped := harness_guard.before_measurement(worktree):
-        return stopped  # a command committed a harness change: that, not the result, decides
     if bundle := save_failures(ctx.store.root, n, checks, complete=False):
         flag(ctx, n, Reason.RETRIES_EXCEEDED, "Done when failed on the PR head.", f"{bundle}\n{link}")
         return "checks-failed"

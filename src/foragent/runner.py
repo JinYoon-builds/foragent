@@ -26,8 +26,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board, capacity, orch_github
-from foragent.harness_guard import HarnessHeld
+from foragent import board, capacity, harness_guard, orch_github
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -255,13 +254,13 @@ def _implement_and_publish(
                 flag(ctx, n, Reason.RETRIES_EXCEEDED, "Checks or review failed after all attempts.", attempt.failure)
                 outcome = "retries-exceeded"
                 return outcome
-        except HarnessHeld as held:
+        except harness_guard.HarnessHeld as held:
             # The test-harness guard held wherever the head was about to be measured
             # (a turn, a base-move re-check, conflict resolution or replay). No ordinary
             # failure handling applies: publish the held head for a person with its paths.
             attempt.review_hold, attempt.review_hold_reason = True, Reason.TEST_HARNESS_CHANGED
             attempt.failure = held.details
-            outcome = _publish(attempt)
+            outcome = harness_guard.publish_hold(attempt)  # the hold wins over every publication check
             return outcome
     except ExecutorStopped as exc:
         outcome = exc.outcome
@@ -276,11 +275,25 @@ def _implement_and_publish(
     finally:
         if outcome != "merged":
             run = ctx.store.get_run(n)
-            _preserve_failed_implementation(
+            _cleanup_after(n, ctx, outcome, "WIP preservation", lambda: _preserve_failed_implementation(
                 n, ctx, git, run.outcome or outcome, approval=attempt.approval, approved_ref=attempt.approved_ref,
                 title=attempt.issue.title, pushed_head=attempt.pushed_head, tracker_available=attempt.tracker_available,
                 push_branch=lambda: _push_branch(attempt),
-            )
+            ))
+
+
+def _cleanup_after(n: int, ctx: RunContext, outcome: str, what: str, step: Callable[[], None]) -> None:
+    """Run one cleanup step; once a person holds the issue, its failure is logged, not a new outcome."""
+    try:
+        step()
+    except Exception as exc:
+        if outcome != "held":
+            raise
+        from foragent.orch_events import append_event
+
+        detail = f"{what} failed after the hold: {' '.join(str(exc).split())[:300]}"
+        _append(ctx.store.log_path(n), detail)
+        append_event(ctx.store, ctx.now(), n, "cleanup-failed", detail)
 
 
 def review_only(
@@ -346,7 +359,7 @@ def review_only(
     finally:
         if started:
             try:
-                ctx.git.remove_worktree(worktree)
+                _cleanup_after(n, ctx, outcome, "Worktree removal", lambda: ctx.git.remove_worktree(worktree))
             finally:
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
@@ -392,8 +405,11 @@ def run_issue(n: int, ctx: RunContext) -> str:
             # Every command's timeout grows by time a talk paused the run (D55 addendum).
             with extend_deadline(partial(paused_seconds, n, ctx)):
                 outcome = _execute(n, ctx, worktree)
+        except ExecutorStopped as exc:
+            outcome = exc.outcome
+            raise
         finally:
-            ctx.git.remove_worktree(worktree)
+            _cleanup_after(n, ctx, outcome, "Worktree removal", lambda: ctx.git.remove_worktree(worktree))
     except ExecutorStopped as exc:
         outcome = exc.outcome
         detail = str(exc)

@@ -32,10 +32,12 @@ def _publish_locked(attempt: Implementation) -> str:
 def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     from foragent.run_checks import _verify_implementation
     from foragent.run_conflicts import _block_rebuild, _merge_moved_base, _resolve_conflicts
-    from foragent import runner
+    from foragent import harness_guard, runner
 
     # Only metadata is read live; instructions and checks always use the snapshot.
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
+    if attempt.review_hold and attempt.review_hold_reason == run_publish.Reason.TEST_HARNESS_CHANGED:
+        return harness_guard.publish_hold(attempt)  # the hold wins over every publication check
     worktree, log = attempt.worktree, attempt.log
     issue = ctx.tracker.get_issue(n)
     title = f"{issue.title} (#{n})"
@@ -106,12 +108,6 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
         return run_publish._hold_changed_head(n, ctx, link)
     if attempt.review_hold:
-        if attempt.review_hold_reason == run_publish.Reason.TEST_HARNESS_CHANGED:
-            # attempt.failure is the guard's list of harness paths.
-            run_publish.flag(ctx, n, attempt.review_hold_reason,
-                             run_publish.text("harness_changed_summary", ctx.config.language),
-                             f"{attempt.failure}\n\n{link}", needs_human=True)
-            return "held"
         summary = (
             "Reviewer repeated a disputed finding after implementer rebuttals"
             if attempt.review_hold_reason == run_publish.Reason.REVIEW_DISPUTE
