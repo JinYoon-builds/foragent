@@ -204,9 +204,11 @@ class RecordingTracker:
             return value
 
         def observe(*args, **kwargs):
+            # A read's facts are as of when it began, not when its answer arrived.
+            started = self._read_started()
             result = value(*args, **kwargs)
             if isinstance(result, Issue):
-                self._context.store.record_issue(result, self._context.config.lanes)
+                self._context.store.record_issue(result, self._context.config.lanes, observed_at=started)
             return result
 
         return observe
@@ -371,7 +373,7 @@ class RecordingTracker:
             closed = {row["number"] for row in store.local_issues() if row.get("state") == "closed"}
             for issue in issues:
                 if issue.state == "closed" and issue.number not in closed and not issue.is_pull_request:
-                    store.record_issue(issue, self._context.config.lanes)
+                    store.record_issue(issue, self._context.config.lanes, observed_at=observed_at)
         store.record_closed_issue_watermark(observed_at)
 
     def _issue_missing(self, number):
@@ -383,6 +385,11 @@ class RecordingTracker:
                 return True
             raise
         return False
+
+    def _read_started(self):
+        """When a read begins; record_issue uses the store clock when the context has none."""
+        now = getattr(self._context, "now", None)
+        return now() if callable(now) else None
 
     def _write(self, n, action, operation, **payload):
         store = self._context.store
@@ -441,22 +448,24 @@ class RecordingTracker:
         labels = list(labels)
         if not labels:
             return
+        started = self._read_started()
         result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), labels=labels)
         if queued:
             return
         if isinstance(result, Issue):
-            self._context.store.record_issue(result, self._context.config.lanes)
+            self._context.store.record_issue(result, self._context.config.lanes, observed_at=started)
         self._context.store.record_labels(n, labels, remove=False, lanes=self._context.config.lanes)
 
     def remove_labels(self, n, labels):
         labels = list(labels)
         for index, label in enumerate(labels):
+            started = self._read_started()
             result, queued = self._write(n, "remove_labels", lambda: self._tracker.remove_labels(n, [label]),
                                          labels=labels[index:])
             if queued:
                 break
             if isinstance(result, Issue):
-                self._context.store.record_issue(result, self._context.config.lanes)
+                self._context.store.record_issue(result, self._context.config.lanes, observed_at=started)
             self._context.store.record_labels(n, [label], remove=True, lanes=self._context.config.lanes)
 
     def list_comments(self, n):
@@ -474,9 +483,10 @@ class RecordingTracker:
 
     def create_issue(self, title, body, labels):
         labels = list(labels)
+        started = self._read_started()
         n = self._tracker.create_issue(title, body, labels)
         self._context.store.record_issue(Issue(n, title, body, frozenset(labels), "open"),
-                                         self._context.config.lanes)
+                                         self._context.config.lanes, observed_at=started)
         return n
 
     def update_issue(self, n, *, title, body):
