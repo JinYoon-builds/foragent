@@ -59,7 +59,8 @@ def test_skills_add_partial_pack_approval_registers_only_valid_skills_and_report
     code = cli_exit(main, ["skills", "catalog", "--json"])
     output = capsys.readouterr()
     assert code == 0, output.err or output.out
-    catalog = json.loads(output.out)
+    # #1028 (2026-10-31): the catalog may also list other libraries (vendored principles); check this pack's rows.
+    catalog = [skill for skill in json.loads(output.out) if skill["id"].startswith("skill-pack:")]
     assert len(catalog) == 2
     assert {skill["name"] for skill in catalog} == {"polish", "tone"}
     assert {skill["id"]: skill["role"] for skill in catalog} == roles
@@ -72,6 +73,10 @@ def test_skills_add_all_invalid_names_every_path_and_registers_nothing(git_histo
     git_history.update({path: INVALID_SKILL for path in invalid_paths})
     config = write_global_config({"skill_libraries": [], "language": "ko"})
     before = config.read_bytes()
+    # #1028 (2026-10-31): other libraries (vendored principles) may be listed; registering nothing
+    # means the catalog is unchanged by this add.
+    assert cli_exit(main, ["skills", "catalog", "--json"]) == 0
+    catalog_before = json.loads(capsys.readouterr().out)
     code = cli_exit(main, ["skills", "add", str(git_history.origin), "--approve"])
     output = capsys.readouterr()
     message = output.out + output.err
@@ -80,4 +85,4 @@ def test_skills_add_all_invalid_names_every_path_and_registers_nothing(git_histo
     for path in invalid_paths:
         assert path in message, f"all-invalid error omitted {path}: {message}"
     assert cli_exit(main, ["skills", "catalog", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == []
+    assert json.loads(capsys.readouterr().out) == catalog_before

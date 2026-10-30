@@ -251,9 +251,10 @@ class RecordingTracker:
         now), never after its reads, so the next periodic tick finds it due.
         A failed read leaves the last snapshot intact and records the failure,
         so local readers report stale data instead of an empty queue.
+        Returns whether the listing showed any change since the last one.
         """
         try:
-            self._refresh_issues(observed_at or self._context.now())
+            return self._refresh_issues(observed_at or self._context.now())
         except TrackerError as exc:
             self._context.store.record_issues_refresh_failure(" ".join(str(exc).split()), self._context.now())
             raise
@@ -327,6 +328,7 @@ class RecordingTracker:
         for number in dropped:
             reason = "remote change" if number in observed else "issue not found"
             self._outbox_dropped(number, reason)
+        return bool(changed or dropped or previous.keys() - observed)
 
     def _merged_prs(self, store, observed_at):
         """Every merged foragent PR, newest update first, as a full listing returns them.
@@ -805,10 +807,13 @@ class FakeTracker:
         ]
 
 
+_GH_TIMEOUT = 120  # Seconds for one gh subprocess outside a bounded tick step.
+
+
 def _run_gh(args: list[str], input: str | None = None) -> bytes:
     return subprocess.run(
         ["gh", *args], input=input.encode() if input is not None else None,
-        check=True, capture_output=True, timeout=120,
+        check=True, capture_output=True, timeout=gh.call_timeout(_GH_TIMEOUT),
     ).stdout
 
 
@@ -874,6 +879,10 @@ class GhTracker:
         self._seen_states: set[str] = set()
 
     def _call(self, args: list[str], input: str | None = None, *, binary: bool = False) -> str | bytes:
+        try:
+            gh.call_timeout(_GH_TIMEOUT)  # A bounded tick step that ran out starts no more gh.
+        except gh.DeadlineExhausted as exc:
+            raise TrackerError(f"deferred: {exc}") from exc
         gh.count_call()  # Every attempt counts, injected runners and retries included.
         try:
             output = self._run(args, input=input)
@@ -884,7 +893,7 @@ class GhTracker:
             raise TrackerError(
                 stderr or str(exc), stdout=stdout or "", returncode=exc.returncode,
             ) from exc
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, subprocess.TimeoutExpired, gh.DeadlineExhausted) as exc:
             raise TrackerError(str(exc)) from exc
 
     def authenticated_login(self, *, refresh: bool = False) -> str:

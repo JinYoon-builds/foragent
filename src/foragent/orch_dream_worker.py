@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from foragent.orch_dream import _runs_since, dream_config, last_dream_at, log_path, media_root, memory_path, record_done, worktree_path
 from foragent.orch_dream_publish import _dream_worktree, _publish  # noqa: F401
+from foragent import orch_rules
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -78,8 +79,12 @@ def publish_media(proposal: Path, target: Path, snapshot: str | None) -> str:
     return f"wrote {target}"
 
 
-def prompt(store: StateStore, config: Config, lane: str, bundle: dict[Path, str]) -> str:
-    """Every run of the lane since its last dream (all of them before the first) and the whole bundle."""
+def prompt(store: StateStore, config: Config, lane: str, bundle: dict[Path, str], root: Path | None = None) -> str:
+    """Every run of the lane since its last dream (all of them before the first) and the whole bundle.
+
+    The authority is the current rules read from root (the dream worktree):
+    docs/rules.md, else docs/decisions.md, quoted so the dream has their text.
+    """
     memory = memory_path(config, lane)
     media = media_root() / f"{lane}.md"
     since = last_dream_at(store, lane)
@@ -95,12 +100,14 @@ def prompt(store: StateStore, config: Config, lane: str, bundle: dict[Path, str]
     media_text = (f"The existing media bundle ({media_root()}/):\n"
                   + "\n".join(f"--- {path} ---\n{content}" for path, content in bundle.items())
                   if bundle else f"The media bundle ({media_root()}/) has no files yet.")
+    rules, content = orch_rules.current_rules(root)
+    rules_text = f"\n{orch_rules.quoted(rules, content)}\n" if content is not None else ""
     return f"""You are dreaming for the "{lane}" lane: tidy the lane's memory between work.
 Do not touch code. Do not edit, modify or change code or any file other than {memory} and the media proposal below.
 
 Memory file: {memory} (create it if it is missing).
-Decisions: docs/decisions.md is authoritative. Follow docs/decisions.md whenever a lesson disagrees with it.
-
+Rules: {rules} is authoritative. Follow {rules} whenever a lesson disagrees with it.
+{rules_text}
 The lane's runs {scope}:
 {history}
 
@@ -109,7 +116,7 @@ Steps:
 2. Add new lessons the runs teach (project-specific patterns, pitfalls, commands) to {memory}.
 3. Remove stale or outdated lessons that the code or the runs no longer support.
 4. Deduplicate: merge duplicate or overlapping lessons into one line.
-5. Resolve contradictions between lessons. Where a lesson conflicts with docs/decisions.md, prefer docs/decisions.md.
+5. Resolve contradictions between lessons. Where a lesson conflicts with {rules}, prefer {rules}.
 6. Promote lessons that recur across projects to the cross-project media bundle {media}.
    Judge "repeated across projects" from the existing media bundle below plus this lane's memory; do not read other repositories.
    Write the complete proposed text of {media} to .foragent/media-{lane}.md in this worktree; the gate copies it there.
@@ -172,7 +179,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
         target = media_root() / f"{lane}.md"
         bundle = _media_bundle()
         covered_until = ctx.now()  # Runs finishing from here on belong to the next dream.
-        text = prompt(store, config, lane, bundle)
+        text = prompt(store, config, lane, bundle, worktree)
         offset = log.stat().st_size if log.exists() else 0
         size = offset
 

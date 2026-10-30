@@ -300,8 +300,12 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
-                                     "references"} if kind == "issues"
-                    else {"checklist", "acceptance_files", "files", "exclusive", "references"}, label)
+                                     "references", "statements"} if kind == "issues"
+                    else {"checklist", "acceptance_files", "files", "exclusive", "references", "statements"}, label)
+            if "statements" in item:
+                _strings(item["statements"], f"{label}.statements", nonempty=True)
+                if any("\n" in line or "\r" in line for line in item["statements"]):
+                    raise PlanError(f"{label}.statements items must each be a single line")
             _text(item["goal"], f"{label}.goal")
             _text(item["out_of_scope"], f"{label}.out_of_scope")
             _strings(item["done_when"], f"{label}.done_when", nonempty=True)
@@ -349,10 +353,15 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
     for kind in ("issues", "edits"):
         for item in plan.get(kind, []):
             for name in acceptance_paths(item["done_when"], config.acceptance_dir):
-                if name not in files and not repo_path(root, name).is_file():
+                if name in files:
+                    continue
+                if not repo_path(root, name).is_file():
+                    # A statement issue's tests are written in preparation; publication refuses
+                    # it until they are reviewed, so a draft may name tests not written yet.
+                    if "statements" in item:
+                        continue
                     raise PlanError(f"Done when references missing acceptance file: {name}")
-                if name not in files:
-                    files[name] = repo_path(root, name).read_text(encoding="utf-8")
+                files[name] = repo_path(root, name).read_text(encoding="utf-8")
     for name, content in references.items():
         if name in files and files[name] != content:
             raise PlanError(f"conflicting file contents: {name}")
@@ -387,6 +396,11 @@ def _plan_marker(identity: str, mapping: dict[str, int], acceptance: dict[str, d
 
 def _child_marker(identity: str, key: str) -> str:
     return f"<!-- foragent:plan-child id={identity} key={key} -->"
+
+
+def _published_body(plan: dict, item: dict, repo: str, config: Config) -> str:
+    """The issue body publish writes for a plan child or edit, before any plan-child marker."""
+    return issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
 
 
 @dataclass
@@ -483,6 +497,10 @@ def _order_owner(tracker: Tracker, config: Config, parent, children: list) -> st
 _MARKER_PREFIX = "<!-- foragent:"
 # A retired issue keeps its text for the record, but no Foragent marker matches it.
 _RETIRED_PREFIX = "<!-- foragent-refused:"
+# Written once, in the creation request of every parent and child published under the
+# owner-label contract. It names no owner (the by: label alone does); it only lets a
+# retry tell an unconfirmed creation from legacy work, which never carries it.
+OWNED_MARKER = "<!-- foragent:owner-label -->"
 
 
 def _labelled(issue) -> bool:
@@ -490,19 +508,35 @@ def _labelled(issue) -> bool:
 
 
 def _retire(tracker: Tracker, config: Config, issue, label: str) -> None:
-    """Best effort: retire an unconfirmed issue's markers and close it.
+    """Close an unconfirmed issue and retire its markers, each step on its own.
 
-    Discovery already ignores unconfirmed issues, so a failure here only leaves
-    an inert issue that the next publication retires again.
+    Closing comes first: a closed issue is never work. Retiring the markers is
+    attempted even when closing fails, and the other way round. Whatever still fails
+    is harmless: discovery never reuses an unconfirmed issue (``_unconfirmed``), and
+    the next publication of the order retires it again.
     """
-    try:
-        if _MARKER_PREFIX in issue.body:
+    if issue.state == "open":
+        try:
+            tracker.close_issue(issue.number, text("identity_closed_unlabelled", config.language, label=label))
+        except Exception:
+            log.warning("could not close unconfirmed issue #%s", issue.number, exc_info=True)
+    if _MARKER_PREFIX in issue.body:
+        try:
             tracker.update_issue(issue.number, title=issue.title,
                                  body=issue.body.replace(_MARKER_PREFIX, _RETIRED_PREFIX))
-        if issue.state == "open":
-            tracker.close_issue(issue.number, text("identity_closed_unlabelled", config.language, label=label))
-    except Exception:
-        log.warning("could not retire unconfirmed issue #%s", issue.number, exc_info=True)
+        except Exception:
+            log.warning("could not retire the markers of unconfirmed issue #%s", issue.number, exc_info=True)
+
+
+def _unconfirmed(issue, mapped: set[int]) -> bool:
+    """Created under the owner-label contract, yet unlabelled and not part of its order.
+
+    Only bodies written by this publisher carry ``OWNED_MARKER``; legacy issues
+    (published before owner labels) never do, so they keep being reused and
+    belong to ``legacy_owner``. A labelled issue, or one already in its parent's
+    map, is a confirmed member of the order.
+    """
+    return OWNED_MARKER in issue.body and not _labelled(issue) and issue.number not in mapped
 
 
 def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str]) -> int:
@@ -510,9 +544,8 @@ def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body
 
     GitHub silently drops labels a creator may not apply, so the label is read back.
     An unconfirmed issue (label missing or unreadable) is retired and publication
-    stops. Even when retiring fails, discovery never reuses it: an unlabelled parent
-    with an empty map, or an unlabelled child missing from its parent's map, is an
-    unconfirmed creation (see ``_unconfirmed``), and a retry retires it again.
+    stops. Even when retiring fails, discovery never reuses it: its body carries
+    ``OWNED_MARKER`` without the label (see ``_unconfirmed``), and a retry retires it again.
     The issue is created in one request so its body has no edit that would
     postdate an approval added in the same publication.
     """
@@ -545,8 +578,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
     parents = [(issue, pattern.search(issue.body)) for issue in all_issues if pattern.search(issue.body)]
-    # A parent refused at creation stops publication before any child exists.
-    unconfirmed = [issue for issue, marker in parents if not _labelled(issue) and marker[1] == "{}"]
+    # A parent is part of its order once it records a child; until then, like a child
+    # missing from the map, an unlabelled owner-contract parent is an unconfirmed creation.
+    unconfirmed = [issue for issue, marker in parents if marker[1] == "{}" and _unconfirmed(issue, set())]
     parents = [(issue, marker) for issue, marker in parents if issue not in unconfirmed]
     if len(parents) > 1:
         raise PlanError(f"multiple parents for plan {plan['id']}")
@@ -572,14 +606,18 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     mapped = set(mapping.values())
     for item in plan["issues"]:
         found = [issue for issue in all_issues if _child_marker(plan["id"], item["key"]) in issue.body]
-        # A child refused at creation never reached its parent's map; only a confirmed
-        # (labelled) child is recovered from its marker after a partial publication.
-        unconfirmed += [issue for issue in found if not _labelled(issue) and issue.number not in mapped]
-        matches = [issue.number for issue in found if _labelled(issue) or issue.number in mapped]
+        unconfirmed += [issue for issue in found if _unconfirmed(issue, mapped)]
+        matches = [issue.number for issue in found if not _unconfirmed(issue, mapped)]
         if len(matches) > 1:
             raise PlanError(f"duplicate children for key {item['key']}")
         if item["key"] not in mapping and matches:
             mapping[item["key"]] = matches[0]
+    # An earlier refusal may have retired an issue's markers but failed to close it.
+    retired = (f"{_RETIRED_PREFIX}plan id={plan['id']} map=",
+               *(_child_marker(plan["id"], item["key"]).replace(_MARKER_PREFIX, _RETIRED_PREFIX)
+                 for item in plan["issues"]))
+    unconfirmed += [issue for issue in all_issues
+                    if issue.state == "open" and any(marker in issue.body for marker in retired)]
     by_number = {issue.number: issue for issue in all_issues}
     edit_numbers = {item["number"] for item in plan.get("edits", [])}
     if edit_numbers & set(mapping.values()):
@@ -613,15 +651,18 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
         return PublishReport(plan["title"], parent, rows, sorted(files), True)
+    require_reviewed_tests(plan)
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
+    # Statement issues take the reviewed-tests route instead of preread.
     new_numbers = bool(selected_numbers - edit_numbers - set(mapping.values()))
     require_clean_preread(plan, root, config, [
         *(item for item in plan["issues"]
-          if approve or item["key"] in selected_keys or mapping.get(item["key"]) in selected_numbers
-          or (new_numbers and item["key"] not in mapping)),
+          if "statements" not in item
+          and (approve or item["key"] in selected_keys or mapping.get(item["key"]) in selected_numbers
+               or (new_numbers and item["key"] not in mapping))),
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
-          if approve or item["number"] in selected_numbers),
+          if "statements" not in item and (approve or item["number"] in selected_numbers)),
     ])
     owner = _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
                          [by_number[n] for n in mapping.values()])
@@ -651,11 +692,13 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     def parent_body() -> str:
         children = [tracker.get_issue(n) for n in mapping.values()]
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
-        return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n"
+        owned = f"{OWNED_MARKER}\n" if parent_owned else ""
+        return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
 
     # An order with no sub-issues (edits or approvals only) is finished once it
     # applies: publish closes its record below, so it never gets a Backlog card.
     childless = not plan["issues"] and not mapping
+    parent_owned = parent is None or OWNED_MARKER in by_number[parent].body
     if parent is None:
         parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
         linked: set[int] = set()
@@ -666,12 +709,14 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     if not childless:
         board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
     for item in plan["issues"]:
-        body = (issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
-                + "\n" + _child_marker(plan["id"], item["key"]) + "\n")
+        number = mapping.get(item["key"])
+        existing = tracker.get_issue(number) if number is not None else None
+        owned = existing is None or OWNED_MARKER in existing.body
+        body = (_published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
+                + (f"{OWNED_MARKER}\n" if owned else ""))
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
         if item.get("interactive", False):
             labels.append("interactive")
-        number = mapping.get(item["key"])
         blobs = acceptance_blobs(item)
         if number is None:
             number = _create_owned(tracker, config, owner, item["title"], body, labels)
@@ -680,7 +725,6 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             # Persist progress before native edge calls so retries reuse the child.
             tracker.update_issue(parent, title=plan["title"], body=parent_body())
         else:
-            existing = tracker.get_issue(number)
             if (existing.body != body or saved_blobs.get(str(number), {}) != blobs
                     or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
@@ -705,7 +749,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
-        body = issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+        body = _published_body(plan, item, repo, config)
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
             name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
@@ -835,19 +879,110 @@ def _unknowns(message: str) -> list[str]:
     return unknowns
 
 
+def _tagged(message: str, tag: str) -> list[str]:
+    return [re.sub(rf"(?i)^{tag}:\s*", "", line) for line in _preread_lines(message)
+            if re.match(rf"(?i)^{tag}:", line)]
+
+
 def _decisions(message: str) -> list[str]:
-    return [re.sub(r"(?i)^DECIDE:\s*", "", line) for line in _preread_lines(message)
-            if re.match(r"(?i)^DECIDE:", line)]
+    return _tagged(message, "DECIDE")
+
+
+def _approach(message: str) -> list[str]:
+    return _tagged(message, "APPROACH")
+
+
+_CHILD_LINE = re.compile(r"<!-- foragent:plan-child id=(\S+) key=(\S+) -->")
+
+
+def _body_digest(body: str) -> str:
+    """Every authored byte of an issue body counts; only line endings and outer blank space do not."""
+    return hashlib.sha256(body.replace("\r\n", "\n").strip().encode("utf-8")).hexdigest()
+
+
+def _without_child_marker(body: str) -> tuple[str, re.Match | None]:
+    """Split off the plan-child marker publish appends as the body's last line, nothing else."""
+    text = body.replace("\r\n", "\n").rstrip()
+    head, _, last = text.rpartition("\n")
+    marker = _CHILD_LINE.fullmatch(last)
+    return (head if marker else text), marker
+
+
+def _blob(data: bytes) -> str:
+    """Git's blob hash of a file's content, as stored in approval snapshots."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _binding(plan: dict, item: dict, config: Config, repo: str | None,
+             published: dict[str, str | bytes]) -> dict:
+    """What the implementer of this item will receive: the exact body and the files it names.
+
+    The files are this issue's acceptance tests and selected references with the contents
+    publication writes (``published`` from validate_plan: plan contents from any issue, else
+    the repository's). The body names the repository in links publish generates; without the
+    repository the body cannot be reproduced, so the record is not bound and never handed over.
+    """
+    content = None if repo is None else _body_digest(_published_body(plan, item, repo, config))
+    names = (set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))
+             | set(order_references.selected(plan, item)))
+    files = {}
+    for name in sorted(names):
+        data = published.get(name)
+        files[name] = "missing" if data is None else _blob(data.encode("utf-8") if isinstance(data, str) else data)
+    return {"content": content, "files": files}
+
+
+def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str],
+                  worktree: Path) -> dict | None:
+    """The latest preread proposal recorded for what this run's implementer receives, if any.
+
+    A record counts only when its key names this issue (plan child key in the same order,
+    or an edit of #n), the body publish rendered for it equals the approved body byte for byte
+    (apart from the trailing plan-child marker publish appends), and every file it bound
+    (acceptance tests and references) has the same content in the run's worktree and, where
+    the approval snapshot names the file, in that snapshot. The preread writer keeps
+    records in write order, so the last match is the latest answer; when that answer
+    proposed nothing (NONE or questions only), there is no proposal to hand over.
+    """
+    try:
+        records = _preread_records(root)
+    except PlanError:
+        return None
+    text, child = _without_child_marker(body)
+    content = _body_digest(text)
+    actual: dict[str, str] = {}
+
+    def current(name: str) -> str:
+        if name not in actual:
+            path = worktree / name
+            actual[name] = _blob(path.read_bytes()) if path.is_file() else "missing"
+        return actual[name]
+
+    latest = None
+    for record in records.values():
+        if not isinstance(record, dict) or record.get("content") != content:
+            continue
+        seen = record.get("files")
+        if not isinstance(seen, dict) or any(
+                not isinstance(sha, str) or current(name) != sha
+                or acceptance_blobs.get(name, sha) != sha for name, sha in seen.items()):
+            continue
+        if record.get("key") == f"#{n}" or (
+                child is not None and record.get("plan") == child[1] and record.get("key") == child[2]):
+            latest = record
+    if latest is None or not (latest.get("approach") or latest.get("decisions")):
+        return None
+    return latest
 
 
 def preread(plan: dict, root: Path, config: Config,
-            tracker: Callable[[], Tracker] | None = None) -> list[dict]:
+            tracker: Callable[[], Tracker] | None = None, repo: str | None = None) -> list[dict]:
     """Ask each issue's implementer, read-only, for its unknowns and record them by content.
 
     Edits need the tracker for each existing issue's title and lane; it is opened only then.
     """
     try:
-        validate_plan(plan, root, config)
+        published = validate_plan(plan, root, config)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
     items = list(plan["issues"])
@@ -888,13 +1023,19 @@ def preread(plan: dict, root: Path, config: Config,
         unknowns = _unknowns(result.last_message)
         records = _preread_records(root)
         decisions = _decisions(result.last_message)
-        records[digest] = {"key": item["key"], "unknowns": unknowns, "decisions": decisions,
+        approach = _approach(result.last_message)
+        # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
+        records.pop(digest, None)
+        records[digest] = {"key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
+                           "unknowns": unknowns, "decisions": decisions, "approach": approach,
                            "at": datetime.now(UTC).isoformat(timespec="seconds")}
         temporary = root / (PREREAD_FILE + ".tmp")
         temporary.unlink(missing_ok=True)  # never write through a leftover link
         temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, root / PREREAD_FILE)
-        results.append({"key": item["key"], "unknowns": unknowns} | ({"decisions": decisions} if decisions else {}))
+        results.append({"key": item["key"], "unknowns": unknowns}
+                       | ({"decisions": decisions} if decisions else {})
+                       | ({"approach": approach} if approach else {}))
     return results
 
 
@@ -907,6 +1048,22 @@ def _uncreated_lanes(plan: dict, config: Config, items: list[dict]) -> tuple[lis
 
 NEW_LANE_STEPS = ("publish the order without --approve first so the lane's agent and skills exist, "
                   "then run fa order preread PLAN.json and publish again with --approve")
+
+
+def require_reviewed_tests(plan: dict) -> None:
+    """A statement issue is published only with tests its lane wrote and an independent reviewer passed.
+
+    The ``statements`` field selects this route for good, even once acceptance_files exist.
+    No reviewed-tests record is read or written here yet, so every statement issue is refused.
+    """
+    keys = [item["key"] for item in plan["issues"] if "statements" in item]
+    keys += [f"#{item['number']}" for item in plan.get("edits", []) if "statements" in item]
+    if keys:
+        raise PlanError(
+            f"cannot publish: statement issue(s) {', '.join(keys)} have no reviewed tests; "
+            "prepare them with fa order prepare PLAN.json so the lane writes the tests and the "
+            "configured reviewer reviews them, then publish again (fa order publish PLAN.json "
+            "--dry-run still previews the plan)")
 
 
 def require_clean_preread(plan: dict, root: Path, config: Config, items: list[dict]) -> None:

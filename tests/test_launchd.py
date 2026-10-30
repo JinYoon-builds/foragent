@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 from hashlib import sha1
 import plistlib
@@ -54,7 +55,8 @@ def test_plist_round_trip_has_exact_job_and_environment(job):
     job, calls = job
     assert plistlib.loads(job.plist()) == {
         "Label": launchd.label_for("Some_Owner/Repo"),
-        "ProgramArguments": [str(job.repo_root / ".venv/bin/fa"), "gate", "tick", "--repo-root", str(job.repo_root)],
+        "ProgramArguments": launchd.wrap_arguments(
+            [str(job.repo_root / ".venv/bin/fa"), "gate", "tick", "--repo-root", str(job.repo_root)]),
         "StartInterval": 300,
         "RunAtLoad": True,
         "ProcessType": "Standard",
@@ -73,9 +75,11 @@ def test_install_creates_directories_and_uses_exact_argv(job):
     assert job.install() == job.label
     assert job.plist_path.read_bytes() == job.plist()
     assert job.state_root.is_dir()
+    # launchd confirms the job is loaded before install reports success.
     assert calls == [
         ["bootout", job.target],
         ["bootstrap", "gui/501", str(job.plist_path)],
+        ["print", job.target],
     ]
 
 
@@ -89,7 +93,7 @@ def test_install_preserves_identical_plist_and_replaces_changed_content(job):
     job.plist_path.write_bytes(plistlib.dumps({"Label": "old"}))
     job.install()
     assert plistlib.loads(job.plist_path.read_bytes())["Label"] == job.label
-    assert len(calls) == 6
+    assert len(calls) == 9
 
 
 @pytest.mark.parametrize("message", [
@@ -131,7 +135,8 @@ def test_install_and_uninstall_remove_legacy_job_and_plist(job, operation):
     assert calls == [
         ["bootout", f"{job.domain}/{job.legacy_label}"],
         ["bootout", job.target],
-        *([["bootstrap", job.domain, str(job.plist_path)]] if operation == "install" else []),
+        *([["bootstrap", job.domain, str(job.plist_path)], ["print", job.target]]
+          if operation == "install" else []),
     ]
 
 
@@ -349,10 +354,11 @@ def test_restart_adds_gate_environment_while_the_job_is_out(tmp_path, monkeypatc
 
     monkeypatch.setattr(launchd, "_run_launchctl", run)
     launchd.InstalledJob(path, "dev.foragent.old", tmp_path, "gui/501").restart()
-    assert calls == [("bootout", None), ("bootstrap", "1")]
+    # One bootout, one bootstrap, then launchd confirms the job is loaded.
+    assert calls == [("bootout", None), ("bootstrap", "1"), ("print", "1")]
     data = plistlib.loads(path.read_bytes())
     assert data["EnvironmentVariables"] == {**old["EnvironmentVariables"], "PYTHONDONTWRITEBYTECODE": "1"}
-    assert data["ProgramArguments"] == [str(fake_fa_shim), *old["ProgramArguments"][1:]]
+    assert data["ProgramArguments"] == launchd.wrap_arguments([str(fake_fa_shim), *old["ProgramArguments"][1:]])
     assert {k: v for k, v in data.items() if k not in {"EnvironmentVariables", "ProgramArguments"}} == {
         k: v for k, v in old.items() if k not in {"EnvironmentVariables", "ProgramArguments"}}
     current = path.read_bytes()
@@ -366,7 +372,7 @@ def test_install_writes_the_plist_only_after_bootout(job):
     job._run = lambda args: seen.append((args[0], job.plist_path.exists())) or subprocess.CompletedProcess(
         args, 0, stdout="", stderr="")
     job.install()
-    assert seen[0] == ("bootout", False) and seen[-1] == ("bootstrap", True)
+    assert seen[0] == ("bootout", False) and seen[-2:] == [("bootstrap", True), ("print", True)]
 
 
 def _jobs_for_one_gate(home, root):
@@ -448,7 +454,8 @@ def test_pinned_uv_path_is_rewritten_and_reloaded_only_between_ticks(tmp_path, m
         assert [command for command, _ in calls] == ["print"]
     calls.clear()
     assert launchd.refresh_jobs(root) == "restarted"
-    updated = {**old, "ProgramArguments": [str(fake_fa_shim), *old["ProgramArguments"][1:]]}
+    updated = {**old, "ProgramArguments": launchd.wrap_arguments(
+        [str(fake_fa_shim), *launchd.gate_command(old["ProgramArguments"])[1:]])}
     assert calls == [("print", old), ("bootout", old), ("bootstrap", updated)]
     assert plistlib.loads(job.plist_path.read_bytes()) == updated
     assert launchd.refresh_jobs(root) == "current"
@@ -596,3 +603,112 @@ def test_failed_print_during_restart_leaves_the_plist_stale_for_the_next_tick(tm
     before = hashed.read_bytes()
     assert launchd.refresh_jobs(root) == "skipped"
     assert hashed.read_bytes() == before and launchd.needs_environment_refresh(hashed)
+
+
+def _reload_gate(tmp_path, monkeypatch, launchctl):
+    """A legacy plist for one gate; its reload fact is written to the returned store."""
+    from foragent import update_check
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    path = tmp_path / "agents/dev.foragent.o.r.plist"
+    _old_plist(path, root, label="dev.foragent.o.r")
+    store = StateStore(tmp_path / "state")
+    monkeypatch.setattr(update_check, "gate_store", lambda _: ("o/r", store))
+    monkeypatch.setattr(launchd, "_run_launchctl", launchctl)
+    monkeypatch.setattr(launchd.time, "sleep", lambda _: None)
+    return launchd.InstalledJob(path, "dev.foragent.o.r", root, "gui/501"), store
+
+
+def _launchctl(loaded, print_code=None):
+    def run(args):
+        if args[0] == "bootout":
+            loaded[0] = False
+        elif args[0] == "bootstrap":
+            loaded[0] = True
+        elif args[0] == "print":
+            code = print_code if print_code is not None else (0 if loaded[0] else 113)
+            return subprocess.CompletedProcess(args, code, "", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+    return run
+
+
+def test_restart_write_failure_after_bootout_still_rolls_back_and_records(tmp_path, monkeypatch, fake_fa_shim):
+    loaded = [True]
+    job, store = _reload_gate(tmp_path, monkeypatch, _launchctl(loaded))
+    writes = []
+    real = launchd._write_plist
+
+    def write(path, content):
+        writes.append(content)
+        if len(writes) < 3:
+            raise OSError("disk full")
+        real(path, content)
+
+    monkeypatch.setattr(launchd, "_write_plist", write)
+    with pytest.raises(launchd.LaunchdError, match="new definition was not loaded"):
+        job.restart()
+    fact = launchd.reload_fact(store.root)
+    assert loaded[0] and fact["loaded"] and fact["recovered"] and not fact["pending"]
+    assert "disk full" in fact["error"] and fact["attempts"] == 1 and fact["rolled_back"]
+    assert plistlib.loads(job.plist_path.read_bytes())["ProgramArguments"][0] == launchd.OSASCRIPT
+
+
+def test_restart_that_cannot_write_any_definition_is_pending_not_raised_raw(tmp_path, monkeypatch, fake_fa_shim):
+    loaded = [True]
+    job, store = _reload_gate(tmp_path, monkeypatch, _launchctl(loaded))
+    before = job.plist_path.read_bytes()
+
+    def write(path, content):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(launchd, "_write_plist", write)
+    with pytest.raises(launchd.LaunchdError, match="job not loaded"):
+        job.restart()
+    fact = launchd.reload_fact(store.root)
+    assert fact["pending"] and not fact["loaded"] and fact["attempts"] == 0
+    assert "read-only file system" in fact["error"]
+    assert job.plist_path.read_bytes() == before
+    assert launchd.reload_pending(job), "The detached refresher can retry it"
+
+
+@pytest.mark.parametrize("print_code, state", [(113, "absent"), (5, "unknown")])
+def test_bootstrap_success_without_a_loaded_job_records_the_confirmation_error(
+        tmp_path, monkeypatch, fake_fa_shim, print_code, state):
+    from foragent import gates
+
+    job, store = _reload_gate(tmp_path, monkeypatch, _launchctl([True], print_code))
+    with pytest.raises(launchd.LaunchdError, match="job not loaded"):
+        job.restart()
+    fact = launchd.reload_fact(store.root)
+    assert fact["pending"] and fact["attempts"] == 1
+    assert fact["error"] == f"launchctl print: job {state} after bootstrap"
+    row = {"repo": "o/r", "repo_root": str(job.repo_root), "last_tick": None, "running_runs": 0,
+           "scheduler": "not loaded", "stale": False, "reload": fact}
+    human = "\n".join(gates.human_lines([row], datetime.now(UTC), "en"))
+    assert fact["error"] in human and f"fa gate install --repo-root {job.repo_root}" in human
+
+
+@pytest.mark.parametrize("failure", ["write", "bootstrap", "confirm"])
+def test_install_failure_after_bootout_records_a_pending_fact(job, monkeypatch, failure):
+    job, calls = job
+
+    def run(args):
+        calls.append(args)
+        code = {"bootstrap": 5 if failure == "bootstrap" else 0,
+                "print": 113}.get(args[0], 0)  # The bootout left nothing loaded.
+        return subprocess.CompletedProcess(args, code, stdout="", stderr="injected")
+
+    job._run = run
+    if failure == "write":
+        monkeypatch.setattr(launchd, "_write_plist", lambda path, content: (_ for _ in ()).throw(OSError("full")))
+    with pytest.raises(launchd.LaunchdError):
+        job.install()
+    fact = launchd.reload_fact(job.state_root)
+    assert fact["pending"] and fact["error"] and fact["plist"] == str(job.plist_path)
+    calls.clear()
+    job._run = lambda args: calls.append(args) or subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(launchd, "_write_plist", lambda path, content: path.write_bytes(content))
+    job.install()
+    fact = launchd.reload_fact(job.state_root)
+    assert fact["error"] is None and fact["loaded"] and not fact["pending"]

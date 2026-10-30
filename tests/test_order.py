@@ -195,6 +195,7 @@ def test_publish_order_contract_labels_native_links_and_summary(publishing, plan
         f"```sh\nuv run pytest -q {FILE}\n```\n```sh\ntrue\n```\n- [ ] Looks right\n"
         f"[{FILE}](https://github.com/owner/repo/blob/main/{FILE})\n\n"
         "<!-- foragent:plan-child id=2026-10-20-login key=api -->\n"
+        "<!-- foragent:owner-label -->\n"
     )
     assert tracker.get_issue(2).body == expected
     assert parse_body(expected).done_when_commands == plan["issues"][0]["done_when"]
@@ -1044,6 +1045,186 @@ def test_preread_reads_and_gates_approved_edits(publishing, plan, monkeypatch):
     assert "approved" in tracker.get_issue(3).labels
 
 
+class _Proposing(_NoUnknowns):
+    reply = "APPROACH: Reuse the writer.\nDECIDE: Name the helper while implementing."
+
+    def run(self, **kwargs):
+        from foragent.executors import ExecResult
+
+        self.calls.append(kwargs)
+        return ExecResult(0, False, self.reply, kwargs["log_path"])
+
+
+REPO = "owner/repo"
+
+
+def _child_body(plan, item, config):
+    """The body publish writes for a plan child, marker included."""
+    return order._published_body(plan, item, REPO, config) + "\n" + order._child_marker(plan["id"], item["key"]) + "\n"
+
+
+API_FILES = {FILE: "assert True\n"}
+
+
+def _handover(root, n, body, files, approved=None):
+    """The proposal a run gets when its worktree holds ``files`` and approval recorded ``approved``."""
+    worktree = root.parent / f"run-{hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:12]}"
+    for name, content in files.items():
+        (worktree / name).parent.mkdir(parents=True, exist_ok=True)
+        (worktree / name).write_text(content)
+    if approved is None:
+        approved = {name: order._blob(content.encode()) for name, content in files.items()}
+    return order.lane_proposal(root, n, body, approved, worktree)
+
+
+def test_preread_proposal_is_recorded_and_bound_to_the_published_issue(publishing, plan, monkeypatch):
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    rows = order.preread(plan, root, config, repo=REPO)
+    assert rows[0] == {"key": "api", "unknowns": [], "decisions": ["Name the helper while implementing."],
+                       "approach": ["Reuse the writer."]}
+    item = plan["issues"][0]
+    body = _child_body(plan, item, config)
+    proposal = _handover(root, 7, body, API_FILES)
+    assert proposal["approach"] == ["Reuse the writer."]
+    assert proposal["decisions"] == ["Name the helper while implementing."]
+    assert _handover(root, 7, body.replace("\n", "\r\n"), API_FILES) is not None
+    other = order._published_body(plan, plan["issues"][1], REPO, config) + order._child_marker(plan["id"], "api")
+    assert _handover(root, 7, other, API_FILES) is None, "another issue's content is not this proposal"
+    assert _handover(root, 7, body.replace(f"id={plan['id']}", "id=another-order"), API_FILES) is None
+    for change in ({"goal": item["goal"] + " Also more."}, {"exclusive": ["api/**"]},
+                   {"checklist": ["Looks right", "And more"]}, {"files": ["api/login.py"]}):
+        assert _handover(root, 7, _child_body(plan, {**item, **change}, config), API_FILES) is None, change
+    other_repo = order._published_body(plan, item, "someone/else", config) + order._child_marker(plan["id"], "api")
+    assert _handover(root, 7, other_repo, API_FILES) is None
+    assert _handover(root, 7, body, {}) is None, "a run without the acceptance file did not get what preread read"
+
+
+@pytest.mark.parametrize("section", ["goal", "out_of_scope"])
+def test_preread_proposal_binds_authored_github_links_byte_for_byte(publishing, plan, monkeypatch, section):
+    """An authored link is part of the WHAT: approving a changed link must not hand over the old proposal."""
+    root, config = publishing[0], publishing[1]
+    item = plan["issues"][0]
+    link = "[API contract](https://github.com/org/contracts/blob/main/{}.md)"
+    original = item[section]
+    item[section] = original + "\n" + link.format("v1")
+    _proposals(root, config, plan, [("s", "APPROACH: Follow v1.")])
+    assert _handover(root, 7, _child_body(plan, item, config), API_FILES)["approach"] == ["Follow v1."]
+    changed = {**item, section: original + "\n" + link.format("v2")}
+    assert _handover(root, 7, _child_body(plan, changed, config), API_FILES) is None
+    # A link into this repository's own base branch is authored text too, not a generated line.
+    own = {**item, section: original + f"\n[Spec](https://github.com/{REPO}/blob/main/docs/spec.md)"}
+    assert _handover(root, 7, _child_body(plan, own, config), API_FILES) is None
+
+
+def test_preread_without_a_repository_records_but_never_hands_over(publishing, plan, monkeypatch):
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    assert order.preread(plan, root, config)[0]["approach"] == ["Reuse the writer."]
+    assert _handover(root, 7, _child_body(plan, plan["issues"][0], config), API_FILES) is None
+
+
+def test_preread_of_changed_acceptance_tests_never_replaces_the_approved_handoff(publishing, plan, monkeypatch):
+    """Approval binds the acceptance files; a preread of other test contents is not the approved proposal."""
+    root, config, item = publishing[0], publishing[1], plan["issues"][0]
+    body = _child_body(plan, item, config)
+    _proposals(root, config, plan, [("s", "APPROACH: Approved plan.")])
+    changed = deepcopy(plan)
+    changed["issues"][0]["acceptance_files"][FILE] = "assert 1 == 1\n"
+    _proposals(root, config, changed, [("s", "APPROACH: Plan for other tests.")])
+    assert _handover(root, 7, body, API_FILES)["approach"] == ["Approved plan."]
+    assert _handover(root, 7, body, {FILE: "assert 1 == 1\n"})["approach"] == ["Plan for other tests."]
+    # The approval snapshot and the run's files must both match what preread read.
+    assert _handover(root, 7, body, API_FILES, approved={FILE: order._blob(b"assert 1 == 1\n")}) is None
+
+
+def test_preread_binds_an_acceptance_file_another_issue_supplies(publishing, plan, monkeypatch):
+    """client runs the api issue's new acceptance file: bind the content publication writes, not the disk."""
+    root, config = publishing[0], publishing[1]
+    client = plan["issues"][1]
+    client["done_when"] = [f"uv run pytest -q {FILE}"]
+    assert not (root / FILE).exists()
+    _proposals(root, config, plan, [("s", "APPROACH: Client plan.")])
+    body = _child_body(plan, client, config)
+    assert _handover(root, 8, body, API_FILES)["approach"] == ["Client plan."]
+    assert _handover(root, 8, body, {FILE: "assert 1 == 1\n"}) is None
+
+
+def test_preread_proposal_of_an_edit_is_bound_to_its_number(publishing, plan, monkeypatch):
+    root, config, tracker = publishing[0], publishing[1], publishing[2]
+    tracker.add_issue(3, "Keep this title", "old", ["size:l", "lane:api"])
+    edit = {"number": 3, "goal": "New goal", "out_of_scope": "Payments.", "done_when": [f"uv run pytest -q {FILE}"],
+            "checklist": [], "acceptance_files": {}}
+    plan["edits"] = [edit]
+    worker = _Proposing()
+    monkeypatch.setattr(order, "executor_for", lambda name: worker)
+    order.preread(plan, root, config, lambda: tracker, repo=REPO)
+    body = order._published_body(plan, edit, REPO, config)
+    assert _handover(root, 3, body, API_FILES)["approach"] == ["Reuse the writer."], "the api issue supplies FILE"
+    assert _handover(root, 4, body, API_FILES) is None
+    assert _handover(root, 3, body, {FILE: "assert 1 == 1\n"}) is None
+
+
+def test_preread_binds_selected_reference_contents(publishing, plan, monkeypatch):
+    """References are what the implementer reads; a newer preread of changed references is not the approved one."""
+    root, config, item = publishing[0], publishing[1], plan["issues"][0]
+    name = "docs/design/a/HANDOFF.md"
+    plan["reference_files"] = {name: "approved handoff\n"}
+    item["references"] = [name]
+    _proposals(root, config, plan, [("s", "APPROACH: Approved references.")])
+    changed = deepcopy(plan)
+    changed["reference_files"][name] = "changed handoff\n"
+    _proposals(root, config, changed, [("s", "APPROACH: Changed references.")])
+    body = _child_body(plan, item, config)
+    assert body == _child_body(changed, changed["issues"][0], config), "the body alone cannot tell them apart"
+    approved = {**API_FILES, name: "approved handoff\n"}
+    assert _handover(root, 7, body, approved)["approach"] == ["Approved references."]
+    assert _handover(root, 7, body, {**API_FILES, name: "changed handoff\n"})["approach"] == ["Changed references."]
+    assert _handover(root, 7, body, API_FILES) is None, "a run without the reference did not get what preread read"
+
+
+def _proposals(root, config, plan, replies):
+    """Preread the plan once per (summary, reply); a summary change gives a new digest, same issue content."""
+    for summary, reply in replies:
+        worker = _Proposing()
+        worker.reply = reply
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(order, "executor_for", lambda name: worker)
+            order.preread({**plan, "summary": summary}, root, config, repo=REPO)
+
+
+def test_preread_proposal_handover_follows_the_latest_write_even_within_one_second(publishing, plan):
+    root, config, item = publishing[0], publishing[1], plan["issues"][0]
+    body = _child_body(plan, item, config)
+    first, second = "APPROACH: First plan.", "APPROACH: Second plan.\nDECIDE: Second choice."
+    _proposals(root, config, plan, [("one", first), ("two", second)])
+    assert _handover(root, 7, body, API_FILES)["approach"] == ["Second plan."]
+    # Prereading the first digest again makes it the latest, although its key already exists.
+    _proposals(root, config, plan, [("one", "APPROACH: Third plan.")])
+    proposal = _handover(root, 7, body, API_FILES)
+    assert proposal["approach"] == ["Third plan."] and proposal["decisions"] == []
+    # A newer answer with nothing to propose replaces the older proposal instead of reviving it.
+    _proposals(root, config, plan, [("two", "NONE")])
+    assert _handover(root, 7, body, API_FILES) is None
+    _proposals(root, config, plan, [("three", "DECIDE: Only a choice.")])
+    proposal = _handover(root, 7, body, API_FILES)
+    assert proposal["decisions"] == ["Only a choice."] and proposal["approach"] == []
+
+
+def test_preread_proposal_reaches_fresh_and_resumed_implementation_prompts(publishing, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / ".foragent").mkdir(parents=True)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    content = order._body_digest(body)
+    (repo / order.PREREAD_FILE).write_text(json.dumps({"d": {
+        "key": "#1", "plan": "p", "content": content, "files": {}, "unknowns": [],
+        "approach": ["Reuse the writer."], "decisions": ["Name the helper later."]}}))
+    seen = _implementation_setup(tmp_path, publishing[1], "main", "m", monkeypatch, real_prompts=True)
+    for prompt in (seen["prompt"], seen["resume_prompt"]):
+        assert prompt.count("Your lane's earlier plan") == 1
+        assert "- Reuse the writer." in prompt and "- Name the helper later." in prompt
+
+
 @pytest.mark.parametrize("change", ["blocked_by", "interactive", "new_lanes"])
 def test_preread_evidence_follows_dependency_interactive_and_lane_changes(publishing, plan, change):
     config, item = publishing[1], plan["issues"][1]
@@ -1057,7 +1238,7 @@ def test_preread_evidence_follows_dependency_interactive_and_lane_changes(publis
     assert order.preread_target(plan, item, config, publishing[0])[2] != before
 
 
-def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
+def _implementation_setup(tmp_path, config, lane, size, monkeypatch, real_prompts=False):
     """What the runner's first implementation attempt passes to the executor."""
     from foragent import run_implementation, runner
 
@@ -1078,14 +1259,16 @@ def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
     store.save_approval(1, body=body, body_sha="x", acceptance_blobs={}, approved_by="human",
                         approved_at=BASE_TIME.isoformat())
     store.start_run(1, branch="b", worktree=tmp_path / "w", lane=lane)
-    ctx = SimpleNamespace(config=run_implementation.lane_config(config, lane), store=store, now=lambda: BASE_TIME)
+    ctx = SimpleNamespace(config=run_implementation.lane_config(config, lane), store=store, now=lambda: BASE_TIME,
+                          repo_root=tmp_path / "repo")
     attempt = SimpleNamespace(n=1, ctx=ctx, worktree=tmp_path / "repo", log=tmp_path / "log", rebuilt=False,
                               size=size, options={}, missing_skills=[], native_claude=ctx.config.executor == "claude",
                               parsed=parse_body(body), baseline=None, executor=None,
                               approval=store.load_approval(1), review_feedback=False,
                               issue=SimpleNamespace(labels=set()))
-    monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
-    monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
+    if not real_prompts:
+        monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
+        monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
     with pytest.raises(Stop):
         run_implementation._implement(attempt, "")
     return seen
@@ -1221,6 +1404,21 @@ def test_perspectives_decisions_cut_keeps_titles_and_latest_twenty(tmp_path):
     assert all(f"### D{n}. Decision {n}" in text for n in range(1, 26))
     assert "Body 5" not in text and "Body 6" in text and "More 25" in text
     assert "Preamble" not in text
+
+
+@pytest.mark.parametrize("make_rules", [
+    lambda path: path.write_bytes(b"# Rules\n\xff\xfe broken\n"),
+    lambda path: path.mkdir(),
+], ids=["invalid-utf8", "directory"])
+def test_perspectives_unreadable_rules_never_falls_back_to_history(tmp_path, make_rules):
+    from foragent import order_perspectives
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/decisions.md").write_text("HISTORY_BEHIND_UNREADABLE_RULES\n", encoding="utf-8")
+    make_rules(tmp_path / "docs/rules.md")
+    prompt = order_perspectives.prompt("incidents", {}, tmp_path)
+    assert "HISTORY_BEHIND_UNREADABLE_RULES" not in prompt
+    assert "docs/rules.md exists but cannot be read" in prompt
 
 
 def test_perspectives_config_rejects_unknown_seat_or_executor():
@@ -1745,6 +1943,13 @@ def test_publication_write_must_stay_inside_its_own_root(tmp_path):
             check_write(tmp_path, name, own)
 
 
+def make_legacy(tracker, number):
+    """Turn an issue into one published before owner labels existed."""
+    issue = tracker.get_issue(number)
+    tracker.remove_labels(number, [label for label in issue.labels if label.startswith("by:")])
+    tracker.update_issue(number, title=issue.title, body=issue.body.replace(order.OWNED_MARKER + "\n", ""))
+
+
 def owners(tracker):
     return {n: {label for label in issue.labels if label.startswith("by:")} for n, issue in tracker.issues.items()}
 
@@ -1795,7 +2000,7 @@ def test_unlabelled_order_gets_new_children_for_its_legacy_owner(publishing, pla
     root, config, tracker, git, _ = publishing
     publish(publishing, plan)
     for number in (1, 2, 3):  # An order published before owner labels existed.
-        tracker.remove_labels(number, ["by:human"])
+        make_legacy(tracker, number)
     tracker.login = "bob"
     plan["issues"].append({**deepcopy(plan["issues"][1]), "key": "late", "title": "Late child"})
     order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
@@ -1813,7 +2018,7 @@ def test_edits_keep_the_existing_issue_owner(publishing, plan):
 
 
 @pytest.mark.parametrize("refused", ["parent", "child"])
-@pytest.mark.parametrize("fault", ["label", "read", "retire", "retire-and-close"])
+@pytest.mark.parametrize("fault", ["label", "read", "retire", "close", "retire-and-close"])
 def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing, plan, refused, fault):
     tracker = publishing[2]
     target = plan["title"] if refused == "parent" else plan["issues"][1]["title"]
@@ -1838,16 +2043,17 @@ def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing
     tracker.create_issue = create
     tracker.get_issue = faulty(read, {"read"})
     tracker.update_issue = faulty(write, {"retire", "retire-and-close"})
-    tracker.close_issue = faulty(close, {"retire-and-close"})
+    tracker.close_issue = faulty(close, {"close", "retire-and-close"})
     with pytest.raises((order.PlanError, TrackerError)):
         publish(publishing, plan)
     number = victim[0]
     for name, original in (("create_issue", created), ("get_issue", read),
                            ("update_issue", write), ("close_issue", close)):
         setattr(tracker, name, original)
-    if fault == "label":
-        assert "<!-- foragent:" not in tracker.get_issue(number).body
-        assert tracker.get_issue(number).state == "closed"
+    first = tracker.get_issue(number)
+    # Each cleanup step runs even when the other one fails.
+    assert (first.state == "closed") == (fault in ("label", "retire"))
+    assert ("<!-- foragent:" not in first.body) == (fault in ("label", "close"))
     tracker.login = "bob"  # Anyone may retry; the unconfirmed issue must not decide the owner.
     report = publish(publishing, plan)
     numbers = {report.parent, *(row["number"] for row in report.rows)}
@@ -1863,3 +2069,111 @@ def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing
         assert leftover.state == "closed" and "<!-- foragent:" not in leftover.body
     publish(publishing, plan)  # Stable afterwards: no duplicate parents or children.
     assert {report.parent, *(row["number"] for row in publish(publishing, plan).rows)} == numbers
+
+
+STATEMENT = "A caller observes one receipt per login."
+# A test the lane has not written yet: a statement draft may name it before preparation.
+UNWRITTEN = "uv run pytest -q tests/acceptance/test_receipt.py"
+
+
+@pytest.mark.parametrize("statements", [False, True])
+def test_only_statement_drafts_may_name_unwritten_tests(publishing, plan, statements):
+    plan["issues"][1]["done_when"] = [UNWRITTEN]
+    if statements:
+        plan["issues"][1]["statements"] = [STATEMENT]
+        report = publish(publishing, plan, dry_run=True)
+        assert "tests/acceptance/test_receipt.py" not in report.paths
+    else:
+        with pytest.raises(order.PlanError, match="missing acceptance file: tests/acceptance/test_receipt.py"):
+            publish(publishing, plan, dry_run=True)
+
+
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+@pytest.mark.parametrize("options", [{}, {"approve": True}])
+def test_statement_issue_without_reviewed_tests_is_refused_before_writes(
+        publishing, plan, monkeypatch, kind, options):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config, tracker, _, events = publishing
+    if kind == "edits":
+        tracker.add_issue(9, "Existing", "old", ["needs-human"])
+        plan["id"] = "2026-10-21-login-update"
+        plan["issues"] = []
+        plan["edits"] = [{"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.",
+                          "done_when": [UNWRITTEN], "statements": [STATEMENT]}]
+        key = "#9"
+    else:
+        # Tests already in the plan and a clean old preread do not turn it into legacy work.
+        plan["issues"][0]["statements"] = [STATEMENT]
+        plan["issues"][0]["done_when"].append(UNWRITTEN)
+        for item in plan["issues"]:
+            _record_preread(root, config, plan, item, [])
+        key = "api"
+    assert publish(publishing, deepcopy(plan), dry_run=True).dry_run
+    before = dict(tracker.issues)
+    with pytest.raises(order.PlanError, match=rf"statement issue\(s\) {re.escape(key)} have no reviewed tests"):
+        publish(publishing, plan, **options)
+    assert events == [] and tracker.issues == before
+    assert not (root / "docs").exists()
+
+
+def test_legacy_issue_beside_a_statement_issue_keeps_the_preread_gate(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    plan["issues"][0]["statements"] = [STATEMENT]
+    with pytest.raises(order.PlanError, match=r"no preread of the current content for issue\(s\) client;"):
+        publish(publishing, plan, approve=True)
+
+
+@pytest.mark.parametrize("value", [[], [""], [" "], "one", [7], ["two\nlines"]])
+def test_invalid_statements_name_the_field(publishing, plan, value):
+    plan["issues"][1]["statements"] = value
+    with pytest.raises(order.PlanError, match=r"issues\[1\]\.statements"):
+        publish(publishing, plan, dry_run=True)
+
+
+def test_statements_appear_verbatim_in_the_issue_body(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    plan["issues"][0]["statements"] = [STATEMENT, "Nothing else changes."]
+    publish(publishing, plan)
+    body = publishing[2].get_issue(2).body
+    assert f"## Behaviour\n- {STATEMENT}\n- Nothing else changes.\n" in body
+    assert parse_body(body).goal == "Implement login."
+    assert "## Behaviour" not in publishing[2].get_issue(3).body
+
+
+@pytest.mark.parametrize("partial", ["parent-only", "unmapped-child"])
+def test_retry_of_a_legacy_partial_order_keeps_it_with_the_legacy_owner(publishing, plan, partial):
+    """A pre-team order that stopped early is still the original factory's order."""
+    root, config, tracker, git, _ = publishing
+    if partial == "parent-only":  # Stopped before its first child: the parent records none.
+        tracker.add_issue(1, plan["title"], f"{plan['summary']}\n\n\n\n{order._plan_marker(plan['id'], {}, {})}\n")
+    else:  # Stopped after creating the client child, before recording it in the map.
+        publish(publishing, plan)
+        parent = tracker.get_issue(1)
+        body = re.sub(r"map=\{[^\n]*?\}", 'map={"api": 2}', parent.body)
+        tracker.update_issue(1, title=parent.title, body=body)
+        for number in (1, 2, 3):
+            make_legacy(tracker, number)
+    tracker.login = "bob"
+    report = order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
+    assert report.parent == 1, "The legacy parent is kept"
+    children = {row["number"] for row in report.rows}
+    survivors = set() if partial == "parent-only" else {2, 3}
+    assert survivors <= children, "Legacy children found by marker are kept"
+    assert all(owners(tracker)[n] == {"by:jin"} for n in children - survivors)
+    assert all(owners(tracker)[n] == set() for n in {1} | survivors), "Legacy issues are not relabelled"
+    assert all(order.OWNED_MARKER not in tracker.get_issue(n).body for n in {1} | survivors)
+    assert all(tracker.get_issue(n).state == "open" for n in {1} | children)
+
+
+
+def test_a_parent_whose_owner_label_a_person_removed_stays_the_orders_parent(publishing, plan):
+    """Removing by: from a recorded order makes it legacy work, never an unconfirmed creation."""
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    tracker.remove_labels(1, ["by:human"])
+    tracker.login = "bob"
+    report = order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
+    assert report.parent == 1 and len(tracker.issues) == 3
+    assert all(issue.state == "open" for issue in tracker.issues.values())
+    assert owners(tracker) == {1: set(), 2: {"by:human"}, 3: {"by:human"}}

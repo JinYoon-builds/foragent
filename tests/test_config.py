@@ -44,6 +44,7 @@ def test_exact_defaults(repo):
         "order_written": False,  # No executor order written: headroom chooses (#186).
         "skill_roles": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
+        "overlap_mode": "measured",
         "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60, "usage_recheck_minutes": 10,
         "tiers": {"s": {"codex_model": None, "codex_effort": "medium", "claude_model": None, "claude_effort": None},

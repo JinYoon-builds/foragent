@@ -18,6 +18,8 @@ MESSAGES = {
                         "wait for its proposals in fa orch inbox.",
         "role_paused": "The {role} role cannot start: executor {executor} is paused by a usage limit until {until}.",
         "role_started": "{role} session started (pid {pid}); proposals arrive in fa orch inbox. Log: {log}",
+        "role_short_help": "A one-line reason for people, written by the caller in the config language; stored beside --why",
+        "role_short_one_line": "--short must be one line.",
     },
     "ko": {
         "architect_help": "측정하고 제안하는 아키텍트 세션 하나를 시작해요 (--why 필요)",
@@ -36,5 +38,7 @@ MESSAGES = {
                         "제안은 fa orch inbox에서 기다리세요.",
         "role_paused": "{role} 역할을 시작할 수 없어요: 실행기 {executor}가 사용량 한도로 {until}까지 멈춰 있어요.",
         "role_started": "{role} 세션을 시작했어요 (pid {pid}). 제안은 fa orch inbox에 들어와요. 로그: {log}",
+        "role_short_help": "사람이 읽을 한 줄 이유. 부르는 쪽이 설정 언어로 써요. --why와 함께 저장돼요",
+        "role_short_one_line": "--short는 한 줄이어야 해요.",
     },
 }

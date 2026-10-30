@@ -218,3 +218,19 @@ def test_unreadable_record_files_fall_back_to_the_folder_name(home, monkeypatch)
     (root / "merged_prs.json").write_text(json.dumps({"prs": "not a list"}), encoding="utf-8")
     (root / "issues.json").write_text("[]", encoding="utf-8")
     assert "owner/folder" in collect(home)
+
+
+@pytest.mark.parametrize("language, words", [("en", "launchd did not load the job"),
+                                             ("ko", "launchd가 작업을 불러오지 않았어요")])
+def test_pending_reload_without_error_text_still_shows_failure_and_recovery_command(language, words):
+    from datetime import UTC, datetime
+
+    row = {"repo": "o/r", "repo_root": "/work/my repo", "last_tick": None, "running_runs": 0,
+           "scheduler": "not loaded", "stale": False,
+           "reload": {"at": "2026-10-31T09:00:00+00:00", "error": None, "attempts": 1,
+                      "recovered": False, "loaded": False, "pending": True}}
+    human = "\n".join(gates.human_lines([row], datetime.now(UTC), language))
+    assert words in human and "fa gate install --repo-root '/work/my repo'" in human
+    row["reload"] = {**row["reload"], "loaded": True, "pending": False}
+    assert "fa gate install" not in "\n".join(gates.human_lines([row], datetime.now(UTC), language)), (
+        "A clean reload shows no failure")

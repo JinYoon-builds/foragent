@@ -42,6 +42,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("review_scope must be claude-local or pr-body")
     if not isinstance(values["interview"], str) or values["interview"] not in {"ouroboros", "native"}:
         raise ConfigError("interview must be ouroboros or native")
+    if not isinstance(values["overlap_mode"], str) or values["overlap_mode"] not in {"measured", "fixed"}:
+        raise ConfigError("overlap_mode must be measured or fixed")
     if type(values["codex_goal"]) is not bool:
         raise ConfigError("codex_goal must be a boolean")
     if not isinstance(values["review_level"], str) or values["review_level"] not in {

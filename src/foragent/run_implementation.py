@@ -24,7 +24,7 @@ from foragent.run_previous import (
     consume_hint, pending_hint, previous_attempt_summary, record_stop_point, saved_feedback_section,
 )
 from foragent.run_parent import parent_context
-from foragent.run_prompts import bug_fix_steps, build_prompt, build_resume_prompt
+from foragent.run_prompts import bug_fix_steps, build_prompt, build_resume_prompt, lane_plan_section
 from foragent.run_review import _read_rebuttals
 from foragent.run_overlap import wait_for_overlap
 from foragent.run_waits import _phase, _timeout
@@ -341,6 +341,16 @@ def _prepare_implementation(
     )
 
 
+def _lane_plan(n: int, ctx: RunContext, approval, worktree: Path) -> str:
+    from foragent.order import lane_proposal
+
+    proposal = lane_proposal(ctx.repo_root, n, approval.body, approval.acceptance_blobs or {}, worktree)
+    if proposal is None:
+        return ""
+    return lane_plan_section([str(line) for line in proposal.get("approach") or []],
+                             [str(line) for line in proposal.get("decisions") or []])
+
+
 def _implement(
     attempt: Implementation,
     failure: str | CIFailure, *, merge_conflicts: list[str] | None = None, reviewer_text: str | None = None,
@@ -360,7 +370,8 @@ def _implement(
     ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, key: tier})
     full_text_dir = cuts.issue_dir(ctx.store.root, n)
     setup = implementer_setup(ctx.config, run.lane, tier, worktree, full_text_dir)
-    model, notes = setup.model, setup.notes
+    # An issue assignment's model (D80), stored at start, wins over the lane and tier model.
+    model, notes = run.executor_model or setup.model, setup.notes
     # Effort and agent belong to this turn's tier; a tier without effort means the executor default.
     options = {**attempt.options, **setup.options}
     attempt.missing_skills.extend(name for name in setup.missing_skills if name not in attempt.missing_skills)
@@ -382,6 +393,7 @@ def _implement(
     # Bug-fix steps reach implementation turns (first, retries, resumes), not conflict resolution.
     procedure = bug_fix_steps(attempt.issue.labels, worktree) if merge_conflicts is None else None
     fixed = lane_skill_names(ctx.config, run.lane, worktree, lane_notes(ctx.config, run.lane, worktree)[0])
+    lane_plan = _lane_plan(n, ctx, attempt.approval, worktree)
     prompt = build_prompt(
         n, attempt.parsed, ctx.config.acceptance_dir, failure_context, ctx.config.language,
         native_goal=not attempt.native_claude and ctx.config.codex_goal, acceptance_locked=attempt.native_claude,
@@ -400,6 +412,7 @@ def _implement(
         review_feedback=review_feedback,
         retry_default=retry_default,
         procedure=procedure,
+        lane_plan=lane_plan,
     )
     offset = log.stat().st_size if log.exists() else 0
     result = None
@@ -413,7 +426,7 @@ def _implement(
                 reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
                 review_feedback=review_feedback, retry_default=retry_default,
                 moved_files=moved_files, parent_context=attempt.approval.parent_context or "",
-                procedure=procedure,
+                procedure=procedure, lane_plan=lane_plan,
             ) + (f"\n\n{saved_feedback}" if saved_feedback else "") + setup.memory_notice,
             model=model, timeout_s=remaining, log_path=log, **options,
         )

@@ -29,7 +29,7 @@ from foragent.labels import issue_lane, lane_display
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
 from foragent.watch_cells import Line, Span, _beside, _cells, _clean, _columns, _fit, _line, _panel, _wrap
-from foragent.watch_data import Snapshot, collect, recent_events
+from foragent.watch_data import Snapshot, collect, collection_root, recent_events
 from foragent.watch_art import ORCHESTRATOR, PALETTE, half_blocks
 from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, render_frame
 from foragent.watch_sections.acorns import issue_box, issue_url
@@ -91,7 +91,12 @@ def run(
         raise ConfigError(text("watch_terminal", config.language))
     argv = sys.argv.copy()
     reload_requested = False
-    refresh = _Refresh(lambda current: collect(status(), tracker, store, current, now()), config)
+    def read(current: Config) -> Snapshot:
+        # Bound inside the worker that calls it, so root-dependent facts read this checkout.
+        with collection_root(repo_root):
+            return collect(status(), tracker, store, current, now())
+
+    refresh = _Refresh(read, config)
     if once:
         # A single printed frame is the calm finished scene, never fireworks.
         with calm():
