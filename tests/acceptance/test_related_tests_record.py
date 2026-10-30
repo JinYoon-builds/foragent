@@ -195,8 +195,9 @@ def test_related_tests_record_timeout_retains_selection_and_total(git_history, t
         check_plan(seconds=900, exit_code=-9, timed_out=True, report=report),
     ])
 
-    # #435 (2026-10-29): a watchdog-stopped related check ends the run as stalled-restart (back to ready).
-    assert run_issue(1, case.ctx) == "stalled-restart", case.store.log_path(1).read_text()
+    # #435 (2026-10-30): this fake reports timed_out with no watchdog decision, which keeps main's timeout path;
+    # a watchdog-stopped related check (stalled-restart) is covered by #435's own tests.
+    assert run_issue(1, case.ctx) == "timeout", case.store.log_path(1).read_text()
     assert len(case.implementer.calls) == len(case.related_calls) == 1
     record, = stored_related_checks(case)
     assert record == {"changed_file_count": 3, "selected_files": list(SELECTED_FILES),
@@ -218,8 +219,9 @@ def test_related_tests_record_timeout_does_not_reuse_prior_junit_times(git_histo
         check_plan(exit_code=1), check_plan(seconds=900, exit_code=-9, timed_out=True, report="missing"),
     ])
 
-    # #435 (2026-10-29): a watchdog-stopped related check ends the run as stalled-restart (back to ready).
-    assert run_issue(1, case.ctx) == "stalled-restart", case.store.log_path(1).read_text()
+    # #435 (2026-10-30): this fake reports timed_out with no watchdog decision, which keeps main's timeout path;
+    # a watchdog-stopped related check (stalled-restart) is covered by #435's own tests.
+    assert run_issue(1, case.ctx) == "timeout", case.store.log_path(1).read_text()
     assert len(case.implementer.calls) == len(case.related_calls) == 2
     assert stored_related_checks(case) == [
         {"changed_file_count": 3, "selected_files": list(SELECTED_FILES),
