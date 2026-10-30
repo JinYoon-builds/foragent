@@ -10,7 +10,7 @@ import re
 
 from foragent.config import Config
 from foragent.watch_data import Snapshot
-from foragent.watch_mouse import talk_alert
+from foragent.watch_mouse import screen_rows
 
 
 # A visible issue number, linked to its GitHub page after each refresh.
@@ -156,18 +156,9 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             visible = watch._window(frame, view_state, height, max(1, width), config.language,
                                     layout if store is not None else None)
             top = view_state.get("scroll", 0)
-            alert = [watch._fit(watch._line(error, "yellow"), max(1, width))] if error else []
-            # A squirrel's talk result off this screen (short or scrolled) takes the bottom row.
-            alert = alert or talk_alert(view_state, visible, max(1, width))
-            if height >= watch.MIN_SCREEN and len(frame) <= height and visible:
-                # F fits: painted as today, its last row (the key help) on the bottom row,
-                # where a refresh error takes its place.
-                body = visible[:-1]
-                visible = body + [[]] * (height - 1 - len(body)) + (alert or visible[-1:])
-            elif alert:
-                # A refresh error takes the bottom row (in place of the position line).
-                bottom = max(0, height - 1)
-                visible = visible[:bottom] + [[]] * (bottom - len(visible[:bottom])) + alert
+            # The bottom rows: F's key help when F fits, then any talk result the painted rows
+            # do not show and a refresh error (watch_mouse.screen_rows).
+            visible = screen_rows(visible, view_state, len(frame), height, max(1, width), error)
             # One highlighted row, by its position: the first issue row on screen.
             mark = watch.highlighted_row(view_state) if view_state.get("issue") is None else None
             marked = set() if mark is None else {mark - top}

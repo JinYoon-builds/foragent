@@ -303,17 +303,19 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         state["repo_root"] = repo_root
     if not rows:
         return talk_line(state, width)
-    badges = width >= BADGE_WIDTH
+    # Text mode is the stage's plain-text view: under 44 columns, or animation off.
+    badges = width >= BADGE_WIDTH and config.animation
     if not badges:
-        # Text mode: the state in words replaces the phase word of a talking row.
-        rows = [{**row, "words": watch.text("talk_talking", config.language)} if row.get("talking") else row
-                for row in rows]
+        # The state in words replaces a talking row's phase word, in a column of its own that
+        # fitting never cuts: names and phase words give way first, then only the whole 💬 stays.
+        said = watch.text("talk_talking", config.language)
+        rows = [{**row, "words": "", "talk": said} if row.get("talking") else row for row in rows]
     cells = [row for row in rows if "toggle" not in row]
     size = lambda key: max((watch._cells(row.get(key, "")) for row in cells if "number" in row), default=0)
     glyph_width = max(watch._cells(value) for value in glyphs.values())
     # Worker lanes share one column; an idle row keeps its whole name.
     lane_width = min(max(10, width // 4), max(watch._cells(row["lane"]) for row in cells))
-    columns = ["glyph", "lane", "number", "title", "words", "activity", "elapsed", "acorns"]
+    columns = ["glyph", "lane", "number", "title", "words", "talk", "activity", "elapsed", "acorns"]
     widths = {"glyph": glyph_width, "lane": lane_width, **{key: size(key) for key in columns[2:]}}
     if width < 60:
         widths["elapsed"] = 0
@@ -324,10 +326,16 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         widths["title"] = min(widths["title"], max(0, width - others - 1))
     # The row must fit: warnings, then the lane name, then the phase word give way, so the
     # glyph, number, elapsed time and acorns at the end are never pushed off the line.
-    for key, least in (("activity", 0), ("lane", 4), ("words", 4), ("lane", 1), ("words", 1)):
+    # A talking row's words are reserved: the lane name and phase words may drop entirely first.
+    reserved = ("lane", 0), ("words", 0)
+    for key, least in (("activity", 0), ("lane", 4), ("words", 4), ("lane", 1), ("words", 1)) + reserved:
         over = sum(value + 1 for value in widths.values() if value) - 1 - width
         if over > 0:
             widths[key] = max(min(widths[key], least), widths[key] - over)
+    if widths["talk"] and sum(value + 1 for value in widths.values() if value) - 1 > width:
+        # Still too narrow: the words go, the 💬 badge stays whole.
+        widths["talk"] = watch._cells("💬")
+        rows = [{**row, "talk": "💬"} if row.get("talk") else row for row in rows]
     shown = [key for key in columns if widths[key]]
     hits, marks = context.get("hits"), context.get("marks")
     lines: list[Line] = []
@@ -344,7 +352,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             target = (glyph_width + 1, len(lines) - 1, min(width, glyph_width + 1 + watch._cells(text)),
                       len(lines), ("more", row["toggle"]))
         elif "number" in row:
-            lines += watch._columns([row[key] for key in shown], [widths[key] for key in shown], row["style"])
+            lines += watch._columns([row.get(key, "") for key in shown], [widths[key] for key in shown], row["style"])
             # The whole row after the squirrel, from its #issue to its acorns, opens the issue's box.
             target = (glyph_width, len(lines) - 1, min(width, watch._cells("".join(v for v, _ in lines[-1]).rstrip())),
                       len(lines), ("acorn", row["issue"]))

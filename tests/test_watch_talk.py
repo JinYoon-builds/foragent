@@ -159,3 +159,114 @@ def test_live_bottom_row_carries_the_talk_line_only_when_the_screen_does_not_sho
     assert talk_alert(state, [watch._line("rows"), shown], 40) == []
     assert talk_alert(state, [watch._line("rows")], 40) == [shown]
     assert talk_alert({}, [watch._line("rows")], 40) == []
+
+
+def fitted_case(language="ko", workers=1, *, lane="abcdefghijklmnop", number=123456):
+    """A lane with a long name whose first worker (a long issue number) is talking."""
+    snapshot, config = lane_case(queued=())
+    numbers = [number, 8][:workers]
+    row = {**snapshot.status["lanes"]["work"], "lane_display": lane, "issue": number,
+           "running": [{"number": n, "title": f"Task {n}"} for n in numbers]}
+    runs = [{"number": n, "lane": "work", "attempts": 1, "started_at": f"2026-10-24T08:0{index}:00+00:00",
+             "talking": n == number} for index, n in enumerate(numbers)]
+    status = {**snapshot.status, "lanes": {"work": row}, "active_runs": runs}
+    return replace(snapshot, status=status), replace(config, language=language)
+
+
+@pytest.mark.parametrize("language,said", [("ko", "대화 중 💬"), ("en", "talking 💬")])
+@pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("glyphs", ["emoji", "ascii"])
+def test_talk_indicator_is_reserved_before_names_and_phase_words_shrink(tmp_path, language, said, workers, glyphs):
+    snapshot, config = fitted_case(language, workers)
+    config = replace(config, view_glyphs=glyphs)
+    for width in range(20, 121):
+        frame = live(snapshot, config, tmp_path, None, width=width)[0]
+        lines = frame.splitlines()
+        row = next(index for index, line in enumerate(lines) if "#123456" in line)
+        other = [line for line in lines if "#8" in line]
+        if width < 44:
+            # Text mode: the whole 💬 stays in the row; the words stay while the row has room.
+            assert "💬" in lines[row] and frame.count("💬") == 1, (width, frame)
+            assert all("💬" not in line for line in other)
+            if width >= 40:
+                assert said in lines[row], (width, lines[row])
+        else:
+            assert frame.count("💬") == 1 and said not in frame, (width, frame)
+            first = next(index for index, line in enumerate(lines) if line.startswith(("🐿", "💤", "[*]", "[z]")))
+            assert lines[first - 1] == "💬", (width, frame)
+        assert (len(other) == 1) == (workers == 2)
+
+
+def test_animation_off_is_text_mode_at_any_width(tmp_path):
+    snapshot, config = fitted_case()
+    frame = live(snapshot, replace(config, animation=False), tmp_path, None, width=120)[0]
+    assert "대화 중 💬" in next(line for line in frame.splitlines() if "#123456" in line)
+    assert frame.count("💬") == 1
+
+
+def test_windowed_screen_reserves_a_row_for_the_talk_line_at_every_height(tmp_path, talks):
+    snapshot, config = lane_case(queued=tuple(range(10, 41)))
+    store, state = StateStore(tmp_path / "state"), {"unfolded": {"work"}}
+    _, layout = live(snapshot, config, tmp_path, state)
+    watch.handle_mouse("left", *squirrel(layout), layout, store, config, state=state)
+    for height in range(3, 30):
+        for scroll in (0, 1000):
+            state["scroll"] = scroll
+            layout = {}
+            lines = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=80, height=height,
+                                                   state=state, layout=layout)).splitlines()
+            assert lines.count("Opened #3") == 1, (height, scroll, lines)
+            assert len(lines) <= height
+            talk_row = lines.index("Opened #3")
+            assert not any(y0 <= talk_row < y1 for _, y0, _, y1, _ in layout["hits"])
+            highlighted = watch.highlighted_row(state)
+            assert highlighted is None or highlighted - state["scroll"] != talk_row
+
+
+def painted(snapshot, config, root, state, height, error="", width=80):
+    """What the live view paints: _frame, its window, then the bottom rows, cut to the screen."""
+    from foragent.watch_mouse import screen_rows
+
+    frame = watch._frame(snapshot, config, root, tick=0, width=width, selected=None,
+                         now=snapshot.captured_at, state=state)
+    visible = watch._window(frame, state, height, width, config.language, {})
+    rows = screen_rows(visible, state, len(frame), height, width, error)[:max(1, height)]
+    return ["".join(value for value, _ in line).rstrip() for line in rows]
+
+
+def clicked_long_lane(tmp_path, talks):
+    snapshot, config = lane_case(queued=tuple(range(10, 41)))
+    store, state = StateStore(tmp_path / "state"), {"unfolded": {"work"}}
+    _, layout = live(snapshot, config, tmp_path, state)
+    watch.handle_mouse("left", *squirrel(layout), layout, store, config, state=state)
+    return snapshot, config, state
+
+
+def test_live_screen_paints_the_talk_line_at_every_height_from_one_row(tmp_path, talks):
+    snapshot, config, state = clicked_long_lane(tmp_path, talks)
+    for height in range(1, 30):
+        for scroll in (0, 1000):
+            state["scroll"] = scroll
+            rows = painted(snapshot, config, tmp_path, state, height)
+            assert len(rows) <= height and rows.count("Opened #3") == 1, (height, scroll, rows)
+
+
+def test_live_screen_keeps_both_the_talk_line_and_a_refresh_error(tmp_path, talks):
+    snapshot, config, state = clicked_long_lane(tmp_path, talks)
+    for height in range(2, 30):
+        rows = painted(snapshot, config, tmp_path, state, height, error="refresh failed")
+        assert rows.count("Opened #3") == 1 and rows.count("refresh failed") == 1, (height, rows)
+    # One row: both share it, the talk result first.
+    assert painted(snapshot, config, tmp_path, state, 1, error="refresh failed") == [
+        "Opened #3 · refresh failed"]
+
+
+def test_screen_rows_without_a_talk_line_keep_todays_bottom_row():
+    from foragent.watch_mouse import screen_rows
+
+    frame = [watch._line(f"row {index}") for index in range(4)]
+    text = lambda rows: ["".join(value for value, _ in line).rstrip() for line in rows]
+    assert text(screen_rows(frame, {}, 4, 6, 40)) == ["row 0", "row 1", "row 2", "", "", "row 3"]
+    assert text(screen_rows(frame, {}, 4, 6, 40, "failed")) == ["row 0", "row 1", "row 2", "", "", "failed"]
+    assert text(screen_rows(frame, {}, 10, 4, 40, "failed")) == ["row 0", "row 1", "row 2", "failed"]
+    assert text(screen_rows(frame, {}, 10, 4, 40)) == ["row 0", "row 1", "row 2", "row 3"]

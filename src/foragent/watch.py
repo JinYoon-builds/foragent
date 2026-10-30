@@ -31,14 +31,14 @@ from foragent.tracker import Issue, Tracker
 from foragent.watch_cells import Line, Span, _beside, _cells, _clean, _columns, _fit, _line, _panel, _wrap
 from foragent.watch_data import Snapshot, collect, recent_events
 from foragent.watch_art import ORCHESTRATOR, PALETTE, half_blocks
-from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, render_frame
+from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window as _layout_window, render_frame
 from foragent.watch_sections.acorns import issue_box, issue_url
 from foragent.watch_sections.detail import render_detail
 from foragent.watch_sections.finished import FIREWORKS_SECONDS, calm
 from foragent.watch_sections.settings import settings_view
 from foragent.watch_sections.stage import _stage
 from foragent.watch_mouse import (
-    MIN_SCREEN, handle_key, handle_mouse, highlighted, highlighted_row, hit_test, osc8, scroll, scroll_limit, switch_to_orchestrator,
+    MIN_SCREEN, handle_key, keep_talk, handle_mouse, highlighted, highlighted_row, hit_test, osc8, scroll, scroll_limit, switch_to_orchestrator,
     terminal_restore_sequences, terminal_setup_sequences, toggle_lane,
 )
 from foragent.watch_open import LOCK_FD_ENV, exclusive, registered
@@ -125,3 +125,9 @@ def run(
             os.execv(sys.executable, [sys.executable, "-m", "foragent.cli", *argv[1:]])
         else:
             os.execv(argv[0], argv)
+
+
+def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width: int, language: str,
+            layout: dict[str, Any] | None = None) -> list[Line]:
+    """watch_layout._window, keeping a fresh talk result on screen whatever its height (#174)."""
+    return keep_talk(_layout_window(frame, state, height, width, language, layout), state, width, layout)

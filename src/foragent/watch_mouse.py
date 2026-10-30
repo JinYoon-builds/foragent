@@ -73,7 +73,8 @@ def highlighted_row(state: dict[str, Any]) -> int | None:
     top, height = state.get("scroll", 0), state.get("height")
     windowed = height is not None and height >= MIN_SCREEN and state.get("length", 0) > height
     bottom = top + height - 1 if windowed else None
-    return next((y for y in sorted(issues) if y >= top and (bottom is None or y < bottom)), None)
+    hidden = state.get("talk_row")  # The row a talk line covers on screen (keep_talk).
+    return next((y for y in sorted(issues) if y >= top and (bottom is None or y < bottom) and y != hidden), None)
 
 
 def highlighted(state: dict[str, Any]) -> int | None:
@@ -340,3 +341,56 @@ def talk_alert(state: dict[str, Any] | None, visible: list[Any], width: int) -> 
     if any("".join(value for value, _ in row).rstrip() == shown for row in visible):
         return []
     return [line]
+
+
+def keep_talk(visible: list[Any], state: dict[str, Any] | None, width: int,
+              layout: dict[str, Any] | None = None) -> list[Any]:
+    """A windowed screen keeps a fresh talk line whatever its height (#174).
+
+    When the slice of F leaves the line off screen, the last row above the position line is
+    reserved for it: that row's click areas go, and it is never the highlighted row.
+    """
+    if state is None:
+        return visible
+    state.pop("talk_row", None)
+    line = talk_line(state, width)
+    height = state.get("height") or 0
+    if not line or height < MIN_SCREEN or state.get("length", 0) <= height or len(visible) < 2:
+        return visible  # No line, or F fits and so shows it.
+    shown = "".join(value for value, _ in line[0]).rstrip()
+    if any("".join(value for value, _ in row).rstrip() == shown for row in visible[:-1]):
+        return visible
+    row = len(visible) - 2
+    if layout is not None:
+        layout["hits"] = [(x0, y0, x1, min(y1, row), target) for x0, y0, x1, y1, target in layout.get("hits", [])
+                          if y0 < min(y1, row)]
+    state["talk_row"] = state.get("scroll", 0) + row  # The F row the line stands in for.
+    return visible[:row] + line + visible[-1:]
+
+
+def screen_rows(visible: list[Any], state: dict[str, Any] | None, length: int, height: int, width: int,
+                error: str = "") -> list[Any]:
+    """The rows the live view paints from the window ``visible`` of an F with ``length`` rows.
+
+    When F fits, its last row (the key help) sits on the bottom row. Messages take the
+    bottom rows: a talk result that the painted rows do not show (only the first
+    ``height`` rows are painted, also under MIN_SCREEN where the window is all of F), then a
+    refresh error. When there are fewer rows than messages, they share one row, talk first.
+    """
+    from foragent import watch
+
+    painted = max(1, height)
+    alert = talk_alert(state, visible[:painted], width)
+    if error:
+        alert.append(watch._fit(watch._line(error, "yellow"), width))
+    if len(alert) > painted:
+        joined = " · ".join("".join(value for value, _ in line).rstrip() for line in alert)
+        alert = [watch._fit(watch._line(joined, "yellow"), width)]
+    if height >= MIN_SCREEN and length <= height and visible:
+        body = visible[:-1]
+        bottom = height - max(1, len(alert))
+        return body[:bottom] + [[]] * (bottom - len(body[:bottom])) + (alert or visible[-1:])
+    if alert:
+        bottom = max(0, height - len(alert))
+        return visible[:bottom] + [[]] * (bottom - len(visible[:bottom])) + alert
+    return visible
