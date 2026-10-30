@@ -18,3 +18,16 @@ metadata:
 - The runner may recreate the worktree from the branch. Committed work survives, but `.foragent/TRY.md` and `REBUTTAL.md` are lost and must be rewritten. In a worktree `.git` is a file, so keep scratch backups in `.foragent/`, not `.git/`.
 - Review defect class: narrow per-row except lists. `json.loads` of deeply nested input raises RecursionError, which is not a ValueError. Box/journal/binding/hook-input parsers catch `Exception` per row, and `stalled` isolates each row. Regression: `tests/test_presence.py -k "deeply or cannot_be_computed"`.
 - Review defect classes: silent truncation and check-then-write races. A journal tail that does not reach back past `since` is reported, and the notice limit and text limit name what they left out. `bind_checkout` re-checks and writes under `store._state_lock()`. That lock is flock-based and also blocks between threads, so the race test uses threads and events. Regressions: `tests/test_presence.py -k "journal_tail or over_the_limit or at_once"`.
+- Rule from 2026-10-31, after two holds on one class (box rows handled as raw text):
+  - Read JSONL by splitting the bytes on `\n` only; `str.splitlines` also splits on U+2028/U+2029.
+  - `json.loads` every line, then filter and sort on parsed fields only; a raw `'"notice"' in line` check misses a kind written with an escaped letter (backslash-u-0069 for the i).
+  - Skip a bad line on its own with one diagnostic.
+  - For a tail read, seek to `start - 1` and drop the first piece: it is empty when the tail begins at a line start.
+  - Regressions: `tests/test_presence.py -k "escaped_kind or line_separator or raw_notice_line or truncated_last or exactly_at_its_edge"`.
+- The spec asks to state design choices in the PR. TRY.md becomes the PR body, so add a `## Design choices` section after the required headings.
+- Review defect class: incomplete schema validation.
+  - `scan` checks per-kind field types (`orch_inbox._ROW_FIELDS`), and notices are checked with `NOTICE_FIELDS`. Each diagnostic names the wrong fields.
+  - A JSONL line that is not an object is diagnosed, not silently dropped.
+  - Optional fields may be absent (older rows), but a field that is present must have its type.
+  - Regressions: `tests/test_presence.py -k wrong_typed`.
+- The journal reader checks every event against `JOURNAL_FIELDS` (at, kind, summary, issue, say), not just notices. A `kind: []` or a missing kind beside a valid notice must give a diagnostic. Both journal writers (`append_event`, `state_phases`) produce this shape. Regression: `tests/test_presence.py -k "malformed_journal_event or other_kinds"`.

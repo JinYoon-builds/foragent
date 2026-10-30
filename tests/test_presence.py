@@ -1,4 +1,5 @@
 import io
+import re
 
 import pytest
 import yaml
@@ -241,7 +242,8 @@ def test_prompt_context_carries_recent_notices_and_names_unreadable_ones(stall_s
     with (store.root / "orch-events.jsonl").open("a", encoding="utf-8") as stream:
         stream.write(json.dumps({"kind": "notice", "at": "broken", "summary": "x"}) + "\n")
     context, problems = presence.prompt_context(root, now)
-    assert problems == ["orch-events.jsonl: 1 unreadable notice line(s)"]
+    assert len(problems) == 1 and re.fullmatch(
+        r"orch-events\.jsonl: tail line \d+ is not a readable notice \(wrong at, status\)", problems[0]), problems
     assert "Push for q2 failed" in context and "Partial read" in context
 
 
@@ -252,9 +254,8 @@ def test_a_corrupt_question_file_hides_no_valid_question_count(stall_store, brok
     root, store, now = stall_store
     orch_inbox.ask(store, "Valid?", ["a", "b"], 1, issues=[5])
     (store.root / "inbox" / "questions" / "broken.json").write_text(broken, encoding="utf-8")
+    # The last case is an object with wrong field types: skipped alone like the others.
     question = " · 1 question needs your answer in the planning session"
-    if broken.startswith('{"id"'):  # well formed but with unusable links: counted, links ignored
-        question = " · 2 questions need your answer in the planning session"
     assert presence.statusline_segment(root, now) == "🐿 0 lanes working · ✋ 1 · 0 merged today" + question
     assert presence.session_start_message(root, None, now) == (
         "since the last report: 0 merges · ✋ 1 · /fa for the report")
@@ -573,3 +574,166 @@ def test_two_checkouts_starting_at_once_bind_only_one(stall_store, monkeypatch):
     second.join(5)
     assert results == {"first": True, "second": False}
     assert presence._bound_root(store, "offline/stall") == root.resolve()
+
+
+def _raw_journal(store, text):
+    with (store.root / "orch-events.jsonl").open("a", encoding="utf-8", errors="surrogatepass") as stream:
+        stream.write(text)
+
+
+def test_an_escaped_kind_is_still_a_notice(stall_store):
+    from datetime import timedelta
+
+    from foragent import orch_inbox, presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    at = (now - timedelta(minutes=2)).isoformat()
+    _raw_journal(store, '{"at": "%s", "kind": "not\\u0069ce", "status": "sent", "summary": "Escaped kind"}\n' % at)
+    notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
+    assert [event["summary"] for event in notices] == ["Escaped kind"] and problems == []
+    assert '"Escaped kind"' in presence.prompt_context(root, now)[0]
+
+
+def test_a_line_separator_inside_a_field_keeps_the_notice_whole(stall_store, monkeypatch):
+    from datetime import timedelta
+
+    from foragent import orch_inbox
+
+    root, store, now = _bound_stall_store(stall_store)
+    store._now = lambda: now - timedelta(minutes=2)
+    orch_inbox.record_notice(store, "sent", "Para\u2029graph", channel="push\u2028line")
+    notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
+    # append_event folds whitespace in summary (U+2029 included); channel keeps U+2028 as is.
+    assert [(event["channel"], event["summary"]) for event in notices] == [("push\u2028line", "Para graph")]
+    assert problems == []
+    context, error = _hook(root, monkeypatch)
+    assert '"push\u2028line"' in context and error == ""
+
+
+def test_a_lone_surrogate_in_a_raw_notice_line_reaches_the_turn_replaced(stall_store, monkeypatch):
+    from datetime import timedelta
+
+    root, store, now = _bound_stall_store(stall_store)
+    at = (now - timedelta(minutes=2)).isoformat()
+    _raw_journal(store, '{"at": "%s", "kind": "notice", "status": "sent", "summary": "a\\ud800b"}\n' % at)
+    context, error = _hook(root, monkeypatch)
+    assert '"a?b"' in context and '"opaque"' in context
+
+
+def test_a_truncated_last_line_is_skipped_alone_with_one_note(stall_store):
+    from datetime import timedelta
+
+    from foragent import orch_inbox
+
+    root, store, now = _bound_stall_store(stall_store)
+    _journal(store, _notice(now - timedelta(minutes=3), "Complete"))
+    _raw_journal(store, '{"at": "%s", "kind": "notice", "summ' % (now - timedelta(minutes=1)).isoformat())
+    notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
+    assert [event["summary"] for event in notices] == ["Complete"]
+    assert len(problems) == 1 and "unreadable (JSONDecodeError)" in problems[0]
+
+
+@pytest.mark.parametrize("on_boundary", [True, False])
+def test_the_tail_keeps_a_line_that_starts_exactly_at_its_edge(stall_store, monkeypatch, on_boundary):
+    import json
+    from datetime import timedelta
+
+    from foragent import orch_inbox
+
+    root, store, now = _bound_stall_store(stall_store)
+    (store.root / "orch-events.jsonl").unlink(missing_ok=True)
+    first = json.dumps(_notice(now - timedelta(hours=30), "Before")) + "\n"
+    edge = json.dumps(_notice(now - timedelta(minutes=5), "At the edge")) + "\n"
+    last = json.dumps(_notice(now - timedelta(minutes=1), "Last")) + "\n"
+    _raw_journal(store, first + edge + last)
+    tail = len((edge + last).encode()) + (0 if on_boundary else -3)
+    monkeypatch.setattr(orch_inbox, "NOTICE_TAIL_BYTES", tail)
+    notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
+    summaries = [event["summary"] for event in notices]
+    if on_boundary:
+        assert summaries == ["At the edge", "Last"]
+    else:
+        assert summaries == ["Last"]
+        assert problems and "earlier notices in the window may be missing" in problems[0]
+
+
+@pytest.mark.parametrize("line,wrong", [
+    ("[]", None),
+    ('{"kind": "notice", "at": "AT", "summary": "s", "status": []}', "status"),
+    ('{"kind": "notice", "at": "AT", "summary": "s", "status": "sent", "channel": 17}', "channel"),
+    ('{"kind": "notice", "at": "AT", "summary": "s", "status": "sent", "ref": {}}', "ref"),
+    ('{"kind": "notice", "at": "AT", "summary": "s", "status": "sent", "issue": true}', "issue"),
+    ('{"kind": "notice", "at": "AT", "summary": 5, "status": "sent"}', "summary"),
+    ('{"kind": "notice", "at": "AT", "summary": "s"}', "status"),
+])
+def test_a_wrong_typed_journal_line_is_skipped_alone_and_named(stall_store, line, wrong):
+    from datetime import timedelta
+
+    from foragent import orch_inbox
+
+    root, store, now = _bound_stall_store(stall_store)
+    _journal(store, _notice(now - timedelta(minutes=3), "Valid"))
+    _raw_journal(store, line.replace("AT", (now - timedelta(minutes=1)).isoformat()) + "\n")
+    notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
+    assert [event["summary"] for event in notices] == ["Valid"]
+    assert len(problems) == 1
+    assert problems[0].endswith("(not an object)" if wrong is None else f"(wrong {wrong})"), problems
+
+
+@pytest.mark.parametrize("kind,field,value", [
+    ("requests", "text", 7), ("requests", "from", None), ("requests", "notes", "x"),
+    ("questions", "question", []), ("questions", "options", ["a", 2]), ("questions", "recommend", "1"),
+    ("questions", "kind", 3), ("questions", "issues", ["7"]),
+])
+def test_a_wrong_typed_box_field_skips_only_that_row_and_names_the_field(stall_store, kind, field, value):
+    import json
+
+    from foragent import orch_inbox, presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    row = (orch_inbox.add_request(store, "planning", "spare") if kind == "requests"
+           else orch_inbox.ask(store, "spare", ["a"], 1))
+    path = store.root / "inbox" / kind / f"{row['id']}.json"
+    record = json.loads(path.read_text())
+    record[field] = value
+    path.write_text(json.dumps(record))
+    rows, problems = orch_inbox.scan(store, kind)
+    assert row["id"] not in [kept["id"] for kept in rows] and len(rows) == 1
+    assert problems == [f'"inbox/{kind}/{row["id"]}.json": not a {kind[:-1]} record (wrong {field})']
+    context = presence.prompt_context(root, now)[0]
+    assert '"opaque"' in context and "Visible question" in context and "Partial read" in context
+
+
+@pytest.mark.parametrize("line,wrong", [
+    ('{"kind": [], "at": "AT", "summary": "s", "issue": null}', "event (wrong kind)"),
+    ('{"at": "AT", "summary": "s", "issue": null}', "event (wrong kind)"),
+    ('{"kind": "retry", "at": "AT", "summary": 5, "issue": 3}', "event (wrong summary)"),
+    ('{"kind": "retry", "at": "AT", "summary": "s", "issue": "3"}', "event (wrong issue)"),
+    ('{"kind": "retry", "at": "AT", "summary": "s", "issue": null, "say": 3}', "event (wrong say)"),
+    ('{"kind": "retry", "at": "noon", "summary": "s", "issue": null}', "event (wrong at)"),
+    ('{"kind": "phase", "summary": "s", "issue": 1}', "event (wrong at)"),
+])
+def test_any_malformed_journal_event_is_named_beside_a_valid_notice(stall_store, line, wrong):
+    from datetime import timedelta
+
+    from foragent import orch_inbox
+
+    root, store, now = _bound_stall_store(stall_store)
+    (store.root / "orch-events.jsonl").unlink(missing_ok=True)
+    _journal(store, _notice(now - timedelta(minutes=3), "Valid"))
+    _raw_journal(store, line.replace("AT", (now - timedelta(minutes=1)).isoformat()) + "\n")
+    notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
+    assert [event["summary"] for event in notices] == ["Valid"]
+    assert problems == [f"orch-events.jsonl: tail line 2 is not a readable {wrong}"]
+
+
+def test_well_formed_events_of_other_kinds_are_not_diagnosed(stall_store):
+    from datetime import timedelta
+
+    from foragent import orch_inbox
+    from foragent.orch_events import append_event
+
+    root, store, now = _bound_stall_store(stall_store)
+    append_event(store, now - timedelta(minutes=2), 201, "retry", "Retry", say="Retried.", verdict="ok")
+    notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
+    assert notices == [] and problems == []

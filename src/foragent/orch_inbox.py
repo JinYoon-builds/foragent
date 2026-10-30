@@ -66,6 +66,60 @@ def _name(kind: str, path: Path) -> str:
     return json.dumps(clean(f"inbox/{kind}/{path.name}"), ensure_ascii=False)
 
 
+def _text(value: Any) -> bool:
+    return isinstance(value, str)
+
+
+def _optional_text(value: Any) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _whole(value: Any) -> bool:
+    return type(value) is int  # bool is not a count or a number here
+
+
+def _optional_whole(value: Any) -> bool:
+    return value is None or type(value) is int
+
+
+def _texts(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _wholes(value: Any) -> bool:
+    return isinstance(value, list) and all(type(item) is int for item in value)
+
+
+def _items(value: Any) -> bool:
+    return isinstance(value, list)
+
+
+# The fields each reader relies on: (name, check, required). A field that is absent
+# but optional is fine (older rows); a field that is present must have its type.
+# Request notes are a list; a single malformed note inside is ignored on its own
+# by the age rule, as before. Times are checked where the age is computed.
+_ROW_FIELDS = {
+    "requests": (("id", _text, True), ("seq", _whole, True), ("status", _text, True),
+                 ("from", _text, True), ("text", _text, True), ("notes", _items, False)),
+    "questions": (("id", _text, True), ("seq", _whole, True), ("status", _text, True),
+                  ("question", _text, True), ("options", _texts, True),
+                  ("recommend", _optional_whole, False), ("kind", _text, False),
+                  ("issues", _wholes, False)),
+}
+# Every journal event, whatever its kind (append_event and the phase journal write
+# these): at (checked as a time), kind, summary, issue and the optional say line.
+JOURNAL_FIELDS = (("kind", _text, True), ("summary", _text, True), ("issue", _optional_whole, False),
+                  ("say", _text, False))
+# What a notice adds on top.
+NOTICE_FIELDS = (("status", _text, True), ("channel", _optional_text, False), ("ref", _optional_text, False))
+
+
+def _wrong_fields(row: dict[str, Any], fields) -> list[str]:
+    """Names of fields that are missing though required, or present with the wrong type."""
+    return [name for name, check, required in fields
+            if (name in row and not check(row[name])) or (required and name not in row)]
+
+
 def scan(store: StateStore, kind: str) -> tuple[list[dict[str, Any]], list[str]]:
     """Every well-formed row of one box, oldest first, and a note for each file left out.
 
@@ -94,9 +148,12 @@ def scan(store: StateStore, kind: str) -> tuple[list[dict[str, Any]], list[str]]
         except Exception as exc:  # any failure (bad JSON, deep nesting's RecursionError) skips this file alone
             skipped.append(f"{_name(kind, path)}: unreadable ({type(exc).__name__})")
             continue
-        if not (isinstance(row, dict) and isinstance(row.get("id"), str)
-                and type(row.get("seq")) is int and isinstance(row.get("status"), str)):
-            skipped.append(f"{_name(kind, path)}: not a {kind[:-1]} record")
+        if not isinstance(row, dict):
+            skipped.append(f"{_name(kind, path)}: not a {kind[:-1]} record (not an object)")
+            continue
+        wrong = _wrong_fields(row, _ROW_FIELDS[kind])
+        if wrong:
+            skipped.append(f"{_name(kind, path)}: not a {kind[:-1]} record (wrong {', '.join(wrong)})")
             continue
         rows.append(row)
     rows.sort(key=lambda row: row["seq"])
@@ -291,59 +348,73 @@ def record_notice(store: StateStore, status: str, summary: str, *, channel: str 
 
 
 def recent_notices(store: StateStore, since: datetime) -> tuple[list[dict[str, Any]], list[str]]:
-    """Notices recorded after ``since``, oldest first, and a note for each line left out."""
+    """Notices recorded after ``since``, oldest first, and one note for each line left out.
+
+    JSONL framing is "\\n" only: a field may hold U+2028 or another character that
+    str.splitlines would split on. Every line is parsed, and notices are chosen and
+    ordered on parsed fields only, never on the raw text (a key may be escaped).
+    """
     path = store.root / "orch-events.jsonl"
     try:
         with path.open("rb") as stream:
             size = stream.seek(0, 2)
-            stream.seek(max(0, size - NOTICE_TAIL_BYTES))
+            start = max(0, size - NOTICE_TAIL_BYTES)
+            # One byte more: whether the tail begins right after a newline.
+            stream.seek(max(0, start - 1))
             data = stream.read()
     except FileNotFoundError:
         return [], []
     except OSError as exc:
         return [], [f"orch-events.jsonl: unreadable ({exc.strerror or exc})"]
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    problems = []
-    if size > NOTICE_TAIL_BYTES:
-        lines = lines[1:]  # the first line may start mid-record
+    lines = data.split(b"\n")
+    if start > 0:
+        # The first piece is the byte before the tail plus whatever of a record the
+        # tail cut into; when that byte is a newline the piece is empty.
+        lines = lines[1:]
+    events, problems = [], []
+    for number, raw in enumerate(lines, 1):
+        if not raw.strip():
+            continue
+        try:
+            event = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception as exc:  # any failure (bad JSON, deep nesting's RecursionError) skips this line alone
+            problems.append(f"orch-events.jsonl: tail line {number} unreadable ({type(exc).__name__})")
+            continue
+        if not isinstance(event, dict):
+            problems.append(f"orch-events.jsonl: tail line {number} is not an event (not an object)")
+            continue
+        at = _event_at(event)
+        wrong = (["at"] if at is None else []) + _wrong_fields(event, JOURNAL_FIELDS)
+        if event.get("kind") == NOTICE_KIND:
+            wrong += _wrong_fields(event, NOTICE_FIELDS)
+        if wrong:
+            what = "notice" if event.get("kind") == NOTICE_KIND else "event"
+            problems.append(f"orch-events.jsonl: tail line {number} is not a readable {what} "
+                            f"(wrong {', '.join(wrong)})")
+            continue
+        events.append((number, at, event))
+    if start > 0:
         # Only the tail was read. Unless it reaches back past ``since``, notices in the
         # window may sit in the part not read: say so instead of looking complete.
-        earliest = _earliest_at(lines)
+        earliest = events[0][1] if events else None
         if earliest is None or earliest > since:
-            problems.append(f"orch-events.jsonl: only the last {NOTICE_TAIL_BYTES} bytes read; "
-                            "earlier notices in the window may be missing")
-    notices, skipped = [], 0
-    for line in lines:
-        if f'"{NOTICE_KIND}"' not in line:
-            continue
-        try:
-            event = json.loads(line)
-            at = datetime.fromisoformat(event["at"])
-        except Exception:  # any failure (bad JSON, deep nesting's RecursionError) skips this line alone
-            skipped += 1
-            continue
-        if not isinstance(event, dict) or event.get("kind") != NOTICE_KIND:
-            continue
-        if at.tzinfo is None or not isinstance(event.get("summary"), str):
-            skipped += 1
-            continue
-        if at > since:
-            notices.append(event)
-    if skipped:
-        problems.append(f"orch-events.jsonl: {skipped} unreadable notice line(s)")
-    return notices, problems
+            problems.insert(0, f"orch-events.jsonl: only the last {NOTICE_TAIL_BYTES} bytes read; "
+                               "earlier notices in the window may be missing")
+    notices = []
+    for _number, at, event in events:
+        if event["kind"] == NOTICE_KIND and at > since:
+            notices.append((at, event))
+    notices.sort(key=lambda item: item[0])
+    return [event for _, event in notices], problems
 
 
-def _earliest_at(lines: list[str]) -> datetime | None:
-    """The time of the first journal line that has a readable timezone-aware one, else None."""
-    for line in lines:
-        try:
-            at = datetime.fromisoformat(json.loads(line)["at"])
-        except Exception:
-            continue
-        if at.tzinfo is not None:
-            return at
-    return None
+def _event_at(event: dict[str, Any]) -> datetime | None:
+    """A journal event's parsed timezone-aware time, else None."""
+    try:
+        at = datetime.fromisoformat(event["at"])
+    except Exception:
+        return None
+    return at if at.tzinfo is not None else None
 
 
 class FollowEvents:
