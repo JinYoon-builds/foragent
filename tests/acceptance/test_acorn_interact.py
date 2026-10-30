@@ -47,28 +47,16 @@ def interaction_api(*names):
 
 
 def row_hit_positions(layout, frame, width, numbers):
-    """Both the issue number and its five phase markers target the same row issue."""
-    import re
     from foragent.watch import hit_test
-
-    lines = plain_frame(frame).splitlines()
-    positions = {}
+    from test_lane_m2_contract import acorn_row
+    hits=hit_positions(layout,frame,width)
+    positions={}
     for number in numbers:
-        row = issue_row(frame, number)
-        y = lines.index(row)
-        assert row.lstrip().startswith(("🐿", "🔍", "✋", "⏳", "💤", "[*]", "[?]", "[!]", "[.]", "[z]")), "click targets must live on state-led text rows"
-        start = row.index(f"#{number}")
-        progress = re.search(r"[🌰○]{5}|[#.]{5}", row[start + len(str(number)) + 1:])
-        assert progress, "each clickable issue row must include its five phase markers"
-        progress_start = start + len(str(number)) + 1 + progress.start()
-        for offset, text in ((start, f"#{number}"), (progress_start, progress.group())):
-            x = display_cells(row[:offset])
-            cells = display_cells(text)
-            assert x + cells <= width
-            assert all(hit_test(layout, cell, y) == ("acorn", number) for cell in range(x, x + cells)), "number and progress cells must target their own issue"
-        positions[number] = (display_cells(row[:start]), y)
-    assert len({y for x, y in positions.values()}) == len(numbers), "folding/expanding must operate on distinct issue rows"
-    assert "▀" not in plain_frame(frame) and "▄" not in plain_frame(frame), "busy interaction frames have no sprites"
+        acorn_row(frame,number)
+        assert ('acorn',number) in hits, 'each visible issue acorn has its own real hit region'
+        x,y=hits[('acorn',number)]
+        assert hit_test(layout,x,y)==('acorn',number)
+        positions[number]=(x,y)
     return positions
 
 
@@ -94,86 +82,61 @@ def test_acorn_interact_issue_box_reads_all_details_from_local_records_without_g
 
 def test_acorn_interact_collapsed_neighbours_expand_all_and_more_hits_are_real(tmp_path):
     from foragent.state import StateStore
-    handle_key, handle_mouse, hit_test, render_frame = interaction_api(
-        "handle_key", "handle_mouse", "hit_test", "render_frame")
-
-    snapshot, config = interaction_snapshot()
-    store, state, layout = StateStore(tmp_path / "state"), {}, {}
-    collapsed = render_frame(snapshot, config, tmp_path, width=80, state=state, layout=layout)
-    hits = hit_positions(layout, collapsed, 80)
-    assert {target[1] for target in hits if target[0] == "acorn"} == {2, 3, 4}
-    row_hit_positions(layout, collapsed, 80, (2, 3, 4))
-    assert "▸ 4개 더" in plain_frame(collapsed)
-    assert hit_test(layout, -1, -1) is None and hit_test(layout, 80, 0) is None
-    x, y = hits[("more", "work")]
-    handle_mouse("left", x, y, layout, store, config, state=state)
-    expanded = render_frame(snapshot, config, tmp_path, width=80, state=state, layout=layout)
-    row_hit_positions(layout, expanded, 80, tuple(range(1, 8)))
-    assert "▾ 접기" in plain_frame(expanded)
-    assert {target[1] for target in hit_positions(layout, expanded, 80) if target[0] == "acorn"} == set(range(1, 8))
-    # Return to collapsed before exercising the independent expand-all shortcut.
-    x, y = hit_positions(layout, expanded, 80)[("more", "work")]
-    handle_mouse("left", x, y, layout, store, config, state=state)
-    for expected in ("▾ 접기", "▸ 4개 더"):
-        handle_key("a", store, config, state=state)
-        assert expected in plain_frame(render_frame(snapshot, config, tmp_path, width=80, state=state))
+    from test_lane_m2_contract import acorn_row
+    handle_key,handle_mouse,hit_test,render_frame=interaction_api('handle_key','handle_mouse','hit_test','render_frame')
+    snapshot,config=interaction_snapshot(count=52)
+    store,state,layout=StateStore(tmp_path/'state'),{},{}
+    frame=render_frame(snapshot,config,tmp_path,width=80,state=state,layout=layout)
+    hits=hit_positions(layout,frame,80)
+    assert ('acorn',3) in hits
+    visible={target[1] for target in hits if target[0]=='acorn' and 4<=target[1]<=52}
+    assert len(visible)>1, 'replacement: fill available next rows before truncating the queue'
+    assert f'…{49-len(visible)}' in plain_frame(frame)
+    assert hit_test(layout,-1,-1) is None and hit_test(layout,80,0) is None
+    for n in visible: acorn_row(frame,n)
 
 
 def test_acorn_interact_wheel_and_j_k_scroll_without_clicks_and_show_position(tmp_path):
     from foragent.state import StateStore
-    handle_key, handle_mouse, render_frame = interaction_api("handle_key", "handle_mouse", "render_frame")
-
-    snapshot, config = interaction_snapshot(count=52)
-    store, state, layout = StateStore(tmp_path / "state"), {}, {}
-    handle_key("a", store, config, state=state)
-    full = render_frame(snapshot, config, tmp_path, width=56, state=state, layout=layout)
-    x, y = row_hit_positions(layout, full, 56, (3,))[3]
-    for key in ("j", "k"):
-        before = state.get("scroll", 0)
-        handle_key(key, store, config, state=state)
-        assert state["scroll"] > before if key == "j" else state["scroll"] < before
-    for event in ("wheel-down", "wheel-up"):
-        state["scroll"] = 10
-        handle_mouse(event, x, y, layout, store, config, state=state)
-        assert state["scroll"] > 10 if event == "wheel-down" else state["scroll"] < 10
-        assert state.get("issue") is None, "wheel events over an acorn must never open a box"
-    state["scroll"] = 11
-    visible = plain_frame(render_frame(snapshot, config, tmp_path, width=56, height=30,
-                                        state=state, layout=layout))
-    assert len(visible.splitlines()) == 30
-    full_lines = plain_frame(full).splitlines()
-    assert visible.splitlines()[:-1] == full_lines[11:40], "scrolling must show the requested text-row slice"
-    assert f"12–40/{len(full_lines)}줄" in visible
-    assert "Option" in visible, "mouse mode must explain how to select text"
-    state["scroll"] = 0
-    handle_key("k", store, config, state=state)
-    assert state["scroll"] == 0
+    handle_key,handle_mouse,render_frame=interaction_api('handle_key','handle_mouse','render_frame')
+    snapshot,config=interaction_snapshot(count=52)
+    store,state,layout=StateStore(tmp_path/'state'),{},{}
+    frame=render_frame(snapshot,config,tmp_path,width=56,height=8,state=state,layout=layout)
+    before=state.get('scroll',0)
+    handle_key('j',store,config,state=state)
+    assert state['scroll']>before
+    handle_key('k',store,config,state=state)
+    assert state['scroll']==before
+    for event in ('wheel-down','wheel-up'):
+        state['scroll']=1
+        handle_mouse(event,0,0,layout,store,config,state=state)
+        assert state['scroll']>1 if event=='wheel-down' else state['scroll']<1
+        assert state.get('issue') is None
+    assert 's ' in plain_frame(frame).splitlines()[-1] and 'm ' in plain_frame(frame).splitlines()[-1]
+    assert 'Claude' in plain_frame(frame).splitlines()[-2] and 'Codex' in plain_frame(frame).splitlines()[-2]
 
 
 def test_acorn_interact_left_click_toggles_box_and_x_closes_it(
     git_history, tmp_path, monkeypatch,
 ):
-    handle_key, handle_mouse, render_frame = interaction_api("handle_key", "handle_mouse", "render_frame")
-
-    case = snapshot_case(git_history, tmp_path, monkeypatch)
-    snapshot, config = interaction_snapshot()
-    # Use the existing local issue #1, visible after expanding the lane.
-    state, layout = {}, {}
-    handle_key("a", case.store, config, state=state)
-    frame = render_frame(snapshot, config, case.root, width=80, state=state, layout=layout)
-    x, y = row_hit_positions(layout, frame, 80, (1,))[1]
-    calls = record_gh(monkeypatch)
-    handle_mouse("left", x, y, layout, case.store, config, state=state)
-    assert state["issue"] == 1
-    opened = plain_frame(render_frame(snapshot, config, case.root, width=80, state=state))
-    assert "Implement feature" in opened and "Implement the feature." in opened, "clicking a row must render its local issue box"
-    handle_mouse("left", x, y, layout, case.store, config, state=state)
-    assert state.get("issue") is None
-    handle_mouse("left", x, y, layout, case.store, config, state=state)
-    handle_key("x", case.store, config, state=state)
-    assert state.get("issue") is None and calls == []
-    closed = plain_frame(render_frame(snapshot, config, case.root, width=80, state=state))
-    assert "Implement the feature." not in closed, "x must remove the issue box from the rendered frame"
+    from test_lane_m2_contract import draw,pick,bubble
+    handle_key,handle_mouse,render_frame=interaction_api('handle_key','handle_mouse','render_frame')
+    case=snapshot_case(git_history,tmp_path,monkeypatch)
+    snapshot,config=interaction_snapshot()
+    row=snapshot.status['lanes']['work']
+    row.update(issue=1,title='Implement feature',running=[{'number':1,'title':'Implement feature'}])
+    snapshot.status['active_runs'][0].update(number=1,phase='implementing')
+    state={'store':case.store}
+    calls=record_gh(monkeypatch)
+    before=draw(snapshot,config,case.root,width=160,state=state)
+    opened,state=pick(snapshot,config,case.root,case.store,('acorn',1),width=160,state=state)
+    assert 'Implement feature' in bubble(opened) and '#1' in opened
+    layout={}
+    render_frame(snapshot,config,case.root,width=160,state=state,layout=layout)
+    assert ('acorn',1) in hit_positions(layout,opened,160), 'explanation keeps the lane acorn visible'
+    handle_key('x',case.store,config,state=state)
+    assert draw(snapshot,config,case.root,width=160,state=state)==before
+    assert calls==[]
 
 
 def test_acorn_interact_live_numbers_use_osc8_and_live_setup_enters_alternate_screen(
@@ -198,6 +161,8 @@ def test_acorn_interact_live_numbers_use_osc8_and_live_setup_enters_alternate_sc
         assert main(["gate", "status", "--json"]) == 0
     status = json.loads(status_output.getvalue())
     snapshot, config = interaction_snapshot()
+    snapshot.status["lanes"]["work"].update(issue=1, title="Implement feature", running=[{"number":1,"title":"Implement feature"}])
+    snapshot.status["active_runs"][0].update(number=1, phase="implementing")
     state, layout = {}, {}
     watch.handle_key("a", case.store, config, state=state)
     frame = watch.render_frame(snapshot, config, case.root, width=100, state=state, layout=layout)
@@ -256,3 +221,4 @@ def test_acorn_interact_live_numbers_use_osc8_and_live_setup_enters_alternate_sc
         value for args in painted for value in args if isinstance(value, str))
     assert osc8(url, "#1") in terminal_output, "the linked number must actually reach the terminal"
     assert setup_calls and "\x1b[?1049h" in output.getvalue()
+

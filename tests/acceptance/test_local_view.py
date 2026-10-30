@@ -82,7 +82,11 @@ def test_local_view_hundred_refreshes_use_local_order_children_titles_and_comple
         assert snapshot.order.number == 99 and snapshot.order.title == "Ship the local dashboard"
         assert (snapshot.completed, snapshot.total) == (1, 4)
         assert [issue.number for issue in snapshot.done["api"]] == [4]
-        assert all(title in frame for title in ("Ship the local dashboard", "Implement feature", "Finished API task"))
+        from test_lane_m2_contract import pick, bubble
+        assert "#1" in frame and "#4" in frame
+        opened, _ = pick(snapshot, case.config, case.root, case.store, ("acorn", 1), width=160)
+        assert "Implement feature" in bubble(opened)
+        assert snapshot.done["api"][0].title == "Finished API task"
         assert "Remote title" not in frame
     assert calls == []
 
@@ -341,8 +345,10 @@ def test_local_view_stale_snapshot_frame_warns_on_first_line_with_active_run(
     calls = record_gh(monkeypatch)
     frame = watch.render_frame(snapshot, case.config, case.root, width=160)
     assert "⚠ 상태를 못 읽었어요" in frame.splitlines()[0]
-    assert "일하는 중 1" in frame and "일하는 중 0" not in frame
-    assert "Implement feature" in frame
+    assert "레인 1곳에서 이슈 1개를 작업하고 있어요." in frame and "일하는 중 0" not in frame
+    from test_lane_m2_contract import pick, bubble
+    opened, _ = pick(snapshot, case.config, case.root, case.store, ("acorn", 1), width=160)
+    assert "Implement feature" in bubble(opened)
     assert calls == []
 
 

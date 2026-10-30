@@ -7,14 +7,13 @@ from datetime import timedelta
 
 
 def _lane_rows(output):
-    glyphs = ("🐿", "🔍", "✋", "⏳", "💤", "[*]", "[?]", "[!]", "[.]", "[z]")
-    return [line for line in output.splitlines() if line.lstrip().startswith(glyphs)]
+    from test_squirrel_running import plain_frame
+    return [line for line in plain_frame(output).splitlines() if '▌' in line or '[' in line and '#' in line]
 
 
 def _api_row(output):
-    rows = [line for line in _lane_rows(output) if "🧩 Api" in line and "#1" in line.split()]
-    assert len(rows) == 1, output
-    return rows[0]
+    from test_lane_m2_contract import acorn_row,bubble
+    return acorn_row(output,1)+'\n'+bubble(output)
 
 
 def test_dead_runner_shows_as_stalled_at_once(git_history, tmp_path, monkeypatch, capsys):
@@ -29,7 +28,8 @@ def test_dead_runner_shows_as_stalled_at_once(git_history, tmp_path, monkeypatch
     now = case.clock[0].isoformat()
     case.store.update_run(1, pid=process.pid, last_activity_at=now, last_progress_at=now)
     assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
-    assert "no worker" in _api_row(capsys.readouterr().out)
+    frame=capsys.readouterr().out
+    assert "#1" in _api_row(frame) and "no worker" in _api_row(frame)
 
 
 def test_stalled_mark_follows_stall_minutes(git_history, tmp_path, monkeypatch, capsys):
@@ -45,7 +45,8 @@ def test_stalled_mark_follows_stall_minutes(git_history, tmp_path, monkeypatch, 
     recent = (case.clock[0] - timedelta(minutes=4)).isoformat()
     case.store.update_run(1, pid=os.getpid(), last_activity_at=recent, last_progress_at=recent)
     assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
-    assert "looks stalled 4 min" in _api_row(capsys.readouterr().out)
+    frame=capsys.readouterr().out
+    assert "#1" in _api_row(frame) and "looks stalled 4 min" in _api_row(frame)
 
     fresh = (case.clock[0] - timedelta(minutes=1)).isoformat()
     case.store.update_run(1, last_activity_at=fresh, last_progress_at=fresh)
@@ -73,3 +74,4 @@ def test_notification_line_names_the_issue_and_the_reason(git_history, tmp_path,
     line = notify(ctx, notifier=lambda line, title: sent.append(line))
     assert sent and line == sent[0]
     assert "#1" in line and "Implement feature" in line, line
+

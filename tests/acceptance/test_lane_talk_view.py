@@ -46,13 +46,12 @@ def talk_view(git_history, tmp_path, monkeypatch, capsys, *, talking=False, fini
 
 
 def squirrel_cells(snapshot, case, width, lane="orch"):
-    from foragent.watch import hit_test, render_frame
-
-    frame = plain_frame(render_frame(snapshot, case.config, case.root, width=width))
-    cells = [(x, y) for y, line in enumerate(frame.splitlines()) for x in range(width)
-             if hit_test(snapshot, case.config, case.root, x=x, y=y, width=width) == ("squirrel", lane)]
-    assert cells, f"The {lane} squirrel needs a public, clickable hit region"
-    return frame, cells
+    from foragent.watch import render_frame,hit_test
+    layout={}
+    frame=plain_frame(render_frame(snapshot,case.config,case.root,width=width,layout=layout))
+    cells=[(x,y) for y,_ in enumerate(frame.splitlines()) for x in range(width) if hit_test(layout,x,y)==('squirrel',lane)]
+    assert cells, f'The {lane} squirrel needs a public clickable hit region'
+    return frame,cells
 
 
 def patch_talk(monkeypatch):
@@ -76,72 +75,69 @@ def patch_talk(monkeypatch):
 def test_lane_talk_view_current_squirrel_click_calls_the_same_talk_function_as_cli(
     git_history, tmp_path, monkeypatch, capsys,
 ):
-    from foragent.watch import handle_mouse
-
-    case, main, snapshot, gh = talk_view(git_history, tmp_path, monkeypatch, capsys)
-    calls = patch_talk(monkeypatch)
-    assert main(["lanes", "talk", "1", "--repo-root", str(case.root)]) == 0
-    assert len(calls) == 1
-    cli_call = calls.pop()
-    _, cells = squirrel_cells(snapshot, case, 56)
-    x, y = cells[0]
-    handle_mouse(snapshot, case.config, case.root, x=x, y=y, width=56)
-    assert calls == [cli_call] and gh == []
+    from test_lane_m2_contract import pick,bubble
+    case,main,snapshot,gh=talk_view(git_history,tmp_path,monkeypatch,capsys)
+    calls=patch_talk(monkeypatch)
+    opened,_=pick(snapshot,case.config,case.root,case.store,('squirrel','orch'),width=240)
+    words=bubble(opened)
+    assert 'src/**' in words and len([line for line in words.splitlines() if line])==3, 'replacement: lane ownership, weekly results, newest memory'
+    assert calls==[] and gh==[], 'r55(c) replaces talk with a local explanation'
 
 
 def test_lane_talk_view_finished_lane_squirrel_talks_to_its_last_issue(
     git_history, tmp_path, monkeypatch, capsys,
 ):
-    from foragent.watch import handle_mouse
-
-    case, main, snapshot, gh = talk_view(git_history, tmp_path, monkeypatch, capsys, finished=True)
-    assert snapshot.status["lanes"]["orch"]["issue"] is None
-    calls = patch_talk(monkeypatch)
-    assert main(["lanes", "talk", "1", "--repo-root", str(case.root)]) == 0
-    assert len(calls) == 1
-    cli_call = calls.pop()
-    _, cells = squirrel_cells(snapshot, case, 56)
-    x, y = cells[0]
-    handle_mouse(snapshot, case.config, case.root, x=x, y=y, width=56)
-    assert calls == [cli_call] and gh == []
+    from test_lane_m2_contract import pick,bubble
+    case,main,snapshot,gh=talk_view(git_history,tmp_path,monkeypatch,capsys,finished=True)
+    calls=patch_talk(monkeypatch)
+    idle_name_target(snapshot, case, "orch")
+    opened,_=pick(snapshot,case.config,case.root,case.store,('squirrel','orch'),width=240)
+    words=bubble(opened)
+    assert 'src/**' in words and '이번 주' in words, 'idle lanes explain their own results rather than talking to the last issue'
+    assert len([line for line in words.splitlines() if line])==3 and calls==[] and gh==[]
 
 
 def test_lane_talk_view_talking_badge_is_above_squirrel_and_text_mode_names_the_state(
     git_history, tmp_path, monkeypatch, capsys,
 ):
-    from foragent.watch import render_frame
-
-    case, _, snapshot, gh = talk_view(git_history, tmp_path, monkeypatch, capsys, talking=True)
-    for width in (56, 44):
-        frame = plain_frame(render_frame(snapshot, case.config, case.root, width=width))
-        assert "💬" in frame, "A talking run needs its speech badge"
-        _, cells = squirrel_cells(snapshot, case, width)
-        lines = frame.splitlines()
-        top = min(y for x, y in cells)
-        left, right = min(x for x, y in cells), max(x for x, y in cells)
-        badges = [(cell_count(line[:index]), y)
-                  for y, line in enumerate(lines[:top])
-                  for index, char in enumerate(line) if char == "💬"]
-        assert any(left <= x <= right and top - 2 <= y < top for x, y in badges), frame
-    plain = plain_frame(render_frame(snapshot, case.config, case.root, width=40))
-    assert "대화 중 💬" in plain, plain
-    for run in snapshot.status["active_runs"]:
-        run["talking"] = False
-    assert "💬" not in plain_frame(render_frame(snapshot, case.config, case.root, width=56))
-    assert "대화 중 💬" not in plain_frame(render_frame(snapshot, case.config, case.root, width=40))
-    assert gh == []
+    from test_lane_m2_contract import pick,bubble,draw
+    case,_,snapshot,gh=talk_view(git_history,tmp_path,monkeypatch,capsys,talking=True)
+    calls=patch_talk(monkeypatch)
+    opened,_=pick(snapshot,case.config,case.root,case.store,('squirrel','orch'),width=240)
+    assert 'src/**' in bubble(opened) and len([s for s in bubble(opened).splitlines() if s])==3
+    for run in snapshot.status['active_runs']: run['talking']=False
+    again,_=pick(snapshot,case.config,case.root,case.store,('squirrel','orch'),width=240)
+    assert bubble(again)==bubble(opened), 'replacement: the introduction is independent of a historical talk session badge'
+    assert calls==[] and gh==[]
 
 
 def test_lane_talk_view_lane_with_no_current_or_past_issue_does_nothing_on_click(
     git_history, tmp_path, monkeypatch, capsys,
 ):
-    from foragent.watch import handle_mouse
+    from test_lane_m2_contract import pick,bubble
+    case,_,snapshot,gh=talk_view(git_history,tmp_path,monkeypatch,capsys)
+    calls=patch_talk(monkeypatch)
+    idle_name_target(snapshot, case, "empty")
+    opened,_=pick(snapshot,case.config,case.root,case.store,('squirrel','empty'),width=240)
+    words=bubble(opened)
+    assert 'empty/**' in words and len([s for s in words.splitlines() if s])==3, 'even an empty lane has ownership to explain'
+    assert calls==[] and gh==[]
 
-    case, _, snapshot, gh = talk_view(git_history, tmp_path, monkeypatch, capsys)
-    assert snapshot.status["lanes"]["empty"]["issue"] is None
-    assert not snapshot.done.get("empty")
-    calls = patch_talk(monkeypatch)
-    _, cells = squirrel_cells(snapshot, case, 56, lane="empty")
-    x, y = cells[0]
-    handle_mouse(snapshot, case.config, case.root, x=x, y=y, width=56)
-    assert calls == [] and gh == []
+
+def idle_name_target(snapshot, case, lane):
+    """One shared sleeping sprite; each idle name selects that lane's introduction."""
+    from foragent.watch import render_frame
+    from foragent.labels import lane_display
+    from test_acorn_interact import hit_positions
+
+    layout = {}
+    frame = plain_frame(render_frame(snapshot, case.config, case.root, width=240, layout=layout))
+    hits = hit_positions(layout, frame, 240)
+    assert ("squirrel", lane) in hits, "idle names retain the public lane explanation target"
+    x, y = hits[("squirrel", lane)]
+    line = frame.splitlines()[y]
+    name = lane_display(case.config, lane, case.config.language)
+    assert name in line, "idle clicks choose a name, not an arbitrary lane under the shared sprite"
+    first = cell_count(line[:line.index(name)])
+    assert first <= x < first + cell_count(name)
+

@@ -133,20 +133,19 @@ def test_settings_window_footer_reflects_review_changes(
     git_history, tmp_path, monkeypatch, capsys,
 ):
     from foragent.config import load_config
-    from foragent.watch import render_frame
-
-    case, main = settings_case(git_history, tmp_path, monkeypatch)
+    from foragent.watch import render_frame,handle_key
+    case,main=settings_case(git_history,tmp_path,monkeypatch)
     readable_settings(case)
-    snapshot, _ = running_snapshot()
-    before = plain_frame(render_frame(snapshot, load_config(case.root), case.root, width=100))
-    assert issue_row(before, 101).lstrip().startswith(("🐿", "[*]")), "review settings must appear below the one-row lane view"
-    assert "머지: 모아서 물어보기" in before.splitlines()[-1]
-    assert cli_exit(main, ["settings", "set", "review", "careful", "--repo-root", str(case.root)]) == 0
-    assert stored_settings(case, main, capsys)["review"] == "careful"
-    after = plain_frame(render_frame(snapshot, load_config(case.root), case.root, width=100))
-    assert issue_row(after, 101).lstrip().startswith(("🐿", "[*]"))
-    assert "머지: 하나씩" in after.splitlines()[-1]
-    assert "머지: 모아서 물어보기" not in after.splitlines()[-1]
+    snapshot,_=running_snapshot()
+    state={'store':case.store}
+    handle_key('s',case.store,load_config(case.root),state=state,repo_root=case.root)
+    before=plain_frame(render_frame(snapshot,load_config(case.root),case.root,width=160,state=state))
+    assert '모아서 물어보기' in before
+    assert cli_exit(main,['settings','set','review','careful','--repo-root',str(case.root)])==0
+    assert stored_settings(case,main,capsys)['review']=='careful'
+    after=plain_frame(render_frame(snapshot,load_config(case.root),case.root,width=160,state=state))
+    assert '하나씩' in after and '모아서 물어보기' not in after
+    assert before.splitlines()[-1]==after.splitlines()[-1]=='도토리를 누르면 설명해요 · s 설정 · m 사용량 모드 · q 끝내기'
 
 
 def test_settings_window_no_executor_needed_for_personal_changes_or_m_shortcut(
@@ -179,9 +178,10 @@ def test_settings_window_no_executor_needed_for_personal_changes_or_m_shortcut(
     snapshot, _ = running_snapshot()
     from foragent.watch import render_frame
     rendered = plain_frame(render_frame(snapshot, load_config(case.root), case.root, width=100))
-    assert issue_row(rendered, 101).lstrip().startswith("[*]"), "personal glyph changes must reach rendered lane rows"
+    assert "#101" in issue_row(rendered, 101), "personal ASCII choice keeps the issue readable"
     assert "▀" not in rendered and "▄" not in rendered
     for expected in ("burn", "keep"):
         handle_key("m", case.store, load_config(case.root), state=state, repo_root=case.root)
         assert stored_settings(case, main, capsys)["claude_quota"]["mode"] == expected
     assert called == calls == []
+
