@@ -17,7 +17,8 @@ def scratch(git_history, tmp_path, files):
     git_command(git_history.clone, "fetch", "origin", "main")
     base = git.ref_sha("refs/remotes/origin/main")
     tree = tmp_path / "scratch" / "tree"
-    return git, tree, order_scratch.build(git, base, tree, {".claude/agents/fa-api.md": ("file", 0o644, b"agent\n")})
+    context = order_scratch_context.Context(git_history.clone, files={".claude/agents/fa-api.md": b"agent\n"})
+    return git, tree, order_scratch.build(git, base, tree, context)
 
 
 def test_only_new_files_under_the_acceptance_directory_are_candidates(git_history, tmp_path):
@@ -89,38 +90,6 @@ def test_writer_reply_is_read_from_a_fenced_block():
     assert order_prepare._envelope('{"acceptance_files": [], "done_when": [], "questions": []}') is None
 
 
-def test_a_proposed_lane_gets_the_agent_and_library_skills_add_lane_would_install(tmp_path, monkeypatch):
-    skill = tmp_path / "library/tdd"
-    skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text("---\nname: tdd\n---\nWrite the test first.\n")
-    seen = []
-
-    class Manager:
-        def __init__(self, config):
-            pass
-
-        def check_install(self, identity, root):
-            seen.append(identity)
-            return SimpleNamespace(path=skill)
-
-    monkeypatch.setattr(order_prepare_setup, "SkillManager", Manager)
-    monkeypatch.setattr(order_prepare_setup, "with_vendored_library", lambda config, cwd, root: config)
-    plan = {"new_lanes": [{"name": "web", "paths": ["web/**"], "skills": ["lib:skills/tdd"]}]}
-    config, files, refused = order_prepare_setup.lane_context(plan, {"lane": "web"}, Config(), tmp_path)
-    assert refused == []
-    assert seen == ["lib:skills/tdd"]
-    assert config.lanes["web"] == {"paths": ["web/**"], "agent": "fa-web", "skills": ["tdd"]}
-    assert files[".claude/skills/tdd/SKILL.md"][2].endswith(b"Write the test first.\n")
-    assert b"web lane (web/**)" in files[".claude/agents/fa-web.md"][2]
-    tree = tmp_path / "tree"
-    tree.mkdir()
-    assert files[".claude/skills/tdd"] is None, "main's older copy of the skill is removed first"
-    for name, data in files.items():
-        if data is not None:
-            (tree / name).parent.mkdir(parents=True, exist_ok=True)
-            (tree / name).write_bytes(data[2])
-    start = order_prepare_setup.writer_setup(replace(config, executor="codex"), {"lane": "web", "size": "s"}, tree)
-    assert start.missing_skills == [] and ".claude/skills/tdd/SKILL.md" in start.notes
 
 
 def test_writers_ignore_inherited_authority_and_may_edit_only_the_tree_tests(tmp_path):
@@ -136,6 +105,7 @@ def test_writers_ignore_inherited_authority_and_may_edit_only_the_tree_tests(tmp
     denied = settings["permissions"]["deny"]
     assert f"Edit(/{root}/**)" in denied and f"Write(/{gitdir}/**)" in denied and f"Edit(/{tree}/.claude/**)" in denied
     assert not any(str(state) + "/**" in rule for rule in denied), "the state directory holds the tree"
+    assert settings["disableAllHooks"] is True
     sandbox = settings["sandbox"]
     assert sandbox["enabled"] is True and sandbox["allowUnsandboxedCommands"] is False
     assert sandbox["filesystem"]["allowWrite"] == [str(tree)] and sandbox["network"]["allowedDomains"] == []
@@ -147,7 +117,8 @@ def test_isolated_executor_commands_drop_user_configuration(tmp_path):
 
     codex = codex_command(tmp_path, tmp_path / "out", isolated=True)
     assert {"--ignore-user-config", "--ignore-rules", "sandbox_workspace_write.writable_roots=[]",
-            "sandbox_workspace_write.network_access=false"} <= set(codex)
+            "sandbox_workspace_write.network_access=false", "notify=[]", "mcp_servers={}"} <= set(codex)
+    assert codex[codex.index("--disable") + 1] == "hooks"
     assert codex[codex.index("-s") + 1] == "workspace-write"
     assert "--ignore-user-config" not in codex_command(tmp_path, tmp_path / "out")
     claude = claude_command(permission_mode="dontAsk", setting_sources="project")
@@ -163,7 +134,7 @@ def test_risk_guidance_follows_the_proposed_lane_paths_without_listed_files(tmp_
     item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "x",
             "lane": "web", "size": "s", "blocked_by": []}
     plan["issues"].append(item)
-    config, _files, _refused = order_prepare_setup.lane_context(plan, item, Config(), tmp_path)
+    config, _context = order_prepare_setup.lane_context(plan, item, Config(), tmp_path)
     prompt = order_prepare.writer_prompt(plan, item, config, tmp_path, tmp_path / "tree", "abc")
     assert "web-lane-risk-note" in prompt
     assert "web-lane-risk-note" not in order_prepare.writer_prompt(
@@ -199,51 +170,8 @@ def test_shared_test_configuration_of_any_tool_is_refused_but_data_fixtures_are_
     assert sorted(candidates) == ["tests/acceptance/data/sample.json", "tests/acceptance/test_new.py"]
 
 
-def test_a_lane_without_an_agent_still_brings_its_checkout_memory(tmp_path):
-    from foragent import lane_memory
-
-    config = Config(lanes={"api": {"paths": ["api/**"]}})
-    memory = tmp_path / lane_memory.lane_directory(config, "api") / "MEMORY.md"
-    memory.parent.mkdir(parents=True)
-    memory.write_text("- lesson\n")
-    _config, files, _refused = order_prepare_setup.lane_context({}, {"lane": "api"}, config, tmp_path)
-    folder = memory.parent.relative_to(tmp_path).as_posix()
-    assert files == {folder: None, memory.relative_to(tmp_path).as_posix(): ("file", 0o644, b"- lesson\n")}
 
 
-def test_scratch_is_the_checkout_view_and_drops_context_the_checkout_deleted(git_history, tmp_path):
-    from foragent import lane_memory
-
-    git_history.update({
-        ".gitattributes": "skipped.txt export-ignore\nversion.txt export-subst\n",
-        "skipped.txt": "kept in a checkout\n", "version.txt": "$Format:%H$\n",
-        ".claude/agents/fa-api.md": "---\nname: fa-api\n---\nSTALE MAIN NOTES\n",
-        ".claude/agent-memory/fa-api/MEMORY.md": "- old lesson\n",
-        ".claude/agent-memory/fa-api/gone.md": "- deleted in the checkout\n",
-        ".claude/skills/tdd/SKILL.md": "---\nname: tdd\ndescription: d\n---\nold\n",
-        ".claude/skills/tdd/old.md": "removed later\n"})
-    root = git_history.clone
-    git_command(root, "fetch", "origin", "main")
-    git = GitRepo(root)
-    base = git.ref_sha("refs/remotes/origin/main")
-    # The checkout deleted the agent file and one memory file, and replaced the skill.
-    config = Config(lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["tdd"]}})
-    (root / lane_memory.lane_directory(config, "api")).mkdir(parents=True, exist_ok=True)
-    (root / lane_memory.lane_directory(config, "api") / "MEMORY.md").write_text("- lesson\n")
-    (root / ".claude/skills/tdd").mkdir(parents=True, exist_ok=True)
-    (root / ".claude/skills/tdd/SKILL.md").write_text("---\nname: tdd\ndescription: d\n---\nnew\n")
-    _config, overlay, _refused = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
-    tree = tmp_path / "attempt/tree"
-    manifest = order_scratch.build(git, base, tree, overlay)
-    assert (tree / "skipped.txt").read_text() == "kept in a checkout\n"
-    assert (tree / "version.txt").read_text() == "$Format:%H$\n"
-    assert not (tree / ".claude/agents/fa-api.md").exists()
-    assert sorted(path.name for path in (tree / ".claude/agent-memory/fa-api").iterdir()) == ["MEMORY.md"]
-    assert sorted(path.name for path in (tree / ".claude/skills/tdd").iterdir()) == ["SKILL.md"]
-    assert "STALE MAIN NOTES" not in order_prepare_setup.writer_setup(
-        replace(config, executor="codex"), {"lane": "api", "size": "s"}, tree).notes
-    # Nothing the writer did not touch is reported, export attributes included.
-    assert order_scratch.changes(git, tree, manifest, "tests/acceptance/") == ({}, [], [])
 
 
 def test_a_failed_writer_still_reports_the_paths_it_changed(git_history, tmp_path):
@@ -268,173 +196,14 @@ def test_a_failed_writer_still_reports_the_paths_it_changed(git_history, tmp_pat
     assert outcome["written"] == {"tests/acceptance/test_partial.py": "assert"}
 
 
-def test_symlinked_context_reaches_the_writer_as_preread_reads_it(git_history, tmp_path):
-    from foragent import lane_memory
-
-    git_history.update({"app.py": "x = 1\n"})
-    root = git_history.clone
-    git_command(root, "fetch", "origin", "main")
-    git = GitRepo(root)
-    base = git.ref_sha("refs/remotes/origin/main")
-    config = Config(executor="codex", lanes={"api": {"paths": ["api/**"], "agent": "fa-api",
-                                                       "skills": ["tdd", "linked"]}})
-    shared = root / "shared"
-    (shared / "linked-skill").mkdir(parents=True)
-    (shared / "agent.md").write_text("---\nname: fa-api\n---\nLINKED AGENT NOTES\n")
-    (shared / "memory.md").write_text("- LINKED LESSON\n")
-    (shared / "SKILL.md").write_text("---\nname: tdd\ndescription: linked skill file\n---\nbody\n")
-    (shared / "linked-skill/SKILL.md").write_text("---\nname: linked\ndescription: linked folder\n---\nbody\n")
-    (root / ".claude/agents").mkdir(parents=True)
-    (root / ".claude/agents/fa-api.md").symlink_to(shared / "agent.md")
-    memory = root / lane_memory.lane_directory(config, "api")
-    memory.mkdir(parents=True)
-    (memory / "MEMORY.md").symlink_to(shared / "memory.md")
-    (root / ".claude/skills/tdd").mkdir(parents=True)
-    (root / ".claude/skills/tdd/SKILL.md").symlink_to(shared / "SKILL.md")
-    (root / ".claude/skills/linked").symlink_to(shared / "linked-skill")
-    _config, overlay, refused = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
-    assert refused == []
-    tree = tmp_path / "attempt/tree"
-    order_scratch.build(git, base, tree, overlay)
-    # Inside links stay links, now pointing inside the scratch tree, never at the checkout.
-    for name in (".claude/agents/fa-api.md", ".claude/skills/tdd/SKILL.md", ".claude/skills/linked",
-                 f"{lane_memory.lane_directory(config, 'api')}/MEMORY.md"):
-        assert (tree / name).is_symlink() and (tree / name).resolve().is_relative_to(tree.resolve()), name
-    writer = order_prepare_setup.writer_setup(config, {"lane": "api", "size": "s"}, tree)
-    preread = order_prepare_setup.writer_setup(config, {"lane": "api", "size": "s"}, root)
-    assert "LINKED AGENT NOTES" in writer.notes and "LINKED LESSON" in writer.notes
-    assert writer.missing_skills == [] and writer.notes == preread.notes
 
 
 
-def test_overlay_never_reaches_through_a_tracked_symlink_into_the_checkout(git_history, tmp_path):
-    from foragent import lane_memory
-
-    config = Config(executor="codex", lanes={"api": {"paths": ["api/**"], "agent": "fa-api"}})
-    folder = lane_memory.lane_directory(config, "api")
-    outside = tmp_path / "checkout-claude"
-    (outside / folder.removeprefix(".claude/")).mkdir(parents=True)
-    (outside / folder.removeprefix(".claude/") / "MEMORY.md").write_text("- original lesson\n")
-    (outside / "agents").mkdir()
-    (outside / "agents/fa-api.md").write_text("ORIGINAL AGENT\n")
-    # main tracks `.claude` as a symlink that leaves the scratch tree.
-    target = str(outside).encode()
-    stream = (f"commit refs/heads/main\ncommitter T <t@example.com> 1792483200 +0000\ndata 4\nlink\n"
-              f"from {git_history.tip}\nM 120000 inline .claude\ndata {len(target)}\n").encode() + target + b"\n\ndone\n"
-    subprocess.run(["git", "fast-import", "--quiet"], cwd=git_history.origin, input=stream, check=True)
-    root = git_history.clone
-    git_command(root, "fetch", "origin", "main")
-    git = GitRepo(root)
-    overlay = {folder: None, f"{folder}/MEMORY.md": ("file", 0o644, b"- lesson\n"), ".claude/agents/fa-api.md": None,
-               ".claude/skills/tdd": None, ".claude/skills/tdd/SKILL.md": ("file", 0o644, b"skill\n")}
-    tree = tmp_path / "attempt/tree"
-    order_scratch.build(git, git.ref_sha("refs/remotes/origin/main"), tree, overlay)
-    assert (outside / folder.removeprefix(".claude/") / "MEMORY.md").read_text() == "- original lesson\n"
-    assert (outside / "agents/fa-api.md").read_text() == "ORIGINAL AGENT\n"
-    assert not (outside / "skills").exists()
-    assert not (tree / ".claude").is_symlink()
-    assert (tree / folder / "MEMORY.md").read_text() == "- lesson\n"
-    assert (tree / ".claude/skills/tdd/SKILL.md").read_text() == "skill\n"
 
 
-def test_a_directory_alias_inside_a_skill_stays_a_link_to_its_folder(tmp_path):
-    skill = tmp_path / ".claude/skills/tdd"
-    (skill / "resources").mkdir(parents=True)
-    (skill / "resources/example.txt").write_text("example\n")
-    (skill / "linked").symlink_to("resources")
-    (skill / "loop").symlink_to(".")
-    entries, refused = {}, []
-    order_scratch_context.place(tmp_path, ".claude/skills/tdd", entries, refused)
-    mode = (skill / "resources/example.txt").stat().st_mode & 0o7777
-    assert refused == []
-    assert entries == {".claude/skills/tdd": None, ".claude/skills/tdd/linked": ("link", "resources"),
-                       ".claude/skills/tdd/resources": None,
-                       ".claude/skills/tdd/loop": ("link", "."),
-                       ".claude/skills/tdd/resources/example.txt": ("file", mode, b"example\n")}
 
 
-def test_outside_links_and_cycles_are_refused_by_path_and_never_crash(git_history, tmp_path):
-    from foragent import lane_memory
-    from foragent.executors import ExecResult
 
-    git_history.update({"app.py": "x = 1\n", ".gitignore": ".venv/\n"})
-    root = git_history.clone
-    git_command(root, "fetch", "origin", "main")
-    git = GitRepo(root)
-    config = Config(executor="codex", lanes={"api": {"paths": ["api/**"], "agent": "fa-api",
-                                                       "skills": ["outside"]}})
-    elsewhere = tmp_path / "elsewhere"
-    (elsewhere / "skill").mkdir(parents=True)
-    (elsewhere / "agent.md").write_text("---\nname: fa-api\n---\nOUTSIDE AGENT NOTES\n")
-    (elsewhere / "memory.md").write_text("- OUTSIDE LESSON\n")
-    (elsewhere / "skill/SKILL.md").write_text("---\nname: outside\ndescription: d\n---\nbody\n")
-    (root / ".claude/agents").mkdir(parents=True)
-    (root / ".claude/agents/fa-api.md").symlink_to(elsewhere / "agent.md")
-    memory = root / lane_memory.lane_directory(config, "api")
-    memory.mkdir(parents=True)
-    (memory / "MEMORY.md").symlink_to(elsewhere / "memory.md")
-    (memory / "cycle.md").symlink_to(memory / "cycle.md")
-    (root / ".claude/skills").mkdir(parents=True)
-    (root / ".claude/skills/outside").symlink_to(elsewhere / "skill")
-    _config, overlay, refused = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
-    folder = lane_memory.lane_directory(config, "api")
-    # Escaping links and cycles are refused by path, never copied and never dropped silently.
-    assert refused == sorted([".claude/agents/fa-api.md", f"{folder}/MEMORY.md", f"{folder}/cycle.md",
-                              ".claude/skills/outside"])
-    assert not any(isinstance(entry, tuple) and b"OUTSIDE" in entry[-1] for entry in overlay.values()
-                   if entry and entry[0] == "file")
-    tree = tmp_path / "attempt/tree"
-    manifest = order_scratch.build(git, git.ref_sha("refs/remotes/origin/main"), tree, overlay)
-    # A cyclic link the writer leaves behind becomes a path question, not a crash.
-    (tree / "tests/acceptance").mkdir(parents=True, exist_ok=True)
-    (tree / "tests/acceptance/loop.py").symlink_to(tree / "tests/acceptance/loop.py")
-    (tree / ".venv").mkdir()
-    (tree / ".venv/loop").symlink_to(tree / ".venv/loop")
-    result = ExecResult(0, False, "{}", tmp_path / "log")
-    outcome = order_prepare._judge(result, None, tree, git, manifest, Config(language="en"), ())
-    assert outcome["status"] == "question"
-    assert any("tests/acceptance/loop.py" in question for question in outcome["questions"])
-    assert any(".venv/loop" in question for question in outcome["questions"])
-
-
-def test_an_executable_skill_script_stays_runnable_in_the_scratch(git_history, tmp_path, monkeypatch):
-    git_history.update({"app.py": "x = 1\n"})
-    root = git_history.clone
-    git_command(root, "fetch", "origin", "main")
-    git = GitRepo(root)
-    script = "#!/bin/sh\necho skill-ran\n"
-    # A checkout skill and a proposed lane's library skill, each with a 0o755 script.
-    (root / ".claude/skills/tdd").mkdir(parents=True)
-    (root / ".claude/skills/tdd/SKILL.md").write_text("---\nname: tdd\ndescription: d\n---\n")
-    (root / ".claude/skills/tdd/run.sh").write_text(script)
-    (root / ".claude/skills/tdd/run.sh").chmod(0o755)
-    library = tmp_path / "library/web-skill"
-    library.mkdir(parents=True)
-    (library / "SKILL.md").write_text("---\nname: web-skill\ndescription: d\n---\n")
-    (library / "go.sh").write_text(script)
-    (library / "go.sh").chmod(0o755)
-
-    class Manager:
-        def __init__(self, config):
-            pass
-
-        def check_install(self, identity, root):
-            return SimpleNamespace(path=library)
-
-    monkeypatch.setattr(order_prepare_setup, "SkillManager", Manager)
-    monkeypatch.setattr(order_prepare_setup, "with_vendored_library", lambda config, cwd, root: config)
-    base = git.ref_sha("refs/remotes/origin/main")
-    checkout = Config(lanes={"api": {"paths": ["api/**"], "skills": ["tdd"]}})
-    plan = {"new_lanes": [{"name": "web", "paths": ["web/**"], "skills": ["lib:web-skill"]}]}
-    for number, (item, config, name) in enumerate([
-            ({"lane": "api"}, checkout, ".claude/skills/tdd/run.sh"),
-            ({"lane": "web"}, Config(), ".claude/skills/web-skill/go.sh")]):
-        _config, overlay, refused = order_prepare_setup.lane_context(plan, item, config, root)
-        tree = tmp_path / f"attempt-{number}/tree"
-        manifest = order_scratch.build(git, base, tree, overlay)
-        assert refused == [] and manifest[name][0] == "100755"
-        ran = subprocess.run([str(tree / name)], capture_output=True, text=True, check=True)
-        assert ran.stdout == "skill-ran\n"
 
 
 def test_a_fifo_or_socket_left_in_the_scratch_is_a_question_and_never_read(git_history, tmp_path, monkeypatch):
@@ -460,56 +229,10 @@ def test_a_fifo_or_socket_left_in_the_scratch_is_a_question_and_never_read(git_h
                        "tests/acceptance/test_pipe.py"]
 
 
-def test_refused_lane_context_asks_before_any_writer_starts(tmp_path, monkeypatch):
-    plan = {"id": "o", "title": "T", "summary": "", "spec_markdown": "", "issues": [
-        {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "x",
-         "done_when": ["true"], "lane": "main", "size": "s", "blocked_by": []}]}
-    store = SimpleNamespace(root=tmp_path / "state")
-    monkeypatch.setattr("foragent.order.validate_plan", lambda plan, root, config: {})
-    monkeypatch.setattr(order_scratch, "base_revision", lambda git, branch: "abc")
-    monkeypatch.setattr(order_prepare_setup, "lane_context",
-                        lambda plan, item, config, root: (config, {}, [".claude/agents/fa-api.md"]))
-    monkeypatch.setattr(order_prepare, "executor_for", lambda name: (_ for _ in ()).throw(AssertionError))
-    row = order_prepare.prepare(plan, tmp_path, Config(language="en"), None, store)[0]
-    assert row["status"] == "question" and ".claude/agents/fa-api.md" in row["questions"][0]
 
 
-def test_library_skill_links_land_inside_the_installed_skill_folder(git_history, tmp_path, monkeypatch):
-    git_history.update({"resources/example.txt": "main's own file\n"})
-    root = git_history.clone
-    git_command(root, "fetch", "origin", "main")
-    git = GitRepo(root)
-    library = tmp_path / "library/web-skill"
-    (library / "resources").mkdir(parents=True)
-    (library / "SKILL.md").write_text("---\nname: web-skill\ndescription: d\n---\n")
-    (library / "resources/example.txt").write_text("skill resource\n")
-    (library / "alias").symlink_to("resources")
-    monkeypatch.setattr(order_prepare_setup, "SkillManager",
-                        lambda config: SimpleNamespace(check_install=lambda identity, root: SimpleNamespace(path=library)))
-    monkeypatch.setattr(order_prepare_setup, "with_vendored_library", lambda config, cwd, root: config)
-    plan = {"new_lanes": [{"name": "web", "paths": ["web/**"], "skills": ["lib:web-skill"]}]}
-    _config, overlay, refused = order_prepare_setup.lane_context(plan, {"lane": "web"}, Config(), root)
-    assert refused == [] and overlay[".claude/skills/web-skill/alias"] == ("link", "resources")
-    tree = tmp_path / "attempt/tree"
-    order_scratch.build(git, git.ref_sha("refs/remotes/origin/main"), tree, overlay)
-    assert (tree / ".claude/skills/web-skill/alias/example.txt").read_text() == "skill resource\n"
-    assert (tree / "resources/example.txt").read_text() == "main's own file\n"
 
 
-def test_a_linked_claude_folder_leading_outside_refuses_every_context_place(tmp_path):
-    from foragent import lane_memory
-
-    root, outside = tmp_path / "repo", tmp_path / "outside"
-    config = Config(lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["tdd"]}})
-    folder = lane_memory.lane_directory(config, "api")
-    for name in ("agents/fa-api.md", f"{folder.removeprefix('.claude/')}/MEMORY.md", "skills/tdd/SKILL.md"):
-        (outside / name).parent.mkdir(parents=True, exist_ok=True)
-        (outside / name).write_text("OUTSIDE\n")
-    root.mkdir()
-    (root / ".claude").symlink_to(outside)
-    _config, overlay, refused = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
-    assert refused == sorted([".claude/agents/fa-api.md", folder, ".claude/skills/tdd"])
-    assert all(entry is None for entry in overlay.values()), overlay
 
 
 def test_folders_made_removed_or_re_permissioned_outside_the_tests_are_questions(git_history, tmp_path):
@@ -527,35 +250,6 @@ def test_folders_made_removed_or_re_permissioned_outside_the_tests_are_questions
 
 
 
-def test_a_linked_memory_folder_drops_what_the_checkout_deleted_at_its_target(git_history, tmp_path):
-    from foragent import lane_memory
-
-    config = Config(executor="codex", lanes={"api": {"paths": ["api/**"], "agent": "fa-api"}})
-    folder = lane_memory.lane_directory(config, "api")
-    # main has the shared memory with a pending file and a link target the checkout no longer has.
-    git_history.update({"shared/memory/MEMORY.md": "- old\n", "shared/memory/MEMORY.new.md": "- STALE PENDING\n",
-                        "shared/gone.md": "STALE TARGET\n"})
-    root = git_history.clone
-    git_command(root, "fetch", "origin", "main")
-    git_command(root, "merge", "--ff-only", "origin/main")
-    git = GitRepo(root)
-    (root / "shared/memory/MEMORY.new.md").unlink()
-    (root / "shared/memory/MEMORY.md").write_text("- current lesson\n")
-    (root / "shared/gone.md").unlink()
-    (root / folder).parent.mkdir(parents=True)
-    (root / folder).symlink_to(root / "shared/memory")
-    (root / ".claude/agents").mkdir(parents=True)
-    (root / ".claude/agents/fa-api.md").symlink_to(root / "shared/gone.md")  # dangling in the checkout
-    _config, overlay, refused = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
-    tree = tmp_path / "attempt/tree"
-    order_scratch.build(git, git.ref_sha("refs/remotes/origin/main"), tree, overlay)
-    assert refused == []
-    assert sorted(path.name for path in (tree / folder).iterdir()) == ["MEMORY.md"]
-    assert not (tree / ".claude/agents/fa-api.md").exists(), "dangling as in the checkout"
-    writer = order_prepare_setup.writer_setup(config, {"lane": "api", "size": "s"}, tree)
-    preread = order_prepare_setup.writer_setup(config, {"lane": "api", "size": "s"}, root)
-    assert "STALE" not in writer.notes and "current lesson" in writer.notes
-    assert writer.notes.replace(str(tree), "") == preread.notes.replace(str(root), "")
 
 
 def test_unreadable_entries_left_by_the_writer_are_questions(git_history, tmp_path):
@@ -578,6 +272,182 @@ def test_unreadable_entries_left_by_the_writer_are_questions(git_history, tmp_pa
     assert refused == ["hidden", "tests/acceptance/locked", "tests/acceptance/test_secret.py"]
 
 
+def checkout(git_history, files=None):
+    git_history.update(files or {"app.py": "x = 1\n"})
+    root = git_history.clone
+    git_command(root, "fetch", "origin", "main")
+    git_command(root, "merge", "--ff-only", "origin/main")
+    git = GitRepo(root)
+    return root, git, git.ref_sha("refs/remotes/origin/main")
+
+
+def make_skill(folder, name):
+    """A skill with every shape a faithful copy must keep."""
+    import os
+
+    (folder / "resources").mkdir(parents=True)
+    (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n---\nUse resources/x.txt\n")
+    (folder / "resources/x.txt").write_text("resource\n")
+    (folder / "alias").symlink_to("resources")
+    (folder / "empty").mkdir()
+    (folder / "private").mkdir()
+    (folder / "private/note.md").write_text("private\n")
+    (folder / "private").chmod(0o700)
+    (folder / "run.sh").write_text("#!/bin/sh\necho skill-ran\n")
+    (folder / "run.sh").chmod(0o755)
+    os.mkfifo(folder / "pipe")
+    os.chmod(folder / "pipe", 0o666)
+
+
+def assert_faithful(tree, source, name):
+    import stat
+
+    assert order_scratch_context.signature(tree / name) == order_scratch_context.signature(source)
+    assert (tree / name / "empty").is_dir() and not any((tree / name / "empty").iterdir())
+    assert stat.S_IMODE((tree / name / "private").stat().st_mode) == 0o700
+    assert (tree / name / "alias").is_symlink() and (tree / name / "alias/x.txt").read_text() == "resource\n"
+    ran = subprocess.run([str(tree / name / "run.sh")], capture_output=True, text=True, check=True)
+    assert ran.stdout == "skill-ran\n"
+
+
+def test_checkout_context_is_copied_whole_and_faithfully(git_history, tmp_path):
+    from foragent import lane_memory
+
+    config = Config(executor="codex", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["tdd"]}})
+    folder = lane_memory.lane_directory(config, "api")
+    root, git, base = checkout(git_history, {
+        ".gitattributes": "skipped.txt export-ignore\n", "skipped.txt": "kept in a checkout\n",
+        ".claude/agents/fa-api.md": "---\nname: fa-api\n---\nSTALE MAIN NOTES\n",
+        f"{folder}/MEMORY.md": "- old\n", f"{folder}/MEMORY.new.md": "- STALE PENDING\n",
+        ".claude/skills/tdd/old.md": "removed later\n"})
+    (root / ".claude/agents/fa-api.md").write_text("---\nname: fa-api\n---\nCURRENT NOTES\n")
+    (root / f"{folder}/MEMORY.new.md").unlink()
+    (root / f"{folder}/MEMORY.md").write_text("- current lesson\n")
+    (root / ".claude/skills/tdd/old.md").unlink()
+    make_skill(root / ".claude/skills/tdd", "tdd")
+    _config, context = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
+    assert sorted(name for _source, name in context.sources
+                  if name not in order_prepare_setup.EXECUTOR_SETTINGS) == sorted([".claude/agents", folder, ".claude/skills/tdd"])
+    tree = tmp_path / "attempt/tree"
+    manifest = order_scratch.build(git, base, tree, context)
+    assert context.refused == []
+    assert (tree / "skipped.txt").read_text() == "kept in a checkout\n"
+    for name in (".claude/agents", folder):
+        assert order_scratch_context.signature(tree / name) == order_scratch_context.signature(root / name)
+    assert_faithful(tree, root / ".claude/skills/tdd", ".claude/skills/tdd")
+    writer = order_prepare_setup.writer_setup(config, {"lane": "api", "size": "s"}, tree)
+    preread = order_prepare_setup.writer_setup(config, {"lane": "api", "size": "s"}, root)
+    assert "CURRENT NOTES" in writer.notes and "STALE" not in writer.notes
+    assert writer.notes.replace(str(tree), "") == preread.notes.replace(str(root), "")
+    # The copied FIFO is part of the baseline, so an untouched tree reports nothing.
+    assert order_scratch.changes(git, tree, manifest, "tests/acceptance/") == ({}, [], [])
+
+
+def test_a_proposed_lane_copies_library_skills_whole_and_its_agent(git_history, tmp_path, monkeypatch):
+    root, git, base = checkout(git_history, {"resources/x.txt": "main's own file\n"})
+    library = tmp_path / "library/web-skill"
+    make_skill(library, "web-skill")
+    monkeypatch.setattr(order_prepare_setup, "SkillManager",
+                        lambda config: SimpleNamespace(check_install=lambda identity, root: SimpleNamespace(path=library)))
+    monkeypatch.setattr(order_prepare_setup, "with_vendored_library", lambda config, cwd, root: config)
+    plan = {"new_lanes": [{"name": "web", "paths": ["web/**"], "skills": ["lib:web-skill"]}]}
+    config, context = order_prepare_setup.lane_context(plan, {"lane": "web"}, Config(), root)
+    assert config.lanes["web"] == {"paths": ["web/**"], "agent": "fa-web", "skills": ["web-skill"]}
+    tree = tmp_path / "attempt/tree"
+    order_scratch.build(git, base, tree, context)
+    assert context.refused == []
+    assert_faithful(tree, library, ".claude/skills/web-skill")
+    assert (tree / "resources/x.txt").read_text() == "main's own file\n"
+    assert b"web lane (web/**)" in (tree / ".claude/agents/fa-web.md").read_bytes()
+    start = order_prepare_setup.writer_setup(replace(config, executor="codex"), {"lane": "web", "size": "s"}, tree)
+    assert start.missing_skills == [] and ".claude/skills/web-skill/SKILL.md" in start.notes
+
+
+def test_links_that_find_other_content_in_the_scratch_are_refused_by_path(git_history, tmp_path):
+    import socket
+
+    from foragent import lane_memory
+
+    config = Config(lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["tdd"]}})
+    folder = lane_memory.lane_directory(config, "api")
+    root, git, base = checkout(git_history, {"shared/same.md": "same\n", "shared/changed.md": "main\n"})
+    (root / "shared/changed.md").write_text("checkout\n")
+    (root / "shared/untracked.md").write_text("only in the checkout\n")
+    (tmp_path / "outside.md").write_text("outside\n")
+    (root / ".claude/agents").mkdir(parents=True)
+    (root / ".claude/agents/fa-api.md").symlink_to("../../shared/same.md")         # same content: kept
+    (root / ".claude/agents/cycle.md").symlink_to("cycle.md")                        # a cycle
+    (root / folder).mkdir(parents=True)
+    (root / folder / "MEMORY.md").symlink_to(tmp_path / "outside.md")               # leads outside
+    (root / ".claude/skills/tdd").mkdir(parents=True)
+    (root / ".claude/skills/tdd/SKILL.md").write_text("---\nname: tdd\ndescription: d\n---\n")
+    (root / ".claude/skills/tdd/changed.md").symlink_to("../../../shared/changed.md")   # main differs
+    (root / ".claude/skills/tdd/untracked.md").symlink_to("../../../shared/untracked.md")  # not in scratch
+    listener = socket.socket(socket.AF_UNIX)
+    cwd = __import__("os").getcwd()
+    try:
+        __import__("os").chdir(root / ".claude/skills/tdd")
+        listener.bind("s.sock")                                                      # cannot be recreated
+        _config, context = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
+        order_scratch.build(git, base, tmp_path / "attempt/tree", context)
+    finally:
+        __import__("os").chdir(cwd)
+        listener.close()
+    assert context.refused == sorted([".claude/agents/cycle.md", f"{folder}/MEMORY.md", ".claude/skills/tdd/changed.md",
+                                      ".claude/skills/tdd/s.sock", ".claude/skills/tdd/untracked.md"])
+
+
+def test_a_linked_claude_folder_leading_outside_refuses_every_context_place(git_history, tmp_path):
+    from foragent import lane_memory
+
+    root, outside = git_history.clone, tmp_path / "outside"
+    config = Config(lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["tdd"]}})
+    folder = lane_memory.lane_directory(config, "api")
+    for name in ("agents/fa-api.md", f"{folder.removeprefix('.claude/')}/MEMORY.md", "skills/tdd/SKILL.md"):
+        (outside / name).parent.mkdir(parents=True, exist_ok=True)
+        (outside / name).write_text("OUTSIDE\n")
+    (root / ".claude").symlink_to(outside)
+    _config, context = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
+    assert sorted(context.refused) == sorted([".claude/agents", folder, ".claude/skills/tdd"])
+    assert all(source is None for source, _name in context.sources)
+
+
+def test_applying_context_never_reaches_through_a_tracked_symlink(git_history, tmp_path):
+    outside = tmp_path / "checkout-claude"
+    (outside / "agents").mkdir(parents=True)
+    (outside / "agents/fa-api.md").write_text("ORIGINAL AGENT\n")
+    target = str(outside).encode()
+    stream = (f"commit refs/heads/main\ncommitter T <t@example.com> 1792483200 +0000\ndata 4\nlink\n"
+              f"from {git_history.tip}\nM 120000 inline .claude\ndata {len(target)}\n").encode() + target + b"\n\ndone\n"
+    subprocess.run(["git", "fast-import", "--quiet"], cwd=git_history.origin, input=stream, check=True)
+    git_command(git_history.clone, "fetch", "origin", "main")
+    git = GitRepo(git_history.clone)
+    source = tmp_path / "source-agents"
+    source.mkdir()
+    (source / "fa-api.md").write_text("NEW AGENT\n")
+    context = order_scratch_context.Context(tmp_path, sources=[(source, ".claude/agents")])
+    tree = tmp_path / "attempt/tree"
+    order_scratch.build(git, git.ref_sha("refs/remotes/origin/main"), tree, context)
+    assert (outside / "agents/fa-api.md").read_text() == "ORIGINAL AGENT\n"
+    assert not (tree / ".claude").is_symlink() and (tree / ".claude/agents/fa-api.md").read_text() == "NEW AGENT\n"
+
+
+def test_refused_lane_context_asks_before_any_writer_starts(tmp_path, monkeypatch):
+    plan = {"id": "o", "title": "T", "summary": "", "spec_markdown": "", "issues": [
+        {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "x",
+         "done_when": ["true"], "lane": "main", "size": "s", "blocked_by": []}]}
+    store = SimpleNamespace(root=tmp_path / "state")
+    context = order_scratch_context.Context(tmp_path, refused=[".claude/agents/fa-api.md"])
+    monkeypatch.setattr("foragent.order.validate_plan", lambda plan, root, config: {})
+    monkeypatch.setattr(order_scratch, "base_revision", lambda git, branch: "abc")
+    monkeypatch.setattr(order_scratch, "protected", lambda git, root, state: ())
+    monkeypatch.setattr(order_scratch, "build", lambda git, base, tree, context: {})
+    monkeypatch.setattr(order_prepare_setup, "lane_context", lambda plan, item, config, root: (config, context))
+    monkeypatch.setattr(order_prepare, "executor_for", lambda name: (_ for _ in ()).throw(AssertionError))
+    row = order_prepare.prepare(plan, tmp_path, Config(language="en"), None, store)[0]
+    assert row["status"] == "question" and ".claude/agents/fa-api.md" in row["questions"][0]
+
+
 def test_a_new_issue_and_an_edit_with_the_same_number_get_their_own_trees(tmp_path, monkeypatch):
     plan = {"id": "o", "title": "T", "summary": "", "spec_markdown": "", "issues": [
         {"key": "7", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "x",
@@ -589,10 +459,11 @@ def test_a_new_issue_and_an_edit_with_the_same_number_get_their_own_trees(tmp_pa
     monkeypatch.setattr("foragent.order.edit_view", lambda item, issue, config: {
         **item, "key": f"#{item['number']}", "title": "E", "lane": "main", "size": "s"})
     monkeypatch.setattr(order_scratch, "base_revision", lambda git, branch: "abc")
-    monkeypatch.setattr(order_prepare_setup, "lane_context", lambda plan, item, config, root: (config, {}, []))
     monkeypatch.setattr(order_scratch, "protected", lambda git, root, state: ())
+    monkeypatch.setattr(order_prepare_setup, "lane_context",
+                        lambda plan, item, config, root: (config, order_scratch_context.Context(root)))
 
-    def build(git, base, tree, overlay):
+    def build(git, base, tree, context):
         assert not tree.exists(), "each issue gets a tree of its own"
         tree.mkdir(parents=True)
         trees.append(tree)
@@ -603,3 +474,66 @@ def test_a_new_issue_and_an_edit_with_the_same_number_get_their_own_trees(tmp_pa
                                  lambda: SimpleNamespace(get_issue=lambda n: None))
     assert [row["key"] for row in rows] == ["7", "#7"] and len(set(trees)) == 2
     assert order_prepare._record_path(store, {"id": "a/b"}) != order_prepare._record_path(store, {"id": "a-b"})
+
+
+
+def test_the_copy_keeps_every_mode_whatever_the_umask(tmp_path):
+    import os
+    import stat
+
+    source = tmp_path / "source/skill"
+    make_skill(source, "skill")
+    (source / "shared").mkdir()
+    (source / "shared/data.txt").write_text("d\n")
+    (source / "shared").chmod(0o777)
+    for mask in (0o022, 0o077, 0o777):
+        dest = tmp_path / f"copy-{mask:o}"
+        refused, links = [], []
+        dest.mkdir()
+        copy = dest / "skill"
+        previous = os.umask(mask)
+        try:
+            order_scratch_context.copy_tree(source, copy, "skill", refused, links)
+        finally:
+            os.umask(previous)
+        assert refused == [] and [name for name, _source in links] == ["skill/alias"]
+        assert order_scratch_context.signature(copy) == order_scratch_context.signature(source), oct(mask)
+        assert stat.S_IMODE(os.lstat(copy / "pipe").st_mode) == 0o666
+        assert stat.S_IMODE(os.lstat(copy / "shared").st_mode) == 0o777
+
+
+def test_a_writer_changing_a_fifo_mode_is_a_question(git_history, tmp_path):
+    import os
+
+    source = tmp_path / "agents"
+    source.mkdir()
+    os.mkfifo(source / "pipe")
+    os.chmod(source / "pipe", 0o600)
+    git_history.update({"app.py": "x = 1\n"})
+    git = GitRepo(git_history.clone)
+    git_command(git_history.clone, "fetch", "origin", "main")
+    context = order_scratch_context.Context(git_history.clone, sources=[(source, ".claude/agents")])
+    tree = tmp_path / "attempt/tree"
+    manifest = order_scratch.build(git, git.ref_sha("refs/remotes/origin/main"), tree, context)
+    assert order_scratch.changes(git, tree, manifest, "tests/acceptance/")[1] == []
+    os.chmod(tree / ".claude/agents/pipe", 0o666)
+    assert order_scratch.changes(git, tree, manifest, "tests/acceptance/")[1] == [".claude/agents/pipe"]
+
+
+
+def test_the_scratch_keeps_no_settings_that_run_commands_outside_the_sandbox(git_history, tmp_path):
+    hook = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "touch /tmp/owned"}]}]},
+            "statusLine": {"type": "command", "command": "touch /tmp/owned"}, "apiKeyHelper": "touch /tmp/owned"}
+    root, git, base = checkout(git_history, {
+        ".claude/settings.json": json.dumps(hook), ".claude/settings.local.json": json.dumps(hook),
+        ".mcp.json": json.dumps({"mcpServers": {"x": {"command": "touch"}}}),
+        ".codex/config.toml": 'notify = ["touch", "/tmp/owned"]\n', ".codex/prompts/keep.md": "kept\n"})
+    _config, context = order_prepare_setup.lane_context({}, {"lane": "main"}, Config(), root)
+    tree = tmp_path / "attempt/tree"
+    manifest = order_scratch.build(git, base, tree, context)
+    assert context.refused == []
+    for name in order_prepare_setup.EXECUTOR_SETTINGS:
+        assert not (tree / name).exists(), name
+    assert (tree / ".codex/prompts/keep.md").read_text() == "kept\n"
+    # Removed before the baseline is read, so the removal itself is no question.
+    assert order_scratch.changes(git, tree, manifest, "tests/acceptance/") == ({}, [], [])

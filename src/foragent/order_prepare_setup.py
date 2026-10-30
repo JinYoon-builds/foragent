@@ -15,66 +15,67 @@ import json
 from pathlib import Path
 import re
 
-from foragent.order_scratch_context import Entry, collect, place
+from foragent.order_scratch_context import Context
 from foragent.config import Config
 from foragent.lanes import agent_text
 from foragent.skills import SkillManager, with_vendored_library
 
 
-def _proposed(plan: dict, lane: str, config: Config, root: Path,
-              refused: list[str]) -> tuple[dict | None, dict[str, Entry]]:
-    """A lane this order creates: the settings and files add_lane would install for it."""
+EXECUTOR_SETTINGS = (".claude/settings.json", ".claude/settings.local.json", ".mcp.json", ".codex/config.toml")
+
+
+def _proposed(plan: dict, lane: str, config: Config, root: Path, context: Context) -> dict | None:
+    """A lane this order creates: the settings add_lane would write; its files go into ``context``.
+
+    Each library skill folder add_lane would install is a whole-tree source at
+    ``.claude/skills/<name>``; the agent definition is generated as add_lane writes it.
+    """
     proposal = next((entry for entry in plan.get("new_lanes", []) if entry["name"] == lane), None)
     if proposal is None or lane in config.lanes:
-        return None, {}
+        return None
     manager = SkillManager(with_vendored_library(config, Path.cwd(), root)) if proposal["skills"] else None
-    entries: dict[str, Entry] = {f".claude/agents/fa-{lane}.md": None}
     installed = []
     for identity in proposal["skills"]:
         skill = manager.check_install(identity, root)  # the same resolution add_lane installs from
         installed.append(skill.path.name)
-        folder = f".claude/skills/{skill.path.name}"
-        entries[folder] = None  # main's older copy must not linger
-        collect(skill.path, folder, skill.path, entries, refused)  # contents and modes as installed
-    entries[f".claude/agents/fa-{lane}.md"] = (
-        "file", 0o644, agent_text(lane, list(proposal["paths"]), installed).encode("utf-8"))
-    return {"paths": list(proposal["paths"]), "agent": f"fa-{lane}", "skills": installed}, entries
+        context.sources.append((skill.path, f".claude/skills/{skill.path.name}"))
+    context.files[f".claude/agents/fa-{lane}.md"] = agent_text(lane, list(proposal["paths"]), installed).encode("utf-8")
+    return {"paths": list(proposal["paths"]), "agent": f"fa-{lane}", "skills": installed}
 
 
-def _checkout_context(config: Config, lane: str, root: Path, refused: list[str]) -> dict[str, Entry]:
-    """The lane's agent, memory and skills as the checkout has them, which may not be on main yet.
+def _checkout_context(config: Config, lane: str, root: Path, context: Context) -> None:
+    """The checkout's context folders for the lane, each copied whole into the scratch.
 
-    The places come from the resolvers the implementer's own notes use (run_lane_skills): the
-    agent file when there is one, the lane's memory directory even without an agent, and the
-    configured lane skills. Each place is built by ``order_scratch_context`` (main's copy removed
-    first, files with their modes, inside links as links); refusals are added to ``refused``.
+    The agents folder, the lane's memory folder (found by the resolver the implementer's notes
+    use, also for a lane without an agent) and each configured lane skill folder.
     """
-    from foragent.run_lane_skills import _agent_text, _lane_settings, _memory_folder, lane_skill_names
+    from foragent.run_lane_skills import _agent_text, _memory_folder, lane_skill_names
 
-    named = _lane_settings(config, lane).get("agent")
-    agent = named if isinstance(named, str) and re.fullmatch(r"fa-[a-z0-9-]+", named) else None
-    places = [f".claude/agents/{agent}.md"] if agent is not None else []
+    context.add_checkout(".claude/agents")
     memory = _memory_folder(config, lane, Path("."))
     if memory is not None:
-        places.append(memory.as_posix())
-    places += [f".claude/skills/{name}" for name in lane_skill_names(config, lane, root, _agent_text(config, lane, root)[0])
-               if re.fullmatch(r"[A-Za-z0-9._-]+", name)]
-    entries: dict[str, Entry] = {}
-    for name in places:
-        place(root, name, entries, refused)
-    return entries
+        context.add_checkout(memory.as_posix())
+    for name in lane_skill_names(config, lane, root, _agent_text(config, lane, root)[0]):
+        if re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            context.add_checkout(f".claude/skills/{name}")
 
 
-def lane_context(plan: dict, item: dict, config: Config,
-                 root: Path) -> tuple[Config, dict[str, Entry], list[str]]:
-    """The configuration with the issue's lane resolved (proposed lanes included), its scratch
-    entries (see ``order_scratch_context``) and the context paths that were refused.
+def lane_context(plan: dict, item: dict, config: Config, root: Path) -> tuple[Config, Context]:
+    """The configuration with the issue's lane resolved (proposed lanes included) and its context.
+
+    ``Context.apply`` copies the sources into a scratch tree; its ``refused`` paths then hold
+    every context entry that could not be reproduced faithfully. A proposed lane's library
+    skills come first, so they win over a checkout folder of the same name.
     """
-    refused: list[str] = []
-    settings, proposed = _proposed(plan, item["lane"], config, root, refused)
+    context = Context(root)
+    settings = _proposed(plan, item["lane"], config, root, context)
     if settings is not None:
         config = replace(config, lanes={**config.lanes, item["lane"]: settings})
-    return config, _checkout_context(config, item["lane"], root, refused) | proposed, sorted(set(refused))
+    _checkout_context(config, item["lane"], root, context)
+    # Settings committed on main could run commands outside the writer's sandbox (hooks, status
+    # line, credential helpers, plugins, MCP servers): the scratch keeps none of them.
+    context.sources += [(None, name) for name in EXECUTOR_SETTINGS]
+    return config, context
 
 
 def writer_setup(config: Config, item: dict, tree: Path):
@@ -92,12 +93,12 @@ def permissions(executor: str, tree: Path, protected: tuple[Path, ...], acceptan
                 directory: Path) -> dict:
     """Executor options that confine the writer to the tree, ignoring any inherited authority.
 
-    Codex runs without the user's config and execpolicy rules, so no configured writable
-    root or network access widens its workspace-write sandbox. Claude loads only the
-    tree's project settings plus this file, no user or local settings and no MCP server;
-    it may Edit only the tree's acceptance directory and its sandboxed shell may write only
-    in the tree, never in a ``protected`` directory (checkout, Git directory, state) or the
-    tree's own Claude settings, with no network.
+    Codex runs without the user's config, execpolicy rules, hooks, notify program and MCP
+    servers, so nothing widens its workspace-write sandbox or runs outside it. Claude loads no
+    user or local settings, the scratch holds no project settings (``EXECUTOR_SETTINGS``), no
+    MCP server is configured and all hooks are disabled; it may Edit only the tree's acceptance
+    directory and its sandboxed shell may write only in the tree, never in a ``protected``
+    directory (checkout, Git directory, state) or the tree's own Claude settings, with no network.
     """
     if executor != "claude":
         return {"isolated": True}
@@ -114,6 +115,9 @@ def permissions(executor: str, tree: Path, protected: tuple[Path, ...], acceptan
                     "filesystem": {"allowWrite": [str(tree)], "denyWrite": [str(place) for place in denied]},
                     "network": {"allowedDomains": []}},
         "enableAllProjectMcpServers": False,
+        # Hooks run with the user's full permissions outside the sandbox, whoever defines them
+        # (settings, agent or skill frontmatter, plugins): none run for the writer.
+        "disableAllHooks": True,
     }
     path = directory / "claude-settings.json"
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

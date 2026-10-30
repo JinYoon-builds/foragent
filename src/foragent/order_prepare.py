@@ -195,16 +195,17 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
     manifest = before = result = protected = None
     try:
         # One resolution feeds the tree, the setup, the prompt and the permissions.
-        lane_config, overlay, refused = setup.lane_context(plan, item, config, root)
-        if refused:
-            # The writer would start with other context than preread reads: ask, do not start.
-            failure = {"status": "question", "reason": say("prepare_question"), "questions": [
-                say("prepare_context_refused", path=name) for name in refused]}
-            return
+        lane_config, context = setup.lane_context(plan, item, config, root)
+        context.files.update(_references(plan, item))
         # Writes must never reach the checkout, its Git directory or this command's state.
         protected = order_scratch.protected(git, root, path.parent.parent)
-        references = {name: ("file", 0o644, data) for name, data in _references(plan, item).items()}
-        manifest = order_scratch.build(git, base, tree, overlay | references)
+        manifest = order_scratch.build(git, base, tree, context)
+        if context.refused:
+            # The writer would start with other context than preread reads: ask, do not start.
+            failure = {"status": "question", "reason": say("prepare_question"), "questions": [
+                say("prepare_context_refused", path=name) for name in context.refused]}
+            manifest = None  # no writer ran: the outcome is the refusal itself
+            return
         start = setup.writer_setup(lane_config, item, tree)
         options = start.options | setup.permissions(start.executor, tree, protected, config.acceptance_dir,
                                                     tree.parent)

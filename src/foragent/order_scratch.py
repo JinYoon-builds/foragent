@@ -86,14 +86,13 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def build(git: GitRepo, base: str, tree: Path, overlay: dict) -> dict[str, tuple[str, str]]:
-    """Check ``base`` out into the new directory ``tree`` and apply the overlay; return the baseline.
+def build(git: GitRepo, base: str, tree: Path, context=None) -> dict[str, tuple[str, str]]:
+    """Check ``base`` out into the new directory ``tree``, add the lane context; return the baseline.
 
     The files are checked out as a checkout of ``base`` would have them (no export-ignore or
-    export-subst rewriting). In the overlay, ``None`` removes that file or directory first (the
-    checkout no longer has it), ``("file", mode, bytes)`` writes a file with that mode and
-    ``("link", target)`` makes a symlink (see order_scratch_context): the lane context.
-    The baseline is read back from the finished tree, so it is exactly what the writer received.
+    export-subst rewriting). ``context`` (order_scratch_context.Context) then replaces each
+    context place with a whole-tree copy of its source. The baseline is read back from the
+    finished tree, so it is exactly what the writer received.
     """
     tree.mkdir(parents=True)
     index = tree.parent / "scratch.index"
@@ -105,17 +104,8 @@ def build(git: GitRepo, base: str, tree: Path, overlay: dict) -> dict[str, tuple
                 raise GitError(done.stderr.decode("utf-8", "replace") or f"git {command[0]} {base} failed")
     finally:
         index.unlink(missing_ok=True)
-    for name in sorted(name for name, entry in overlay.items() if entry is None):
-        if _own_parents(tree, name, create=False):
-            _remove_path(tree / name)
-    for name, entry in sorted((name, entry) for name, entry in overlay.items() if entry is not None):
-        _own_parents(tree, name, create=True)
-        _remove_path(tree / name)
-        if entry[0] == "link":
-            os.symlink(entry[1], tree / name)
-        else:
-            (tree / name).write_bytes(entry[2])
-            os.chmod(tree / name, entry[1])  # the source's permission bits, executable included
+    if context is not None:
+        context.apply(tree)  # the lane context, copied whole (order_scratch_context)
     return _entries(tree)
 
 
@@ -198,7 +188,7 @@ def _entries(tree: Path) -> dict[str, tuple[str, str]]:
                     continue
                 found[relative] = ("100755" if info.st_mode & 0o111 else "100644", blob(data))
             else:
-                found[relative] = (SPECIAL, oct(stat.S_IFMT(info.st_mode)))
+                found[relative] = (SPECIAL, oct(info.st_mode))  # its type and permission bits
     for name in unlisted:
         if name and Path(name) != tree:
             found[Path(name).relative_to(tree).as_posix()] = (SPECIAL, "unlisted")

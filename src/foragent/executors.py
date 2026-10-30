@@ -172,8 +172,10 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
     args += [part for path in add_dirs for part in ("--add-dir", str(path))]
     if isolated:
         # No user config, execpolicy rules, extra writable roots or network: only the workspace.
+        # No hooks, notify program or MCP server either: they would run outside the sandbox.
         args += ["--ignore-user-config", "--ignore-rules", "-c", "sandbox_workspace_write.writable_roots=[]",
-                 "-c", "sandbox_workspace_write.network_access=false"]
+                 "-c", "sandbox_workspace_write.network_access=false", "--disable", "hooks",
+                 "-c", "notify=[]", "-c", "mcp_servers={}"]
     return args + (["-m", model] if model is not None else []) + (
         ["-c", f"model_reasoning_effort={effort}"] if effort is not None else []
     )
