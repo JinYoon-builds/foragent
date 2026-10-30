@@ -48,10 +48,12 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat,
                      group: run_merge_group.Membership | None = None) -> str:
     from foragent.run_checks import _verify_implementation
     from foragent.run_conflicts import _block_rebuild, _merge_moved_base, _resolve_conflicts
-    from foragent import runner
+    from foragent import harness_guard, runner
 
     # Only metadata is read live; instructions and checks always use the snapshot.
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
+    if attempt.review_hold and attempt.review_hold_reason == run_publish.Reason.TEST_HARNESS_CHANGED:
+        return harness_guard.publish_hold(attempt)  # the hold wins over every publication check
     worktree, log = attempt.worktree, attempt.log
     issue = ctx.tracker.get_issue(n)
     title = f"{issue.title} (#{n})"

@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import capacity, cuts
+from foragent import capacity, cuts, harness_guard
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config
 from foragent.git import GitRepo
@@ -483,10 +483,12 @@ def _verify_contents(attempt: Implementation) -> str:
         follow_base(attempt)
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
+            harness_guard.guard_staged(attempt)  # a Done when command can commit
             attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                                  slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n)))
             _progress(n, ctx)
         if attempt.baseline and attempt.baseline.node_ids:
+            harness_guard.guard_staged(attempt)
             started = ctx.monotonic()
             command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
             result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
@@ -529,6 +531,7 @@ def _verify_contents(attempt: Implementation) -> str:
         if not _prepare_target(attempt):
             raise ExecutorStopped("hash-mismatch")
         attempt.paths = git.changed_paths(attempt.start_ref)
+        harness_guard.guard_staged(attempt)  # a command committed a harness change: that, not the result, decides
         checked_tree = git.staged_tree_sha()
         if checked_tree != staged_tree:
             # Save this pass before anything replaces it: if re-verification cannot finish,
@@ -578,6 +581,8 @@ def _check_review_head(
             check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)),
                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
                                   full_text_dir=cuts.issue_dir(ctx.store.root, n))
+            if stopped := harness_guard.before_measurement(worktree):
+                return stopped  # the command committed a harness change: that, not its result, decides
             checks.append(check)
             _progress(n, ctx)
             if check.timed_out or runner._remaining(n, ctx) <= 0:

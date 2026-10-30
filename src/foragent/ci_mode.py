@@ -178,9 +178,10 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
 
 
 def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None):
-    from foragent.ci_local import LocalComparisonUnavailable, fallback_comparison
+    from foragent import ci_local, harness_guard
 
     n, ctx = attempt.n, attempt.ctx
+    harness_guard.guard_comparison(attempt, head, pr)  # the comparison measures exactly this head
     if deadline is None:
         deadline = ctx.now().timestamp() + 1200
     if base_sha is None:
@@ -205,9 +206,9 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         workflow_error = str(exc)
     if changed_workflows:
         try:
-            fallback_comparison(attempt, base_sha)
+            ci_local.fallback_comparison(attempt, base_sha)
             return evidence
-        except LocalComparisonUnavailable as exc:
+        except ci_local.LocalComparisonUnavailable as exc:
             flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Local acceptance comparison unavailable", str(exc))
             raise ExecutorStopped("held", str(exc)) from exc
     try:
@@ -237,9 +238,9 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         detail = f"{exc}\n{infrastructure}".strip()
         if ctx.config.checks_fallback == "local":
             try:
-                fallback_comparison(attempt, base_sha)
+                ci_local.fallback_comparison(attempt, base_sha)
                 return evidence
-            except LocalComparisonUnavailable as fallback:
+            except ci_local.LocalComparisonUnavailable as fallback:
                 detail += f"\n{fallback}"
         flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
         raise ExecutorStopped("held", detail) from exc
@@ -250,9 +251,9 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     if infrastructure:
         if ctx.config.checks_fallback == "local":
             try:
-                fallback_comparison(attempt, base_sha)
+                ci_local.fallback_comparison(attempt, base_sha)
                 return evidence
-            except LocalComparisonUnavailable as exc:
+            except ci_local.LocalComparisonUnavailable as exc:
                 infrastructure += f"\n{exc}"
         flag(ctx, n, Reason.CI_NOT_STARTED, "CI jobs did not start", infrastructure)
         raise ExecutorStopped("held", infrastructure)
@@ -263,7 +264,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
 def review_checks(n, ctx, git, target_branch):
     """Rechecking an existing issue PR uses the same CI and machine evidence."""
     from types import SimpleNamespace
-    from foragent import runner
+    from foragent import harness_guard, runner
     from foragent.ci_local import capture_local_only, check, verify_local_only_units
     from foragent.run_checks import _related_unit_tests, run_related_check, trusts_ci
     from foragent.run_waits import in_phase
@@ -287,6 +288,7 @@ def review_checks(n, ctx, git, target_branch):
                                   own_only=ctx.config.runner_unit_tests != "all"
                                   and (enabled(ctx, target_branch) or trusts_ci(git.root, ctx.config)))
         if baseline.node_ids:
+            harness_guard.guard_comparison(attempt, git.head_sha())  # as the head is after the local-only run
             checks.append(check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", git.root))
         if own:
             # Related tests are a recorded check of their own, as in an implementation's verification.

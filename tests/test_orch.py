@@ -612,3 +612,55 @@ def test_review_only_spec_conflict_stops_with_spec_question_and_keeps_pr_open(re
     assert len(question) == 1 and conflict in question[0]
     events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
     assert [e["verdict"] for e in events if e["kind"] == "review"] == ["SPEC-CONFLICT"]
+
+
+@pytest.mark.parametrize("entry", ["review-only", "resolve"])
+def test_review_entries_hold_unlisted_harness_change_before_measuring_head(review_case, monkeypatch, entry):
+    """The PR head commits an unlisted conftest.py: hold for a person before any Done when runs."""
+    c = review_case
+    base = git_command(c.history.origin, "rev-parse", "refs/heads/main")
+    c.history.update({"tests/sub/conftest.py": "# changed harness\n"})
+    c.head = c.history.tip
+    c.tracker.set_pr_head_sha(c.pr, c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    c.ctx.git.fetch()
+    measured = []
+    monkeypatch.setattr(runner, "_check", lambda *args, **kwargs: measured.append(args))
+    if entry == "resolve":
+        orch.resolve(c.ctx, 1, "pass", "Reviewed the current head")
+    else:
+        assert runner.review_only(1, c.ctx) == "held"
+    assert measured == [] and c.review_calls == []
+    assert c.tracker.merged_prs == [] and c.tracker.get_issue(c.pr).state == "open"
+    assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    held = [comment.body for comment in c.tracker.list_comments(1) if "reason=test-harness-changed" in comment.body]
+    assert len(held) == 1 and held[0].startswith("<!-- foragent:needs-human") and "tests/sub/conftest.py" in held[0]
+    # A held PR is left as it is: no push and no new PR.
+    assert len(c.tracker.created_prs) == 1
+    assert not any("push" in args or "commit" in args for _, args in c.operations)
+
+
+def test_review_head_without_harness_changes_is_measured_and_recorded(review_case):
+    c = review_case
+    assert runner.review_only(1, c.ctx) == "merged"
+    assert c.store.get_run(1).harness_guard["guarded"] == c.head
+
+
+@pytest.mark.parametrize("last", [False, True], ids=["before-a-later-command", "last-command"])
+def test_review_done_when_that_commits_a_harness_change_holds(review_case, last):
+    """A head that moves between review measurements is guarded again; it is a harness hold, not checks-failed."""
+    from runner_support import set_done_when
+
+    c = review_case
+    commit_harness = ("mkdir -p gen && echo '# harness' > gen/conftest.py && git add gen/conftest.py && "
+                      "git -c user.name=t -c user.email=t@t commit -qm harness && echo RAN_""FIRST")
+    set_done_when(c, [commit_harness] if last else [commit_harness, 'echo RAN_""SECOND'])
+    c.tracker.edit_body(1, c.store.load_approval(1).body)
+    assert runner.review_only(1, c.ctx) == "held"
+    log = c.store.log_path(1).read_text()
+    assert "RAN_FIRST" in log and "RAN_SECOND" not in log
+    assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
+    assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
+    assert c.tracker.merged_prs == []

@@ -99,6 +99,8 @@ class Run:
     related_tests: list[dict] = field(default_factory=list)
     # 'issue' runs implement an issue; a 'dream' run (number 0) tidies one lane's memory (#189).
     kind: str = "issue"
+    # The last head the test-harness guard passed: {"merge_base": sha, "guarded": commit or tree sha}.
+    harness_guard: dict = field(default_factory=dict)
 
     @property
     def key(self) -> int | str:

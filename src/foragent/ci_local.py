@@ -149,17 +149,21 @@ class LocalComparisonUnavailable(ValueError):
 
 
 def fallback_comparison(attempt, base_sha):
+    from foragent import harness_guard
     from foragent.run_baseline import _capture_acceptance_baseline
 
     n, ctx = attempt.n, attempt.ctx
     started = ctx.monotonic()
-    head = attempt.git.head_sha()
     try:
         baseline = _capture_acceptance_baseline(n, ctx, ctx.config.test_command or attempt.baseline.command, base_sha)
     except AttemptFailure as exc:
         raise LocalComparisonUnavailable(str(exc)) from exc
     if baseline is None:
         raise LocalComparisonUnavailable("fallback acceptance baseline unavailable")
+    # This checkout's commit is what is measured (not the PR head the caller named): guard that,
+    # and accept the result only if the checkout is still exactly that commit afterwards.
+    head = attempt.git.head_sha()
+    harness_guard.guard_comparison(attempt, head)
     result = None
     if baseline.node_ids:
         # Running the acceptance comparison on the head is checking time, not CI waiting.
