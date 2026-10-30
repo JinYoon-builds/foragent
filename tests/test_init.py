@@ -133,6 +133,10 @@ class Setup:
             return json.dumps({"isPrivate": self.private})
         if args == ["api", "user", "--jq", ".login"]:
             return "human\n"
+        if args == ["api", "user"]:
+            return json.dumps({"login": "Human", "type": "User"})
+        if args[:3] == ["api", "--paginate", "repos/owner/repo/issues?state=all&per_page=100"]:
+            return "[]"
         if args[:3] == ["api", "-X", "POST"]:
             return "{}"
         raise AssertionError(args)

@@ -672,13 +672,26 @@
 - 계기: Jin: "이거 잘 깎아가지고 같이 프로젝트 하는 팀원들도 쓰게 해주고 싶어." 오픈소스이므로 혼자 쓰는 사람과 팀 모두를 받아야 한다. 같은 날 "로컬이 진실, PR 없이 push" 안을 검토했으나, 팀 저장소는 main 직접 push를 막아 두는 경우가 많고 사람 팀원은 GitHub PR에서 리뷰·토론하므로 **PR과 'GitHub가 진실'은 유지**한다. GitHub 한도 문제의 원인은 PR이 아니라 반복 조회였다(레인 화면이 그릴 때마다 승인 이슈마다 PR 조회 — 1분 110회, gate tick의 이슈별 다시 읽기). 답은 #138(로컬 스냅샷)·#221(바뀐 것만)·#139(화면은 GitHub 0회)·쓰기 대기열이다.
 - 결정:
   1. **팀 버전을 따로 만들지 않는다.** 혼자는 "팀원이 한 명인 팀"이다. 팀 기능은 사람이 둘 이상일 때 저절로 켜진다(승인자 여럿, gate 여럿).
-  2. **각자 공장(B).** 팀원마다 자기 컴퓨터에서 자기 쿼터로 gate를 돌린다. 한 사람의 개인 구독으로 팀 전체 일을 돌리는 방식(A)은 쿼터 약관 문제가 생길 수 있어 기본으로 삼지 않는다(약관은 실제로 할 때 확인).
-  3. **담당은 두 층.** ① 주문한 사람 — 발행할 때 정해지고, 그 이슈의 질문(D71)과 결정이 이 사람에게 간다(D76의 기획 세션·폰 알림). ② 일하는 공장 — 준비된 이슈를 먼저 잡은 gate가 맡고 GitHub assignee에 표시한다. 다른 gate는 건너뛴다. 잡은 공장이 꺼지면 일정 시간 뒤 풀려 다른 공장이 이어받는다. 사람이 assignee를 미리 넣으면 그 공장만 잡는다(예: 디자인 이슈는 디자이너).
+  2. *(claim-first 배정은 아래 2026-10-30 D78 revision이 대체)* **각자 공장(B).** 팀원마다 자기 컴퓨터에서 자기 쿼터로 gate를 돌린다. 한 사람의 개인 구독으로 팀 전체 일을 돌리는 방식(A)은 쿼터 약관 문제가 생길 수 있어 기본으로 삼지 않는다(약관은 실제로 할 때 확인).
+  3. *(claim-first 배정은 아래 2026-10-30 D78 revision이 대체)* **담당은 두 층.** ① 주문한 사람 — 발행할 때 정해지고, 그 이슈의 질문(D71)과 결정이 이 사람에게 간다(D76의 기획 세션·폰 알림). ② 일하는 공장 — 준비된 이슈를 먼저 잡은 gate가 맡고 GitHub assignee에 표시한다. 다른 gate는 건너뛴다. 잡은 공장이 꺼지면 일정 시간 뒤 풀려 다른 공장이 이어받는다. 사람이 assignee를 미리 넣으면 그 공장만 잡는다(예: 디자인 이슈는 디자이너).
   4. **쿼터 여유가 큰 공장이 더 일한다** — D74가 팀 전체로 넓어진다.
   5. **보드를 켠다.** 팀원은 다람쥐 화면보다 GitHub 보드로 본다(D31). #221로 바뀐 칸만 쓰게 된 뒤 켠다.
   6. **설치는 `fa init` 한 번.**
 - 순서: 배관(#138, #221, #139, #219, 쓰기 대기열)이 안정된 뒤 시작한다. 첫 팀원 한 명과 작게 시험한다.
-- D78 보강 (2026-10-25, Jin: "각자 기기로 돌리는 건 맞는데, 서로 같은 이슈를 가져가면 안 되잖어"): 3번 "먼저 잡은 공장이 맡는다"를 원자적 잠금과 임대로 구현한다. GitHub assignee나 라벨은 동시에 둘이 써도 둘 다 성공하므로 잠금이 될 수 없다. 대신 ref 생성이 원자적이라는 점을 쓴다: 공장은 `foragent/claim/issue-<n>` ref를 만들어 잡고, 이미 있으면 생성이 실패하므로 건너뛴다(GitHub가 한 명만 성공시킨다). 잡은 공장은 일하는 동안 주기적으로 생존 신호(임대)를 갱신하고, 신호가 정해진 시간 끊기면 잡기가 풀려 다른 공장이 남겨 둔 작업(#270)에서 이어받는다. 사람이 assignee를 미리 정하면 그 사람 공장만 잡는다. 임대 시간은 고정 숫자가 아니라 기록(공장의 평소 신호 간격)으로 정한다(D89). 시작은 D88 조건(시간당 5건 안정) 뒤.
+- *(v1에서는 아래 2026-10-30 D78 revision이 대체)* D78 보강 (2026-10-25, Jin: "각자 기기로 돌리는 건 맞는데, 서로 같은 이슈를 가져가면 안 되잖어"): 3번 "먼저 잡은 공장이 맡는다"를 원자적 잠금과 임대로 구현한다. GitHub assignee나 라벨은 동시에 둘이 써도 둘 다 성공하므로 잠금이 될 수 없다. 대신 ref 생성이 원자적이라는 점을 쓴다: 공장은 `foragent/claim/issue-<n>` ref를 만들어 잡고, 이미 있으면 생성이 실패하므로 건너뛴다(GitHub가 한 명만 성공시킨다). 잡은 공장은 일하는 동안 주기적으로 생존 신호(임대)를 갱신하고, 신호가 정해진 시간 끊기면 잡기가 풀려 다른 공장이 남겨 둔 작업(#270)에서 이어받는다. 사람이 assignee를 미리 정하면 그 사람 공장만 잡는다. 임대 시간은 고정 숫자가 아니라 기록(공장의 평소 신호 간격)으로 정한다(D89). 시작은 D88 조건(시간당 5건 안정) 뒤.
+
+### D78 revision — each person's factory works that person's orders (2026-10-30, Jin)
+Each teammate runs their own factory on their own machine and Claude Code
+subscription. For v1, ownership is the person who published the order, recorded
+on every published issue as by:<login>. That factory alone admits or acts on the
+issue; other factories show it as a read-only fact. Unlabelled historical work
+stays with the repository's original factory. This supersedes D78-2/3's
+claim-first allocation and the 2026-10-25 per-issue claim/lease addendum for v1.
+Keep D78-1 (one product, singleton is a one-person team), D78-5 (GitHub board),
+and D78-6 (fa init once). Each person's development capacity is the goal;
+cross-person conflicts go to agents to resolve. D78-4's team quota allocation
+and atomic ref claims/leases belong to the later, opt-in work-stealing step:
+an idle factory may then pull waiting work from other people. They are not v1.
 
 ### D79. pstack을 적극적으로 가져온다 — 원칙은 그대로, 절차서는 다듬어서 (2026-10-23, Jin) — 미구현
 - 계기: #138이 여섯 번 넘어진 원인을 찾다가, 기획 세션이 재 보지 않고 "이슈가 커서 쪼개자"고 추측했다. Jin이 "명세만 보면 안 그래 보이는데?"라고 물어서 재 보니 잠긴 시험은 6개(289줄)였고, 진짜 원인은 작업자 지시문의 '선택: 전체 시험도 돌려라'(runner.py:216, 고침은 #272)와 멈출 때 코드가 사라지는 구멍(#270)이었다. Jin: "근본적인 원인을 최대한 아래까지 파고드는 시도를 규칙화해야… 이미 잘 만들어진 걸 잘 가져오는 게 우리 철학." pstack(cursor/plugins의 `pstack/`, MIT, 로런 탠)의 `principle-fix-root-causes`와 `bug-fix` 절차서가 이 일을 한다: "Be scientific. Every shipped line traces to runtime evidence… When evidence refutes a hypothesis, revert what it motivated."

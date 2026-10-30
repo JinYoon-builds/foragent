@@ -74,3 +74,4 @@
 - #981 4차: 이슈 본문에 파일 이름을 링크로 넣을 때는 `order_references.repository_link`(라벨 이스케이프 + URL quote)를 쓴다. 단어 안 밑줄은 이스케이프하지 않는다. 기존 시험 링크 글자가 바뀌면 재발행 때 기존 이슈의 승인이 모두 풀리기 때문이다. 렌더링되지 않는 preread 프롬프트와 파서가 다시 읽는 `## Files`는 원문 그대로 둔다(REBUTTAL).
 - #981 5차(규칙): 발행 쓰기는 `update_base` 뒤 `_publish_files` 맨 앞에서 전체 검사 + 파일마다 쓰기 직전 `order_files.check_write`(루트 아래 링크 없음, 실제 경로가 자기 루트 안). 상위 폴더는 `real_directory`로 한 단계씩 만든다(`mkdir(parents=True)`가 검사 전에 링크를 따라감). preread는 `.foragent/references/<hash>/reader-*`(mkdtemp)를 리더마다 쓰고 자기 것만 지운다. digest는 리더 없는 프롬프트(`preread_target(..., reader=None)`)로 계산한다.
 - #1012(D98): preread 답은 `APPROACH:`/`DECIDE:`/`QUESTION:` 줄. `_unknowns`는 QUESTION과 접두어 없는 줄만, `_decisions`는 DECIDE 줄을 기록하고 비어 있지 않을 때만 `decisions`로 돌려준다. 스펙의 참조 패치는 ```diff 블록 앞에 `--- a/ +++ b/` 머리줄을 붙여 `git apply`로 적용된다.
+- [#1003 team identity](team-identity-1003.md) — by:<login> 소유 라벨·ownership.py 공용 규칙·로그인 캐시; `capacity.machine_root`는 모듈 속성으로 부를 것

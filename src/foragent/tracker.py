@@ -85,6 +85,7 @@ class PullRequest:
 
 class Tracker(Protocol):
     def rate_limit_reset(self) -> datetime | None: ...
+    def authenticated_login(self, *, refresh: bool = False) -> str: ...
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]: ...
     def list_open_issues(self) -> list[Issue]: ...
     def list_issues(self, state: str = "all") -> list[Issue]: ...
@@ -155,6 +156,14 @@ class TrackerError(RuntimeError):
 
 _FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
 _NOT_STARTED = re.compile(r"\bjob was not started\b", re.I)
+
+
+class IdentityError(TrackerError):
+    """The signed-in GitHub principal is not a person who can order work (for example an App token)."""
+
+    def __init__(self, login: str, kind: str):
+        super().__init__(f"GitHub credential belongs to {login} ({kind}), not a person")
+        self.login, self.kind = login, kind
 
 
 class CIEvidence(str):
@@ -553,9 +562,11 @@ class FakeTracker:
 
     def __init__(
         self, actor: str = "foragent-bot", now: Callable[[], datetime] | None = None,
-        *, strict: bool = False,
+        *, strict: bool = False, login: str | None = None,
     ):
         self.actor = actor
+        # The injectable authenticated person (D78 revision); defaults to the actor.
+        self.login = actor if login is None else login
         self._now = now or (lambda: datetime.now(UTC))
         self.strict = strict
         self.issues: dict[int, Issue] = {}
@@ -578,6 +589,11 @@ class FakeTracker:
 
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         return self._projects.graphql(query, variables, self)
+
+    def authenticated_login(self, *, refresh: bool = False) -> str:
+        if not self.login:
+            raise TrackerError("not authenticated")
+        return self.login.lower()
 
     def _timestamp(self) -> str:
         return self._now().astimezone(UTC).isoformat()
@@ -870,6 +886,33 @@ class GhTracker:
             ) from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise TrackerError(str(exc)) from exc
+
+    def authenticated_login(self, *, refresh: bool = False) -> str:
+        """The lowercase login of the person gh is signed in as on this machine.
+
+        The answer is cached in the machine data root under a hash of the host and
+        the active credential, so repositories and processes share one ``gh api user``
+        read, and switching accounts or tokens never reuses another principal.
+        ``refresh`` (fa init) reads it again. Credentials themselves are never stored.
+        """
+        from foragent import identity_cache
+
+        key = identity_cache.credential_key()
+        if not refresh and key is not None and (login := identity_cache.read(key)):
+            return login
+        try:
+            data = json.loads(self._call(["api", "user"]))
+        except json.JSONDecodeError as exc:
+            raise TrackerError(f"invalid user JSON: {exc}") from exc
+        login = data.get("login") if isinstance(data, dict) else None
+        if not isinstance(login, str) or not login:
+            raise TrackerError("gh api user returned no login")
+        if data.get("type", "User") != "User":
+            raise IdentityError(login, str(data.get("type")))
+        login = login.lower()
+        if key is not None:
+            identity_cache.write(key, login)
+        return login
 
     def rate_limit_reset(self) -> datetime | None:
         """Also keeps the core requests remaining from the same response in ``rate_limit_remaining``."""

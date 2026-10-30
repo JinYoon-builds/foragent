@@ -200,6 +200,32 @@ def _claude_by_env() -> str | None:
     return kind if kind is not None and _claude_installed() else None
 
 
+def _identity_notes(tracker: Tracker, config: Config) -> list[str]:
+    """Read the signed-in GitHub account again and say whose factory this is (D78 revision).
+
+    Re-running fa init after `gh auth login`/`switch` is how a factory learns its new
+    account. Another person's labelled work without a shared legacy_owner means the
+    repository is not ready for a second factory yet.
+    """
+    from foragent.ownership import OwnershipError, parse_orderer
+
+    try:
+        login = tracker.authenticated_login(refresh=True)
+    except (TrackerError, ValueError) as exc:
+        return [text("init_identity_failed", config.language, error=" ".join(str(exc).split())[:300])]
+    notes = [text("init_identity", config.language, login=login)]
+    if config.legacy_owner is None:
+        try:
+            owners = {owner for issue in tracker.list_issues()
+                      if (owner := parse_orderer(issue.labels)) is not None}
+        except (TrackerError, OwnershipError):
+            owners = set()
+        if owners - {login.lower()}:
+            notes.append(text("init_legacy_owner_missing", config.language,
+                              owners=", ".join(sorted(owners - {login.lower()}))))
+    return notes
+
+
 def _preflight_language(root: Path, language: str | None) -> str:
     """Language for errors raised before setup: the flag, else the existing config, else English."""
     if language is not None:
@@ -360,6 +386,7 @@ def init_repo(
     # GhTracker counts its own attempts; its default runner must not count them again.
     tracker = tracker or GhTracker(repo, run=gh_run)
     tracker.ensure_labels(LABELS)
+    notes.extend(_identity_notes(tracker, config))
     board_id = config.board
     if not no_board:
         created_boards: set[str] = set()

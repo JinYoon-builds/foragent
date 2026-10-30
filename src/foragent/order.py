@@ -5,12 +5,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import quote
 
-from foragent import board, design, order_references
+from foragent import board, design, order_references, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -24,7 +25,11 @@ from foragent.order_files import check_destinations, check_write, issue_body, va
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
-from foragent.tracker import LabelSpec, Tracker, pr_issue_number
+from foragent.ownership import OwnershipError, effective_orderer, label_description, owner_label, parse_orderer
+from foragent.tracker import IdentityError, Issue, LabelSpec, Tracker, TrackerError, pr_issue_number
+
+
+log = logging.getLogger(__name__)
 
 
 class PlanError(ValueError):
@@ -452,6 +457,78 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
     return published_blobs
 
 
+def _order_owner(tracker: Tracker, config: Config, parent, children: list) -> str:
+    """The person this order's new issues belong to; republication never transfers it.
+
+    An existing order keeps its parent's owner (the effective legacy owner for an
+    unlabelled parent). A new order belongs to the authenticated publisher. Every
+    existing issue of the order must have at most one owner label.
+    """
+    language = config.language
+    try:
+        login = tracker.authenticated_login()
+    except IdentityError as exc:
+        raise PlanError(text("identity_not_a_person", language, login=exc.login, kind=exc.kind)) from exc
+    except TrackerError as exc:
+        raise PlanError(text("identity_unavailable", language, error=" ".join(str(exc).split())[:300])) from exc
+    try:
+        for issue in children:
+            parse_orderer(issue.labels, language)
+        return effective_orderer(parent, config, login) if parent is not None else parse_orderer(
+            [owner_label(login)], language)
+    except OwnershipError as exc:
+        raise PlanError(str(exc)) from exc
+
+
+_MARKER_PREFIX = "<!-- foragent:"
+# A retired issue keeps its text for the record, but no Foragent marker matches it.
+_RETIRED_PREFIX = "<!-- foragent-refused:"
+
+
+def _labelled(issue) -> bool:
+    return any(label.lower().startswith(ownership.PREFIX) for label in issue.labels)
+
+
+def _retire(tracker: Tracker, config: Config, issue, label: str) -> None:
+    """Best effort: retire an unconfirmed issue's markers and close it.
+
+    Discovery already ignores unconfirmed issues, so a failure here only leaves
+    an inert issue that the next publication retires again.
+    """
+    try:
+        if _MARKER_PREFIX in issue.body:
+            tracker.update_issue(issue.number, title=issue.title,
+                                 body=issue.body.replace(_MARKER_PREFIX, _RETIRED_PREFIX))
+        if issue.state == "open":
+            tracker.close_issue(issue.number, text("identity_closed_unlabelled", config.language, label=label))
+    except Exception:
+        log.warning("could not retire unconfirmed issue #%s", issue.number, exc_info=True)
+
+
+def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str]) -> int:
+    """Create an issue carrying ``owner``'s label, or refuse it and stop publication.
+
+    GitHub silently drops labels a creator may not apply, so the label is read back.
+    An unconfirmed issue (label missing or unreadable) is retired and publication
+    stops. Even when retiring fails, discovery never reuses it: an unlabelled parent
+    with an empty map, or an unlabelled child missing from its parent's map, is an
+    unconfirmed creation (see ``_unconfirmed``), and a retry retires it again.
+    The issue is created in one request so its body has no edit that would
+    postdate an approval added in the same publication.
+    """
+    label = owner_label(owner)
+    number = tracker.create_issue(title, body, [label, *labels])
+    try:
+        confirmed = label in tracker.get_issue(number).labels
+    except Exception:
+        _retire(tracker, config, Issue(number, title, body, frozenset(), "open"), label)
+        raise
+    if not confirmed:
+        _retire(tracker, config, Issue(number, title, body, frozenset(), "open"), label)
+        raise PlanError(text("identity_label_missing", config.language, number=number, label=label))
+    return number
+
+
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
             git: GitRepo | None = None, manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
@@ -468,6 +545,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
     parents = [(issue, pattern.search(issue.body)) for issue in all_issues if pattern.search(issue.body)]
+    # A parent refused at creation stops publication before any child exists.
+    unconfirmed = [issue for issue, marker in parents if not _labelled(issue) and marker[1] == "{}"]
+    parents = [(issue, marker) for issue, marker in parents if issue not in unconfirmed]
     if len(parents) > 1:
         raise PlanError(f"multiple parents for plan {plan['id']}")
     parent, mapping, saved_blobs = None, {}, {}
@@ -489,8 +569,13 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                 raise ValueError("invalid acceptance blob map")
         except ValueError as exc:
             raise PlanError(f"invalid plan map on parent #{parent}") from exc
+    mapped = set(mapping.values())
     for item in plan["issues"]:
-        matches = [issue.number for issue in all_issues if _child_marker(plan["id"], item["key"]) in issue.body]
+        found = [issue for issue in all_issues if _child_marker(plan["id"], item["key"]) in issue.body]
+        # A child refused at creation never reached its parent's map; only a confirmed
+        # (labelled) child is recovered from its marker after a partial publication.
+        unconfirmed += [issue for issue in found if not _labelled(issue) and issue.number not in mapped]
+        matches = [issue.number for issue in found if _labelled(issue) or issue.number in mapped]
         if len(matches) > 1:
             raise PlanError(f"duplicate children for key {item['key']}")
         if item["key"] not in mapping and matches:
@@ -538,12 +623,18 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
           if approve or item["number"] in selected_numbers),
     ])
+    owner = _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
+                         [by_number[n] for n in mapping.values()])
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
+    # The owner label exists before any file or issue does: without it, nothing is published.
+    tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
     with git.publish_lock():
         git.update_base(config.base_branch)
         published_blobs = _publish_files(plan, root, config, git, files, manager)
+    for issue in unconfirmed:
+        _retire(tracker, config, issue, owner_label(owner))
     lane_names = {item["lane"] for item in plan["issues"]} - {"main"}
     tracker.ensure_labels([*LABELS, *(LabelSpec(f"lane:{name}", "ededed", f"Foragent lane {name}.") for name in sorted(lane_names))])
     if any(item.get("interactive", False) for item in plan["issues"]):
@@ -566,7 +657,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     # applies: publish closes its record below, so it never gets a Backlog card.
     childless = not plan["issues"] and not mapping
     if parent is None:
-        parent = tracker.create_issue(plan["title"], parent_body(), [])
+        parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
         linked: set[int] = set()
     else:
         tracker.update_issue(parent, title=plan["title"], body=parent_body())
@@ -583,7 +674,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         number = mapping.get(item["key"])
         blobs = acceptance_blobs(item)
         if number is None:
-            number = tracker.create_issue(item["title"], body, labels)
+            number = _create_owned(tracker, config, owner, item["title"], body, labels)
             mapping[item["key"]] = number
             recorded_blobs[str(number)] = blobs
             # Persist progress before native edge calls so retries reuse the child.
