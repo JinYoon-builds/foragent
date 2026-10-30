@@ -26,8 +26,9 @@ def fast_self_merge(git_history, tmp_path, monkeypatch, project_name, *, install
 
     case.implementer.steps = [implement]
 
-    def merged(number, *, expected_head_sha, method="squash"):
-        merge(number, expected_head_sha=expected_head_sha, method=method)
+    def merged(number, *, expected_head_sha, method="squash", expected_base_sha=None):
+        merge(number, expected_head_sha=expected_head_sha, method=method,
+              **({"expected_base_sha": expected_base_sha} if expected_base_sha is not None else {}))
         git_command(git_history.origin, "update-ref", "refs/heads/main", expected_head_sha)
         git_history.tip = expected_head_sha
 

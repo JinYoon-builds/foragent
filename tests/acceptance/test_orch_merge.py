@@ -69,9 +69,10 @@ def test_approved_merge_posts_attribution_logs_event_and_matches_head(git_histor
     merged = []
     merge = case.tracker.merge_pr
 
-    def checked(number, *, expected_head_sha, method="squash"):
+    def checked(number, *, expected_head_sha, method="squash", expected_base_sha=None):
         merged.append((number, expected_head_sha))
-        return merge(number, expected_head_sha=expected_head_sha, method=method)
+        return merge(number, expected_head_sha=expected_head_sha, method=method,
+              **({"expected_base_sha": expected_base_sha} if expected_base_sha is not None else {}))
 
     monkeypatch.setattr(case.tracker, "merge_pr", checked)
     at = "2026-10-21T12:00:00+00:00"
