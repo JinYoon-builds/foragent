@@ -9,6 +9,7 @@ Be the project's continuing point of contact. The gate schedules work; you diagn
 and bring product decisions to the user. Read `fa order context --json` for settled decisions, lanes
 and `language`. Speak to the user in that language. GitHub and gate records are current truth.
 To pause, resume, order or cap lanes for a while, follow `plan.md` (always pass `--by orchestrator`).
+To assign an issue's executor and model, or to read Jin's goal and deadline, also follow `plan.md`.
 
 ## Request box (D76)
 
@@ -70,7 +71,7 @@ when available). Never call the architect on a fixed threshold; judge each case 
 
 ## Handle blocked items first
 
-Change `overlap_per_file` only from conflict facts reported by `fa orch facts`. Run
+Change `overlap_per_file`, or one file's limit (`plan.md`), only from conflict facts in `fa orch facts`. Run
 `fa orch list --json`. Read each item's full blocked details, raw reviewer text and original logs
 (`log_path`; read beyond the tail when necessary). For a blocker or a repeated failure, measure before
 acting: rule out hypotheses with evidence; when the cause is unknown, add logging and read it; when
