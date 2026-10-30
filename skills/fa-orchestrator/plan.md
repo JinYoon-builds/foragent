@@ -15,6 +15,7 @@ Always pass `--by orchestrator`. Without it the command records the change as a 
 | Order a lane's issues | `fa orch queue LANE N N ... --by orchestrator` (`--clear` removes it) |
 | Cap a lane's runs | `fa orch plan --width LANE=N --by orchestrator` (`LANE=off` clears; repeatable) |
 | End the whole plan | `fa orch plan --expires ISO --by orchestrator` |
+| Let N runs share one file | `fa orch plan --overlap PATH=N --why "<evidence>" --by orchestrator [--expires ISO]` (`PATH=off` clears; repeatable) |
 
 - A pause needs both `--until` and `--why`; it lapses by itself when `--until` passes.
 - Times are ISO; a time without a timezone is local time. Past times are refused.
@@ -22,7 +23,13 @@ Always pass `--by orchestrator`. Without it the command records the change as a 
   fresh plan with no expiry.
 - Without a width a lane has no fixed cap: free slots fill with ready issues whose files do not
   overlap running ones. Use a width only to hold a lane back; use a pause to stop it.
+- A file limit replaces `overlap_per_file` for that one file; other files keep it. Choose N from the
+  file's rows in `fa orch facts` (overlapping merges, conflict rate, resolution seconds, redo count)
+  and the work waiting on it: cheap conflicts can justify more sharing, costly ones less. Put those
+  numbers in `--why`. N counts every run on the file, the new one included. Exclusive files, budgets
+  and `overlap_mode: fixed` still win. With `--overlap`, `--expires` ends only those file limits;
+  without it an entry keeps its expiry (a new one has none). The plan's own expiry does not end them.
 - A refusal that names `human` means a person wrote that item. Leave it as it is; if it blocks the
   work, ask the person (D71) instead of working around it.
 - Every edit is recorded in `fa orch log` (`plan-pause`, `plan-resume`, `plan-queue`,
-  `plan-width`, `plan-expires`, `plan-expired`).
+  `plan-width`, `plan-expires`, `plan-overlap`, `plan-expired`).

@@ -50,10 +50,15 @@ def add_parsers(orch_actions, queue) -> None:
     pause.add_argument("--why", required=True)
     resume = orch_actions.add_parser("resume", help="Remove a lane's plan pause")
     resume.add_argument("lane")
-    plan = orch_actions.add_parser("plan", help="Show the plan, or set lane widths and its expiry")
+    plan = orch_actions.add_parser("plan", help="Show the plan, or set lane widths, file overlap limits and expiry")
     plan.add_argument("--width", action="append", default=[], metavar="LANE=N",
                       help="Cap a lane's running runs (N >= 1), or LANE=off to clear; may repeat")
-    plan.add_argument("--expires", help="ISO time when the whole plan lapses")
+    plan.add_argument("--overlap", action="append", default=[], metavar="PATH=N",
+                      help="Let N running runs share one repository file (N >= 1), replacing "
+                           "overlap_per_file for it, or PATH=off to clear; may repeat; needs --why")
+    plan.add_argument("--why", help="With --overlap: the recorded evidence behind the limit")
+    plan.add_argument("--expires", help="ISO time when the whole plan lapses; with --overlap, when those "
+                                        "file limits lapse")
     plan.add_argument("--json", action="store_true")
     for command in (pause, resume, plan, queue):
         command.add_argument("--by", choices=orch_plan.AUTHORS, default="human",
@@ -97,6 +102,20 @@ def _widths(values: list[str], language: str) -> dict:
     return widths
 
 
+def _overlaps(values: list[str], language: str) -> dict:
+    limits = {}
+    for value in values:
+        path, sep, raw = value.rpartition("=")
+        try:
+            limit = None if raw == "off" else int(raw)
+        except ValueError:
+            limit = 0
+        if not sep or not path or (limit is not None and limit < 1):
+            _fail(text("orch_plan_bad_overlap", language, value=value))
+        limits[path] = limit
+    return limits
+
+
 def run(args, store, config) -> None:
     """Plan pauses, widths, expiry and their display; queues go through ``fa orch queue``."""
     plan_module, language = orch_plan, config.language
@@ -112,10 +131,23 @@ def run(args, store, config) -> None:
             print(text("orch_plan_resumed" if removed else "orch_plan_not_paused", language, lane=args.lane))
             return
         widths = _widths(args.width, language)
+        overlaps = _overlaps(args.overlap, language)
         _check_lanes("plan", list(widths), config)
         expires = _plan_time("plan", args.expires, language) if args.expires else None
-        current = (plan_module.set_plan(store, widths, expires, args.by) if widths or expires
-                   else plan_module.load(store))
+        if args.why is not None and not overlaps:
+            _fail(text("orch_plan_why_without_overlap", language))
+        if overlaps and widths:
+            _fail(text("orch_plan_overlap_and_width", language))
+        if overlaps:
+            # With --overlap, --expires ends those file limits only, never the rest of the plan.
+            from foragent.scheduler_lanes import _filesystem_case_sensitive
+
+            current = plan_module.set_files(store, overlaps, args.why or "", expires, args.by,
+                                            case_sensitive=_filesystem_case_sensitive(args.repo_root))
+        elif widths or expires:
+            current = plan_module.set_plan(store, widths, expires, args.by)
+        else:
+            current = plan_module.load(store)
     except plan_module.PlanRefused as exc:
         refuse(args.action, exc, language)
     if args.json:
@@ -138,6 +170,9 @@ def _plan_lines(plan: dict, language: str) -> list[str]:
         if lane in plan["width"]:
             parts.append(text("orch_plan_width", language, width=plan["width"][lane], by=authors["width"][lane]))
         lines.append(text("orch_plan_line", language, lane=lane, parts="; ".join(parts)))
+    for path, item in sorted(plan["files"].items()):
+        lines.append(text("orch_plan_file", language, path=path, limit=item["limit"], by=item["by"],
+                          why=item["why"], until=item["expires_at"] or text("orch_plan_file_no_expiry", language)))
     if not lines and not plan["expires_at"]:
         return [text("orch_plan_none", language)]
     if plan["expires_at"]:

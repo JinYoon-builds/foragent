@@ -150,6 +150,27 @@ def recorded_union(store) -> set[str]:
         return set()
 
 
+def file_limits(ctx) -> dict[str, int]:
+    """The plan's per-file limits in force, as escaped patterns; none under ``overlap_mode: fixed``."""
+    if ctx.config.overlap_mode == "fixed":
+        return {}
+    from foragent import orch_plan
+
+    now = ctx.now() if hasattr(ctx, "now") else ctx.store._now()
+    return {escape(path): limit for path, limit in orch_plan.file_limits(ctx.store, now).items()}
+
+
+def limit_for(ctx, pattern: str, planned: dict[str, int]) -> int:
+    """How many runs may share ``pattern``: the plan's limit for its file, else overlap_per_file.
+
+    A glob may match a planned file and other files, so it takes the lowest limit it can meet.
+    """
+    hits = [limit for path, limit in planned.items() if intersects(ctx, pattern, path)]
+    if hits and not has_magic(pattern):
+        return min(hits)
+    return min([ctx.config.overlap_per_file, *hits])
+
+
 def at_capacity(ctx, files: list[str], peers: list[Claim], *, union: set[str] | None = None) -> bool:
     """Count distinct runs sharing the same possible path, not matching patterns."""
     if union is None:
@@ -157,10 +178,10 @@ def at_capacity(ctx, files: list[str], peers: list[Claim], *, union: set[str] | 
     files = [path for path in files if path not in union]
     peers = [Claim(peer.run, peer.parsed, [path for path in peer.files if path not in union])
              for peer in peers]
-    limit = ctx.config.overlap_per_file
+    planned = file_limits(ctx)
     for path in files:
         matching = [peer for peer in peers if any_overlap(ctx, [path], peer.files)]
-        for group in combinations(matching, limit):
+        for group in combinations(matching, limit_for(ctx, path, planned)):
             for patterns in product(*(peer.files for peer in group)):
                 if intersects(ctx, path, *patterns):
                     return True
