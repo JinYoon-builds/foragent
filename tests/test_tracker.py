@@ -1695,3 +1695,31 @@ def test_observe_closed_issues_starts_at_the_last_listing_and_records_unlisted_c
     tracker.observe_closed_issues(observed_at=clock[0])
     assert states() == {1: "closed", 2: "open", 3: "closed"}
     assert ctx.store.closed_issue_watermark() == clock[0]
+
+
+def test_bounded_gh_caps_each_call_and_starts_none_once_the_shared_budget_is_spent(monkeypatch):
+    import subprocess
+    import time
+
+    from foragent import gh
+    from foragent.tracker import GhTracker
+
+    clock, timeouts = [100.0], []
+
+    def run(argv, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        clock[0] += 3
+        return subprocess.CompletedProcess(argv, 0, stdout=b"[]")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    tracker = GhTracker("owner/repo")
+    budget = gh.Budget(5, 4)
+    with budget.spend():
+        tracker.sub_issues(1)  # 4 s cap of 5 left.
+    with budget.spend():
+        tracker.sub_issues(2)  # Only 2 s are left.
+        with pytest.raises(TrackerError, match="deferred"):
+            tracker.sub_issues(3)  # Nothing left: no subprocess at all.
+    tracker.sub_issues(4)  # Outside a bounded block the usual timeout applies.
+    assert timeouts == [4, 2, 120]
