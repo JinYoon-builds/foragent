@@ -6,7 +6,10 @@ Runtime dependencies resolve through foragent.watch to preserve its patch points
 from typing import Any
 
 
-Span = tuple[str, str]
+# A named style ("working", "dim") or a structured pixel colour ("art", fg, bg) with
+# xterm-256 indices; None is the terminal default. Lines never carry ANSI escapes.
+Style = str | tuple[str, int | None, int | None]
+Span = tuple[str, Style]
 Line = list[Span]
 
 
