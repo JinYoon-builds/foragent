@@ -121,3 +121,58 @@ def test_orch_alive_help_comes_from_the_messages_registry():
 
     assert text("heartbeats_help")
     assert text("heartbeats_help", "ko") != text("heartbeats_help")
+
+
+def _clocked(tmp_path, clock):
+    return StateStore(tmp_path / "state", now=lambda: clock[0])
+
+
+def test_renew_plan_heartbeat_never_creates_and_waits_one_minute(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    clock = [datetime(2026, 10, 30, 12, tzinfo=UTC)]
+    store = _clocked(tmp_path, clock)
+    assert orch_inbox.renew_plan_heartbeat(store) is False
+    assert not orch_inbox.plan_heartbeat_path(store).exists()
+    orch_inbox.write_plan_heartbeat(store)
+    written = orch_inbox.plan_heartbeat_path(store).read_bytes()
+    clock[0] += timedelta(seconds=60)
+    assert orch_inbox.renew_plan_heartbeat(store) is False
+    assert orch_inbox.plan_heartbeat_path(store).read_bytes() == written
+    clock[0] += timedelta(seconds=1)
+    assert orch_inbox.renew_plan_heartbeat(store) is True
+    assert json.loads(orch_inbox.plan_heartbeat_path(store).read_text())["at"] == clock[0].isoformat()
+
+
+def test_ask_kind_is_validated_and_follow_events_skip_what_existed(store):
+    with pytest.raises(InboxError):
+        orch_inbox.ask(store, "Which?", ["a"], 1, kind="vote")
+    before = orch_inbox.add_request(store, "planning", "old")
+    old = orch_inbox.ask(store, "Old?", ["a"], 1)
+    orch_inbox.answer(store, old["id"], "a")
+    merge = orch_inbox.ask(store, "Merge?", ["Merge"], 1, kind="merge")
+    events = orch_inbox.FollowEvents(store)
+    new = orch_inbox.add_request(store, "planning", "new")
+    orch_inbox.set_request_status(store, before["id"], "processing", "note")
+    orch_inbox.answer(store, merge["id"], "Merge")
+    assert events.poll(store) == [
+        {"event": "request", "id": new["id"], "from": "planning", "text": "new"},
+        {"event": "answer", "id": merge["id"], "kind": "merge", "answer": "Merge"},
+    ]
+    assert events.poll(store) == []
+
+
+def test_follow_events_fall_back_to_timestamps_when_the_start_read_fails(tmp_path, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    clock = [datetime(2026, 10, 30, 12, tzinfo=UTC)]
+    store = _clocked(tmp_path, clock)
+    before = orch_inbox.add_request(store, "planning", "before")
+    clock[0] += timedelta(seconds=1)
+    original = orch_inbox._records
+    monkeypatch.setattr(orch_inbox, "_records", lambda *args: (_ for _ in ()).throw(OSError("busy")))
+    events = orch_inbox.FollowEvents(store)
+    monkeypatch.setattr(orch_inbox, "_records", original)
+    at_start = orch_inbox.add_request(store, "planning", "at start")
+    assert [event["id"] for event in events.poll(store)] == [at_start["id"]]
+    assert before["id"] != at_start["id"] and events.poll(store) == []

@@ -103,3 +103,39 @@ def test_repeated_failed_reads_print_once_in_follow_and_recover_with_the_real_sn
     assert next(stream) == known
     assert not (ctx.store.root / "orch-watch-unknown.json").exists()
     assert json.loads((ctx.store.root / "orch-watch.json").read_text()) == known
+
+
+def test_follow_emits_inbox_records_written_while_the_first_reads_fail(ctx, monkeypatch):
+    from foragent import orch_inbox
+
+    old = orch_inbox.add_request(ctx.store, "planning", "before start")
+    question = orch_inbox.ask(ctx.store, "Merge?", ["Merge"], 1, kind="merge")
+    known = list(orch.watch(ctx))[0]
+    original = ctx.store.local_issues
+    failures = [1, 1]
+    written = []
+
+    def local_issues():
+        if failures:
+            failures.pop()
+            if not written:  # written after watch started, before its first good read
+                written.append(orch_inbox.add_request(ctx.store, "planning", "during failure"))
+                orch_inbox.answer(ctx.store, question["id"], "Merge")
+            raise OSError("disk busy")
+        return original()
+
+    monkeypatch.setattr(ctx.store, "local_issues", local_issues)
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        assert len(sleeps) < 5, "the events never came; the loss would make this wait forever"
+
+    monkeypatch.setattr(orch.time, "sleep", sleep)
+    stream = orch.watch(ctx, interval=1, follow=True)
+    assert next(stream)["unknown"] is True
+    assert next(stream) == known
+    assert next(stream) == {"event": "request", "id": written[0]["id"], "from": "planning",
+                            "text": "during failure"}
+    assert next(stream) == {"event": "answer", "id": question["id"], "kind": "merge", "answer": "Merge"}
+    assert old["id"] != written[0]["id"]
