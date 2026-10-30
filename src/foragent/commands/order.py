@@ -22,6 +22,10 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
 }
 new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
+issues[].statements and edits[].statements are optional nonempty lists of one-line, plain-language
+behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route
+for good: a real publish (with or without approval) refuses the issue until its lane has written
+tests and the configured reviewer has reviewed them; --dry-run still previews it.
 --approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
 content; --dry-run never needs one.
 files lists repository-relative paths or globs expected to change; absolute paths and .. are rejected.
