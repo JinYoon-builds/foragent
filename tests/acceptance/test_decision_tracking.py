@@ -34,6 +34,9 @@ def test_publication_retains_decision_marker_and_republication_replaces_it(tmp_p
                    if line.startswith("<!-- foragent:decisions ")]
         assert markers == ["<!-- foragent:decisions " + json.dumps(sorted(set(decisions))) + " -->"]
     number = children[0].number
+    del plan["issues"][0]["decisions"]
+    order.publish(plan, tmp_path, config, tracker, repo="offline/decisions", git=git)
+    assert '<!-- foragent:decisions ["D71"] -->' in tracker.get_issue(number).body
     edit = {key: plan["issues"][0][key] for key in ("goal", "out_of_scope", "done_when")}
     edit.update(number=number, decisions=["D82"])
     plan.update(id="decision-edit-fixture", issues=[], edits=[edit])
@@ -41,9 +44,16 @@ def test_publication_retains_decision_marker_and_republication_replaces_it(tmp_p
     body = tracker.get_issue(number).body
     assert '<!-- foragent:decisions ["D82"] -->' in body
     assert '<!-- foragent:decisions ["D71"] -->' not in body
+    del edit["decisions"]
+    order.publish(plan, tmp_path, config, tracker, repo="offline/decisions", git=git)
+    assert '<!-- foragent:decisions ["D82"] -->' in tracker.get_issue(number).body
+    edit["decisions"] = []
+    order.publish(plan, tmp_path, config, tracker, repo="offline/decisions", git=git)
+    assert '<!-- foragent:decisions [] -->' in tracker.get_issue(number).body
+    assert '<!-- foragent:decisions ["D82"] -->' not in tracker.get_issue(number).body
 
 
-@pytest.mark.parametrize("invalid", ["D79", [79], ["D790x"]])
+@pytest.mark.parametrize("invalid", ["D79", [79], ["D790x"], ["D79-1"]])
 def test_invalid_decision_ids_are_rejected_before_publication(tmp_path, invalid):
     plan = small_plan()
     plan["issues"][0]["decisions"] = invalid
@@ -62,7 +72,7 @@ def test_decisions_command_combines_markers_and_published_legacy_specs_and_track
     (docs / "specs").mkdir(parents=True)
     (docs / "decisions.md").write_text("# Decisions\n" + "".join(
         f"### D{n}. Decision {n} — 미구현\n" for n in (7, 71, 74, 79, 82)))
-    (docs / "specs/legacy.md").write_text("# Published legacy order\nD71 and D74; D740 is a different ID.\n")
+    (docs / "specs/legacy.md").write_text("# Published legacy order\nD71-2 and D74; D740 is a different ID.\n")
     (docs / "specs/unpublished.md").write_text("# Unpublished draft\nD82\n")
     marker = '<!-- foragent:decisions ["D79"] -->'
     rows = [
@@ -73,8 +83,12 @@ def test_decisions_command_combines_markers_and_published_legacy_specs_and_track
         Issue(14, "Cancelled", '<!-- foragent:decisions ["D74"] -->', frozenset(),
               "closed", state_reason="not_planned"),
         Issue(15, "Unrelated D7 in a title", "D7 in ordinary prose", frozenset(), "open"),
+        Issue(16, "Explicitly unlinked legacy child",
+              '<!-- foragent:plan-child id=legacy key=other -->\n<!-- foragent:decisions [] -->',
+              frozenset(), "open"),
     ]
-    case.store.refresh_local_issues(rows, [], {}, case.store._now())
+    observed = case.store._now()
+    case.store.refresh_local_issues(rows, [], {}, observed)
 
     def read():
         before = {p: p.read_bytes() for p in case.store.root.rglob("*") if p.is_file()}
@@ -90,18 +104,36 @@ def test_decisions_command_combines_markers_and_published_legacy_specs_and_track
     assert set(result) == {"D7", "D71", "D74", "D79", "D82"}
     assert result["D79"]["issues"] == [11, 12] and result["D79"]["state"] == "in progress"
     assert result["D71"]["issues"] == [13] and result["D71"]["state"] == "done"
+    assert result["D71"]["observed_at"] == observed.isoformat()
+    assert read()["D71"]["observed_at"] == observed.isoformat(), "Reads do not renew observation time"
     assert result["D74"]["issues"] == [13, 14] and result["D74"]["state"] == "in progress"
     for identity in ("D7", "D82"):
         assert result[identity]["issues"] == []
         assert result[identity]["state"] == "decided, nothing ordered"
     case.store.update_local_issue(12, state="closed", state_reason="completed")
     assert read()["D79"]["state"] == "done", "Every linked issue must finish"
-    case.store.update_local_issue(12, state="open", state_reason=None, merged=True)
+    case.store.update_local_issue(12, state="closed", state_reason=None, merged=True)
     assert read()["D79"]["state"] == "done", "An observed merge also proves completion"
+    case.store.update_local_issue(12, state="open", state_reason=None, merged=True)
+    assert read()["D79"]["state"] == "in progress", "Reopening outranks an old merged PR"
+    case.store.update_local_issue(12, state="closed", state_reason="completed", merged=True)
     case.store.update_local_issue(11, state="open", state_reason=None)
     assert read()["D79"]["state"] == "in progress", "Reopening changes the derived state"
     case.store.update_local_issue(11, state="closed", state_reason=None)
     assert read()["D79"]["state"] == "in progress", "Unknown closure reason does not prove completion"
+
+
+def test_missing_ledger_is_distinguishable_from_a_readable_empty_ledger(tmp_path, monkeypatch, capsys):
+    case = offline_local_cli(tmp_path, monkeypatch)
+    capsys.readouterr()
+    missing = cli_exit(case.main, ["decisions", "--json", "--repo-root", str(case.root)])
+    missing_output = capsys.readouterr()
+    (case.root / "docs").mkdir()
+    (case.root / "docs/decisions.md").write_text("# No decisions yet\n")
+    empty = cli_exit(case.main, ["decisions", "--json", "--repo-root", str(case.root)])
+    empty_output = capsys.readouterr()
+    assert empty == 0 and json.loads(empty_output.out) == []
+    assert missing != 0 or missing_output.err.strip(), "Unavailable input cannot look like an empty ledger"
 
 
 def test_repository_decision_headings_have_no_hand_written_unimplemented_status():
