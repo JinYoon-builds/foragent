@@ -9,6 +9,9 @@ MESSAGES = {
         "ownership_unknown_factory": (
             "This factory does not know its GitHub account. Run fa init to sign in again, then try again."),
         "ownership_foreign": "#{number} is worked by {owner}; this factory is {factory}.",
+        "ownership_unconfirmed": (
+            "#{number} was published for an owner label it does not have, so no factory works it. "
+            "Add one by:<login> label for the person who ordered it, or close it."),
         "identity_unavailable": (
             "Cannot read the GitHub account for this factory, so nothing was published. "
             "Run gh auth login (or fa init), then try again. GitHub said: {error}"),
@@ -36,6 +39,9 @@ MESSAGES = {
         "ownership_unknown_factory": (
             "이 공장의 GitHub 계정을 몰라요. fa init으로 다시 로그인한 뒤 다시 해 보세요."),
         "ownership_foreign": "#{number}은 {owner}의 일이에요. 이 공장은 {factory}예요.",
+        "ownership_unconfirmed": (
+            "#{number}은 주인 라벨이 붙어야 하는데 없어서 어느 공장도 일하지 않아요. "
+            "주문한 사람의 by:<login> 라벨을 하나 붙이거나 이슈를 닫으세요."),
         "identity_unavailable": (
             "이 공장의 GitHub 계정을 읽지 못해서 아무것도 발행하지 않았어요. "
             "gh auth login(또는 fa init)을 한 뒤 다시 해 보세요. GitHub 응답: {error}"),

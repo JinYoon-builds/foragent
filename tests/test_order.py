@@ -19,6 +19,7 @@ from foragent.reasons import Reason, format_comment
 from foragent.scheduler import TickContext, tick
 from foragent.skills import SkillManager
 from foragent.state import StateStore
+from foragent.ownership import OwnershipError, effective_orderer
 from foragent.tracker import FakeTracker, TrackerError
 
 from conftest import BASE_TIME, git_command
@@ -2010,11 +2011,19 @@ def test_unlabelled_order_gets_new_children_for_its_legacy_owner(publishing, pla
 def test_edits_keep_the_existing_issue_owner(publishing, plan):
     tracker = publishing[2]
     tracker.add_issue(9, "Legacy", "old body", labels=["size:s"])
-    tracker.add_issue(10, "Alice's", "old body", labels=["size:s", "by:alice"])
+    tracker.add_issue(10, "Alice's", f"old body\n{order.OWNED_MARKER}\n", labels=["size:s", "by:alice"])
+    tracker.add_issue(11, "Ownerless", f"old body\n{order.OWNED_MARKER}\n", labels=["size:s"])
     edit = {key: plan["issues"][1][key] for key in ("goal", "out_of_scope", "done_when", "checklist")}
-    plan["issues"], plan["edits"] = [], [{**edit, "number": 9}, {**edit, "number": 10}]
+    plan["issues"], plan["edits"] = [], [{**edit, "number": n} for n in (9, 10, 11)]
     publish(publishing, plan, approve=True)
-    assert owners(tracker)[9] == set() and owners(tracker)[10] == {"by:alice"}
+    assert owners(tracker)[9] == set() and owners(tracker)[10] == {"by:alice"} and owners(tracker)[11] == set()
+    # The rewritten body keeps each issue's owner-label contract, and only theirs.
+    assert [order.OWNED_MARKER in tracker.get_issue(n).body for n in (9, 10, 11)] == [False, True, True]
+    with pytest.raises(OwnershipError):
+        effective_orderer(tracker.get_issue(11), replace(publishing[1], legacy_owner="jin"), "jin")
+    events = {n: list(tracker.label_events(n)) for n in (9, 10, 11)}
+    publish(publishing, plan, approve=True)  # Idempotent: the kept contract does not look like a change.
+    assert {n: list(tracker.label_events(n)) for n in (9, 10, 11)} == events
 
 
 @pytest.mark.parametrize("refused", ["parent", "child"])
@@ -2053,7 +2062,12 @@ def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing
     first = tracker.get_issue(number)
     # Each cleanup step runs even when the other one fails.
     assert (first.state == "closed") == (fault in ("label", "retire"))
-    assert ("<!-- foragent:" not in first.body) == (fault in ("label", "close"))
+    assert ("<!-- foragent:plan" not in first.body) == (fault in ("label", "close"))
+    if fault != "read":  # Whatever rollback failed, an unlabelled leftover is nobody's work, never legacy work.
+        assert not owners(tracker)[number] and order.OWNED_MARKER in first.body
+        for config in (publishing[1], replace(publishing[1], legacy_owner="jin")):
+            with pytest.raises(OwnershipError, match=f"#{number} was published for an owner label"):
+                effective_orderer(first, config, "human")
     tracker.login = "bob"  # Anyone may retry; the unconfirmed issue must not decide the owner.
     report = publish(publishing, plan)
     numbers = {report.parent, *(row["number"] for row in report.rows)}
@@ -2066,7 +2080,8 @@ def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing
     assert all(tracker.get_issue(n).state == "open" for n in numbers)
     leftover = tracker.get_issue(number)
     if fault != "read":  # A labelled (confirmed but unread) issue stays a normal owned issue.
-        assert leftover.state == "closed" and "<!-- foragent:" not in leftover.body
+        assert leftover.state == "closed" and "<!-- foragent:plan" not in leftover.body
+        assert order.OWNED_MARKER in leftover.body
     publish(publishing, plan)  # Stable afterwards: no duplicate parents or children.
     assert {report.parent, *(row["number"] for row in publish(publishing, plan).rows)} == numbers
 
@@ -2167,13 +2182,16 @@ def test_retry_of_a_legacy_partial_order_keeps_it_with_the_legacy_owner(publishi
 
 
 
-def test_a_parent_whose_owner_label_a_person_removed_stays_the_orders_parent(publishing, plan):
-    """Removing by: from a recorded order makes it legacy work, never an unconfirmed creation."""
+def test_a_parent_whose_owner_label_a_person_removed_is_refused_not_replaced(publishing, plan):
+    """A recorded order without its by: label is neither recreated nor given to anyone."""
     root, config, tracker, git, _ = publishing
     publish(publishing, plan)
     tracker.remove_labels(1, ["by:human"])
     tracker.login = "bob"
-    report = order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
-    assert report.parent == 1 and len(tracker.issues) == 3
-    assert all(issue.state == "open" for issue in tracker.issues.values())
-    assert owners(tracker) == {1: set(), 2: {"by:human"}, 3: {"by:human"}}
+    before = deepcopy(tracker.issues)
+    with pytest.raises(order.PlanError, match="#1 was published for an owner label"):
+        order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
+    assert tracker.issues == before
+    tracker.add_labels(1, ["by:human"])  # A person restores the owner; publication continues.
+    assert order.publish(plan, root, config, tracker, repo="owner/repo", git=git).parent == 1
+    assert len(tracker.issues) == 3

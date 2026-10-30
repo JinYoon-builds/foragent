@@ -25,7 +25,7 @@ from foragent.order_files import check_destinations, check_write, issue_body, va
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
-from foragent.ownership import OwnershipError, effective_orderer, label_description, owner_label, parse_orderer
+from foragent.ownership import OWNED_MARKER, OwnershipError, effective_orderer, label_description, owner_label, parse_orderer
 from foragent.tracker import IdentityError, Issue, LabelSpec, Tracker, TrackerError, pr_issue_number
 
 
@@ -497,14 +497,26 @@ def _order_owner(tracker: Tracker, config: Config, parent, children: list) -> st
 _MARKER_PREFIX = "<!-- foragent:"
 # A retired issue keeps its text for the record, but no Foragent marker matches it.
 _RETIRED_PREFIX = "<!-- foragent-refused:"
-# Written once, in the creation request of every parent and child published under the
-# owner-label contract. It names no owner (the by: label alone does); it only lets a
-# retry tell an unconfirmed creation from legacy work, which never carries it.
-OWNED_MARKER = "<!-- foragent:owner-label -->"
 
 
 def _labelled(issue) -> bool:
     return any(label.lower().startswith(ownership.PREFIX) for label in issue.labels)
+
+
+def _retired_body(body: str) -> str:
+    """``body`` with its publication markers retired and its owner-label contract kept.
+
+    The plan, child and v1 markers stop matching, so nothing finds or works it as
+    order content; ``OWNED_MARKER`` stays, so an unlabelled issue still has no owner
+    (``ownership.effective_orderer``) instead of turning into legacy work.
+    """
+    retired_contract = OWNED_MARKER.replace(_MARKER_PREFIX, _RETIRED_PREFIX)
+    return body.replace(_MARKER_PREFIX, _RETIRED_PREFIX).replace(retired_contract, OWNED_MARKER)
+
+
+def _with_contract(body: str, existing_body: str) -> str:
+    """Rewritten ``body`` that keeps the owner-label contract of the issue it replaces."""
+    return f"{body}{OWNED_MARKER}\n" if OWNED_MARKER in existing_body and OWNED_MARKER not in body else body
 
 
 def _retire(tracker: Tracker, config: Config, issue, label: str) -> None:
@@ -520,10 +532,10 @@ def _retire(tracker: Tracker, config: Config, issue, label: str) -> None:
             tracker.close_issue(issue.number, text("identity_closed_unlabelled", config.language, label=label))
         except Exception:
             log.warning("could not close unconfirmed issue #%s", issue.number, exc_info=True)
-    if _MARKER_PREFIX in issue.body:
+    retired = _retired_body(issue.body)
+    if retired != issue.body:
         try:
-            tracker.update_issue(issue.number, title=issue.title,
-                                 body=issue.body.replace(_MARKER_PREFIX, _RETIRED_PREFIX))
+            tracker.update_issue(issue.number, title=issue.title, body=retired)
         except Exception:
             log.warning("could not retire the markers of unconfirmed issue #%s", issue.number, exc_info=True)
 
@@ -544,8 +556,10 @@ def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body
 
     GitHub silently drops labels a creator may not apply, so the label is read back.
     An unconfirmed issue (label missing or unreadable) is retired and publication
-    stops. Even when retiring fails, discovery never reuses it: its body carries
-    ``OWNED_MARKER`` without the label (see ``_unconfirmed``), and a retry retires it again.
+    stops. Even when every rollback step fails, the issue is nobody's work: its body
+    carries ``OWNED_MARKER`` without the label, which ``ownership.effective_orderer``
+    refuses (never legacy work), discovery never reuses it (``_unconfirmed``), and
+    a retry retires it again.
     The issue is created in one request so its body has no edit that would
     postdate an approval added in the same publication.
     """
@@ -749,7 +763,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
-        body = _published_body(plan, item, repo, config)
+        # An edit rewrites the whole body; the issue's owner-label contract survives it.
+        body = _with_contract(_published_body(plan, item, repo, config), existing.body)
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
             name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()

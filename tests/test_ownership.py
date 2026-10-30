@@ -9,8 +9,8 @@ from foragent.ownership import OwnershipError, effective_orderer, owner_label, p
 from foragent.tracker import FakeTracker, GhTracker, IdentityError
 
 
-def issue(*labels, number=12):
-    return SimpleNamespace(number=number, labels=frozenset(labels))
+def issue(*labels, number=12, body=""):
+    return SimpleNamespace(number=number, labels=frozenset(labels), body=body)
 
 
 def test_parse_orderer_reads_one_normalized_label():
@@ -129,3 +129,14 @@ def test_host_switch_reads_the_login_again(monkeypatch, tmp_path):
     answers[0] = {"login": "Carol"}
     assert GhTracker("o/r", run=run).authenticated_login() == "carol"
     assert len(calls) == 2
+
+
+def test_an_unlabelled_owner_contract_issue_has_no_owner():
+    contract = "Goal\n<!-- foragent:owner-label -->\n"
+    for config, factory in ((Config(), "alice"), (Config(legacy_owner="jin"), "jin"), (Config(), None)):
+        with pytest.raises(OwnershipError, match="#12 was published for an owner label"):
+            effective_orderer(issue(body=contract), config, factory)
+        with pytest.raises(OwnershipError):
+            require_owned(issue(body=contract), config, factory or "jin")
+    assert effective_orderer(issue("by:bob", body=contract), Config(legacy_owner="jin"), "alice") == "bob"
+    assert effective_orderer(issue(body="Goal\n"), Config(legacy_owner="jin"), "alice") == "jin"

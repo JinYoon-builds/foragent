@@ -4,6 +4,10 @@ The one owner truth is a single ``by:<login>`` label stamped at publication.
 Plan markers keep publication idempotent; they are not a second owner record.
 An issue without the label is legacy work: it belongs to ``legacy_owner`` when the
 repository names one, otherwise (the unchanged single-factory path) to this factory.
+The exception is an issue whose body carries ``OWNED_MARKER``: it was created
+under the owner-label contract, so a missing label means its owner was never
+confirmed (or was removed), not that it is legacy work. It has no owner until a
+person adds one ``by:<login>`` label, and no factory acts on it.
 Logins compare lowercase, as GitHub treats them.
 """
 
@@ -13,6 +17,9 @@ import re
 from foragent.i18n import text
 
 PREFIX = "by:"
+# Written in the creation request of every issue published under the owner-label contract.
+# It names no owner; it only says that a by: label is expected (see module docstring).
+OWNED_MARKER = "<!-- foragent:owner-label -->"
 LABEL_COLOR = "c5def5"
 # GitHub user logins: alphanumerics and single inner hyphens, at most 39 characters.
 _LOGIN = re.compile(r"[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,38}")
@@ -51,12 +58,15 @@ def effective_orderer(issue, config, factory_login: str | None) -> str:
     """The person whose factory works ``issue``.
 
     Legacy work belongs to ``config.legacy_owner``; with no setting, the unchanged
-    singleton path keeps it with this factory.
+    singleton path keeps it with this factory. An unlabelled issue published under
+    the owner-label contract is not legacy work and has no owner (OwnershipError).
     """
     language = getattr(config, "language", "en")
     owner = parse_orderer(issue.labels, language)
     if owner is not None:
         return owner
+    if OWNED_MARKER in (getattr(issue, "body", None) or ""):
+        raise OwnershipError(text("ownership_unconfirmed", language, number=issue.number))
     legacy = getattr(config, "legacy_owner", None)
     if legacy is not None:
         return normalize_login(legacy, language)

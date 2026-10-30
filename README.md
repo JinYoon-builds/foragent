@@ -61,7 +61,7 @@ Each person runs their own factory: their own machine, their own Claude Code sub
 - **Your account.** `fa init` reads the signed-in GitHub account again and prints `GitHub account: <login>`. After `gh auth login` or `gh auth switch`, run `fa init` again. A GitHub App or bot token cannot order work.
 - **Before the second person joins.** Merge the team-mode version first and stop or upgrade every older `fa`: an old gate ignores `by:` labels. Then the original factory adds `legacy_owner: <its login>` to `.foragent.yml` through a normal PR. Issues without a `by:` label (older work and hand-made issues) belong to that person. The new teammate runs `fa init` once and starts one gate.
 - **Permissions.** Each person needs write access to the repository, including labels. If GitHub does not apply the owner label, publishing stops and closes the unlabelled issue, so no other factory takes it.
-- **Labels are trusted.** `by:` is reserved for orderer logins. Anyone who can edit labels can move an issue; Foragent cannot tell a correction from a mistake. To hand work over (someone leaves, a login is renamed, a label is wrong), stop the affected factories, keep their unfinished work, agree on the new owner, change the one `by:` label (and `legacy_owner` if needed), then start only the owning factory. An issue with two `by:` labels is refused until one is removed.
+- **Labels are trusted.** `by:` is reserved for orderer logins. Anyone who can edit labels can move an issue; Foragent cannot tell a correction from a mistake. To hand work over (someone leaves, a login is renamed, a label is wrong), stop the affected factories, keep their unfinished work, agree on the new owner, change the one `by:` label (and `legacy_owner` if needed), then start only the owning factory. An issue with two `by:` labels is refused until one is removed. An issue Foragent published without its `by:` label (for example, the label was removed) is not legacy work: no factory works it until one `by:` label is added.
 
 ## Known limits, contributions welcome
 
@@ -128,7 +128,7 @@ Codex CLI는 선택이에요. Codex CLI에 로그인되어 있으면 gate가 Cod
 - **내 계정.** `fa init`은 로그인한 GitHub 계정을 다시 읽고 `GitHub 계정: <login>`을 보여 줘요. `gh auth login`이나 `gh auth switch` 뒤에는 `fa init`을 다시 실행하세요. GitHub App이나 봇 토큰으로는 주문할 수 없어요.
 - **두 번째 사람이 오기 전에.** 먼저 팀 모드 버전을 머지하고, 옛 `fa`는 모두 멈추거나 올리세요. 옛 gate는 `by:` 라벨을 몰라요. 그다음 원래 공장이 평소 PR로 `.foragent.yml`에 `legacy_owner: <그 로그인>`을 넣어요. `by:` 라벨이 없는 이슈(예전 일, 손으로 만든 이슈)는 그 사람의 일이에요. 새 팀원은 `fa init`을 한 번 실행하고 gate 하나를 시작해요.
 - **권한.** 사람마다 저장소 쓰기 권한(라벨 포함)이 필요해요. GitHub가 주인 라벨을 붙이지 않으면 발행이 멈추고, 라벨 없는 이슈를 닫아서 다른 공장이 가져가지 않게 해요.
-- **라벨은 믿고 써요.** `by:`는 주문한 사람의 로그인에만 써요. 라벨을 고칠 수 있는 사람은 이슈를 옮길 수 있어요. Foragent는 고친 것과 실수를 구별하지 못해요. 일을 넘길 때(누가 떠나거나, 로그인 이름이 바뀌거나, 라벨이 틀렸을 때)는 관련 공장을 멈추고, 끝나지 않은 일을 지키고, 새 주인을 정하고, `by:` 라벨 하나를 바꾸고(필요하면 `legacy_owner`도), 주인 공장만 다시 시작하세요. `by:` 라벨이 둘인 이슈는 하나를 지울 때까지 거절해요.
+- **라벨은 믿고 써요.** `by:`는 주문한 사람의 로그인에만 써요. 라벨을 고칠 수 있는 사람은 이슈를 옮길 수 있어요. Foragent는 고친 것과 실수를 구별하지 못해요. 일을 넘길 때(누가 떠나거나, 로그인 이름이 바뀌거나, 라벨이 틀렸을 때)는 관련 공장을 멈추고, 끝나지 않은 일을 지키고, 새 주인을 정하고, `by:` 라벨 하나를 바꾸고(필요하면 `legacy_owner`도), 주인 공장만 다시 시작하세요. `by:` 라벨이 둘인 이슈는 하나를 지울 때까지 거절해요. Foragent가 발행했는데 `by:` 라벨이 없는 이슈(예: 라벨을 지운 경우)는 옛 일이 아니에요. `by:` 라벨을 하나 붙일 때까지 어느 공장도 일하지 않아요.
 
 ### 알려진 한계, 기여 환영
 
