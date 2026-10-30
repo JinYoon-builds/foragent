@@ -291,7 +291,8 @@ def test_error_exit_code_and_single_stderr_line(app, monkeypatch, capsys, error)
     if isinstance(error, ConfigError):
         monkeypatch.setattr(cli, "load_config", fail)
     elif isinstance(error, TrackerError):
-        monkeypatch.setattr(tracker, "list_issues", fail)
+        # A failed listing is recorded and the tick goes on (#995); a GitHub error after it still ends the command.
+        monkeypatch.setattr("foragent.scheduler._recover_runs", fail)
     else:
         monkeypatch.setattr(git, "fetch", fail)
     assert cli.main(["gate", "tick", "--repo-root", str(root), "--no-start"]) == 1
