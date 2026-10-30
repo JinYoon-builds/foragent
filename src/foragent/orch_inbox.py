@@ -18,9 +18,13 @@ from foragent.orch_events import append_event
 from foragent.state import StateStore
 
 REQUEST_STATUSES = ("new", "processing", "done")
+# What a person's question decides (#970): a D71 question, a merge approval or an order card.
+QUESTION_KINDS = ("question", "merge", "order")
 # A planning session that renewed its heartbeat this recently can still read a
 # cross-session message, so a new question does not need a push.
 PLAN_HEARTBEAT_SECONDS = 120
+# The statusline renews an existing planning heartbeat only once it is this old.
+PLAN_RENEW_SECONDS = 60
 _QUESTION_PUSH = {
     "en": ("A question needs your answer", "{id}: {question}"),
     "ko": ("답할 질문이 있어요", "{id}: {question}"),
@@ -105,8 +109,10 @@ def set_request_status(store: StateStore, request_id: str, status: str, note: st
 
 
 def ask(store: StateStore, question: str, options: list[str], recommend: int | None,
-        issues: list[int] = ()) -> dict[str, Any]:
+        issues: list[int] = (), kind: str = "question") -> dict[str, Any]:
     """Record an open question; ``issues`` are the issues that wait on its answer."""
+    if kind not in QUESTION_KINDS:
+        raise InboxError(f"--kind must be one of: {', '.join(QUESTION_KINDS)}")
     if not question.strip():
         raise InboxError("question must not be empty")
     if recommend is not None and not 1 <= recommend <= len(options):
@@ -114,7 +120,7 @@ def ask(store: StateStore, question: str, options: list[str], recommend: int | N
     if any(number < 1 for number in issues):
         raise InboxError("--issue must be a positive issue number")
     record = _create(store, "questions", "q", {
-        "question": question, "options": list(options), "recommend": recommend,
+        "kind": kind, "question": question, "options": list(options), "recommend": recommend,
         "status": "open", "answer": None,
         "issues": list(dict.fromkeys(issues)),
     })
@@ -128,7 +134,8 @@ def ask_once(store: StateStore, key: str, question: str, options: list[str], rec
         if any(row.get("key") == key for row in _records(store, "questions")):
             return None
         seq = max((int(row.get("seq", 0)) for row in _records(store, "questions")), default=0) + 1
-        record = {"id": f"q{seq}", "seq": seq, "key": key, "question": question, "options": list(options),
+        record = {"id": f"q{seq}", "seq": seq, "key": key, "kind": "question",
+                  "question": question, "options": list(options),
                   "recommend": recommend, "status": "open", "answer": None, "issues": [],
                   "created_at": store._timestamp(), "updated_at": store._timestamp()}
         store._write_json(_folder(store, "questions") / f"{record['id']}.json", record)
@@ -148,15 +155,33 @@ def write_plan_heartbeat(store: StateStore) -> dict[str, str]:
     return record
 
 
-def planning_alive(store: StateStore) -> bool:
-    """True when the planning heartbeat is at most PLAN_HEARTBEAT_SECONDS old."""
+def _plan_heartbeat_age(store: StateStore) -> timedelta | None:
     try:
         at = datetime.fromisoformat(json.loads(plan_heartbeat_path(store).read_text(encoding="utf-8"))["at"])
     except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return store._now() - at if at.tzinfo is not None else None
+
+
+def planning_alive(store: StateStore) -> bool:
+    """True when the planning heartbeat is at most PLAN_HEARTBEAT_SECONDS old."""
+    age = _plan_heartbeat_age(store)
+    return age is not None and age <= timedelta(seconds=PLAN_HEARTBEAT_SECONDS)
+
+
+def renew_plan_heartbeat(store: StateStore) -> bool:
+    """Refresh an existing planning heartbeat older than PLAN_RENEW_SECONDS; never create one.
+
+    The planning session's own ``fa plan heartbeat`` creates the file; the
+    statusline of that session keeps it fresh (#970).
+    """
+    if not plan_heartbeat_path(store).is_file():
         return False
-    if at.tzinfo is None:
+    age = _plan_heartbeat_age(store)
+    if age is not None and age <= timedelta(seconds=PLAN_RENEW_SECONDS):
         return False
-    return store._now() - at <= timedelta(seconds=PLAN_HEARTBEAT_SECONDS)
+    write_plan_heartbeat(store)
+    return True
 
 
 def route_question(store: StateStore, config: Config, repo: str, record: dict[str, Any]) -> bool:
@@ -191,6 +216,56 @@ def answer(store: StateStore, question_id: str, text: str) -> dict[str, Any]:
     record = _update(store, "questions", question_id, change)
     append_event(store, store._now(), None, "answer", f"{question_id}: {text}")
     return _public(record)
+
+
+class FollowEvents:
+    """New request ids and newly answered questions since watch started (#970).
+
+    The baseline is read when the watch starts, not at its first successful
+    poll, so records written while early polls fail still emit. If even that
+    read fails, only records stamped before the start count as seen. Records
+    present at the start, including ones from an earlier run, count as seen.
+    Status notes on a request are not new events.
+    """
+
+    def __init__(self, store: StateStore) -> None:
+        self.started = store._now()
+        self.requests: set[str] | None = None
+        self.answers: set[str] = set()
+        try:
+            self.requests, self.answers = self._ids(*self._read(store))
+        except Exception:
+            self.requests = None  # decided from timestamps at the first good poll
+
+    @staticmethod
+    def _read(store: StateStore) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        rows = _records(store, "requests")
+        answered = [row for row in _records(store, "questions") if row.get("status") == "closed"]
+        return rows, answered
+
+    @staticmethod
+    def _ids(rows, answered) -> tuple[set[str], set[str]]:
+        return {row["id"] for row in rows}, {row["id"] for row in answered}
+
+    def _before_start(self, value: Any) -> bool:
+        try:
+            return datetime.fromisoformat(value) < self.started
+        except (TypeError, ValueError):
+            return False  # an unreadable time emits rather than hides the record
+
+    def poll(self, store: StateStore) -> list[dict[str, Any]]:
+        rows, answered = self._read(store)
+        if self.requests is None:
+            self.requests = {row["id"] for row in rows if self._before_start(row.get("created_at"))}
+            self.answers = {row["id"] for row in answered if self._before_start(row.get("answered_at"))}
+        events = [{"event": "request", "id": row["id"], "from": row.get("from"), "text": row.get("text")}
+                  for row in rows if row["id"] not in self.requests]
+        events += [{"event": "answer", "id": row["id"], "kind": row.get("kind", "question"),
+                    "answer": row.get("answer")} for row in answered if row["id"] not in self.answers]
+        requests, answers = self._ids(rows, answered)
+        self.requests |= requests
+        self.answers |= answers
+        return events
 
 
 def _public(record: dict[str, Any]) -> dict[str, Any]:

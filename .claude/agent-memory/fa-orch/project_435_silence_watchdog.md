@@ -31,3 +31,5 @@ metadata:
 12차(규칙 2026-10-30): ID는 `run_baseline_resume.test_id` 하나로 정한다(뿌리 경로에만 realpath, 워크트리 기준, 밖이면 원래 nodeid). 이 함수는 inspect.getsource로 플러그인에 그대로 복사된다. `.partial` 파일은 {node_ids, failed}이며 실패가 언제나 이긴다. 정상 종료가 아닌 캡처는 실패를 저장하고, 멈춘 캡처만 통과를 더한다. 키에 `CACHE_VERSION`을 넣었다(_baseline_identity). test_run_baseline이 키를 손으로 계산하던 곳은 `_baseline_cache`를 쓰게 바꿨다. teardown 멈춤은 비목표다.
 
 13차: `run_related_check`가 직접 `after_check(n, ctx, [*gathered, result])`를 부른다. 그래서 ci_mode를 고치지 않고도 모든 호출자에서 멈춤이 전달된다. runtime-limit의 실행기 쪽 기록 이름(timeout인지 killed인지)은 잠긴 test_keep_unfinished_work:170/172와 리뷰가 충돌해서 QUESTION.md에 남겼다.
+
+14차: runtime-limit의 실행기 쪽 기록은 timeout으로 확정됐다(옵션 1). main의 harness_guard.guard_staged가 `attempt.parsed.files`를 읽는데, 잠긴 침묵 시험의 가짜 parsed에는 그 필드가 없다. 그래서 `getattr(..., 'files', [])`로 읽게 했다. main 비교는 실패한 ID만 main 소스로 다시 돌리면 빠르다(전체를 돌리면 10분을 넘는다). 체크아웃에 `.foragent/`가 없으면 `fa test`가 인수 없이 전체 시험을 돌린다. 먼저 `mkdir -p`부터 한다.
