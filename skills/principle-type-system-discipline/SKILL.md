@@ -1,0 +1,15 @@
+---
+name: principle-type-system-discipline
+description: "Apply when designing types, reviewing a function signature, or writing code in any statically-typed language. Make illegal states unrepresentable, brand semantic primitives, parse external data at boundaries, exhaust variants, derive from authoritative schemas."
+---
+
+Source: vendored from `pstack/skills/principle-type-system-discipline/SKILL.md` (pstack by Lauren Tan, MIT License, Copyright (c) 2026 Lauren Tan, source commit 9b93e81). See LICENSE.
+Changed: removed `disable-model-invocation: true` so an agent can load the skill after installing it; dropped the reference to the typescript-best-practices skill, which Foragent does not ship. The text is otherwise unchanged.
+
+# Type System Discipline
+
+Make the compiler reject impossible states, mismatched primitives, and unhandled variants. Prefer defining errors and special cases out of existence over proliferating handlers.
+
+- **Brand semantic primitives.** `UserId` and `OrderId` are strings underneath but should not be interchangeable. Give each its own type, such as a branded intersection in TypeScript or a newtype elsewhere. Validate once at creation, trust the type downstream. If two arguments share a primitive type but mean different things, brand them.
+- **External data is untyped until parsed.** RPC payloads, JSON, IPC messages, CLI args, config files, environment variables, database rows. Have a parse function at every boundary that turns unstructured input into the typed model. The **boundary-discipline** principle skill says where to put validation.
+- **Derive types from authoritative schemas.** When a protocol buffer, OpenAPI spec, GraphQL schema, database migration, design-token file, or another file owns a shape, derive from it instead of hand-rolling a parallel type. See the **encode-lessons-in-structure** principle skill.
