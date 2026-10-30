@@ -129,10 +129,7 @@ Classify each message using its context; a message may contain several kinds.
 | Thought | Record it in the project's decision notes only; it creates no issues or approval. |
 | Setting change | Run `fa settings set KEY VALUE` for a key `fa settings list` shows ("turn off automatic merge" means `review batch`), with no extra confirmation, and report the change to the person in one line; for a team-scope key say it applies to the whole team, then commit and push `.foragent.yml` from a temporary worktree of the default branch. Unknown key or rejected value: one line with the valid choices. Details: [settings](references/settings.md). |
 
-Keep one order draft in `docs/specs/`; split it with the `fa-order` skill. When clear, propose one card with new
-issues by lane, dependencies and Done when checks. Ask (`--kind order`): [add] (recommended) / [edit] / [later]. After
-the user chose [add], publish with `fa order publish --approve PLAN.json`. Never add `approved` except through
-`fa order publish` after the user chose it. Card details: [order card](references/order-card.md).
+For order drafts, use `fa-order`; follow [order card](references/order-card.md) for [add]/[edit]/[later], the planning handoff and first-hand approval before `fa order publish --approve`.
 
 ## Design handoff from planning
 
@@ -147,4 +144,4 @@ the last tidy, or `idle-quota` when no lane runs and quota is left) and puts one
 with the evidence numbers in `fa orch inbox` per due period; it never orders tidy work. Judge whether
 to call the architect (`fa orch architect --why "<numbers>"`), which reads widely, ranks and proposes
 refactors ([checklist](references/tidy.md)). Propose the tidy order with `fa orch ask`; after the user
-approves, publish it via `fa order publish`, each issue in the lane that owns its files; Done when: all existing tests still pass, behaviour unchanged. Then `fa tidy done`.
+approves in the publishing session, follow [order card](references/order-card.md), each issue in the lane that owns its files; Done when: all existing tests still pass, behaviour unchanged. Then `fa tidy done`.
