@@ -4,8 +4,9 @@ Account-wide files under $XDG_DATA_HOME/foragent (default ~/.local/share/foragen
   claude-rate-limits.json  {seen_at: ISO UTC, rate_limits: the input object unchanged}
   statusline-wrapper.json  {enabled: bool, previous_command: str | null}
 
-The install also adds Foragent's SessionStart hook (`fa statusline --session-start`)
-beside the statusline in Claude's user settings; uninstalling or declining removes it.
+The install also adds Foragent's SessionStart hook (`fa statusline --session-start`) and
+UserPromptSubmit hook (`fa statusline --prompt-context`) beside the statusline in Claude's
+user settings; uninstalling or declining removes both.
 """
 
 from collections.abc import Callable, Iterator
@@ -25,6 +26,16 @@ WRAPPER_COMMAND = "fa statusline"
 HOOK_COMMAND = "fa statusline --session-start"
 # Sessions the person starts or resumes; not /clear or compaction inside a session.
 HOOK_MATCHER = "startup|resume"
+PROMPT_COMMAND = "fa statusline --prompt-context"
+# Seconds Claude Code waits for the prompt hook before it goes on without its context.
+PROMPT_TIMEOUT = 5
+# Foragent's hook in each Claude Code event: (its fa arguments, the group to install).
+HOOKS = {
+    "SessionStart": (["statusline", "--session-start"],
+                     {"matcher": HOOK_MATCHER, "hooks": [{"type": "command", "command": HOOK_COMMAND}]}),
+    "UserPromptSubmit": (["statusline", "--prompt-context"],
+                         {"hooks": [{"type": "command", "command": PROMPT_COMMAND, "timeout": PROMPT_TIMEOUT}]}),
+}
 # Set while the previous command runs, so a nested wrapper never runs it again.
 NESTED_ENV = "FORAGENT_STATUSLINE_ACTIVE"
 PROMPT = ("Install the Foragent statusline in Claude Code? It records Claude's rate limits "
@@ -94,16 +105,26 @@ def is_wrapper(command: str) -> bool:
 
 def is_session_hook(command: Any) -> bool:
     """True when a hook command runs `fa statusline --session-start`."""
-    return isinstance(command, str) and _fa_arguments(command) == ["statusline", "--session-start"]
+    return isinstance(command, str) and _fa_arguments(command) == HOOKS["SessionStart"][0]
+
+
+def _is_ours(event: str, hook: Any) -> bool:
+    return (isinstance(hook, dict) and isinstance(hook.get("command"), str)
+            and _fa_arguments(hook["command"]) == HOOKS[event][0])
+
+
+def _hooked(settings: dict, event: str) -> bool:
+    hooks = settings.get("hooks")
+    groups = hooks.get(event) if isinstance(hooks, dict) else None
+    return isinstance(groups, list) and any(
+        isinstance(group, dict) and isinstance(group.get("hooks"), list)
+        and any(_is_ours(event, hook) for hook in group["hooks"])
+        for group in groups)
 
 
 def has_hook(settings: dict) -> bool:
-    hooks = settings.get("hooks")
-    groups = hooks.get("SessionStart") if isinstance(hooks, dict) else None
-    return isinstance(groups, list) and any(
-        isinstance(group, dict) and isinstance(group.get("hooks"), list)
-        and any(isinstance(hook, dict) and is_session_hook(hook.get("command")) for hook in group["hooks"])
-        for group in groups)
+    """True when every Foragent hook is installed."""
+    return all(_hooked(settings, event) for event in HOOKS)
 
 
 def wrapper_active(settings: dict) -> bool:
@@ -114,36 +135,42 @@ def wrapper_active(settings: dict) -> bool:
 
 
 def with_hook(settings: dict) -> dict:
-    """``settings`` with Foragent's SessionStart hook added (unchanged when it is there)."""
+    """``settings`` with every missing Foragent hook added (unchanged when all are there)."""
     if has_hook(settings):
         return settings
     hooks = settings.get("hooks")
     hooks = dict(hooks) if isinstance(hooks, dict) else {}
-    groups = hooks.get("SessionStart")
-    groups = list(groups) if isinstance(groups, list) else []
-    groups.append({"matcher": HOOK_MATCHER, "hooks": [{"type": "command", "command": HOOK_COMMAND}]})
-    return {**settings, "hooks": {**hooks, "SessionStart": groups}}
+    for event, (_arguments, group) in HOOKS.items():
+        if _hooked(settings, event):
+            continue
+        groups = hooks.get(event)
+        groups = list(groups) if isinstance(groups, list) else []
+        groups.append(json.loads(json.dumps(group)))
+        hooks[event] = groups
+    return {**settings, "hooks": hooks}
 
 
 def without_hook(settings: dict) -> dict:
-    """``settings`` without Foragent's SessionStart hook; emptied containers go too."""
-    if not has_hook(settings):
+    """``settings`` without Foragent's hooks; emptied containers go too."""
+    if not any(_hooked(settings, event) for event in HOOKS):
         return settings
     hooks = dict(settings["hooks"])
-    groups = []
-    for group in hooks["SessionStart"]:
-        if isinstance(group, dict) and isinstance(group.get("hooks"), list):
-            kept = [hook for hook in group["hooks"]
-                    if not (isinstance(hook, dict) and is_session_hook(hook.get("command")))]
-            if len(kept) != len(group["hooks"]):
-                if kept:
-                    groups.append({**group, "hooks": kept})
-                continue
-        groups.append(group)
-    if groups:
-        hooks["SessionStart"] = groups
-    else:
-        del hooks["SessionStart"]
+    for event in HOOKS:
+        if not _hooked(settings, event):
+            continue
+        groups = []
+        for group in hooks[event]:
+            if isinstance(group, dict) and isinstance(group.get("hooks"), list):
+                kept = [hook for hook in group["hooks"] if not _is_ours(event, hook)]
+                if len(kept) != len(group["hooks"]):
+                    if kept:
+                        groups.append({**group, "hooks": kept})
+                    continue
+            groups.append(group)
+        if groups:
+            hooks[event] = groups
+        else:
+            del hooks[event]
     result = dict(settings)
     if hooks:
         result["hooks"] = hooks
@@ -173,7 +200,7 @@ def record_usage(raw: bytes, now: Callable[[], datetime] = lambda: datetime.now(
 def _session_input(raw: bytes) -> dict:
     try:
         payload = json.loads(raw)
-    except ValueError:
+    except Exception:  # Claude's hook input is outside data; any parse failure means no input
         return {}
     return payload if isinstance(payload, dict) else {}
 
@@ -183,6 +210,8 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
 
     Claude Code shows a hook's systemMessage to the person; plain stdout would reach only
     Claude. Outside a Foragent project, or with presence.session_start off, it prints nothing.
+    It also brings an earlier install's hooks up to date and binds a planning checkout to
+    its repository's box, so nobody reruns fa init for either.
     """
     from foragent import presence
 
@@ -197,12 +226,48 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
         return 0
     presence.record_terminal(folder, datetime.now(UTC))
     try:
+        if load_record() is not None:
+            _sync_hook()
+        presence.bind_checkout(folder, datetime.now(UTC))
+    except Exception:  # Setup upkeep must never disturb the session that is starting.
+        pass
+    try:
         message = presence.session_start_message(folder, session_id if isinstance(session_id, str) else None,
                                                  datetime.now(UTC))
     except Exception:  # A failed summary must never disturb the session that is starting.
         message = None
     if message:
         stdout.write((json.dumps({"systemMessage": message}, ensure_ascii=False) + "\n").encode("utf-8"))
+        stdout.flush()
+    return 0
+
+
+def prompt_context(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
+    """Entry point for the UserPromptSubmit hook: the planning turn's box facts as additionalContext.
+
+    Always exits 0 so the prompt goes on. What could not be read is said on stderr
+    (and inside the context), so a partial read never looks like an empty box.
+    """
+    from foragent import presence
+
+    stdin = stdin or sys.stdin.buffer
+    stdout = stdout or sys.stdout.buffer
+    payload = _session_input(stdin.read())
+    cwd = payload.get("cwd")
+    try:
+        folder = Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd()
+        context, problems = presence.prompt_context(folder, datetime.now(UTC))
+    except Exception as exc:  # The person's prompt must go on whatever the local state holds.
+        context, problems = None, [f"could not read the Foragent box ({type(exc).__name__}: {exc})"]
+    from foragent.orch_inbox import clean
+
+    # The one place box text leaves the process: whatever slipped past the row
+    # rendering, an unencodable character becomes "?" here instead of an error.
+    for problem in problems:
+        print(clean(f"fa statusline --prompt-context: partial read: {problem}"), file=sys.stderr)
+    if context:
+        output = {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": clean(context)}}
+        stdout.write((json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8", "replace"))
         stdout.flush()
     return 0
 
@@ -310,9 +375,9 @@ def _sync_hook() -> str:
 
 
 def _sync_hook_locked() -> str:
-    """Match the SessionStart hook to the statusline: "hooked" when it was added, else "kept".
+    """Match Foragent's hooks to the statusline: "hooked" when one was added, else "kept".
 
-    Installs from before the hook existed get it at the next init. The hook is added
+    Installs from before a hook existed get it at the next init or session start. The hook is added
     only beside an active wrapper, so a statusLine the user replaced does not bring it
     back; a declined or uninstalled statusline has none.
     """
@@ -397,7 +462,7 @@ def _write_bytes(path: Path, data: bytes) -> None:
 
 
 def _strip_hook(content: str, intended: dict) -> tuple[str, dict]:
-    """Remove Foragent's SessionStart hook from ``content``/``intended``, keeping other bytes."""
+    """Remove Foragent's hooks from ``content``/``intended``, keeping other bytes."""
     stripped = without_hook(intended)
     if stripped is intended:
         return content, intended
@@ -414,7 +479,7 @@ def _strip_hook(content: str, intended: dict) -> tuple[str, dict]:
 def uninstall(language: str = "en") -> tuple[int, str]:
     """Undo the wrapper: put back the recorded command, or remove our statusLine.
 
-    Foragent's SessionStart hook goes too, whatever happened to the statusline:
+    Foragent's hooks go too, whatever happened to the statusline:
     a statusLine the user changed, or a record that is missing or already off,
     still leaves no hook behind. Only those members change; every other byte of
     settings.json stays. Returns (exit code, message for the user).
