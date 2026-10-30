@@ -112,7 +112,10 @@ def _save_hint(store: StateStore, number: int, message: str) -> None:
 def _queue(thread: str, message: str, cwd: Path, number: int, language: str) -> None:
     codex = shutil.which("codex") or "codex"
     try:
-        _call([codex, "queue", "--thread", thread, "--message", message], cwd, timeout=QUEUE_TIMEOUT)
+        # Text that starts with "-" (such as "--help") is attached ("--message=...") so the CLI can
+        # never read it as an option; other text stays a separate value. The thread id is ours.
+        text_arg = [f"--message={message}"] if message.startswith("-") else ["--message", message]
+        _call([codex, "queue", "--thread", thread, *text_arg], cwd, timeout=QUEUE_TIMEOUT)
     except (OSError, subprocess.SubprocessError) as exc:
         detail = getattr(exc, "stderr", None) or str(exc)
         raise TalkError(text("talk_queue_failed", language, n=number,
@@ -171,8 +174,9 @@ def _decide(number: int, message: str | None, store: StateStore, config: Config,
     else:
         title = f"resume #{number} {token}"
         program = shutil.which(executor) or executor
-        extra = [message] if message else []
-        command = ([program, "resume", session, *extra, "-C", str(cwd)] if executor == "codex"
+        # A person's first prompt goes after "--", so text such as "--help" is never read as an option.
+        extra = ["--", message] if message else []
+        command = ([program, "resume", session, "-C", str(cwd), *extra] if executor == "codex"
                    else [program, "--resume", session, *extra])
     if running:
         current = store.talk_state(run)[0]

@@ -140,7 +140,7 @@ def test_blocked_message_becomes_first_resume_prompt(store, tmp_path, monkeypatc
     terminals = Terminals(monkeypatch)
     lanes.talk(1, message="Why blocked?", store=store, config=config(), repo_root=tmp_path)
     command = terminals.opened()[0]
-    assert "resume thread-1 'Why blocked?'" in command[command.index("--command") + 1]
+    assert _resume_tokens(command) == (["resume", "thread-1"], ["Why blocked?"])
     assert not any(Path(argv[0]).name == "codex" for argv in terminals.calls)
 
 
@@ -941,7 +941,7 @@ def test_a_finished_issues_message_opens_a_new_resume_terminal_with_it(store, tm
     lanes.talk(1, message="Why blocked?", store=store, config=config(), repo_root=tmp_path)
     assert len(terminals.opened()) == 2
     command = terminals.opened()[-1]
-    assert "resume thread-1 'Why blocked?'" in command[command.index("--command") + 1]
+    assert _resume_tokens(command) == (["resume", "thread-1"], ["Why blocked?"])
 
 
 def test_the_message_is_sent_before_the_log_opens_and_the_event_follows_the_launch(store, tmp_path, monkeypatch):
@@ -1314,3 +1314,46 @@ def test_closing_a_superseded_talk_never_closes_the_newer_one_with_the_same_id(s
     run = store.get_run(1)
     assert len(events(store, "talk-closed")) == 1 and run.talking is True
     assert run.talking_since == (NOW + timedelta(minutes=3)).isoformat()
+
+
+def _resume_tokens(create):
+    """The resume command a terminal runs: (subcommand and session, the arguments after "--")."""
+    import shlex
+
+    words = shlex.split(create[create.index("--command") + 1])
+    return words[1:3], words[words.index("--") + 1:] if "--" in words else []
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+def test_a_first_prompt_that_looks_like_an_option_stays_the_prompt(store, tmp_path, monkeypatch, executor):
+    import shlex
+
+    session(store, executor, status="blocked")
+    terminals = Terminals(monkeypatch)
+    lanes.talk(1, message="--help", store=store, config=config(executor=executor), repo_root=tmp_path)
+    words = shlex.split(terminals.opened()[-1][terminals.opened()[-1].index("--command") + 1])
+    flag = "resume" if executor == "codex" else "--resume"
+    assert words[1:3] == [flag, "thread-1"] and words[-2:] == ["--", "--help"]
+    assert words.index("--") == len(words) - 2  # Every option comes before the end-of-options marker.
+
+
+def test_a_queued_message_that_looks_like_an_option_is_never_a_flag(store, tmp_path, monkeypatch):
+    session(store, "codex")
+    terminals = Terminals(monkeypatch)
+    lanes.talk(1, message="--help", store=store, config=config(), repo_root=tmp_path)
+    (queue,) = [argv for argv in terminals.calls if Path(argv[0]).name == "codex"]
+    assert queue[1:] == ["queue", "--thread", "thread-1", "--message=--help"]
+
+
+def test_a_hint_that_looks_like_an_option_is_saved_as_text(store, tmp_path, monkeypatch):
+    session(store, "claude")
+    Terminals(monkeypatch)
+    lanes.talk(1, message="--help", store=store, config=config(executor="claude"), repo_root=tmp_path)
+    assert (store.root / "hints/1.txt").read_text() == "--help"
+
+
+def test_fa_takes_an_option_like_message_in_its_attached_form(store, tmp_path, monkeypatch, capsys):
+    session(store, "claude")
+    Terminals(monkeypatch)
+    assert _cli(store, monkeypatch, tmp_path, "--message=--help", executor="claude") == 0
+    assert (store.root / "hints/1.txt").read_text() == "--help" and "next attempt" in capsys.readouterr().out
