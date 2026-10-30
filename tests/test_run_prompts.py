@@ -165,3 +165,18 @@ def test_resume_prompt_restates_the_lanes_earlier_plan_only_when_given():
     section = lane_plan_section(["Reuse the writer."], [])
     assert section in build_resume_prompt(1, BODY, BODY, lane_plan=section)
     assert "Your lane's earlier plan" not in build_resume_prompt(1, BODY, BODY)
+
+
+def test_review_prompt_carries_lane_decisions_as_context_only_when_recorded():
+    from foragent.run_prompts import lane_decisions_section
+
+    parsed = parse_body(BODY)
+    assert lane_decisions_section([]) == ""
+    assert build_review_prompt(parsed, "diff", lane_decisions="") == build_review_prompt(parsed, "diff")
+    section = lane_decisions_section(["Name the helper while implementing.", "Use a local tuple."])
+    prompt = build_review_prompt(parsed, "diff", lane_decisions=section)
+    assert prompt.count("- Name the helper while implementing.") == 1
+    assert prompt.count("- Use a local tuple.") == 1
+    assert "not acceptance criteria" in section
+    # Context sits with the issue text, before the diff the reviewer judges.
+    assert prompt.index(section) < prompt.index("Done when commands:") < prompt.index("Diff:")
