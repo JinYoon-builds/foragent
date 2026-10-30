@@ -40,6 +40,13 @@ def observed_record(row: dict[str, Any], snapshot: dict[str, Any] | None = None)
     return {key: row.get(key) for key in OBSERVED}
 
 
+def record_removal(snapshot: dict[str, Any], number: int, at: datetime) -> None:
+    """Keep when an issue was seen gone, so an older observation cannot bring it back."""
+    removed = snapshot.setdefault("removed", {})
+    if (_time(removed.get(str(number))) or at) <= at:
+        removed[str(number)] = at.isoformat()
+
+
 def newer_than(row: dict[str, Any] | None, at: datetime, snapshot: dict[str, Any] | None = None) -> bool:
     """Whether the row holds an observation taken after ``at``."""
     seen = _time(observed_record(row, snapshot).get("observed_at")) if row else None
@@ -67,6 +74,21 @@ def overlay(facts: dict[str, Any], entries: list[dict[str, Any]], lanes: dict | 
     return out
 
 
+def _shown(facts: dict[str, Any], entry: dict[str, Any]) -> bool:
+    """Whether the facts already show a write's whole effect. A comment, including a close
+    comment, is not an observed fact, so it is never shown."""
+    action = entry["action"]
+    if action == "add_labels":
+        return set(entry["labels"]) <= set(facts["labels"])
+    if action == "remove_labels":
+        return not set(entry["labels"]) & set(facts["labels"])
+    if action == "update_issue":
+        return (facts["title"], facts["body"]) == (entry["title"], entry["body"])
+    if action == "close_issue":
+        return facts["state"] == "closed" and entry.get("body") is None
+    return False
+
+
 def apply_observation(snapshot: dict[str, Any], row: dict[str, Any], facts: dict[str, Any], at: datetime,
                       *, lanes: dict | None = None, local_since: int | None = None,
                       forget_reads: bool = True) -> tuple[bool, bool]:
@@ -80,6 +102,11 @@ def apply_observation(snapshot: dict[str, Any], row: dict[str, Any], facts: dict
     if stored is not None and (at < stored or at == stored and local_since is not None
                                and row.get("revision", 0) > local_since):
         return False, False
+    removed = _time((snapshot.get("removed") or {}).get(str(number)))
+    if removed is not None and at <= removed:
+        # A listing at ``removed`` showed the issue gone; an observation not after it is older.
+        return False, False
+    (snapshot.get("removed") or {}).pop(str(number), None)
     record = {**{key: facts[key] for key in OBSERVED if key != "observed_at"}, "observed_at": at.isoformat()}
     outbox = snapshot.get("outbox", [])
     pending = [entry for entry in outbox if entry["issue"] == number]
@@ -88,11 +115,9 @@ def apply_observation(snapshot: dict[str, Any], row: dict[str, Any], facts: dict
     base = bases.get(str(number))
     dropped = False
     if judged and base is not None:
-        # The observation began after these writes were queued, so GitHub either shows
-        # their effect (confirmed) or someone changed the issue (contradicted); unchanged
-        # facts mean the writes are still undelivered (delivering a write that was already
-        # true is harmless). A reopening or a new close reason changes state_reason even
-        # when state matches; a baseline from before #1025 may lack it.
+        # The observation began after these writes were queued, so someone changing the
+        # issue contradicts them. A reopening or a new close reason changes state_reason
+        # even when state matches; a baseline from before #1025 may lack it.
         fields = {"labels", "state"} | ({"state_reason"} & base.keys()) | ({"title", "body"} if any(
             entry["action"] == "update_issue" for entry in judged) else set())
         if any(record[key] != base.get(key) for key in fields):
@@ -102,6 +127,20 @@ def apply_observation(snapshot: dict[str, Any], row: dict[str, Any], facts: dict
             dropped = True
     unconfirmed = [entry for entry in row.get("unconfirmed", [])
                    if (_time(entry.get("delivered_at")) or at) > at]
+    if judged and not dropped:
+        # A judged write is confirmed when GitHub, with the earlier writes still queued on
+        # top, already shows its whole effect: delivering it would change nothing.
+        facts_now, kept, retired = overlay(record, unconfirmed, lanes), [], set()
+        judged_ids = {entry["id"] for entry in judged}
+        for entry in pending:
+            if entry["id"] in judged_ids and _shown(facts_now, entry):
+                retired.add(entry["id"])
+            else:
+                kept.append(entry)
+                facts_now = overlay(facts_now, [entry], lanes)
+        if retired:
+            snapshot["outbox"] = [entry for entry in snapshot["outbox"] if entry["id"] not in retired]
+            pending = kept
     if pending and base is not None:
         base.update(overlay(record, unconfirmed, lanes, base.get("lane")))
     elif not pending:

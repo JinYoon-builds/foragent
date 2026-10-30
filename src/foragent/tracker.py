@@ -230,9 +230,15 @@ class RecordingTracker:
         return self.get_issue(n)
 
     def list_issues(self, *args, **kwargs):
-        """The full listing, unrecorded: it is the bulk observation refresh_issues applies with
-        its own bookkeeping (PR facts, dropped writes, issues no longer listed)."""
-        return self._tracker.list_issues(*args, **kwargs)
+        """List issues; each one returned is an observation.
+
+        Inside refresh_issues the listing is not recorded here: refresh_local_issues applies
+        it with its own bookkeeping (PR facts, dropped writes, issues no longer listed)."""
+        started = self._read_started()
+        result = self._tracker.list_issues(*args, **kwargs)
+        if not getattr(self, "_refreshing", False):
+            self._observe(result, started)
+        return result
 
     def sub_issues(self, n):
         started = self._read_started()
@@ -263,7 +269,11 @@ class RecordingTracker:
         Returns whether the listing showed any change since the last one.
         """
         try:
-            return self._refresh_issues(observed_at or self._context.now())
+            self._refreshing = True
+            try:
+                return self._refresh_issues(observed_at or self._context.now())
+            finally:
+                self._refreshing = False
         except TrackerError as exc:
             self._context.store.record_issues_refresh_failure(" ".join(str(exc).split()), self._context.now())
             raise
@@ -303,7 +313,7 @@ class RecordingTracker:
             try:
                 comments[issue.number] = [asdict(comment) for comment in self._tracker.list_comments(issue.number)]
             except TrackerError as exc:
-                if not exc.is_not_found or not self._issue_missing(issue.number):
+                if not exc.is_not_found or self._issue_missing(issue.number) is None:
                     raise
                 missing.add(issue.number)
         issues = [issue for issue in issues if issue.number not in missing]
@@ -394,14 +404,20 @@ class RecordingTracker:
         store.record_closed_issue_watermark(observed_at)
 
     def _issue_missing(self, number):
-        """A missing write resource alone does not prove that its issue is gone."""
+        """When a lookup that found the issue gone began, or None if it exists.
+
+        A missing write resource alone does not prove that its issue is gone; the absence is
+        an observation as old as the lookup's start, never as new as its answer."""
+        started = self._read_started()
         try:
-            self._tracker.get_issue(number)
+            issue = self._tracker.get_issue(number)
         except TrackerError as exc:
             if exc.is_not_found:
-                return True
+                return started or self._context.store._now()
             raise
-        return False
+        if isinstance(issue, Issue):
+            self._observe([issue], started)
+        return None
 
     def _read_started(self):
         """When a read begins; record_issue uses the store clock when the context has none."""
@@ -438,19 +454,27 @@ class RecordingTracker:
                 if action == "remove_labels":
                     labels = entry["labels"]
                     for index, label in enumerate(labels):
-                        self._tracker.remove_labels(number, [label])
+                        started = self._read_started()
+                        result = self._tracker.remove_labels(number, [label])
                         store.deliver_github_write(entry, remaining_labels=labels[index + 1:])
+                        if isinstance(result, Issue):
+                            self._observe([result], started)
                 elif action == "update_issue":
                     self._tracker.update_issue(number, title=entry["title"], body=entry["body"])
                     store.deliver_github_write(entry)
                 else:
                     payload = entry["labels"] if action == "add_labels" else entry["body"]
+                    started = self._read_started()
                     result = getattr(self._tracker, action)(number, payload)
                     store.deliver_github_write(entry, comment_id=result if action == "comment" else None)
+                    if isinstance(result, Issue):
+                        # The write's answer shows the issue; delivered first, so it is not judged
+                        # against its own queued write.
+                        self._observe([result], started)
             except TrackerError as exc:
                 try:
-                    if exc.is_not_found and self._issue_missing(number):
-                        store.drop_missing_github_issue(number)
+                    gone = self._issue_missing(number) if exc.is_not_found else None
+                    if gone is not None and store.drop_missing_github_issue(number, observed_at=gone):
                         self._outbox_dropped(number, "issue not found")
                         dropped.add(number)
                         continue

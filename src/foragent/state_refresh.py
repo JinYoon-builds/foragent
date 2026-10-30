@@ -5,7 +5,13 @@ from datetime import datetime
 from typing import Any
 
 from foragent.state_issues import _copy
-from foragent.state_observe import OBSERVED, apply_observation, confirmed, newer_than
+from foragent.state_observe import (
+    OBSERVED,
+    apply_observation,
+    confirmed,
+    newer_than,
+    record_removal,
+)
 
 
 class IssueRefreshMixin:
@@ -57,8 +63,10 @@ class IssueRefreshMixin:
                     "state_reason": getattr(issue, "state_reason", None),
                 }, now, lanes=lanes, local_since=since_revision, forget_reads=False)
                 if not applied:
-                    # An observation older than the stored one applies nothing.
-                    rows[key] = old
+                    # An observation older than the stored one (or than the issue's removal)
+                    # applies nothing; an issue without a row stays without one.
+                    if old:
+                        rows[key] = old
                     skipped.add(key)
                     continue
                 if contradicted:
@@ -127,6 +135,8 @@ class IssueRefreshMixin:
                 # proves nothing about it.
                 if number not in rows and newer_than(row, now, snapshot):
                     rows[number] = row
+                elif number not in rows:
+                    record_removal(snapshot, int(number), now)
             failure = _merge_time((snapshot.get("refresh_failure") or {}).get("failed_at"))
             if failure is None or failure <= now:
                 # Only a listing that began after a failed read clears that failure.

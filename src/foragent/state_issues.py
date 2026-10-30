@@ -5,7 +5,13 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from foragent.labels import READY, issue_lane
-from foragent.state_observe import OBSERVED, apply_observation, record_result
+from foragent.state_observe import (
+    OBSERVED,
+    apply_observation,
+    newer_than,
+    record_removal,
+    record_result,
+)
 
 REFRESH_INTERVAL = timedelta(minutes=5)
 
@@ -113,16 +119,27 @@ class IssueSnapshotMixin:
         row = self._issue_record()["issues"].get(str(number)) or {}
         return _copy((row.get("board_values") or {}).get(project, {}).get(field))
 
-    def drop_missing_github_issue(self, number: int) -> None:
-        """Remove a confirmed missing issue and all its pending writes atomically."""
+    def drop_missing_github_issue(self, number: int, *, observed_at: datetime | None = None) -> bool:
+        """Remove a confirmed missing issue and all its pending writes atomically.
+
+        ``observed_at`` is when the lookup that found it missing began. The absence is older
+        than an observation of the issue or a write queued after that, so then nothing is
+        removed and this returns False; a later lookup decides again."""
+        at = observed_at or self._now()
         with self._state_lock():
             snapshot = self._issue_snapshot()
+            if newer_than(snapshot["issues"].get(str(number)), at, snapshot) or any(
+                    entry["issue"] == number and (_state.datetime.fromisoformat(entry["queued_at"]) > at)
+                    for entry in snapshot.get("outbox", [])):
+                return False
             snapshot["outbox"] = [entry for entry in snapshot.get("outbox", [])
                                   if entry["issue"] != number]
             snapshot.get("outbox_base", {}).pop(str(number), None)
             snapshot["issues"].pop(str(number), None)
+            record_removal(snapshot, number, at)
             snapshot["revision"] = snapshot.get("revision", 0) + 1
             self._write_json(self.root / "issues.json", snapshot)
+            return True
 
     def _local_issue(self, snapshot: dict[str, Any], number: int) -> dict[str, Any]:
         return snapshot["issues"].setdefault(str(number), {
@@ -249,6 +266,7 @@ class IssueSnapshotMixin:
             for issue in issues:
                 if issue.is_pull_request:
                     continue
+                known = str(issue.number) in snapshot["issues"]
                 row = self._local_issue(snapshot, issue.number)
                 facts = {"title": issue.title, "body": issue.body, "labels": sorted(issue.labels),
                          "state": issue.state, "state_reason": getattr(issue, "state_reason", None),
@@ -257,6 +275,8 @@ class IssueSnapshotMixin:
                 applied, contradicted = apply_observation(snapshot, row, facts, at, lanes=lanes)
                 if contradicted:
                     dropped.append(issue.number)
+                if not applied and not known:
+                    snapshot["issues"].pop(str(issue.number), None)
                 if applied:
                     snapshot["revision"] = snapshot.get("revision", 0) + 1
                     row.update(revision=snapshot["revision"], updated_at=self._timestamp())

@@ -625,3 +625,184 @@ def test_an_older_list_read_changes_nothing(tmp_path):
     before = (state.root / "issues.json").read_bytes()
     state.record_issues([issue("closed", "completed")], {}, observed_at=minutes(1))
     assert (state.root / "issues.json").read_bytes() == before
+
+
+# Review 10: listings outside refresh, removals and confirmed writes (#1025).
+
+def test_a_listing_outside_refresh_records_a_reopening(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
+    assert d79(tmp_path, state)["state"] == "done"
+
+    class Lister:
+        def list_issues(self, state="all"):
+            return [issue("open", "reopened")]
+
+    clock.at = minutes(2)
+    assert [item.number for item in _recording(state, clock, Lister()).list_issues("open")] == [9]
+    assert d79(tmp_path, state)["state"] == "in progress"
+
+
+@pytest.mark.parametrize("late", ["refresh", "read"])
+def test_an_issue_removed_by_a_newer_listing_is_not_recreated_by_an_older_one(tmp_path, late):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
+    state.refresh_local_issues([], [], {}, minutes(5))
+    assert state.local_issues() == []
+    if late == "refresh":
+        state.refresh_local_issues([issue("closed", "completed")], [], {}, minutes(3))
+    else:
+        state.record_issues([issue("closed", "completed")], {}, observed_at=minutes(3))
+    assert state.local_issues() == []
+    assert d79(tmp_path, state)["issues"] == []
+    state.record_issue(issue(), {}, observed_at=minutes(6))
+    assert [row["state"] for row in state.local_issues()] == ["open"], "A newer observation brings it back"
+
+
+def test_a_confirmed_missing_issue_is_not_recreated_by_an_older_read(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
+    clock.at = minutes(5)
+    state.drop_missing_github_issue(9)
+    state.record_issue(issue("closed", "completed"), {}, observed_at=minutes(4))
+    assert state.local_issues() == []
+
+
+@pytest.mark.parametrize("seen, action, payload", [
+    (issue(labels=["x"]), "add_labels", {"labels": ["x"]}),
+    (issue(), "remove_labels", {"labels": ["x"]}),
+    (issue(body="same"), "update_issue", {"title": "T", "body": "same"}),
+    (issue("closed", "completed"), "close_issue", {"body": None}),
+])
+def test_a_write_github_already_shows_is_retired_without_a_drop(tmp_path, seen, action, payload):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([seen], [], {}, NOW)
+    clock.at = minutes(1)
+    state.queue_github_write(9, action, **payload)
+    assert state.refresh_local_issues([seen], [], {}, minutes(2)) == [], "A confirmation is not a drop"
+    assert state.github_outbox() == []
+
+
+@pytest.mark.parametrize("seen, writes", [
+    (issue("closed", "completed"), [("close_issue", {"body": "Done"})]),
+    (issue(), [("add_labels", {"labels": ["x"]}), ("remove_labels", {"labels": ["x"]})]),
+    (issue(), [("comment", {"body": "note"})]),
+])
+def test_writes_github_does_not_yet_show_stay_queued(tmp_path, seen, writes):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([seen], [], {}, NOW)
+    clock.at = minutes(1)
+    for action, payload in writes:
+        state.queue_github_write(9, action, **payload)
+    state.refresh_local_issues([seen], [], {}, minutes(2))
+    assert [entry["action"] for entry in state.github_outbox()] == [action for action, _ in writes]
+
+
+def test_a_flushed_write_answer_and_a_missing_check_are_observations(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
+    clock.at = minutes(1)
+    state.queue_github_write(9, "add_labels", labels=["x"])
+
+    class Writer:
+        def add_labels(self, number, labels):
+            return issue("closed", "not_planned", labels=["x"])
+
+        def get_issue(self, number):
+            return issue("open", "reopened")
+
+    clock.at = minutes(2)
+    tracker = _recording(state, clock, Writer())
+    tracker.flush_outbox()
+    assert state.local_issues()[0]["state_reason"] == "not_planned"
+    clock.at = minutes(3)
+    assert tracker._issue_missing(9) is None
+    assert state.local_issues()[0]["state_reason"] == "reopened"
+
+
+def test_a_rejected_read_in_a_batch_leaves_no_placeholder_row(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
+    state.refresh_local_issues([], [], {}, minutes(5))
+    other = Issue(10, "Other", "", frozenset(), "open")
+    state.record_issues([issue("closed", "completed"), other], {}, observed_at=minutes(3))
+    assert [row["number"] for row in state.local_issues()] == [10]
+
+
+# Review 11: an absence is as old as the lookup that found it (#1025).
+
+def _not_found():
+    from foragent.tracker import TrackerError
+
+    return TrackerError("HTTP 404: Not Found (https://api.github.com/repos/o/r/issues/9)")
+
+
+def test_a_delayed_not_found_lookup_never_removes_a_newer_observation(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
+    clock.at = minutes(1)
+    state.queue_github_write(9, "add_labels", labels=["x"])
+
+    class Gone:
+        def add_labels(self, number, labels):
+            raise _not_found()
+
+        def get_issue(self, number):
+            # The lookup begins at T2; a reopening is recorded at T3 before the 404 returns at T4.
+            clock.at = minutes(3)
+            state.record_issue(issue("open", "reopened"), {}, observed_at=minutes(3))
+            clock.at = minutes(4)
+            raise _not_found()
+
+    clock.at = minutes(2)
+    with pytest.raises(type(_not_found())):
+        _recording(state, clock, Gone()).flush_outbox()
+    row, = state.local_issues()
+    assert (row["state"], row["observed_at"]) == ("open", minutes(3).isoformat())
+    assert "9" not in (state._issue_record().get("removed") or {}), "No removal is recorded"
+    assert d79(tmp_path, state) == {"id": "D79", "issues": [9], "state": "in progress",
+                                    "observed_at": minutes(3).isoformat()}
+
+
+def test_a_not_found_lookup_removes_the_issue_as_of_its_start(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
+    clock.at = minutes(1)
+    state.queue_github_write(9, "add_labels", labels=["x"])
+
+    class Gone:
+        def add_labels(self, number, labels):
+            raise _not_found()
+
+        def get_issue(self, number):
+            clock.at = minutes(4)
+            raise _not_found()
+
+    clock.at = minutes(2)
+    _recording(state, clock, Gone()).flush_outbox()
+    assert state.local_issues() == [] and state.github_outbox() == []
+    assert [event["kind"] for event in _events(state)] == ["outbox-dropped"]
+    # Stamped with the lookup start (T2): a read that began at T3 is newer and brings it back.
+    state.record_issue(issue(), {}, observed_at=minutes(3))
+    assert [row["number"] for row in state.local_issues()] == [9]
+
+
+def test_a_write_queued_after_the_lookup_began_keeps_the_issue(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue()], [], {}, NOW)
+    clock.at = minutes(3)
+    state.queue_github_write(9, "comment", body="note")
+    assert state.drop_missing_github_issue(9, observed_at=minutes(2)) is False
+    assert len(state.github_outbox()) == 1 and len(state.local_issues()) == 1
+    assert state.drop_missing_github_issue(9, observed_at=minutes(4)) is True
+    assert state.local_issues() == [] and state.github_outbox() == []
