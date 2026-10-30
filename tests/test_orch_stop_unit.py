@@ -102,7 +102,8 @@ def test_a_reused_pid_with_another_start_time_is_refused_before_any_kill(case, m
     monkeypatch.setattr(processes, "list_processes",
                         lambda: ProcessTable((ProcessIdentity(RUNNER, 1, RUNNER, RUNNER, 99.0),)))
     monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **k: pytest.fail("A reused PID is not ours"))
-    with pytest.raises(orch.OrchError, match="different process"):
+    # The recorded runner is gone, so stop agrees with park and status: not running (#435).
+    with pytest.raises(orch.OrchError, match="not running"):
         orch.stop(case.ctx, 1, "reprioritize")
     assert case.store.get_run(1).status == "running"
 
@@ -117,8 +118,26 @@ def test_missing_identity_or_unreadable_table_is_left_to_the_kill_path(case, mon
     assert orch_stop.unsafe_target(case.store.get_run(1)) is None
 
 
-def test_a_both_none_run_is_not_running(case, monkeypatch):
-    case.store.update_run(1, pid=None, executor_pgid=None)
+def test_a_both_none_run_is_running_and_stopped_through_the_kill_path(case, monkeypatch):
+    """#435: park and the status row call a record without processes running, so stop does too."""
+    from foragent.scheduler_stop import run_is_live
+
+    case.store.update_run(1, pid=None, executor_pgid=None, process_identities=[])
+    assert run_is_live(case.store.get_run(1))
+    calls = []
+
+    def kill(ctx, number, report, **kwargs):
+        calls.append(number)
+        ctx.store.finish_run(number, outcome="stopped", detail=kwargs["detail"])
+        return True
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    orch.stop(case.ctx, 1, "reprioritize")
+    assert calls == [1] and case.store.get_run(1).status != "running"
+
+
+def test_a_finished_run_is_not_running(case, monkeypatch):
+    case.store.finish_run(1, outcome="error")
     monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **k: pytest.fail("Nothing to kill"))
     with pytest.raises(orch.OrchError, match="not running"):
         orch.stop(case.ctx, 1, "reprioritize")
