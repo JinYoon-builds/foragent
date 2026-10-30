@@ -238,21 +238,26 @@ def _assert_squirrel(output):
     rows = watch_art.half_blocks(watch_art.ORCHESTRATOR, watch_art.PALETTE)
     lines = output.splitlines()
     painted = [index for index, line in enumerate(lines) if "▀" in line or "▄" in line]
-    assert len(painted) == len(rows), "The first minute must show all eight rows of the existing big squirrel"
-    assert painted == list(range(painted[0], painted[0] + len(rows))), "Keep the squirrel's half-block rows together"
+    assert len(painted) == len(rows), "Keep all eight rows of the existing big squirrel"
+    assert painted == list(range(painted[0], painted[0] + len(rows)))
     for index, row in zip(painted, rows):
-        line = lines[index]
-        expected = "".join(glyph for glyph, _, _ in row).rstrip()
-        assert SGR.sub("", line).rstrip() == expected, "Render watch_art.ORCHESTRATOR unchanged as half-block rows"
-        cells = _colored_cells(line)
-        for actual, (glyph, foreground, background) in zip(cells, row):
-            assert actual[0] == glyph, "Preserve each squirrel half-block glyph"
+        cells = _colored_cells(lines[index])
+        expected_width = len("".join(glyph for glyph, _, _ in row).rstrip())
+        assert len(cells) == expected_width
+        for (glyph, foreground, background), (_, upper, lower) in zip(cells, row):
+            expected_upper = None if upper is None else _rgb(upper)
+            expected_lower = None if lower is None else _rgb(lower)
+            if upper is None and lower is not None:
+                assert glyph == "▄", "r52: bottom-only pixels must not inherit the terminal foreground"
             if glyph == "▀":
-                assert actual[1] == (None if foreground is None else _rgb(foreground)), (
-                    "Preserve the squirrel's foreground palette colors and transparency")
-            assert actual[2] == (None if background is None else _rgb(background)), (
-                "Preserve the squirrel's background palette colors and transparency")
-    assert painted[-1] < len(lines) - 1, "Place the squirrel above the one-line status segment"
+                actual_upper, actual_lower = foreground, background
+            elif glyph == "▄":
+                actual_upper, actual_lower = background, foreground
+            else:
+                assert glyph == " "
+                actual_upper = actual_lower = background
+            assert (actual_upper, actual_lower) == (expected_upper, expected_lower), "Keep both palette pixels and transparent halves"
+    assert painted[-1] < len(lines) - 1
     _assert_status_segment(lines[-1])
 
 
