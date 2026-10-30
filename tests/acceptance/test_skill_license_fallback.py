@@ -30,7 +30,8 @@ def offline_catalog(tmp_path, monkeypatch, capsys):
         assert code == 0, f"fa skills catalog --json must succeed: {output.err}"
         payload = json.loads(output.out)
         assert isinstance(payload, list), "The JSON catalog must be a list of skills"
-        return payload
+        # #1028 (2026-10-31): Foragent's vendored principles (library "pstack") may also be listed.
+        return [item for item in payload if not item["id"].startswith("pstack:")]
 
     return library, catalog
 
