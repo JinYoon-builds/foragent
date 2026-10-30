@@ -215,3 +215,4 @@
 - #158: 오케 스킬 150줄 한도(splitlines 기준, wc보다 1 많음)는 라우팅 표에 한 줄 행을 더하고 세부는 references/settings.md로 맞췄다. zsh는 `$files` 변수를 단어로 나누지 않으니 `fa test`에는 `$(... | tr '\n' ' ')`를 직접 넘긴다.
 - #794 재시도: 요청을 끝내는 동사는 `orch_inbox.set_request_status(..., check=fn)`으로 상태 확인과 완료 표시를 state lock 안에서 한 번에 한다(동시 답 경쟁). 스코어카드 역할 행은 설정 역할만이 아니라 열린 신호·창 안 신호가 있는 역할도 넣는다. 동시성 시험은 `_file_lock`이 호출마다 새 fd로 flock하므로 스레드 두 개로 재현된다. 작업공간 재생성 때 `.foragent/TRY.md`·`REBUTTAL.md`는 사라지므로 다시 써야 한다. "파일 이동" 안내는 오탐일 수 있으니 `git ls-tree origin/main`으로 확인한다.
 - #131 재시도: Goal(2026-10-29)이 묶음 나이를 finished_at, 없으면 묶음의 가장 새 파일 mtime으로 정했다(기간·크기 규칙 공통 `_group_age`). 병합 보존 일수는 `settings.read_machine()`의 log_retention_days(기본 7, conftest가 XDG_STATE_HOME 격리). main의 `orch_role_raise.tick`은 정상 종료 경로의 `done(..., finished=True)` 직전에 둔다.
+- [#413 orch refresh](project_413_refresh.md) — heartbeat session fields, orch_spawn_launch split, locked --bg argv, zsh ${=T}

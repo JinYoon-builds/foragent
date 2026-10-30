@@ -49,16 +49,38 @@ class StateStore(
     # Heartbeat file stem for each side; each write overwrites one small file.
     HEARTBEATS = {"orchestrator": "orch", "gate": "gate"}
 
-    def write_heartbeat(self, side: str, at: datetime, *, session: dict | None = None) -> None:
-        """Overwrite one side's heartbeat with ``at`` (no lock: one atomic replace).
+    # The orchestrator heartbeat also names its active Claude session (#413); writes keep these.
+    SESSION_FIELDS = ("session_id", "transcript_path", "started_at", "status", "previous")
+
+    def write_heartbeat(self, side: str, at: datetime, *, session: dict | None = None,
+                        session_id: str | None = None) -> None:
+        """Overwrite one side's heartbeat with ``at``, keeping the orchestrator's session fields.
 
         ``session`` is the writer's Claude session ``{pid, start_time}``, if known.
+        ``session_id`` is the writer's ``FORAGENT_SESSION_ID``: a write from another
+        session than the active one (a retired session) is ignored; a write without
+        an id is accepted. The orchestrator side reads and replaces under the state
+        lock, so it never undoes a refresh that switched the active session.
         """
         self.root.mkdir(parents=True, exist_ok=True)
+        path = self.root / f"{self.HEARTBEATS[side]}-heartbeat.json"
         record: dict = {"at": at.isoformat()}
         if session is not None:
             record["session"] = session
-        self._write_json(self.root / f"{self.HEARTBEATS[side]}-heartbeat.json", record)
+        if side != "orchestrator":
+            self._write_json(path, record)
+            return
+        with self._state_lock():
+            try:
+                old = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                old = {}
+            old = old if isinstance(old, dict) else {}
+            active = old.get("session_id")
+            if session_id and active and session_id != active:
+                return
+            record.update({key: old[key] for key in self.SESSION_FIELDS if key in old})
+            self._write_json(path, record)
 
     def heartbeat_session(self, side: str) -> dict | None:
         """The Claude session recorded in one side's heartbeat, or None."""

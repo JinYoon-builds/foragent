@@ -76,6 +76,9 @@ class Config:
     run_hours: str = "always"
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
+    # `fa orch refresh-due`: either threshold (inclusive) makes a fresh orchestrator session due.
+    orch_refresh_compactions: int = 4
+    orch_refresh_hours: int = 24
     tick_failure_alert: int = 3
     max_runtime_minutes: int = 90
     max_retries: int = 2
