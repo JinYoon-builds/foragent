@@ -146,3 +146,22 @@ def test_bug_steps_reach_first_attempt_and_retry_for_bug_label_only(run_case, la
     assert len(c.executor.calls) == 2
     for call in c.executor.calls:
         assert ("This issue is a bug. Follow these steps:" in call["prompt"]) is (label == "type: bug")
+
+
+def test_implementation_prompt_carries_the_lanes_earlier_plan_only_when_given():
+    from foragent.run_prompts import lane_plan_section
+
+    parsed = parse_body(BODY)
+    section = lane_plan_section(["Reuse the writer."], ["Name the helper while implementing."])
+    prompt = build_prompt(1, parsed, "tests/acceptance/", lane_plan=section)
+    assert "Your lane's earlier plan" in prompt
+    assert "- Reuse the writer." in prompt and "- Name the helper while implementing." in prompt
+    assert "Your lane's earlier plan" not in build_prompt(1, parsed, "tests/acceptance/")
+
+
+def test_resume_prompt_restates_the_lanes_earlier_plan_only_when_given():
+    from foragent.run_prompts import build_resume_prompt, lane_plan_section
+
+    section = lane_plan_section(["Reuse the writer."], [])
+    assert section in build_resume_prompt(1, BODY, BODY, lane_plan=section)
+    assert "Your lane's earlier plan" not in build_resume_prompt(1, BODY, BODY)

@@ -202,8 +202,8 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
     """Publish what waits for ``boundary``: one commit and push, then each order's issues.
 
     Status moves waiting -> committed (the local commit exists) -> published. Before
-    writing, the flush journals every file's earlier bytes; an interrupted write is undone
-    or, when HEAD shows it committed, recorded as committed (``order_batch_journal``).
+    writing, the flush journals every path it will write; recovery finishes or undoes an
+    interrupted flush from the commit shas it recorded (``order_batch_journal``).
     """
     boundary = _boundary(boundary, config.language)
     with _lock(root, "order-batch-flush.lock"):
@@ -248,13 +248,14 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
                           lanes=journal.lane_writes(root, creating))
 
             def committed(blobs: dict[str, str]) -> None:
+                journal.batch_done(directory, git)  # recorded first: recovery trusts only this sha
                 _committed(root, written["orders"], written["notes"], blobs)
                 journal.clear(directory)
 
             try:
                 for entry, files in prepared:
                     order.write_order_files(entry["plan"], root, config, git, files, manager,
-                                            lane_done=lambda name: journal.lane_done(directory, root, name))
+                                            lane_done=lambda name: journal.lane_done(directory, root, name, git))
                     if any(lane["name"] not in config.lanes for lane in entry["plan"].get("new_lanes", [])):
                         # Later orders and the issue pass see the lane this order just created.
                         config = replace(config, lanes=load_config(root).lanes)

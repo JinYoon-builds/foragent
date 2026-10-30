@@ -1,19 +1,20 @@
 """The one in-flight batch write, so an interrupted flush is undone or finished from Git facts.
 
-Before a flush writes any file it records, for each path, the bytes before and the Git
-blob id after. Whether that write was committed is read from HEAD's blobs, never guessed
-from the working tree's current text, which other people and later boundaries may change.
-Not committed: each file is restored to its earlier bytes. Committed: the batch's orders
-and notes are marked committed. Either way the journal is then removed.
+Before a flush writes anything it lists every path it will write (order files, notes and
+new-lane files) with its earlier bytes. Right after each new lane's own commit and right
+after the batch commit, the journal records that commit's sha. Recovery decides only by
+those recorded facts, never by comparing HEAD or the working tree with what was written:
 
-New lanes are written by ``add_lane`` and committed on their own before the batch commit,
-so their files are listed separately with their earlier bytes. A lane file whose current
-bytes are HEAD's was committed and stays; any other is restored, and when the lane's
-configuration goes back, the skill directories this batch created go with it.
+- the recorded batch commit is an ancestor of HEAD: the batch is done; only its checkpoint
+  (orders and notes marked committed) is written;
+- otherwise every listed path goes back to the bytes of the last recorded commit that is
+  still an ancestor of HEAD (or to its bytes before the flush), and is unstaged, so nothing
+  stays in the index. Skill directories of lanes without such a commit are removed.
+
+Either way the journal is then removed and a later flush retries the remaining work.
 """
 
 import base64
-import hashlib
 import json
 import os
 import shutil
@@ -28,6 +29,7 @@ from foragent.paths import repo_path
 from foragent.state_locks import _file_lock
 
 JOURNAL_FILE = "order-batch-journal.json"
+VERSION = 2
 
 
 def _directory(root: Path) -> Path:
@@ -48,15 +50,6 @@ def _lock(root: Path, name: str):
         raise order.PlanError(f"{path} must be a regular file, not a symlink")
     with _file_lock(path):
         yield
-
-
-def blob_id(data: bytes) -> str:
-    """Git's blob id for these bytes, as HEAD reports it."""
-    return hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
-
-
-def _data(content: str | bytes) -> bytes:
-    return content.encode("utf-8") if isinstance(content, str) else content
 
 
 def _bytes(root: Path, name: str) -> bytes | None:
@@ -84,8 +77,8 @@ def lane_writes(root: Path, lanes: list[dict]) -> dict:
             if not repo_path(root, directory).exists() and directory not in seen:
                 seen.add(directory)
                 directories[lane["name"]].append(directory)
-    return {"files": {name: _encoded(_bytes(root, name)) for name in sorted(files)},
-            "directories": directories}
+    start = {"lane": None, "commit": None, "files": {name: _encoded(_bytes(root, name)) for name in files}}
+    return {"paths": sorted(files), "directories": directories, "checkpoints": [start]}
 
 
 def _save(directory: Path, value: dict) -> None:
@@ -97,26 +90,34 @@ def _save(directory: Path, value: dict) -> None:
     os.replace(stream.name, directory / JOURNAL_FILE)
 
 
-def lane_done(directory: Path, root: Path, name: str) -> None:
-    """A lane's own commit landed: later recovery undoes only what came after it."""
-    value = json.loads((directory / JOURNAL_FILE).read_text(encoding="utf-8"))
+def _load(directory: Path) -> dict:
+    return json.loads((directory / JOURNAL_FILE).read_text(encoding="utf-8"))
+
+
+def lane_done(directory: Path, root: Path, name: str, git) -> None:
+    """A lane's own commit landed: record its sha and the lane files' bytes at that commit."""
+    value = _load(directory)
     lanes = value["lanes"]
-    lanes["files"] = {path: _encoded(_bytes(root, path)) for path in lanes["files"]}
-    lanes["directories"].pop(name, None)
+    lanes["checkpoints"].append({"lane": name, "commit": git.head_sha(),
+                                 "files": {path: _encoded(_bytes(root, path)) for path in lanes["paths"]}})
+    _save(directory, value)
+
+
+def batch_done(directory: Path, git) -> None:
+    """The batch commit exists: record its sha before anything else can be interrupted."""
+    value = _load(directory)
+    value["batch_commit"] = git.head_sha()
     _save(directory, value)
 
 
 def write(directory: Path, root: Path, files: dict[str, str | bytes], *, branch: str,
           orders: dict[str, list[str]], notes: list[str], lanes: dict | None = None) -> None:
-    """Record the planned write of ``files`` (and new-lane paths) before any of them changes."""
-    entries = {}
-    for name, content in sorted(files.items()):
-        path = repo_path(root, name)
-        before = path.read_bytes() if path.is_file() else None
-        entries[name] = {"before": None if before is None else base64.b64encode(before).decode("ascii"),
-                         "after": blob_id(_data(content))}
-    _save(directory, {"branch": branch, "orders": orders, "notes": notes, "files": entries,
-                      "lanes": lanes or {"files": {}, "directories": {}}})
+    """List every path the flush will write, with its bytes now, before any of them changes."""
+    _save(directory, {"version": VERSION, "branch": branch, "orders": orders, "notes": notes,
+                      "files": {name: _encoded(_bytes(root, name)) for name in sorted(files)},
+                      "batch_commit": None,
+                      "lanes": lanes or {"paths": [], "directories": {}, "checkpoints": [
+                          {"lane": None, "commit": None, "files": {}}]}})
 
 
 def clear(directory: Path) -> None:
@@ -124,73 +125,71 @@ def clear(directory: Path) -> None:
 
 
 def _restore(root: Path, name: str, before: bytes | None) -> None:
+    if _bytes(root, name) == before and not repo_path(root, name).is_symlink():
+        return
     check_write(root, name, PurePosixPath(name).parent.as_posix())  # never through a planted link
-    target = repo_path(root, name)
     if before is None:
-        target.unlink()
+        repo_path(root, name).unlink()
     else:
         write_atomic(root, name, before)
 
 
-def _recover_lanes(root: Path, git, lanes: dict) -> None:
-    files = lanes["files"]
-    if not files:
-        return
-    heads = git.blob_shas(git.head_sha(), list(files))
-    config_before, config_now = _decoded(files[".foragent.yml"]), _bytes(root, ".foragent.yml")
-    # The lane exists only once its own commit holds the saved configuration; skill copies
-    # and .gitignore lines start before that save, so nothing else marks it as finished.
-    lane_committed = (config_now is not None and config_now != config_before
-                      and heads.get(".foragent.yml") == blob_id(config_now))
-    for name, encoded in files.items():
-        before, current = _decoded(encoded), _bytes(root, name)
-        if current == before or (lane_committed and current is not None and heads.get(name) == blob_id(current)):
-            continue  # untouched, or the lane commit holds exactly these bytes
-        _restore(root, name, before)
-    if not lane_committed:
-        # Copied skills are ignored by Git, so a partial copy is removed, never trusted.
-        for relative in (path for paths in lanes["directories"].values() for path in paths):
+def _committed(git, sha: str | None) -> bool:
+    return sha is not None and git.is_ancestor(sha, "HEAD")
+
+
+def _undo_lanes(root: Path, git, lanes: dict) -> None:
+    """Back to the last lane commit still in HEAD's history; later lanes' writes go."""
+    kept = lanes["checkpoints"][0]
+    done = set()
+    for checkpoint in lanes["checkpoints"][1:]:
+        if not _committed(git, checkpoint["commit"]):
+            break
+        kept = checkpoint
+        done.add(checkpoint["lane"])
+    for name in lanes["paths"]:
+        _restore(root, name, _decoded(kept["files"][name]))
+    # Copied skills are ignored by Git, so a partial copy is removed, never trusted.
+    for lane, paths in lanes["directories"].items():
+        if lane in done:
+            continue
+        for relative in paths:
             path = repo_path(root, relative)
             if path.is_symlink():
                 raise order.PlanError(f"{relative} must be a real directory, not a symlink")
             if path.is_dir():
                 shutil.rmtree(path)
+    git.restore_staged_paths("HEAD", lanes["paths"])
 
 
 def recover(directory: Path, root: Path, git, mark_committed, language: str) -> None:
-    """Finish or undo a recorded write; ``mark_committed(orders, notes, head_blobs)`` records success."""
+    """Finish or undo a recorded write; ``mark_committed(orders, notes, blobs)`` records success."""
     path = directory / JOURNAL_FILE
     if path.is_symlink():
         raise order.PlanError(f"{path} must be a regular file, not a symlink")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = _load(directory)
     except FileNotFoundError:
         return
     except ValueError as exc:
         raise order.PlanError(f"{path} is not valid JSON") from exc
+    if value.get("version") != VERSION:
+        raise order.PlanError(text("batch_recover_format", language, path=path))
     # Recovery needs no configuration: the branch it wrote on is recorded here.
     if git.current_branch() != value["branch"]:
         raise order.PlanError(text("batch_recover_branch", language, branch=value["branch"]))
-    lanes = value.get("lanes", {"files": {}, "directories": {}})
-    files = value["files"]
-    for name in [*files, *lanes["files"]]:
+    files, lanes = value["files"], value["lanes"]
+    for name in [*files, *lanes["paths"]]:
         leftover = temporary_path(root, name)
         if leftover.is_symlink() or leftover.is_file():
             leftover.unlink()  # an interrupted atomic write never reached its file
-    _recover_lanes(root, git, lanes)
-    heads = git.blob_shas(git.head_sha(), list(files)) if files else {}
-    if all(heads.get(name) == entry["after"] for name, entry in files.items()):
-        mark_committed(value["orders"], value["notes"], heads)
+    if _committed(git, value["batch_commit"]):
+        # Committed blobs come from the recorded commit, so later commits cannot change them.
+        mark_committed(value["orders"], value["notes"], git.blob_shas(value["batch_commit"], list(files)))
         clear(directory)
         return
-    # Not committed: put back each file this batch wrote, and only those.
-    for name, entry in files.items():
-        target = repo_path(root, name)
-        before = None if entry["before"] is None else base64.b64decode(entry["before"])
-        current = target.read_bytes() if target.is_file() else None
-        if current == before:
-            continue
-        if current is None or blob_id(current) != entry["after"]:
-            raise order.PlanError(text("batch_recover_changed", language, path=name))
-        _restore(root, name, before)
+    _undo_lanes(root, git, lanes)
+    for name, encoded in files.items():
+        _restore(root, name, _decoded(encoded))
+    git.restore_staged_paths("HEAD", list(files))  # nothing of the batch stays staged
     clear(directory)
