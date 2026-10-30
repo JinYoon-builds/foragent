@@ -36,15 +36,18 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def memory_dir(name: str) -> str:
-    return f".claude/agent-memory/fa-{name}/"
+def memory_dir(name: str, agent: str | None = None, memory: str | None = None) -> str:
+    """The role's memory directory, from the one resolver lanes use too (#1000)."""
+    from foragent import lane_memory
+
+    return lane_memory.memory_directory(name, agent, memory)
 
 
 def default_entry(name: str, skills: list[str] | None = None) -> dict[str, Any]:
     signals = {"architect": [{"paths": [], "kinds": [kind]} for kind in ARCHITECT_KINDS],
                "docs": [{"paths": list(DOCS_PATHS), "kinds": []}]}.get(name, [])
     entry = {"agent": f"fa-{name}", "skills": [f"fa-{name}"] if skills is None else list(skills),
-             "memory": memory_dir(name), "signals": signals}
+             "memory": memory_dir(name, f"fa-{name}"), "signals": signals}
     if name == "docs":
         entry["scope"] = list(DOCS_PATHS)
     entry["created_at"] = _now()
@@ -64,7 +67,7 @@ def load_roles(config: Config) -> dict[str, dict[str, Any]]:
         roles[name] = {
             "agent": entry.get("agent") or f"fa-{name}",
             "skills": list(entry.get("skills", [])),
-            "memory": entry.get("memory") or memory_dir(name),
+            "memory": memory_dir(name, entry.get("agent"), entry.get("memory")),
             "signals": deepcopy(entry.get("signals", [])),
             "scope": [scope] if isinstance(scope, str) else list(scope),
             "created_at": entry.get("created_at"),
@@ -186,7 +189,7 @@ def _memory_file(root: Path, name: str, memory: str) -> str:
 
 def _ensure_memory(root: Path, name: str, entry: dict[str, Any]) -> str:
     """Create the role's MEMORY.md when missing (an existing one, even empty, is kept); return its path."""
-    relative = _memory_file(root, name, entry.get("memory") or memory_dir(name))
+    relative = _memory_file(root, name, memory_dir(name, entry.get("agent"), entry.get("memory")))
     memory = repo_path(root, relative)
     if not memory.exists():
         memory.parent.mkdir(parents=True, exist_ok=True)
