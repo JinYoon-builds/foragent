@@ -74,6 +74,24 @@ def _covers(claim: dict, key: tuple[int, str | None]) -> dict | None:
     return None
 
 
+def squash_tree(git, parent: str, head: str) -> str | None:
+    """The tree a squash merge of ``head`` onto ``parent`` produces, or None on conflict or error."""
+    try:
+        return git._call(["merge-tree", "--write-tree", parent, head]).splitlines()[0].strip()
+    except (GitError, IndexError):
+        return None
+
+
+def is_squash_of(git, commit: str, head: str) -> bool:
+    """``commit`` is exactly the squash of ``head`` onto its first parent (by content, not position)."""
+    try:
+        parent = git._call(["rev-parse", f"{commit}^1"]).strip()
+        tree = git._call(["rev-parse", f"{commit}^{{tree}}"]).strip()
+    except GitError:
+        return False
+    return squash_tree(git, parent, head) == tree
+
+
 def _eligible(row: dict | None, max_group: int) -> bool:
     return bool(row and row.get("group") and row.get("checks") == "local" and row.get("auto")
                 and max_group > 1)
@@ -171,16 +189,25 @@ class Membership:
         self.led = True
         _append(attempt.log, "Merge group " + ", ".join(f"#{m['n']}" for m in claim["members"])
                 + f": joint check on {base_sha}")
-        passed = joint_check(attempt, [row for _, row in members], base_sha)
-        with ctx.store._state_lock():
-            append_row(ctx.store, {"event": "verdict", "id": claim["id"], "target": self.place.target,
-                                   "result": "pass" if passed else "fail", "culprits": [],
-                                   "at": ctx.now().isoformat()})
+        passed = False
+        try:
+            passed = joint_check(attempt, [row for _, row in members], base_sha)
+        finally:
+            # Even when the check raised, close this live leader's claim with a verdict:
+            # an open claim would otherwise keep reserving members while the run cleans up.
+            self._verdict(claim, passed)
         _append(attempt.log, f"Merge group joint check {'passed' if passed else 'failed'}")
         if passed:
             self.claim = claim
         else:
             self.solo = True
+
+    def _verdict(self, claim: dict, passed: bool) -> None:
+        ctx = self.attempt.ctx
+        with ctx.store._state_lock():
+            append_row(ctx.store, {"event": "verdict", "id": claim["id"], "target": self.place.target,
+                                   "result": "pass" if passed else "fail", "culprits": [],
+                                   "at": ctx.now().isoformat()})
 
     def _candidates(self, events: list[dict], room: int) -> list[tuple[tuple[int, str | None], dict]]:
         """The oldest live, eligible ready others no live open or decided claim names."""
@@ -217,10 +244,13 @@ class Membership:
             commits = git._call(["rev-list", "--reverse", "--first-parent", f"{base}..{target_sha}"]).split()
         except GitError:
             return False
-        merged = self._earlier_merges()
+        heads = self._earlier_heads()
         previous = base
         for commit in commits:
-            if commit not in merged and not base_move_is_neutral(self.attempt, BaseMove(previous, commit)):
+            # An earlier member's merge is proven by content: the commit must be exactly its
+            # recorded head squashed onto the commit's parent, never just a recorded SHA.
+            if not any(is_squash_of(git, commit, head) for head in heads) and not base_move_is_neutral(
+                    self.attempt, BaseMove(previous, commit)):
                 return False
             previous = commit
         return True
@@ -238,14 +268,14 @@ class Membership:
         return {(row["n"], row.get("started_at")): row for row in rows(self.attempt.ctx.store)
                 if row.get("event") == "merged" and row.get("group") == claim_id}
 
-    def _earlier_merges(self) -> set[str]:
-        """merged_sha of earlier members of this claim, each merged with its recorded head."""
-        merged, shas = self._merged_rows(), set()
+    def _earlier_heads(self) -> list[str]:
+        """Claimed heads of earlier members that report merging exactly that head."""
+        merged, heads = self._merged_rows(), []
         for member, started in self._members()[:self._position()]:
             row = merged.get((member["n"], started))
-            if row is not None and row.get("head_sha") == member["head_sha"] and row.get("merged_sha"):
-                shas.add(row["merged_sha"])
-        return shas
+            if row is not None and row.get("head_sha") == member["head_sha"]:
+                heads.append(member["head_sha"])
+        return heads
 
     def _later_holder(self) -> bool:
         """A later live member still holds this pass verdict for its exact head."""
@@ -276,8 +306,7 @@ class Membership:
     def merged(self, pr: int, head: str, base_sha: str) -> None:
         """Append this run's own merged row; main is read under its own merge.lock.
 
-        The merge commit is the first main commit after the base re-read under the
-        lock, not main's tip: another push may already have landed on top of it.
+        merged_sha is informational: followers prove each interval commit by content.
         """
         if self.claim is None:
             return
@@ -286,9 +315,11 @@ class Membership:
             ctx.git.fetch("origin", self.place.target)
             tip = ctx.git.ref_sha(f"origin/{self.place.target}")
             after = ctx.git._call(["rev-list", "--reverse", "--first-parent", f"{base_sha}..{tip}"]).split()
-            merged_sha = after[0] if after else None
+            # The commit whose content is this head's squash, not merely the first one after
+            # the base: an outside push may land between the base read and the merge.
+            merged_sha = next((commit for commit in after if is_squash_of(ctx.git, commit, head)), None)
         except GitError:
-            merged_sha = None  # Later members then cannot prove this merge and re-check instead.
+            merged_sha = None  # Later members then re-prove the interval by content anyway.
         with ctx.store._state_lock():
             append_row(ctx.store, {"n": self.place.n, "event": "merged", "started_at": self.place.started_at,
                                    "target": self.place.target, "group": self.claim["id"], "head_sha": head,
@@ -312,10 +343,25 @@ class Membership:
                      text("merge_group_merged", "en", pr=pr, head=head, others=others))
         return text("merge_group_closed", ctx.config.language, others=others)
 
+    def _pass_claim(self) -> dict | None:
+        """The newest pass claim naming this run instance, read from the queue itself."""
+        found = None
+        for claim, verdict in _claims(rows(self.attempt.ctx.store), self.place.target):
+            if verdict is not None and verdict.get("result") == "pass" and _covers(claim, self.place.key):
+                found = claim
+        return found
+
     def leave(self) -> None:
-        """Leave the group path without merging: reinstall earlier group merges if none follows."""
-        if self.claim is None or self.left:
-            self.solo = self.solo or self.claim is not None
+        """Leave the group path without merging: reinstall earlier group merges if none follows.
+
+        The group is read from the queue, so a run that leaves before loading its
+        claim (for example its head changed while it waited) still reinstalls.
+        """
+        if self.left:
+            return
+        if self.claim is None and grouping_enabled(self.attempt, self.automatic):
+            self.claim = self._pass_claim()
+        if self.claim is None:
             return
         self.left = True
         try:
@@ -339,19 +385,14 @@ def joint_check(attempt: Implementation, members: list[dict[str, Any]], base_sha
     from foragent import runner
 
     n, ctx, log = attempt.n, attempt.ctx, attempt.log
+    combined = squash_sequence(attempt, members, base_sha)
+    if combined is None:
+        return False
     with tempfile.TemporaryDirectory(prefix=f"foragent-group-{n}-", dir=ctx.store.root) as directory:
         worktree = Path(directory) / "worktree"
-        ctx.git.add_detached_worktree(worktree, base_sha)
+        ctx.git.add_detached_worktree(worktree, combined)
         try:
             git = ctx.git.at(worktree)
-            for row in members:
-                try:
-                    if row.get("branch"):
-                        ctx.git.fetch("origin", row["branch"])
-                    git.merge_base(row["head_sha"])
-                except GitError as exc:
-                    _append(log, f"Merge group: #{row['n']} does not merge cleanly: {exc}")
-                    return False
             combined_head = git.head_sha()
             git.stage_changes()
             combined_tree = git.staged_tree_sha()
@@ -365,7 +406,7 @@ def joint_check(attempt: Implementation, members: list[dict[str, Any]], base_sha
             results = [check(command) for command in dict.fromkeys(
                 command for row in members for command in row.get("done_when") or ())]
             ids = {node for row in members for node in row.get("baseline_ids") or ()}
-            fresh = _baseline_on(attempt, members, base_sha)
+            fresh = _baseline_on(attempt, members, base_sha, worktree)
             if fresh is None:
                 return False
             ids |= fresh
@@ -383,13 +424,47 @@ def joint_check(attempt: Implementation, members: list[dict[str, Any]], base_sha
             ctx.git.remove_worktree(worktree)
 
 
-def _baseline_on(attempt: Implementation, members: list[dict[str, Any]], base_sha: str) -> set[str] | None:
+def squash_sequence(attempt: Implementation, members: list[dict[str, Any]], base_sha: str) -> str | None:
+    """A commit whose tree equals squash-merging every claimed head onto ``base_sha`` in order.
+
+    Each step is the tree GitHub's squash produces (merge-tree of the head onto the
+    previous result), so the joint check sees exactly what sequential merges publish,
+    even when a later head contains and reverts an earlier member's commit.
+    """
+    ctx, current = attempt.ctx, base_sha
+    for row in members:
+        try:
+            if row.get("branch"):
+                ctx.git.fetch("origin", row["branch"])
+        except GitError:
+            pass  # The head may already be local; merge-tree below decides.
+        tree = squash_tree(ctx.git, current, row["head_sha"])
+        if tree is None:
+            _append(attempt.log, f"Merge group: #{row['n']} does not squash cleanly onto the group")
+            return None
+        try:
+            current = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                                     "commit-tree", tree, "-p", current, "-m", f"Merge group: #{row['n']}"]).strip()
+        except GitError as exc:
+            _append(attempt.log, f"Merge group: #{row['n']} could not be combined: {exc}")
+            return None
+    return current
+
+
+def _baseline_on(attempt: Implementation, members: list[dict[str, Any]], base_sha: str,
+                 worktree: Path) -> set[str] | None:
     """Pass IDs on the pinned main when a member's baseline ran elsewhere; None if unavailable."""
     from foragent.run_baseline import _capture_acceptance_baseline
 
-    if all(row.get("baseline_base_sha") in (None, base_sha) for row in members):
+    # A member without a baseline (or with one from another base) gives no evidence for
+    # this main: capture what passes here, unless no test command is known anywhere.
+    if all(row.get("baseline_base_sha") == base_sha for row in members):
         return set()
     test_command = next((row["baseline_test_command"] for row in members if row.get("baseline_test_command")), None)
+    if test_command is None:
+        from foragent import runner
+
+        test_command = attempt.ctx.config.test_command or next(iter(runner.detect_test_commands(worktree)), None)
     if test_command is None:
         return set()
     try:

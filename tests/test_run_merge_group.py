@@ -96,3 +96,116 @@ def test_only_the_last_live_member_holding_its_exact_head_reinstalls(tmp_path):
     assert first.reinstall_now() is False  # 5 still can.
     store.finish_run(5, "crashed")
     assert first.reinstall_now() is True  # No later live member holds it: this merge reinstalls.
+
+
+def git_repo(tmp_path):
+    """A plumbing-only repository: commits are built without git commit or checkout."""
+    import subprocess
+
+    from foragent.git import GitRepo
+
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def run(*args, stdin=None):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=root,
+                              check=True, capture_output=True, text=True, input=stdin).stdout.strip()
+
+    run("init", "-q", "-b", "main")
+    return GitRepo(root), run
+
+
+def make_commit(run, files, parent=None, message="c"):
+    """A commit whose tree holds exactly ``files`` (name -> content)."""
+    entries = []
+    for name, content in sorted(files.items()):
+        blob = run("hash-object", "-w", "--stdin", stdin=content)
+        entries.append(f"100644 blob {blob}\t{name}")
+    tree = run("mktree", stdin="\n".join(entries) + "\n")
+    return run("commit-tree", tree, *(["-p", parent] if parent else []), "-m", message)
+
+
+def test_a_merge_is_identified_by_content_not_by_its_position(tmp_path):
+    from foragent.run_merge_group import is_squash_of, squash_tree
+
+    git, run = git_repo(tmp_path)
+    base = make_commit(run, {"base.txt": "base\n"})
+    head = make_commit(run, {"base.txt": "base\n", "member.md": "member\n"}, base, "member")
+    # An outside source push lands between the member's base read and its squash merge.
+    outside = make_commit(run, {"base.txt": "base\n", "outside.py": "VALUE = 1\n"}, base, "outside")
+    squash = run("commit-tree", squash_tree(git, outside, head), "-p", outside, "-m", "squash")
+    assert is_squash_of(git, squash, head)
+    assert not is_squash_of(git, outside, head), "The first commit after the base is not proof"
+
+
+def test_the_joint_tree_equals_sequential_squashes_even_when_a_head_reverts_an_earlier_member(tmp_path):
+    from foragent.run_merge_group import squash_sequence
+
+    git, run = git_repo(tmp_path)
+    base = make_commit(run, {"base.txt": "base\n"})
+    first = make_commit(run, {"base.txt": "base\n", "first.txt": "first\n"}, base, "first")
+    # The second head contains the first member's commit, then reverts it.
+    reverted = make_commit(run, {"base.txt": "base\n"}, first, "revert first")
+    second = make_commit(run, {"base.txt": "base\n", "second.txt": "second\n"}, reverted, "second")
+    attempt = SimpleNamespace(ctx=SimpleNamespace(git=git), log=tmp_path / "log")
+    combined = squash_sequence(attempt, [{"n": 1, "head_sha": first}, {"n": 4, "head_sha": second}], base)
+    files = set(run("ls-tree", "-r", "--name-only", combined).splitlines())
+    # Two squashes publish both members' net changes; an ordinary merge would drop first.txt.
+    assert files == {"base.txt", "first.txt", "second.txt"}
+
+
+def test_a_member_without_a_baseline_never_counts_as_evidence_for_the_pinned_main(tmp_path, monkeypatch):
+    from foragent import run_baseline
+    from foragent.run_merge_group import _baseline_on
+
+    captured = []
+    monkeypatch.setattr(run_baseline, "_capture_acceptance_baseline",
+                        lambda n, ctx, command, base: captured.append((command, base))
+                        or SimpleNamespace(node_ids=("tests/acceptance/test_new.py::test_new",)))
+    attempt = SimpleNamespace(n=1, ctx=SimpleNamespace(config=Config(test_command="pytest -q")),
+                              log=tmp_path / "log")
+    members = [{"baseline_base_sha": None}, {"baseline_base_sha": None}]  # Both started with no tests.
+    assert _baseline_on(attempt, members, "b" * 40, tmp_path) == {"tests/acceptance/test_new.py::test_new"}
+    assert captured == [("pytest -q", "b" * 40)]
+
+
+def test_a_member_that_leaves_before_loading_its_claim_still_reinstalls_earlier_merges(tmp_path, monkeypatch):
+    from foragent import runner
+
+    store, ctx = setup(tmp_path, 1, 4)
+    write(store, ready(store, 1, "1" * 40), ready(store, 4, "4" * 40),
+          claim(store, "g", 1, [(1, "1" * 40), (4, "4" * 40)]),
+          {"event": "verdict", "id": "g", "target": "main", "result": "pass", "culprits": []},
+          {"n": 1, "event": "merged", "started_at": store.get_run(1).started_at, "target": "main",
+           "group": "g", "head_sha": "1" * 40, "merged_sha": "m" * 40, "pr": 11})
+    reinstalls = []
+    monkeypatch.setattr(runner, "after_merge", lambda ctx, pr, base: reinstalls.append(pr))
+    last = membership(ctx, 4, store)
+    assert last.claim is None  # Its head changed while waiting: it never reached its turn.
+    last.leave()
+    assert reinstalls == [11], "The deferred reinstall of the group's merges must still run once"
+    last.leave()
+    assert reinstalls == [11]
+
+
+def test_a_live_leaders_claim_gets_a_verdict_even_when_its_joint_check_raises(tmp_path, monkeypatch):
+    import pytest
+
+    from foragent import run_merge_group
+
+    store, ctx = setup(tmp_path, 1, 4)
+    write(store, ready(store, 1, "1" * 40), ready(store, 4, "4" * 40))
+    ctx.git = SimpleNamespace(fetch=lambda remote, ref: None, ref_sha=lambda ref: "b" * 40)
+
+    def broken(*args):
+        raise RuntimeError("worktree vanished")
+
+    monkeypatch.setattr(run_merge_group, "joint_check", broken)
+    leader = membership(ctx, 1, store)
+    leader.attempt.log = tmp_path / "log"
+    with pytest.raises(RuntimeError):
+        leader.at_turn("1" * 40)
+    events = run_merge_group.rows(store)
+    group = next(row for row in events if row.get("event") == "group")
+    verdicts = [row for row in events if row.get("event") == "verdict" and row["id"] == group["id"]]
+    assert [row["result"] for row in verdicts] == ["fail"], "No open claim may outlive its live leader's check"
