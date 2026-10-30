@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import contextvars
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, replace
 import json
@@ -319,7 +320,9 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     before = git.review_state()
     try:
         with ThreadPoolExecutor(max_workers=len(prompts), thread_name_prefix=f"review-{n}") as pool:
-            futures = [pool.submit(call, prompt, path) for prompt, path in zip(prompts, logs)]
+            # Each reviewer runs in a copy of this context, so the run's pause clock reaches it.
+            futures = [pool.submit(contextvars.copy_context().run, call, prompt, path)
+                       for prompt, path in zip(prompts, logs)]
         errors = [future.exception() for future in futures]
     finally:
         edited = restore(before)

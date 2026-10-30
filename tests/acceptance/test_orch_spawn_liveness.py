@@ -196,7 +196,15 @@ def test_orch_spawn_liveness_reused_pid_spawns_and_records_the_new_identity(
         "orch-spawn.json must retain the spawned session's start time to detect later PID reuse"
     )
     assert stored["spawned_at"] == case.clock[0].isoformat()
-    assert heartbeat.read_bytes() == before
+    # #413 (2026-10-30): a gate launch writes its new session descriptor into
+    # the heartbeat at once, so the bytes change and name the launched session.
+    launched = [argv for argv in commands if "--session-id" in argv]
+    assert len(launched) == 1, commands
+    session_id = launched[0][launched[0].index("--session-id") + 1]
+    assert heartbeat.read_bytes() != before
+    assert session_id in heartbeat.read_text(encoding="utf-8"), (
+        "The heartbeat must name the spawned session's id"
+    )
     assert not events(case), "A planning Claude with a reused PID is not a live orchestrator"
 
     # If the new session exits too, spacing must still hold across store reopening.

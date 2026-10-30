@@ -32,13 +32,14 @@ from foragent.state_refresh import IssueRefreshMixin
 from foragent.state_github import GithubCallsMixin
 from foragent.state_logs import LogRetentionMixin
 from foragent.state_runs import RunRecordsMixin
+from foragent.state_talk import TalkRecordsMixin
 
 # The <state>/logs/ size cap; prune_logs deletes the oldest issue logs above it.
 LOG_LIMIT_BYTES = 500 * 1024 * 1024
 
 
 class StateStore(
-    IssueSnapshotMixin, IssueRefreshMixin, RunRecordsMixin, GithubCallsMixin, LocalRecordsMixin,
+    IssueSnapshotMixin, IssueRefreshMixin, RunRecordsMixin, TalkRecordsMixin, GithubCallsMixin, LocalRecordsMixin,
     LogRetentionMixin, StateLocksMixin, StateBase,
 ):
     @classmethod

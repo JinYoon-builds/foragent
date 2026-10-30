@@ -359,7 +359,7 @@ def _implement(
     # availability waits, launch failures and interruptions; acknowledge it
     # only once the implementer returns an ordinary execution result.
     if (retry_default or hint is not None) and classify_result(result) == "normal":
-        consume_hint(ctx.store.root, n)
+        consume_hint(ctx.store.root, n, hint)
     if moved_files and classify_result(result) == "normal":
         ctx.store.update_run(n, moved_files=[])  # named once, after delivery
     _record_skills_used(n, ctx, result)

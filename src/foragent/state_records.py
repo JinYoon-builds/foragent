@@ -1,6 +1,7 @@
 """Frozen records persisted by the local state store."""
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -112,3 +113,59 @@ class Run:
     # A reviewer None means no review.
     executor: str | None = None
     reviewer: str | None = None
+    # Runner waits as wall-clock regions: each open wait by key (its region as far as it has
+    # credited), closed ones merged. ``waited_seconds`` changes by exactly the growth of their
+    # union, so concurrent waits count once whatever order they credit in (D55 addendum).
+    pause_regions: dict[str, list[str]] = field(default_factory=dict)
+    pause_closed: list[list[str]] = field(default_factory=list)
+    # The recorded session is not the running worker's (a fresh thread is starting, or it was
+    # inherited from an earlier run and not resumed yet); nothing may be sent to it.
+    session_stale: bool = False
+
+    # A person's talk terminal is open (fa lanes talk): derived on every read from the talk
+    # events by StateStore (D95), never stored; stall and runtime checks pause meanwhile.
+    @property
+    def talking(self) -> bool:
+        return self.talking_since is not None
+
+    @property
+    def talking_since(self) -> str | None:
+        return self.__dict__.get("_talk_since")
+
+    def wait_regions(self) -> list[tuple[datetime, datetime]]:
+        """Every runner wait's credited region (closed and open) as wall-clock pairs."""
+        pairs = [*self.pause_closed, *self.pause_regions.values()]
+        return [(start, end) for start, end in ((_at(a), _at(b)) for a, b in pairs) if start and end]
+
+    def talk_pause_seconds(self, now: datetime) -> float:
+        """Paused talk time that no runner wait credit already covers, derived up to ``now``.
+
+        The talk regions come from the events (closed, superseded or open until ``now``),
+        so this is never lost, never counted twice and never shrinks as time passes: the
+        run's total pause is ``waited_seconds`` plus this, the length of the union.
+        """
+        talks = [(start, end or now) for start, end in self.__dict__.get("_talk_regions", ())]
+        if not talks:
+            return 0.0
+        waits = self.wait_regions()
+        return max(0.0, union_seconds([*waits, *talks]) - union_seconds(waits))
+
+
+def union_seconds(regions) -> float:
+    """Length of the union of ``(start, end)`` datetime pairs."""
+    total, reach = 0.0, None
+    for start, end in sorted((start, end) for start, end in regions if end > start):
+        if reach is None or start > reach:
+            total += (end - start).total_seconds()
+            reach = end
+        elif end > reach:
+            total += (end - reach).total_seconds()
+            reach = end
+    return total
+
+
+def _at(value: str | None) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except (TypeError, ValueError):
+        return None
