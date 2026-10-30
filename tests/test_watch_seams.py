@@ -84,3 +84,43 @@ def test_sideways_acorn_canonicalizes_styles_and_never_looks_running():
     assert parked == unknown and parked[2] == ("#3 parked", ("art", 252, 240))
     assert watch_art.sideways_acorn(3, "", "question", ascii=True) == [("[#3]", "question")]
     assert watch_art.sideways_acorn(3, "x", "parked", ascii=True) == [("[#3 x]", "next")]
+
+
+def test_open_settings_still_renders_every_section_and_applies_hidden_replacements(tmp_path, monkeypatch):
+    from foragent import watch_layout
+    from foragent.watch_sections import settings as settings_window
+    from datetime import UTC, datetime
+    from foragent.watch_data import Snapshot
+
+    snapshot = Snapshot({"lanes": {}, "active_runs": []}, {}, None, 0, 0, None, [], datetime(2026, 10, 31, tzinfo=UTC))
+    config = Config()
+    calls = []
+
+    def section(name, order, row, replaces=()):
+        def render(*args, **context):
+            calls.append(name)
+            return [[(row, "")]]
+        return SimpleNamespace(__name__="foragent.watch_sections." + name, ORDER=order, REPLACES=replaces,
+                               GAP=False, GAP_AFTER=False, render=render)
+
+    monkeypatch.setattr(watch_layout, "_sections", lambda: [
+        section("squirrels", 1, "HEAD"), section("hidden", 2, "HIDDEN", ("foragent.watch_sections.help",)),
+        section("help", 3, "HELP")])
+    monkeypatch.setattr(settings_window, "render", lambda *a, **k: [[("WINDOW", "")]])
+    state = {}
+    settings_window.open_window(state)
+    frame = watch_layout._frame(snapshot, config, tmp_path, tick=0, width=40, selected=None,
+                                now=snapshot.captured_at, state=state)
+    assert {"squirrels", "hidden", "help"} <= set(calls)  # Hidden sections still draw once.
+    assert [''.join(v for v, _ in line).strip() for line in frame] == ["HEAD", "WINDOW"]
+
+
+def test_named_styles_beyond_the_terminal_pairs_keep_their_attributes():
+    curses, initialized = fake_curses(colors=8, pairs=9)
+    styles = {}
+    palette = watch_terminal._Palette(curses, styles)
+    assert palette.attribute("question") == 8 << 8  # Pair 8 exists.
+    assert palette.attribute("next") == curses.A_DIM  # Pair 9 does not: no init, still dim.
+    assert palette.attribute("separator") == curses.A_DIM
+    assert palette.link("next", curses.A_DIM) == "\x1b[0m\x1b[2m"
+    assert initialized == [(8, curses.COLOR_RED, -1)]

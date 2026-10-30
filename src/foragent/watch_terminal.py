@@ -83,6 +83,10 @@ class _Palette:
         if not self.enabled:
             styles.update({name: extra for name, (*_, extra) in self.named.items()})
 
+    def free(self, index: int) -> bool:
+        """Whether pair ``index`` exists; COLOR_PAIRS exists once start_color has run."""
+        return index < getattr(self.curses, "COLOR_PAIRS", 0)
+
     def colour(self, value: int | None) -> int:
         if value is None:
             return -1
@@ -94,8 +98,7 @@ class _Palette:
             return 0
         key = self.colour(foreground), self.colour(background)
         if key not in self.allocated:
-            # COLOR_PAIRS exists once start_color has run; without it no pair is free.
-            if self.next >= getattr(self.curses, "COLOR_PAIRS", 0):
+            if not self.free(self.next):
                 return 0
             self.curses.init_pair(self.next, *key)
             self.allocated[key] = self.next
@@ -112,9 +115,12 @@ class _Palette:
             elif style in self.named:
                 index, extended, base, extra = self.named[style]
                 ink = extended if self.extended else base
-                curses.init_pair(index, ink, -1)
-                self.styles[style] = curses.color_pair(index) | (0 if self.extended else extra)
-                self.inks[style] = ink, -1
+                if self.free(index):
+                    curses.init_pair(index, ink, -1)
+                    self.styles[style] = curses.color_pair(index) | (0 if self.extended else extra)
+                    self.inks[style] = ink, -1
+                else:
+                    self.styles[style] = extra  # No such pair: the text keeps its dim look.
         attribute = style_attribute(style, styles=self.styles, pair=self.pair)
         if isinstance(style, tuple):
             if self.enabled and attribute:

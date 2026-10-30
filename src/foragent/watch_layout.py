@@ -138,8 +138,6 @@ def _frame(
     # Declarations are unconditional: a section replaces its targets even when it draws
     # nothing or the settings window hides it. Absent names are ignored.
     replaced = {name for section in discovered for name in getattr(section, "REPLACES", ())}
-    # The open settings window (#173) replaces everything between the header and the help line.
-    sections = settings_window.shown_sections(discovered, state)
     Hit = tuple[int, int, int, int, Any]
     Mark = tuple[int, int, str | None]  # (row, issue number, its lane; None when not foldable)
     rendered: list[tuple[ModuleType, list[Line], list[Hit], list[Mark]]] = []
@@ -154,10 +152,15 @@ def _frame(
                                height=height, state=state, **extra)
         return section, list(lines), own, marks
 
-    for section in sections:
+    for section in discovered:
         rendered.append(draw(section))
-    # Every section drew once in ORDER; replaced ones now leave no rows, hits, marks or roles.
+    # Every discovered section drew once in ORDER; replaced ones now leave no rows, hits,
+    # marks or roles. Only then does the open settings window (#173) keep the header, its
+    # window and the help line among the surviving contributions.
     rendered = [item for item in rendered if item[0].__name__ not in replaced]
+    surviving = {id(item[0]): item for item in rendered}
+    rendered = [surviving.get(id(section)) or draw(section)
+                for section in settings_window.shown_sections([item[0] for item in rendered], state)]
     # From its SIDE width on, a section (the orchestrator box) stands to the right
     # of the sections between the lane rows and itself.
     side = next((index for index, (section, *_) in enumerate(rendered) if getattr(section, "SIDE", None)), None)
