@@ -84,8 +84,9 @@ before-and-after output, and what shipped and what was reverted.
    scheduler.py and run_publish.py splits: every module-level name of the old module stays
    importable from it, and existing patches on the old module still reach the code (the new modules
    look names up through the facade at call time).
-2. Each split order carries a line-limit acceptance test and reserves the file with `exclusive:`
-   while it runs.
+2. Split by responsibility, not by size: each new module owns one concern. Justify the split with
+   measured facts from `fa orch facts` (overlap waits on the file, or files that change together),
+   and reserve the file with `exclusive:` while the split order runs.
 3. Last step: list the open issues whose Files name a moved path and update their Files (the
    orchestrator does this through order edits and a preread). The old module names stay importable
    through the facade until those issues merge.
