@@ -10,6 +10,7 @@ MESSAGES = {
         "scorecard_binding": "Binding constraint now: {now}",
         "scorecard_binding_changed": "Binding constraint now: {now} (changed from {before} the previous day)",
         "presence_statusline": "🐿 {lanes} lanes working · ✋ {turns} · {merged} merged today",
+        "presence_stalled_requests": "Stuck requests: {count} (over {hours} h) · fa orch inbox",
         "presence_session_start": "since the last report: {merged} merges · ✋ {turns} · /fa for the report",
     },
     "ko": {
@@ -20,6 +21,7 @@ MESSAGES = {
         "scorecard_binding": "지금 묶는 제약: {now}",
         "scorecard_binding_changed": "지금 묶는 제약: {now} (전날 {before}에서 바뀜)",
         "presence_statusline": "🐿 레인 {lanes} 일하는 중 · ✋ {turns} · 오늘 머지 {merged}",
+        "presence_stalled_requests": "요청 {count}개가 {hours}시간 넘게 멈춰 있어요 · fa orch inbox",
         "presence_session_start": "지난 보고 이후 머지 {merged} · ✋ {turns} · /fa 로 보고 보기",
     },
 }

@@ -122,3 +122,69 @@ def test_project_without_a_repository_still_gets_its_first_minute_squirrel(proje
     assert presence.squirrel(project, "no-repo", started + timedelta(seconds=59)) is not None
     assert presence.squirrel(project, "no-repo", started + timedelta(seconds=60)) is None
     assert presence.squirrel(project, "other-session", started) is None
+
+
+STALL_BASE = "🐿 0 lanes working · ✋ 0 · 0 merged today"
+
+
+@pytest.fixture
+def stall_store(tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+
+    from foragent.state import StateStore
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.delenv("FORAGENT_ROLE", raising=False)
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / ".foragent.yml").write_text(yaml.safe_dump({"repo": "offline/stall"}), encoding="utf-8")
+    now = datetime(2026, 10, 30, 12, tzinfo=UTC)
+    return root, StateStore.for_repo("offline/stall", now=lambda: now), now
+
+
+def _stalled_row(store, now, notes):
+    import json
+    from datetime import timedelta
+
+    from foragent import orch_inbox
+
+    row = orch_inbox.add_request(store, "planning", "opaque")
+    path = store.root / "inbox" / "requests" / f"{row['id']}.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record.update(status="processing", created_at=(now - timedelta(minutes=10)).isoformat(), notes=notes)
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_a_malformed_note_is_ignored_on_its_own(stall_store):
+    from datetime import timedelta
+
+    from foragent import presence
+
+    root, store, now = stall_store
+    at = (now - timedelta(hours=2)).isoformat()
+    _stalled_row(store, now, ["junk", {"status": "processing"}, {"at": at},
+                              {"status": "processing", "at": at}, {"at": now.isoformat()}])
+    assert presence.statusline_segment(root, now) == STALL_BASE + " · Stuck requests: 1 (over 2 h) · fa orch inbox"
+
+
+def test_the_request_status_decides_even_after_a_note_naming_another_status(stall_store):
+    from datetime import timedelta
+
+    from foragent import presence
+
+    root, store, now = stall_store
+    _stalled_row(store, now, [{"status": "processing", "at": (now - timedelta(hours=4)).isoformat()},
+                              {"status": "done", "at": (now - timedelta(hours=3)).isoformat()}])
+    assert presence.statusline_segment(root, now) == STALL_BASE + " · Stuck requests: 1 (over 4 h) · fa orch inbox"
+
+
+def test_an_unreadable_requests_box_leaves_out_only_the_stall_fact(stall_store):
+    from datetime import timedelta
+
+    from foragent import presence
+
+    root, store, now = stall_store
+    _stalled_row(store, now, [{"status": "processing", "at": (now - timedelta(hours=4)).isoformat()}])
+    store.start_run(7, branch="foragent/issue-7", worktree=store.worktree_path(7), lane="main")
+    (store.root / "inbox" / "requests" / "r9.json").write_text("{not json", encoding="utf-8")
+    assert presence.statusline_segment(root, now) == "🐿 1 lanes working · ✋ 0 · 0 merged today"
