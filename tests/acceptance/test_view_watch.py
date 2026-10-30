@@ -13,43 +13,27 @@ def test_once_frame_contains_lane_queue_done_stall_and_recent_events(
     git_history, tmp_path, monkeypatch, capsys, language, words,
 ):
     import json
-    from functools import partial
-
     from foragent import watch
     from foragent.scheduler import tick
     from test_orch_review_handoff import tick_context
     from test_view_status import status_case
-
-    case, main = status_case(git_history, tmp_path, monkeypatch, language=language)
-    case.tracker.add_issue(5, "Next API task", labels=["approved", "ready", "lane:api"])
-    for number in (10, 20):
-        case.tracker.add_issue(number, f"Finished {number}", labels=["lane:api"], state="closed")
-        pr = case.tracker.create_pr(head=f"foragent/issue-{number}", base="main", title=f"Finished {number}",
-                                    body=f"Closes #{number}")
-        case.tracker.merge_pr(pr, expected_head_sha=case.tracker.pr_head_sha(pr))
-        case.store.start_run(number, branch=f"foragent/issue-{number}",
-                             worktree=case.store.worktree_path(number), lane="api")
-        case.store.finish_run(number, outcome="merged")
-    case.tracker.add_issue(99, "Current order")
-    for number in (1, 5, 10, 20):
-        case.tracker.set_parent(number, 99)
-    tick(tick_context(case, start_runs=False))
-    events = [{"at": case.clock[0].isoformat(), "issue": 2, "kind": "retry", "summary": f"handled-event-{i}"}
-              for i in range(7)]
-    (case.store.root / "orch-events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
-    # Check the full summary; the viewport may hide recent events to keep worker rows visible.
-    monkeypatch.setattr(watch, "_frame", partial(watch._frame, height=None))
-    assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
-    output = capsys.readouterr().out
-    row = _api_row(output)
-    assert "✓ 2" in output
-    assert "○" in row and "11" in row and words[1] in row
-    queued = [line for line in _lane_rows(output) if "🧩 Web" in line and "#4" in line.split()]
-    assert len(queued) == 1 and queued[0].lstrip().startswith(("⏳", "[.]")), output
-    assert "handled-event-6" in output and "handled-event-0" not in output and "handled-event-1" not in output
-    assert "2/4" in output and "1" in output
-    assert all(word in output.lower() for word in words)
-    assert "\x1b[" not in output
+    case,main=status_case(git_history,tmp_path,monkeypatch,language=language)
+    case.tracker.add_issue(5,'Next API task',labels=['approved','ready','lane:api'])
+    for number in (10,20):
+        case.tracker.add_issue(number,f'Finished {number}',labels=['lane:api'],state='closed')
+        case.store.start_run(number,branch=f'foragent/issue-{number}',worktree=case.store.worktree_path(number),lane='api')
+        case.store.finish_run(number,outcome='merged')
+    tick(tick_context(case,start_runs=False))
+    events=[{'at':case.clock[0].isoformat(),'issue':2,'kind':'retry','summary':f'handled-event-{i}'} for i in range(7)]
+    (case.store.root/'orch-events.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in events))
+    assert main(['gate','watch','--once','--repo-root',str(case.root)])==0
+    output=capsys.readouterr().out
+    assert all(f'#{n}' in output for n in (1,2,3,4,5))
+    assert ('오늘 이슈 2개 머지' if language=='ko' else 'today 2 issues merged') in output
+    assert '▌' in output and ('질문' if language=='ko' else 'question') in output
+    assert 'handled-event-6' not in output, 'the fixed r56 summary replaces the raw event table'
+    assert watch.recent_events(case.store)[0]['summary']=='handled-event-6', 'event facts remain available locally'
+    assert '\x1b[' not in output
 
 
 def test_agent_detail_render_exposes_config_and_only_first_three_memory_lines(tmp_path):
@@ -68,3 +52,4 @@ def test_agent_detail_render_exposes_config_and_only_first_three_memory_lines(tm
     assert all(value in text for value in ("Server", "api/**", "claude", "test-model", "testing-strategy",
                                            "2", "First lesson", "Second lesson", "Third lesson"))
     assert "Fourth must stay hidden" not in text
+

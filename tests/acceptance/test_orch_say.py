@@ -51,7 +51,8 @@ def test_orch_say_commands_keep_raw_summary_and_render_person_line(
     assert event["say"] == say
     assert event["summary"] and event["summary"] != say
     frame = event_frame(case, main, capsys)
-    assert say in frame
+    from test_lane_m2_contract import bubble
+    assert "기획 세션" in bubble(frame) or "작업하고 있어요" in bubble(frame), "r56 summary replaces the latest-say header"
     assert event["summary"] not in frame
     assert "queued implementation retry" not in frame
 
@@ -60,7 +61,8 @@ def test_orch_say_missing_say_renders_localized_kind_and_issue(git_history, tmp_
     case, main = speaking_case(git_history, tmp_path, monkeypatch)
     assert main(["orch", "retry", "1"]) == 0
     frame = event_frame(case, main, capsys)
-    assert any("#1" in line and "다시 맡겼어요" in line for line in frame.splitlines())
+    from test_lane_m2_contract import bubble
+    assert "도토리를 누르면 무슨 일인지 알려 줄게요." in bubble(frame) and "#1" in frame
     assert "queued implementation retry" not in frame
 
 

@@ -72,7 +72,7 @@ def test_progress_words_all_open_orders_share_one_bar_and_totals_do_not_follow_f
     for first in (90007, 90100, 90205):
         snapshot.status["active_runs"] = [{"number": first, "lane": "api", "attempts": 1}]
         frame = plain_frame(render_frame(snapshot, case.config, case.root, width=100))
-        assert frame.count("12/41") == 1
+        assert frame.count("33% · 이슈 43개 중 14개 완료") == 1
         bars = [line for line in frame.splitlines() if re.search(r"[█▓░]{2,}", line)]
         assert len(bars) == 1, bars
         assert all(value not in frame for value in ("7/20", "0/8", "5/13", "14/43"))
@@ -89,7 +89,7 @@ def test_progress_words_eta_is_clock_time_from_three_recent_merges_for_all_remai
     case = progress_case(git_history, tmp_path, monkeypatch)
     snapshot, calls = local_snapshot(case, monkeypatch, capsys)
     frame = plain_frame(render_frame(snapshot, case.config, case.root, width=100, now=case.clock[0]))
-    assert "12/41" in frame
+    assert "33% · 이슈 43개 중 14개 완료" in frame
     assert calls == []
 
 
@@ -102,7 +102,7 @@ def test_progress_words_no_recent_merges_does_not_invent_an_end_time(
     case = progress_case(git_history, tmp_path, monkeypatch, recent=0)
     snapshot, calls = local_snapshot(case, monkeypatch, capsys)
     frame = plain_frame(render_frame(snapshot, case.config, case.root, width=100))
-    assert "12/41" in frame and calls == []
+    assert "33% · 이슈 43개 중 14개 완료" in frame and calls == []
 
 
 def test_progress_words_recorded_quota_includes_percentage_reset_and_words(
@@ -117,8 +117,8 @@ def test_progress_words_recorded_quota_includes_percentage_reset_and_words(
     # The runner is fake; observation still uses the real, guarded gh boundary.
     snapshot, calls = local_snapshot(case, monkeypatch, capsys)
     frame = plain_frame(render_frame(snapshot, case.ctx.config, case.root, width=160))
-    quota = next((line for line in frame.splitlines() if "쿼터" in line and "Codex 67%" in line), "")
-    assert quota, frame
-    assert "리셋" in quota
-    assert datetime.fromtimestamp(CODEX_RESET, UTC).astimezone().strftime("%H:%M") in frame
+    quota = frame.splitlines()[-2]
+    assert "Codex 67%" in quota and "Claude" in quota
+    assert datetime.fromtimestamp(CODEX_RESET, UTC).astimezone().strftime("%H:%M") in quota
+    assert "s 설정" in frame.splitlines()[-1] and "m 사용량 모드" in frame.splitlines()[-1]
     assert calls == []

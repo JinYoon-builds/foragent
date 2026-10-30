@@ -454,7 +454,7 @@ def test_launchd_preserves_stable_symlink_path_in_generated_plist(installation, 
     assert launchd.fa_executable() == shim
     job = launchd.Launchd(tmp_path, repo="owner/repo", home=tmp_path,
                           executable=shim if via == "explicit" else None)
-    assert plistlib.loads(job.plist())["ProgramArguments"][0] == str(shim)
+    assert launchd.gate_command(plistlib.loads(job.plist())["ProgramArguments"])[0] == str(shim)
 
 
 def test_windows_retains_in_place_install_fallback(tmp_path, monkeypatch):
