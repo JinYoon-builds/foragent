@@ -20,6 +20,8 @@ SESSIONS = "presence-sessions"
 SQUIRREL_FOR = timedelta(seconds=60)
 # The hook drops start records older than this; a squirrel never needs them again.
 SESSION_KEEP = timedelta(days=1)
+# A processing request untouched by a status change for longer than this is stuck.
+STALL_AFTER = timedelta(minutes=60)
 
 
 def project_root(start: Path) -> Path | None:
@@ -91,6 +93,58 @@ def _project(cwd: Path):
     return config, (StateStore.for_repo(repo) if repo else None)
 
 
+def _planning_session(cwd: Path, store) -> bool:
+    """A planning session: no FORAGENT_ROLE at all (even empty), a nameable store, outside its worktrees."""
+    import os
+
+    if "FORAGENT_ROLE" in os.environ or store is None:
+        return False
+    return not cwd.resolve().is_relative_to((store.root / "worktrees").resolve())
+
+
+def _parse_at(value) -> datetime | None:
+    """A timezone-aware time from an ISO string, else None."""
+    try:
+        at = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return at if at.tzinfo else None
+
+
+def _processing_since(row: dict):
+    """When this processing request last moved into processing: a datetime, or None when unreadable.
+
+    Only a note whose status differs from the one before it is a transition, so a
+    repeated processing note does not reset the age. A malformed note (not an object,
+    or missing status or at) is ignored on its own. Without a transition into
+    processing, the creation time counts; updated_at never does.
+    """
+    selected = row.get("created_at")
+    previous = "new"
+    notes = row.get("notes")
+    for note in notes if isinstance(notes, list) else ():
+        if not isinstance(note, dict) or "status" not in note or "at" not in note:
+            continue
+        if note["status"] != previous and note["status"] == "processing":
+            selected = note["at"]
+        previous = note["status"]
+    return _parse_at(selected)
+
+
+def stalled_requests(store, now: datetime) -> tuple[int, int] | None:
+    """(count, whole hours since the oldest) of processing requests stuck over STALL_AFTER, else None.
+
+    Every source counts; a request whose selected time is unreadable is skipped alone.
+    """
+    from foragent.orch_inbox import requests
+
+    since = [_processing_since(row) for row in requests(store) if row.get("status") == "processing"]
+    stuck = [at for at in since if at is not None and now - at > STALL_AFTER]
+    if not stuck:
+        return None
+    return len(stuck), int((now - min(stuck)) // timedelta(hours=1))
+
+
 def renew_planning(cwd: Path) -> bool:
     """Keep this planning session's ``fa plan heartbeat`` fresh from the statusline (#970).
 
@@ -98,20 +152,13 @@ def renew_planning(cwd: Path) -> bool:
     inside the gate's worktrees. Only an existing heartbeat older than a minute is
     rewritten; nothing else, such as the session start record, is touched.
     """
-    import os
-
     from foragent.orch_inbox import renew_plan_heartbeat
 
-    if "FORAGENT_ROLE" in os.environ:
-        return False
     try:
         project = _project(cwd)
-        if project is None or project[1] is None:
+        if project is None or not _planning_session(cwd, project[1]):
             return False
-        store = project[1]
-        if cwd.resolve().is_relative_to((store.root / "worktrees").resolve()):
-            return False
-        return renew_plan_heartbeat(store)
+        return renew_plan_heartbeat(project[1])
     except Exception:  # The user's statusline must keep working whatever the local state holds.
         return False
 
@@ -127,9 +174,18 @@ def statusline_segment(cwd: Path, now: datetime) -> str | None:
         config, store = project
         # No local state yet (never run here, or no repo set): every count is zero.
         lanes, turns, merged = counts(store, now) if store and store.root.is_dir() else (0, 0, 0)
-        return text("presence_statusline", config.language, lanes=lanes, turns=turns, merged=merged)
+        segment = text("presence_statusline", config.language, lanes=lanes, turns=turns, merged=merged)
     except Exception:  # The user's statusline must keep working whatever the local state holds.
         return None
+    try:
+        # Only the planning session, which handles requests, is told about stuck ones.
+        stalled = stalled_requests(store, now) if _planning_session(cwd, store) and store.root.is_dir() else None
+        if stalled is None:
+            return segment
+        count, hours = stalled
+        return segment + " · " + text("presence_stalled_requests", config.language, count=count, hours=hours)
+    except Exception:  # An unreadable requests box leaves out only this fact.
+        return segment
 
 
 def _sessions() -> Path:
