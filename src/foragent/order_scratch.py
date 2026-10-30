@@ -77,6 +77,16 @@ def build(git: GitRepo, base: str, tree: Path, overlay: dict[str, bytes]) -> dic
     return manifest
 
 
+def protected(git: GitRepo, root: Path, state: Path) -> tuple[Path, ...]:
+    """Places a writer must not reach: the checkout, its (common) Git directory and the state."""
+    places = [root, state]
+    try:
+        places.append(Path(git._call(["rev-parse", "--path-format=absolute", "--git-common-dir"]).strip()))
+    except GitError:
+        pass
+    return tuple(dict.fromkeys(place.resolve() for place in places))
+
+
 def stamps(tree: Path, names) -> dict[str, tuple[int, int, int]]:
     """Each file's inode, change time and modification time, taken before the writer starts.
 
@@ -150,8 +160,12 @@ def changes(git: GitRepo, tree: Path, manifest: dict[str, tuple[str, str]], acce
         path = tree / name
         directory = next((str(parent) for parent in reversed(PurePosixPath(name).parents)
                           if str(parent) + "/" in ignored), None)
-        if name not in manifest and directory is not None and not any(
-                path.resolve().is_relative_to(place.resolve()) for place in protected):
+        # The exemption covers tool output only: anything there that reaches a protected place
+        # (by symlink) or is shared test configuration inside the acceptance directory is refused.
+        target = path.resolve()
+        if name not in manifest and directory is not None and (target.is_relative_to(root) or not any(
+                target.is_relative_to(place.resolve()) for place in protected)) and not (
+                PurePosixPath(name).is_relative_to(inside) and PurePosixPath(name).name in SHARED_TEST_CONFIG):
             output.add(directory)
         elif (name in manifest or found.get(name, ("",))[0] == "120000"
                 or not PurePosixPath(name).is_relative_to(inside)

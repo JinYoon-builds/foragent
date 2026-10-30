@@ -4,9 +4,13 @@ Runtime dependencies resolve through foragent.watch to preserve its patch points
 """
 
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
+from pathlib import Path
 from typing import Any
 
 from foragent import orch_inbox
@@ -66,6 +70,27 @@ class Snapshot:
     # The usage line's facts, read once per refresh (``meter``): usage.json, the machine's
     # running runs and budget, the effective Claude mode and memory pressure. Empty when not collected.
     meter: dict[str, Any] = field(default_factory=dict)
+    # Per-lane, per-role, per-waiting-issue and per-parked-issue facts for the lane blocks
+    # and their explanations. Empty until a collector fills them; manual snapshots stay safe.
+    lane_facts: dict[str, dict] = field(default_factory=dict)
+    role_facts: dict[str, dict] = field(default_factory=dict)
+    waiting_facts: dict[int, dict] = field(default_factory=dict)
+    park_facts: dict[int, dict] = field(default_factory=dict)
+
+
+# The checkout a refresh reads root-dependent facts under. watch.run binds it around its
+# five-argument collect call, so the facade's patch point keeps its shape.
+COLLECTION_ROOT: ContextVar[Path | None] = ContextVar("COLLECTION_ROOT", default=None)
+
+
+@contextmanager
+def collection_root(root: Path) -> Iterator[Path]:
+    """Bind the checkout root for collect calls in this context, restoring it afterwards."""
+    token = COLLECTION_ROOT.set(root)
+    try:
+        yield root
+    finally:
+        COLLECTION_ROOT.reset(token)
 
 
 def meter(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
@@ -153,12 +178,17 @@ def evidence(store: StateStore, numbers: list[int], now: datetime) -> tuple[dict
 
 def collect(
     status: dict[str, Any], tracker: Tracker, store: StateStore, config: Config, now: datetime,
+    *, repo_root: Path | None = None,
 ) -> Snapshot:
     """Supplement the shared status JSON with order edges and completions from local records.
 
-    The tracker is accepted for compatibility; refreshes never read it.
+    The tracker is accepted for compatibility; refreshes never read it. ``repo_root`` is
+    the checkout for root-dependent facts: an explicit value wins, else the bound
+    COLLECTION_ROOT; unbound it stays None (never the cwd or the state folder's parent).
     """
     from foragent import watch
+
+    repo_root = repo_root if repo_root is not None else COLLECTION_ROOT.get()
 
     rows = {row["number"]: row for row in store.local_issues()}
     issues = {number: Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])

@@ -2,7 +2,8 @@
 
 render_frame fills a caller-owned layout with hit boxes; coordinates are
 zero-based screen cells. Handlers change a caller-owned state: ``issue`` is the
-open box's number (or None), ``scroll`` the zero-based first visible frame row,
+open box's number (or None), ``explanation_target`` the selected ('role', name) or
+('squirrel', slug) to explain (or None), ``scroll`` the zero-based first visible frame row,
 ``unfolded`` the lanes showing all their rows. Each frame records ``length``,
 ``rows`` (issue rows as (y, number)) and, on a screen, ``height``. Runtime
 dependencies resolve through foragent.watch to preserve its patch points.
@@ -98,6 +99,12 @@ def handle_mouse(
     if button != "left":
         return
     target = watch.hit_test(layout, x, y)
+    if isinstance(target, tuple) and target[0] in EXPLAINED:
+        # The same target closes its explanation; another one switches to it.
+        if state.pop("explanation_target", None) != target:
+            state["explanation_target"] = target
+        return
+    state.pop("explanation_target", None)  # Any other click clears the selection, then acts.
     if target == ("orchestrator", None):
         watch.switch_to_orchestrator(store)
     elif isinstance(target, tuple) and target[0] == "acorn":
@@ -106,6 +113,10 @@ def handle_mouse(
         _open(state, None if state.get("issue") == target[1] else target[1], store, row)
     elif isinstance(target, tuple) and target[0] == "more":
         toggle_lane(state, target[1])
+
+
+# Click targets that select an explanation instead of acting.
+EXPLAINED = frozenset({"role", "squirrel"})
 
 
 def toggle_lane(state: dict[str, Any], slug: str) -> None:
@@ -120,7 +131,8 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
 
     j/k (and the arrows) move one row, Enter opens the highlighted row's box, f folds
     its lane, a unfolds every lane when any is folded (else folds all), o switches to
-    the orchestrator, m flips the Claude quota mode (keep/burn), x or Esc closes the box (Esc quits when none is open). While a
+    the orchestrator, m flips the Claude quota mode (keep/burn), x or Esc closes the selected
+    explanation, else the box (Esc quits when neither is open). While a
     box is open, Enter, f, a, m and s do nothing. s opens the settings window (#173); while it is
     open it takes every key but q and m. ``confirm(message)`` approves a team change; without it the
     window asks y/n itself. ``repo_root`` is where the window saves.
@@ -135,7 +147,9 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
     if settings_window.is_open(state) and not (key == "m" and state.get("settings_prompt") is None):
         settings_window.handle(key, store, config, state, repo_root, confirm)
         return False
-    if key == "esc":
+    if key in ("esc", "x") and state.get("explanation_target") is not None:
+        del state["explanation_target"]
+    elif key == "esc":
         if not is_open:
             return True
         _open(state, None, store)
@@ -153,6 +167,7 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
     elif is_open:
         pass
     elif key == "s":
+        state.pop("explanation_target", None)
         settings_window.open_window(state)
     elif key == "m":
         # The same flip as `fa quota mode`: from the effective mode to the other one.

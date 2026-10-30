@@ -104,7 +104,7 @@ def _envelope(message: str) -> dict | None:
     return None
 
 
-def _judge(result, tree: Path, git: GitRepo, manifest: dict, config: Config, root: Path,
+def _judge(result, tree: Path, git: GitRepo, manifest: dict, config: Config, protected: tuple[Path, ...],
            before: dict | None = None) -> dict:
     """Facts of one writer attempt: what it wrote, what was refused, and the resulting status."""
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
@@ -114,7 +114,7 @@ def _judge(result, tree: Path, git: GitRepo, manifest: dict, config: Config, roo
         return {"status": "interrupted", "reason": say(
             "prepare_failed", code=result.exit_code, timeout=", timed out" if result.timed_out else "",
             log=result.log_path)}
-    candidates, refused, ignored = order_scratch.changes(git, tree, manifest, config.acceptance_dir, (root,), before)
+    candidates, refused, ignored = order_scratch.changes(git, tree, manifest, config.acceptance_dir, protected, before)
     written, questions = {}, [say("prepare_refused_path", path=name, directory=config.acceptance_dir)
                               for name in refused]
     for name, data in candidates.items():
@@ -178,7 +178,10 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
         lane_config, overlay = setup.lane_context(plan, item, config, root)
         manifest = order_scratch.build(git, base, tree, overlay | _references(plan, item))
         start = setup.writer_setup(lane_config, item, tree)
-        options = start.options | setup.permissions(start.executor, tree, root, config.acceptance_dir, tree.parent)
+        # Writes must never reach the checkout, its Git directory or this command's state.
+        protected = order_scratch.protected(git, root, path.parent.parent)
+        options = start.options | setup.permissions(start.executor, tree, protected, config.acceptance_dir,
+                                                    tree.parent)
         facts.update(executor=start.executor, model=start.model, options=start.options,
                      skills_missing=start.missing_skills)
         if start.missing_skills:
@@ -190,7 +193,7 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
         result = executor_for(start.executor).run(worktree=tree, prompt=prompt, model=start.model,
                                                   timeout_s=WRITER_TIMEOUT_S, log_path=log, **options)
         facts.update(exit_code=result.exit_code, timed_out=result.timed_out, session_id=result.session_id)
-        outcome = _judge(result, tree, git, manifest, config, root, before)
+        outcome = _judge(result, tree, git, manifest, config, protected, before)
     except (GitError, OSError, ValueError) as exc:
         outcome = {"status": "interrupted", "reason": say("prepare_error", error=" ".join(str(exc).split())[:300])}
     finally:

@@ -75,19 +75,33 @@ def _rule(tool: str, path: Path) -> str:
     return f"{tool}(//{path.as_posix().lstrip('/')})"
 
 
-def permissions(executor: str, tree: Path, root: Path, acceptance_dir: str, directory: Path) -> dict:
-    """Executor options that confine the writer to the tree (Claude only; see the module note)."""
+def permissions(executor: str, tree: Path, protected: tuple[Path, ...], acceptance_dir: str,
+                directory: Path) -> dict:
+    """Executor options that confine the writer to the tree, ignoring any inherited authority.
+
+    Codex runs without the user's config and execpolicy rules, so no configured writable
+    root or network access widens its workspace-write sandbox. Claude loads only the
+    tree's project settings plus this file, no user or local settings and no MCP server;
+    it may Edit only the tree's acceptance directory and its sandboxed shell may write only
+    in the tree, never in a ``protected`` directory (checkout, Git directory, state) or the
+    tree's own Claude settings, with no network.
+    """
     if executor != "claude":
-        return {}
+        return {"isolated": True}
     tests = tree / acceptance_dir.strip("/")
+    # The state directory holds the tree itself; the sandbox already keeps shell writes in the tree.
+    denied = [place for place in protected if not tree.resolve().is_relative_to(place)] + [tree / ".claude"]
     settings = {
         "permissions": {
             "allow": ["Read", "Glob", "Grep", "Bash", _rule("Edit", tests / "**"), _rule("Write", tests / "**")],
-            "deny": ["WebFetch", "WebSearch", _rule("Edit", root / "**"), _rule("Write", root / "**")],
+            "deny": ["WebFetch", "WebSearch", *(_rule(tool, place / "**") for place in denied
+                                                for tool in ("Edit", "Write"))],
         },
-        "sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False},
+        "sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
+                    "filesystem": {"allowWrite": [str(tree)], "denyWrite": [str(place) for place in denied]},
+                    "network": {"allowedDomains": []}},
         "enableAllProjectMcpServers": False,
     }
     path = directory / "claude-settings.json"
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return {"settings_path": path, "permission_mode": "dontAsk"}
+    return {"settings_path": path, "permission_mode": "dontAsk", "setting_sources": "project"}

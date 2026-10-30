@@ -37,14 +37,19 @@ def test_only_new_files_under_the_acceptance_directory_are_candidates(git_histor
     (tree / ".venv/bin").mkdir(parents=True)
     (tree / ".venv/bin/python").symlink_to("/usr/bin/python3")
     (tree / ".venv/checkout").symlink_to(tmp_path / "checkout")
+    # The state directory holds the tree; a link from tool output to its records still escapes.
+    (tree / ".venv/state").symlink_to(tmp_path / "scratch" / "records.json")
+    (tree / ".venv/inside").symlink_to(tree / "tests")
+    (tree / "tests/acceptance/__pycache__/conftest.py").write_text("pytest_plugins = []\n")
     (tree / "src").mkdir()
     (tree / "src/_build.py").write_text("SOURCE = 1\n")
     (tree / "tests/acceptance/run.log").write_text("log\n")
     candidates, refused, ignored = order_scratch.changes(
-        git, tree, manifest, "tests/acceptance/", (tmp_path / "checkout",))
+        git, tree, manifest, "tests/acceptance/", (tmp_path / "checkout", tmp_path / "scratch"))
     assert candidates == {"tests/acceptance/test_new.py": b"assert False\n",
                           "tests/acceptance/helpers/fake.py": b"TABLE = []\n"}
-    assert refused == [".venv/checkout", "app.py", "src/_build.py", "tests/acceptance/conftest.py",
+    assert refused == [".venv/checkout", ".venv/state", "app.py", "src/_build.py",
+                       "tests/acceptance/__pycache__/conftest.py", "tests/acceptance/conftest.py",
                        "tests/acceptance/run.log", "tests/acceptance/test_link.py",
                        "tests/acceptance/test_old.py"]
     assert ignored == [".venv", "tests/acceptance/__pycache__"]
@@ -114,16 +119,37 @@ def test_a_proposed_lane_gets_the_agent_and_library_skills_add_lane_would_instal
     assert start.missing_skills == [] and ".claude/skills/tdd/SKILL.md" in start.notes
 
 
-def test_claude_writer_may_edit_only_the_tree_acceptance_directory(tmp_path):
-    tree, root = tmp_path / "attempt/tree", tmp_path / "checkout"
-    assert order_prepare_setup.permissions("codex", tree, root, "tests/acceptance/", tmp_path) == {}
-    options = order_prepare_setup.permissions("claude", tree, root, "tests/acceptance/", tmp_path)
-    assert options["permission_mode"] == "dontAsk"
+def test_writers_ignore_inherited_authority_and_may_edit_only_the_tree_tests(tmp_path):
+    state, root, gitdir = tmp_path / "state", tmp_path / "checkout", tmp_path / "checkout/.git"
+    tree = state / "prepare/o/a/attempt-1/tree"
+    protected = (root, state, gitdir)
+    assert order_prepare_setup.permissions("codex", tree, protected, "tests/acceptance/", tmp_path) == {"isolated": True}
+    options = order_prepare_setup.permissions("claude", tree, protected, "tests/acceptance/", tmp_path)
+    assert options["permission_mode"] == "dontAsk" and options["setting_sources"] == "project"
     settings = json.loads(options["settings_path"].read_text())
     edits = [rule for rule in settings["permissions"]["allow"] if rule.startswith(("Edit", "Write"))]
     assert edits == [f"Edit(/{tree}/tests/acceptance/**)", f"Write(/{tree}/tests/acceptance/**)"]
-    assert f"Edit(/{root}/**)" in settings["permissions"]["deny"]
-    assert settings["sandbox"]["enabled"] is True and settings["sandbox"]["allowUnsandboxedCommands"] is False
+    denied = settings["permissions"]["deny"]
+    assert f"Edit(/{root}/**)" in denied and f"Write(/{gitdir}/**)" in denied and f"Edit(/{tree}/.claude/**)" in denied
+    assert not any(str(state) + "/**" in rule for rule in denied), "the state directory holds the tree"
+    sandbox = settings["sandbox"]
+    assert sandbox["enabled"] is True and sandbox["allowUnsandboxedCommands"] is False
+    assert sandbox["filesystem"]["allowWrite"] == [str(tree)] and sandbox["network"]["allowedDomains"] == []
+    assert str(root) in sandbox["filesystem"]["denyWrite"]
+
+
+def test_isolated_executor_commands_drop_user_configuration(tmp_path):
+    from foragent.executors import claude_command, codex_command
+
+    codex = codex_command(tmp_path, tmp_path / "out", isolated=True)
+    assert {"--ignore-user-config", "--ignore-rules", "sandbox_workspace_write.writable_roots=[]",
+            "sandbox_workspace_write.network_access=false"} <= set(codex)
+    assert codex[codex.index("-s") + 1] == "workspace-write"
+    assert "--ignore-user-config" not in codex_command(tmp_path, tmp_path / "out")
+    claude = claude_command(permission_mode="dontAsk", setting_sources="project")
+    assert claude[claude.index("--permission-mode") + 1] == "dontAsk"
+    assert claude[claude.index("--setting-sources") + 1] == "project" and "--strict-mcp-config" in claude
+    assert "--setting-sources" not in claude_command()
 
 
 def test_risk_guidance_follows_the_proposed_lane_paths_without_listed_files(tmp_path):

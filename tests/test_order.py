@@ -627,7 +627,7 @@ def test_interrupted_lane_commit_is_completed_before_issues(publishing, plan, mo
     monkeypatch.setattr(git, "commit_paths", original)
     publish((root, load_config(root), tracker, git, events), plan)
     assert events[0][1] == "Foragent lane web"
-    assert set(events[0][2]) == {".foragent.yml", ".claude/agents/fa-web.md"}
+    assert set(events[0][2]) == {".foragent.yml", ".claude/agents/fa-web.md", ".gitattributes"}
 
 
 def test_edit_with_changed_acceptance_invalidates_approval_on_retry(publishing, plan):
@@ -707,7 +707,7 @@ def test_lane_skills_stay_local_and_copy_into_runner_worktree(offline_publicatio
     assert "skills: [testing-strategy]" in (runner / ".claude/agents/fa-web.md").read_text()
     lane_commit = next(args for args in calls if "commit" in args and args[args.index("-m") + 1] == "Foragent lane web")
     assert set(lane_commit[lane_commit.index("--") + 1:]) == {
-        ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ":!CLAUDE.local.md",
+        ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ".gitattributes", ":!CLAUDE.local.md",
     }
     assert len([args for args in calls if args[0] == "push"]) == 1
     order.publish(plan, root, load_config(root), tracker, repo="owner/repo", git=git, manager=manager)
@@ -1300,8 +1300,9 @@ def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_pa
     assert {key: implementation[key] for key in setup.options} == setup.options
     if lane == "api":
         assert ("agent" in setup.options) == (executor == "claude")
-    expected_prefix = implementation["prompt"].removesuffix("PROMPT")
-    assert prompt.startswith(expected_prefix) and prompt.removeprefix(expected_prefix) == order.preread_prompt(plan, item)
+    # The lane-memory notice (the writer contract, D95) follows the task in both prompts.
+    expected_prefix, _, notice = implementation["prompt"].partition("PROMPT")
+    assert prompt == expected_prefix + order.preread_prompt(plan, item) + notice
     if executor == "codex" and lane == "api":
         assert "API lane rules." in expected_prefix and "polish" in expected_prefix
 

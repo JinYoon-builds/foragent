@@ -156,7 +156,7 @@ class Executor(Protocol):
 def codex_command(worktree: Path, output_path: Path, model: str | None = None,
                   effort: str | None = None, *, resume_session_id: str | None = None,
                   read_only: bool = False, prompt: str | None = None,
-                  add_dirs: tuple[Path, ...] = ()) -> list[str]:
+                  add_dirs: tuple[Path, ...] = (), isolated: bool = False) -> list[str]:
     if resume_session_id is not None and (prompt is None or not prompt.strip()):
         raise ValueError("Session resume requires a non-empty prompt")
     # Resume has its own CLI options; cwd is supplied by run_logged.
@@ -170,6 +170,10 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
     ]
     # Extra writable roots, e.g. the state directory for the architect's `fa orch request`.
     args += [part for path in add_dirs for part in ("--add-dir", str(path))]
+    if isolated:
+        # No user config, execpolicy rules, extra writable roots or network: only the workspace.
+        args += ["--ignore-user-config", "--ignore-rules", "-c", "sandbox_workspace_write.writable_roots=[]",
+                 "-c", "sandbox_workspace_write.network_access=false"]
     return args + (["-m", model] if model is not None else []) + (
         ["-c", f"model_reasoning_effort={effort}"] if effort is not None else []
     )
@@ -178,7 +182,7 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
 def claude_command(
     model: str | None = None, settings_path: Path | None = None, agent: str | None = None,
     *, resume_session_id: str | None = None, read_only: bool = False, prompt: str | None = None,
-    effort: str | None = None, permission_mode: str | None = None,
+    effort: str | None = None, permission_mode: str | None = None, setting_sources: str | None = None,
 ) -> list[str]:
     if resume_session_id is not None and (prompt is None or not prompt.strip()):
         raise ValueError("Session resume requires a non-empty prompt")
@@ -188,6 +192,9 @@ def claude_command(
     args = ["claude", "-p", "--permission-mode", mode, "--output-format", "stream-json", "--verbose"]
     if settings_path is not None:
         args += ["--settings", str(settings_path)]
+    if setting_sources is not None:
+        # Only these settings files load (no user settings), and no MCP server is configured.
+        args += ["--setting-sources", setting_sources, "--strict-mcp-config"]
     if agent is not None:
         args += ["--agent", agent]
     if resume_session_id is not None:
@@ -232,7 +239,7 @@ class CodexExecutor:
         self, *, worktree: Path, prompt: str, model: str | None,
         timeout_s: int, log_path: Path, effort: str | None = None,
         resume_session_id: str | None = None, read_only: bool = False,
-        add_dirs: tuple[Path, ...] = (), events_path: Path | None = None,
+        add_dirs: tuple[Path, ...] = (), events_path: Path | None = None, isolated: bool = False,
     ) -> ExecResult:
         with tempfile.TemporaryDirectory(prefix="foragent-codex-") as temporary:
             output_path = Path(temporary) / "last-message.txt"
@@ -243,6 +250,8 @@ class CodexExecutor:
                 options["read_only"] = True
             if add_dirs:
                 options["add_dirs"] = tuple(add_dirs)
+            if isolated:
+                options["isolated"] = True
             code, timed_out, _ = run_logged(
                 codex_command(worktree, output_path, model, effort, **options), cwd=worktree, prompt=prompt,
                 timeout_s=timeout_s, log_path=log_path,
@@ -270,10 +279,11 @@ class ClaudeExecutor:
         agent: str | None = None, review_pr: int | None = None,
         resume_session_id: str | None = None,
         goal: str | None = None, read_only: bool = False, effort: str | None = None,
-        permission_mode: str | None = None,
+        permission_mode: str | None = None, setting_sources: str | None = None,
     ) -> ExecResult:
         output_path = log_path.with_suffix(".stdout")
-        options = {} if permission_mode is None else {"permission_mode": permission_mode}
+        options = {key: value for key, value in (("permission_mode", permission_mode),
+                                                 ("setting_sources", setting_sources)) if value is not None}
         if effort is not None:
             options["effort"] = effort
         if read_only:

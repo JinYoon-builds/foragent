@@ -1,2 +1,14 @@
-# Lane memory indexes only gain lines; keep both sides when lane clones merge.
-.claude/agent-memory/**/MEMORY.md merge=union
+.claude/agent-memory/fa-architect/MEMORY.md merge=union
+.claude/agent-memory/fa-docs/MEMORY.md merge=union
+.claude/agent-memory/fa-orchestrator/MEMORY.md merge=union
+# Only each lane's dream edits its curated memory; it merges as ordinary text.
+.claude/agent-memory/fa-adopt/MEMORY.md !merge
+.claude/agent-memory/fa-bench/MEMORY.md !merge
+.claude/agent-memory/fa-board/MEMORY.md !merge
+.claude/agent-memory/fa-design/MEMORY.md !merge
+.claude/agent-memory/fa-orch/MEMORY.md !merge
+.claude/agent-memory/fa-order/MEMORY.md !merge
+.claude/agent-memory/fa-skills/MEMORY.md !merge
+.claude/agent-memory/fa-view/MEMORY.md !merge
+# Pending lane lessons only gain lines; keep both sides when lane clones merge.
+.claude/agent-memory/**/MEMORY.new.md merge=union
