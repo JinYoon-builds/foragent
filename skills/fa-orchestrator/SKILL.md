@@ -71,7 +71,7 @@ when available). Never call the architect on a fixed threshold; judge each case 
 
 ## Handle blocked items first
 
-Change `overlap_per_file` only from conflict facts reported by `fa orch facts`. Run
+Change `overlap_per_file`, or one file's limit (`plan.md`), only from conflict facts in `fa orch facts`. Run
 `fa orch list --json`. Read each item's full blocked details, raw reviewer text and original logs
 (`log_path`; read beyond the tail when necessary). For a blocker or a repeated failure, measure before
 acting: rule out hypotheses with evidence; when the cause is unknown, add logging and read it; when
