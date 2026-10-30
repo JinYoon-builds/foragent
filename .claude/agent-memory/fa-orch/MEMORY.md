@@ -225,3 +225,4 @@
 - #1041(D77): main 시험 실패 측정은 `orch_scorecard_main_tests.py`; `--record-main-tests FILE`이 `<state>/main-test-observations.jsonl`에 추가만 하고 (change, check, result)로 중복 제거. 잠긴 인수 시험 82번째 줄이 `set <= dict`로 항상 TypeError라 QUESTION.md로 남김(한 줄 고친 사본에선 7개 통과). `test_orch_scorecard_unit`이 human 출력 줄 수를 세므로 새 줄은 끝에 붙이고 그 수를 갱신.
 - [#995 tick admission](project_995_tick_admission.md) — refresh-failure fallback, gh.Budget 10s/5s, board read only on changed listing, D69 lane conflict
 - #1055: refresh 첫 프롬프트 2번과 dream 권위 문구는 `orch_rules.current_rules(root)`(rules.md → decisions.md)로 대상 저장소·dream 작업공간에서 고르고 본문을 인용한다. test_lane_memory_writers 6개 실패는 범위 밖 기준선.
+- [#1042 D80 assign/goal](project_1042_assign_goal.md) — plan.json assignments/goal, decide() hook, Run.executor_model

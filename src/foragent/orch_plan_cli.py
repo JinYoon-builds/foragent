@@ -11,11 +11,11 @@ import sys
 from pathlib import Path
 from typing import NoReturn
 
-from foragent import orch_plan, orch_queue
+from foragent import orch_assign, orch_plan, orch_queue
 from foragent.i18n import text
 from foragent.labels import lane_order
 
-ACTIONS = {"pause", "resume", "plan"}
+ACTIONS = {"pause", "resume", "plan", *orch_assign.ACTIONS}
 
 
 def lane_queue(args, store, config) -> None:
@@ -60,6 +60,7 @@ def add_parsers(orch_actions, queue) -> None:
                              help="Who writes this (default: human); the orchestrator passes --by orchestrator")
         if command is not queue:
             command.add_argument("--repo-root", type=Path, default=Path.cwd())
+    orch_assign.add_parsers(orch_actions)
 
 
 def _fail(message: str) -> NoReturn:
@@ -100,6 +101,9 @@ def _widths(values: list[str], language: str) -> dict:
 def run(args, store, config) -> None:
     """Plan pauses, widths, expiry and their display; queues go through ``fa orch queue``."""
     plan_module, language = orch_plan, config.language
+    if args.action in orch_assign.ACTIONS:
+        orch_assign.run(args, store, config)
+        return
     try:
         if args.action == "pause":
             _check_lanes("pause", [args.lane], config)
@@ -138,10 +142,11 @@ def _plan_lines(plan: dict, language: str) -> list[str]:
         if lane in plan["width"]:
             parts.append(text("orch_plan_width", language, width=plan["width"][lane], by=authors["width"][lane]))
         lines.append(text("orch_plan_line", language, lane=lane, parts="; ".join(parts)))
+    controls = orch_assign.plan_lines(plan)
     if not lines and not plan["expires_at"]:
-        return [text("orch_plan_none", language)]
+        return controls or [text("orch_plan_none", language)]
     if plan["expires_at"]:
         lines.append(text("orch_plan_expires", language, at=plan["expires_at"], by=authors["expires_at"]))
     else:
         lines.append(text("orch_plan_no_expiry", language))
-    return lines
+    return controls + lines
