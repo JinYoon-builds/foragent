@@ -47,10 +47,11 @@ def test_recorded_file_plan_allows_fifth_run_without_releasing_exclusive_claims(
     assert PATH in output and WHY in output, "The public plan retains the decision and its evidence"
     for number in range(1, 7):
         _lane_clone_issue(ctx, number, [PATH])
-    _lane_clone_issue(ctx, 7, ["src/foragent/other.py"])
-    exclusive = ctx.tracker.get_issue(7)
-    ctx.tracker.update_issue(7, title=exclusive.title, body=exclusive.body.replace(
-        "<!-- foragent:v1 -->\n", f"<!-- foragent:v1 -->\nexclusive:\n  - {PATH}\n"))
+    # #1027 (2026-10-31): #7 is approved with its exclusive reservation already in the body; editing
+    # the body after approval would invalidate the approval (a separate safety rule).
+    from test_scheduler import BODY, approve
+    approve(ctx, 7, body=BODY.replace("<!-- foragent:v1 -->\n", f"<!-- foragent:v1 -->\nexclusive:\n  - {PATH}\n")
+            + "\n## Files\n- src/foragent/other.py\n", labels=["lane:orch", "ready"])
     report = tick(ctx)
     assert report.skipped is None
     assert starts == [1, 2, 3, 4, 5], report.actions
@@ -62,7 +63,9 @@ def test_recorded_file_plan_allows_fifth_run_without_releasing_exclusive_claims(
 
 def test_human_plan_is_protected_and_expiry_restores_the_configured_fallback(ctx, monkeypatch, capsys):
     starts = _wide_lane(ctx, 8)
-    ctx.config = replace(ctx.config, overlap_per_file=3)
+    # #1027 (2026-10-31): the clock jumps two hours past plan expiry; the running #1 must not be
+    # restarted or killed by the stall and runtime limits, which are separate rules.
+    ctx.config = replace(ctx.config, overlap_per_file=3, stall_minutes=240, max_runtime_minutes=240)
     set_file_plan(ctx, monkeypatch, capsys, value="1", by="human")
     before = (ctx.store.root / "plan.json").read_bytes()
     code, output = command(ctx, monkeypatch, capsys, "--overlap", f"{PATH}=5", "--why", WHY,
@@ -88,7 +91,7 @@ def test_fixed_config_override_wins_over_recorded_file_plan(ctx, monkeypatch, ca
     config_file = ctx.repo_root / ".foragent.yml"
     config_file.write_text(config_file.read_text() + "overlap_mode: fixed\noverlap_per_file: 1\n")
     loaded = load_config(ctx.repo_root)
-    ctx.config = replace(loaded, lanes=ctx.config.lanes)
+    ctx.config = replace(loaded, lanes=ctx.config.lanes, approvers=ctx.config.approvers)  # #1027: keep approvers
     for number in range(1, 4):
         _lane_clone_issue(ctx, number, [PATH])
     assert tick(ctx).skipped is None

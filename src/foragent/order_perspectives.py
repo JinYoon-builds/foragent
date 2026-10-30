@@ -45,13 +45,14 @@ SEAT_FOCUS = {
                 "step fails halfway, and how the person would notice and recover.",
     "maintainer": "You are the maintainer in six months who did not write this. Ask what will be "
                   "hard to understand, change or debug, and which choices need recording now.",
-    "incidents": "You are the incidents reviewer. Compare the plan with the risk map and past "
-                 "decisions below; ask where it repeats a known failure or contradicts a decision.",
+    "incidents": "You are the incidents reviewer. Compare the plan with the risk map and the "
+                 "rules or decisions below; ask where it repeats a known failure or contradicts them.",
     "other_users": "Other users: does this assume the maintainer's tools, accounts, OS, language or "
                    "habits? Does it still work for a Claude-only, Codex-only or API-key user, a "
                    "non-Korean user, or a project without a screen? Should this be a setting asked "
                    "once at init instead of a constant?",
 }
+RULES_FILE = "docs/rules.md"
 DECISIONS_FILE = "docs/decisions.md"
 RISK_FILE = ".foragent-risks.yml"
 LATEST_DECISIONS = 20
@@ -107,8 +108,15 @@ def prompt(seat: str, plan: dict, root: Path, language: str = "en") -> str:
             risks = (root / RISK_FILE).read_text(encoding="utf-8").strip()
         except (FileNotFoundError, UnicodeDecodeError):
             risks = f"({RISK_FILE} does not exist)"
-        body += (f"\n## Risk map ({RISK_FILE})\n```yaml\n{risks}\n```\n\n"
-                 f"## Decisions ({DECISIONS_FILE})\n{decisions_text(root)}\n")
+        body += f"\n## Risk map ({RISK_FILE})\n```yaml\n{risks}\n```\n\n"
+        try:
+            rules = (root / RULES_FILE).read_text(encoding="utf-8").strip() or "(empty)"
+        except FileNotFoundError:
+            body += f"## Decisions ({DECISIONS_FILE})\n{decisions_text(root)}\n"
+        except (OSError, UnicodeDecodeError) as exc:
+            body += f"## Current rules ({RULES_FILE})\n({RULES_FILE} exists but cannot be read: {exc})\n"
+        else:
+            body += f"## Current rules ({RULES_FILE})\n{rules}\n"
     return body
 
 

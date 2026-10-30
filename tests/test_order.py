@@ -1404,6 +1404,21 @@ def test_perspectives_decisions_cut_keeps_titles_and_latest_twenty(tmp_path):
     assert "Preamble" not in text
 
 
+@pytest.mark.parametrize("make_rules", [
+    lambda path: path.write_bytes(b"# Rules\n\xff\xfe broken\n"),
+    lambda path: path.mkdir(),
+], ids=["invalid-utf8", "directory"])
+def test_perspectives_unreadable_rules_never_falls_back_to_history(tmp_path, make_rules):
+    from foragent import order_perspectives
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/decisions.md").write_text("HISTORY_BEHIND_UNREADABLE_RULES\n", encoding="utf-8")
+    make_rules(tmp_path / "docs/rules.md")
+    prompt = order_perspectives.prompt("incidents", {}, tmp_path)
+    assert "HISTORY_BEHIND_UNREADABLE_RULES" not in prompt
+    assert "docs/rules.md exists but cannot be read" in prompt
+
+
 def test_perspectives_config_rejects_unknown_seat_or_executor():
     from foragent.config import ConfigError, DEFAULTS
     from foragent.config_validation import _validate

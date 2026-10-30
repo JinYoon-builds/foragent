@@ -138,6 +138,19 @@ def test_first_prompt_names_every_lane_queue():
         assert f"`fa orch queue {lane}`" in prompt
 
 
+
+def test_first_prompt_names_decisions_without_a_quote_when_both_documents_are_missing(tmp_path):
+    prompt = orch_refresh.first_prompt(Config(), "/s/orch-handoff.md", None, tmp_path)
+    assert "2. docs/decisions.md\n" in prompt and "---" not in prompt
+
+
+def test_dream_prompt_keeps_decisions_authority_when_both_documents_are_missing(tmp_path):
+    from foragent import orch_dream_worker
+    from foragent.state import StateStore
+
+    text = orch_dream_worker.prompt(StateStore(tmp_path / "state"), Config(lanes={"orch": {}}), "orch", {}, tmp_path)
+    assert "Follow docs/decisions.md whenever a lesson disagrees" in text and "--- docs/" not in text
+
 def test_compactions_count_only_the_active_sessions_boundaries(tmp_path):
     rows = [{"type": "system", "subtype": "compact_boundary", "sessionId": session}
             for session in ("old-id", "other-id", "old-id")]
