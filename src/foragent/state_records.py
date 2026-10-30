@@ -115,6 +115,8 @@ class Run:
     # A reviewer None means no review.
     executor: str | None = None
     reviewer: str | None = None
+    # The implementer's model an issue assignment chose at start (D80); None: the ordinary model.
+    executor_model: str | None = None
     # Runner waits as wall-clock regions: each open wait by key (its region as far as it has
     # credited), closed ones merged. ``waited_seconds`` changes by exactly the growth of their
     # union, so concurrent waits count once whatever order they credit in (D55 addendum).
