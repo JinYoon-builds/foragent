@@ -13,6 +13,8 @@ MESSAGES = {
         "settings_desc_reviewer": "The agent that reviews the code: claude or codex; unset lets the other tool review, none skips review.",
         "settings_desc_claude_quota.mode": "keep saves part of your Claude quota; burn uses all of it.",
         "settings_desc_notify": "Where alerts go: none, claude-push, macos, command:<path>, slack:<url> or ntfy:<topic>.",
+        "settings_desc_notify_filter": ("Which alerts reach you: all, or decisions (open questions, merge approvals "
+                                        "and order cards only; the rest stays in the planning session's context)."),
         "settings_desc_animation": "Fireworks and the big squirrel in the lane view: true or false.",
         "settings_desc_language": "The language Foragent uses with you: en or ko.",
         "settings_desc_view_glyphs": "How the lane view draws its rows: auto picks for your terminal, emoji or ascii.",
@@ -44,6 +46,8 @@ MESSAGES = {
         "settings_desc_reviewer": "코드를 검토하는 에이전트예요: claude 또는 codex. 비우면 다른 도구가 검토하고, none이면 검토하지 않아요.",
         "settings_desc_claude_quota.mode": "keep은 Claude 한도 일부를 남기고, burn은 모두 써요.",
         "settings_desc_notify": "알림을 보낼 곳이에요: none, claude-push, macos, command:<경로>, slack:<URL>, ntfy:<주제>.",
+        "settings_desc_notify_filter": ("받을 알림을 정해요: all 또는 decisions(열린 질문·머지 승인·주문 카드만 받고, "
+                                        "나머지는 기획 세션의 맥락에만 남겨요)."),
         "settings_desc_animation": "레인 화면의 불꽃놀이와 큰 다람쥐를 보여 줄지 정해요: true 또는 false.",
         "settings_desc_language": "Foragent가 쓰는 언어예요: en 또는 ko.",
         "settings_desc_view_glyphs": "레인 화면의 줄을 그리는 기호예요: auto는 터미널에 맞춰 고르고, emoji나 ascii로 정할 수 있어요.",

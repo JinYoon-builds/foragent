@@ -172,5 +172,6 @@ def record_failure(store: StateStore, config: Config, repo: str, exc: BaseExcept
         request = orch_inbox.add_request(store, "gate", line, {"tick_failure_since": at})
         record["alert_request"] = request["id"]
         store._write_json(outcome_path(store), record)
-        notify.send(replace(config, repo=repo), _PUSH.get(config.language, _PUSH["en"]), line)
+        with notify.sending("blocked"):
+            notify.send(replace(config, repo=repo), _PUSH.get(config.language, _PUSH["en"]), line)
     return record
