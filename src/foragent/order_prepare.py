@@ -23,6 +23,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -45,7 +46,13 @@ def _now() -> str:
 
 
 def _slug(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-") or "issue"
+    """A readable, collision-free file name: a cleaned prefix plus a hash of the exact value.
+
+    Distinct order ids or issue keys ("7" and the edit "#7", "a/b" and "a-b") never share a
+    record, lock or scratch tree.
+    """
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")[:40] or "issue"
+    return f"{readable}-{hashlib.sha256(value.encode('utf-8')).hexdigest()[:10]}"
 
 
 def _record_path(store: StateStore, plan: dict) -> Path:
@@ -174,7 +181,7 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
     entries = record["issues"]
     entry = entries.setdefault(item["key"], {"key": item["key"], "holds": 0, "attempts": []})
     attempt = len(entry["attempts"]) + 1
-    home = path.parent / _slug(plan["id"]) / _slug(item["key"].lstrip("#"))
+    home = path.parent / _slug(plan["id"]) / _slug(item["key"])
     # Earlier attempts' trees stay for inspection; each attempt gets its own new tree.
     tree, log = home / f"attempt-{attempt}" / "tree", home / f"attempt-{attempt}" / "writer.log"
     facts = {"attempt": attempt, "role": "writer", "started_at": _now(), "base_revision": base,
@@ -188,10 +195,16 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
     manifest = before = result = protected = None
     try:
         # One resolution feeds the tree, the setup, the prompt and the permissions.
-        lane_config, overlay = setup.lane_context(plan, item, config, root)
+        lane_config, overlay, refused = setup.lane_context(plan, item, config, root)
+        if refused:
+            # The writer would start with other context than preread reads: ask, do not start.
+            failure = {"status": "question", "reason": say("prepare_question"), "questions": [
+                say("prepare_context_refused", path=name) for name in refused]}
+            return
         # Writes must never reach the checkout, its Git directory or this command's state.
         protected = order_scratch.protected(git, root, path.parent.parent)
-        manifest = order_scratch.build(git, base, tree, overlay | _references(plan, item))
+        references = {name: ("file", 0o644, data) for name, data in _references(plan, item).items()}
+        manifest = order_scratch.build(git, base, tree, overlay | references)
         start = setup.writer_setup(lane_config, item, tree)
         options = start.options | setup.permissions(start.executor, tree, protected, config.acceptance_dir,
                                                     tree.parent)

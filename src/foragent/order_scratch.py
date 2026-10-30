@@ -13,6 +13,7 @@ import os
 import re
 from pathlib import Path, PurePosixPath
 import shutil
+import stat
 import subprocess
 
 from foragent.git import GitError, GitRepo
@@ -47,7 +48,12 @@ def _names_above(manifest: dict, acceptance_dir: str) -> set[str]:
     """Names of tracked files in the directories above the acceptance directory, lower-cased."""
     inside = PurePosixPath(acceptance_dir.strip("/"))
     above = {str(parent) for parent in inside.parents} | {"."}
-    return {PurePosixPath(name).name.lower() for name in manifest if str(PurePosixPath(name).parent) in above}
+    return {PurePosixPath(name).name.lower() for name, entry in manifest.items()
+            if entry[0] != DIRECTORY and str(PurePosixPath(name).parent) in above}
+
+
+SPECIAL = "special"  # FIFO, socket or device: compared by type, never read
+DIRECTORY = "040000"  # a real folder, compared by its permission bits
 
 
 def real(path: Path) -> Path | None:
@@ -80,12 +86,13 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def build(git: GitRepo, base: str, tree: Path, overlay: dict[str, bytes | None]) -> dict[str, tuple[str, str]]:
+def build(git: GitRepo, base: str, tree: Path, overlay: dict) -> dict[str, tuple[str, str]]:
     """Check ``base`` out into the new directory ``tree`` and apply the overlay; return the baseline.
 
     The files are checked out as a checkout of ``base`` would have them (no export-ignore or
     export-subst rewriting). In the overlay, ``None`` removes that file or directory first (the
-    checkout no longer has it) and bytes then write a file: the lane context the writer reads.
+    checkout no longer has it), ``("file", mode, bytes)`` writes a file with that mode and
+    ``("link", target)`` makes a symlink (see order_scratch_context): the lane context.
     The baseline is read back from the finished tree, so it is exactly what the writer received.
     """
     tree.mkdir(parents=True)
@@ -98,13 +105,17 @@ def build(git: GitRepo, base: str, tree: Path, overlay: dict[str, bytes | None])
                 raise GitError(done.stderr.decode("utf-8", "replace") or f"git {command[0]} {base} failed")
     finally:
         index.unlink(missing_ok=True)
-    for name in sorted(name for name, data in overlay.items() if data is None):
+    for name in sorted(name for name, entry in overlay.items() if entry is None):
         if _own_parents(tree, name, create=False):
             _remove_path(tree / name)
-    for name, data in sorted((name, data) for name, data in overlay.items() if data is not None):
+    for name, entry in sorted((name, entry) for name, entry in overlay.items() if entry is not None):
         _own_parents(tree, name, create=True)
         _remove_path(tree / name)
-        (tree / name).write_bytes(data)
+        if entry[0] == "link":
+            os.symlink(entry[1], tree / name)
+        else:
+            (tree / name).write_bytes(entry[2])
+            os.chmod(tree / name, entry[1])  # the source's permission bits, executable included
     return _entries(tree)
 
 
@@ -149,23 +160,48 @@ def stamps(tree: Path, names) -> dict[str, tuple[int, int, int]]:
             info = os.lstat(tree / name)
         except OSError:
             continue
-        found[name] = (info.st_ino, info.st_ctime_ns, info.st_mtime_ns)
+        if not stat.S_ISDIR(info.st_mode):  # a folder's times change whenever a test is added
+            found[name] = (info.st_ino, info.st_ctime_ns, info.st_mtime_ns)
     return found
 
 
 def _entries(tree: Path) -> dict[str, tuple[str, str]]:
-    """Every file and symlink in the tree, without following any symlink."""
+    """Every entry in the tree by its lstat type, without following or opening anything else.
+
+    Regular files map to (100644 | 100755, blob), symlinks to (120000, blob of the target text),
+    real folders to (040000, permission bits) and any other entry (FIFO, socket, device) to
+    ("special", type) so it is never read; a file or folder that cannot be read is special too,
+    because the inspection cannot vouch for it.
+    """
     found = {}
-    for directory, folders, files in os.walk(tree, followlinks=False):
+    # A folder that cannot be listed hides what it holds: it is recorded, never skipped.
+    unlisted: list[str] = []
+    for directory, folders, files in os.walk(tree, followlinks=False,
+                                             onerror=lambda error: unlisted.append(error.filename)):
         here = Path(directory)
+        if here != tree:
+            found[here.relative_to(tree).as_posix()] = (DIRECTORY, oct(stat.S_IMODE(os.lstat(here).st_mode)))
         for name in [*files, *(folder for folder in folders if (here / folder).is_symlink())]:
             path = here / name
             relative = path.relative_to(tree).as_posix()
-            if path.is_symlink():
+            try:
+                info = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(info.st_mode):
                 found[relative] = ("120000", blob(os.fsencode(os.readlink(path))))
-            elif path.is_file():
-                mode = "100755" if os.access(path, os.X_OK) else "100644"
-                found[relative] = (mode, blob(path.read_bytes()))
+            elif stat.S_ISREG(info.st_mode):
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    found[relative] = (SPECIAL, "unreadable")
+                    continue
+                found[relative] = ("100755" if info.st_mode & 0o111 else "100644", blob(data))
+            else:
+                found[relative] = (SPECIAL, oct(stat.S_IFMT(info.st_mode)))
+    for name in unlisted:
+        if name and Path(name) != tree:
+            found[Path(name).relative_to(tree).as_posix()] = (SPECIAL, "unlisted")
     return found
 
 
@@ -178,6 +214,17 @@ def _ignored(git: GitRepo, tree: Path, names: list[str]) -> set[str]:
         ["git", f"--git-dir={git_dir}", "--work-tree=.", "check-ignore", "--no-index", "-z", "--stdin"],
         cwd=tree, input="\0".join(names).encode() + b"\0", capture_output=True, check=False)
     return {name.decode() for name in result.stdout.split(b"\0") if name}
+
+
+def _new_folder_allowed(name: str, found: dict, manifest: dict, inside: PurePosixPath, acceptance_dir: str,
+                        above: set[str]) -> bool:
+    """A new real folder for tests: the acceptance directory, a folder above it or one inside it."""
+    if name in manifest or found.get(name, ("",))[0] != DIRECTORY:
+        return False
+    path = PurePosixPath(name)
+    if path == inside or path in inside.parents:
+        return True
+    return path.is_relative_to(inside) and not shared_configuration(name, acceptance_dir, above)
 
 
 def changes(git: GitRepo, tree: Path, manifest: dict[str, tuple[str, str]], acceptance_dir: str,
@@ -201,7 +248,8 @@ def changes(git: GitRepo, tree: Path, manifest: dict[str, tuple[str, str]], acce
                      if found.get(name) != manifest.get(name) or name in touched)
     existing = {str(parent) for name in manifest for parent in PurePosixPath(name).parents}
     new_directories = sorted({str(parent) for name in changed if name not in manifest
-                              for parent in PurePosixPath(name).parents if str(parent) not in existing})
+                              for parent in PurePosixPath(name).parents if str(parent) not in existing}
+                             | {name for name in changed if name not in manifest and found[name][0] == DIRECTORY})
     ignored = _ignored(git, tree, [directory + "/" for directory in new_directories])
     inside = PurePosixPath(acceptance_dir.strip("/"))
     above = _names_above(manifest, acceptance_dir)
@@ -209,6 +257,20 @@ def changes(git: GitRepo, tree: Path, manifest: dict[str, tuple[str, str]], acce
     candidates, refused, output = {}, [], set()
     for name in changed:
         path = tree / name
+        if found.get(name, ("",))[0] == SPECIAL:
+            refused.append(name)  # a FIFO, socket or device is never a test, wherever it sits
+            continue
+        if DIRECTORY in (found.get(name, ("",))[0], manifest.get(name, ("",))[0]):
+            if _new_folder_allowed(name, found, manifest, inside, acceptance_dir, above):
+                continue
+            owner = next((folder for folder in (name, *map(str, PurePosixPath(name).parents))
+                          if folder + "/" in ignored), None)
+            if name not in manifest and found[name][0] == DIRECTORY and owner is not None:
+                output.add(min((folder for folder in new_directories if folder + "/" in ignored
+                                and PurePosixPath(name).is_relative_to(folder)), key=len))
+                continue
+            refused.append(name)  # a folder made, removed or re-permissioned outside the tests
+            continue
         directory = next((str(parent) for parent in reversed(PurePosixPath(name).parents)
                           if str(parent) + "/" in ignored), None)
         # The exemption covers tool output only: anything there that reaches a protected place

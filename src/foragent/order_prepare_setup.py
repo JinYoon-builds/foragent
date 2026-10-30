@@ -15,95 +15,66 @@ import json
 from pathlib import Path
 import re
 
-from foragent import order_scratch
+from foragent.order_scratch_context import Entry, collect, place
 from foragent.config import Config
 from foragent.lanes import agent_text
 from foragent.skills import SkillManager, with_vendored_library
 
 
-def _proposed(plan: dict, lane: str, config: Config, root: Path) -> tuple[dict | None, dict[str, bytes | None]]:
+def _proposed(plan: dict, lane: str, config: Config, root: Path,
+              refused: list[str]) -> tuple[dict | None, dict[str, Entry]]:
     """A lane this order creates: the settings and files add_lane would install for it."""
     proposal = next((entry for entry in plan.get("new_lanes", []) if entry["name"] == lane), None)
     if proposal is None or lane in config.lanes:
         return None, {}
     manager = SkillManager(with_vendored_library(config, Path.cwd(), root)) if proposal["skills"] else None
-    files, installed = {f".claude/agents/fa-{lane}.md": None}, []
+    entries: dict[str, Entry] = {f".claude/agents/fa-{lane}.md": None}
+    installed = []
     for identity in proposal["skills"]:
         skill = manager.check_install(identity, root)  # the same resolution add_lane installs from
         installed.append(skill.path.name)
-        files[f".claude/skills/{skill.path.name}"] = None  # main's older copy must not linger
-        for path in sorted(skill.path.rglob("*")):
-            if path.is_file():
-                files[f".claude/skills/{skill.path.name}/{path.relative_to(skill.path).as_posix()}"] = path.read_bytes()
-    files[f".claude/agents/fa-{lane}.md"] = agent_text(lane, list(proposal["paths"]), installed).encode("utf-8")
-    return {"paths": list(proposal["paths"]), "agent": f"fa-{lane}", "skills": installed}, files
+        folder = f".claude/skills/{skill.path.name}"
+        entries[folder] = None  # main's older copy must not linger
+        collect(skill.path, folder, skill.path, entries, refused)  # contents and modes as installed
+    entries[f".claude/agents/fa-{lane}.md"] = (
+        "file", 0o644, agent_text(lane, list(proposal["paths"]), installed).encode("utf-8"))
+    return {"paths": list(proposal["paths"]), "agent": f"fa-{lane}", "skills": installed}, entries
 
 
-def _checkout_context(config: Config, lane: str, root: Path) -> dict[str, bytes | None]:
+def _checkout_context(config: Config, lane: str, root: Path, refused: list[str]) -> dict[str, Entry]:
     """The lane's agent, memory and skills as the checkout has them, which may not be on main yet.
 
-    The paths come from the resolvers the implementer's own notes use (run_lane_skills), so the
-    writer sees the same files: the agent file when there is one, the lane's memory directory
-    even without an agent, and the configured lane skills. Each place maps to ``None`` first so
-    main's copy is removed: what the checkout deleted is gone from the scratch tree as well.
+    The places come from the resolvers the implementer's own notes use (run_lane_skills): the
+    agent file when there is one, the lane's memory directory even without an agent, and the
+    configured lane skills. Each place is built by ``order_scratch_context`` (main's copy removed
+    first, files with their modes, inside links as links); refusals are added to ``refused``.
     """
     from foragent.run_lane_skills import _agent_text, _lane_settings, _memory_folder, lane_skill_names
 
     named = _lane_settings(config, lane).get("agent")
     agent = named if isinstance(named, str) and re.fullmatch(r"fa-[a-z0-9-]+", named) else None
-    # (place, readers accept it only inside the repository)
-    places = [(f".claude/agents/{agent}.md", False)] if agent is not None else []
+    places = [f".claude/agents/{agent}.md"] if agent is not None else []
     memory = _memory_folder(config, lane, Path("."))
     if memory is not None:
-        places.append((memory.as_posix(), False))
-    places += [(f".claude/skills/{name}", True) for name in lane_skill_names(config, lane, root, _agent_text(config, lane, root)[0])
+        places.append(memory.as_posix())
+    places += [f".claude/skills/{name}" for name in lane_skill_names(config, lane, root, _agent_text(config, lane, root)[0])
                if re.fullmatch(r"[A-Za-z0-9._-]+", name)]
-    files: dict[str, bytes | None] = {}
-    for place, inside_only in places:
-        files[place] = None
-        files.update(_readable(root, place, inside_only=inside_only))
-    return files
+    entries: dict[str, Entry] = {}
+    for name in places:
+        place(root, name, entries, refused)
+    return entries
 
 
-def _readable(root: Path, place: str, *, inside_only: bool) -> dict[str, bytes]:
-    """The files a reader of ``root/place`` sees, as plain bytes under their own paths.
-
-    Readers follow symlinks, so a link is copied as the content it resolves to, through linked
-    directories too, and a directory reachable under two names appears under both. The lane
-    notes read the agent file and memory wherever their links point; lane skills count only
-    when they resolve inside the repository (``inside_only``), as ``run_lane_skills.lane_skills``
-    checks. A link back into its own ancestors (a cycle) or one that cannot be resolved is
-    left out, as readers cannot read it either.
+def lane_context(plan: dict, item: dict, config: Config,
+                 root: Path) -> tuple[Config, dict[str, Entry], list[str]]:
+    """The configuration with the issue's lane resolved (proposed lanes included), its scratch
+    entries (see ``order_scratch_context``) and the context paths that were refused.
     """
-    base = order_scratch.real(root)
-    found: dict[str, bytes] = {}
-
-    def visit(path: Path, ancestors: frozenset[Path]) -> None:
-        target = order_scratch.real(path)
-        if target is None or base is None or inside_only and not target.is_relative_to(base):
-            return
-        try:
-            if target.is_file():
-                found[path.relative_to(root).as_posix()] = target.read_bytes()
-            elif target.is_dir() and target not in ancestors:
-                for child in sorted(path.iterdir()):
-                    visit(child, ancestors | {target})
-        except OSError:  # unreadable for the readers as well
-            return
-
-    visit(root / place, frozenset())
-    return found
-
-
-def lane_context(plan: dict, item: dict, config: Config, root: Path) -> tuple[Config, dict[str, bytes | None]]:
-    """The configuration with the issue's lane resolved (proposed lanes included) and its files.
-
-    The files are a scratch overlay: ``None`` removes a place, bytes write a file.
-    """
-    settings, proposed = _proposed(plan, item["lane"], config, root)
+    refused: list[str] = []
+    settings, proposed = _proposed(plan, item["lane"], config, root, refused)
     if settings is not None:
         config = replace(config, lanes={**config.lanes, item["lane"]: settings})
-    return config, _checkout_context(config, item["lane"], root) | proposed
+    return config, _checkout_context(config, item["lane"], root, refused) | proposed, sorted(set(refused))
 
 
 def writer_setup(config: Config, item: dict, tree: Path):

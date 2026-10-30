@@ -17,6 +17,9 @@ MESSAGES = {
         "prepare_error": "The writer could not start: {error}",
         "prepare_stopped": "Preparation stopped while the writer was running.",
         "prepare_missing_skills": "The lane's skills {skills} are not available, so no writer started; sync the skill libraries and run fa order prepare again.",
+        "prepare_context_refused": ("The lane context path {path} is a link leading outside the repository, a link "
+                                    "cycle or a special file, so the writer would not see what preread sees. "
+                                    "Should it become a regular file or a link inside the repository?"),
         "prepare_busy": "Another fa order prepare for this order is running; nothing was started.",
         "prepare_none": "Not prepared yet.",
         "prepare_row": "{key}: {status} — {reason}",
@@ -39,6 +42,8 @@ MESSAGES = {
         "prepare_error": "작성자를 시작하지 못했어요: {error}",
         "prepare_stopped": "작성자가 일하는 중에 준비가 멈췄어요.",
         "prepare_missing_skills": "레인 스킬 {skills}를 찾지 못해 작성자를 시작하지 않았어요. 스킬 라이브러리를 동기화한 뒤 fa order prepare를 다시 실행하세요.",
+        "prepare_context_refused": ("레인 맥락 경로 {path}가 저장소 밖으로 가는 링크, 순환 링크, 또는 특수 파일이라 "
+                                    "작성자가 preread와 같은 내용을 볼 수 없어요. 일반 파일이나 저장소 안 링크로 바꿀까요?"),
         "prepare_busy": "이 주문의 다른 fa order prepare가 실행 중이에요. 아무것도 시작하지 않았어요.",
         "prepare_none": "아직 준비하지 않았어요.",
         "prepare_row": "{key}: {status} — {reason}",
