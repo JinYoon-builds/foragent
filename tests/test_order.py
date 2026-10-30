@@ -1043,6 +1043,202 @@ def test_preread_reads_and_gates_approved_edits(publishing, plan, monkeypatch):
     assert "approved" in tracker.get_issue(3).labels
 
 
+class _Proposing(_NoUnknowns):
+    reply = "APPROACH: Reuse the writer.\nDECIDE: Name the helper while implementing."
+
+    def run(self, **kwargs):
+        from foragent.executors import ExecResult
+
+        self.calls.append(kwargs)
+        return ExecResult(0, False, self.reply, kwargs["log_path"])
+
+
+REPO = "owner/repo"
+
+
+def _child_body(plan, item, config):
+    """The body publish writes for a plan child, marker included."""
+    return order._published_body(plan, item, REPO, config) + "\n" + order._child_marker(plan["id"], item["key"]) + "\n"
+
+
+API_FILES = {FILE: "assert True\n"}
+
+
+def _handover(root, n, body, files, approved=None):
+    """The proposal a run gets when its worktree holds ``files`` and approval recorded ``approved``."""
+    worktree = root.parent / f"run-{hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:12]}"
+    for name, content in files.items():
+        (worktree / name).parent.mkdir(parents=True, exist_ok=True)
+        (worktree / name).write_text(content)
+    if approved is None:
+        approved = {name: order._blob(content.encode()) for name, content in files.items()}
+    return order.lane_proposal(root, n, body, approved, worktree)
+
+
+def test_preread_proposal_is_recorded_and_bound_to_the_published_issue(publishing, plan, monkeypatch):
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    rows = order.preread(plan, root, config, repo=REPO)
+    assert rows[0] == {"key": "api", "unknowns": [], "decisions": ["Name the helper while implementing."],
+                       "approach": ["Reuse the writer."]}
+    item = plan["issues"][0]
+    body = _child_body(plan, item, config)
+    proposal = _handover(root, 7, body, API_FILES)
+    assert proposal["approach"] == ["Reuse the writer."]
+    assert proposal["decisions"] == ["Name the helper while implementing."]
+    assert _handover(root, 7, body.replace("\n", "\r\n"), API_FILES) is not None
+    other = order._published_body(plan, plan["issues"][1], REPO, config) + order._child_marker(plan["id"], "api")
+    assert _handover(root, 7, other, API_FILES) is None, "another issue's content is not this proposal"
+    assert _handover(root, 7, body.replace(f"id={plan['id']}", "id=another-order"), API_FILES) is None
+    for change in ({"goal": item["goal"] + " Also more."}, {"exclusive": ["api/**"]},
+                   {"checklist": ["Looks right", "And more"]}, {"files": ["api/login.py"]}):
+        assert _handover(root, 7, _child_body(plan, {**item, **change}, config), API_FILES) is None, change
+    other_repo = order._published_body(plan, item, "someone/else", config) + order._child_marker(plan["id"], "api")
+    assert _handover(root, 7, other_repo, API_FILES) is None
+    assert _handover(root, 7, body, {}) is None, "a run without the acceptance file did not get what preread read"
+
+
+def test_preread_proposal_survives_the_decision_marker_publish_appends(publishing, plan, monkeypatch):
+    """Decision links are bookkeeping like the plan-child marker; they are not what preread read (#1025)."""
+    from foragent import decisions
+
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    order.preread(plan, root, config, repo=REPO)
+    item = plan["issues"][0]
+    child = decisions.with_marker(_child_body(plan, item, config), ["D79"], None)
+    assert child.rstrip().endswith(decisions.marker(["D79"]))
+    assert _handover(root, 7, child, API_FILES)["approach"] == ["Reuse the writer."]
+    assert _handover(root, 7, decisions.with_marker(child, [], None), API_FILES) is not None
+    changed = decisions.with_marker(_child_body(plan, {**item, "goal": item["goal"] + " More."}, config), ["D79"], None)
+    assert _handover(root, 7, changed, API_FILES) is None, "the marker never hides a changed WHAT"
+
+
+@pytest.mark.parametrize("section", ["goal", "out_of_scope"])
+def test_preread_proposal_binds_authored_github_links_byte_for_byte(publishing, plan, monkeypatch, section):
+    """An authored link is part of the WHAT: approving a changed link must not hand over the old proposal."""
+    root, config = publishing[0], publishing[1]
+    item = plan["issues"][0]
+    link = "[API contract](https://github.com/org/contracts/blob/main/{}.md)"
+    original = item[section]
+    item[section] = original + "\n" + link.format("v1")
+    _proposals(root, config, plan, [("s", "APPROACH: Follow v1.")])
+    assert _handover(root, 7, _child_body(plan, item, config), API_FILES)["approach"] == ["Follow v1."]
+    changed = {**item, section: original + "\n" + link.format("v2")}
+    assert _handover(root, 7, _child_body(plan, changed, config), API_FILES) is None
+    # A link into this repository's own base branch is authored text too, not a generated line.
+    own = {**item, section: original + f"\n[Spec](https://github.com/{REPO}/blob/main/docs/spec.md)"}
+    assert _handover(root, 7, _child_body(plan, own, config), API_FILES) is None
+
+
+def test_preread_without_a_repository_records_but_never_hands_over(publishing, plan, monkeypatch):
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    assert order.preread(plan, root, config)[0]["approach"] == ["Reuse the writer."]
+    assert _handover(root, 7, _child_body(plan, plan["issues"][0], config), API_FILES) is None
+
+
+def test_preread_of_changed_acceptance_tests_never_replaces_the_approved_handoff(publishing, plan, monkeypatch):
+    """Approval binds the acceptance files; a preread of other test contents is not the approved proposal."""
+    root, config, item = publishing[0], publishing[1], plan["issues"][0]
+    body = _child_body(plan, item, config)
+    _proposals(root, config, plan, [("s", "APPROACH: Approved plan.")])
+    changed = deepcopy(plan)
+    changed["issues"][0]["acceptance_files"][FILE] = "assert 1 == 1\n"
+    _proposals(root, config, changed, [("s", "APPROACH: Plan for other tests.")])
+    assert _handover(root, 7, body, API_FILES)["approach"] == ["Approved plan."]
+    assert _handover(root, 7, body, {FILE: "assert 1 == 1\n"})["approach"] == ["Plan for other tests."]
+    # The approval snapshot and the run's files must both match what preread read.
+    assert _handover(root, 7, body, API_FILES, approved={FILE: order._blob(b"assert 1 == 1\n")}) is None
+
+
+def test_preread_binds_an_acceptance_file_another_issue_supplies(publishing, plan, monkeypatch):
+    """client runs the api issue's new acceptance file: bind the content publication writes, not the disk."""
+    root, config = publishing[0], publishing[1]
+    client = plan["issues"][1]
+    client["done_when"] = [f"uv run pytest -q {FILE}"]
+    assert not (root / FILE).exists()
+    _proposals(root, config, plan, [("s", "APPROACH: Client plan.")])
+    body = _child_body(plan, client, config)
+    assert _handover(root, 8, body, API_FILES)["approach"] == ["Client plan."]
+    assert _handover(root, 8, body, {FILE: "assert 1 == 1\n"}) is None
+
+
+def test_preread_proposal_of_an_edit_is_bound_to_its_number(publishing, plan, monkeypatch):
+    root, config, tracker = publishing[0], publishing[1], publishing[2]
+    tracker.add_issue(3, "Keep this title", "old", ["size:l", "lane:api"])
+    edit = {"number": 3, "goal": "New goal", "out_of_scope": "Payments.", "done_when": [f"uv run pytest -q {FILE}"],
+            "checklist": [], "acceptance_files": {}}
+    plan["edits"] = [edit]
+    worker = _Proposing()
+    monkeypatch.setattr(order, "executor_for", lambda name: worker)
+    order.preread(plan, root, config, lambda: tracker, repo=REPO)
+    body = order._published_body(plan, edit, REPO, config)
+    assert _handover(root, 3, body, API_FILES)["approach"] == ["Reuse the writer."], "the api issue supplies FILE"
+    assert _handover(root, 4, body, API_FILES) is None
+    assert _handover(root, 3, body, {FILE: "assert 1 == 1\n"}) is None
+
+
+def test_preread_binds_selected_reference_contents(publishing, plan, monkeypatch):
+    """References are what the implementer reads; a newer preread of changed references is not the approved one."""
+    root, config, item = publishing[0], publishing[1], plan["issues"][0]
+    name = "docs/design/a/HANDOFF.md"
+    plan["reference_files"] = {name: "approved handoff\n"}
+    item["references"] = [name]
+    _proposals(root, config, plan, [("s", "APPROACH: Approved references.")])
+    changed = deepcopy(plan)
+    changed["reference_files"][name] = "changed handoff\n"
+    _proposals(root, config, changed, [("s", "APPROACH: Changed references.")])
+    body = _child_body(plan, item, config)
+    assert body == _child_body(changed, changed["issues"][0], config), "the body alone cannot tell them apart"
+    approved = {**API_FILES, name: "approved handoff\n"}
+    assert _handover(root, 7, body, approved)["approach"] == ["Approved references."]
+    assert _handover(root, 7, body, {**API_FILES, name: "changed handoff\n"})["approach"] == ["Changed references."]
+    assert _handover(root, 7, body, API_FILES) is None, "a run without the reference did not get what preread read"
+
+
+def _proposals(root, config, plan, replies):
+    """Preread the plan once per (summary, reply); a summary change gives a new digest, same issue content."""
+    for summary, reply in replies:
+        worker = _Proposing()
+        worker.reply = reply
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(order, "executor_for", lambda name: worker)
+            order.preread({**plan, "summary": summary}, root, config, repo=REPO)
+
+
+def test_preread_proposal_handover_follows_the_latest_write_even_within_one_second(publishing, plan):
+    root, config, item = publishing[0], publishing[1], plan["issues"][0]
+    body = _child_body(plan, item, config)
+    first, second = "APPROACH: First plan.", "APPROACH: Second plan.\nDECIDE: Second choice."
+    _proposals(root, config, plan, [("one", first), ("two", second)])
+    assert _handover(root, 7, body, API_FILES)["approach"] == ["Second plan."]
+    # Prereading the first digest again makes it the latest, although its key already exists.
+    _proposals(root, config, plan, [("one", "APPROACH: Third plan.")])
+    proposal = _handover(root, 7, body, API_FILES)
+    assert proposal["approach"] == ["Third plan."] and proposal["decisions"] == []
+    # A newer answer with nothing to propose replaces the older proposal instead of reviving it.
+    _proposals(root, config, plan, [("two", "NONE")])
+    assert _handover(root, 7, body, API_FILES) is None
+    _proposals(root, config, plan, [("three", "DECIDE: Only a choice.")])
+    proposal = _handover(root, 7, body, API_FILES)
+    assert proposal["decisions"] == ["Only a choice."] and proposal["approach"] == []
+
+
+def test_preread_proposal_reaches_fresh_and_resumed_implementation_prompts(publishing, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / ".foragent").mkdir(parents=True)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    content = order._body_digest(body)
+    (repo / order.PREREAD_FILE).write_text(json.dumps({"d": {
+        "key": "#1", "plan": "p", "content": content, "files": {}, "unknowns": [],
+        "approach": ["Reuse the writer."], "decisions": ["Name the helper later."]}}))
+    seen = _implementation_setup(tmp_path, publishing[1], "main", "m", monkeypatch, real_prompts=True)
+    for prompt in (seen["prompt"], seen["resume_prompt"]):
+        assert prompt.count("Your lane's earlier plan") == 1
+        assert "- Reuse the writer." in prompt and "- Name the helper later." in prompt
+
+
 @pytest.mark.parametrize("change", ["blocked_by", "interactive", "new_lanes"])
 def test_preread_evidence_follows_dependency_interactive_and_lane_changes(publishing, plan, change):
     config, item = publishing[1], plan["issues"][1]
@@ -1056,7 +1252,7 @@ def test_preread_evidence_follows_dependency_interactive_and_lane_changes(publis
     assert order.preread_target(plan, item, config, publishing[0])[2] != before
 
 
-def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
+def _implementation_setup(tmp_path, config, lane, size, monkeypatch, real_prompts=False):
     """What the runner's first implementation attempt passes to the executor."""
     from foragent import run_implementation, runner
 
@@ -1077,14 +1273,16 @@ def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
     store.save_approval(1, body=body, body_sha="x", acceptance_blobs={}, approved_by="human",
                         approved_at=BASE_TIME.isoformat())
     store.start_run(1, branch="b", worktree=tmp_path / "w", lane=lane)
-    ctx = SimpleNamespace(config=run_implementation.lane_config(config, lane), store=store, now=lambda: BASE_TIME)
+    ctx = SimpleNamespace(config=run_implementation.lane_config(config, lane), store=store, now=lambda: BASE_TIME,
+                          repo_root=tmp_path / "repo")
     attempt = SimpleNamespace(n=1, ctx=ctx, worktree=tmp_path / "repo", log=tmp_path / "log", rebuilt=False,
                               size=size, options={}, missing_skills=[], native_claude=ctx.config.executor == "claude",
                               parsed=parse_body(body), baseline=None, executor=None,
                               approval=store.load_approval(1), review_feedback=False,
                               issue=SimpleNamespace(labels=set()))
-    monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
-    monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
+    if not real_prompts:
+        monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
+        monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
     with pytest.raises(Stop):
         run_implementation._implement(attempt, "")
     return seen

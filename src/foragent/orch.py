@@ -132,8 +132,9 @@ def _issue(ctx: RunContext, n: int) -> Issue:
     issue = RecordingTracker(ctx.tracker, ctx).get_issue(n)
     if issue.is_pull_request or issue.state != "open":
         raise OrchError(f"#{n} must be an open issue")
-    run = ctx.store.get_run(n)
-    if RUNNING in issue.labels or (run is not None and run.status == "running"):
+    from foragent.scheduler_stop import run_is_live
+
+    if run_is_live(ctx.store.get_run(n)):  # The same rule as fa orch stop (#435).
         raise OrchError(f"issue #{n} is running; wait for its runner to finish")
     return issue
 

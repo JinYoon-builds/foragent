@@ -545,3 +545,83 @@ def test_an_older_listing_keeps_a_newer_refresh_failure(tmp_path):
     assert state.issues_observation()["failed_at"] == minutes(5).isoformat()
     state.refresh_local_issues([issue()], [], {}, minutes(6))
     assert state.issues_observation()["failed_at"] is None
+
+
+# Every tracker read lands through the one observation writer (#1025 review 9).
+
+def _recording(state, clock, inner):
+    from types import SimpleNamespace
+
+    from foragent.config import Config
+    from foragent.tracker import RecordingTracker
+
+    return RecordingTracker(inner, SimpleNamespace(store=state, config=Config(), now=lambda: clock.at))
+
+
+def _events(state):
+    import json
+
+    path = state.root / "orch-events.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_a_closed_issue_read_records_a_changed_close_reason_of_an_issue_already_closed(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
+    assert d79(tmp_path, state)["state"] == "done"
+
+    class Closed:
+        def issues_closed_since(self, since):
+            return [issue("closed", "not_planned")]
+
+    clock.at = minutes(5)
+    _recording(state, clock, Closed()).observe_closed_issues(observed_at=minutes(5))
+    row = state.local_issues()[0]
+    assert (row["state_reason"], row["observed_at"]) == ("not_planned", minutes(5).isoformat())
+    assert d79(tmp_path, state)["state"] == "in progress"
+
+
+@pytest.mark.parametrize("method", ["sub_issues", "list_open_issues"])
+def test_issues_returned_by_list_reads_are_observations(tmp_path, method):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
+
+    class Lists:
+        def sub_issues(self, number):
+            return [issue("closed", "not_planned")]
+
+        def list_open_issues(self, number=None):
+            return [issue("closed", "not_planned")]
+
+    clock.at = minutes(2)
+    assert [item.number for item in getattr(_recording(state, clock, Lists()), method)(1)] == [9]
+    assert state.local_issues()[0]["state_reason"] == "not_planned"
+    assert d79(tmp_path, state)["state"] == "in progress"
+
+
+def test_a_read_that_contradicts_queued_writes_drops_them_and_says_so(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue()], [], {}, NOW)
+    clock.at = minutes(1)
+    state.queue_github_write(9, "close_issue", body=None)
+
+    class Reader:
+        def get_issue(self, number):
+            return issue("open", "reopened")
+
+    clock.at = minutes(2)
+    _recording(state, clock, Reader()).get_issue(9)
+    assert state.github_outbox() == []
+    assert [(event["issue"], event["kind"]) for event in _events(state)] == [(9, "outbox-dropped")]
+
+
+def test_an_older_list_read_changes_nothing(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.refresh_local_issues([issue()], [], {}, minutes(5))
+    before = (state.root / "issues.json").read_bytes()
+    state.record_issues([issue("closed", "completed")], {}, observed_at=minutes(1))
+    assert (state.root / "issues.json").read_bytes() == before

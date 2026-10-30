@@ -208,7 +208,10 @@ class RecordingTracker:
             started = self._read_started()
             result = value(*args, **kwargs)
             if isinstance(result, Issue):
-                self._context.store.record_issue(result, self._context.config.lanes, observed_at=started)
+                self._observe([result], started)
+            elif isinstance(result, list) and result and all(isinstance(item, Issue) for item in result):
+                # A list read (sub_issues, list_issues, ...) observes each issue it returns.
+                self._observe(result, started)
             return result
 
         return observe
@@ -226,10 +229,23 @@ class RecordingTracker:
             return issue
         return self.get_issue(n)
 
+    def list_issues(self, *args, **kwargs):
+        """The full listing, unrecorded: it is the bulk observation refresh_issues applies with
+        its own bookkeeping (PR facts, dropped writes, issues no longer listed)."""
+        return self._tracker.list_issues(*args, **kwargs)
+
     def sub_issues(self, n):
+        started = self._read_started()
         children = self._tracker.sub_issues(n)
+        self._observe(children, started)
         pending = self._pending_issues()
         return [pending.get(child.number, child) for child in children]
+
+    def _observe(self, issues, started):
+        """Every issue a read returns lands through the store's one observation writer."""
+        for number in self._context.store.record_issues(list(issues), self._context.config.lanes,
+                                                        observed_at=started):
+            self._outbox_dropped(number, "remote change")
 
     def _outbox_dropped(self, number, reason):
         from foragent.orch_events import append_event
@@ -353,6 +369,8 @@ class RecordingTracker:
         already showed every earlier close. Each closed issue the local record
         does not show closed is recorded, including one created and closed
         between listings, so this tick's board sync moves its card to Done.
+        Issues already closed locally are recorded too: a changed close reason
+        (completed to not_planned) is a newer observation.
         """
         read = getattr(self._tracker, "issues_closed_since", None)
         if read is None:
@@ -370,10 +388,9 @@ class RecordingTracker:
                     raise
                 log.warning("Could not read recently closed issues: %s", exc)
                 return  # Keep the watermark; the next tick reads this span again.
-            closed = {row["number"] for row in store.local_issues() if row.get("state") == "closed"}
-            for issue in issues:
-                if issue.state == "closed" and issue.number not in closed and not issue.is_pull_request:
-                    store.record_issue(issue, self._context.config.lanes, observed_at=observed_at)
+            # Every issue the read shows is an observation, including one already closed
+            # locally whose close reason changed; the store keeps whichever is newer.
+            self._observe(issues, observed_at)
         store.record_closed_issue_watermark(observed_at)
 
     def _issue_missing(self, number):
@@ -453,7 +470,7 @@ class RecordingTracker:
         if queued:
             return
         if isinstance(result, Issue):
-            self._context.store.record_issue(result, self._context.config.lanes, observed_at=started)
+            self._observe([result], started)
         self._context.store.record_labels(n, labels, remove=False, lanes=self._context.config.lanes)
 
     def remove_labels(self, n, labels):
@@ -465,7 +482,7 @@ class RecordingTracker:
             if queued:
                 break
             if isinstance(result, Issue):
-                self._context.store.record_issue(result, self._context.config.lanes, observed_at=started)
+                self._observe([result], started)
             self._context.store.record_labels(n, [label], remove=True, lanes=self._context.config.lanes)
 
     def list_comments(self, n):
@@ -485,8 +502,7 @@ class RecordingTracker:
         labels = list(labels)
         started = self._read_started()
         n = self._tracker.create_issue(title, body, labels)
-        self._context.store.record_issue(Issue(n, title, body, frozenset(labels), "open"),
-                                         self._context.config.lanes, observed_at=started)
+        self._observe([Issue(n, title, body, frozenset(labels), "open")], started)
         return n
 
     def update_issue(self, n, *, title, body):

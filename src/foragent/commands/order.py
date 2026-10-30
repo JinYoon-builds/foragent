@@ -119,8 +119,13 @@ def add(commands) -> None:
 def _preread(args, root) -> int:
     cli = facade()
     config = cli.load_config(root)
+    try:
+        # The repository publish will name in the issue body, so preread can bind its proposal to it.
+        repo = config.repo or cli.GitRepo(root).remote_slug()
+    except cli.GitError:
+        repo = None
     results = cli.order.preread(cli.order.read_plan(args.plan), root, config,
-                                lambda: cli.GhTracker(config.repo or cli.GitRepo(root).remote_slug()))
+                                lambda: cli.GhTracker(repo or cli.GitRepo(root).remote_slug()), repo=repo)
     if args.json:
         print(cli.json.dumps({"issues": results}, ensure_ascii=False))
     else:

@@ -234,18 +234,36 @@ class IssueSnapshotMixin:
             row.update({key: value for key, value in fields.items() if key not in seen})
             self._save_local_issue(snapshot, row)
 
-    def record_issue(self, issue: Any, lanes: dict, *, observed_at: datetime | None = None) -> None:
+    def record_issue(self, issue: Any, lanes: dict, *, observed_at: datetime | None = None) -> list[int]:
         """Apply a single read; ``observed_at`` is when the read began (default: now)."""
+        return self.record_issues([issue], lanes, observed_at=observed_at)
+
+    def record_issues(self, issues: list, lanes: dict, *, observed_at: datetime | None = None) -> list[int]:
+        """Apply reads that began at ``observed_at`` (default: now) in one transaction.
+
+        Returns the issues whose queued writes the reads contradicted and dropped."""
+        at = observed_at or self._now()
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            if issue.is_pull_request:
-                return
-            row = self._local_issue(snapshot, issue.number)
-            facts = {"title": issue.title, "body": issue.body, "labels": sorted(issue.labels), "state": issue.state,
-                     "state_reason": getattr(issue, "state_reason", None), "lane": issue_lane(issue.labels, lanes)}
-            # An older observation changes nothing, not even this row's revision or update time.
-            if apply_observation(snapshot, row, facts, observed_at or self._now(), lanes=lanes)[0]:
-                self._save_local_issue(snapshot, row)
+            changed, dropped = False, []
+            for issue in issues:
+                if issue.is_pull_request:
+                    continue
+                row = self._local_issue(snapshot, issue.number)
+                facts = {"title": issue.title, "body": issue.body, "labels": sorted(issue.labels),
+                         "state": issue.state, "state_reason": getattr(issue, "state_reason", None),
+                         "lane": issue_lane(issue.labels, lanes)}
+                # An older observation changes nothing, not even this row's revision or update time.
+                applied, contradicted = apply_observation(snapshot, row, facts, at, lanes=lanes)
+                if contradicted:
+                    dropped.append(issue.number)
+                if applied:
+                    snapshot["revision"] = snapshot.get("revision", 0) + 1
+                    row.update(revision=snapshot["revision"], updated_at=self._timestamp())
+                    changed = True
+            if changed:
+                self._write_json(self.root / "issues.json", snapshot)
+            return dropped
 
     def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict) -> None:
         with self._state_lock():
