@@ -37,16 +37,6 @@ def _record_path(store: StateStore) -> Path:
     return store.root / "orch-spawn.json"
 
 
-def _write_record(store: StateStore, fields: dict) -> None:
-    """Replace the spawn record, carrying over the last launched session's descriptor (#413).
-
-    Only ``orch_sessions.record_spawn`` replaces the descriptor, after a launch
-    ran, so a reservation or a failed launch never loses the session it names.
-    """
-    descriptor = (_read_record(store) or {}).get("descriptor")
-    store._write_json(_record_path(store), {**fields, **({"descriptor": descriptor} if descriptor else {})})
-
-
 def _alive(store: StateStore, now: datetime) -> bool:
     last = store.heartbeats()["orchestrator"]
     return last is not None and (now - last).total_seconds() <= ALIVE_SECONDS
@@ -99,8 +89,8 @@ def _record_session(store: StateStore, now: datetime, screen: str, pid) -> None:
         row = None
     if row is None:
         return
-    _write_record(store, {"spawned_at": now.isoformat(), "screen": screen, "launched": True,
-                          "pid": pid, "start_time": row.start_time})
+    store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen, "launched": True,
+                                            "pid": pid, "start_time": row.start_time})
 
 
 def record_launch(store: StateStore, now: datetime, screen: str, result) -> None:
@@ -110,7 +100,8 @@ def record_launch(store: StateStore, now: datetime, screen: str, result) -> None
     out (``launched: false``). The PID and start time are optional evidence, so a
     failure to read them never hides a launch that happened.
     """
-    _write_record(store, {"spawned_at": now.isoformat(), "screen": screen, "launched": result is not None})
+    store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen,
+                                            "launched": result is not None})
     if result is not None:
         try:
             _record_session(store, now, screen, getattr(result, "pid", None))

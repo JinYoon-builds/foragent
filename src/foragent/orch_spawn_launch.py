@@ -54,7 +54,7 @@ def launch(root: Path, store: StateStore, now: datetime, planned) -> bool:
     """Reserve the spacing, run the launch command and record its outcome; whether it ran."""
     screen, argv, env, _descriptor = planned
     # A failed or timed-out command may still open later, so it reserves the spacing too.
-    orch_spawn._write_record(store, {"spawned_at": now.isoformat(), "screen": screen})
+    store._write_json(orch_spawn._record_path(store), {"spawned_at": now.isoformat(), "screen": screen})
     try:
         result = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, check=True, timeout=10, env=env)
@@ -66,14 +66,10 @@ def launch(root: Path, store: StateStore, now: datetime, planned) -> bool:
 
 
 def adopt(store: StateStore, planned, now: datetime) -> None:
-    """Inside the openers' lock, right after a launch: the new session becomes the active one.
-
-    Its descriptor goes into the spawn record; the heartbeat is left as the watch
-    wrote it, and ``orch_sessions`` derives the active session from both.
-    """
+    """Inside the openers' lock, right after a launch: the new session becomes the heartbeat's active one."""
     from foragent import orch_sessions
 
-    orch_sessions.record_spawn(store, planned[3], now)
+    orch_sessions.activate(store, planned[3], now)
 
 
 def _opened(store: StateStore, config: Config, root: Path, now: datetime, planned) -> None:

@@ -76,14 +76,9 @@ class StateStore(
             except (OSError, ValueError):
                 old = {}
             old = old if isinstance(old, dict) else {}
-            from foragent import orch_sessions  # Late: orch_sessions imports this module.
-
-            # A newer gate-spawned session (#413) is the active one even before its first write.
-            old, retired = orch_sessions.settle(self, old, at)
             active = old.get("session_id")
             if session_id and active and session_id != active:
                 return
-            orch_sessions.remember(self, retired)
             record.update({key: old[key] for key in self.SESSION_FIELDS if key in old})
             self._write_json(path, record)
 

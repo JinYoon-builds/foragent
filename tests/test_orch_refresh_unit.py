@@ -166,9 +166,10 @@ def test_every_launch_gets_its_own_new_session_id_and_records_it(setup, monkeypa
     before = (store.root / "orch-heartbeat.json").read_bytes()
     assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="o/r"), now=NOW, spacing=not explicit) == screen
     (argv, env), = calls
-    new_id = orch_sessions.active(store)["session_id"]
-    assert new_id not in ("launcher-id", "old-id")
-    assert (store.root / "orch-heartbeat.json").read_bytes() == before, "a gate launch leaves the heartbeat alone"
+    record = _heartbeat(store)
+    new_id = record["session_id"]
+    assert new_id not in ("launcher-id", "old-id") and record["status"] == "active", "written at once"
+    assert record["previous"]["session_id"] == "old-id" and record["previous"]["status"] == "retired"
     assert env["FORAGENT_SESSION_ID"] == new_id and env["FORAGENT_ROLE"] == "orchestrator"
     command = argv if screen == "background" else shlex.split(argv[-1])
     assert command[command.index("--session-id") + 1] == new_id
@@ -176,12 +177,13 @@ def test_every_launch_gets_its_own_new_session_id_and_records_it(setup, monkeypa
         assert command[:3] == ["env", "FORAGENT_ROLE=orchestrator", f"FORAGENT_SESSION_ID={new_id}"]
     assert orch_refresh.due(store, Config(repo="o/r"), NOW)["session_id"] == new_id
     later = NOW + timedelta(seconds=5)
+    after_launch = (store.root / "orch-heartbeat.json").read_bytes()
+    assert after_launch != before
     store.write_heartbeat("orchestrator", later, session_id="old-id")  # the dead session is ignored
-    assert (store.root / "orch-heartbeat.json").read_bytes() == before
+    assert (store.root / "orch-heartbeat.json").read_bytes() == after_launch
     store.write_heartbeat("orchestrator", later, session_id=new_id)  # the new session's first write
     record = _heartbeat(store)
     assert record["session_id"] == new_id and record["status"] == "active" and record["at"] == later.isoformat()
-    assert record["previous"]["session_id"] == "old-id" and record["previous"]["status"] == "retired"
     history = [json.loads(line)["session_id"]
                for line in (store.root / "orch-sessions.jsonl").read_text(encoding="utf-8").splitlines()]
     assert history == ["old-id"]
@@ -229,8 +231,8 @@ def test_spawned_session_is_recorded_inside_the_openers_lock(setup, monkeypatch,
     monkeypatch.setenv("TMUX", "/tmp/tmux")
     _approve(store)
     seen = []
-    record = orch_sessions.record_spawn
-    monkeypatch.setattr(orch_sessions, "record_spawn",
+    record = orch_sessions.activate
+    monkeypatch.setattr(orch_sessions, "activate",
                         lambda *args, **kwargs: seen.append(_lock_held(store)) or record(*args, **kwargs))
     assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="o/r"), now=NOW, spacing=not explicit) == "tmux"
     assert seen and all(seen), seen
@@ -298,20 +300,6 @@ def _spawn(store, repo, at, *, fail=False, monkeypatch=None):
     return orch_spawn.ensure_orchestrator(repo, store, Config(repo="o/r"), now=at)
 
 
-def test_spawned_session_without_any_heartbeat_is_not_due(setup, tmp_path):
-    store, repo, _calls = setup
-    _approve(store)
-    assert _spawn(store, repo, NOW) == "background"
-    spawned = json.loads((store.root / "orch-spawn.json").read_text())["descriptor"]
-    rows = [{"type": "system", "subtype": "compact_boundary", "sessionId": spawned["session_id"]}] * 9
-    path = Path(spawned["transcript_path"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    report = orch_refresh.due(store, Config(repo="o/r"), NOW + timedelta(hours=30))
-    assert report["due"] is False and "heartbeat" in report["reason"] and report["session_id"] is None
-    assert not (store.root / "orch-heartbeat.json").exists()
-
-
 def test_failed_second_launch_keeps_the_first_spawned_session_active(setup, monkeypatch):
     store, repo, _calls = setup
     _approve(store)
@@ -320,7 +308,7 @@ def test_failed_second_launch_keeps_the_first_spawned_session_active(setup, monk
     first = orch_sessions.active(store)["session_id"]
     assert _spawn(store, repo, NOW + timedelta(minutes=3), fail=True, monkeypatch=monkeypatch) is None
     assert orch_sessions.active(store)["session_id"] == first, "a failed launch must not revive the older session"
-    assert _history(store) == []
+    assert _history(store) == ["old-id"]
 
 
 def test_second_launch_retires_the_first_spawned_session_once(setup):
@@ -331,25 +319,11 @@ def test_second_launch_retires_the_first_spawned_session_once(setup):
     first = orch_sessions.active(store)["session_id"]
     _spawn(store, repo, NOW + timedelta(minutes=3))
     second = orch_sessions.active(store)["session_id"]
-    assert second != first and _history(store) == [first]
+    assert second != first and _history(store) == ["old-id", first]
     store.write_heartbeat("orchestrator", NOW + timedelta(minutes=4), session_id=first)  # retired: ignored
     assert orch_sessions.active(store)["session_id"] == second
     store.write_heartbeat("orchestrator", NOW + timedelta(minutes=4), session_id=second)
-    assert _history(store) == [first, "old-id"] and _heartbeat(store)["session_id"] == second
-
-
-def test_a_settled_spawned_session_is_retired_once_when_replaced(setup):
-    store, repo, _calls = setup
-    _approve(store)
-    orch_sessions.activate(store, OLD, NOW - timedelta(hours=2))
-    _spawn(store, repo, NOW)
-    first = orch_sessions.active(store)["session_id"]
-    store.write_heartbeat("orchestrator", NOW + timedelta(seconds=5), session_id=first)  # settles it
-    assert _history(store) == ["old-id"]
-    _spawn(store, repo, NOW + timedelta(minutes=3))
-    second = orch_sessions.active(store)["session_id"]
-    store.write_heartbeat("orchestrator", NOW + timedelta(minutes=4), session_id=second)
-    assert _history(store) == ["old-id", first]
+    assert _history(store) == ["old-id", first] and _heartbeat(store)["session_id"] == second
 
 
 def test_a_retired_spawned_session_never_returns_even_on_a_timestamp_tie(setup):
