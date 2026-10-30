@@ -1799,25 +1799,25 @@ def test_batch_rejects_two_waiting_orders_writing_different_content_before_write
     assert publishing[4] == [] and publishing[2].issues == {}
 
 
-def test_batch_note_is_appended_once_even_when_its_commit_is_retried(publishing):
+def test_batch_note_is_appended_once_even_when_its_commit_is_retried(publishing, monkeypatch):
     from foragent import order_batch
 
-    root = publishing[0]
+    root, git = publishing[0], publishing[3]
     (root / "docs").mkdir()
     (root / "docs/ideas.md").write_text("# Ideas\nOld.\n")
-    entry = order_batch.note(root, "idea", "A new idea.", "next-code-merge", "en")
-    other = order_batch.note(root, "idea", "Later idea.", "a-later-time", "en")
-    for _ in range(2):  # The second pass is a resume of a push that already happened.
+    order_batch.note(root, "idea", "A new idea.", "next-code-merge", "en")
+    order_batch.note(root, "idea", "Later idea.", "a-later-time", "en")
+    original = git.push_base
+    monkeypatch.setattr(git, "push_base", lambda branch: (_ for _ in ()).throw(GitError("interrupted")))
+    with pytest.raises(GitError):
         _flush(publishing)
-        order_batch._update(root, lambda state: [row.update(status="waiting") for row in state["notes"]
-                                                 if row["id"] == entry["id"]])
+    monkeypatch.setattr(git, "push_base", original)
+    _flush(publishing)  # The resume pushes the existing commit; it does not append again.
     content = (root / "docs/ideas.md").read_text()
-    assert content.startswith("# Ideas\nOld.\n") and content.count("A new idea.") == 1
-    assert "Later idea." not in content
-    assert [event[0] for event in publishing[4]] == ["commit", "push", "push"]
+    assert content == "# Ideas\nOld.\n\nA new idea.\n"
+    assert [event[0] for event in publishing[4]] == ["commit", "push"]
     statuses = {row["text"]: row["status"] for row in order_batch.pending(root)["notes"]}
-    assert statuses == {"A new idea.": "waiting", "Later idea.": "waiting"}
-    assert other["boundary"] == "a-later-time"
+    assert statuses == {"A new idea.": "published", "Later idea.": "waiting"}
 
 
 @pytest.mark.parametrize("boundary", ["", "  ", "a\nb"])
@@ -1927,10 +1927,10 @@ def test_batch_refuses_a_done_when_file_that_changed_after_deferral(publishing, 
                if issue.title in {item["title"] for item in plan["issues"]})
 
 
-def test_batch_rule_note_replaces_the_current_rule_line_once_with_its_order(publishing, plan):
+def test_batch_rule_note_replaces_the_current_rule_line_once_with_its_order(publishing, plan, monkeypatch):
     from foragent import order_batch
 
-    root = publishing[0]
+    root, git = publishing[0], publishing[3]
     (root / "docs").mkdir()
     (root / "docs/rules.md").write_text("# Rules\n- Publish at once. (D10)\n- Keep tests locked. (D11)\n")
     _batch(publishing, plan)
@@ -1938,9 +1938,12 @@ def test_batch_rule_note_replaces_the_current_rule_line_once_with_its_order(publ
     order_batch.note(root, "rule", "- Publish in batches. (D12)", "next-code-merge", "en",
                      replace="- Publish at once. (D10)")
     assert (root / "docs/rules.md").read_text().count("Publish at once") == 1  # waiting, unchanged
-    for _ in range(2):  # The second pass resumes after the push already happened.
+    original = git.push_base
+    monkeypatch.setattr(git, "push_base", lambda branch: (_ for _ in ()).throw(GitError("interrupted")))
+    with pytest.raises(GitError):
         _flush(publishing)
-        order_batch._update(root, lambda state: [row.update(status="waiting") for row in state["notes"]])
+    monkeypatch.setattr(git, "push_base", original)
+    _flush(publishing)  # The resume finds the replaced line gone and must not need it.
     rules = (root / "docs/rules.md").read_text()
     assert rules == "# Rules\n- Publish in batches. (D12)\n- Keep tests locked. (D11)\n"
     assert (root / "docs/decisions.md").read_text().count("D12. Batch publication") == 1
@@ -1972,3 +1975,133 @@ def test_batch_rule_lines_are_single_and_replace_is_rule_only(publishing, kind, 
 
     with pytest.raises(order.PlanError):
         order_batch.note(publishing[0], kind, text, "next-code-merge", "en", replace=replace)
+
+
+def _rules_case(publishing, plan):
+    from foragent import order_batch
+
+    root = publishing[0]
+    (root / "docs").mkdir()
+    (root / "docs/rules.md").write_text("# Rules\n- A. (D1)\n")
+    publishing[3].saved["docs/rules.md"] = (root / "docs/rules.md").read_text()  # committed on the base
+    _batch(publishing, plan)
+    order_batch.note(root, "rule", "- B. (D2)", "next-code-merge", "en", replace="- A. (D1)")
+    order_batch.note(root, "rule", "- C. (D3)", "next-code-merge", "en", replace="- B. (D2)")
+    order_batch.note(root, "rule", "- Extra. (D4)", "next-code-merge", "en")
+    return root
+
+
+@pytest.mark.parametrize("interrupt", ["push_base", "commit_paths"])
+def test_batch_resume_recognizes_superseded_rule_replacements(publishing, plan, monkeypatch, interrupt):
+    from foragent import order_batch
+
+    root, git = _rules_case(publishing, plan), publishing[3]
+    original = getattr(git, interrupt)
+
+    def fail(*args):
+        raise GitError("interrupted")
+
+    monkeypatch.setattr(git, interrupt, fail)
+    with pytest.raises(GitError):
+        _flush(publishing)
+    monkeypatch.setattr(git, interrupt, original)
+    _flush(publishing)
+    assert (root / "docs/rules.md").read_text() == "# Rules\n- C. (D3)\n- Extra. (D4)\n"
+    state = order_batch.pending(root)
+    assert {row["status"] for row in [*state["orders"], *state["notes"]]} == {"published"}
+    assert [event[0] for event in publishing[4]].count("commit") == 1
+
+
+def test_batch_resume_keeps_a_later_change_to_a_committed_rule_line(publishing, plan, monkeypatch):
+    from foragent import order_batch
+
+    root, git = _rules_case(publishing, plan), publishing[3]
+    original = git.push_base
+    monkeypatch.setattr(git, "push_base", lambda branch: (_ for _ in ()).throw(GitError("interrupted")))
+    with pytest.raises(GitError):
+        _flush(publishing)
+    monkeypatch.setattr(git, "push_base", original)
+    # A later boundary edits the same line before the interrupted batch resumes.
+    order_batch.note(root, "rule", "- D. (D5)", "later", "en", replace="- C. (D3)")
+    order_batch.note(root, "rule", "- Extra2. (D6)", "later", "en", replace="- Extra. (D4)")
+    _flush(publishing, "later")
+    spec = root / f"docs/specs/{plan['id']}.md"  # someone also edits the committed order's spec
+    spec.write_text("# Login\nClarified later.\n")
+    git.saved[f"docs/specs/{plan['id']}.md"] = spec.read_text()
+    _flush(publishing)
+    assert (root / "docs/rules.md").read_text() == "# Rules\n- D. (D5)\n- Extra2. (D6)\n"
+    assert spec.read_text() == "# Login\nClarified later.\n"
+    assert order_batch.pending(root)["orders"][0]["status"] == "published"
+    assert any(issue.title == plan["issues"][0]["title"] for issue in publishing[2].list_issues())
+    assert {row["status"] for row in order_batch.pending(root)["notes"]} == {"published"}
+
+
+
+def _checkout(root):
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*")
+            if p.is_file() and not {".git", ".foragent", "home"} & set(p.relative_to(root).parts)}
+
+
+def test_batch_failed_commit_leaves_the_checkout_and_a_later_boundary_cannot_strand_it(
+    publishing, plan, monkeypatch,
+):
+    from foragent import order_batch
+
+    root, git = _rules_case(publishing, plan), publishing[3]
+    before = _checkout(root)
+    original = git.commit_paths
+    monkeypatch.setattr(git, "commit_paths", lambda *args: (_ for _ in ()).throw(GitError("interrupted")))
+    with pytest.raises(GitError):
+        _flush(publishing)
+    assert _checkout(root) == before, "An uncommitted batch write is undone, specs and tests included"
+    monkeypatch.setattr(git, "commit_paths", original)
+    order_batch.note(root, "rule", "- Unrelated. (D9)", "later", "en")
+    _flush(publishing, "later")
+    _flush(publishing)
+    assert (root / "docs/rules.md").read_text() == "# Rules\n- C. (D3)\n- Unrelated. (D9)\n- Extra. (D4)\n"
+    state = order_batch.pending(root)
+    assert {row["status"] for row in [*state["orders"], *state["notes"]]} == {"published"}
+
+
+@pytest.mark.parametrize("stop", ["before_commit", "after_commit"])
+def test_batch_killed_flush_is_settled_from_head_by_the_next_flush(publishing, plan, monkeypatch, stop):
+    from foragent import order_batch, order_batch_journal
+
+    root, git = _rules_case(publishing, plan), publishing[3]
+    recover = order_batch_journal.recover
+    monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)  # the process dies: no cleanup
+    if stop == "before_commit":
+        monkeypatch.setattr(git, "commit_paths", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
+    else:
+        monkeypatch.setattr(order_batch, "_committed", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    monkeypatch.setattr(order_batch_journal, "recover", recover)
+    order_batch.note(root, "rule", "- Unrelated. (D9)", "later", "en")
+    _flush(publishing, "later")  # any boundary settles the journal before reading files
+    _flush(publishing)
+    assert (root / "docs/rules.md").read_text().count("- C. (D3)") == 1
+    assert "- A. (D1)" not in (root / "docs/rules.md").read_text()
+    assert "- Unrelated. (D9)" in (root / "docs/rules.md").read_text()
+    commits = [event[1] for event in publishing[4] if event[0] == "commit"]
+    assert len(commits) == 2, commits  # one per boundary, never a repeat of the first batch
+    state = order_batch.pending(root)
+    assert {row["status"] for row in [*state["orders"], *state["notes"]]} == {"published"}
+    assert not (root / ".foragent/order-batch-journal.json").exists()
+
+
+def test_batch_recovery_refuses_a_file_edited_after_the_killed_write(publishing, plan, monkeypatch):
+    from foragent import order_batch, order_batch_journal
+
+    root, git = _rules_case(publishing, plan), publishing[3]
+    monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
+    monkeypatch.setattr(git, "commit_paths", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    (root / "docs/rules.md").write_text((root / "docs/rules.md").read_text() + "- Hand edit.\n")
+    with pytest.raises(order.PlanError, match="docs/rules.md"):
+        _flush(publishing)
+    assert "- Hand edit." in (root / "docs/rules.md").read_text()
+    assert (root / ".foragent/order-batch-journal.json").exists()

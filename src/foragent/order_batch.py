@@ -16,19 +16,18 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from foragent import order, order_references
+from foragent import order_batch_journal as journal
 from foragent.config import Config, load_config
 from foragent.git import GitError
 from foragent.i18n import text
-from foragent.order_files import check_destinations, check_write
-from foragent.paths import repo_path
+from foragent.order_batch_notes import COMMITTED, NOTE_FILES, _note_files, _write_notes
+from foragent.order_files import check_destinations
 from foragent.state_locks import _file_lock
 
 QUEUE_FILE = "order-batch.json"
-# decision and idea notes append to their history; a rule note edits one current-rules line.
-NOTE_FILES = {"decision": "docs/decisions.md", "idea": "docs/ideas.md", "rule": "docs/rules.md"}
 WAITING, PUBLISHED = "waiting", "published"
 
 
@@ -166,55 +165,6 @@ def pending(root: Path) -> dict:
             "notes": [dict(row) for row in state["notes"]]}
 
 
-def _note_marker(entry: dict) -> str:
-    return f"<!-- foragent:note {entry['id']} -->"
-
-
-def _rule_lines(name: str, current: str, entry: dict, language: str) -> str:
-    """Replace (or add) one current-rules line; a line already in place counts as done."""
-    lines = current.splitlines()
-    if entry["text"] in lines:
-        return current
-    if "replace" not in entry:
-        return current + ("" if not current or current.endswith("\n") else "\n") + entry["text"] + "\n"
-    if entry["replace"] not in lines:
-        raise order.PlanError(text("batch_rule_line_missing", language, path=name, line=entry["replace"]))
-    lines[lines.index(entry["replace"])] = entry["text"]
-    return "\n".join(lines) + ("\n" if current.endswith("\n") else "")
-
-
-def _note_files(root: Path, notes: list[dict], language: str) -> dict[str, str]:
-    """Each note file with its waiting notes applied once; computed before any write."""
-    contents: dict[str, str] = {}
-    for entry in notes:
-        name = NOTE_FILES[entry["kind"]]
-        if name not in contents:
-            path = repo_path(root, name)
-            if entry["kind"] == "rule" and not path.is_file():
-                # A project without current rules records the decision only.
-                raise order.PlanError(text("batch_rules_missing", language, path=name))
-            contents[name] = path.read_text(encoding="utf-8") if path.is_file() else ""
-        if entry["kind"] == "rule":
-            contents[name] = _rule_lines(name, contents[name], entry, language)
-        elif _note_marker(entry) not in contents[name]:
-            current = contents[name]
-            separator = "" if not current or current.endswith("\n\n") else "\n" if current.endswith("\n") else "\n\n"
-            contents[name] = f"{current}{separator}{_note_marker(entry)}\n{entry['text']}\n"
-    return contents
-
-
-def _write_notes(root: Path, contents: dict[str, str]) -> None:
-    for name, content in contents.items():
-        path = repo_path(root, name)
-        if path.is_file() and path.read_text(encoding="utf-8") == content:
-            continue
-        own_root = PurePosixPath(name).parent.as_posix()
-        check_write(root, name, own_root)
-        order_references.real_directory(root, own_root)
-        check_write(root, name, own_root)
-        path.write_text(content, encoding="utf-8")
-
-
 def _check_new_lanes(plans: list[dict], config: Config) -> None:
     """Orders creating the same lane must agree on it, or the second would fail after the commit."""
     seen: dict[str, dict] = {}
@@ -226,11 +176,43 @@ def _check_new_lanes(plans: list[dict], config: Config) -> None:
                 raise order.PlanError(text("batch_lane_conflict", config.language, lane=lane["name"]))
 
 
+def _mark(root: Path, kind: str, revisions: set[str], **fields) -> None:
+    def change(current: dict) -> None:
+        for row in current[kind]:
+            if row.get("revision", row["id"]) in revisions and row["status"] != PUBLISHED:
+                row.update(fields)
+
+    _update(root, change)
+
+
+def _committed(root: Path, orders: dict[str, list[str]], notes: list[str], heads: dict[str, str]) -> None:
+    """Record that the batch commit exists: later runs push and finish, never rewrite."""
+    for revision, names in orders.items():
+        _mark(root, "orders", {revision}, status=COMMITTED, blobs={name: heads[name] for name in names})
+    _mark(root, "notes", set(notes), status=COMMITTED)
+
+
+def _require_base(git, config: Config) -> None:
+    if git.current_branch() != config.base_branch:
+        raise GitError(f"order flush must run on the base branch {config.base_branch!r}")
+
+
 def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
           manager=None) -> dict:
-    """Publish what waits for ``boundary``: one commit and push, then each order's issues."""
+    """Publish what waits for ``boundary``: one commit and push, then each order's issues.
+
+    Status moves waiting -> committed (the local commit exists) -> published. Before
+    writing, the flush journals every file's earlier bytes; an interrupted write is undone
+    or, when HEAD shows it committed, recorded as committed (``order_batch_journal``).
+    """
     boundary = _boundary(boundary, config.language)
     with _lock(root, "order-batch-flush.lock"):
+        directory = _directory(root)
+        if (directory / journal.JOURNAL_FILE).exists():
+            # A flush of any boundary that stopped mid-write is settled before anything reads files.
+            _require_base(git, config)
+            with git.publish_lock():
+                journal.recover(directory, root, git, lambda *facts: _committed(root, *facts), config.language)
         state = _load(root)
         orders = [row for row in state["orders"] if row["status"] != PUBLISHED and row["boundary"] == boundary]
         notes = [row for row in state["notes"] if row["status"] != PUBLISHED and row["boundary"] == boundary]
@@ -238,6 +220,8 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
             return {"boundary": boundary, "orders": [], "notes": [], "parents": {}}
         prepared = []
         for entry in orders:
+            if entry["status"] == COMMITTED:
+                continue  # its files are in a local commit; later edits to them must stay
             # Every order's own checks pass before anything is written for any of them.
             order.publish(entry["plan"], root, config, tracker, repo=repo, check_only=True, **_approval(entry))
             files = order.validate_plan(entry["plan"], root, config)
@@ -250,40 +234,45 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
                     raise order.PlanError(text("batch_path_conflict", config.language, path=name))
                 combined[name] = content
         _check_new_lanes([entry["plan"] for entry, _ in prepared], config)
-        if git.current_branch() != config.base_branch:
-            raise GitError(f"order flush must run on the base branch {config.base_branch!r}")
+        _require_base(git, config)
         with git.publish_lock():
             git.update_base(config.base_branch)
             check_destinations(root, combined)
-            note_contents = _note_files(root, notes, config.language)  # may refuse; nothing written yet
-            for entry, files in prepared:
-                order.write_order_files(entry["plan"], root, config, git, files, manager)
-                if any(lane["name"] not in config.lanes for lane in entry["plan"].get("new_lanes", [])):
-                    # Later orders and the issue pass see the lane this order just created.
-                    config = replace(config, lanes=load_config(root).lanes)
-            _write_notes(root, note_contents)
-            title = f"Foragent batch {boundary}: {len(orders)} order(s), {len(notes)} note(s)"
-            blobs = order.commit_and_push(config, git, {**combined, **note_contents}, title)
-        done_at, published = _now(), {row["id"] for row in notes}
+            applying = [row for row in notes if row["status"] != COMMITTED]
+            note_contents = _note_files(root, applying, config.language)  # may refuse; nothing written yet
+            planned = {**combined, **note_contents}
+            written = {"orders": {entry["revision"]: sorted(files) for entry, files in prepared},
+                       "notes": [row["id"] for row in applying]}
+            journal.write(directory, root, planned, **written)
 
-        def mark_notes(current: dict) -> None:
-            # Notes are files only, so the pushed commit has published them.
-            for row in current["notes"]:
-                if row["id"] in published:
-                    row.update(status=PUBLISHED, published_at=done_at)
+            def committed(blobs: dict[str, str]) -> None:
+                _committed(root, written["orders"], written["notes"], blobs)
+                journal.clear(directory)
 
-        _update(root, mark_notes)
+            try:
+                for entry, files in prepared:
+                    order.write_order_files(entry["plan"], root, config, git, files, manager)
+                    if any(lane["name"] not in config.lanes for lane in entry["plan"].get("new_lanes", [])):
+                        # Later orders and the issue pass see the lane this order just created.
+                        config = replace(config, lanes=load_config(root).lanes)
+                _write_notes(root, note_contents)
+                title = f"Foragent batch {boundary}: {len(prepared)} order(s), {len(applying)} note(s)"
+                order.commit_and_push(config, git, planned, title, after_commit=committed)
+            except BaseException:
+                # Undo an uncommitted write now, so waiting work never stays in the checkout.
+                journal.recover(directory, root, git, lambda *facts: _committed(root, *facts), config.language)
+                raise
+        published = {row["id"] for row in notes}
+        _mark(root, "notes", published, status=PUBLISHED, published_at=_now())
         parents: dict[str, int | None] = {}
-        for entry, files in prepared:
-            report = order.publish(entry["plan"], root, config, tracker, repo=repo, git=git, manager=manager,
-                                   published_blobs={name: blobs[name] for name in files}, **_approval(entry))
+        for entry in orders:
+            current = next((row for row in _load(root)["orders"] if row.get("revision") == entry["revision"]), None)
+            if current is None or current["status"] != COMMITTED:
+                continue  # replaced while flushing; the newer version waits for its own flush
+            if config.lanes.keys() != load_config(root).lanes.keys():
+                config = replace(config, lanes=load_config(root).lanes)
+            report = order.publish(current["plan"], root, config, tracker, repo=repo, git=git, manager=manager,
+                                   published_blobs=current["blobs"], **_approval(current))
             parents[entry["id"]] = report.parent
-
-            def mark(current: dict, revision=entry["revision"], parent=report.parent) -> None:
-                for row in current["orders"]:
-                    if row.get("revision") == revision and row["status"] != PUBLISHED:
-                        row.update(status=PUBLISHED, published_at=_now(), parent=parent)
-
-            _update(root, mark)
-        return {"boundary": boundary, "orders": [entry["id"] for entry, _ in prepared],
-                "notes": sorted(published), "parents": parents}
+            _mark(root, "orders", {entry["revision"]}, status=PUBLISHED, published_at=_now(), parent=report.parent)
+        return {"boundary": boundary, "orders": list(parents), "notes": sorted(published), "parents": parents}

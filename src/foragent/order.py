@@ -441,8 +441,12 @@ def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, file
             path.write_bytes(data)
 
 
-def commit_and_push(config: Config, git: GitRepo, files: dict, title: str) -> dict[str, str]:
-    """Commit the given written paths once, confirm HEAD has them all, and push the base."""
+def commit_and_push(config: Config, git: GitRepo, files: dict, title: str,
+                    after_commit=None) -> dict[str, str]:
+    """Commit the given written paths once, confirm HEAD has them all, and push the base.
+
+    ``after_commit`` receives the committed blobs before the push, so a caller can record
+    that the commit exists even when the push is interrupted."""
     git.ensure_tracked(list(files))
     changed = git.uncommitted_paths(list(files))
     if changed:
@@ -451,6 +455,8 @@ def commit_and_push(config: Config, git: GitRepo, files: dict, title: str) -> di
     missing = [name for name in files if published_blobs.get(name, "missing") == "missing"]
     if missing:
         raise PlanError(f"published commit is missing files: {', '.join(sorted(missing))}")
+    if after_commit is not None:
+        after_commit(published_blobs)
     # Also retry a previously failed push when the files already match HEAD.
     git.push_base(config.base_branch)
     return published_blobs

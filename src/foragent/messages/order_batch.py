@@ -12,6 +12,8 @@ MESSAGES = {
         "batch_rule_one_line": "a rule note and its --replace line must each be one non-empty line",
         "batch_rule_line_missing": "{path} has no line {line!r} to replace; check the current rule and queue the rule note again",
         "batch_rules_missing": "{path} does not exist; record the decision only and drop the rule note",
+        "batch_recover_changed": "an interrupted batch wrote {path}, and it changed again before it was committed; "
+                                 "compare it with the last commit, then delete .foragent/order-batch-journal.json",
         "batch_lane_conflict": "two waiting orders create the lane {lane} differently; make them agree first",
         "batch_waiting": "Waiting for {boundary}: {title} ({approved} of {count} issue(s) approved). "
                          "Run fa order flush --boundary {boundary} when that boundary arrives.",
@@ -44,6 +46,8 @@ MESSAGES = {
         "batch_rule_one_line": "규칙 기록과 --replace 줄은 각각 비어 있지 않은 한 줄이어야 해요",
         "batch_rule_line_missing": "{path}에 바꿀 줄 {line!r}이(가) 없어요. 현재 규칙을 확인하고 규칙 기록을 다시 맡겨 주세요",
         "batch_rules_missing": "{path}이(가) 없어요. 결정만 기록하고 규칙 기록은 빼 주세요",
+        "batch_recover_changed": "중단된 일괄 올리기가 {path}을(를) 썼는데, 커밋 전에 다시 바뀌었어요. "
+                                 "마지막 커밋과 비교한 다음 .foragent/order-batch-journal.json을 지워 주세요",
         "batch_lane_conflict": "기다리는 두 주문이 {lane} 레인을 서로 다르게 만들어요. 먼저 둘을 맞춰 주세요",
         "batch_waiting": "{boundary}을(를) 기다려요: {title} (이슈 {count}개 중 {approved}개 승인). "
                          "그때가 오면 fa order flush --boundary {boundary}를 실행하세요.",
