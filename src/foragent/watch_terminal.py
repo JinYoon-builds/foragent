@@ -10,7 +10,7 @@ import re
 
 from foragent.config import Config
 from foragent.watch_data import Snapshot
-from foragent.watch_sections import talk as talk_section
+from foragent.watch_mouse import talk_alert
 
 
 # A visible issue number, linked to its GitHub page after each refresh.
@@ -158,7 +158,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             top = view_state.get("scroll", 0)
             alert = [watch._fit(watch._line(error, "yellow"), max(1, width))] if error else []
             # A squirrel's talk result off this screen (short or scrolled) takes the bottom row.
-            alert = alert or talk_section.alert(view_state, visible, max(1, width))
+            alert = alert or talk_alert(view_state, visible, max(1, width))
             if height >= watch.MIN_SCREEN and len(frame) <= height and visible:
                 # F fits: painted as today, its last row (the key help) on the bottom row,
                 # where a refresh error takes its place.

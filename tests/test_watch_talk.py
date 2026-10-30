@@ -137,18 +137,25 @@ def test_long_expanded_lane_rows_never_trim_the_talk_line_away(tmp_path, monkeyp
     store, state = StateStore(tmp_path / "state"), {"unfolded": {"work"}}
     _, layout = live(snapshot, config, tmp_path, state)
     watch.handle_mouse("left", *squirrel(layout), layout, store, config, state=state)
-    frame = live(snapshot, config, tmp_path, state)[0]
-    assert len(frame.splitlines()) > SCREEN_ROWS
-    # Within the first screen, above the footer, before any key or timeout.
-    assert "Opened #3" in frame.splitlines()[:SCREEN_ROWS - 1]
+    from foragent.watch_mouse import talk_alert
+
+    lines = watch._frame(snapshot, config, tmp_path, tick=0, width=80, selected=None,
+                         now=snapshot.captured_at, state=state)
+    plain = ["".join(value for value, _ in line).rstrip() for line in lines]
+    assert len(plain) > SCREEN_ROWS
+    # Kept with the lane rows, before any key or timeout, directly under the lane rows (the fold line).
+    assert plain.count("Opened #3") == 1
+    assert plain[plain.index("Opened #3") - 1].strip() == "▾ 접기"
+    # A screen showing only the first rows carries it in its bottom message row.
+    assert talk_alert(state, lines[:SCREEN_ROWS - 1], 80) == [watch._fit(watch._line("Opened #3", "yellow"), 80)]
 
 
 def test_live_bottom_row_carries_the_talk_line_only_when_the_screen_does_not_show_it():
-    from foragent.watch_sections import talk
+    from foragent.watch_mouse import show_talk, talk_alert
 
     state = {}
-    talk.show(state, "Opened #3")
+    show_talk(state, "Opened #3")
     shown = watch._fit(watch._line("Opened #3", "yellow"), 40)
-    assert talk.alert(state, [watch._line("rows"), shown], 40) == []
-    assert talk.alert(state, [watch._line("rows")], 40) == [shown]
-    assert talk.alert({}, [watch._line("rows")], 40) == []
+    assert talk_alert(state, [watch._line("rows"), shown], 40) == []
+    assert talk_alert(state, [watch._line("rows")], 40) == [shown]
+    assert talk_alert({}, [watch._line("rows")], 40) == []

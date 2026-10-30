@@ -117,13 +117,12 @@ def handle_mouse(button: Any, *args: Any, **kwargs: Any) -> Any:
 
 def _click_snapshot(snapshot: Any, config: Config, root: Path, *, x: int, y: int, width: int) -> str | None:
     from foragent import watch
-    from foragent.watch_sections import talk
 
     target = watch.hit_test(_snapshot_layout(snapshot, config, root, width), x, y)
     if not (isinstance(target, tuple) and target[0] == "squirrel"):
         return None
-    number = talk.lane_issue(snapshot.status.get("lanes", {}).get(target[1]))
-    return None if number is None else talk.talk(number, config, root)
+    number = lane_issue(snapshot.status.get("lanes", {}).get(target[1]))
+    return None if number is None else talk_lane(number, config, root)
 
 
 def _handle_mouse(
@@ -131,7 +130,6 @@ def _handle_mouse(
     *, state: dict[str, Any] | None = None,
 ) -> None:
     from foragent import watch
-    from foragent.watch_sections import talk
 
     state = {} if state is None else state
     if button in ("wheel-down", "wheel-up"):
@@ -152,7 +150,7 @@ def _handle_mouse(
         # The lane rows recorded what each squirrel talks to; a lane with no issue does nothing.
         number = state.get("talk_issues", {}).get(target[1])
         if number is not None:
-            talk.show(state, talk.talk(number, config, state.get("repo_root") or Path.cwd(), store))
+            show_talk(state, talk_lane(number, config, state.get("repo_root") or Path.cwd(), store))
 
 
 def toggle_lane(state: dict[str, Any], slug: str) -> None:
@@ -266,3 +264,79 @@ def switch_to_orchestrator(store: StateStore) -> bool:
     except (OSError, watch.subprocess.SubprocessError):
         return False  # A closed tab must not break the view.
     return True
+
+
+# Talking to a lane's worker (#174). A click on a lane row's squirrel (its glyph cell) runs
+# the same ``lanes.talk`` as ``fa lanes talk`` for the lane's current issue, else its last one
+# (the most recently finished run, ``last_issue`` in status); a lane with neither does nothing.
+# The result or error stays on one line under the lane rows until the next key or 10 seconds.
+TALK_SECONDS = 10
+# Below this width a talking row names its state in words instead of a badge line above it.
+BADGE_WIDTH = 44
+# Row states whose issue is the lane's current one; any other row talks to the last issue.
+CURRENT_STATES = frozenset({"working", "blocked", "waiting-human"})
+
+
+def lane_issue(row: dict[str, Any] | None) -> int | None:
+    """The issue a lane's squirrel talks to: the current one, else the last finished, else None."""
+    if not row:
+        return None
+    if row.get("issue") is not None and row.get("state") in CURRENT_STATES:
+        return row["issue"]
+    return row.get("last_issue")
+
+
+def talk_lane(number: int, config: Config, repo_root: Path, store: StateStore | None = None) -> str:
+    """Run ``fa lanes talk <number>`` in process; return its line or the LaneError text.
+
+    ``lanes.talk`` returns once the terminal is opened, so the view never waits on the session.
+    """
+    from foragent import lanes
+    from foragent.git import GitRepo
+
+    root = Path(repo_root).resolve()
+    if store is None:
+        store = StateStore.for_repo(config.repo or GitRepo(root).remote_slug())
+    try:
+        return lanes.talk(number, message=None, store=store, config=config, repo_root=root)
+    except lanes.LaneError as exc:
+        return str(exc)
+
+
+def show_talk(state: dict[str, Any] | None, line: str) -> None:
+    """Keep the talk result for the message line under the lane rows."""
+    from foragent import watch
+
+    if state is not None:
+        state["talk_message"] = (line, watch.time.monotonic())
+
+
+def talk_line(state: dict[str, Any] | None, width: int) -> list[Any]:
+    """The talk result line while it is fresh; it is forgotten after TALK_SECONDS."""
+    from foragent import watch
+
+    found = (state or {}).get("talk_message")
+    if not found:
+        return []
+    if watch.time.monotonic() - found[1] > TALK_SECONDS:
+        state.pop("talk_message", None)
+        return []
+    return [watch._fit(watch._line(watch._clean(found[0]), "yellow"), width)]
+
+
+def talk_alert(state: dict[str, Any] | None, visible: list[Any], width: int) -> list[Any]:
+    """The talk line for the live view's bottom message row when the screen does not show it.
+
+    A screen shorter than the frame, or scrolled, can leave the line under the lane rows
+    off screen; the bottom row then carries it until the next key or the timeout.
+    """
+    from foragent import watch
+
+    found = (state or {}).get("talk_message")
+    if not found:
+        return []
+    line = watch._fit(watch._line(watch._clean(found[0]), "yellow"), width)
+    shown = "".join(value for value, _ in line).rstrip()
+    if any("".join(value for value, _ in row).rstrip() == shown for row in visible):
+        return []
+    return [line]
