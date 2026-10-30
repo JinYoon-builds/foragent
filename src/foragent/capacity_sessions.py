@@ -41,13 +41,20 @@ def directory(root: Path) -> Path:
     return root / WORKLOADS_DIR
 
 
+def new_path(store: StateStore, pid: int) -> Path:
+    """Name a record before it exists, so the caller's cleanup owns it from the start."""
+    return directory(store.root) / f"{pid}-{secrets.token_hex(4)}.json"
+
+
 def add(
-    store: StateStore, *, pid: int, kind: str, issue: int | None = None, role: str | None = None,
-) -> Path:
-    """Write one record for a slot this process now holds; the caller removes it."""
-    folder = directory(store.root)
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{pid}-{secrets.token_hex(4)}.json"
+    store: StateStore, path: Path, *, pid: int, kind: str, issue: int | None = None, role: str | None = None,
+) -> None:
+    """Write the record at ``path`` (from new_path) for a slot this process now holds.
+
+    The caller's cleanup owns ``path`` before this runs, so an interruption anywhere
+    in here, the rename included, still ends in its removal.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
     value: dict[str, Any] = {
         "pid": pid, "kind": kind, "started_at": datetime.now(UTC).isoformat(),
     }
@@ -56,7 +63,6 @@ def add(
     if role is not None:
         value["role"] = role
     store._write_json(path, value)
-    return path
 
 
 def remove(path: Path) -> None:

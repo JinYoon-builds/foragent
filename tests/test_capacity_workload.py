@@ -1,7 +1,7 @@
 """Boundaries of capacity.hold_workload (#991): liveness, run identity, limits, test slots."""
 
-from datetime import UTC, datetime, timedelta
 import fcntl
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -29,7 +29,8 @@ def now():
 def test_dead_workload_stops_counting_and_readers_keep_its_file(case):
     sibling = StateStore(case.root / "other")
     case.table.add(42001, cwd=case.root, start_time=1)
-    path = capacity_sessions.add(sibling, pid=42001, kind="preread")
+    path = capacity_sessions.new_path(sibling, 42001)
+    capacity_sessions.add(sibling, path, pid=42001, kind="preread")
     assert capacity.machine_holders(case.store, now()) == ["other preread"]
     case.table.exit(42001)
     assert capacity.machine_runs(case.store, now()) == 0
@@ -92,8 +93,8 @@ def test_tests_hold_one_test_slot_and_nesting_reuses_both(case, monkeypatch):
     taken = []
     original = capacity._take_test_slot
 
-    def take(limit, deadline=None):
-        stream = original(limit, deadline)
+    def take(limit, **options):
+        stream = original(limit, **options)
         taken.append(stream is not None)
         return stream
 
@@ -253,8 +254,8 @@ def test_test_slot_wait_and_timeout_speak_the_selected_language(case, monkeypatc
 def reviewers(case, count, *, tests=False, wait_s=0):
     """Run reviewers as run_review does: a pool thread per reviewer, each in copy_context()."""
     import contextvars
-    from concurrent.futures import ThreadPoolExecutor
     import threading
+    from concurrent.futures import ThreadPoolExecutor
 
     inside, done = threading.Barrier(count + 1), threading.Event()
 
@@ -299,3 +300,144 @@ def test_copied_context_reviewer_takes_its_own_test_slot(case):
         pool.shutdown()
         assert isinstance(error, TimeoutError), "The one test slot belongs to the worker's thread"
         assert capacity.machine_runs(case.store, now()) == 1
+
+
+# Defect class: admission inferred from comparing two snapshot counts instead of identity.
+@pytest.mark.parametrize("exit_at", [1, 2])
+def test_release_during_admission_never_reads_as_reuse(case, monkeypatch, exit_at):
+    sibling = StateStore(case.root / "other")
+    for number, pid in ((1, 42010), (2, 42011)):
+        case.table.add(pid, cwd=case.root, start_time=1)
+        sibling.start_run(number, branch="b", worktree="w", pid=pid)
+    real, scans = StateStore.active_runs, []
+
+    def active_runs(store):
+        runs = real(store)
+        if store.root == sibling.root:
+            scans.append(len(runs))
+            if len(scans) == exit_at:
+                case.table.exit(42010)  # Holder 1 exits during (1) or after (2) the first scan.
+        return runs
+
+    monkeypatch.setattr(StateStore, "active_runs", active_runs)
+    with pytest.raises(TimeoutError):
+        with capacity.hold_workload(case.store, case.config, kind="preread", wait_s=0):
+            pytest.fail("Holder 2 still fills the one slot")
+    assert capacity_sessions.read(case.store.root) == []
+
+
+def test_reuse_needs_the_agents_own_run_or_reservation(case, monkeypatch):
+    case.store.prepare_run_start(8)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", capacity.OVERLOAD_LOAD))
+    with pytest.raises(TimeoutError, match="load"):
+        with capacity.hold_workload(case.store, case.config, kind="preread", wait_s=0):
+            pytest.fail("Without issue 8's identity there is no reuse and no sensor bypass")
+    with capacity.hold_workload(case.store, case.config, kind="worker", issue=8, wait_s=0):
+        assert capacity.machine_runs(case.store, now()) == 1
+
+
+# Defect class: a wait that blocks before the waiting guidance is shown.
+def test_busy_test_slot_guard_reports_before_waiting_with_real_counts(case, monkeypatch, capsys):
+    clock = [0.0]
+    seen = []
+    monkeypatch.setattr(capacity.time, "monotonic", lambda: clock[0])
+
+    def sleep(seconds):
+        seen.append(capsys.readouterr().err)
+        clock[0] += seconds
+
+    monkeypatch.setattr(capacity.time, "sleep", sleep)
+    guard = (case.root / capacity.TEST_SLOTS_LOCK).open("a")
+    fcntl.flock(guard.fileno(), fcntl.LOCK_EX)
+    try:
+        with pytest.raises(TimeoutError) as error:
+            with capacity.hold_workload(case.store, case.config, tests=True, wait_s=3):
+                pytest.fail("The guard never freed")
+    finally:
+        guard.close()
+    assert "Ctrl-C" in seen[0], "Guidance comes before the first wait"
+    assert "0/1 test slots used" in seen[0] and "lock" in seen[0]
+    assert "every test slot" not in str(error.value) and "lock" in str(error.value)
+    assert clock[0] == pytest.approx(3)
+    assert capacity.machine_runs(case.store, now()) == 0
+
+
+# Defect class: inherited ownership. A forked child keeps the parent's context and Thread object.
+def as_child(case, monkeypatch, pid=42020):
+    """Make capacity see a forked child: same thread object and context, a new pid."""
+    case.table.add(pid, cwd=case.root, start_time=2)
+    monkeypatch.setitem(capacity.os.overrides, "getpid", lambda: pid)
+
+
+def test_forked_child_needs_its_own_slot(case, monkeypatch):
+    parent = capacity.os.getpid()
+    with capacity.hold_workload(case.store, case.config, kind="worker"):
+        as_child(case, monkeypatch)
+        with pytest.raises(TimeoutError):
+            with capacity.hold_workload(case.store, case.config, kind="child", wait_s=0):
+                pytest.fail("At budget 1 the parent's slot is not the child's")
+        capacity.write_state(case.store, 2, now())
+        with capacity.hold_workload(case.store, case.config, kind="child", wait_s=0):
+            assert capacity.machine_runs(case.store, now()) == 2
+        monkeypatch.setitem(capacity.os.overrides, "getpid", lambda: parent)
+    assert capacity.machine_runs(case.store, now()) == 0
+
+
+def test_forked_child_takes_its_own_test_slot(case, monkeypatch):
+    capacity.write_state(case.store, 2, now())
+    with capacity.hold_workload(case.store, case.config, kind="worker", tests=True):
+        as_child(case, monkeypatch)
+        with pytest.raises(TimeoutError):
+            with capacity.hold_workload(case.store, case.config, kind="child", tests=True, wait_s=0):
+                pytest.fail("The one test slot belongs to the parent")
+
+
+def test_forked_child_unwinding_leaves_parent_record_and_lock(case, monkeypatch):
+    hold = capacity.hold_workload(case.store, case.config, kind="worker")
+    hold.__enter__()
+    slot = capacity.hold_test_slot(1)
+    slot.__enter__()
+    unlocks = []
+    real = capacity.fcntl.flock
+    monkeypatch.setattr(capacity.fcntl, "flock",
+                        lambda fd, op: unlocks.append(op) if op == capacity.fcntl.LOCK_UN else real(fd, op))
+    as_child(case, monkeypatch)
+    slot.__exit__(None, None, None)
+    hold.__exit__(None, None, None)
+    assert unlocks == [], "Only the process that took the test slot unlocks it"
+    assert len(capacity_sessions.read(case.store.root)) == 1, "Only the parent removes its record"
+
+
+# Defect class: an interruption between taking a resource and handing it to its cleanup.
+def test_ctrl_c_after_the_record_is_written_rolls_it_back(case, monkeypatch):
+    real = StateStore._write_json
+
+    def write_then_interrupt(store, path, value):
+        real(store, path, value)
+        if path.parent.name == capacity_sessions.WORKLOADS_DIR:
+            raise KeyboardInterrupt()  # After the rename, before add() returns.
+
+    monkeypatch.setattr(StateStore, "_write_json", write_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        with capacity.hold_workload(case.store, case.config):
+            pytest.fail("Interrupted before admission finished")
+    assert capacity_sessions.read(case.store.root) == []
+    monkeypatch.setattr(StateStore, "_write_json", real)
+    with capacity.hold_workload(case.store, case.config, wait_s=0):
+        assert capacity.machine_runs(case.store, now()) == 1
+
+
+def test_ctrl_c_right_after_admission_rolls_the_record_back(case, monkeypatch):
+    real = capacity._acquire_workload
+
+    def admit_then_interrupt(*args, **kwargs):
+        real(*args, **kwargs)
+        assert capacity.machine_runs(case.store, now()) == 1
+        raise KeyboardInterrupt()  # Admitted, before the caller's block starts.
+
+    monkeypatch.setattr(capacity, "_acquire_workload", admit_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        with capacity.hold_workload(case.store, case.config):
+            pytest.fail("Interrupted before the block")
+    assert capacity.machine_runs(case.store, now()) == 0
+    assert capacity._WORKLOAD.get() is None and capacity._WORKLOAD_TESTS.get() is None
