@@ -31,3 +31,4 @@ metadata:
   - Optional fields may be absent (older rows), but a field that is present must have its type.
   - Regressions: `tests/test_presence.py -k wrong_typed`.
 - The journal reader checks every event against `JOURNAL_FIELDS` (at, kind, summary, issue, say), not just notices. A `kind: []` or a missing kind beside a valid notice must give a diagnostic. Both journal writers (`append_event`, `state_phases`) produce this shape. Regression: `tests/test_presence.py -k "malformed_journal_event or other_kinds"`.
+- A "baseline regression" in another lane's acceptance test can be a test-owner fix. Here `test_statusline_wrapper.py` (fixed on main in 560dbcb6) ignores every `fa statusline --…` hook. When the orch hint says "rebase onto main", first check `git log HEAD..origin/main` and `git merge-tree`: the runner had already merged the fix, and the rules forbid committing.
