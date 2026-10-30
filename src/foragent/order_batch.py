@@ -9,9 +9,6 @@ interruption: notes carry an id marker in their file, orders reuse their issue m
 """
 
 import hashlib
-import json
-import os
-import tempfile
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -24,41 +21,20 @@ from foragent.git import GitError
 from foragent.i18n import text
 from foragent.order_batch_journal import _directory, _lock
 from foragent.order_batch_notes import COMMITTED, NOTE_FILES, _note_files, _write_notes
+from foragent.order_batch_queue import (
+    PUBLISHED,
+    WAITING,
+    _committed,
+    _load,
+    _mark,
+    _revalidate,
+    _update,
+)
 from foragent.order_files import check_destinations
-
-QUEUE_FILE = "order-batch.json"
-WAITING, PUBLISHED = "waiting", "published"
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
-
-
-def _load(root: Path) -> dict:
-    path = root / ".foragent" / QUEUE_FILE
-    try:
-        value = json.loads(path.read_text(encoding="utf-8")) if not path.is_symlink() else {}
-    except FileNotFoundError:
-        value = {}
-    except ValueError as exc:
-        raise order.PlanError(f"{path} is not valid JSON") from exc
-    value = value if isinstance(value, dict) else {}
-    return {"orders": list(value.get("orders", [])), "notes": list(value.get("notes", []))}
-
-
-def _update(root: Path, change) -> dict:
-    with _lock(root, "order-batch-state.lock"):
-        state = _load(root)
-        change(state)
-        directory = _directory(root)
-        # A fresh exclusive temporary name, then an atomic rename over the queue file.
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, prefix=".order-batch.",
-                                         suffix=".tmp", delete=False) as stream:
-            stream.write(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(stream.name, directory / QUEUE_FILE)
-        return state
 
 
 def _boundary(boundary: str, language: str) -> str:
@@ -155,22 +131,6 @@ def _check_new_lanes(plans: list[dict], config: Config) -> None:
                 raise order.PlanError(text("batch_lane_conflict", config.language, lane=lane["name"]))
 
 
-def _mark(root: Path, kind: str, revisions: set[str], **fields) -> None:
-    def change(current: dict) -> None:
-        for row in current[kind]:
-            if row.get("revision", row["id"]) in revisions and row["status"] != PUBLISHED:
-                row.update(fields)
-
-    _update(root, change)
-
-
-def _committed(root: Path, orders: dict[str, list[str]], notes: list[str], heads: dict[str, str]) -> None:
-    """Record that the batch commit exists: later runs push and finish, never rewrite."""
-    for revision, names in orders.items():
-        _mark(root, "orders", {revision}, status=COMMITTED, blobs={name: heads[name] for name in names})
-    _mark(root, "notes", set(notes), status=COMMITTED)
-
-
 def _settle(root: Path, git, language: str) -> bool:
     """Undo or finish a flush that stopped mid-write; True when there was one."""
     directory = _directory(root)
@@ -189,7 +149,22 @@ def recover(root: Path, git, language: str = "en") -> bool:
     .foragent.yml; callers run it before loading configuration for a flush.
     """
     with _lock(root, "order-batch-flush.lock"):
-        return _settle(root, git, language)
+        settled = _settle(root, git, language)
+        _revalidate(root, git)
+        return settled
+
+
+class _DeferredCommits:
+    """The flush's Git, except that lane commits only collect paths for the batch commit."""
+
+    def __init__(self, git):
+        self._git, self.paths = git, []
+
+    def __getattr__(self, name):
+        return getattr(self._git, name)
+
+    def commit_paths(self, paths: list[str], title: str) -> None:
+        self.paths += [path for path in paths if path not in self.paths]
 
 
 def _require_base(git, config: Config) -> None:
@@ -211,6 +186,7 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
         if _settle(root, git, config.language):
             # Recovery may have undone a lane in .foragent.yml; the caller's config predates it.
             config = replace(config, lanes=load_config(root).lanes)
+        _revalidate(root, git)
         state = _load(root)
         orders = [row for row in state["orders"] if row["status"] != PUBLISHED and row["boundary"] == boundary]
         notes = [row for row in state["notes"] if row["status"] != PUBLISHED and row["boundary"] == boundary]
@@ -244,27 +220,33 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
                        "notes": [row["id"] for row in applying]}
             creating = [lane for entry, _ in prepared for lane in entry["plan"].get("new_lanes", [])
                         if lane["name"] not in config.lanes]
-            journal.write(directory, root, planned, **written, branch=config.base_branch,
+            journal.write(directory, root, planned, **written, branch=config.base_branch, base=git.head_sha(),
                           lanes=journal.lane_writes(root, creating))
 
+            token = journal.token(directory)
+
             def committed(blobs: dict[str, str]) -> None:
-                journal.batch_done(directory, git)  # recorded first: recovery trusts only this sha
-                _committed(root, written["orders"], written["notes"], blobs)
+                journal.batch_done(directory, git)  # the sha first; the token also finds the commit
+                _committed(root, written["orders"], written["notes"], blobs, git.head_sha(), token)
                 journal.clear(directory)
 
+            deferred = _DeferredCommits(git)
             try:
                 for entry, files in prepared:
-                    order.write_order_files(entry["plan"], root, config, git, files, manager,
-                                            lane_done=lambda name: journal.lane_done(directory, root, name, git))
+                    order.write_order_files(entry["plan"], root, config, deferred, files, manager)
                     if any(lane["name"] not in config.lanes for lane in entry["plan"].get("new_lanes", [])):
                         # Later orders and the issue pass see the lane this order just created.
                         config = replace(config, lanes=load_config(root).lanes)
                 _write_notes(root, note_contents)
-                title = f"Foragent batch {boundary}: {len(prepared)} order(s), {len(applying)} note(s)"
-                order.commit_and_push(config, git, planned, title, after_commit=committed)
+                title = (f"Foragent batch {boundary}: {len(prepared)} order(s), {len(applying)} note(s)"
+                         f"\n\n{journal.marker(token)}")
+                # New lanes' files join this one commit: a single boundary to record and recover.
+                order.commit_and_push(config, git, {**dict.fromkeys(deferred.paths), **planned}, title,
+                                      after_commit=committed)
             except BaseException:
                 # Undo an uncommitted write now, so waiting work never stays in the checkout.
                 journal.recover(directory, root, git, lambda *facts: _committed(root, *facts), config.language)
+                _revalidate(root, git)
                 raise
         published = {row["id"] for row in notes}
         _mark(root, "notes", published, status=PUBLISHED, published_at=_now())

@@ -422,10 +422,10 @@ class PublishReport:
 
 
 def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
-                      manager: SkillManager | None, lane_done=None) -> None:
+                      manager: SkillManager | None) -> None:
     """Write this order's own paths (and new lanes) on the refreshed base, without committing them.
 
-    ``lane_done(name)`` runs after each new lane's own commit, so a batch can checkpoint it."""
+    New lanes commit through ``git``; a batch passes one that defers those commits to its own."""
     # Destinations are checked here, after the base refresh, so upstream changes count.
     spec = f"docs/specs/{plan['id']}.md"
     references = set(plan.get("reference_files", {}))
@@ -437,8 +437,6 @@ def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, file
     for lane in plan.get("new_lanes", []):
         if lane["name"] not in config.lanes:
             add_lane(root, lane["name"], lane["paths"], skills=lane["skills"], git=git, manager=manager, push=False)
-            if lane_done is not None:
-                lane_done(lane["name"])
         else:
             # Recover a lane whose files were written before an interrupted commit.
             paths = lane_files(root, lane["name"], config.lanes[lane["name"]].get("skills", []))

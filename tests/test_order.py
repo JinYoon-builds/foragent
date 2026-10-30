@@ -49,6 +49,7 @@ class PublishingGit:
         self.branch = "main"
         self.history = [("published", None)]  # the base commit's tree is ``saved`` until a commit
         self.index = {}
+        self.messages = {}
 
     def current_branch(self):
         return self.branch
@@ -89,6 +90,10 @@ class PublishingGit:
 
     def commit_paths(self, paths, title):
         self.stage(paths)
+        if all(self.index[path] == self.saved.get(path) for path in paths):
+            for path in paths:
+                self.index.pop(path)
+            raise GitError("nothing to commit")  # real `git commit --only` rejects an empty commit
         self._commit(paths, title)
 
     def _freeze_base(self):
@@ -105,6 +110,13 @@ class PublishingGit:
             else:
                 self.saved[path] = text
         self.history.append((f"commit-{len(self.history)}", dict(self.saved)))
+        self.messages[self.head_sha()] = title
+
+    def find_commit(self, marker):
+        for sha, _tree in reversed(self.history):
+            if marker in self.messages.get(sha, ""):
+                return sha
+        return None
 
     def unrelated_commit(self, path, text):
         """Someone else's later commit on the base."""
@@ -122,6 +134,13 @@ class PublishingGit:
         self.history = self.history[:shas.index(sha) + 1]
         if self.history[-1][1] is not None:
             self.saved = dict(self.history[-1][1])
+
+    def blob_bytes(self, sha):
+        for tree in [self.saved, *(tree for _, tree in self.history if tree is not None)]:
+            for text in tree.values():
+                if self._blob(text) == sha.decode():
+                    return text.encode()
+        raise AssertionError(f"unknown blob {sha}")
 
     def is_ancestor(self, ancestor, head):
         assert head == "HEAD"
@@ -2141,7 +2160,7 @@ def test_batch_orders_creating_the_same_new_lane_publish_with_the_created_lane(p
     _flush(publishing)
     root, tracker, events = publishing[0], publishing[2], publishing[4]
     assert load_config(root).lanes["web"]["paths"] == ["web/**"]
-    assert [event[1] for event in events if event[0] == "commit"].count("Foragent lane web") == 1
+    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md")
     titles = {issue.title: issue for issue in tracker.list_issues()}
     for value in plans:
         assert "lane:web" in titles[value["issues"][0]["title"]].labels
@@ -2371,7 +2390,7 @@ def _skill_manager(root):
 
 
 LANE_STEPS = ["skill_copy", "gitignore_written", "config_saved", "agent_written", "lane_commit",
-              "batch_commit", "push"]
+              "batch_commit", "batch_unrecorded", "push"]
 
 
 @pytest.mark.parametrize("killed", [False, True], ids=["raised", "killed"])
@@ -2416,11 +2435,13 @@ def test_batch_lane_creation_interrupted_at_each_write_resumes(publishing, plan,
         monkeypatch.setattr(pathlib.Path, "write_text", agent_fails)
     elif step == "agent_written":
         monkeypatch.setattr(lanes, "lane_files", raise_stop)
-    elif step in {"lane_commit", "batch_commit"}:
-        prefix = "Foragent lane" if step == "lane_commit" else "Foragent batch"
+    elif step == "lane_commit":  # where add_lane commits: the batch defers that commit to its own
+        monkeypatch.setattr(order_batch._DeferredCommits, "commit_paths", raise_stop)
+    elif step == "batch_commit":
         # `git add` runs before the failing commit, so its paths are left staged.
-        monkeypatch.setattr(git, "commit_paths", lambda paths, title: (git.stage(paths), raise_stop())
-                            if title.startswith(prefix) else commit_paths(paths, title))
+        monkeypatch.setattr(git, "commit_paths", lambda paths, title: (git.stage(paths), raise_stop()))
+    elif step == "batch_unrecorded":  # the batch commit landed; its sha is not recorded yet
+        monkeypatch.setattr(order_batch_journal, "batch_done", raise_stop)
     else:
         monkeypatch.setattr(git, "push_base", raise_stop)
     if killed:
@@ -2429,13 +2450,12 @@ def test_batch_lane_creation_interrupted_at_each_write_resumes(publishing, plan,
         order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git, manager=manager)
     monkeypatch.undo()
     monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
-    if not killed and step in {"skill_copy", "gitignore_written", "config_saved", "agent_written", "lane_commit"}:
+    if not killed and step in {"skill_copy", "gitignore_written", "config_saved", "agent_written", "lane_commit",
+                               "batch_commit"}:
         assert "web" not in load_config(root).lanes, "An uncommitted lane is undone with the batch"
         assert not (root / ".claude/agents/fa-web.md").exists()
         assert not (root / ".claude/skills/testing-strategy").exists()
         assert (root / ".gitignore").read_text() == "THIRD_PARTY_NOTICES.md\n"
-    if not killed and step == "batch_commit":  # the lane's own commit landed, so the lane stays
-        assert git.saved[".foragent.yml"] == (root / ".foragent.yml").read_text()
     if not killed:
         assert git.index == {}, "rollback unstages lane and batch paths alike"
     stale = load_config(root)  # the CLI loads config before the flush settles the journal
@@ -2444,8 +2464,7 @@ def test_batch_lane_creation_interrupted_at_each_write_resumes(publishing, plan,
     assert (root / ".claude/agents/fa-web.md").is_file()
     assert (root / ".claude/skills/testing-strategy/SKILL.md").is_file()
     assert (root / ".gitignore").read_text().count("/.claude/skills/testing-strategy/") == 1
-    titles = [event[1] for event in events if event[0] == "commit"]
-    assert titles.count("Foragent lane web") == 1 and len(titles) == 2, titles
+    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore")
     issue, = [issue for issue in tracker.list_issues() if issue.title == "web0 web"]
     assert "lane:web" in issue.labels
     assert order_batch.pending(root)["orders"][0]["status"] == "published"
@@ -2516,11 +2535,10 @@ def test_batch_second_new_lane_interrupted_keeps_the_committed_first_lane(publis
     monkeypatch.undo()
     monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
     if not killed:
-        assert set(load_config(root).lanes) == {"api", "web"}, "the committed first lane stays"
+        assert set(load_config(root).lanes) == {"api"}, "nothing of an uncommitted batch stays"
     order_batch.flush("next-code-merge", root, load_config(root), tracker, repo="owner/repo", git=git)
     assert {"web", "site"} <= set(load_config(root).lanes)
-    titles = [event[1] for event in events if event[0] == "commit"]
-    assert titles.count("Foragent lane web") == 1 and titles.count("Foragent lane site") == 1, titles
+    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md", ".claude/agents/fa-site.md")
     assert order_batch.pending(root)["orders"][0]["status"] == "published"
 
 
@@ -2563,7 +2581,7 @@ def test_batch_cli_flush_recovers_a_damaged_configuration_before_reading_it(publ
     assert run("flush", "--boundary", "next-code-merge") == 0, capsys.readouterr().err
     assert load_config(root).lanes["web"]["paths"] == ["web/**"]
     assert order_batch.pending(root)["orders"][0]["status"] == "published"
-    assert [event[1] for event in events if event[0] == "commit"].count("Foragent lane web") == 1
+    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md")
 
 
 def test_lane_settings_save_is_atomic(tmp_path, monkeypatch):
@@ -2786,3 +2804,127 @@ def test_batch_failed_commit_leaves_nothing_staged_in_a_real_repository(offline_
     # Neither the index nor the working tree keeps the batch (no `AD docs/ideas.md`).
     assert git_command(root, "status", "--porcelain=v1", "--untracked-files=all") == before
     assert not (root / "docs/ideas.md").exists()
+
+
+
+def _one_batch_commit(events, *lane_files):
+    """A batch with new lanes makes exactly one commit, and it carries the lanes' files."""
+    commits = [event for event in events if event[0] == "commit"]
+    assert [event[1].split(":")[0] for event in commits] == ["Foragent batch next-code-merge"], commits
+    assert set(lane_files) <= commits[0][2].keys(), sorted(commits[0][2])
+
+
+
+def test_batch_recovery_keeps_lane_files_someone_else_committed_meanwhile(publishing, plan, monkeypatch):
+    from foragent import order_batch, order_batch_journal
+
+    root, config, tracker, git, events = publishing
+    (root / ".gitignore").write_text("THIRD_PARTY_NOTICES.md\n")
+    git.saved.update({name: (root / name).read_text() for name in (".foragent.yml", ".gitignore")})
+    _batch(publishing, _lane_plan(plan, "web0"))
+    monkeypatch.setattr(git, "commit_paths", lambda paths, title: (git.stage(paths), _die()))
+    monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)  # killed before cleanup
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    git.index.clear()
+    # Meanwhile someone commits another lane and an ignore rule on the same base.
+    site = "lanes: {api: {paths: ['api/**'], agent: fa-api}, site: {paths: ['site/**'], agent: fa-site}}\n"
+    git.unrelated_commit(".foragent.yml", site)
+    git.unrelated_commit(".gitignore", "THIRD_PARTY_NOTICES.md\n/site-cache/\n")
+    git.unrelated_commit(".claude/agents/fa-site.md", "site agent\n")
+    order_batch.recover(root, git)
+    assert (root / ".foragent.yml").read_text() == site, "committed work is never rolled back"
+    assert "/site-cache/" in (root / ".gitignore").read_text()
+    assert not (root / ".claude/agents/fa-web.md").exists() and git.index == {}
+    _flush(publishing)
+    assert set(load_config(root).lanes) == {"api", "site", "web"}
+    assert (root / ".claude/agents/fa-site.md").read_text() == "site agent\n"
+    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md")
+
+
+def _notes_case(publishing, plan):
+    from foragent import order_batch
+
+    root, git = _rules_case(publishing, plan), publishing[3]
+    for name, text in (("docs/ideas.md", "# Ideas\n"), ("docs/decisions.md", "# Decisions\n")):
+        (root / name).write_text(text)
+        git.saved[name] = text
+    order_batch.note(root, "idea", "An idea.", "next-code-merge", "en")
+    order_batch.note(root, "decision", "D9. A decision.", "next-code-merge", "en")
+    return root, git
+
+
+def test_batch_unrecorded_commit_is_found_by_its_token_after_later_appends(publishing, plan, monkeypatch):
+    from foragent import order_batch, order_batch_journal
+
+    root, git = _notes_case(publishing, plan)
+    events = publishing[4]
+    monkeypatch.setattr(order_batch_journal, "batch_done", _die)  # committed; sha never saved
+    monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    # Later commits append to the same files before the resume.
+    for name, extra in (("docs/ideas.md", "Later idea.\n"), ("docs/decisions.md", "D10. Later.\n"),
+                        ("docs/rules.md", "- Later rule. (D10)\n")):
+        git.unrelated_commit(name, (root / name).read_text() + extra)
+    _flush(publishing)
+    ideas, decisions, rules = ((root / name).read_text() for name in
+                               ("docs/ideas.md", "docs/decisions.md", "docs/rules.md"))
+    assert ideas.count("An idea.") == 1 and ideas.endswith("Later idea.\n")
+    assert decisions.count("D9. A decision.") == 1 and decisions.endswith("D10. Later.\n")
+    assert rules == "# Rules\n- C. (D3)\n- Extra. (D4)\n- Later rule. (D10)\n"
+    assert [event[0] for event in events].count("commit") == 1
+    state = order_batch.pending(root)
+    assert {row["status"] for row in [*state["orders"], *state["notes"]]} == {"published"}
+
+
+@pytest.mark.parametrize("stop", ["before_clear", "push"])
+def test_batch_checkpoint_of_a_commit_that_left_history_waits_again(publishing, plan, monkeypatch, stop):
+    from foragent import order_batch, order_batch_journal
+
+    root, git = _notes_case(publishing, plan)
+    events, base = publishing[4], git.head_sha()
+    if stop == "before_clear":  # the queue says committed; the journal still exists
+        clear = order_batch_journal.clear
+        calls = []
+        monkeypatch.setattr(order_batch_journal, "clear",
+                            lambda directory: calls.append(1) or (_die() if len(calls) == 1 else clear(directory)))
+        monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
+    else:  # the journal is gone; only the queue checkpoint remembers the commit
+        monkeypatch.setattr(git, "push_base", _die)
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    assert {row["status"] for row in order_batch.pending(root)["notes"]} == {"committed"}
+    git.reset_to(base)  # the batch commit is no longer in HEAD's history
+    for name in ("docs/ideas.md", "docs/decisions.md", "docs/rules.md"):
+        (root / name).write_text(git.saved[name])  # the checkout follows the reset
+    for name in [p.relative_to(root).as_posix() for p in (root / "docs/specs").rglob("*")]:
+        (root / name).unlink()
+    _flush(publishing)
+    assert (root / "docs/ideas.md").read_text().count("An idea.") == 1
+    assert (root / "docs/decisions.md").read_text().count("D9. A decision.") == 1
+    assert git.saved["docs/ideas.md"].count("An idea.") == 1, "the note reaches HEAD again"
+    assert f"docs/specs/{plan['id']}.md" in git.saved, "the order's files are published again"
+    assert [event[0] for event in events].count("commit") == 2
+    state = order_batch.pending(root)
+    assert {row["status"] for row in [*state["orders"], *state["notes"]]} == {"published"}
+
+
+def test_real_git_finds_a_batch_commit_by_its_marker_only_in_head_history(git_history):
+    base = git_history.tip
+    git_history.update({"a.txt": "b\n"}, message="Foragent batch x: 0 order(s)\n\nForagent-Batch: tok123")
+    batch = git_history.tip
+    git_history.update({"b.txt": "c\n"}, message="Later\n\nForagent-Batch: other9")
+    repo = GitRepo(git_history.origin)  # a bare repository: HEAD is refs/heads/main
+    assert repo.find_commit("Foragent-Batch: tok123") == batch
+    assert repo.find_commit("Foragent-Batch: other9") == git_history.tip
+    assert repo.find_commit("Foragent-Batch: missing") is None
+    git_command(git_history.origin, "update-ref", "refs/heads/elsewhere", batch)  # still reachable elsewhere
+    git_command(git_history.origin, "update-ref", "refs/heads/main", base)
+    assert repo.find_commit("Foragent-Batch: tok123") is None, "a commit outside HEAD's history does not count"

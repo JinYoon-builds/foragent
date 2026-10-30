@@ -366,6 +366,10 @@ class GitRepo:
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()
 
+    def find_commit(self, marker: str) -> str | None:
+        """The newest commit in HEAD's history whose message contains ``marker`` verbatim."""
+        return self._call(["log", "-n", "1", "--format=%H", "--fixed-strings", f"--grep={marker}", "HEAD"]).strip() or None
+
     def is_ancestor(self, ancestor: str, head: str) -> bool:
         try:
             self._call(["merge-base", "--is-ancestor", ancestor, head])
