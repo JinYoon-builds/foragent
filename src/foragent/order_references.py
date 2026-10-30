@@ -9,6 +9,7 @@ import base64
 import binascii
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
@@ -101,11 +102,32 @@ def selected(plan: dict, item: dict) -> list[str]:
     return sorted(plan.get("reference_files", {})) if chosen is None else sorted(set(chosen))
 
 
+LABEL_SPECIAL = set("\\[]<>`*~&")
+
+
+def markdown_label(text: str) -> str:
+    """A file name as link text that renders literally and cannot end or break the link.
+
+    Backslash-escape characters that close the label, start code spans, HTML or
+    entities, or add emphasis. An underscore is escaped unless it sits inside a word,
+    where GitHub never treats it as emphasis, so common names stay unchanged.
+    """
+    escaped = []
+    for index, char in enumerate(text):
+        inside_word = (char == "_" and 0 < index < len(text) - 1
+                       and text[index - 1].isalnum() and text[index + 1].isalnum())
+        escaped.append(f"\\{char}" if char in LABEL_SPECIAL or (char == "_" and not inside_word) else char)
+    return "".join(escaped)
+
+
+def repository_link(name: str, repo: str, base: str) -> str:
+    return f"[{markdown_label(name)}](https://github.com/{repo}/blob/{quote(base, safe='')}/{quote(name)})"
+
+
 def body_lines(names: list[str], repo: str, base: str) -> list[str]:
     if not names:
         return []
-    return ["", "## References",
-            *(f"- [{name}](https://github.com/{repo}/blob/{quote(base, safe='')}/{quote(name)})" for name in names)]
+    return ["", "## References", *(f"- {repository_link(name, repo, base)}" for name in names)]
 
 
 def _decoded(plan: dict, names: list[str]) -> dict[str, str | bytes]:
@@ -143,26 +165,58 @@ def _longest_backticks(text: str) -> int:
     return longest
 
 
+def real_directory(root: Path, relative: str, *, create: bool = True) -> Path | None:
+    """root/relative as real directories only, created one level at a time.
+
+    Every component must be a real directory, never a symlink, so writes and
+    deletions below it cannot leave the tree. Without create, a missing one gives None.
+    """
+    current = root
+    for part in PurePosixPath(relative).parts:
+        current = current / part
+        if current.is_symlink() or (current.exists() and not current.is_dir()):
+            raise _error(f"{current} must be a real directory, not a symlink or file")
+        if not current.exists():
+            if not create:
+                return None
+            current.mkdir()
+    return current
+
+
+def _write_new(path: Path, data: bytes) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+
+
 def materialize(plan: dict, item: dict, root: Path) -> Path | None:
-    """Write the issue's selected references into the ignored content-addressed snapshot."""
+    """Write the issue's selected references into a fresh, ignored content-addressed snapshot."""
+    from foragent.order_files import check_destinations
+
     contents = _decoded(plan, selected(plan, item))
     if not contents:
         return None
-    from foragent.order_files import check_destinations
-
     snapshot = snapshot_dir(root, contents)
+    relative = snapshot.relative_to(root).as_posix()
     check_destinations(snapshot, contents)
+    real_directory(root, SNAPSHOTS)
+    # A leftover from an interrupted reader is replaced; rmtree never follows links inside it.
+    remove(root, snapshot)
     try:
+        real_directory(root, relative)
         for name, content in contents.items():
-            path = snapshot / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content.encode("utf-8") if isinstance(content, str) else content)
+            parent = real_directory(snapshot, PurePosixPath(name).parent.as_posix())
+            _write_new(parent / PurePosixPath(name).name,
+                       content.encode("utf-8") if isinstance(content, str) else content)
     except BaseException:
-        remove(snapshot)
+        remove(root, snapshot)
         raise
     return snapshot
 
 
-def remove(snapshot: Path | None) -> None:
-    if snapshot is not None:
-        shutil.rmtree(snapshot, ignore_errors=True)
+def remove(root: Path, snapshot: Path | None) -> None:
+    """Delete a snapshot only through real directories, so a link never redirects the deletion."""
+    if snapshot is None:
+        return
+    if real_directory(root, snapshot.relative_to(root).as_posix(), create=False) is not None:
+        shutil.rmtree(snapshot)

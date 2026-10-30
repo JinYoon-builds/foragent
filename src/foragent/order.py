@@ -738,10 +738,12 @@ def preread(plan: dict, root: Path, config: Config,
         # A generic reader is not the lane's implementer; record nothing rather than false evidence.
         raise PlanError(f"cannot preread issue(s) {', '.join(waiting)}: new lane(s) {', '.join(lanes)} "
                         f"do not exist yet; {NEW_LANE_STEPS}")
-    directory = root / ".foragent"
-    logs = directory / "preread-logs"
-    logs.mkdir(parents=True, exist_ok=True)
+    # Local evidence stays in real directories; a planted symlink must not redirect writes.
+    directory = order_references.real_directory(root, ".foragent")
+    logs = order_references.real_directory(root, ".foragent/preread-logs")
     ignore = directory / ".gitignore"
+    if ignore.is_symlink():
+        raise PlanError(f"{ignore} must be a regular file, not a symlink")
     if not ignore.exists():
         ignore.write_text("*\n", encoding="utf-8")
     results = []
@@ -749,13 +751,15 @@ def preread(plan: dict, root: Path, config: Config,
         setup, prompt, digest = preread_target(plan, item, config, root)
         log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
         # Readers see approved references only in this ignored snapshot, never at their destination.
+        if log.is_symlink():
+            log.unlink()
         snapshot = order_references.materialize(plan, item, root)
         try:
             result = executor_for(setup.executor).run(
                 worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
                 log_path=log, read_only=True, **setup.options)
         finally:
-            order_references.remove(snapshot)
+            order_references.remove(root, snapshot)
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
             raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
         unknowns = _unknowns(result.last_message)
@@ -763,6 +767,7 @@ def preread(plan: dict, root: Path, config: Config,
         records[digest] = {"key": item["key"], "unknowns": unknowns,
                            "at": datetime.now(UTC).isoformat(timespec="seconds")}
         temporary = root / (PREREAD_FILE + ".tmp")
+        temporary.unlink(missing_ok=True)  # never write through a leftover link
         temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, root / PREREAD_FILE)
         results.append({"key": item["key"], "unknowns": unknowns})

@@ -1466,22 +1466,175 @@ def test_acceptance_destination_that_is_a_directory_is_rejected_before_any_write
 
 
 def test_preread_snapshot_is_removed_when_materializing_fails(tmp_path, monkeypatch):
-    from pathlib import Path
-
     from foragent import order_references
 
     plan = {"reference_files": {"docs/design/a/one.md": "1", "docs/design/b/two.md": "2"}}
-    real = Path.write_bytes
+    real = order_references._write_new
     calls = []
 
-    def failing(self, data):
-        calls.append(self)
+    def failing(path, data):
+        calls.append(path)
         if len(calls) == 2:
             raise OSError("disk full")
-        return real(self, data)
+        return real(path, data)
 
-    monkeypatch.setattr(Path, "write_bytes", failing)
+    monkeypatch.setattr(order_references, "_write_new", failing)
     with pytest.raises(OSError):
         order_references.materialize(plan, {}, tmp_path)
     snapshots = tmp_path / order_references.SNAPSHOTS
-    assert len(calls) == 2 and (not snapshots.exists() or not any(snapshots.iterdir()))
+    assert len(calls) == 2 and snapshots.is_dir() and not any(snapshots.iterdir())
+
+
+@pytest.mark.parametrize("references,expected", [
+    (None, ["docs/design/a/HANDOFF.md", "docs/design/a/draft.html"]),
+    ([], []),
+])
+def test_edit_references_default_to_every_plan_reference_and_empty_selects_none(publishing, plan, references, expected):
+    root, config, tracker, git, _events = publishing
+    tracker.add_issue(9, "Existing visual issue", "old", [])
+    plan["reference_files"] = {name: "approved" for name in ["docs/design/a/HANDOFF.md", "docs/design/a/draft.html"]}
+    edit = {"number": 9, "goal": "Use the design", "out_of_scope": "Other screens", "done_when": ["true"]}
+    if references is not None:
+        edit["references"] = references
+    plan["edits"] = [edit]
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    body = tracker.get_issue(9).body
+    links = re.findall(r"^- \[(docs/design/[^\]]+)\]\(https://github\.com/owner/repo/blob/main/", body, re.M)
+    assert links == expected
+    assert ("## References\n" in body) == bool(expected)
+
+
+
+SNAPSHOT_PLAN = {"reference_files": {"docs/design/a/HANDOFF.md": "approved"}}
+
+
+def _outside(tmp_path):
+    outside = tmp_path / "outside"
+    (outside / "docs/design/a").mkdir(parents=True)
+    (outside / "docs/design/a/HANDOFF.md").write_text("keep me")
+    return outside
+
+
+def _snapshot_name(root):
+    from foragent import order_references
+
+    return order_references.snapshot_dir(root, {"docs/design/a/HANDOFF.md": "approved"}).name
+
+
+@pytest.mark.parametrize("link", [".foragent", ".foragent/preread-references", "hash", "inner"])
+def test_preread_snapshot_never_writes_or_deletes_through_symlinks(tmp_path, link):
+    from foragent import order_references
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = _outside(tmp_path)
+    snapshots = root / order_references.SNAPSHOTS
+    if link == ".foragent":
+        (root / ".foragent").symlink_to(outside, target_is_directory=True)
+    elif link == ".foragent/preread-references":
+        (root / ".foragent").mkdir()
+        (outside / _snapshot_name(root)).mkdir()
+        (outside / _snapshot_name(root) / "keep.txt").write_text("keep me")
+        snapshots.symlink_to(outside, target_is_directory=True)
+    elif link == "hash":
+        snapshots.mkdir(parents=True)
+        (snapshots / _snapshot_name(root)).symlink_to(outside, target_is_directory=True)
+    else:
+        # A stale real snapshot whose inner directory links outside.
+        stale = snapshots / _snapshot_name(root)
+        stale.mkdir(parents=True)
+        (stale / "docs").symlink_to(outside / "docs", target_is_directory=True)
+    if link == "inner":
+        snapshot = order_references.materialize(SNAPSHOT_PLAN, {}, root)
+        assert (snapshot / "docs").is_dir() and not (snapshot / "docs").is_symlink()
+        assert (snapshot / "docs/design/a/HANDOFF.md").read_text() == "approved"
+        order_references.remove(root, snapshot)
+        assert not snapshot.exists()
+    else:
+        with pytest.raises(order.PlanError, match="real directory"):
+            order_references.materialize(SNAPSHOT_PLAN, {}, root)
+    assert (outside / "docs/design/a/HANDOFF.md").read_text() == "keep me"
+    assert sorted(p.relative_to(outside).as_posix() for p in outside.rglob("*")) == sorted(
+        ["docs", "docs/design", "docs/design/a", "docs/design/a/HANDOFF.md",
+         *([_snapshot_name(root), f"{_snapshot_name(root)}/keep.txt"]
+           if link == ".foragent/preread-references" else [])])
+
+
+def test_preread_snapshot_removal_skips_a_path_redirected_while_the_reader_ran(tmp_path):
+    from foragent import order_references
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = _outside(tmp_path)
+    snapshot = order_references.materialize(SNAPSHOT_PLAN, {}, root)
+    snapshots = snapshot.parent
+    import shutil
+    shutil.rmtree(snapshots)
+    snapshots.symlink_to(outside, target_is_directory=True)
+    (outside / snapshot.name).mkdir()
+    with pytest.raises(order.PlanError, match="real directory"):
+        order_references.remove(root, snapshot)
+    assert (outside / snapshot.name).is_dir()
+
+
+@pytest.mark.parametrize("name", [".gitignore", "preread.json.tmp"])
+def test_preread_local_files_never_write_through_symlinks(publishing, plan, monkeypatch, tmp_path, name):
+    root, config = publishing[0], publishing[1]
+    target = tmp_path / f"outside-{name}"
+    (root / ".foragent").mkdir()
+    (root / ".foragent" / name).symlink_to(target)
+
+    class Reader:
+        def run(self, **kwargs):
+            return SimpleNamespace(exit_code=0, timed_out=False, last_message="NONE")
+
+    monkeypatch.setattr(order, "executor_for", lambda executor: Reader())
+    if name == ".gitignore":
+        with pytest.raises(order.PlanError, match="symlink"):
+            order.preread(plan, root, config)
+    else:
+        order.preread(plan, root, config)
+        assert json.loads((root / ".foragent/preread.json").read_text())
+    assert not target.exists()
+
+
+SPECIAL_NAMES = ["docs/design/topic/draft].html", "docs/design/topic/a[b].md", "docs/design/topic/co`de`.md",
+                 "docs/design/topic/*bold*.md", "docs/design/topic/<b>x.md", "docs/design/topic/a&amp;b.md",
+                 "docs/design/topic/_lead_.md", "docs/design/topic/~x~.md", "docs/design/topic/(p).md"]
+LINK = re.compile(r"^(?:- )?\[((?:\\[!-/:-@\[-`{-~]|[^\\\[\]`<&*~])*)\]\((https://github\.com/owner/repo/blob/main/[^\s()<>]+)\)$")
+
+
+def _link_labels(body):
+    """Read links the way CommonMark does: only escaped specials may appear in the label."""
+    labels = {}
+    for line in body.splitlines():
+        if match := LINK.match(line):
+            label = re.sub(r"\\(.)", r"\1", match[1])
+            labels[label] = match[2]
+    return labels
+
+
+def test_reference_and_edit_links_escape_markdown_specials_in_file_names(publishing, plan):
+    from urllib.parse import quote
+
+    root, config, tracker, git, _events = publishing
+    tracker.add_issue(9, "Existing visual issue", "old", [])
+    plan["reference_files"] = {name: "approved" for name in SPECIAL_NAMES}
+    plan["edits"] = [{"number": 9, "goal": "Use the design", "out_of_scope": "Other screens", "done_when": ["true"]}]
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    child = next(row.number for row in tracker.list_issues() if row.title == plan["issues"][0]["title"])
+    for number in (child, 9):
+        labels = _link_labels(tracker.get_issue(number).body)
+        for name in SPECIAL_NAMES:
+            assert labels.get(name) == f"https://github.com/owner/repo/blob/main/{quote(name)}", (number, name)
+
+
+def test_acceptance_links_escape_specials_but_keep_ordinary_names_unchanged():
+    from foragent.order_files import issue_body
+
+    item = {"goal": "g", "out_of_scope": "o", "done_when": ["true"],
+            "acceptance_files": {"tests/acceptance/test_a]b.py": "", "tests/acceptance/test_login_flow.py": ""}}
+    body = issue_body(item, "owner/repo", "main")
+    assert _link_labels(body)["tests/acceptance/test_a]b.py"].endswith("/test_a%5Db.py")
+    assert ("[tests/acceptance/test_login_flow.py](https://github.com/owner/repo/blob/main/"
+            "tests/acceptance/test_login_flow.py)") in body.splitlines()

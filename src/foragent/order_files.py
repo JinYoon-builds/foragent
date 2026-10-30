@@ -1,11 +1,10 @@
 """Validate issue path lists and render approved issue bodies."""
 
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote
 
 from foragent.issue import MARKER, acceptance_paths
 from foragent.issue_metadata import exclusive_header
-from foragent.order_references import body_lines
+from foragent.order_references import body_lines, repository_link
 from foragent.paths import repo_path
 
 
@@ -57,6 +56,6 @@ def issue_body(item: dict, repo: str, base: str, acceptance_dir: str = "tests/ac
         lines.extend(["```sh", command, "```"])
     lines.extend(f"- [ ] {text}" for text in item.get("checklist", []))
     for path in sorted(set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], acceptance_dir))):
-        lines.append(f"[{path}](https://github.com/{repo}/blob/{quote(base, safe='')}/{quote(path)})")
+        lines.append(repository_link(path, repo, base))
     return "\n".join(lines) + "\n"
 
