@@ -62,13 +62,13 @@ class _Edit:
 
         Skills that still need copying are kept in ``self.to_install``, like the lanes code copies them.
         """
-        from foragent.skills import SkillError, SkillManager
+        from foragent.skills import SkillError, SkillManager, with_vendored_library
 
         self.to_install = []
         names = []
         for identity in skills:
             if self.manager is None:
-                self.manager = SkillManager(self.config)
+                self.manager = SkillManager(with_vendored_library(self.config, self.root))
             try:
                 names.append(self.manager.check_install(identity, self.root).path.name)
                 self.to_install.append(identity)

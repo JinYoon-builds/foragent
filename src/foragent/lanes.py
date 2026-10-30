@@ -9,7 +9,7 @@ import yaml
 from foragent.config import Config, LaneSettings, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.paths import repo_path
-from foragent.skills import SkillManager
+from foragent.skills import SkillManager, with_vendored_library
 
 
 class LaneError(ValueError):
@@ -43,7 +43,7 @@ def validate_lane(root: Path, config: Config, name: str, paths: list[str], skill
     if agent.exists():
         raise LaneError(f"agent already exists: {agent.relative_to(root)}")
     repo_path(root, ".foragent.yml")
-    manager = manager or (SkillManager(config) if skills else None)
+    manager = manager or (SkillManager(with_vendored_library(config, root)) if skills else None)
     return _check_skills(root, skills, manager)
 
 
@@ -64,7 +64,7 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
              push: bool = True, title: str | None = None, emoji: str | None = None) -> dict:
     config = load_config(root)
     skills = skills or []
-    manager = manager or (SkillManager(config) if skills else None)
+    manager = manager or (SkillManager(with_vendored_library(config, root)) if skills else None)
     installed = validate_lane(root, config, name, paths, skills, executor, model, manager)
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
@@ -128,7 +128,7 @@ def set_lane_skills(root: Path, name: str, skills: list[str], *,
         raise LaneError(f"invalid agent frontmatter: {agent}: {exc}") from exc
     if not isinstance(header, dict):
         raise LaneError(f"agent requires mapping frontmatter: {agent}")
-    manager = manager or (SkillManager(config) if skills else None)
+    manager = manager or (SkillManager(with_vendored_library(config, root)) if skills else None)
     installed = _check_skills(root, skills, manager)
     lane["skills"] = installed
     _validate({**asdict(config), "lanes": {**config.lanes, name: lane}})

@@ -169,12 +169,18 @@ class SkillManager:
             name = repo.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") if isinstance(entry, str) else entry["name"]
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in {".", ".."}:
                 raise SkillError(f"invalid library name: {name}")
-            if any(lib.name == name for lib in self.libraries):
-                raise SkillError(f"duplicate library name: {name}")
             path = Path(entry["path"]).expanduser() if isinstance(entry, dict) and "path" in entry else directory / name
             vendored = isinstance(entry, dict) and entry.get("revision")
             library = Library(name, repo, path, entry["revision"] if vendored else None,
                               tuple(entry.get("skills", ())) if vendored else None)
+            # Names and prefixes are public skill IDs; a pinned library's IDs never pass to another source.
+            pinned = next((lib for lib in self.libraries if lib.revision is not None
+                           and (lib.name == name or lib.prefix == library.prefix)), None)
+            if pinned is not None:
+                raise SkillError(f"library name {name} is taken by the vendored {pinned.name} library "
+                                 f"({pinned.path}); rename the configured library in skill_libraries")
+            if any(lib.name == name for lib in self.libraries):
+                raise SkillError(f"duplicate library name: {name}")
             if any(lib.prefix == library.prefix for lib in self.libraries):
                 raise SkillError(f"duplicate library prefix: {library.prefix}")
             self.libraries.append(library)
@@ -408,17 +414,15 @@ def _is_own_source(library: Library) -> bool:
 
 
 VENDORED_MANIFEST = "skills/pstack/library.yml"
-# Foragent's own source tree: its skills/ are package data, read from the installed location instead.
-_SOURCE = Path(__file__).resolve().parents[2]
 
 
 def vendored_library(root: Path | None = None) -> dict[str, Any] | None:
     """The library entry for skills vendored with Foragent at a pinned revision.
 
     The project's own copy wins, so a moved or copied checkout finds itself; otherwise the installed
-    package data. Foragent's own source tree is the package, not a project vendoring it. Only the skills the manifest lists belong to it.
+    package data. Only the skills the manifest lists belong to it.
     """
-    bases = [root] if root is not None and root.resolve() != _SOURCE else []
+    bases = [root] if root is not None else []
     bases += [Path(sysconfig.get_path("data")) / "share/foragent"]
     for base in bases:
         manifest = base / VENDORED_MANIFEST
@@ -437,13 +441,11 @@ def vendored_library(root: Path | None = None) -> dict[str, Any] | None:
 
 
 def with_vendored_library(config: Config, root: Path | None = None) -> Config:
-    """Add the vendored library to the configured ones; a configured library of the same name keeps it."""
+    """Put the vendored library before the configured ones, so a configured name cannot take its IDs."""
     entry = vendored_library(root)
-    names = {item.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") if isinstance(item, str) else item.get("name")
-             for item in config.skill_libraries}
-    if entry is None or entry["name"] in names:
+    if entry is None or any(isinstance(item, dict) and item.get("revision") for item in config.skill_libraries):
         return config
-    return replace(config, skill_libraries=[*config.skill_libraries, entry])
+    return replace(config, skill_libraries=[entry, *config.skill_libraries])
 
 
 def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: SkillManager) -> list[str]:

@@ -962,8 +962,21 @@ def test_vendored_library_prefers_project_then_installed_package_data(tmp_path, 
     catalog = SkillManager(config).catalog()
     assert [(row["id"], row["license"], row["copies"]) for row in catalog] == [
         ("pstack:principle-demo", "MIT", ["skills/principle-demo"])]
-    configured = Config(skill_libraries=[{"name": "pstack", "repo": "x", "path": str(tmp_path)}])
-    assert skills.with_vendored_library(configured, project) is configured
+    # A configured library cannot take the pinned IDs, whatever form names it.
+    other = tmp_path / "other"
+    (other / "skills/principle-local").mkdir(parents=True)
+    (other / "skills/principle-local/SKILL.md").write_text("---\nname: principle-local\ndescription: Other.\n---\n")
+    for entry in ({"name": "pstack", "repo": "x", "path": str(other)}, "https://example.invalid/team/pstack.git",
+                  {"name": "stack", "repo": "y", "path": str(other)}):
+        clash = skills.with_vendored_library(Config(skill_libraries=[entry]), project)
+        if isinstance(entry, dict) and entry["name"] == "stack":
+            manager = SkillManager(clash)
+            assert manager._select("pstack:principle-local").path == project / "skills/principle-local"
+            continue
+        with pytest.raises(SkillError, match="taken by the vendored pstack library"):
+            SkillManager(clash)
+    assert skills.with_vendored_library(skills.with_vendored_library(Config(skill_libraries=[]), project),
+                                        project).skill_libraries[0]["path"] == str(project)
 
 
 def test_sync_never_pulls_pinned_or_self_sourced_libraries(tmp_path, monkeypatch):
