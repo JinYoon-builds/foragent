@@ -117,19 +117,18 @@ def choose_tier(ctx: RunContext, run, size: str) -> tuple[str, str]:
     """The next executor turn's key and tier (#238, architect r42): derived, never looked up.
 
     Turn k = len(attempt_tiers) + 1 counts every executor turn (implementation, conflict
-    resolution, CI repair, rebuild, a turn again after a limit wait or restart). The base is
-    turn 1's recorded tier, or, when there is none, l with ample quota of the run's executor,
-    else the size. Turn k is the base stepped up k - 1 times, capped at l. The last allowed
-    attempt is l while the executor's usage is measured; without current usage nothing is
-    upgraded beyond the step (rule 3), as before #238.
+    resolution, CI repair, rebuild, a turn again after a limit wait or restart). The last
+    allowed attempt is l, whatever the usage or executor kind. Otherwise the base is turn 1's
+    recorded tier, or, when there is none, l with ample quota of the run's executor, else the
+    size; turn k is the base stepped up k - 1 times, capped at l.
     """
-    k = len(run.attempt_tiers) + 1
+    k = str(len(run.attempt_tiers) + 1)
+    if run.attempts >= ctx.config.max_retries + 1:
+        return k, "l"
     base = run.attempt_tiers.get("1")
-    left = quota_left(ctx)
     if base not in _TIERS:
-        base = "l" if left is not None and left >= ctx.config.tiers_headroom_ample else size
-    last = run.attempts >= ctx.config.max_retries + 1 and left is not None
-    return str(k), "l" if last else attempt_tier(base, k)
+        base = "l" if ample_quota(ctx) else size
+    return k, attempt_tier(base, int(k))
 
 
 def implementer_setup(
