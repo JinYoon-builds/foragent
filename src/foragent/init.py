@@ -11,7 +11,7 @@ import sys
 
 import yaml
 
-from foragent import board, gh, launchd, role_agents, roles
+from foragent import board, gh, lane_memory, launchd, role_agents, roles
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
@@ -200,6 +200,32 @@ def _claude_by_env() -> str | None:
     return kind if kind is not None and _claude_installed() else None
 
 
+def _identity_notes(tracker: Tracker, config: Config) -> list[str]:
+    """Read the signed-in GitHub account again and say whose factory this is (D78 revision).
+
+    Re-running fa init after `gh auth login`/`switch` is how a factory learns its new
+    account. Another person's labelled work without a shared legacy_owner means the
+    repository is not ready for a second factory yet.
+    """
+    from foragent.ownership import OwnershipError, parse_orderer
+
+    try:
+        login = tracker.authenticated_login(refresh=True)
+    except (TrackerError, ValueError) as exc:
+        return [text("init_identity_failed", config.language, error=" ".join(str(exc).split())[:300])]
+    notes = [text("init_identity", config.language, login=login)]
+    if config.legacy_owner is None:
+        try:
+            owners = {owner for issue in tracker.list_issues()
+                      if (owner := parse_orderer(issue.labels)) is not None}
+        except (TrackerError, OwnershipError):
+            owners = set()
+        if owners - {login.lower()}:
+            notes.append(text("init_legacy_owner_missing", config.language,
+                              owners=", ".join(sorted(owners - {login.lower()}))))
+    return notes
+
+
 def _preflight_language(root: Path, language: str | None) -> str:
     """Language for errors raised before setup: the flag, else the existing config, else English."""
     if language is not None:
@@ -208,6 +234,17 @@ def _preflight_language(root: Path, language: str | None) -> str:
         return load_config(root).language if (root / ".foragent.yml").exists() else "en"
     except (ConfigError, OSError):
         return "en"
+
+
+def _bind_checkout(root: Path) -> None:
+    """Bind this checkout to its repository's box when it is the first with that origin (#1026)."""
+    from datetime import UTC, datetime
+
+    from foragent import presence
+    try:
+        presence.bind_checkout(root, datetime.now(UTC))
+    except Exception:  # Optional upkeep: the session-start hook binds later instead.
+        logging.getLogger(__name__).debug("checkout binding skipped", exc_info=True)
 
 
 def init_repo(
@@ -325,6 +362,9 @@ def init_repo(
         print(f"Warning: kept {', '.join(invalid_agents)} unchanged; its frontmatter needs name, "
               "memory: project and the skills of its roles entry.", file=sys.stderr)
 
+    # Re-running init moves lane memory to its two writers (D95); a second run changes nothing.
+    migrated = lane_memory.migrate(root, config)
+
     created = [path for path in contents if not (root / path).exists()]
     existed = [path for path in contents if (root / path).exists()]
     if config_path.exists():
@@ -342,7 +382,9 @@ def init_repo(
     # Also recover a deletion left uncommitted by an interrupted setup.
     legacy_paths = [LEGACY_PUBLISH_WORKFLOW] if not (root / LEGACY_PUBLISH_WORKFLOW).exists() else []
     pending = list(dict.fromkeys([
-        *created, *tracked_removals, *([".foragent.yml"] if updated_config is not None else []),
+        *created, *tracked_removals, *([".foragent.yml"] if updated_config is not None else []), *migrated,
+        # Files an interrupted earlier run migrated but never committed are found by their state.
+        *git.uncommitted_paths(lane_memory.managed_paths(root, config)),
         *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root, role_skills), *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
@@ -360,6 +402,7 @@ def init_repo(
     # GhTracker counts its own attempts; its default runner must not count them again.
     tracker = tracker or GhTracker(repo, run=gh_run)
     tracker.ensure_labels(LABELS)
+    notes.extend(_identity_notes(tracker, config))
     board_id = config.board
     if not no_board:
         created_boards: set[str] = set()
@@ -407,6 +450,7 @@ def init_repo(
                 stream.write(data if isinstance(data, bytes) else data.encode("utf-8"))
     for path in removed:
         (root / path).unlink()
+    lane_memory.apply(root, migrated)
     if WORKFLOW in created:
         write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:
@@ -419,6 +463,7 @@ def init_repo(
     if push_planned:
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
+    _bind_checkout(root)
     return InitReport(created, existed, False, bool(pending), push_planned, label,
                       normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
                       notes=notes, tracker=tracker)

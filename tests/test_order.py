@@ -19,6 +19,7 @@ from foragent.reasons import Reason, format_comment
 from foragent.scheduler import TickContext, tick
 from foragent.skills import SkillManager
 from foragent.state import StateStore
+from foragent.ownership import OwnershipError, effective_orderer
 from foragent.tracker import FakeTracker, TrackerError
 
 from conftest import BASE_TIME, git_command
@@ -176,7 +177,7 @@ def test_interactive_republication_syncs_label_without_duplicate_children(publis
     assert "interactive" in tracker.get_issue(2).labels
     publish(publishing, plan)
     assert len(tracker.issues) == 3
-    assert tracker.get_issue(2).labels == {"lane:api", "size:m", "custom"}
+    assert tracker.get_issue(2).labels == {"by:human", "lane:api", "size:m", "custom"}
     plan["issues"][0]["interactive"] = True
     publish(publishing, plan)
     assert "interactive" in tracker.get_issue(2).labels
@@ -195,11 +196,13 @@ def test_publish_order_contract_labels_native_links_and_summary(publishing, plan
         f"```sh\nuv run pytest -q {FILE}\n```\n```sh\ntrue\n```\n- [ ] Looks right\n"
         f"[{FILE}](https://github.com/owner/repo/blob/main/{FILE})\n\n"
         "<!-- foragent:plan-child id=2026-10-20-login key=api -->\n"
+        "<!-- foragent:owner-label -->\n"
     )
     assert tracker.get_issue(2).body == expected
     assert parse_body(expected).done_when_commands == plan["issues"][0]["done_when"]
-    assert tracker.get_issue(2).labels == {"lane:api", "size:m", "approved"}
-    assert tracker.get_issue(3).labels == {"size:s", "approved"}
+    assert tracker.get_issue(2).labels == {"by:human", "lane:api", "size:m", "approved"}
+    assert tracker.get_issue(3).labels == {"by:human", "size:s", "approved"}
+    assert tracker.get_issue(1).labels == {"by:human"}
     assert tracker.parent_of(2) == tracker.parent_of(3) == 1
     assert [dep.number for dep in tracker.blocked_by(3)] == [2]
     assert {"size:s", "size:m", "size:l", "lane:api"} <= tracker.labels.keys()
@@ -223,7 +226,7 @@ def test_publish_projects_are_idempotent_and_failure_does_not_stop_publication(p
     for _ in range(2):
         report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git, approve=True)
         assert report.parent == 1
-    assert len(tracker.issues) == 3 and tracker.get_issue(2).labels == {"lane:api", "size:m", "approved"}
+    assert len(tracker.issues) == 3 and tracker.get_issue(2).labels == {"by:human", "lane:api", "size:m", "approved"}
     if offline:
         assert "Could not add issue" in caplog.text and "Could not set board Status" in caplog.text
     else:
@@ -627,7 +630,7 @@ def test_interrupted_lane_commit_is_completed_before_issues(publishing, plan, mo
     monkeypatch.setattr(git, "commit_paths", original)
     publish((root, load_config(root), tracker, git, events), plan)
     assert events[0][1] == "Foragent lane web"
-    assert set(events[0][2]) == {".foragent.yml", ".claude/agents/fa-web.md"}
+    assert set(events[0][2]) == {".foragent.yml", ".claude/agents/fa-web.md", ".gitattributes"}
 
 
 def test_edit_with_changed_acceptance_invalidates_approval_on_retry(publishing, plan):
@@ -707,7 +710,7 @@ def test_lane_skills_stay_local_and_copy_into_runner_worktree(offline_publicatio
     assert "skills: [testing-strategy]" in (runner / ".claude/agents/fa-web.md").read_text()
     lane_commit = next(args for args in calls if "commit" in args and args[args.index("-m") + 1] == "Foragent lane web")
     assert set(lane_commit[lane_commit.index("--") + 1:]) == {
-        ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ":!CLAUDE.local.md",
+        ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ".gitattributes", ":!CLAUDE.local.md",
     }
     assert len([args for args in calls if args[0] == "push"]) == 1
     order.publish(plan, root, load_config(root), tracker, repo="owner/repo", git=git, manager=manager)
@@ -1057,8 +1060,9 @@ REPO = "owner/repo"
 
 
 def _child_body(plan, item, config):
-    """The body publish writes for a plan child, marker included."""
-    return order._published_body(plan, item, REPO, config) + "\n" + order._child_marker(plan["id"], item["key"]) + "\n"
+    """The body publish writes for a new plan child, its plan and owner-label markers included."""
+    return (order._published_body(plan, item, REPO, config) + "\n" + order._child_marker(plan["id"], item["key"])
+            + "\n" + order.OWNED_MARKER + "\n")
 
 
 API_FILES = {FILE: "assert True\n"}
@@ -1087,6 +1091,13 @@ def test_preread_proposal_is_recorded_and_bound_to_the_published_issue(publishin
     assert proposal["approach"] == ["Reuse the writer."]
     assert proposal["decisions"] == ["Name the helper while implementing."]
     assert _handover(root, 7, body.replace("\n", "\r\n"), API_FILES) is not None
+    legacy = body.replace(order.OWNED_MARKER + "\n", "")  # A child published before owner labels.
+    assert _handover(root, 7, legacy, API_FILES) == proposal
+    # The body publish writes is exactly the one the run is handed the proposal for.
+    tracker, git = publishing[2], publishing[3]
+    publish(publishing, plan)
+    assert tracker.get_issue(2).body == body
+    assert _handover(root, 7, body + "\nAppended by a person.\n", API_FILES) is None
     other = order._published_body(plan, plan["issues"][1], REPO, config) + order._child_marker(plan["id"], "api")
     assert _handover(root, 7, other, API_FILES) is None, "another issue's content is not this proposal"
     assert _handover(root, 7, body.replace(f"id={plan['id']}", "id=another-order"), API_FILES) is None
@@ -1159,6 +1170,9 @@ def test_preread_proposal_of_an_edit_is_bound_to_its_number(publishing, plan, mo
     order.preread(plan, root, config, lambda: tracker, repo=REPO)
     body = order._published_body(plan, edit, REPO, config)
     assert _handover(root, 3, body, API_FILES)["approach"] == ["Reuse the writer."], "the api issue supplies FILE"
+    # An edit of an issue published under owner labels keeps that contract line at its end.
+    contract = order._with_contract(body, f"old\n{order.OWNED_MARKER}\n")
+    assert contract != body and _handover(root, 3, contract, API_FILES)["approach"] == ["Reuse the writer."]
     assert _handover(root, 4, body, API_FILES) is None
     assert _handover(root, 3, body, {FILE: "assert 1 == 1\n"}) is None
 
@@ -1300,8 +1314,9 @@ def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_pa
     assert {key: implementation[key] for key in setup.options} == setup.options
     if lane == "api":
         assert ("agent" in setup.options) == (executor == "claude")
-    expected_prefix = implementation["prompt"].removesuffix("PROMPT")
-    assert prompt.startswith(expected_prefix) and prompt.removeprefix(expected_prefix) == order.preread_prompt(plan, item)
+    # The lane-memory notice (the writer contract, D95) follows the task in both prompts.
+    expected_prefix, _, notice = implementation["prompt"].partition("PROMPT")
+    assert prompt == expected_prefix + order.preread_prompt(plan, item) + notice
     if executor == "codex" and lane == "api":
         assert "API lane rules." in expected_prefix and "polish" in expected_prefix
 
@@ -1941,6 +1956,155 @@ def test_publication_write_must_stay_inside_its_own_root(tmp_path):
             check_write(tmp_path, name, own)
 
 
+def make_legacy(tracker, number):
+    """Turn an issue into one published before owner labels existed."""
+    issue = tracker.get_issue(number)
+    tracker.remove_labels(number, [label for label in issue.labels if label.startswith("by:")])
+    tracker.update_issue(number, title=issue.title, body=issue.body.replace(order.OWNED_MARKER + "\n", ""))
+
+
+def owners(tracker):
+    return {n: {label for label in issue.labels if label.startswith("by:")} for n, issue in tracker.issues.items()}
+
+
+def test_publish_without_an_authenticated_person_changes_nothing(publishing, plan):
+    tracker, events = publishing[2], publishing[4]
+    tracker.login = ""
+    with pytest.raises(order.PlanError, match="GitHub account"):
+        publish(publishing, plan, approve=True)
+    assert events == [] and tracker.issues == {} and tracker.labels == {}
+
+
+def test_owner_label_dropped_by_github_closes_the_issue_and_stops(publishing, plan):
+    tracker = publishing[2]
+    created = tracker.create_issue
+
+    def drop_owner(title, body, labels):  # GitHub ignores labels its caller may not apply.
+        return created(title, body, [label for label in labels if not label.startswith("by:")])
+
+    tracker.create_issue = drop_owner
+    with pytest.raises(order.PlanError, match="by:human"):
+        publish(publishing, plan)
+    assert [(n, issue.state) for n, issue in tracker.issues.items()] == [(1, "closed")]
+    assert "by:human" in tracker.list_comments(1)[0].body
+
+
+def test_republication_and_approval_keep_the_publishers_owner(publishing, plan):
+    tracker = publishing[2]
+    publish(publishing, plan)
+    tracker.login = "Bob"
+    plan["issues"].append({**deepcopy(plan["issues"][1]), "key": "late", "title": "Late child"})
+    publish(publishing, plan, approve=True)
+    assert owners(tracker) == {1: {"by:human"}, 2: {"by:human"}, 3: {"by:human"}, 4: {"by:human"}}
+    assert "by:bob" not in tracker.labels
+
+
+def test_republication_refuses_contradictory_owner_labels(publishing, plan):
+    tracker = publishing[2]
+    publish(publishing, plan)
+    tracker.add_labels(3, ["by:bob"])
+    before = deepcopy(tracker.issues)
+    with pytest.raises(order.PlanError, match="by:human|bob"):
+        publish(publishing, plan, approve=True)
+    assert tracker.issues == before
+
+
+def test_unlabelled_order_gets_new_children_for_its_legacy_owner(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    for number in (1, 2, 3):  # An order published before owner labels existed.
+        make_legacy(tracker, number)
+    tracker.login = "bob"
+    plan["issues"].append({**deepcopy(plan["issues"][1]), "key": "late", "title": "Late child"})
+    order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
+    assert owners(tracker) == {1: set(), 2: set(), 3: set(), 4: {"by:jin"}}
+
+
+def test_edits_keep_the_existing_issue_owner(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(9, "Legacy", "old body", labels=["size:s"])
+    tracker.add_issue(10, "Alice's", f"old body\n{order.OWNED_MARKER}\n", labels=["size:s", "by:alice"])
+    tracker.add_issue(11, "Ownerless", f"old body\n{order.OWNED_MARKER}\n", labels=["size:s"])
+    edit = {key: plan["issues"][1][key] for key in ("goal", "out_of_scope", "done_when", "checklist")}
+    plan["issues"], plan["edits"] = [], [{**edit, "number": n} for n in (9, 10, 11)]
+    publish(publishing, plan, approve=True)
+    assert owners(tracker)[9] == set() and owners(tracker)[10] == {"by:alice"} and owners(tracker)[11] == set()
+    # The rewritten body keeps each issue's owner-label contract, and only theirs.
+    assert [order.OWNED_MARKER in tracker.get_issue(n).body for n in (9, 10, 11)] == [False, True, True]
+    with pytest.raises(OwnershipError):
+        effective_orderer(tracker.get_issue(11), replace(publishing[1], legacy_owner="jin"), "jin")
+    events = {n: list(tracker.label_events(n)) for n in (9, 10, 11)}
+    publish(publishing, plan, approve=True)  # Idempotent: the kept contract does not look like a change.
+    assert {n: list(tracker.label_events(n)) for n in (9, 10, 11)} == events
+
+
+@pytest.mark.parametrize("refused", ["parent", "child"])
+@pytest.mark.parametrize("fault", ["label", "read", "read-unlabelled", "retire", "close", "retire-and-close"])
+def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing, plan, refused, fault):
+    tracker = publishing[2]
+    target = plan["title"] if refused == "parent" else plan["issues"][1]["title"]
+    created, read, write, close = tracker.create_issue, tracker.get_issue, tracker.update_issue, tracker.close_issue
+    victim = []
+
+    def create(title, body, labels):
+        if title == target and not victim:
+            if fault != "read":  # GitHub drops a label its caller may not apply.
+                labels = [label for label in labels if not label.startswith("by:")]
+            victim.append(created(title, body, labels))
+            return victim[0]
+        return created(title, body, labels)
+
+    def faulty(method, kinds, once=False):
+        failed = []
+
+        def call(n, *args, **kwargs):
+            if victim and n == victim[0] and fault in kinds and not (once and failed):
+                failed.append(n)
+                raise TrackerError(f"{method.__name__} failed")
+            return method(n, *args, **kwargs)
+        return call
+
+    tracker.create_issue = create
+    # One transient read failure: any rollback after it would succeed, so a wrong one shows.
+    tracker.get_issue = faulty(read, {"read", "read-unlabelled"}, once=True)
+    tracker.update_issue = faulty(write, {"retire", "retire-and-close"})
+    tracker.close_issue = faulty(close, {"close", "retire-and-close"})
+    with pytest.raises((order.PlanError, TrackerError)):
+        publish(publishing, plan)
+    number = victim[0]
+    for name, original in (("create_issue", created), ("get_issue", read),
+                           ("update_issue", write), ("close_issue", close)):
+        setattr(tracker, name, original)
+    first = tracker.get_issue(number)
+    # Each cleanup step runs even when the other one fails.
+    assert (first.state == "closed") == (fault in ("label", "retire"))
+    assert ("<!-- foragent:plan" not in first.body) == (fault in ("label", "close"))
+    if fault == "read":  # The outcome was unknown, and it was a labelled issue: nothing undone.
+        assert owners(tracker)[number] == {"by:human"} and first.state == "open"
+        assert "<!-- foragent:plan" in first.body, "its live markers let a retry find it"
+    if fault != "read":  # Whatever rollback failed, an unlabelled leftover is nobody's work, never legacy work.
+        assert not owners(tracker)[number] and order.OWNED_MARKER in first.body
+        for config in (publishing[1], replace(publishing[1], legacy_owner="jin")):
+            with pytest.raises(OwnershipError, match=f"#{number} was published for an owner label"):
+                effective_orderer(first, config, "human")
+    tracker.login = "bob"  # Anyone may retry; the unconfirmed issue must not decide the owner.
+    report = publish(publishing, plan)
+    numbers = {report.parent, *(row["number"] for row in report.rows)}
+    labelled = "by:human" in tracker.get_issue(number).labels
+    assert labelled == (fault == "read")
+    assert (number in numbers) == labelled, "A labelled issue is reused, an unlabelled one never"
+    # A reused labelled parent keeps its original owner; a fresh parent belongs to the retrying person.
+    expected = {"by:bob"} if refused == "parent" and number not in numbers else {"by:human"}
+    assert all(owners(tracker)[n] == expected for n in numbers)
+    assert all(tracker.get_issue(n).state == "open" for n in numbers)
+    leftover = tracker.get_issue(number)
+    if fault != "read":  # A labelled (confirmed but unread) issue stays a normal owned issue.
+        assert leftover.state == "closed" and "<!-- foragent:plan" not in leftover.body
+        assert order.OWNED_MARKER in leftover.body
+    publish(publishing, plan)  # Stable afterwards: no duplicate parents or children.
+    assert {report.parent, *(row["number"] for row in publish(publishing, plan).rows)} == numbers
+
+
 STATEMENT = "A caller observes one receipt per login."
 # A test the lane has not written yet: a statement draft may name it before preparation.
 UNWRITTEN = "uv run pytest -q tests/acceptance/test_receipt.py"
@@ -2009,3 +2173,44 @@ def test_statements_appear_verbatim_in_the_issue_body(publishing, plan, monkeypa
     assert f"## Behaviour\n- {STATEMENT}\n- Nothing else changes.\n" in body
     assert parse_body(body).goal == "Implement login."
     assert "## Behaviour" not in publishing[2].get_issue(3).body
+
+
+@pytest.mark.parametrize("partial", ["parent-only", "unmapped-child"])
+def test_retry_of_a_legacy_partial_order_keeps_it_with_the_legacy_owner(publishing, plan, partial):
+    """A pre-team order that stopped early is still the original factory's order."""
+    root, config, tracker, git, _ = publishing
+    if partial == "parent-only":  # Stopped before its first child: the parent records none.
+        tracker.add_issue(1, plan["title"], f"{plan['summary']}\n\n\n\n{order._plan_marker(plan['id'], {}, {})}\n")
+    else:  # Stopped after creating the client child, before recording it in the map.
+        publish(publishing, plan)
+        parent = tracker.get_issue(1)
+        body = re.sub(r"map=\{[^\n]*?\}", 'map={"api": 2}', parent.body)
+        tracker.update_issue(1, title=parent.title, body=body)
+        for number in (1, 2, 3):
+            make_legacy(tracker, number)
+    tracker.login = "bob"
+    report = order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
+    assert report.parent == 1, "The legacy parent is kept"
+    children = {row["number"] for row in report.rows}
+    survivors = set() if partial == "parent-only" else {2, 3}
+    assert survivors <= children, "Legacy children found by marker are kept"
+    assert all(owners(tracker)[n] == {"by:jin"} for n in children - survivors)
+    assert all(owners(tracker)[n] == set() for n in {1} | survivors), "Legacy issues are not relabelled"
+    assert all(order.OWNED_MARKER not in tracker.get_issue(n).body for n in {1} | survivors)
+    assert all(tracker.get_issue(n).state == "open" for n in {1} | children)
+
+
+
+def test_a_parent_whose_owner_label_a_person_removed_is_refused_not_replaced(publishing, plan):
+    """A recorded order without its by: label is neither recreated nor given to anyone."""
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    tracker.remove_labels(1, ["by:human"])
+    tracker.login = "bob"
+    before = deepcopy(tracker.issues)
+    with pytest.raises(order.PlanError, match="#1 was published for an owner label"):
+        order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
+    assert tracker.issues == before
+    tracker.add_labels(1, ["by:human"])  # A person restores the owner; publication continues.
+    assert order.publish(plan, root, config, tracker, repo="owner/repo", git=git).parent == 1
+    assert len(tracker.issues) == 3

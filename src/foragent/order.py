@@ -5,12 +5,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import quote
 
-from foragent import board, design, order_references
+from foragent import board, design, order_references, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -24,7 +25,11 @@ from foragent.order_files import check_destinations, check_write, issue_body, va
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
-from foragent.tracker import LabelSpec, Tracker, pr_issue_number
+from foragent.ownership import OWNED_MARKER, OwnershipError, effective_orderer, label_description, owner_label, parse_orderer
+from foragent.tracker import IdentityError, Issue, LabelSpec, Tracker, TrackerError, pr_issue_number
+
+
+log = logging.getLogger(__name__)
 
 
 class PlanError(ValueError):
@@ -466,6 +471,108 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
     return published_blobs
 
 
+def _order_owner(tracker: Tracker, config: Config, parent, children: list) -> str:
+    """The person this order's new issues belong to; republication never transfers it.
+
+    An existing order keeps its parent's owner (the effective legacy owner for an
+    unlabelled parent). A new order belongs to the authenticated publisher. Every
+    existing issue of the order must have at most one owner label.
+    """
+    language = config.language
+    try:
+        login = tracker.authenticated_login()
+    except IdentityError as exc:
+        raise PlanError(text("identity_not_a_person", language, login=exc.login, kind=exc.kind)) from exc
+    except TrackerError as exc:
+        raise PlanError(text("identity_unavailable", language, error=" ".join(str(exc).split())[:300])) from exc
+    try:
+        for issue in children:
+            parse_orderer(issue.labels, language)
+        return effective_orderer(parent, config, login) if parent is not None else parse_orderer(
+            [owner_label(login)], language)
+    except OwnershipError as exc:
+        raise PlanError(str(exc)) from exc
+
+
+_MARKER_PREFIX = "<!-- foragent:"
+# A retired issue keeps its text for the record, but no Foragent marker matches it.
+_RETIRED_PREFIX = "<!-- foragent-refused:"
+
+
+def _labelled(issue) -> bool:
+    return any(label.lower().startswith(ownership.PREFIX) for label in issue.labels)
+
+
+def _retired_body(body: str) -> str:
+    """``body`` with its publication markers retired and its owner-label contract kept.
+
+    The plan, child and v1 markers stop matching, so nothing finds or works it as
+    order content; ``OWNED_MARKER`` stays, so an unlabelled issue still has no owner
+    (``ownership.effective_orderer``) instead of turning into legacy work.
+    """
+    retired_contract = OWNED_MARKER.replace(_MARKER_PREFIX, _RETIRED_PREFIX)
+    return body.replace(_MARKER_PREFIX, _RETIRED_PREFIX).replace(retired_contract, OWNED_MARKER)
+
+
+def _with_contract(body: str, existing_body: str) -> str:
+    """Rewritten ``body`` that keeps the owner-label contract of the issue it replaces."""
+    return f"{body}{OWNED_MARKER}\n" if OWNED_MARKER in existing_body and OWNED_MARKER not in body else body
+
+
+def _retire(tracker: Tracker, config: Config, issue, label: str) -> None:
+    """Close an unconfirmed issue and retire its markers, each step on its own.
+
+    Closing comes first: a closed issue is never work. Retiring the markers is
+    attempted even when closing fails, and the other way round. Whatever still fails
+    is harmless: discovery never reuses an unconfirmed issue (``_unconfirmed``), and
+    the next publication of the order retires it again.
+    """
+    if issue.state == "open":
+        try:
+            tracker.close_issue(issue.number, text("identity_closed_unlabelled", config.language, label=label))
+        except Exception:
+            log.warning("could not close unconfirmed issue #%s", issue.number, exc_info=True)
+    retired = _retired_body(issue.body)
+    if retired != issue.body:
+        try:
+            tracker.update_issue(issue.number, title=issue.title, body=retired)
+        except Exception:
+            log.warning("could not retire the markers of unconfirmed issue #%s", issue.number, exc_info=True)
+
+
+def _unconfirmed(issue, mapped: set[int]) -> bool:
+    """Created under the owner-label contract, yet unlabelled and not part of its order.
+
+    Only bodies written by this publisher carry ``OWNED_MARKER``; legacy issues
+    (published before owner labels) never do, so they keep being reused and
+    belong to ``legacy_owner``. A labelled issue, or one already in its parent's
+    map, is a confirmed member of the order.
+    """
+    return OWNED_MARKER in issue.body and not _labelled(issue) and issue.number not in mapped
+
+
+def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str]) -> int:
+    """Create an issue carrying ``owner``'s label, or refuse it and stop publication.
+
+    GitHub silently drops labels a creator may not apply, so the label is read back.
+    Only an issue observed without its label is retired, and publication stops. When
+    the read itself fails, the outcome is unknown and nothing is touched: a labelled
+    issue keeps its live markers, so a retry reuses it under its original owner; an
+    unlabelled one carries ``OWNED_MARKER`` without the label, so it is nobody's work
+    (``ownership.effective_orderer``), discovery never reuses it (``_unconfirmed``),
+    and a retry retires it. The same holds when every rollback step fails.
+    The issue is created in one request so its body has no edit that would
+    postdate an approval added in the same publication.
+    """
+    label = owner_label(owner)
+    number = tracker.create_issue(title, body, [label, *labels])
+    confirmed = label in tracker.get_issue(number).labels
+    if not confirmed:
+        _retire(tracker, config, Issue(number, title, body, frozenset(), "open"), label)
+        raise PlanError(text("identity_label_missing", config.language, number=number, label=label))
+    return number
+
+
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
             git: GitRepo | None = None, manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
@@ -482,6 +589,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
     parents = [(issue, pattern.search(issue.body)) for issue in all_issues if pattern.search(issue.body)]
+    # A parent is part of its order once it records a child; until then, like a child
+    # missing from the map, an unlabelled owner-contract parent is an unconfirmed creation.
+    unconfirmed = [issue for issue, marker in parents if marker[1] == "{}" and _unconfirmed(issue, set())]
+    parents = [(issue, marker) for issue, marker in parents if issue not in unconfirmed]
     if len(parents) > 1:
         raise PlanError(f"multiple parents for plan {plan['id']}")
     parent, mapping, saved_blobs = None, {}, {}
@@ -503,12 +614,21 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                 raise ValueError("invalid acceptance blob map")
         except ValueError as exc:
             raise PlanError(f"invalid plan map on parent #{parent}") from exc
+    mapped = set(mapping.values())
     for item in plan["issues"]:
-        matches = [issue.number for issue in all_issues if _child_marker(plan["id"], item["key"]) in issue.body]
+        found = [issue for issue in all_issues if _child_marker(plan["id"], item["key"]) in issue.body]
+        unconfirmed += [issue for issue in found if _unconfirmed(issue, mapped)]
+        matches = [issue.number for issue in found if not _unconfirmed(issue, mapped)]
         if len(matches) > 1:
             raise PlanError(f"duplicate children for key {item['key']}")
         if item["key"] not in mapping and matches:
             mapping[item["key"]] = matches[0]
+    # An earlier refusal may have retired an issue's markers but failed to close it.
+    retired = (f"{_RETIRED_PREFIX}plan id={plan['id']} map=",
+               *(_child_marker(plan["id"], item["key"]).replace(_MARKER_PREFIX, _RETIRED_PREFIX)
+                 for item in plan["issues"]))
+    unconfirmed += [issue for issue in all_issues
+                    if issue.state == "open" and any(marker in issue.body for marker in retired)]
     by_number = {issue.number: issue for issue in all_issues}
     edit_numbers = {item["number"] for item in plan.get("edits", [])}
     if edit_numbers & set(mapping.values()):
@@ -555,12 +675,18 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
           if "statements" not in item and (approve or item["number"] in selected_numbers)),
     ])
+    owner = _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
+                         [by_number[n] for n in mapping.values()])
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
+    # The owner label exists before any file or issue does: without it, nothing is published.
+    tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
     with git.publish_lock():
         git.update_base(config.base_branch)
         published_blobs = _publish_files(plan, root, config, git, files, manager)
+    for issue in unconfirmed:
+        _retire(tracker, config, issue, owner_label(owner))
     lane_names = {item["lane"] for item in plan["issues"]} - {"main"}
     tracker.ensure_labels([*LABELS, *(LabelSpec(f"lane:{name}", "ededed", f"Foragent lane {name}.") for name in sorted(lane_names))])
     if any(item.get("interactive", False) for item in plan["issues"]):
@@ -577,13 +703,15 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     def parent_body() -> str:
         children = [tracker.get_issue(n) for n in mapping.values()]
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
-        return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n"
+        owned = f"{OWNED_MARKER}\n" if parent_owned else ""
+        return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
 
     # An order with no sub-issues (edits or approvals only) is finished once it
     # applies: publish closes its record below, so it never gets a Backlog card.
     childless = not plan["issues"] and not mapping
+    parent_owned = parent is None or OWNED_MARKER in by_number[parent].body
     if parent is None:
-        parent = tracker.create_issue(plan["title"], parent_body(), [])
+        parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
         linked: set[int] = set()
     else:
         tracker.update_issue(parent, title=plan["title"], body=parent_body())
@@ -592,20 +720,22 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     if not childless:
         board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
     for item in plan["issues"]:
-        body = _published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
+        number = mapping.get(item["key"])
+        existing = tracker.get_issue(number) if number is not None else None
+        owned = existing is None or OWNED_MARKER in existing.body
+        body = (_published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
+                + (f"{OWNED_MARKER}\n" if owned else ""))
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
         if item.get("interactive", False):
             labels.append("interactive")
-        number = mapping.get(item["key"])
         blobs = acceptance_blobs(item)
         if number is None:
-            number = tracker.create_issue(item["title"], body, labels)
+            number = _create_owned(tracker, config, owner, item["title"], body, labels)
             mapping[item["key"]] = number
             recorded_blobs[str(number)] = blobs
             # Persist progress before native edge calls so retries reuse the child.
             tracker.update_issue(parent, title=plan["title"], body=parent_body())
         else:
-            existing = tracker.get_issue(number)
             if (existing.body != body or saved_blobs.get(str(number), {}) != blobs
                     or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
@@ -630,7 +760,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
-        body = _published_body(plan, item, repo, config)
+        # An edit rewrites the whole body; the issue's owner-label contract survives it.
+        body = _with_contract(_published_body(plan, item, repo, config), existing.body)
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
             name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
@@ -782,9 +913,16 @@ def _body_digest(body: str) -> str:
 
 
 def _without_child_marker(body: str) -> tuple[str, re.Match | None]:
-    """Split off the plan-child marker publish appends as the body's last line, nothing else."""
+    """Split off the lines publish appends after the rendered body, nothing else.
+
+    Those are the plan-child marker (children) and the owner-label contract line
+    (``OWNED_MARKER``, last; children and edits of contract issues).
+    """
     text = body.replace("\r\n", "\n").rstrip()
     head, _, last = text.rpartition("\n")
+    if last == OWNED_MARKER:
+        text = head.rstrip()
+        head, _, last = text.rpartition("\n")
     marker = _CHILD_LINE.fullmatch(last)
     return (head if marker else text), marker
 
@@ -819,7 +957,7 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
 
     A record counts only when its key names this issue (plan child key in the same order,
     or an edit of #n), the body publish rendered for it equals the approved body byte for byte
-    (apart from the trailing plan-child marker publish appends), and every file it bound
+    (apart from the trailing lines publish appends), and every file it bound
     (acceptance tests and references) has the same content in the run's worktree and, where
     the approval snapshot names the file, in that snapshot. The preread writer keeps
     records in write order, so the last match is the latest answer; when that answer

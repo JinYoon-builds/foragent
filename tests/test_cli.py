@@ -801,6 +801,8 @@ def test_tick_returns_while_notification_child_is_still_running(app, monkeypatch
     children = []
 
     def slow_notification(args, **kwargs):
+        if args[:1] == ["git"]:
+            return popen(args, **kwargs)  # Origin lookups (#1030) run as they are.
         # Replace GitHub/osascript with a real offline child that stays busy.
         child = popen([sys.executable, "-c", "import sys; sys.stdin.readline()"],
                       **{**kwargs, "stdin": subprocess.PIPE})

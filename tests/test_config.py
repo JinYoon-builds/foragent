@@ -25,7 +25,7 @@ def test_exact_defaults(repo):
     expected = {
         "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
-        "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "run_hours": "always",
+        "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "orch_silent_alert_minutes": 30,
@@ -36,7 +36,7 @@ def test_exact_defaults(repo):
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
-        "interview": "native", "ouroboros_version": None, "profile": None, "animation": True, "update_check": True,
+        "interview": "native", "ouroboros_version": None, "profile": None, "legacy_owner": None, "animation": True, "update_check": True,
         "upstream_reports": None, "perspectives": {}, "claude_quota": {"mode": "keep", "keep_percent": 80},
         "view_glyphs": "auto",
         "presence": {"statusline": True, "session_start": True, "report": True},
@@ -486,3 +486,27 @@ def test_roles_are_derived_when_the_config_has_no_roles_key(repo):
     assert role_drift(repo, config) == [], "Derived defaults have no stored entry to drift from"
     (repo / ".foragent.yml").write_text(yaml.safe_dump({"roles": {"security": {"agent": "fa-security"}}}))
     assert list(load_roles(load_config(repo))) == ["security"], "A stored block is the whole source"
+
+
+def test_personal_notify_filter_wins_over_the_repository_and_is_checked(tmp_path):
+    (tmp_path / ".foragent.yml").write_text("skill_libraries: []\nnotify_filter: all\n")
+    personal = tmp_path / "personal.yml"
+    personal.write_text("skill_libraries: []\nnotify_filter: decisions\n")
+    assert load_config(tmp_path, personal).notify_filter == "decisions"
+    assert load_config(tmp_path, tmp_path / "absent.yml").notify_filter == "all"
+    personal.write_text("skill_libraries: []\nnotify_filter: urgent\n")
+    with pytest.raises(ConfigError, match="notify_filter"):
+        load_config(tmp_path, personal)
+
+
+@pytest.mark.parametrize("login", ["", "-alice", "alice-", "a--b", "al ice", "by:alice", 3, ["alice"], "a" * 40])
+def test_legacy_owner_must_be_a_github_login(repo, tmp_path, login):
+    write_settings(repo / ".foragent.yml", {"legacy_owner": login})
+    with pytest.raises(ConfigError, match="legacy_owner"):
+        load_config(repo, tmp_path / "global.yml")
+
+
+def test_legacy_owner_is_optional_and_kept_as_written(repo, tmp_path):
+    assert load_config(repo, tmp_path / "global.yml").legacy_owner is None
+    write_settings(repo / ".foragent.yml", {"legacy_owner": "Jin-Yoon"})
+    assert load_config(repo, tmp_path / "global.yml").legacy_owner == "Jin-Yoon"

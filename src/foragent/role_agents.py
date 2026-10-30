@@ -11,6 +11,7 @@ import sysconfig
 
 import yaml
 
+from foragent import lane_memory
 from foragent.paths import repo_path
 
 
@@ -64,7 +65,7 @@ def _templates(root: Path, *, existing_skills: bool = False,
     contents: dict[str, str] = {}
     for role in ROLES:
         contents[f".claude/agents/{role}.md"] = agent_text(role, _skills(role, skills))
-        contents[f".claude/agent-memory/{role}/MEMORY.md"] = MEMORY.get(role, f"# {role} memory\n")
+        contents[lane_memory.memory_directory(role, role) + "MEMORY.md"] = MEMORY.get(role, f"# {role} memory\n")
         # Copy the skills the roles source lists, not the role's own name (#769).
         for name in _skills(role, skills):
             skill = f".claude/skills/{name}"
