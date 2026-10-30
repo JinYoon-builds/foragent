@@ -51,6 +51,18 @@ def test_call_refuses_while_the_executor_is_paused(tmp_path):
 
 
 
+def test_call_refuses_a_multi_line_short_before_launching(tmp_path, monkeypatch):
+    launches = []
+    monkeypatch.setattr(orch_architect.subprocess, "Popen", lambda *a, **kw: launches.append(a))
+    store = StateStore(tmp_path / "state")
+    now = datetime(2026, 10, 27, tzinfo=UTC)
+    with pytest.raises(orch_architect.ArchitectRefused, match="one line"):
+        orch_architect.call(tmp_path, store, Config(executor="claude"), "evidence", now,
+                            short="first\nsecond")
+    assert launches == [] and not orch_architect.record_path(store).exists()
+    assert not (store.root / "orch-events.jsonl").exists()
+
+
 def test_call_refuses_a_role_missing_from_the_roles_source(tmp_path, monkeypatch):
     launches = []
     monkeypatch.setattr(orch_architect.subprocess, "Popen", lambda *a, **kw: launches.append(a))

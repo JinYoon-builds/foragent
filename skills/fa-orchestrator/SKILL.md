@@ -71,7 +71,7 @@ when available). Never call the architect on a fixed threshold; judge each case 
 
 ## Handle blocked items first
 
-Change `overlap_per_file` only from conflict facts reported by `fa orch facts`. Run
+Change `overlap_per_file`, or one file's limit (`plan.md`), only from conflict facts in `fa orch facts`. Run
 `fa orch list --json`. Read each item's full blocked details, raw reviewer text and original logs
 (`log_path`; read beyond the tail when necessary). For a blocker or a repeated failure, measure before
 acting: rule out hypotheses with evidence; when the cause is unknown, add logging and read it; when
@@ -101,8 +101,9 @@ logs, then file a fix issue as a new order through `fa-order`. The same defect c
 within your authority (skill rule, issue edit or split, queue) and give one line to the person. Never weaken locked tests, cross review or merge
 conditions to recover a metric: ask the person first with choices and a recommendation, and wait for the answer. Every retrospective answers
 "does this need the architect?" in one `fa orch note` line from the facts and log: overlap waits repeating on the same hot files; repeat holds of a design defect class (two writers, check-then-act);
-files over their line limit; approved work in one lane while others are idle. If any holds, call `fa orch architect --why "<signal and numbers>"`, or record why not; no fixed threshold
-([why](references/retrospective.md)). Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why`); record proposals: `fa orch role-decision <id> accepted|rejected`. Answer every role-signal request in the inbox (from gate, with `role` and `signal`): call the role, then `fa orch signal-answer <id> called --why "<what it found>"`, or answer `fa orch signal-answer <id> not-now --why "<reason>"`; never pass a signal to the person. Here, review the unanswered and not-now signals (scorecard `signals`).
+files over their line limit; approved work in one lane while others are idle. If any holds, call `fa orch architect --why "<signal and numbers>" --short "<one-line reason>"`, or record why not; no fixed threshold
+([why](references/retrospective.md)). `--why` carries the full evidence to the role; `--short` is the one-line reason people see, which you write in the config `language`.
+Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why ... --short ...`); record proposals: `fa orch role-decision <id> accepted|rejected`. Answer every role-signal request in the inbox (from gate, with `role` and `signal`): call the role, then `fa orch signal-answer <id> called --why "<what it found>"`, or answer `fa orch signal-answer <id> not-now --why "<reason>"`; never pass a signal to the person. Here, review the unanswered and not-now signals (scorecard `signals`).
 
 ## Human decisions, notification and merge
 

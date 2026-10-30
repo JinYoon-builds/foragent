@@ -1,7 +1,8 @@
 """`fa orch park|unpark`: the orchestrator's recorded answer to a blocked or held issue.
 
 These verbs are the only writers of the waiting-person label and of the parked and
-unparked journal events; the gate tick only reads them (``parked_at``).
+unparked journal events; the gate tick only reads them (``parked_at``). Park also
+removes the approved label, so a parked issue never starts; unpark does not restore it.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 
-from foragent.labels import BLOCKED, NEEDS_HUMAN, WAITING_PERSON
+from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, WAITING_PERSON
 from foragent.state import StateStore
 
 
@@ -49,7 +50,8 @@ def park(ctx, n: int, why: str, *, for_person: bool = False) -> str:
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     if for_person:
         tracker.add_labels(n, [WAITING_PERSON])
-    tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
+    # Park revokes admission; only a new approval (fa order publish) lets the gate start it again.
+    tracker.remove_labels(n, [APPROVED, BLOCKED, NEEDS_HUMAN])
     summary = f"#{n}: parked" + (" for a person's decision" if for_person else "") + f"; why: {why}"
     orch._event(ctx, n, "parked", summary)
     return summary

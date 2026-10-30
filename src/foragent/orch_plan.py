@@ -1,11 +1,15 @@
 """The per-repository plan under ``<state>/plan.json``.
 
-One file holds the lane queues, plan pauses (until, why), lane widths and the
-plan's expiry, each with the author who wrote it (``human`` or
-``orchestrator``). It also holds per-issue executor/model assignments and the
-goal with its deadline (``orch_assign``); the plan's expiry never lapses those:
-an assignment lapses at its own ``until``, and the goal stays until it is
-changed or cleared. The plan is a preference above the safety lines: the tick
+One file holds the lane queues, plan pauses (until, why), lane widths, the
+plan's expiry and per-file overlap limits (limit, why, expiry), each with the
+author who wrote it (``human`` or ``orchestrator``). A file limit replaces
+``overlap_per_file`` for that one path; the agent chooses it from recorded
+overlap facts and the gate applies it as written. Each file limit has its own
+expiry, so editing one never changes or expires the plan's other items. It
+also holds per-issue executor/model assignments and the goal with its deadline
+(``orch_assign``); the plan's expiry never lapses those: an assignment lapses
+at its own ``until``, and the goal stays until it is changed or cleared. The
+plan is a preference above the safety lines: the tick
 still applies blockers, budgets, the overlap cap and exclusive rules, and a
 queue never unpauses a lane. An orchestrator never changes or clears an item a
 person wrote.
@@ -23,8 +27,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
+from glob import has_magic
 import json
 from pathlib import Path
+import posixpath
 
 from foragent import orch_events
 from foragent.state import StateStore
@@ -41,13 +47,13 @@ def _path(store: StateStore) -> Path:
 
 
 def _empty() -> dict:
-    return {"queues": {}, "paused": {}, "width": {}, "expires_at": None,
+    return {"queues": {}, "paused": {}, "width": {}, "expires_at": None, "files": {},
             "authors": {"queues": {}, "width": {}, "expires_at": None},
             "assignments": {}, "goal": None}
 
 
 # Every key the plan loader reads; anything else (e.g. a throughput goal) is not plan state here.
-STORED_KEYS = ("queues", "paused", "width", "expires_at", "authors", "written_by", "assignments", "goal")
+STORED_KEYS = ("queues", "paused", "width", "expires_at", "files", "authors", "written_by", "assignments", "goal")
 
 
 def plan_fields(data: dict) -> dict:
@@ -78,6 +84,9 @@ def _read(store: StateStore) -> dict:
                       for lane, item in (data.get("paused") or {}).items()}
     plan["width"] = {str(lane): int(n) for lane, n in (data.get("width") or {}).items()}
     plan["expires_at"] = data.get("expires_at")
+    plan["files"] = {str(path): {"limit": int(item["limit"]), "why": item.get("why", ""),
+                                 "by": item.get("by", "human"), "expires_at": item.get("expires_at")}
+                     for path, item in (data.get("files") or {}).items()}
     plan["authors"] = {
         "queues": {lane: (authors.get("queues") or {}).get(lane, "human") for lane in plan["queues"]},
         "width": {lane: (authors.get("width") or {}).get(lane, "human") for lane in plan["width"]},
@@ -102,6 +111,7 @@ def written_by(plan: dict) -> str | None:
     """``human`` when any live item is a person's, else ``orchestrator``; None when empty."""
     authors = [*plan["authors"]["queues"].values(), *plan["authors"]["width"].values(),
                *(item["by"] for item in plan["paused"].values()),
+               *(item["by"] for item in plan["files"].values()),
                *(item["by"] for item in plan["assignments"].values())]
     if plan["goal"]:
         authors.append(plan["goal"]["by"])
@@ -117,12 +127,15 @@ def _expired(plan: dict, now: datetime) -> bool:
 
 
 def _in_force(plan: dict, now: datetime) -> dict:
-    """The derived plan: empty once expired; pauses and assignments whose ``until`` has passed left out.
+    """The derived plan: empty once expired; pauses, file limits and assignments past their time left out.
 
-    The plan's expiry lapses lane preferences only; assignments and the goal outlive it.
+    The plan's expiry lapses lane preferences only; file limits, assignments and the goal outlive it.
     """
+    files = {path: item for path, item in plan["files"].items()
+             if not item["expires_at"] or now < datetime.fromisoformat(item["expires_at"])}
     if _expired(plan, now):
         plan = {**_empty(), "assignments": plan["assignments"], "goal": plan["goal"]}
+    plan["files"] = files
     plan["paused"] = {lane: item for lane, item in plan["paused"].items()
                       if now < datetime.fromisoformat(item["until"])}
     plan["assignments"] = {number: item for number, item in plan["assignments"].items()
@@ -176,6 +189,11 @@ def queue(store: StateStore, lane: str, now: datetime | None = None) -> list[int
 
 def width(store: StateStore, lane: str, now: datetime) -> int | None:
     return load(store, now)["width"].get(lane)
+
+
+def file_limits(store: StateStore, now: datetime) -> dict[str, int]:
+    """The per-file overlap limits in force: repository-relative path -> limit."""
+    return {path: item["limit"] for path, item in load(store, now)["files"].items()}
 
 
 def lane_paused(store: StateStore, lane: str, now: datetime) -> bool:
@@ -280,6 +298,77 @@ def set_plan(store: StateStore, widths: dict[str, int | None], expires: datetime
             plan["authors"]["expires_at"] = by
             events.append(("plan-expires", None, f"plan expires at {expires.isoformat()} by {by}",
                            {"expires_at": expires.isoformat()}))
+        return events
+
+    return _edit(store, by, change)
+
+
+def normal_file(path: str, root: Path | None = None) -> str:
+    """One spelling per in-root file; a path outside the repository or a pattern is refused.
+
+    With the checkout ``root``, symbolic links in the path are followed, so a link that leaves
+    the repository is refused and an in-root alias names the file it points to. The path as
+    given is resolved there, not its text normal form: ``link/..`` is the link target's parent,
+    which text normalisation would silently drop.
+    """
+    raw = path.strip().replace("\\", "/")
+    if not raw or raw.startswith("/") or has_magic(raw):
+        raise PlanRefused(f"'{path}' must be a file path inside the repository")
+    normal = posixpath.normpath(raw)
+    if normal in (".", "..") or normal.startswith("../"):
+        raise PlanRefused(f"'{path}' is outside the repository")
+    if root is None:
+        return normal
+    base = root.resolve()
+    try:
+        real = (base / raw).resolve().relative_to(base).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        raise PlanRefused(f"'{path}' is outside the repository") from None
+    if real == ".":
+        raise PlanRefused(f"'{path}' must be a file path inside the repository")
+    return real
+
+
+def set_files(store: StateStore, limits: dict[str, int | None], why: str, expires: datetime | None,
+              by: str = "human", *, case_sensitive: bool | None = True, root: Path | None = None) -> dict:
+    """Set per-file overlap limits (None clears one) with their reason and expiry; all or nothing.
+
+    Only the named files change: the plan's queues, pauses, widths and expiry stay as they are.
+    Without ``expires`` an entry keeps its current expiry (a new one has none). On a
+    case-insensitive checkout (``case_sensitive`` False) a spelling that differs only in case
+    names the stored entry, so it keeps that entry's author protection. With ``root`` an alias
+    through a symbolic link names its target, so it shares that entry's protection too.
+    """
+    if not why.strip():
+        raise PlanRefused("--overlap needs --why with the recorded evidence")
+    normal: dict[str, int | None] = {}
+    for path, value in limits.items():
+        normal[normal_file(path, root)] = value
+
+    def change(plan, now):
+        if case_sensitive is False:
+            stored = {path.casefold(): path for path in plan["files"]}
+            keyed = {stored.get(path.casefold(), path): value for path, value in normal.items()}
+        else:
+            keyed = normal
+        for path in keyed:
+            current = plan["files"].get(path)
+            _check_author(current and current["by"], by, f"file {path}'s overlap limit")
+        if expires is not None and expires <= now:
+            raise PlanRefused(f"--expires {expires.isoformat()} is in the past")
+        events = []
+        for path, value in keyed.items():
+            current = plan["files"].get(path)
+            at = expires.isoformat() if expires is not None else current and current["expires_at"]
+            if value is None:
+                plan["files"].pop(path, None)
+                summary = f"file {path} overlap limit cleared by {by}: {why}"
+            else:
+                plan["files"][path] = {"limit": value, "why": why, "by": by, "expires_at": at}
+                summary = f"file {path} overlap limit {value} by {by}" + (
+                    f" until {at}" if at else "") + f": {why}"
+            events.append(("plan-overlap", None, summary,
+                           {"file": path, "limit": value, "why": why, "expires_at": at}))
         return events
 
     return _edit(store, by, change)
